@@ -28,8 +28,8 @@ sys.path.insert(0, str(ROOT / "scripts/ci"))
 sys.path.insert(0, str(ROOT / "tests/python"))
 import joint_stop_verdict as jv  # noqa: E402
 from joint_stop_logs import (  # noqa: E402
-    CELL, JOIN_QUANTA, MARKER, OK_SUMMARY, PREAMBLE, S1_RECEIPT,
-    SHED_RECEIPT, STARVED_RECEIPT, UNATTRIBUTED_RECEIPT,
+    CELL, FELL_BACK_RECEIPT, JOIN_QUANTA, MARKER, OK_SUMMARY, PREAMBLE,
+    S1_RECEIPT, SHED_RECEIPT, STARVED_RECEIPT, UNATTRIBUTED_RECEIPT,
     body_for, case_failed_record, case_record, frame, healthy_outcome,
     log_for, no_feed_probe, no_feed_record, offset_of, passing, precluded,
     precluded_record, qualified_record, record_line, wedge_outcome,
@@ -335,8 +335,8 @@ ROWS = [
         0, outcome=healthy_outcome(0)))), 101, False, F, "case-outcome",
      "r9-2: post-link evidence before a preclusion"),
     ("precluded-linked-case", log_for(edited(PR, case_set(
-        0, branch="linked", outcome=None, no_feed=None))), 101, False, F,
-     "no-feed-binding", "r9-2: preclusion of a linked case"),
+        0, branch="linked", outcome=None, no_feed=None, join_feeds=1))), 101,
+     False, F, "no-feed-binding", "r9-2: preclusion of a linked case"),
     ("precluded-wrong-receipt", log_for(edited(PR, lambda r: r["terminal"]
                                                .update(receipt=S1_RECEIPT
                                                        + " ok"))), 101,
@@ -467,6 +467,73 @@ ROWS = [
         2, "no-feeds-receipt-starved"), lambda r: r["cases"][2][
             "no_feed"].pop("shed"))), 101, False, F, "record-schema",
      "derived"),
+    # --- bounded join arithmetic (tier-1 r12 F1) ---------------------
+    ("linked-join-huge", log_for(edited(QR, case_set(
+        3, join_quanta=10 ** 12)), ok=True), 0, False, F, "join-bound",
+     "r12 F1: a schema-valid huge join is refused before any loop"),
+    ("linked-join-u64-max", log_for(edited(QR, case_set(
+        3, join_quanta=2 ** 64 - 1, join_passes=2 ** 64 - 1)), ok=True), 0,
+     False, F, "join-bound", "r12 F1"),
+    # --- feeds that installed, then fell back (tier-1 r12 F2) --------
+    ("fell-back-case1", log_for(no_feed_record(1, "no-feeds-fell-back")),
+     101, False, F, "no-feed-fell-back",
+     "r12 F2: install-then-fallback is a named cause, never accepted"),
+    ("fell-back-at-the-bound", log_for(edited(no_feed_record(
+        1, "no-feeds-fell-back"), case_set(
+            1, join_quanta=JOIN_QUANTA, join_passes=4, join_feeds=1))), 101,
+     False, F, "no-feed-fell-back",
+     "control: feeds on the last join quantum that fell back"),
+    ("fell-back-without-feeds", log_for(edited(no_feed_record(
+        1, "no-feeds-fell-back"), case_set(1, join_feeds=0))), 101, False,
+     F, "join-bound", "r12 F2: an early join end needs a feed"),
+    ("fell-back-spent-without-feeds", log_for(edited(no_feed_record(
+        1, "no-feeds-fell-back"), case_set(
+            1, join_quanta=JOIN_QUANTA, join_passes=4, join_feeds=0))), 101,
+     False, F, "no-feed-cause", "r12 F2: fell-back needs the join's feeds"),
+    ("unattributed-hiding-fallback", log_for(edited(no_feed_record(
+        2, "no-feeds-unattributed"), case_set(2, join_feeds=2))), 101, False,
+     F, "join-bound", "r12 F2: feeds at the join's end are fell-back"),
+    ("starved-hiding-fallback", log_for(edited(no_feed_record(
+        2, "no-feeds-receipt-starved"), case_set(2, join_feeds=1))), 101,
+     False, F, "join-bound", "r12 F2"),
+    ("linked-early-without-feeds", log_for(edited(QR, case_set(
+        3, join_feeds=0)), ok=True), 0, False, F, "join-bound",
+     "r12 F2: a join ends early only on a feed or an S1 latch"),
+    ("linked-spent-without-feeds", log_for(edited(QR, case_set(
+        3, join_quanta=JOIN_QUANTA, join_passes=4, join_feeds=0)), ok=True),
+     0, False, Q, "full-matrix",
+     "control: feeds that arrived after the join bound"),
+    ("linked-missing-feeds", log_for(edited(QR, case_set(
+        3, join_feeds=None)), ok=True), 0, False, F, "join-bound",
+     "derived"),
+    ("feeds-on-unlinked-setup", log_for(edited(case_failed_record(
+        6, "setup"), case_set(6, join_feeds=0))), 101, False, F,
+     "join-bound", "derived"),
+    ("join-feeds-not-an-int", log_for(edited(QR, case_set(
+        3, join_feeds="1")), ok=True), 0, False, F, "record-schema",
+     "derived"),
+    ("probe-missing-fallback", log_for(edited(no_feed_record(
+        1, "no-feeds-fell-back"), lambda r: r["cases"][1][
+            "no_feed"].pop("fallback"))), 101, False, F, "record-schema",
+     "derived"),
+    ("probe-fallback-not-an-int", log_for(edited(no_feed_record(
+        1, "no-feeds-fell-back"), lambda r: r["cases"][1][
+            "no_feed"].update(fallback="2"))), 101, False, F, "record-schema",
+     "mutation sweep"),
+    # --- shed bound to its proof (tier-1 r12 GLM 1) ------------------
+    ("unattributed-with-foreign-shed", log_for(edited(no_feed_record(
+        2, "no-feeds-unattributed"), lambda r: r["cases"][2][
+            "no_feed"].update(foreign_shed=5))), 101, False, F,
+     "no-feed-unattributed",
+     "r12 GLM 1: proven-foreign shed names no fixture cause"),
+    ("calls-shed-from-foreign-only", log_for(edited(no_feed_record(
+        0, "no-feeds-calls-shed"), lambda r: r["cases"][0][
+            "no_feed"].update(shed=0, foreign_shed=17))), 101, False, F,
+     "no-feed-cause", "r12 GLM 1: foreign shed is never calls-shed"),
+    ("probe-foreign-shed-not-an-int", log_for(edited(no_feed_record(
+        2, "no-feeds-receipt-starved"), lambda r: r["cases"][2][
+            "no_feed"].update(foreign_shed="1"))), 101, False, F,
+     "record-schema", "derived"),
 
     # --- wedge ------------------------------------------------------------
     ("wedge-describing-success", log_for(edited(WR, case_set(
@@ -589,21 +656,34 @@ class JointStopVerdictTableTests(unittest.TestCase):
                 'prep: index / STOP_OFFSETS_MS.len(),',
                 '#[serde(tag = "kind", rename_all = "kebab-case")]',
                 'JointBranch::S1 => Some("s1-precluded"),',
+                'JointBranch::FellBack => Some("no-feeds-fell-back"),',
+                'JointBranch::FellBack => "fell-back",',
+                'join.feeds = coordinator.registry().joint_feeds() as u64;',
+                'let held = caller_of(&coordinator, process_a.pid())?;',
+                'case.note_no_feed(no_feed_probe(&lane, &coordinator, held));',
+                'subject == crate::inventory_present::JOINT_RETAINED_S1_SUBJECT',
+                'reason.starts_with("joint_fallback_")',
+                'unproven: lane_shed.saturating_sub(foreign),',
+                'lane_shed_split_from(lane_shed, coordinator.registry()'
+                '.foreign_unrouted_calls())',
                 'JointBranch::Unattributed => Some("no-feeds-unattributed"),',
                 'JointBranch::ReceiptStarved => Some("no-feeds-receipt-starved"),',
                 'JointBranch::ReceiptStarved => "receipt-starved",',
                 'JointBranch::CallsShed => Some("no-feeds-calls-shed"),',
                 'JointBranch::CallsShed => "calls-shed",',
                 'let branch = joint_branch(&coordinator, '
-                'lane.shed_calls_disclosed());',
+                'lane.shed_calls_disclosed(), held, &join);\n'
+                '    case.link(&branch, join);',
                 'const STOP_JOIN_QUANTA: u64 = %d;' % jv.JOIN_QUANTA,
                 'const STOP_JOIN_PASS_EVERY: u64 = %d;' % jv.JOIN_PASS_EVERY,
                 'quanta % STOP_JOIN_PASS_EVERY == 1',
-                'case.link(&branch, join_quanta, join_passes);',
+                'let branch = match joint_branch(driver.coordinator, '
+                'lane_shed, caller_a, &join) {',
                 '("semantic admission deferred", '
-                '"semantic_unavailable:no_receipt") => {',
-                '("semantic receipt refused", "partition") => '
-                'starved.partition += repeats,',
+                '"semantic_unavailable:no_receipt")\n'
+                '                if caller.as_ref() == Some(&held) =>',
+                '("semantic receipt refused", "partition") if '
+                'caller.is_none() => {',
                 'stage: "setup",', 'stage: "drive",', 'stage: "check",',
                 '(StopCheck::AtQ, check_stop_at_q),',
                 '(StopCheck::Latch, check_stop_latch),',
@@ -614,6 +694,8 @@ class JointStopVerdictTableTests(unittest.TestCase):
             with self.subTest(literal=literal):
                 self.assertIn(literal, rust)
         self.assertEqual(jv.NO_FEED, {"s1-precluded": S1_RECEIPT,
+                                      "no-feeds-fell-back":
+                                          FELL_BACK_RECEIPT,
                                       "no-feeds-receipt-starved":
                                           STARVED_RECEIPT,
                                       "no-feeds-calls-shed": SHED_RECEIPT,
@@ -624,6 +706,7 @@ class JointStopVerdictTableTests(unittest.TestCase):
         # joins its lines with nothing.
         self.assertIn(STARVED_RECEIPT, re.sub(r"\\\n\s*", "", rust))
         self.assertIn(SHED_RECEIPT, re.sub(r"\\\n\s*", "", rust))
+        self.assertIn(FELL_BACK_RECEIPT, re.sub(r"\\\n\s*", "", rust))
         case = rust.split("struct StopCaseRecord {", 1)[1].split("\n}", 1)[0]
         self.assertEqual(
             sorted(re.findall(r"^    (\w+):", case, re.M)) ,
@@ -658,8 +741,8 @@ class JointStopVerdictTableTests(unittest.TestCase):
         got = jv.classify(log_for(no_feed_record(0, "no-feeds-calls-shed")),
                           101, CELL)
         self.assertEqual(got["reason"], "no-feed-calls-shed")
-        self.assertIn("shed=17 after %d join quanta and 4 discovery passes"
-                      % JOIN_QUANTA, got["detail"])
+        self.assertIn("shed=17 foreign_shed=0 after %d join quanta and 4 "
+                      "discovery passes" % JOIN_QUANTA, got["detail"])
         self.assertNotIn("unexplained", got["detail"])
 
     def test_starved_detail_names_the_typed_cause(self):
@@ -672,7 +755,33 @@ class JointStopVerdictTableTests(unittest.TestCase):
                       got["detail"])
         self.assertEqual([jv.join_passes_for(n) for n in (0, 1, 2, 9, 10, 32)],
                          [0, 0, 1, 1, 2, 4])
+        self.assertEqual(
+            [jv.join_passes_for(n) for n in range(JOIN_QUANTA + 1)],
+            [sum(1 for q in range(n) if q % jv.JOIN_PASS_EVERY == 1)
+             for n in range(JOIN_QUANTA + 1)],
+            "the closed form equals the schedule over the whole bound")
+        self.assertIsNone(jv.join_passes_for(JOIN_QUANTA + 1))
         self.assertNotIn("unexplained", got["detail"])
+
+    def test_fell_back_detail_names_the_typed_cause(self):
+        got = jv.classify(log_for(no_feed_record(1, "no-feeds-fell-back")),
+                          101, CELL)
+        self.assertEqual(got["reason"], "no-feed-fell-back")
+        self.assertIn("fallback=2 after 3 join quanta and 1 discovery passes "
+                      "ending with 2 feeds", got["detail"])
+        self.assertIn("joint_fallback_unsealable x2", got["detail"])
+
+    def test_huge_join_is_refused_in_bounded_time(self):
+        # r12 F1: the old scan took minutes on a 10**12 join; the bound
+        # is checked first and the schedule is closed form.
+        import time
+        for join in (10 ** 12, 10 ** 19, 2 ** 64 - 1):
+            with self.subTest(join=join):
+                started = time.monotonic()
+                got = jv.classify(log_for(edited(QR, case_set(
+                    3, join_quanta=join)), ok=True), 0, CELL)
+                self.assertLess(time.monotonic() - started, 2.0)
+                self.assertEqual(got["reason"], "join-bound")
 
     def test_no_feed_detail_names_the_sampled_evidence(self):
         got = jv.classify(log_for(no_feed_record(4, "no-feeds-unattributed")),
@@ -718,7 +827,7 @@ class JointStopVerdictTableTests(unittest.TestCase):
 SOLE_GUARDS = (
     "summary-not-terminal", "summary-counts",
     "summary-duplicate", "record-duplicate", "record-misplaced",
-    "record-cell", "case-sequence",
+    "record-cell", "case-sequence", "join-bound",
     "case-outcome", "completion", "terminal-status", "terminal-case",
     "qualified-count", "unexpected-pass", "precluded-binding",
     "no-feed-binding", "wedge-binding", "wedge-unexpected",

@@ -36,20 +36,28 @@ FAILED_SUMMARY = ("test result: FAILED. 0 passed; 1 failed; 0 ignored; "
 S1_RECEIPT = "no joint feeds with S1 seal (producers unlinked, zero installs)"
 UNATTRIBUTED_RECEIPT = ("no joint feeds without S1 seal (producers linked, "
                         "zero installs unexplained)")
+FELL_BACK_RECEIPT = ("no joint feeds from the linked session: feeds "
+                     "installed during the join, then every feed fell back "
+                     "to S1 (counted in fallback)")
 STARVED_RECEIPT = ("no joint feeds from the linked session: the held "
-                   "caller's birth receipt was deferred (no_receipt) or "
-                   "refused (partition) and no later birth bound")
-SHED_RECEIPT = ("no joint feeds from the linked session: fixture calls "
-                "were shed without a route (counted in shed) and no birth "
-                "bound")
+                   "caller's birth admission was deferred (no_receipt) or a "
+                   "session birth receipt was refused (partition, "
+                   "caller-less) and no later birth bound")
+SHED_RECEIPT = ("no joint feeds from the linked session: calls not proven "
+                "foreign were shed without a route (counted in shed, "
+                "foreign shed apart) and no birth bound")
 RECEIPTS = {"s1-precluded": S1_RECEIPT,
+            "no-feeds-fell-back": FELL_BACK_RECEIPT,
             "no-feeds-receipt-starved": STARVED_RECEIPT,
             "no-feeds-calls-shed": SHED_RECEIPT,
             "no-feeds-unattributed": UNATTRIBUTED_RECEIPT}
-LINKED_NO_FEED = ("no-feeds-receipt-starved", "no-feeds-calls-shed",
-                  "no-feeds-unattributed")
+LINKED_NO_FEED = ("no-feeds-fell-back", "no-feeds-receipt-starved",
+                  "no-feeds-calls-shed", "no-feeds-unattributed")
 JOIN_QUANTA = 32
 JOIN_PASSES = 4  # passes before join quanta 2, 10, 18 and 26
+# A fell-back case: feeds installed after 3 join quanta (one pass, due
+# before quantum 2), then all fell back before the linkage decision.
+FELL_BACK_JOIN = (3, 1, 2)
 BACKTRACE = [
     "",
     "Stack backtrace:",
@@ -92,6 +100,10 @@ def no_feed_probe(branch="no-feeds-unattributed"):
                  "reason": "semantic_unavailable:no_receipt", "count": 1},
                 {"subject": "semantic receipt refused",
                  "reason": "partition", "count": 1}]
+    fell_back = branch == "no-feeds-fell-back"
+    if fell_back:
+        gaps = [{"subject": "Joint key operations unavailable; retained S1",
+                 "reason": "joint_fallback_unsealable", "count": 2}]
     return {"joint_feeds": 0,
             "journal_linked": branch in LINKED_NO_FEED,
             "backstop_routed": 0, "birth_capacity": None,
@@ -99,14 +111,24 @@ def no_feed_probe(branch="no-feeds-unattributed"):
             "gaps": gaps, "no_receipt": 2 if starved else 0,
             "partition": 1 if starved else 0,
             "shed": 18 if starved else (17 if branch == "no-feeds-calls-shed"
-                                        else 0)}
+                                        else 0),
+            "foreign_shed": 1 if starved else 0,
+            "fallback": 2 if fell_back else 0}
 
 
 def join_of(branch):
-    """The join the cell spends before deciding `branch`."""
+    """The (quanta, passes, feeds) join the cell ends before deciding
+    `branch`: q1's feeds for a linked case, none for S1, the fell-back
+    shape, else the whole bound without a feed."""
     if branch is None:
         return None
-    return JOIN_QUANTA if branch in LINKED_NO_FEED else 0
+    if branch == "linked":
+        return (0, 0, 1)
+    if branch == "no-feeds-fell-back":
+        return FELL_BACK_JOIN
+    if branch in LINKED_NO_FEED:
+        return (JOIN_QUANTA, JOIN_PASSES, 0)
+    return (0, 0, 0)
 
 
 def case_record(k, branch="linked", outcome="healthy", completed=None,
@@ -119,12 +141,11 @@ def case_record(k, branch="linked", outcome="healthy", completed=None,
         no_feed = no_feed_probe(branch) if branch in RECEIPTS else None
     if join == "spent":
         join = join_of(branch)
-    passes = None if join is None else (JOIN_PASSES if join == JOIN_QUANTA
-                                        else 0)
+    quanta, passes, feeds = (None, None, None) if join is None else join
     return {"name": "wp7-stop%d" % k, "index": k, "prep": k // 4,
-            "offset_ms": offset_of(k), "branch": branch, "join_quanta": join,
-            "join_passes": passes, "outcome": outcome, "no_feed": no_feed,
-            "completed": completed}
+            "offset_ms": offset_of(k), "branch": branch,
+            "join_quanta": quanta, "join_passes": passes, "join_feeds": feeds,
+            "outcome": outcome, "no_feed": no_feed, "completed": completed}
 
 
 def record(cases, terminal):

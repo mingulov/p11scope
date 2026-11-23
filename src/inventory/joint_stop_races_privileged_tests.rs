@@ -533,8 +533,9 @@ fn joint_drive_text(
 /// What the cell sampled when a case produced no Joint feeds: the two
 /// branch inputs, the unlinked-backstop count, the first birth
 /// capacity refusal, the drive state and every registry gap by
-/// (subject, reason) with its count. Carried in the verdict record so
-/// a no-feed refusal names its evidence instead of "unexplained".
+/// (subject, reason) with its count (repeats included, like the typed
+/// counters below). Carried in the verdict record so a no-feed refusal
+/// names its evidence instead of "unexplained".
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 struct NoFeedProbe {
     joint_feeds: u64,
@@ -543,11 +544,17 @@ struct NoFeedProbe {
     birth_capacity: Option<String>,
     drive: String,
     gaps: Vec<NoFeedGap>,
-    /// Typed starvation cause: `no_receipt` deferrals and `partition`
-    /// receipt refusals (with repeats), and the lane's disclosed shed.
+    /// Typed no-feed causes, each counted with repeats: the held
+    /// caller's `no_receipt` deferrals, the caller-less `partition`
+    /// receipt refusals, the lane's disclosed shed split into calls not
+    /// proven foreign (`shed`) and calls proven foreign
+    /// (`foreign_shed`), and the Joint feeds that fell back to S1
+    /// (`fallback`, the `joint_fallback_*` endings).
     no_receipt: u64,
     partition: u64,
     shed: u64,
+    foreign_shed: u64,
+    fallback: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -560,15 +567,11 @@ struct NoFeedGap {
 fn no_feed_probe(
     lane: &crate::inventory_semantics::AttestedSemanticLane,
     coordinator: &InventoryCoordinator<OsProcessSource>,
+    held: crate::discovery::caller_registry::CallerId,
 ) -> NoFeedProbe {
     let registry = coordinator.registry();
-    let starved = receipt_starvation(coordinator);
-    let mut counts: BTreeMap<(String, String), u64> = BTreeMap::new();
-    for gap in registry.gaps().iter() {
-        *counts
-            .entry((gap.subject.clone(), gap.reason.clone()))
-            .or_default() += 1;
-    }
+    let starved = receipt_starvation(coordinator, held);
+    let shed = lane_shed_split(coordinator, lane.shed_calls_disclosed());
     NoFeedProbe {
         joint_feeds: registry.joint_feeds() as u64,
         journal_linked: registry.journal_linked(),
@@ -577,18 +580,39 @@ fn no_feed_probe(
             .first_birth_capacity()
             .map(|latch| format!("{latch:?}")),
         drive: joint_drive_text(lane, coordinator),
-        gaps: counts
-            .into_iter()
-            .map(|((subject, reason), count)| NoFeedGap {
-                subject,
-                reason,
-                count,
-            })
-            .collect(),
+        gaps: no_feed_gaps_from(
+            registry
+                .gaps()
+                .iter()
+                .zip(registry.gap_repeats().iter())
+                .map(|(gap, repeats)| (gap.subject.as_str(), gap.reason.as_str(), *repeats)),
+        ),
         no_receipt: starved.no_receipt,
         partition: starved.partition,
-        shed: lane.shed_calls_disclosed(),
+        shed: shed.unproven,
+        foreign_shed: shed.foreign,
+        fallback: joint_fallbacks(coordinator),
     }
+}
+
+/// Every gap by (subject, reason), summing repeats, so a row's count is
+/// the same unit as the typed counters (never one per registry entry).
+fn no_feed_gaps_from<'a>(gaps: impl Iterator<Item = (&'a str, &'a str, u64)>) -> Vec<NoFeedGap> {
+    let mut counts: BTreeMap<(String, String), u64> = BTreeMap::new();
+    for (subject, reason, repeats) in gaps {
+        let count = counts
+            .entry((subject.to_string(), reason.to_string()))
+            .or_default();
+        *count = count.saturating_add(repeats);
+    }
+    counts
+        .into_iter()
+        .map(|((subject, reason), count)| NoFeedGap {
+            subject,
+            reason,
+            count,
+        })
+        .collect()
 }
 
 /// Drive one Running transaction to publication through the real lane
@@ -963,41 +987,49 @@ fn sum_unrouted_disclosed(
 /// default (true) when zero births flowed (total shed). Joint
 /// installs prove a real linked world; a latched false proves the
 /// latch ran (births flowed, producers unlinked); linked-true with
-/// zero installs is unattributed unless a typed cause is present: a
-/// starved birth receipt (`no_receipt` deferral or `partition`
-/// refusal), else fixture calls the lane shed without a route. Each is
-/// its own failing cause.
+/// zero installs is unattributed unless a typed cause is present: feeds
+/// that installed during the join and then all fell back, else a
+/// starved birth receipt (the held caller's `no_receipt` deferral or a
+/// caller-less `partition` refusal), else calls not proven foreign
+/// that the lane shed without a route. Each is its own failing cause.
 enum JointBranch {
     Linked,
     S1,
+    FellBack,
     ReceiptStarved,
     CallsShed,
     Unattributed,
 }
 
-/// `lane_shed` is the lane's disclosed shed count; only fixtures call
-/// the providers, so every shed call is a fixture call.
+/// The branch of the session as it stands, given the join that ran
+/// before it: `held` is the held caller (its own deferrals count),
+/// `lane_shed` the lane's disclosed shed count (the proven-foreign
+/// share never names fixture loss).
 fn joint_branch(
     coordinator: &InventoryCoordinator<OsProcessSource>,
     lane_shed: u64,
+    held: crate::discovery::caller_registry::CallerId,
+    join: &StopJoin,
 ) -> JointBranch {
-    let starved = receipt_starvation(coordinator);
+    let starved = receipt_starvation(coordinator, held);
     joint_branch_from(
         coordinator.registry().joint_feeds(),
         coordinator.registry().journal_linked(),
+        join.feeds > 0,
         starved.no_receipt + starved.partition > 0,
-        lane_shed > 0,
+        lane_shed_split(coordinator, lane_shed).unproven > 0,
     )
 }
 
 /// Pure branch decision over the registry inputs: installs prove a
 /// linked world, a latched-unlinked seal proves S1, zero installs on a
-/// linked session names its typed cause (a starved birth receipt
-/// first, then shed calls), and only no typed cause is unattributed
-/// (never S1).
+/// linked session names its typed cause (feeds seen at the join's end
+/// that fell back first, then a starved birth receipt, then shed
+/// calls), and only no typed cause is unattributed (never S1).
 fn joint_branch_from(
     joint_feeds: usize,
     journal_linked: bool,
+    join_fed: bool,
     receipt_starved: bool,
     calls_shed: bool,
 ) -> JointBranch {
@@ -1005,6 +1037,8 @@ fn joint_branch_from(
         JointBranch::Linked
     } else if !journal_linked {
         JointBranch::S1
+    } else if join_fed {
+        JointBranch::FellBack
     } else if receipt_starved {
         JointBranch::ReceiptStarved
     } else if calls_shed {
@@ -1022,9 +1056,10 @@ fn joint_branch_from(
 /// (`no_receipt`) or a refused receipt (`partition`) is retried only on
 /// the next discovery pass, so the join also runs passes (see
 /// `STOP_JOIN_PASS_EVERY`). 32 quanta with 4 passes is a wide margin
-/// over the observed need (one quantum, or one pass plus a quantum)
-/// and still ends a real starvation in bounded time. An S1 latch never
-/// changes, so an unlinked session does not wait.
+/// over the observed need (saved runs joined after one quantum; no
+/// saved run has yet shown a pass curing a deferred receipt) and still
+/// ends a real starvation in bounded time. An unlinked session does
+/// not wait.
 const STOP_JOIN_QUANTA: u64 = 32;
 
 /// One discovery pass before the 2nd, 10th, 18th and 26th join
@@ -1050,19 +1085,121 @@ fn stop_join_continues(joint_feeds: usize, journal_linked: bool, quanta: u64) ->
     joint_feeds == 0 && journal_linked && quanta < STOP_JOIN_QUANTA
 }
 
+/// One step of the join, decided before it runs: stop, service one
+/// quantum, or drive a discovery pass and then service the quantum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JoinStep {
+    Stop,
+    Quantum,
+    PassThenQuantum,
+}
+
+/// Pure step decision the drive's join loop follows verbatim.
+fn stop_join_step(joint_feeds: usize, journal_linked: bool, quanta: u64) -> JoinStep {
+    if !stop_join_continues(joint_feeds, journal_linked, quanta) {
+        JoinStep::Stop
+    } else if stop_join_pass_due(quanta) {
+        JoinStep::PassThenQuantum
+    } else {
+        JoinStep::Quantum
+    }
+}
+
+/// What the join spent and saw: quanta serviced after q1, discovery
+/// passes driven, and the Joint feeds installed when it ended (a
+/// nonzero count that is gone at the linkage decision fell back).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct StopJoin {
+    quanta: u64,
+    passes: u64,
+    feeds: u64,
+}
+
 /// The typed birth-receipt starvation evidence: registry gaps counted
-/// with their repeats by exact (subject, reason) code. The codes are
-/// the product's frozen gap vocabulary: `AdmissionPreparationError::
-/// NoReceipt` (deferral) and `CurrentReceiptRefusal::Partition`.
+/// with their repeats by exact (subject, reason) code and binding. The
+/// codes are the product's frozen gap vocabulary:
+/// `AdmissionPreparationError::NoReceipt` (a deferral recorded for its
+/// caller; only the held caller's count) and
+/// `CurrentReceiptRefusal::Partition` (recorded caller-less, so it
+/// names the session, never a caller).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct ReceiptStarvation {
     no_receipt: u64,
     partition: u64,
 }
 
-fn receipt_starvation(coordinator: &InventoryCoordinator<OsProcessSource>) -> ReceiptStarvation {
+fn receipt_starvation(
+    coordinator: &InventoryCoordinator<OsProcessSource>,
+    held: crate::discovery::caller_registry::CallerId,
+) -> ReceiptStarvation {
     let registry = coordinator.registry();
     receipt_starvation_from(
+        held,
+        registry
+            .gaps()
+            .iter()
+            .zip(registry.gap_repeats().iter())
+            .map(|(gap, repeats)| {
+                (
+                    gap.caller,
+                    gap.subject.as_str(),
+                    gap.reason.as_str(),
+                    *repeats,
+                )
+            }),
+    )
+}
+
+fn receipt_starvation_from<'a, C: PartialEq>(
+    held: C,
+    gaps: impl Iterator<Item = (Option<C>, &'a str, &'a str, u64)>,
+) -> ReceiptStarvation {
+    let mut starved = ReceiptStarvation::default();
+    for (caller, subject, reason, repeats) in gaps {
+        match (subject, reason) {
+            ("semantic admission deferred", "semantic_unavailable:no_receipt")
+                if caller.as_ref() == Some(&held) =>
+            {
+                starved.no_receipt = starved.no_receipt.saturating_add(repeats);
+            }
+            ("semantic receipt refused", "partition") if caller.is_none() => {
+                starved.partition = starved.partition.saturating_add(repeats);
+            }
+            _ => {}
+        }
+    }
+    starved
+}
+
+/// The lane's disclosed shed split by proof: `foreign` is the share the
+/// registry proved came from callers other than the bound ones; the
+/// rest (`unproven`) is the bound callers' shed plus any dropped-batch
+/// shed nobody was proven to own.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct LaneShedSplit {
+    unproven: u64,
+    foreign: u64,
+}
+
+fn lane_shed_split(
+    coordinator: &InventoryCoordinator<OsProcessSource>,
+    lane_shed: u64,
+) -> LaneShedSplit {
+    lane_shed_split_from(lane_shed, coordinator.registry().foreign_unrouted_calls())
+}
+
+fn lane_shed_split_from(lane_shed: u64, foreign: u64) -> LaneShedSplit {
+    LaneShedSplit {
+        unproven: lane_shed.saturating_sub(foreign),
+        foreign,
+    }
+}
+
+/// Joint feeds that ended in an ordered fallback to S1, counted with
+/// repeats from their named `joint_fallback_<cause>` endings.
+fn joint_fallbacks(coordinator: &InventoryCoordinator<OsProcessSource>) -> u64 {
+    let registry = coordinator.registry();
+    joint_fallbacks_from(
         registry
             .gaps()
             .iter()
@@ -1071,20 +1208,12 @@ fn receipt_starvation(coordinator: &InventoryCoordinator<OsProcessSource>) -> Re
     )
 }
 
-fn receipt_starvation_from<'a>(
-    gaps: impl Iterator<Item = (&'a str, &'a str, u64)>,
-) -> ReceiptStarvation {
-    let mut starved = ReceiptStarvation::default();
-    for (subject, reason, repeats) in gaps {
-        match (subject, reason) {
-            ("semantic admission deferred", "semantic_unavailable:no_receipt") => {
-                starved.no_receipt += repeats;
-            }
-            ("semantic receipt refused", "partition") => starved.partition += repeats,
-            _ => {}
-        }
-    }
-    starved
+fn joint_fallbacks_from<'a>(gaps: impl Iterator<Item = (&'a str, &'a str, u64)>) -> u64 {
+    gaps.filter(|(subject, reason, _)| {
+        *subject == crate::inventory_present::JOINT_RETAINED_S1_SUBJECT
+            && reason.starts_with("joint_fallback_")
+    })
+    .fold(0u64, |total, (_, _, repeats)| total.saturating_add(repeats))
 }
 
 /// Branch tag printed for a stop case that produced no Joint feeds.
@@ -1095,6 +1224,7 @@ fn no_feed_branch_tag(branch: &JointBranch) -> Option<&'static str> {
     match branch {
         JointBranch::Linked => None,
         JointBranch::S1 => Some("s1-precluded"),
+        JointBranch::FellBack => Some("no-feeds-fell-back"),
         JointBranch::ReceiptStarved => Some("no-feeds-receipt-starved"),
         JointBranch::CallsShed => Some("no-feeds-calls-shed"),
         JointBranch::Unattributed => Some("no-feeds-unattributed"),
@@ -1108,13 +1238,18 @@ fn no_feed_reason(branch: &JointBranch) -> Option<&'static str> {
     match branch {
         JointBranch::Linked => None,
         JointBranch::S1 => Some("no joint feeds with S1 seal (producers unlinked, zero installs)"),
+        JointBranch::FellBack => Some(
+            "no joint feeds from the linked session: feeds installed during the join, then \
+             every feed fell back to S1 (counted in fallback)",
+        ),
         JointBranch::ReceiptStarved => Some(
-            "no joint feeds from the linked session: the held caller's birth receipt was \
-             deferred (no_receipt) or refused (partition) and no later birth bound",
+            "no joint feeds from the linked session: the held caller's birth admission was \
+             deferred (no_receipt) or a session birth receipt was refused (partition, \
+             caller-less) and no later birth bound",
         ),
         JointBranch::CallsShed => Some(
-            "no joint feeds from the linked session: fixture calls were shed without a \
-             route (counted in shed) and no birth bound",
+            "no joint feeds from the linked session: calls not proven foreign were shed \
+             without a route (counted in shed, foreign shed apart) and no birth bound",
         ),
         JointBranch::Unattributed => {
             Some("no joint feeds without S1 seal (producers linked, zero installs unexplained)")
@@ -1782,28 +1917,33 @@ fn run_stop_offset(
     // deferred or refused birth receipt is retried on the next
     // discovery pass: service a bounded number more quanta with
     // scheduled passes, still holding the call.
-    let mut join_quanta = 0u64;
-    let mut join_passes = 0u64;
-    while stop_join_continues(
-        coordinator.registry().joint_feeds(),
-        coordinator.registry().journal_linked(),
-        join_quanta,
-    ) {
-        if stop_join_pass_due(join_quanta) {
-            drive_native_passes_until(&mut coordinator, &mut |passes| Ok(passes >= 1))?;
-            join_passes += 1;
+    let mut join = StopJoin::default();
+    loop {
+        let step = stop_join_step(
+            coordinator.registry().joint_feeds(),
+            coordinator.registry().journal_linked(),
+            join.quanta,
+        );
+        if step == JoinStep::Stop {
+            break;
         }
-        join_quanta += 1;
+        if step == JoinStep::PassThenQuantum {
+            drive_native_passes_until(&mut coordinator, &mut |passes| Ok(passes >= 1))?;
+            join.passes += 1;
+        }
+        join.quanta += 1;
         service_to_published(
             &mut lane,
             &mut coordinator,
             false,
-            &format!("{tag}-join{join_quanta}"),
+            &format!("{tag}-join{}", join.quanta),
         )?;
     }
+    join.feeds = coordinator.registry().joint_feeds() as u64;
     eprintln!(
-        "JOINT_STOP {tag}: q1 published in {q1_polls} polls, joined after {join_quanta} more \
-         quanta and {join_passes} passes; releasing the held call"
+        "JOINT_STOP {tag}: q1 published in {q1_polls} polls, joined after {} more quanta and \
+         {} passes with {} feeds; releasing the held call",
+        join.quanta, join.passes, join.feeds
     );
     {
         let _release = std::fs::File::create(&release)?;
@@ -1892,10 +2032,11 @@ fn run_stop_offset(
     // loudly with the branch tag instead: S1 keeps its proven
     // environmental tag, while the unattributed default (zero feeds,
     // no latched seal) gets its own tag and cause.
-    let branch = joint_branch(&coordinator, lane.shed_calls_disclosed());
-    case.link(&branch, join_quanta, join_passes);
+    let held = caller_of(&coordinator, process_a.pid())?;
+    let branch = joint_branch(&coordinator, lane.shed_calls_disclosed(), held, &join);
+    case.link(&branch, join);
     if no_feed_reason(&branch).is_some() {
-        case.note_no_feed(no_feed_probe(&lane, &coordinator));
+        case.note_no_feed(no_feed_probe(&lane, &coordinator, held));
     }
     if let Some(reason) = no_feed_reason(&branch) {
         let feed_tag = no_feed_branch_tag(&branch).expect("a reason implies a tag");
@@ -2118,9 +2259,10 @@ fn run_stop_offset(
                 || gap.subject == "for lane stop"
         })
         .map(|gap| format!("{}: {}", gap.subject, gap.reason));
-    let branch = match joint_branch(driver.coordinator, lane_shed) {
+    let branch = match joint_branch(driver.coordinator, lane_shed, caller_a, &join) {
         JointBranch::Linked => "linked",
         JointBranch::S1 => "s1",
+        JointBranch::FellBack => "fell-back",
         JointBranch::ReceiptStarved => "receipt-starved",
         JointBranch::CallsShed => "calls-shed",
         JointBranch::Unattributed => "unattributed",
@@ -2167,8 +2309,9 @@ fn run_stop_offset(
 /// silently. The lane requests the production journal session (builds that
 /// omit the journal object refuse at lane start); an S1 seal fails loudly
 /// with the s1-precluded branch tag instead of passing dry, while a
-/// feed-less run with no latched seal fails with the distinct
-/// no-feeds-unattributed tag.
+/// feed-less run with no latched seal fails with its typed cause's tag
+/// (no-feeds-fell-back, no-feeds-receipt-starved, no-feeds-calls-shed)
+/// or, with none, the distinct no-feeds-unattributed tag.
 /// Last-waiter disposition: a live last waiter before stop is unreachable
 /// (collected ticks resolve waiters same tick; 1,390 slice samples,
 /// 0 waiters: 352 linked plus 1,038 micro-slice no-feed probe with
@@ -2487,10 +2630,13 @@ struct StopCaseRecord {
     offset_ms: u64,
     branch: Option<&'static str>,
     /// Quanta serviced after q1 before the linkage decision (set with
-    /// `branch`); a linked no-feed verdict spends all `STOP_JOIN_QUANTA`.
+    /// `branch`); a linked no-feed verdict other than fell-back spends
+    /// all `STOP_JOIN_QUANTA` (the validator refuses one that did not).
     join_quanta: Option<u64>,
     /// Discovery passes the join ran (`stop_join_passes_for` its quanta).
     join_passes: Option<u64>,
+    /// Joint feeds installed when the join ended (set with `branch`).
+    join_feeds: Option<u64>,
     outcome: Option<StopOutcome>,
     /// Set exactly on a no-feed case: the evidence behind its branch.
     no_feed: Option<NoFeedProbe>,
@@ -2517,7 +2663,8 @@ enum StopTerminal {
         cause: &'static str,
         receipt: &'static str,
     },
-    /// Any other no-feed case (unattributed, or S1 after a linked case).
+    /// Any other no-feed case (a linked session's typed cause or
+    /// unattributed, or S1 after a linked case).
     NoFeed {
         case: usize,
         cause: &'static str,
@@ -2564,6 +2711,7 @@ impl StopLedger {
             branch: None,
             join_quanta: None,
             join_passes: None,
+            join_feeds: None,
             outcome: None,
             no_feed: None,
             completed: false,
@@ -2678,32 +2826,29 @@ impl StopLedger {
 
 impl StopCaseRecord {
     /// Record the linkage decision, once, before anything is driven.
-    fn link(&mut self, branch: &JointBranch, join_quanta: u64, join_passes: u64) {
+    /// Record the linkage decision and the join behind it. The join
+    /// loop alone fixes its quanta and passes, so their bound and
+    /// schedule are asserted; the feeds come from the product, so how
+    /// they relate to the branch is recorded, never asserted (the
+    /// validator's `join-bound` check refuses an inconsistent record
+    /// and the record still prints).
+    fn link(&mut self, branch: &JointBranch, join: StopJoin) {
         assert!(self.branch.is_none(), "{}: linked once", self.name);
         assert!(
-            join_quanta <= STOP_JOIN_QUANTA,
+            join.quanta <= STOP_JOIN_QUANTA,
             "{}: the join spends at most {STOP_JOIN_QUANTA} quanta",
             self.name
         );
-        if matches!(
-            branch,
-            JointBranch::Unattributed | JointBranch::ReceiptStarved | JointBranch::CallsShed
-        ) {
-            assert_eq!(
-                join_quanta, STOP_JOIN_QUANTA,
-                "{}: a linked no-feed verdict waits the whole join bound",
-                self.name
-            );
-        }
         assert_eq!(
-            join_passes,
-            stop_join_passes_for(join_quanta),
+            join.passes,
+            stop_join_passes_for(join.quanta),
             "{}: the join runs its scheduled discovery passes",
             self.name
         );
         self.branch = Some(no_feed_branch_tag(branch).unwrap_or("linked"));
-        self.join_quanta = Some(join_quanta);
-        self.join_passes = Some(join_passes);
+        self.join_quanta = Some(join.quanta);
+        self.join_passes = Some(join.passes);
+        self.join_feeds = Some(join.feeds);
     }
 
     /// Record what a no-feed case sampled, once, after its linkage.
@@ -2762,6 +2907,7 @@ impl StopCaseRecord {
 fn no_feed_receipt(tag: &str) -> &'static str {
     let branch = match tag {
         "s1-precluded" => JointBranch::S1,
+        "no-feeds-fell-back" => JointBranch::FellBack,
         "no-feeds-receipt-starved" => JointBranch::ReceiptStarved,
         "no-feeds-calls-shed" => JointBranch::CallsShed,
         "no-feeds-unattributed" => JointBranch::Unattributed,
@@ -2923,10 +3069,31 @@ fn full_stop_ledger() -> StopLedger {
     ledger
 }
 
+/// The join of a linked case whose feeds installed during q1.
+const LINKED_JOIN: StopJoin = StopJoin {
+    quanta: 0,
+    passes: 0,
+    feeds: 1,
+};
+
+/// The join a fell-back case ended: feeds installed after three quanta.
+const FELL_BACK_JOIN: StopJoin = StopJoin {
+    quanta: 3,
+    passes: 1,
+    feeds: 2,
+};
+
+/// The join a linked no-feed case spends: the whole bound, no feed.
+const SPENT_JOIN: StopJoin = StopJoin {
+    quanta: STOP_JOIN_QUANTA,
+    passes: 4,
+    feeds: 0,
+};
+
 /// Open `index`, link it, collect `outcome` and judge it.
 fn judge_stop_case(ledger: &mut StopLedger, index: usize, outcome: StopOutcome) -> Result<()> {
     let case = ledger.open(index);
-    case.link(&JointBranch::Linked, 0, 0);
+    case.link(&JointBranch::Linked, LINKED_JOIN);
     case.collect(outcome);
     case.judge()
 }
@@ -2942,10 +3109,15 @@ fn completed_stop_cases(ledger: &mut StopLedger, count: usize) {
 /// Link `case` to a no-feed branch with a sampled probe, as the drive does.
 fn link_no_feed(case: &mut StopCaseRecord, branch: JointBranch) {
     let linked = !matches!(branch, JointBranch::S1);
+    let fell_back = matches!(branch, JointBranch::FellBack);
     let starved = matches!(branch, JointBranch::ReceiptStarved);
     let shed = matches!(branch, JointBranch::CallsShed);
-    let join = if linked { STOP_JOIN_QUANTA } else { 0 };
-    case.link(&branch, join, stop_join_passes_for(join));
+    let join = match branch {
+        JointBranch::S1 => StopJoin::default(),
+        JointBranch::FellBack => FELL_BACK_JOIN,
+        _ => SPENT_JOIN,
+    };
+    case.link(&branch, join);
     case.note_no_feed(NoFeedProbe {
         joint_feeds: 0,
         journal_linked: linked,
@@ -2960,6 +3132,8 @@ fn link_no_feed(case: &mut StopCaseRecord, branch: JointBranch) {
         no_receipt: u64::from(starved),
         partition: u64::from(starved),
         shed: 17 * u64::from(shed),
+        foreign_shed: 0,
+        fallback: 2 * u64::from(fell_back),
     });
 }
 
@@ -3153,7 +3327,7 @@ fn stop_verdict_names_setup_and_drive_failures() {
         }
     ));
     let mut ledger = full_stop_ledger();
-    ledger.open(0).link(&JointBranch::Linked, 0, 0);
+    ledger.open(0).link(&JointBranch::Linked, LINKED_JOIN);
     match stop_terminal_of(ledger, error()) {
         StopTerminal::CaseFailed {
             case: Some(0),
@@ -3169,7 +3343,7 @@ fn stop_verdict_names_setup_and_drive_failures() {
 #[should_panic(expected = "opens only after the previous case completed")]
 fn stop_ledger_refuses_a_case_after_an_unfinished_one() {
     let mut ledger = full_stop_ledger();
-    ledger.open(0).link(&JointBranch::Linked, 0, 0);
+    ledger.open(0).link(&JointBranch::Linked, LINKED_JOIN);
     ledger.open(1);
 }
 
@@ -3178,7 +3352,7 @@ fn stop_ledger_refuses_a_case_after_an_unfinished_one() {
 fn stop_ledger_refuses_an_outcome_on_a_no_feed_case() {
     let mut ledger = full_stop_ledger();
     let case = ledger.open(0);
-    case.link(&JointBranch::S1, 0, 0);
+    case.link(&JointBranch::S1, StopJoin::default());
     case.collect(healthy_stop_outcome_at(0));
 }
 
@@ -3187,7 +3361,7 @@ fn stop_ledger_refuses_an_outcome_on_a_no_feed_case() {
 fn stop_ledger_refuses_an_outcome_from_another_offset() {
     let mut ledger = full_stop_ledger();
     let case = ledger.open(0);
-    case.link(&JointBranch::Linked, 0, 0);
+    case.link(&JointBranch::Linked, LINKED_JOIN);
     case.collect(healthy_stop_outcome_at(20));
 }
 
@@ -3195,9 +3369,7 @@ fn stop_ledger_refuses_an_outcome_from_another_offset() {
 #[should_panic(expected = "carries the evidence it sampled")]
 fn stop_ledger_refuses_a_no_feed_terminal_without_its_probe() {
     let mut ledger = full_stop_ledger();
-    ledger
-        .open(0)
-        .link(&JointBranch::Unattributed, STOP_JOIN_QUANTA, 4);
+    ledger.open(0).link(&JointBranch::Unattributed, SPENT_JOIN);
     let _ = stop_terminal_of(ledger, Err(anyhow::anyhow!("not attempted")));
 }
 
@@ -3206,7 +3378,7 @@ fn stop_ledger_refuses_a_no_feed_terminal_without_its_probe() {
 fn stop_ledger_refuses_a_probe_on_a_linked_case() {
     let mut ledger = full_stop_ledger();
     let case = ledger.open(0);
-    case.link(&JointBranch::Linked, 0, 0);
+    case.link(&JointBranch::Linked, LINKED_JOIN);
     case.note_no_feed(NoFeedProbe {
         joint_feeds: 0,
         journal_linked: true,
@@ -3217,6 +3389,8 @@ fn stop_ledger_refuses_a_probe_on_a_linked_case() {
         no_receipt: 0,
         partition: 0,
         shed: 0,
+        foreign_shed: 0,
+        fallback: 0,
     });
 }
 
@@ -3225,8 +3399,8 @@ fn stop_ledger_refuses_a_probe_on_a_linked_case() {
 fn stop_ledger_refuses_a_second_linkage_decision() {
     let mut ledger = full_stop_ledger();
     let case = ledger.open(0);
-    case.link(&JointBranch::Linked, 0, 0);
-    case.link(&JointBranch::S1, 0, 0);
+    case.link(&JointBranch::Linked, LINKED_JOIN);
+    case.link(&JointBranch::S1, StopJoin::default());
 }
 
 /// The matrix cell prints its record on every return path: the body
@@ -3268,32 +3442,38 @@ fn stop_cell_prints_its_record_before_returning() {
 
 #[test]
 fn joint_branch_splits_s1_from_the_unattributed_default() {
-    for starved in [false, true] {
-        for shed in [false, true] {
-            assert!(matches!(
-                joint_branch_from(2, true, starved, shed),
-                JointBranch::Linked
-            ));
-            assert!(matches!(
-                joint_branch_from(0, false, starved, shed),
-                JointBranch::S1
-            ));
+    for fed in [false, true] {
+        for starved in [false, true] {
+            for shed in [false, true] {
+                assert!(matches!(
+                    joint_branch_from(2, true, fed, starved, shed),
+                    JointBranch::Linked
+                ));
+                assert!(matches!(
+                    joint_branch_from(0, false, fed, starved, shed),
+                    JointBranch::S1
+                ));
+                assert!(matches!(
+                    joint_branch_from(0, true, true, starved, shed),
+                    JointBranch::FellBack
+                ));
+            }
         }
     }
     assert!(matches!(
-        joint_branch_from(0, true, false, false),
+        joint_branch_from(0, true, false, false, false),
         JointBranch::Unattributed
     ));
     assert!(matches!(
-        joint_branch_from(0, true, true, false),
+        joint_branch_from(0, true, false, true, false),
         JointBranch::ReceiptStarved
     ));
     assert!(matches!(
-        joint_branch_from(0, true, true, true),
+        joint_branch_from(0, true, false, true, true),
         JointBranch::ReceiptStarved
     ));
     assert!(matches!(
-        joint_branch_from(0, true, false, true),
+        joint_branch_from(0, true, false, false, true),
         JointBranch::CallsShed
     ));
 }
@@ -3328,6 +3508,25 @@ fn no_feed_tags_name_each_branch_cause() {
     let shed = no_feed_reason(&JointBranch::CallsShed).expect("a cause");
     assert!(shed.contains("shed"), "the shed cause names it: {shed}");
     assert_eq!(no_feed_receipt("no-feeds-calls-shed"), shed);
+    assert_eq!(
+        no_feed_branch_tag(&JointBranch::FellBack),
+        Some("no-feeds-fell-back")
+    );
+    let fell_back = no_feed_reason(&JointBranch::FellBack).expect("a cause");
+    assert!(
+        fell_back.contains("fell back") && fell_back.contains("fallback"),
+        "the fell-back cause names its count: {fell_back}"
+    );
+    assert_eq!(no_feed_receipt("no-feeds-fell-back"), fell_back);
+    assert!(
+        starved.contains("held caller") && starved.contains("caller-less"),
+        "the starved cause binds no_receipt to the held caller and partition to \
+         the session: {starved}"
+    );
+    assert!(
+        shed.contains("not proven foreign"),
+        "the shed cause never claims foreign shed: {shed}"
+    );
     let unattributed = no_feed_reason(&JointBranch::Unattributed).expect("a cause");
     assert!(
         unattributed.contains("producers linked, zero installs unexplained"),
@@ -3379,13 +3578,116 @@ fn stop_join_runs_discovery_passes_on_its_schedule() {
     assert_eq!(stop_join_passes_for(STOP_JOIN_QUANTA), 4);
 }
 
+/// The drive's join loop follows `stop_join_step` verbatim: a linked,
+/// feedless session runs the full bound with its four passes; a feed
+/// arriving after quantum `k` stops the join at `k` with the schedule's
+/// passes; an unlinked latch never steps.
+#[test]
+fn stop_join_steps_until_a_feed_or_the_bound() {
+    fn run(feed_after: Option<u64>, linked: bool) -> (u64, u64) {
+        let (mut quanta, mut passes) = (0u64, 0u64);
+        loop {
+            let feeds = usize::from(feed_after.is_some_and(|k| quanta >= k));
+            match stop_join_step(feeds, linked, quanta) {
+                JoinStep::Stop => return (quanta, passes),
+                JoinStep::PassThenQuantum => passes += 1,
+                JoinStep::Quantum => {}
+            }
+            quanta += 1;
+        }
+    }
+    assert_eq!(run(None, true), (STOP_JOIN_QUANTA, 4));
+    assert_eq!(run(None, false), (0, 0));
+    assert_eq!(run(Some(0), true), (0, 0));
+    for k in 1..=STOP_JOIN_QUANTA {
+        assert_eq!(
+            run(Some(k), true),
+            (k, stop_join_passes_for(k)),
+            "feed after {k}"
+        );
+    }
+    assert_eq!(stop_join_step(0, true, 0), JoinStep::Quantum);
+    assert_eq!(stop_join_step(0, true, 1), JoinStep::PassThenQuantum);
+    assert_eq!(stop_join_step(0, true, STOP_JOIN_QUANTA), JoinStep::Stop);
+    assert_eq!(stop_join_step(1, true, 1), JoinStep::Stop);
+    assert_eq!(stop_join_step(0, false, 1), JoinStep::Stop);
+}
+
+/// Shed proven foreign never names fixture loss: only the unproven
+/// rest selects the calls-shed cause.
+#[test]
+fn lane_shed_split_separates_proven_foreign_shed() {
+    assert_eq!(
+        lane_shed_split_from(18, 1),
+        LaneShedSplit {
+            unproven: 17,
+            foreign: 1
+        }
+    );
+    assert_eq!(
+        lane_shed_split_from(5, 5),
+        LaneShedSplit {
+            unproven: 0,
+            foreign: 5
+        },
+        "foreign-only shed is not a calls-shed cause"
+    );
+    assert_eq!(lane_shed_split_from(0, 0), LaneShedSplit::default());
+}
+
+/// A no-feed probe's gap rows count repeats, the unit of its typed
+/// counters: two registry entries of one (subject, reason) with 1 and 2
+/// repeats are one row of 3.
+#[test]
+fn no_feed_gaps_sum_repeats_per_subject_and_reason() {
+    let gaps = [
+        ("semantic receipt refused", "partition", 1),
+        ("semantic receipt refused", "partition", 2),
+        ("semantic receipt refused", "domain", 4),
+    ];
+    assert_eq!(
+        no_feed_gaps_from(gaps.into_iter()),
+        vec![
+            NoFeedGap {
+                subject: "semantic receipt refused".to_string(),
+                reason: "domain".to_string(),
+                count: 4,
+            },
+            NoFeedGap {
+                subject: "semantic receipt refused".to_string(),
+                reason: "partition".to_string(),
+                count: 3,
+            },
+        ]
+    );
+}
+
+/// The fallback count reads only the named `joint_fallback_*`
+/// endings of retained-S1 Joint feeds, with repeats.
+#[test]
+fn joint_fallbacks_count_only_their_named_endings() {
+    let subject = crate::inventory_present::JOINT_RETAINED_S1_SUBJECT;
+    let gaps = [
+        (subject, "joint_fallback_unsealable", 2),
+        (subject, "joint_fallback_no_owner", 3),
+        (subject, "joint_seal_refused", 5),
+        ("semantic receipt refused", "joint_fallback_unsealable", 7),
+    ];
+    assert_eq!(joint_fallbacks_from(gaps.into_iter()), 5);
+    assert_eq!(joint_fallbacks_from(std::iter::empty()), 0);
+}
+
 #[test]
 #[should_panic(expected = "the join runs its scheduled discovery passes")]
 fn stop_ledger_refuses_a_no_feed_verdict_without_discovery_passes() {
     let mut ledger = full_stop_ledger();
-    ledger
-        .open(0)
-        .link(&JointBranch::ReceiptStarved, STOP_JOIN_QUANTA, 0);
+    ledger.open(0).link(
+        &JointBranch::ReceiptStarved,
+        StopJoin {
+            passes: 0,
+            ..SPENT_JOIN
+        },
+    );
 }
 
 /// The join's pass is a real discovery pass, driven before the quantum
@@ -3408,77 +3710,164 @@ fn stop_join_drives_a_discovery_pass_when_due() {
         .collect();
     assert!(
         code.contains(concat!(
-            "if stop_join_pass_due(join_quanta) {",
-            "drive_native_passes_until(&mut coordinator, &mut |passes| Ok(passes >= 1))?;",
-            "join_passes += 1;",
+            "let mut join = StopJoin::default();",
+            "loop {",
+            "let step = stop_join_step(",
+            "coordinator.registry().joint_feeds(),",
+            "coordinator.registry().journal_linked(),",
+            "join.quanta,",
+            ");",
+            "if step == JoinStep::Stop {",
+            "break;",
             "}",
-            "join_quanta += 1;",
+            "if step == JoinStep::PassThenQuantum {",
+            "drive_native_passes_until(&mut coordinator, &mut |passes| Ok(passes >= 1))?;",
+            "join.passes += 1;",
+            "}",
+            "join.quanta += 1;",
             "service_to_published(",
+            "&mut lane,",
+            "&mut coordinator,",
+            "false,",
+            "&format!(\"{tag}-join{}\", join.quanta),",
+            ")?;",
+            "}",
+            "join.feeds = coordinator.registry().joint_feeds() as u64;",
         )),
-        "the join drives a discovery pass before its scheduled quantum"
+        "the join follows stop_join_step: stops when it says, drives a discovery pass \
+         before its scheduled quantum, and records the feeds it ended with"
     );
 }
 
+/// Feeds that install during the join and then all fall back before
+/// the linkage decision are product behavior, not a ledger bug: the
+/// case links to its own fell-back cause, records the join it ended
+/// (early, with feeds) and prints a failing no-feed terminal instead
+/// of panicking.
 #[test]
-#[should_panic(expected = "a linked no-feed verdict waits the whole join bound")]
-fn stop_ledger_refuses_a_no_feed_verdict_after_one_quantum() {
+fn stop_ledger_records_feeds_that_fell_back_after_the_join() {
+    assert!(matches!(
+        joint_branch_from(0, true, true, false, false),
+        JointBranch::FellBack
+    ));
     let mut ledger = full_stop_ledger();
-    ledger.open(0).link(&JointBranch::Unattributed, 0, 0);
+    completed_stop_cases(&mut ledger, 1);
+    link_no_feed(ledger.open(1), JointBranch::FellBack);
+    let case = &ledger.cases[1];
+    assert_eq!(
+        (
+            case.branch,
+            case.join_quanta,
+            case.join_passes,
+            case.join_feeds
+        ),
+        (Some("no-feeds-fell-back"), Some(3), Some(1), Some(2))
+    );
+    assert!(matches!(
+        stop_terminal_of(ledger, Err(anyhow::anyhow!("not attempted"))),
+        StopTerminal::NoFeed {
+            case: 1,
+            cause: "no-feeds-fell-back",
+            ..
+        }
+    ));
 }
 
+/// A full-spend cause on a join that ended early is impossible in
+/// the drive (the loop ends early only on a feed or an unlinked
+/// latch), but its inputs are product state: the ledger records the
+/// join as it was so the validator's `join-bound` check refuses the
+/// record by name, never a panic that prints no record.
 #[test]
-#[should_panic(expected = "a linked no-feed verdict waits the whole join bound")]
-fn stop_ledger_refuses_a_starved_verdict_before_the_bound() {
-    let mut ledger = full_stop_ledger();
-    ledger
-        .open(0)
-        .link(&JointBranch::ReceiptStarved, STOP_JOIN_QUANTA - 1, 4);
-}
-
-#[test]
-#[should_panic(expected = "a linked no-feed verdict waits the whole join bound")]
-fn stop_ledger_refuses_a_shed_verdict_before_the_bound() {
-    let mut ledger = full_stop_ledger();
-    ledger.open(0).link(&JointBranch::CallsShed, 1, 0);
+fn stop_ledger_records_an_early_join_for_every_linked_no_feed_cause() {
+    for branch in [
+        JointBranch::ReceiptStarved,
+        JointBranch::CallsShed,
+        JointBranch::Unattributed,
+    ] {
+        let mut ledger = full_stop_ledger();
+        let case = ledger.open(0);
+        case.link(
+            &branch,
+            StopJoin {
+                quanta: 1,
+                passes: 0,
+                feeds: 0,
+            },
+        );
+        assert_eq!(
+            (case.join_quanta, case.join_passes, case.join_feeds),
+            (Some(1), Some(0), Some(0))
+        );
+    }
 }
 
 #[test]
 #[should_panic(expected = "the join spends at most")]
 fn stop_ledger_refuses_a_join_past_its_bound() {
     let mut ledger = full_stop_ledger();
-    ledger
-        .open(0)
-        .link(&JointBranch::Linked, STOP_JOIN_QUANTA + 1, 4);
+    ledger.open(0).link(
+        &JointBranch::Linked,
+        StopJoin {
+            quanta: STOP_JOIN_QUANTA + 1,
+            ..SPENT_JOIN
+        },
+    );
 }
 
 /// The starvation cause counts the exact frozen codes with repeats and
 /// nothing else; a starved case is a failing no-feed terminal.
 #[test]
 fn receipt_starvation_counts_only_its_typed_codes() {
+    const HELD: u32 = 1;
+    const OTHER: u32 = 2;
     let gaps = [
         (
+            Some(HELD),
             "semantic admission deferred",
             "semantic_unavailable:no_receipt",
             3,
         ),
-        ("semantic receipt refused", "partition", 2),
-        ("semantic receipt refused", "domain", 5),
+        (None, "semantic receipt refused", "partition", 2),
+        (Some(HELD), "semantic receipt refused", "domain", 5),
         (
+            Some(HELD),
             "semantic admission deferred",
             "semantic_unavailable:other",
             7,
         ),
-        ("semantic calls unrouted", "partition", 11),
+        (None, "semantic calls unrouted", "partition", 11),
     ];
     assert_eq!(
-        receipt_starvation_from(gaps.into_iter()),
+        receipt_starvation_from(HELD, gaps.into_iter()),
         ReceiptStarvation {
             no_receipt: 3,
             partition: 2
         }
     );
     assert_eq!(
-        receipt_starvation_from(std::iter::empty()),
+        receipt_starvation_from(HELD, std::iter::empty()),
+        ReceiptStarvation::default()
+    );
+    // Another caller's deferral, a caller-less deferral and a partition
+    // bound to a caller never name the held caller's receipt.
+    let foreign = [
+        (
+            Some(OTHER),
+            "semantic admission deferred",
+            "semantic_unavailable:no_receipt",
+            4,
+        ),
+        (
+            None,
+            "semantic admission deferred",
+            "semantic_unavailable:no_receipt",
+            6,
+        ),
+        (Some(HELD), "semantic receipt refused", "partition", 8),
+    ];
+    assert_eq!(
+        receipt_starvation_from(HELD, foreign.into_iter()),
         ReceiptStarvation::default()
     );
     let mut ledger = full_stop_ledger();

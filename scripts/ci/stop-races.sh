@@ -44,8 +44,9 @@
 #     in brackets: a signal or other exit status, a missing, malformed,
 #     duplicated or non-terminal summary, a missing, duplicated,
 #     misplaced or malformed record, a record for another cell, a
-#     narrowed, short, out-of-order or contradictory case list, the
-#     unattributed no-feed cause, S1 after linked cases, an unexpected
+#     narrowed, short, out-of-order or contradictory case list, a
+#     linked no-feed cause (fell-back, receipt-starved, calls-shed or
+#     unattributed), S1 after linked cases, an unexpected
 #     pass under 1, or a wedge under 0.
 #   The entry forces the full 12-case matrix: inherited WP7_STOP_PREPS /
 #     WP7_STOP_OFFSETS narrowing is unset for the cell (direct libtest

@@ -23,6 +23,7 @@
       "branch": "linked",
       "join_quanta": 0,
       "join_passes": 0,
+      "join_feeds": 1,
       "outcome": {
         "offset_ms": 0,
         "begin": "polling",
@@ -62,6 +63,7 @@
       "branch": "linked",
       "join_quanta": 0,
       "join_passes": 0,
+      "join_feeds": 1,
       "outcome": {
         "offset_ms": 1,
         "begin": "polling",
@@ -101,6 +103,7 @@
       "branch": "linked",
       "join_quanta": 0,
       "join_passes": 0,
+      "join_feeds": 1,
       "outcome": {
         "offset_ms": 5,
         "begin": "polling",
@@ -140,6 +143,7 @@
       "branch": "linked",
       "join_quanta": 0,
       "join_passes": 0,
+      "join_feeds": 1,
       "outcome": {
         "offset_ms": 20,
         "begin": "polling",
@@ -179,6 +183,7 @@
       "branch": "linked",
       "join_quanta": 0,
       "join_passes": 0,
+      "join_feeds": 1,
       "outcome": {
         "offset_ms": 0,
         "begin": "polling",
@@ -218,6 +223,7 @@
       "branch": "linked",
       "join_quanta": 0,
       "join_passes": 0,
+      "join_feeds": 1,
       "outcome": {
         "offset_ms": 1,
         "begin": "polling",
@@ -257,6 +263,7 @@
       "branch": "linked",
       "join_quanta": 0,
       "join_passes": 0,
+      "join_feeds": 1,
       "outcome": {
         "offset_ms": 5,
         "begin": "polling",
@@ -296,6 +303,7 @@
       "branch": "linked",
       "join_quanta": 0,
       "join_passes": 0,
+      "join_feeds": 1,
       "outcome": {
         "offset_ms": 20,
         "begin": "polling",
@@ -335,6 +343,7 @@
       "branch": "linked",
       "join_quanta": 0,
       "join_passes": 0,
+      "join_feeds": 1,
       "outcome": {
         "offset_ms": 0,
         "begin": "polling",
@@ -374,6 +383,7 @@
       "branch": "linked",
       "join_quanta": 0,
       "join_passes": 0,
+      "join_feeds": 1,
       "outcome": {
         "offset_ms": 1,
         "begin": "polling",
@@ -413,6 +423,7 @@
       "branch": "linked",
       "join_quanta": 0,
       "join_passes": 0,
+      "join_feeds": 1,
       "outcome": {
         "offset_ms": 5,
         "begin": "polling",
@@ -452,6 +463,7 @@
       "branch": "linked",
       "join_quanta": 0,
       "join_passes": 0,
+      "join_feeds": 1,
       "outcome": {
         "offset_ms": 20,
         "begin": "polling",

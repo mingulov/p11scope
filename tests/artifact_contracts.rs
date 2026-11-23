@@ -12406,13 +12406,15 @@ fn hosted_pipeline_runs_one_full_matrix_per_commit() {
     assert!(
         ci.contains(concat!(
             "\nconcurrency:\n",
-            "  group: ci-${{ github.event_name }}-${{ github.ref }}\n",
+            "  group: ci-${{ github.event_name }}-${{ github.ref }}${{ github.event_name == ",
+            "'workflow_dispatch' && format('-{0}', github.run_id) || '' }}\n",
             "  cancel-in-progress: ${{ github.event_name == 'push' && ",
             "(startsWith(github.ref, 'refs/heads/test/') || ",
             "startsWith(github.ref, 'refs/heads/task/')) }}\n",
         )),
         "only a push to a development branch cancels its overtaken run; \
-         dispatches and other refs sequence instead of cancelling"
+         dispatches take a run-id group each so the pending queue never \
+         replaces one, and other refs sequence instead of cancelling"
     );
     for job in CARGO_JOBS {
         let block = job_block(&ci, job);

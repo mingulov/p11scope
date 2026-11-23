@@ -465,11 +465,14 @@ class BpfKernelsContractTests(unittest.TestCase):
 
     def test_concurrency_cancels_only_test_and_task_pushes(self):
         # The group carries the event, so a push can never cancel an
-        # agent's dispatch; only pushes to development branches cancel
-        # the run a newer push overtook.
+        # agent's dispatch; each dispatch adds its run id, so the
+        # pending queue never replaces one either. Only pushes to
+        # development branches cancel the run a newer push overtook.
         self.assertIn(
             "concurrency:\n"
-            "  group: bpf-kernels-${{ github.event_name }}-${{ github.ref }}\n"
+            "  group: bpf-kernels-${{ github.event_name }}-${{ github.ref }}"
+            "${{ github.event_name == 'workflow_dispatch' && "
+            "format('-{0}', github.run_id) || '' }}\n"
             "  cancel-in-progress: ${{ github.event_name == 'push' && "
             "(startsWith(github.ref, 'refs/heads/test/') || "
             "startsWith(github.ref, 'refs/heads/task/')) }}",

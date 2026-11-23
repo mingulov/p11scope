@@ -119,10 +119,13 @@ on:
 permissions:
   contents: read
 # Per workflow, event and ref, so a push can never cancel an agent's
-# dispatch on the same branch. Pushes to development branches cancel the
-# run a newer push overtook; every other event sequences its runs.
+# dispatch on the same branch; each dispatch adds its run id, so two
+# dispatches never share a group either (with the default queue a new
+# run replaces a still-pending run in its group, which ate a second
+# agent dispatch). Pushes to development branches cancel the run a
+# newer push overtook; every other event sequences its runs.
 concurrency:
-  group: privileged-tests-${{ github.event_name }}-${{ github.ref }}
+  group: privileged-tests-${{ github.event_name }}-${{ github.ref }}${{ github.event_name == 'workflow_dispatch' && format('-{0}', github.run_id) || '' }}
   cancel-in-progress: ${{ github.event_name == 'push' && (startsWith(github.ref, 'refs/heads/test/') || startsWith(github.ref, 'refs/heads/task/')) }}
 env:
   CI_TOOL_BPF_LINKER: 0.10.4

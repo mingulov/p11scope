@@ -381,7 +381,9 @@ pub(crate) struct JointStaging {
     /// incarnation must not pile a new segment onto audits that just
     /// proved stuck — seen live, such a reseed re-arms the stuck
     /// session and spends the lane's interruption budget. A void
-    /// delivery clears it ([`Self::record_fence`]).
+    /// delivery clears it ([`Self::record_fence`]), and so does fresh
+    /// proof of health: a served cooldown plus a clean session health
+    /// window ([`Self::lift_settled_stuck_bar`]).
     fresh_reseed_barred: bool,
 }
 
@@ -576,6 +578,12 @@ impl JointStaging {
         self.frontier
     }
 
+    /// Stuck-bar flag for bar tests.
+    #[cfg(test)]
+    pub(crate) fn fresh_reseed_barred_for_test(&self) -> bool {
+        self.fresh_reseed_barred
+    }
+
     /// Recorded void fence for fence tests.
     #[cfg(test)]
     pub(crate) fn segment_fence_for_test(&self) -> Option<u64> {
@@ -758,6 +766,28 @@ impl JointStaging {
         self.reseeded_cooldown = self.reseeded_cooldown.saturating_sub(1);
     }
 
+    /// Lift the stuck bar on fresh proof of health, without waiting for
+    /// a void (owner rule: recover from fresh proof and continue): once
+    /// the stuck-degrade cooldown is served and the session has
+    /// published a full health window since its last stuck-session
+    /// abandon, the audits that proved stuck have since proved
+    /// auditable again, so a fresh incarnation may reseed. Live, a feed
+    /// stuck-degraded after a busy-host void stayed barred for the rest
+    /// of the run (no later void reached the S1Only feed), refusing
+    /// 10,327 fresh births. The duty bound is unchanged: each stuck
+    /// episode still costs at most [`RESEED_STUCK_DEGRADE_STREAK`]
+    /// passes plus a [`RESEED_COOLDOWN_PASSES`]-quantum cooldown, and the
+    /// health gate keeps every reseed out of an unhealthy window.
+    /// Returns whether this call lifted the bar.
+    pub(crate) fn lift_settled_stuck_bar(&mut self, session_healthy: bool) -> bool {
+        if self.fresh_reseed_barred && self.reseeded_cooldown == 0 && session_healthy {
+            self.fresh_reseed_barred = false;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Reseed a voided feed onto a fresh birth receipt at or above its
     /// recorded fence (Task 3 re-selection): the old below-fence receipt
     /// never resumes, but a fresh receipt for the same incarnation with
@@ -890,38 +920,53 @@ impl JointStaging {
         self.reseeded_stuck_streak = 0;
     }
 
-    pub(crate) fn try_reselect_joint(
-        &mut self,
+    /// Why [`Self::try_reselect_joint`] would refuse this receipt
+    /// (`None`: it would reseed), without changing the feed. The staging
+    /// predicate asks it so an original staged in the reseed's own pass
+    /// is never disposed as an S1-only subject of the key the reseed is
+    /// about to seal.
+    pub(crate) fn reselect_refusal(
+        &self,
         receipt: &crate::semantics_objects::journal::BootstrapReceipt,
-    ) -> Result<(), ReselectRefusal> {
+    ) -> Option<ReselectRefusal> {
         let Some(old) = self.selected_receipt.as_ref() else {
-            return Err(ReselectRefusal::NoSegment);
+            return Some(ReselectRefusal::NoSegment);
         };
         if !self.reseed_eligible() {
-            return Err(ReselectRefusal::NoSegment);
+            return Some(ReselectRefusal::NoSegment);
         }
         let same_domain = receipt.domain() == old.domain();
         let superseding = !same_domain && receipt.proof().reseed_supersedes(&old.proof());
         if !same_domain && !superseding {
-            return Err(ReselectRefusal::ForeignReceipt);
+            return Some(ReselectRefusal::ForeignReceipt);
         }
         if !superseding
             && matches!(self.degraded_window, Some(DegradedWindow::Fallback))
             && !self.segment_resumable
         {
-            return Err(ReselectRefusal::SegmentUnresumable);
+            return Some(ReselectRefusal::SegmentUnresumable);
         }
         if receipt.birth_cut() <= old.birth_cut() {
-            return Err(ReselectRefusal::NoProgress);
+            return Some(ReselectRefusal::NoProgress);
         }
         if self
             .segment_fence
             .is_some_and(|fence| receipt.birth_cut() < fence)
         {
-            return Err(ReselectRefusal::BelowFence);
+            return Some(ReselectRefusal::BelowFence);
         }
         if superseding && self.fresh_reseed_barred {
-            return Err(ReselectRefusal::StuckBarred);
+            return Some(ReselectRefusal::StuckBarred);
+        }
+        None
+    }
+
+    pub(crate) fn try_reselect_joint(
+        &mut self,
+        receipt: &crate::semantics_objects::journal::BootstrapReceipt,
+    ) -> Result<(), ReselectRefusal> {
+        if let Some(refusal) = self.reselect_refusal(receipt) {
+            return Err(refusal);
         }
         self.mode = FeedMode::Joint;
         self.selected_receipt = Some(*receipt);
@@ -7740,5 +7785,39 @@ mod tests {
         let mut feed = barred(old);
         feed.reseeded_cooldown = 3;
         assert!(!feed.reseed_stuck_barred(&proof(71, 4, 9)));
+    }
+
+    /// RED twin (stuck bar recovery): the bar lifts on fresh proof of
+    /// health alone — a served cooldown plus a healthy session — with
+    /// no void, and only then. Each blocker alone keeps it.
+    #[test]
+    fn stuck_bar_lifts_after_cooldown_and_health_without_a_void() {
+        fn barred(old: BootstrapReceipt) -> JointStaging {
+            let mut feed = JointStaging::select_s1_only();
+            feed.selected_receipt = Some(old);
+            feed.degraded_window = Some(DegradedWindow::Loss);
+            feed.fresh_reseed_barred = true;
+            feed
+        }
+        let old = receipt(proof(71, 3, 9));
+        let fresh = proof(71, 4, 9);
+        // Cooling: kept, healthy or not.
+        let mut feed = barred(old);
+        feed.reseeded_cooldown = 1;
+        assert!(!feed.lift_settled_stuck_bar(true));
+        assert!(!feed.lift_settled_stuck_bar(false));
+        // Served, but the session is still unhealthy: kept.
+        feed.tick_reseed_cooldown();
+        assert!(!feed.lift_settled_stuck_bar(false));
+        assert!(feed.reseed_stuck_barred(&fresh), "still barred");
+        // Served and healthy: lifted, once.
+        assert!(feed.lift_settled_stuck_bar(true));
+        assert!(!feed.lift_settled_stuck_bar(true), "lifts once");
+        assert!(!feed.reseed_stuck_barred(&fresh), "the fresh proof reseeds");
+        assert!(!feed.fresh_reseed_barred);
+        // An unbarred feed reports no lift.
+        let mut feed = barred(old);
+        feed.fresh_reseed_barred = false;
+        assert!(!feed.lift_settled_stuck_bar(true));
     }
 }

@@ -2099,34 +2099,40 @@ impl PreservedBasis {
     }
 }
 
-/// Outcome of one bounded barrier scan.
+/// Outcome of one bounded pre-barrier scan (birth coverage plus barrier,
+/// same cursor, one evaluation per visited row).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum BarrierCheck {
-    /// Unbound staging bars seals.
+    /// Unbound staging bars seals (birth covers, barrier stands).
     Barrier,
-    /// No barrier stands.
+    /// No barrier stands (birth covers, no barrier).
     Clear,
+    /// Birth does not cover retained staged history for this key.
+    BirthMismatch,
     /// Budget exhausted mid-scan: call again to resume.
     Yielded,
 }
 
-/// Resumable barrier-scan cursors: open resumes by key (valid
+/// Resumable pre-barrier-scan cursors: open resumes by key (valid
 /// across table mutations); refused resumes by index, restarting
-/// when its length moved.
+/// when its length moved. A barrier found early waits for birth
+/// verification of the remaining rows (`saw_barrier`), since a later
+/// birth failure wins.
 #[derive(Clone, Debug)]
 pub(crate) struct BarrierScan {
     open_after: Option<JournalNativeKey>,
     refused_index: usize,
     refused_len: usize,
     refused_phase: bool,
+    saw_barrier: bool,
 }
 
-/// One completed production-seal barrier decision, retained for its
-/// frame while the same frontier and staging/binding membership
-/// stand. Unbound entries never convert (no key names their image),
-/// so conversion alone never flips the answer; any membership change
-/// (ingest, wipe, new attestation) changes a length below and drops
-/// the decision. A new frame starts with no decision.
+/// One completed production-seal pre-barrier decision, retained for its
+/// frame while the same key, birth cut, frontier and staging/binding
+/// membership stand. Unbound entries never convert (no key names their
+/// image), so conversion alone never flips the barrier half; any
+/// membership change (ingest, wipe, new attestation) changes a length
+/// below and drops the decision. A new frame starts with no decision.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SealBarrierDecision {
     frontier: u64,
@@ -2134,6 +2140,8 @@ pub(crate) struct SealBarrierDecision {
     open_len: usize,
     refused_len: usize,
     image_keys_len: usize,
+    key: JournalDomainKey,
+    birth_cut: u64,
 }
 
 /// Production-seal barrier work held by its frame: the resumable
@@ -9044,15 +9052,10 @@ impl JournalAdapter {
         // The birth covers all retained staged history for the key:
         // conversion proves staged begins, so a cut at or above any of
         // them would certify history the birth excludes. A sibling
-        // key's staging belongs to its own birth.
+        // key's staging belongs to its own birth. Coverage shares the
+        // barrier's cursor below (one evaluation per visited row).
         let image = (key.cookie, key.exec);
         let live = self.live_keys_for_image(image);
-        if !self.birth_covers_staged(key, &live, image, bootstrap.birth_cut()) {
-            // Diagnostic-only (bootstrap arms): count the refusing arm. The
-            // refusal below is unchanged.
-            self.note_bootstrap_arm(SealBootstrapArm::Covers);
-            return SealAttempt::Decided(Err(self.failure(JournalGap::BootstrapMismatch)));
-        }
         if frontier < state.sealed_through {
             self.note_seal_stage(SealStageGate::FrontierRegression);
             return SealAttempt::Decided(Err(self.failure(JournalGap::FrontierRegression)));
@@ -9080,11 +9083,26 @@ impl JournalAdapter {
         // excluded. It drops only through an explicit void or a
         // recorded refusal disposal (image taint, disposed raw, or
         // refused S1-only subjects), each with its gap and ledger
-        // accounting.
-        match self.scan_seal_barrier(barrier, frontier, budget) {
+        // accounting. Birth coverage rides the same cursor (a birth
+        // failure wins even past an early barrier).
+        match self.scan_seal_barrier(
+            barrier,
+            frontier,
+            budget,
+            key,
+            &live,
+            image,
+            bootstrap.birth_cut(),
+        ) {
             BarrierCheck::Barrier => {
                 self.note_seal_stage(SealStageGate::UnboundStaging);
                 return SealAttempt::Decided(Err(self.wait(SealWait::UnboundStaging)));
+            }
+            BarrierCheck::BirthMismatch => {
+                // Diagnostic-only (bootstrap arms): count the refusing arm.
+                // The refusal below is unchanged.
+                self.note_bootstrap_arm(SealBootstrapArm::Covers);
+                return SealAttempt::Decided(Err(self.failure(JournalGap::BootstrapMismatch)));
             }
             BarrierCheck::Clear => {
                 // The scan spent from the shared slice; re-bound the
@@ -9451,6 +9469,7 @@ impl JournalAdapter {
             refused_index: 0,
             refused_len: self.refused.len(),
             refused_phase: false,
+            saw_barrier: false,
         });
         if scan.refused_len != self.refused.len() {
             scan.refused_index = 0;
@@ -9516,25 +9535,35 @@ impl JournalAdapter {
         }
     }
 
-    /// One bounded production-seal barrier scan for a frame's
-    /// frontier, charging the frame's shared slice per examined row
-    /// and resuming from the frame's cursor across retries. A
-    /// completed decision is retained while the same frontier and
-    /// staging/binding membership stand, so same-frame retries reuse
-    /// it with zero new visits; any membership change drops it and
-    /// restarts. Yields (saving its cursor, deciding nothing) when
-    /// the budget exhausts.
-    pub(crate) fn scan_seal_barrier(
+    /// One bounded production-seal pre-barrier scan for a frame's
+    /// frontier: birth coverage plus barrier, same cursor, charging the
+    /// frame's shared slice per examined row and resuming across retries.
+    /// Each visited row evaluates both predicates (one unit covers the
+    /// constant work); a birth failure wins immediately, while a barrier
+    /// found early waits for birth verification of the remaining rows.
+    /// A completed decision is retained while the same key, birth cut,
+    /// frontier and staging/binding membership stand, so same-target
+    /// retries reuse it with zero new visits; any change drops it and
+    /// restarts. Yields (saving its cursor, deciding nothing) when the
+    /// budget exhausts.
+    #[allow(clippy::too_many_arguments)] // One pre-barrier scan carries its key's birth inputs with its frontier and slice.
+    fn scan_seal_barrier(
         &self,
         state: &mut SealBarrierState,
         frontier: u64,
         budget: &mut usize,
+        key: JournalDomainKey,
+        live: &[JournalDomainKey],
+        image: (u64, u64),
+        birth_cut: u64,
     ) -> BarrierCheck {
         if let Some(decision) = state.decision {
             if decision.frontier == frontier
                 && decision.open_len == self.open.len()
                 && decision.refused_len == self.refused.len()
                 && decision.image_keys_len == self.image_keys.len()
+                && decision.key == key
+                && decision.birth_cut == birth_cut
             {
                 return if decision.barrier {
                     BarrierCheck::Barrier
@@ -9550,6 +9579,7 @@ impl JournalAdapter {
             refused_index: 0,
             refused_len: self.refused.len(),
             refused_phase: false,
+            saw_barrier: false,
         });
         if scan.refused_len != self.refused.len() {
             scan.refused_index = 0;
@@ -9572,7 +9602,7 @@ impl JournalAdapter {
                         .open
                         .range((std::ops::Bound::Excluded(last), std::ops::Bound::Unbounded)),
                 };
-                for (key, entry) in range {
+                for (native, entry) in range {
                     if examined >= allowance {
                         break;
                     }
@@ -9580,21 +9610,24 @@ impl JournalAdapter {
                     #[cfg(test)]
                     self.barrier_row_visits
                         .set(self.barrier_row_visits.get().saturating_add(1));
-                    scan.open_after = Some(*key);
+                    #[cfg(test)]
+                    self.birth_cover_evals
+                        .set(self.birth_cover_evals.get().saturating_add(1));
+                    scan.open_after = Some(*native);
+                    if entry.image == image
+                        && entry.begin_ordinal <= birth_cut
+                        && (self.converts_here(key, live, entry)
+                            || entry.converted_for == Some(key))
+                    {
+                        *budget = budget.saturating_sub(examined);
+                        state.cursor = None;
+                        return BarrierCheck::BirthMismatch;
+                    }
                     if entry.converted_ticket.is_none()
                         && entry.begin_ordinal <= frontier
                         && !self.image_keys.contains_key(&entry.image)
                     {
-                        *budget = budget.saturating_sub(examined);
-                        state.decision = Some(SealBarrierDecision {
-                            frontier,
-                            barrier: true,
-                            open_len: self.open.len(),
-                            refused_len: self.refused.len(),
-                            image_keys_len: self.image_keys.len(),
-                        });
-                        state.cursor = None;
-                        return BarrierCheck::Barrier;
+                        scan.saw_barrier = true;
                     }
                 }
                 *budget = budget.saturating_sub(examined);
@@ -9612,30 +9645,39 @@ impl JournalAdapter {
                     #[cfg(test)]
                     self.barrier_row_visits
                         .set(self.barrier_row_visits.get().saturating_add(1));
-                    if refused.cut <= frontier && !self.image_keys.contains_key(&refused.image) {
+                    #[cfg(test)]
+                    self.birth_cover_evals
+                        .set(self.birth_cover_evals.get().saturating_add(1));
+                    if refused.image == image
+                        && refused.cut <= birth_cut
+                        && self.refused_converts_here(key, live, refused)
+                    {
                         *budget = budget.saturating_sub(examined);
-                        state.decision = Some(SealBarrierDecision {
-                            frontier,
-                            barrier: true,
-                            open_len: self.open.len(),
-                            refused_len: self.refused.len(),
-                            image_keys_len: self.image_keys.len(),
-                        });
                         state.cursor = None;
-                        return BarrierCheck::Barrier;
+                        return BarrierCheck::BirthMismatch;
+                    }
+                    if refused.cut <= frontier && !self.image_keys.contains_key(&refused.image) {
+                        scan.saw_barrier = true;
                     }
                 }
                 *budget = budget.saturating_sub(examined);
                 if examined < allowance || scan.refused_index >= self.refused.len() {
+                    let barrier = scan.saw_barrier;
                     state.decision = Some(SealBarrierDecision {
                         frontier,
-                        barrier: false,
+                        barrier,
                         open_len: self.open.len(),
                         refused_len: self.refused.len(),
                         image_keys_len: self.image_keys.len(),
+                        key,
+                        birth_cut,
                     });
                     state.cursor = None;
-                    return BarrierCheck::Clear;
+                    return if barrier {
+                        BarrierCheck::Barrier
+                    } else {
+                        BarrierCheck::Clear
+                    };
                 }
             }
         }
@@ -25504,6 +25546,9 @@ pub(crate) mod tests {
                 BarrierCheck::Yielded => {}
                 BarrierCheck::Clear => break true,
                 BarrierCheck::Barrier => break false,
+                BarrierCheck::BirthMismatch => {
+                    unreachable!("watchdog barrier scan never reports birth mismatch")
+                }
             }
             assert!(calls < 1000, "the sliced scan always terminates");
         };

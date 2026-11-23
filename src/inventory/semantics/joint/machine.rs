@@ -4740,6 +4740,13 @@ impl LiveJointMachine {
                                                 crate::semantics_objects::journal::BarrierCheck::Clear => {
                                                     false
                                                 }
+                                                crate::semantics_objects::journal::BarrierCheck::BirthMismatch => {
+                                                    // The watchdog park check scans barrier
+                                                    // only, never birth coverage.
+                                                    unreachable!(
+                                                        "watchdog barrier scan never reports birth mismatch"
+                                                    )
+                                                }
                                                 crate::semantics_objects::journal::BarrierCheck::Yielded => {
                                                     return (
                                                         Phase::Audited {

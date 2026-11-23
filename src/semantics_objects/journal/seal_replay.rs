@@ -186,31 +186,18 @@ pub(super) struct ReplayBounds {
 
 impl ReplayBounds {
     pub(super) fn sample(adapter: &JournalAdapter, model: &ObjectSemantics) -> Option<Self> {
+        // O(1) conservative bounds from maintained cardinalities: each
+        // filtered count is at most the open population, so the worst-case
+        // exact sum (all opens unconverted with ends and abandonments) is
+        // the safe upper bound. No table walks, so retries size without
+        // rereading the prefix.
         let refused = adapter.refused.len();
-        let begins = adapter
-            .open
-            .values()
-            .filter(|entry| entry.converted_ticket.is_none())
-            .count();
-        let terminals = adapter
-            .open
-            .values()
-            .filter(|entry| entry.end.is_some() && !entry.end_converted)
-            .count();
+        let opens = adapter.open.len();
+        let begins = opens;
+        let terminals = opens;
         // Every staged abandonment may own one terminal step: a bounded
         // loss or a per-call disposal (dooming ones never convert).
-        let abandoned = adapter
-            .open
-            .values()
-            .filter(|entry| entry.abandon.is_some())
-            .count();
-        #[cfg(test)]
-        adapter.replay_sample_visits.set(
-            adapter
-                .replay_sample_visits
-                .get()
-                .saturating_add(adapter.open.len().saturating_mul(3)),
-        );
+        let abandoned = opens;
         let pending = model.replay_pending_count();
         let steps = refused
             .checked_add(usize::from(refused != 0))?

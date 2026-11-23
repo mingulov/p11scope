@@ -27343,12 +27343,13 @@ exit 0
     }
 
     #[test]
-    fn counts_for_a_late_bound_row_rebase_past_the_pre_admission_sight() {
+    fn counts_for_a_late_bound_row_carry_the_pre_admission_calls() {
         // Late binding: the row was recorded before the admission (t0
-        // 40 < 50) with a first-sight count of 2 (pre-admission calls
-        // the edge never attributes). The bind rebases past that
-        // sight, so only post-admission growth stages: refresh to 5
-        // reads 3.
+        // 40 < 50) with a first-sight count of 2. The late bind proves
+        // the same task held the same image from the row to the
+        // sighting (live cookie match, clean exec window), so those
+        // two calls are this caller's: the edge counts them, and the
+        // refresh to 5 reads 5 since t0, never a post-admission 3.
         let (mut native, caller) = watched_native();
         native.answer(7, 500, 41);
         let mut row = native.row(41, 1, 7, 40, 0);
@@ -27362,7 +27363,38 @@ exit 0
             .edges()
             .find(|edge| edge.caller == caller)
             .expect("the caller has an edge");
-        assert_eq!(edge.entry_count, 3);
+        assert_eq!(edge.entry_count, 5);
+        assert_eq!(edge.entry_first_seen_ns, Some(40));
+        assert_eq!(
+            native.scene.coverage(caller),
+            UseCoverage::Counted {
+                since_ns: 40,
+                lossy: false,
+                pid_exit: false
+            }
+        );
+    }
+
+    #[test]
+    fn counts_for_a_late_bound_row_with_no_post_admission_growth_stay_counted() {
+        // The cgroup fork-child shape (CI run 45046518330): every call
+        // happened before the admission, so the refresh equals the
+        // first sight. The known count is published on the bound
+        // caller's edge; the edge never falls back to a bare witness.
+        let (mut native, caller) = watched_native();
+        native.answer(7, 500, 41);
+        let mut row = native.row(41, 1, 7, 40, 0);
+        row.entry_count = 1507;
+        native.read(vec![row]);
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 1507)]);
+        native.drain();
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        let edge = registry
+            .edges()
+            .find(|edge| edge.caller == caller)
+            .expect("the caller has an edge");
+        assert_eq!(edge.entry_count, 1507, "the known count is never dropped");
         assert_eq!(
             native.scene.coverage(caller),
             UseCoverage::Counted {

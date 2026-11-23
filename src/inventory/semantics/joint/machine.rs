@@ -3505,6 +3505,24 @@ impl LiveJointMachine {
             }
             Phase::Idle => {
                 let reserve = coordinator.registry().semantic_storage_reserver();
+                // A direct binder can admit between Idle polls without
+                // staging EVENTS or entering a non-Idle phase. Any move in
+                // the admission revision or required-target count since the
+                // last Idle poll invalidates the completed flag and restarts
+                // a partial scan from scratch, so the new caller is examined
+                // before collection. Unchanged inputs keep skipping.
+                let cur_revision = coordinator.semantic_absence_revision();
+                let cur_required = lane.subset().required().len();
+                if cur_revision != self.absence_revision
+                    || cur_required != self.absence_required
+                {
+                    self.absence_done = false;
+                    self.absence_binding = 0;
+                    self.absence_after = None;
+                    self.absence_entry = 0;
+                }
+                self.absence_revision = cur_revision;
+                self.absence_required = cur_required;
                 // No collection, binder or New can precede this scan. One
                 // accepted current image is paired with one real attached
                 // target per action; no Mapped-only selector/cross-product.

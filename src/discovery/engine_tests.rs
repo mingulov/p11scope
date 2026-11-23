@@ -103986,6 +103986,45 @@ fn carried_fix2_release_holds_only_named_ids() {
     );
     let again = engine.allocate_view_id().unwrap();
     assert_eq!(again, recycled, "the ID keeps recycling after the commit");
+    // A second named release on maintained state holds too: with the named
+    // set already built, no lazy rebuild masks a dropped insert.
+    let parts2 = mo_shared_pin_parts();
+    let mut pins2 = parts2.pins;
+    let (bound2, skipped2) = bind_scanned_modules(&[parts2.module_r, parts2.module_l], &mut pins2);
+    assert!(skipped2.is_empty(), "{skipped2:?}");
+    let mut engine2 = Engine::empty();
+    engine2.scope = Scope::System;
+    engine2.next_view_id = 100;
+    engine2.plan = plan::build_from_reconciled_modules(&bound2);
+    engine2.pinned = pins2;
+    engine2.modules = bound2;
+    for view in [MO_VIEW_R, MO_VIEW_L] {
+        engine2
+            .views
+            .push(ProcessView::open(ProcessViewId(view), std::process::id()).unwrap());
+    }
+    engine2
+        .views
+        .retain(|view| view.id() != ProcessViewId(MO_VIEW_R));
+    engine2.release_view_id(ProcessViewId(MO_VIEW_R));
+    assert_eq!(
+        engine2.held_view_id_count(),
+        1,
+        "the first named release holds"
+    );
+    assert!(
+        !engine2.named_view_ids.is_empty(),
+        "the first release maintains the named set"
+    );
+    engine2
+        .views
+        .retain(|view| view.id() != ProcessViewId(MO_VIEW_L));
+    engine2.release_view_id(ProcessViewId(MO_VIEW_L));
+    assert_eq!(
+        engine2.held_view_id_count(),
+        2,
+        "a maintained-state named release holds too"
+    );
     // A rowless engine holds nothing even with a stale named entry: with
     // no rows, no verdict can name anything.
     let mut bare = Engine::empty();

@@ -1186,11 +1186,11 @@ def assert_handoff_pair(module):
     # Only the window's own well-formedness is asserted here.
     windows = module["unobserved_windows"]
     reasons = [w["reason"] for w in windows]
-    assert reasons == ["late_discovery", "mapped_unattached"], windows
+    if not (reasons == ["late_discovery", "mapped_unattached"]): raise AssertionError(windows)
     late, unattached = windows
-    assert late["end_ns"] == module["attached_at_ns"], windows
-    assert unattached["start_ns"] == late["start_ns"], windows
-    assert unattached["start_ns"] <= unattached["end_ns"], windows
+    if not (late["end_ns"] == module["attached_at_ns"]): raise AssertionError(windows)
+    if not (unattached["start_ns"] == late["start_ns"]): raise AssertionError(windows)
+    if not (unattached["start_ns"] <= unattached["end_ns"]): raise AssertionError(windows)
 
 def assert_pre68_held(module):
     # Pre-6.8 held twin: the overlay split either absorbs into the
@@ -1202,7 +1202,7 @@ def assert_pre68_held(module):
     if reasons == ["late_discovery", "mapped_unattached"]:
         assert_handoff_pair(module)
         return "handoff pair"
-    assert module["unobserved_windows"] == [], module["unobserved_windows"]
+    if not (module["unobserved_windows"] == []): raise AssertionError(module["unobserved_windows"])
     return "merged []"
 
 def assert_pre68_passive(module):
@@ -1214,8 +1214,8 @@ def assert_pre68_passive(module):
         assert_handoff_pair(module)
         return "handoff pair"
     windows = module["unobserved_windows"]
-    assert windows and len(windows) == 1 and windows[0]["reason"] == "pre_attach", windows
-    assert windows[0]["end_ns"] == module["attached_at_ns"], windows
+    if not (windows and len(windows) == 1 and windows[0]["reason"] == "pre_attach"): raise AssertionError(windows)
+    if not (windows[0]["end_ns"] == module["attached_at_ns"]): raise AssertionError(windows)
     return "merged pre_attach"
 
 def load(name):
@@ -1235,7 +1235,7 @@ def load(name):
 
 def prearmed_module(evidence):
     mods = [m for m in evidence["discovery"] if "prearm" in m.get("sources", [])]
-    assert len(mods) == 1, f"one pre-armed module, got {len(mods)}"
+    if not (len(mods) == 1): raise AssertionError(f"one pre-armed module, got {len(mods)}")
     return mods[0]
 
 def completed_calls(text, function):
@@ -1248,21 +1248,21 @@ held = prearmed_module(held_evidence)
 if pre_68:
     held_shape = assert_pre68_held(held)
 else:
-    assert held["unobserved_windows"] == [], held["unobserved_windows"]
-assert "scan" in held["sources"], held["sources"]
+    if not (held["unobserved_windows"] == []): raise AssertionError(held["unobserved_windows"])
+if not ("scan" in held["sources"]): raise AssertionError(held["sources"])
 summary = held_ledger[-1]
-assert (summary["initializes"], summary["finalizes"]) == (3, 3), summary
+if not ((summary["initializes"], summary["finalizes"]) == (3, 3)): raise AssertionError(summary)
 counts = tuple(completed_calls(held_text, name)
                for name in ("C_Initialize", "C_Finalize", "C_GetFunctionList"))
-assert counts == (3, 3, 1), counts
+if not (counts == (3, 3, 1)): raise AssertionError(counts)
 passive = prearmed_module(load("passive")[0])
-assert "scan" in passive["sources"], passive["sources"]
+if not ("scan" in passive["sources"]): raise AssertionError(passive["sources"])
 if pre_68:
     passive_shape = assert_pre68_passive(passive)
 else:
     windows = passive["unobserved_windows"]
-    assert windows and len(windows) == 1 and windows[0]["reason"] == "pre_attach", windows
-    assert windows[0]["end_ns"] == passive["attached_at_ns"], windows
+    if not (windows and len(windows) == 1 and windows[0]["reason"] == "pre_attach"): raise AssertionError(windows)
+    if not (windows[0]["end_ns"] == passive["attached_at_ns"]): raise AssertionError(windows)
 if pre_68:
     print(f"pre-6.8 exact: held {held_shape}, passive {passive_shape}, 3/3 ledger and 3/3/1 trace")
 else:

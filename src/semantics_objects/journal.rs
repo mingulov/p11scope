@@ -7442,7 +7442,7 @@ impl JournalAdapter {
         // blocked (image-tainted or dead with recorded grounding)
         // when this admission carries new post-fence object proof.
         let blocked = permanently_dead
-            || self.image_taint_blocks((last.cookie, last.exec), self.voided_through);
+            || self.image_taint_blocks((last.cookie, last.exec), *self.voided_through);
         if (permanently_dead && self.incarnation_mint_eligible(last))
             || (blocked && self.quarantine_end_eligible(admitted, last))
         {
@@ -7528,7 +7528,7 @@ impl JournalAdapter {
         if !self.tainted_images.contains(&image) {
             return false;
         }
-        if self.voided_through == 0 {
+        if *self.voided_through == 0 {
             return false;
         }
         self.image_keys.get(&image).is_some_and(|siblings| {
@@ -7539,7 +7539,7 @@ impl JournalAdapter {
                         || (!state.refused
                             && !state.tainted
                             && !state.era_ended
-                            && self.image_taint_blocks(image, self.voided_through))
+                            && self.image_taint_blocks(image, *self.voided_through))
                 })
             })
         })
@@ -7571,7 +7571,7 @@ impl JournalAdapter {
         let Some(state) = self.keys.get(&latest) else {
             return false;
         };
-        if self.voided_through == 0 {
+        if *self.voided_through == 0 {
             return false;
         }
         let image = (latest.cookie, latest.exec);
@@ -7579,7 +7579,7 @@ impl JournalAdapter {
             if !self.quarantine_death_recorded(latest) {
                 return false;
             }
-        } else if !self.image_taint_blocks(image, self.voided_through) {
+        } else if !self.image_taint_blocks(image, *self.voided_through) {
             return false;
         }
         let Some(fingerprint) = admitted.journal_call_fingerprint() else {
@@ -7613,7 +7613,7 @@ impl JournalAdapter {
             rv: admitted.s1_facts().rv,
         };
         self.open.values().any(|entry| {
-            entry.begin_ordinal > self.voided_through
+            entry.begin_ordinal > *self.voided_through
                 && entry.end.is_some()
                 && entry.abandon.is_none()
                 && entry.converted_ticket.is_none()
@@ -7660,11 +7660,11 @@ impl JournalAdapter {
         if !self.tainted_images.contains(&image) {
             return false;
         }
-        if !self.image_taint_blocks(image, self.voided_through) {
+        if !self.image_taint_blocks(image, *self.voided_through) {
             return false;
         }
-        self.tainted_images.remove(&image);
-        self.taint_evidence.remove(&image);
+        self.tainted_images.edit().remove(&image);
+        self.taint_evidence.edit().remove(&image);
         self.shed_only_taints.remove(&image);
         self.reentry_taint_lifts = self.reentry_taint_lifts.saturating_add(1);
         self.claims_prune_dirty = true;
@@ -7738,7 +7738,7 @@ impl JournalAdapter {
                     .get(&last)
                     .is_some_and(|state| state.refused || state.tainted || state.era_ended)
                     && self.incarnation_mint_eligible(last);
-                !dead_alone || self.image_taint_blocks((key.cookie, key.exec), self.voided_through)
+                !dead_alone || self.image_taint_blocks((key.cookie, key.exec), *self.voided_through)
             });
         if quarantine_mint
             && let Some(last) = quarantined
@@ -7747,7 +7747,11 @@ impl JournalAdapter {
                 .get(&last)
                 .is_some_and(|state| !state.refused && !state.tainted && !state.era_ended)
         {
-            self.keys.get_mut(&last).expect("quarantined key").era_ended = true;
+            self.keys
+                .edit()
+                .get_mut(&last)
+                .expect("quarantined key")
+                .era_ended = true;
             self.note_ended_mark(last);
         }
         if quarantine_mint {

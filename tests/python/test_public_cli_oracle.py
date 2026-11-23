@@ -1889,6 +1889,8 @@ class RunnerNoiseTests(unittest.TestCase):
         self.assertEqual(result["qualification"], "owned-provider-counts-with-ambient-gap")
         self.assertIn("pid_descendant_gaps=60", result["detail"])
         self.assertIn("discovery_skips=0", result["detail"])
+        self.assertIn("learned_first_use=1", result["detail"])
+        self.assertIn("learned_staged_files=1", result["detail"])
 
     def test_learned_first_use_passes_on_system_when_allowed(self):
         # Relaxed parity: the hosted public-cli leg runs system
@@ -1907,6 +1909,8 @@ class RunnerNoiseTests(unittest.TestCase):
         result = self.run_case(mutate, cell="system", allow_pid_descendant_gaps=True)
         self.assertEqual(result["qualification"], "owned-provider-counts-with-runner-noise")
         self.assertIn("pid_descendant_gaps=60", result["detail"])
+        self.assertIn("learned_first_use=1", result["detail"])
+        self.assertIn("learned_staged_files=1", result["detail"])
 
     def test_learned_first_use_passes_on_mt_system_in_strict_mode(self):
         # The first-use cell disjunct covers mt-system too: the same
@@ -1924,6 +1928,8 @@ class RunnerNoiseTests(unittest.TestCase):
         result = self.run_case_mt_system(mutate)
         self.assertEqual(result["qualification"], "owned-provider-counts-with-ambient-gap")
         self.assertIn("pid_descendant_gaps=60", result["detail"])
+        self.assertIn("learned_first_use=1", result["detail"])
+        self.assertIn("learned_staged_files=1", result["detail"])
 
     def test_learned_first_use_passes_on_mt_system_when_allowed(self):
         # Relaxed parity for mt-system with exact owned counts.
@@ -1940,6 +1946,8 @@ class RunnerNoiseTests(unittest.TestCase):
         result = self.run_case_mt_system(mutate, allow_pid_descendant_gaps=True)
         self.assertEqual(result["qualification"], "owned-provider-counts-with-runner-noise")
         self.assertIn("pid_descendant_gaps=60", result["detail"])
+        self.assertIn("learned_first_use=1", result["detail"])
+        self.assertIn("learned_staged_files=1", result["detail"])
 
     def test_learned_first_use_prearm_still_fails_in_strict_mode(self):
         # The original run 44950781943 refusal stays loud: one folded
@@ -2108,6 +2116,46 @@ class RunnerNoiseTests(unittest.TestCase):
             d["evidence"]["learned_staged_files"] = 1
             d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
         result = self.run_case(mutate, cell="profile-pid", want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
+
+    def test_learned_first_use_on_cgroup_cell_fails_in_strict_mode(self):
+        # The arm's own cell check is the only exclusion for
+        # cgroup-scope cells, which reach the shared system/cgroup
+        # gap branch: the same disclosure on a cgroup cell still
+        # fails (this twin kills the weakened-cell-check mutant).
+        def mutate(d, l, r):
+            d["capture"]["scope"] = "cgroup"
+            r["scope"] = "cgroup"
+            d["evidence"]["skipped"] = [{
+                "name": "learned provider file",
+                "reason": "a provider file was learned after its first use; "
+                          "its earlier calls were not observed"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped", "pid_descendant_gaps"]}
+            d["evidence"]["pid_descendant_gaps"] = 60
+            d["evidence"]["learned_staged_files"] = 1
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case(mutate, cell="profile-cgroup", want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
+
+    def test_learned_first_use_with_zero_gap_count_fails_in_strict_mode(self):
+        # The arm pins a nonzero gap count alongside the gap cause:
+        # the disclosure claiming the cause with a zero count is
+        # inconsistent evidence (the producer derives causes from
+        # counts) and still fails at the gap gate.
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [{
+                "name": "learned provider file",
+                "reason": "a provider file was learned after its first use; "
+                          "its earlier calls were not observed"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped", "pid_descendant_gaps"]}
+            d["evidence"]["pid_descendant_gaps"] = 0
+            d["evidence"]["learned_staged_files"] = 1
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case(mutate, cell="system", want=1)
         self.assertIn("lossy or unknown observation gap class",
                       result["detail"])
 

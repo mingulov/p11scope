@@ -98,6 +98,11 @@ pub(crate) const PROOF_PER_OPERATION_IO_BYTES: u64 = 256 * 1024 * 1024;
 /// the caps above, never a smaller fixed number.
 pub(crate) const LEARNED_RETRY_TOTAL_IO_BYTES: u64 =
     MAX_MOUNTINFO_BYTES + PROOF_PER_OPERATION_IO_BYTES + READ_CHUNK as u64;
+/// Mount-table lines charged per credit (INV-2): one positive credit is
+/// one bounded step of at most 64 leaf units, with a stop poll between
+/// strides. Shared by the table reader below and the exact-mount-id
+/// scan in `identity`, so both halves of a resolution stride alike.
+pub(crate) const MOUNTINFO_STRIDE: usize = 64;
 // ponytail: this independent ceiling is the calibration knob if real providers hit it.
 pub(crate) const DEFAULT_WORK_CEILING: u64 = 16 * 1024 * 1024;
 /// Production Inventory per-pass attempted-I/O window. Calibrated 2026-11-09:
@@ -616,9 +621,28 @@ fn read_mountinfo_pass<R: Read>(
             .checked_add(usize::from(chunk[read - 1] != b'\n'))
             .ok_or_else(|| MOUNTINFO_ENTRY_CEILING_REASON.to_string())?;
         let added_lines = next_lines.saturating_sub(progress.observed_lines);
-        budget
-            .spend(u64::try_from(added_lines).unwrap_or(u64::MAX))
-            .map_err(str::to_string)?;
+        // INV-2: at most MOUNTINFO_STRIDE new lines per credit, with a
+        // stop poll between strides, so a stop landing mid-table
+        // refuses instead of charging the whole table in one unbounded
+        // spend. Totals match the old single spend exactly.
+        let mut remaining_lines = added_lines;
+        let mut first_stride = true;
+        while remaining_lines > 0 {
+            if !first_stride {
+                if let Some(reason) = budget.stopped_reason() {
+                    return Err(reason.into());
+                }
+                if let Some(reason) = deadline(budget) {
+                    return Err(reason.into());
+                }
+            }
+            first_stride = false;
+            let stride = remaining_lines.min(MOUNTINFO_STRIDE);
+            budget
+                .spend(u64::try_from(stride).unwrap_or(u64::MAX))
+                .map_err(str::to_string)?;
+            remaining_lines -= stride;
+        }
         if u64::try_from(next_len).unwrap_or(u64::MAX) > table_cap {
             return Err(MOUNTINFO_CEILING_REASON.into());
         }

@@ -502,7 +502,14 @@ impl LoaderPid {
     /// verification always refuses.
     #[cfg(test)]
     pub(crate) fn dead_for_test(pid: u32) -> Self {
-        Self::new(pid, 0, MountNamespaceId { device: 0, inode: 0 })
+        Self::new(
+            pid,
+            0,
+            MountNamespaceId {
+                device: 0,
+                inode: 0,
+            },
+        )
     }
 
     #[cfg(test)]

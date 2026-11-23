@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use p11scope_manifest::elf::ElfAbi;
 use p11scope_manifest::identity::{
     IdentityKind, InspectedObject, MappingFileKey, OpenObjectError, SelfMappedFallback,
-    inspect_file_with_reader_exporting, is_missing_mount_id_error, mapping_file_key,
+    fd_mount_id, inspect_file_with_reader_exporting, is_missing_mount_id_error, mapping_file_key,
     mapping_file_key_in_mountinfo, open_object, open_object_errno, open_regular,
 };
 use p11scope_manifest::manifest::{Manifest, Resolution};
@@ -33,7 +33,7 @@ use super::handle_table::{AcquireOutcome, DeferredReason, Filing, HandleTable, H
 use super::refresh_queue::RetirementProof;
 use crate::discovery::scan::{
     COLLECTION_STOP_REASON, CaptureWorkBudget, INTERFACE_WINDOW_CEILING_REASON, IO_CEILING_REASON,
-    InspectedFileKey, SCAN_CLOCK_REASON, SCAN_DEADLINE_REASON, ScannedEntry, ScannedModule,
+    InspectedFileKey, MOUNTINFO_STRIDE, SCAN_CLOCK_REASON, SCAN_DEADLINE_REASON, ScannedEntry, ScannedModule,
     Skipped, TABLE_WINDOW_CEILING_REASON, WORK_CEILING_REASON, read_maps_or_refuse, read_mountinfo,
     standard_function_names,
 };
@@ -9019,16 +9019,97 @@ fn overlay_uncertainty(entry: &Entry, kept: &Entry) -> Skipped {
 /// resolves fdinfo's mount ID through mountinfo, so btrfs subvolumes and overlay are
 /// compared in the same representation `/proc/<pid>/maps` uses. Missing mount data is
 /// incomparable and fails closed; `st_dev` is never substituted.
-fn identity_of(file: &std::fs::File) -> Result<MappingFileKey, String> {
-    mapping_file_key(file).map_err(|error| format!("mapping identity unavailable: {error}"))
+fn identity_of(
+    file: &std::fs::File,
+    budget: &mut CaptureWorkBudget,
+) -> Result<MappingFileKey, String> {
+    let table = std::fs::File::open("/proc/self/mountinfo")
+        .map_err(|error| format!("cannot open observer mount table: {error}"))
+        .and_then(|table| read_mountinfo(table, budget))?;
+    identity_of_in_mountinfo(file, &table, budget)
+}
+
+/// The mount-id row for one exact mount id, scanned in INV-2 strides
+/// of at most [`MOUNTINFO_STRIDE`] lines per credit with a stop poll
+/// between strides: a whole-table scan would charge nothing and answer
+/// nothing until the end. Returns the matched row on an exact
+/// mount-id match, `Ok(None)` when the table does not name the id,
+/// and `Err` on budget refusal or stop.
+fn scan_mount_table_for_row_with<'table>(
+    table: &'table str,
+    mount_id: &str,
+    budget: &mut CaptureWorkBudget,
+    mut stop: impl FnMut(&mut CaptureWorkBudget) -> Option<&'static str>,
+) -> Result<Option<&'table str>, String> {
+    let mut rows = table.lines();
+    let mut first_stride = true;
+    loop {
+        if !first_stride {
+            if let Some(reason) = budget.stopped_reason() {
+                return Err(reason.into());
+            }
+            if let Some(reason) = stop(budget) {
+                return Err(reason.into());
+            }
+        }
+        first_stride = false;
+        let mut stride_rows = 0usize;
+        let mut found = None;
+        for row in rows.by_ref().take(MOUNTINFO_STRIDE) {
+            stride_rows += 1;
+            if found.is_none() {
+                let mut fields = row.split_ascii_whitespace();
+                if fields.next() == Some(mount_id) {
+                    found = Some(row);
+                }
+            }
+        }
+        budget
+            .spend(u64::try_from(stride_rows).unwrap_or(u64::MAX))
+            .map_err(str::to_string)?;
+        if let Some(row) = found {
+            return Ok(Some(row));
+        }
+        if stride_rows < MOUNTINFO_STRIDE {
+            return Ok(None);
+        }
+    }
+}
+
+/// [`mapping_file_key_in_mountinfo`] with the exact-id scan metered:
+/// the table is walked in [`MOUNTINFO_STRIDE`]-line credits with stop
+/// polls between strides, and only the matched row reaches the shared
+/// parser — so the parse and every error string stay the shared
+/// implementation's, while no whole-table scan runs uncharged. One
+/// credit covers the fdinfo row, one the delegate's bounded re-read.
+fn mapping_file_key_in_mountinfo_metered_with(
+    file: &std::fs::File,
+    mountinfo: &str,
+    budget: &mut CaptureWorkBudget,
+    stop: impl FnMut(&mut CaptureWorkBudget) -> Option<&'static str>,
+) -> Result<MappingFileKey, String> {
+    let mount_id = fd_mount_id(file)?;
+    budget.spend(1).map_err(str::to_string)?;
+    let row = scan_mount_table_for_row_with(mountinfo, &mount_id, budget, stop)?;
+    budget.spend(1).map_err(str::to_string)?;
+    // An unmatched id resolves against the empty table, which the
+    // shared parser refuses with its exact missing-mount error — no
+    // error string is duplicated here.
+    mapping_file_key_in_mountinfo(file, row.unwrap_or(""))
 }
 
 fn identity_of_in_mountinfo(
     file: &std::fs::File,
     mountinfo: &str,
+    budget: &mut CaptureWorkBudget,
 ) -> Result<MappingFileKey, String> {
-    mapping_file_key_in_mountinfo(file, mountinfo)
-        .map_err(|error| format!("mapping identity unavailable: {error}"))
+    mapping_file_key_in_mountinfo_metered_with(
+        file,
+        mountinfo,
+        budget,
+        CaptureWorkBudget::check_deadline_now,
+    )
+    .map_err(|error| format!("mapping identity unavailable: {error}"))
 }
 
 /// Resolves `file` in this view's mount table, re-reading the table once when
@@ -9042,20 +9123,25 @@ fn identity_of_in_mountinfo(
 fn identity_of_in_mountinfo_with_reread(
     file: &std::fs::File,
     mountinfo: &str,
-    reread: impl FnOnce() -> Result<String, String>,
+    budget: &mut CaptureWorkBudget,
+    reread: impl FnOnce(&mut CaptureWorkBudget) -> Result<String, String>,
 ) -> Result<MappingFileKey, String> {
-    reread_on_missing_mount(identity_of_in_mountinfo(file, mountinfo), file, reread)
+    let first = identity_of_in_mountinfo(file, mountinfo, budget);
+    reread_on_missing_mount(first, file, budget, reread)
 }
 
 /// The retry half of the rule above, given the first resolution's result.
+/// The re-read receives the budget, so the retry's table open and the
+/// second resolution charge the same allowance as the first.
 fn reread_on_missing_mount(
     first: Result<MappingFileKey, String>,
     file: &std::fs::File,
-    reread: impl FnOnce() -> Result<String, String>,
+    budget: &mut CaptureWorkBudget,
+    reread: impl FnOnce(&mut CaptureWorkBudget) -> Result<String, String>,
 ) -> Result<MappingFileKey, String> {
     match first {
-        Err(error) if is_missing_mount_id_error(&error) => match reread() {
-            Ok(fresh) => identity_of_in_mountinfo(file, &fresh),
+        Err(error) if is_missing_mount_id_error(&error) => match reread(budget) {
+            Ok(fresh) => identity_of_in_mountinfo(file, &fresh, budget),
             Err(_) => Err(error),
         },
         outcome => outcome,
@@ -9133,7 +9219,7 @@ fn open_view_object_with(
     budget: &mut CaptureWorkBudget,
 ) -> Result<(std::fs::File, ObjectKey), String> {
     let (file, mountinfo) = view.open_then_cached_mountinfo(open, mounts, budget)?;
-    let first = identity_of_in_mountinfo(&file, mountinfo);
+    let first = identity_of_in_mountinfo(&file, mountinfo, budget);
     let key = object_key(identity_in_cached_table(
         view, &file, first, mounts, budget,
     )?);
@@ -9162,7 +9248,7 @@ fn identity_in_cached_table(
     mounts: &mut MountTableCache,
     budget: &mut CaptureWorkBudget,
 ) -> Result<MappingFileKey, String> {
-    let retried = reread_on_missing_mount(first, file, || {
+    let retried = reread_on_missing_mount(first, file, budget, |budget| {
         mounts.invalidate();
         Ok(view
             .open_then_cached_mountinfo(|_| Ok(()), mounts, budget)?
@@ -9175,7 +9261,13 @@ fn identity_in_cached_table(
     if !shared_namespace_with_observer(view) {
         return retried;
     }
-    match mapping_file_key(file) {
+    let table = std::fs::File::open("/proc/self/mountinfo")
+        .ok()
+        .and_then(|table| read_mountinfo(table, budget).ok());
+    let Some(table) = table else {
+        return retried;
+    };
+    match identity_of_in_mountinfo(file, &table, budget) {
         Ok(key) => Ok(key),
         Err(_) => retried,
     }
@@ -9237,7 +9329,7 @@ pub(crate) fn retained_object_key_cached(
     budget: &mut CaptureWorkBudget,
 ) -> Result<ObjectKey, String> {
     let ((), mountinfo) = view.open_then_cached_mountinfo(|_| Ok(()), mounts, budget)?;
-    let first = identity_of_in_mountinfo(file, mountinfo);
+    let first = identity_of_in_mountinfo(file, mountinfo, budget);
     Ok(object_key(identity_in_cached_table(
         view, file, first, mounts, budget,
     )?))
@@ -9280,7 +9372,7 @@ pub(crate) fn learned_retry_maps_key(
     let Ok(mountinfo) = mountinfo else {
         return derived;
     };
-    identity_of_manifest(file, Some(&mountinfo))
+    identity_of_manifest(file, Some(&mountinfo), budget)
         .map(object_key)
         .unwrap_or(derived)
 }
@@ -9572,10 +9664,11 @@ fn open_manifest_locator(path: &Path) -> ManifestLocatorOpen {
 fn identity_of_manifest(
     file: &std::fs::File,
     retained_mountinfo: Option<&str>,
+    budget: &mut CaptureWorkBudget,
 ) -> Result<MappingFileKey, String> {
     match retained_mountinfo {
-        Some(mountinfo) => identity_of_in_mountinfo(file, mountinfo),
-        None => identity_of(file),
+        Some(mountinfo) => identity_of_in_mountinfo(file, mountinfo, budget),
+        None => identity_of(file, budget),
     }
 }
 
@@ -9629,12 +9722,17 @@ fn identity_of_in_loader_table_with_verifier(
     mut verify: impl FnMut(&LoaderPid) -> Result<(), String>,
 ) -> Result<MappingFileKey, String> {
     verify(pin)?;
-    let table = std::fs::File::open(format!("/proc/{}/mountinfo", pin.pid()))
-        .map_err(|error| format!("cannot open loader mount table: {error}"))
-        .and_then(|table| read_mountinfo(table, budget))?;
-    let key = mapping_file_key_in_mountinfo(file, &table)
-        .map_err(|error| format!("mapping identity unavailable: {error}"))?;
+    // The table fd stays owned here: the read borrows it, so success
+    // closes below and every refusal drops it at scope end — no path
+    // leaks the descriptor past the lookup. The read strides like
+    // every other mount-table read, and the resolution strides the
+    // exact-id scan, so each credit stays bounded.
+    let held = std::fs::File::open(format!("/proc/{}/mountinfo", pin.pid()))
+        .map_err(|error| format!("cannot open loader mount table: {error}"))?;
+    let text = read_mountinfo(&held, budget)?;
+    let key = identity_of_in_mountinfo(file, &text, budget)?;
     verify(pin)?;
+    drop(held);
     Ok(key)
 }
 
@@ -9651,7 +9749,7 @@ fn identity_with_loader_fallback(
     loader_pid: Option<LoaderPid>,
     budget: &mut CaptureWorkBudget,
 ) -> Result<MappingFileKey, String> {
-    let first = identity_of_manifest(file, retained_mountinfo);
+    let first = identity_of_manifest(file, retained_mountinfo, budget);
     match (&first, loader_pid) {
         (Err(error), Some(pin)) if is_missing_mount_id_error(error) => {
             match identity_of_in_loader_table(file, &pin, budget) {
@@ -10182,7 +10280,7 @@ fn pin_manifest_objects_with_read_policy(
     let mut batch_spent = prior_bytes;
     for (object, file, pin, mountinfo) in pinned {
         let count_mapping = if meter_identity {
-            match identity_of_manifest(&file, mountinfo.as_deref()) {
+            match identity_of_manifest(&file, mountinfo.as_deref(), budget) {
                 Ok(mapping) => Some(mapping),
                 Err(error) => {
                     skipped.push(Skipped {
@@ -10290,7 +10388,7 @@ fn pin_manifest_objects_with_read_policy(
         }
         let mapping = match count_mapping
             .map(Ok)
-            .unwrap_or_else(|| identity_of_manifest(&file, mountinfo.as_deref()))
+            .unwrap_or_else(|| identity_of_manifest(&file, mountinfo.as_deref(), budget))
         {
             Ok(mapping) => mapping,
             Err(error) => {
@@ -12656,7 +12754,7 @@ fn pin_map_files_fallback(
     let ((), mountinfo) = view
         .open_then_cached_mountinfo(|_| Ok(()), mounts, budget)
         .map_err(Unproven)?;
-    let first = identity_of_in_mountinfo(&file, mountinfo);
+    let first = identity_of_in_mountinfo(&file, mountinfo, budget);
     let found = identity_in_cached_table(view, &file, first, mounts, budget).map_err(Unproven)?;
     Ok((file, found))
 }
@@ -12799,7 +12897,7 @@ fn pin_scanned_object_inner(
         Some(candidate) => {
             let file = open_object_errno(candidate)
                 .map_err(|error| PinOutcome::for_open_object_error(view, error))?;
-            let found = mapping_file_key(&file).map_err(PinOutcome::for_mapping_unavailable)?;
+            let found = identity_of(&file, budget).map_err(PinOutcome::for_mapping_unavailable)?;
             (file, found)
         }
         None => {
@@ -12812,7 +12910,7 @@ fn pin_scanned_object_inner(
                 .map_err(|error| PinOutcome::for_view_error(view, error))?;
             match open {
                 Ok(file) => {
-                    let first = identity_of_in_mountinfo(&file, mountinfo);
+                    let first = identity_of_in_mountinfo(&file, mountinfo, budget);
                     let found = identity_in_cached_table(view, &file, first, mounts, budget)
                         .map_err(|error| PinOutcome::for_view_error(view, error))?;
                     (file, found)
@@ -16453,10 +16551,11 @@ mod tests {
             .find_map(|path| {
                 let file = open_regular(path).ok()?;
                 let mut prefix = String::new();
+                let mut budget = CaptureWorkBudget::default();
                 for line in full.lines() {
                     prefix.push_str(line);
                     prefix.push('\n');
-                    if identity_of_in_mountinfo(&file, &prefix).is_ok() {
+                    if identity_of_in_mountinfo(&file, &prefix, &mut budget).is_ok() {
                         return (prefix.len() < full.len()).then_some((path, prefix));
                     }
                 }
@@ -16465,7 +16564,7 @@ mod tests {
             .expect("a controlled regular file must have a matching non-final mount row");
         let file = open_regular(path).unwrap();
         assert!(
-            identity_of_in_mountinfo(&file, &prefix).is_ok(),
+            identity_of_in_mountinfo(&file, &prefix, &mut CaptureWorkBudget::default()).is_ok(),
             "the prefix contains this opened fd's matching mount ID"
         );
         assert!(
@@ -16487,7 +16586,10 @@ mod tests {
 
         let (opened, key) = open_view_object(&view, path, &mut CaptureWorkBudget::default())
             .expect("the same caller accepts the EOF-proven complete table");
-        assert_eq!(key, object_key(identity_of(&opened).unwrap()));
+        assert_eq!(
+            key,
+            object_key(identity_of(&opened, &mut CaptureWorkBudget::default()).unwrap())
+        );
     }
 
     #[test]
@@ -16506,7 +16608,8 @@ mod tests {
             observer.mount_id
         );
         let rereads = RefCell::new(0usize);
-        let found = identity_of_in_mountinfo_with_reread(&file, stale, || {
+        let mut budget = CaptureWorkBudget::default();
+        let found = identity_of_in_mountinfo_with_reread(&file, stale, &mut budget, |_| {
             *rereads.borrow_mut() += 1;
             Ok(fresh.clone())
         })
@@ -16531,7 +16634,8 @@ mod tests {
         );
         let stale = "999999 1 8:1 / /other rw - ext4 /dev/other rw\n";
         let rereads = RefCell::new(0usize);
-        let error = identity_of_in_mountinfo_with_reread(&file, stale, || {
+        let mut budget = CaptureWorkBudget::default();
+        let error = identity_of_in_mountinfo_with_reread(&file, stale, &mut budget, |_| {
             *rereads.borrow_mut() += 1;
             Ok(stale.to_string())
         })
@@ -16557,7 +16661,8 @@ mod tests {
         );
         let stale = "999999 1 8:1 / /other rw - ext4 /dev/other rw\n";
         let rereads = RefCell::new(0usize);
-        let error = identity_of_in_mountinfo_with_reread(&file, stale, || {
+        let mut budget = CaptureWorkBudget::default();
+        let error = identity_of_in_mountinfo_with_reread(&file, stale, &mut budget, |_| {
             *rereads.borrow_mut() += 1;
             Err("stale".into())
         })
@@ -16583,7 +16688,8 @@ mod tests {
             observer.mount_id
         );
         let rereads = RefCell::new(0usize);
-        let error = identity_of_in_mountinfo_with_reread(&file, &corrupt, || {
+        let mut budget = CaptureWorkBudget::default();
+        let error = identity_of_in_mountinfo_with_reread(&file, &corrupt, &mut budget, |_| {
             *rereads.borrow_mut() += 1;
             Ok(corrupt.clone())
         })
@@ -16753,22 +16859,175 @@ mod tests {
         let pin = LoaderPid::for_self_for_test().expect("pin the live test process");
         let mut budget = CaptureWorkBudget::default();
         let mut calls = 0;
-        let error = identity_of_in_loader_table_with_verifier(
-            &file,
-            &pin,
-            &mut budget,
-            |_| {
-                calls += 1;
-                if calls == 1 {
-                    Ok(())
-                } else {
-                    Err("injected post-lookup exit".to_string())
-                }
-            },
-        )
+        let error = identity_of_in_loader_table_with_verifier(&file, &pin, &mut budget, |_| {
+            calls += 1;
+            if calls == 1 {
+                Ok(())
+            } else {
+                Err("injected post-lookup exit".to_string())
+            }
+        })
         .expect_err("a loader lost mid-lookup must not resolve");
         assert_eq!(error, "injected post-lookup exit");
         assert_eq!(calls, 2, "the pin is proved before and after the lookup");
+    }
+
+    /// A mount table with `decoys` non-matching rows and the fd's match
+    /// as the final row: decoy ids sit far above any real mount id, and
+    /// the builder refuses to emit a decoy that collides with the match.
+    fn mount_table_with_match_last(mount_id: &str, decoys: usize) -> String {
+        let mut table = String::new();
+        for index in 0..decoys {
+            let id = 1_000_000u64 + index as u64;
+            assert_ne!(
+                id.to_string(),
+                mount_id,
+                "decoys must not match the fd mount"
+            );
+            table.push_str(&format!(
+                "{id} 1 8:1 / /decoy{index} rw - ext4 /dev/decoy rw\n"
+            ));
+        }
+        table.push_str(&format!(
+            "{mount_id} 1 9:9 / /target rw - ext4 /dev/target rw\n"
+        ));
+        table
+    }
+
+    /// The exact-id scan strides like the table read: 131 rows take
+    /// three credits (64/64/3) with one stop poll between each pair of
+    /// strides, and the match on the last row still resolves.
+    #[test]
+    fn exact_mount_scan_strides_64_rows_per_credit() {
+        let file = open_regular(Path::new("/bin/sh")).unwrap();
+        let mount_id = fd_mount_id(&file).unwrap();
+        let table = mount_table_with_match_last(&mount_id, 130);
+        let mut budget = CaptureWorkBudget::default();
+        let mut polls = 0;
+        let key = mapping_file_key_in_mountinfo_metered_with(&file, &table, &mut budget, |_| {
+            polls += 1;
+            None
+        })
+        .expect("the match on the last row must resolve");
+        assert_eq!((key.device_major, key.device_minor), (9, 9));
+        assert_eq!(polls, 2, "one stop poll between each pair of strides");
+        assert_eq!(
+            budget.work_units_count(),
+            1 + 64 + 64 + 3 + 1,
+            "fdinfo row, three strides, delegate re-read: {}",
+            budget.work_units_count()
+        );
+    }
+
+    /// A stop landing between two scan strides refuses with only the
+    /// finished strides charged: tripping on the first inter-stride
+    /// poll charges the fdinfo row plus the first 64-row stride, and
+    /// the match later in the table is never reached.
+    #[test]
+    fn exact_mount_scan_stop_between_strides_refuses() {
+        let file = open_regular(Path::new("/bin/sh")).unwrap();
+        let mount_id = fd_mount_id(&file).unwrap();
+        let table = mount_table_with_match_last(&mount_id, 130);
+        let mut budget = CaptureWorkBudget::default();
+        let mut polls = 0;
+        let error = mapping_file_key_in_mountinfo_metered_with(&file, &table, &mut budget, |_| {
+            polls += 1;
+            (polls == 1).then_some(crate::discovery::scan::SCAN_DEADLINE_REASON)
+        })
+        .unwrap_err();
+        assert_eq!(error, crate::discovery::scan::SCAN_DEADLINE_REASON);
+        assert_eq!(
+            budget.work_units_count(),
+            1 + 64,
+            "fdinfo row plus the first 64-row stride: {}",
+            budget.work_units_count()
+        );
+    }
+
+    /// 64 rows resolve in a single credit with no inter-stride poll;
+    /// the 65th row opens a second credit with one poll between.
+    #[test]
+    fn exact_mount_scan_strides_on_the_64_row_boundary() {
+        let file = open_regular(Path::new("/bin/sh")).unwrap();
+        let mount_id = fd_mount_id(&file).unwrap();
+        for (decoys, polls_want, units_want) in [(63, 0, 1 + 64 + 1), (64, 1, 1 + 64 + 1 + 1)] {
+            let table = mount_table_with_match_last(&mount_id, decoys);
+            let mut budget = CaptureWorkBudget::default();
+            let mut polls = 0;
+            mapping_file_key_in_mountinfo_metered_with(&file, &table, &mut budget, |_| {
+                polls += 1;
+                None
+            })
+            .expect("the boundary match must resolve");
+            assert_eq!(polls, polls_want, "decoys: {decoys}");
+            assert_eq!(budget.work_units_count(), units_want, "decoys: {decoys}");
+        }
+    }
+
+    /// A budget exhausted mid-scan refuses the resolution: with only
+    /// 70 units left, the fdinfo row and the first stride fit, and the
+    /// second stride names the work ceiling.
+    #[test]
+    fn exact_mount_scan_budget_exhaustion_refuses() {
+        let file = open_regular(Path::new("/bin/sh")).unwrap();
+        let mount_id = fd_mount_id(&file).unwrap();
+        let table = mount_table_with_match_last(&mount_id, 130);
+        let mut budget = CaptureWorkBudget::default();
+        assert!(budget.charge(budget.work_ceiling() - 70));
+        let error =
+            mapping_file_key_in_mountinfo_metered_with(&file, &table, &mut budget, |_| None)
+                .unwrap_err();
+        assert_eq!(error, crate::discovery::scan::WORK_CEILING_REASON);
+    }
+
+    /// A match on the first row stops after the first stride: no later
+    /// stride is read, charged, or stop-polled, however long the table.
+    #[test]
+    fn exact_mount_scan_stops_at_the_first_match() {
+        let file = open_regular(Path::new("/bin/sh")).unwrap();
+        let mount_id = fd_mount_id(&file).unwrap();
+        let mut table = format!("{mount_id} 1 9:9 / /target rw - ext4 /dev/target rw\n");
+        for index in 0..130 {
+            table.push_str(&format!(
+                "{} 1 8:1 / /decoy{index} rw - ext4 /dev/decoy rw\n",
+                1_000_000u64 + index
+            ));
+        }
+        let mut budget = CaptureWorkBudget::default();
+        let mut polls = 0;
+        let key = mapping_file_key_in_mountinfo_metered_with(&file, &table, &mut budget, |_| {
+            polls += 1;
+            None
+        })
+        .expect("the first-row match must resolve");
+        assert_eq!((key.device_major, key.device_minor), (9, 9));
+        assert_eq!(polls, 0, "no second stride, no inter-stride poll");
+        assert_eq!(
+            budget.work_units_count(),
+            1 + 64 + 1,
+            "fdinfo row, one stride, delegate re-read: {}",
+            budget.work_units_count()
+        );
+    }
+
+    /// Exhaustion through the threaded resolution path (not just the
+    /// scan seam): the production caller charges its own budget, so a
+    /// spent allowance refuses with the prefixed ceiling reason.
+    #[test]
+    fn threaded_mount_resolution_budget_exhaustion_refuses() {
+        let file = open_regular(Path::new("/bin/sh")).unwrap();
+        let mount_id = fd_mount_id(&file).unwrap();
+        let table = mount_table_with_match_last(&mount_id, 130);
+        let mut budget = CaptureWorkBudget::default();
+        assert!(budget.charge(budget.work_ceiling() - 70));
+        let error = identity_of_in_mountinfo(&file, &table, &mut budget).unwrap_err();
+        assert_eq!(
+            error,
+            format!(
+                "mapping identity unavailable: {}",
+                crate::discovery::scan::WORK_CEILING_REASON
+            )
+        );
     }
 
     #[test]
@@ -17710,7 +17969,8 @@ mod tests {
     #[test]
     fn retained_mount_table_controls_manifest_mapping_identity() {
         let file = open_object(Path::new("/bin/sh")).unwrap();
-        let observer = identity_of_manifest(&file, None).unwrap();
+        let observer =
+            identity_of_manifest(&file, None, &mut CaptureWorkBudget::default()).unwrap();
         let target_major = observer.device_major.saturating_add(1);
         let target_minor = observer.device_minor.saturating_add(1);
         let target_mountinfo = format!(
@@ -17718,7 +17978,12 @@ mod tests {
             observer.mount_id
         );
 
-        let retained = identity_of_manifest(&file, Some(&target_mountinfo)).unwrap();
+        let retained = identity_of_manifest(
+            &file,
+            Some(&target_mountinfo),
+            &mut CaptureWorkBudget::default(),
+        )
+        .unwrap();
         assert_eq!(retained.mount_id, observer.mount_id);
         assert_eq!(
             (retained.device_major, retained.device_minor),

@@ -88904,6 +88904,75 @@ fn learned_candidate_with_dead_loader_pid_stages_through_the_observer_table() {
     );
 }
 
+/// Terminal flush under an exhausted budget refuses every queued
+/// candidate loudly and stages nothing: the two unpaced passes stay
+/// finite because the queue is bounded and each attempt is bounded,
+/// and no refusal is silent — every queued file keeps its named row.
+#[test]
+fn learned_terminal_flush_under_an_exhausted_budget_refuses_everything_loudly() {
+    let (fixture, _view, _module, _pins) = loaded_seed_provider();
+    let seed = fixture._dir.path().join("seed-provider.so");
+    let (tx, rx) = std::sync::mpsc::sync_channel(64);
+    let mut displays = Vec::new();
+    for index in 0..10 {
+        let copy = fixture._dir.path().join(format!("seed-burst-{index}.so"));
+        std::fs::copy(&seed, &copy).unwrap();
+        {
+            use std::io::Write as _;
+            let mut trailer = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&copy)
+                .unwrap();
+            trailer.write_all(&[index as u8; 256]).unwrap();
+        }
+        let display = copy.to_string_lossy().into_owned();
+        let file = std::fs::File::open(&copy).unwrap();
+        let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+        tx.send(crate::fanotify::LearnMsg::Candidate(
+            crate::fanotify::LearnedCandidate {
+                file,
+                dev,
+                ino,
+                display_path: display.clone(),
+                loader_exe: None,
+                loader_unknown_reason: None,
+                loader_pid: None,
+                run_learned: false,
+                proving_retained: false,
+            },
+        ))
+        .unwrap();
+        displays.push(display);
+    }
+    let _drain_alive = &tx;
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    assert!(!engine.budget.charge(u64::MAX), "the budget must exhaust");
+    engine.set_learned_rx_for_test(rx);
+    engine.flush_learned_files_at_capture_end();
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        0,
+        "an exhausted budget stages nothing"
+    );
+    assert!(
+        engine.learned_notes.is_empty(),
+        "an exhausted budget files no loader notes"
+    );
+    let mut refused: Vec<_> = engine
+        .counters
+        .object_skips
+        .iter()
+        .map(|skip| skip.subject.clone())
+        .collect();
+    refused.sort();
+    displays.sort();
+    assert_eq!(
+        refused, displays,
+        "every queued file keeps its named refusal row"
+    );
+}
+
 /// A fanotify queue overflow files one aggregate gap: some short-lived
 /// loads may not have been learned, counted but never per-file.
 #[test]

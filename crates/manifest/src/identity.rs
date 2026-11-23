@@ -154,6 +154,24 @@ pub fn mapping_file_key(file: &std::fs::File) -> Result<MappingFileKey, String> 
     mapping_file_key_in_mountinfo(file, &mountinfo)
 }
 
+/// The mount ID an opened fd was opened through, from its fdinfo
+/// (`mnt_id:`): the key every mount-table resolution matches exactly.
+/// Split out so metered callers scan in strides without duplicating
+/// the lookup; the error strings stay this function's, shared by all
+/// resolutions.
+#[cfg(feature = "identify")]
+pub fn fd_mount_id(file: &std::fs::File) -> Result<String, String> {
+    use std::os::unix::io::AsRawFd as _;
+
+    let fdinfo = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", file.as_raw_fd()))
+        .map_err(|error| format!("reading fd mount identity failed: {error}"))?;
+    fdinfo
+        .lines()
+        .find_map(|line| line.strip_prefix("mnt_id:\t"))
+        .map(str::to_string)
+        .ok_or_else(|| "fd mount identity is missing".to_string())
+}
+
 /// Resolves an opened fd's mount ID in the mount table of the process view
 /// through which it was opened. Mount IDs name mounts, not global devices, so a
 /// foreign `/proc/<pid>/root` fd must not be resolved through the observer's table.
@@ -167,12 +185,7 @@ pub fn mapping_file_key_in_mountinfo(
     let metadata = file
         .metadata()
         .map_err(|error| format!("metadata failed: {error}"))?;
-    let fdinfo = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", file.as_raw_fd()))
-        .map_err(|error| format!("reading fd mount identity failed: {error}"))?;
-    let mount_id = fdinfo
-        .lines()
-        .find_map(|line| line.strip_prefix("mnt_id:\t"))
-        .ok_or_else(|| "fd mount identity is missing".to_string())?;
+    let mount_id = fd_mount_id(file)?;
     let parsed_mount_id = mount_id
         .parse()
         .map_err(|_| format!("invalid fd mount identity {mount_id:?}"))?;

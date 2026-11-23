@@ -25110,6 +25110,7 @@ fn learned_staging_rescans_owned_members_and_views_promptly() {
         loader_unknown_reason: None,
         run_learned: true,
         proving_retained: false,
+        loader_pid: None,
     });
     assert_eq!(
         engine.learned_staged_files_for_test(),
@@ -88780,6 +88781,7 @@ fn learned_candidate_stages_through_prearm_and_marks_first_run_gap() {
             loader_unknown_reason: None,
             run_learned: false,
             proving_retained: false,
+            loader_pid: None,
         },
     ))
     .unwrap();
@@ -88828,6 +88830,44 @@ fn learned_candidate_stages_through_prearm_and_marks_first_run_gap() {
     assert!(
         engine.learned_frame_owed_for_test(),
         "staging owes the expedited frame"
+    );
+}
+
+/// A candidate that carries its loader pid stages exactly like one
+/// without when the observer's table names the mount: the loader
+/// table is only a fallback for a foreign mount id, never a
+/// different first resolution.
+#[test]
+fn learned_candidate_with_loader_pid_stages_through_the_observer_table() {
+    let (fixture, _view, _module, _pins) = loaded_seed_provider();
+    let library = fixture._dir.path().join("seed-provider.so");
+    let file = std::fs::File::open(&library).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.stage_learned_candidate(crate::fanotify::LearnedCandidate {
+        file,
+        dev,
+        ino,
+        display_path: library.to_string_lossy().into_owned(),
+        loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+        loader_unknown_reason: None,
+        loader_pid: Some(std::process::id()),
+        run_learned: false,
+        proving_retained: false,
+    });
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        1,
+        "the loader-carrying candidate stages"
+    );
+    assert!(
+        engine
+            .prearm_input
+            .iter()
+            .flat_map(|input| input.inputs.iter())
+            .any(|entry| entry.path.ends_with("seed-provider.so")),
+        "the staged record carries the display path"
     );
 }
 
@@ -88912,6 +88952,7 @@ fn learned_scan_covered_file_stays_unstaged_and_silent() {
             loader_unknown_reason: None,
             run_learned: false,
             proving_retained: false,
+            loader_pid: None,
         },
     ))
     .unwrap();
@@ -89787,6 +89828,7 @@ fn learned_run_learned_scan_covered_file_still_stages() {
             loader_unknown_reason: None,
             run_learned: true,
             proving_retained: false,
+            loader_pid: None,
         },
     ))
     .unwrap();
@@ -89844,6 +89886,7 @@ fn learned_run_learned_retained_covered_file_stages_silently() {
             loader_unknown_reason: None,
             run_learned: true,
             proving_retained: true,
+            loader_pid: None,
         },
     ))
     .unwrap();
@@ -89941,6 +89984,7 @@ fn learned_run_learned_prearmed_file_dedupes_by_identity_not_spelling() {
             loader_unknown_reason: None,
             run_learned: true,
             proving_retained: false,
+            loader_pid: None,
         },
     ))
     .unwrap();
@@ -89989,6 +90033,7 @@ fn learned_cap_names_the_excess_once() {
             loader_unknown_reason: None,
             run_learned: false,
             proving_retained: false,
+            loader_pid: None,
         },
     ))
     .unwrap();
@@ -90071,6 +90116,7 @@ fn learned_service_bounds_pins_per_tick() {
                 loader_unknown_reason: None,
                 run_learned: false,
                 proving_retained: false,
+                loader_pid: None,
             },
         ))
         .unwrap();
@@ -90134,6 +90180,7 @@ fn learned_capture_end_flushes_pending_candidates() {
                 loader_unknown_reason: None,
                 run_learned: false,
                 proving_retained: false,
+                loader_pid: None,
             },
         ))
         .unwrap();
@@ -90193,6 +90240,7 @@ fn learned_shutdown_stages_unserviced_channel() {
             loader_unknown_reason: None,
             run_learned: false,
             proving_retained: false,
+            loader_pid: None,
         },
     ))
     .unwrap();
@@ -90248,6 +90296,7 @@ fn learned_clean_shutdown_after_drain_join_files_no_loss() {
             loader_unknown_reason: None,
             run_learned: false,
             proving_retained: false,
+            loader_pid: None,
         },
     ))
     .unwrap();
@@ -90305,6 +90354,7 @@ fn learned_terminal_record_publishes_unserviced_file() {
             loader_unknown_reason: None,
             run_learned: false,
             proving_retained: false,
+            loader_pid: None,
         },
     ))
     .unwrap();
@@ -90377,6 +90427,7 @@ fn learned_pin_refusal_after_proof_settles_without_staging() {
             loader_unknown_reason: None,
             run_learned: false,
             proving_retained: false,
+            loader_pid: None,
         },
     ))
     .unwrap();
@@ -90430,6 +90481,7 @@ fn learned_staging_invalidates_a_stable_plan() {
             loader_unknown_reason: None,
             run_learned: false,
             proving_retained: false,
+            loader_pid: None,
         },
     ))
     .unwrap();
@@ -90520,6 +90572,7 @@ fn learned_replaced_file_at_same_path_stages_fresh() {
                 loader_unknown_reason: None,
                 run_learned: false,
                 proving_retained: false,
+                loader_pid: None,
             },
         ))
         .unwrap();
@@ -90582,6 +90635,7 @@ fn learned_deleted_held_file_is_refused_not_staged() {
             loader_unknown_reason: None,
             run_learned: false,
             proving_retained: false,
+            loader_pid: None,
         },
     ))
     .unwrap();
@@ -90659,6 +90713,7 @@ fn learned_file_deleted_between_check_and_pin_is_refused_not_staged() {
             loader_unknown_reason: None,
             run_learned: false,
             proving_retained: false,
+            loader_pid: None,
         },
     ))
     .unwrap();
@@ -90750,6 +90805,7 @@ fn learned_file_replaced_over_opened_path_with_hard_link_is_refused() {
             loader_unknown_reason: None,
             run_learned: false,
             proving_retained: false,
+            loader_pid: None,
         },
     ))
     .unwrap();
@@ -90981,6 +91037,7 @@ fn loader_exhaustion_names_once_and_watch_still_stages() {
             loader_unknown_reason: None,
             run_learned: true,
             proving_retained: false,
+            loader_pid: None,
         },
     ))
     .unwrap();
@@ -91235,6 +91292,7 @@ fn learned_staging_applies_without_a_discovery_batch() {
             loader_unknown_reason: None,
             run_learned: false,
             proving_retained: false,
+            loader_pid: None,
         },
     ))
     .unwrap();
@@ -92467,6 +92525,7 @@ fn handle_table_learned_candidate_pushed_back_on_budget_wait() {
         loader_unknown_reason: None,
         run_learned: false,
         proving_retained: false,
+        loader_pid: None,
     };
     let gaps_before = engine.counters.object_skips.len();
     engine.stage_learned_candidate(candidate);
@@ -92591,6 +92650,7 @@ fn handle_table_learned_retry_shares_a_resident_row() {
             loader_unknown_reason: None,
             run_learned: false,
             proving_retained: false,
+            loader_pid: None,
         });
     };
     stage(&mut engine);
@@ -92686,6 +92746,7 @@ fn handle_table_learned_retry_under_full_table_proves_nothing() {
             loader_unknown_reason: None,
             run_learned: false,
             proving_retained: false,
+            loader_pid: None,
         });
     };
     let io_before = engine.budget.attempted_io_bytes();
@@ -92761,6 +92822,7 @@ fn handle_table_learned_same_subject_defers_file_once() {
             loader_unknown_reason: None,
             run_learned: false,
             proving_retained: false,
+            loader_pid: None,
         });
         (dev, ino)
     };
@@ -92826,6 +92888,7 @@ fn handle_table_learned_push_back_holds_the_pending_bound() {
                 loader_unknown_reason: None,
                 run_learned: false,
                 proving_retained: false,
+                loader_pid: None,
             });
     }
     let candidate = crate::fanotify::LearnedCandidate {
@@ -92837,6 +92900,7 @@ fn handle_table_learned_push_back_holds_the_pending_bound() {
         loader_unknown_reason: None,
         run_learned: false,
         proving_retained: false,
+        loader_pid: None,
     };
     engine.stage_learned_candidate(candidate);
     assert_eq!(
@@ -92900,6 +92964,7 @@ fn handle_table_learned_flush_under_full_table_holds_the_pending_bound() {
                 loader_unknown_reason: None,
                 run_learned: false,
                 proving_retained: false,
+                loader_pid: None,
             },
         ))
         .unwrap();
@@ -93202,6 +93267,7 @@ int main(int argc, char **argv) {
         loader_unknown_reason: None,
         run_learned: false,
         proving_retained: false,
+        loader_pid: None,
     });
     engine.service_learned_files();
     assert!(
@@ -95889,6 +95955,7 @@ fn member_stop_refused_provider_is_no_attached_resume() {
                 loader_unknown_reason: None,
                 run_learned: true,
                 proving_retained: false,
+                loader_pid: None,
             });
     }
     let mut session = ScriptedSession::default();

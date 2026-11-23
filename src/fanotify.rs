@@ -110,6 +110,16 @@ pub(crate) struct LearnedCandidate {
     /// `/proc/<loader>/exe` at first sight, or the finite reason below.
     pub(crate) loader_exe: Option<String>,
     pub(crate) loader_unknown_reason: Option<&'static str>,
+    /// The loading process at first sight: the reuse-immune pidfd pid
+    /// when it is still alive, else the event-time metadata pid (the
+    /// same tally pid the `Load` message carries). Staging resolves
+    /// the held fd's mount through this process's mount table when
+    /// the observer's table does not name it (a provider loaded from
+    /// a private mount namespace): mount IDs are exact-matched, so a
+    /// reused or dead pid only misses, never misattributes. `None`
+    /// when no pid could be read, and always `None` for run-learned
+    /// files, which prove through their scan view instead.
+    pub(crate) loader_pid: Option<u32>,
     /// Synthesized by owned-run scan learning (E1) rather than the
     /// fanotify drain: the proving mapper is a transient descendant,
     /// so transient scan coverage does not exempt the file from
@@ -2111,6 +2121,7 @@ impl DrainCtx<'_> {
             display_path,
             loader_exe,
             loader_unknown_reason,
+            loader_pid: tally,
             run_learned: false,
             proving_retained: false,
         };
@@ -4204,6 +4215,7 @@ mod tests {
                 display_path: "/bin/sh".to_string(),
                 loader_exe: None,
                 loader_unknown_reason: Some(super::LOADER_EXE_UNREADABLE_REASON),
+                loader_pid: None,
                 run_learned: false,
                 proving_retained: false,
             }),

@@ -25230,6 +25230,7 @@ impl Engine {
             ino: identity.1,
             display_path: display_path.to_owned(),
             loader_exe,
+            loader_pid: None,
             loader_unknown_reason,
             run_learned: true,
             proving_retained,
@@ -25956,6 +25957,7 @@ impl Engine {
         let request = crate::discovery::identity::PrearmPinRequest::open_with_display(
             open,
             candidate.display_path.clone(),
+            candidate.loader_pid,
         );
         // Pin-failure retries re-prove against a fresh per-pass budget
         // instead of the capture budget: a transient race under capture

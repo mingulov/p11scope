@@ -9578,6 +9578,53 @@ fn identity_of_manifest(
     }
 }
 
+/// Resolves a learned file's mount through its loading process's mount
+/// table: the observer's table never names a mount it cannot see (a
+/// provider loaded from a private mount namespace), while the loader's
+/// table names the exact mount the fd was opened through. Mount IDs
+/// are exact-matched, never substituted: a dead or reused pid, an
+/// unreadable table, or a mount ID the loader's table does not name
+/// all miss rather than misattribute. The read is budgeted like every
+/// other mount-table read (paced: at most one per learned staging
+/// that misses the observer's table, inside the learned file/tick
+/// bounds), and identity parsing stays in this module.
+fn identity_of_in_loader_table(
+    file: &std::fs::File,
+    loader_pid: u32,
+    budget: &mut CaptureWorkBudget,
+) -> Result<MappingFileKey, String> {
+    let table = std::fs::File::open(format!("/proc/{loader_pid}/mountinfo"))
+        .map_err(|error| format!("cannot open loader mount table: {error}"))
+        .and_then(|table| read_mountinfo(table, budget))?;
+    mapping_file_key_in_mountinfo(file, &table)
+        .map_err(|error| format!("mapping identity unavailable: {error}"))
+}
+
+/// [`identity_of_manifest`] with the learned-file fallback: when the
+/// retained (observer or view) table does not name the fd's mount and
+/// the drain read a loader pid, one budgeted resolution through the
+/// loader's table follows. Success returns the loader-resolved key;
+/// any fallback failure keeps the first error text byte-for-byte, so
+/// refused files report exactly as before. Any other first error, or
+/// no loader pid, returns the first result untouched.
+fn identity_with_loader_fallback(
+    file: &std::fs::File,
+    retained_mountinfo: Option<&str>,
+    loader_pid: Option<u32>,
+    budget: &mut CaptureWorkBudget,
+) -> Result<MappingFileKey, String> {
+    let first = identity_of_manifest(file, retained_mountinfo);
+    match (&first, loader_pid) {
+        (Err(error), Some(pid)) if is_missing_mount_id_error(error) => {
+            match identity_of_in_loader_table(file, pid, budget) {
+                Ok(key) => Ok(key),
+                Err(_) => first,
+            }
+        }
+        _ => first,
+    }
+}
+
 /// Classifies only a locator that no longer resolves as deferred staleness. Every
 /// opened object's remaining checks are fatal except an exact recorded-identity
 /// mismatch; the caller may ignore either stale class only after a scan-opened
@@ -10400,6 +10447,12 @@ impl PrearmPinError {
 pub(crate) struct PrearmPinRequest {
     open: PathBuf,
     display: String,
+    /// The loading process for a learned file, when the drain read one:
+    /// staging resolves the held fd's mount through this process's
+    /// mount table when the observer's table does not name it (a
+    /// provider loaded from a private mount namespace). Operator pins
+    /// and run-learned files carry `None` (observer or view tables).
+    loader_pid: Option<u32>,
 }
 
 impl PrearmPinRequest {
@@ -10408,13 +10461,23 @@ impl PrearmPinRequest {
         Self {
             display: path.to_string_lossy().into_owned(),
             open: path,
+            loader_pid: None,
         }
     }
 
     /// Opens `open`, records `display` (learned files: the held fd plus
-    /// the readlink spelling).
-    pub(crate) fn open_with_display(open: PathBuf, display: String) -> Self {
-        Self { open, display }
+    /// the readlink spelling), resolving a foreign mount through
+    /// `loader_pid`'s table when the observer's table misses it.
+    pub(crate) fn open_with_display(
+        open: PathBuf,
+        display: String,
+        loader_pid: Option<u32>,
+    ) -> Self {
+        Self {
+            open,
+            display,
+            loader_pid,
+        }
     }
 }
 
@@ -10512,6 +10575,7 @@ fn prove_prearm_requests_in_views(
     for request in requests {
         let spelling = request.open.to_string_lossy().into_owned();
         let display = request.display.clone();
+        let loader_pid = request.loader_pid;
         if normalize_target_path(&spelling).is_none() {
             skipped.push(Skipped {
                 subject: display.clone(),
@@ -10627,13 +10691,13 @@ fn prove_prearm_requests_in_views(
                 continue;
             }
         };
-        opened.push((display, file, pin, mountinfo));
+        opened.push((display, file, pin, mountinfo, loader_pid));
     }
 
     // Phase 2: identify, hash, bracket and prove every opened object.
     let mut proved_objects = Vec::new();
     let mut batch_spent = prior_bytes;
-    for (spelling, file, pin, mountinfo) in opened {
+    for (spelling, file, pin, mountinfo, loader_pid) in opened {
         let inspected = match inspect_file_with_reader_exporting(
             &file,
             |file, bytes, offset| {
@@ -10687,16 +10751,17 @@ fn prove_prearm_requests_in_views(
                 continue;
             }
         }
-        let mapping = match identity_of_manifest(&file, mountinfo.as_deref()) {
-            Ok(mapping) => mapping,
-            Err(error) => {
-                skipped.push(Skipped {
-                    subject: spelling.clone(),
-                    reason: format!("prearm object unavailable: {error}"),
-                });
-                continue;
-            }
-        };
+        let mapping =
+            match identity_with_loader_fallback(&file, mountinfo.as_deref(), loader_pid, budget) {
+                Ok(mapping) => mapping,
+                Err(error) => {
+                    skipped.push(Skipped {
+                        subject: spelling.clone(),
+                        reason: format!("prearm object unavailable: {error}"),
+                    });
+                    continue;
+                }
+            };
         let key = object_key(mapping);
         let Some(raw) = RawObjectInstance::prearm(key, spelling.clone()) else {
             skipped.push(Skipped {
@@ -16485,6 +16550,121 @@ mod tests {
         assert!(
             error.contains("invalid mount device"),
             "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_foreign_mount_id_resolves_through_the_loader_table() {
+        let file = open_regular(Path::new("/bin/sh")).unwrap();
+        let observer = mapping_file_key(&file).unwrap();
+        // A retained table that names every mount except this fd's own:
+        // the shape a private mount namespace leaves behind.
+        let stale = "999999 1 8:1 / /other rw - ext4 /dev/other rw\n";
+        let found = identity_with_loader_fallback(
+            &file,
+            Some(stale),
+            Some(std::process::id()),
+            &mut CaptureWorkBudget::default(),
+        )
+        .expect("the loader table must heal the foreign mount id");
+        assert_eq!(found.mount_id, observer.mount_id);
+        assert_eq!(
+            (found.device_major, found.device_minor),
+            (observer.device_major, observer.device_minor),
+            "the key must resolve in the loader table, not the stale one"
+        );
+        assert_eq!(found.inode, observer.inode, "inode still comes from fstat");
+    }
+
+    #[test]
+    fn a_gone_loader_keeps_the_observer_error() {
+        let file = open_regular(Path::new("/bin/sh")).unwrap();
+        let observer = mapping_file_key(&file).unwrap();
+        let stale = "999999 1 8:1 / /other rw - ext4 /dev/other rw\n";
+        let error = identity_with_loader_fallback(
+            &file,
+            Some(stale),
+            Some(u32::MAX),
+            &mut CaptureWorkBudget::default(),
+        )
+        .expect_err("a loader that is already gone must still fail");
+        assert_eq!(
+            error,
+            format!(
+                "mapping identity unavailable: fd mount {} is missing from the mount table",
+                observer.mount_id
+            ),
+            "a failed fallback keeps the first error text byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn a_foreign_mount_id_without_a_loader_keeps_the_observer_error() {
+        let file = open_regular(Path::new("/bin/sh")).unwrap();
+        let observer = mapping_file_key(&file).unwrap();
+        let stale = "999999 1 8:1 / /other rw - ext4 /dev/other rw\n";
+        let error = identity_with_loader_fallback(
+            &file,
+            Some(stale),
+            None,
+            &mut CaptureWorkBudget::default(),
+        )
+        .expect_err("no loader pid means no fallback");
+        assert_eq!(
+            error,
+            format!(
+                "mapping identity unavailable: fd mount {} is missing from the mount table",
+                observer.mount_id
+            ),
+            "operator pins keep today's error text byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn a_loader_fallback_never_heals_another_error() {
+        let file = open_regular(Path::new("/bin/sh")).unwrap();
+        let observer = mapping_file_key(&file).unwrap();
+        // The mount row is present but corrupt: no loader table can heal it.
+        let corrupt = format!(
+            "{} 1 not-a-device / /target rw - ext4 /dev/target rw\n",
+            observer.mount_id
+        );
+        let error = identity_with_loader_fallback(
+            &file,
+            Some(&corrupt),
+            Some(std::process::id()),
+            &mut CaptureWorkBudget::default(),
+        )
+        .expect_err("an invalid mount device must still fail");
+        assert!(
+            error.contains("invalid mount device"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_loader_table_read_is_budgeted() {
+        let file = open_regular(Path::new("/bin/sh")).unwrap();
+        let observer = mapping_file_key(&file).unwrap();
+        let stale = "999999 1 8:1 / /other rw - ext4 /dev/other rw\n";
+        let mut budget = CaptureWorkBudget::new(crate::discovery::scan::ScanLimits {
+            per_object_bytes: 0,
+            total_bytes: 0,
+        });
+        let error = identity_with_loader_fallback(
+            &file,
+            Some(stale),
+            Some(std::process::id()),
+            &mut budget,
+        )
+        .expect_err("a stopped budget must refuse the loader read");
+        assert_eq!(
+            error,
+            format!(
+                "mapping identity unavailable: fd mount {} is missing from the mount table",
+                observer.mount_id
+            ),
+            "a budgeted-out fallback keeps the first error text byte-for-byte"
         );
     }
 
@@ -26543,7 +26723,11 @@ mod tests {
         let display = library.to_string_lossy().into_owned();
         let mut budget = crate::discovery::scan::CaptureWorkBudget::default();
         let pinning = pin_prearm_requests_in_views_with_budget(
-            &[PrearmPinRequest::open_with_display(open, display.clone())],
+            &[PrearmPinRequest::open_with_display(
+                open,
+                display.clone(),
+                None,
+            )],
             &[],
             None,
             0,

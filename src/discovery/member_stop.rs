@@ -1007,6 +1007,7 @@ impl Engine {
                             display_path,
                             loader_exe,
                             loader_unknown_reason,
+                            loader_pid: None,
                             run_learned: true,
                             proving_retained: false,
                         },

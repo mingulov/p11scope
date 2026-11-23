@@ -12075,6 +12075,13 @@ fn start_retained_with<S>(
             break;
         }
         if named {
+            // A pin read error proves neither exit nor change: refuse
+            // the unverified generation instead of claiming a change.
+            if discovered.named_generation_unproven_on_pin_recheck(&stale) {
+                bail!(
+                    "the named process generation was unverified before attach; exit or change unproven"
+                );
+            }
             bail!("the named process generation changed before attach");
         }
         remove_stale_views(discovered, &stale)?;
@@ -12089,6 +12096,13 @@ fn start_retained_with<S>(
         // No event/map consumer can see this session. Dropping it first tears
         // down every just-created link before the named capture fails.
         drop(session);
+        // A pin read error proves neither exit nor change: refuse
+        // the unverified generation instead of claiming a change.
+        if discovered.named_generation_unproven_on_pin_recheck(&stale) {
+            bail!(
+                "the named process generation was unverified while attaching; exit or change unproven"
+            );
+        }
         bail!("the named process generation changed while attaching");
     }
     // H-2: a multi-process capture starts once. Restarting the whole session
@@ -27936,6 +27950,14 @@ impl Engine {
                     _ if named && exited => Ok(changed),
                     Some(LoaderArmFailure::Ordinary(error)) if named => Err(error),
                     _ if named => {
+                        // A pin read error proves neither exit nor
+                        // change: refuse the unverified generation
+                        // instead of claiming a change.
+                        if self.named_generation_unproven_on_pin_recheck(&[view_id]) {
+                            bail!(
+                                "the named process generation was unverified during loader arming; exit or change unproven"
+                            );
+                        }
                         bail!("the named process generation changed during loader arming")
                     }
                     _ => Ok(changed),
@@ -29356,6 +29378,30 @@ impl Engine {
         }
         self.mark_partial("live loader arming", reason);
         Ok(false)
+    }
+
+    /// Recheck stale named views with the Result-typed pin read: any
+    /// view the pin cannot judge (a read error, or no retained view at
+    /// all) makes the generation unverified instead of a claimed
+    /// change. A readable pin keeps the stale report's change claim,
+    /// which stays positive exit-or-change evidence outside read
+    /// errors: only `Err` reroutes, never a readable verdict. Tests
+    /// script the recheck with `State` answers (fault injection); an
+    /// empty script reads the live pins.
+    fn named_generation_unproven_on_pin_recheck(&self, stale: &[ProcessViewId]) -> bool {
+        stale.iter().any(|id| {
+            #[cfg(test)]
+            if let Some(answer) = self.pop_pin_probe_state() {
+                return match answer {
+                    Some(Err(_)) | None => true,
+                    Some(Ok(_)) => false,
+                };
+            }
+            self.views
+                .iter()
+                .find(|view| view.id() == *id)
+                .is_none_or(|view| view.retained_pin().original_discovery_state().is_err())
+        })
     }
 
     /// Whether this view's retained original pin *proves* its process exited.

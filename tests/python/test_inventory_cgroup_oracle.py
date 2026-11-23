@@ -39,6 +39,48 @@ DEADLINE = "cgroup collection deadline reached"
 UNBOUND_SUBJECT = "used by an unidentified caller image"
 UNBOUND_FIRST = "no live caller incarnation held the tgid when the row was read"
 UNBOUND_FIRST_EXITED = "the pinned caller exited before its cookie could be queried"
+ACTIVATION = "native owner activation refused"
+FUNCTIONS = ["C_GenerateRandom", "C_DigestInit", "C_Digest",
+             "C_FindObjectsInit", "C_FindObjects", "C_FindObjectsFinal"]
+ITERS = 250
+# cgroup-fork: each member drives ITERS x six calls plus four setup and
+# three teardown entries (1507 at the qualifier's 250 iterations).
+DRIVEN = 6 * ITERS + 7
+
+
+def inside_ledger(*, iters=ITERS, complete=True):
+    """The cgroup-fork LEDGER line: parent plus child totals per function."""
+    return "LEDGER " + json.dumps({
+        "schema": "p11scope/public-cli-ledger/v1", "pid": 100,
+        "complete": complete,
+        "functions": [{"name": name, "attempts": 2 * iters,
+                       "successful": 2 * iters} for name in FUNCTIONS]})
+
+
+def counted(count=DRIVEN):
+    """An edge's entries as published for an exactly counted caller."""
+    return {"cap": 18446744073709551615, "count": count,
+            "coverage": {"detail": None, "first_ns": None, "lossy": False,
+                         "reason": None, "since_ns": 1000, "state": "counted",
+                         "until_ns": None},
+            "first_seen_ns": 1000, "in_flight": False, "last_seen_ns": 2000,
+            "observation": "observed", "saturated": False}
+
+
+def witnessed_zero():
+    """The regressed child shape: the witness saw it, the count is gone."""
+    return {"cap": 18446744073709551615, "count": 0,
+            "coverage": {"detail": None, "first_ns": 1000, "lossy": None,
+                         "reason": None, "since_ns": None,
+                         "state": "witnessed", "until_ns": None},
+            "first_seen_ns": None, "in_flight": False, "last_seen_ns": None,
+            "observation": "unknown (count unavailable; use witnessed)",
+            "saturated": False}
+
+
+def owned_edges():
+    return [{"caller": "c0", "module": "m0", "entries": counted()},
+            {"caller": "c1", "module": "m0", "entries": counted()}]
 
 
 def unbound_reason(first=UNBOUND_FIRST):
@@ -60,12 +102,14 @@ def extract_inventory_oracle():
     return "".join(lines[start + 1:end])
 
 
-def run_oracle(report, *, modfs, pin=None, modpath=MODPATH):
+def run_oracle(report, *, modfs, pin=None, modpath=MODPATH, ledger=None):
     """Run the extracted oracle against a fixture report."""
     block = extract_inventory_oracle()
     if pin is None:
         pin = PIN
-    inside_wl = "READY pid=100\nCHILD pid=101\nLEDGER x\n"
+    if ledger is None:
+        ledger = inside_ledger()
+    inside_wl = "READY pid=100\nCHILD pid=101\n%s\n" % ledger
     outside_wl = "READY pid=102\nLEDGER y\n"
     with tempfile.TemporaryDirectory() as raw:
         tmp = Path(raw)
@@ -102,8 +146,7 @@ def decided_report():
         "callers": [
             {"id": "c0", "pid": 100, "image": {"authority": "native_exact"}},
             {"id": "c1", "pid": 101, "image": {"authority": "native_exact"}}],
-        "edges": [{"caller": "c0", "module": "m0"},
-                  {"caller": "c1", "module": "m0"}],
+        "edges": owned_edges(),
         "gaps": [
             {"caller": "c0", "module": None, "pid": 100,
              "reason": UNPROVEN, "subject": MODPATH, "repeats": 10},
@@ -241,8 +284,7 @@ def healthy_report_with_unbound():
                      "lifecycle": "mapped",
                      "paths": [MODPATH]}],
         "callers": [{"id": "c0", "pid": 100}, {"id": "c1", "pid": 101}],
-        "edges": [{"caller": "c0", "module": "m0"},
-                  {"caller": "c1", "module": "m0"}],
+        "edges": owned_edges(),
         "gaps": [
             {"caller": None, "module": "m0", "pid": None,
              "reason": unbound_reason(), "subject": UNBOUND_SUBJECT,
@@ -503,7 +545,161 @@ class DeferredActivationTests(unittest.TestCase):
         report["gaps"][-1]["subject"] = "native owner refresh refused"
         rc, out = run_oracle(report, modfs="overlayfs")
         self.assertNotEqual(rc, 0, out)
-        self.assertIn("overlay published extra gap", out)
+        self.assertIn("activation refusal under another subject", out)
+
+
+class CountReconciliationTests(unittest.TestCase):
+    """Driven equals counted, per caller, on its own owned-module edge."""
+
+    SHAPES = (("overlayfs", False), ("ext4", True))
+
+    def report(self, witness):
+        return deferred_recovered_report(modfs_witness=witness)
+
+    def test_exactly_counted_callers_pass(self):
+        for modfs, witness in self.SHAPES:
+            with self.subTest(modfs=modfs):
+                rc, out = run_oracle(self.report(witness), modfs=modfs)
+                self.assertEqual(rc, 0, out)
+
+    def test_child_count_dropped_to_witnessed_zero_fails(self):
+        # The regression this lane fixed: the fork child's 1507 calls
+        # bound to c1 as "witnessed, count unavailable".
+        for modfs, witness in self.SHAPES:
+            with self.subTest(modfs=modfs):
+                report = self.report(witness)
+                report["edges"][1]["entries"] = witnessed_zero()
+                rc, out = run_oracle(report, modfs=modfs)
+                self.assertNotEqual(rc, 0, out)
+                self.assertIn("fork child calls not counted", out)
+
+    def test_missing_child_edge_fails(self):
+        for modfs, witness in self.SHAPES:
+            with self.subTest(modfs=modfs):
+                report = self.report(witness)
+                del report["edges"][1]
+                rc, out = run_oracle(report, modfs=modfs)
+                self.assertNotEqual(rc, 0, out)
+                self.assertIn("fork child has no edge to the owned module", out)
+
+    def test_missing_parent_edge_fails(self):
+        report = self.report(True)
+        del report["edges"][0]
+        rc, out = run_oracle(report, modfs="ext4")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("inside parent has no edge to the owned module", out)
+
+    def test_child_edge_to_another_module_fails(self):
+        report = self.report(True)
+        report["edges"][1]["module"] = "m9"
+        rc, out = run_oracle(report, modfs="ext4")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("fork child has no edge to the owned module", out)
+
+    def test_short_child_count_fails(self):
+        for modfs, witness in self.SHAPES:
+            with self.subTest(modfs=modfs):
+                report = self.report(witness)
+                report["edges"][1]["entries"] = counted(DRIVEN - 1)
+                rc, out = run_oracle(report, modfs=modfs)
+                self.assertNotEqual(rc, 0, out)
+                self.assertIn("fork child counted 1506 entries, drove 1507", out)
+
+    def test_excess_parent_count_fails(self):
+        report = self.report(True)
+        report["edges"][0]["entries"] = counted(DRIVEN + 1)
+        rc, out = run_oracle(report, modfs="ext4")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("inside parent counted 1508 entries, drove 1507", out)
+
+    def test_count_follows_the_ledger(self):
+        # The driven amount comes from the ledger, not a constant.
+        report = self.report(True)
+        report["edges"][0]["entries"] = counted(6 * 100 + 7)
+        report["edges"][1]["entries"] = counted(6 * 100 + 7)
+        rc, out = run_oracle(report, modfs="ext4",
+                             ledger=inside_ledger(iters=100))
+        self.assertEqual(rc, 0, out)
+        rc, out = run_oracle(report, modfs="ext4")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("inside parent counted 607 entries, drove 1507", out)
+
+    def test_incomplete_ledger_fails(self):
+        rc, out = run_oracle(self.report(True), modfs="ext4",
+                             ledger=inside_ledger(complete=False))
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("inside ledger incomplete", out)
+
+    def test_unparsable_ledger_fails(self):
+        rc, out = run_oracle(self.report(True), modfs="ext4",
+                             ledger="LEDGER x")
+        self.assertNotEqual(rc, 0, out)
+
+
+class RefusalIdentityTests(unittest.TestCase):
+    """An activation refusal is recognized by its reason on every
+    substrate, and binds to the refused caller incarnation."""
+
+    SHAPES = (("overlayfs", False), ("ext4", True))
+
+    def test_settle_refusal_under_another_subject_fails(self):
+        for modfs, witness in self.SHAPES:
+            with self.subTest(modfs=modfs):
+                report = (witness_available_report() if witness
+                          else decided_report())
+                report["callers"][1]["image"]["authority"] = "scan_pinned"
+                for g in report["gaps"]:
+                    if g.get("caller") == "c1" and g.get("reason") == NATIVE:
+                        g["subject"] = "native owner refresh refused"
+                rc, out = run_oracle(report, modfs=modfs)
+                self.assertNotEqual(rc, 0, out)
+                self.assertIn("activation refusal under another subject", out)
+
+    def test_recovered_settle_refusal_under_another_subject_fails(self):
+        for modfs, witness in self.SHAPES:
+            with self.subTest(modfs=modfs):
+                report = (witness_available_report() if witness
+                          else decided_report())
+                for g in report["gaps"]:
+                    if g.get("caller") == "c1" and g.get("reason") == NATIVE:
+                        g["subject"] = "native owner refresh refused"
+                rc, out = run_oracle(report, modfs=modfs)
+                self.assertNotEqual(rc, 0, out)
+                self.assertIn("activation refusal under another subject", out)
+
+    def test_deferral_under_another_subject_fails_on_every_substrate(self):
+        for modfs, witness in self.SHAPES:
+            with self.subTest(modfs=modfs):
+                report = deferred_recovered_report(modfs_witness=witness)
+                report["callers"][1]["image"]["authority"] = "scan_pinned"
+                report["gaps"][-1]["subject"] = "native owner refresh refused"
+                rc, out = run_oracle(report, modfs=modfs)
+                self.assertNotEqual(rc, 0, out)
+                self.assertIn("activation refusal under another subject", out)
+
+    def test_refusal_of_another_incarnation_at_the_same_pid_fails(self):
+        # The child pid's activated incarnation does not recover a
+        # refusal of a different incarnation (new start time) there.
+        for modfs, witness in self.SHAPES:
+            with self.subTest(modfs=modfs):
+                report = deferred_recovered_report(modfs_witness=witness)
+                report["callers"][1]["start_time"] = 500
+                report["callers"].append(
+                    {"id": "c2", "pid": 101, "start_time": 900,
+                     "image": {"authority": "scan_pinned"}})
+                report["gaps"][-1]["caller"] = "c2"
+                rc, out = run_oracle(report, modfs=modfs)
+                self.assertNotEqual(rc, 0, out)
+                self.assertIn("deferred activation never recovered", out)
+
+    def test_refusal_of_an_unknown_caller_fails(self):
+        for modfs, witness in self.SHAPES:
+            with self.subTest(modfs=modfs):
+                report = deferred_recovered_report(modfs_witness=witness)
+                report["gaps"][-1]["caller"] = "c7"
+                rc, out = run_oracle(report, modfs=modfs)
+                self.assertNotEqual(rc, 0, out)
+                self.assertIn("deferred activation never recovered", out)
 
 
 class NeverSettledTests(unittest.TestCase):

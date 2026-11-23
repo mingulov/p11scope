@@ -290,6 +290,13 @@ pub(crate) trait CallerLookup<Pin> {
     fn retained_callers(&self, _pid: u32) -> Vec<RetainedCaller> {
         Vec::new()
     }
+    /// The one retained incarnation of `pid` whose lifetime a kernel
+    /// leader-exit stamp closes (its `last_seen_ns` is that exit), in
+    /// any scope: no other process can hold a tgid while its leader
+    /// lives. The default is none.
+    fn exit_witnessed_caller(&self, _pid: u32) -> Option<RetainedCaller> {
+        None
+    }
 }
 
 impl<Source: ProcessSource> CallerLookup<Source::Pin> for CallerAdapter<Source> {
@@ -1702,6 +1709,19 @@ impl NativeBinder {
                 None => {
                     pending.resight_due = false;
                     pending.last_attempt = Some(current);
+                    // The caller may have exited between the read and
+                    // this pass: a retained lifetime that its exit
+                    // evidence (arrived since the read) now closes
+                    // around the row carries it. No query is spent.
+                    // Only a kernel-witnessed exit qualifies here: the
+                    // general fallback's custody gate belongs to the
+                    // row's own read.
+                    let event_ns = pending.row.recorded_at_ns;
+                    if let Some(only) = lookup.exit_witnessed_caller(row_tgid)
+                        && retained_candidate(&only, event_ns)
+                    {
+                        pending.retained = Some(only);
+                    }
                 }
                 Some(caller) => {
                     queries += 1;

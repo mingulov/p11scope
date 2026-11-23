@@ -21255,8 +21255,8 @@ fn owned_tree_watch_backs_off_unproductive_members() {
 /// churn (allocator mmaps) would force re-examination and make the
 /// counts nondeterministic. The member is `sh` (three mappings on every
 /// host); killing it orphans the `sleep` grandchild, which exits on its
-/// own 30 s bound. The consult is forced on: production gates it on 9p
-/// read-only mounts, which lib tests never see.
+/// own 30 s bound. The consult is forced on: production gates it on
+/// overlayfs / 9p mounts, which lib tests never see.
 #[test]
 fn owned_tree_watch_repeat_over_unchanged_member_reads_no_file_bytes() {
     let dir = tempfile::tempdir().expect("watch cgroup dir");
@@ -21546,12 +21546,16 @@ fn owned_tree_watch_repeat_getter_match_takes_full_path() {
     sleeper.wait().expect("reap sleeper");
 }
 
-/// Pre-open consult gate: 9p read-only mounts only. Every other
-/// filesystem (including 9p read-write, whose bytes can change under the
-/// key) keeps the open-first flow byte-identical.
+/// Pre-open consult gate: overlayfs (any mode) or 9p read-only mounts.
+/// Every other filesystem keeps the open-first flow byte-identical;
+/// 9p read-write stays out because a loose-cache client could serve
+/// stale attributes under a matching key.
 #[test]
-fn preopen_consult_gate_admits_only_nine_p_read_only() {
+fn preopen_consult_gate_admits_overlay_and_nine_p_read_only() {
     use crate::discovery::scan::{NINE_P_MAGIC, preopen_consult_eligible};
+    use p11scope_manifest::identity::OVERLAYFS_SUPER_MAGIC;
+    assert!(preopen_consult_eligible(Some(OVERLAYFS_SUPER_MAGIC), true));
+    assert!(preopen_consult_eligible(Some(OVERLAYFS_SUPER_MAGIC), false));
     assert!(preopen_consult_eligible(Some(NINE_P_MAGIC), true));
     for (magic, read_only) in [
         (None, true),
@@ -21568,6 +21572,22 @@ fn preopen_consult_gate_admits_only_nine_p_read_only() {
             "gate rejects magic={magic:?} read_only={read_only}"
         );
     }
+}
+
+/// Pre-open entries expire after the TTL: a stale generation misses and
+/// re-proves instead of serving old facts past a slow underlay.
+#[test]
+fn preopen_entry_expires_after_ttl() {
+    use crate::discovery::scan::{PREOPEN_ENTRY_TTL_NS, preopen_entry_fresh};
+    assert!(preopen_entry_fresh(1_000, 1_000));
+    assert!(preopen_entry_fresh(1_000, 1_000 + PREOPEN_ENTRY_TTL_NS));
+    assert!(!preopen_entry_fresh(
+        1_000,
+        1_000 + PREOPEN_ENTRY_TTL_NS + 1
+    ));
+    // A backwards clock reads fresh (saturating age zero); the monotonic
+    // source never goes backwards, and a failed read misses outright.
+    assert!(preopen_entry_fresh(2_000, 1_000));
 }
 
 /// Pre-open keys never cross mount namespaces: the same file examined

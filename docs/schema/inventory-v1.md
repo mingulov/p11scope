@@ -1767,13 +1767,18 @@ report and `--json` stdout carry the same value). Runs without
 - `status`: `complete` (every line delivered, and for a file stream the
   writer never failed), `truncated` (an `--event-log -` reader was slow
   or closed, so lines shed with counters), or `failed` (the event writer
-  failed and retired; capture still completed).
+  failed and retired). `failed` describes the event log only: it can
+  accompany a completed capture or a capture that itself failed to
+  start or finish, which the report's own status and exit code state.
 - `lines_lost` / `bytes_lost`: the stdout lines and line bytes shed,
   the same counters `totals` and `ended` carry as `stdout_lost`; always
-  zero for a file stream.
+  zero for a file stream. The outcome is taken after the stream's last
+  line, so it also counts a shed `ended` line, which a reader never
+  sees and whose own `stdout_lost` cannot include itself.
 - `reason`: `none` for `complete`; `event_log_error` for `failed`;
   otherwise the first shed cause: `broken_pipe`, `slow_reader`,
-  `write_error`, `zero_write` or `invalid_descriptor`.
+  `write_error`, `zero_write` or `invalid_descriptor` (`unknown` when
+  the cause was not classified).
 
 Counts only: no event content, paths or payload bytes.
 

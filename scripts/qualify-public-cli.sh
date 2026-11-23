@@ -824,6 +824,42 @@ child_pid=int([l for l in inside.splitlines() if l.startswith('CHILD pid=')][0].
 outside_pid=int([l for l in outside.splitlines() if l.startswith('READY pid=')][0].split('=')[1])
 assert sum(l.startswith('LEDGER ') for l in inside.splitlines())==1, 'inside ledger missing'
 assert sum(l.startswith('LEDGER ') for l in outside.splitlines())==1, 'outside ledger missing (leak test invalid)'
+# Strict types while parsing: every field a typed record uses has
+# exactly its JSON type (a null, missing field or wrong type fails here,
+# before any index or match is built; bool is never an int).
+NONE=type(None)
+def typed(value,types,what):
+    assert type(value) in types, '%s has type %s: %r' % (what,type(value).__name__,value)
+    return value
+for c in typed(report.get('callers'),(list,),'callers'):
+    typed(c,(dict,),'caller')
+    typed(c.get('id'),(str,),'caller id')
+    typed(c.get('pid'),(int,),'caller pid')
+    typed(c.get('start_time'),(int,),'caller start_time')
+    typed(c.get('start_time_unit'),(str,),'caller start_time_unit')
+    typed(c.get('retired'),(bool,),'caller retired')
+    typed(typed(c.get('image'),(dict,),'caller image').get('authority'),(str,),'caller authority')
+for m in typed(report.get('modules'),(list,),'modules'):
+    typed(typed(m,(dict,),'module').get('id'),(str,),'module id')
+for e in typed(report.get('edges'),(list,),'edges'):
+    typed(e,(dict,),'edge')
+    typed(e.get('caller'),(str,),'edge caller')
+    typed(e.get('module'),(str,),'edge module')
+    n=typed(e.get('entries'),(dict,),'edge entries')
+    typed(n.get('count'),(int,),'edge count')
+    cov=typed(n.get('coverage'),(dict,),'edge coverage')
+    typed(cov.get('state'),(str,),'edge coverage state')
+    typed(cov.get('lossy'),(bool,NONE),'edge coverage lossy')
+    typed(n.get('observation'),(str,),'edge observation')
+    typed(n.get('saturated'),(bool,),'edge saturated')
+    typed(n.get('in_flight'),(bool,),'edge in_flight')
+for g in typed(report.get('gaps'),(list,),'gaps'):
+    typed(g,(dict,),'gap')
+    typed(g.get('caller'),(str,NONE),'gap caller')
+    typed(g.get('pid'),(int,NONE),'gap pid')
+    typed(g.get('module'),(str,NONE),'gap module')
+    typed(g.get('subject'),(str,),'gap subject')
+    typed(g.get('reason'),(str,NONE),'gap reason')
 # Ids are unique in the raw arrays before any index is built: a
 # repeated id would let one row hide another (the diff reader refuses
 # the same shape).
@@ -874,8 +910,6 @@ def entries_record(e):
 EXACT={'state':'counted','lossy':False,'observation':'observed','saturated':False,'in_flight':False}
 records=[{'id':cid,'pid':c.get('pid'),'start_time':c.get('start_time'),'start_time_unit':c.get('start_time_unit'),'retired':c.get('retired'),'authority':(c.get('image') or {}).get('authority'),'edges':[(e.get('module'),entries_record(e)) for e in edges if e.get('caller')==cid]} for cid,c in callers.items()]
 assert not [r for r in records if r['pid']==outside_pid], 'outside workload leaked into cgroup inventory'
-assert [r for r in records if r['pid']==inside_pid], 'inside parent not a caller'
-assert [r for r in records if r['pid']==child_pid], 'fork-after-attach child not a caller'
 assert any(r['pid'] in (inside_pid,child_pid) and m==owned for r in records for m,_ in r['edges']), 'no inside edge to owned module'
 extra=[r for r in records if r['pid'] not in (inside_pid,child_pid)]
 assert not extra, 'unexpected caller outside the workload: %r' % (extra,)
@@ -923,6 +957,14 @@ def classify(g):
 # per-caller row names a workload caller at that caller's own pid and
 # the module its producer sets (none, or the owned module for an
 # admission note).
+# The producer records only upward admission transitions (rank
+# unresolved < refused < admitted), with optional parenthesized reasons.
+TRANSITIONS=('unresolved to refused','unresolved to admitted','refused to admitted')
+def admission_framed(reason):
+    prefix=modpath+': admission changed from '
+    if not reason.startswith(prefix): return False
+    rest=reason[len(prefix):]
+    return any(rest==t or (rest.startswith(t+' (') and rest.endswith(')') and len(rest)>len(t)+3) for t in TRANSITIONS)
 def at_workload(g,module=None):
     r=workload.get(g.get('caller'))
     return r is not None and g.get('pid')==r['pid'] and g.get('module')==module
@@ -946,7 +988,7 @@ for kind,g in kinds:
     if kind=='deadline':
         assert g.get('subject')=='cgroup scope transaction incomplete' and g.get('caller') is None and g.get('pid') is None and g.get('module') is None, 'collection deadline attribution: %r' % (g,)
     if kind=='admission-note':
-        assert at_workload(g,owned) and (g.get('reason') or '').startswith(modpath+': admission changed from '), 'admission note attribution: %r' % (g,)
+        assert at_workload(g,owned) and admission_framed(g.get('reason') or ''), 'admission note attribution: %r' % (g,)
 # The facts-retained refresh refusal only comes with a run-deadline
 # straddle: the deadline gap must be present in the same run, and at
 # most one retained row per owning caller.
@@ -970,7 +1012,7 @@ for label,pid,gen in expected:
     assert len(r['edges'])==1, '%s has %d edges, expected its one owned edge: %r' % (label,len(r['edges']),r['edges'])
     x=own[0]
     assert {k:x[k] for k in EXACT}==EXACT, '%s calls not counted exactly: %r' % (label,x)
-    assert isinstance(x['count'],int) and x['count']==driven, '%s counted %r entries, drove %d' % (label,x['count'],driven)
+    assert x['count']==driven, '%s counted %r entries, drove %d' % (label,x['count'],driven)
 unproven=[g for k,g in kinds if k=='unproven']
 if degraded:
     # The published degraded shape keeps the named unproven gap per
@@ -982,7 +1024,6 @@ if degraded:
         assert g.get('subject')==modpath, 'overlay unproven subject'
         assert g.get('module') is None, 'overlay unproven module'
         assert g.get('pid')==workload[g.get('caller')]['pid'], 'overlay unproven pid'
-    assert len(gaps)>0, 'overlay published shape carries no gaps'
 print('inventory cgroup: inside=%d child=%d outside=%d excluded module=%s admission=%s unproven=%d gaps=%d' % (inside_pid,child_pid,outside_pid,owned,state,len(unproven),len(report.get('gaps',[]))))
 PY
     rc=$?

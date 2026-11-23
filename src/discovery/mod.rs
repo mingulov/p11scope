@@ -7,6 +7,7 @@ pub(crate) mod caller_registry;
 pub(crate) mod confirm_shards;
 pub(crate) mod elf_needed;
 pub mod engine;
+pub(crate) mod generation_proof;
 pub(crate) mod handle_table;
 pub mod hooks;
 pub mod identity;

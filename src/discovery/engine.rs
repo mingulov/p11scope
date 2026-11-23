@@ -19,6 +19,10 @@ use crate::capacity::CounterBudget;
 use crate::cli::CaptureArgs;
 use crate::discovery::attribution;
 use crate::discovery::elf_needed;
+use crate::discovery::generation_proof::{
+    ChangedGenerationSite, GenerationProof, GenerationUnproven, changed_generation_skip,
+    is_permission_denial, unproven_generation_skip,
+};
 use crate::discovery::handle_table::{DeferredReason, Filing, HandleTable};
 use crate::discovery::hooks::{HookAbi, HookRegistry};
 use crate::discovery::identity::{
@@ -10791,15 +10795,6 @@ const UNREADABLE_PERMISSION_SUBJECT: &str = "process view";
 const UNREADABLE_PERMISSION_REASON: &str = "a process in scope could not be retained or scanned; permission was denied, and a provider \
      only that process mapped was never discovered";
 
-/// Whether a discovery-read failure detail reports a permission
-/// refusal (EACCES "Permission denied", EPERM "Operation not
-/// permitted"). Same markers the inspect layer already uses for its
-/// sudo hint: the process may be live and unchanged, so the refusal
-/// is never evidence of exit or change.
-fn is_permission_denial(detail: &str) -> bool {
-    detail.contains("Permission denied") || detail.contains("not permitted")
-}
-
 /// Whether a discovery-read failure detail reports the scan work
 /// ceiling: the member was never read, so the stop is a named "not
 /// checked this pass" state, never exit/change evidence. The member
@@ -14095,118 +14090,6 @@ fn delta_module_owned_by_stale_view(
     !known
 }
 
-/// Proof that a stale generation actually ended or changed: the ONLY
-/// token that can file the changed-generation label. Each variant is
-/// positive pin evidence from `original_generation_state`; anything
-/// else (poll failure, unreadable `/proc`, missing custody, a
-/// contradicted recheck) is `GenerationUnproven` and files the named
-/// not-proven gap instead. Constructed solely by the stale-set judge
-/// (`judge_stale_set`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GenerationProof {
-    /// At least one affected original provably exited.
-    ProvenExit,
-    /// At least one affected original provably changed (PID reuse: the
-    /// same numeric PID now names a different start time).
-    ProvenChange,
-}
-
-/// Why a stale generation could NOT be proven exited or changed: every
-/// other outcome of the pin check. All variants file the same named
-/// not-proven gap (never the changed label); the variant rides in
-/// diagnostics, never in the public row. Budget refusals never reach
-/// this classifier — the work ceiling stops the pass upstream and files
-/// the scan-budget row, which likewise claims neither event — so no
-/// budget variant exists here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GenerationUnproven {
-    /// The pin check failed (pidfd poll error, `/proc` read error).
-    PinFailure,
-    /// The pin check was denied (EACCES/EPERM).
-    PermissionDenied,
-    /// No view is retained for the stale ID (missing custody).
-    MissingCustody,
-    /// The pin re-reads Current: the stale report was contradicted (a
-    /// transient poll error ahead of a successful recheck).
-    Contradicted,
-    /// Any other unclassified failure.
-    Unknown,
-}
-
-/// The three sites that may file the changed-generation label, each
-/// with its exact internal pair. The pairs live ONLY in the two
-/// constructors below; the drift guard asserts the literals appear
-/// nowhere else in this file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ChangedGenerationSite {
-    Candidate,
-    InventoryPreflight,
-    PostRetirementPreflight,
-}
-
-/// The ONE constructor for the changed-generation internal pair: it
-/// takes a `GenerationProof`, which only the stale-set judge can
-/// produce from positive pin evidence. No other path can file this
-/// label. Both proof variants file the same exit-or-change row, which
-/// never names which event proved it.
-fn changed_generation_skip(proof: GenerationProof, site: ChangedGenerationSite) -> Skipped {
-    // Total: a future proof variant must choose its row here.
-    match proof {
-        GenerationProof::ProvenExit | GenerationProof::ProvenChange => {}
-    }
-    let (subject, reason) = match site {
-        ChangedGenerationSite::Candidate => (
-            "live discovery generation",
-            "candidate generation changed before mutation; canonical identity, plan, and links were unchanged",
-        ),
-        ChangedGenerationSite::InventoryPreflight => (
-            "live inventory generation",
-            "an exact retained or newly opened process generation changed during inventory preflight",
-        ),
-        ChangedGenerationSite::PostRetirementPreflight => (
-            "live inventory generation",
-            "an exact retained or newly opened process generation changed during post-retirement preflight",
-        ),
-    };
-    Skipped {
-        subject: subject.into(),
-        reason: reason.into(),
-    }
-}
-
-/// The ONE constructor for the unverified-generation internal pair:
-/// every `GenerationUnproven` outcome at every site files the named
-/// not-proven gap, which claims neither exit nor change.
-fn unproven_generation_skip(unproven: GenerationUnproven, site: ChangedGenerationSite) -> Skipped {
-    // Total: a future unproven outcome must map to the gap here, so no
-    // new failure mode can silently become an exit/change claim.
-    match unproven {
-        GenerationUnproven::PinFailure
-        | GenerationUnproven::PermissionDenied
-        | GenerationUnproven::MissingCustody
-        | GenerationUnproven::Contradicted
-        | GenerationUnproven::Unknown => {}
-    }
-    let (subject, reason) = match site {
-        ChangedGenerationSite::Candidate => (
-            "live discovery generation",
-            "candidate generation unverified before mutation; exit or change unproven, canonical identity, plan, and links were unchanged",
-        ),
-        ChangedGenerationSite::InventoryPreflight => (
-            "live inventory generation",
-            "an exact retained or newly opened process generation was unverified during inventory preflight; exit or change unproven",
-        ),
-        ChangedGenerationSite::PostRetirementPreflight => (
-            "live inventory generation",
-            "an exact retained or newly opened process generation was unverified during post-retirement preflight; exit or change unproven",
-        ),
-    };
-    Skipped {
-        subject: subject.into(),
-        reason: reason.into(),
-    }
-}
-
 /// One observation of a stale generation set: the first proof (if any
 /// affected original proves exit or change), the first unproven reason
 /// (otherwise), and whether every retained stale view proved (the
@@ -14217,25 +14100,6 @@ struct StaleSetVerdict {
     first_proof: Option<GenerationProof>,
     first_unproven: Option<GenerationUnproven>,
     all_retained_proven: bool,
-}
-
-/// Map one pin verdict to proof or unproven reason: `None` (no view
-/// retained, or a scripted missing answer) has no custody; `Current`
-/// contradicts the stale report; an error is a permission denial when
-/// it carries the EACCES/EPERM markers, else a pin failure.
-fn classify_generation_state(
-    state: Option<Result<OriginalGenerationState, String>>,
-) -> Result<GenerationProof, GenerationUnproven> {
-    match state {
-        Some(Ok(OriginalGenerationState::Exited)) => Ok(GenerationProof::ProvenExit),
-        Some(Ok(OriginalGenerationState::Reused)) => Ok(GenerationProof::ProvenChange),
-        Some(Ok(OriginalGenerationState::Current)) => Err(GenerationUnproven::Contradicted),
-        Some(Err(detail)) if is_permission_denial(&detail) => {
-            Err(GenerationUnproven::PermissionDenied)
-        }
-        Some(Err(_)) => Err(GenerationUnproven::PinFailure),
-        None => Err(GenerationUnproven::MissingCustody),
-    }
 }
 
 fn validate_loader_record_context<'a>(
@@ -29004,26 +28868,30 @@ impl Engine {
 
     /// Classify one stale view's generation from its pin: positive
     /// exit/reuse proof, or the reason proof is unavailable. Retained
-    /// views read through `retained_generation_state` (scripted in
-    /// tests); newcomers read their live pin, or a scripted State
-    /// answer in stale-ID order when the test armed one (fault
-    /// injection for the preflight twins). Unknown IDs have no
-    /// custody at all. Asked before the retirement drops the view,
-    /// while the pin is still held.
+    /// and newcomer views read through the sealed authority's live-pin
+    /// judge, or a scripted State answer in stale-ID order when the
+    /// test armed one (fault injection for the preflight twins).
+    /// Unknown IDs have no custody at all. This moves proof values out
+    /// of the authority; it mints none. Asked before the retirement
+    /// drops the view, while the pin is still held.
     fn classify_stale_view(
         &self,
         id: ProcessViewId,
         extra_views: &[&ProcessView],
     ) -> Result<GenerationProof, GenerationUnproven> {
-        if self.views.iter().any(|view| view.id() == id) {
-            return classify_generation_state(self.retained_generation_state(id));
+        if let Some(view) = self.views.iter().find(|view| view.id() == id) {
+            #[cfg(test)]
+            if let Some(answer) = self.pop_pin_probe_state() {
+                return GenerationProof::judge_scripted(answer);
+            }
+            return GenerationProof::judge_pin(view.retained_pin());
         }
         if let Some(view) = extra_views.iter().find(|view| view.id() == id) {
             #[cfg(test)]
             if let Some(answer) = self.pop_pin_probe_state() {
-                return classify_generation_state(answer);
+                return GenerationProof::judge_scripted(answer);
             }
-            return classify_generation_state(Some(view.original_generation_state()));
+            return GenerationProof::judge_pin(view.retained_pin());
         }
         Err(GenerationUnproven::MissingCustody)
     }

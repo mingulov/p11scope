@@ -7187,9 +7187,10 @@ fn folded_pairs_publish_and_project_with_every_record_kept() {
 #[test]
 fn folded_gap_noise_pairs_match_their_filing_sites() {
     let source = include_str!("engine.rs");
-    // (subject, reason, public reason): the nine pairs filed as
-    // quoted literals in `engine.rs` source.
-    let pairs: &[(&str, &str, &str)] = &[
+    let authority_source = include_str!("generation_proof.rs");
+    // (subject, reason, public reason): the six generation pairs filed
+    // as quoted literals in the sealed authority's source.
+    let authority_pairs: &[(&str, &str, &str)] = &[
         (
             "live discovery generation",
             "candidate generation changed before mutation; canonical identity, plan, and links were unchanged",
@@ -7220,6 +7221,10 @@ fn folded_gap_noise_pairs_match_their_filing_sites() {
             "an exact retained or newly opened process generation was unverified during post-retirement preflight; exit or change unproven",
             "process generation unverified mid-flight; exit or change unproven",
         ),
+    ];
+    // (subject, reason, public reason): the three pairs still filed as
+    // quoted literals in `engine.rs` source.
+    let pairs: &[(&str, &str, &str)] = &[
         (
             "live discovery generation",
             "a stale generation report was contradicted or unprovable on pin recheck; retirement deferred",
@@ -7236,15 +7241,20 @@ fn folded_gap_noise_pairs_match_their_filing_sites() {
             "no unique attached loader context",
         ),
     ];
-    for &(subject, reason, public) in pairs {
+    for &(subject, reason, public) in authority_pairs.iter().chain(pairs.iter()) {
         let quoted_subject = format!("\"{subject}\"");
         let quoted_reason = format!("\"{reason}\"");
+        let home = if authority_pairs.contains(&(subject, reason, public)) {
+            authority_source
+        } else {
+            source
+        };
         assert!(
-            source.contains(quoted_subject.as_str()),
+            home.contains(quoted_subject.as_str()),
             "folded pair ({subject}, {reason}) must keep its subject at its filing site"
         );
         assert!(
-            source.contains(quoted_reason.as_str()),
+            home.contains(quoted_reason.as_str()),
             "folded pair ({subject}, {reason}) must keep its reason at its filing site"
         );
         let projected = crate::render::capture_skipped_out(&Skipped {
@@ -7300,12 +7310,13 @@ fn folded_gap_noise_pairs_match_their_filing_sites() {
         projected.reason,
         "process unreadable mid-flight; permission denied"
     );
-    // The changed-generation label is constructor-gated: each of its
-    // three reasons appears exactly once in the filing source, inside
-    // `changed_generation_skip` (which requires a `GenerationProof`
-    // token). A pasted literal at any call site fails here instead of
-    // filing the label without proof.
-    let changed_ctor = source
+    // The changed-generation label is constructor-gated inside the
+    // sealed authority: each of its three reasons appears exactly once
+    // in `changed_generation_skip` (which requires a `GenerationProof`
+    // token), and nowhere in the engine's filing source. A pasted
+    // literal at any call site fails here instead of filing the label
+    // without proof.
+    let changed_ctor = authority_source
         .split_once("fn changed_generation_skip")
         .map(|(_, after)| after)
         .expect("the changed-generation constructor must exist")
@@ -7323,13 +7334,20 @@ fn folded_gap_noise_pairs_match_their_filing_sites() {
             "the constructor must hold the changed pair exactly once: {reason}"
         );
         assert!(
-            !source.replacen(changed_ctor, "", 1).contains(reason),
-            "the changed pair must not be pasted outside its constructor: {reason}"
+            !authority_source
+                .replacen(changed_ctor, "", 1)
+                .contains(reason),
+            "the changed pair must be defined once in the authority: {reason}"
+        );
+        assert!(
+            !source.contains(reason),
+            "the changed pair must not be pasted at a filing site: {reason}"
         );
     }
     // The unverified-generation gap is constructor-gated the same way:
-    // every unproven outcome files through `unproven_generation_skip`.
-    let unproven_ctor = source
+    // every unproven outcome files through the authority's
+    // `unproven_generation_skip`.
+    let unproven_ctor = authority_source
         .split_once("fn unproven_generation_skip")
         .map(|(_, after)| after)
         .expect("the unverified-generation constructor must exist")
@@ -7347,8 +7365,14 @@ fn folded_gap_noise_pairs_match_their_filing_sites() {
             "the constructor must hold the unverified pair exactly once: {reason}"
         );
         assert!(
-            !source.replacen(unproven_ctor, "", 1).contains(reason),
-            "the unverified pair must not be pasted outside its constructor: {reason}"
+            !authority_source
+                .replacen(unproven_ctor, "", 1)
+                .contains(reason),
+            "the unverified pair must be defined once in the authority: {reason}"
+        );
+        assert!(
+            !source.contains(reason),
+            "the unverified pair must not be pasted at a filing site: {reason}"
         );
     }
     // Retired changed-generation pairs never come back: no member
@@ -7411,8 +7435,10 @@ fn generation_proof_construction_stays_inside_its_authority() {
         std::fs::read_to_string(&authority_path).expect("the sealed proof authority must exist");
     // Only the authority names proof variants: a fabricating call site
     // must name one, which fails here — and fails to compile, since the
-    // representation is private to the authority.
-    for marker in ["ProvenExit", "ProvenChange", "ProofKind"] {
+    // representation is private to the authority. (The enum itself is
+    // matched with its `enum` keyword: the unrelated
+    // `ExactnessProofKind` shares the bare suffix.)
+    for marker in ["ProvenExit", "ProvenChange", "enum ProofKind"] {
         assert!(
             authority.contains(marker),
             "the authority must mint {marker}"
@@ -15654,9 +15680,12 @@ fn inventory_preflight_ready_pidfd_without_start_time_stays_silent() {
     let retained_stale = BTreeSet::from([id]);
     let extra: [&ProcessView; 0] = [];
     for (site, label) in [
-        (ChangedGenerationSite::InventoryPreflight, "first preflight"),
         (
-            ChangedGenerationSite::PostRetirementPreflight,
+            crate::discovery::generation_proof::ChangedGenerationSite::InventoryPreflight,
+            "first preflight",
+        ),
+        (
+            crate::discovery::generation_proof::ChangedGenerationSite::PostRetirementPreflight,
             "post-retirement preflight",
         ),
     ] {

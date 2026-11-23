@@ -47,6 +47,29 @@ BPF_REFUSAL_ROWS = [
 ]
 LIB_CELL_KERNELS = ["v6.6.157", "v6.12.111"]
 
+# Checked-in extra cell groups for the cells dispatch input. Each group
+# adds its jobs on top of the tier selection; unknown names fail the run.
+# bpf-matrix is the BPF-diff equivalent (full BPF matrix, every guest
+# kernel, the journal/counter flavours); cli-guests widens only the CLI
+# kernel lists; the rest add one job family each.
+CELL_GROUPS = frozenset({
+    "bpf-matrix",
+    "cli-guests",
+    "coverage",
+    "counter-flavor",
+    "browser",
+    "pkcs11-full",
+    "providers-full",
+})
+
+# The pinned guest kernel list for the kernels dispatch input: positives
+# and CLI guests (the refusal controls always run with their job and are
+# not selectable; host always runs and is not selectable either).
+PINNED_KERNELS = frozenset([
+    kernel for guests in CLI_FULL_KERNELS.values() for kernel in guests
+    if kernel != "host"
+] + BPF_POSITIVE_KERNELS)
+
 # Path classes. Order matters: the first matching rule classifies the path.
 # Anything unmatched is unknown and forces the full tier.
 # The BPF crates plus the build scripts that emit BPF objects: a change
@@ -207,6 +230,33 @@ def validate_tier(value, event):
         raise ValueError(f"tier {value!r} applies to dispatches only, "
                          f"not {event}")
     return value
+
+
+def parse_list(value, known, kind):
+    """Comma-separated validated names; empty fragments dropped."""
+    names = [item.strip() for item in value.split(",")]
+    names = [item for item in names if item]
+    for name in names:
+        if name not in known:
+            raise ValueError(f"unknown {kind}: {name!r}")
+    return frozenset(names)
+
+
+def parse_cells(value):
+    """The cells dispatch input as a group set; unknown groups fail."""
+    return parse_list(value, CELL_GROUPS, "cell group")
+
+
+def parse_kernels(value):
+    """The kernels dispatch input as a guest set; unknown kernels fail."""
+    return parse_list(value, PINNED_KERNELS, "kernel")
+
+
+def narrow(job_list, kernels):
+    """A kernel list narrowed to the requested guests (None keeps all)."""
+    if kernels is None:
+        return list(job_list)
+    return [kernel for kernel in job_list if kernel in kernels]
 
 
 # Job universes: every job id in each workflow. The selection contract
@@ -372,7 +422,7 @@ def _deselected(jobs, reason):
 
 
 def select_ci(tier, bpf_extra, event, delivery_task, dedupe_run,
-              release_preview, privileged_e2e):
+              release_preview, privileged_e2e, cells=frozenset()):
     """Per-job (state, reason) for ci.yml."""
     ordinary = ["lint", "audit", "tests", "contracts", "scripts"]
     jobs = {"dedupe": ("selected", None), "select": ("selected", None)}
@@ -402,14 +452,14 @@ def select_ci(tier, bpf_extra, event, delivery_task, dedupe_run,
             "deduped by an earlier covering run"))
     else:
         jobs.update(_selected(ordinary))
-        if tier == "quick" and not bpf_extra:
+        if tier == "quick" and not bpf_extra and "bpf-matrix" not in cells:
             jobs["bpf-noninterference"] = (
                 "not-selected",
                 "quick tier without BPF, toolchain or lockfile changes")
         else:
             jobs["bpf-noninterference"] = ("selected", None)
         jobs["archive-log"] = ("conditional", "archives selected check logs")
-        if tier == "quick":
+        if tier == "quick" and "coverage" not in cells:
             jobs["coverage"] = ("not-selected",
                                 "coverage runs on the full tier only")
             jobs["coverage-report"] = ("not-selected",
@@ -431,7 +481,8 @@ def select_ci(tier, bpf_extra, event, delivery_task, dedupe_run,
     return jobs
 
 
-def select_privileged(tier, bpf_extra, event, pkcs11_full):
+def select_privileged(tier, bpf_extra, event, pkcs11_full,
+                      cells=frozenset()):
     """Per-job (state, reason) for privileged-tests.yml."""
     jobs = {"select": ("selected", None)}
     if event == "schedule":
@@ -442,7 +493,8 @@ def select_privileged(tier, bpf_extra, event, pkcs11_full):
         jobs["pkcs11-check-full"] = ("selected", None)
         jobs["pkcs11-check-providers-full"] = ("selected", None)
         return jobs
-    quick_only = tier == "quick" and not bpf_extra
+    quick_only = tier == "quick" and not bpf_extra \
+        and "bpf-matrix" not in cells and "counter-flavor" not in cells
     jobs.update(_selected([
         "privileged-build",
         "privileged-shard",
@@ -469,20 +521,24 @@ def select_privileged(tier, bpf_extra, event, pkcs11_full):
         jobs.update(_selected(["privileged-build-journal",
                                "privileged-second-flavor",
                                "privileged-counter-flavor"]))
-    if tier == "quick":
+    if tier == "quick" and "browser" not in cells:
         jobs["browser-cells"] = ("not-selected", "not in the quick tier")
-        jobs["container-image"] = ("not-selected", "not in the quick tier")
     else:
         jobs["browser-cells"] = ("selected", None)
+    if tier == "quick":
+        jobs["container-image"] = ("not-selected", "not in the quick tier")
+    else:
         jobs["container-image"] = ("selected", None)
-    if tier == "integration" or pkcs11_full:
+    if tier == "integration" or pkcs11_full or "pkcs11-full" in cells:
         jobs["pkcs11-check-full"] = ("selected", None)
-        jobs["pkcs11-check-providers-full"] = ("selected", None)
     else:
         jobs["pkcs11-check-full"] = (
             "not-selected",
             "FULL suites run on schedule, dispatch with the flag, "
             "or the integration tier")
+    if tier == "integration" or pkcs11_full or "providers-full" in cells:
+        jobs["pkcs11-check-providers-full"] = ("selected", None)
+    else:
         jobs["pkcs11-check-providers-full"] = (
             "not-selected",
             "FULL suites run on schedule, dispatch with the flag, "
@@ -490,72 +546,103 @@ def select_privileged(tier, bpf_extra, event, pkcs11_full):
     return jobs
 
 
-def select_bpf(tier, bpf_extra):
+def select_bpf(tier, bpf_extra, cells=frozenset(), kernels=None):
     """Per-job (state, reason) for bpf-kernels.yml."""
     jobs = {"select": ("selected", None)}
-    matrix = tier != "quick" or bpf_extra
+    matrix = tier != "quick" or bpf_extra or "bpf-matrix" in cells
     jobs["bpf-load-build"] = ("selected", None)
     jobs["bpf-load-host"] = ("selected", None)
-    if matrix:
-        jobs.update(_selected(["kvm-probe", "bpf-load-kernels",
-                               "bpf-load-gate1-build",
-                               "bpf-load-gate1-kernels",
-                               "lib-cells-kernels"]))
-    else:
+    if not matrix:
         jobs.update(_deselected(
             ["kvm-probe", "bpf-load-kernels", "bpf-load-gate1-build",
              "bpf-load-gate1-kernels", "lib-cells-kernels"],
             "quick tier without BPF, toolchain or lockfile changes"))
+        return jobs
+    narrowed = {
+        "bpf-load-kernels": narrow(BPF_POSITIVE_KERNELS, kernels),
+        "bpf-load-gate1-kernels": narrow(BPF_POSITIVE_KERNELS, kernels),
+        "lib-cells-kernels": narrow(LIB_CELL_KERNELS, kernels),
+    }
+    picked = {job for job, guests in narrowed.items() if guests}
+    for job, guests in narrowed.items():
+        if guests:
+            jobs[job] = ("selected", None)
+        else:
+            jobs[job] = ("not-selected",
+                         "none of the requested kernels are in its list")
+    if "bpf-load-gate1-kernels" in picked:
+        jobs["bpf-load-gate1-build"] = ("selected", None)
+    else:
+        jobs["bpf-load-gate1-build"] = (
+            "not-selected", "its gate-1 matrix selected no kernel")
+    if picked:
+        jobs["kvm-probe"] = ("selected", None)
+    else:
+        jobs["kvm-probe"] = (
+            "not-selected", "no guest matrix selected a kernel")
     return jobs
 
 
-def cli_kernels(tier, bpf_extra):
-    """Guest kernel lists per CLI job for this tier."""
-    if tier == "quick" and not bpf_extra:
-        return {job: list(CLI_QUICK_KERNELS) for job in CLI_FULL_KERNELS}
-    return {job: list(kernels)
-            for job, kernels in CLI_FULL_KERNELS.items()}
+def cli_kernels(tier, bpf_extra, cells=frozenset(), kernels=None):
+    """Guest kernel lists per CLI job for this tier and narrowing."""
+    if tier == "quick" and not bpf_extra and "bpf-matrix" not in cells \
+            and "cli-guests" not in cells:
+        base = {job: list(CLI_QUICK_KERNELS) for job in CLI_FULL_KERNELS}
+    else:
+        base = {job: list(guests)
+                for job, guests in CLI_FULL_KERNELS.items()}
+    # Host always runs; guests narrow to the requested set (a CLI job
+    # whose guests narrow away still runs its host leg).
+    return {job: ["host"] + [kernel for kernel in guests
+                             if kernel != "host"
+                             and (kernels is None or kernel in kernels)]
+            for job, guests in base.items()}
 
 
-def bpf_matrices():
-    """The full BPF matrices: positives plus the refusal controls."""
+def bpf_matrices(kernels=None):
+    """The BPF matrices: narrowed positives plus the refusal controls,
+    which always run with their job."""
+    positives = narrow(BPF_POSITIVE_KERNELS, kernels)
     return {
-        "matrix_bpf_load": {"kernel": list(BPF_POSITIVE_KERNELS),
+        "matrix_bpf_load": {"kernel": positives,
                             "include": [dict(row) for row in BPF_REFUSAL_ROWS]},
-        "matrix_bpf_gate1": {"kernel": list(BPF_POSITIVE_KERNELS)},
-        "matrix_lib_cells": {"kernel": list(LIB_CELL_KERNELS)},
+        "matrix_bpf_gate1": {"kernel": positives},
+        "matrix_lib_cells": {"kernel": narrow(LIB_CELL_KERNELS, kernels)},
     }
 
 
 def build_selection(workflow, event, ref, sha, tier_input, classes,
                     base_branch, delivery_task="checks", dedupe_run=True,
                     release_preview=False, privileged_e2e=False,
-                    pkcs11_full=False):
+                    pkcs11_full=False, cells=frozenset(), kernels=None):
     """The selection document plus flattened outputs for one run."""
     if workflow not in UNIVERSE:
         raise ValueError(f"unknown workflow: {workflow!r}")
     tier, bpf_extra = decide_tier(event, ref, tier_input, classes)
     if workflow == "ci":
         states = select_ci(tier, bpf_extra, event, delivery_task,
-                           dedupe_run, release_preview, privileged_e2e)
+                           dedupe_run, release_preview, privileged_e2e,
+                           cells)
     elif workflow == "privileged-tests":
-        states = select_privileged(tier, bpf_extra, event, pkcs11_full)
+        states = select_privileged(tier, bpf_extra, event, pkcs11_full,
+                                   cells)
     else:
-        states = select_bpf(tier, bpf_extra)
+        states = select_bpf(tier, bpf_extra, cells, kernels)
     # The gate always runs (needs all, if: always); the record excludes
     # its own writer, and the run conclusion judges it instead.
     states["gate"] = ("selected", None)
-    kernels = cli_kernels(tier, bpf_extra)
-    matrices = {f"matrix_{job.replace('-', '_')}": {"kernel": kernels[job]}
+    cli = cli_kernels(tier, bpf_extra, cells, kernels)
+    matrices = {f"matrix_{job.replace('-', '_')}": {"kernel": cli[job]}
                 for job in CLI_FULL_KERNELS}
-    matrices.update(bpf_matrices())
+    bpf = bpf_matrices(kernels)
+    matrices.update(bpf)
     children = {}
     for job in CLI_FULL_KERNELS:
-        children[job] = len(kernels[job])
-    children["bpf-load-kernels"] = (len(BPF_POSITIVE_KERNELS)
+        children[job] = len(cli[job])
+    children["bpf-load-kernels"] = (len(bpf["matrix_bpf_load"]["kernel"])
                                     + len(BPF_REFUSAL_ROWS))
-    children["bpf-load-gate1-kernels"] = len(BPF_POSITIVE_KERNELS)
-    children["lib-cells-kernels"] = len(LIB_CELL_KERNELS)
+    children["bpf-load-gate1-kernels"] = len(bpf["matrix_bpf_gate1"]["kernel"])
+    children["lib-cells-kernels"] = len(bpf["matrix_lib_cells"]["kernel"])
     children.update({job: count for job, count in STATIC_CHILDREN.items()
                      if job != "contracts-shards"})
     names = {"contracts": [f"contracts-{index + 1}" for index in
@@ -576,6 +663,8 @@ def build_selection(workflow, event, ref, sha, tier_input, classes,
         "tier": tier,
         "bpf_extra": bpf_extra,
         "path_classes": sorted(classes) if classes is not None else None,
+        "cells": sorted(cells),
+        "kernels": sorted(kernels) if kernels is not None else None,
         "jobs": jobs,
     }, matrices
 
@@ -612,11 +701,13 @@ def main():
     if not workflow or not event or not ref or not sha:
         raise ValueError("P11SCOPE_CI_WORKFLOW, GITHUB_EVENT_NAME, "
                          "GITHUB_REF and GITHUB_SHA must all be set")
-    if os.environ.get("P11SCOPE_CI_CELLS", ""):
-        raise ValueError("cells selection is not wired yet")
-    if os.environ.get("P11SCOPE_CI_KERNELS", ""):
-        raise ValueError("kernels selection is not wired yet")
     tier_input = validate_tier(os.environ.get("P11SCOPE_CI_TIER", ""), event)
+    cells = parse_cells(os.environ.get("P11SCOPE_CI_CELLS", ""))
+    kernels_value = os.environ.get("P11SCOPE_CI_KERNELS", "")
+    kernels = parse_kernels(kernels_value) if kernels_value.strip(", ") else None
+    if event != "workflow_dispatch" and (cells or kernels is not None):
+        raise ValueError("cells and kernels apply to dispatches only, "
+                         f"not {event}")
     base_branch = read_base_branch()
     raw = changed_paths(event, ref, sha, base_branch)
     classes = None if raw is None else classify_paths(raw)
@@ -631,7 +722,7 @@ def main():
         workflow, event, ref, sha, tier_input, classes, base_branch,
         delivery_task=delivery_task, dedupe_run=dedupe_run,
         release_preview=release_preview, privileged_e2e=privileged_e2e,
-        pkcs11_full=pkcs11_full)
+        pkcs11_full=pkcs11_full, cells=cells, kernels=kernels)
     write_outputs(selection, matrices)
     print(f"tier={selection['tier']} bpf_extra={selection['bpf_extra']} "
           f"classes={' '.join(selection['path_classes'] or ['unknown'])}")

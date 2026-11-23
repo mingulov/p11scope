@@ -163,9 +163,11 @@ build/shards/summary, the cheap installed cells, bpf-load-host, and the CLI
 cells on host + v6.6 + v7.3.1); a BPF-crate, toolchain or lockfile change
 adds the full BPF matrix, every guest kernel and the journal/counter
 flavours. Pushes to `dev/*`, `main` and any other branch, pull requests
-and dispatches run the full tier (coverage, every kernel, browsers,
-container image). A `.github/` or `scripts/ci/` change, or any
-unclassified path, runs the full tier. Each workflow ends in a gate job
+and `tier=full` dispatches run the full tier (coverage, every kernel,
+browsers, container image); agents dispatch `tier=quick|integration|full`
+with `cells` (checked-in group names) and `kernels` (pinned list)
+overrides, passed through env. A `.github/` or `scripts/ci/` change, or
+any unclassified path, runs the full tier. Each workflow ends in a gate job
 that writes a `p11scope/ci-gate/v1` record (tier plus per-job
 passed/failed/cancelled/not-selected); the gate fails on any failed,
 cancelled or required-but-not-run job, and its summary names every

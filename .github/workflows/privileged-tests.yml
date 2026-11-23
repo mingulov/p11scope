@@ -101,6 +101,19 @@ on:
         description: Also run the FULL pkcs11-check suites (SoftHSM ~2.5 h plus the kryoptic/Haskoki provider matrix) in addition to smoke
         type: boolean
         default: false
+      tier:
+        description: Cell tier for agent dispatches
+        type: choice
+        options: [quick, integration, full]
+        default: full
+      cells:
+        description: Extra checked-in cell groups, comma-separated (unknown names fail the run)
+        type: string
+        default: ''
+      kernels:
+        description: Guest kernels for kernel-matrix jobs, comma-separated subset of the pinned list (unknown names fail the run)
+        type: string
+        default: ''
 permissions:
   contents: read
 # Per workflow, event and ref, so a push can never cancel an agent's
@@ -163,6 +176,9 @@ jobs:
       - id: choose
         env:
           P11SCOPE_CI_WORKFLOW: privileged-tests
+          P11SCOPE_CI_TIER: ${{ inputs.tier }}
+          P11SCOPE_CI_CELLS: ${{ inputs.cells }}
+          P11SCOPE_CI_KERNELS: ${{ inputs.kernels }}
           P11SCOPE_CI_PKCS11_FULL: ${{ inputs.pkcs11_check_full }}
         run: python3 -I scripts/ci/select-cells.py
   privileged-build:

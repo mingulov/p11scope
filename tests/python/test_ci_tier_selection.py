@@ -77,7 +77,7 @@ def select(workflow, event, ref, classes, tier_input="full", **kwargs):
     """SELECT.build_selection with test defaults."""
     arguments = {"delivery_task": "checks", "dedupe_run": True,
                  "release_preview": False, "privileged_e2e": False,
-                 "pkcs11_full": False}
+                 "pkcs11_full": False, "cells": frozenset(), "kernels": None}
     arguments.update(kwargs)
     return SELECT.build_selection(
         workflow, event, ref, "a" * 40, tier_input, classes, "dev/v0.8.0",
@@ -147,6 +147,33 @@ class TierSelectionTests(unittest.TestCase):
                 expected.update(DYNAMIC_MATRICES.get(name, {}).values())
                 self.assertEqual(set(job["outputs"]), expected)
 
+    def test_dispatch_inputs_declared(self):
+        for name in WORKFLOWS:
+            with self.subTest(workflow=name):
+                document = yaml.safe_load(workflow_text(name))
+                trigger = document.get("on", document.get(True))[
+                    "workflow_dispatch"]
+                inputs = trigger["inputs"]
+                self.assertEqual(inputs["tier"]["type"], "choice")
+                self.assertEqual(inputs["tier"]["options"],
+                                 ["quick", "integration", "full"])
+                self.assertEqual(inputs["tier"]["default"], "full")
+                for key in ("cells", "kernels"):
+                    self.assertEqual(inputs[key]["type"], "string")
+                    self.assertEqual(inputs[key]["default"], "")
+
+    def test_select_env_passes_dispatch_inputs(self):
+        for name in WORKFLOWS:
+            with self.subTest(workflow=name):
+                job = workflow_jobs(name)["select"]
+                choose = job["steps"][1]
+                self.assertEqual(choose["env"]["P11SCOPE_CI_TIER"],
+                                 "${{ inputs.tier }}")
+                self.assertEqual(choose["env"]["P11SCOPE_CI_CELLS"],
+                                 "${{ inputs.cells }}")
+                self.assertEqual(choose["env"]["P11SCOPE_CI_KERNELS"],
+                                 "${{ inputs.kernels }}")
+
     def test_gate_job_wiring(self):
         for name in WORKFLOWS:
             with self.subTest(workflow=name):
@@ -215,7 +242,7 @@ class TierSelectionTests(unittest.TestCase):
         selection, _ = select("ci", "push", "refs/heads/test/x", {"known"})
         self.assertEqual(selection["schema"], "p11scope/ci-selection/v1")
         for key in ("workflow", "event", "ref", "sha", "base", "tier",
-                    "bpf_extra", "path_classes", "jobs"):
+                    "bpf_extra", "path_classes", "cells", "kernels", "jobs"):
             self.assertIn(key, selection)
         self.assertEqual(set(selection["jobs"]), set(SELECT.UNIVERSE["ci"]))
         for job, entry in selection["jobs"].items():
@@ -405,7 +432,75 @@ class TierSelectionTests(unittest.TestCase):
             SELECT.validate_tier("quick", "push")
         self.assertEqual(SELECT.validate_tier("", "push"), "full")
 
-    def test_cells_and_kernels_inputs_are_rejected_before_wiring(self):
+    def test_cells_add_their_jobs_on_quick(self):
+        expectations = {
+            "bpf-matrix": {
+                "ci": ("bpf-noninterference",),
+                "privileged-tests": ("privileged-build-journal",
+                                     "privileged-second-flavor",
+                                     "privileged-counter-flavor"),
+                "bpf-kernels": ("bpf-load-kernels",
+                                "bpf-load-gate1-kernels",
+                                "lib-cells-kernels"),
+            },
+            "coverage": {"ci": ("coverage", "coverage-report")},
+            "counter-flavor": {"privileged-tests": (
+                "privileged-build-journal", "privileged-second-flavor",
+                "privileged-counter-flavor")},
+            "browser": {"privileged-tests": ("browser-cells",)},
+            "pkcs11-full": {"privileged-tests": ("pkcs11-check-full",)},
+            "providers-full": {"privileged-tests": (
+                "pkcs11-check-providers-full",)},
+        }
+        for group, workflows in expectations.items():
+            for workflow, jobs in workflows.items():
+                with self.subTest(group=group, workflow=workflow):
+                    selection, matrices = select(
+                        workflow, "workflow_dispatch",
+                        "refs/heads/test/x", {"known"}, tier_input="quick",
+                        cells=frozenset({group}))
+                    self.assertEqual(selection["tier"], "quick")
+                    self.assertEqual(selection["cells"], [group])
+                    for job in jobs:
+                        self.assertEqual(
+                            selection["jobs"][job]["state"], "selected",
+                            job)
+        # cli-guests widens only the kernel lists: the BPF jobs stay out.
+        selection, matrices = select(
+            "privileged-tests", "workflow_dispatch", "refs/heads/test/x",
+            {"known"}, tier_input="quick", cells=frozenset({"cli-guests"}))
+        current = states(selection)
+        self.assertEqual(current["privileged-second-flavor"], "not-selected")
+        for job, kernels in SELECT.CLI_FULL_KERNELS.items():
+            output = f"matrix_{job.replace('-', '_')}"
+            self.assertEqual(matrices[output]["kernel"], kernels)
+        # bpf-matrix widens the CLI lists too (every guest kernel).
+        selection, matrices = select(
+            "privileged-tests", "workflow_dispatch", "refs/heads/test/x",
+            {"known"}, tier_input="quick", cells=frozenset({"bpf-matrix"}))
+        for job, kernels in SELECT.CLI_FULL_KERNELS.items():
+            output = f"matrix_{job.replace('-', '_')}"
+            self.assertEqual(matrices[output]["kernel"], kernels)
+
+    def test_unknown_cells_and_kernels_fail(self):
+        with self.assertRaisesRegex(ValueError, "unknown cell group"):
+            SELECT.parse_cells("browser,release-preview")
+        with self.assertRaisesRegex(ValueError, "unknown kernel"):
+            SELECT.parse_kernels("v6.6.157,v9.9.9")
+        with self.assertRaisesRegex(ValueError, "unknown kernel"):
+            SELECT.parse_kernels("host")
+        with self.assertRaisesRegex(ValueError, "unknown kernel"):
+            SELECT.parse_kernels("v6.1.188")
+        # Empty fragments are dropped, not failed.
+        self.assertEqual(SELECT.parse_cells("browser,,"), frozenset({"browser"}))
+        self.assertEqual(SELECT.parse_kernels(""), frozenset())
+        self.assertEqual(SELECT.CELL_GROUPS, frozenset({
+            "bpf-matrix", "cli-guests", "coverage", "counter-flavor",
+            "browser", "pkcs11-full", "providers-full"}))
+        self.assertEqual(SELECT.PINNED_KERNELS, frozenset({
+            "v6.6.157", "v6.12.111", "v6.18.58", "v7.3.1", "v7.4-rc2"}))
+
+    def test_cells_and_kernels_apply_to_dispatches_only(self):
         saved = dict(os.environ)
         os.environ.update(P11SCOPE_CI_WORKFLOW="ci",
                           GITHUB_EVENT_NAME="push",
@@ -413,15 +508,66 @@ class TierSelectionTests(unittest.TestCase):
                           GITHUB_SHA="a" * 40,
                           P11SCOPE_CI_CELLS="browser")
         try:
-            with self.assertRaisesRegex(ValueError, "cells"):
+            with self.assertRaisesRegex(ValueError, "dispatches only"):
                 SELECT.main()
             os.environ["P11SCOPE_CI_CELLS"] = ""
             os.environ["P11SCOPE_CI_KERNELS"] = "v6.6.157"
-            with self.assertRaisesRegex(ValueError, "kernels"):
+            with self.assertRaisesRegex(ValueError, "dispatches only"):
                 SELECT.main()
         finally:
             os.environ.clear()
             os.environ.update(saved)
+
+    def test_kernels_narrow_the_matrices(self):
+        kernels = frozenset({"v6.6.157", "v7.3.1"})
+        selection, matrices = select(
+            "privileged-tests", "workflow_dispatch", "refs/heads/dev/v0.8.0",
+            {"known"}, kernels=kernels)
+        self.assertEqual(selection["kernels"], ["v6.6.157", "v7.3.1"])
+        for name in ("matrix_public_cli", "matrix_witness_cli",
+                     "matrix_run_tree"):
+            self.assertEqual(matrices[name]["kernel"],
+                             ["host", "v6.6.157", "v7.3.1"])
+        self.assertEqual(selection["jobs"]["public-cli"]["children"], 3)
+        selection, matrices = select(
+            "bpf-kernels", "workflow_dispatch", "refs/heads/dev/v0.8.0",
+            {"known"}, kernels=kernels)
+        self.assertEqual(matrices["matrix_bpf_load"], {
+            "kernel": ["v6.6.157", "v7.3.1"],
+            "include": [
+                {"kernel": "v6.1.188", "refusal_control": True},
+                {"kernel": "v5.15.221", "refusal_control": True,
+                 "denial_branch": "denied"},
+            ]})
+        self.assertEqual(selection["jobs"]["bpf-load-kernels"]["children"],
+                         4)
+        current = states(selection)
+        for job in ("bpf-load-kernels", "bpf-load-gate1-kernels",
+                    "lib-cells-kernels", "bpf-load-gate1-build",
+                    "kvm-probe"):
+            self.assertEqual(current[job], "selected", job)
+
+    def test_kernels_outside_a_list_deselect_it_honestly(self):
+        # v7.4-rc2 is pinned for public-cli and witness-cli but not for
+        # run-tree or the lib cells: run-tree keeps its host leg, the
+        # lib cells step aside with a reason, and nothing fails.
+        kernels = frozenset({"v7.4-rc2"})
+        selection, matrices = select(
+            "privileged-tests", "workflow_dispatch", "refs/heads/dev/v0.8.0",
+            {"known"}, kernels=kernels)
+        self.assertEqual(matrices["matrix_public_cli"]["kernel"],
+                         ["host", "v7.4-rc2"])
+        self.assertEqual(matrices["matrix_run_tree"]["kernel"], ["host"])
+        self.assertEqual(selection["jobs"]["run-tree"]["children"], 1)
+        selection, _ = select(
+            "bpf-kernels", "workflow_dispatch", "refs/heads/dev/v0.8.0",
+            {"known"}, kernels=kernels)
+        current = states(selection)
+        self.assertEqual(current["bpf-load-gate1-kernels"], "selected")
+        self.assertEqual(current["lib-cells-kernels"], "not-selected")
+        self.assertIn("none of the requested kernels",
+                      selection["jobs"]["lib-cells-kernels"]["reason"])
+        self.assertEqual(current["kvm-probe"], "selected")
 
     def test_delivery_dispatch_and_dedupe_deselect_ordinary_jobs(self):
         selection, _ = select("ci", "workflow_dispatch", "refs/heads/main",

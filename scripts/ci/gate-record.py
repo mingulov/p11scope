@@ -326,6 +326,8 @@ def main(argv):
         "tier": selection["tier"],
         "bpf_extra": selection["bpf_extra"],
         "path_classes": selection["path_classes"],
+        "cells": selection.get("cells", []),
+        "kernels": selection.get("kernels"),
         "event": selection["event"],
         "ref": selection["ref"],
         "verdict": verdict,

@@ -784,6 +784,10 @@ enum BirthRefusal {
     OriginalMismatch,
     Install(crate::discovery::caller_registry::instance_input::JointReceiptInstallRefusal),
     SegmentUnresumable,
+    /// A segment-doomed birth while the adapter withholds its
+    /// successor: the previous successor died without a validated
+    /// birth, so the next one waits its backoff.
+    SuccessorBackoff,
     StuckBarred,
     SessionUnhealthy,
 }
@@ -826,6 +830,7 @@ impl BirthRefusal {
             Self::OriginalMismatch => "joint_birth_original_mismatch".into(),
             Self::Install(refusal) => format!("joint_birth_install_{refusal:?}"),
             Self::SegmentUnresumable => "joint_birth_install_segment_unresumable".into(),
+            Self::SuccessorBackoff => "joint_birth_install_successor_backoff".into(),
             // Same strings as the post-install arm refusals they
             // mirror: early or late, the gap names one blocker.
             Self::StuckBarred => "joint_birth_reseed_stuck_barred".into(),
@@ -1851,7 +1856,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             if segment_doomed {
                 drop(reservation);
                 drop(slot);
-                association[first].refusal = Some((caller, BirthRefusal::SegmentUnresumable));
+                // The adapter's successor decision names the wait: a
+                // backoff after an unproductive successor, or the plain
+                // doom (no successor may mint for this proof yet).
+                let refusal = if adapter.successor_backoff_for(&proof).is_some() {
+                    BirthRefusal::SuccessorBackoff
+                } else {
+                    BirthRefusal::SegmentUnresumable
+                };
+                association[first].refusal = Some((caller, refusal));
                 continue;
             }
             if stuck_barred {

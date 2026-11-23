@@ -331,6 +331,10 @@ enum ConsumerState {
     Delivered,
     LossDelivered,
 }
+/// Gap subject for a proof-destroying fallback close that fenced its
+/// key and created the successor at the close's frontier.
+pub(crate) const FALLBACK_FENCED_SUBJECT: &str = "joint fallback fence";
+
 /// Gap subject for a parked stuck consumer's forced-fallback
 /// degrade: the watchdog parked the consumer past its retry stall
 /// with counted loss instead of tripping the lane.
@@ -2730,10 +2734,34 @@ impl IngestedJointQuantum {
                 Ok(self.progress())
             }
             FailureBatchProgress::Complete(
-                FailureApplyOutcome::Degraded { .. } | FailureApplyOutcome::FellBack { .. },
+                applied @ (FailureApplyOutcome::Degraded { .. }
+                | FailureApplyOutcome::FellBack { .. }),
             ) => {
                 if batch.negative_delivered().is_none() {
                     return Err(RawQuantumRefusal::DispositionMismatch);
+                }
+                // A fallback close that destroyed this segment's proof
+                // fences its key at the close's frontier and creates the
+                // successor there (ruling R10), instead of dooming every
+                // later same-domain birth until some later void fences
+                // the dead key. The adapter decides; the close names the
+                // decision and the calls it disposed in one gap.
+                if matches!(applied, FailureApplyOutcome::FellBack { .. })
+                    && !crate::semantics_key_use::segment_resumable_after(stuck_gap)
+                    && let Some(decision) =
+                        adapter.fence_destroyed_proof(&target.bootstrap().proof(), self.frontier.0)
+                {
+                    let units = batch
+                        .delivered_replayed()
+                        .saturating_add(batch.delivered_disposed());
+                    registry.record_gap(crate::discovery::caller_registry::RegistryGap {
+                        caller: Some(target.caller()),
+                        module: None,
+                        pid: None,
+                        subject: FALLBACK_FENCED_SUBJECT.to_string(),
+                        reason: decision.gap_reason(units as u64),
+                        budget: None,
+                    });
                 }
                 // A parked consumer's forced fallback lands its named
                 // park gap here, with exact loss counts: the watchdog

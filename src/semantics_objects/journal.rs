@@ -812,6 +812,16 @@ struct ImageSighting {
     first_affecting: Option<u64>,
 }
 
+/// Which rule mints a binding's next incarnation (see
+/// [`JournalAdapter::successor_mint_rule`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SuccessorRule {
+    /// A fenced dead key with recorded dead-frame grounding.
+    Death,
+    /// New post-fence object proof ends the binding's quarantine.
+    QuarantineEnd,
+}
+
 /// One key's attribution of its image's staged history at a frontier.
 /// Death evidence for one dead journal key, kept outside the
 /// size-pinned per-key state (only dead keys hold an entry): which
@@ -830,6 +840,74 @@ struct JournalDeathMarks {
     tainted: bool,
     /// Clean close.
     ended: bool,
+    /// The proof-destroying fallback close that fenced this key, if
+    /// any (see [`JournalAdapter::fence_destroyed_proof`]).
+    fallback: Option<FallbackFence>,
+}
+
+/// One proof-destroying fallback close's fence on a dead key: the
+/// close's frontier (the key's own fence, and the floor every
+/// successor birth cuts at or above), the length of the unproductive
+/// successor chain it ends, and the passes left before a successor
+/// may mint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FallbackFence {
+    fence: u64,
+    chain: u32,
+    wait: u32,
+}
+
+/// What one proof-destroying fallback close decided (see
+/// [`JournalAdapter::fence_destroyed_proof`]): the typed record the
+/// close discloses as one gap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FallbackFenceDecision {
+    /// The close's frontier: the closed key's fence and the floor
+    /// every successor birth must cut at or above.
+    pub(crate) fence: u64,
+    /// Consecutive successors that died without a validated birth
+    /// (zero: this key made progress, or was not such a successor).
+    pub(crate) chain: u32,
+    /// Passes before a successor may mint (zero: at once).
+    pub(crate) backoff_passes: u32,
+    /// Whether the death rule may mint past this key once it is dead:
+    /// false when a refusal already grounds in a capable frame, which
+    /// never mints (the binding then waits for quarantine-end proof).
+    pub(crate) successor_allowed: bool,
+}
+
+impl FallbackFenceDecision {
+    /// The gap reason for this close, with the calls it disposed.
+    pub(crate) fn gap_reason(&self, calls: u64) -> String {
+        format!(
+            "install_segment_fallback_fenced calls={calls} fence={} chain={} backoff_passes={} successor={}",
+            self.fence,
+            self.chain,
+            self.backoff_passes,
+            if self.successor_allowed {
+                "minted"
+            } else {
+                "capable_frame"
+            }
+        )
+    }
+}
+
+/// The successor backoff after `chain` consecutive unproductive
+/// successors: zero for none, else [`RESEED_COOLDOWN_PASSES`] doubled
+/// per further one, never beyond its square (finite: a backoff always
+/// ends, so the binding stays recoverable).
+fn fallback_backoff_passes(chain: u32) -> u32 {
+    use crate::semantics_key_use::RESEED_COOLDOWN_PASSES as UNIT;
+    if chain == 0 {
+        return 0;
+    }
+    let doublings = chain - 1;
+    let ceiling = UNIT.saturating_mul(UNIT);
+    if doublings >= 32 {
+        return ceiling;
+    }
+    UNIT.saturating_mul(1u32 << doublings.min(31)).min(ceiling)
 }
 
 /// Whether one unclaimed staged call's END sits at an H0 position the
@@ -7020,12 +7098,7 @@ impl BootstrapReceipt {
         {
             return Err(BirthRefusal::EvidenceMismatch);
         }
-        let fenced_through = adapter
-            .keys
-            .get(&grant.proof.key)
-            .map(|state| state.void_fence)
-            .unwrap_or(0)
-            .max(*adapter.voided_through);
+        let fenced_through = adapter.key_resume_fence(grant.proof.key);
         if grant.birth_cut < fenced_through {
             return Err(BirthRefusal::BelowVoidFence);
         }
@@ -7524,12 +7597,7 @@ impl JournalAdapter {
         }
         let key = self.resolve_binding_key(admitted);
         let fresh = !self.keys.contains_key(&key);
-        let fenced_through = self
-            .keys
-            .get(&key)
-            .map(|state| state.void_fence)
-            .unwrap_or(0)
-            .max(*self.voided_through);
+        let fenced_through = self.key_resume_fence(key);
         if self.image_taint_blocks((key.cookie, key.exec), fenced_through)
             && self.quarantine_end_applies(admitted).is_none()
         {
@@ -7608,10 +7676,9 @@ impl JournalAdapter {
         // dead-frame dooms, and quarantine-end mints for anything
         // blocked (image-tainted or dead with recorded grounding)
         // when this admission carries new post-fence object proof.
-        let blocked = permanently_dead
-            || self.image_taint_blocks((last.cookie, last.exec), *self.voided_through);
-        if (permanently_dead && self.incarnation_mint_eligible(last))
-            || (blocked && self.quarantine_end_eligible(admitted, last))
+        if self
+            .successor_mint_rule(admitted, last, permanently_dead)
+            .is_some()
         {
             JournalDomainKey {
                 incarnation: last.incarnation.saturating_add(1),
@@ -7659,6 +7726,145 @@ impl JournalAdapter {
                         .get(&latest)
                         .is_some_and(|marks| marks.ended))
         })
+    }
+
+    /// The one owner of the doom/successor decision: which rule, if
+    /// any, mints a fresh incarnation past the binding's latest key
+    /// (no live incarnation exists). The death rule mints for a fenced
+    /// dead key with recorded dead-frame grounding — fenced by a void
+    /// ([`Self::fence_void`]) or by a proof-destroying fallback close
+    /// ([`Self::fence_destroyed_proof`]); quarantine-end mints on new
+    /// post-fence object proof. A key whose fallback close still serves
+    /// its successor backoff mints under neither rule until the backoff
+    /// ends ([`Self::tick_fallback_backoff`]). Resolution, the fallback
+    /// close and the birth probe all decide through this function.
+    fn successor_mint_rule(
+        &self,
+        admitted: &AdmittedInstanceCall,
+        last: JournalDomainKey,
+        permanently_dead: bool,
+    ) -> Option<SuccessorRule> {
+        if self.successor_backoff(last).is_some() {
+            return None;
+        }
+        if permanently_dead && self.incarnation_mint_eligible(last) {
+            return Some(SuccessorRule::Death);
+        }
+        let blocked = permanently_dead
+            || self.image_taint_blocks((last.cookie, last.exec), *self.voided_through);
+        (blocked && self.quarantine_end_eligible(admitted, last))
+            .then_some(SuccessorRule::QuarantineEnd)
+    }
+
+    /// Passes left before a successor may mint past this key's
+    /// proof-destroying fallback close (`None`: no backoff stands).
+    fn successor_backoff(&self, key: JournalDomainKey) -> Option<u32> {
+        self.death_marks
+            .get(&key)
+            .and_then(|marks| marks.fallback)
+            .map(|fence| fence.wait)
+            .filter(|wait| *wait > 0)
+    }
+
+    /// The birth probe's view of [`Self::successor_mint_rule`]: passes
+    /// left before the dead key behind this proof may mint a successor
+    /// (`None`: no backoff withholds it). A doomed same-proof birth is
+    /// named as backoff while this stands.
+    pub(crate) fn successor_backoff_for(&self, proof: &JournalDomainProof) -> Option<u32> {
+        self.successor_backoff(proof.key)
+    }
+
+    /// The fence a key's births and seals resume at: its own fence,
+    /// the global void fence, and — for a successor minted past a
+    /// proof-destroying fallback close — that close's frontier, so no
+    /// successor birth certifies history at or below the close.
+    fn key_resume_fence(&self, key: JournalDomainKey) -> u64 {
+        let own = self.keys.get(&key).map_or(0, |state| state.void_fence);
+        let inherited = key
+            .incarnation
+            .checked_sub(1)
+            .and_then(|incarnation| {
+                self.death_marks
+                    .get(&JournalDomainKey { incarnation, ..key })
+            })
+            .and_then(|marks| marks.fallback)
+            .map_or(0, |fence| fence.fence);
+        own.max(*self.voided_through).max(inherited)
+    }
+
+    /// Fence a key whose segment a fallback close just ended with its
+    /// proof destroyed (ruling R10): the close creates the successor
+    /// at its own frontier instead of waiting for a later void. The key
+    /// fences at `frontier` through the void's own per-key fence, so
+    /// the death rule (in [`Self::successor_mint_rule`]) mints the next
+    /// incarnation on the next resolution once the key is dead with
+    /// recorded dead-frame grounding. A key still live-flagged at the
+    /// close is never retired here: its feed is S1Only, so its next
+    /// calls are refused S1-only subjects and it dies through that
+    /// recorded refusal first. The successor births only at or above
+    /// the fence ([`Self::key_resume_fence`]) with fresh proof through
+    /// normal admission, and inherits nothing. Progress bounds the
+    /// cycle: when this key was itself such a successor and never
+    /// sealed (no validated birth), the next successor waits an
+    /// exponential backoff in
+    /// [`crate::semantics_key_use::RESEED_COOLDOWN_PASSES`] units. Once
+    /// per key (`None` on a repeat or an unknown key).
+    pub(crate) fn fence_destroyed_proof(
+        &mut self,
+        proof: &JournalDomainProof,
+        frontier: u64,
+    ) -> Option<FallbackFenceDecision> {
+        let key = proof.key;
+        let state = self.keys.get(&key)?;
+        if self
+            .death_marks
+            .get(&key)
+            .is_some_and(|marks| marks.fallback.is_some())
+        {
+            return None;
+        }
+        let progressed = state.sealed_through > 0;
+        let predecessor_chain = key
+            .incarnation
+            .checked_sub(1)
+            .and_then(|incarnation| {
+                self.death_marks
+                    .get(&JournalDomainKey { incarnation, ..key })
+            })
+            .and_then(|marks| marks.fallback)
+            .map(|fence| fence.chain);
+        let chain = match (progressed, predecessor_chain) {
+            (false, Some(chain)) => chain.saturating_add(1),
+            _ => 0,
+        };
+        let wait = fallback_backoff_passes(chain);
+        {
+            let state = self.keys.edit().get_mut(&key).expect("closed key");
+            state.void_fence = state.void_fence.max(frontier);
+        }
+        self.death_marks.entry(key).or_default().fallback = Some(FallbackFence {
+            fence: frontier,
+            chain,
+            wait,
+        });
+        Some(FallbackFenceDecision {
+            fence: frontier,
+            chain,
+            backoff_passes: wait,
+            successor_allowed: !self
+                .death_marks
+                .get(&key)
+                .is_some_and(|marks| marks.refused_capable == Some(true)),
+        })
+    }
+
+    /// Tick one pass off every fallback successor backoff.
+    pub(crate) fn tick_fallback_backoff(&mut self) {
+        for marks in self.death_marks.values_mut() {
+            if let Some(fence) = marks.fallback.as_mut() {
+                fence.wait = fence.wait.saturating_sub(1);
+            }
+        }
     }
 
     /// Whether a dead key's deaths are all recorded (capable
@@ -9454,7 +9660,7 @@ impl JournalAdapter {
         // current retained truth: moved native evidence or a chain break
         // between attestation and seal still refuses. The fence is the
         // same global-aware fence attestation used, so the two agree.
-        let fenced_through = state.void_fence.max(*self.voided_through);
+        let fenced_through = self.key_resume_fence(key);
         if let Err(refusal) = self.verify_birth(
             &bootstrap.proof(),
             bootstrap.birth(),
@@ -27460,6 +27666,327 @@ pub(crate) mod tests {
             .seal_at(&bootstrap, 8)
             .expect_err("the doomed proof keeps refusing");
         assert_eq!(stale.gap, JournalGap::DomainTainted);
+    }
+
+    /// A sole key that sealed once, then a seal-time doom grounded in a
+    /// dead frame with no void anywhere: the live shape where a
+    /// proof-destroying fallback close found no fence to mint past.
+    /// Returns the doomed proof and its bootstrap.
+    fn fallback_fence_doomed_scene() -> (Scene, JournalDomainProof, BootstrapReceipt) {
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_EXEC_EXIT;
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+        use pkcs11_types::CkRv;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let first = begin_bytes(1, 1, create, 0);
+        scene.ingest(&first);
+        scene.ingest(&end_bytes(&first, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.seal(&bootstrap).expect("sole key seals");
+        scene.attest_session_function(SESSION, "C_GetAttributeValue");
+        let getattr = function_id("C_GetAttributeValue");
+        let outer = begin_bytes(1, 2, getattr, 0);
+        scene.ingest(&outer);
+        assert_eq!(
+            scene.ingest_ordinary(ordinary_for(&outer, CkRv::SESSION_HANDLE_INVALID.0)),
+            JournalDisposition::ReturnObserved
+        );
+        let abandon = abandon_bytes(1, 2, JOURNAL_REASON_EXEC_EXIT, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        let doom = scene.seal(&bootstrap).expect_err("seal-time doom");
+        assert_eq!(doom.gap, JournalGap::DomainTainted);
+        assert!(scene.adapter.keys[&proof.key].refused);
+        assert_eq!(*scene.adapter.voided_through, 0, "no void in this run");
+        (scene, proof, bootstrap)
+    }
+
+    #[test]
+    fn object_journal_fallback_close_mints_fenced_successor() {
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let (mut scene, proof, bootstrap) = fallback_fence_doomed_scene();
+        // Control: without the close's fence the dead binding stays
+        // doomed (the live refusal storm: no void ever fences it).
+        let stuck = scene.attest_function("C_CreateObject");
+        assert_eq!(stuck.key, proof.key, "an unfenced death mints nothing");
+        let fence = scene.adapter.consumed_through;
+        let decision = scene
+            .adapter
+            .fence_destroyed_proof(&proof, fence)
+            .expect("the close fences the doomed key");
+        assert_eq!(
+            decision,
+            FallbackFenceDecision {
+                fence,
+                chain: 0,
+                backoff_passes: 0,
+                successor_allowed: true,
+            }
+        );
+        assert_eq!(
+            decision.gap_reason(3),
+            format!(
+                "install_segment_fallback_fenced calls=3 fence={fence} chain=0 backoff_passes=0 successor=minted"
+            )
+        );
+        assert_eq!(
+            scene.adapter.fence_destroyed_proof(&proof, fence + 5),
+            None,
+            "one decision per closed key"
+        );
+        let reborn = scene.attest_function("C_CreateObject");
+        assert_eq!(
+            reborn.key,
+            JournalDomainKey {
+                incarnation: proof.key.incarnation + 1,
+                ..proof.key
+            },
+            "the close mints the next incarnation"
+        );
+        assert_ne!(reborn.domain(), proof.domain(), "fresh model domain");
+        let below = SessionBirthGrant::scripted(
+            reborn,
+            BirthKind::AbsenceAppearance,
+            fence - 1,
+            scene.closure_generation(),
+        );
+        assert_eq!(
+            BootstrapReceipt::attest(&scene.adapter, &below),
+            Err(BirthRefusal::BelowVoidFence),
+            "no successor birth certifies history below the close"
+        );
+        let grant = SessionBirthGrant::scripted(
+            reborn,
+            BirthKind::AbsenceAppearance,
+            fence,
+            scene.closure_generation(),
+        );
+        let rebirth = BootstrapReceipt::attest(&scene.adapter, &grant).expect("at-fence birth");
+        let create = function_id("C_CreateObject");
+        let second = begin_bytes(1, 3, create, 0);
+        scene.ingest(&second);
+        scene.ingest(&end_bytes(&second, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 70));
+        let success = scene
+            .seal(&rebirth)
+            .expect("the successor seals fresh post-fence proof");
+        assert_eq!(success.prefix.settled().len(), 1);
+        assert_eq!(success.prefix.domain(), reborn.domain());
+        let stale = scene.seal(&bootstrap).expect_err("old proof refuses");
+        assert_eq!(stale.gap, JournalGap::DomainTainted);
+    }
+
+    #[test]
+    fn object_journal_fallback_fence_straddler_is_never_attributed() {
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let (mut scene, proof, _) = fallback_fence_doomed_scene();
+        // A call in flight across the close: BEGIN at or below the
+        // fence, END after the successor minted and claimed it.
+        let create = function_id("C_CreateObject");
+        let straddler = begin_bytes(1, 3, create, 0);
+        scene.ingest(&straddler);
+        let fence = scene.adapter.consumed_through;
+        scene
+            .adapter
+            .fence_destroyed_proof(&proof, fence)
+            .expect("the close fences the doomed key");
+        let reborn = scene.attest_function("C_CreateObject");
+        assert_eq!(reborn.key.incarnation, proof.key.incarnation + 1);
+        scene.ingest(&end_bytes(
+            &straddler,
+            OBJECT_ACTION_CREATE,
+            0,
+            ENTRY_NS + 70,
+        ));
+        let grant = SessionBirthGrant::scripted(
+            reborn,
+            BirthKind::AbsenceAppearance,
+            fence,
+            scene.closure_generation(),
+        );
+        let rebirth = BootstrapReceipt::attest(&scene.adapter, &grant).expect("at-fence birth");
+        let refused = scene
+            .seal(&rebirth)
+            .expect_err("a straddler below the fence is never attributed");
+        assert_eq!(refused.gap, JournalGap::BootstrapMismatch);
+        assert_eq!(
+            scene.adapter.keys[&reborn.key].sealed_through, 0,
+            "nothing converted under the successor"
+        );
+    }
+
+    /// Doom a minted successor on its first seal (no validated birth):
+    /// birth at `fence`, then an exit-grounded abandonment with
+    /// corroborated negative evidence refuses the key.
+    fn doom_unsealed_successor(
+        scene: &mut Scene,
+        successor: JournalDomainProof,
+        fence: u64,
+        thread: u64,
+    ) {
+        let grant = SessionBirthGrant::scripted(
+            successor,
+            BirthKind::AbsenceAppearance,
+            fence,
+            scene.closure_generation(),
+        );
+        let receipt = BootstrapReceipt::attest(&scene.adapter, &grant).expect("successor birth");
+        doom_sealed_key(scene, &receipt, thread);
+        assert_eq!(
+            scene.adapter.keys[&successor.key].sealed_through, 0,
+            "the successor never validated a birth"
+        );
+    }
+
+    /// Doom one key at its next seal: an exit-grounded abandonment
+    /// with corroborated negative evidence (dead-frame grounding).
+    fn doom_sealed_key(scene: &mut Scene, receipt: &BootstrapReceipt, thread: u64) {
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_EXEC_EXIT;
+        use pkcs11_types::CkRv;
+
+        scene.attest_session_function(SESSION, "C_GetAttributeValue");
+        let getattr = function_id("C_GetAttributeValue");
+        let outer = begin_bytes(thread, 1, getattr, 0);
+        scene.ingest(&outer);
+        assert_eq!(
+            scene.ingest_ordinary(ordinary_for(&outer, CkRv::SESSION_HANDLE_INVALID.0)),
+            JournalDisposition::ReturnObserved
+        );
+        let abandon = abandon_bytes(thread, 1, JOURNAL_REASON_EXEC_EXIT, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        let doom = scene.seal(receipt).expect_err("seal-time doom");
+        assert_eq!(doom.gap, JournalGap::DomainTainted);
+        assert!(scene.adapter.keys[&receipt.proof().key].refused);
+    }
+
+    #[test]
+    fn object_journal_fallback_successor_without_progress_backs_off_then_recovers() {
+        use crate::semantics_key_use::RESEED_COOLDOWN_PASSES;
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let (mut scene, proof, _) = fallback_fence_doomed_scene();
+        let fence = scene.adapter.consumed_through;
+        scene
+            .adapter
+            .fence_destroyed_proof(&proof, fence)
+            .expect("first close");
+        let first = scene.attest_function("C_CreateObject");
+        assert_eq!(first.key.incarnation, proof.key.incarnation + 1);
+        // The successor dies at once without a validated birth: its
+        // first seal dooms it (dead-frame grounding), then its own
+        // proof-destroying close fences it.
+        doom_unsealed_successor(&mut scene, first, fence, 20);
+        let fence2 = scene.adapter.consumed_through;
+        let decision = scene
+            .adapter
+            .fence_destroyed_proof(&first, fence2)
+            .expect("the successor's close");
+        assert_eq!(
+            decision,
+            FallbackFenceDecision {
+                fence: fence2,
+                chain: 1,
+                backoff_passes: RESEED_COOLDOWN_PASSES,
+                successor_allowed: true,
+            },
+            "no progress: the next successor waits one cooldown unit"
+        );
+        for pass in 0..RESEED_COOLDOWN_PASSES {
+            assert_eq!(
+                scene.adapter.successor_backoff_for(&first),
+                Some(RESEED_COOLDOWN_PASSES - pass)
+            );
+            // Resolution only (no claim filed): the binding still
+            // names the dead successor.
+            let admitted = scene
+                .fixture
+                .admit_session_function(SESSION, "C_CreateObject");
+            assert_eq!(
+                scene
+                    .adapter
+                    .bind_admitted_key(&admitted)
+                    .expect("binds")
+                    .key,
+                first.key,
+                "no mint while the backoff stands (pass {pass})"
+            );
+            scene.adapter.tick_fallback_backoff();
+        }
+        assert_eq!(scene.adapter.successor_backoff_for(&first), None);
+        let second = scene.attest_function("C_CreateObject");
+        assert_eq!(
+            second.key.incarnation,
+            first.key.incarnation + 1,
+            "the backoff ends: recoverable, never a permanent stop"
+        );
+        // A second unproductive successor doubles the wait.
+        doom_unsealed_successor(&mut scene, second, fence2, 21);
+        let fence3 = scene.adapter.consumed_through;
+        let doubled = scene
+            .adapter
+            .fence_destroyed_proof(&second, fence3)
+            .expect("second unproductive close");
+        assert_eq!(
+            (doubled.chain, doubled.backoff_passes),
+            (2, 2 * RESEED_COOLDOWN_PASSES)
+        );
+        for _ in 0..doubled.backoff_passes {
+            scene.adapter.tick_fallback_backoff();
+        }
+        let third = scene.attest_function("C_CreateObject");
+        assert_eq!(third.key.incarnation, second.key.incarnation + 1);
+        // Progress resets the chain: the third successor validates a
+        // birth (one seal succeeds), so its own death mints at once.
+        let grant = SessionBirthGrant::scripted(
+            third,
+            BirthKind::AbsenceAppearance,
+            fence3,
+            scene.closure_generation(),
+        );
+        let rebirth = BootstrapReceipt::attest(&scene.adapter, &grant).expect("third birth");
+        let create = function_id("C_CreateObject");
+        let call = begin_bytes(1, 9, create, 0);
+        scene.ingest(&call);
+        scene.ingest(&end_bytes(&call, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 90));
+        scene.seal(&rebirth).expect("validated birth");
+        assert!(scene.adapter.keys[&third.key].sealed_through > 0);
+        doom_sealed_key(&mut scene, &rebirth, 22);
+        let reset = scene
+            .adapter
+            .fence_destroyed_proof(&third, scene.adapter.consumed_through)
+            .expect("productive successor's close");
+        assert_eq!(
+            (reset.chain, reset.backoff_passes),
+            (0, 0),
+            "progress resets"
+        );
+        let fourth = scene.attest_function("C_CreateObject");
+        assert_eq!(fourth.key.incarnation, third.key.incarnation + 1);
+    }
+
+    #[test]
+    fn fallback_backoff_doubles_in_cooldown_units_and_stays_finite() {
+        use crate::semantics_key_use::RESEED_COOLDOWN_PASSES as UNIT;
+        let expected = [
+            0,
+            UNIT,
+            2 * UNIT,
+            4 * UNIT,
+            8 * UNIT,
+            16 * UNIT,
+            UNIT * UNIT,
+            UNIT * UNIT,
+        ];
+        for (chain, want) in expected.iter().enumerate() {
+            assert_eq!(
+                fallback_backoff_passes(chain as u32),
+                *want,
+                "chain {chain}"
+            );
+        }
+        assert_eq!(fallback_backoff_passes(u32::MAX), UNIT * UNIT);
     }
 
     #[test]

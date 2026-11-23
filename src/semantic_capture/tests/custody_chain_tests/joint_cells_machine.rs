@@ -2320,13 +2320,17 @@ fn mixed_image_and_exact_refusal_pending(scenario: MixedRefusalControl) {
             .adapter()
             .proof_refused_for_test(c_proof)
     );
-    assert_eq!(
-        coordinator
-            .joint_capture_mut()
-            .adapter_mut()
-            .bind_admitted_key(&c_input),
-        Ok(c_proof),
-        "the exact refused C image is still untainted and keeps its era"
+    // The native refusal's fallback close destroyed C's proof and
+    // fenced its key there (ruling R10), so once the exact refusal
+    // kills that key its binding mints the successor at once.
+    let successor = coordinator
+        .joint_capture_mut()
+        .adapter_mut()
+        .bind_admitted_key(&c_input)
+        .expect("the exact refused C image is still untainted");
+    assert!(
+        successor.reseed_supersedes(&c_proof),
+        "the refused C key binds its fenced successor, never the dead key"
     );
     let work =
         failures[0].effects.effects.len() + coordinator.registry().joint_history_targets().count();

@@ -1027,13 +1027,37 @@ impl InspectedFileKey {
 pub(crate) const NINE_P_MAGIC: u64 = 0x0102_1997;
 
 /// Whether the pre-open facts consult may run for a range on this
-/// filesystem: 9p read-only mounts only. Read-only means the bytes cannot
-/// change under the key (a remount shows new flags on the next consult,
-/// an overwrite through a read-write alias bumps ctime and misses), so a
-/// key hit names the proven bytes. Every other filesystem keeps the
-/// existing open-first flow byte-identical.
+/// filesystem: overlayfs (any mode) or 9p read-only mounts. Overlay
+/// layers change identity on copy-up (a miss) and carry kernel ctime
+/// (an overwrite misses), so the generation key stays exact; 9p needs
+/// read-only as well because a loose-cache client could serve stale
+/// attributes. Read-only 9p bytes cannot change under the key (a remount
+/// shows new flags on the next consult). Every other filesystem keeps
+/// the existing open-first flow byte-identical.
 pub(crate) fn preopen_consult_eligible(fs_magic: Option<u64>, read_only: bool) -> bool {
-    fs_magic == Some(NINE_P_MAGIC) && read_only
+    fs_magic.is_some_and(|magic| {
+        magic == p11scope_manifest::identity::OVERLAYFS_SUPER_MAGIC
+            || (magic == NINE_P_MAGIC && read_only)
+    })
+}
+
+/// How long one pre-open entry stays valid: 60 s, the NFS attribute-cache
+/// worst case, so a stale-underlay hit can never outlive the staleness
+/// the open-first flow already accepts there. Fresh mounts (9p default,
+/// local disks) never notice it; entries simply re-prove once a minute.
+pub(crate) const PREOPEN_ENTRY_TTL_NS: u64 = 60_000_000_000;
+
+/// Whether an entry stored at `stored_ns` is still fresh at `now_ns`.
+pub(crate) fn preopen_entry_fresh(stored_ns: u64, now_ns: u64) -> bool {
+    now_ns.saturating_sub(stored_ns) <= PREOPEN_ENTRY_TTL_NS
+}
+
+/// One retained pre-open entry: proven facts plus the monotonic instant
+/// they were stored, for the TTL bound.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PreopenEntry {
+    pub(crate) facts: ElfExportFacts,
+    pub(crate) stored_ns: u64,
 }
 
 /// Pre-open cache key: the mount namespace (usable paths resolve per
@@ -1069,15 +1093,11 @@ impl PreopenFileKey {
     }
 }
 
-/// Identity, generation and filesystem of one usable mapping path, read
-/// before any open: the pre-open consult's whole input (one statx plus
-/// one statfs on the path itself, no privileges needed). `None` on any
-/// failure falls back to the full path.
-fn preopen_target_metadata(
-    path: &std::path::Path,
-) -> Option<(std::fs::Metadata, Option<u64>, bool)> {
+/// Filesystem identity of one usable mapping path: magic plus
+/// read-only flag. Read first so ineligible filesystems pay one syscall
+/// pair, not the full consult; `None` on any failure falls back.
+fn preopen_target_fs(path: &std::path::Path) -> Option<(Option<u64>, bool)> {
     use std::os::unix::ffi::OsStrExt as _;
-    let metadata = std::fs::metadata(path).ok()?;
     let bytes = path.as_os_str().as_bytes();
     let cpath = std::ffi::CString::new(bytes).ok()?;
     // Filesystem magic via `statfs`, like `map_files_entry_file`.
@@ -1101,7 +1121,7 @@ fn preopen_target_metadata(
     } else {
         false
     };
-    Some((metadata, magic, read_only))
+    Some((magic, read_only))
 }
 
 /// Whether the scanned view shares the observer's mount namespace: the
@@ -1162,13 +1182,13 @@ enum PreopenConsult {
     Hit(ElfExportFacts, MappedFile),
 }
 
-/// Consult proven facts before opening: on 9p read-only mounts (or forced
-/// in tests), reuse a previous full examination of this exact file
-/// generation instead of reopening, re-proving and re-parsing it. The
-/// caller keeps narrowed, deleted, custody-held, hinted and excluded
-/// groups on the full path; inside, multi-path groups, foreign
-/// namespaces, getter matches, unreadable inputs and budget refusals of
-/// the lookup step itself also fall back.
+/// Consult proven facts before opening: on eligible mounts (overlayfs,
+/// 9p read-only; or forced in tests), reuse a previous full examination
+/// of this exact file generation instead of reopening, re-proving and
+/// re-parsing it. The caller keeps narrowed, deleted, custody-held,
+/// hinted and excluded groups on the full path; inside, multi-path
+/// groups, foreign namespaces, getter matches, unreadable inputs and
+/// budget refusals of the lookup step itself also fall back.
 #[allow(clippy::too_many_arguments)]
 fn preopen_consult(
     view: &ProcessView,
@@ -1183,12 +1203,23 @@ fn preopen_consult(
     if !(same_mount_ns && preopen_group_single_path(group, map_index)) {
         return PreopenConsult::Skip;
     }
-    let Some((target, magic, read_only)) = preopen_target_metadata(usable) else {
-        return PreopenConsult::Skip;
+    let forced = preopen_consult_forced();
+    // Filesystem first: ineligible filesystems fall back before paying
+    // for identity. Forced tests skip the gate (their tmpfs never has
+    // it) but still read real identity below.
+    let (magic, read_only) = match preopen_target_fs(usable) {
+        Some(identity) => identity,
+        None if forced => (None, false),
+        None => {
+            return PreopenConsult::Skip;
+        }
     };
-    if !(preopen_consult_forced() || preopen_consult_eligible(magic, read_only)) {
+    if !(forced || preopen_consult_eligible(magic, read_only)) {
         return PreopenConsult::Skip;
     }
+    let Ok(target) = std::fs::metadata(usable) else {
+        return PreopenConsult::Skip;
+    };
     if budget
         .getter_objects
         .contains(&(target.dev(), target.ino()))
@@ -1200,7 +1231,10 @@ fn preopen_consult(
     }
     let candidate =
         PreopenFileKey::for_target(view.mount_namespace(), key.device, key.inode, &target);
-    match budget.preopen_facts_for(&candidate) {
+    let Some(now_ns) = crate::attach::monotonic_ns() else {
+        return PreopenConsult::Skip;
+    };
+    match budget.preopen_facts_for(&candidate, now_ns) {
         Some(facts) => {
             let mapped = MappedFile {
                 identity: FileIdentity {
@@ -1338,8 +1372,9 @@ fn export_cache_bytes(key: &InspectedFileKey, value: &ElfExportFacts) -> u64 {
 
 /// Retained bytes of one pre-open entry: same accounting as the export
 /// facts, under the pre-open key.
-fn preopen_cache_bytes(key: &PreopenFileKey, value: &ElfExportFacts) -> u64 {
+fn preopen_cache_bytes(key: &PreopenFileKey, value: &PreopenEntry) -> u64 {
     let dynamic = value
+        .facts
         .exports
         .iter()
         .fold(0usize, |bytes, (name, _)| bytes.saturating_add(name.len()));
@@ -1348,6 +1383,7 @@ fn preopen_cache_bytes(key: &PreopenFileKey, value: &ElfExportFacts) -> u64 {
             .saturating_add(std::mem::size_of_val(value))
             .saturating_add(
                 value
+                    .facts
                     .exports
                     .len()
                     .saturating_mul(std::mem::size_of::<(String, u64)>()),
@@ -1355,6 +1391,7 @@ fn preopen_cache_bytes(key: &PreopenFileKey, value: &ElfExportFacts) -> u64 {
             .saturating_add(dynamic)
             .saturating_add(
                 value
+                    .facts
                     .excluded_anchor_ranges
                     .len()
                     .saturating_mul(std::mem::size_of::<(u64, u64)>()),
@@ -1644,12 +1681,12 @@ pub struct CaptureWorkBudget {
     loader_elf_facts: BTreeMap<LoaderFactsKey, LoaderElfFacts>,
     /// Export facts one completed examination proved, keyed before any
     /// open (mount namespace plus maps and target identity). The pre-open
-    /// consult hits here for unchanged files on 9p read-only mounts,
-    /// where the post-open cache never stores; every other filesystem
-    /// never consults and never stores, keeping its flow byte-identical.
-    /// Entries share the retained byte ceiling with the other file-fact
-    /// maps (separate entry count, like the refusal map).
-    preopen_file_facts: BTreeMap<PreopenFileKey, ElfExportFacts>,
+    /// consult hits here for unchanged files where the post-open cache
+    /// never stores; every other filesystem never consults and never
+    /// stores, keeping its flow byte-identical. Entries share the
+    /// retained byte ceiling with the other file-fact maps (separate
+    /// entry count, like the refusal map).
+    preopen_file_facts: BTreeMap<PreopenFileKey, PreopenEntry>,
     /// Keys of this pass's file-fact maps that a lookup hit or an insertion
     /// touched. Carried entries missing here are dead for this pass (a
     /// changed pin, a replaced library, a remounted overlay) and are the
@@ -2585,24 +2622,26 @@ impl CaptureWorkBudget {
         self.preopen_hits
     }
 
-    /// Look up pre-open facts by a key built before any open. A hit marks
-    /// the key touched like the post-open lookup.
-    pub(crate) fn preopen_facts_for(&mut self, key: &PreopenFileKey) -> Option<ElfExportFacts> {
-        let value = self.preopen_file_facts.get(key).cloned();
-        if value.is_some() {
-            self.touched_preopen_files.insert(*key);
+    /// Look up pre-open facts by a key built before any open. Only a
+    /// TTL-fresh entry hits; a stale one misses (the LRU reclaims it).
+    /// A hit marks the key touched like the post-open lookup.
+    pub(crate) fn preopen_facts_for(
+        &mut self,
+        key: &PreopenFileKey,
+        now_ns: u64,
+    ) -> Option<ElfExportFacts> {
+        let entry = self.preopen_file_facts.get(key)?;
+        if !preopen_entry_fresh(entry.stored_ns, now_ns) {
+            return None;
         }
-        value
+        self.touched_preopen_files.insert(*key);
+        Some(entry.facts.clone())
     }
 
     /// Retain pre-open facts under their pre-open key. Same entry limit
     /// value as the export facts (separate count, like the refusal map)
     /// and the same shared byte ceiling.
-    pub(crate) fn note_preopen_facts(
-        &mut self,
-        key: PreopenFileKey,
-        value: ElfExportFacts,
-    ) -> bool {
+    pub(crate) fn note_preopen_facts(&mut self, key: PreopenFileKey, value: PreopenEntry) -> bool {
         if !self.may_mutate_retained_state() {
             return false;
         }
@@ -7147,8 +7186,8 @@ fn record_module_cursor(
 }
 
 // Test-only: force the pre-open facts consult on. Production gates it
-// on 9p read-only mounts (whose files lib tests never see); tests run
-// on tmpfs and drive the consult with real range identity instead.
+// on overlayfs / 9p mounts (whose files lib tests never see); tests run
+// on tmpfs and drive the consult with real target identity instead.
 #[cfg(test)]
 thread_local! {
     pub(crate) static FORCE_PREOPEN_FACTS_CONSULT: std::cell::Cell<bool> =
@@ -9724,8 +9763,15 @@ fn scan_view_examined_mode(
             // a fresh proof below).
             if let Some(candidate) = preopen_key
                 && matches!(guarded, GuardOutcome::Proven)
+                && let Some(now_ns) = crate::attach::monotonic_ns()
             {
-                budget.note_preopen_facts(candidate, facts.clone());
+                budget.note_preopen_facts(
+                    candidate,
+                    PreopenEntry {
+                        facts: facts.clone(),
+                        stored_ns: now_ns,
+                    },
+                );
             }
             continue;
         }

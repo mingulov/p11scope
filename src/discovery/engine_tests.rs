@@ -16134,6 +16134,87 @@ fn inventory_preflight_all_four_causes_file_five_rows_at_both_sites() {
     }
 }
 
+/// Fix6 twin (both inventory preflights, same-cause dedup): a stale
+/// set with a proven exit beside TWO newcomers refused for the SAME
+/// cause (pin failure) publishes the proof row plus ONE gap row at
+/// either site — two same-cause losses share their one specified
+/// record (`observed-profile-v2.md:152`), while the proof row stays.
+/// Drives the shared helper directly with scripted answers; the
+/// verdict's unproven length pins the cause-set shape (a Vec that
+/// kept duplicates would file two gap rows here).
+#[test]
+fn inventory_preflight_same_cause_newcomers_share_one_gap_row() {
+    let pids = [
+        spawn_execed_sleep().id(),
+        spawn_execed_sleep().id(),
+        spawn_execed_sleep().id(),
+    ];
+    let mut engine = Engine::empty();
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(0), pids[0]).unwrap());
+    let newcomers = [
+        ProcessView::open(ProcessViewId(1), pids[1]).unwrap(),
+        ProcessView::open(ProcessViewId(2), pids[2]).unwrap(),
+    ];
+    let stale = BTreeSet::from([ProcessViewId(0), ProcessViewId(1), ProcessViewId(2)]);
+    let retained_stale = BTreeSet::from([ProcessViewId(0)]);
+    let extra = [&newcomers[0], &newcomers[1]];
+    for (site, changed_reason, gap_reason, label) in [
+        (
+            crate::discovery::generation_proof::ChangedGenerationSite::InventoryPreflight,
+            "an exact retained or newly opened process generation changed during inventory preflight",
+            "an exact retained or newly opened process generation was unverified during inventory preflight; exit or change unproven",
+            "first preflight",
+        ),
+        (
+            crate::discovery::generation_proof::ChangedGenerationSite::PostRetirementPreflight,
+            "an exact retained or newly opened process generation changed during post-retirement preflight",
+            "an exact retained or newly opened process generation was unverified during post-retirement preflight; exit or change unproven",
+            "post-retirement preflight",
+        ),
+    ] {
+        // Stale-ID order: the retained proof first, then the two
+        // same-cause newcomers.
+        engine.pin_probe_script.borrow_mut().extend([
+            PinProbeAnswer::State(Some(Ok(crate::process::OriginalGenerationState::Exited))),
+            PinProbeAnswer::State(Some(Err("simulated pin poll failure".to_string()))),
+            PinProbeAnswer::State(Some(Err("simulated pin poll failure".to_string()))),
+        ]);
+        let (skips, retained_unproven) =
+            engine.inventory_preflight_generation_skip(&retained_stale, &stale, &extra, site);
+        let proven = skips
+            .proven
+            .as_ref()
+            .unwrap_or_else(|| panic!("{label}: a mixed set files the changed row"));
+        assert_eq!(proven.subject, "live inventory generation");
+        assert_eq!(proven.reason, changed_reason);
+        assert_eq!(
+            skips.unproven.len(),
+            1,
+            "{label}: two same-cause refusals share one gap row"
+        );
+        let unproven = &skips.unproven[0];
+        assert_eq!(unproven.subject, "live inventory generation");
+        assert_eq!(unproven.reason, gap_reason);
+        assert!(
+            !retained_unproven,
+            "{label}: a proven retained exit never arms the named-target bail"
+        );
+        assert!(
+            engine.pin_probe_script.borrow().is_empty(),
+            "{label}: all three views consumed their answers: {:?}",
+            engine.pin_probe_script.borrow()
+        );
+    }
+    for pid in pids {
+        assert!(
+            !crate::process::generation_dead(pid),
+            "a refused child is still live and unchanged: {pid}"
+        );
+    }
+}
+
 /// Fix5 twin (first inventory preflight, tick-level): a retained child
 /// admitted on tick 1 and a newcomer admitted on tick 2 are both
 /// killed and reaped inside the tick-2 first preflight. The retained
@@ -47178,16 +47259,59 @@ fn named_unprovable_generation_refuses_unverified_before_attach() {
     assert_eq!(starts.get(), 0, "no attach action may follow the mismatch");
 }
 
-/// Fix5 control beside the precheck refusal twin: the same forced
-/// staleness with a readable live pin keeps the "changed" bail,
-/// pinned by its exact text — the stale report is positive
-/// exit-or-change evidence, and only a pin READ ERROR reroutes to
-/// the unverified refusal.
+/// Fix6 control beside the precheck refusal twins: a named view whose
+/// pin PROVES reuse (a live self pid under a retained start time one
+/// tick off) reads stale, and the pre-attach bail keeps "changed",
+/// pinned by its exact text. Only positive exit/reuse proof keeps
+/// the claim; every unproven recheck (read error, denial, missing
+/// custody, contradicted Current) refuses as unverified instead.
 #[test]
-fn named_readable_generation_keeps_changed_bail_before_attach() {
+fn named_proven_reuse_keeps_changed_bail_before_attach() {
+    let view = crate::process::reused_process_view_for_test(ProcessViewId(0), std::process::id())
+        .expect("a reused view over the live test process");
+    assert!(!view.still_the_same(), "the reused view reads stale");
+    assert_eq!(
+        view.retained_pin().original_discovery_state(),
+        Ok(crate::process::OriginalGenerationState::Reused),
+        "the fixture recheck genuinely proves reuse"
+    );
+    let mut discovered = lifecycle_discovered(vec![view]);
+    let starts = Cell::new(0);
+    let error = start_retained_with(
+        &mut discovered,
+        true,
+        crate::process::stale_view_ids,
+        |_, _| {
+            starts.set(starts.get() + 1);
+            Ok(FakeSession(Default::default()))
+        },
+    )
+    .expect_err("a proven named generation change is fatal");
+    assert_eq!(
+        error.to_string(),
+        "the named process generation changed before attach",
+        "{error:#}"
+    );
+    assert_eq!(starts.get(), 0, "no attach action may follow the mismatch");
+}
+
+/// Fix6 twin (attach precheck bail, contradicted recheck): forced
+/// staleness with a recheck that reads `Current` — the stale report
+/// was contradicted (a transient pin error ahead of a successful
+/// recheck) — must refuse as UNVERIFIED, never claim the generation
+/// changed before attach. Pre-fix a readable pin keeps "changed" for
+/// a live target.
+#[test]
+fn named_contradicted_generation_refuses_unverified_before_attach() {
     let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
     let stale = view.id();
     let mut discovered = lifecycle_discovered(vec![view]);
+    discovered
+        .pin_probe_script
+        .borrow_mut()
+        .extend([PinProbeAnswer::State(Some(Ok(
+            crate::process::OriginalGenerationState::Current,
+        )))]);
     let starts = Cell::new(0);
     let error = start_retained_with(
         &mut discovered,
@@ -47198,13 +47322,21 @@ fn named_readable_generation_keeps_changed_bail_before_attach() {
             Ok(FakeSession(Default::default()))
         },
     )
-    .expect_err("a named generation change is fatal");
-    assert_eq!(
-        error.to_string(),
-        "the named process generation changed before attach",
+    .expect_err("a contradicted named generation refuses startup");
+    assert!(
+        error.to_string().contains("was unverified before attach"),
         "{error:#}"
     );
+    assert!(
+        !error.to_string().contains("changed"),
+        "the refusal never claims the generation changed: {error:#}"
+    );
     assert_eq!(starts.get(), 0, "no attach action may follow the mismatch");
+    assert!(
+        discovered.pin_probe_script.borrow().is_empty(),
+        "the state recheck consumed its answer: {:?}",
+        discovered.pin_probe_script.borrow()
+    );
 }
 
 /// Fix5 twin (attach postcheck bail, tier-1 F1): the same unprovable
@@ -47245,14 +47377,31 @@ fn named_unprovable_generation_refuses_unverified_while_attaching() {
     assert!(!log.borrow().contains(&"consume"));
 }
 
-/// Fix5 control beside the postcheck refusal twin: the same forced
-/// staleness with a readable live pin keeps the "changed" bail,
-/// pinned by its exact text, and still drops the just-created session
-/// before any event consumption.
+/// Fix6 control beside the postcheck refusal twins: a named view
+/// whose pin PROVES exit (a killed-unreaped child: its pidfd is
+/// ready, so the discovery observation reads `Exited`) keeps the
+/// "changed" bail, pinned by its exact text, and still drops the
+/// just-created session before any event consumption. Stale timing
+/// is forced to select the postcheck site; the exit proof itself is
+/// a live pin read.
 #[test]
-fn named_readable_generation_keeps_changed_bail_while_attaching() {
-    let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+fn named_exited_generation_keeps_changed_bail_while_attaching() {
+    let mut child = spawn_execed_sleep();
+    let pid = child.id();
+    let view = ProcessView::open(ProcessViewId(0), pid).unwrap();
+    assert!(
+        view.retained_pin().pidfd_raw_for_test().is_some(),
+        "the twin holds a real pidfd, or it tests the wrong pin shape"
+    );
     let stale = view.id();
+    child.kill().unwrap();
+    wait_until_zombie(pid);
+    assert!(!view.still_the_same(), "the killed child reads stale");
+    assert_eq!(
+        view.retained_pin().original_discovery_state(),
+        Ok(crate::process::OriginalGenerationState::Exited),
+        "the fixture recheck genuinely proves exit"
+    );
     let mut discovered = lifecycle_discovered(vec![view]);
     let checks = Cell::new(0);
     let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
@@ -47268,7 +47417,7 @@ fn named_readable_generation_keeps_changed_bail_while_attaching() {
             Ok(FakeSession(std::rc::Rc::clone(&log)))
         },
     )
-    .expect_err("a named generation change is fatal");
+    .expect_err("a proven named generation change is fatal");
     assert_eq!(
         error.to_string(),
         "the named process generation changed while attaching",
@@ -47276,6 +47425,70 @@ fn named_readable_generation_keeps_changed_bail_while_attaching() {
     );
     assert_eq!(*log.borrow(), ["start", "drop"]);
     assert!(!log.borrow().contains(&"consume"));
+    child.wait().unwrap();
+}
+
+/// Fix6 twin (attach postcheck bail, contradicted recheck): forced
+/// staleness after the session starts with a recheck that reads
+/// `Current` must refuse as UNVERIFIED, never claim the generation
+/// changed while attaching. The just-created session still drops
+/// before any event consumption. Pre-fix a readable pin keeps
+/// "changed" for a live target.
+#[test]
+fn named_contradicted_generation_refuses_unverified_while_attaching() {
+    let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+    let stale = view.id();
+    let mut discovered = lifecycle_discovered(vec![view]);
+    discovered
+        .pin_probe_script
+        .borrow_mut()
+        .extend([PinProbeAnswer::State(Some(Ok(
+            crate::process::OriginalGenerationState::Current,
+        )))]);
+    let checks = Cell::new(0);
+    let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let error = start_retained_with(
+        &mut discovered,
+        true,
+        |_| {
+            checks.set(checks.get() + 1);
+            (checks.get() == 2).then_some(stale).into_iter().collect()
+        },
+        |_, _| {
+            log.borrow_mut().push("start");
+            Ok(FakeSession(std::rc::Rc::clone(&log)))
+        },
+    )
+    .expect_err("a contradicted named generation refuses startup");
+    assert!(
+        error.to_string().contains("was unverified while attaching"),
+        "{error:#}"
+    );
+    assert!(
+        !error.to_string().contains("changed"),
+        "the refusal never claims the generation changed: {error:#}"
+    );
+    assert_eq!(*log.borrow(), ["start", "drop"]);
+    assert!(!log.borrow().contains(&"consume"));
+    assert!(
+        discovered.pin_probe_script.borrow().is_empty(),
+        "the state recheck consumed its answer: {:?}",
+        discovered.pin_probe_script.borrow()
+    );
+}
+
+/// Fix6 pin (recheck missing-custody arm): a stale ID with no
+/// retained view is unproven, never "changed". Unreachable for
+/// named captures (their stale IDs always name the retained view),
+/// but the arm must stay fail-closed: a future caller passing an
+/// unknown ID must get the unverified refusal, not a change claim.
+#[test]
+fn named_recheck_without_custody_is_unproven() {
+    let engine = Engine::empty();
+    assert!(
+        engine.named_generation_unproven_on_pin_recheck(&[ProcessViewId(7)]),
+        "a stale ID with no retained view never keeps a change claim"
+    );
 }
 
 /// View-collapse fix8 F3 (codex blocking): an initial named-process pin
@@ -93545,14 +93758,26 @@ fn named_generation_loss_with_unprovable_pin_refuses_unverified_during_loader_ar
     child.wait().unwrap();
 }
 
-/// Fix5 control beside the arming refusal twin: the same forced loss
-/// with a readable live pin keeps the "changed" bail — the stale
-/// report is positive exit-or-change evidence, and only a pin READ
-/// ERROR reroutes to the unverified refusal.
+/// Fix6 control beside the arming refusal twins: the same forced
+/// loss with a recheck that PROVES exit (scripted `Exited` after
+/// live early checks — an exit that raced in between the loss
+/// report and the recheck) keeps the "changed" bail, pinned by its
+/// exact text. Only positive exit/reuse proof keeps the claim. The
+/// script answers, in order, the exit probe, the retirement
+/// re-verify's exit probe and state probe, the two exit probes
+/// around the loss mark, and the bail's state recheck.
 #[test]
-fn named_generation_loss_with_readable_pin_keeps_changed_bail_during_loader_arming() {
+fn named_proven_exit_race_keeps_changed_bail_during_loader_arming() {
     let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
     engine.lose_generation_after_arm_for_test = true;
+    engine.pin_probe_script.borrow_mut().extend([
+        PinProbeAnswer::Exited(Ok(false)),
+        PinProbeAnswer::Exited(Ok(false)),
+        PinProbeAnswer::State(Some(Ok(crate::process::OriginalGenerationState::Current))),
+        PinProbeAnswer::Exited(Ok(false)),
+        PinProbeAnswer::Exited(Ok(false)),
+        PinProbeAnswer::State(Some(Ok(crate::process::OriginalGenerationState::Exited))),
+    ]);
     let error = engine
         .arm_loader_or_partial(
             0,
@@ -93560,14 +93785,220 @@ fn named_generation_loss_with_readable_pin_keeps_changed_bail_during_loader_armi
             &mut true,
             &mut PendingViewRetirements::new(),
         )
-        .expect_err("a named generation loss still refuses the capture");
+        .expect_err("a proven named generation loss still refuses the capture");
     let text = format!("{error:#}");
+    assert_eq!(
+        text, "the named process generation changed during loader arming",
+        "a proven stale report keeps the changed bail: {text}"
+    );
     assert!(
-        text.contains("changed during loader arming"),
-        "a readable stale report keeps the changed bail: {text}"
+        engine.pin_probe_script.borrow().is_empty(),
+        "the exit probes and the state recheck consumed their answers: {:?}",
+        engine.pin_probe_script.borrow()
     );
     child.kill().unwrap();
     child.wait().unwrap();
+}
+
+/// Fix6 twin (loader-arming bail, contradicted recheck): the same
+/// forced loss with a recheck that reads `Current` — the stale
+/// report was contradicted — must refuse as UNVERIFIED, never claim
+/// the generation changed during loader arming. Pre-fix a readable
+/// pin keeps "changed" for a live target. Same script shape as the
+/// control above, with a contradicted recheck.
+#[test]
+fn named_contradicted_generation_refuses_unverified_during_loader_arming() {
+    let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+    engine.lose_generation_after_arm_for_test = true;
+    engine.pin_probe_script.borrow_mut().extend([
+        PinProbeAnswer::Exited(Ok(false)),
+        PinProbeAnswer::Exited(Ok(false)),
+        PinProbeAnswer::State(Some(Ok(crate::process::OriginalGenerationState::Current))),
+        PinProbeAnswer::Exited(Ok(false)),
+        PinProbeAnswer::Exited(Ok(false)),
+        PinProbeAnswer::State(Some(Ok(crate::process::OriginalGenerationState::Current))),
+    ]);
+    let error = engine
+        .arm_loader_or_partial(
+            0,
+            &mut ScriptedSession::default(),
+            &mut true,
+            &mut PendingViewRetirements::new(),
+        )
+        .expect_err("a contradicted named generation refuses the capture");
+    let text = format!("{error:#}");
+    assert!(
+        text.contains("was unverified during loader arming"),
+        "the refusal names the unverified generation: {text}"
+    );
+    assert!(
+        !text.contains("changed"),
+        "the refusal never claims the generation changed: {text}"
+    );
+    assert!(
+        engine.pin_probe_script.borrow().is_empty(),
+        "the exit probes and the state recheck consumed their answers: {:?}",
+        engine.pin_probe_script.borrow()
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+/// Fix6 twin (loader-attachment bail C4, unprovable pin): a named
+/// target whose generation is lost inside `attach_dynamic_loader`
+/// (a scripted kill between the arm's precheck and postcheck) but
+/// whose pin reads fail (scripted poll failures — the exit probes
+/// still report not exited) must refuse as UNVERIFIED, never claim
+/// the generation changed during loader attachment. Pre-fix the
+/// bail claims "changed" with no positive proof. The script
+/// answers, in order, the inner arm's queue exit probe and state
+/// probe, mark exit probe, C4-guard exit probe and state recheck,
+/// then the outer wrapper's expected-exit probe, queue probes, mark
+/// probe and exit gate before the ordinary-error pass-through.
+#[test]
+fn named_unprovable_generation_refuses_unverified_during_loader_attachment() {
+    let (child, mut engine, _modules) = engine_with_one_accepted_provider();
+    let pid = child.id();
+    engine.pin_probe_script.borrow_mut().extend([
+        PinProbeAnswer::Exited(Ok(false)),
+        PinProbeAnswer::State(Some(Err("simulated pin poll failure".to_string()))),
+        PinProbeAnswer::Exited(Ok(false)),
+        PinProbeAnswer::Exited(Ok(false)),
+        PinProbeAnswer::State(Some(Err("simulated pin poll failure".to_string()))),
+        PinProbeAnswer::Exited(Ok(false)),
+        PinProbeAnswer::Exited(Ok(false)),
+        PinProbeAnswer::State(Some(Err("simulated pin poll failure".to_string()))),
+        PinProbeAnswer::Exited(Ok(false)),
+        PinProbeAnswer::Exited(Ok(false)),
+    ]);
+    let mut session = ScriptedSession::default();
+    session.lose_generation_at_dynamic_loader_attach(pid);
+    let error = engine
+        .arm_loader_or_partial(
+            0,
+            &mut session,
+            &mut true,
+            &mut PendingViewRetirements::new(),
+        )
+        .expect_err("an unproven named generation refuses the capture");
+    let text = format!("{error:#}");
+    assert!(
+        text.contains("was unverified during loader attachment"),
+        "the refusal names the unverified generation: {text}"
+    );
+    assert!(
+        !text.contains("changed"),
+        "the refusal never claims the generation changed: {text}"
+    );
+    assert!(
+        engine.pin_probe_script.borrow().is_empty(),
+        "every probe consumed its answer: {:?}",
+        engine.pin_probe_script.borrow()
+    );
+    // The scripted attach killed and reaped the child above; its
+    // handle drops here without waiting.
+    drop(child);
+}
+
+/// Fix6 twin (loader-attachment bail C4, contradicted recheck): the
+/// same lost attach with a recheck that reads `Current` must refuse
+/// as UNVERIFIED, never claim the generation changed during loader
+/// attachment. Same script shape as the unprovable twin above, with
+/// contradicted state answers.
+#[test]
+fn named_contradicted_generation_refuses_unverified_during_loader_attachment() {
+    let (child, mut engine, _modules) = engine_with_one_accepted_provider();
+    let pid = child.id();
+    let contradicted =
+        || PinProbeAnswer::State(Some(Ok(crate::process::OriginalGenerationState::Current)));
+    engine.pin_probe_script.borrow_mut().extend([
+        PinProbeAnswer::Exited(Ok(false)),
+        contradicted(),
+        PinProbeAnswer::Exited(Ok(false)),
+        PinProbeAnswer::Exited(Ok(false)),
+        contradicted(),
+        PinProbeAnswer::Exited(Ok(false)),
+        PinProbeAnswer::Exited(Ok(false)),
+        contradicted(),
+        PinProbeAnswer::Exited(Ok(false)),
+        PinProbeAnswer::Exited(Ok(false)),
+    ]);
+    let mut session = ScriptedSession::default();
+    session.lose_generation_at_dynamic_loader_attach(pid);
+    let error = engine
+        .arm_loader_or_partial(
+            0,
+            &mut session,
+            &mut true,
+            &mut PendingViewRetirements::new(),
+        )
+        .expect_err("a contradicted named generation refuses the capture");
+    let text = format!("{error:#}");
+    assert!(
+        text.contains("was unverified during loader attachment"),
+        "the refusal names the unverified generation: {text}"
+    );
+    assert!(
+        !text.contains("changed"),
+        "the refusal never claims the generation changed: {text}"
+    );
+    assert!(
+        engine.pin_probe_script.borrow().is_empty(),
+        "every probe consumed its answer: {:?}",
+        engine.pin_probe_script.borrow()
+    );
+    // The scripted attach killed and reaped the child above; its
+    // handle drops here without waiting.
+    drop(child);
+}
+
+/// Fix6 control beside the loader-attachment refusal twins: the same
+/// lost attach with a recheck that PROVES reuse (scripted `Reused`
+/// after live early checks — a reuse that raced in between the loss
+/// report and the recheck) keeps the "changed" bail, pinned by its
+/// exact text end to end through the outer ordinary-error
+/// pass-through. Only positive exit/reuse proof keeps the claim.
+#[test]
+fn named_proven_reuse_race_keeps_changed_bail_during_loader_attachment() {
+    let (child, mut engine, _modules) = engine_with_one_accepted_provider();
+    let pid = child.id();
+    let contradicted =
+        || PinProbeAnswer::State(Some(Ok(crate::process::OriginalGenerationState::Current)));
+    engine.pin_probe_script.borrow_mut().extend([
+        PinProbeAnswer::Exited(Ok(false)),
+        contradicted(),
+        PinProbeAnswer::Exited(Ok(false)),
+        PinProbeAnswer::Exited(Ok(false)),
+        PinProbeAnswer::State(Some(Ok(crate::process::OriginalGenerationState::Reused))),
+        PinProbeAnswer::Exited(Ok(false)),
+        PinProbeAnswer::Exited(Ok(false)),
+        contradicted(),
+        PinProbeAnswer::Exited(Ok(false)),
+        PinProbeAnswer::Exited(Ok(false)),
+    ]);
+    let mut session = ScriptedSession::default();
+    session.lose_generation_at_dynamic_loader_attach(pid);
+    let error = engine
+        .arm_loader_or_partial(
+            0,
+            &mut session,
+            &mut true,
+            &mut PendingViewRetirements::new(),
+        )
+        .expect_err("a proven named generation loss still refuses the capture");
+    let text = format!("{error:#}");
+    assert_eq!(
+        text, "the named process generation changed during loader attachment",
+        "a proven stale report keeps the changed bail: {text}"
+    );
+    assert!(
+        engine.pin_probe_script.borrow().is_empty(),
+        "every probe consumed its answer: {:?}",
+        engine.pin_probe_script.borrow()
+    );
+    // The scripted attach killed and reaped the child above; its
+    // handle drops here without waiting.
+    drop(child);
 }
 
 /// The export-hook generation-change mark: silent for an ending group,

@@ -2439,8 +2439,15 @@ impl IngestedJointQuantum {
             {
                 // This original target advanced without a delivery. Charge
                 // the same shared slice so later targets and the machine's
-                // no-progress guard observe the actual committed work.
-                *remaining -= 1;
+                // no-progress guard observe the actual committed work. The
+                // decision credit is reserved: with no budget left the
+                // same seal retries with fresh budget instead of advancing
+                // for free or underflowing the slice.
+                let Some(left) = remaining.checked_sub(1) else {
+                    // (`storage` drops here, refunding its reservation.)
+                    return QuantumSealProgress::LocalPending;
+                };
+                *remaining = left;
                 self.advance_consumer(ConsumerState::Future);
                 return QuantumSealProgress::AwaitFutureInput;
             }

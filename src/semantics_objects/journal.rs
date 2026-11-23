@@ -9061,6 +9061,15 @@ impl JournalAdapter {
                 // inline allowance to what remains so a later doom or
                 // void never spends past the service budget.
                 self.inline_credit = (*budget).min(SCOPED_RECOVERY_SLICE);
+                if *budget == 0 {
+                    // The final row spent the last credit: the completed
+                    // clear stays cached, but post-barrier seal work and
+                    // its Future settlement need a paid decision credit
+                    // of their own. Yield so the same frame resumes with
+                    // fresh budget (re-running entry, fault and birth
+                    // checks) instead of settling at zero.
+                    return SealAttempt::Yielded;
+                }
             }
             BarrierCheck::Yielded => return SealAttempt::Yielded,
         }

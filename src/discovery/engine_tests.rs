@@ -21247,6 +21247,215 @@ fn owned_tree_watch_backs_off_unproductive_members() {
     sleeper.wait().expect("reap sleeper");
 }
 
+/// Pre-open facts consult: a watch repeat over an unchanged member reuses
+/// the proven file facts instead of reopening and re-proving every
+/// mapping. The rotation still visits the member (its visit count grows),
+/// but no second deep scan runs. Only the sleeper is watched: the test
+/// runner's own maps churn (allocator mmaps) would force re-examination
+/// and make the deep count nondeterministic. The consult is forced on:
+/// production gates it on 9p read-only mounts, which lib tests never see.
+#[test]
+fn owned_tree_watch_repeat_over_unchanged_member_skips_deep_rescan() {
+    let dir = tempfile::tempdir().expect("watch cgroup dir");
+    let mut sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleeper");
+    std::fs::write(
+        dir.path().join("cgroup.procs"),
+        format!("{}\n", sleeper.id()),
+    )
+    .expect("write cgroup.procs");
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 7,
+        path: dir.path().into(),
+        dir: Arc::new(File::open(dir.path()).expect("open watch dir")),
+    };
+    engine.owned_run_pid = Some(std::process::id());
+    engine.owned_watch_run_budget_ns = u64::MAX;
+    crate::discovery::scan::FORCE_PREOPEN_FACTS_CONSULT.with(|force| force.set(true));
+    let first = 1_000u64;
+    engine.owned_tree_watch(Some(first));
+    assert_eq!(
+        engine.deep_scans(),
+        1,
+        "the first visit deep-scans the member"
+    );
+    let scans_after_first: u32 = engine
+        .owned_watch_unproven
+        .values()
+        .map(|entry| entry.scans)
+        .sum();
+    assert_eq!(scans_after_first, 1, "one visit after the first run");
+    engine.owned_tree_watch(Some(first + OWNED_WATCH_SCAN_MIN_NS));
+    let scans_after_second: u32 = engine
+        .owned_watch_unproven
+        .values()
+        .map(|entry| entry.scans)
+        .sum();
+    assert_eq!(
+        scans_after_second, 2,
+        "the rotation still visits the member"
+    );
+    assert_eq!(
+        engine.deep_scans(),
+        1,
+        "the unchanged repeat reuses proven facts (no second deep scan)"
+    );
+    crate::discovery::scan::FORCE_PREOPEN_FACTS_CONSULT.with(|force| force.set(false));
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
+/// The cheap repeat performs no provider metadata reads: a hit opens
+/// nothing and fstats nothing, while a full examination opens and pins
+/// every mapping. (Per-pass work without a charge is an INV-2 finding
+/// class; the hit path charges its own lookups instead.)
+#[test]
+fn owned_tree_watch_repeat_over_unchanged_member_reads_no_provider_metadata() {
+    let dir = tempfile::tempdir().expect("watch cgroup dir");
+    let mut sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleeper");
+    std::fs::write(
+        dir.path().join("cgroup.procs"),
+        format!("{}\n", sleeper.id()),
+    )
+    .expect("write cgroup.procs");
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 7,
+        path: dir.path().into(),
+        dir: Arc::new(File::open(dir.path()).expect("open watch dir")),
+    };
+    engine.owned_run_pid = Some(std::process::id());
+    engine.owned_watch_run_budget_ns = u64::MAX;
+    crate::discovery::scan::FORCE_PREOPEN_FACTS_CONSULT.with(|force| force.set(true));
+    let first = 1_000u64;
+    let count_first = std::rc::Rc::new(std::cell::Cell::new(0u32));
+    {
+        let count_first = count_first.clone();
+        crate::discovery::identity::provider_metadata_read_test::observe(
+            move |_| count_first.set(count_first.get() + 1),
+            || engine.owned_tree_watch(Some(first)),
+        );
+    }
+    assert!(
+        count_first.get() > 4,
+        "the first visit reads provider metadata (non-vacuous): {}",
+        count_first.get()
+    );
+    let count_second = std::rc::Rc::new(std::cell::Cell::new(0u32));
+    {
+        let count_second = count_second.clone();
+        crate::discovery::identity::provider_metadata_read_test::observe(
+            move |_| count_second.set(count_second.get() + 1),
+            || engine.owned_tree_watch(Some(first + OWNED_WATCH_SCAN_MIN_NS)),
+        );
+    }
+    assert!(
+        count_second.get() * 2 < count_first.get(),
+        "the unchanged repeat reads no provider metadata (hit opens nothing): first={} second={}",
+        count_first.get(),
+        count_second.get()
+    );
+    crate::discovery::scan::FORCE_PREOPEN_FACTS_CONSULT.with(|force| force.set(false));
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
+/// The consult misses when the file changed: overwriting a member-mapped
+/// file between two watch runs re-reads it, while unchanged mappings
+/// reuse. Guard: passes before (everything re-reads) and after (only the
+/// changed file re-reads); an always-hit cache fails it (nothing re-read).
+/// The member is `sh` (dynamically linked everywhere, unlike the static
+/// Rust `sleep` on some hosts) waiting on a `sleep 30` grandchild and
+/// preloading a tmpfs copy of libc so the test owns the bytes it
+/// overwrites; the maps check keeps a silently ignored preload from going
+/// vacuous. Killing `sh` orphans the grandchild, which exits on its own
+/// 30 s bound; nothing else tracks it.
+#[test]
+fn owned_tree_watch_repeat_after_file_overwrite_rereads_the_file() {
+    let dir = tempfile::tempdir().expect("watch cgroup dir");
+    let libc = ["usr/lib/x86_64-linux-gnu/libc.so.6", "usr/lib64/libc.so.6"]
+        .into_iter()
+        .map(|relative| std::path::PathBuf::from("/").join(relative))
+        .find(|candidate| candidate.is_file())
+        .expect("a system libc to copy");
+    let loader = [
+        "usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+        "usr/lib64/ld-linux-x86-64.so.2",
+    ]
+    .into_iter()
+    .map(|relative| std::path::PathBuf::from("/").join(relative))
+    .find(|candidate| candidate.is_file())
+    .expect("a system loader to overwrite with");
+    let copy = dir.path().join("preload-libc.so.6");
+    std::fs::copy(&libc, &copy).expect("copy libc for preloading");
+    let copied = std::fs::metadata(&copy).expect("the preloaded copy exists");
+    assert!(
+        copied.is_file() && copied.len() > 100_000,
+        "the preloaded copy is a real file: {copied:?}"
+    );
+    let mut sleeper = std::process::Command::new("sh")
+        .args(["-c", "LD_PRELOAD= sleep 30"])
+        .env("LD_PRELOAD", &copy)
+        .spawn()
+        .expect("spawn preloaded shell");
+    // The member may not have exec'd yet when first read (its pre-exec
+    // maps are its parent's); poll boundedly for the preloaded mapping.
+    let mut preloaded = false;
+    for _ in 0..100 {
+        let maps = std::fs::read_to_string(format!("/proc/{}/maps", sleeper.id()))
+            .expect("read sleeper maps");
+        if maps.lines().any(|line| line.contains("preload-libc.so.6")) {
+            preloaded = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        preloaded,
+        "the sleeper maps the preloaded copy (non-vacuous preload)"
+    );
+    std::fs::write(
+        dir.path().join("cgroup.procs"),
+        format!("{}\n", sleeper.id()),
+    )
+    .expect("write cgroup.procs");
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 7,
+        path: dir.path().into(),
+        dir: Arc::new(File::open(dir.path()).expect("open watch dir")),
+    };
+    engine.owned_run_pid = Some(std::process::id());
+    engine.owned_watch_run_budget_ns = u64::MAX;
+    crate::discovery::scan::FORCE_PREOPEN_FACTS_CONSULT.with(|force| force.set(true));
+    let first = 1_000u64;
+    engine.owned_tree_watch(Some(first));
+    let io_after_first = engine.budget.attempted_io_bytes();
+    assert!(
+        io_after_first > 30_000,
+        "the first visit reads file bytes (non-vacuous): {io_after_first}"
+    );
+    std::fs::copy(&loader, &copy).expect("overwrite the preloaded copy");
+    engine.owned_tree_watch(Some(first + OWNED_WATCH_SCAN_MIN_NS));
+    let io_second = engine
+        .budget
+        .attempted_io_bytes()
+        .saturating_sub(io_after_first);
+    assert!(
+        io_second > 5_000,
+        "the changed file is re-read (not served stale): second-run bytes={io_second}"
+    );
+    crate::discovery::scan::FORCE_PREOPEN_FACTS_CONSULT.with(|force| force.set(false));
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
 /// Rotation reaches every member, not just the extremes: with three
 /// unproven members the middle pid scans within three runs instead
 /// of starving behind the newest and oldest.

@@ -12421,9 +12421,9 @@ fn hosted_pipeline_runs_one_full_matrix_per_commit() {
                 "    needs: [coverage, select]\n    if: needs.select.outputs.run_coverage_report == 'true'\n"
             ));
         } else if job == "contracts" {
-            assert!(block.starts_with(&format!(
-                "    name: contracts-${{{{ matrix.shard }}}}\n    needs: [dedupe, select]\n    if: needs.dedupe.outputs.run == 'true' && needs.select.outputs.run_contracts == 'true'\n"
-            )));
+            assert!(block.starts_with(
+                "    name: contracts-${{ matrix.shard }}\n    needs: [dedupe, select]\n    if: needs.dedupe.outputs.run == 'true' && needs.select.outputs.run_contracts == 'true'\n"
+            ));
         } else if job == "bpf-noninterference" {
             assert_hosted_bpf_noninterference(&ci).unwrap();
         } else {

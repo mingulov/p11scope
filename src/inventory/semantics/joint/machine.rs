@@ -4511,6 +4511,12 @@ impl LiveJointMachine {
                 // retired, or a shell lane with no capture) stay
                 // S1Only with their deferred gap already disclosed.
                 coordinator.tick_reseed_cooldowns();
+                // The same pass unit serves every fallback successor
+                // backoff (the adapter owns that decision).
+                coordinator
+                    .joint_capture_mut()
+                    .adapter_mut()
+                    .tick_fallback_backoff();
                 coordinator.queue_reseed_for_awaiting_feeds();
                 for image in coordinator.drain_joint_reseed_queue() {
                     coordinator

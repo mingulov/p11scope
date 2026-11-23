@@ -296,13 +296,28 @@ committed state exactly as before.
 
 ## 8. Recorded deviations (NOT changed by this model)
 
-- D1 View-id reuse: ENFORCED by recycled-ID holdback (see §2). A
-  recycled numeric id can never alias a committed carried row within
-  one assembly: the id is unavailable for admission until its last
-  carried row retires. No per-row generation marking is needed while
-  the holdback stands; if the holdback is ever relaxed, the merge
-  (which matches on the numeric view id), the binder, and the scrub
-  must all become generation-qualified first.
+> Amended 2026-11-23 (v072-carried-view-ids fix1): D1's holdback
+> mechanism is superseded by the reserved-owner substitution below.
+> Authority: the v072 lane brief tasking the Opus C1 prescription
+> (reserved owner per file, numeric ID released at once, held IDs
+> counted in `free_slots`); the six directed assertion updates and
+> this substitution still await explicit controller/owner ruling
+> confirmation (see the fix1 lane report). The safety invariant —
+> a recycled numeric id can never alias a committed carried row —
+> is preserved by construction and restated below.
+
+- D1 View-id reuse: ENFORCED by reserved-owner substitution (was:
+  recycled-ID holdback, see §2). A recycled numeric id can never
+  alias a committed carried row within one assembly: carried rows
+  ride under the reserved `CARRIED_VIEW_ID` owner instead of naming
+  numeric IDs, so the numeric id recycles at once while the retained
+  row can never file claims under the reused generation (the rebuild
+  choke denies the reserved owner; it never enters currency, stale,
+  or admission checks). Residual numeric holders, if any, still hold
+  via the maintained holdback (a commit/release-boundary set read O(1)
+  by allocation and the scheduler; the hold semantics are unchanged).
+  No per-row generation marking is needed: the merge key includes the
+  view, and aliasing claims across generations stays prohibited.
 - D2 Previously-carried currency: newly retired views leave
   `candidate.views`; previously carried views still enter it (preserved
   fix3 behavior; the stale-refusal follow-up owns it). Ownership
@@ -332,7 +347,9 @@ One table-driven suite over entry points × invariants:
   (`merge_ownership_entry_outcomes_follow_the_case_table`,
   `engine_tests.rs:95635`): E1/E2/E4/E5/E6/E7 × {carried→refused at
   the currency check with the generation marker witnessed,
-  healthy→committed with no refusal}, except E5's healthy cell,
+  healthy→committed with no refusal}, except E2's carried cell
+  (commits the detach now that no retired numeric view rides, per
+  the D1 amendment above) and E5's healthy cell,
   which is the empty-scan control (the rescan runs — its memory-scan
   attempt is witnessed — and honestly commits nothing because the
   harness stages no found modules). The committing E5 positive is
@@ -351,9 +368,11 @@ One table-driven suite over entry points × invariants:
   (`scanned_rebind_cursor_denies_carried_views_but_reconciles_their_rows`,
   `identity.rs:19036`) and its graph-entry bound regression
   (`terminal_rebind_authority_credit_stays_bounded_over_many_live_views`,
-  `engine_tests.rs:76407`); view-id holdback has its admission regression
-  (`merge_ownership_e1_reused_view_id_holds_while_carried_row_rides`,
-  `engine_tests.rs:93751`); E11 has its snapshot control
+  `engine_tests.rs:76407`); view-id release has its admission regression
+  (was: `merge_ownership_e1_reused_view_id_holds_while_carried_row_rides`;
+  now: `merge_ownership_e1_reused_view_id_releases_while_carried_row_rides`,
+  asserting at-once reuse beside a claimless reserved-owner row, per the
+  D1 amendment above); E11 has its snapshot control
   (`merge_ownership_e11_snapshot_binds_fresh_views_with_claims`,
   `engine_tests.rs:94887`), asserting each bound row's exact table
   object, (object, offset) targets and pins; E10/E12 name their

@@ -102279,6 +102279,12 @@ fn carried_fix1_cached_currency_excludes_reserved_carrier() {
         "a stable carrier is not a stale generation: {:?}",
         admission.stale_views
     );
+    // The staleness choke itself never compares the reserved owner as a
+    // generation, even when one reaches it directly.
+    assert!(
+        stale_process_views(&[], &[], &BTreeSet::from([Engine::CARRIED_VIEW_ID])).is_empty(),
+        "staleness skips the reserved owner"
+    );
     // Cached path 2: empty churn carrying a checked-clean newcomer.
     let id_n = engine.allocate_view_id_for_newcomer(me).unwrap();
     let view_n = ProcessView::open(id_n, me).unwrap();
@@ -102543,6 +102549,32 @@ fn carried_fix1_exports_only_live_scan_keeps_carrier_tables() {
             "nothing retires while the carrier supplies the slot (pending={pending}): {:?}",
             next.delta.retire
         );
+        // Phase 3: the quiet riding tick takes the cached path (the gate
+        // mirrors the coverage proof) and still keeps the carrier. The
+        // full-rebuild kill switch proves the path: armed, it fails a
+        // full rebuild while the cached path succeeds.
+        engine.plan = next.plan;
+        engine.pinned = next.pinned;
+        engine.modules = next.modules;
+        engine.plan_rebuild_stable = true;
+        engine.fail_full_candidate_rebuild_for_test = true;
+        engine.set_disable_empty_tick_fast_path_for_test(true);
+        assert!(
+            engine
+                .inventory_candidate(&empty, &[], &[], Vec::new(), &empty)
+                .is_err(),
+            "the kill switch arms the full path (pending={pending})"
+        );
+        engine.set_disable_empty_tick_fast_path_for_test(false);
+        let quiet = engine
+            .inventory_candidate(&empty, &[], &[], Vec::new(), &empty)
+            .expect("the cached path succeeds with the kill switch armed");
+        assert!(
+            quiet.modules.iter().any(|module| {
+                module.scanned.view == Engine::CARRIED_VIEW_ID && module.object == object
+            }),
+            "the cached path keeps the carrier too (pending={pending})"
+        );
     }
 }
 
@@ -102766,7 +102798,9 @@ fn carried_fix1_held_ids_maintained_without_table_sweep() {
         "a released ID with a naming row stays held"
     );
     // Twin 2: the same state rebuilt so the row rides under the reserved
-    // carrier and nothing numeric is held.
+    // carrier and nothing numeric is held. Committed through the
+    // production apply so the commit-boundary refresh is pinned too —
+    // no explicit refresh call here.
     let mut free = setup();
     free.views.retain(|view| view.id() != view_r);
     free.release_view_id(view_r);
@@ -102774,9 +102808,10 @@ fn carried_fix1_held_ids_maintained_without_table_sweep() {
     let rebuilt = free
         .inventory_candidate(&BTreeSet::from([view_r]), &[], &[], Vec::new(), &empty)
         .unwrap();
-    free.plan = rebuilt.plan;
-    free.pinned = rebuilt.pinned;
-    free.modules = rebuilt.modules;
+    let mut session = ScriptedSession::default();
+    let mut additions_allowed = true;
+    free.apply_candidate(&mut session, rebuilt, &mut additions_allowed, false, &[])
+        .expect("the rebuild applies");
     assert_eq!(
         free.held_view_id_count(),
         0,
@@ -103046,5 +103081,89 @@ fn carried_fix1_exited_prover_stages_unknown_loader_as_transient() {
     assert!(
         !staged.proving_retained,
         "the recycled numeric ID proves no retention"
+    );
+}
+
+#[test]
+fn carried_fix1_owned_learn_never_restats_learned_carriers() {
+    // Finding 3 (repeat apply): a second apply over already-settled
+    // carriers performs no held-file operation — the exact keys skip
+    // before the duplicate/stat while staging stays put. Needs the
+    // fix1 probe hooks, so it lands with the implementation; the
+    // dedup-removal mutation kills it (second-apply probes read 3).
+    use crate::discovery::identity::test_fixture::real_scan_pin;
+    let dir = tempfile::tempdir().expect("learned backing dir");
+    let mut pins = PinnedObjects::empty();
+    for index in 0..3 {
+        let backing = dir.path().join(format!("libprov{index}.so"));
+        std::fs::write(&backing, format!("p11scope-fixture:provider-bytes-{index}"))
+            .expect("write backing");
+        let sha = format!("{:064x}", 0xcd0000u64 + index as u64);
+        let skips = pins.absorb(real_scan_pin(&backing, None, 400, &sha));
+        assert!(skips.is_empty(), "{skips:?}");
+    }
+    let objects: Vec<PinnedObjectId> = pins.pinned().map(|pin| pin.id).collect();
+    assert_eq!(objects.len(), 3, "every backing file pins distinctly");
+    let proofs: Vec<OwnedLearnProof> = objects
+        .iter()
+        .enumerate()
+        .map(|(index, object)| {
+            let key = overlay_key(9100 + index as u64);
+            let mut module = owned_proof_module_without_tables(key);
+            module.view = Engine::CARRIED_VIEW_ID;
+            OwnedLearnProof {
+                view: Engine::CARRIED_VIEW_ID,
+                path: dir
+                    .path()
+                    .join(format!("libprov{index}.so"))
+                    .to_string_lossy()
+                    .into_owned(),
+                object: *object,
+                loader_exe: None,
+                loader_unknown_reason: Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
+                module,
+            }
+        })
+        .collect();
+    let me = std::process::id();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 7,
+        path: "/".into(),
+        dir: Arc::new(File::open("/").expect("open root dir")),
+    };
+    engine.owned_run_pid = Some(me);
+    engine.next_view_id = 100;
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(0), me).expect("own view opens"));
+    engine.learn_owned_proofs(&mut pins, &proofs);
+    assert_eq!(
+        engine.owned_learn_stage_attempts_for_test, 3,
+        "the first apply attempts every proof"
+    );
+    assert_eq!(
+        engine.owned_learn_file_probes_for_test, 3,
+        "the first apply stats every new file once"
+    );
+    assert_eq!(engine.pending_learned.len(), 3, "all three stage");
+    engine.learn_owned_proofs(&mut pins, &proofs);
+    assert_eq!(
+        engine.owned_learn_stage_attempts_for_test, 3,
+        "the repeat apply attempts nothing more"
+    );
+    assert_eq!(
+        engine.owned_learn_file_probes_for_test, 3,
+        "the repeat apply stats nothing more"
+    );
+    assert_eq!(
+        engine.pending_learned.len(),
+        3,
+        "no duplicate staging on repeat applies"
+    );
+    assert_eq!(
+        engine.learned_cap_skipped(),
+        0,
+        "no cap accounting without pressure"
     );
 }

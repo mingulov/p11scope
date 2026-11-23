@@ -383,6 +383,29 @@ ROWS = [
     ("receipt-starved-case0", log_for(no_feed_record(
         0, "no-feeds-receipt-starved")), 101, False, F,
      "no-feed-receipt-starved", "seal r9: never environmental"),
+    ("starved-without-discovery-passes", log_for(edited(no_feed_record(
+        2, "no-feeds-receipt-starved"), case_set(2, join_passes=0))), 101,
+     False, F, "join-bound", "seal r9 correction: a deferred or refused "
+     "receipt retries only on a discovery pass"),
+    ("unattributed-one-pass-short", log_for(edited(no_feed_record(
+        2, "no-feeds-unattributed"), case_set(2, join_passes=3))), 101,
+     False, F, "join-bound", "seal r9 correction"),
+    ("linked-pass-before-first-quantum", log_for(edited(QR, case_set(
+        3, join_quanta=1, join_passes=1)), ok=True), 0, False, F,
+     "join-bound", "derived"),
+    ("linked-joined-after-a-pass", log_for(edited(QR, case_set(
+        3, join_quanta=2, join_passes=1)), ok=True), 0, False, Q,
+     "full-matrix", "control: one pass then a quantum"),
+    ("passes-on-unlinked-setup", log_for(edited(case_failed_record(
+        6, "setup"), case_set(6, join_passes=0))), 101, False, F,
+     "join-bound", "mutation sweep: passes without a join"),
+    ("probe-shed-not-an-int", log_for(edited(no_feed_record(
+        2, "no-feeds-receipt-starved"), lambda r: r["cases"][2][
+            "no_feed"].update(shed="18"))), 101, False, F, "record-schema",
+     "mutation sweep"),
+    ("linked-missing-passes", log_for(edited(QR, case_set(
+        3, join_passes=None)), ok=True), 0, False, F, "join-bound",
+     "derived"),
     ("unattributed-after-one-quantum", log_for(edited(no_feed_record(
         0, "no-feeds-unattributed"), case_set(0, join_quanta=1))), 101,
      False, F, "join-bound", "seal r9: stop0/stop1 judged after one "
@@ -393,10 +416,12 @@ ROWS = [
      "quantum"),
     ("starved-before-the-bound", log_for(edited(no_feed_record(
         2, "no-feeds-receipt-starved"), case_set(
-            2, join_quanta=JOIN_QUANTA - 1))), 101, False, F, "join-bound",
+            2, join_quanta=JOIN_QUANTA - 1, join_passes=4))), 101, False, F,
+     "join-bound",
      "derived"),
     ("linked-past-the-bound", log_for(edited(QR, case_set(
-        3, join_quanta=JOIN_QUANTA + 1)), ok=True), 0, False, F,
+        3, join_quanta=JOIN_QUANTA + 1, join_passes=4)), ok=True), 0, False,
+     F,
      "join-bound", "derived"),
     ("join-on-unlinked-setup", log_for(edited(case_failed_record(
         6, "setup"), case_set(6, join_quanta=0))), 101, False, F,
@@ -549,11 +574,13 @@ class JointStopVerdictTableTests(unittest.TestCase):
                 'JointBranch::ReceiptStarved => Some("no-feeds-receipt-starved"),',
                 'JointBranch::ReceiptStarved => "receipt-starved",',
                 'const STOP_JOIN_QUANTA: u64 = %d;' % jv.JOIN_QUANTA,
+                'const STOP_JOIN_PASS_EVERY: u64 = %d;' % jv.JOIN_PASS_EVERY,
+                'quanta % STOP_JOIN_PASS_EVERY == 1',
+                'case.link(&branch, join_quanta, join_passes);',
                 '("semantic admission deferred", '
                 '"semantic_unavailable:no_receipt") => {',
                 '("semantic receipt refused", "partition") => '
                 'starved.partition += repeats,',
-                'case.link(&branch, join_quanta);',
                 'stage: "setup",', 'stage: "drive",', 'stage: "check",',
                 '(StopCheck::AtQ, check_stop_at_q),',
                 '(StopCheck::Latch, check_stop_latch),',
@@ -608,7 +635,10 @@ class JointStopVerdictTableTests(unittest.TestCase):
         self.assertEqual(got["qualification"], "failed")
         self.assertEqual(got["reason"], "no-feed-receipt-starved")
         self.assertIn("no_receipt=2 partition=1 shed=18 after %d join "
-                      "quanta" % JOIN_QUANTA, got["detail"])
+                      "quanta and 4 discovery passes" % JOIN_QUANTA,
+                      got["detail"])
+        self.assertEqual([jv.join_passes_for(n) for n in (0, 1, 2, 9, 10, 32)],
+                         [0, 0, 1, 1, 2, 4])
         self.assertNotIn("unexplained", got["detail"])
 
     def test_no_feed_detail_names_the_sampled_evidence(self):

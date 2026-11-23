@@ -44,6 +44,7 @@ RECEIPTS = {"s1-precluded": S1_RECEIPT,
             "no-feeds-unattributed": UNATTRIBUTED_RECEIPT}
 LINKED_NO_FEED = ("no-feeds-receipt-starved", "no-feeds-unattributed")
 JOIN_QUANTA = 32
+JOIN_PASSES = 4  # passes before join quanta 2, 10, 18 and 26
 BACKTRACE = [
     "",
     "Stack backtrace:",
@@ -111,9 +112,12 @@ def case_record(k, branch="linked", outcome="healthy", completed=None,
         no_feed = no_feed_probe(branch) if branch in RECEIPTS else None
     if join == "spent":
         join = join_of(branch)
+    passes = None if join is None else (JOIN_PASSES if join == JOIN_QUANTA
+                                        else 0)
     return {"name": "wp7-stop%d" % k, "index": k, "prep": k // 4,
             "offset_ms": offset_of(k), "branch": branch, "join_quanta": join,
-            "outcome": outcome, "no_feed": no_feed, "completed": completed}
+            "join_passes": passes, "outcome": outcome, "no_feed": no_feed,
+            "completed": completed}
 
 
 def record(cases, terminal):

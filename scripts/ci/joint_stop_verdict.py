@@ -27,7 +27,7 @@ types, no floats, no duplicate keys):
               "branch": null | "linked" | "s1-precluded"
                         | "no-feeds-receipt-starved"
                         | "no-feeds-unattributed",
-              "join_quanta": null | int,
+              "join_quanta": null | int, "join_passes": null | int,
               "outcome": null | OUTCOME,
               "no_feed": null | {"joint_feeds": int, "journal_linked": bool,
                                  "backstop_routed": int,
@@ -50,7 +50,11 @@ join_quanta is how many quanta the cell serviced after q1, with the
 call still held, before its linkage decision (null exactly before a
 linkage). It never exceeds JOIN_QUANTA (the cell's STOP_JOIN_QUANTA),
 and a linked no-feed branch (receipt-starved or unattributed) must
-have spent all of it: one quantum is never a no-feed verdict. A
+have spent all of it: one quantum is never a no-feed verdict.
+join_passes counts the discovery passes the join ran (a deferred or
+refused receipt is retried only on a pass); it must equal the
+schedule's count for join_quanta (a pass before every quantum q with
+q % JOIN_PASS_EVERY == 1, so 4 over the full bound). A
 linked no-feed case is receipt-starved exactly when its probe counts a
 `no_receipt` deferral or a `partition` receipt refusal; that cause is
 named but never accepted.
@@ -112,6 +116,12 @@ NO_FEED = {
 }
 LINKED_NO_FEED = ("no-feeds-receipt-starved", "no-feeds-unattributed")
 JOIN_QUANTA = 32
+JOIN_PASS_EVERY = 8
+
+
+def join_passes_for(quanta):
+    """Discovery passes the cell's join schedule runs over `quanta`."""
+    return sum(1 for q in range(quanta) if q % JOIN_PASS_EVERY == 1)
 BRANCHES = ("linked",) + tuple(NO_FEED)
 STOP_CHECKS = ("at-q", "latch", "abandon", "terminal", "reconcile")
 STAGES = ("setup", "drive", "check")
@@ -308,14 +318,18 @@ def _judge(record, status, expect_wedge, check):
               "wp7-stop%d: a no-feed probe on branch %r (the cell samples "
               "one exactly on a no-feed case)" % (k, case["branch"]))
         join = case["join_quanta"]
+        passes = case["join_passes"]
         check("join-bound",
               (join is None) == (case["branch"] is None)
+              and (passes is None) == (join is None)
+              and (join is None or passes == join_passes_for(join))
               and (join is None or join <= JOIN_QUANTA)
               and (case["branch"] not in LINKED_NO_FEED
                    or join == JOIN_QUANTA),
-              "wp7-stop%d: join_quanta %r on branch %r (at most %d; a linked "
-              "no-feed verdict spends all %d)"
-              % (k, join, case["branch"], JOIN_QUANTA, JOIN_QUANTA))
+              "wp7-stop%d: join_quanta %r with %r passes on branch %r (at "
+              "most %d, with the scheduled passes; a linked no-feed verdict "
+              "spends all %d)"
+              % (k, join, passes, case["branch"], JOIN_QUANTA, JOIN_QUANTA))
         probe = case["no_feed"]
         if case["branch"] in LINKED_NO_FEED and probe is not None:
             starved = probe["no_receipt"] + probe["partition"] > 0
@@ -377,12 +391,12 @@ def _judge(record, status, expect_wedge, check):
         check("no-feed-receipt-starved",
               branch != "no-feeds-receipt-starved",
               "wp7-stop%d: %s; no_receipt=%d partition=%d shed=%d after %d "
-              "join quanta; %s"
+              "join quanta and %d discovery passes; %s"
               % (last, NO_FEED["no-feeds-receipt-starved"],
                  open_case["no_feed"]["no_receipt"],
                  open_case["no_feed"]["partition"],
                  open_case["no_feed"]["shed"], open_case["join_quanta"],
-                 probe))
+                 open_case["join_passes"], probe))
         check("no-feed-unattributed", branch != "no-feeds-unattributed",
               "wp7-stop%d: %s; %s" % (last, NO_FEED["no-feeds-unattributed"],
                                       probe))
@@ -429,9 +443,11 @@ def _probe_text(probe):
         return "no probe"
     gaps = ", ".join("%s/%s x%d" % (gap["subject"], gap["reason"],
                                     gap["count"]) for gap in probe["gaps"])
-    return ("feeds=%d linked=%s backstop=%d capacity=%s gaps=[%s] drive=%s"
+    return ("feeds=%d linked=%s backstop=%d capacity=%s no_receipt=%d "
+            "partition=%d shed=%d gaps=[%s] drive=%s"
             % (probe["joint_feeds"], probe["journal_linked"],
-               probe["backstop_routed"], probe["birth_capacity"], gaps,
+               probe["backstop_routed"], probe["birth_capacity"],
+               probe["no_receipt"], probe["partition"], probe["shed"], gaps,
                probe["drive"]))[:1500]
 
 
@@ -518,7 +534,8 @@ OUTCOME_FIELDS = {
 CASE_FIELDS = {
     "name": _is_str, "index": _is_u64, "prep": _is_u64,
     "offset_ms": _is_u64, "branch": _opt(_one_of(*BRANCHES)),
-    "join_quanta": _opt(_is_u64), "outcome": lambda v: True, "no_feed": lambda v: True,
+    "join_quanta": _opt(_is_u64), "join_passes": _opt(_is_u64),
+    "outcome": lambda v: True, "no_feed": lambda v: True,
     "completed": lambda v: type(v) is bool,
 }
 GAP_FIELDS = {"subject": _is_str, "reason": _is_str, "count": _is_u64}

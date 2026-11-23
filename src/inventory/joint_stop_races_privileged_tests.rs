@@ -1006,11 +1006,31 @@ fn joint_branch_from(
 /// held, before it judges a linked session that has no Joint feed yet.
 /// On a busy host the first quantum fills with ~1024 rows of system
 /// traffic before the held caller's birth binds, and the feeds arrive
-/// on the next quantum (~40 ms later). 32 quanta is a 32x margin over
-/// that observed need and still ends a real starvation (thousands of
-/// quanta without a feed) in well under a few seconds. An S1 latch
-/// never changes, so an unlinked session does not wait.
+/// on the next quantum (~40 ms later). A deferred admission
+/// (`no_receipt`) or a refused receipt (`partition`) is retried only on
+/// the next discovery pass, so the join also runs passes (see
+/// `STOP_JOIN_PASS_EVERY`). 32 quanta with 4 passes is a wide margin
+/// over the observed need (one quantum, or one pass plus a quantum)
+/// and still ends a real starvation in bounded time. An S1 latch never
+/// changes, so an unlinked session does not wait.
 const STOP_JOIN_QUANTA: u64 = 32;
+
+/// One discovery pass before the 2nd, 10th, 18th and 26th join
+/// quantum: the first extra quantum catches a birth that missed q1's
+/// full quantum; each pass offers a deferred or refused receipt its
+/// retry, followed by quanta to bind it.
+const STOP_JOIN_PASS_EVERY: u64 = 8;
+
+/// Pure pass schedule: a discovery pass is due before quantum
+/// `quanta + 1` when `quanta % STOP_JOIN_PASS_EVERY == 1`.
+fn stop_join_pass_due(quanta: u64) -> bool {
+    quanta % STOP_JOIN_PASS_EVERY == 1
+}
+
+/// Passes the schedule runs over a join of `quanta` quanta.
+fn stop_join_passes_for(quanta: u64) -> u64 {
+    (quanta + STOP_JOIN_PASS_EVERY - 2) / STOP_JOIN_PASS_EVERY
+}
 
 /// Pure join decision: keep servicing while the session is linked,
 /// has no Joint feed and the bound is not spent.
@@ -1741,14 +1761,21 @@ fn run_stop_offset(
         "{tag}: the held call entered before q1 ended: {t_enter} < {q1_end_ns}"
     );
     // A linked session whose first quantum filled before the held
-    // caller's birth bound gets its feeds on a following quantum:
-    // service a bounded number more, still holding the call.
+    // caller's birth bound gets its feeds on a following quantum, and a
+    // deferred or refused birth receipt is retried on the next
+    // discovery pass: service a bounded number more quanta with
+    // scheduled passes, still holding the call.
     let mut join_quanta = 0u64;
+    let mut join_passes = 0u64;
     while stop_join_continues(
         coordinator.registry().joint_feeds(),
         coordinator.registry().journal_linked(),
         join_quanta,
     ) {
+        if stop_join_pass_due(join_quanta) {
+            drive_native_passes_until(&mut coordinator, &mut |passes| Ok(passes >= 1))?;
+            join_passes += 1;
+        }
         join_quanta += 1;
         service_to_published(
             &mut lane,
@@ -1759,7 +1786,7 @@ fn run_stop_offset(
     }
     eprintln!(
         "JOINT_STOP {tag}: q1 published in {q1_polls} polls, joined after {join_quanta} more \
-         quanta; releasing the held call"
+         quanta and {join_passes} passes; releasing the held call"
     );
     {
         let _release = std::fs::File::create(&release)?;
@@ -1849,7 +1876,7 @@ fn run_stop_offset(
     // environmental tag, while the unattributed default (zero feeds,
     // no latched seal) gets its own tag and cause.
     let branch = joint_branch(&coordinator);
-    case.link(&branch, join_quanta);
+    case.link(&branch, join_quanta, join_passes);
     if no_feed_reason(&branch).is_some() {
         case.note_no_feed(no_feed_probe(&lane, &coordinator));
     }
@@ -2444,6 +2471,8 @@ struct StopCaseRecord {
     /// Quanta serviced after q1 before the linkage decision (set with
     /// `branch`); a linked no-feed verdict spends all `STOP_JOIN_QUANTA`.
     join_quanta: Option<u64>,
+    /// Discovery passes the join ran (`stop_join_passes_for` its quanta).
+    join_passes: Option<u64>,
     outcome: Option<StopOutcome>,
     /// Set exactly on a no-feed case: the evidence behind its branch.
     no_feed: Option<NoFeedProbe>,
@@ -2516,6 +2545,7 @@ impl StopLedger {
             offset_ms: STOP_OFFSETS_MS[index % STOP_OFFSETS_MS.len()],
             branch: None,
             join_quanta: None,
+            join_passes: None,
             outcome: None,
             no_feed: None,
             completed: false,
@@ -2630,7 +2660,7 @@ impl StopLedger {
 
 impl StopCaseRecord {
     /// Record the linkage decision, once, before anything is driven.
-    fn link(&mut self, branch: &JointBranch, join_quanta: u64) {
+    fn link(&mut self, branch: &JointBranch, join_quanta: u64, join_passes: u64) {
         assert!(self.branch.is_none(), "{}: linked once", self.name);
         assert!(
             join_quanta <= STOP_JOIN_QUANTA,
@@ -2647,8 +2677,15 @@ impl StopCaseRecord {
                 self.name
             );
         }
+        assert_eq!(
+            join_passes,
+            stop_join_passes_for(join_quanta),
+            "{}: the join runs its scheduled discovery passes",
+            self.name
+        );
         self.branch = Some(no_feed_branch_tag(branch).unwrap_or("linked"));
         self.join_quanta = Some(join_quanta);
+        self.join_passes = Some(join_passes);
     }
 
     /// Record what a no-feed case sampled, once, after its linkage.
@@ -2870,7 +2907,7 @@ fn full_stop_ledger() -> StopLedger {
 /// Open `index`, link it, collect `outcome` and judge it.
 fn judge_stop_case(ledger: &mut StopLedger, index: usize, outcome: StopOutcome) -> Result<()> {
     let case = ledger.open(index);
-    case.link(&JointBranch::Linked, 0);
+    case.link(&JointBranch::Linked, 0, 0);
     case.collect(outcome);
     case.judge()
 }
@@ -2887,7 +2924,8 @@ fn completed_stop_cases(ledger: &mut StopLedger, count: usize) {
 fn link_no_feed(case: &mut StopCaseRecord, branch: JointBranch) {
     let linked = !matches!(branch, JointBranch::S1);
     let starved = matches!(branch, JointBranch::ReceiptStarved);
-    case.link(&branch, if linked { STOP_JOIN_QUANTA } else { 0 });
+    let join = if linked { STOP_JOIN_QUANTA } else { 0 };
+    case.link(&branch, join, stop_join_passes_for(join));
     case.note_no_feed(NoFeedProbe {
         joint_feeds: 0,
         journal_linked: linked,
@@ -3095,7 +3133,7 @@ fn stop_verdict_names_setup_and_drive_failures() {
         }
     ));
     let mut ledger = full_stop_ledger();
-    ledger.open(0).link(&JointBranch::Linked, 0);
+    ledger.open(0).link(&JointBranch::Linked, 0, 0);
     match stop_terminal_of(ledger, error()) {
         StopTerminal::CaseFailed {
             case: Some(0),
@@ -3111,7 +3149,7 @@ fn stop_verdict_names_setup_and_drive_failures() {
 #[should_panic(expected = "opens only after the previous case completed")]
 fn stop_ledger_refuses_a_case_after_an_unfinished_one() {
     let mut ledger = full_stop_ledger();
-    ledger.open(0).link(&JointBranch::Linked, 0);
+    ledger.open(0).link(&JointBranch::Linked, 0, 0);
     ledger.open(1);
 }
 
@@ -3120,7 +3158,7 @@ fn stop_ledger_refuses_a_case_after_an_unfinished_one() {
 fn stop_ledger_refuses_an_outcome_on_a_no_feed_case() {
     let mut ledger = full_stop_ledger();
     let case = ledger.open(0);
-    case.link(&JointBranch::S1, 0);
+    case.link(&JointBranch::S1, 0, 0);
     case.collect(healthy_stop_outcome_at(0));
 }
 
@@ -3129,7 +3167,7 @@ fn stop_ledger_refuses_an_outcome_on_a_no_feed_case() {
 fn stop_ledger_refuses_an_outcome_from_another_offset() {
     let mut ledger = full_stop_ledger();
     let case = ledger.open(0);
-    case.link(&JointBranch::Linked, 0);
+    case.link(&JointBranch::Linked, 0, 0);
     case.collect(healthy_stop_outcome_at(20));
 }
 
@@ -3139,7 +3177,7 @@ fn stop_ledger_refuses_a_no_feed_terminal_without_its_probe() {
     let mut ledger = full_stop_ledger();
     ledger
         .open(0)
-        .link(&JointBranch::Unattributed, STOP_JOIN_QUANTA);
+        .link(&JointBranch::Unattributed, STOP_JOIN_QUANTA, 4);
     let _ = stop_terminal_of(ledger, Err(anyhow::anyhow!("not attempted")));
 }
 
@@ -3148,7 +3186,7 @@ fn stop_ledger_refuses_a_no_feed_terminal_without_its_probe() {
 fn stop_ledger_refuses_a_probe_on_a_linked_case() {
     let mut ledger = full_stop_ledger();
     let case = ledger.open(0);
-    case.link(&JointBranch::Linked, 0);
+    case.link(&JointBranch::Linked, 0, 0);
     case.note_no_feed(NoFeedProbe {
         joint_feeds: 0,
         journal_linked: true,
@@ -3167,8 +3205,8 @@ fn stop_ledger_refuses_a_probe_on_a_linked_case() {
 fn stop_ledger_refuses_a_second_linkage_decision() {
     let mut ledger = full_stop_ledger();
     let case = ledger.open(0);
-    case.link(&JointBranch::Linked, 0);
-    case.link(&JointBranch::S1, 0);
+    case.link(&JointBranch::Linked, 0, 0);
+    case.link(&JointBranch::S1, 0, 0);
 }
 
 /// The matrix cell prints its record on every return path: the body
@@ -3282,11 +3320,76 @@ fn stop_join_services_a_linked_session_until_its_feed_or_the_bound() {
     assert_eq!(quanta, STOP_JOIN_QUANTA);
 }
 
+/// A deferred admission or refused receipt is retried only on a
+/// discovery pass: the join runs passes before the 2nd, 10th, 18th and
+/// 26th quantum, never before the first, and four over the full bound.
+#[test]
+fn stop_join_runs_discovery_passes_on_its_schedule() {
+    let due: Vec<u64> = (0..STOP_JOIN_QUANTA)
+        .filter(|quanta| stop_join_pass_due(*quanta))
+        .collect();
+    assert_eq!(due, [1, 9, 17, 25]);
+    for quanta in 0..=STOP_JOIN_QUANTA {
+        assert_eq!(
+            stop_join_passes_for(quanta),
+            (0..quanta).filter(|q| stop_join_pass_due(*q)).count() as u64,
+            "the pass count of a {quanta}-quantum join"
+        );
+    }
+    assert_eq!(
+        stop_join_passes_for(1),
+        0,
+        "a one-quantum join runs no pass"
+    );
+    assert_eq!(stop_join_passes_for(2), 1);
+    assert_eq!(stop_join_passes_for(STOP_JOIN_QUANTA), 4);
+}
+
+#[test]
+#[should_panic(expected = "the join runs its scheduled discovery passes")]
+fn stop_ledger_refuses_a_no_feed_verdict_without_discovery_passes() {
+    let mut ledger = full_stop_ledger();
+    ledger
+        .open(0)
+        .link(&JointBranch::ReceiptStarved, STOP_JOIN_QUANTA, 0);
+}
+
+/// The join's pass is a real discovery pass, driven before the quantum
+/// it is scheduled for; the pin reads the drive above its own body and
+/// strips line comments.
+#[test]
+fn stop_join_drives_a_discovery_pass_when_due() {
+    let source = include_str!("joint_stop_races_privileged_tests.rs");
+    let head = source
+        .split_once("fn stop_join_drives_a_discovery_pass_when_due(")
+        .expect("the pin keeps its name")
+        .0;
+    let drive = head
+        .split_once("fn run_stop_offset(")
+        .expect("the drive keeps its name")
+        .1;
+    let code: String = drive
+        .lines()
+        .map(|line| line.split("//").next().unwrap_or("").trim())
+        .collect();
+    assert!(
+        code.contains(concat!(
+            "if stop_join_pass_due(join_quanta) {",
+            "drive_native_passes_until(&mut coordinator, &mut |passes| Ok(passes >= 1))?;",
+            "join_passes += 1;",
+            "}",
+            "join_quanta += 1;",
+            "service_to_published(",
+        )),
+        "the join drives a discovery pass before its scheduled quantum"
+    );
+}
+
 #[test]
 #[should_panic(expected = "a linked no-feed verdict waits the whole join bound")]
 fn stop_ledger_refuses_a_no_feed_verdict_after_one_quantum() {
     let mut ledger = full_stop_ledger();
-    ledger.open(0).link(&JointBranch::Unattributed, 0);
+    ledger.open(0).link(&JointBranch::Unattributed, 0, 0);
 }
 
 #[test]
@@ -3295,7 +3398,7 @@ fn stop_ledger_refuses_a_starved_verdict_before_the_bound() {
     let mut ledger = full_stop_ledger();
     ledger
         .open(0)
-        .link(&JointBranch::ReceiptStarved, STOP_JOIN_QUANTA - 1);
+        .link(&JointBranch::ReceiptStarved, STOP_JOIN_QUANTA - 1, 4);
 }
 
 #[test]
@@ -3304,7 +3407,7 @@ fn stop_ledger_refuses_a_join_past_its_bound() {
     let mut ledger = full_stop_ledger();
     ledger
         .open(0)
-        .link(&JointBranch::Linked, STOP_JOIN_QUANTA + 1);
+        .link(&JointBranch::Linked, STOP_JOIN_QUANTA + 1, 4);
 }
 
 /// The starvation cause counts the exact frozen codes with repeats and

@@ -824,6 +824,12 @@ child_pid=int([l for l in inside.splitlines() if l.startswith('CHILD pid=')][0].
 outside_pid=int([l for l in outside.splitlines() if l.startswith('READY pid=')][0].split('=')[1])
 assert sum(l.startswith('LEDGER ') for l in inside.splitlines())==1, 'inside ledger missing'
 assert sum(l.startswith('LEDGER ') for l in outside.splitlines())==1, 'outside ledger missing (leak test invalid)'
+# Ids are unique in the raw arrays before any index is built: a
+# repeated id would let one row hide another (the diff reader refuses
+# the same shape).
+for kind in ('callers','modules'):
+    ids=[x.get('id') for x in report.get(kind,[])]
+    assert len(ids)==len(set(ids)), 'duplicate %s id: %r' % (kind[:-1],ids)
 modules={m['id']:m for m in report.get('modules',[])}
 owned=None
 for mid,m in modules.items():
@@ -908,11 +914,18 @@ def classify(g):
     if reason in activation_refusals: return 'activation'
     if g.get('subject')==ACTIVATION: return 'unexpected-activation'
     if reason.startswith(UNPROVEN): return 'unproven'
-    if g.get('subject')=='module admission changed' and g.get('module')==owned: return 'admission-note'
+    if g.get('subject')=='module admission changed': return 'admission-note'
     if named_unbound(g): return 'unbound'
-    if reason==DEADLINE and g.get('subject')=='cgroup scope transaction incomplete' and g.get('caller') is None: return 'deadline'
-    if reason==RETAINED and g.get('subject')=='native owner refresh refused' and g.get('caller') in workload: return 'retained'
+    if reason==DEADLINE: return 'deadline'
+    if reason==RETAINED: return 'retained'
     return None
+# Each allowance carries exactly the producer's attribution: a
+# per-caller row names a workload caller at that caller's own pid and
+# the module its producer sets (none, or the owned module for an
+# admission note).
+def at_workload(g,module=None):
+    r=workload.get(g.get('caller'))
+    return r is not None and g.get('pid')==r['pid'] and g.get('module')==module
 gaps=report.get('gaps',[])
 kinds=[(classify(g),g) for g in gaps]
 degraded=modfs=='overlayfs' or any(k=='unproven' for k,_ in kinds)
@@ -926,9 +939,14 @@ for kind,g in kinds:
     # caller id must be a workload caller at the row's pid.
     if kind=='activation':
         assert g.get('subject')==ACTIVATION, 'activation refusal under another subject: %r' % (g,)
-        r=workload.get(g.get('caller'))
-        assert r is not None and r['pid']==g.get('pid') and r['authority']=='native_exact', '%s: %r' % (activation_refusals[g['reason']],g)
+        assert at_workload(g) and workload[g['caller']]['authority']=='native_exact', '%s: %r' % (activation_refusals[g['reason']],g)
     assert kind!='unexpected-activation', 'unexpected activation refusal: %r' % (g,)
+    if kind=='retained':
+        assert g.get('subject')=='native owner refresh refused' and at_workload(g), 'retained refresh attribution: %r' % (g,)
+    if kind=='deadline':
+        assert g.get('subject')=='cgroup scope transaction incomplete' and g.get('caller') is None and g.get('pid') is None and g.get('module') is None, 'collection deadline attribution: %r' % (g,)
+    if kind=='admission-note':
+        assert at_workload(g,owned) and (g.get('reason') or '').startswith(modpath+': admission changed from '), 'admission note attribution: %r' % (g,)
 # The facts-retained refresh refusal only comes with a run-deadline
 # straddle: the deadline gap must be present in the same run, and at
 # most one retained row per owning caller.
@@ -962,6 +980,7 @@ if degraded:
     assert sorted(g.get('caller') for g in unproven)==want, 'overlay unproven caller cover'
     for g in unproven:
         assert g.get('subject')==modpath, 'overlay unproven subject'
+        assert g.get('module') is None, 'overlay unproven module'
         assert g.get('pid')==workload[g.get('caller')]['pid'], 'overlay unproven pid'
     assert len(gaps)>0, 'overlay published shape carries no gaps'
 print('inventory cgroup: inside=%d child=%d outside=%d excluded module=%s admission=%s unproven=%d gaps=%d' % (inside_pid,child_pid,outside_pid,owned,state,len(unproven),len(report.get('gaps',[]))))

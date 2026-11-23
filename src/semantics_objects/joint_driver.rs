@@ -994,6 +994,17 @@ impl IngestedRaw {
 /// frame's raw slot instead of a seal.
 pub(crate) const INGEST_BREAK_VOID_GAP: JournalGap = JournalGap::IngestBreakLoss;
 
+/// Ruling O6-2b: the typed gap reason for one image's pre-key
+/// disposal loss, with its exact open-call count (`None` for any other
+/// disposal gap, which this disclosure never names).
+pub(crate) fn pregrant_loss_gap_reason(gap: JournalGap, calls: u64) -> Option<String> {
+    matches!(
+        gap,
+        JournalGap::PregrantNonAdmission | JournalGap::PregrantRawLoss
+    )
+    .then(|| format!("joint_{}_history_loss calls={calls}", gap.label()))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RawDisposeReason {
     Empty,
@@ -1009,6 +1020,9 @@ pub(crate) struct RawDisposition {
     frontier: ConsumptionOrdinal,
     reason: RawDisposeReason,
     failure: Option<SealFailure>,
+    /// Ruling O6-2b: per image (image order), the exact count of calls
+    /// still open in a pre-key disposal, disposed as named loss.
+    pregrant_losses: Vec<u64>,
     prepaid_bytes: usize,
     // Original effect/scope buffers drop before their retained reservation.
     _storage: ResourceLease,
@@ -1018,6 +1032,12 @@ pub(crate) struct RawDisposition {
 impl RawDisposition {
     pub(crate) fn reason(&self) -> RawDisposeReason {
         self.reason
+    }
+
+    /// Per image, the exact count of open calls this pre-key disposal
+    /// released as named loss (empty otherwise).
+    pub(crate) fn pregrant_losses(&self) -> &[u64] {
+        &self.pregrant_losses
     }
 
     pub(crate) fn failure(&self) -> Option<&SealFailure> {
@@ -2632,20 +2652,48 @@ impl RawJointQuantum {
         // is provably another caller's (there is no bound caller to
         // differ from), so the localized refusal must not taint it: the
         // interval is fenced as loss below instead, and a process that
-        // binds later can still enter Joint above that fence. The one
-        // exception is an image with a BEGIN still open in this
-        // quantum: its terminal can still arrive and would be
-        // unaccountable, so it keeps the localized refusal.
+        // binds later can still enter Joint above that fence. An image
+        // with a BEGIN still open in this quantum is quarantined only
+        // up to that fence (ruling O6-2b, superseding the O6-2
+        // permanence): each open call is counted, named loss, its
+        // terminal is expected-absent, and the next admission that
+        // binds above the fence lifts the quarantine, so the image
+        // recovers from fresh proof instead of never entering Joint.
         let pre_key = !unlocalized && owner.adapter.keys.is_empty();
-        let open_images: std::collections::BTreeSet<(u64, u64)> = if pre_key {
+        let pregrant_open: Vec<((u64, u64), super::JournalNativeKey, u32)> = if pre_key {
             self.invocations
                 .iter()
                 .filter(|invocation| !invocation.terminal)
-                .map(|invocation| super::JournalAdapter::image_of_begin(&invocation.begin))
+                .map(|invocation| {
+                    (
+                        super::JournalAdapter::image_of_begin(&invocation.begin),
+                        (invocation.begin.thread(), invocation.begin.sequence()),
+                        invocation.begin.descriptor() - 1,
+                    )
+                })
                 .collect()
         } else {
-            Default::default()
+            Vec::new()
         };
+        let open_images: std::collections::BTreeSet<(u64, u64)> =
+            pregrant_open.iter().map(|(image, _, _)| *image).collect();
+        let pregrant_losses: Vec<u64> = open_images
+            .iter()
+            .map(|image| {
+                pregrant_open
+                    .iter()
+                    .filter(|(open, _, _)| open == image)
+                    .count() as u64
+            })
+            .collect();
+        // The disposal's own fence: every item below consumes one
+        // position (overflow is unlocalized, so never pre-key).
+        let pregrant_fence = (*owner.adapter.voided_through).max(
+            owner
+                .adapter
+                .consumed_through
+                .saturating_add(self.ordered.len() as u64),
+        );
         // Diagnostic-only (Task 0): snapshot the invalidation flag before
         // the refusal below, so the break arm can tell a disposal that
         // newly voided the stream from one that found it already void.
@@ -2657,11 +2705,15 @@ impl RawJointQuantum {
                 self.disposal_gap(&owner.adapter, unlocalized)
             };
             if pre_key {
-                owner.adapter.refuse_disposed_raw_deferred(
+                let gap = if reason == RawDisposeReason::NoAdmission {
+                    JournalGap::PregrantNonAdmission
+                } else {
+                    JournalGap::PregrantRawLoss
+                };
+                owner.adapter.refuse_pregrant_disposed_raw(
                     &mut owner.model,
-                    self.affecting_images()
-                        .filter(|image| open_images.contains(image)),
-                    false,
+                    &pregrant_open,
+                    pregrant_fence,
                     gap,
                 )
             } else {
@@ -2705,6 +2757,10 @@ impl RawJointQuantum {
             // the whole consumed interval so no later birth or seal
             // can certify across it.
             let fenced = (*owner.adapter.voided_through).max(owner.adapter.consumed_through);
+            debug_assert_eq!(
+                fenced, pregrant_fence,
+                "the quarantine evidence is the fence"
+            );
             *owner.adapter.voided_through.edit() = fenced;
         }
         if contiguous && !unlocalized {
@@ -2732,6 +2788,7 @@ impl RawJointQuantum {
             frontier,
             reason,
             failure,
+            pregrant_losses,
             prepaid_bytes,
             _storage: storage,
         })

@@ -288,11 +288,17 @@ fn joint_empty_and_capacity_raw_dispositions_need_no_drain_grant() {
     let capacity = raw
         .dispose_without_ingest(&mut owner, &retained, RawDisposeReason::Capacity)
         .unwrap_or_else(|(_, reason)| panic!("pre-completion capacity disposal: {reason:?}"));
-    assert!(capacity.failure().is_some());
+    assert_eq!(
+        capacity.failure().map(|failure| failure.gap),
+        Some(crate::semantics_objects::journal::JournalGap::PregrantRawLoss)
+    );
+    assert_eq!(capacity.pregrant_losses(), &[1]);
     // The capacity-lost BEGIN is still open in this quantum: its
-    // terminal can still arrive unaccountable, so even pre-key the
-    // image keeps the localized refusal.
+    // terminal is expected-absent and the image is quarantined, but
+    // only up to the disposal's fence (ruling O6-2b): the next
+    // admission above it lifts the quarantine.
     assert!(owner.adapter.is_tainted((COOKIE, EXEC)));
+    assert!(owner.adapter.taint_lifts_at_fence_for_test((COOKIE, EXEC)));
     assert!(owner.adapter.voids_through_for_test(capacity.frontier()));
     assert_eq!(owner.ledger().census(), 0);
     assert_eq!(owner.adapter.consumed_through_for_test(), 1);

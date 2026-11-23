@@ -1550,6 +1550,15 @@ pub(crate) enum JournalGap {
     /// refused) and dropped staged custody. Later seals re-prove
     /// above the recorded fence; nothing re-covers fenced history.
     IngestBreakLoss,
+    /// Ruling O6-2b: a quantum collected before any journal key existed
+    /// was disposed without an admission (a request closed it before
+    /// any admission bound a grant). Its interval is fenced as loss and
+    /// every call still open in it is counted, named loss, never
+    /// attributed; the images keep no permanent taint and re-enter
+    /// Joint at the next admission that binds above the fence.
+    PregrantNonAdmission,
+    /// The same pre-key disposal for a capacity or terminal loss.
+    PregrantRawLoss,
 }
 
 impl JournalGap {
@@ -1582,6 +1591,8 @@ impl JournalGap {
             Self::CutExhausted => "cut_exhausted",
             Self::ClaimUnmatched => "claim_unmatched",
             Self::IngestBreakLoss => "ingest_break_loss",
+            Self::PregrantNonAdmission => "pregrant_nonadmission",
+            Self::PregrantRawLoss => "pregrant_raw_loss",
         }
     }
 }
@@ -4903,9 +4914,21 @@ impl JournalAdapter {
         self.tainted_images.edit().remove(&image);
         self.taint_evidence.edit().remove(&image);
         self.shed_only_taints.remove(&image);
+        self.purge_state_changing_absences(image);
         self.reentry_taint_lifts = self.reentry_taint_lifts.saturating_add(1);
         self.claims_prune_dirty = true;
         true
+    }
+
+    /// Every lift to a clean image keeps only neutral absences: a
+    /// tainted image excuses any released terminal, but on a clean one
+    /// an excused ABANDON consumes blindly, so a state-changing absence
+    /// (a dropped or pre-grant-released open that outlived the taint)
+    /// must still promote instead of riding the lift.
+    fn purge_state_changing_absences(&mut self, image: (u64, u64)) {
+        self.derived_absent.retain(|(absent_image, _), function| {
+            *absent_image != image || disposes_unclaimable_original(*function)
+        });
     }
 
     /// Whether taint-overflow key marks are still owed.
@@ -5001,6 +5024,48 @@ impl JournalAdapter {
             self.raw_rejection = Some(ticket);
         }
         failure
+    }
+
+    /// Ruling O6-2b: dispose a pre-key quantum's still-open calls as
+    /// counted loss instead of a permanent taint. Each open call's
+    /// terminal becomes expected-absent (excused while its image is
+    /// quarantined, and only for neutral clean returns once it is
+    /// clean), and each image with an open call is quarantined with
+    /// `evidence` (the disposal's own fence) instead of permanently, so
+    /// the next admission that binds above the fence lifts it and the
+    /// image re-enters Joint on fresh proof. The exact per-image counts
+    /// ride the disposition for the typed disclosure.
+    fn refuse_pregrant_disposed_raw(
+        &mut self,
+        model: &mut ObjectSemantics,
+        open: &[((u64, u64), JournalNativeKey, u32)],
+        evidence: u64,
+        gap: JournalGap,
+    ) -> SealFailure {
+        for &(image, key, function) in open {
+            self.note_derived_absence(image, key, function);
+            self.note_image_taint_at(image, Some(evidence));
+        }
+        let ticket = self.issue_rejection(RecoveryMode::LocalRaw, true, None);
+        let mut failure = SealFailure {
+            take_failed: None,
+            scope: SealFailure::deferred_scope(),
+            gap,
+            effects: ObjectEffects::default(),
+            h3_voided: None,
+            fence: None,
+        };
+        if !self.settle_inline(model, ticket, &mut failure) {
+            self.raw_rejection = Some(ticket);
+        }
+        failure
+    }
+
+    /// Test-only: whether the image's quarantine lifts at the current
+    /// void fence (clean, or evidence at or below it).
+    #[cfg(test)]
+    pub(crate) fn taint_lifts_at_fence_for_test(&self, image: (u64, u64)) -> bool {
+        !self.image_taint_blocks(image, *self.voided_through)
     }
 
     /// End Joint after a linked stream broke while ingesting (keyrows
@@ -7723,6 +7788,7 @@ impl JournalAdapter {
         self.tainted_images.edit().remove(&image);
         self.taint_evidence.edit().remove(&image);
         self.shed_only_taints.remove(&image);
+        self.purge_state_changing_absences(image);
         self.reentry_taint_lifts = self.reentry_taint_lifts.saturating_add(1);
         self.claims_prune_dirty = true;
         true
@@ -34371,17 +34437,35 @@ pub(crate) mod tests {
     /// no-progress void.
     #[test]
     fn seal_unbound_barrier_in_flight_offers_one_grace_frame() {
-        for settled in [false, true] {
+        // (shape, settled): an in-flight open row alone qualifies; a
+        // settled open row, a refused row, or a refused row beside an
+        // in-flight one (mixed) keeps the retry.
+        for (shape, settled) in [
+            ("in_flight", false),
+            ("settled", true),
+            ("refused", true),
+            ("mixed", true),
+        ] {
             let (mut scene, bootstrap, audit) = metered_seal_scene(3);
             let frontier = scene.adapter.consumed_frontier().0;
-            if settled {
-                scene
+            match shape {
+                "in_flight" => scene
                     .adapter
-                    .populate_unbound_settled_barrier_row_for_test(frontier);
-            } else {
-                scene
+                    .populate_unbound_barrier_row_for_test(frontier),
+                "settled" => scene
                     .adapter
-                    .populate_unbound_barrier_row_for_test(frontier);
+                    .populate_unbound_settled_barrier_row_for_test(frontier),
+                "refused" => scene
+                    .adapter
+                    .populate_unbound_refused_barrier_row_for_test(frontier),
+                _ => {
+                    scene
+                        .adapter
+                        .populate_unbound_barrier_row_for_test(frontier);
+                    scene
+                        .adapter
+                        .populate_unbound_refused_barrier_row_for_test(frontier);
+                }
             }
             let mut barrier = SealBarrierState::default();
             let mut budget = usize::MAX;
@@ -34396,7 +34480,7 @@ pub(crate) mod tests {
                 assert_eq!(scene.adapter.seal_unbound_in_flight.get(), None);
                 assert!(
                     !scene.adapter.take_unbound_in_flight_grace(frontier),
-                    "settled unbound history retries toward the void shed"
+                    "{shape}: settled unbound history retries toward the void shed"
                 );
             } else {
                 assert_eq!(scene.adapter.seal_unbound_in_flight.get(), Some(frontier));
@@ -34434,5 +34518,147 @@ pub(crate) mod tests {
                 "min={min:?} granted={granted} frontier={frontier}"
             );
         }
+    }
+
+    /// Ruling O6-2b at the seal layer: a pre-key release quarantines
+    /// the image only up to the disposal's fence, excuses the released
+    /// call's late terminal while quarantined, and the next attest
+    /// above the fence lifts it. RED before: the pre-key disposal
+    /// promoted a permanent taint, so the attest refused forever.
+    #[test]
+    fn object_journal_pregrant_release_recovers_at_the_next_attest() {
+        let mut scene = Scene::new(image_default());
+        let sign = function_id("C_SignInit");
+        let mut begin = begin_bytes(1, 1, sign, 0);
+        put_u64(&mut begin, 88, 0x9090_9090_9090_9090);
+        begin[126] = 1;
+        *scene.adapter.voided_through.edit() = 5;
+        let failure = scene.adapter.refuse_pregrant_disposed_raw(
+            &mut scene.model,
+            &[((COOKIE, EXEC), (1, 1), sign)],
+            5,
+            JournalGap::PregrantNonAdmission,
+        );
+        assert_eq!(failure.gap, JournalGap::PregrantNonAdmission);
+        assert_eq!(failure.gap.label(), "pregrant_nonadmission");
+        assert!(scene.adapter.is_tainted((COOKIE, EXEC)), "quarantined");
+        assert!(
+            scene.adapter.taint_lifts_at_fence_for_test((COOKIE, EXEC)),
+            "the quarantine evidences only the fenced disposal"
+        );
+        let end = end_bytes(
+            &begin,
+            p11scope_ebpf_common::object_wire::OBJECT_ACTION_ACCESS,
+            0,
+            ENTRY_NS + 50,
+        );
+        assert_eq!(
+            scene.ingest(&end),
+            JournalDisposition::Contradiction(JournalContradiction::TerminalBeforeBegin),
+            "the released call's late terminal keeps its disposition"
+        );
+        assert!(
+            scene.adapter.taint_lifts_at_fence_for_test((COOKIE, EXEC)),
+            "the excused terminal never makes the quarantine permanent"
+        );
+        let admitted = scene.fixture.admit();
+        scene
+            .adapter
+            .attest_key(&admitted)
+            .expect("the image re-enters Joint above the fence");
+        assert!(!scene.adapter.is_tainted((COOKIE, EXEC)), "lifted");
+    }
+
+    /// Twin: a state-changing pre-grant-released call that returns only
+    /// after the lift is unattributed state change and still taints;
+    /// a neutral one with a clean return is excused.
+    #[test]
+    fn object_journal_pregrant_release_state_changing_terminal_after_lift_taints() {
+        for (name, taints) in [("C_CreateObject", true), ("C_SignInit", false)] {
+            let mut scene = Scene::new(image_default());
+            let function = function_id(name);
+            let mut begin = begin_bytes(1, 1, function, 0);
+            if !taints {
+                put_u64(&mut begin, 88, 0x9090_9090_9090_9090);
+                begin[126] = 1;
+            }
+            *scene.adapter.voided_through.edit() = 5;
+            scene.adapter.refuse_pregrant_disposed_raw(
+                &mut scene.model,
+                &[((COOKIE, EXEC), (1, 1), function)],
+                5,
+                JournalGap::PregrantNonAdmission,
+            );
+            assert!(scene.adapter.lift_fenced_image_taint((COOKIE, EXEC)));
+            let action = if taints {
+                OBJECT_ACTION_CREATE
+            } else {
+                p11scope_ebpf_common::object_wire::OBJECT_ACTION_ACCESS
+            };
+            let end = end_bytes(&begin, action, 0, ENTRY_NS + 50);
+            let _ = scene.ingest(&end);
+            assert_eq!(
+                scene.adapter.image_refused((COOKIE, EXEC)),
+                taints,
+                "{name}"
+            );
+        }
+    }
+
+    /// Class site: every lift to a clean image purges state-changing
+    /// absences. RED before: a fenced lift kept the dropped create's
+    /// absence, so its late ABANDON was excused blindly on the clean
+    /// image instead of promoting.
+    #[test]
+    fn object_journal_fenced_lift_purges_state_changing_absences() {
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+        for (name, taints) in [("C_CreateObject", true), ("C_SignInit", false)] {
+            let mut scene = Scene::new(image_default());
+            let function = function_id(name);
+            let mut begin = begin_bytes(1, 1, function, 0);
+            if !taints {
+                put_u64(&mut begin, 88, 0x9090_9090_9090_9090);
+                begin[126] = 1;
+            }
+            assert_eq!(
+                scene.ingest(&begin),
+                JournalDisposition::BeginAdmitted,
+                "{name}"
+            );
+            *scene.adapter.voided_through.edit() = 5;
+            scene.adapter.taint_image_at(
+                (COOKIE, EXEC),
+                TaintCause::Contradiction(JournalContradiction::TerminalBeforeBegin),
+                Some(5),
+            );
+            assert!(
+                scene.adapter.lift_fenced_image_taint((COOKIE, EXEC)),
+                "{name}"
+            );
+            let abandon =
+                abandon_bytes(1, 1, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
+            let _ = scene.ingest(&abandon);
+            assert_eq!(
+                scene.adapter.image_refused((COOKIE, EXEC)),
+                taints,
+                "{name}"
+            );
+        }
+    }
+
+    /// The typed O6-2b disclosure reason: exact count, frozen label,
+    /// and no reason for any other gap.
+    #[test]
+    fn pregrant_loss_gap_reason_is_typed_and_exact() {
+        use super::joint_driver::pregrant_loss_gap_reason;
+        assert_eq!(
+            pregrant_loss_gap_reason(JournalGap::PregrantNonAdmission, 3).as_deref(),
+            Some("joint_pregrant_nonadmission_history_loss calls=3")
+        );
+        assert_eq!(
+            pregrant_loss_gap_reason(JournalGap::PregrantRawLoss, 1).as_deref(),
+            Some("joint_pregrant_raw_loss_history_loss calls=1")
+        );
+        assert_eq!(pregrant_loss_gap_reason(JournalGap::ImageTainted, 1), None);
     }
 }

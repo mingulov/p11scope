@@ -494,6 +494,59 @@ class ObserverGateTests(unittest.TestCase):
                          "a fixed sleep must not stand in for the pass-0 gate")
 
 
+def extract_inventory_invocation():
+    """The cgroup cell's real oracle invocation: the python3 line with its
+    shell arguments, the heredoc body and its terminator."""
+    lines = QUAL.read_text().splitlines(keepends=True)
+    start = next(
+        i for i, line in enumerate(lines)
+        if '"$cell-inside.wl"' in line
+        and line.strip().startswith("python3 - "))
+    end = next(i for i in range(start, len(lines))
+               if lines[i].rstrip("\n") == "PY")
+    return "".join(lines[start:end + 1])
+
+
+class GenerationHandoffTests(unittest.TestCase):
+    """The shell hands each registered workload generation to the
+    oracle in its own position; a swap fails the healthy cell."""
+
+    def run_invocation(self, gen, childgen):
+        body = (
+            "cell=inventory-cgroup; ext=json; module_fs=overlayfs\n"
+            "MODULE=%s\nbefore='%s'\ngen=%s; childgen=%s\n%s"
+            "echo RC=$?\ncat \"$cell.detail\"\n"
+            % (MODPATH, json.dumps(PUBLISHED_PIN), gen, childgen,
+               extract_inventory_invocation()))
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            (tmp / "inventory-cgroup.json").write_text(
+                json.dumps(overlay_published_report()))
+            (tmp / "inventory-cgroup-inside.wl").write_text(
+                "READY pid=100\nCHILD pid=101\n%s\n" % INSIDE_LEDGER)
+            (tmp / "inventory-cgroup-outside.wl").write_text(
+                "READY pid=102\nLEDGER y\n")
+            proc = subprocess.run(["bash", "-u", "-c", body],
+                                  capture_output=True, text=True,
+                                  timeout=30, cwd=raw)
+        return proc.stdout + proc.stderr
+
+    def test_registered_generations_qualify_in_order(self):
+        out = self.run_invocation(GENERATIONS[100], GENERATIONS[101])
+        self.assertIn("RC=0", out)
+        self.assertIn("inventory cgroup: inside=100 child=101", out)
+
+    def test_swapped_generations_fail_the_cell(self):
+        out = self.run_invocation(GENERATIONS[101], GENERATIONS[100])
+        self.assertIn("RC=1", out)
+        self.assertIn("inside parent start time 5000 is not the "
+                      "workload generation 5001", out)
+
+    def test_invocation_passes_parent_then_child(self):
+        line = extract_inventory_invocation().splitlines()[0]
+        self.assertIn('"$module_fs" "$gen" "$childgen" <<', line)
+
+
 class InventoryOverlayTests(unittest.TestCase):
     def test_overlay_published_shape_passes(self):
         rc, out = run_oracle(overlay_published_report(), pin=PUBLISHED_PIN)

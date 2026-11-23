@@ -5103,15 +5103,19 @@ fn assert_pregrant_loss_disclosed(
     calls: u64,
 ) {
     let gaps = scene.coordinator.registry().gaps();
-    let losses: Vec<&str> = gaps
+    let losses: Vec<(&str, &str)> = gaps
         .iter()
         .filter(|gap| gap.reason.starts_with("joint_pregrant_"))
-        .map(|gap| gap.reason.as_str())
+        .map(|gap| (gap.subject.as_str(), gap.reason.as_str()))
         .collect();
+    let expected = format!("joint_pregrant_nonadmission_history_loss calls={calls}");
     assert_eq!(
         losses,
-        vec![format!("joint_pregrant_nonadmission_history_loss calls={calls}").as_str()],
-        "one typed loss row with the exact count"
+        vec![(
+            crate::inventory_present::JOINT_RETAINED_S1_SUBJECT,
+            expected.as_str()
+        )],
+        "one typed loss row: exact subject, reason and count"
     );
     assert!(
         gaps.iter()

@@ -42475,6 +42475,12 @@ pub(crate) mod session_fixture {
         /// killed and reaped inside that call, i.e. a generation lost after
         /// the candidate was built but before its admission reads the views.
         preflight_losses: RefCell<VecDeque<Option<u32>>>,
+        /// One batch per upcoming `preflight_targets` call: every pid in
+        /// the batch is killed and reaped inside that call. The batched
+        /// sibling of `preflight_losses` for ticks that lose two
+        /// generations at one preflight (mixed proof/refusal batches); a
+        /// call consults both queues, so tests script one seam per call.
+        preflight_loss_batches: RefCell<VecDeque<Vec<u32>>>,
         /// One entry per upcoming `detach_slots` call: `Some(pid)` is killed
         /// and reaped inside that call, i.e. a generation lost during the
         /// kernel's serialized link teardown, after the candidate's admission
@@ -42603,6 +42609,18 @@ pub(crate) mod session_fixture {
             script: impl IntoIterator<Item = Option<u32>>,
         ) {
             *self.preflight_losses.borrow_mut() = script.into_iter().collect();
+        }
+
+        /// Schedules generation-loss batches inside the next
+        /// `preflight_targets` calls: every pid in the batch is killed
+        /// and reaped in that call. The batched sibling of
+        /// `lose_generations_at_preflight` for mixed batches (a proven
+        /// exit beside an unproven newcomer at one preflight).
+        pub(crate) fn lose_generation_batches_at_preflight(
+            &mut self,
+            script: impl IntoIterator<Item = Vec<u32>>,
+        ) {
+            *self.preflight_loss_batches.borrow_mut() = script.into_iter().collect();
         }
 
         /// Schedules the outcome of the next one-shot slot detaches; `true`
@@ -43028,6 +43046,14 @@ pub(crate) mod session_fixture {
                     .collect(),
             );
             if let Some(Some(pid)) = self.preflight_losses.borrow_mut().pop_front() {
+                kill_and_reap(pid);
+            }
+            for pid in self
+                .preflight_loss_batches
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or_default()
+            {
                 kill_and_reap(pid);
             }
             if let Some(continuity) = &self.pid_continuity {

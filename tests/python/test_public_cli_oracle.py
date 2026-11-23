@@ -281,13 +281,64 @@ UNCHECKED_INTERNAL_REASON = (
 # The engine's unverified-generation marks (src/discovery/engine.rs
 # `unproven_generation_skip`): filed when a stale candidate or
 # inventory preflight cannot prove exit or change — the process may be
-# live and unchanged, so the failure proves neither event.
-# The candidate pair stands for the twins (the Rust projection test
-# pins all three internal pairs to the one row).
+# live and unchanged, so the failure proves neither event. Each
+# distinct refusal cause files its own pair (twelve pairs: three
+# sites times four causes); all project to the one public row.
 UNVERIFIED_CANDIDATE_INTERNAL_REASON = (
     "candidate generation unverified before mutation; "
     "exit or change unproven, canonical identity, plan, and links "
     "were unchanged")
+UNVERIFIED_CANDIDATE_DENIED_REASON = (
+    "candidate generation unverified before mutation; "
+    "a pin read was denied, exit or change unproven, canonical identity, "
+    "plan, and links were unchanged")
+UNVERIFIED_CANDIDATE_NOCUSTODY_REASON = (
+    "candidate generation unverified before mutation; "
+    "no generation pin was retained, exit or change unproven, canonical "
+    "identity, plan, and links were unchanged")
+UNVERIFIED_CANDIDATE_CONTRADICTED_REASON = (
+    "candidate generation unverified before mutation; "
+    "the stale report was contradicted, exit or change unproven, canonical "
+    "identity, plan, and links were unchanged")
+UNVERIFIED_PREFLIGHT_INTERNAL_REASON = (
+    "an exact retained or newly opened process generation was unverified "
+    "during inventory preflight; exit or change unproven")
+UNVERIFIED_PREFLIGHT_DENIED_REASON = (
+    "an exact retained or newly opened process generation was unverified "
+    "during inventory preflight; a pin read was denied, exit or change unproven")
+UNVERIFIED_PREFLIGHT_NOCUSTODY_REASON = (
+    "an exact retained or newly opened process generation was unverified "
+    "during inventory preflight; no generation pin was retained, exit or change unproven")
+UNVERIFIED_PREFLIGHT_CONTRADICTED_REASON = (
+    "an exact retained or newly opened process generation was unverified "
+    "during inventory preflight; the stale report was contradicted, exit or change unproven")
+UNVERIFIED_POSTFLIGHT_INTERNAL_REASON = (
+    "an exact retained or newly opened process generation was unverified "
+    "during post-retirement preflight; exit or change unproven")
+UNVERIFIED_POSTFLIGHT_DENIED_REASON = (
+    "an exact retained or newly opened process generation was unverified "
+    "during post-retirement preflight; a pin read was denied, exit or change unproven")
+UNVERIFIED_POSTFLIGHT_NOCUSTODY_REASON = (
+    "an exact retained or newly opened process generation was unverified "
+    "during post-retirement preflight; no generation pin was retained, exit or change unproven")
+UNVERIFIED_POSTFLIGHT_CONTRADICTED_REASON = (
+    "an exact retained or newly opened process generation was unverified "
+    "during post-retirement preflight; the stale report was contradicted, "
+    "exit or change unproven")
+UNVERIFIED_INTERNAL_PAIRS = (
+    ("live discovery generation", UNVERIFIED_CANDIDATE_INTERNAL_REASON),
+    ("live discovery generation", UNVERIFIED_CANDIDATE_DENIED_REASON),
+    ("live discovery generation", UNVERIFIED_CANDIDATE_NOCUSTODY_REASON),
+    ("live discovery generation", UNVERIFIED_CANDIDATE_CONTRADICTED_REASON),
+    ("live inventory generation", UNVERIFIED_PREFLIGHT_INTERNAL_REASON),
+    ("live inventory generation", UNVERIFIED_PREFLIGHT_DENIED_REASON),
+    ("live inventory generation", UNVERIFIED_PREFLIGHT_NOCUSTODY_REASON),
+    ("live inventory generation", UNVERIFIED_PREFLIGHT_CONTRADICTED_REASON),
+    ("live inventory generation", UNVERIFIED_POSTFLIGHT_INTERNAL_REASON),
+    ("live inventory generation", UNVERIFIED_POSTFLIGHT_DENIED_REASON),
+    ("live inventory generation", UNVERIFIED_POSTFLIGHT_NOCUSTODY_REASON),
+    ("live inventory generation", UNVERIFIED_POSTFLIGHT_CONTRADICTED_REASON),
+)
 
 
 # The engine's terminal record-resolution mark (src/discovery/engine.rs
@@ -400,14 +451,22 @@ def producer_unchecked_row():
 def producer_unverified_row():
     """The public unverified-generation row, from the real binary.
 
-    All three internal pairs project to the one row; the candidate
-    pair stands for the twins (the Rust projection test pins all
-    three). The expected row is pinned by value above.
+    All twelve internal pairs (three sites times four refusal
+    causes) project to the one row; each is exact-matched through
+    the binary here, and the candidate pair's row is returned for
+    the rejection twins. The expected row is pinned by value above.
     """
-    return binary_row(
-        "live discovery generation", UNVERIFIED_CANDIDATE_INTERNAL_REASON,
-        UNVERIFIED_PUBLIC_ROW["name"], UNVERIFIED_PUBLIC_ROW["reason"],
-        context="unverified-generation projection")
+    row = None
+    for subject, reason in UNVERIFIED_INTERNAL_PAIRS:
+        projected = binary_row(
+            subject, reason,
+            UNVERIFIED_PUBLIC_ROW["name"], UNVERIFIED_PUBLIC_ROW["reason"],
+            context="unverified-generation projection")
+        if (subject, reason) == ("live discovery generation",
+                                 UNVERIFIED_CANDIDATE_INTERNAL_REASON):
+            row = projected
+    assert row is not None
+    return row
 
 
 def producer_terminal_row():

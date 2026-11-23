@@ -15773,6 +15773,248 @@ fn inventory_preflight_mixed_set_files_both_rows_at_both_sites() {
     );
 }
 
+/// Fix5 twin (first inventory preflight, tick-level): a retained child
+/// admitted on tick 1 and a newcomer admitted on tick 2 are both
+/// killed and reaped inside the tick-2 first preflight. The retained
+/// pin proves the exit (scripted `Exited`) while the newcomer's pin
+/// cannot judge it (scripted poll failure): the preflight's own
+/// filing loop must file BOTH the changed row and the named
+/// unverified gap, the newcomer stays withheld and queued for
+/// refresh, and both rows survive publication. The shared-helper twin
+/// pins the verdict with live pins; this pins the site: a filing loop
+/// that drops the unproven half files only the proof row here.
+#[test]
+fn inventory_preflight_mixed_tick_files_both_rows_at_first_preflight() {
+    let (mut engine, dir) = engine_over_cgroup_naming(&[]);
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    let mut session = ScriptedSession::default();
+    // Tick 1 admits the retained child.
+    let retained_pid = spawn_execed_sleep().id();
+    std::fs::write(dir.path().join("cgroup.procs"), format!("{retained_pid}\n")).unwrap();
+    refresh_inventory_with(&mut engine, &mut session);
+    assert_eq!(engine.views.len(), 1, "tick 1 admits the retained child");
+    let retained_id = engine.views[0].id();
+    assert_eq!(
+        retained_id,
+        ProcessViewId(0),
+        "the retained child mints ID 0"
+    );
+    assert_eq!(engine.next_view_id, 1, "tick 1 mints one ID");
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .all(|skip| skip.subject != "live inventory generation"),
+        "tick 1 is clean: no generation rows before the mixed batch: {:?}",
+        engine.counters.object_skips
+    );
+    let calls_after_tick_1 = session.preflight_targets.borrow().len();
+    // Tick 2 admits the newcomer; the first preflight kills both.
+    let newcomer_pid = spawn_execed_sleep().id();
+    std::fs::write(
+        dir.path().join("cgroup.procs"),
+        format!("{retained_pid}\n{newcomer_pid}\n"),
+    )
+    .unwrap();
+    session.lose_generation_batches_at_preflight([vec![retained_pid, newcomer_pid]]);
+    // Stale-ID order: the retained ID 0 sorts before the newcomer ID.
+    engine.pin_probe_script.borrow_mut().extend([
+        PinProbeAnswer::State(Some(Ok(crate::process::OriginalGenerationState::Exited))),
+        PinProbeAnswer::State(Some(Err("simulated pin poll failure".to_string()))),
+    ]);
+    refresh_inventory_with(&mut engine, &mut session);
+    assert_eq!(
+        session.preflight_targets.borrow().len(),
+        calls_after_tick_1 + 2,
+        "tick 2 tripped its first preflight (plus the stale tail's conservative replay)"
+    );
+    assert_eq!(engine.next_view_id, 2, "tick 2 minted the newcomer ID");
+    assert!(
+        engine.retired_view_ids.contains(&1),
+        "the dropped newcomer's ID returns to the pool: {:?}",
+        engine.retired_view_ids
+    );
+    assert!(
+        !engine.views.iter().any(|view| view.pid() == newcomer_pid),
+        "the newcomer stays withheld: {:?}",
+        engine
+            .views
+            .iter()
+            .map(|view| view.pid())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        engine.refresh_requested.contains_key(&newcomer_pid),
+        "the lost newcomer's pid is queued again: {:?}",
+        engine.refresh_requested
+    );
+    assert!(
+        engine.pin_probe_script.borrow().is_empty(),
+        "both proof probes consumed their scripted answers: {:?}",
+        engine.pin_probe_script.borrow()
+    );
+    let expected: BTreeSet<(String, String)> = BTreeSet::from([
+        (
+            "live inventory generation".to_string(),
+            "an exact retained or newly opened process generation changed during inventory preflight"
+                .to_string(),
+        ),
+        (
+            "live inventory generation".to_string(),
+            "an exact retained or newly opened process generation was unverified during inventory preflight; exit or change unproven"
+                .to_string(),
+        ),
+    ]);
+    let filed: BTreeSet<(String, String)> = engine
+        .counters
+        .object_skips
+        .iter()
+        .filter(|skip| skip.subject == "live inventory generation")
+        .map(|skip| (skip.subject.clone(), skip.reason.clone()))
+        .collect();
+    assert_eq!(
+        filed, expected,
+        "the first preflight files both rows: {:?}",
+        engine.counters.object_skips
+    );
+    engine
+        .publish_current_capture_facts()
+        .expect("publication runs");
+    let published: BTreeSet<(String, String)> = engine
+        .plan
+        .skipped
+        .iter()
+        .filter(|skip| skip.subject == "live inventory generation")
+        .map(|skip| (skip.subject.clone(), skip.reason.clone()))
+        .collect();
+    assert_eq!(
+        published, expected,
+        "both rows survive publication: {:?}",
+        engine.plan.skipped
+    );
+}
+
+/// Fix5 twin (post-retirement preflight, tick-level): the same mixed
+/// batch as the first-preflight twin, lost at the post-retirement
+/// preflight instead — tick 2 passes its first preflight with both
+/// children live, then kills both inside the second preflight call.
+/// The post-retirement filing loop is its own loop with its own drop
+/// mutant; this pins it the same way: both rows, newcomer withheld
+/// and queued for refresh, both rows published.
+#[test]
+fn inventory_preflight_mixed_tick_files_both_rows_at_post_retirement_preflight() {
+    let (mut engine, dir) = engine_over_cgroup_naming(&[]);
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    let mut session = ScriptedSession::default();
+    // Tick 1 admits the retained child.
+    let retained_pid = spawn_execed_sleep().id();
+    std::fs::write(dir.path().join("cgroup.procs"), format!("{retained_pid}\n")).unwrap();
+    refresh_inventory_with(&mut engine, &mut session);
+    assert_eq!(engine.views.len(), 1, "tick 1 admits the retained child");
+    let retained_id = engine.views[0].id();
+    assert_eq!(
+        retained_id,
+        ProcessViewId(0),
+        "the retained child mints ID 0"
+    );
+    assert_eq!(engine.next_view_id, 1, "tick 1 mints one ID");
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .all(|skip| skip.subject != "live inventory generation"),
+        "tick 1 is clean: no generation rows before the mixed batch: {:?}",
+        engine.counters.object_skips
+    );
+    let calls_after_tick_1 = session.preflight_targets.borrow().len();
+    // Tick 2 admits the newcomer; the post-retirement preflight kills
+    // both (the first preflight call stays clean).
+    let newcomer_pid = spawn_execed_sleep().id();
+    std::fs::write(
+        dir.path().join("cgroup.procs"),
+        format!("{retained_pid}\n{newcomer_pid}\n"),
+    )
+    .unwrap();
+    session.lose_generation_batches_at_preflight([Vec::new(), vec![retained_pid, newcomer_pid]]);
+    // Stale-ID order: the retained ID 0 sorts before the newcomer ID.
+    engine.pin_probe_script.borrow_mut().extend([
+        PinProbeAnswer::State(Some(Ok(crate::process::OriginalGenerationState::Exited))),
+        PinProbeAnswer::State(Some(Err("simulated pin poll failure".to_string()))),
+    ]);
+    refresh_inventory_with(&mut engine, &mut session);
+    assert_eq!(
+        session.preflight_targets.borrow().len(),
+        calls_after_tick_1 + 3,
+        "tick 2 passed its first preflight, tripped its second, and replayed"
+    );
+    assert_eq!(engine.next_view_id, 2, "tick 2 minted the newcomer ID");
+    assert!(
+        engine.retired_view_ids.contains(&1),
+        "the dropped newcomer's ID returns to the pool: {:?}",
+        engine.retired_view_ids
+    );
+    assert!(
+        !engine.views.iter().any(|view| view.pid() == newcomer_pid),
+        "the newcomer stays withheld: {:?}",
+        engine
+            .views
+            .iter()
+            .map(|view| view.pid())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        engine.refresh_requested.contains_key(&newcomer_pid),
+        "the lost newcomer's pid is queued again: {:?}",
+        engine.refresh_requested
+    );
+    assert!(
+        engine.pin_probe_script.borrow().is_empty(),
+        "both proof probes consumed their scripted answers: {:?}",
+        engine.pin_probe_script.borrow()
+    );
+    let expected: BTreeSet<(String, String)> = BTreeSet::from([
+        (
+            "live inventory generation".to_string(),
+            "an exact retained or newly opened process generation changed during post-retirement preflight"
+                .to_string(),
+        ),
+        (
+            "live inventory generation".to_string(),
+            "an exact retained or newly opened process generation was unverified during post-retirement preflight; exit or change unproven"
+                .to_string(),
+        ),
+    ]);
+    let filed: BTreeSet<(String, String)> = engine
+        .counters
+        .object_skips
+        .iter()
+        .filter(|skip| skip.subject == "live inventory generation")
+        .map(|skip| (skip.subject.clone(), skip.reason.clone()))
+        .collect();
+    assert_eq!(
+        filed, expected,
+        "the post-retirement preflight files both rows: {:?}",
+        engine.counters.object_skips
+    );
+    engine
+        .publish_current_capture_facts()
+        .expect("publication runs");
+    let published: BTreeSet<(String, String)> = engine
+        .plan
+        .skipped
+        .iter()
+        .filter(|skip| skip.subject == "live inventory generation")
+        .map(|skip| (skip.subject.clone(), skip.reason.clone()))
+        .collect();
+    assert_eq!(
+        published, expected,
+        "both rows survive publication: {:?}",
+        engine.plan.skipped
+    );
+}
+
 /// Fix4 B2 RED twin (named-target refusal): a named target whose stale
 /// report the pin cannot judge (scripted poll failure at the
 /// post-retirement preflight — the fault injection the review used)
@@ -46303,6 +46545,78 @@ fn named_generation_change_during_attach_drops_before_event_consumption() {
     .expect_err("a named generation change is fatal");
 
     assert!(error.to_string().contains("while attaching"), "{error:#}");
+    assert_eq!(*log.borrow(), ["start", "drop"]);
+    assert!(!log.borrow().contains(&"consume"));
+}
+
+/// Fix5 twin (attach precheck bail, tier-1 F1): a named view whose pin
+/// cannot be judged (an unprovable pin over the live test process:
+/// no pidfd, no start time) reads stale, but the pre-attach bail must
+/// refuse as UNVERIFIED — never claim the generation changed before
+/// attach. Pre-fix the bail claims "changed" for a live target.
+#[test]
+fn named_unprovable_generation_refuses_unverified_before_attach() {
+    let view =
+        crate::process::unprovable_process_view_for_test(ProcessViewId(0), std::process::id())
+            .expect("an unprovable view over the live test process");
+    assert!(!view.still_the_same(), "the unprovable view reads stale");
+    let mut discovered = lifecycle_discovered(vec![view]);
+    let starts = Cell::new(0);
+    let error = start_retained_with(
+        &mut discovered,
+        true,
+        crate::process::stale_view_ids,
+        |_, _| {
+            starts.set(starts.get() + 1);
+            Ok(FakeSession(Default::default()))
+        },
+    )
+    .expect_err("an unproven named generation refuses startup");
+    assert!(
+        error.to_string().contains("was unverified before attach"),
+        "{error:#}"
+    );
+    assert!(
+        !error.to_string().contains("changed"),
+        "the refusal never claims the generation changed: {error:#}"
+    );
+    assert_eq!(starts.get(), 0, "no attach action may follow the mismatch");
+}
+
+/// Fix5 twin (attach postcheck bail, tier-1 F1): the same unprovable
+/// named view going stale after the session starts must refuse as
+/// UNVERIFIED — never claim the generation changed while attaching.
+/// The just-created session still drops before any event consumption.
+#[test]
+fn named_unprovable_generation_refuses_unverified_while_attaching() {
+    let view =
+        crate::process::unprovable_process_view_for_test(ProcessViewId(0), std::process::id())
+            .expect("an unprovable view over the live test process");
+    let stale = view.id();
+    let mut discovered = lifecycle_discovered(vec![view]);
+    let checks = Cell::new(0);
+    let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let error = start_retained_with(
+        &mut discovered,
+        true,
+        |_| {
+            checks.set(checks.get() + 1);
+            (checks.get() == 2).then_some(stale).into_iter().collect()
+        },
+        |_, _| {
+            log.borrow_mut().push("start");
+            Ok(FakeSession(std::rc::Rc::clone(&log)))
+        },
+    )
+    .expect_err("an unproven named generation refuses startup");
+    assert!(
+        error.to_string().contains("was unverified while attaching"),
+        "{error:#}"
+    );
+    assert!(
+        !error.to_string().contains("changed"),
+        "the refusal never claims the generation changed: {error:#}"
+    );
     assert_eq!(*log.borrow(), ["start", "drop"]);
     assert!(!log.borrow().contains(&"consume"));
 }
@@ -92523,6 +92837,80 @@ fn lost_generation_after_a_failed_arm_records_nothing_only_for_an_ending_group()
             engine.counters.object_skips
         );
     }
+}
+
+/// Fix5 twin (loader-arming bail, tier-1 F1): a named target whose
+/// generation is lost after a successful arm, but whose pin state
+/// reads fail (scripted poll failures — the exit probes still report
+/// the live child as not exited), must refuse as UNVERIFIED — never
+/// claim the generation changed. The pin proved neither exit nor
+/// change, and the target may be live and unchanged. Pre-fix the bail
+/// claims "changed" for a possibly live target. (Fault injection is
+/// scripted because an unprovable pin shape fails the arm itself
+/// before any bail; the script answers, in order, the exit probe,
+/// the retirement re-verify's exit probe and state probe, the two
+/// exit probes around the loss mark, and the bail's state recheck.)
+#[test]
+fn named_generation_loss_with_unprovable_pin_refuses_unverified_during_loader_arming() {
+    let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+    engine.lose_generation_after_arm_for_test = true;
+    engine.pin_probe_script.borrow_mut().extend([
+        PinProbeAnswer::Exited(Ok(false)),
+        PinProbeAnswer::Exited(Ok(false)),
+        PinProbeAnswer::State(Some(Err("simulated pin poll failure".to_string()))),
+        PinProbeAnswer::Exited(Ok(false)),
+        PinProbeAnswer::Exited(Ok(false)),
+        PinProbeAnswer::State(Some(Err("simulated pin poll failure".to_string()))),
+    ]);
+    let error = engine
+        .arm_loader_or_partial(
+            0,
+            &mut ScriptedSession::default(),
+            &mut true,
+            &mut PendingViewRetirements::new(),
+        )
+        .expect_err("an unproven named generation refuses the capture");
+    let text = format!("{error:#}");
+    assert!(
+        text.contains("was unverified during loader arming"),
+        "the refusal names the unverified generation: {text}"
+    );
+    assert!(
+        !text.contains("changed"),
+        "the refusal never claims the generation changed: {text}"
+    );
+    assert!(
+        engine.pin_probe_script.borrow().is_empty(),
+        "the exit probes and the state recheck consumed their answers: {:?}",
+        engine.pin_probe_script.borrow()
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+/// Fix5 control beside the arming refusal twin: the same forced loss
+/// with a readable live pin keeps the "changed" bail — the stale
+/// report is positive exit-or-change evidence, and only a pin READ
+/// ERROR reroutes to the unverified refusal.
+#[test]
+fn named_generation_loss_with_readable_pin_keeps_changed_bail_during_loader_arming() {
+    let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+    engine.lose_generation_after_arm_for_test = true;
+    let error = engine
+        .arm_loader_or_partial(
+            0,
+            &mut ScriptedSession::default(),
+            &mut true,
+            &mut PendingViewRetirements::new(),
+        )
+        .expect_err("a named generation loss still refuses the capture");
+    let text = format!("{error:#}");
+    assert!(
+        text.contains("changed during loader arming"),
+        "a readable stale report keeps the changed bail: {text}"
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
 }
 
 /// The export-hook generation-change mark: silent for an ending group,

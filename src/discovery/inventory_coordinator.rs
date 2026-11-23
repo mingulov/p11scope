@@ -1009,13 +1009,15 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// Leader exits already recorded as link loss (H6 slice 2): one entry
     /// per incarnation at most, never cleared (IDs never reuse).
     leader_link_loss_noted: BTreeSet<CallerId>,
-    /// Kernel-stamped leader exits per pid (F7 clocks only): the
-    /// earliest `LEADER_EXIT` hook at or after an incarnation's
-    /// admission, keyed by pid then caller. While the leader lived no
-    /// other process could hold its tgid, so a row stamped inside
-    /// `[admission, exit)` is that caller's even outside PID scope. One
-    /// entry per retained record at most; removed when its record folds.
-    leader_exit_witness: HashMap<u32, Vec<(CallerId, u64)>>,
+    /// Kernel-stamped leader exits per proven incarnation (system
+    /// scope, F7 clocks only): the earliest `LEADER_EXIT` hook for the
+    /// pid at or after the instant the incarnation's leader was proven
+    /// alive ([`CallerAdapter::leader_alive_ns`]). While that leader
+    /// lived no other process could hold its tgid, and its own exit is
+    /// the first leader exit of the tgid after that instant, so a row
+    /// stamped inside `[alive, exit)` is that caller's. One entry per
+    /// retained record at most; removed when its record folds.
+    leader_exit_witness: HashMap<CallerId, u64>,
     pending_leader_exits: BTreeMap<CallerId, leader_exit::PendingLeaderExit<Source::Pin>>,
     leader_exit_cursor: Option<CallerId>,
     /// Whether BPF hook timestamps and observer admission stamps share
@@ -1585,11 +1587,11 @@ fn collapse_hint_misses(
 struct RetainedGate<'a, Source: ProcessSource> {
     adapter: &'a CallerAdapter<Source>,
     allowed: bool,
-    /// Kernel leader-exit stamps per pid: outside the gate, the one
-    /// retained holder of a pid with a witnessed exit still resolves,
-    /// its lifetime ending at that exit (never at the later reconcile
-    /// that observed it), so a reused pid can never fall inside it.
-    exit_witness: &'a HashMap<u32, Vec<(CallerId, u64)>>,
+    /// Kernel leader-exit stamps per proven incarnation: a row inside
+    /// `[leader proven alive, leader exit)` resolves to that incarnation
+    /// in system scope (see `InventoryCoordinator::leader_exit_witness`).
+    exit_witness: &'a HashMap<CallerId, u64>,
+    exit_allowed: bool,
 }
 
 impl<'a, Source: ProcessSource> CallerLookup<Source::Pin> for RetainedGate<'a, Source> {
@@ -1601,24 +1603,31 @@ impl<'a, Source: ProcessSource> CallerLookup<Source::Pin> for RetainedGate<'a, S
         if self.allowed {
             CallerLookup::retained_callers(self.adapter, pid)
         } else {
-            self.exit_witnessed_caller(pid).into_iter().collect()
+            Vec::new()
         }
     }
 
-    fn exit_witnessed_caller(&self, pid: u32) -> Option<RetainedCaller> {
-        let stamps = self.exit_witness.get(&pid)?;
-        let held = CallerLookup::retained_callers(self.adapter, pid);
-        let [only] = held.as_slice() else {
+    fn exit_witnessed_caller(&self, pid: u32, event_ns: u64) -> Option<RetainedCaller> {
+        if !self.exit_allowed {
             return None;
-        };
-        stamps
-            .iter()
-            .find(|(id, _)| *id == only.id)
-            .map(|&(_, exit_ns)| RetainedCaller {
-                last_seen_ns: exit_ns,
-                retired: true,
-                ..*only
-            })
+        }
+        let (id, alive_ns, exit_ns) = self
+            .adapter
+            .leader_proven(pid)
+            .filter_map(|(id, alive_ns)| Some((id, alive_ns, *self.exit_witness.get(&id)?)))
+            .find(|&(_, alive_ns, exit_ns)| alive_ns <= event_ns && event_ns < exit_ns)?;
+        let record = self.adapter.record(id)?;
+        Some(RetainedCaller {
+            id,
+            // The proven interval, never the scan-window stamps.
+            first_seen_ns: alive_ns,
+            last_seen_ns: exit_ns,
+            retired: true,
+            start_time: record.start_time,
+            exe_present: record.exe.is_some(),
+            exec_observed: record.exec_observed,
+            lifecycle: record.lifecycle,
+        })
     }
 }
 
@@ -7930,7 +7939,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 }
                 self.registry.compact_folded_caller(id);
                 self.leader_link_loss_noted.remove(&id);
-                self.forget_leader_exit_witness(record.pid, id);
+                self.leader_exit_witness.remove(&id);
                 self.staged_retirements.remove(&id);
                 self.retired_caller_rows = self.retired_caller_rows.saturating_add(1);
                 if folded_caller.with_calls {
@@ -10310,6 +10319,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     adapter: &self.adapter,
                     allowed: self.retained_fallback_allowed(&batch),
                     exit_witness: &self.leader_exit_witness,
+                    exit_allowed: self.exit_witness_allowed(&batch),
                 };
                 // An incomplete re-sight pass resumes on the next
                 // witness batch (the owed attempts persist in the
@@ -10429,40 +10439,38 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .retain(|class| class.domain != domain);
     }
 
-    /// Stamps the kernel leader exit `hook_ts_ns` on the incarnation of
-    /// `pid` that held the tgid at that instant: the latest admitted at
-    /// or before the hook, live or already retired (reconcile may retire
-    /// an exited caller before its exit record drains). Only the
-    /// earliest hook after an admission is that caller's own exit; a
-    /// later one may be a reused pid's. Without comparable clocks the
-    /// hook cannot be ordered against admissions and stamps nothing.
+    /// Stamps the kernel leader exit `hook_ts_ns` on every proven
+    /// incarnation of `pid` whose leader was proven alive at or before
+    /// it, keeping the earliest: that incarnation's own leader exit is
+    /// the first leader exit of the tgid after its proven-alive instant
+    /// (no other process can hold the tgid before it), so a later hook
+    /// (a reused pid's) never replaces it. A missing own exit is ring
+    /// loss, which vetoes the retained decision. System scope only: a
+    /// cgroup filter can drop the own exit without any loss count.
+    /// Without comparable clocks nothing is stamped. Bounded by the
+    /// pid's proven incarnations, never a walk of every caller.
     fn note_leader_exit_witness(&mut self, pid: u32, hook_ts_ns: u64) {
-        if !self.exit_clocks_comparable {
+        if !self.exit_clocks_comparable || !matches!(self.engine.scope, Scope::System) {
             return;
         }
-        let Some(holder) = self
-            .adapter
-            .records()
-            .filter(|record| record.pid == pid && record.admitted_ns <= hook_ts_ns)
-            .max_by_key(|record| record.admitted_ns)
-            .map(|record| record.id)
-        else {
-            return;
-        };
-        let stamps = self.leader_exit_witness.entry(pid).or_default();
-        match stamps.iter_mut().find(|(id, _)| *id == holder) {
-            Some((_, exit_ns)) => *exit_ns = (*exit_ns).min(hook_ts_ns),
-            None => stamps.push((holder, hook_ts_ns)),
+        for (id, alive_ns) in self.adapter.leader_proven(pid) {
+            if alive_ns <= hook_ts_ns {
+                let exit_ns = self.leader_exit_witness.entry(id).or_insert(hook_ts_ns);
+                *exit_ns = (*exit_ns).min(hook_ts_ns);
+            }
         }
     }
 
-    fn forget_leader_exit_witness(&mut self, pid: u32, id: CallerId) {
-        if let Some(stamps) = self.leader_exit_witness.get_mut(&pid) {
-            stamps.retain(|(held, _)| *held != id);
-            if stamps.is_empty() {
-                self.leader_exit_witness.remove(&pid);
-            }
-        }
+    /// Whether this witness batch may resolve rows through a witnessed
+    /// leader exit: system scope, comparable exit clocks and a healthy
+    /// read (a poisoned owner drops lifecycle records before the ring,
+    /// so an unhealthy capture cannot prove a hook was not missed).
+    fn exit_witness_allowed(&self, batch: &WitnessBatch) -> bool {
+        matches!(self.engine.scope, Scope::System)
+            && self.exit_clocks_comparable
+            && batch.health.failures.is_empty()
+            && batch.health_unproven.is_none()
+            && batch.health_regression.is_none()
     }
 
     /// `LEADER_EXIT` records (H6 slice 2): a leader exit whose generation
@@ -43859,7 +43867,10 @@ int main(void) {
         // must not close the old lifetime around the reuser's row (400).
         agreeing(|| {
             let (mut native, caller) = proven_system_native(true);
-            let _ = caller;
+            assert_eq!(
+                native.scene.coordinator.adapter.leader_alive_ns(caller),
+                None
+            );
             retire_then_exits(&mut native, &[190, 450]);
             let row = native.row(41, 1, 7, 400, 0);
             native.witness(vec![row]);
@@ -43969,19 +43980,30 @@ int main(void) {
                 800,
                 &mut || Some(900),
             );
-            let second = native.scene.coordinator.adapter.live_id(7).expect("B admitted");
+            let second = native
+                .scene
+                .coordinator
+                .adapter
+                .live_id(7)
+                .expect("B admitted");
             assert_ne!(first, second);
+            native.scene.project(7, 950);
+            native.scene.coordinator.commit_batch(false).unwrap();
             retire_then_exits(&mut native, &[1_200]);
             let rows = vec![native.row(41, 1, 7, 300, 0), native.row(42, 1, 7, 1_000, 0)];
             native.witness(rows);
             assert_eq!(bound_census(&native), (2, 2, 0));
-            let registry = &native.scene.coordinator.registry;
             for caller in [first, second] {
+                let edges: Vec<_> = native
+                    .scene
+                    .coordinator
+                    .registry
+                    .edges()
+                    .map(|edge| (edge.caller, edge.entry_count))
+                    .collect();
                 assert!(
-                    registry
-                        .edges()
-                        .any(|edge| edge.caller == caller && edge.entry_count > 0),
-                    "{caller:?} counts its own row"
+                    edges.iter().any(|&(held, _)| held == caller),
+                    "{caller:?} holds its own row: {edges:?}"
                 );
             }
         });

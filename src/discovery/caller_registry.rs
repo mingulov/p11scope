@@ -1063,6 +1063,10 @@ struct TrackedCaller<Pin> {
     record: CallerRecord,
     pin: Option<SharedCallerPin<Pin>>,
     leader_exit_pending: bool,
+    /// An instant at which this incarnation's leader thread provably
+    /// lived (see [`CallerAdapter::leader_alive_ns`]); `None` when never
+    /// proven.
+    leader_alive_ns: Option<u64>,
 }
 
 /// Tracks caller incarnations: admission, exit/exec/reuse retirement with
@@ -1087,6 +1091,10 @@ pub(crate) struct CallerAdapter<Source: ProcessSource> {
     /// forwards these to the binder, whose retained-identity fallback
     /// voids holders admitted at or before them.
     pid_reuses: Vec<(u32, u64)>,
+    /// Retained incarnations with a leader-alive proof, by pid: the
+    /// bounded lookup for kernel leader-exit stamps (never a walk of
+    /// every caller). Entries leave with their record.
+    proven_by_pid: BTreeMap<u32, Vec<CallerId>>,
 }
 
 /// Why one admission attempt failed: an honest pin failure, or a budget
@@ -1231,6 +1239,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
             scoped_retire_cursor: None,
             detection_clock_failed: false,
             pid_reuses: Vec::new(),
+            proven_by_pid: BTreeMap::new(),
         }
     }
 
@@ -1434,6 +1443,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
             id,
             TrackedCaller {
                 leader_exit_pending: false,
+                leader_alive_ns: None,
                 record: CallerRecord {
                     id,
                     pid,
@@ -1609,6 +1619,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
             id,
             TrackedCaller {
                 leader_exit_pending: false,
+                leader_alive_ns: None,
                 record: CallerRecord {
                     id,
                     pid: prepared.pid,
@@ -1728,6 +1739,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
             id,
             TrackedCaller {
                 leader_exit_pending: false,
+                leader_alive_ns: None,
                 record: CallerRecord {
                     id,
                     pid,
@@ -1917,12 +1929,50 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                 0
             }
         };
-        self.callers
+        // Leader-alive proof: the stamp was sampled after the pin
+        // opened; the leader thread is then read live (not a zombie or
+        // dead, which also refuses cold zombie-leader admissions) and the
+        // pin still holds the same generation after that read. So the
+        // leader lived at a later instant than the stamp and the pin
+        // existed before it: it lived at the stamp, and its tgid could
+        // name no other process then. An exit during admission fails the
+        // proof instead of discarding the genuine exit.
+        let proven = admitted_ns != 0
+            && !self.source.gone(pid)
+            && self
+                .callers
+                .get(&id)
+                .and_then(|tracked| tracked.pin.as_ref())
+                .is_some_and(|pin| self.source.still_the_same(pin));
+        let tracked = self
+            .callers
             .get_mut(&id)
-            .expect("the admitted caller retains its record")
-            .record
-            .admitted_ns = admitted_ns;
+            .expect("the admitted caller retains its record");
+        tracked.record.admitted_ns = admitted_ns;
+        tracked.leader_alive_ns = proven.then_some(admitted_ns);
+        if proven {
+            self.proven_by_pid.entry(pid).or_default().push(id);
+        }
         Ok(id)
+    }
+
+    /// Retained incarnations of `pid` with a leader-alive proof, as
+    /// `(caller, proven-alive instant)`, oldest first.
+    pub(crate) fn leader_proven(&self, pid: u32) -> impl Iterator<Item = (CallerId, u64)> + '_ {
+        self.proven_by_pid
+            .get(&pid)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| Some((*id, self.callers.get(id)?.leader_alive_ns?)))
+    }
+
+    /// The detection stamp of `id` when its leader thread was proven
+    /// alive at that instant (bracketed by the held pin and a later
+    /// live leader read), `None` otherwise: a raced, cold or unstamped
+    /// admission proves nothing.
+    #[cfg(test)]
+    pub(crate) fn leader_alive_ns(&self, id: CallerId) -> Option<u64> {
+        self.callers.get(&id)?.leader_alive_ns
     }
 
     fn retire(&mut self, id: CallerId, lifecycle: CallerLifecycle, reason: String, now_ns: u64) {
@@ -1955,6 +2005,12 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         self.callers.remove(&id);
         if self.live_by_pid.get(&pid) == Some(&id) {
             self.live_by_pid.remove(&pid);
+        }
+        if let Some(proven) = self.proven_by_pid.get_mut(&pid) {
+            proven.retain(|held| *held != id);
+            if proven.is_empty() {
+                self.proven_by_pid.remove(&pid);
+            }
         }
         true
     }
@@ -2202,6 +2258,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
             id,
             TrackedCaller {
                 leader_exit_pending: false,
+                leader_alive_ns: None,
                 record: CallerRecord {
                     id,
                     pid,

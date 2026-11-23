@@ -9464,22 +9464,18 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             // A pruned dropped pair keeps its exact base as a tombstone:
             // the revival rebases past it exactly like an unpruned drop.
             // A late-bound row (recorded before its caller's admission)
-            // rebases past its first sight instead: the pre-admission
-            // subtotal is unattributed, and only post-admission growth
-            // stages. An on-time row whose first recorded entry passed
-            // through a plan-proven setup endpoint, whose caller
-            // spawned after the initial attach with the endpoint
-            // already live, observed its setup seed first: it bases
-            // past exactly that one call, so only counted calls stage.
+            // bases like an on-time row: the late bind proved the same
+            // task held the same image from the row's first entry to
+            // the sighting, so its pre-admission calls are this
+            // caller's and count from the row's first entry (data
+            // always: a known count is never dropped). A row whose
+            // first recorded entry passed through a plan-proven setup
+            // endpoint, whose caller spawned after the initial attach
+            // with the endpoint already live, observed its setup seed
+            // first: it bases past exactly that one call, so only
+            // counted calls stage.
             None => {
-                let late = self
-                    .adapter
-                    .record(caller)
-                    .is_some_and(|record| row.recorded_at_ns < record.first_seen_ns);
-                let fresh = if late {
-                    let sight = row.entry_count;
-                    (sight, sight, held_first, held_first)
-                } else if self.seeded_first_sight(row, caller) {
+                let fresh = if self.seeded_first_sight(row, caller) {
                     (1, 1, held_first, held_first)
                 } else {
                     (0, 0, 0, held_first)

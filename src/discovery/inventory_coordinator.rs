@@ -54,8 +54,8 @@ use crate::discovery::inventory_attach_set::{
 };
 use crate::discovery::native_binding::{
     BinderLimits, Binding, BoundImage, CallerLookup, CurrentBindingCheck, CurrentBindingRequest,
-    CurrentBindingSighting, Decision, ExecTransition, LiveCaller, NativeBinder, NativeIdentity,
-    RetainedCaller, UnboundReason,
+    CurrentBindingSighting, Decision, ExecTransition, ExitWitnessValidator, LiveCaller,
+    NativeBinder, NativeIdentity, RetainedCaller, UnboundReason,
 };
 use crate::discovery::scan::{
     INVENTORY_WINDOW_IO_BYTES, InventoryDiscoveryLimits, InventoryRetainedLimits,
@@ -1611,11 +1611,19 @@ impl<'a, Source: ProcessSource> CallerLookup<Source::Pin> for RetainedGate<'a, S
         if !self.exit_allowed {
             return None;
         }
-        let (id, alive_ns, exit_ns) = self
+        // Exactly one proven interval may contain the event: hooks can
+        // drain out of order, so an older holder's transiently wide
+        // interval can overlap a younger holder's. Overlapping holders
+        // refuse with no snapshot, never the oldest.
+        let mut containing = self
             .adapter
             .leader_proven(pid)
             .filter_map(|(id, alive_ns)| Some((id, alive_ns, *self.exit_witness.get(&id)?)))
-            .find(|&(_, alive_ns, exit_ns)| alive_ns <= event_ns && event_ns < exit_ns)?;
+            .filter(|&(_, alive_ns, exit_ns)| alive_ns <= event_ns && event_ns < exit_ns);
+        let (id, alive_ns, exit_ns) = containing.next()?;
+        if containing.next().is_some() {
+            return None;
+        }
         let record = self.adapter.record(id)?;
         Some(RetainedCaller {
             id,
@@ -1628,6 +1636,26 @@ impl<'a, Source: ProcessSource> CallerLookup<Source::Pin> for RetainedGate<'a, S
             exec_observed: record.exec_observed,
             lifecycle: record.lifecycle,
         })
+    }
+}
+
+impl<Source: ProcessSource> ExitWitnessValidator for RetainedGate<'_, Source> {
+    fn current_holder(&self, pid: u32, event_ns: u64) -> Option<CallerId> {
+        // Decide-time revalidation: the same exactly-one containment
+        // as the resolve path, against the current stamps, without
+        // the batch health gate (the row carries the health of the
+        // read that produced it). A shrunk exit or a later
+        // overlapping holder refuses here.
+        let mut containing = self
+            .adapter
+            .leader_proven(pid)
+            .filter_map(|(id, alive_ns)| Some((id, alive_ns, *self.exit_witness.get(&id)?)))
+            .filter(|&(_, alive_ns, exit_ns)| alive_ns <= event_ns && event_ns < exit_ns);
+        let (id, _, _) = containing.next()?;
+        if containing.next().is_some() {
+            return None;
+        }
+        Some(id)
     }
 }
 
@@ -4617,7 +4645,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     pub(crate) fn note_extend_receipt(&mut self, receipt: &ExtendReceipt) {
         // Exec coverage is the binder's, whatever capture coverage holds.
         if let Some(coverage) = receipt.exec_coverage {
-            self.binder.note_exec_coverage(coverage);
+            let gate = RetainedGate {
+                adapter: &self.adapter,
+                allowed: false,
+                exit_witness: &self.leader_exit_witness,
+                exit_allowed: false,
+            };
+            self.binder
+                .note_exec_coverage_with_validator(coverage, Some(&gate));
         }
         // Keymeta Task 7 (spec §17.4): the attach-side counted
         // `info_return_deferred` gap rides every receipt into the
@@ -8550,8 +8585,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // Forward recorded PID reuses first: every reconcile (scan,
         // scoped, or empty pass) funnels through here, so the binder
         // learns each turnover whether or not a successor admitted. PID
-        // scope only: the retained fallback (the sole consumer) runs
-        // there, so other scopes never grow the reuse table.
+        // scope only: only the PID retained fallback consults the reuse
+        // veto there, so other scopes never grow the reuse table. The
+        // system-scope exit path relies on proven-interval containment
+        // instead and never sees these turnovers.
         let reuses = self.adapter.take_pid_reuses();
         if matches!(self.engine.scope, Scope::Pid(_)) {
             for (pid, at_ns) in reuses {
@@ -10325,7 +10362,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 // witness batch (the owed attempts persist in the
                 // binder); the receipt below reports whether any
                 // remain, so the stop machine can read on for them.
-                let _resight = self.binder.absorb_witnesses(&batch, &gate, &mut *identity);
+                // The gate doubles as the decide-time validator, so
+                // exit snapshots revalidate against these same stamps.
+                let _resight = self.binder.absorb_witnesses_with_validator(
+                    &batch,
+                    &gate,
+                    &mut *identity,
+                    Some(&gate),
+                );
                 self.note_witness_batch(&batch);
                 self.record_witness_integrity(&batch);
                 // Counts merge before the binder's decisions stage, so a
@@ -10345,14 +10389,28 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 self.lifecycle_high_water_bytes = self
                     .lifecycle_high_water_bytes
                     .max(batch.drain_high_water_bytes);
-                self.binder.absorb_lifecycle(&batch);
+                // Leader exits note before absorption: the decisions
+                // absorption releases revalidate against the current
+                // witness, which includes this batch's own hooks.
+                // (Absorption reads only EXEC records, horizons and
+                // failures, so the order is otherwise unobservable.)
+                self.note_leader_exits(&batch);
+                let gate = RetainedGate {
+                    adapter: &self.adapter,
+                    allowed: false,
+                    exit_witness: &self.leader_exit_witness,
+                    // Resolve runs on witness batches only; the
+                    // validator below ignores this health gate.
+                    exit_allowed: false,
+                };
+                self.binder
+                    .absorb_lifecycle_with_validator(&batch, Some(&gate));
                 // Stash EXEC exe identities before the hook loop (the
                 // join is numbering-independent: domain and ticket,
                 // never the pid) and latch any lifecycle loss first,
                 // so rows staged below resolve against it.
                 self.stash_exec_exes(&batch);
                 self.note_exec_loss_from_binder(batch.domain);
-                self.note_leader_exits(&batch);
                 // Exec hooks for callers the binder never held mint through
                 // the hook path (the lost race); held callers stay the
                 // row-proven path's. Runs after absorption so a row the
@@ -10802,8 +10860,18 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
         for (domain, coverage_start) in due {
             let revalidated = self.adapter.revalidate_admitted_before(coverage_start);
-            self.binder
-                .note_revalidation(domain, pass_start_ns, revalidated);
+            let gate = RetainedGate {
+                adapter: &self.adapter,
+                allowed: false,
+                exit_witness: &self.leader_exit_witness,
+                exit_allowed: false,
+            };
+            self.binder.note_revalidation_with_validator(
+                domain,
+                pass_start_ns,
+                revalidated,
+                Some(&gate),
+            );
         }
         self.stage_binder_output(identity, pass_start_ns).events
     }

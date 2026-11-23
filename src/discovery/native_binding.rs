@@ -295,10 +295,21 @@ pub(crate) trait CallerLookup<Pin> {
     /// `first_seen_ns..last_seen_ns` is that proven interval (the
     /// instant its leader was proven alive, then its own leader exit).
     /// No other process can hold a tgid while its leader lives. The
-    /// default is none.
+    /// default is none. Resolves only when exactly one proven
+    /// interval contains the event: overlapping holders refuse with
+    /// no snapshot, never the oldest.
     fn exit_witnessed_caller(&self, _pid: u32, _event_ns: u64) -> Option<RetainedCaller> {
         None
     }
+}
+
+/// The current exit-witness holder for decide-time revalidation: the
+/// unique proven incarnation of `pid` whose kernel-witnessed interval
+/// contains `event_ns` right now, or `None` when zero or several do.
+/// Health-independent: the row carries the health of the read that
+/// produced it, checked separately at decision time.
+pub(crate) trait ExitWitnessValidator {
+    fn current_holder(&self, pid: u32, event_ns: u64) -> Option<CallerId>;
 }
 
 impl<Source: ProcessSource> CallerLookup<Source::Pin> for CallerAdapter<Source> {
@@ -633,6 +644,16 @@ struct Pending {
     /// coverage and competing-image checks still run at decision time,
     /// once both horizons cover the read.
     retained: Option<RetainedCaller>,
+    /// True when `retained` came from the kernel-witnessed exit path
+    /// (system scope) rather than the PID fallback. Only exit
+    /// snapshots revalidate against the current witness at decision
+    /// time and carry the read's health; the PID path is untouched.
+    retained_is_exit: bool,
+    /// Health of the witness read that produced this row (no
+    /// failures, health proven, no regression). An exit snapshot
+    /// from an unhealthy read never binds, even when a later
+    /// healthy batch re-sights it.
+    read_healthy: bool,
     /// A re-sight attempt is still owed before this row may be decided
     /// without a sighting: exactly when the row sits in the domain's
     /// owed queue. A fresh row without a read-time sighting or a
@@ -1032,14 +1053,27 @@ impl NativeBinder {
 
     /// Where `coverage`'s domain began recording execs (the facade's
     /// activation stamp). The first report wins: coverage never restarts
-    /// later within one domain.
+    /// later within one domain. Tests only: production passes the
+    /// current exit witness explicitly.
+    #[cfg(test)]
     pub(crate) fn note_exec_coverage(&mut self, coverage: ExecCoverage) {
+        self.note_exec_coverage_with_validator(coverage, None);
+    }
+
+    /// [`Self::note_exec_coverage`] with the current exit witness for
+    /// the decisions it releases: exit snapshots revalidate against
+    /// it, and refuse without one.
+    pub(crate) fn note_exec_coverage_with_validator(
+        &mut self,
+        coverage: ExecCoverage,
+        exit_validator: Option<&dyn ExitWitnessValidator>,
+    ) {
         let index = self.domain_index(coverage.domain());
         let state = &mut self.domains[index];
         if state.coverage_ns.is_none() {
             state.coverage_ns = Some(coverage.start_ns());
         }
-        self.decide_ready(index);
+        self.decide_ready(index, exit_validator);
     }
 
     /// Domains whose revalidation pass is due for a scan pass that started
@@ -1062,11 +1096,26 @@ impl NativeBinder {
     /// started at `pass_start_ns` found unchanged (same pin, start time and
     /// exe identity). Ignored unless that pass started at or after the
     /// coverage start; only the first qualifying pass counts.
+    /// Tests only: production passes the current exit witness explicitly.
+    #[cfg(test)]
     pub(crate) fn note_revalidation(
         &mut self,
         domain: NativeDomainId,
         pass_start_ns: u64,
         revalidated: HashSet<CallerId>,
+    ) {
+        self.note_revalidation_with_validator(domain, pass_start_ns, revalidated, None);
+    }
+
+    /// [`Self::note_revalidation`] with the current exit witness for
+    /// the decisions it releases: exit snapshots revalidate against
+    /// it, and refuse without one.
+    pub(crate) fn note_revalidation_with_validator(
+        &mut self,
+        domain: NativeDomainId,
+        pass_start_ns: u64,
+        revalidated: HashSet<CallerId>,
+        exit_validator: Option<&dyn ExitWitnessValidator>,
     ) {
         let Some(index) = self.domains.iter().position(|state| state.domain == domain) else {
             return;
@@ -1078,7 +1127,7 @@ impl NativeBinder {
             return;
         }
         state.revalidated = Some(revalidated);
-        self.decide_ready(index);
+        self.decide_ready(index, exit_validator);
     }
 
     /// Free per-process exec state for departed tasks (R-C51-5): a gone
@@ -1485,7 +1534,21 @@ impl NativeBinder {
             .sum()
     }
 
+    /// Tests only: production passes the current exit witness explicitly.
+    #[cfg(test)]
     pub(crate) fn absorb_lifecycle(&mut self, batch: &DiscoveryBatch) {
+        self.absorb_lifecycle_with_validator(batch, None);
+    }
+
+    /// [`Self::absorb_lifecycle`] with the current exit witness for
+    /// the decisions it releases: exit snapshots revalidate against
+    /// it, and refuse without one. The caller notes this batch's own
+    /// exits before absorbing, so the witness is current through it.
+    pub(crate) fn absorb_lifecycle_with_validator(
+        &mut self,
+        batch: &DiscoveryBatch,
+        exit_validator: Option<&dyn ExitWitnessValidator>,
+    ) {
         let index = self.domain_index(batch.domain);
         let limit = self.limits.exec_tgids;
         let state = &mut self.domains[index];
@@ -1512,7 +1575,7 @@ impl NativeBinder {
             state.lifecycle_ns = Some(state.lifecycle_ns.map_or(started, |was| was.max(started)));
         }
         state.batch_seq += 1;
-        self.decide_ready(index);
+        self.decide_ready(index, exit_validator);
     }
 
     /// One witness read: its health (read before its rows) covers earlier
@@ -1529,11 +1592,26 @@ impl NativeBinder {
     /// [`ResightOutcome::Incomplete`] when owed rows remain; the next
     /// batch resumes with them. A re-sighted row decides only once both
     /// horizons started strictly after its query completed.
+    /// Tests only: production passes the current exit witness explicitly.
+    #[cfg(test)]
     pub(crate) fn absorb_witnesses<Pin>(
         &mut self,
         batch: &WitnessBatch,
         lookup: &dyn CallerLookup<Pin>,
         identity: &mut dyn NativeIdentity<Pin>,
+    ) -> ResightOutcome {
+        self.absorb_witnesses_with_validator(batch, lookup, identity, None)
+    }
+
+    /// [`Self::absorb_witnesses`] with the current exit witness for
+    /// the decisions it releases: exit snapshots revalidate against
+    /// it, and refuse without one.
+    pub(crate) fn absorb_witnesses_with_validator<Pin>(
+        &mut self,
+        batch: &WitnessBatch,
+        lookup: &dyn CallerLookup<Pin>,
+        identity: &mut dyn NativeIdentity<Pin>,
+        exit_validator: Option<&dyn ExitWitnessValidator>,
     ) -> ResightOutcome {
         let index = self.domain_index(batch.domain);
         self.domains[index].batch_seq += 1;
@@ -1577,6 +1655,13 @@ impl NativeBinder {
         // the pass only owes rows carried from earlier batches.
         let outcome = self.resight_pass(index, lookup, identity);
         let read_ns = stamp(batch.rows_read_ns);
+        // Every row of this read carries its health: an unhealthy
+        // capture cannot prove a hook was not missed, so an exit
+        // snapshot from this read never binds, here or on a later
+        // healthy re-sight. The PID fallback never consults it.
+        let read_healthy = batch.health.failures.is_empty()
+            && batch.health_unproven.is_none()
+            && batch.health_regression.is_none();
         self.census.integrity += batch.integrity.len() as u64;
         for row in &batch.rows {
             self.census.rows += 1;
@@ -1627,13 +1712,18 @@ impl NativeBinder {
                     let [only] = held.as_slice() else {
                         return None;
                     };
-                    retained_candidate(only, row.recorded_at_ns).then_some(*only)
+                    retained_candidate(only, row.recorded_at_ns).then_some((*only, false))
                 })
                 .or_else(|| {
-                    needs_retained
+                    (needs_retained && read_healthy)
                         .then(|| lookup.exit_witnessed_caller(row.host_tgid, row.recorded_at_ns))
                         .flatten()
                         .filter(|witnessed| retained_candidate(witnessed, row.recorded_at_ns))
+                        .map(|witnessed| (witnessed, true))
+                });
+            let (retained, retained_is_exit) = retained
+                .map_or((None, false), |(snapshot, is_exit)| {
+                    (Some(snapshot), is_exit)
                 });
             // A row without a read-time sighting or a retained
             // fallback joins the owed queue: the read-time lookup was
@@ -1649,13 +1739,15 @@ impl NativeBinder {
                 read_ns,
                 sighting,
                 retained,
+                retained_is_exit,
+                read_healthy,
                 resight_due: due,
                 last_attempt: None,
             });
             state.next_pos += 1;
             self.census.pending += 1;
         }
-        self.decide_ready(index);
+        self.decide_ready(index, exit_validator);
         outcome
     }
 
@@ -1723,12 +1815,16 @@ impl NativeBinder {
                     // around the row carries it. No query is spent.
                     // Only a kernel-witnessed exit qualifies here: the
                     // general fallback's custody gate belongs to the
-                    // row's own read.
+                    // row's own read. A row read while unhealthy
+                    // carries that health and never resolves here,
+                    // even on a healthy pass.
                     let event_ns = pending.row.recorded_at_ns;
-                    if let Some(only) = lookup.exit_witnessed_caller(row_tgid, event_ns)
+                    if pending.read_healthy
+                        && let Some(only) = lookup.exit_witnessed_caller(row_tgid, event_ns)
                         && retained_candidate(&only, event_ns)
                     {
                         pending.retained = Some(only);
+                        pending.retained_is_exit = true;
                     }
                 }
                 Some(caller) => {
@@ -2047,7 +2143,7 @@ impl NativeBinder {
         self.decided.push(Decision { row, binding });
     }
 
-    fn decide_ready(&mut self, index: usize) {
+    fn decide_ready(&mut self, index: usize, exit_validator: Option<&dyn ExitWitnessValidator>) {
         loop {
             // The front row's gate: uncovered or revalidation-waiting
             // rows hold; an unsighted row without a retained fallback
@@ -2118,6 +2214,7 @@ impl NativeBinder {
                 &pending,
                 &self.reuse_ns,
                 self.exit_clocks_comparable,
+                exit_validator,
                 &mut self.transitions,
             );
             self.record(pending.row, binding);
@@ -2131,6 +2228,7 @@ fn decide(
     pending: &Pending,
     reuse_ns: &HashMap<u32, u64>,
     clocks_comparable: bool,
+    exit_validator: Option<&dyn ExitWitnessValidator>,
     transitions: &mut Vec<ExecTransition>,
 ) -> Binding {
     let row = &pending.row;
@@ -2159,6 +2257,7 @@ fn decide(
                     UnboundReason::NoLiveCaller,
                     reuse_ns,
                     clocks_comparable,
+                    exit_validator,
                 )
             },
         );
@@ -2177,6 +2276,7 @@ fn decide(
                         UnboundReason::CallerExited,
                         reuse_ns,
                         clocks_comparable,
+                        exit_validator,
                     )
                 },
             );
@@ -2275,7 +2375,10 @@ fn decide(
 /// after it, and no competing image of the ticket. A held conflicting
 /// image is ambiguous (no cookie answer exists to prove a transition,
 /// so none is emitted). Anything else binds and caches exactly like a
-/// live binding.
+/// live binding. Exit snapshots (system scope) additionally revalidate
+/// against the current witness below: the read-time interval may have
+/// shrunk or overlapped since, so the row binds only when the current
+/// witness still resolves to the same holder.
 fn decide_retained(
     state: &mut DomainState,
     pending: &Pending,
@@ -2283,6 +2386,7 @@ fn decide_retained(
     miss: UnboundReason,
     reuse_ns: &HashMap<u32, u64>,
     clocks_comparable: bool,
+    exit_validator: Option<&dyn ExitWitnessValidator>,
 ) -> Binding {
     // Without comparable clocks the exec/loss orderings below are
     // meaningless: hook stamps and admission stamps may not share a
@@ -2291,11 +2395,30 @@ fn decide_retained(
         return Binding::Unbound(miss);
     }
     let row = &pending.row;
+    // An exit snapshot's read-time interval is stale once a later drain
+    // shrinks its exit or overlaps it with another holder: revalidate
+    // at decide time against the current witness, and refuse with the
+    // live-miss gap unless it still resolves to this same holder. A
+    // row read while unhealthy never binds through the exit path,
+    // even on a later healthy batch. The PID fallback skips both.
+    if pending.retained_is_exit {
+        if !pending.read_healthy {
+            return Binding::Unbound(miss);
+        }
+        let Some(validator) = exit_validator else {
+            return Binding::Unbound(miss);
+        };
+        if validator.current_holder(row.host_tgid, row.recorded_at_ns) != Some(retained.id) {
+            return Binding::Unbound(miss);
+        }
+    }
     // A recorded PID reuse at or after the retained admission voids the
     // retained identity even with no admitted successor: the turnover
     // window is ambiguous (which generation fired the row is unknown),
     // so the row keeps its live-miss gap. A reuse before the admission
-    // is another generation's turnover.
+    // is another generation's turnover. (PID scope only: the
+    // coordinator forwards turnovers there; the system-scope exit path
+    // relies on containment instead.)
     if reuse_ns
         .get(&row.host_tgid)
         .is_some_and(|&at_ns| at_ns >= retained.first_seen_ns)

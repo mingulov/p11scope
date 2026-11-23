@@ -14189,6 +14189,49 @@ struct GetterPrefaultRange {
     next_addr: u64,
 }
 
+/// One abandoned warmup range's finite cause: four identity refusals
+/// (never read) and three read losses (proven, then unread). Each files
+/// its deduped named gap and counts exactly; the fixed sentences carry
+/// no path, pid, address or error chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GetterPrefaultLossCause {
+    HeldUnavailable,
+    IdentityMismatch,
+    IdentityUnreadable,
+    OverlayUnproven,
+    MemUnopenable,
+    ShortRead,
+    ReadError,
+}
+
+impl GetterPrefaultLossCause {
+    fn reason(self) -> &'static str {
+        match self {
+            GetterPrefaultLossCause::HeldUnavailable => {
+                "a manifest getter warmup range refused: held proof unavailable"
+            }
+            GetterPrefaultLossCause::IdentityMismatch => {
+                "a manifest getter warmup range refused: range identity mismatch"
+            }
+            GetterPrefaultLossCause::IdentityUnreadable => {
+                "a manifest getter warmup range refused: range identity unreadable"
+            }
+            GetterPrefaultLossCause::OverlayUnproven => {
+                "a manifest getter warmup range refused: overlay identity unproven"
+            }
+            GetterPrefaultLossCause::MemUnopenable => {
+                "a manifest getter warmup range unread: target memory unopenable"
+            }
+            GetterPrefaultLossCause::ShortRead => {
+                "a manifest getter warmup range unread: short target read"
+            }
+            GetterPrefaultLossCause::ReadError => {
+                "a manifest getter warmup range unread: target read error"
+            }
+        }
+    }
+}
+
 /// Test-only scripted warmup proof and per-pass caps. Production has no
 /// seam: proof always comes from the pinned identity owner and the
 /// target's `map_files` entries, and the caps are the named constants.
@@ -26761,16 +26804,15 @@ impl Engine {
 
     /// INV-2 per-pass bounds for the manifest-getter warmup: one
     /// I/O-bearing row (one target read attempt, success or failure) per
-    /// read credit, one native call (one held-identity lookup or range
-    /// identity proof) per proof credit, at most this many credits per
-    /// pass. Proofs that need no system call (the maps-key fast path)
-    /// spend no credit; the pre-read re-proof rides its batch proof's
-    /// credit (one logical proof, two stats for TOCTOU safety). Maps
-    /// enumeration strides in units of 64 with frame/deadline polls. The
-    /// capture frame, deadline and ceilings may stop a pass sooner;
-    /// every deferred pass makes progress (at least one read attempt or
-    /// proof) except a frame spent before any work, so the pass count is
-    /// finite.
+    /// read credit, one native call (one held-identity lookup, batch
+    /// range stat or read-time re-proof stat) per proof credit, at most
+    /// this many credits per pass. Proofs that need no system call (the
+    /// maps-key fast path) spend no credit. Maps enumeration, the
+    /// carried-index build and the merge stride in units of 64 with
+    /// frame, deadline and work-budget polls. The capture frame,
+    /// deadline and ceilings may stop a pass sooner; every pass at
+    /// production caps completes, refuses or advances at least one
+    /// range, so the pass count is finite.
     const GETTER_PREFAULT_READS_PER_PASS: usize = 64;
     const GETTER_PREFAULT_PROOFS_PER_PASS: usize = 64;
     /// Maps entries per enumeration stride: polled for frame, deadline
@@ -26803,19 +26845,24 @@ impl Engine {
     /// warmup and attaches at once: a best-effort warmup must never
     /// delay the hooks past the capture's own limits.
     ///
-    /// No range reads without its current-pass identity proof. A maps key
+    /// No chunk reads without its current-pass identity proof. A maps key
     /// alone never authorizes a read (inode numbers repeat across Btrfs
     /// subvolumes and overlay layers): each range proves like-for-like
     /// against the pinned object's held `vm_file` — the maps-key fast
     /// path where the filesystem allows it, else the range's own
-    /// `map_files` stat plus a pre-read re-proof — and carried proof
-    /// never authorizes a read (only offsets persist). Unproven ranges
-    /// (stranger, unreadable, overlay even on equality, or missing held
-    /// proof) are refused with a finite named counted gap; the bytes
-    /// stay unread and a later BPF miss still reports honestly via its
-    /// independent counter. Without the capability the warmup proves
-    /// nothing and reads nothing, and getter acquisition proceeds
-    /// otherwise as before the warmup existed.
+    /// `map_files` stat — and every chunk re-proves with a live
+    /// `map_files` stat immediately before it reads, through the same
+    /// pass's bracketed process authority and the pass's one memory
+    /// handle. Carried proof never authorizes a read (only offsets
+    /// persist). Unproven ranges (stranger, unreadable, overlay even on
+    /// equality, or missing held proof) are refused with a finite named
+    /// counted gap; the bytes stay unread and a later BPF miss still
+    /// reports honestly via its independent counter. Proven ranges the
+    /// pass cannot read (unopenable memory, short read, read error) are
+    /// abandoned loudly with their own finite named counted gaps.
+    /// Without the capability the warmup proves nothing and reads
+    /// nothing, and getter acquisition proceeds otherwise as before the
+    /// warmup existed.
     ///
     /// Limits: only file-backed ranges are faulted (heap and
     /// anonymous-BSS tables stay exposed); every byte read spends the
@@ -26823,10 +26870,11 @@ impl Engine {
     /// per-object allowance spans passes through the cursor; under an
     /// Inventory policy with no active scan the allowance is zero, so
     /// this faults nothing; and a page can be reclaimed again before the
-    /// getter returns. A same-generation remap between the re-proof stat
-    /// and the first byte remains a residual microsecond window, matching
-    /// the ordinary scan's guard-to-read shape; the re-proof keeps it to
-    /// one stat-to-read pair per range.
+    /// getter returns. A same-generation remap between one chunk's
+    /// re-proof stat and its first byte remains a residual microsecond
+    /// window, matching the ordinary scan's guard-to-read shape; the
+    /// per-chunk re-proof keeps it to one stat-to-read pair per chunk,
+    /// with no phase boundary and no other-range work between.
     fn prefault_manifest_getter_data(
         &mut self,
         view: ProcessViewId,
@@ -26882,28 +26930,7 @@ impl Engine {
         // cursor for the next pass. Read bytes stay cumulative for the
         // per-object allowance across the reopen.
         if self.frame_work_exhausted() {
-            let carried_bytes = self
-                .getter_prefault_cursors
-                .get(&view)
-                .map(|cursor| cursor.op_bytes)
-                .unwrap_or(0);
-            let fresh = self
-                .getter_prefault_cursors
-                .get(&view)
-                .is_none_or(|cursor| cursor.objects != objects);
-            if fresh {
-                self.getter_prefault_cursors.insert(
-                    view,
-                    GetterPrefaultCursor {
-                        objects,
-                        ranges: Vec::new(),
-                        next: 0,
-                        next_addr: 0,
-                        op_bytes: carried_bytes,
-                        enumerated: false,
-                    },
-                );
-            }
+            self.getter_prefault_keep_cursor_for_frame_yield(view, &objects);
             return Deferred { frame_spent: true };
         }
         let Ok(maps) = Self::read_maps(&self.views[position], &mut self.budget) else {
@@ -26921,22 +26948,7 @@ impl Engine {
                 #[cfg(test)]
                 self.getter_prefault_latch_frame_trip(GetterPrefaultStrideSite::Enum);
                 if self.frame_work_exhausted() {
-                    let carried_bytes = self
-                        .getter_prefault_cursors
-                        .get(&view)
-                        .map(|cursor| cursor.op_bytes)
-                        .unwrap_or(0);
-                    self.getter_prefault_cursors.insert(
-                        view,
-                        GetterPrefaultCursor {
-                            objects: objects.clone(),
-                            ranges: Vec::new(),
-                            next: 0,
-                            next_addr: 0,
-                            op_bytes: carried_bytes,
-                            enumerated: false,
-                        },
-                    );
+                    self.getter_prefault_keep_cursor_for_frame_yield(view, &objects);
                     return Deferred { frame_spent: true };
                 }
                 if self.budget.check_deadline_now().is_some() {
@@ -27004,27 +27016,61 @@ impl Engine {
         }
         let mut cursor = cursor.expect("a warmup cursor is always present here");
         let carried = std::mem::take(&mut cursor.ranges);
-        let carried_index: BTreeMap<
+        // The carried index strides like the enumeration (a yield here or
+        // in the merge restores the carried ranges untouched: old progress
+        // retires only against a completed fresh enumeration).
+        let mut carried_index: BTreeMap<
             (u64, u64, u64, u64, u64, PinnedObjectId),
             &GetterPrefaultRange,
-        > = carried
-            .iter()
-            .map(|old| {
+        > = BTreeMap::new();
+        for at in 0..carried.len() {
+            if at > 0 && at % Self::GETTER_PREFAULT_ENUM_STRIDE == 0 {
+                #[cfg(test)]
+                self.getter_prefault_latch_frame_trip(GetterPrefaultStrideSite::Index);
+                if self.frame_work_exhausted() {
+                    drop(carried_index);
+                    Self::restore_prefault_carried(&mut cursor, carried);
+                    self.getter_prefault_cursors.insert(view, cursor);
+                    return Deferred { frame_spent: true };
+                }
+                if self.budget.check_deadline_now().is_some() {
+                    return Complete;
+                }
+                if !self.budget.charge(1) {
+                    return Complete;
+                }
+            }
+            let old = &carried[at];
+            carried_index.insert(
                 (
-                    (
-                        old.start,
-                        old.end,
-                        old.device_major,
-                        old.device_minor,
-                        old.inode,
-                        old.object,
-                    ),
-                    old,
-                )
-            })
-            .collect();
+                    old.start,
+                    old.end,
+                    old.device_major,
+                    old.device_minor,
+                    old.inode,
+                    old.object,
+                ),
+                old,
+            );
+        }
         let mut merged = Vec::with_capacity(candidates.len());
-        for mut candidate in candidates {
+        for (at, mut candidate) in candidates.into_iter().enumerate() {
+            if at > 0 && at % Self::GETTER_PREFAULT_ENUM_STRIDE == 0 {
+                #[cfg(test)]
+                self.getter_prefault_latch_frame_trip(GetterPrefaultStrideSite::Merge);
+                if self.frame_work_exhausted() {
+                    drop(carried_index);
+                    Self::restore_prefault_carried(&mut cursor, carried);
+                    self.getter_prefault_cursors.insert(view, cursor);
+                    return Deferred { frame_spent: true };
+                }
+                if self.budget.check_deadline_now().is_some() {
+                    return Complete;
+                }
+                if !self.budget.charge(1) {
+                    return Complete;
+                }
+            }
             if let Some(old) = carried_index.get(&(
                 candidate.start,
                 candidate.end,
@@ -27067,15 +27113,26 @@ impl Engine {
         if next >= cursor.ranges.len() {
             return Complete;
         }
-        // Prove the pending ranges in maps order. Every held-identity
-        // lookup and every `map_files` stat is admitted under the proof
-        // cap before the work (including errors); the maps-key fast path
-        // spends no credit. Frame and deadline are polled between
-        // work-bearing steps. Each newly refused range files its finite
-        // named counted gap; carried refusals were already counted.
+        // Prove and read the pending ranges in maps order, one range at a
+        // time: each range is proved and read (as far as the caps allow)
+        // before the next range's held lookup runs, so no pass spends
+        // all credits looking ahead — every pass at production caps
+        // completes, refuses or advances at least one range. Every
+        // held-identity lookup, batch stat and read-time re-proof is
+        // admitted under the proof cap before the work (including
+        // errors); the maps-key fast path spends no credit. Every chunk
+        // re-proves immediately before it reads (fast ranges included):
+        // a mismatch or unreadable re-proof refuses the range with its
+        // finite named counted gap and reads zero further bytes from
+        // it. Frame and deadline are polled between work-bearing steps.
+        // Each newly refused range files its finite named counted gap;
+        // carried refusals were already counted.
         let mut proofs_spent = 0usize;
         let mut held_cache: BTreeMap<PinnedObjectId, Option<MappedFile>> = BTreeMap::new();
-        let mut slow: Vec<(usize, MappedFile)> = Vec::new();
+        let mut mem: Option<std::fs::File> = None;
+        let mut chunk = [0u8; Self::GETTER_PREFAULT_CHUNK];
+        let mut op_bytes = cursor.op_bytes;
+        let mut reads_spent = 0usize;
         for index in 0..cursor.ranges.len() {
             if cursor.ranges[index].refused
                 || cursor.ranges[index].next_addr >= cursor.ranges[index].end
@@ -27106,18 +27163,17 @@ impl Engine {
             }
             let Some(held) = held_cache[&object] else {
                 cursor.ranges[index].refused = true;
-                self.note_prefault_refusal(
-                    "a manifest getter warmup range refused: held proof unavailable",
-                );
+                self.note_prefault_loss(GetterPrefaultLossCause::HeldUnavailable);
                 continue;
             };
-            let range = &cursor.ranges[index];
+            let start = cursor.ranges[index].start;
+            let end = cursor.ranges[index].end;
             let key = ObjectKey {
                 device: Device {
-                    major: range.device_major,
-                    minor: range.device_minor,
+                    major: cursor.ranges[index].device_major,
+                    minor: cursor.ranges[index].device_minor,
                 },
-                inode: range.inode,
+                inode: cursor.ranges[index].inode,
             };
             if held.key_is_identity(key) {
                 cursor.ranges[index].proven = true;
@@ -27127,162 +27183,65 @@ impl Engine {
                 // fresh identity — and the best-effort warmup spends
                 // no kernel witness.
                 cursor.ranges[index].refused = true;
-                self.note_prefault_refusal(
-                    "a manifest getter warmup range refused: overlay identity unproven",
-                );
+                self.note_prefault_loss(GetterPrefaultLossCause::OverlayUnproven);
+                continue;
             } else {
-                slow.push((index, held));
-            }
-        }
-        if !slow.is_empty() {
-            if self.frame_work_exhausted() {
-                Self::store_prefault_resume(&mut cursor);
-                self.getter_prefault_cursors.insert(view, cursor);
-                return Deferred { frame_spent: true };
-            }
-            if self.budget.check_deadline_now().is_some() {
-                return Complete;
-            }
-            let take = slow.len().min(proofs_per_pass.saturating_sub(proofs_spent));
-            if take == 0 {
-                Self::store_prefault_resume(&mut cursor);
-                self.getter_prefault_cursors.insert(view, cursor);
-                return Deferred { frame_spent: false };
-            }
-            proofs_spent += take;
-            #[cfg(test)]
-            self.getter_prefault_note_proof_attempts(take as u64);
-            let _ = proofs_spent;
-            let addrs: Vec<(u64, u64)> = slow[..take]
-                .iter()
-                .map(|&(index, _)| (cursor.ranges[index].start, cursor.ranges[index].end))
-                .collect();
-            let batch = self.getter_prefault_batch_identities(position, &addrs);
-            // A short batch refuses: trusting fewer verdicts than
-            // ranges would skip proof. A batch failure (exit or pid
-            // reuse between the brackets) refuses the batch; the next
-            // pass revalidates the generation before trusting anything.
-            let complete = batch
-                .as_ref()
-                .is_ok_and(|identities| identities.len() == addrs.len());
-            for (offset, &(index, held)) in slow[..take].iter().enumerate() {
-                let verdict = complete.then(|| {
-                    batch
-                        .as_ref()
-                        .ok()
-                        .and_then(|identities| identities.get(offset))
-                });
-                let proved = verdict.flatten().is_some_and(|identity| {
+                if proofs_spent >= proofs_per_pass {
+                    Self::store_prefault_resume(&mut cursor);
+                    self.getter_prefault_cursors.insert(view, cursor);
+                    return Deferred { frame_spent: false };
+                }
+                proofs_spent += 1;
+                #[cfg(test)]
+                self.getter_prefault_note_proof_attempts(1);
+                let batch = self.getter_prefault_batch_identities(position, &[(start, end)]);
+                // A short batch refuses: trusting fewer verdicts than
+                // ranges would skip proof. A batch failure (exit or pid
+                // reuse between the brackets) refuses the range; the next
+                // pass revalidates the generation before trusting anything.
+                let verdict = batch
+                    .as_ref()
+                    .ok()
+                    .and_then(|identities| identities.first());
+                let proved = verdict.is_some_and(|identity| {
                     identity
                         .as_ref()
                         .is_ok_and(|identity| *identity == held.identity)
                 });
-                cursor.ranges[index].proven = proved;
-                cursor.ranges[index].refused = !proved;
                 if !proved {
-                    let unreadable = verdict
-                        .flatten()
-                        .is_none_or(|identity| identity.as_ref().is_err());
-                    self.note_prefault_refusal(if unreadable {
-                        "a manifest getter warmup range refused: range identity unreadable"
+                    let unreadable = verdict.is_none_or(|identity| identity.is_err());
+                    cursor.ranges[index].proven = false;
+                    cursor.ranges[index].refused = true;
+                    self.note_prefault_loss(if unreadable {
+                        GetterPrefaultLossCause::IdentityUnreadable
                     } else {
-                        "a manifest getter warmup range refused: range identity mismatch"
+                        GetterPrefaultLossCause::IdentityMismatch
                     });
+                    continue;
+                }
+                cursor.ranges[index].proven = true;
+            }
+            if mem.is_none() {
+                match self.getter_prefault_open_memory(position) {
+                    Ok(opened) => mem = Some(opened),
+                    Err(()) => {
+                        // Terminal: a best-effort warmup never delays the
+                        // hooks past the capture's own limits. Every
+                        // unfinished, unrefused range is abandoned loudly
+                        // with the exact count.
+                        let abandoned = cursor
+                            .ranges
+                            .iter()
+                            .filter(|range| !range.refused && range.next_addr < range.end)
+                            .count();
+                        for _ in 0..abandoned {
+                            self.note_prefault_loss(GetterPrefaultLossCause::MemUnopenable);
+                        }
+                        return Complete;
+                    }
                 }
             }
-        }
-        // Re-prove every batch-proven range before its first byte (rides
-        // the batch credit; bounded by the batch size): a remap between
-        // the batch proof and the read is refused here, so zero bytes
-        // come from the replacement. Fast ranges need no live stat.
-        for &(index, held) in &slow {
-            if !cursor.ranges[index].proven {
-                continue;
-            }
-            if self.frame_work_exhausted() {
-                Self::store_prefault_resume(&mut cursor);
-                self.getter_prefault_cursors.insert(view, cursor);
-                return Deferred { frame_spent: true };
-            }
-            if self.budget.check_deadline_now().is_some() {
-                return Complete;
-            }
-            let range = (cursor.ranges[index].start, cursor.ranges[index].end);
-            #[cfg(test)]
-            self.getter_prefault_note_proof_attempts(1);
-            let confirmed = self
-                .getter_prefault_reproof_identity(position, range)
-                .is_ok_and(|identity| identity == held.identity);
-            if !confirmed {
-                cursor.ranges[index].proven = false;
-                cursor.ranges[index].refused = true;
-                self.note_prefault_refusal(
-                    "a manifest getter warmup range refused: range identity mismatch",
-                );
-            }
-        }
-        // Read the proven ranges in maps order from their per-range
-        // offsets. Completed and refused ranges skip; a pending range
-        // (proof credits spent) defers the pass for the next one. Every
-        // attempt spends its read credit before the `read_at`, including
-        // failures; a failed or short read ends its range (best-effort,
-        // never retried, no gap — the downstream miss still reports
-        // honestly if the page stayed cold).
-        let needs_mem = cursor
-            .ranges
-            .iter()
-            .any(|range| range.proven && !range.refused && range.next_addr < range.end);
-        if !needs_mem {
-            let pending = cursor
-                .ranges
-                .iter()
-                .any(|range| !range.proven && !range.refused && range.next_addr < range.end);
-            if pending {
-                Self::store_prefault_resume(&mut cursor);
-                self.getter_prefault_cursors.insert(view, cursor);
-                return Deferred { frame_spent: false };
-            }
-            return Complete;
-        }
-        #[cfg(test)]
-        let scripted_open_failure = self
-            .getter_prefault_for_test
-            .as_ref()
-            .is_some_and(|seam| seam.fail_mem_open.get());
-        #[cfg(not(test))]
-        let scripted_open_failure = false;
-        let mem = if scripted_open_failure {
-            Err(())
-        } else {
-            self.views[position]
-                .with_filesystem(&mut self.budget, |filesystem, _| {
-                    Ok(filesystem.open_memory())
-                })
-                .map_err(|_| ())
-                .and_then(|inner| inner.map_err(|_| ()))
-        };
-        let Ok(mem) = mem else {
-            return Complete;
-        };
-        let mut chunk = [0u8; Self::GETTER_PREFAULT_CHUNK];
-        let mut op_bytes = cursor.op_bytes;
-        let mut reads_spent = 0usize;
-        let mut index = 0usize;
-        while index < cursor.ranges.len() {
-            if cursor.ranges[index].refused
-                || cursor.ranges[index].next_addr >= cursor.ranges[index].end
-            {
-                index += 1;
-                continue;
-            }
-            if !cursor.ranges[index].proven {
-                cursor.op_bytes = op_bytes;
-                Self::store_prefault_resume(&mut cursor);
-                self.getter_prefault_cursors.insert(view, cursor);
-                return Deferred { frame_spent: false };
-            }
-            let start = cursor.ranges[index].start;
-            let end = cursor.ranges[index].end;
+            let mem = mem.as_ref().expect("target memory opens above or abandons");
             let mut addr = cursor.ranges[index].next_addr.clamp(start, end);
             while addr < end {
                 #[cfg(test)]
@@ -27307,6 +27266,33 @@ impl Engine {
                 let len = (end - addr).min(chunk.len() as u64) as usize;
                 if self.budget.allowed_io(op_bytes, len) < len {
                     return Complete;
+                }
+                if proofs_spent >= proofs_per_pass {
+                    cursor.ranges[index].next_addr = addr;
+                    cursor.op_bytes = op_bytes;
+                    Self::store_prefault_resume(&mut cursor);
+                    self.getter_prefault_cursors.insert(view, cursor);
+                    return Deferred { frame_spent: false };
+                }
+                proofs_spent += 1;
+                #[cfg(test)]
+                self.getter_prefault_note_proof_attempts(1);
+                match self.getter_prefault_reproof_identity(position, (start, end)) {
+                    Ok(identity) if identity == held.identity => {}
+                    Ok(_) => {
+                        cursor.ranges[index].proven = false;
+                        cursor.ranges[index].refused = true;
+                        cursor.ranges[index].next_addr = end;
+                        self.note_prefault_loss(GetterPrefaultLossCause::IdentityMismatch);
+                        break;
+                    }
+                    Err(_) => {
+                        cursor.ranges[index].proven = false;
+                        cursor.ranges[index].refused = true;
+                        cursor.ranges[index].next_addr = end;
+                        self.note_prefault_loss(GetterPrefaultLossCause::IdentityUnreadable);
+                        break;
+                    }
                 }
                 #[cfg(test)]
                 let (simulated_failure, simulated_short) = self
@@ -27346,6 +27332,12 @@ impl Engine {
                         op_bytes = op_bytes.saturating_add(read as u64);
                         reads_spent += 1;
                         if read != len {
+                            // Best-effort, never retried: the unread tail
+                            // is abandoned loudly with its exact count (a
+                            // later BPF miss still reports honestly via
+                            // its independent counter if the page stayed
+                            // cold).
+                            self.note_prefault_loss(GetterPrefaultLossCause::ShortRead);
                             cursor.ranges[index].next_addr = end;
                             break;
                         }
@@ -27356,6 +27348,9 @@ impl Engine {
                             seam.record_attempts.borrow_mut().push((addr, len, false));
                         }
                         reads_spent += 1;
+                        // Best-effort, never retried: the unread range is
+                        // abandoned loudly with its exact count.
+                        self.note_prefault_loss(GetterPrefaultLossCause::ReadError);
                         cursor.ranges[index].next_addr = end;
                         break;
                     }
@@ -27367,9 +27362,64 @@ impl Engine {
                 addr = following;
                 cursor.ranges[index].next_addr = addr;
             }
-            index += 1;
         }
         Complete
+    }
+
+    /// Keeps the view's warmup cursor across a frame yield before its
+    /// replacement is ready: an existing cursor for the same objects
+    /// stays intact (ranges, offsets and bytes; only `enumerated`
+    /// flips, since this pass enumerated nothing), otherwise a fresh
+    /// empty cursor opens with the carried byte total. Old progress
+    /// retires only against a completed fresh enumeration, never on a
+    /// yield.
+    fn getter_prefault_keep_cursor_for_frame_yield(
+        &mut self,
+        view: ProcessViewId,
+        objects: &[PinnedObjectId],
+    ) {
+        let Some(cursor) = self.getter_prefault_cursors.get_mut(&view) else {
+            self.getter_prefault_cursors.insert(
+                view,
+                GetterPrefaultCursor {
+                    objects: objects.to_vec(),
+                    ranges: Vec::new(),
+                    next: 0,
+                    next_addr: 0,
+                    op_bytes: 0,
+                    enumerated: false,
+                },
+            );
+            return;
+        };
+        if cursor.objects.as_slice() != objects {
+            let carried_bytes = cursor.op_bytes;
+            *cursor = GetterPrefaultCursor {
+                objects: objects.to_vec(),
+                ranges: Vec::new(),
+                next: 0,
+                next_addr: 0,
+                op_bytes: carried_bytes,
+                enumerated: false,
+            };
+            return;
+        }
+        cursor.enumerated = false;
+    }
+
+    /// Restores a reconciliation yield's carried ranges into its cursor:
+    /// offsets and refusals persist, proof never does (`proven` resets —
+    /// the next pass re-proves everything against fresh maps).
+    fn restore_prefault_carried(
+        cursor: &mut GetterPrefaultCursor,
+        mut carried: Vec<GetterPrefaultRange>,
+    ) {
+        for range in &mut carried {
+            range.proven = false;
+        }
+        cursor.ranges = carried;
+        cursor.enumerated = false;
+        Self::store_prefault_resume(cursor);
     }
 
     /// Derives the cursor's resume position from its per-range offsets:
@@ -27405,6 +27455,27 @@ impl Engine {
                 .ok_or_else(|| format!("no scripted held proof for object {object:?}"));
         }
         self.pinned.object_mapped_identity(object)
+    }
+
+    /// The pass's one target-memory handle, opened lazily at the first
+    /// proven range through its generation-and-namespace bracket (whose
+    /// cost stays at the owner). Fails through the same handler,
+    /// scripted under the test seam, which never consults production.
+    fn getter_prefault_open_memory(&mut self, position: usize) -> Result<std::fs::File, ()> {
+        #[cfg(test)]
+        if self
+            .getter_prefault_for_test
+            .as_ref()
+            .is_some_and(|seam| seam.fail_mem_open.get())
+        {
+            return Err(());
+        }
+        self.views[position]
+            .with_filesystem(&mut self.budget, |filesystem, _| {
+                Ok(filesystem.open_memory())
+            })
+            .map_err(|_| ())
+            .and_then(|inner| inner.map_err(|_| ()))
     }
 
     /// The `vm_file` identities of `ranges` in the view at `position`,
@@ -27487,14 +27558,13 @@ impl Engine {
         )
     }
 
-    /// The pre-read re-proof identity of `range`: the live `map_files`
-    /// stat, so a remap between the batch proof and the first byte is
-    /// refused before anything is read. Scripted under the test seam
-    /// from `reproof_ranges` (falling back to `ranges` when absent), so
-    /// the remap twin simulates its invalidation deterministically.
-    /// Rides the batch proof's credit (one logical proof, two stats for
-    /// TOCTOU safety, like a bracket's double validation); bounded by
-    /// the batch size.
+    /// The read-time re-proof identity of `range`: the live `map_files`
+    /// stat, consulted immediately before every chunk so a remap is
+    /// refused before anything further is read. Scripted under the test
+    /// seam from `reproof_ranges` (falling back to `ranges` when
+    /// absent), so the remap twins simulate their invalidations
+    /// deterministically. Metered like any native proof step, one credit
+    /// per chunk.
     fn getter_prefault_reproof_identity(
         &mut self,
         position: usize,
@@ -27527,13 +27597,23 @@ impl Engine {
             .unwrap_or_else(|| Err(std::io::Error::other("empty re-proof batch")))
     }
 
-    /// Files one finite named proof-refusal gap (deduped exact
+    /// Files one finite named warmup-loss gap (deduped exact
     /// subject/reason, sanitized downstream to the closed vocabulary)
-    /// and counts the refused range. `cause` is one of the four fixed
-    /// sentences; it carries no path, pid, address or error chain.
-    fn note_prefault_refusal(&mut self, cause: &'static str) {
-        self.getter_prefault_refused_ranges = self.getter_prefault_refused_ranges.saturating_add(1);
-        self.mark_partial("live manifest getter warmup", cause);
+    /// and counts the abandoned range in its exact bucket.
+    fn note_prefault_loss(&mut self, cause: GetterPrefaultLossCause) {
+        let bucket = match cause {
+            GetterPrefaultLossCause::HeldUnavailable
+            | GetterPrefaultLossCause::IdentityMismatch
+            | GetterPrefaultLossCause::IdentityUnreadable
+            | GetterPrefaultLossCause::OverlayUnproven => &mut self.getter_prefault_refused_ranges,
+            GetterPrefaultLossCause::MemUnopenable => {
+                &mut self.getter_prefault_mem_unopenable_ranges
+            }
+            GetterPrefaultLossCause::ShortRead => &mut self.getter_prefault_short_read_ranges,
+            GetterPrefaultLossCause::ReadError => &mut self.getter_prefault_failed_read_ranges,
+        };
+        *bucket = bucket.saturating_add(1);
+        self.mark_partial("live manifest getter warmup", cause.reason());
     }
 
     /// Test-only loop-trip countdown, consulted by the warmup's loop poll

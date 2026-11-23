@@ -37083,7 +37083,6 @@ fn prefault_manifest_getter_data_charges_the_window_not_collection_work() {
     let mut engine = discovered_from_inputs(vec![view], modules, pins, vec![input]);
     let object = engine.modules[0].object;
     let sites = vec![(object, 0x80, "C_GetFunctionList".to_string())];
-    install_prefault_fast_proof(&mut engine, object);
     // One file, many mappings: every one matches the pinned object, so
     // the pre-fault walks megabytes and any per-byte work conversion
     // dwarfs the maps-read noise.
@@ -37104,6 +37103,10 @@ fn prefault_manifest_getter_data_charges_the_window_not_collection_work() {
         assert_ne!(mapping, libc::MAP_FAILED);
         mappings.push(mapping);
     }
+    // Proof installs after the mappings exist: the read-time re-proof
+    // consults a live verdict per range, so every range needs its
+    // scripted match.
+    install_prefault_fast_proof(&mut engine, object);
     let charged = std::sync::Arc::new(std::sync::Mutex::new(0u64));
     let counted = std::sync::Arc::clone(&charged);
     engine
@@ -37115,7 +37118,17 @@ fn prefault_manifest_getter_data_charges_the_window_not_collection_work() {
     let skips = engine.counters.object_skips.len();
     let before = engine.budget.attempted_io_bytes();
     let hook_before = *charged.lock().unwrap();
-    engine.prefault_manifest_getter_data(id, &sites);
+    // 128 ranges exceed one pass of proof credits (each range's read-time
+    // re-proof spends its own), so the span warms over bounded passes.
+    let mut passes = 0;
+    loop {
+        let outcome = engine.prefault_manifest_getter_data(id, &sites);
+        passes += 1;
+        if outcome == GetterPrefaultOutcome::Complete {
+            break;
+        }
+        assert!(passes < 6, "the span warms over bounded passes");
+    }
     for mapping in mappings {
         // SAFETY: each successful mapping above, released once.
         assert_eq!(unsafe { libc::munmap(mapping, padded) }, 0);
@@ -38193,9 +38206,10 @@ fn prefault_manifest_getter_data_never_rereads_a_range_whose_file_changed_under_
     );
 }
 
-/// Range proofs are bounded per pass too: with three proof credits per
-/// pass (one held lookup plus two range stats), four ranges prove and
-/// warm over two passes, each pass leaving the rest pending.
+/// Range proofs are bounded per pass too: with five proof credits per
+/// pass (one held lookup, two batch stats, two read-time re-proofs),
+/// four ranges prove and warm over two passes, each pass leaving the
+/// rest pending.
 #[test]
 fn prefault_manifest_getter_data_proves_only_a_bounded_batch_of_ranges_per_pass() {
     use crate::discovery::identity::{FileIdentity, MappedFile};
@@ -38229,7 +38243,7 @@ fn prefault_manifest_getter_data_proves_only_a_bounded_batch_of_ranges_per_pass(
         },
         scripted,
     );
-    engine.set_prefault_caps_for_test(None, Some(3));
+    engine.set_prefault_caps_for_test(None, Some(5));
     let maps_len = std::fs::read("/proc/self/maps").unwrap().len() as u64;
     let skips = engine.counters.object_skips.len();
     let lens: Vec<u64> = ranges.iter().map(|range| range.1 - range.0).collect();
@@ -38537,10 +38551,11 @@ fn prefault_manifest_getter_data_spends_a_read_credit_for_every_failed_read() {
     );
 }
 
-/// Held-identity lookups share the proof cap: with two proof credits per
-/// pass and three slow ranges of one object, each pass affords one held
-/// lookup plus one range stat, so three ranges take three passes. (Twin:
-/// free held lookups would prove two ranges per pass and finish in two.)
+/// Held-identity lookups share the proof cap: with three proof credits
+/// per pass (one held lookup, one batch stat, one read-time re-proof)
+/// and three slow ranges of one object, each pass warms one range, so
+/// three ranges take three passes. (Twin: free held lookups would
+/// batch-prove the next range in the same pass.)
 #[test]
 fn prefault_manifest_getter_data_admits_held_probes_under_the_proof_cap() {
     use crate::discovery::identity::{FileIdentity, MappedFile};
@@ -38572,7 +38587,7 @@ fn prefault_manifest_getter_data_admits_held_probes_under_the_proof_cap() {
         },
         scripted,
     );
-    engine.set_prefault_caps_for_test(None, Some(2));
+    engine.set_prefault_caps_for_test(None, Some(3));
     for (pass, proven) in [(1usize, 0usize), (2, 1)] {
         let outcome = engine.prefault_manifest_getter_data(id, &sites);
         assert_eq!(
@@ -39236,11 +39251,13 @@ fn drive_liveness_for_n_distinct_slow_objects(count: usize) {
         arrival.windows(2).all(|pair| pair[0] < pair[1]),
         "reads advance in maps order: {arrival:?}"
     );
-    assert_eq!(
-        engine.counters.object_skips.len(),
-        skips,
-        "a healthy warmup files no gap"
-    );
+    // The warmup files nothing; the attach path may file its own rows
+    // (causal timing), which this lane does not own.
+    let warmup_gaps = engine.counters.object_skips[skips..]
+        .iter()
+        .filter(|row| row.subject == "live manifest getter warmup")
+        .count();
+    assert_eq!(warmup_gaps, 0, "a healthy warmup files no gap");
     assert_eq!(engine.getter_prefault_refused_ranges, 0);
     assert_eq!(engine.getter_prefault_mem_unopenable_ranges, 0);
     assert_eq!(engine.getter_prefault_short_read_ranges, 0);

@@ -783,6 +783,22 @@ class StraddleShapeTests(unittest.TestCase):
          "duplicate run deadline rows"),
     ]
 
+    def test_preparation_rejects_boolean_count_on_both_substrates(self):
+        # Fix5 (sweep M-P8): the prep count floor is exactly
+        # repeats>=1 over real integers — a boolean count stays
+        # malformed on both substrates.
+        for modfs, base in (("overlayfs", decided_report),
+                            ("ext4", witness_available_report)):
+            with self.subTest(substrate=modfs):
+                report = base()
+                report["gaps"].append(
+                    straddle_prep_row(over={"repeats": True}))
+                report["gaps"].append(straddle_deadline_row())
+                rc, out = run_oracle(report, modfs=modfs)
+                self.assertNotEqual(rc, 0, out)
+                self.assertIn("malformed interrupted preparation count",
+                              out)
+
     def test_single_field_mutations_fail_on_both_substrates(self):
         self.assertEqual(len(self.CASES), 15)
         for modfs, base in (("overlayfs", decided_report),
@@ -861,6 +877,47 @@ class DeadlineOnlyShapeTests(unittest.TestCase):
                     rc, out = run_oracle(report, modfs=modfs)
                     self.assertNotEqual(rc, 0, out)
                     self.assertIn(message, out)
+
+    def test_deadline_count_boundaries_on_both_substrates(self):
+        # Fix5 (sweep M-D7/M-D8): the count floor is exactly
+        # repeats>=1 over real integers — a single recording
+        # qualifies, a boolean count stays malformed.
+        for modfs, base in (("overlayfs", decided_report),
+                            ("ext4", witness_available_report)):
+            with self.subTest(substrate=modfs, case="single recording"):
+                report = base()
+                report["gaps"].append(
+                    straddle_deadline_row(over={"repeats": 1}))
+                rc, out = run_oracle(report, modfs=modfs)
+                self.assertEqual(rc, 0, out)
+            with self.subTest(substrate=modfs, case="boolean count"):
+                report = base()
+                report["gaps"].append(
+                    straddle_deadline_row(over={"repeats": True}))
+                rc, out = run_oracle(report, modfs=modfs)
+                self.assertNotEqual(rc, 0, out)
+                self.assertIn("malformed run deadline count", out)
+
+    def test_near_deadline_reason_is_not_deadline_validated(self):
+        # Fix5 (sweep M-D6): the deadline selector matches the exact
+        # reason only — a near-miss reason skips deadline shape
+        # validation and falls through to the transaction gate on
+        # both substrates, with the branch-appropriate message.
+        for modfs, base, message in (
+                ("overlayfs", decided_report,
+                 "overlay published extra gap"),
+                ("ext4", witness_available_report,
+                 "unrecognized cgroup transaction row")):
+            with self.subTest(substrate=modfs):
+                report = base()
+                report["gaps"].append(
+                    straddle_deadline_row(
+                        drop=("caller",),
+                        over={"reason":
+                              "cgroup collection frobnicate exploded"}))
+                rc, out = run_oracle(report, modfs=modfs)
+                self.assertNotEqual(rc, 0, out)
+                self.assertIn(message, out)
 
     def test_retained_refresh_with_malformed_deadline_fails_without_prep(self):
         # The retained-refresh presence check reuses the validated

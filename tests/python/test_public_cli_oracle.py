@@ -2275,6 +2275,53 @@ class RunnerNoiseTests(unittest.TestCase):
         self.assertIn("lossy or unknown observation gap class",
                       failed["detail"])
 
+    def test_learned_first_use_with_non_integer_counts_fails_in_strict_mode(self):
+        # Fix5 (sweep A8/A10/A12): the learned counters are real
+        # integers — a boolean staged count or a false loss/cap
+        # flag compares equal but stays malformed.
+        def base(d, l, r):
+            d["evidence"]["skipped"] = [{
+                "name": "learned provider file",
+                "reason": "a provider file was learned after its first use; "
+                          "its earlier calls were not observed"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped", "pid_descendant_gaps"]}
+            d["evidence"]["pid_descendant_gaps"] = 60
+            d["evidence"]["learned_staged_files"] = 1
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        cases = (
+            ("boolean staged count", {"learned_staged_files": True}),
+            ("false event loss", {"learned_event_loss": False}),
+            ("false cap skip", {"learned_cap_skipped": False}),
+        )
+        for name, over in cases:
+            def mutate(d, l, r, over=over):
+                base(d, l, r)
+                d["evidence"].update(over)
+            with self.subTest(case=name):
+                result = self.run_case(mutate, cell="system", want=1)
+                self.assertIn("lossy or unknown observation gap class",
+                              result["detail"])
+
+    def test_non_first_use_details_omit_the_fragment(self):
+        # Fix5 (sweep F4/F5): the first-use fragment renders if and
+        # only if the arm holds — accepted non-first-use shapes in
+        # both summary modes never name it.
+        def noise(d, l, r):
+            d["evidence"]["pid_descendant_gaps"] = 1
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["pid_descendant_gaps"]}
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        relaxed = self.run_case(noise, cell="system",
+                                allow_pid_descendant_gaps=True)
+        self.assertEqual(relaxed["qualification"],
+                         "owned-provider-counts-with-runner-noise")
+        self.assertNotIn("learned_first_use", relaxed["detail"])
+        strict = self.run_case(noise, cell="system")
+        self.assertEqual(strict["qualification"],
+                         "owned-provider-counts-with-ambient-gap")
+        self.assertNotIn("learned_first_use", strict["detail"])
+
     def test_attribution_gap_without_noise_passes_in_both_modes(self):
         # The system counts cell never gated attribution/semantics gaps
         # (strict discloses them via PARTIAL); relaxed mode must accept

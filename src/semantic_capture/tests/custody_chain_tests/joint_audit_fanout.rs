@@ -33554,6 +33554,124 @@ fn joint_drain_proof_slice_yields_and_resumes_through_bounded_seal() {
 }
 
 #[test]
+fn joint_drain_proof_retry_samples_its_preflight_once() {
+    // A bounded seal that retries across proof slices samples its
+    // replay preflight once, not once per retry: two proof-needing
+    // drains plus 63 retained rows (65 classified entries) under a
+    // 65-unit budget visit 64, yield once in-loop, retry the last
+    // entry, and seal, with one preflight sample and every unit
+    // spent. Sampling per retry would report two samples.
+    use crate::semantics_objects::journal::tests::abandon_bytes;
+    use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+    use pkcs11_types::CkRv;
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    let (target, pid) = fixture.replay_target();
+    let image = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .semantic_bindings()
+        .get(target.caller())
+        .unwrap()
+        .image();
+    for sequence in [2u64, 3] {
+        let (begin, ordinary) =
+            fixture
+                .scene
+                .encoded_with_rv(pid, 0, "C_SignUpdate", sequence, CkRv::DEVICE_REMOVED.0);
+        let mut abandon = abandon_bytes(
+            u64::from(pid),
+            sequence,
+            JOURNAL_REASON_SYNC_RETURN_RESULT_LOST,
+            (image.task_cookie, image.exec_id),
+        );
+        abandon[24..32].copy_from_slice(&begin[24..32]);
+        abandon[48..52].copy_from_slice(&begin[104..108]);
+        abandon[56..64].copy_from_slice(&begin[48..56]);
+        let source = fixture.scene.drain.source_mut();
+        source.push_record(begin.to_vec());
+        source.push_record(ordinary[24..392].to_vec());
+        source.push_record(abandon.to_vec());
+    }
+    let mut frame = fixture.audited(2, 2, &BirthFault);
+    assert!(
+        frame.failure_for_test().is_none(),
+        "clean audit: {:?}",
+        frame.failure_for_test()
+    );
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture_mut()
+        .adapter_mut()
+        .populate_foreign_open_rows_for_test(63);
+    let h0 = fixture.scene.real.h0.clone();
+    let mut births = NativeFrameBirths {
+        h0: &h0,
+        attached: &fixture.attached,
+        retained: &mut fixture.births,
+        seen: Vec::new(),
+        unreadable: false,
+    };
+    let mut ports = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_frame_ports(&fixture.scene.producers)
+        .unwrap();
+    frame.bind_targets(&ports).unwrap();
+    ports
+        .read()
+        .1
+        .adapter()
+        .reset_test_replay_bound_counters_for_test();
+    let mut remaining = 65;
+    assert_eq!(
+        frame.seal_next_bounded(&mut ports, &mut births, &BirthFault, &mut remaining),
+        Ok(QuantumSealProgress::DeliveryReady),
+        "the in-loop retry resumes and seals in one service"
+    );
+    assert_eq!(remaining, 0, "every slice spends its visits");
+    assert_eq!(
+        ports.read().1.adapter().test_drain_proof_visits_for_test(),
+        65,
+        "the retry classifies only the remainder, never discards"
+    );
+    assert_eq!(
+        ports
+            .read()
+            .1
+            .adapter()
+            .test_replay_bound_samples_for_test(),
+        1,
+        "one bounded seal samples its preflight once, never per retry"
+    );
+    let seal = frame
+        .active_seal_for_test()
+        .expect("the resumed seal succeeds");
+    assert_eq!(seal.prefix.settled().len(), 2);
+    assert!(
+        seal.prefix.settled().iter().all(|call| !call.abandoned),
+        "both empty-window drains complete: {:?}",
+        seal.prefix.settled()
+    );
+    assert!(
+        !seal.effects.effects.iter().any(|effect| matches!(
+            effect,
+            ObjectEffect::Gap {
+                reason: ObjectGap::OutcomeLost
+            }
+        )),
+        "no outcome is lost: {:?}",
+        seal.effects.effects
+    );
+}
+
+#[test]
 fn joint_replay_step_capacity_refusal_preserves_original() {
     let mut fixture = CanonicalFanoutScene::prior_sealed();
     let (_, pid) = fixture.replay_target();

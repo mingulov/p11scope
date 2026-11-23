@@ -2256,11 +2256,19 @@ pub(crate) struct JournalAdapter {
     /// scanned while attributing staged calls.
     #[cfg(test)]
     test_seal_census_visits: usize,
-    /// Test-only drain order-proof visits: open entries scanned while
-    /// proving lifecycle windows. Interior mutability so the shared
-    /// `&self` predicate counts without a signature change.
+    /// Test-only drain order-proof visits: open entries classified
+    /// while deriving lifecycle window dispositions, one charged unit
+    /// each. Interior mutability so the shared `&self` predicate counts
+    /// without a signature change.
     #[cfg(test)]
     test_drain_proof_visits: std::cell::Cell<usize>,
+    /// Test-only replay-bound preflight calls and the open entries
+    /// sampled across them: the joint retry loop must sample once per
+    /// bounded seal, in one linear pass.
+    #[cfg(test)]
+    test_replay_bound_samples: std::cell::Cell<usize>,
+    #[cfg(test)]
+    test_replay_bound_visits: std::cell::Cell<usize>,
     /// Test-only phase trace: `None` (off) by default; `Some` records
     /// one sample per claim while enabled.
     #[cfg(test)]
@@ -2392,6 +2400,10 @@ impl JournalAdapter {
             test_seal_census_visits: 0,
             #[cfg(test)]
             test_drain_proof_visits: std::cell::Cell::new(0),
+            #[cfg(test)]
+            test_replay_bound_samples: std::cell::Cell::new(0),
+            #[cfg(test)]
+            test_replay_bound_visits: std::cell::Cell::new(0),
             #[cfg(test)]
             test_phase_trace: None,
             #[cfg(test)]
@@ -2870,6 +2882,41 @@ impl JournalAdapter {
     #[cfg(test)]
     pub(crate) fn test_drain_proof_visits_for_test(&self) -> usize {
         self.test_drain_proof_visits.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_replay_bound_samples_for_test(&self) -> usize {
+        self.test_replay_bound_samples.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_replay_bound_visits_for_test(&self) -> usize {
+        self.test_replay_bound_visits.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_test_replay_bound_counters_for_test(&self) {
+        self.test_replay_bound_samples.set(0);
+        self.test_replay_bound_visits.set(0);
+    }
+
+    /// Test-only exact mirror of the drain order index, rebuilt from
+    /// the open table: every staged BEGIN plus every staged END and
+    /// ABANDON ordinal. Twins asserting index maintenance compare the
+    /// live index against this reconstruction.
+    #[cfg(test)]
+    pub(crate) fn drain_index_mirror_for_test(&self) -> BTreeSet<((u64, u64), u64)> {
+        let mut mirror = BTreeSet::new();
+        for entry in self.open.values() {
+            mirror.insert((entry.image, entry.begin_ordinal));
+            if let Some(staged) = entry.end {
+                mirror.insert((entry.image, staged.ordinal));
+            }
+            if let Some(staged) = entry.abandon {
+                mirror.insert((entry.image, staged.ordinal));
+            }
+        }
+        mirror
     }
 
     pub(crate) fn consumed_frontier(&self) -> ConsumptionOrdinal {
@@ -23021,8 +23068,8 @@ pub(crate) mod tests {
         );
         assert_eq!(
             scene.adapter.test_drain_proof_visits_for_test(),
-            1,
-            "the conversion seal derives the one open drain"
+            2,
+            "the conversion seal classifies both open entries, holder and opener"
         );
         assert!(
             scene.adapter.open.contains_key(&(1, 1)),
@@ -23095,7 +23142,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             scene.adapter.test_drain_proof_visits_for_test(),
-            1,
+            2,
             "a converted drain costs no re-derivation on later seals"
         );
     }
@@ -23261,6 +23308,16 @@ pub(crate) mod tests {
                 scene.model.project().sessions.is_empty(),
                 "no session survives the blocked drain"
             );
+            assert_eq!(
+                scene
+                    .adapter
+                    .keys
+                    .get(&proof.key)
+                    .expect("sealed key")
+                    .bounded_upper,
+                Some(3),
+                "the Ticket bound names the observed return"
+            );
         }
         // A sibling drain completing between the opener's return and
         // its abandonment: only its ABANDON sits in the window.
@@ -23333,6 +23390,16 @@ pub(crate) mod tests {
             assert!(
                 scene.model.project().sessions.is_empty(),
                 "no session survives the blocked drain"
+            );
+            assert_eq!(
+                scene
+                    .adapter
+                    .keys
+                    .get(&proof.key)
+                    .expect("sealed key")
+                    .bounded_upper,
+                Some(4),
+                "the Ticket bound names the observed return"
             );
         }
     }
@@ -23557,6 +23624,379 @@ pub(crate) mod tests {
             )),
             "no outcome is lost: {:?}",
             success.effects.effects
+        );
+    }
+
+    #[test]
+    fn object_journal_drain_proof_scan_charges_every_open_entry() {
+        // The budgeted derivation charges every open entry it
+        // classifies, not just drain candidates: 70 lifecycle drains
+        // plus 100 ordinary settled calls visit 170 entries in slices
+        // of one credit (64 units), each slice charging exactly its
+        // visits, resuming without discarding, with every drain
+        // completing. A scan that classified outside the credit would
+        // visit more than 64 per slice; a cursor that advanced only
+        // on candidates would re-yield forever past the drains.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+        const DRAINS: u64 = 70;
+        const ORDINARY: u64 = 100;
+        let mut scene = Scene::new(image_default());
+        let open = function_id("C_OpenSession");
+        let update = function_id("C_SignUpdate");
+        scene.attest_function_n("C_OpenSession", DRAINS as usize);
+        scene.attest_function_n("C_SignUpdate", ORDINARY as usize);
+        let proof = scene.attest_function("C_OpenSession");
+        for sequence in 1..=DRAINS {
+            let begin = begin_bytes(1, sequence, open, 0);
+            assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+            assert_eq!(
+                scene.ingest_ordinary(ordinary_for(&begin, 0)),
+                JournalDisposition::ReturnObserved
+            );
+            let abandon = abandon_bytes(
+                1,
+                sequence,
+                JOURNAL_REASON_SYNC_RETURN_RESULT_LOST,
+                (COOKIE, EXEC),
+            );
+            assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        }
+        for sequence in 1..=ORDINARY {
+            let begin = begin_bytes(2, sequence, update, 0);
+            assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+            assert_eq!(
+                scene.ingest(&end_bytes_absent(&begin, 0, ENTRY_NS + 50)),
+                JournalDisposition::EndStaged
+            );
+        }
+        assert_eq!(
+            scene.adapter.open.len(),
+            (DRAINS + ORDINARY) as usize,
+            "drains plus ordinary calls fill the scanned table"
+        );
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.adapter.test_drain_proof_visits.set(0);
+        let first = scene
+            .seal(&bootstrap)
+            .expect_err("the first slice yields at the budget boundary");
+        assert_eq!(first.gap, JournalGap::BoundNotReady);
+        assert_eq!(
+            scene.adapter.last_seal_wait(),
+            SealWait::DrainProofPending,
+            "the yield names its resume cause"
+        );
+        assert_eq!(
+            scene.adapter.test_drain_proof_visits.get(),
+            64,
+            "one slice classifies one credit, no more"
+        );
+        let second = scene
+            .seal(&bootstrap)
+            .expect_err("the second slice yields at the budget boundary");
+        assert_eq!(second.gap, JournalGap::BoundNotReady);
+        assert_eq!(
+            scene.adapter.last_seal_wait(),
+            SealWait::DrainProofPending,
+            "the yield names its resume cause"
+        );
+        assert_eq!(
+            scene.adapter.test_drain_proof_visits.get(),
+            128,
+            "resumption classifies the next credit, never discards"
+        );
+        let success = scene.seal(&bootstrap).expect("resumption completes");
+        assert_eq!(
+            scene.adapter.test_drain_proof_visits.get(),
+            (DRAINS + ORDINARY) as usize,
+            "the last slice classifies only the remainder"
+        );
+        assert_eq!(
+            success.prefix.settled().len(),
+            (DRAINS + ORDINARY) as usize,
+            "every staged call settles"
+        );
+        assert!(
+            success
+                .prefix
+                .settled()
+                .iter()
+                .filter(|call| call.begin_cut <= 3 * DRAINS)
+                .all(|call| !call.abandoned),
+            "every empty-window drain completes: {:?}",
+            success.prefix.settled()
+        );
+        assert!(
+            !success.effects.effects.iter().any(|effect| matches!(
+                effect,
+                ObjectEffect::Gap {
+                    reason: super::ObjectGap::OutcomeLost
+                }
+            )),
+            "no outcome is lost: {:?}",
+            success.effects.effects
+        );
+    }
+
+    #[test]
+    fn object_journal_drain_proofs_rederive_after_the_frontier_moves() {
+        // A new frontier clears the proof cache and the scan cursor.
+        // A holder keeps two converted drains staged past their seal
+        // (3 visits); a third drain stages under the moved frontier,
+        // and the next seal re-classifies every entry (7 cumulative).
+        // With the reset dropped, the seal resumes after the stale
+        // cursor and visits only the newcomer. The earlier drains
+        // keep their loss under the covered-return bar; the fresh
+        // drain still completes.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+        let mut scene = Scene::new(image_default());
+        let open = function_id("C_OpenSession");
+        let sign = function_id("C_Sign");
+        scene.attest_function("C_Sign");
+        scene.attest_function_n("C_OpenSession", 3);
+        let proof = scene.attest_function("C_OpenSession");
+        let holder = begin_bytes(2, 1, sign, 0);
+        assert_eq!(scene.ingest(&holder), JournalDisposition::BeginAdmitted);
+        for sequence in 1..=2 {
+            let begin = begin_bytes(1, sequence, open, 0);
+            assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+            assert_eq!(
+                scene.ingest_ordinary(ordinary_for(&begin, 0)),
+                JournalDisposition::ReturnObserved
+            );
+            let abandon = abandon_bytes(
+                1,
+                sequence,
+                JOURNAL_REASON_SYNC_RETURN_RESULT_LOST,
+                (COOKIE, EXEC),
+            );
+            assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        }
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.adapter.test_drain_proof_visits.set(0);
+        let first = scene.seal(&bootstrap).expect("two drains seal at once");
+        assert_eq!(first.prefix.settled().len(), 3);
+        assert_eq!(
+            scene.adapter.test_drain_proof_visits.get(),
+            3,
+            "the first frontier classifies its three entries"
+        );
+        assert_eq!(
+            scene.adapter.open.len(),
+            3,
+            "the holder keeps both converted drains staged"
+        );
+        let begin = begin_bytes(1, 3, open, 0);
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        assert_eq!(
+            scene.ingest_ordinary(ordinary_for(&begin, 0)),
+            JournalDisposition::ReturnObserved
+        );
+        let abandon = abandon_bytes(1, 3, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        let second = scene.seal(&bootstrap).expect("the moved frontier seals");
+        assert_eq!(
+            scene.adapter.test_drain_proof_visits.get(),
+            7,
+            "the new frontier re-derives every candidate, never resumes stale"
+        );
+        let fresh = *second
+            .prefix
+            .settled()
+            .iter()
+            .find(|call| call.begin_cut == 8)
+            .expect("the fresh drain settles in the second seal");
+        assert!(
+            !fresh.abandoned && fresh.end_cut == Some(10),
+            "the fresh drain completes at its abandonment: {fresh:?}"
+        );
+    }
+
+    #[test]
+    fn object_journal_pruned_ordinal_leaves_no_window_blocker() {
+        // Removal keeps the order-proof index exact: the opener
+        // returns early, a sibling stages its BEGIN and END inside
+        // the future drain window, the sibling leaves through the
+        // production prune-removal path, and the abandonment
+        // certifies last. The pruned ordinals must block nothing:
+        // with the index removal dropped, the stale BEGIN and END
+        // keep the loss. (A seal-driven prune cannot stage this
+        // shape: any open drain holds the single-key prune watermark
+        // at its own begin, so removal under an open drain goes
+        // through the prune removal itself, exactly as
+        // `prune_settled` calls it once the watermark allows.)
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+        let mut scene = Scene::new(image_default());
+        let open = function_id("C_OpenSession");
+        let close = function_id("C_CloseSession");
+        scene.attest_function("C_OpenSession");
+        let proof = scene.attest_function("C_CloseSession");
+        let begin = begin_bytes(1, 1, open, 0);
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        assert_eq!(
+            scene.ingest_ordinary(ordinary_for(&begin, 0)),
+            JournalDisposition::ReturnObserved
+        );
+        let sibling = begin_bytes(1, 2, close, 0);
+        assert_eq!(scene.ingest(&sibling), JournalDisposition::BeginAdmitted);
+        assert_eq!(
+            scene.ingest(&end_bytes_absent(&sibling, 0, ENTRY_NS + 80)),
+            JournalDisposition::EndStaged
+        );
+        scene
+            .adapter
+            .remove_open_where(|native, _| *native == (1, 2));
+        assert!(
+            !scene.adapter.open.contains_key(&(1, 2)),
+            "the sibling left the open table"
+        );
+        assert_eq!(
+            scene.adapter.drain_ordinals,
+            scene.adapter.drain_index_mirror_for_test(),
+            "removal keeps the order index an exact mirror of open"
+        );
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        let mut pad = ordinary_for(&begin, 0);
+        pad.slot = 99;
+        scene.ingest_ordinary(pad);
+        let bootstrap = scene.bootstrap(proof, 0);
+        let success = scene.seal(&bootstrap).expect("the drain seals");
+        let drained = *success
+            .prefix
+            .settled()
+            .iter()
+            .find(|call| call.begin_cut == 1)
+            .expect("the drained call settles");
+        assert!(
+            !drained.abandoned,
+            "the pruned ordinals block nothing: {drained:?}"
+        );
+        assert_eq!(
+            drained.end_cut,
+            Some(5),
+            "the completion cut is the abandonment ordinal"
+        );
+        assert_eq!(
+            scene.adapter.drain_ordinals,
+            scene.adapter.drain_index_mirror_for_test(),
+            "the seal's own prune keeps the mirror exact"
+        );
+    }
+
+    #[test]
+    fn object_journal_wipe_clears_the_order_index_before_restart() {
+        // A void/wipe clears the order-proof index with the open
+        // table: staged history wipes, the mirror must be empty
+        // (with the clear dropped, every wiped ordinal lingers and
+        // the index grows with each restart), then fresh post-void
+        // history seals and a fresh drain completes above the wiped
+        // ordinals.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+        let mut scene = Scene::new(image_default());
+        let open = function_id("C_OpenSession");
+        scene.attest_function("C_OpenSession");
+        let doomed = begin_bytes(1, 1, open, 0);
+        assert_eq!(scene.ingest(&doomed), JournalDisposition::BeginAdmitted);
+        assert_eq!(
+            scene.ingest_ordinary(ordinary_for(&doomed, 0)),
+            JournalDisposition::ReturnObserved
+        );
+        let sibling = begin_bytes(1, 2, open, 0);
+        assert_eq!(scene.ingest(&sibling), JournalDisposition::BeginAdmitted);
+        assert_eq!(
+            scene.adapter.drain_index_mirror_for_test().len(),
+            2,
+            "two staged BEGINs populate the mirror"
+        );
+        scene.adapter.void_staged();
+        assert!(
+            scene.adapter.open.is_empty(),
+            "the wipe drops staged history"
+        );
+        assert_eq!(
+            scene.adapter.drain_ordinals,
+            scene.adapter.drain_index_mirror_for_test(),
+            "the wipe clears the order index, never lingers"
+        );
+        assert!(
+            scene.adapter.drain_ordinals.is_empty(),
+            "no wiped ordinal survives the restart"
+        );
+        let proof = scene.attest_function("C_OpenSession");
+        let begin = begin_bytes(1, 3, open, 0);
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        assert_eq!(
+            scene.ingest_ordinary(ordinary_for(&begin, 0)),
+            JournalDisposition::ReturnObserved
+        );
+        let abandon = abandon_bytes(1, 3, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        let mut pad = ordinary_for(&begin, 0);
+        pad.slot = 99;
+        scene.ingest_ordinary(pad);
+        let bootstrap = scene.bootstrap(proof, 0);
+        let success = scene.seal(&bootstrap).expect("post-void history seals");
+        let drained = *success
+            .prefix
+            .settled()
+            .iter()
+            .find(|call| call.begin_cut == 4)
+            .expect("the fresh drain settles");
+        assert!(
+            !drained.abandoned,
+            "the fresh drain completes above the wipe: {drained:?}"
+        );
+        assert_eq!(
+            scene.adapter.drain_ordinals,
+            scene.adapter.drain_index_mirror_for_test(),
+            "the restart seal keeps the mirror exact"
+        );
+    }
+
+    #[test]
+    fn object_journal_test_end_clear_keeps_the_order_index_exact() {
+        // The test-only missing-END helper keeps the order-proof
+        // index exact: dropping the staged END removes its ordinal
+        // alongside the entry update, like every production removal.
+        let mut scene = Scene::new(image_default());
+        scene.attest_function("C_SignUpdate");
+        let update = function_id("C_SignUpdate");
+        let begin = begin_bytes(1, 1, update, 0);
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        assert_eq!(
+            scene.ingest(&end_bytes_absent(&begin, 0, ENTRY_NS + 50)),
+            JournalDisposition::EndStaged
+        );
+        assert!(
+            scene.adapter.clear_open_end_for_test((1, 1)),
+            "the staged END drops"
+        );
+        assert_eq!(
+            scene.adapter.drain_ordinals,
+            scene.adapter.drain_index_mirror_for_test(),
+            "the helper keeps the order index an exact mirror of open"
+        );
+    }
+
+    #[test]
+    fn object_journal_replay_bounds_sample_in_one_pass() {
+        // The seal preflight samples the retained table in one
+        // linear pass: one sample call visits each open entry once,
+        // never once per counted category.
+        let scene = keepup_scene_with_retained(16);
+        scene.adapter.reset_test_replay_bound_counters_for_test();
+        let bounds = super::seal_replay::ReplayBounds::sample(&scene.adapter, &scene.model)
+            .expect("replay bounds");
+        let _ = bounds;
+        assert_eq!(
+            scene.adapter.test_replay_bound_samples_for_test(),
+            1,
+            "one sample call"
+        );
+        assert_eq!(
+            scene.adapter.test_replay_bound_visits_for_test(),
+            16,
+            "one pass visits each retained entry once"
         );
     }
 

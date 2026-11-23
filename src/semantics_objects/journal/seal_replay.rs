@@ -186,23 +186,45 @@ pub(super) struct ReplayBounds {
 
 impl ReplayBounds {
     pub(super) fn sample(adapter: &JournalAdapter, model: &ObjectSemantics) -> Option<Self> {
+        #[cfg(test)]
+        adapter
+            .test_replay_bound_samples
+            .set(adapter.test_replay_bound_samples.get() + 1);
         let refused = adapter.refused.len();
         let begins = adapter
             .open
             .values()
-            .filter(|entry| entry.converted_ticket.is_none())
+            .filter(|entry| {
+                #[cfg(test)]
+                adapter
+                    .test_replay_bound_visits
+                    .set(adapter.test_replay_bound_visits.get() + 1);
+                entry.converted_ticket.is_none()
+            })
             .count();
         let terminals = adapter
             .open
             .values()
-            .filter(|entry| entry.end.is_some() && !entry.end_converted)
+            .filter(|entry| {
+                #[cfg(test)]
+                adapter
+                    .test_replay_bound_visits
+                    .set(adapter.test_replay_bound_visits.get() + 1);
+                entry.end.is_some() && !entry.end_converted
+            })
             .count();
         // Every staged abandonment may own one terminal step: a bounded
         // loss or a per-call disposal (dooming ones never convert).
         let abandoned = adapter
             .open
             .values()
-            .filter(|entry| entry.abandon.is_some())
+            .filter(|entry| {
+                #[cfg(test)]
+                adapter
+                    .test_replay_bound_visits
+                    .set(adapter.test_replay_bound_visits.get() + 1);
+                entry.abandon.is_some()
+            })
             .count();
         let pending = model.replay_pending_count();
         let steps = refused

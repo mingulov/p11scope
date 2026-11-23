@@ -189,7 +189,7 @@ def run_oracle(report, *, modfs="overlayfs", pin=None):
         (tmp / "out.wl").write_text(outside_wl)
         proc = subprocess.run(
             ["python3", "-I", "-", "r.json", "in.wl", "out.wl",
-             json.dumps(pin), "500", MODPATH, modfs,
+             json.dumps(pin), "250", "500", MODPATH, modfs,
              str(GENERATIONS[100]), str(GENERATIONS[101])],
             input=block, capture_output=True, text=True, timeout=30,
             cwd=str(tmp))
@@ -533,7 +533,7 @@ class GenerationHandoffTests(unittest.TestCase):
         body = (
             "cell=inventory-cgroup; ext=json; module_fs=overlayfs\n"
             "%sMODULE=%s\nbefore='%s'\ngen=%s; childgen=%s\n"
-            "outside_iters=500\n%s"
+            "inside_iters=250; outside_iters=500\n%s"
             "echo RC=$?\ncat \"$cell.detail\"\n"
             % ("export PYTHONOPTIMIZE=1\n" if optimize else "",
                MODPATH, json.dumps(PUBLISHED_PIN), gen, childgen,

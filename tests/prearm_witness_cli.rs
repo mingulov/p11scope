@@ -1353,6 +1353,14 @@ fn privileged_profile_system_learned_provider_second_round_catches_oneshots() {
             }
         }
     }
+    fn wait_pred(capture: &mut GuardedChild, what: &str, mut pred: impl FnMut(&str) -> bool) {
+        loop {
+            let line = next_line_within(capture, what, Duration::from_secs(300));
+            if pred(&line) {
+                return;
+            }
+        }
+    }
 
     let out = dir.path().join("out.json");
     let mut child = Command::new(bin())
@@ -1398,7 +1406,14 @@ fn privileged_profile_system_learned_provider_second_round_catches_oneshots() {
     // names the copy), then a few ordinary frames for the expedited
     // attach, so the rate below measures steady-state catching, not
     // arm latency on a small or loaded host.
-    wait_line(&mut capture, "learned staging", "libbrandnew-");
+    let copy_name = copy
+        .file_name()
+        .expect("copy file name")
+        .to_string_lossy()
+        .into_owned();
+    wait_pred(&mut capture, "learned staging", |line| {
+        is_fresh_staging_line_for(line, &copy_name)
+    });
     std::thread::sleep(Duration::from_secs(10));
     // Round 2: twenty one-shot runs, no retry masking the rate.
     for index in 0..20 {
@@ -1457,7 +1472,7 @@ fn privileged_profile_system_learned_provider_second_round_catches_oneshots() {
     );
     // The first run is a named miss, not silent.
     assert!(
-        text.contains("learned provider file") && text.contains("learned after its first use"),
+        has_first_use_gap_record(&profile),
         "first run must be a named gap"
     );
 }
@@ -1654,6 +1669,239 @@ fn learned_private_mount_oracle_requires_the_full_round() {
     ));
 }
 
+/// Whether a capture-diagnostics line is the fresh-staging record for
+/// the exact `file_name`: the engine emits
+/// `p11scope: learned provider {display} (first loaded by {loader}):
+/// {loads} earlier loads missed; attached for later runs` exactly once
+/// per newly staged file. Another copy, an `already staged` note, an
+/// `already scan-covered; not staged` refusal, or gap prose never
+/// match: the name is boundary-pinned (`/name (`), the shape is exact.
+fn is_fresh_staging_line_for(line: &str, file_name: &str) -> bool {
+    let line = line.trim_end();
+    line.starts_with("p11scope: learned provider ")
+        && line.contains(&format!("/{file_name} (first loaded by "))
+        && line.ends_with(" earlier loads missed; attached for later runs")
+}
+
+/// Negative controls for the staging gate above: only the fresh
+/// staging record for the exact file may release the workload.
+#[test]
+fn fresh_staging_line_names_the_exact_file_and_shape() {
+    let file_name = "libprivatemnt-123-p28.so";
+    assert!(is_fresh_staging_line_for(
+        "p11scope: learned provider /tmp/cell/mnt/libprivatemnt-123-p28.so (first loaded by /tmp/cell/p28-mnt-holder): 1 earlier loads missed; attached for later runs\n",
+        file_name,
+    ));
+    // Another copy's fresh staging is foreign evidence.
+    assert!(!is_fresh_staging_line_for(
+        "p11scope: learned provider /tmp/cell/mnt/libprivatemnt-456-p28.so (first loaded by /tmp/cell/p28-mnt-holder): 1 earlier loads missed; attached for later runs\n",
+        file_name,
+    ));
+    // A refusal in place of staging, for the same file.
+    assert!(!is_fresh_staging_line_for(
+        "p11scope: learned provider /tmp/cell/mnt/libprivatemnt-123-p28.so already staged; loader note added\n",
+        file_name,
+    ));
+    assert!(!is_fresh_staging_line_for(
+        "p11scope: learned provider /tmp/cell/mnt/libprivatemnt-123-p28.so already scan-covered; not staged\n",
+        file_name,
+    ));
+    // Gap prose without the staging shape.
+    assert!(!is_fresh_staging_line_for(
+        "note: learned provider file libprivatemnt-123-p28.so learned after its first use\n",
+        file_name,
+    ));
+    // A substring trap: a longer name sharing the file name as a prefix.
+    assert!(!is_fresh_staging_line_for(
+        "p11scope: learned provider /tmp/cell/mnt/libprivatemnt-123-p28.so.evil (first loaded by /tmp/cell/p28-mnt-holder): 1 earlier loads missed; attached for later runs\n",
+        file_name,
+    ));
+}
+
+/// Whether the profile carries the learned first-use gap as a
+/// structured skip row for the exact subject and reason: only an
+/// `evidence.skipped[]` entry with render's `SkippedOut` name/reason
+/// proves the gap — the same phrases anywhere else in the document
+/// (a note, a path, another row's text) prove nothing.
+fn has_first_use_gap_record(profile: &serde_json::Value) -> bool {
+    // Keep beside render::LEARNED_SKIP_SUBJECT / LEARNED_FIRST_RUN_REASON.
+    const SUBJECT: &str = "learned provider file";
+    const REASON: &str =
+        "a provider file was learned after its first use; its earlier calls were not observed";
+    profile["evidence"]["skipped"]
+        .as_array()
+        .is_some_and(|skipped| {
+            skipped.iter().any(|skip| {
+                skip["name"].as_str() == Some(SUBJECT) && skip["reason"].as_str() == Some(REASON)
+            })
+        })
+}
+
+/// Negative controls for the gap record above: only the structured
+/// skip row counts.
+#[test]
+fn first_use_gap_record_requires_the_structured_skip() {
+    let row = serde_json::json!({
+        "name": "learned provider file",
+        "reason": "a provider file was learned after its first use; its earlier calls were not observed",
+    });
+    assert!(has_first_use_gap_record(
+        &serde_json::json!({"evidence": {"skipped": [row]}})
+    ));
+    // The same phrases outside any skip row.
+    assert!(!has_first_use_gap_record(&serde_json::json!({
+        "evidence": {
+            "skipped": [],
+            "note": "learned provider file x learned after its first use",
+        }
+    })));
+    // The right subject with the wrong reason.
+    assert!(!has_first_use_gap_record(&serde_json::json!({
+        "evidence": {"skipped": [{
+            "name": "learned provider file",
+            "reason": "file-learning events were lost; some provider files may not have been learned",
+        }]}
+    })));
+    // No evidence section at all.
+    assert!(!has_first_use_gap_record(&serde_json::json!({})));
+}
+
+/// Whether the workload ledger has the known shape the C fixture
+/// emits: exactly the eight counters, one Initialize, one Finalize,
+/// and `ITERS` GetInfo calls. An empty or partial ledger never
+/// validates — comparing exact counts against silence would pass on
+/// nothing observed.
+fn validate_workload_ledger(ledger: &BTreeMap<String, u64>) -> bool {
+    const NAMES: [&str; 8] = [
+        "C_Initialize",
+        "C_Finalize",
+        "C_GetInfo",
+        "C_GetSlotList",
+        "C_GetSlotInfo",
+        "C_GetTokenInfo",
+        "C_GetMechanismList",
+        "C_GetMechanismInfo",
+    ];
+    ledger.len() == NAMES.len()
+        && NAMES.iter().all(|name| ledger.contains_key(*name))
+        && ledger.get("C_Initialize").copied() == Some(1)
+        && ledger.get("C_Finalize").copied() == Some(1)
+        && ledger.get("C_GetInfo").copied() == Some(u64::from(ITERS))
+}
+
+/// Negative controls for the ledger shape above: only the known
+/// eight-counter ledger validates.
+#[test]
+fn workload_ledger_validator_requires_the_known_shape() {
+    fn ledger(pairs: &[(&str, u64)]) -> BTreeMap<String, u64> {
+        pairs
+            .iter()
+            .map(|(name, count)| ((*name).to_string(), *count))
+            .collect()
+    }
+    let good = ledger(&[
+        ("C_Initialize", 1),
+        ("C_Finalize", 1),
+        ("C_GetInfo", u64::from(ITERS)),
+        ("C_GetSlotList", 10),
+        ("C_GetSlotInfo", 5),
+        ("C_GetTokenInfo", 5),
+        ("C_GetMechanismList", 10),
+        ("C_GetMechanismInfo", 5),
+    ]);
+    assert!(validate_workload_ledger(&good));
+    // Silence never validates.
+    assert!(!validate_workload_ledger(&BTreeMap::new()));
+    // A missing counter never validates.
+    let mut missing = good.clone();
+    missing.remove("C_GetInfo");
+    assert!(!validate_workload_ledger(&missing));
+    // A cold Initialize (the workload never ran) never validates.
+    let mut cold = good.clone();
+    cold.insert("C_Initialize".to_string(), 0);
+    assert!(!validate_workload_ledger(&cold));
+    // A drifted hot count never validates.
+    let mut drifted = good.clone();
+    drifted.insert("C_GetInfo".to_string(), u64::from(ITERS) + 1);
+    assert!(!validate_workload_ledger(&drifted));
+    // An unexpected ninth counter never validates.
+    let mut extra = good.clone();
+    extra.insert("C_Extra".to_string(), 1);
+    assert!(!validate_workload_ledger(&extra));
+}
+
+/// Whether the exact module record names the private-mount holder as
+/// its first loader: the holder lives for the whole capture, so its
+/// executable is always readable at learn time and the finite unknown
+/// is not accepted here (one-shot loaders in other cells keep their
+/// allowance).
+fn private_mount_loader_named(first_loaded_by: &serde_json::Value) -> bool {
+    first_loaded_by
+        .get("exe")
+        .and_then(|exe| exe.as_str())
+        .is_some_and(|exe| exe.ends_with("p28-mnt-holder"))
+}
+
+/// Negative controls for the loader naming above: only the holder's
+/// executable counts.
+#[test]
+fn private_mount_loader_naming_requires_the_holder_exe() {
+    assert!(private_mount_loader_named(&serde_json::json!({
+        "exe": "/tmp/cell/p28-mnt-holder",
+    })));
+    // The finite unknown is refused here: the holder is always alive.
+    assert!(!private_mount_loader_named(&serde_json::json!({
+        "exe_unknown_reason": "loader exe link unreadable",
+    })));
+    // Another program's executable is foreign evidence.
+    assert!(!private_mount_loader_named(&serde_json::json!({
+        "exe": "/usr/bin/pkcs11-tool",
+    })));
+    // A missing loader record names nothing.
+    assert!(!private_mount_loader_named(&serde_json::json!({})));
+}
+
+/// Exact counts in both directions against a validated ledger: every
+/// ledger function observed exactly its count, and the total outside
+/// the ledger. Silence passes this comparison — that is why the cell
+/// validates the ledger shape first.
+fn ledger_counts_match(
+    observed: &BTreeMap<String, u64>,
+    ledger: &BTreeMap<String, u64>,
+) -> (bool, u64) {
+    let mut exact = true;
+    for (name, want) in ledger {
+        if observed.get(name).copied().unwrap_or(0) != *want {
+            exact = false;
+        }
+    }
+    let spurious: u64 = observed
+        .iter()
+        .filter(|(name, _)| !ledger.contains_key(*name))
+        .map(|(_, count)| count)
+        .sum();
+    (exact, spurious)
+}
+
+/// The count comparison, including its documented hole: silence
+/// passes, so the ledger validator must gate it.
+#[test]
+fn ledger_counts_comparison_needs_the_validated_ledger() {
+    let ledger: BTreeMap<String, u64> = [("C_Initialize".to_string(), 1)].into_iter().collect();
+    let same = ledger.clone();
+    assert_eq!(ledger_counts_match(&same, &ledger), (true, 0));
+    let short: BTreeMap<String, u64> = BTreeMap::new();
+    assert_eq!(ledger_counts_match(&short, &ledger), (false, 0));
+    let mut noisy = ledger.clone();
+    noisy.insert("C_Noisy".to_string(), 2);
+    assert_eq!(ledger_counts_match(&noisy, &ledger), (true, 2));
+    // The hole the validator closes: silence against silence.
+    assert_eq!(
+        ledger_counts_match(&BTreeMap::new(), &BTreeMap::new()),
+        (true, 0)
+    );
+}
+
 /// A provider learned from a private mount namespace (owner
 /// acceptance): a tmpfs the observer sees is mounted before the
 /// capture, so its superblock is marked at startup; a holder in a
@@ -1719,13 +1967,14 @@ fn privileged_profile_system_learned_provider_private_mount_is_learned_and_count
             }
         }
     }
-    /// Waits up to `budget` for `needle`, consuming lines; false on
-    /// timeout (the caller fails on the verdict, with the report).
-    fn wait_line_within(
+    /// Waits up to `budget` for a line selected by `pred`, consuming
+    /// lines; false on timeout (the caller fails on the verdict, with
+    /// the report).
+    fn wait_pred_within(
         capture: &mut GuardedChild,
         what: &str,
-        needle: &str,
         budget: Duration,
+        mut pred: impl FnMut(&str) -> bool,
     ) -> bool {
         let deadline = Instant::now() + budget;
         loop {
@@ -1733,7 +1982,7 @@ fn privileged_profile_system_learned_provider_private_mount_is_learned_and_count
                 return false;
             }
             let line = next_line_within(capture, what, Duration::from_secs(60));
-            if line.contains(needle) {
+            if pred(&line) {
                 return true;
             }
         }
@@ -1851,16 +2100,21 @@ fn privileged_profile_system_learned_provider_private_mount_is_learned_and_count
         "the holder must map nothing of the copy"
     );
 
-    // The learning event itself (the diagnostics staging line names
-    // the copy): bounded, so an unlearned file fails on the verdict
+    // The learning event itself (the fresh-staging record for the
+    // exact copy): bounded, so an unlearned file fails on the verdict
     // below instead of hanging. Then a few ordinary frames for the
     // expedited attach, so the workload measures steady-state
     // catching, not arm latency.
-    let staged_seen = wait_line_within(
+    let copy_name = copy
+        .file_name()
+        .expect("copy file name")
+        .to_string_lossy()
+        .into_owned();
+    let staged_seen = wait_pred_within(
         &mut capture,
         "learned staging",
-        "libprivatemnt-",
         Duration::from_secs(300),
+        |line| is_fresh_staging_line_for(line, &copy_name),
     );
     std::thread::sleep(Duration::from_secs(10));
     // The workload maps the same copy from the observer's namespace
@@ -1871,6 +2125,10 @@ fn privileged_profile_system_learned_provider_private_mount_is_learned_and_count
     let workload_status = driven.wait_expect("workload exit");
     assert!(workload_status.success(), "workload exits clean");
     let ledger_counts = read_ledger_file(&ledger);
+    assert!(
+        validate_workload_ledger(&ledger_counts),
+        "the workload ledger must have its known eight-counter shape: {ledger_counts:?}"
+    );
     // Operator stop: the report must still be written (data-always).
     // SAFETY: signalling our own capture child.
     assert_eq!(
@@ -1895,33 +2153,15 @@ fn privileged_profile_system_learned_provider_private_mount_is_learned_and_count
 
     let record = module_record(&profile, &copy);
     let observed = function_calls(&profile, record_sha256(record));
-    let mut counts_exact = true;
-    for (name, want) in &ledger_counts {
-        if observed.get(name).copied().unwrap_or(0) != *want {
-            counts_exact = false;
-        }
-    }
-    let spurious: u64 = observed
-        .iter()
-        .filter(|(name, _)| !ledger_counts.contains_key(*name))
-        .map(|(_, count)| count)
-        .sum();
+    let (counts_exact, spurious) = ledger_counts_match(&observed, &ledger_counts);
     // The provider is listed with the program that first loaded it.
     let first = record.get("first_loaded_by");
-    let loader_named = first.is_some_and(|first| {
-        let exe = first.get("exe").and_then(|exe| exe.as_str());
-        let unknown = first
-            .get("exe_unknown_reason")
-            .and_then(|reason| reason.as_str());
-        exe.is_some_and(|exe| exe.ends_with("p28-mnt-holder"))
-            || unknown == Some("loader exe link unreadable")
-    });
+    let loader_named = first.is_some_and(private_mount_loader_named);
     let pre_attach_loads = first
         .and_then(|first| first.get("pre_attach_loads"))
         .and_then(|loads| loads.as_u64());
     let staged = profile["evidence"]["learned_staged_files"].as_u64();
-    let first_use_gap =
-        text.contains("learned provider file") && text.contains("learned after its first use");
+    let first_use_gap = has_first_use_gap_record(&profile);
     assert!(
         staged_seen,
         "the learned staging line must name the copy (the file was not learned)"

@@ -2744,8 +2744,10 @@ impl CallerRegistry {
     /// Tick one quantum off every feed's stuck-degrade cooldown, and
     /// lift the stuck bar of every feed whose cooldown is served while
     /// the session is healthy. The machine calls this every Births
-    /// phase beside the reseed queue scan; the scan itself is bounded
-    /// by the registry limit.
+    /// phase beside the reseed queue scan, after that phase's births
+    /// were offered: the pass that serves a cooldown still refuses its
+    /// births as stuck-barred, and the lifted feed re-offers on the
+    /// next pass. The scan itself is bounded by the registry limit.
     pub(crate) fn tick_reseed_cooldowns(&mut self) {
         // A served cooldown in a healthy session lifts the stuck bar
         // (fresh proof of health; no void needed), so the reseed queue

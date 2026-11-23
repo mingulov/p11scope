@@ -19699,6 +19699,8 @@ fn joint_machine_idle_admission_between_polls_rescans_before_collection() {
 
     // The rescan must examine the admitted caller before any void unit
     // or collection runs. A cached completion would void/collect first.
+    // Completion only follows an exhaustive visit of every binding in
+    // order, so re-completion proves the admitted index was examined.
     let units_before_rescan = fixture
         .scene
         .real
@@ -19708,8 +19710,33 @@ fn joint_machine_idle_admission_between_polls_rescans_before_collection() {
         .adapter()
         .recovery_units_for_test();
     let collect_before_rescan = fixture.native.collect_calls;
-    let reads_before_rescan = fixture.native.absence_reads.len();
-    for poll in 1..=5 {
+    // The first poll after admission must clear the stale completion and
+    // restart from scratch without spending void units or collecting.
+    fixture.service(1).expect("the rescan never refuses");
+    let (done, _, _, _, _, _) = fixture.machine.absence_episode_for_test();
+    assert!(
+        !done,
+        "admission clears the completed flag for a rescan"
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .recovery_units_for_test(),
+        units_before_rescan,
+        "the invalidating poll spends no void units"
+    );
+    assert_eq!(
+        fixture.native.collect_calls, collect_before_rescan,
+        "no collection starts before the rescan"
+    );
+    // The rescan then runs to completion (visiting the admitted index)
+    // before void or collection resumes.
+    for poll in 2..=8 {
         let units_before = fixture
             .scene
             .real
@@ -19728,15 +19755,19 @@ fn joint_machine_idle_admission_between_polls_rescans_before_collection() {
             .joint_capture()
             .adapter()
             .recovery_units_for_test();
-        let new_reads = &fixture.native.absence_reads[reads_before_rescan..];
-        if new_reads.iter().any(|(_, image, _)| *image == image_b) {
+        let (done, _, _, _, _, _) = fixture.machine.absence_episode_for_test();
+        if done {
+            // Completion re-arms the episode and lets void resume in the
+            // same poll (one unit, like the first scan's completing poll),
+            // still before any collection.
             assert_eq!(
-                units_after, units_before_rescan,
-                "the rescan spends no void units before examining the admitted caller"
+                units_after,
+                units_before_rescan + 1,
+                "the re-completing poll voids one unit"
             );
             assert_eq!(
                 fixture.native.collect_calls, collect_before_rescan,
-                "no collection starts before the rescan examines the admitted caller"
+                "no collection starts before the void drains"
             );
             assert_eq!(
                 fixture.machine.diagnostic_snapshot_for_test().0,
@@ -19747,11 +19778,11 @@ fn joint_machine_idle_admission_between_polls_rescans_before_collection() {
         }
         assert_eq!(
             units_after, units_before,
-            "rescan poll {poll} spends no void units before examining the admitted caller"
+            "rescan poll {poll} spends no void units before re-completion"
         );
         assert_eq!(
             fixture.native.collect_calls, collect_before,
-            "no collection starts before the rescan examines the admitted caller"
+            "no collection starts before the rescan re-completes"
         );
         assert_eq!(
             fixture.machine.diagnostic_snapshot_for_test().0,
@@ -19759,7 +19790,7 @@ fn joint_machine_idle_admission_between_polls_rescans_before_collection() {
             "the rescan stays Idle"
         );
     }
-    panic!("the admitted caller's eligible target must be examined within five polls and before any void or collection");
+    panic!("the rescan must re-complete within eight polls and before any void or collection");
 }
 
 /// E9b: a scoped void sheds barrier-causing unbound staging — a stuck

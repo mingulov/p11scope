@@ -11666,10 +11666,11 @@ impl JournalAdapter {
     /// flight at the cut qualifies: their returns, and the S1 calls
     /// that dispose or refuse their images, arrive in a later quantum,
     /// so retrying this immutable frame can only end in the
-    /// no-progress void. Each row gets one grace frame: a row at or
-    /// below the last granted frontier that still bars a later frame
-    /// never returned, and that frame retries toward the void shed as
-    /// before. Re-asking for the granted frontier is idempotent (a
+    /// no-progress void. The grace is per frontier, not per row: a
+    /// barrier whose oldest in-flight row is newer than the last granted
+    /// frontier gets one grace frame; a barrier still holding a row at
+    /// or below it (even beside newer rows) retries toward the void shed
+    /// as before. Re-asking for the granted frontier is idempotent (a
     /// settle that yields for budget asks again).
     pub(crate) fn take_unbound_in_flight_grace(&self, frontier: u64) -> bool {
         let granted = self.unbound_grace_through.get();

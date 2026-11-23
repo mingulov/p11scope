@@ -4832,16 +4832,16 @@ impl JournalAdapter {
     /// Promote one image's taint to permanent for independent
     /// raw/original-refusal evidence: shed-only lift eligibility is
     /// revoked first, including for an already shed-tainted image,
-    /// then the taint is recorded as before. Telemetry, bounds and
-    /// per-key effects match `note_image_taint_at`; only the shed-only
-    /// provenance changes. Every refusal path that bypasses
-    /// `taint_image` must route through this. Disposed raw content is
-    /// unknown effects: the taint never lifts.
+    /// then permanent evidence is recorded even when the image already
+    /// carries fenced evidence (the combine rule makes it permanent), so
+    /// no later void can lift it. Telemetry, bounds and per-key effects
+    /// match `note_image_taint_at`, which is idempotent for an image
+    /// already tainted. Every refusal path that bypasses `taint_image`
+    /// must route through this. Disposed raw content and unowned S1-only
+    /// subjects are unknown effects: the taint never lifts.
     fn promote_image_taint(&mut self, image: (u64, u64)) {
         self.shed_only_taints.remove(&image);
-        if !self.is_tainted(image) {
-            self.note_image_taint_at(image, None);
-        }
+        self.note_image_taint_at(image, None);
     }
 
     /// Record only the irreversible image evidence. A raw batch marks
@@ -25326,6 +25326,43 @@ pub(crate) mod tests {
     /// retires its rows one leaf unit each across credits, and the
     /// finished result (every row's retirement plus the all-key scope)
     /// waits for the negative frame that carries the raw failure.
+    /// Site twin (disposed raw, localized): an image that already
+    /// carries fenced quarantine evidence becomes permanently tainted
+    /// when disposed raw content refuses it, so a void past the old
+    /// fence lifts nothing.
+    #[test]
+    fn localized_raw_refusal_permanentizes_a_fenced_taint() {
+        let mut harness = OwnerHarness::new(image_default());
+        let image = (0x5151, 0x5252);
+        harness
+            .owner
+            .adapter_mut()
+            .note_image_taint_at(image, Some(3));
+        assert_eq!(
+            harness.owner.adapter().taint_evidence_for_test(image),
+            Some(Some(3))
+        );
+        {
+            let (adapter, model) = harness.owner.parts();
+            let _ = adapter.refuse_disposed_raw_deferred(
+                model,
+                std::iter::once(image),
+                false,
+                JournalGap::Malformed,
+            );
+        }
+        let adapter = harness.owner.adapter_mut();
+        assert_eq!(
+            adapter.taint_evidence_for_test(image),
+            Some(None),
+            "disposed raw content is unknown effects: permanent"
+        );
+        *adapter.voided_through.edit() = 1_000;
+        assert!(!adapter.taint_lifts_at_fence_for_test(image));
+        assert!(!adapter.lift_fenced_image_taint(image));
+        assert!(adapter.is_tainted(image));
+    }
+
     #[test]
     fn unlocalized_raw_refusal_retires_rows_per_credit() {
         use super::joint_driver::RecoveryProgress;
@@ -34640,6 +34677,53 @@ pub(crate) mod tests {
         let _ = scene.ingest(&end);
         let image = scene.adapter.pose_unminted_s1only_subject_for_test((1, 1));
         let frontier = scene.adapter.consumed_through;
+        let (failure, pending) = scene
+            .adapter
+            .refuse_s1only_subjects(&mut scene.model)
+            .expect("one S1-only subject");
+        assert!(pending.is_none(), "settles inline");
+        assert_eq!(failure.gap, JournalGap::ImageTainted);
+        assert!(scene.adapter.is_tainted(image), "the image is tainted");
+        assert_eq!(
+            scene.adapter.taint_evidence_for_test(image),
+            Some(None),
+            "the taint carries no fence: no void can lift it"
+        );
+        // Even a void past every consumed ordinal leaves it in place.
+        *scene.adapter.voided_through.edit() = frontier.saturating_add(1_000);
+        assert!(!scene.adapter.taint_lifts_at_fence_for_test(image));
+        assert!(!scene.adapter.lift_fenced_image_taint(image));
+        assert!(scene.adapter.is_tainted(image), "still tainted");
+    }
+
+    /// Site twin over a fenced taint: the same unminted S1-only subject
+    /// on an image that already carries fenced (liftable) evidence
+    /// leaves permanent evidence, so a void past the old fence lifts
+    /// nothing.
+    #[test]
+    fn object_journal_unminted_s1only_subject_permanentizes_a_fenced_taint() {
+        let mut scene = Scene::new(image_default());
+        let sign = function_id("C_SignInit");
+        let mut begin = begin_bytes(1, 1, sign, 0);
+        put_u64(&mut begin, 88, 0x9090_9090_9090_9090);
+        begin[126] = 1;
+        let _ = scene.ingest(&begin);
+        let end = end_bytes(
+            &begin,
+            p11scope_ebpf_common::object_wire::OBJECT_ACTION_ACCESS,
+            0,
+            ENTRY_NS + 50,
+        );
+        let _ = scene.ingest(&end);
+        let image = scene.adapter.pose_unminted_s1only_subject_for_test((1, 1));
+        let frontier = scene.adapter.consumed_through;
+        // A fenced quarantine (the pre-grant shape) already covers the
+        // image: the unowned subject must still make it permanent.
+        scene.adapter.note_image_taint_at(image, Some(frontier));
+        assert_eq!(
+            scene.adapter.taint_evidence_for_test(image),
+            Some(Some(frontier))
+        );
         let (failure, pending) = scene
             .adapter
             .refuse_s1only_subjects(&mut scene.model)

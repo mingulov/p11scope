@@ -73,18 +73,6 @@ fn canonical_spelling(path: &str) -> String {
         .unwrap_or_else(|_| path.to_string())
 }
 
-/// Distinct verified spellings by canonical path (the sorted-first
-/// spelling kept per file), sorted for a stable order.
-fn dedupe_canonical(paths: Vec<String>) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
-    let mut distinct: Vec<String> = paths
-        .into_iter()
-        .filter(|path| seen.insert(canonical_spelling(path)))
-        .collect();
-    distinct.sort();
-    distinct
-}
-
 /// Open `path` for the mapping probe: close-on-exec, never a
 /// controlling terminal, never following a final-component symlink,
 /// never blocking on a FIFO or device open. A symlink (however
@@ -233,8 +221,267 @@ fn maps_identity_at(maps: &str, addr: u64) -> Option<(u64, u64)> {
 /// `by_identity` (scripted single-path tests).
 pub(crate) struct ScanLearned<'a> {
     pub by_identity: &'a HashMap<(u64, u64), String>,
+    /// The verification probe the draining [`ExeResolver::resolve`]
+    /// uses; production steps pass their probe to
+    /// [`ExeResolver::step`] directly.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub verify: VerifyProbe<'a>,
     pub all_by_identity: Option<&'a HashMap<(u64, u64), Vec<String>>>,
+}
+
+/// Take `n` slow units from a step allowance, or none at all.
+fn take_units(units: &mut usize, n: usize) -> bool {
+    if *units < n {
+        return false;
+    }
+    *units -= n;
+    true
+}
+
+/// Distinct verified spellings by canonical path, from spellings whose
+/// canonical form was read once at verification: the first spelling
+/// per file in input order is kept, then the result is sorted.
+fn dedupe_verified(verified: &[(String, String)]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut distinct: Vec<String> = verified
+        .iter()
+        .filter(|(_, canonical)| seen.insert(canonical.clone()))
+        .map(|(path, _)| path.clone())
+        .collect();
+    distinct.sort();
+    distinct
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobPhase {
+    Live,
+    Learned,
+    Index,
+}
+
+/// One resumable executable resolution: its EXEC pair, the learned
+/// spellings snapshot taken at its start, and every candidate
+/// verified so far. A job owes nothing between steps but memory.
+#[derive(Debug, Clone)]
+pub(crate) struct ResolveJob {
+    pid: u32,
+    dev: u64,
+    ino: u64,
+    hook_ts_ns: u64,
+    phase: JobPhase,
+    cursor: usize,
+    learned: Vec<String>,
+    learned_ok: Vec<(String, String)>,
+    indexed: Option<Vec<String>>,
+    indexed_ok: Vec<(String, String)>,
+}
+
+impl ResolveJob {
+    /// Start one resolution: snapshots every spelling the scan learned
+    /// for the pair (primary plus teacher spellings, sorted, deduped) —
+    /// memory only; every read happens in [`ExeResolver::step`].
+    pub(crate) fn begin(
+        pid: u32,
+        dev: u64,
+        ino: u64,
+        hook_ts_ns: u64,
+        scan: &ScanLearned<'_>,
+    ) -> Self {
+        let mut learned = Vec::new();
+        if let Some(path) = scan.by_identity.get(&(dev, ino)) {
+            learned.push(path.clone());
+        }
+        if let Some(all) = scan.all_by_identity
+            && let Some(paths) = all.get(&(dev, ino))
+        {
+            learned.extend(paths.iter().cloned());
+        }
+        // The primary usually lists among the known spellings too:
+        // each distinct spelling verifies once.
+        learned.sort();
+        learned.dedup();
+        Self {
+            pid,
+            dev,
+            ino,
+            hook_ts_ns,
+            phase: JobPhase::Live,
+            cursor: 0,
+            learned,
+            learned_ok: Vec::new(),
+            indexed: None,
+            indexed_ok: Vec::new(),
+        }
+    }
+
+    /// Whether this job resolves exactly this EXEC (the same pair,
+    /// instant and pid): a changed stash restarts resolution.
+    pub(crate) fn is_for(&self, pid: u32, dev: u64, ino: u64, hook_ts_ns: u64) -> bool {
+        (self.pid, self.dev, self.ino, self.hook_ts_ns) == (pid, dev, ino, hook_ts_ns)
+    }
+
+    /// Sources (b) and (c) pool their verified spellings: the shown
+    /// path is the sorted-first verified spelling, learned preferred
+    /// over index; every distinct canonical spelling lists as a
+    /// candidate, sorted. One candidate reads unambiguous; two or more
+    /// keep the shown path and read ambiguous, never unknown.
+    fn verdict(&self) -> UnboundExe {
+        let (dev, ino) = (self.dev, self.ino);
+        let learned = dedupe_verified(&self.learned_ok);
+        let indexed = dedupe_verified(&self.indexed_ok);
+        let canonical_of = |path: &String| {
+            self.learned_ok
+                .iter()
+                .chain(self.indexed_ok.iter())
+                .find(|(verified, _)| verified == path)
+                .map(|(_, canonical)| canonical.clone())
+                .unwrap_or_else(|| path.clone())
+        };
+        let mut seen = std::collections::HashSet::new();
+        let mut candidates = Vec::new();
+        for path in learned.iter().chain(indexed.iter()) {
+            if seen.insert(canonical_of(path)) {
+                candidates.push(path.clone());
+            }
+        }
+        candidates.sort();
+        let (path, resolution) = match (learned.first(), indexed.first()) {
+            (Some(path), _) => (path, ExeResolution::ScanLearned),
+            (None, Some(path)) => (path, ExeResolution::SystemIndex),
+            (None, None) => {
+                return UnboundExe {
+                    dev,
+                    ino,
+                    path: None,
+                    resolution: ExeResolution::PathUnknown,
+                    identity_candidates: Vec::new(),
+                };
+            }
+        };
+        UnboundExe {
+            dev,
+            ino,
+            path: Some(path.clone()),
+            resolution,
+            identity_candidates: candidates,
+        }
+    }
+}
+
+/// One directory frame of a resumable index walk.
+struct IndexFrame {
+    dir: PathBuf,
+    depth: usize,
+    names: Option<Vec<PathBuf>>,
+    pos: usize,
+    sub_pos: usize,
+}
+
+/// A resumable system-index build: the fixed roots still to walk (in
+/// order), the directory frames in progress, and the shadow entries.
+struct IndexBuild {
+    roots: std::collections::VecDeque<PathBuf>,
+    frames: Vec<IndexFrame>,
+    entries: HashMap<u64, Vec<String>>,
+    paths: usize,
+    shed: u64,
+}
+
+impl IndexBuild {
+    /// Walk the fixed roots (sorted, so same-ino candidates keep walk
+    /// order), skipping final-component symlinks and non-files,
+    /// bounded by the cap, spending at most `units`. Unreadable roots
+    /// shed silently: the index is a hint, and a miss degrades to
+    /// unknown, never to an error. Returns whether the walk completed.
+    fn advance(&mut self, cap: usize, units: &mut usize) -> bool {
+        loop {
+            let Some(frame) = self.frames.last_mut() else {
+                if self.paths >= cap {
+                    return true;
+                }
+                let Some(root) = self.roots.pop_front() else {
+                    return true;
+                };
+                self.frames.push(IndexFrame {
+                    dir: root,
+                    depth: 0,
+                    names: None,
+                    pos: 0,
+                    sub_pos: 0,
+                });
+                continue;
+            };
+            let Some(names) = frame.names.as_ref() else {
+                if !take_units(units, 1) {
+                    return false;
+                }
+                let mut names: Vec<PathBuf> = match std::fs::read_dir(&frame.dir) {
+                    Ok(read) => read
+                        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                        .collect(),
+                    Err(_) => Vec::new(),
+                };
+                names.sort();
+                frame.names = Some(names);
+                continue;
+            };
+            if frame.pos < names.len() {
+                if !take_units(units, 2) {
+                    return false;
+                }
+                let path = names[frame.pos].clone();
+                frame.pos += 1;
+                // Final-component symlinks are never indexed: the
+                // confirmation probe opens with O_NOFOLLOW and would
+                // refuse them, so indexing them only spends cap and
+                // probes on dead candidates.
+                match std::fs::symlink_metadata(&path) {
+                    Ok(link) if link.is_symlink() => continue,
+                    Ok(_) => {}
+                    Err(_) => continue,
+                }
+                let meta = match std::fs::metadata(&path) {
+                    Ok(meta) => meta,
+                    Err(_) => continue,
+                };
+                if !meta.is_file() {
+                    continue;
+                }
+                if self.paths >= cap {
+                    self.shed = self.shed.saturating_add(1);
+                    continue;
+                }
+                self.paths += 1;
+                self.entries
+                    .entry(meta.ino())
+                    .or_default()
+                    .push(path.to_string_lossy().into_owned());
+                continue;
+            }
+            if frame.depth == 0
+                && frame.dir == Path::new(LIBEXEC_SUBDIR_ROOT)
+                && frame.sub_pos < names.len()
+                && self.paths < cap
+            {
+                if !take_units(units, 1) {
+                    return false;
+                }
+                let path = names[frame.sub_pos].clone();
+                frame.sub_pos += 1;
+                if path.is_dir() {
+                    self.frames.push(IndexFrame {
+                        dir: path,
+                        depth: 1,
+                        names: None,
+                        pos: 0,
+                        sub_pos: 0,
+                    });
+                }
+                continue;
+            }
+            self.frames.pop();
+        }
+    }
 }
 
 /// Lazy system-binary index plus resolution.
@@ -247,6 +494,8 @@ pub(crate) struct ExeResolver {
     /// Indexed paths (the unit the cap bounds).
     paths: usize,
     built_at: Option<u64>,
+    /// The resumable build in progress (first build or shadow refresh).
+    build: Option<IndexBuild>,
     /// Builds so far (test-observed; production keeps the count so
     /// the lazy-build policy stays measurable).
     #[allow(dead_code)]
@@ -271,6 +520,7 @@ impl ExeResolver {
             entries: HashMap::new(),
             paths: 0,
             built_at: None,
+            build: None,
             builds: 0,
             shed: 0,
             clock: crate::attach::monotonic_ns,
@@ -286,6 +536,9 @@ impl ExeResolver {
     /// Resolve one EXEC-joined `(dev, ino)` pair to a path: a live
     /// link, a scan record, the system index, else unknown with its
     /// reason. A `(0, 0)` pair reads unavailable without any read.
+    /// Drains one [`ResolveJob`] without a unit bound (callers that
+    /// own no step budget: unit tests and the draining wrappers).
+    #[cfg(test)]
     pub(crate) fn resolve(
         &mut self,
         pid: u32,
@@ -295,59 +548,104 @@ impl ExeResolver {
         proc: &ProcReads<'_>,
         scan: &ScanLearned<'_>,
     ) -> UnboundExe {
-        if dev == 0 && ino == 0 {
-            return UnboundExe {
-                dev,
-                ino,
-                path: None,
-                resolution: ExeResolution::ExeUnavailable,
-                identity_candidates: Vec::new(),
-            };
-        }
-        if let Some(path) = Self::via_live_process(pid, dev, ino, hook_ts_ns, proc) {
-            return UnboundExe {
-                dev,
-                ino,
-                identity_candidates: vec![path.clone()],
-                path: Some(path),
-                resolution: ExeResolution::ProcAlive,
-            };
-        }
-        // Sources (b) and (c) pool their verified spellings: the
-        // shown path is the sorted-first verified spelling, learned
-        // preferred over index; every distinct canonical spelling
-        // lists as a candidate, sorted. One candidate reads
-        // unambiguous; two or more keep the shown path and read
-        // ambiguous, never unknown.
-        let learned = Self::scan_learned_hits(dev, ino, scan);
-        let indexed = self.system_index_hits(dev, ino);
-        let mut seen = std::collections::HashSet::new();
-        let mut candidates = Vec::new();
-        for path in learned.iter().chain(indexed.iter()) {
-            if seen.insert(canonical_spelling(path)) {
-                candidates.push(path.clone());
+        let mut job = ResolveJob::begin(pid, dev, ino, hook_ts_ns, scan);
+        let mut units = usize::MAX;
+        self.step(&mut job, proc, &*scan.verify, &mut units)
+            .expect("an unbounded step always completes")
+    }
+
+    /// Advance one resolution by at most `units` slow units (INV-2),
+    /// returning its verdict once complete; `None` means the job
+    /// stays owed and resumes on a later call with its progress kept.
+    /// Units: the live-process source reads two (start time and exe
+    /// identity); each learned or indexed candidate costs two (its
+    /// mapping probe and its canonical spelling); the system index
+    /// build charges its own walk (see [`Self::advance_index`]).
+    pub(crate) fn step(
+        &mut self,
+        job: &mut ResolveJob,
+        proc: &ProcReads<'_>,
+        verify: &dyn Fn(&str) -> Option<(u64, u64)>,
+        units: &mut usize,
+    ) -> Option<UnboundExe> {
+        let (dev, ino) = (job.dev, job.ino);
+        loop {
+            match job.phase {
+                JobPhase::Live => {
+                    if dev == 0 && ino == 0 {
+                        return Some(UnboundExe {
+                            dev,
+                            ino,
+                            path: None,
+                            resolution: ExeResolution::ExeUnavailable,
+                            identity_candidates: Vec::new(),
+                        });
+                    }
+                    if proc.trusted {
+                        if !take_units(units, 2) {
+                            return None;
+                        }
+                        if let Some(path) =
+                            Self::via_live_process(job.pid, dev, ino, job.hook_ts_ns, proc)
+                        {
+                            return Some(UnboundExe {
+                                dev,
+                                ino,
+                                identity_candidates: vec![path.clone()],
+                                path: Some(path),
+                                resolution: ExeResolution::ProcAlive,
+                            });
+                        }
+                    }
+                    job.phase = JobPhase::Learned;
+                }
+                JobPhase::Learned => {
+                    // Source (b): every spelling the scan learned for
+                    // this pair — the primary plus every known teacher
+                    // spelling — re-verified by the mapping probe (a
+                    // replaced file refuses).
+                    while job.cursor < job.learned.len() {
+                        if !take_units(units, 2) {
+                            return None;
+                        }
+                        let path = job.learned[job.cursor].clone();
+                        job.cursor += 1;
+                        if verify(&path).is_some_and(|pair| pair == (dev, ino)) {
+                            let canonical = canonical_spelling(&path);
+                            job.learned_ok.push((path, canonical));
+                        }
+                    }
+                    job.cursor = 0;
+                    job.phase = JobPhase::Index;
+                }
+                JobPhase::Index => {
+                    // Source (c): the lazy system index. Every
+                    // same-ino candidate is confirmed against the
+                    // joined pair in the mapped device domain.
+                    if job.indexed.is_none() {
+                        if !self.advance_index(units) {
+                            return None;
+                        }
+                        job.indexed = Some(self.entries.get(&ino).cloned().unwrap_or_default());
+                    }
+                    let candidates = job.indexed.as_ref().expect("snapshot taken above");
+                    while job.cursor < candidates.len() {
+                        if !take_units(units, 2) {
+                            return None;
+                        }
+                        let path = candidates[job.cursor].clone();
+                        job.cursor += 1;
+                        if self
+                            .maps_identity_of(&path)
+                            .is_some_and(|pair| pair == (dev, ino))
+                        {
+                            let canonical = canonical_spelling(&path);
+                            job.indexed_ok.push((path, canonical));
+                        }
+                    }
+                    return Some(job.verdict());
+                }
             }
-        }
-        candidates.sort();
-        let (path, resolution) = match (learned.first(), indexed.first()) {
-            (Some(path), _) => (path, ExeResolution::ScanLearned),
-            (None, Some(path)) => (path, ExeResolution::SystemIndex),
-            (None, None) => {
-                return UnboundExe {
-                    dev,
-                    ino,
-                    path: None,
-                    resolution: ExeResolution::PathUnknown,
-                    identity_candidates: Vec::new(),
-                };
-            }
-        };
-        UnboundExe {
-            dev,
-            ino,
-            path: Some(path.clone()),
-            resolution,
-            identity_candidates: candidates,
         }
     }
 
@@ -394,50 +692,55 @@ impl ExeResolver {
         live.path
     }
 
-    /// Source (b): every spelling the scan learned for this
-    /// maps-domain `(dev, ino)` — the primary plus every known
-    /// teacher spelling — re-verified by the mapping probe (a
-    /// replaced file refuses), distinct by canonical path, sorted.
-    fn scan_learned_hits(dev: u64, ino: u64, scan: &ScanLearned<'_>) -> Vec<String> {
-        let mut spellings = Vec::new();
-        if let Some(path) = scan.by_identity.get(&(dev, ino)) {
-            spellings.push(path.clone());
+    /// Advance the system index by at most `units` slow units: the
+    /// first build must complete before any lookup (`false` until it
+    /// does); a stale index (older than the refresh window) rebuilds
+    /// into a shadow while lookups keep the last complete index, and
+    /// the shadow replaces it once complete. Without a clock the cache
+    /// is kept, never rebuild-looped. Units: one per directory read,
+    /// two per entry (its link and file metadata), one per libexec
+    /// subdirectory check.
+    pub(crate) fn advance_index(&mut self, units: &mut usize) -> bool {
+        if self.build.is_none() {
+            if let Some(built) = self.built_at {
+                match self.now_ns() {
+                    Some(now) if now.saturating_sub(built) < INDEX_REFRESH_WINDOW_NS => {
+                        return true;
+                    }
+                    None => return true,
+                    _ => {}
+                }
+            }
+            self.build = Some(IndexBuild {
+                roots: self.index_dirs().into(),
+                frames: Vec::new(),
+                entries: HashMap::new(),
+                paths: 0,
+                shed: 0,
+            });
         }
-        if let Some(all) = scan.all_by_identity
-            && let Some(paths) = all.get(&(dev, ino))
-        {
-            spellings.extend(paths.iter().cloned());
+        let cap = self.cap;
+        let build = self.build.as_mut().expect("a build is in progress");
+        if !build.advance(cap, units) {
+            // A stale index keeps serving lookups while its shadow
+            // builds; the first build has nothing to serve yet.
+            return self.built_at.is_some();
         }
-        // The primary usually lists among the known spellings too:
-        // each distinct spelling verifies once.
-        spellings.sort();
-        spellings.dedup();
-        let verified: Vec<String> = spellings
-            .into_iter()
-            .filter(|path| (scan.verify)(path).is_some_and(|pair| pair == (dev, ino)))
-            .collect();
-        dedupe_canonical(verified)
+        let build = self.build.take().expect("the build just completed");
+        self.builds += 1;
+        self.entries = build.entries;
+        self.paths = build.paths;
+        self.shed = self.shed.saturating_add(build.shed);
+        self.built_at = Some(self.now_ns().unwrap_or(0));
+        true
     }
 
-    /// Source (c): the lazy system index. Every same-ino candidate
-    /// is confirmed against the joined pair in the mapped device
-    /// domain (a deleted or replaced binary refuses, as does a
-    /// stat-only pair on a split-device host); hits list distinct
-    /// by canonical path, sorted.
-    fn system_index_hits(&mut self, dev: u64, ino: u64) -> Vec<String> {
-        self.refresh_index_if_stale();
-        let Some(candidates) = self.entries.get(&ino) else {
-            return Vec::new();
-        };
-        let verified: Vec<String> = candidates
-            .iter()
-            .filter(|path| {
-                self.maps_identity_of(path)
-                    .is_some_and(|pair| pair == (dev, ino))
-            })
-            .cloned()
-            .collect();
-        dedupe_canonical(verified)
+    fn now_ns(&self) -> Option<u64> {
+        #[cfg(test)]
+        if let Some(now) = self.now_override {
+            return Some(now);
+        }
+        (self.clock)()
     }
 
     /// The maps-domain identity of one indexed path: the scripted
@@ -449,95 +752,6 @@ impl ExeResolver {
             return answers.get(path).copied();
         }
         real_maps_identity(path)
-    }
-
-    /// Build the index on the first miss, then at most every few
-    /// seconds. Without a clock the cache is kept, never
-    /// rebuild-looped.
-    fn refresh_index_if_stale(&mut self) {
-        if self.built_at.is_some() {
-            match (self.built_at, self.now_ns()) {
-                (Some(built), Some(now)) if now.saturating_sub(built) < INDEX_REFRESH_WINDOW_NS => {
-                    return;
-                }
-                (_, None) => return,
-                _ => {}
-            }
-        }
-        self.rebuild();
-    }
-
-    fn now_ns(&self) -> Option<u64> {
-        #[cfg(test)]
-        if let Some(now) = self.now_override {
-            return Some(now);
-        }
-        (self.clock)()
-    }
-
-    /// Walk the fixed roots (sorted, so same-ino candidates keep
-    /// walk order), skipping final-component symlinks and
-    /// non-files, bounded by the cap. Unreadable roots shed
-    /// silently: the index is a hint, and a miss degrades to
-    /// unknown, never to an error.
-    fn rebuild(&mut self) {
-        self.builds += 1;
-        self.entries.clear();
-        self.paths = 0;
-        for dir in self.index_dirs() {
-            if self.paths >= self.cap {
-                break;
-            }
-            self.index_dir(&dir, 0);
-        }
-        self.built_at = Some(self.now_ns().unwrap_or(0));
-    }
-
-    fn index_dir(&mut self, dir: &Path, depth: usize) {
-        let mut names: Vec<PathBuf> = match std::fs::read_dir(dir) {
-            Ok(read) => read
-                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-                .collect(),
-            Err(_) => return,
-        };
-        names.sort();
-        for path in &names {
-            // Final-component symlinks are never indexed: the
-            // confirmation probe opens with O_NOFOLLOW and would
-            // refuse them, so indexing them only spends cap and
-            // probes on dead candidates.
-            match std::fs::symlink_metadata(path) {
-                Ok(link) if link.is_symlink() => continue,
-                Ok(_) => {}
-                Err(_) => continue,
-            }
-            let meta = match std::fs::metadata(path) {
-                Ok(meta) => meta,
-                Err(_) => continue,
-            };
-            if !meta.is_file() {
-                continue;
-            }
-            if self.paths >= self.cap {
-                self.shed = self.shed.saturating_add(1);
-                continue;
-            }
-            self.paths += 1;
-            self.entries
-                .entry(meta.ino())
-                .or_default()
-                .push(path.to_string_lossy().into_owned());
-        }
-        if depth == 0 && dir == Path::new(LIBEXEC_SUBDIR_ROOT) {
-            for path in &names {
-                if self.paths >= self.cap {
-                    break;
-                }
-                if path.is_dir() {
-                    self.index_dir(path, 1);
-                }
-            }
-        }
     }
 
     fn index_dirs(&self) -> Vec<PathBuf> {
@@ -1346,6 +1560,75 @@ mod tests {
     #[test]
     fn index_cap_pinned_from_measurement() {
         assert_eq!(DEFAULT_MAX_SYSTEM_INDEX_ENTRIES, 65_536);
+    }
+
+    /// The system index build is bounded per step and resumes: 40
+    /// files cost one directory read plus two units each (81), so a
+    /// 64-unit step leaves the first build owed (no lookup may use a
+    /// half-built first index), and the next step completes it once.
+    #[test]
+    fn the_index_build_resumes_across_unit_budgets() {
+        let dir = tempfile::tempdir().unwrap();
+        for n in 0..40 {
+            std::fs::write(dir.path().join(format!("tool-{n:02}")), b"x").unwrap();
+        }
+        let mut resolver = ExeResolver::new();
+        resolver.set_index_dirs(vec![dir.path().to_path_buf()]);
+        resolver.set_now(1_000_000_000);
+        let mut units = 64;
+        assert!(
+            !resolver.advance_index(&mut units),
+            "the first build is owed"
+        );
+        assert_eq!(
+            (units, resolver.index_builds(), resolver.index_len()),
+            (1, 0, 0)
+        );
+        let mut units = 64;
+        assert!(resolver.advance_index(&mut units));
+        assert_eq!((64 - units, resolver.index_builds()), (18, 1));
+        assert_eq!(resolver.index_len(), 40);
+        // A stale index keeps serving while its shadow rebuilds.
+        std::fs::write(dir.path().join("tool-40"), b"x").unwrap();
+        resolver.set_now(1_000_000_000 + 60_000_000_000);
+        let mut units = 10;
+        assert!(resolver.advance_index(&mut units), "the last index serves");
+        assert_eq!((resolver.index_builds(), resolver.index_len()), (1, 40));
+        let mut units = 200;
+        assert!(resolver.advance_index(&mut units));
+        assert_eq!((resolver.index_builds(), resolver.index_len()), (2, 41));
+    }
+
+    /// One resolution resumes without repeating work: 40 learned
+    /// spellings cost two units each, a 64-unit step verifies 32 and
+    /// stays owed, and the next step verifies only the remaining 8.
+    #[test]
+    fn a_resolution_job_resumes_without_reverifying() {
+        let mut resolver = ExeResolver::new();
+        resolver.set_index_dirs(Vec::new());
+        let proc = ScriptedProc::dead();
+        let mut scan = ScriptedScan::empty();
+        let paths: Vec<String> = (0..40).map(|n| format!("/learned/tool-{n:02}")).collect();
+        let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+        scan.learned_multi(8, 99, &refs);
+        let reads = proc.reads(false, None, None);
+        let learned = scan.scan();
+        let mut job = ResolveJob::begin(7, 8, 99, 2_000_000_000, &learned);
+        let mut units = 64;
+        assert!(
+            resolver
+                .step(&mut job, &reads, &*learned.verify, &mut units)
+                .is_none()
+        );
+        assert_eq!((units, scan.verify_calls.get()), (0, 32));
+        let mut units = 64;
+        let exe = resolver
+            .step(&mut job, &reads, &*learned.verify, &mut units)
+            .expect("the job completes");
+        assert_eq!(scan.verify_calls.get(), 40, "each spelling verifies once");
+        assert_eq!(64 - units, 16);
+        assert_eq!(exe.resolution, ExeResolution::ScanLearned);
+        assert_eq!(exe.path.as_deref(), Some("/learned/tool-00"));
     }
 
     /// The index refreshes at most every few seconds.

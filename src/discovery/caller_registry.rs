@@ -3373,6 +3373,32 @@ pub(crate) const COUNTED_BEFORE_TRACKING: &str = "counted before tracking";
 /// observed while dropped: the excluded subtotal, counted and named.
 pub(crate) const IDENTITY_RETRY_TERMINAL: &str = "identity retry terminal";
 
+/// A decided no-live-caller row the full per-domain retry set could not
+/// retain: its unbound verdict is final (one deduplicated disclosure).
+pub(crate) const IDENTITY_RETRY_SHED: &str = "identity retry shed";
+
+/// The typed key of one counted exclusion carrier: the disclosure's
+/// subject, the member and module it names, and how its amounts
+/// combine. Every counted exclusion combines here at apply time whether
+/// or not its detail row fits the gap budget, so a full quota can hide
+/// neither the excluded amount nor its cause or member.
+pub(crate) type CountedExclusionKey = (
+    &'static str,
+    Option<CallerId>,
+    Option<ModuleId>,
+    CountedAmount,
+);
+
+/// How one counted disclosure's amount combines with its key's earlier
+/// ones: disjoint ranges sum; a cumulative re-disclosure of the same
+/// growing pair keeps the largest amount (an honest lower bound when
+/// several pairs share one key, never a double count).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum CountedAmount {
+    Disjoint,
+    Cumulative,
+}
+
 /// Where every decided native witness row went, each row exactly once
 /// (C4 review M3): `edge` witnessed one caller edge, `module` became one
 /// module's `unbound_use` row, `ambiguous` named an endpoint several
@@ -3888,6 +3914,15 @@ enum Mutation {
         /// `terminal_phase` captured at stage time (see `RecordGap`).
         terminal: bool,
     },
+    /// One counted exclusion disclosure (see [`CountedExclusionKey`]):
+    /// `gap` is its ordinary detail row, `calls` the excluded amount.
+    RecordCountedGap {
+        gap: RegistryGap,
+        key: CountedExclusionKey,
+        calls: u64,
+        /// `terminal_phase` captured at stage time (see `RecordGap`).
+        terminal: bool,
+    },
     RecordTerminalRetryExcluded {
         /// The terminal cause text (`domain finish`, `endpoint
         /// resolution loss`, or `re-refusal (<code>)`): settlements
@@ -4189,6 +4224,17 @@ pub(crate) struct CallerRegistry {
     /// never count by repeats). Retention is guaranteed, never
     /// budgeted: at most one row per finite cause.
     terminal_retry_gap_index: BTreeMap<String, usize>,
+    /// Authoritative counted exclusions by typed key: (excluded calls,
+    /// disclosures), summed at apply time for every disclosure, retained
+    /// or not. Keys are bounded by members and modules (product limits).
+    counted_exclusions: HashMap<CountedExclusionKey, (u64, u64)>,
+    /// Counted disclosures whose detail row did not fit the ordinary
+    /// gap budget: (calls, disclosures, first detail reason) per key,
+    /// published as one guaranteed carrier row each.
+    counted_overflow: HashMap<CountedExclusionKey, (u64, u64, String)>,
+    /// Where each key's guaranteed carrier row publishes in `gaps`
+    /// (rewritten in place; never budgeted, at most one row per key).
+    counted_overflow_index: HashMap<CountedExclusionKey, usize>,
     /// Terminal/stop-time phase: set once the lane stops. Gaps staged
     /// from now on carry the terminal flag and may use the headroom
     /// above the bound; gaps staged before it keep the plain bound
@@ -4524,6 +4570,9 @@ impl CallerRegistry {
             suppressed_demoted_placed: BTreeSet::new(),
             terminal_retry_totals: BTreeMap::new(),
             terminal_retry_gap_index: BTreeMap::new(),
+            counted_exclusions: HashMap::new(),
+            counted_overflow: HashMap::new(),
+            counted_overflow_index: HashMap::new(),
             terminal_phase: false,
             staged: Vec::new(),
             joint_publication: None,
@@ -5884,6 +5933,26 @@ impl CallerRegistry {
         self.terminal_retry_totals.clone()
     }
 
+    /// The authoritative counted exclusions: typed key -> (excluded
+    /// calls, disclosures). Test-only typed oracle.
+    #[cfg(test)]
+    pub(crate) fn counted_exclusions_for_test(&self) -> BTreeMap<CountedExclusionKey, (u64, u64)> {
+        self.counted_exclusions
+            .iter()
+            .map(|(key, total)| (*key, *total))
+            .collect()
+    }
+
+    /// The guaranteed carrier rows past the ordinary budget: typed key
+    /// -> (calls, disclosures). Test-only typed oracle.
+    #[cfg(test)]
+    pub(crate) fn counted_overflow_for_test(&self) -> BTreeMap<CountedExclusionKey, (u64, u64)> {
+        self.counted_overflow
+            .iter()
+            .map(|(key, (calls, events, _))| (*key, (*calls, *events)))
+            .collect()
+    }
+
     /// Stage one global health regression (a native identity, pair, or
     /// usage evidence counter rose between `at_ns`, the last clean read,
     /// and `detected_ns`, the read that saw it). The failure cannot be
@@ -6083,7 +6152,9 @@ impl CallerRegistry {
         self.staged
             .iter()
             .filter_map(|staged| match staged {
-                Mutation::RecordGap { gap, .. } => Some((gap.subject.clone(), gap.reason.clone())),
+                Mutation::RecordGap { gap, .. } | Mutation::RecordCountedGap { gap, .. } => {
+                    Some((gap.subject.clone(), gap.reason.clone()))
+                }
                 _ => None,
             })
             .collect()
@@ -6096,7 +6167,9 @@ impl CallerRegistry {
         self.staged
             .iter()
             .filter_map(|staged| match staged {
-                Mutation::RecordGap { gap, .. } => Some(gap.clone()),
+                Mutation::RecordGap { gap, .. } | Mutation::RecordCountedGap { gap, .. } => {
+                    Some(gap.clone())
+                }
                 _ => None,
             })
             .collect()
@@ -6519,6 +6592,109 @@ impl CallerRegistry {
         self.gaps
             .len()
             .saturating_sub(self.terminal_retry_gap_index.len())
+            .saturating_sub(self.counted_overflow_index.len())
+    }
+
+    /// Whether a new distinct gap would be suppressed by the ordinary
+    /// budget right now (the exact predicate of [`Self::push_gap_as`]).
+    fn gap_would_be_suppressed(&self, gap: &RegistryGap, terminal: bool) -> bool {
+        if self.gap_index.contains_key(gap) {
+            return false;
+        }
+        let cap = if terminal {
+            self.limits.max_gaps.saturating_add(TERMINAL_GAP_RESERVE)
+        } else {
+            self.limits.max_gaps
+        };
+        self.budgeted_gaps_len() >= cap
+    }
+
+    /// Publish one counted exclusion: the authoritative typed total
+    /// grows first, at apply time, independent of retention. The
+    /// detail row then takes the ordinary budget (deduplicated with
+    /// repeats like every gap); a detail the budget would suppress is
+    /// carried instead by the key's one guaranteed row, which names the
+    /// subject, the member and the module and leads with the summed
+    /// count, so a full quota hides no excluded call, cause or member.
+    fn push_counted_gap(
+        &mut self,
+        gap: RegistryGap,
+        key: CountedExclusionKey,
+        calls: u64,
+        terminal: bool,
+    ) {
+        let combine = |held: u64| match key.3 {
+            CountedAmount::Disjoint => held.saturating_add(calls),
+            CountedAmount::Cumulative => held.max(calls),
+        };
+        let total = self.counted_exclusions.entry(key).or_insert((0, 0));
+        total.0 = combine(total.0);
+        total.1 = total.1.saturating_add(1);
+        if !self.gap_would_be_suppressed(&gap, terminal) {
+            self.push_gap_as(gap, terminal);
+            return;
+        }
+        let entry = self
+            .counted_overflow
+            .entry(key)
+            .or_insert_with(|| (0, 0, gap.reason.clone()));
+        entry.0 = combine(entry.0);
+        entry.1 = entry.1.saturating_add(1);
+        let (sum, events) = (entry.0, entry.1);
+        let bound = match key.3 {
+            CountedAmount::Disjoint => "",
+            CountedAmount::Cumulative => "at least ",
+        };
+        // Shed retry rows count decided rows, every other key calls.
+        let unit = if key.0 == IDENTITY_RETRY_SHED {
+            "rows"
+        } else {
+            "calls"
+        };
+        let reason = format!(
+            "{bound}{sum} {unit} in {events} disclosure(s) of this cause past the gap bound are \
+             carried here (first: {})",
+            entry.2
+        );
+        let row = RegistryGap {
+            caller: key.1,
+            module: key.2,
+            pid: None,
+            subject: key.0.into(),
+            reason,
+            budget: None,
+        };
+        if let Some(&index) = self.counted_overflow_index.get(&key)
+            && let Some(retained) = self.gaps.get_mut(index)
+            && retained.subject == key.0
+        {
+            let old = std::mem::replace(retained, row.clone());
+            self.gap_index.remove(&old);
+            self.gap_index.insert(row, index);
+            return;
+        }
+        let index = self.gaps.len();
+        self.gap_index.insert(row.clone(), index);
+        self.gaps.push(row);
+        self.gap_repeats.push(1);
+        self.counted_overflow_index.insert(key, index);
+    }
+
+    /// Stage one counted exclusion disclosure (see
+    /// [`Self::push_counted_gap`]).
+    pub(crate) fn record_counted_gap(
+        &mut self,
+        gap: RegistryGap,
+        key: CountedExclusionKey,
+        calls: u64,
+    ) {
+        let terminal = self.terminal_phase;
+        self.staged.push(Mutation::RecordCountedGap {
+            gap,
+            key,
+            calls,
+            terminal,
+        });
     }
 
     fn push_gap_as(&mut self, gap: RegistryGap, terminal: bool) {
@@ -7102,6 +7278,12 @@ impl CallerRegistry {
             Mutation::RecordTerminalRetryExcluded { cause, excluded } => {
                 self.push_terminal_retry_excluded(cause, excluded);
             }
+            Mutation::RecordCountedGap {
+                gap,
+                key,
+                calls,
+                terminal,
+            } => self.push_counted_gap(gap, key, calls, terminal),
             Mutation::DropFoldReceipt { fold_id } => {
                 // Ordered with the insert that records it: a release
                 // staged before the insert applies still lands after
@@ -7565,59 +7747,77 @@ impl CallerRegistry {
             (PendingRejection::Ambiguous, _) => {
                 for key in modules {
                     let id = self.modules_by_key.get(key).copied();
-                    self.push_gap(RegistryGap {
-                        caller: None,
+                    let terminal = self.terminal_phase;
+                    self.push_counted_gap(
+                        RegistryGap {
+                            caller: None,
+                            module: id,
+                            pid: None,
+                            subject: DEMOTED_COUNT_REJECTED.into(),
+                            reason: with_key(
+                                format!(
+                                    "a native witness endpoint is shared by {} admitted modules \
+                                     (re-resolved with {count} unattributed calls after sharing appeared): \
+                                     which module was used is ambiguous, so no edge and no module-level use \
+                                     is recorded",
+                                    modules.len()
+                                ),
+                                id,
+                                key,
+                            ),
+                            budget: None,
+                        },
+                        (DEMOTED_COUNT_REJECTED, Some(caller), id, CountedAmount::Cumulative),
+                        count,
+                        terminal,
+                    );
+                }
+            }
+            (PendingRejection::NoEdge, [key]) => {
+                let id = self.modules_by_key.get(key).copied();
+                let terminal = self.terminal_phase;
+                self.push_counted_gap(
+                    RegistryGap {
+                        caller: Some(caller),
                         module: id,
                         pid: None,
                         subject: DEMOTED_COUNT_REJECTED.into(),
                         reason: with_key(
                             format!(
-                                "a native witness endpoint is shared by {} admitted modules \
-                                 (re-resolved with {count} unattributed calls after sharing appeared): \
-                                 which module was used is ambiguous, so no edge and no module-level use \
-                                 is recorded",
-                                modules.len()
+                                "{} has no mapping edge to this module: the re-resolved count ({count} calls) \
+                                 names no carrier, so no edge and no module-level use is recorded; a count never \
+                                 invents a mapping",
+                                caller.label()
                             ),
                             id,
                             key,
                         ),
                         budget: None,
-                    });
-                }
-            }
-            (PendingRejection::NoEdge, [key]) => {
-                let id = self.modules_by_key.get(key).copied();
-                self.push_gap(RegistryGap {
-                    caller: Some(caller),
-                    module: id,
-                    pid: None,
-                    subject: DEMOTED_COUNT_REJECTED.into(),
-                    reason: with_key(
-                        format!(
-                            "{} has no mapping edge to this module: the re-resolved count ({count} calls) \
-                             names no carrier, so no edge and no module-level use is recorded; a count never \
-                             invents a mapping",
-                            caller.label()
-                        ),
-                        id,
-                        key,
-                    ),
-                    budget: None,
-                });
+                    },
+                    (DEMOTED_COUNT_REJECTED, Some(caller), id, CountedAmount::Cumulative),
+                    count,
+                    terminal,
+                );
             }
             (PendingRejection::NoEdge, []) => {
-                self.push_gap(RegistryGap {
-                    caller: Some(caller),
-                    module: None,
-                    pid: None,
-                    subject: DEMOTED_COUNT_REJECTED.into(),
-                    reason: format!(
-                        "the pair re-resolved after its endpoint left the attach set ({count} calls): no module \
-                         can carry them, so no edge and no module-level use is recorded; history stands on the \
-                         stale edge"
-                    ),
-                    budget: None,
-                });
+                let terminal = self.terminal_phase;
+                self.push_counted_gap(
+                    RegistryGap {
+                        caller: Some(caller),
+                        module: None,
+                        pid: None,
+                        subject: DEMOTED_COUNT_REJECTED.into(),
+                        reason: format!(
+                            "the pair re-resolved after its endpoint left the attach set ({count} calls): no module \
+                             can carry them, so no edge and no module-level use is recorded; history stands on the \
+                             stale edge"
+                        ),
+                        budget: None,
+                    },
+                    (DEMOTED_COUNT_REJECTED, Some(caller), None, CountedAmount::Cumulative),
+                    count,
+                    terminal,
+                );
             }
             // Multi-candidate placements reject ambiguous, never NoEdge.
             (PendingRejection::NoEdge, _) => {}
@@ -7630,12 +7830,16 @@ impl CallerRegistry {
         if absolute <= base {
             return;
         }
-        self.record_gap(RegistryGap {
-            caller: Some(caller), module: None, pid: None,
-            subject: DEMOTED_COUNT_REJECTED.into(),
-            reason: format!("the current physical owner is not proven for absolute count range ({base}, {absolute}] ({} unattributed calls); historical counts remain and no witness or module-level use is recorded", absolute - base),
-            budget: None,
-        });
+        self.record_counted_gap(
+            RegistryGap {
+                caller: Some(caller), module: None, pid: None,
+                subject: DEMOTED_COUNT_REJECTED.into(),
+                reason: format!("the current physical owner is not proven for absolute count range ({base}, {absolute}] ({} unattributed calls); historical counts remain and no witness or module-level use is recorded", absolute - base),
+                budget: None,
+            },
+            (DEMOTED_COUNT_REJECTED, Some(caller), None, CountedAmount::Disjoint),
+            absolute - base,
+        );
     }
 
     /// A late-bound row's excluded pre-admission subtotal: the
@@ -7652,12 +7856,16 @@ impl CallerRegistry {
         if sight == 0 {
             return;
         }
-        self.record_gap(RegistryGap {
-            caller: Some(caller), module: None, pid: None,
-            subject: COUNTED_BEFORE_TRACKING.into(),
-            reason: format!("{sight} pre-admission calls are excluded from this member's edge (absolute count range (0, {sight}]): {cause}; only post-admission growth stages"),
-            budget: None,
-        });
+        self.record_counted_gap(
+            RegistryGap {
+                caller: Some(caller), module: None, pid: None,
+                subject: COUNTED_BEFORE_TRACKING.into(),
+                reason: format!("{sight} pre-admission calls are excluded from this member's edge (absolute count range (0, {sight}]): {cause}; only post-admission growth stages"),
+                budget: None,
+            },
+            (COUNTED_BEFORE_TRACKING, Some(caller), None, CountedAmount::Disjoint),
+            sight,
+        );
     }
 
     /// One row whose endpoint several admitted modules share, with no
@@ -10892,6 +11100,152 @@ pub(crate) mod tests {
         // The retained module is untouched: no eviction rewrote history.
         let key = ModuleKey::physical(8, 1, 11, Some("sha0011".into()), "/lib/a.so");
         assert!(registry.module_id_for(&key).is_some());
+    }
+
+    fn counted_gap(caller: u32, calls: u64, tag: &str) -> RegistryGap {
+        RegistryGap {
+            caller: Some(CallerId(caller)),
+            module: None,
+            pid: None,
+            subject: COUNTED_BEFORE_TRACKING.into(),
+            reason: format!("{calls} calls {tag}"),
+            budget: None,
+        }
+    }
+
+    #[test]
+    fn counted_gaps_carry_their_amounts_past_a_full_quota() {
+        // `--max-gaps 1`: the first counted detail retains ordinarily;
+        // a distinct one past the bound lands on the member's one
+        // guaranteed carrier row (outside the budget, never counted as
+        // suppressed), and a second overflow sums into it in place. The
+        // typed totals sum every disclosure, retained or carried.
+        let mut registry =
+            CallerRegistry::new(RegistryLimits::new(64, 64, 64, 1, 1 << 20, 64).unwrap());
+        let key = (
+            COUNTED_BEFORE_TRACKING,
+            Some(CallerId(1)),
+            None,
+            CountedAmount::Disjoint,
+        );
+        for (calls, tag) in [(2, "a"), (5, "b"), (7, "c")] {
+            registry.record_counted_gap(counted_gap(1, calls, tag), key, calls);
+        }
+        registry.publish();
+        assert_eq!(
+            registry.counted_exclusions_for_test(),
+            BTreeMap::from([(key, (14, 3))])
+        );
+        assert_eq!(
+            registry.counted_overflow_for_test(),
+            BTreeMap::from([(key, (12, 2))])
+        );
+        assert_eq!(
+            registry.gaps_suppressed(),
+            0,
+            "nothing counted is suppressed"
+        );
+        assert_eq!(registry.gaps().len(), 2, "one detail plus one carrier row");
+        assert_eq!(
+            registry.budgeted_gaps_len(),
+            1,
+            "the carrier is outside the budget"
+        );
+        let carrier = &registry.gaps()[1];
+        assert_eq!(
+            (carrier.caller, carrier.subject.as_str()),
+            (Some(CallerId(1)), COUNTED_BEFORE_TRACKING)
+        );
+        assert!(carrier.reason.starts_with("12 calls in 2 disclosure(s)"));
+        assert_eq!(registry.gap_repeats(), [1, 1]);
+        // An ordinary gap past the bound is still suppressed: the
+        // carrier never widens the ordinary allotment.
+        registry.record_gap(RegistryGap {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: "ordinary".into(),
+            reason: "past the bound".into(),
+            budget: None,
+        });
+        registry.publish();
+        assert_eq!(registry.gaps_suppressed(), 1);
+    }
+
+    #[test]
+    fn counted_gap_repeats_and_cumulative_amounts_never_double_count() {
+        // A repeated identical detail bumps repeats and sums its
+        // disjoint amount; a cumulative key keeps the largest amount.
+        let mut registry =
+            CallerRegistry::new(RegistryLimits::new(64, 64, 64, 8, 1 << 20, 64).unwrap());
+        let disjoint = (
+            COUNTED_BEFORE_TRACKING,
+            Some(CallerId(1)),
+            None,
+            CountedAmount::Disjoint,
+        );
+        registry.record_counted_gap(counted_gap(1, 2, "same"), disjoint, 2);
+        registry.record_counted_gap(counted_gap(1, 2, "same"), disjoint, 2);
+        registry.publish();
+        assert_eq!(registry.gap_repeats(), [2]);
+        let cumulative = (
+            DEMOTED_COUNT_REJECTED,
+            Some(CallerId(2)),
+            None,
+            CountedAmount::Cumulative,
+        );
+        let terminal = registry.terminal_phase;
+        for calls in [40, 45, 41] {
+            registry.push_counted_gap(
+                RegistryGap {
+                    caller: Some(CallerId(2)),
+                    module: None,
+                    pid: None,
+                    subject: DEMOTED_COUNT_REJECTED.into(),
+                    reason: format!("{calls} rejected"),
+                    budget: None,
+                },
+                cumulative,
+                calls,
+                terminal,
+            );
+        }
+        assert_eq!(
+            registry.counted_exclusions_for_test(),
+            BTreeMap::from([(disjoint, (4, 2)), (cumulative, (45, 3))])
+        );
+    }
+
+    #[test]
+    fn a_retirement_count_gap_survives_a_full_quota() {
+        // The retirement watermark's disjoint ranges are a counted
+        // exclusion too: past a full quota the member's carrier keeps
+        // their sum.
+        let mut registry =
+            CallerRegistry::new(RegistryLimits::new(64, 64, 64, 1, 1 << 20, 64).unwrap());
+        registry.record_gap(RegistryGap {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: "filler".into(),
+            reason: "fills the one slot".into(),
+            budget: None,
+        });
+        registry.note_retirement_count_gap(CallerId(3), 2, 9);
+        registry.note_retirement_count_gap(CallerId(3), 9, 10);
+        registry.publish();
+        let key = (
+            DEMOTED_COUNT_REJECTED,
+            Some(CallerId(3)),
+            None,
+            CountedAmount::Disjoint,
+        );
+        assert_eq!(
+            registry.counted_overflow_for_test(),
+            BTreeMap::from([(key, (8, 2))])
+        );
+        assert_eq!(registry.gaps().len(), 2);
+        assert_eq!(registry.gaps()[1].caller, Some(CallerId(3)));
     }
 
     #[test]

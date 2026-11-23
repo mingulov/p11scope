@@ -1893,6 +1893,7 @@ impl CallerRegistry {
             | Mutation::NoteModuleAbsent { .. }
             | Mutation::NoteMemberUnscanned { .. }
             | Mutation::RecordGap { .. }
+            | Mutation::RecordCountedGap { .. }
             | Mutation::RecordKeyedGap { .. }
             | Mutation::RecordAggregatedUnrouted { .. }
             | Mutation::RecordTerminalRetryExcluded { .. }

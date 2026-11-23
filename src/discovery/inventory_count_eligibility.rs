@@ -142,6 +142,7 @@ pub(super) struct RecoveryWorkBudget {
     pub(super) visited: usize,
     pub(super) queries: usize,
     limit: usize,
+    query_limit: usize,
 }
 impl RecoveryWorkBudget {
     pub(super) fn new() -> Self {
@@ -149,6 +150,16 @@ impl RecoveryWorkBudget {
             visited: 0,
             queries: 0,
             limit: 128,
+            query_limit: 4,
+        }
+    }
+    /// The same budget with at most `limit` queries (never more than
+    /// the ordinary four): a caller sharing one slow-work credit
+    /// passes what remains of it.
+    pub(super) fn with_query_limit(limit: usize) -> Self {
+        Self {
+            query_limit: limit.min(4),
+            ..Self::new()
         }
     }
     pub(super) fn remaining(&self) -> usize {
@@ -172,7 +183,7 @@ impl RecoveryWorkBudget {
         self.limit = limit.min(128);
     }
     pub(super) fn query(&mut self) -> bool {
-        if self.queries >= 4 {
+        if self.queries >= self.query_limit {
             return false;
         }
         self.queries += 1;

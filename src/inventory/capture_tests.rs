@@ -3043,7 +3043,7 @@ fn stopping_with_sixty_five_pending_rows_finishes_in_two_credits() {
 }
 
 /// Bounded Finish through the phased stop driver: 65 rows preloaded
-/// as pending through the real read path take two Finish credits
+/// as pending through the real read path take three Finish credits
 /// through `NativeStop::step`, then retirement and the stop summary
 /// run. RED: the base stages one Finish for all 65.
 #[test]
@@ -3147,9 +3147,11 @@ fn phased_stop_with_sixty_five_pending_rows_finishes_in_two_credits() {
     };
     let log = entries(&log);
     let finishes = log.iter().filter(|entry| *entry == "stage:finish").count();
+    // Each flushed row costs its cookie query and its fresh stash
+    // entry's start-time read: 130 units take exactly three credits.
     assert_eq!(
-        finishes, 2,
-        "65 pending rows take exactly two Finish credits: {log:?}"
+        finishes, 3,
+        "65 pending rows take exactly three Finish credits: {log:?}"
     );
     assert!(
         matches!(stopped.summary.retirement, Retirement::Closed(_)),
@@ -3583,6 +3585,32 @@ fn a_blocking_stop_latches_only_gap_free_sweeps() {
         lane.read_delay = Duration::from_millis(10);
         let _ = run(&mut scene, lane, 1);
         assert_eq!(scene.refresh_losses, losses, "gappy reads {gappy:?}");
+    }
+}
+
+/// The shared stop decision over every input combination (exact
+/// table): a latched proof finishes unless owed work can still read
+/// within the deadline; only an unproven stop past its deadline is a
+/// refresh loss.
+#[test]
+fn the_terminal_refresh_step_table_is_exact() {
+    use super::{TerminalRefreshStep as S, terminal_refresh_step};
+    let table = [
+        ((false, false, false), S::ReadOn),
+        ((false, true, false), S::ReadOn),
+        ((false, false, true), S::RefreshLoss),
+        ((false, true, true), S::RefreshLoss),
+        ((true, false, false), S::Finish),
+        ((true, true, false), S::ReadOn),
+        ((true, false, true), S::Finish),
+        ((true, true, true), S::Finish),
+    ];
+    for ((proven, owed, expired), step) in table {
+        assert_eq!(
+            terminal_refresh_step(proven, owed, expired),
+            step,
+            "proven={proven} owed={owed} expired={expired}"
+        );
     }
 }
 

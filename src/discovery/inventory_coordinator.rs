@@ -62,7 +62,7 @@ use crate::discovery::scan::{
     InventoryWindowLimits, WindowId,
 };
 use crate::discovery::sweep_attribution::AttributionLoss;
-use crate::discovery::unbound_exe::{ExeResolver, ProcReads, ScanLearned};
+use crate::discovery::unbound_exe::{ExeResolver, ProcReads, ResolveJob, ScanLearned};
 use crate::inspect_system::inventory_cgroup::{
     CgroupAdmissionPermit, CgroupCollectRequest, CgroupCollection, CgroupFence,
     OPERATOR_STOP_PARTIAL_SCAN_GAP_SUBJECT, ScopedCollectionOutcome, SharedCollectionWork,
@@ -726,6 +726,19 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// backfills and staging batches rebuild the learned map without
     /// re-probing. Bounded; a full cache stops retaining.
     exe_probe_cache: HashMap<String, Option<(u64, u64)>>,
+    /// Probe answers for caller paths the full cache cannot retain,
+    /// kept only while staging work is held (see `held_stage`): an
+    /// interrupted learn resumes without re-probing them, and the
+    /// scratch frees once the held queue drains.
+    learn_scratch: HashMap<String, Option<(u64, u64)>>,
+    /// Staging work taken from the binder (decided rows, exec
+    /// transitions) or the lifecycle stash (executable backfills) that
+    /// waits, in order, for its slow work: one action stages only what
+    /// its [`StageCredit`] covers, and the rest resumes first on the
+    /// next action.
+    held_stage: VecDeque<HeldStage>,
+    /// The resumable slow-work progress of the head of `held_stage`.
+    head_work: HeadWork,
     /// Cached observer-timems boottime gate for live-process reads
     /// (the observer's time namespace never changes mid-process).
     timens_boottime_ok: Option<bool>,
@@ -1037,6 +1050,67 @@ const MAX_PRUNED_EXEC_TOMBSTONES: usize = 65_536;
 /// settling a whole domain synchronously in one stage.
 const FINISH_SETTLEMENT_PER_CREDIT: usize = 64;
 
+/// Slow units (process-state reads, executable probes, directory and
+/// metadata reads) one non-Finish staging action may spend staging its
+/// decided rows and executable backfills (INV-2). A Finish action
+/// instead spends its one shared [`FINISH_SETTLEMENT_PER_CREDIT`]
+/// credit across flush, staging, reconciliation queries and
+/// settlement. Work past the allowance waits in order and resumes.
+const STAGE_IO_PER_ACTION: usize = 64;
+
+/// One pre-admission stash entry's staleness check: a liveness read
+/// and a start-time read.
+const STASH_STALE_CHECK_UNITS: usize = 2;
+
+/// One staging action's slow-work allowance (see
+/// [`STAGE_IO_PER_ACTION`]): every unit is charged before its work.
+#[derive(Debug)]
+struct StageCredit {
+    left: usize,
+}
+
+impl StageCredit {
+    fn new(units: usize) -> Self {
+        Self { left: units }
+    }
+
+    /// Take `units` before doing their work, or none at all.
+    fn take(&mut self, units: usize) -> bool {
+        if self.left < units {
+            return false;
+        }
+        self.left -= units;
+        true
+    }
+}
+
+/// One unit of held staging work, staged strictly in order.
+enum HeldStage {
+    Decision(Decision),
+    Transitions(Vec<ExecTransition>),
+    /// An EXEC that arrived after its image staged: resolve and
+    /// attach its executable.
+    Backfill {
+        cookie: DomainCookie,
+        exec: StashedExec,
+    },
+}
+
+/// The head of the held staging queue's resumable slow work.
+#[derive(Default)]
+struct HeadWork {
+    /// The pre-admission prerequisites are met (space proven, or a
+    /// whole prune cycle completed over the full stash).
+    preadmission_ready: bool,
+    /// A prune cycle over the full stash: the pid snapshot at its
+    /// start and the next index to check.
+    prune_cycle: Option<(Vec<u32>, usize)>,
+    /// The executable resolution in progress.
+    resolve: Option<ResolveJob>,
+    /// The completed executable verdict, kept until the head stages.
+    resolved: Option<UnboundExe>,
+}
+
 /// Scan-learned exe-probe cache: one entry per distinct caller path
 /// at most, so the retained set cannot outnumber admitted callers
 /// under the default caller bound (4,096). A full cache stops
@@ -1064,6 +1138,40 @@ type LearnedExeMaps = (
     HashMap<(u64, u64), String>,
     HashMap<(u64, u64), Vec<String>>,
 );
+
+#[cfg(test)]
+thread_local! {
+    /// Production executable mapping probes performed on this thread
+    /// (test-observed: every probe is one charged slow unit).
+    static EXE_PROBE_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The production mapping probe for learned caller paths and for
+/// learned-spelling verification.
+fn probe_exe_path(path: &str) -> Option<(u64, u64)> {
+    #[cfg(test)]
+    EXE_PROBE_CALLS.with(|calls| calls.set(calls.get() + 1));
+    crate::discovery::unbound_exe::real_maps_identity(path)
+}
+
+/// Production executable probes this thread performed so far.
+#[cfg(test)]
+fn exe_probe_calls() -> u64 {
+    EXE_PROBE_CALLS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Pre-admission stash staleness checks performed on this thread
+    /// (test-observed: each is two charged slow units).
+    static STASH_STALE_CHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Stash staleness checks this thread performed so far.
+#[cfg(test)]
+fn stash_stale_checks() -> u64 {
+    STASH_STALE_CHECKS.with(std::cell::Cell::get)
+}
 
 /// One staged native owner: all preparation I/O (fresh observation,
 /// warm view, guarded scan, prepared reconciliation, pin preflight)
@@ -1443,6 +1551,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             exec_loss_domains: HashSet::new(),
             exe_resolver: ExeResolver::new(),
             exe_probe_cache: HashMap::new(),
+            learn_scratch: HashMap::new(),
+            held_stage: VecDeque::new(),
+            head_work: HeadWork::default(),
             timens_boottime_ok: None,
             pair_counts: HashMap::new(),
             pair_targets: HashMap::new(),
@@ -1782,7 +1893,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         Self::scan_exe_identities_cached(
             &self.adapter,
             &mut self.exe_probe_cache,
-            probe_exe_path,
+            crate::discovery::unbound_exe::real_maps_identity,
         )
     }
 
@@ -1821,30 +1932,58 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// The EXEC arrived after its row staged: resolve and attach the
     /// executable to every image set holding the cookie. Images
     /// staged later join at stage time instead.
+    /// The resolution's reads are slow work, so the backfill joins the
+    /// held staging queue (in order) and resolves under its credit.
     fn backfill_unbound_exe(&mut self, cookie: DomainCookie, exec: StashedExec) {
         if !self.registry.has_unbound_image(cookie) {
             return;
         }
-        let (learned, all_learned) = Self::scan_exe_candidates_cached(
-            &self.adapter,
-            &mut self.exe_probe_cache,
-            probe_exe_path,
-        );
-        let exe = self.resolve_unbound_exe(exec, &learned, &all_learned);
-        self.registry.attach_unbound_exe(cookie, exe);
+        self.held_stage
+            .push_back(HeldStage::Backfill { cookie, exec });
     }
 
-    /// Resolve one stashed EXEC to its [`UnboundExe`] verdict. The
+    /// Advance the head's resolution of one stashed EXEC to its
+    /// [`UnboundExe`] verdict within `credit`, `None` while it waits.
+    /// The learned maps must cover every caller path first (each cold
+    /// path is one charged probe); the job then snapshots them and
+    /// steps through its sources (see [`ExeResolver::step`]). The
     /// live-process source reads exactly the start time and the
-    /// maps-domain exe identity through the process source — no
-    /// other reads. Both identity probes compare in the mapped
-    /// device domain, like for like with the EXEC pair.
-    fn resolve_unbound_exe(
-        &mut self,
-        exec: StashedExec,
-        learned: &HashMap<(u64, u64), String>,
-        all_learned: &HashMap<(u64, u64), Vec<String>>,
-    ) -> UnboundExe {
+    /// maps-domain exe identity through the process source — no other
+    /// reads. Both identity probes compare in the mapped device
+    /// domain, like for like with the EXEC pair.
+    fn prepare_exe(&mut self, exec: StashedExec, credit: &mut StageCredit) -> Option<UnboundExe> {
+        let current = self
+            .head_work
+            .resolve
+            .as_ref()
+            .is_some_and(|job| job.is_for(exec.pid_host, exec.dev, exec.ino, exec.hook_ts_ns));
+        if !current {
+            let empty = (HashMap::new(), HashMap::new());
+            // A `(0, 0)` pair reads unavailable without any read.
+            let (learned, all_learned) = if exec.dev == 0 && exec.ino == 0 {
+                empty
+            } else {
+                Self::scan_exe_candidates_budgeted(
+                    &self.adapter,
+                    &mut self.exe_probe_cache,
+                    &mut self.learn_scratch,
+                    probe_exe_path,
+                    &mut credit.left,
+                )?
+            };
+            let scan = ScanLearned {
+                by_identity: &learned,
+                verify: Box::new(probe_exe_path),
+                all_by_identity: Some(&all_learned),
+            };
+            self.head_work.resolve = Some(ResolveJob::begin(
+                exec.pid_host,
+                exec.dev,
+                exec.ino,
+                exec.hook_ts_ns,
+                &scan,
+            ));
+        }
         let trusted = self.proc_reads_trusted();
         let mono_now = crate::attach::monotonic_ns();
         let boot_now = crate::discovery::pause::boot_ns();
@@ -1858,19 +1997,116 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             boot_now,
             tick_ns,
         };
-        let scan = ScanLearned {
-            by_identity: learned,
-            verify: Box::new(probe_exe_path),
-            all_by_identity: Some(all_learned),
+        let job = self
+            .head_work
+            .resolve
+            .as_mut()
+            .expect("the head's resolution started above");
+        let verdict = self
+            .exe_resolver
+            .step(job, &proc, &probe_exe_path, &mut credit.left)?;
+        self.head_work.resolve = None;
+        Some(verdict)
+    }
+
+    /// Ready the pre-admission stash for the head row's staging within
+    /// `credit`: when the stash might not take the row's keys (its
+    /// size plus every key exceeds the limit), one whole prune cycle
+    /// over the stash (one charged staleness check per entry, resumable
+    /// across actions) completes first — where the stash used to prune
+    /// whole inline — so overflow still means a full stash after a full
+    /// prune. Otherwise nothing is read here.
+    fn prepare_preadmission(
+        &mut self,
+        keys: &[Option<ModuleKey>],
+        credit: &mut StageCredit,
+    ) -> bool {
+        if self.head_work.preadmission_ready {
+            return true;
+        }
+        let source = self.adapter.source();
+        let Some(capture) = self.capture.as_mut() else {
+            self.head_work.preadmission_ready = true;
+            return true;
         };
-        self.exe_resolver.resolve(
-            exec.pid_host,
-            exec.dev,
-            exec.ino,
-            exec.hook_ts_ns,
-            &proc,
-            &scan,
-        )
+        let stash = &mut capture.preadmission;
+        if stash.overflowed {
+            self.head_work.preadmission_ready = true;
+            return true;
+        }
+        if self.head_work.prune_cycle.is_none() {
+            // Every key may need an entry (the row's own entry may be
+            // stale and pruned at staging): an upper bound, read-free.
+            if stash.len.saturating_add(keys.len()) <= stash.limit {
+                self.head_work.preadmission_ready = true;
+                return true;
+            }
+            self.head_work.prune_cycle = Some((stash.entries.keys().copied().collect(), 0));
+        }
+        let (pids, next) = self
+            .head_work
+            .prune_cycle
+            .as_mut()
+            .expect("the cycle started above");
+        while *next < pids.len() {
+            if !credit.take(STASH_STALE_CHECK_UNITS) {
+                return false;
+            }
+            stash.prune_pid(pids[*next], source);
+            *next += 1;
+        }
+        self.head_work.preadmission_ready = true;
+        true
+    }
+
+    /// Ready the held head decision within `credit`: `Some(exe)` once
+    /// every slow read its staging performs is done or charged (`exe`
+    /// is its prepared executable verdict when it stages an unbound
+    /// image with a stashed EXEC), `None` while it waits. Bound rows,
+    /// re-observations and rows without a stash entry read nothing.
+    fn prepare_held_decision(&mut self, credit: &mut StageCredit) -> Option<Option<UnboundExe>> {
+        let Some(HeldStage::Decision(decision)) = self.held_stage.front() else {
+            return Some(None);
+        };
+        let Binding::Unbound(_) = decision.binding else {
+            return Some(None);
+        };
+        if decision.retry == DecisionRetry::Reobserved {
+            return Some(None);
+        }
+        let row = decision.row.clone();
+        let modules = self.witness_modules(&row);
+        let keys: Vec<Option<ModuleKey>> = match &modules {
+            Ok(modules) => modules.iter().cloned().map(Some).collect(),
+            Err(_) => vec![None],
+        };
+        if !self.prepare_preadmission(&keys, credit) {
+            return None;
+        }
+        if modules.is_ok()
+            && self.head_work.resolved.is_none()
+            && let Some(stashed) = self.exec_exe.get(&row.cookie()).copied()
+        {
+            let exe = self.prepare_exe(stashed, credit)?;
+            self.head_work.resolved = Some(exe);
+        }
+        // The row's own stash reads at staging: its entry's staleness
+        // check (two reads) and a possible re-insert, else one
+        // start-time read for its fresh entry.
+        let stash_reads = self.capture.as_ref().map_or(0, |capture| {
+            let stash = &capture.preadmission;
+            if stash.overflowed {
+                0
+            } else if stash.entries.contains_key(&row.host_tgid) {
+                STASH_STALE_CHECK_UNITS + 1
+            } else {
+                1
+            }
+        });
+        if !credit.take(stash_reads) {
+            return None;
+        }
+        Some(self.head_work.resolved.take())
     }
 
     /// Live-process reads are trusted only under agreeing pidns
@@ -1926,13 +2162,36 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// distinct paths probe to one pair (snapshot clones across
     /// subvolumes), resolution keeps a shown path and discloses
     /// the collision instead of first-wins silence.
+    #[cfg(test)]
     fn scan_exe_candidates_cached(
         adapter: &CallerAdapter<Source>,
         cache: &mut HashMap<String, Option<(u64, u64)>>,
         probe: impl Fn(&str) -> Option<(u64, u64)>,
     ) -> LearnedExeMaps {
+        // Unbounded and with a per-build scratch: the overflow tail
+        // past a full cache probes per build.
+        let mut scratch = HashMap::new();
+        let mut units = usize::MAX;
+        Self::scan_exe_candidates_budgeted(adapter, cache, &mut scratch, probe, &mut units)
+            .expect("an unbounded learn always completes")
+    }
+
+    /// The learned maps once every caller path has a probe answer,
+    /// spending at most `units` probes (one slow unit each) on paths
+    /// neither the sticky cache nor `scratch` answers yet; `None`
+    /// while some path still owes its probe (answers so far are kept,
+    /// so the walk resumes without re-probing). Answers the full cache
+    /// cannot retain land in `scratch`.
+    fn scan_exe_candidates_budgeted(
+        adapter: &CallerAdapter<Source>,
+        cache: &mut HashMap<String, Option<(u64, u64)>>,
+        scratch: &mut HashMap<String, Option<(u64, u64)>>,
+        probe: impl Fn(&str) -> Option<(u64, u64)>,
+        units: &mut usize,
+    ) -> Option<LearnedExeMaps> {
         let mut learned = HashMap::new();
         let mut all: HashMap<(u64, u64), Vec<String>> = HashMap::new();
+        let mut complete = true;
         for record in adapter.records() {
             let Some(exe) = record.exe.as_ref() else {
                 continue;
@@ -1940,14 +2199,21 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             let Some(path) = exe.path.as_ref() else {
                 continue;
             };
-            let cached = match cache.get(path) {
+            let cached = match cache.get(path).or_else(|| scratch.get(path)) {
                 Some(cached) => *cached,
                 None => {
+                    if *units == 0 {
+                        complete = false;
+                        continue;
+                    }
+                    *units -= 1;
                     let probed = probe(path);
                     // A full cache stops retaining: the overflow tail
-                    // probes per build, still correct.
+                    // keeps its answer only in the scratch.
                     if cache.len() < DEFAULT_MAX_EXE_PROBE_CACHE_ENTRIES {
                         cache.insert(path.clone(), probed);
+                    } else {
+                        scratch.insert(path.clone(), probed);
                     }
                     probed
                 }
@@ -1958,11 +2224,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             learned.entry(pair).or_insert_with(|| path.clone());
             all.entry(pair).or_default().push(path.clone());
         }
+        if !complete {
+            return None;
+        }
         for bucket in all.values_mut() {
             bucket.sort();
             bucket.dedup();
         }
-        (learned, all)
+        Some((learned, all))
     }
 
     /// Terminal refresh under a possibly unknown stop: when `unknown_stop`
@@ -8254,6 +8523,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // A Finish batch's pending-row flush (domain, rows still owed):
         // the settlement queue below shares its credit.
         let mut finish_flush: Option<(NativeDomainId, bool)> = None;
+        // This action's slow-work allowance: a Finish spends its one
+        // shared credit (flush, staging reads, reconciliation queries,
+        // settlement); any other action stages under its own.
+        let mut credit = StageCredit::new(match &batch {
+            NativeBatch::Finish { .. } => FINISH_SETTLEMENT_PER_CREDIT,
+            _ => STAGE_IO_PER_ACTION,
+        });
         match batch {
             NativeBatch::Witness(batch) => {
                 // The binder absorbs before the batch's health is noted:
@@ -8322,28 +8598,42 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 // Finish stages at most one credit of work however deep
                 // both queues run. The receipt reports the combined
                 // continuation below.
-                let credit = self
-                    .binder
-                    .finish_credit(domain, FINISH_SETTLEMENT_PER_CREDIT);
-                finish_flush = Some((domain, credit.owed));
+                let flush = self.binder.finish_credit(domain, credit.left);
+                credit.left -= flush.flushed;
+                finish_flush = Some((domain, flush.owed));
             }
             NativeBatch::Semantic(batch) => self.stage_semantic_batch(batch),
         }
-        let mut receipt = self.stage_binder_output(identity, now_ns);
+        let mut receipt = self.stage_binder_output(identity, now_ns, &mut credit);
         receipt.events.extend(hook_events);
         if let Some(domain) = resight_domain {
             receipt.resight_owed = self.binder.resight_owed(domain);
         }
-        self.reconcile_count_eligibility(identity, &mut RecoveryWorkBudget::new());
+        // A Finish's reconciliation queries draw from its credit too;
+        // other actions keep the reconciliation's own allowance.
+        let mut recovery = match finish_flush {
+            Some(_) => RecoveryWorkBudget::with_query_limit(credit.left),
+            None => RecoveryWorkBudget::new(),
+        };
+        self.reconcile_count_eligibility(identity, &mut recovery);
+        if finish_flush.is_some() {
+            credit.left = credit.left.saturating_sub(recovery.queries);
+        }
         if let Some((domain, began_ns, gap_free)) = tombstone_cleanup {
             self.expire_exec_tombstones(domain, began_ns, gap_free);
         }
         if let Some((domain, flush_owed)) = finish_flush {
-            // Staged decisions (flush rows, and any re-refusal or
-            // endpoint-loss settlement each one carries) spent the
-            // credit first; the settlement queue takes the remainder.
-            let settle_budget = FINISH_SETTLEMENT_PER_CREDIT.saturating_sub(receipt.decided);
-            receipt.settlement_owed = self.finish_native_domain(domain, settle_budget, flush_owed);
+            // Flushed rows, their staging reads (and any re-refusal or
+            // endpoint-loss settlement each one carries) and the
+            // reconciliation queries spent the credit first; the
+            // settlement queue takes the remainder. Held staging work
+            // keeps the finish owed like an unflushed row.
+            // Settlement waits behind held staging work, so a held
+            // re-observation always decides its mark first.
+            let held = !self.held_stage.is_empty();
+            let settle_budget = if held { 0 } else { credit.left };
+            receipt.settlement_owed =
+                self.finish_native_domain(domain, settle_budget, flush_owed || held);
         }
         receipt
     }
@@ -8372,7 +8662,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         if tombstones.is_empty() {
             return;
         }
-        let pending = self.binder.pending_cookies(domain);
+        // Held decided rows still resolve their images later, exactly
+        // like pending ones.
+        let mut pending = self.binder.pending_cookies(domain);
+        pending.extend(self.held_stage.iter().filter_map(|held| match held {
+            HeldStage::Decision(decision) if decision.row.cookie().domain() == domain => {
+                Some(decision.row.cookie())
+            }
+            _ => None,
+        }));
         tombstones.retain(|cookie, pruned_ns| pending.contains(cookie) || *pruned_ns >= began_ns);
     }
 
@@ -8753,27 +9051,82 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             self.binder
                 .note_revalidation(domain, pass_start_ns, revalidated);
         }
-        self.stage_binder_output(identity, pass_start_ns).events
+        self.stage_binder_output(
+            identity,
+            pass_start_ns,
+            &mut StageCredit::new(STAGE_IO_PER_ACTION),
+        )
+        .events
     }
 
     /// Stages what the binder decided since the last call: decided rows,
-    /// then proven exec transitions, then the census.
+    /// then proven exec transitions, then the census. Decisions and
+    /// transitions join the held staging queue behind any earlier held
+    /// work and stage strictly in order while `credit` covers each
+    /// head's slow reads; the rest waits for the next action (the
+    /// census still names every decided row).
     fn stage_binder_output(
         &mut self,
         identity: &mut dyn NativeIdentity<Source::Pin>,
         now_ns: u64,
+        credit: &mut StageCredit,
     ) -> NativeReceipt {
         let decisions = self.binder.take_decisions();
         let decided = decisions.len();
+        self.held_stage
+            .extend(decisions.into_iter().map(HeldStage::Decision));
+        let transitions = self.binder.take_transitions();
+        if !transitions.is_empty() {
+            self.held_stage
+                .push_back(HeldStage::Transitions(transitions));
+        }
         let mut unresolved: Vec<String> = Vec::new();
-        // Scan-learned exe identities, built at most once per call
-        // and only when an unbound image stages.
-        let mut learned: Option<LearnedExeMaps> = None;
-        for decision in decisions {
-            if let Err(reason) = self.stage_witness(decision, &mut learned) {
-                self.registry.note_unresolved_witness();
-                unresolved.push(reason);
+        let mut events = Vec::new();
+        while let Some(head) = self.held_stage.front() {
+            match head {
+                HeldStage::Decision(_) => {
+                    let Some(exe) = self.prepare_held_decision(credit) else {
+                        break;
+                    };
+                    let Some(HeldStage::Decision(decision)) = self.held_stage.pop_front() else {
+                        unreachable!("the head is a decision");
+                    };
+                    self.head_work = HeadWork::default();
+                    if let Err(reason) = self.stage_witness(decision, exe) {
+                        self.registry.note_unresolved_witness();
+                        unresolved.push(reason);
+                    }
+                }
+                HeldStage::Backfill { exec, .. } => {
+                    let exec = *exec;
+                    let Some(exe) = self.prepare_exe(exec, credit) else {
+                        break;
+                    };
+                    let Some(HeldStage::Backfill { cookie, .. }) = self.held_stage.pop_front()
+                    else {
+                        unreachable!("the head is a backfill");
+                    };
+                    self.head_work = HeadWork::default();
+                    self.registry.attach_unbound_exe(cookie, exe);
+                }
+                HeldStage::Transitions(_) => {
+                    let Some(HeldStage::Transitions(transitions)) = self.held_stage.pop_front()
+                    else {
+                        unreachable!("the head is a transition set");
+                    };
+                    for transition in transitions {
+                        events.extend(self.apply_exec_transition(
+                            transition,
+                            &mut *identity,
+                            now_ns,
+                            &mut crate::attach::monotonic_ns,
+                        ));
+                    }
+                }
             }
+        }
+        if self.held_stage.is_empty() {
+            self.learn_scratch.clear();
         }
         if let Some(first) = unresolved.first() {
             self.registry.record_gap(RegistryGap {
@@ -8788,15 +9141,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 ),
                 budget: None,
             });
-        }
-        let mut events = Vec::new();
-        for transition in self.binder.take_transitions() {
-            events.extend(self.apply_exec_transition(
-                transition,
-                &mut *identity,
-                now_ns,
-                &mut crate::attach::monotonic_ns,
-            ));
         }
         self.apply_reconcile_events(&events, now_ns);
         self.registry
@@ -9754,9 +10098,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 Some(LateWindowBreak::Reuse)
             );
         let retry_rule = retry_rebind && retry_target_ok && retry_place_ok && retry_reuse_ok;
-        if retry_rebind && !retry_rule {
-            self.release_retry_standing(&key);
-        }
+        // Any bind over a retained mark that misses the retry rule keeps
+        // the first placement and revives at the base chosen below: the
+        // mark settles the first placement's uncarried prefix through
+        // that base, then releases (see `settle_retry_revival`).
+        let revival_miss = !retry_rule && self.retry_owed.contains_key(&key);
         let (base, staged, staged_ns, base_since) = match self.pair_targets.get(&key) {
             Some(PairTarget::Pending {
                 base,
@@ -9851,6 +10197,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 }
             }
         };
+        if revival_miss {
+            self.settle_retry_excluded(&key, base, RetryTerminalCause::RevivalMiss);
+            self.release_retry_standing(&key);
+        }
         if self.diagnostics.is_some() {
             let mut record = if let Some(count) = self.pair_counts.get(&key).map(|held| held.read) {
                 self.diagnostic_count_record(key, caller, count, base, staged, base_since)
@@ -9991,13 +10341,29 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let Some(owed) = self.retry_owed.get(key) else {
             return;
         };
-        let accounted = owed.accounted;
         let held = self
             .pair_counts
             .get(key)
             .map(|held| held.count)
-            .unwrap_or(accounted);
-        let excluded = held.saturating_sub(accounted);
+            .unwrap_or(owed.accounted);
+        self.settle_retry_excluded(key, held, cause);
+    }
+
+    /// Settle the retained mark's uncarried interval `(accounted,
+    /// through]`: the first placement carries exactly `accounted` (its
+    /// fold's entries, 0 when it folds nowhere — a shared endpoint,
+    /// an unresolved endpoint, or an unregistered module), and nothing
+    /// else will ever place the interval. A terminal settlement passes
+    /// the held absolute; a revival miss passes its revival base, past
+    /// which the ordinary count pipeline carries the growth, so prefix
+    /// and growth never overlap. The amount joins its cause's
+    /// guaranteed per-cause total.
+    fn settle_retry_excluded(&mut self, key: &PairKey, through: u64, cause: RetryTerminalCause) {
+        let Some(owed) = self.retry_owed.get(key) else {
+            return;
+        };
+        let accounted = owed.accounted;
+        let excluded = through.saturating_sub(accounted);
         if excluded == 0 {
             return;
         }
@@ -10005,6 +10371,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             RetryTerminalCause::ReRefused(reason) => format!("re-refusal ({})", reason.code()),
             RetryTerminalCause::EndpointLoss => "endpoint resolution loss".to_string(),
             RetryTerminalCause::Finish => "domain finish".to_string(),
+            RetryTerminalCause::RevivalMiss => "a revival without the retry proof".to_string(),
         };
         // Per-cause aggregate, never a budgeted detail row: the total
         // for this cause stays published with guaranteed retention no
@@ -11233,7 +11600,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     fn stage_witness(
         &mut self,
         decision: Decision,
-        learned: &mut Option<LearnedExeMaps>,
+        prepared_exe: Option<UnboundExe>,
     ) -> Result<(), String> {
         let Decision {
             row,
@@ -11340,17 +11707,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 // one, latched domain loss reads lost, else the
                 // image stays provisionally unjoined (a later EXEC
                 // backfills it, later loss flips it).
-                let exe = match self.exec_exe.get(&cookie).copied() {
-                    Some(stashed) => {
-                        let (learned, all_learned) = learned.get_or_insert_with(|| {
-                            Self::scan_exe_candidates_cached(
-                                &self.adapter,
-                                &mut self.exe_probe_cache,
-                                probe_exe_path,
-                            )
-                        });
-                        self.resolve_unbound_exe(stashed, learned, all_learned)
-                    }
+                // The stash's resolution was prepared, under the
+                // staging credit, before this row staged.
+                debug_assert_eq!(
+                    prepared_exe.is_some(),
+                    self.exec_exe.contains_key(&cookie),
+                    "a stashed EXEC stages exactly its prepared verdict"
+                );
+                let exe = match prepared_exe {
+                    Some(exe) => exe,
                     None if self.has_exec_tombstone(&cookie)
                         || self.exec_evidence_lost(cookie.domain()) =>
                     {
@@ -11457,16 +11822,23 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// fields: every shed row lands on one deduplicated gap row with
     /// repeats, never a per-row flood.
     fn note_retry_shed(&mut self) {
-        self.registry.record_gap(RegistryGap {
-            caller: None,
-            module: None,
-            pid: None,
-            subject: "identity retry shed".into(),
-            reason: "a decided no-live-caller row could not be retained for re-observation: \
-                 the per-domain retry set is full, so its unbound verdict is final"
-                .into(),
-            budget: None,
-        });
+        use crate::discovery::caller_registry::{CountedAmount, IDENTITY_RETRY_SHED};
+        // Counted outside the ordinary quota: a full gap budget never
+        // hides that shed verdicts are final, nor how many rows shed.
+        self.registry.record_counted_gap(
+            RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: IDENTITY_RETRY_SHED.into(),
+                reason: "a decided no-live-caller row could not be retained for re-observation: \
+                     the per-domain retry set is full, so its unbound verdict is final"
+                    .into(),
+                budget: None,
+            },
+            (IDENTITY_RETRY_SHED, None, None, CountedAmount::Disjoint),
+            1,
+        );
     }
 
     /// R-C51-1 (fail-safe): an unbound CALLER_USE row of `pid` — refused
@@ -11519,9 +11891,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             if held {
                 continue;
             }
-            if stash.len >= stash.limit {
-                stash.prune(source);
-            }
+            // A full stash already completed its whole prune cycle
+            // under the staging credit before this row staged
+            // (`prepare_preadmission`), so full here means full.
             if stash.len >= stash.limit {
                 stash.overflowed = true;
                 stash.refused += 1;
@@ -13808,6 +14180,11 @@ enum RetryTerminalCause {
     EndpointLoss,
     /// The domain finished with the row still retained.
     Finish,
+    /// A bind revived the pair without meeting the retry rule: its
+    /// first placement stands and only growth past the revival base
+    /// counts, so the first placement's uncarried prefix (through the
+    /// revival base) is excluded here.
+    RevivalMiss,
 }
 
 /// One pruned dropped pair's absolute base and its read anchor: a late
@@ -14548,6 +14925,8 @@ impl PreadmissionStash {
     /// with another start time. Each fork or exec writes rows under its
     /// own image key, so a later holder's use leaves rows of its own.
     fn stale<S: ProcessSource>(entry: &PreadmissionEntry, pid: u32, source: &S) -> bool {
+        #[cfg(test)]
+        STASH_STALE_CHECKS.with(|checks| checks.set(checks.get() + 1));
         source.gone(pid)
             || matches!(
                 (entry.start_time, source.start_time(pid)),
@@ -44537,7 +44916,10 @@ int main(void) {
             .edges()
             .find(|edge| edge.caller == caller)
             .expect("the revival binds");
-        assert_eq!(edge.entry_count, 40, "revival carries post-drop growth only");
+        assert_eq!(
+            edge.entry_count, 40,
+            "revival carries post-drop growth only"
+        );
         assert!(native.scene.coordinator.retry_owed.is_empty());
     }
 
@@ -44668,6 +45050,296 @@ int main(void) {
         let exes = scene_unbound_exe(&native);
         assert_eq!(exes.len(), 1);
         assert_eq!(exes[0].resolution, ExeResolution::PathUnknown);
+    }
+
+    // ---- Bounded staging slow work (r7, F1 class) ----
+
+    /// Admit `n` callers whose executables are distinct cold paths
+    /// (never probed, nonexistent: each probe is one failed open).
+    fn admit_cold_exe_callers(native: &mut NativeScene, n: u32) {
+        for i in 0..n {
+            let pid = 3_000 + i;
+            native.scene.source.spawn(pid, 100);
+            native
+                .scene
+                .source
+                .exec(pid, 101, &format!("/nonexistent-p11scope-r7/tool-{i}"));
+            native
+                .scene
+                .coordinator
+                .adapter
+                .admit(pid, ImageAuthority::ScanPinned, 100)
+                .unwrap();
+        }
+    }
+
+    /// Caller paths the sticky probe cache has not answered yet.
+    fn cold_exe_paths(native: &NativeScene) -> u64 {
+        let coordinator = &native.scene.coordinator;
+        let mut cold = HashSet::new();
+        for record in coordinator.adapter.records() {
+            if let Some(path) = record.exe.as_ref().and_then(|exe| exe.path.as_ref())
+                && !coordinator.exe_probe_cache.contains_key(path)
+            {
+                cold.insert(path.clone());
+            }
+        }
+        cold.len() as u64
+    }
+
+    #[test]
+    fn finish_charges_cold_executable_probes_to_its_credit() {
+        // One initially pending row with a stashed EXEC, flushed by
+        // Finish, over 65+ cold caller paths: the learn probes draw
+        // from the one 64-unit Finish credit (the flushed row spent 1),
+        // the row waits in order, and the next credit finishes the
+        // learn and stages it with its resolved verdict.
+        // RED (mutation): an uncharged learn probes every path at once.
+        let (mut native, _) = NativeScene::new();
+        native.scene.coordinator.set_exe_index_dirs(Vec::new());
+        admit_cold_exe_callers(&mut native, 65);
+        native.execs(vec![exec_record(41, 9, 100, 8, 99)]);
+        let staged = native.read(vec![native.row(41, 1, 9, 210, 0)]);
+        assert_eq!(staged.decided, 0, "no horizon yet: the row stays pending");
+        let cold = cold_exe_paths(&native);
+        assert!(cold >= 65, "{cold}");
+        let domain = native.domain;
+        let mut probes = Vec::new();
+        let mut owed = Vec::new();
+        loop {
+            let before = exe_probe_calls();
+            let receipt = native.stage(NativeBatch::Finish { domain });
+            probes.push(exe_probe_calls() - before);
+            owed.push((
+                receipt.settlement_owed,
+                native.scene.coordinator.held_stage.len(),
+            ));
+            native.scene.coordinator.commit_batch(false).unwrap();
+            if !receipt.settlement_owed {
+                break;
+            }
+            assert!(probes.len() < 8, "the finish converges: {probes:?}");
+        }
+        assert_eq!(probes, [63, cold - 63], "per-credit probes: {owed:?}");
+        assert_eq!(owed, [(true, 1), (false, 0)]);
+        assert_eq!(cold_exe_paths(&native), 0, "every path learned once");
+        let exes = scene_unbound_exe(&native);
+        assert_eq!(exes.len(), 1);
+        assert_eq!((exes[0].dev, exes[0].ino), (8, 99));
+        assert_eq!(exes[0].resolution, ExeResolution::PathUnknown);
+        let census = native.scene.coordinator.registry.witness_census();
+        assert_eq!((census.rows, census.pending), (1, 0));
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .registry
+                .witness_placement()
+                .total(),
+            1
+        );
+    }
+
+    #[test]
+    fn witness_staging_charges_cold_executable_probes() {
+        // The same learn reached from ordinary witness staging: every
+        // action spends at most its 64-unit staging allowance, the row
+        // stages once the learn completes, and nothing is probed twice.
+        let (mut native, _) = NativeScene::new();
+        native.scene.coordinator.set_exe_index_dirs(Vec::new());
+        admit_cold_exe_callers(&mut native, 130);
+        native.execs(vec![exec_record(41, 9, 100, 8, 99)]);
+        let cold = cold_exe_paths(&native);
+        let row = native.row(41, 1, 9, 210, 0);
+        let per_action = actions_until_idle(&mut native, row, exe_probe_calls);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(
+            per_action.iter().all(|probes| *probes <= 64),
+            "{per_action:?}"
+        );
+        assert_eq!(per_action.iter().sum::<u64>(), cold, "{per_action:?}");
+        assert!(native.scene.coordinator.held_stage.is_empty());
+        let exes = scene_unbound_exe(&native);
+        assert_eq!(exes.len(), 1);
+        assert_eq!(exes[0].resolution, ExeResolution::PathUnknown);
+    }
+
+    #[test]
+    fn an_exec_backfill_charges_its_probes_and_resumes() {
+        // Row-before-EXEC over cold caller paths: the EXEC's backfill
+        // resolution waits in order under the staging allowance and
+        // attaches its verdict once the learn completes.
+        let (mut native, _) = NativeScene::new();
+        native.scene.coordinator.set_exe_index_dirs(Vec::new());
+        native.witness(vec![native.row(41, 1, 9, 210, 0)]);
+        admit_cold_exe_callers(&mut native, 100);
+        let cold = cold_exe_paths(&native);
+        let before = exe_probe_calls();
+        native.execs(vec![exec_record(41, 9, 100, 8, 99)]);
+        let first = exe_probe_calls() - before;
+        assert_eq!(first, 64, "the first action spends its whole allowance");
+        assert_eq!(native.scene.coordinator.held_stage.len(), 1);
+        let before = exe_probe_calls();
+        native.drain();
+        assert_eq!(exe_probe_calls() - before, cold - 64);
+        assert!(native.scene.coordinator.held_stage.is_empty());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let exes = scene_unbound_exe(&native);
+        assert_eq!(exes.len(), 1);
+        assert_eq!((exes[0].dev, exes[0].ino), (8, 99));
+        assert_eq!(exes[0].resolution, ExeResolution::PathUnknown);
+    }
+
+    /// Read `row`, drain, then read on until no staging is held; the
+    /// `counter` delta of each action, in order.
+    fn actions_until_idle(
+        native: &mut NativeScene,
+        row: WitnessRow,
+        counter: fn() -> u64,
+    ) -> Vec<u64> {
+        let mut per_action = Vec::new();
+        let before = counter();
+        native.read(vec![row]);
+        per_action.push(counter() - before);
+        let before = counter();
+        native.drain();
+        per_action.push(counter() - before);
+        for _ in 0..8 {
+            let before = counter();
+            native.read(Vec::new());
+            per_action.push(counter() - before);
+            if native.scene.coordinator.held_stage.is_empty() {
+                return per_action;
+            }
+        }
+        panic!("staging converges: {per_action:?}");
+    }
+
+    /// Stage one unbound row from each live, never-admitted pid in
+    /// `pids`, filling the pre-admission stash.
+    fn stash_rows(native: &mut NativeScene, pids: std::ops::Range<u32>) {
+        for pid in pids {
+            native.scene.source.spawn(pid, 100 + u64::from(pid));
+            native.witness(vec![native.row(u64::from(pid), 1, pid, 1_000, 0)]);
+        }
+    }
+
+    #[test]
+    fn a_full_stash_prune_cycle_resumes_across_staging_credits() {
+        // A full 40-entry stash meets a row with a fresh key: the whole
+        // prune cycle (40 staleness checks, 80 units) runs under the
+        // staging allowance across two actions instead of at once, then
+        // overflows exactly as a whole prune of a live stash did. A
+        // twin with one exited writer frees its slot instead.
+        for exited in [false, true] {
+            let (mut native, _) = watched_native();
+            stash_limit(&mut native, 40);
+            stash_rows(&mut native, 6_000..6_040);
+            assert_eq!(native.preadmission().held, 40);
+            if exited {
+                native.scene.source.kill(6_000);
+            }
+            native.scene.source.spawn(6_100, 777);
+            let row = native.row(6_100, 1, 6_100, 2_000, 0);
+            let per_action = actions_until_idle(&mut native, row, stash_stale_checks);
+            native.scene.coordinator.commit_batch(false).unwrap();
+            assert!(
+                per_action.iter().all(|checks| 2 * checks <= 64),
+                "exited={exited}: {per_action:?}"
+            );
+            assert_eq!(
+                per_action.iter().sum::<u64>(),
+                40,
+                "one whole cycle: {per_action:?}"
+            );
+            assert!(
+                per_action.iter().filter(|checks| **checks > 0).count() >= 2,
+                "the cycle resumed: {per_action:?}"
+            );
+            assert!(native.scene.coordinator.held_stage.is_empty());
+            let counters = native.preadmission();
+            let overflow = native
+                .gap_subjects()
+                .contains(&"native pre-admission rows past their bound".to_string());
+            if exited {
+                assert_eq!((counters.held, counters.pruned, overflow), (40, 1, false));
+            } else {
+                assert_eq!((counters.held, counters.pruned, overflow), (40, 0, true));
+            }
+        }
+    }
+
+    #[test]
+    fn a_finish_reconciliation_draws_its_queries_from_the_credit() {
+        // The reconciliation's queries share a Finish credit: never more
+        // than its remainder, never more than the ordinary four.
+        let mut spent = RecoveryWorkBudget::with_query_limit(0);
+        assert!(!spent.query(), "an exhausted credit allows no query");
+        let mut two = RecoveryWorkBudget::with_query_limit(2);
+        assert!(two.query() && two.query() && !two.query());
+        let mut capped = RecoveryWorkBudget::with_query_limit(64);
+        let allowed = (0..10).filter(|_| capped.query()).count();
+        assert_eq!(allowed, 4);
+    }
+
+    #[test]
+    fn a_retry_revival_discloses_its_rejected_growth_exactly() {
+        // The revival-miss growth stays typed: the rejected demoted
+        // count carries exactly the 40 calls past the revival base,
+        // beside the 3-call prefix; its repeated cumulative snapshot
+        // max-merges instead of double counting.
+        use crate::discovery::caller_registry::{CountedAmount, DEMOTED_COUNT_REJECTED};
+        let native = shared_revival_miss();
+        let registry = &native.scene.coordinator.registry;
+        let caller = native.scene.coordinator.adapter.live_id(9).unwrap();
+        type Rejected = ((Option<CallerId>, CountedAmount), (u64, u64));
+        let rejected: Vec<Rejected> = registry
+            .counted_exclusions_for_test()
+            .into_iter()
+            .filter(|((subject, ..), _)| *subject == DEMOTED_COUNT_REJECTED)
+            .map(|((_, member, _, amount), total)| ((member, amount), total))
+            .collect();
+        assert_eq!(
+            rejected,
+            vec![((Some(caller), CountedAmount::Cumulative), (40, 2))],
+            "two cumulative disclosures of one 40-call rejection never sum"
+        );
+        assert!(registry.counted_overflow_for_test().is_empty());
+    }
+
+    #[test]
+    fn a_late_rebase_counts_its_exclusion_typed_with_and_without_pressure() {
+        // Typed carrier twins: without pressure the detail row carries
+        // the 2 calls and the overflow carrier is empty; with the
+        // ordinary allotment full (and with the reserve full too) the
+        // guaranteed carrier holds exactly the 2 calls for the member.
+        use crate::discovery::caller_registry::{COUNTED_BEFORE_TRACKING, CountedAmount};
+        for (pressure, reserve) in [(false, false), (true, false), (true, true)] {
+            let (native, caller) = late_rebase_after(|native| {
+                if pressure {
+                    fill_gap_quota(native, reserve);
+                }
+            });
+            let registry = &native.scene.coordinator.registry;
+            let key = (
+                COUNTED_BEFORE_TRACKING,
+                Some(caller),
+                None,
+                CountedAmount::Disjoint,
+            );
+            assert_eq!(
+                registry.counted_exclusions_for_test(),
+                BTreeMap::from([(key, (2, 1))]),
+                "pressure={pressure} reserve={reserve}"
+            );
+            let overflow = registry.counted_overflow_for_test();
+            if pressure {
+                assert_eq!(overflow, BTreeMap::from([(key, (2, 1))]));
+            } else {
+                assert!(overflow.is_empty());
+            }
+            assert_eq!(counted_before_tracking_rows(&native, caller), 1);
+        }
     }
 }
 
@@ -46365,25 +47037,3 @@ mod stop_diff_tests {
         );
     }
 }
-
-#[cfg(test)]
-thread_local! {
-    /// Production executable mapping probes performed on this thread
-    /// (test-observed: every probe is one charged slow unit).
-    static EXE_PROBE_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
-/// The production mapping probe for learned caller paths and for
-/// learned-spelling verification.
-fn probe_exe_path(path: &str) -> Option<(u64, u64)> {
-    #[cfg(test)]
-    EXE_PROBE_CALLS.with(|calls| calls.set(calls.get() + 1));
-    crate::discovery::unbound_exe::real_maps_identity(path)
-}
-
-/// Production executable probes this thread performed so far.
-#[cfg(test)]
-fn exe_probe_calls() -> u64 {
-    EXE_PROBE_CALLS.with(std::cell::Cell::get)
-}
-

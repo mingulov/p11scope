@@ -1590,23 +1590,29 @@ impl<L> NativeLane<L> {
         // (lossy, never a fresh terminal word) and is reported.
         let refresh_budget = self.windows.terminal_sweep_budget;
         let refresh_deadline = Instant::now() + refresh_budget;
+        // A completed gap-free sweep is latched for this stop: a later
+        // read that continues for owed re-sight work starts a new
+        // sweep that may end partial at the deadline, and that
+        // unfinished continuation never revokes the proof already
+        // in force (see [`terminal_refresh_step`]).
+        let mut proven = false;
         let exact = loop {
             let terminal = self.read();
-            let exact = terminal.refresh_sweep_completed && !terminal.refresh_sweep_gaps;
+            proven |= terminal.refresh_sweep_completed && !terminal.refresh_sweep_gaps;
             let receipt = host.stage_native(
                 NativeBatch::Witness(Box::new(terminal)),
                 &mut self.capture,
                 now_ns(),
             );
             events.extend(receipt.events);
-            // Owed re-sight work keeps the terminal refresh reading
-            // within its deadline even once a sweep lands exact: the
-            // finish files only work the continuations actually
-            // attempted. Past the deadline an exact sweep still
-            // finishes (never a refresh-loss misreport); the
-            // remaining rows file incomplete, as accounted.
-            if (exact && !receipt.resight_owed) || Instant::now() >= refresh_deadline {
-                break exact;
+            match terminal_refresh_step(
+                proven,
+                receipt.resight_owed,
+                Instant::now() >= refresh_deadline,
+            ) {
+                TerminalRefreshStep::ReadOn => {}
+                TerminalRefreshStep::Finish => break true,
+                TerminalRefreshStep::RefreshLoss => break false,
             }
         };
         if !exact {
@@ -1707,6 +1713,37 @@ enum NativeStopPhase {
     Summarize,
 }
 
+/// One terminal count-refresh decision, shared by the blocking and
+/// the phased stop drivers so they cannot diverge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminalRefreshStep {
+    /// Read again: no proof yet, or owed re-sight work remains, and
+    /// the deadline has not passed.
+    ReadOn,
+    /// A gap-free sweep completed during this stop: finish.
+    Finish,
+    /// The deadline passed and no gap-free sweep ever completed.
+    RefreshLoss,
+}
+
+/// `proven` is the stop's latched proof that a gap-free count-refresh
+/// sweep completed (never the most recent read alone): owed re-sight
+/// work keeps reading within the deadline once proven, an unfinished
+/// continuation sweep never revokes the proof, and only a stop that
+/// never completed one reports a refresh loss. Later read failures
+/// keep their own disclosure through the staged witness health.
+pub(crate) fn terminal_refresh_step(
+    proven: bool,
+    owed: bool,
+    expired: bool,
+) -> TerminalRefreshStep {
+    match (proven, owed, expired) {
+        (true, false, _) | (true, true, true) => TerminalRefreshStep::Finish,
+        (false, _, true) => TerminalRefreshStep::RefreshLoss,
+        (_, _, false) => TerminalRefreshStep::ReadOn,
+    }
+}
+
 #[derive(Clone, Copy)]
 enum NativeAfterStage {
     Held,
@@ -1743,6 +1780,9 @@ pub(crate) struct NativeStop<L> {
     /// flush, terminal settlement, or cleanup): the stop machine
     /// stages Finish again instead of retiring at once.
     staged_settlement_owed: bool,
+    /// A gap-free terminal refresh sweep completed during this stop:
+    /// latched, so a later partial continuation read never revokes it.
+    refresh_proven: bool,
 }
 
 // Both variants move the same native owner; returning Pending must remain
@@ -1779,6 +1819,7 @@ impl<L> NativeStop<L> {
             retirement: None,
             staged_resight_owed: false,
             staged_settlement_owed: false,
+            refresh_proven: false,
         }
     }
 
@@ -1896,25 +1937,17 @@ impl<L> NativeStop<L> {
                         }
                     }
                     NativeAfterStage::PostWitness { exact } => {
-                        // Owed re-sight work keeps the terminal refresh
-                        // reading within its deadline even once a sweep
-                        // lands exact: the finish files only work the
-                        // continuations actually attempted. Past the
-                        // deadline an exact sweep still finishes (its
-                        // refresh was exact — never a refresh-loss
-                        // misreport); the remaining rows file
-                        // incomplete, as accounted.
-                        let owed = self.staged_resight_owed;
-                        self.phase = if exact && !owed {
-                            NativeStopPhase::Finish
-                        } else if now >= self.refresh_deadline.unwrap() {
-                            if exact {
-                                NativeStopPhase::Finish
-                            } else {
-                                NativeStopPhase::RefreshLoss
-                            }
-                        } else {
-                            NativeStopPhase::PostWitness
+                        // The same shared decision as the blocking
+                        // driver, over the stop's latched proof.
+                        self.refresh_proven |= exact;
+                        self.phase = match terminal_refresh_step(
+                            self.refresh_proven,
+                            self.staged_resight_owed,
+                            now >= self.refresh_deadline.unwrap(),
+                        ) {
+                            TerminalRefreshStep::ReadOn => NativeStopPhase::PostWitness,
+                            TerminalRefreshStep::Finish => NativeStopPhase::Finish,
+                            TerminalRefreshStep::RefreshLoss => NativeStopPhase::RefreshLoss,
                         };
                     }
                     NativeAfterStage::Finish => {
@@ -2005,7 +2038,12 @@ impl<L> NativeStop<L> {
             NativeStopPhase::PostWitness => {
                 let end = self.refresh_deadline.unwrap();
                 if self.refresh_attempted && now >= end {
-                    self.phase = NativeStopPhase::RefreshLoss;
+                    // Past the deadline without an owed read: the
+                    // latched proof decides, like after a staging.
+                    self.phase = match terminal_refresh_step(self.refresh_proven, false, true) {
+                        TerminalRefreshStep::Finish => NativeStopPhase::Finish,
+                        _ => NativeStopPhase::RefreshLoss,
+                    };
                 } else {
                     let batch = self
                         .lane

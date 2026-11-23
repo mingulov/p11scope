@@ -5149,8 +5149,11 @@ mod tests {
     fn learn_taken_slot_closes_group_while_helper_stuck() {
         use std::os::unix::io::{AsRawFd, FromRawFd};
         let mut fds = [0; 2];
-        // SAFETY: libc pipe into a live array; checked before use.
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // Close-on-exec: a child that a sibling test spawns while this
+        // pipe is open must not keep the reader past its exec, or the
+        // write below succeeds through the child's copy.
+        // SAFETY: libc pipe2 into a live array; checked before use.
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
         // SAFETY: fresh owned fds from the pipe above.
         let reader = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[0]) };
         let writer = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[1]) };

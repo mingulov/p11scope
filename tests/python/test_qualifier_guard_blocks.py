@@ -334,6 +334,12 @@ class EventStdoutGuardTests(GuardCase):
          "early-close report event_output []"),
     ]
 
+    def test_smallest_measured_loss_passes(self):
+        # One shed line of one byte is still measured loss.
+        case = event_case(2)
+        case["epipe"]["event_output"].update(lines_lost=1, bytes_lost=1)
+        self.check(case, ok=True, marker="ok lines=6 totals=2")
+
     def test_stderr_never_decides_loss(self):
         # Codex r8 F3: any stderr text, including a contradictory
         # one, leaves the typed verdict unchanged in both directions.

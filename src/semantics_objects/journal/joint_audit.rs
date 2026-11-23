@@ -2212,19 +2212,22 @@ impl IngestedJointQuantum {
             .ok_or(RawQuantumRefusal::Admission)?;
         // Drain proof slices yield with their prefix cached: retry with a
         // fresh slice while service budget remains, never discarding. Each
-        // retry derives at least one candidate, so the loop terminates.
+        // retry classifies at least one entry, so the loop terminates.
+        // The preflight samples once, ahead of the loop: a yielding seal
+        // stages nothing (only proof cache, cursors and spent move), so
+        // the bounds a retry would recompute are the ones already held.
+        let bounds = ReplayBounds::sample(owner.adapter(), owner.model())
+            .ok_or(RawQuantumRefusal::Capacity)?;
+        let bytes = result_storage_bound(owner.adapter(), owner.model())
+            .and_then(|base| base.checked_add(bounds.retained_bytes()?))
+            .ok_or(RawQuantumRefusal::Capacity)?;
+        let temporary = bounds
+            .temporary_bytes()
+            .ok_or(RawQuantumRefusal::Capacity)?;
         let (outcome, storage, bytes, mark) = loop {
             if *remaining == 0 {
                 return Ok(self.progress());
             }
-            let bounds = ReplayBounds::sample(owner.adapter(), owner.model())
-                .ok_or(RawQuantumRefusal::Capacity)?;
-            let bytes = result_storage_bound(owner.adapter(), owner.model())
-                .and_then(|base| base.checked_add(bounds.retained_bytes()?))
-                .ok_or(RawQuantumRefusal::Capacity)?;
-            let temporary = bounds
-                .temporary_bytes()
-                .ok_or(RawQuantumRefusal::Capacity)?;
             let reserver = owner
                 .ledger()
                 .resource_reserver()
@@ -2267,6 +2270,11 @@ impl IngestedJointQuantum {
                 failure.gap == JournalGap::BoundNotReady
                     && adapter.last_seal_wait() == SealWait::DrainProofPending
             }) {
+                assert!(
+                    spent > 0,
+                    "a yielded proof slice always charges at least one visit, \
+                     so the retry loop terminates"
+                );
                 continue;
             }
             break (outcome, storage, bytes, mark);

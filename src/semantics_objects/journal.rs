@@ -2145,9 +2145,11 @@ pub(crate) struct JournalAdapter {
     /// Frontier the proof cache was derived for (`None` before the first
     /// derivation): a new frontier clears the cache and restarts.
     drain_proof_cache_frontier: Option<u64>,
-    /// Resume cursor for the budgeted derivation: the next candidate to
-    /// derive (`None` starts at the first). Preserved across slice
-    /// yields so resumption never discards derived prefix progress.
+    /// Resume cursor for the budgeted derivation: the last classified
+    /// open key (`None` starts before the first). The walk charges one
+    /// unit per visited entry, candidate or not, and persists the
+    /// cursor past every visit, so resumption after a yield never
+    /// re-classifies and never discards the derived prefix.
     drain_proof_cursor: Option<JournalNativeKey>,
     floors: BTreeMap<u64, u64>,
     /// One ordered Session EVENTS/boot-clock namespace. Non-evicted
@@ -2647,6 +2649,59 @@ impl JournalAdapter {
         }
     }
 
+    /// Test-only: stage `rows` synthetic unconverted open entries with
+    /// unique identities onto an unkeyed foreign image, above every cut
+    /// (so they bar nothing), each with its census membership and custody
+    /// charge, so a converting seal has many journal rows to classify.
+    /// Unlike [`Self::populate_foreign_open_rows_for_test`], which clones
+    /// one template identity (fine for doom and recovery paths that never
+    /// validate invocation claims), each row decodes fresh BEGIN words on
+    /// its own thread, so claim validation sees singletons, never a
+    /// `ClaimAmbiguity` taint.
+    #[cfg(test)]
+    pub(crate) fn populate_unique_foreign_open_rows_for_test(&mut self, rows: usize) {
+        use p11scope_ebpf_common::object_journal::{JournalRecord, decode_journal_record};
+        use p11scope_ebpf_common::object_wire::{
+            publish_object_descriptors, verify_object_descriptors,
+        };
+        let template = *self.open.values().next().expect("a retained open entry");
+        let descriptors = publish_object_descriptors();
+        assert!(verify_object_descriptors(&descriptors));
+        for index in 0..rows as u64 {
+            let native = (u64::MAX - 1, index);
+            let raw = tests::begin_bytes(1_000 + index, 1, template.function, 0);
+            let JournalRecord::Begin(begin) =
+                decode_journal_record(&raw, &descriptors).expect("synthetic begin decodes")
+            else {
+                panic!("synthetic begin record");
+            };
+            let mut entry = template;
+            entry.begin = begin;
+            entry.image = (template.image.0 ^ 0x5eed_0000, template.image.1);
+            entry.begin_ordinal = u64::MAX / 2 + index;
+            entry.end = None;
+            entry.abandon = None;
+            entry.converted_ticket = None;
+            entry.converted_for = None;
+            entry.end_converted = false;
+            entry.drained_converted = false;
+            entry.corroborated_return = None;
+            entry.raw_resource = None;
+            entry.collected_origin = None;
+            entry.s1only_subject = None;
+            self.ledger
+                .charge_h8open(entry.begin_ordinal, 1)
+                .expect("synthetic custody charges");
+            self.retained_member_inc(
+                identity_of_begin(&entry.begin),
+                RetainedMember::Open(native),
+            );
+            assert!(self.open.insert(native, entry).is_none());
+            self.drain_ordinals
+                .insert((entry.image, entry.begin_ordinal));
+        }
+    }
+
     /// Test-only read of the adapter invalidation flag; see above.
     #[cfg(test)]
     pub(crate) fn invalidated_for_test(&self) -> bool {
@@ -2741,12 +2796,18 @@ impl JournalAdapter {
 
     /// Tests-only missing terminal: drop one open original's staged END
     /// so the disposal path's expected-absent branch can be exercised.
+    /// The ordinal leaves the order index with the entry, like every
+    /// production removal.
     #[cfg(test)]
     pub(crate) fn clear_open_end_for_test(&mut self, native: JournalNativeKey) -> bool {
         let Some(entry) = self.open.get_mut(&native) else {
             return false;
         };
-        entry.end = None;
+        let image = entry.image;
+        let staged = entry.end.take();
+        if let Some(staged) = staged {
+            self.drain_ordinals.remove(&(image, staged.ordinal));
+        }
         true
     }
 
@@ -2882,6 +2943,11 @@ impl JournalAdapter {
     #[cfg(test)]
     pub(crate) fn test_drain_proof_visits_for_test(&self) -> usize {
         self.test_drain_proof_visits.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_test_drain_proof_visits_for_test(&self) {
+        self.test_drain_proof_visits.set(0);
     }
 
     #[cfg(test)]
@@ -9557,9 +9623,13 @@ impl JournalAdapter {
     /// the actual return carries lifecycle authority (negative returns,
     /// pending or ambiguous outcomes), and effect-free neutral returns
     /// replay anywhere. A drain without its proof keeps the bounded loss.
-    /// An empty window means no same-image history sits between the
-    /// observed return and the abandonment, so completing at the
-    /// abandonment cut cannot move the call past dependent history.
+    /// An empty window means no currently staged same-image BEGIN, END
+    /// or abandonment ordinal sits between the observed return and the
+    /// abandonment, so completing at the abandonment cut cannot move
+    /// the call past staged dependent history. Refused begins,
+    /// ordinary CALL ordinals and already-pruned sibling history live
+    /// outside the index; whether overlapping proven drains need
+    /// true-return replay stays an open product question.
     ///
     /// Window dispositions derive once per frontier (see
     /// [`Self::ensure_drain_proofs`]) from the incremental per-image
@@ -9587,6 +9657,14 @@ impl JournalAdapter {
         }
         let returned = entry.corroborated_return.filter(|at| *at <= frontier)?;
         if drained_needs_order_proof(entry.function, entry.corroborated_returned.rv) {
+            // Proofs derive before any consumer reads them (the seal
+            // derives first, and the candidate predicate matches this
+            // read predicate entry for entry), so a miss is unreachable;
+            // the miss default below refuses only defensively.
+            debug_assert!(
+                self.drain_proof_cache.contains_key(&native),
+                "drain proofs derive before any consumer reads them"
+            );
             if !self
                 .drain_proof_cache
                 .get(&native)
@@ -9620,53 +9698,64 @@ impl JournalAdapter {
     }
 
     /// Derive drain window dispositions for one frontier in budgeted
-    /// slices of at most one credit ([`SCOPED_RECOVERY_SLICE`] units, one
-    /// per candidate range probe): each candidate's window emptiness is
-    /// computed once from the per-image index and cached for every seal
-    /// of this frontier to reuse. A slice that exhausts its budget
+    /// slices of at most one credit ([`SCOPED_RECOVERY_SLICE`] units):
+    /// each open entry costs one unit to classify, and each
+    /// candidate's window emptiness is computed once from the
+    /// per-image index and cached for every seal of this frontier to
+    /// reuse. The walk never materializes the candidate set: it
+    /// resumes from the persisted scan cursor through an indexed
+    /// range, one entry per step. A slice that exhausts its budget
     /// yields [`SealWait::DrainProofPending`] with the derived prefix
-    /// cached and the cursor on the last derived candidate, so the next
-    /// seal resumes after it and never discards progress. A new frontier
-    /// clears the cache and restarts. Converted drains and effect-free
-    /// neutral drains need no proof and cost nothing here.
+    /// cached and the cursor past the last classified entry, so the
+    /// next seal resumes after it and never discards progress. A new
+    /// frontier clears the cache and restarts. Converted drains and
+    /// effect-free neutral drains need no proof and cost nothing
+    /// beyond their classification.
     fn ensure_drain_proofs(&mut self, frontier: u64) -> Result<(), SealFailure> {
         if self.drain_proof_cache_frontier != Some(frontier) {
             self.drain_proof_cache.clear();
             self.drain_proof_cursor = None;
             self.drain_proof_cache_frontier = Some(frontier);
         }
-        let candidates: Vec<JournalNativeKey> = self
-            .open
-            .iter()
-            .filter_map(|(native, entry)| {
-                let staged = entry.abandon.filter(|staged| {
-                    staged.ordinal <= frontier
-                        && staged.abandon.reason() == JOURNAL_REASON_SYNC_RETURN_RESULT_LOST
-                })?;
-                if !return_drains_without_tail(entry.function) {
-                    return None;
-                }
-                entry.corroborated_return.filter(|at| *at <= frontier)?;
-                if entry.drained_converted {
-                    return None;
-                }
-                if !drained_needs_order_proof(entry.function, entry.corroborated_returned.rv) {
-                    return None;
-                }
-                let _ = staged;
-                Some(*native)
-            })
-            .collect();
-        let start = match self.drain_proof_cursor {
-            None => 0,
-            Some(cursor) => match candidates.binary_search(&cursor) {
-                Ok(index) => index + 1,
-                Err(index) => index,
-            },
-        };
         let mut credit = self.inline_credit.min(SCOPED_RECOVERY_SLICE);
         let allowance = credit;
-        for native in candidates.iter().skip(start) {
+        loop {
+            // One indexed step past the cursor, copying the
+            // classification words before the borrow ends: no table
+            // scan, no candidate vector, no borrow held across the
+            // cached derivation below.
+            let next = match self.drain_proof_cursor {
+                None => self.open.iter().next(),
+                Some(cursor) => {
+                    use std::ops::Bound::Excluded;
+                    self.open
+                        .range((Excluded(cursor), std::ops::Bound::Unbounded))
+                        .next()
+                }
+            }
+            .map(|(native, entry)| {
+                (
+                    *native,
+                    entry.image,
+                    entry.function,
+                    entry.abandon,
+                    entry.corroborated_return,
+                    entry.drained_converted,
+                    entry.corroborated_returned.rv,
+                )
+            });
+            let Some((
+                native,
+                image,
+                function,
+                abandon,
+                corroborated_return,
+                drained_converted,
+                rv,
+            )) = next
+            else {
+                break;
+            };
             if credit == 0 {
                 self.inline_spent = self.inline_spent.saturating_add(allowance - credit);
                 return Err(self.wait(SealWait::DrainProofPending));
@@ -9677,12 +9766,31 @@ impl JournalAdapter {
                 self.test_drain_proof_visits
                     .set(self.test_drain_proof_visits.get() + 1);
             }
-            let entry = self.open.get(native).expect("candidate entry");
-            let returned = entry.corroborated_return.expect("candidate return");
-            let abandoned = entry.abandon.expect("candidate abandon").ordinal;
-            let empty = self.drain_window_empty(entry.image, returned, abandoned);
-            self.drain_proof_cache.insert(*native, empty);
-            self.drain_proof_cursor = Some(*native);
+            // The cursor advances past every visited entry, candidate
+            // or not: a run of non-candidates longer than the credit
+            // still makes progress across slices instead of re-yielding
+            // over the same entries forever.
+            self.drain_proof_cursor = Some(native);
+            let Some(staged) = abandon.filter(|staged| {
+                staged.ordinal <= frontier
+                    && staged.abandon.reason() == JOURNAL_REASON_SYNC_RETURN_RESULT_LOST
+            }) else {
+                continue;
+            };
+            if !return_drains_without_tail(function) {
+                continue;
+            }
+            let Some(returned) = corroborated_return.filter(|at| *at <= frontier) else {
+                continue;
+            };
+            if drained_converted {
+                continue;
+            }
+            if !drained_needs_order_proof(function, rv) {
+                continue;
+            }
+            let empty = self.drain_window_empty(image, returned, staged.ordinal);
+            self.drain_proof_cache.insert(native, empty);
         }
         self.inline_spent = self.inline_spent.saturating_add(allowance - credit);
         Ok(())
@@ -23142,8 +23250,12 @@ pub(crate) mod tests {
         );
         assert_eq!(
             scene.adapter.test_drain_proof_visits_for_test(),
-            2,
-            "a converted drain costs no re-derivation on later seals"
+            4,
+            "the moved frontier re-classifies both staged entries, deriving nothing new"
+        );
+        assert!(
+            scene.adapter.drain_proof_cache.is_empty(),
+            "the converted drain re-derives no disposition on later seals"
         );
     }
 

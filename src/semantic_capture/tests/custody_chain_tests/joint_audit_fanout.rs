@@ -33504,6 +33504,11 @@ fn joint_drain_proof_slice_yields_and_resumes_through_bounded_seal() {
         .joint_frame_ports(&fixture.scene.producers)
         .unwrap();
     frame.bind_targets(&ports).unwrap();
+    ports
+        .read()
+        .1
+        .adapter()
+        .reset_test_drain_proof_visits_for_test();
     let mut remaining = 1;
     assert_eq!(
         frame.seal_next_bounded(&mut ports, &mut births, &BirthFault, &mut remaining),
@@ -33518,7 +33523,7 @@ fn joint_drain_proof_slice_yields_and_resumes_through_bounded_seal() {
     assert_eq!(
         ports.read().1.adapter().test_drain_proof_visits_for_test(),
         1,
-        "one slice derives one disposition, no more"
+        "one slice classifies one entry, no more"
     );
     let mut remaining = 64;
     assert_eq!(
@@ -33539,7 +33544,7 @@ fn joint_drain_proof_slice_yields_and_resumes_through_bounded_seal() {
     assert_eq!(
         ports.read().1.adapter().test_drain_proof_visits_for_test(),
         2,
-        "resumption derives only the remainder, never discards"
+        "resumption classifies only the remainder, never discards"
     );
     assert!(
         !seal.effects.effects.iter().any(|effect| matches!(
@@ -33607,7 +33612,7 @@ fn joint_drain_proof_retry_samples_its_preflight_once() {
         .coordinator
         .joint_capture_mut()
         .adapter_mut()
-        .populate_foreign_open_rows_for_test(63);
+        .populate_unique_foreign_open_rows_for_test(63);
     let h0 = fixture.scene.real.h0.clone();
     let mut births = NativeFrameBirths {
         h0: &h0,
@@ -33629,6 +33634,11 @@ fn joint_drain_proof_retry_samples_its_preflight_once() {
         .1
         .adapter()
         .reset_test_replay_bound_counters_for_test();
+    ports
+        .read()
+        .1
+        .adapter()
+        .reset_test_drain_proof_visits_for_test();
     let mut remaining = 65;
     assert_eq!(
         frame.seal_next_bounded(&mut ports, &mut births, &BirthFault, &mut remaining),
@@ -33650,9 +33660,13 @@ fn joint_drain_proof_retry_samples_its_preflight_once() {
         1,
         "one bounded seal samples its preflight once, never per retry"
     );
-    let seal = frame
-        .active_seal_for_test()
-        .expect("the resumed seal succeeds");
+    let seal = frame.active_seal_for_test().unwrap_or_else(|| {
+        panic!(
+            "the resumed seal succeeds: failure={:?} wait={:?}",
+            frame.failure_for_test(),
+            ports.read().1.adapter().last_seal_wait(),
+        )
+    });
     assert_eq!(seal.prefix.settled().len(), 2);
     assert!(
         seal.prefix.settled().iter().all(|call| !call.abandoned),

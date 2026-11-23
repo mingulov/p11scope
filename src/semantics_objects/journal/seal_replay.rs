@@ -191,41 +191,22 @@ impl ReplayBounds {
             .test_replay_bound_samples
             .set(adapter.test_replay_bound_samples.get() + 1);
         let refused = adapter.refused.len();
-        let begins = adapter
-            .open
-            .values()
-            .filter(|entry| {
-                #[cfg(test)]
-                adapter
-                    .test_replay_bound_visits
-                    .set(adapter.test_replay_bound_visits.get() + 1);
-                entry.converted_ticket.is_none()
-            })
-            .count();
-        let terminals = adapter
-            .open
-            .values()
-            .filter(|entry| {
-                #[cfg(test)]
-                adapter
-                    .test_replay_bound_visits
-                    .set(adapter.test_replay_bound_visits.get() + 1);
-                entry.end.is_some() && !entry.end_converted
-            })
-            .count();
-        // Every staged abandonment may own one terminal step: a bounded
-        // loss or a per-call disposal (dooming ones never convert).
-        let abandoned = adapter
-            .open
-            .values()
-            .filter(|entry| {
-                #[cfg(test)]
-                adapter
-                    .test_replay_bound_visits
-                    .set(adapter.test_replay_bound_visits.get() + 1);
-                entry.abandon.is_some()
-            })
-            .count();
+        // One linear pass counts every category: begins still
+        // unconverted, terminals awaiting conversion, and staged
+        // abandonments (each may own one terminal step: a bounded loss
+        // or a per-call disposal; dooming ones never convert).
+        let mut begins = 0;
+        let mut terminals = 0;
+        let mut abandoned = 0;
+        for entry in adapter.open.values() {
+            #[cfg(test)]
+            adapter
+                .test_replay_bound_visits
+                .set(adapter.test_replay_bound_visits.get() + 1);
+            begins += usize::from(entry.converted_ticket.is_none());
+            terminals += usize::from(entry.end.is_some() && !entry.end_converted);
+            abandoned += usize::from(entry.abandon.is_some());
+        }
         let pending = model.replay_pending_count();
         let steps = refused
             .checked_add(usize::from(refused != 0))?

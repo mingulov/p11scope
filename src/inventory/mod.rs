@@ -12917,6 +12917,15 @@ mod tests {
                 assert_eq!(result.unwrap(), 1);
                 let document: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
                 assert_eq!(document["observation"]["passes"], 2);
+                // The retired file writer reports `failed` beside a
+                // completed capture.
+                assert_eq!(
+                    document["event_output"],
+                    serde_json::json!({
+                        "status": "failed", "lines_lost": 0, "bytes_lost": 0,
+                        "reason": "event_log_error",
+                    })
+                );
                 if with_report {
                     assert_eq!(std::fs::read(&report).unwrap(), stdout);
                 }
@@ -12966,6 +12975,13 @@ mod tests {
         .unwrap();
         assert_eq!(result, 0);
         assert_eq!(std::fs::read(&report).unwrap(), stdout);
+        let document: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(
+            document["event_output"],
+            serde_json::json!({
+                "status": "complete", "lines_lost": 0, "bytes_lost": 0, "reason": "none",
+            })
+        );
         let records = event_records(&events);
         assert_eq!(records.first().unwrap()["kind"], "started");
         assert_eq!(records.last().unwrap()["kind"], "ended");
@@ -13654,6 +13670,48 @@ mod tests {
             document
         };
         assert_eq!(strip(complete), strip(truncated));
+    }
+
+    /// Only the terminal `ended` line sheds: the snapshot is taken after
+    /// it, so it counts that one line (which no reader sees and whose own
+    /// `stdout_lost` cannot include itself).
+    #[test]
+    fn event_output_counts_a_shed_ended_line_alone() {
+        use std::io::Read as _;
+        use std::os::fd::AsRawFd as _;
+        let (mut read, write) = event_stdout_test_pipe();
+        let writer = super::EventWriter::create_stdout_on_fd(
+            write.as_raw_fd(),
+            std::time::Duration::from_millis(50),
+        )
+        .unwrap();
+        let mut stream = super::EventLogState::new(Some(writer));
+        assert_eq!(
+            stream.attempt("startup", |writer| writer.append(
+                "started",
+                serde_json::json!({}),
+                1
+            )),
+            None
+        );
+        let mut delivered = vec![0_u8; 4096];
+        let n = read.read(&mut delivered).unwrap();
+        assert!(
+            n > 0 && delivered[n - 1] == b'\n',
+            "the started line was delivered whole"
+        );
+        drop(read);
+        stream.attempt("completion", |writer| {
+            writer.finish(serde_json::json!({"passes": 0}), 2)
+        });
+        let output = stream.event_output().unwrap();
+        assert_eq!(output["status"], "truncated");
+        assert_eq!(output["lines_lost"], 1, "only `ended` shed: {output}");
+        assert_eq!(output["reason"], "broken_pipe");
+        let bytes = output["bytes_lost"].as_u64().unwrap();
+        assert!(bytes > 1 && bytes < 4096, "{output}");
+        drop(stream);
+        drop(write);
     }
 
     /// No event log, no `event_output`: the field never appears in a
@@ -14674,6 +14732,17 @@ mod tests {
                 "closing event failure discarded -o: {result:?}"
             );
             assert_eq!(std::fs::read(report).unwrap(), stdout);
+            // Both the `ended` append and the sync fault retire the
+            // writer: the snapshot after the tail says `failed`.
+            let document: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+            assert_eq!(
+                document["event_output"],
+                serde_json::json!({
+                    "status": "failed", "lines_lost": 0, "bytes_lost": 0,
+                    "reason": "event_log_error",
+                }),
+                "after_ended={after_ended}"
+            );
             assert_eq!(
                 attempts
                     .borrow()
@@ -21218,6 +21287,15 @@ mod tests {
             gaps.iter()
                 .any(|gap| gap["subject"] == "inventory capture failed"),
             "the failure gap publishes beside the watches: {gaps:?}"
+        );
+        // A capture startup failure retires the event writer too: the
+        // event log's own outcome is `failed`, beside the failed capture.
+        assert_eq!(
+            document["event_output"],
+            serde_json::json!({
+                "status": "failed", "lines_lost": 0, "bytes_lost": 0,
+                "reason": "event_log_error",
+            })
         );
     }
 

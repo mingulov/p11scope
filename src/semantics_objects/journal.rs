@@ -2313,19 +2313,29 @@ enum SealDecision {
 #[cfg(test)]
 pub(crate) fn seal_advance_units_bound(rows: usize, keys: usize) -> usize {
     let prepay = (rows * SEAL_CONVERT_OPEN_PASSES + keys)
-        .max(rows * 2)
-        .max(keys * 2);
+        .max(rows * SEAL_TAINT_PASSES)
+        .max(keys * SEAL_DOOM_KEY_PASSES);
     rows + rows + prepay + 1
 }
 
-/// Open-table passes one conversion makes after its prepay: the begin
-/// selection, the terminal delta, the frozen replay table, the
-/// terminal actions, the settled open list, and pruning's earliest-open
-/// pass and removal pass.
-const SEAL_CONVERT_OPEN_PASSES: usize = 7;
-/// Refused-table passes one conversion makes: the cut selection, the
-/// corroborated upper and the compaction.
-const SEAL_CONVERT_REFUSED_PASSES: usize = 3;
+/// Open-table row visits one conversion makes per open row after its
+/// prepay: the begin selection and the begin actions, the terminal
+/// delta, the frozen replay table, the terminal selection and its
+/// actions (up to two terminals per row: an end and an abandonment),
+/// the settled open list, settlement's walk over the converted calls,
+/// and pruning's earliest-open pass and removal pass.
+const SEAL_CONVERT_OPEN_PASSES: usize = 11;
+/// Refused-table row visits one conversion makes per refused row: the
+/// cut selection and its model refusals, the corroborated upper, the
+/// compaction and the consumed rows' census and claim release.
+const SEAL_CONVERT_REFUSED_PASSES: usize = 5;
+/// Row visits an image taint's synchronous drain makes per staged row:
+/// the open selection, its derived-absence notes and the removal pass;
+/// the refused selection, the retain and the dropped rows' census.
+const SEAL_TAINT_PASSES: usize = 3;
+/// Key-list visits a doom makes per key of its image: the live-set
+/// build and its frozen set.
+const SEAL_DOOM_KEY_PASSES: usize = 2;
 
 /// One production seal scan held by its frame across polls: stamp,
 /// resume phase, accumulated facts, the per-identity aggregates, the
@@ -4609,6 +4619,8 @@ impl JournalAdapter {
             .filter(|(_, entry)| entry.image == image)
             .map(|(key, entry)| (*key, entry.function))
             .collect();
+        #[cfg(test)]
+        self.note_seal_apply_visits(dropped_keys.len());
         for (key, function) in dropped_keys {
             self.note_derived_absence(image, key, function);
         }
@@ -4622,6 +4634,8 @@ impl JournalAdapter {
             .copied()
             .collect();
         self.refused.edit().retain(|refused| refused.image != image);
+        #[cfg(test)]
+        self.note_seal_apply_visits(dropped.len());
         for refused in &dropped {
             self.retained_refused_dec(refused);
         }
@@ -9509,11 +9523,12 @@ impl JournalAdapter {
     }
 
     /// Rows a decided seal's own application visits, prepaid one unit
-    /// per row before it runs: an image taint's synchronous drain (two
-    /// passes over each table), the doom's live-set build (two passes
-    /// over the image's keys), or conversion with settlement and
-    /// pruning ([`SEAL_CONVERT_OPEN_PASSES`] open passes,
-    /// [`SEAL_CONVERT_REFUSED_PASSES`] refused passes, one key pass).
+    /// per row before it runs: an image taint's synchronous drain
+    /// ([`SEAL_TAINT_PASSES`] visits per staged row), the doom's
+    /// live-set build ([`SEAL_DOOM_KEY_PASSES`] visits per image key), or
+    /// conversion with settlement and pruning
+    /// ([`SEAL_CONVERT_OPEN_PASSES`] per open row,
+    /// [`SEAL_CONVERT_REFUSED_PASSES`] per refused row, one key pass).
     /// Waits and refusals without table work owe nothing.
     fn seal_decision_cost(&self, decision: &SealDecision, image: (u64, u64)) -> usize {
         let keys = self.image_keys.get(&image).map_or(0, Vec::len);
@@ -9522,8 +9537,8 @@ impl JournalAdapter {
                 .open
                 .len()
                 .saturating_add(self.refused.len())
-                .saturating_mul(2),
-            SealDecision::Doom { .. } => keys.saturating_mul(2),
+                .saturating_mul(SEAL_TAINT_PASSES),
+            SealDecision::Doom { .. } => keys.saturating_mul(SEAL_DOOM_KEY_PASSES),
             SealDecision::Convert { .. } => self
                 .open
                 .len()
@@ -10707,6 +10722,8 @@ impl JournalAdapter {
         // Frozen as a set: the cursor's per-claimant liveness test is an
         // indexed lookup, so the image's key-list width never prices an
         // attribution out of reach.
+        #[cfg(test)]
+        self.note_seal_apply_visits(live.len());
         let live: BTreeSet<JournalDomainKey> = live.iter().copied().collect();
         self.rejection_queue
             .back_mut()
@@ -11307,6 +11324,8 @@ impl JournalAdapter {
             .map(|refused| refused.cut)
             .collect();
         refused_cuts.sort_unstable();
+        #[cfg(test)]
+        self.note_seal_apply_visits(refused_cuts.len());
         for cut in &refused_cuts {
             let start = effects.effects.len();
             let refused_effects = model.note_refused_begin(
@@ -11373,6 +11392,8 @@ impl JournalAdapter {
                 }
             }
             *self.refused.edit() = kept;
+            #[cfg(test)]
+            self.note_seal_apply_visits(consumed.len());
             for refused in &consumed {
                 self.retained_refused_dec(refused);
                 self.consume_claim(&refused.identity(), key);
@@ -11394,6 +11415,8 @@ impl JournalAdapter {
         let mut settled = replay
             .as_mut()
             .map_or_else(Vec::new, ReplayPreparation::take_calls);
+        #[cfg(test)]
+        self.note_seal_apply_visits(begins.len());
         for (native, _) in begins {
             let entry = *self.open.get(&native).expect("staged begin");
             // The exact physical invocation has one qualified H0
@@ -11598,6 +11621,8 @@ impl JournalAdapter {
             }
         }
         terminals.sort_by_key(|(_, ordinal)| *ordinal);
+        #[cfg(test)]
+        self.note_seal_apply_visits(terminals.len());
         for (native, _) in terminals {
             let entry = *self.open.get(&native).expect("staged terminal");
             let token = entry.converted_ticket.expect("converted begin");
@@ -11719,6 +11744,10 @@ impl JournalAdapter {
         // result bound covers it, and no second settlement-sized
         // vector is ever held beside it.
         let offset = effects.effects.len();
+        // Settlement walks the converted calls once (the model's own
+        // per-call work is outside this meter).
+        #[cfg(test)]
+        self.note_seal_apply_visits(prefix.settled.len());
         match &mut replay {
             Some(replay) => model.settle_recorded_into(
                 CompleteInputPrefix::sealed(&prefix),
@@ -34075,5 +34104,143 @@ pub(crate) mod tests {
             "cached answer"
         );
         assert_eq!(budget, 1);
+    }
+
+    /// Drive one-credit production seal polls to a decision on a held
+    /// scan, proving each yielded poll pays exactly one unit and the
+    /// deciding poll visits no row and pays no scan unit. Returns the
+    /// outcome, the application's row visits and the prepaid units.
+    fn drive_metered_seal(
+        scene: &mut Scene,
+        audit: &JournalAuditReceipt,
+        bootstrap: &BootstrapReceipt,
+    ) -> (Result<SealSuccess, SealFailure>, usize, usize) {
+        let bound = scene.adapter.seal_charge_bound_for_test((COOKIE, EXEC));
+        let mut barrier = SealBarrierState::default();
+        let mut polls = 0usize;
+        loop {
+            assert!(
+                polls < bound,
+                "decides within the charge-model bound {bound}"
+            );
+            let visits = scene.adapter.barrier_row_visits_for_test();
+            let units = scene.adapter.seal_scan_units_for_test();
+            let applied = scene.adapter.seal_apply_visits_for_test();
+            let mut budget = 1;
+            let attempt = metered_seal_poll(scene, audit, bootstrap, &mut barrier, &mut budget);
+            polls += 1;
+            let visits = scene.adapter.barrier_row_visits_for_test() - visits;
+            let units = scene.adapter.seal_scan_units_for_test() - units;
+            let applied = scene.adapter.seal_apply_visits_for_test() - applied;
+            match attempt {
+                SealAttempt::Yielded => {
+                    assert_eq!((units, budget), (1, 0), "poll {polls}: one paid unit");
+                    assert!(visits <= 1, "poll {polls}: at most one row");
+                    assert_eq!(
+                        applied, 0,
+                        "poll {polls}: nothing applies before the decision"
+                    );
+                }
+                SealAttempt::Decided(outcome) => {
+                    assert_eq!(
+                        (visits, units),
+                        (0, 0),
+                        "the deciding poll pays no scan unit"
+                    );
+                    let prepaid = barrier.progress_for_test().expect("held scan").prepaid;
+                    return (outcome, applied, prepaid);
+                }
+            }
+        }
+    }
+
+    /// Stage claims and audit the collection for a metered seal over
+    /// whatever `scene` holds.
+    fn metered_prepare(scene: &mut Scene) -> JournalAuditReceipt {
+        scene.install_observed_closure();
+        scene.prepare_claims();
+        let audit = scene.audit();
+        let cell = ScriptedFaultCell::steady(audit.fault_after);
+        scene
+            .adapter
+            .audit_collected(&mut scene.model, &audit, &cell)
+            .expect("clean collection audits");
+        audit
+    }
+
+    /// A taint decision prepays its synchronous drain: two staged calls
+    /// sharing one entry-time identity are an ambiguity, so the seal
+    /// taints the image and drains every staged table. Driven at one
+    /// credit per poll over a table past one slice, the drain's row
+    /// visits are positive and never exceed the prepaid units; zeroing
+    /// or under-pricing the taint charge fails here.
+    #[test]
+    fn seal_metered_taint_prepays_its_drain() {
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        // Foreign rows cloned from the staged begin share its identity:
+        // the claim check finds more than one staged call per claim.
+        scene.adapter.populate_foreign_open_rows_for_test(100);
+        let bootstrap = scene.bootstrap(proof, 0);
+        let audit = metered_prepare(&mut scene);
+        let rows = scene.adapter.open.len() + scene.adapter.refused.len();
+        assert!(rows > SCOPED_RECOVERY_SLICE, "past one slice: {rows}");
+        let (outcome, apply, prepaid) = drive_metered_seal(&mut scene, &audit, &bootstrap);
+        let failure = outcome.expect_err("an ambiguous claim taints");
+        assert_eq!(failure.gap, JournalGap::ImageTainted);
+        assert!(apply > 0, "the drain visits its tables");
+        assert_eq!(
+            prepaid,
+            rows * SEAL_TAINT_PASSES,
+            "the taint prepays its drain over every staged row"
+        );
+        assert!(
+            apply <= prepaid,
+            "drain visits {apply} within the prepay {prepaid}"
+        );
+    }
+
+    /// A doom decision prepays its live-set build: an unbounded
+    /// abandonment refuses the key, and the doom freezes the image's
+    /// live keys. Driven at one credit per poll over a table past one
+    /// slice, the live-set visits are positive and never exceed the
+    /// prepaid units; zeroing the doom charge fails here.
+    #[test]
+    fn seal_metered_doom_prepays_its_live_set() {
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_ENTRY_COLLISION;
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest_calls(2);
+        let create = function_id("C_CreateObject");
+        let outer = begin_bytes(1, 1, create, 0);
+        let inner = begin_bytes(1, 2, create, 0);
+        assert_eq!(scene.ingest(&outer), JournalDisposition::BeginAdmitted);
+        assert_eq!(scene.ingest(&inner), JournalDisposition::BeginAdmitted);
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_ENTRY_COLLISION, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        scene.adapter.populate_foreign_open_rows_for_test(100);
+        let bootstrap = scene.bootstrap(proof, 0);
+        let audit = metered_prepare(&mut scene);
+        let keys = scene
+            .adapter
+            .image_keys
+            .get(&(COOKIE, EXEC))
+            .map_or(0, Vec::len);
+        assert!(keys > 0);
+        let (outcome, apply, prepaid) = drive_metered_seal(&mut scene, &audit, &bootstrap);
+        let failure = outcome.expect_err("an unbounded abandonment dooms the key");
+        assert_eq!(failure.gap, JournalGap::DomainTainted);
+        assert!(apply > 0, "the doom builds its live set");
+        assert_eq!(
+            prepaid,
+            keys * SEAL_DOOM_KEY_PASSES,
+            "the doom prepays its key passes"
+        );
+        assert!(
+            apply <= prepaid,
+            "live-set visits {apply} within the prepay {prepaid}"
+        );
     }
 }

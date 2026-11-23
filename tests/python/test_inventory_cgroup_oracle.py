@@ -134,34 +134,34 @@ def unbound_reason(first=UNBOUND_FIRST):
             "attributed by pid" % (MODPATH, first))
 
 
-def extract_inventory_oracle():
-    """Extract the inventory-cgroup python oracle block from the qualifier."""
-    lines = QUAL.read_text().splitlines(keepends=True)
-    start = next(
-        i for i, line in enumerate(lines)
-        if '"$cell-inside.wl"' in line
-        and line.strip().startswith(("python3 -I - ", "python3 - ")))
-    end = next(i for i in range(start, len(lines))
-               if lines[i].rstrip("\n") == "PY")
-    return "".join(lines[start + 1:end])
+RECORDS = ROOT / "scripts/qualify_records.py"
+RUN_ID = "test-run"
 
 
-# Interpreters the oracle must hold under: the plain test interpreter,
-# an optimized one (-O strips assert statements), and the live line's
-# plain "python3 -" with PYTHONOPTIMIZE inherited from the environment.
-PLAIN = (["python3", "-I", "-"], None)
-OPTIMIZED = (["python3", "-O", "-I", "-"], None)
-INHERITED = (["python3", "-"], {"PYTHONOPTIMIZE": "1"})
+def stamp(tmp, cell):
+    """The shell's run stamp for one leg (written before its inputs)."""
+    subprocess.run(["python3", "-I", str(RECORDS), "stamp", str(tmp / (cell + ".stamp")), RUN_ID, cell],
+                   check=True)
+
+
+# Interpreters the loader must hold under: the plain test interpreter,
+# an optimized one (-O strips assert statements), and PYTHONOPTIMIZE
+# inherited from the environment.
+PLAIN = (["python3", "-I"], None)
+OPTIMIZED = (["python3", "-O", "-I"], None)
+INHERITED = (["python3"], {"PYTHONOPTIMIZE": "1"})
 
 
 def run_oracle(report, *, modfs, pin=None, modpath=MODPATH, ledger=None,
                generations=None, inside_wl=None, outside_wl=None,
                interpreter=PLAIN, report_text=None, pin_text=None, inside_iters=ITERS,
-               outside_iters=OUTSIDE_ITERS):
-    """Run the extracted oracle against a fixture report."""
+               outside_iters=OUTSIDE_ITERS, pids=(100, 101, 102), verdict_out=None):
+    """Run the cgroup-inventory judge of the typed loader on a fixture.
+
+    `pids` are the launched inside parent, the registered owned child
+    and the launched outside workload, as the shell passes them."""
     if generations is None:
         generations = (GENERATIONS[100], GENERATIONS[101])
-    block = extract_inventory_oracle()
     if pin is None:
         pin = PIN
     if ledger is None:
@@ -172,6 +172,7 @@ def run_oracle(report, *, modfs, pin=None, modpath=MODPATH, ledger=None,
         outside_wl = globals()["outside_wl"]()
     with tempfile.TemporaryDirectory() as raw:
         tmp = Path(raw)
+        stamp(tmp, "inventory-cgroup")
         (tmp / "r.json").write_text(
             json.dumps(report) if report_text is None else report_text)
         (tmp / "in.wl").write_text(inside_wl)
@@ -184,13 +185,18 @@ def run_oracle(report, *, modfs, pin=None, modpath=MODPATH, ledger=None,
                    if not k.startswith("PYTHON")}
             env.update(extra_env)
         proc = subprocess.run(
-            argv + ["r.json", "in.wl", "out.wl",
-                    json.dumps(pin) if pin_text is None else pin_text,
-                    str(inside_iters), str(outside_iters),
-                    modpath, modfs,
-                    str(generations[0]), str(generations[1])],
-            input=block, capture_output=True, text=True, timeout=30,
-            cwd=str(tmp), env=env)
+            argv + [str(RECORDS), "cgroup-inventory", "--stamp", "inventory-cgroup.stamp",
+                    "--run-id", RUN_ID, "--verdict", "verdict.json", "--cell", "inventory-cgroup",
+                    "--report", "r.json", "--inside-wl", "in.wl", "--outside-wl", "out.wl",
+                    "--pin", json.dumps(pin) if pin_text is None else pin_text,
+                    "--inside-iters", str(inside_iters), "--outside-iters", str(outside_iters),
+                    "--module", modpath, "--module-fs", modfs,
+                    "--inside-pid", str(pids[0]), "--inside-gen", str(generations[0]),
+                    "--child-pid", str(pids[1]), "--child-gen", str(generations[1]),
+                    "--outside-pid", str(pids[2])],
+            capture_output=True, text=True, timeout=30, cwd=str(tmp), env=env)
+        if verdict_out is not None:
+            verdict_out.update(json.loads((tmp / "verdict.json").read_text()))
     return proc.returncode, verdict(proc.stdout + proc.stderr)
 
 
@@ -1514,7 +1520,8 @@ class WorkloadLedgerTests(unittest.TestCase):
         text = QUAL.read_text()
         self.assertIn('asuser "$CFORK" "$MODULE" "$inside_iters" 200', text)
         self.assertIn('"$GATED" "$MODULE" "$outside_iters" 200 "$outside_gate"', text)
-        self.assertIn('"$before" "$inside_iters" "$outside_iters" "$MODULE"', text)
+        self.assertIn('--pin "$before" --inside-iters "$inside_iters" --outside-iters "$outside_iters" '
+                      '--module "$MODULE"', text)
 
     def test_inside_iterations_come_from_the_shell(self):
         self.fails("inside ledger attempts 500 are not two members of 249 "

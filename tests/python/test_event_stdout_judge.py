@@ -3,9 +3,10 @@
 # SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Contract for the inventory-event-stdout cell judge.
 
-The judge lives inline in scripts/qualify-public-cli.sh
-(`inventory_event_stdout()`); this suite extracts that exact heredoc and
-runs it against synthetic streams. The totals cadence is anchored at
+The judge is the `event-stdout` judge of scripts/qualify_records.py,
+which `inventory_event_stdout()` in scripts/qualify-public-cli.sh calls;
+this suite runs it against synthetic streams and decides from its typed
+verdict record. The totals cadence is anchored at
 `started`, not at a pass number: on a slow attach the first pass
 commits after the interval is already due, so the first totals
 legitimately trails pass 0, while a totals before its due date is
@@ -15,7 +16,6 @@ Run: python3 -I tests/python/test_event_stdout_judge.py -v
 """
 
 import json
-import os
 import subprocess
 import sys
 import tempfile
@@ -29,18 +29,8 @@ SCHEMA = "p11scope/inventory-events/v1"
 INTERVAL_NS = 2_000_000_000
 
 
-def extract_judge():
-    lines = SCRIPT.read_text(encoding="utf-8").splitlines()
-    start = next(
-        i for i, line in enumerate(lines) if line == "inventory_event_stdout() {"
-    )
-    heredoc = next(i for i in range(start, len(lines)) if "<<'PY'" in lines[i])
-    end = next(i for i in range(heredoc + 1, len(lines)) if lines[i] == "PY")
-    block = "\n".join(lines[heredoc + 1 : end]) + "\n"
-    assert SCHEMA in block and "event-epipe.head" in block, (
-        "extracted the wrong heredoc"
-    )
-    return block
+RECORDS = ROOT / "scripts" / "qualify_records.py"
+RUN_ID = "test-run"
 
 
 def row(seq, at_ns, kind, event):
@@ -68,6 +58,7 @@ def totals(pass_no):
         "callers": 1,
         "modules": 1,
         "edges": 1,
+        "stdout_lost": {"lines": 0, "bytes": 0},
     }
 
 
@@ -79,18 +70,20 @@ def report(passes, event_output=COMPLETE):
     return {
         "schema": "p11scope/inventory/v1",
         "observation": {"passes": passes},
-        "callers": [0],
-        "modules": [0],
-        "edges": [0],
+        "callers": [{}],
+        "modules": [{}],
+        "edges": [{}],
         "event_output": dict(event_output),
     }
 
 
 def run_judge(stream, full_report):
-    judge = extract_judge()
+    """Run the loader's event-stdout judge; the result carries the parsed
+    verdict record as `.verdict`."""
     with tempfile.TemporaryDirectory() as tmp:
         tmpdir = Path(tmp)
-        (tmpdir / "judge.py").write_text(judge, encoding="utf-8")
+        subprocess.run([sys.executable, "-I", str(RECORDS), "stamp", "inventory-event-stdout.stamp",
+                        RUN_ID, "inventory-event-stdout"], cwd=tmp, check=True)
         with (tmpdir / "event-stdout.jsonl").open("w", encoding="utf-8") as handle:
             for entry in stream:
                 handle.write(json.dumps(entry) + "\n")
@@ -101,24 +94,18 @@ def run_judge(stream, full_report):
             json.dumps(report(1, TRUNCATED)), encoding="utf-8"
         )
         (tmpdir / "event-epipe.head").write_bytes(b"{" + b"x" * 199)
-        (tmpdir / "event-epipe.stderr").write_text(
-            "p11scope: inventory event log stdout shed 2 lines\n", encoding="utf-8"
-        )
-        env = dict(
-            os.environ,
-            full_out=str(tmpdir / "event-stdout.json"),
-            epipe_out=str(tmpdir / "event-epipe.json"),
-            rc1="0",
-            rc2="1",
-        )
-        return subprocess.run(
-            [sys.executable, "-I", "judge.py"],
+        result = subprocess.run(
+            [sys.executable, "-I", str(RECORDS), "event-stdout", "--stamp", "inventory-event-stdout.stamp",
+             "--run-id", RUN_ID, "--verdict", "verdict.json", "--jsonl", "event-stdout.jsonl",
+             "--full-report", "event-stdout.json", "--epipe-report", "event-epipe.json",
+             "--epipe-head", "event-epipe.head", "--rc1", "0", "--rc2", "1"],
             cwd=tmp,
-            env=env,
             capture_output=True,
             text=True,
             timeout=60,
         )
+        result.verdict = json.loads((tmpdir / "verdict.json").read_text(encoding="utf-8"))
+        return result
 
 
 STARTED = 1_000_000_000_000
@@ -159,7 +146,7 @@ class EventStdoutJudgeTests(unittest.TestCase):
         ]
         result = run_judge(stream, report(1))
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('row["at_ns"] - last_at', result.stderr)
+        self.assertEqual(result.verdict["rule"], "event.totals-cadence", result.stdout)
 
     def test_totals_disagreeing_with_its_marker_rejected(self):
         commit = STARTED + 2_700_000_000
@@ -173,7 +160,7 @@ class EventStdoutJudgeTests(unittest.TestCase):
         ]
         result = run_judge(stream, report(1))
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('marker["totals"]', result.stderr)
+        self.assertEqual(result.verdict["rule"], "event.totals-marker", result.stdout)
 
 
 if __name__ == "__main__":

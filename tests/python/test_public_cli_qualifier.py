@@ -61,16 +61,14 @@ def write_results(tmp, rows):
     return path
 
 
-def extract_inventory_oracle():
-    """Extract the inventory-cgroup python oracle block from the qualifier."""
-    lines = QUAL.read_text().splitlines(keepends=True)
-    start = next(
-        i for i, line in enumerate(lines)
-        if '"$cell-inside.wl"' in line
-        and line.strip().startswith(("python3 -I - ", "python3 - ")))
-    end = next(i for i in range(start, len(lines))
-               if lines[i].rstrip("\n") == "PY")
-    return "".join(lines[start + 1:end])
+RECORDS = ROOT / "scripts" / "qualify_records.py"
+RUN_ID = "test-run"
+
+
+def stamp(tmp, cell):
+    """The shell's run stamp for one leg (written before its inputs)."""
+    subprocess.run(["python3", "-I", str(RECORDS), "stamp", str(Path(tmp) / (cell + ".stamp")),
+                    RUN_ID, cell], check=True)
 
 
 MODPATH = "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so"
@@ -176,23 +174,25 @@ def overlay_published_report():
 
 
 def run_oracle(report, *, modfs="overlayfs", pin=None):
-    """Run the extracted oracle against a fixture report."""
-    block = extract_inventory_oracle()
+    """Run the loader's cgroup-inventory judge against a fixture report."""
     if pin is None:
         pin = {"dev": [0, 0], "ino": 0, "sha256": "00"}
     inside_wl = "READY pid=100\nCHILD pid=101\n%s\n" % INSIDE_LEDGER
     outside_wl = "READY pid=102\n%s\n" % OUTSIDE_LEDGER
     with tempfile.TemporaryDirectory() as raw:
         tmp = Path(raw)
+        stamp(tmp, "inventory-cgroup")
         (tmp / "r.json").write_text(json.dumps(report))
         (tmp / "in.wl").write_text(inside_wl)
         (tmp / "out.wl").write_text(outside_wl)
         proc = subprocess.run(
-            ["python3", "-I", "-", "r.json", "in.wl", "out.wl",
-             json.dumps(pin), "250", "500", MODPATH, modfs,
-             str(GENERATIONS[100]), str(GENERATIONS[101])],
-            input=block, capture_output=True, text=True, timeout=30,
-            cwd=str(tmp))
+            ["python3", "-I", str(RECORDS), "cgroup-inventory", "--stamp", "inventory-cgroup.stamp",
+             "--run-id", RUN_ID, "--cell", "inventory-cgroup", "--report", "r.json",
+             "--inside-wl", "in.wl", "--outside-wl", "out.wl", "--pin", json.dumps(pin),
+             "--inside-iters", "250", "--outside-iters", "500", "--module", MODPATH,
+             "--module-fs", modfs, "--inside-pid", "100", "--inside-gen", str(GENERATIONS[100]),
+             "--child-pid", "101", "--child-gen", str(GENERATIONS[101]), "--outside-pid", "102"],
+            capture_output=True, text=True, timeout=30, cwd=str(tmp))
     return proc.returncode, verdict(proc.stdout + proc.stderr)
 
 
@@ -422,7 +422,7 @@ class ScriptTextTests(unittest.TestCase):
         # may remain. The oracle still fails loudly on unnamed
         # owned-module gaps.
         text = QUAL.read_text()
-        self.assertIn("inventory gaps about owned module", text,
+        self.assertIn("inventory gaps about owned module", RECORDS.read_text(),
                       "the oracle must still fail loudly on unnamed owned-module gaps")
         anchor = 'detail="$detail observer_rc=$observer_rc"'
         start = text.index(anchor)
@@ -435,14 +435,15 @@ class ScriptTextTests(unittest.TestCase):
                          "the inventory 7.x expected-failure reason must be gone")
 
     def test_inventory_overlay_published_shape_present(self):
-        text = QUAL.read_text()
+        # The judge lives in the loader; the shell keeps the fs gate.
+        text = QUAL.read_text() + RECORDS.read_text()
         self.assertNotIn("REASON_INVENTORY_OVERLAY", text,
                          "the overlay empty view is fixed; its reason must be gone")
         self.assertNotIn("inventory overlay unproven signature", text,
                          "the empty-view signature must be gone: it never qualifies")
         self.assertIn('module_fs=$(stat -f -c %T "$MODULE"', text,
                       "the overlay branch must be gated on the module fs")
-        self.assertIn("modfs=='overlayfs'", text,
+        self.assertIn('modfs == "overlayfs"', text,
                       "the gate must use stat(1)'s spelling: GNU stat "
                       "prints 'overlayfs', never 'overlay'")
         self.assertIn("empty view never qualifies", text,
@@ -513,16 +514,13 @@ class ObserverGateTests(unittest.TestCase):
 
 
 def extract_inventory_invocation():
-    """The cgroup cell's real oracle invocation: the python3 line with its
-    shell arguments, the heredoc body and its terminator."""
+    """The cgroup cell's real judge invocation: the loader call line with
+    its shell arguments, exactly as the qualifier runs it."""
     lines = QUAL.read_text().splitlines(keepends=True)
-    start = next(
-        i for i, line in enumerate(lines)
-        if '"$cell-inside.wl"' in line
-        and line.strip().startswith(("python3 -I - ", "python3 - ")))
-    end = next(i for i in range(start, len(lines))
-               if lines[i].rstrip("\n") == "PY")
-    return "".join(lines[start:end + 1])
+    found = [line for line in lines if 'python3 -I "$RECORDS" cgroup-inventory ' in line]
+    if len(found) != 1:
+        raise AssertionError("%d cgroup-inventory invocations" % len(found))
+    return found[0]
 
 
 class GenerationHandoffTests(unittest.TestCase):
@@ -532,14 +530,17 @@ class GenerationHandoffTests(unittest.TestCase):
     def run_invocation(self, gen, childgen, report=None, optimize=False):
         body = (
             "cell=inventory-cgroup; ext=json; module_fs=overlayfs\n"
+            "RECORDS=%s; RUN_ID=%s\n"
+            "inside=100; child_owned=101; outside=102\n"
             "%sMODULE=%s\nbefore='%s'\ngen=%s; childgen=%s\n"
             "inside_iters=250; outside_iters=500\n%s"
             "echo RC=$?\ncat \"$cell.detail\"\n"
-            % ("export PYTHONOPTIMIZE=1\n" if optimize else "",
+            % (RECORDS, RUN_ID, "export PYTHONOPTIMIZE=1\n" if optimize else "",
                MODPATH, json.dumps(PUBLISHED_PIN), gen, childgen,
                extract_inventory_invocation()))
         with tempfile.TemporaryDirectory() as raw:
             tmp = Path(raw)
+            stamp(tmp, "inventory-cgroup")
             (tmp / "inventory-cgroup.json").write_text(
                 json.dumps(report or overlay_published_report()))
             (tmp / "inventory-cgroup-inside.wl").write_text(
@@ -579,8 +580,9 @@ class GenerationHandoffTests(unittest.TestCase):
         self.assertIn("RC=0", out)
 
     def test_invocation_passes_parent_then_child(self):
-        line = extract_inventory_invocation().splitlines()[0]
-        self.assertIn('"$module_fs" "$gen" "$childgen" <<', line)
+        line = extract_inventory_invocation()
+        self.assertIn('--inside-pid "$inside" --inside-gen "$gen" --child-pid "${child_owned}" '
+                      '--child-gen "$childgen" --outside-pid "$outside"', line)
 
 
 def qualifier_heredocs():
@@ -596,13 +598,18 @@ def qualifier_heredocs():
 
 class OptimizationProofTests(unittest.TestCase):
     """No qualifier check depends on assert statements, and every python
-    heredoc runs isolated from inherited PYTHON* settings."""
+    run (the remaining heredocs and every loader judge) is isolated from
+    inherited PYTHON* settings."""
 
     def test_heredocs_found(self):
-        self.assertGreaterEqual(len(qualifier_heredocs()), 9)
+        # The evidence judges moved into the loader; the four remaining
+        # heredocs only format rows, receipts and the summary.
+        self.assertEqual(len(qualifier_heredocs()), 4)
 
     def test_no_heredoc_uses_assert_statements(self):
-        for line, body in qualifier_heredocs():
+        bodies = [(line, body) for line, body in qualifier_heredocs()]
+        bodies.append(("scripts/qualify_records.py", RECORDS.read_text()))
+        for line, body in bodies:
             with self.subTest(invocation=line.strip()[:60]):
                 tree = ast.parse(body)
                 asserts = [node.lineno for node in ast.walk(tree)
@@ -613,6 +620,14 @@ class OptimizationProofTests(unittest.TestCase):
         for line, _ in qualifier_heredocs():
             with self.subTest(invocation=line.strip()[:60]):
                 self.assertIn("python3 -I - ", line + " ")
+
+    def test_every_loader_call_runs_isolated(self):
+        text = QUAL.read_text()
+        calls = [line for line in text.splitlines() if '"$RECORDS"' in line]
+        self.assertGreaterEqual(len(calls), 8)
+        for line in calls:
+            with self.subTest(call=line.strip()[:80]):
+                self.assertIn('python3 -I "$RECORDS" ', line)
 
 
 class InventoryOverlayTests(unittest.TestCase):
@@ -753,111 +768,42 @@ def compile_oracle(module, label, mode):
 
 
 def extract_handoff_oracle():
-    """Extract the run-prearm python oracle block from the qualifier."""
-    lines = QUAL.read_text().splitlines(keepends=True)
-    start = next(
-        i for i, line in enumerate(lines)
-        if line.strip() in ("detail=$(python3 -I - <<'PY' 2>&1", "detail=$(python3 - <<'PY' 2>&1"))
-    end = next(i for i in range(start, len(lines))
-               if lines[i].rstrip("\n") == "PY")
-    return "".join(lines[start + 1:end])
+    """The run-prearm judge's source: the typed loader module."""
+    return RECORDS.read_text()
+
+
+def load_records():
+    """Compile the whole loader module at COMPILE_OPTIMIZE (the module,
+    not a copy; its __main__ guard keeps the command line from running)."""
+    namespace = {"__name__": "qualify_records", "__file__": str(RECORDS)}
+    exec(compile_oracle(ast.parse(RECORDS.read_text()), str(RECORDS), "exec"), namespace)
+    return namespace
 
 
 def load_handoff_pair():
-    """Compile assert_handoff_pair from the real oracle block.
-
-    AST-extracted (not copied) so the tests track the shipped oracle;
-    only the function is compiled, never the block's top-level capture
-    assertions.
-    """
-    tree = ast.parse(extract_handoff_oracle())
-    for node in tree.body:
-        if isinstance(node, ast.FunctionDef) and node.name == "assert_handoff_pair":
-            namespace = {}
-            exec(compile_oracle(ast.Module(body=[node], type_ignores=[]),
-                         "<handoff>", "exec"), namespace)
-            return namespace["assert_handoff_pair"]
-    raise AssertionError("assert_handoff_pair missing from the run-prearm oracle")
-
-
-def load_pre68_dispatch(name, label):
-    """Compile a pre-6.8 twin dispatch from the real oracle block.
-
-    AST-extracted (not copied) so the tests track the shipped oracle;
-    the handoff-pair delegate compiles into the same namespace
-    (functions only, never the block's top-level capture assertions).
-    """
-    tree = ast.parse(extract_handoff_oracle())
-    nodes = [node for node in tree.body
-             if isinstance(node, ast.FunctionDef)
-             and node.name in ("assert_handoff_pair", name)]
-    found = {node.name for node in nodes}
-    if "assert_handoff_pair" not in found:
-        raise AssertionError("assert_handoff_pair missing from the run-prearm oracle")
-    if name not in found:
-        raise AssertionError(f"{name} missing from the run-prearm oracle")
-    namespace = {}
-    exec(compile_oracle(ast.Module(body=nodes, type_ignores=[]),
-                 label, "exec"), namespace)
-    return namespace[name]
+    """assert_handoff_pair from the real loader."""
+    return load_records()["assert_handoff_pair"]
 
 
 def load_pre68_held():
-    """Compile assert_pre68_held from the real oracle block."""
-    return load_pre68_dispatch("assert_pre68_held", "<pre68-held>")
+    """assert_pre68_held from the real loader."""
+    return load_records()["assert_pre68_held"]
 
 
 def load_pre68_passive():
-    """Compile assert_pre68_passive from the real oracle block."""
-    return load_pre68_dispatch("assert_pre68_passive", "<pre68-passive>")
+    """assert_pre68_passive from the real loader."""
+    return load_records()["assert_pre68_passive"]
 
 
 def load_prearm_counter():
-    """Compile completed_calls from the real run-prearm oracle block.
-
-    AST-extracted (not copied) so the tests track the shipped counter;
-    only the function is compiled, never the block's top-level capture
-    assertions.
-    """
-    tree = ast.parse(extract_handoff_oracle())
-    for node in tree.body:
-        if isinstance(node, ast.FunctionDef) and node.name == "completed_calls":
-            namespace = {}
-            exec(compile_oracle(ast.Module(body=[node], type_ignores=[]),
-                         "<prearm-counter>", "exec"), namespace)
-            return namespace["completed_calls"]
-    raise AssertionError("completed_calls missing from the run-prearm oracle")
+    """completed_calls from the real loader."""
+    return load_records()["completed_calls"]
 
 
 def load_prearm_gate():
-    """Compile the shipped `if not (counts == (3, 3, 1))` gate (not a copy).
-
-    Returns a gate(counts) callable executing exactly that check:
-    healthy (3, 3, 1) passes, any other count raises AssertionError.
-    """
-    tree = ast.parse(extract_handoff_oracle())
-    for node in tree.body:
-        if not (isinstance(node, ast.If) and isinstance(node.test, ast.UnaryOp)
-                and isinstance(node.test.op, ast.Not) and not node.orelse
-                and len(node.body) == 1 and isinstance(node.body[0], ast.Raise)):
-            continue
-        test = node.test.operand
-        if not (isinstance(test, ast.Compare) and isinstance(test.left, ast.Name)
-                and test.left.id == "counts" and len(test.ops) == 1
-                and isinstance(test.ops[0], ast.Eq) and len(test.comparators) == 1):
-            continue
-        compar = test.comparators[0]
-        if not (isinstance(compar, ast.Tuple)
-                and [getattr(elt, "value", None) for elt in compar.elts] == [3, 3, 1]):
-            continue
-        code = compile_oracle(ast.Module(body=[node], type_ignores=[]),
-                       "<prearm-gate>", "exec")
-
-        def gate(counts, _code=code):
-            exec(_code, {"counts": counts})
-
-        return gate
-    raise AssertionError("run-prearm (3, 3, 1) gate missing from the oracle")
+    """The loader's (3, 3, 1) trace-count gate: healthy (3, 3, 1)
+    passes, any other count raises (an AssertionError subclass)."""
+    return load_records()["check_trace_counts"]
 
 
 def prearm_trace_lines(*, separator=" -> ", counts=(3, 3, 1)):
@@ -940,18 +886,18 @@ class HandoffPairTests(unittest.TestCase):
                     self.check(module)
 
     def test_handoff_pair_call_sites_are_the_two_pre68_twins(self):
-        text = QUAL.read_text()
+        text = RECORDS.read_text()
         self.assertEqual(text.count("assert_handoff_pair("), 3,
                          "def plus exactly the held/passive pre-6.8 calls")
 
     def test_six_eight_plus_branch_is_unchanged(self):
         # The >= 6.8 path keeps its exact assertions: held [] and the
         # passive single pre_attach with end == attached_at.
-        text = QUAL.read_text()
+        text = RECORDS.read_text()
         for line in (
-            'if not (held["unobserved_windows"] == []): raise AssertionError(held["unobserved_windows"])',
-            'if not (windows and len(windows) == 1 and windows[0]["reason"] == "pre_attach"): raise AssertionError(windows)',
-            'if not (windows[0]["end_ns"] == passive["attached_at_ns"]): raise AssertionError(windows)',
+            'require(held["unobserved_windows"] == [], PREARM_HELD, repr(held["unobserved_windows"]))',
+            'require(len(windows) == 1 and windows[0]["reason"] == "pre_attach", PREARM_PASSIVE, repr(windows))',
+            'require(windows[0]["end_ns"] == module["attached_at_ns"], PREARM_PASSIVE, repr(windows))',
         ):
             with self.subTest(line=line):
                 self.assertIn(line, text)
@@ -1054,7 +1000,7 @@ class Pre68DispatchTests(unittest.TestCase):
             check({"attached_at_ns": 200})
 
     def test_dispatch_call_sites_are_the_two_pre68_twins(self):
-        text = QUAL.read_text()
+        text = RECORDS.read_text()
         self.assertEqual(text.count("assert_pre68_held("), 2,
                          "def plus exactly the held pre-6.8 call")
         self.assertEqual(text.count("assert_pre68_passive("), 2,
@@ -1189,12 +1135,6 @@ class OptimizeLevelProofTests(unittest.TestCase):
             COMPILE_OPTIMIZE = -1
 
 
-PREARM_RUNNER = (
-    "import platform, sys\n"
-    "platform.release = lambda: sys.argv[1]\n"
-    "exec(compile(open(sys.argv[2]).read(), '<run-prearm>', 'exec'))\n")
-
-
 def prearm_trace(counts=(3, 3, 1)):
     names = ("C_Initialize", "C_Finalize", "C_GetFunctionList")
     rows = []
@@ -1223,16 +1163,19 @@ def prearm_twins():
     held_text = ["noise"] + prearm_trace() + [
         "EVIDENCE " + json.dumps(prearm_evidence([]))]
     passive_text = ["EVIDENCE " + json.dumps(prearm_evidence(PRE_ATTACH))]
-    ledger = [json.dumps({"initializes": 1, "finalizes": 1}), "",
-              json.dumps({"initializes": 3, "finalizes": 3})]
+    # The loader's real ledger: one row per completed pair, then one
+    # summary (prearm-first-use.c).
+    ledger = [json.dumps({"pair": n, "init_ns": 10 + n, "init_returned_ns": 20 + n,
+                          "fini_returned_ns": 30 + n}) for n in range(3)]
+    ledger.append(json.dumps({"initializes": 3, "finalizes": 3}))
     return {"held": [held_text, list(ledger)],
             "passive": [passive_text, list(ledger)]}
 
 
 class WholePrearmBlockTests(unittest.TestCase):
-    """The whole run-prearm block (top-level checks included) against
-    twin files, under the plain, -O and inherited-PYTHONOPTIMIZE
-    interpreters, with a faked kernel release."""
+    """The whole run-prearm judge of the loader against twin files,
+    under the plain, -O and inherited-PYTHONOPTIMIZE interpreters, with
+    a given kernel release."""
 
     MODES = (("plain", ["python3", "-I"], None),
              ("-O", ["python3", "-O", "-I"], None),
@@ -1242,7 +1185,7 @@ class WholePrearmBlockTests(unittest.TestCase):
     def run_block(self, twins, release, argv, extra_env):
         with tempfile.TemporaryDirectory() as tmp_name:
             tmp = Path(tmp_name)
-            (tmp / "block.py").write_text(extract_handoff_oracle())
+            stamp(tmp, "run-prearm")
             for name, (text, ledger) in twins.items():
                 (tmp / ("run-prearm-%s.txt" % name)).write_text("\n".join(text) + "\n")
                 (tmp / ("run-prearm-%s.wl" % name)).write_text("\n".join(ledger) + "\n")
@@ -1252,7 +1195,12 @@ class WholePrearmBlockTests(unittest.TestCase):
                 env = {k: v for k, v in os.environ.items()
                        if not k.startswith("PYTHON")}
                 env.update(extra_env)
-            proc = subprocess.run(argv + ["-c", PREARM_RUNNER, release, "block.py"],
+            proc = subprocess.run(argv + [str(RECORDS), "run-prearm", "--stamp", "run-prearm.stamp",
+                                          "--run-id", RUN_ID, "--kernel-release", release,
+                                          "--held-report", "run-prearm-held.txt",
+                                          "--held-ledger", "run-prearm-held.wl",
+                                          "--passive-report", "run-prearm-passive.txt",
+                                          "--passive-ledger", "run-prearm-passive.wl"],
                                   cwd=tmp, capture_output=True, text=True,
                                   timeout=30, env=env)
             return proc.returncode, verdict(proc.stdout + proc.stderr)
@@ -1553,20 +1501,8 @@ class CounterRefusalTests(unittest.TestCase):
 
 
 def load_completed_calls():
-    """Compile completed_calls from the real oracle block.
-
-    AST-extracted (not copied) so the tests track the shipped oracle;
-    only the function is compiled, never the block's top-level capture
-    assertions.
-    """
-    tree = ast.parse(extract_handoff_oracle())
-    for node in tree.body:
-        if isinstance(node, ast.FunctionDef) and node.name == "completed_calls":
-            namespace = {}
-            exec(compile_oracle(ast.Module(body=[node], type_ignores=[]),
-                         "<completed>", "exec"), namespace)
-            return namespace["completed_calls"]
-    raise AssertionError("completed_calls missing from the run-prearm oracle")
+    """completed_calls from the real loader."""
+    return load_prearm_counter()
 
 
 class CompletedCallsTests(unittest.TestCase):

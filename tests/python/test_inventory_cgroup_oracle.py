@@ -33,6 +33,8 @@ NATIVE = ("no settled expected native image for this caller in the "
 REFRESH_RETAINED = ("the final-sample permit was not granted; "
                     "prior owner facts retained")
 REFRESH_MEMBER_LOST = "the final-sample permit was not granted"
+DEFERRED = ("only one native owner activation per transaction; the staged "
+            "owner is deferred to a later pass; scan-pinned fallback retained")
 DEADLINE = "cgroup collection deadline reached"
 UNBOUND_SUBJECT = "used by an unidentified caller image"
 UNBOUND_FIRST = "no live caller incarnation held the tgid when the row was read"
@@ -424,6 +426,80 @@ class RefuseTests(unittest.TestCase):
         rc, out = run_oracle(report, modfs="ext4")
         self.assertNotEqual(rc, 0, out)
         self.assertIn("duplicate retained refresh for one caller", out)
+
+
+def deferred_recovered_report(*, modfs_witness=False):
+    """Both members settle in one pass (CI run 45046518330, v6.12.111).
+
+    Late binding settles the fork child's expected image in the same
+    pass as the parent's, so both stage; the one-commit-per-transaction
+    gate activates c0 and defers c1 by name; the next pass activates
+    c1 from fresh proof. Both callers end native_exact, and the child's
+    witness row binds to c1, so no module-level unbound positive exists.
+    """
+    report = witness_available_report() if modfs_witness else decided_report()
+    report["callers"] = [
+        {"id": "c0", "pid": 100, "image": {"authority": "native_exact"}},
+        {"id": "c1", "pid": 101, "image": {"authority": "native_exact"}}]
+    report["gaps"] = [
+        g for g in report["gaps"]
+        if g.get("subject") != UNBOUND_SUBJECT
+        and not (g.get("caller") == "c1" and g.get("reason") == NATIVE)]
+    report["gaps"].append(
+        {"caller": "c1", "module": None, "pid": 101,
+         "reason": DEFERRED, "subject": "native owner activation refused",
+         "repeats": 1})
+    return report
+
+
+class DeferredActivationTests(unittest.TestCase):
+    def test_deferred_then_activated_member_passes_degraded(self):
+        rc, out = run_oracle(deferred_recovered_report(), modfs="overlayfs")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("unproven=2 gaps=4", out)
+
+    def test_deferred_then_activated_member_passes_witness_available(self):
+        rc, out = run_oracle(deferred_recovered_report(modfs_witness=True),
+                             modfs="ext4")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("unproven=0 gaps=2", out)
+
+    def test_deferred_member_that_stays_scan_pinned_fails(self):
+        # Recover and continue: a deferral is a disclosure of one
+        # delayed activation, never a resting state.
+        report = deferred_recovered_report()
+        report["callers"][1]["image"]["authority"] = "scan_pinned"
+        rc, out = run_oracle(report, modfs="overlayfs")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("deferred activation never recovered", out)
+
+    def test_deferred_member_that_stays_scan_pinned_fails_witness_available(self):
+        report = deferred_recovered_report(modfs_witness=True)
+        report["callers"][1]["image"]["authority"] = "scan_pinned"
+        rc, out = run_oracle(report, modfs="ext4")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("deferred activation never recovered", out)
+
+    def test_deferred_member_without_image_fails(self):
+        report = deferred_recovered_report()
+        del report["callers"][1]["image"]
+        rc, out = run_oracle(report, modfs="overlayfs")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("deferred activation never recovered", out)
+
+    def test_callerless_deferral_fails(self):
+        report = deferred_recovered_report()
+        report["gaps"][-1]["caller"] = None
+        rc, out = run_oracle(report, modfs="overlayfs")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("deferred activation never recovered", out)
+
+    def test_deferral_under_another_subject_fails(self):
+        report = deferred_recovered_report()
+        report["gaps"][-1]["subject"] = "native owner refresh refused"
+        rc, out = run_oracle(report, modfs="overlayfs")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("overlay published extra gap", out)
 
 
 if __name__ == "__main__":

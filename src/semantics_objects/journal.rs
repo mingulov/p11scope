@@ -23071,7 +23071,8 @@ pub(crate) mod tests {
                 ObjectEffect::SessionEnded { .. }
                     | ObjectEffect::Unresolved { .. }
                     | ObjectEffect::Gap {
-                        reason: super::ObjectGap::OutcomeLost,
+                        reason: super::ObjectGap::OutcomeLost
+                            | super::ObjectGap::DuplicateCompletion,
                         ..
                     }
             )),

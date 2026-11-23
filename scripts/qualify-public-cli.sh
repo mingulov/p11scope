@@ -1439,7 +1439,7 @@ if not (lb[0]['pid']==parent and lb[0]['exe']=='chain-parent' and lb[0]['start_t
 for a in lb:
     if not (a['pid']!=1): raise AssertionError('init is never shown as the launcher: %r' % (a,))
 for a in lb[1:]:
-    if not (a['pid']>0 and isinstance(a['start_time'],int)): raise AssertionError('ancestor generation: %r' % (a,))
+    if not (type(a['pid']) is int and a['pid']>0 and type(a['start_time']) is int): raise AssertionError('ancestor generation: %r' % (a,))
 if not (c.get('launched_by_origin')=='chain'): raise AssertionError('real chain origin: %r' % (c.get('launched_by_origin'),))
 if not (c.get('launched_by_unit') is None): raise AssertionError('no unit beside a real chain')
 gap=c.get('launched_by_gap')

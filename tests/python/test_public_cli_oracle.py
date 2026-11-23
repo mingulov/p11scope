@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Public CLI oracle entrypoint controls; all expectations are independent."""
 
+import ast
 import copy
 import ctypes
 import hashlib
@@ -299,7 +300,8 @@ def assert_live_deferral_still_folds():
 
 class OracleTests(unittest.TestCase):
     def run_case(self, mutate=None, *, cell="profile-pid", want=0,
-                 allow_pid_descendant_gaps=False, census=None):
+                 allow_pid_descendant_gaps=False, census=None,
+                 python_flags=()):
         report, ledger, receipt = inputs(metrics=cell == "metrics-pid", system=cell == "system")
         receipt["cell"] = cell
         if mutate:
@@ -315,7 +317,7 @@ class OracleTests(unittest.TestCase):
                 paths[key].write_text(text)
             paths["ledger"] = tmp / "ledger"
             paths["ledger"].write_text("\n".join(ledger) + "\n")
-            args = [sys.executable, "-I", str(ORACLE),
+            args = [sys.executable, "-I", *python_flags, str(ORACLE),
                     "--cell", cell, *sum((["--" + key, str(path)]
                                          for key, path in paths.items()), [])]
             if allow_pid_descendant_gaps:
@@ -2229,6 +2231,49 @@ class RunnerNoiseTests(unittest.TestCase):
         result = self.run_case(mutate, cell="system", want=1)
         self.assertIn("lossy or unknown observation gap class",
                       result["detail"])
+
+    def test_oracle_has_no_bare_asserts(self):
+        # Fix5 (no assert-based checks): the oracle refuses via
+        # require(), never bare assert, so optimization cannot
+        # strip a refusal. Pinned structurally.
+        tree = ast.parse(ORACLE.read_text())
+        found = sorted(node.lineno for node in ast.walk(tree)
+                       if isinstance(node, ast.Assert))
+        self.assertEqual(found, [])
+
+    def test_learned_first_use_verdicts_match_under_optimization(self):
+        # Fix5: the first-use accepts in both summary modes and
+        # the strict refusal read identically under python3 -O.
+        def positive(d, l, r):
+            d["evidence"]["skipped"] = [{
+                "name": "learned provider file",
+                "reason": "a provider file was learned after its first use; "
+                          "its earlier calls were not observed"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped", "pid_descendant_gaps"]}
+            d["evidence"]["pid_descendant_gaps"] = 60
+            d["evidence"]["learned_staged_files"] = 1
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        strict = self.run_case(positive, cell="system",
+                               python_flags=("-O",))
+        self.assertEqual(strict["qualification"],
+                         "owned-provider-counts-with-ambient-gap")
+        self.assertIn("learned_first_use=1", strict["detail"])
+        self.assertIn("learned_staged_files=1", strict["detail"])
+        relaxed = self.run_case(positive, cell="system",
+                                allow_pid_descendant_gaps=True,
+                                python_flags=("-O",))
+        self.assertEqual(relaxed["qualification"],
+                         "owned-provider-counts-with-runner-noise")
+        self.assertIn("learned_first_use=1", relaxed["detail"])
+
+        def refusal(d, l, r):
+            positive(d, l, r)
+            d["evidence"]["learned_staged_files"] = 2
+        failed = self.run_case(refusal, cell="system", want=1,
+                               python_flags=("-O",))
+        self.assertIn("lossy or unknown observation gap class",
+                      failed["detail"])
 
     def test_attribution_gap_without_noise_passes_in_both_modes(self):
         # The system counts cell never gated attribution/semantics gaps

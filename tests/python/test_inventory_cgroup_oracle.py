@@ -14,6 +14,7 @@ scripts/qualify-public-cli.sh (not copied) so the twins track the
 real code.
 """
 
+import ast
 import json
 import subprocess
 import tempfile
@@ -75,6 +76,26 @@ def run_oracle(report, *, modfs, pin=None, modpath=MODPATH):
         (tmp / "out.wl").write_text(outside_wl)
         proc = subprocess.run(
             ["python3", "-I", "-", "r.json", "in.wl", "out.wl",
+             json.dumps(pin), modpath, modfs],
+            input=block, capture_output=True, text=True, timeout=30,
+            cwd=str(tmp))
+    return proc.returncode, proc.stdout + proc.stderr
+
+
+def run_oracle_optimized(report, *, modfs, pin=None, modpath=MODPATH):
+    """Run the extracted oracle with assertions stripped (python3 -O)."""
+    block = extract_inventory_oracle()
+    if pin is None:
+        pin = PIN
+    inside_wl = "READY pid=100\nCHILD pid=101\nLEDGER x\n"
+    outside_wl = "READY pid=102\nLEDGER y\n"
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        (tmp / "r.json").write_text(json.dumps(report))
+        (tmp / "in.wl").write_text(inside_wl)
+        (tmp / "out.wl").write_text(outside_wl)
+        proc = subprocess.run(
+            ["python3", "-I", "-O", "-", "r.json", "in.wl", "out.wl",
              json.dumps(pin), modpath, modfs],
             input=block, capture_output=True, text=True, timeout=30,
             cwd=str(tmp))
@@ -903,6 +924,110 @@ class TransactionReasonTests(unittest.TestCase):
                     rc, out = run_oracle(report, modfs=modfs)
                     self.assertNotEqual(rc, 0, out)
                     self.assertIn(message, out)
+
+    def test_transaction_with_fallback_reason_fails_on_both_substrates(self):
+        # Fix5: the fallback reason is known on the degraded branch
+        # for its own native-refusal subject only — a transaction
+        # row carrying it is an impossible shape and must fail on
+        # both substrates, with the branch-appropriate message.
+        for modfs, base, message in (
+                ("overlayfs", decided_report,
+                 "overlay published extra gap"),
+                ("ext4", witness_available_report,
+                 "unrecognized cgroup transaction row")):
+            with self.subTest(substrate=modfs):
+                report = base()
+                report["gaps"].append(
+                    straddle_deadline_row(over={"reason": NATIVE}))
+                rc, out = run_oracle(report, modfs=modfs)
+                self.assertNotEqual(rc, 0, out)
+                self.assertIn(message, out)
+
+
+class ExplicitRefusalTests(unittest.TestCase):
+    # Fix5 (no assert-based checks): every refusal in the extracted
+    # inventory-cgroup block raises explicitly, so the verdicts are
+    # identical under optimization (python3 -O strips bare asserts).
+    # The AST test pins the property structurally; the behavioral
+    # test pins it on the accepts plus one refusal per guard family
+    # (transaction gate, validated deadline collection, retained
+    # presence, prep shape, degraded reason list, empty view).
+    def test_block_has_no_bare_asserts(self):
+        tree = ast.parse(extract_inventory_oracle())
+        found = sorted(node.lineno for node in ast.walk(tree)
+                       if isinstance(node, ast.Assert))
+        self.assertEqual(found, [])
+
+    def test_verdicts_match_under_optimization(self):
+        accepts = [
+            ("decided overlay", decided_report(), "overlayfs"),
+            ("witness available", witness_available_report(), "ext4"),
+        ]
+        for name, report, modfs in accepts:
+            with self.subTest(case=name):
+                rc, out = run_oracle_optimized(report, modfs=modfs)
+                self.assertEqual(rc, 0, out)
+        refusals = [
+            ("transaction unknown reason",
+             {"reason": "cgroup collection frobnicate exploded"},
+             "overlayfs", "overlay published extra gap"),
+            ("transaction unknown reason",
+             {"reason": "cgroup collection frobnicate exploded"},
+             "ext4", "unrecognized cgroup transaction row"),
+            ("transaction fallback reason",
+             {"reason": NATIVE},
+             "overlayfs", "overlay published extra gap"),
+            ("transaction fallback reason",
+             {"reason": NATIVE},
+             "ext4", "unrecognized cgroup transaction row"),
+            ("malformed deadline scope",
+             {"caller": "c0"},
+             "overlayfs", "malformed run deadline scope"),
+        ]
+        for name, over, modfs, message in refusals:
+            with self.subTest(case=name, substrate=modfs):
+                base = (decided_report() if modfs == "overlayfs"
+                        else witness_available_report())
+                base["gaps"].append(straddle_deadline_row(over=over))
+                rc, out = run_oracle_optimized(base, modfs=modfs)
+                self.assertNotEqual(rc, 0, out)
+                self.assertIn(message, out)
+        prep = decided_report()
+        prep["gaps"].append(
+            straddle_prep_row(over={"subject": "wrong subject"}))
+        prep["gaps"].append(straddle_deadline_row())
+        with self.subTest(case="malformed prep subject"):
+            rc, out = run_oracle_optimized(prep, modfs="overlayfs")
+            self.assertNotEqual(rc, 0, out)
+            self.assertIn("malformed interrupted preparation row", out)
+        retained = decided_report()
+        retained["gaps"].append(
+            {"caller": "c0", "module": None, "pid": 100,
+             "reason": REFRESH_RETAINED,
+             "subject": "native owner refresh refused",
+             "repeats": 1})
+        with self.subTest(case="retained without deadline"):
+            rc, out = run_oracle_optimized(retained, modfs="overlayfs")
+            self.assertNotEqual(rc, 0, out)
+            self.assertIn("retained refresh without a run deadline", out)
+        extra = decided_report()
+        extra["gaps"].append(
+            {"caller": None, "module": None, "pid": None,
+             "reason": "something new", "subject": "novel gap",
+             "repeats": 1})
+        with self.subTest(case="unnamed extra gap"):
+            rc, out = run_oracle_optimized(extra, modfs="overlayfs")
+            self.assertNotEqual(rc, 0, out)
+            self.assertIn("overlay published extra gap", out)
+        empty = decided_report()
+        empty["modules"] = []
+        empty["edges"] = []
+        empty["gaps"] = [g for g in empty["gaps"]
+                         if g.get("module") != "m0"]
+        with self.subTest(case="empty view"):
+            rc, out = run_oracle_optimized(empty, modfs="overlayfs")
+            self.assertNotEqual(rc, 0, out)
+            self.assertIn("empty view never qualifies", out)
 
 
 if __name__ == "__main__":

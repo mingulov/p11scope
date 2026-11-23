@@ -21311,6 +21311,52 @@ int main(int argc, char **argv) {
         assert_eq!(between.requests.len(), 1, "expiry prevents the next chunk");
     }
 
+    /// One mount-table read charges at most 64 new lines per credit and
+    /// polls the stop between strides: 130 lines in a single chunk take
+    /// three line strides (64/64/2) with a stop poll between each, so a
+    /// stop landing mid-table refuses instead of charging the whole
+    /// table in one unbounded spend.
+    #[test]
+    fn mountinfo_reader_polls_between_64_line_strides() {
+        let chunk = "1 1 8:1 / / rw - ext4 /dev/root rw\n".repeat(130);
+        let mut reader =
+            RecordingReader::new([ReaderStep::Bytes(chunk.into_bytes()), ReaderStep::Eof]);
+        let mut budget = CaptureWorkBudget::default();
+        let mut polls = 0;
+        read_mountinfo_with(&mut reader, &mut budget, 1024 * 1024, |_| {
+            polls += 1;
+            None
+        })
+        .unwrap();
+        assert_eq!(
+            polls, 5,
+            "loop-top, two inter-stride, loop-top, publish: {polls}"
+        );
+    }
+
+    /// A stop landing between two line strides refuses with only the
+    /// finished strides charged: tripping on the first inter-stride
+    /// poll (poll 2) charges the one read plus the first 64 lines.
+    #[test]
+    fn mountinfo_reader_stop_between_strides_charges_only_finished_strides() {
+        let chunk = "1 1 8:1 / / rw - ext4 /dev/root rw\n".repeat(130);
+        let mut reader =
+            RecordingReader::new([ReaderStep::Bytes(chunk.into_bytes()), ReaderStep::Eof]);
+        let mut budget = CaptureWorkBudget::default();
+        let mut polls = 0;
+        let error = read_mountinfo_with(&mut reader, &mut budget, 1024 * 1024, |_| {
+            polls += 1;
+            (polls == 2).then_some(SCAN_DEADLINE_REASON)
+        })
+        .unwrap_err();
+        assert_eq!(error, SCAN_DEADLINE_REASON);
+        assert_eq!(
+            budget.work_units, 65,
+            "one read plus the first 64-line stride: {}",
+            budget.work_units
+        );
+    }
+
     /// Fix A: admission charges each unique table once. Byte-identical
     /// repeats skip the candidate charge but still decode (per-view results
     /// are never served from a cache); byte-different tables charge again.

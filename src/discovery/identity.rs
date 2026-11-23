@@ -16578,6 +16578,52 @@ mod tests {
         assert_eq!(found.inode, observer.inode, "inode still comes from fstat");
     }
 
+    /// A different live process that sees the same mount must not
+    /// satisfy the loader fallback: the lookup is bound to the loading
+    /// process's incarnation, not to any pid whose table names the
+    /// mount id: accepting the substitute would misattribute the file.
+    #[test]
+    fn a_substituted_loader_sharing_the_mount_must_not_resolve() {
+        struct LiveChild(std::process::Child);
+        impl Drop for LiveChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let file = open_regular(Path::new("/bin/sh")).unwrap();
+        let observer = mapping_file_key(&file).unwrap();
+        // A retained table that names every mount except this fd's own:
+        // the shape a private mount namespace leaves behind.
+        let stale = "999999 1 8:1 / /other rw - ext4 /dev/other rw\n";
+        // A substitute: another live process in the shared mount
+        // namespace, never the loader — its table names the same mount.
+        let substitute = LiveChild(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn a substitute process sharing the mount namespace"),
+        );
+        let error = identity_with_loader_fallback(
+            &file,
+            Some(stale),
+            Some(substitute.0.id()),
+            &mut CaptureWorkBudget::default(),
+        )
+        .expect_err("a substituted loader must not resolve the foreign mount id");
+        assert_eq!(
+            error,
+            format!(
+                "mapping identity unavailable: fd mount {} is missing from the mount table",
+                observer.mount_id
+            ),
+            "a refused substitution keeps the first error text byte-for-byte"
+        );
+    }
+
     #[test]
     fn a_gone_loader_keeps_the_observer_error() {
         let file = open_regular(Path::new("/bin/sh")).unwrap();

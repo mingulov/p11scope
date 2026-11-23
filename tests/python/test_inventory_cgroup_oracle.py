@@ -1309,6 +1309,8 @@ class IdentityTypeTests(unittest.TestCase):
         ("sha-int", ["identity", "sha256"], 7, "module sha256 has type int"),
         ("admission-state-int", ["admission", "state"], 1,
          "module admission state has type int"),
+        ("admission-missing", ["admission"], _DELETE,
+         "module admission missing"),
     ]
 
     def test_each_identity_type_row_fails(self):
@@ -1326,7 +1328,12 @@ class IdentityTypeTests(unittest.TestCase):
         for name, pin, marker in (
                 ("pin-ino-bool", dict(PIN, ino=True), "pin ino has type bool"),
                 ("pin-dev-float", dict(PIN, dev=[0.0, 46]), "pin dev has type float"),
-                ("pin-sha-null", dict(PIN, sha256=None), "pin sha256 has type NoneType")):
+                ("pin-sha-null", dict(PIN, sha256=None), "pin sha256 has type NoneType"),
+                ("pin-dev-missing", {k: v for k, v in PIN.items() if k != "dev"},
+                 "pin dev missing"),
+                ("pin-dev-triple", dict(PIN, dev=PIN["dev"] + [0]),
+                 "pin dev is not [major, minor]"),
+                ("pin-not-object", [PIN], "pin has type list")):
             with self.subTest(row=name):
                 rc, out = run_oracle(report, modfs="ext4", pin=pin)
                 self.assertNotEqual(rc, 0, out)

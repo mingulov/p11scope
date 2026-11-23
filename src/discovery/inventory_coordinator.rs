@@ -29675,11 +29675,7 @@ exit 0
     fn terminal_retry_total(native: &NativeScene) -> u64 {
         let registry = &native.scene.coordinator.registry;
         let mut total = 0u64;
-        for (gap, repeats) in registry
-            .gaps()
-            .iter()
-            .zip(registry.gap_repeats().iter())
-        {
+        for (gap, repeats) in registry.gaps().iter().zip(registry.gap_repeats().iter()) {
             if gap.subject == "identity retry terminal" {
                 let first = gap.reason.split_whitespace().next().unwrap_or("?");
                 let count: u64 = first
@@ -29957,8 +29953,7 @@ exit 0
             })
             .collect();
         native.witness(rows);
-        let counts: Vec<(u64, u64, usize, u64)> =
-            (0..65).map(|i| (100 + i, 1, 1, 2)).collect();
+        let counts: Vec<(u64, u64, usize, u64)> = (0..65).map(|i| (100 + i, 1, 1, 2)).collect();
         native.counts_read(Vec::new(), counts);
         native
             .scene
@@ -30046,7 +30041,10 @@ exit 0
             "only the rebound fold's receipt is consumed"
         );
         let census = native.scene.coordinator.registry.witness_census();
-        assert_eq!((census.rows, census.bound, census.unbound_total()), (2, 1, 1));
+        assert_eq!(
+            (census.rows, census.bound, census.unbound_total()),
+            (2, 1, 1)
+        );
         native.answer(10, 700, 42);
         native.read(Vec::new());
         native.scene.coordinator.commit_batch(false).unwrap();
@@ -30056,7 +30054,10 @@ exit 0
             "the second retraction consumes the last receipt"
         );
         let census = native.scene.coordinator.registry.witness_census();
-        assert_eq!((census.rows, census.bound, census.unbound_total()), (2, 2, 0));
+        assert_eq!(
+            (census.rows, census.bound, census.unbound_total()),
+            (2, 2, 0)
+        );
         assert_eq!(
             native.module_unbound(),
             None,
@@ -30576,11 +30577,7 @@ exit 0
         let fold_calls = unbound.as_ref().map(|unbound| unbound.entries).unwrap_or(0);
         let mut gap_calls = 0u64;
         let mut gap_rows = 0usize;
-        for (gap, repeats) in registry
-            .gaps()
-            .iter()
-            .zip(registry.gap_repeats().iter())
-        {
+        for (gap, repeats) in registry.gaps().iter().zip(registry.gap_repeats().iter()) {
             if gap.subject == "identity retry terminal" {
                 gap_rows += 1;
                 let first = gap.reason.split_whitespace().next().unwrap_or("?");

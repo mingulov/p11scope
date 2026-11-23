@@ -6040,10 +6040,8 @@ impl CallerRegistry {
     /// guaranteed retention (at most one row per finite cause), never
     /// through the generic budgeted detail that a full quota sheds.
     pub(crate) fn record_terminal_retry_excluded(&mut self, cause: String, excluded: u64) {
-        self.staged.push(Mutation::RecordTerminalRetryExcluded {
-            cause,
-            excluded,
-        });
+        self.staged
+            .push(Mutation::RecordTerminalRetryExcluded { cause, excluded });
     }
 
     /// Enter the terminal/stop-time phase: gaps staged from now on

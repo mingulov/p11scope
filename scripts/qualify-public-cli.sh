@@ -612,7 +612,7 @@ stop=evidence['stop_quiescence']
 proven=stop.get('state')=='proven' and stop.get('post_q_events') is False and stop.get('post_q_discovery') is False
 if not (evidence.get('drain_proven') is proven): raise AssertionError('drain_proven must match the stop-gate evidence')
 samples=evidence.get('scheduling',{}).get('inter_drain_gap',{}).get('samples')
-if not (isinstance(samples,int) and samples>0): raise AssertionError('report must carry this capture live-loop drain samples')
+if not (type(samples) is int and samples>0): raise AssertionError('report must carry this capture live-loop drain samples')
 if not (evidence.get('child_still_running') is False): raise AssertionError('owned child must be settled, not still running')
 PY
   result second-sigint "$([ "$custody" = 1 ] && [ "$cleanup_ok" = 1 ] && [ "$rc" = 130 ] && [ "$report_ok" = 1 ] && grep -qa 'p11scope: cleanup incomplete' sig2.stderr && ! grep -qa panicked sig2.stderr && echo 1 || echo 0)" "rc=$rc child_custody=$custody child=${child:-unknown} cleanup_complete=$cleanup_ok report_ok=$report_ok"

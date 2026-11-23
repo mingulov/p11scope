@@ -25,6 +25,16 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 QUAL = ROOT / "scripts/qualify-public-cli.sh"
 
+
+def verdict(text):
+    """Keep only the lines a check emits: a failure is matched on its
+    final exception line, never on traceback frames (a frame's source
+    line would show a check's message text even when another error
+    raised there)."""
+    return "\n".join(line for line in text.splitlines()
+                     if line and not line[0].isspace()
+                     and not line.startswith("Traceback (most recent call last)"))
+
 MODPATH = "/usr/lib64/pkcs11/libsofthsm2.so"
 PIN = {"dev": [0, 46], "ino": 153887,
        "sha256": "611254bf118e3c4ef0f3ef3dd25667d984202ef10055b7d6d5da20d60898c5a5"}
@@ -209,7 +219,7 @@ def run_oracle(report, *, modfs, pin=None, modpath=MODPATH, ledger=None,
                     str(generations[0]), str(generations[1])],
             input=block, capture_output=True, text=True, timeout=30,
             cwd=str(tmp), env=env)
-    return proc.returncode, proc.stdout + proc.stderr
+    return proc.returncode, verdict(proc.stdout + proc.stderr)
 
 
 def run_oracle_optimized(report, *, modfs, pin=None, modpath=MODPATH):
@@ -2302,6 +2312,15 @@ class WorkloadLedgerTests(unittest.TestCase):
         ("bool-successful", outside_ledger(functions=[
             {"name": n, "attempts": 500, "successful": True} for n in FUNCTIONS]),
          "outside ledger function successful has type bool"),
+        ("schema-missing", outside_ledger().replace('"schema": "p11scope/public-cli-ledger/v1", ', ''),
+         "outside ledger schema missing"),
+        ("name-missing", outside_ledger(functions=[
+            {"attempts": 500, "successful": 500}] + [
+            {"name": n, "attempts": 500, "successful": 500} for n in FUNCTIONS[1:]]),
+         "outside ledger function name missing"),
+        ("function-not-object", outside_ledger(functions=["C_GenerateRandom"] + [
+            {"name": n, "attempts": 500, "successful": 500} for n in FUNCTIONS[1:]]),
+         "outside ledger function has type str"),
         ("renamed", outside_ledger(functions=[
             {"name": n, "attempts": 500, "successful": 500}
             for n in FUNCTIONS[:5] + ["C_Sign"]]),

@@ -44103,6 +44103,298 @@ int main(void) {
     }
 
     #[test]
+    fn a_system_scope_shrunk_exit_after_the_snapshot_stays_unbound() {
+        // The exit witness shrinks after the row's snapshot: proof at
+        // 200, hook 450 drains, row at 400 is read (snapshot
+        // [200, 450)), then the true own exit 300 drains. The row at
+        // 400 lies past the shrunk exit and must stay unbound, never
+        // bind through the stale wide interval.
+        agreeing(|| {
+            let (mut native, caller) = proven_system_native(false);
+            retire_then_exits(&mut native, &[450]);
+            let row = native.row(41, 1, 7, 400, 0);
+            let read = native.stamps.read(native.domain, vec![row]);
+            native.stage(read);
+            let at = native.stamps.tick();
+            native.stage(NativeBatch::Lifecycle(leader_exit_drain(
+                native.domain,
+                at,
+                300,
+            )));
+            native.witness(Vec::new());
+            assert_eq!(bound_census(&native), (1, 0, 0));
+            assert_eq!(no_live_caller(&native), Some(1));
+            assert!(
+                !matches!(native.scene.coverage(caller), UseCoverage::Counted { .. }),
+                "{:?}",
+                native.scene.coverage(caller)
+            );
+        });
+    }
+
+    #[test]
+    fn a_system_scope_reordered_leader_exits_bind_the_row_to_its_own_holder() {
+        // Two proven holders of pid 7 (A [200, ?), B [900, ?)) with
+        // hooks {450, 1_200} draining inverted: 1_200 first, so both
+        // transient intervals cover the row at 1_000. The row must
+        // never bind the oldest holder through the overlap; once the
+        // true 450 shrinks A, the re-sight binds B with its count.
+        agreeing(|| {
+            let (mut native, first) = proven_system_native(false);
+            retire_then_exits(&mut native, &[]);
+            native.scene.source.spawn(7, 800);
+            native.scene.coordinator.adapter.reconcile_detected(
+                &[7].into_iter().collect(),
+                &mut |_| ImageAuthority::ScanPinned,
+                800,
+                &mut || Some(900),
+            );
+            let second = native
+                .scene
+                .coordinator
+                .adapter
+                .live_id(7)
+                .expect("B admitted");
+            assert_ne!(first, second);
+            native.scene.project(7, 950);
+            native.scene.coordinator.commit_batch(false).unwrap();
+            retire_then_exits(&mut native, &[]);
+            let at = native.stamps.tick();
+            native.stage(NativeBatch::Lifecycle(leader_exit_drain(
+                native.domain,
+                at,
+                1_200,
+            )));
+            let row = native.row(42, 1, 7, 1_000, 0);
+            let read = native.stamps.read(native.domain, vec![row]);
+            native.stage(read);
+            let at = native.stamps.tick();
+            native.stage(NativeBatch::Lifecycle(leader_exit_drain(
+                native.domain,
+                at,
+                450,
+            )));
+            native.witness(Vec::new());
+            assert_eq!(bound_census(&native), (1, 1, 0));
+            let edges: Vec<_> = native
+                .scene
+                .coordinator
+                .registry
+                .edges()
+                .map(|edge| (edge.caller, edge.entry_count))
+                .collect();
+            assert!(
+                edges
+                    .iter()
+                    .any(|&(held, count)| held == second && count > 0),
+                "B holds its own row: {edges:?}"
+            );
+            assert!(
+                !edges
+                    .iter()
+                    .any(|&(held, count)| held == first && count > 0),
+                "A never inherits B's row: {edges:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_system_scope_ordered_leader_exits_bind_the_row_to_its_own_holder() {
+        // In-order control for the reordered twin: hooks [450, 1_200]
+        // drain before the row at 1_000, so only B's proven interval
+        // contains it. Binds B with its count, like the reordered
+        // shape must after the shrink.
+        agreeing(|| {
+            let (mut native, first) = proven_system_native(false);
+            retire_then_exits(&mut native, &[]);
+            native.scene.source.spawn(7, 800);
+            native.scene.coordinator.adapter.reconcile_detected(
+                &[7].into_iter().collect(),
+                &mut |_| ImageAuthority::ScanPinned,
+                800,
+                &mut || Some(900),
+            );
+            let second = native
+                .scene
+                .coordinator
+                .adapter
+                .live_id(7)
+                .expect("B admitted");
+            assert_ne!(first, second);
+            native.scene.project(7, 950);
+            native.scene.coordinator.commit_batch(false).unwrap();
+            retire_then_exits(&mut native, &[]);
+            for hook in [450, 1_200] {
+                let at = native.stamps.tick();
+                native.stage(NativeBatch::Lifecycle(leader_exit_drain(
+                    native.domain,
+                    at,
+                    hook,
+                )));
+            }
+            let row = native.row(42, 1, 7, 1_000, 0);
+            native.witness(vec![row]);
+            assert_eq!(bound_census(&native), (1, 1, 0));
+            let edges: Vec<_> = native
+                .scene
+                .coordinator
+                .registry
+                .edges()
+                .map(|edge| (edge.caller, edge.entry_count))
+                .collect();
+            assert!(
+                edges
+                    .iter()
+                    .any(|&(held, count)| held == second && count > 0),
+                "B holds its own row: {edges:?}"
+            );
+            assert!(
+                !edges
+                    .iter()
+                    .any(|&(held, count)| held == first && count > 0),
+                "A never inherits B's row: {edges:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_system_scope_unhealthy_read_never_binds_on_a_healthy_resight() {
+        // The row is read on an unhealthy batch (health unproven), so
+        // it carries that read's health and never binds through the
+        // exit path, even when the next healthy batch re-sights it.
+        agreeing(|| {
+            let (mut native, caller) = proven_system_native(false);
+            retire_then_exits(&mut native, &[450]);
+            let row = native.row(41, 1, 7, 300, 0);
+            let NativeBatch::Witness(mut batch) = native.stamps.read(native.domain, vec![row])
+            else {
+                unreachable!("the scripted read constructs a witness batch");
+            };
+            batch.health_unproven = Some("scripted unhealthy read".into());
+            native.stage(NativeBatch::Witness(batch));
+            let binder = native.scene.coordinator.binder.census();
+            assert_eq!((binder.rows, binder.bound, binder.pending), (1, 0, 1));
+            native.witness(Vec::new());
+            assert_eq!(bound_census(&native), (1, 0, 0));
+            assert_eq!(no_live_caller(&native), Some(1));
+            assert!(
+                !matches!(native.scene.coverage(caller), UseCoverage::Counted { .. }),
+                "{:?}",
+                native.scene.coverage(caller)
+            );
+        });
+    }
+
+    #[test]
+    fn a_system_scope_ignored_pre_proof_hook_still_binds_on_the_genuine_exit() {
+        // Availability: the earlier hook 150 predates the proven-alive
+        // instant 200 and never stamps, so the genuine exit 450 still
+        // closes the lifetime and the row at 300 binds and counts.
+        agreeing(|| {
+            let (mut native, caller) = proven_system_native(false);
+            retire_then_exits(&mut native, &[150, 450]);
+            let row = native.row(41, 1, 7, 300, 0);
+            native.witness(vec![row]);
+            assert_eq!(bound_census(&native), (1, 1, 0));
+            assert!(
+                matches!(native.scene.coverage(caller), UseCoverage::Counted { .. }),
+                "{:?}",
+                native.scene.coverage(caller)
+            );
+        });
+    }
+
+    #[test]
+    fn a_system_scope_zombie_during_admission_proves_no_lifetime() {
+        // The leader zombifies inside its admission: the pin still
+        // names the same generation (start time matches) but the stat
+        // state proves it dead, so no leader-alive proof exists and
+        // the row stays unbound.
+        agreeing(|| {
+            let (mut native, caller) = proven_system_native_shaped(Some(200), |source| {
+                source.zombify(7);
+            });
+            assert_eq!(
+                native.scene.coordinator.adapter.leader_alive_ns(caller),
+                None
+            );
+            retire_then_exits(&mut native, &[450]);
+            let row = native.row(41, 1, 7, 300, 0);
+            native.witness(vec![row]);
+            assert_eq!(bound_census(&native), (1, 0, 0));
+            assert_eq!(no_live_caller(&native), Some(1));
+        });
+    }
+
+    #[test]
+    fn a_system_scope_owed_row_folded_before_its_exit_stays_unbound() {
+        // The row is read owed (no exit stamped yet), then its caller
+        // folds before the exit drains: proof and stamp leave with the
+        // record, so the row keeps its live-miss gap and never binds.
+        agreeing(|| {
+            let (mut native, _) = proven_system_native(false);
+            retire_then_exits(&mut native, &[]);
+            let row = native.row(41, 1, 7, 300, 0);
+            let read = native.stamps.read(native.domain, vec![row]);
+            native.stage(read);
+            let caller = native
+                .scene
+                .coordinator
+                .adapter
+                .leader_proven(7)
+                .next()
+                .map(|(id, _)| id)
+                .expect("A proven");
+            native.scene.coordinator.note_rendered_callers(&[caller]);
+            let receipt = native.scene.coordinator.retire_rendered_callers(600, None);
+            assert_eq!(receipt.retired, 1, "the owed row folds its caller");
+            let at = native.stamps.tick();
+            native.stage(NativeBatch::Lifecycle(leader_exit_drain(
+                native.domain,
+                at,
+                450,
+            )));
+            native.witness(Vec::new());
+            assert_eq!(bound_census(&native), (1, 0, 0));
+            assert_eq!(no_live_caller(&native), Some(1));
+        });
+    }
+
+    #[test]
+    fn a_system_scope_later_holder_overlapping_the_snapshot_stays_unbound() {
+        // A later holder overlaps the snapshot after it is taken: A
+        // [200, 1_200) snapshots the row at 1_000, then B proven at
+        // 900 is stamped 1_100, so both intervals contain the event.
+        // The decide-time check refuses the stale oldest-holder bind.
+        agreeing(|| {
+            let (mut native, _) = proven_system_native(false);
+            retire_then_exits(&mut native, &[1_200]);
+            let row = native.row(42, 1, 7, 1_000, 0);
+            let read = native.stamps.read(native.domain, vec![row]);
+            native.stage(read);
+            native.scene.source.spawn(7, 800);
+            native.scene.coordinator.adapter.reconcile_detected(
+                &[7].into_iter().collect(),
+                &mut |_| ImageAuthority::ScanPinned,
+                800,
+                &mut || Some(900),
+            );
+            native.scene.project(7, 950);
+            native.scene.coordinator.commit_batch(false).unwrap();
+            retire_then_exits(&mut native, &[]);
+            let at = native.stamps.tick();
+            native.stage(NativeBatch::Lifecycle(leader_exit_drain(
+                native.domain,
+                at,
+                1_100,
+            )));
+            native.witness(Vec::new());
+            assert_eq!(bound_census(&native), (1, 0, 0));
+            assert_eq!(no_live_caller(&native), Some(1));
+        });
+    }
+
+    #[test]
     fn a_cgroup_scope_retained_row_stays_unbound() {
         // PID-scope-only fallback under cgroup scope: only the engine
         // scope differs from the bound twin (production cgroup batches

@@ -9408,6 +9408,7 @@ pub(crate) mod tests {
     #[derive(Debug, Clone)]
     struct ScriptedProcess {
         alive: bool,
+        zombie: bool,
         start_time: u64,
         exe: Option<ExeIdentity>,
         /// The scripted maps-domain reading of the same process (what
@@ -9470,6 +9471,7 @@ pub(crate) mod tests {
                 pid,
                 ScriptedProcess {
                     alive: true,
+                    zombie: false,
                     start_time,
                     exe: exe.clone(),
                     exe_maps: exe,
@@ -9489,6 +9491,7 @@ pub(crate) mod tests {
                 pid,
                 ScriptedProcess {
                     alive: true,
+                    zombie: false,
                     start_time: process_start_time(pid).unwrap(),
                     exe: exe.clone(),
                     exe_maps: exe,
@@ -9530,6 +9533,16 @@ pub(crate) mod tests {
 
         pub(crate) fn gone_calls(&self) -> u64 {
             self.state.borrow().gone_calls
+        }
+
+        /// The leader zombifies but stays unreaped: its pidfd and start
+        /// time still name the same generation (the fallback pin still
+        /// matches), while the stat state proves it dead. Production
+        /// `generation_dead` reads `Z` the same way.
+        pub(crate) fn zombify(&self, pid: u32) {
+            if let Some(process) = self.state.borrow_mut().processes.get_mut(&pid) {
+                process.zombie = true;
+            }
         }
 
         pub(crate) fn set_leader_exit_observation(
@@ -9717,7 +9730,7 @@ pub(crate) mod tests {
             !state
                 .processes
                 .get(&pid)
-                .is_some_and(|process| process.alive)
+                .is_some_and(|process| process.alive && !process.zombie)
         }
 
         fn proven_exited(&self, pid: u32) -> bool {

@@ -9,7 +9,8 @@ use crate::events::{
 };
 use crate::semantics_edge::resources::SemanticResourcePool;
 use crate::semantics_objects::journal::tests::{
-    COOKIE, ENTRY_NS, EXEC, abandon_bytes, begin_bytes, end_bytes_absent, function_id,
+    COOKIE, ENTRY_NS, EXEC, abandon_bytes, begin_bytes, begin_bytes_image, end_bytes_absent,
+    function_id,
 };
 use p11scope_ebpf_common::object_wire::publish_object_descriptors;
 
@@ -1128,4 +1129,46 @@ fn joint_raw_disposed_quantum_preserves_unbounded_abandonment() {
         owner.adapter().image_tainted_for_test((COOKIE, EXEC)),
         "the unaccounted abandonment taints its image on the disposed-quantum path"
     );
+}
+
+/// Pre-grant loss counts are exact per image, in image order (one pass
+/// over the open calls): two images, one and two open BEGINs.
+#[test]
+fn joint_pregrant_capacity_losses_count_each_image_exactly() {
+    let events = EventsDomain::test_standin(0xb226);
+    let retained = producers(&events);
+    let pool = SemanticResourcePool::default();
+    let mut owner = JointCaptureOwner::new(JournalLimits::policy(), pool.reserver());
+    let sign = function_id("C_Sign");
+    let low = (COOKIE, EXEC);
+    let high = (COOKIE, EXEC + 1);
+    let records = [
+        begin_bytes_image(2, 1, sign, 0, high).to_vec(),
+        begin_bytes_image(1, 1, sign, 0, low).to_vec(),
+        begin_bytes_image(3, 1, sign, 0, high).to_vec(),
+    ];
+    let mut drain = EventDrain::over_domain(ScriptedRecords::records(records, 4), events);
+    let raw = RawJointQuantum::collect_bounded_with_adapter(
+        &mut drain,
+        &publish_object_descriptors(),
+        3,
+        None,
+        &SteadyFault(Cell::new(None)),
+        &retained,
+        |bytes| pool.reserve(bytes),
+        owner.adapter_mut(),
+    )
+    .unwrap();
+    assert_eq!(raw.attempted, raw.capacity);
+    let capacity = raw
+        .dispose_without_ingest(&mut owner, &retained, RawDisposeReason::Capacity)
+        .unwrap_or_else(|(_, reason)| panic!("pre-completion capacity disposal: {reason:?}"));
+    assert_eq!(
+        capacity.pregrant_losses(),
+        &[1, 2],
+        "one count per image, exact, in image order"
+    );
+    assert!(owner.adapter.is_tainted(low) && owner.adapter.is_tainted(high));
+    assert!(owner.adapter.taint_lifts_at_fence_for_test(low));
+    assert!(owner.adapter.taint_lifts_at_fence_for_test(high));
 }

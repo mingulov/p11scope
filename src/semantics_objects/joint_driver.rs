@@ -2675,17 +2675,15 @@ impl RawJointQuantum {
         } else {
             Vec::new()
         };
+        // One pass: exact per-image open counts, in image order.
+        let mut open_counts: std::collections::BTreeMap<(u64, u64), u64> =
+            std::collections::BTreeMap::new();
+        for (image, _, _) in &pregrant_open {
+            *open_counts.entry(*image).or_default() += 1;
+        }
+        let pregrant_losses: Vec<u64> = open_counts.values().copied().collect();
         let open_images: std::collections::BTreeSet<(u64, u64)> =
-            pregrant_open.iter().map(|(image, _, _)| *image).collect();
-        let pregrant_losses: Vec<u64> = open_images
-            .iter()
-            .map(|image| {
-                pregrant_open
-                    .iter()
-                    .filter(|(open, _, _)| open == image)
-                    .count() as u64
-            })
-            .collect();
+            open_counts.keys().copied().collect();
         // The disposal's own fence: every item below consumes one
         // position (overflow is unlocalized, so never pre-key).
         let pregrant_fence = (*owner.adapter.voided_through).max(

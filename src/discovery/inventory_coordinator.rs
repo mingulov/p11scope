@@ -36380,6 +36380,163 @@ int main(void) {
         }
     }
 
+    /// Admits and retires `generations` proven holders of `pid` in
+    /// order through the production detection path, with distinct
+    /// start times and increasing detection stamps (holder `i` is
+    /// proven alive at `1_000 + i * 100`). Returns the holders
+    /// oldest-first. Nothing is staged: the caller finishes the scene
+    /// (coverage, attach, scope) after populating every hot pid.
+    fn admit_hot_pid(scene: &mut CaptureScene, pid: u32, generations: usize) -> Vec<CallerId> {
+        assert!((2..=4000).contains(&generations));
+        let mut holders = Vec::with_capacity(generations);
+        for i in 0..generations {
+            scene.source.spawn(pid, 500 + i as u64);
+            scene.coordinator.adapter.reconcile_detected(
+                &[pid].into_iter().collect(),
+                &mut |_| ImageAuthority::ScanPinned,
+                50,
+                &mut || Some(1_000 + i as u64 * 100),
+            );
+            let caller = scene
+                .coordinator
+                .adapter
+                .live_id(pid)
+                .expect("hot generation admitted");
+            holders.push(caller);
+            scene.source.kill(pid);
+            scene.coordinator.adapter.reconcile(
+                &BTreeSet::new(),
+                &mut |_| ImageAuthority::ScanPinned,
+                300_000 + i as u64,
+            );
+            assert!(scene.coordinator.adapter.live_id(pid).is_none());
+        }
+        let proven: Vec<(CallerId, u64)> =
+            scene.coordinator.adapter.leader_proven(pid).collect();
+        assert_eq!(proven.len(), generations, "every generation proven");
+        assert_eq!(
+            proven.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            holders,
+            "proven holders stay oldest-first"
+        );
+        assert_eq!(proven.first().map(|(_, alive)| *alive), Some(1_000));
+        assert_eq!(
+            proven.last().map(|(_, alive)| *alive),
+            Some(1_000 + (generations as u64 - 1) * 100)
+        );
+        holders
+    }
+
+    /// A system-scope scene with `generations` proven pid 7 holders
+    /// (see [`admit_hot_pid`]) finished for staging: coverage,
+    /// attach, system scope and comparable exit clocks.
+    fn hot_pid_system_native(generations: usize) -> (NativeScene, Vec<CallerId>) {
+        let mut scene = CaptureScene::new(2);
+        let holders = admit_hot_pid(&mut scene, 7, generations);
+        scene
+            .coordinator
+            .begin_capture_coverage(CaptureScopeCoverage::System);
+        let mut native = NativeScene::over(scene, 0);
+        native.scene.attach_all(100, ScopeCustody::System);
+        native.scene.project(7, 120);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.scene.coordinator.engine.scope = Scope::System;
+        native.scene.coordinator.exit_clocks_comparable = true;
+        (native, holders)
+    }
+
+    /// One `LEADER_EXIT` lifecycle batch carrying every hook for `pid`
+    /// in record order.
+    fn leader_exit_drain_many(
+        domain: NativeDomainId,
+        at: u64,
+        pid: u32,
+        hooks: &[u64],
+    ) -> DiscoveryBatch {
+        let mut drain = DiscoveryBatch::scripted(domain, Vec::new(), at);
+        for &hook_ts_ns in hooks {
+            // SAFETY: DiscoveryRecord contains only integer fields;
+            // this is the same fixed, zero-reserved lifecycle wire
+            // shape the real producer emits.
+            let mut record: p11scope_ebpf_common::DiscoveryRecord =
+                unsafe { std::mem::zeroed() };
+            record.hook_ts_ns = hook_ts_ns;
+            record.pid_tgid = ((pid as u64) << 32) | pid as u64;
+            record.kind = p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT;
+            drain.records.push(record);
+        }
+        drain
+    }
+
+    /// `count` rows for pid 7, one per holder starting at `start`:
+    /// row `i` sits at holder `start + i`'s exclusive window
+    /// (`alive + 25`, inside `[alive, alive + 50)` once that holder's
+    /// exit stamps) with a distinct ticket and exec, so every row
+    /// binds its own holder with no shared cached image.
+    fn hot_rows(native: &NativeScene, start: usize, count: usize) -> Vec<WitnessRow> {
+        (0..count)
+            .map(|i| {
+                let holder = start + i;
+                native.row(
+                    5_000 + holder as u64,
+                    9_000 + holder as u64,
+                    7,
+                    1_025 + holder as u64 * 100,
+                    0,
+                )
+            })
+            .collect()
+    }
+
+    /// Stamps the first `count` holders of `pid` with their own exits
+    /// (`alive + 50`) in batches of at most 59 hooks, so every setup
+    /// batch fits its holder pool and never defers: row `i` then
+    /// resolves exactly to holder `i`.
+    fn stamp_hot_exits(native: &mut NativeScene, pid: u32, count: usize) {
+        for batch in (0..count).collect::<Vec<_>>().chunks(59) {
+            let hooks: Vec<u64> = batch.iter().map(|&i| 1_050 + i as u64 * 100).collect();
+            let at = native.stamps.tick();
+            native.stage(NativeBatch::Lifecycle(leader_exit_drain_many(
+                native.domain,
+                at,
+                pid,
+                &hooks,
+            )));
+        }
+    }
+
+    /// Every staged use edge belongs to `holder`: exact attribution
+    /// with no caller edge anywhere else.
+    fn assert_only_holder_edged(native: &NativeScene, holder: CallerId) {
+        let edges: Vec<(CallerId, u64)> = native
+            .scene
+            .coordinator
+            .registry
+            .edges()
+            .map(|edge| (edge.caller, edge.entry_count))
+            .collect();
+        assert!(!edges.is_empty(), "the bound rows edged their holder");
+        for &(held, _) in &edges {
+            assert_eq!(held, holder, "no row edged another holder: {edges:?}");
+        }
+    }
+
+    /// The staged use edges belong exactly to `holders`, one edge per
+    /// holder: every row bound its own holder, nothing else edged.
+    fn assert_holders_edged(native: &NativeScene, holders: &[CallerId]) {
+        let mut edged: Vec<CallerId> = native
+            .scene
+            .coordinator
+            .registry
+            .edges()
+            .map(|edge| edge.caller)
+            .collect();
+        edged.sort();
+        let mut expected = holders.to_vec();
+        expected.sort();
+        assert_eq!(edged, expected, "every row edged exactly its own holder");
+    }
+
     fn bound_census(native: &NativeScene) -> (u64, u64, u64) {
         let census = native.scene.coordinator.registry.witness_census();
         (census.rows, census.bound, census.pending)
@@ -36915,7 +37072,7 @@ int main(void) {
     }
 
     #[test]
-    fn a_system_scope_owed_row_folded_before_its_exit_stays_unbound() {
+    fn a_system_scope_row_read_before_fold_with_exit_after_fold_stays_unbound() {
         // The row is read owed (no exit stamped yet), then its caller
         // folds before the exit drains: proof and stamp leave with the
         // record, so the row keeps its live-miss gap and never binds.
@@ -36945,6 +37102,371 @@ int main(void) {
             native.witness(Vec::new());
             assert_eq!(bound_census(&native), (1, 0, 0));
             assert_eq!(no_live_caller(&native), Some(1));
+        });
+    }
+
+    #[test]
+    fn a_system_scope_row_first_read_after_fold_and_exit_stays_unbound() {
+        // Fold-before-first-read: the caller retires, renders and folds
+        // before any row is read; the exit drains with no holders left;
+        // only then is the first row read. Proof and stamp left with
+        // the record, so the read finds no retained holder and the row
+        // keeps its live-miss gap with no caller edge.
+        agreeing(|| {
+            let (mut native, _) = proven_system_native(false);
+            retire_then_exits(&mut native, &[]);
+            assert_eq!(
+                bound_census(&native),
+                (0, 0, 0),
+                "no row is read before the fold"
+            );
+            let caller = native
+                .scene
+                .coordinator
+                .adapter
+                .leader_proven(7)
+                .next()
+                .map(|(id, _)| id)
+                .expect("proven holder");
+            native.scene.coordinator.note_rendered_callers(&[caller]);
+            let receipt = native.scene.coordinator.retire_rendered_callers(600, None);
+            assert_eq!(
+                receipt.retired, 1,
+                "the fold retires its caller before any read"
+            );
+            assert!(
+                native
+                    .scene
+                    .coordinator
+                    .adapter
+                    .leader_proven(7)
+                    .next()
+                    .is_none(),
+                "proof left with the record"
+            );
+            let at = native.stamps.tick();
+            native.stage(NativeBatch::Lifecycle(leader_exit_drain(
+                native.domain,
+                at,
+                450,
+            )));
+            let row = native.row(41, 1, 7, 300, 0);
+            native.witness(vec![row]);
+            assert_eq!(bound_census(&native), (1, 0, 0));
+            assert_eq!(no_live_caller(&native), Some(1));
+            assert!(
+                native
+                    .scene
+                    .coordinator
+                    .registry
+                    .edges()
+                    .all(|edge| edge.caller != caller),
+                "the folded caller edged nothing"
+            );
+        });
+    }
+
+    #[test]
+    fn a_system_scope_hot_pid_read_defers_past_the_holder_pool() {
+        // 1,100 proven holders of pid 7 (over the 1,024 visit bound)
+        // with 70 own exits stamped; 70 rows, one per holder window.
+        // One staging's holder pool (1,024 visits x 64 units) resolves
+        // 59 rows (59 x 1,100 = 64,900 units) and defers 11 to the
+        // owed queue with the named exhaustion gap; a later batch
+        // resolves them and every row binds its own holder, with no
+        // other caller edge.
+        agreeing(|| {
+            let (mut native, holders) = hot_pid_system_native(1100);
+            stamp_hot_exits(&mut native, 7, 70);
+            native.read(hot_rows(&native, 0, 70));
+            assert_eq!(
+                native.scene.coordinator.binder.owed_len_for_test(),
+                11,
+                "the read defers exactly the rows past the pool"
+            );
+            native.witness(Vec::new());
+            native.witness(Vec::new());
+            assert_eq!(bound_census(&native), (70, 70, 0));
+            assert_holders_edged(&native, &holders[..70]);
+            assert!(
+                native.scene.coordinator.registry.gaps().iter().any(|gap| gap
+                    .subject
+                    == "holder scan pool exhausted"),
+                "the pool exhaustion files the named gap"
+            );
+        });
+    }
+
+    #[test]
+    fn a_system_scope_hot_pid_resight_defers_past_the_holder_pool() {
+        // 59 rows read owed, then 118 more (the pass first consumes
+        // the 59 owed attempts, then defers the 118 new rows at read);
+        // the next pass re-sights the 118 owed rows and defers 59
+        // past the pool (59 x 1,100 = 64,900 units), reporting owed
+        // work; after the 177 own exits drain, later batches finish
+        // every row on its own holder with no other caller edge.
+        agreeing(|| {
+            let (mut native, holders) = hot_pid_system_native(1100);
+            native.read(hot_rows(&native, 0, 59));
+            native.read(hot_rows(&native, 59, 118));
+            let receipt = native.read(Vec::new());
+            assert!(receipt.resight_owed, "the pass reports its owed rows");
+            assert_eq!(
+                native.scene.coordinator.binder.owed_len_for_test(),
+                59,
+                "the re-sight pass defers exactly the rows past the pool"
+            );
+            stamp_hot_exits(&mut native, 7, 177);
+            native.witness(Vec::new());
+            native.witness(Vec::new());
+            native.witness(Vec::new());
+            native.witness(Vec::new());
+            native.witness(Vec::new());
+            native.witness(Vec::new());
+            assert_eq!(bound_census(&native), (177, 177, 0));
+            assert_holders_edged(&native, &holders[..177]);
+            assert!(
+                native.scene.coordinator.registry.gaps().iter().any(|gap| gap
+                    .subject
+                    == "holder scan pool exhausted"),
+                "the pool exhaustion files the named gap"
+            );
+        });
+    }
+
+    #[test]
+    fn a_system_scope_hot_pid_decide_holds_past_the_holder_pool() {
+        // 60 snapshotted rows decide in one drain: 59 validate
+        // (59 x 1,100 = 64,900 units) and the 60th holds the front
+        // with the named exhaustion gap; the next staging resumes it
+        // and all 60 bind their own holders with no other edge.
+        agreeing(|| {
+            let (mut native, holders) = hot_pid_system_native(1100);
+            stamp_hot_exits(&mut native, 7, 60);
+            native.read(hot_rows(&native, 0, 30));
+            native.read(hot_rows(&native, 30, 30));
+            // A health-only read covers the second read's rows, so
+            // the drain below decides all 60 in one staging.
+            native.read(Vec::new());
+            native.drain();
+            assert_eq!(
+                native.scene.coordinator.binder.pending_rows().count(),
+                1,
+                "the drain holds exactly the row past the pool"
+            );
+            let census = bound_census(&native);
+            assert_eq!(
+                (census.0, census.1),
+                (60, 59),
+                "59 rows decided, the held row waits"
+            );
+            native.witness(Vec::new());
+            native.witness(Vec::new());
+            assert_eq!(bound_census(&native), (60, 60, 0));
+            assert_holders_edged(&native, &holders[..60]);
+            assert!(
+                native.scene.coordinator.registry.gaps().iter().any(|gap| gap
+                    .subject
+                    == "holder scan pool exhausted"),
+                "the pool exhaustion files the named gap"
+            );
+        });
+    }
+
+    #[test]
+    fn a_system_scope_hot_pid_exit_stamping_defers_past_the_holder_pool() {
+        // 70 hooks in one batch over 1,100 holders: 59 stamp
+        // (59 x 1,100 = 64,900 units) and 11 defer to the next
+        // lifecycle staging with the named exhaustion gap; the drain
+        // completes every stamp and a row in the oldest window binds
+        // its true holder with no other caller edge.
+        agreeing(|| {
+            let (mut native, holders) = hot_pid_system_native(1100);
+            let hooks: Vec<u64> = (0..70).map(|i| 1_050 + i * 100).collect();
+            let at = native.stamps.tick();
+            native.stage(NativeBatch::Lifecycle(leader_exit_drain_many(
+                native.domain,
+                at,
+                7,
+                &hooks,
+            )));
+            assert_eq!(
+                native.scene.coordinator.leader_exit_witness.len(),
+                59,
+                "the batch stamps exactly the hooks inside the pool"
+            );
+            native.drain();
+            assert_eq!(
+                native.scene.coordinator.leader_exit_witness.len(),
+                70,
+                "the next drain stamps the deferred hooks"
+            );
+            let row = native.row(41, 1, 7, 1025, 0);
+            native.witness(vec![row]);
+            assert_eq!(bound_census(&native), (1, 1, 0));
+            assert_only_holder_edged(&native, holders[0]);
+            assert!(
+                native.scene.coordinator.registry.gaps().iter().any(|gap| gap
+                    .subject
+                    == "holder scan pool exhausted"),
+                "the pool exhaustion files the named gap"
+            );
+        });
+    }
+
+    #[test]
+    fn a_system_scope_deferred_exit_hook_gates_its_pid_until_the_drain() {
+        // An out-of-order small hook defers behind a hook storm: its
+        // pid's resolutions hold (owed, never decided on the wide
+        // partial stamps) until the drain completes the stamps; the
+        // row then correctly stays unbound past the true exit, with
+        // the named exhaustion gap and no caller edge.
+        agreeing(|| {
+            let mut scene = CaptureScene::new(2);
+            let _storm = admit_hot_pid(&mut scene, 7, 1100);
+            let gated = admit_hot_pid(&mut scene, 9, 700);
+            scene
+                .coordinator
+                .begin_capture_coverage(CaptureScopeCoverage::System);
+            let mut native = NativeScene::over(scene, 0);
+            native.scene.attach_all(100, ScopeCustody::System);
+            native.scene.project(7, 120);
+            native.scene.coordinator.commit_batch(false).unwrap();
+            native.scene.coordinator.engine.scope = Scope::System;
+            native.scene.coordinator.exit_clocks_comparable = true;
+            // The gated pid's wide exit stamps first; the row
+            // snapshots the oldest holder against complete stamps.
+            let at = native.stamps.tick();
+            native.stage(NativeBatch::Lifecycle(leader_exit_drain_many(
+                native.domain,
+                at,
+                9,
+                &[100_000],
+            )));
+            let endpoint = native.scene.delta.endpoints[0];
+            let row = WitnessRow::scripted(native.domain, 41, 1, endpoint.object, endpoint.id, 9, 1050);
+            native.read(vec![row]);
+            // A 60-hook storm for the hot pid defers its last hook.
+            let storm_hooks: Vec<u64> = (0..60).map(|i| 200_000 + i).collect();
+            let at = native.stamps.tick();
+            native.stage(NativeBatch::Lifecycle(leader_exit_drain_many(
+                native.domain,
+                at,
+                7,
+                &storm_hooks,
+            )));
+            // The drain takes the storm's deferred hook, then 58 more
+            // storm hooks, and defers the gated pid's small hook.
+            let at = native.stamps.tick();
+            let mut drain = leader_exit_drain_many(native.domain, at, 7, &storm_hooks[1..59]);
+            let small = leader_exit_drain_many(native.domain, at, 9, &[1001]);
+            drain.records.extend(small.records);
+            native.stage(NativeBatch::Lifecycle(drain));
+            // Horizons cover the row, but its pid's stamps are
+            // incomplete: the row holds undecided, never bound on the
+            // wide partial interval.
+            native.read(Vec::new());
+            assert_eq!(
+                native.scene.coordinator.binder.pending_rows().count(),
+                1,
+                "the gated row holds while its hook is deferred"
+            );
+            let census = bound_census(&native);
+            assert_eq!(
+                (census.0, census.1),
+                (1, 0),
+                "the gated row waits undecided"
+            );
+            // The next lifecycle drain completes the small hook; the
+            // row lies past the true exit and stays unbound.
+            native.drain();
+            native.witness(Vec::new());
+            assert_eq!(bound_census(&native), (1, 0, 0));
+            assert_eq!(no_live_caller(&native), Some(1));
+            assert!(
+                native
+                    .scene
+                    .coordinator
+                    .registry
+                    .edges()
+                    .all(|edge| edge.caller != gated[0]),
+                "the gated row edged nothing"
+            );
+            assert!(
+                native.scene.coordinator.registry.gaps().iter().any(|gap| gap
+                    .subject
+                    == "holder scan pool exhausted"),
+                "the pool exhaustion files the named gap"
+            );
+        });
+    }
+
+    #[test]
+    fn a_system_scope_dropped_exit_hook_blinds_only_its_pid() {
+        // An 1,100-hook storm for the hot pid overflows the 1,024
+        // deferred-hook queue: the pid is exit-blinded with the named
+        // loss gap and its rows keep their live-miss gaps, while a
+        // quiet control pid still binds its own holder.
+        agreeing(|| {
+            let (mut native, _) = hot_pid_system_native(1100);
+            native.scene.source.spawn(8, 600);
+            native.scene.coordinator.adapter.reconcile_detected(
+                &[8].into_iter().collect(),
+                &mut |_| ImageAuthority::ScanPinned,
+                50,
+                &mut || Some(200),
+            );
+            let control = native
+                .scene
+                .coordinator
+                .adapter
+                .live_id(8)
+                .expect("control admitted");
+            native.scene.source.kill(8);
+            native.scene.coordinator.adapter.reconcile(
+                &BTreeSet::new(),
+                &mut |_| ImageAuthority::ScanPinned,
+                500,
+            );
+            let storm: Vec<u64> = (0..1100).map(|i| 200_000 + i).collect();
+            let at = native.stamps.tick();
+            native.stage(NativeBatch::Lifecycle(leader_exit_drain_many(
+                native.domain,
+                at,
+                7,
+                &storm,
+            )));
+            let at = native.stamps.tick();
+            native.stage(NativeBatch::Lifecycle(leader_exit_drain_many(
+                native.domain,
+                at,
+                8,
+                &[450],
+            )));
+            let endpoint = native.scene.delta.endpoints[0];
+            let blinded = WitnessRow::scripted(native.domain, 41, 1, endpoint.object, endpoint.id, 7, 1025);
+            let held = WitnessRow::scripted(native.domain, 42, 1, endpoint.object, endpoint.id, 8, 300);
+            native.witness(vec![blinded, held]);
+            assert_eq!(bound_census(&native), (2, 1, 0));
+            assert_eq!(no_live_caller(&native), Some(1));
+            assert_only_holder_edged(&native, control);
+            let blinded_gap = native
+                .scene
+                .coordinator
+                .registry
+                .gaps()
+                .iter()
+                .find(|gap| gap.subject == "deferred leader-exit hook dropped")
+                .expect("the dropped hook files the named loss gap");
+            assert_eq!(blinded_gap.pid, Some(7));
+            assert_eq!(
+                blinded_gap.budget,
+                Some(crate::discovery::caller_registry::BudgetRefusal {
+                    resource: "deferred_exit_hooks",
+                    limit: 1024,
+                    requested: 1025,
+                })
+            );
         });
     }
 

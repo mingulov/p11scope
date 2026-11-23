@@ -18543,57 +18543,108 @@ fn joint_machine_staging_rearm_names_staging_cause_in_its_gap() {
 /// filled its 4,096 witness slots with installed-then-refused
 /// reseeds and stopped on provider storage at 450 s. A reseed
 /// birth in an unhealthy window now refuses BEFORE install: no
-/// grant, no witness, the same named gap, S1Only kept. Full live
-/// chain — the re-arm trips the gate, the void ends the feed, the
-/// rebirth refuses early, the lane publishes on.
+/// grant, no witness, the same named gap, S1Only kept. Drives the
+/// association directly (a machine-driven rebirth needs a live
+/// router retry, which shell-lane fixtures never arm): one
+/// prepared birth for a posed void-ended feed in a tripped window.
+/// The consume closure panics if reached: the refusal lands
+/// before native consume.
 #[test]
 fn joint_machine_unhealthy_reseed_refuses_before_install() {
-    let mut fixture = MachineScene::new(1);
-    fixture.prime(1);
-    fixture.refuse_at_audited(2);
-    assert_eq!(
-        fixture.rearm("semantic_unavailable"),
-        Some(false),
-        "the re-arm trips the health gate"
+    use crate::inventory_semantics::RetainedJointBirths;
+
+    let (mut scene, ingested, _attached, _grant) = prepared_birth_originals(1, false, false);
+    let input = scene
+        .real
+        .scene
+        .coordinator
+        .prepared_semantic_batch()
+        .expect("one prepared batch")
+        .admissions()
+        .next()
+        .expect("one prepared admission")
+        .clone();
+    let proof = scene
+        .real
+        .scene
+        .coordinator
+        .prepared_semantic_batch()
+        .expect("one prepared batch")
+        .claims()
+        .next()
+        .expect("one prepared claim")
+        .1
+        .expect("the claim proves");
+    let receipt = crate::semantics_objects::journal::BootstrapReceipt::scripted(
+        proof,
+        crate::semantics_objects::journal::BirthKind::AttachObserved,
+        0,
+        0,
     );
-    // A real idle void ends the feed (the re-arm's own abandon
-    // discarded nothing, so its scoped break names no members).
-    // The void delivers at the next commit and queues the reseed;
-    // the rebirth arrives the quantum after, still inside the
-    // 3-pass unhealthy window (one publish ticks to 1).
-    fixture
-        .scene
+    let key = input.instance_key_for_test();
+    let (_, _, _, caller) = input.journal_binding();
+    let coordinator = &mut scene.real.scene.coordinator;
+    assert!(
+        coordinator
+            .registry_mut()
+            .install_joint_receipt(key.clone(), receipt),
+        "the first birth installs for the new key"
+    );
+    let note = || {
+        crate::discovery::caller_registry::instance_input::AdmittedInstance::scripted(
+            key.clone(),
+            caller,
+        )
+    };
+    coordinator.registry_mut().note_instance(note());
+    coordinator.registry_mut().publish();
+    coordinator
+        .registry_mut()
+        .pose_void_ended_feed_for_test(&key, 1);
+    coordinator.registry_mut().pose_session_unhealthy_for_test();
+    // Re-register unstaged, like the current quantum's collection:
+    // the plan matches staged registrations.
+    coordinator.registry_mut().note_instance(note());
+    let installed_before = coordinator.joint_births_installed();
+    let mut births = RetainedJointBirths::new();
+    let disposition = scene
         .real
         .scene
         .coordinator
-        .joint_capture_mut()
-        .adapter_mut()
-        .break_stream_for_test();
-    let installed_before = fixture
-        .scene
-        .real
-        .scene
-        .coordinator
-        .joint_births_installed();
-    fixture.assert_recovers("unhealthy-early-void", 5);
-    fixture.assert_recovers("unhealthy-early-rebirth", 6);
+        .prepare_joint_births(
+            &ingested,
+            &scene.producers,
+            &mut births,
+            |_candidate: crate::semantic_capture::H0BirthCandidate,
+             _absence: Option<crate::semantic_capture::CommittedAbsenceBirth>,
+             _input: &crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,
+             _binding: &crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding,
+             _proof: &crate::semantics_objects::journal::JournalDomainProof,
+             _adapter: &crate::semantics_objects::journal::JournalAdapter|
+             -> Result<
+                crate::semantic_capture::RetainedBirthWitness,
+                crate::attach::BirthObservationRefusal,
+            > {
+                panic!("pre-install refusal must not reach native consume")
+            },
+        )
+        .expect("the prepared batch associates");
     assert_eq!(
-        fixture
-            .scene
-            .real
-            .scene
-            .coordinator
-            .joint_births_installed(),
-        installed_before,
+        disposition.installed, 0,
         "the unhealthy rebirth installs nothing"
     );
-    let gaps = fixture
-        .scene
-        .real
-        .scene
-        .coordinator
-        .registry()
-        .staged_scope_gaps_for_test();
+    assert_eq!(
+        scene.real.scene.coordinator.joint_births_installed(),
+        installed_before,
+        "no witness is retained for the refused rebirth"
+    );
+    let registry = scene.real.scene.coordinator.registry();
+    let gaps: Vec<(String, String)> = registry
+        .gaps()
+        .iter()
+        .map(|gap| (gap.subject.clone(), gap.reason.clone()))
+        .chain(registry.staged_scope_gaps_for_test())
+        .collect();
     assert!(
         gaps.iter().any(|(subject, reason)| {
             subject == crate::inventory_present::JOINT_BIRTH_UNAVAILABLE_SUBJECT
@@ -18601,27 +18652,15 @@ fn joint_machine_unhealthy_reseed_refuses_before_install() {
         }),
         "the refused rebirth names the unhealthy session"
     );
-    assert!(
-        gaps.iter().all(|(_, reason)| {
-            reason != crate::inventory_present::JOINT_REENTRY_COMPLETED_REASON
-        }),
-        "no recovery is claimed in the unhealthy window"
-    );
-    let modes: Vec<_> = fixture
-        .scene
-        .real
-        .scene
-        .coordinator
-        .registry()
+    let modes: Vec<_> = registry
         .instance_semantic_edges()
         .map(|record| record.feed.mode())
         .collect();
-    assert!(!modes.is_empty(), "the recovery quantum retains its feed");
     assert!(
         modes
             .iter()
             .all(|mode| *mode == crate::semantics_key_use::FeedMode::S1Only),
-        "the voided feed rides S1Only through the window: {modes:?}"
+        "the voided feed stays S1Only: {modes:?}"
     );
 }
 

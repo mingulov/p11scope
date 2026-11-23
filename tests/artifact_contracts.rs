@@ -12466,9 +12466,9 @@ fn hosted_pipeline_runs_one_full_matrix_per_commit() {
         "manual delivery selection must precede the ordinary non-push path"
     );
     let covering = concat!(
-        "                if [ \"$ran\" = 3 ]; then\n",
-        "                  decide false \"commit $GITHUB_SHA already passed the full check matrix in $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$id; this run skips it\"\n",
-        "                fi\n",
+        "              if [ \"$ran\" = 3 ]; then\n",
+        "                decide false \"commit $GITHUB_SHA already passed the full check matrix in $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$id; this run skips it\"\n",
+        "              fi\n",
     );
     assert!(
         dedupe.contains(covering),

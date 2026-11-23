@@ -167,6 +167,13 @@ class SecondSigintReportTests(GuardCase):
                 mutate(report)
                 self.check(report, ok=False, marker=marker)
 
+    def test_duplicate_key_fails(self):
+        # Last-wins would let a second key hide a still-running child.
+        text = json.dumps(sigint_report()).replace(
+            '"child_still_running": false', '"child_still_running": true, "child_still_running": false')
+        self.expect(ok=False, marker="duplicate JSON key 'child_still_running'",
+                    files={"sigint2.json": text}, argv=["sigint2.json"])
+
 
 # -- event stdout -------------------------------------------------------
 
@@ -275,6 +282,10 @@ class EventStdoutGuardTests(GuardCase):
         ("totals-other-pass", event_field(2, "pass", 1), "(0, {"),
         ("totals-passes", event_field(2, "passes", 3), "'passes': 3"),
         ("totals-callers", event_field(2, "callers", 9), "('callers', {"),
+        ("totals-modules", event_field(2, "modules", 9), "('modules', {"),
+        ("totals-edges", event_field(2, "edges", 9), "('edges', {"),
+        ("final-modules-disagree", lambda c: c["report"]["modules"].append({}), "('modules', 2, "),
+        ("final-edges-disagree", lambda c: c["report"]["edges"].append({}), "('edges', 3, "),
         ("totals-early", stream_row(2, "at_ns", INTERVAL - 1), "'at_ns': 1999999999"),
         ("early-close-rc", setter("rc2", "0"), "early-close rc=0"),
         ("head-empty", setter("head", ""), "the head holds event bytes"),
@@ -303,6 +314,29 @@ class EventStdoutGuardTests(GuardCase):
         for seq, row in enumerate(stream):
             row["seq"] = seq
         self.check(case, ok=True, marker="ok lines=5 totals=2")
+
+    def test_duplicate_keys_fail(self):
+        case = event_case(2)
+        rows = [json.dumps(r) for r in case["stream"]]
+        rows[1] = rows[1].replace('"kind": "pass_committed"', '"kind": "totals", "kind": "pass_committed"')
+        case["jsonl"] = "\n".join(rows) + "\n"
+        self.check(case, ok=False, marker="duplicate JSON key 'kind'")
+        for name in ("report", "epipe"):
+            with self.subTest(document=name):
+                case = event_case(2)
+                text = json.dumps(case[name]).replace(
+                    '"schema": "p11scope/inventory/v1"',
+                    '"schema": "other", "schema": "p11scope/inventory/v1"')
+                self.check_text(case, name, text, marker="duplicate JSON key 'schema'")
+
+    def check_text(self, case, name, text, *, marker):
+        files = {"event-stdout.jsonl": "".join(json.dumps(r) + "\n" for r in case["stream"]),
+                 "full.json": text if name == "report" else json.dumps(case["report"]),
+                 "epipe.json": text if name == "epipe" else json.dumps(case["epipe"]),
+                 "event-epipe.head": case["head"], "event-epipe.stderr": case["stderr"]}
+        env = {"full_out": "full.json", "epipe_out": "epipe.json",
+               "rc1": case["rc1"], "rc2": case["rc2"]}
+        self.expect(ok=False, marker=marker, files=files, env=env)
 
     def test_five_totals_fail(self):
         self.check(event_case(5), ok=False, marker="totals count 5")
@@ -383,6 +417,15 @@ class ParentChainGuardTests(GuardCase):
                 if caller is None:
                     report["callers"].append(copy.deepcopy(report["callers"][1]))
                 self.check(report, ok=False, marker=marker)
+
+    def test_duplicate_key_fails(self):
+        text = json.dumps(chain_report()).replace(
+            '"launched_by_origin": "chain"', '"launched_by_origin": "unit", "launched_by_origin": "chain"')
+        self.expect(ok=False, marker="duplicate JSON key 'launched_by_origin'",
+                    files={"r.json": text, "c.txt": "gated (from chain-parent)\n",
+                           "v.txt": "gated <- chain-parent <- bash\n"},
+                    argv=["r.json", "c.txt", "v.txt", str(WL), str(WL_GEN),
+                          str(PARENT), str(PARENT_GEN)])
 
     def test_concise_and_verbose_text_are_checked(self):
         self.check(chain_report(), ok=False, marker="concise one-hop", concise="gated\n")

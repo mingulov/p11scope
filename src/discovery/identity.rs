@@ -156,6 +156,10 @@ pub(crate) mod prearm_pin_test {
     thread_local! {
         static INJECT_CHANGE_ONCE: Cell<bool> = const { Cell::new(false) };
         static PAD_MOUNTINFO: Cell<Option<(u32, usize)>> = const { Cell::new(None) };
+        static PAD_OVERLAY_MAPS: Cell<Option<(u32, usize)>> = const { Cell::new(None) };
+        static LAST_OVERLAY_PROBE: Cell<
+            Option<(Option<p11scope_manifest::maps::ObjectKey>, u64)>,
+        > = const { Cell::new(None) };
     }
 
     pub fn inject_file_change_once() {
@@ -188,6 +192,54 @@ pub(crate) mod prearm_pin_test {
             }
             _ => None,
         })
+    }
+
+    /// Runs the pin-time self-mapping proof down the overlay branch
+    /// with `padding_bytes` of synthetic maps lines chained in front
+    /// of the real maps on each of the next `pins` pin-time probes.
+    /// Only the branch selection and the padding are scripted: the
+    /// mmap, the production bounded reader, the parse and every
+    /// budget charge are the production path.
+    pub fn inject_overlay_maps_padding_for_pins(pins: u32, padding_bytes: usize) {
+        PAD_OVERLAY_MAPS.with(|slot| slot.set(Some((pins, padding_bytes))));
+    }
+
+    pub(crate) fn take_overlay_maps_padding() -> Option<usize> {
+        PAD_OVERLAY_MAPS.with(|slot| match slot.get() {
+            Some((remaining, padding)) if remaining > 0 => {
+                slot.set(if remaining == 1 {
+                    None
+                } else {
+                    Some((remaining - 1, padding))
+                });
+                Some(padding)
+            }
+            _ => None,
+        })
+    }
+
+    /// Whether a padded overlay probe is still armed: tests assert
+    /// this is false at the end, so an unconsumed arm fails loudly
+    /// instead of leaking into another test on the same thread.
+    pub fn overlay_maps_padding_armed_for_test() -> bool {
+        PAD_OVERLAY_MAPS.with(|slot| slot.get().is_some())
+    }
+
+    pub(crate) fn record_overlay_probe_answer(
+        answer: Option<p11scope_manifest::maps::ObjectKey>,
+        consumed_bytes: u64,
+    ) {
+        LAST_OVERLAY_PROBE.with(|slot| slot.set(Some((answer, consumed_bytes))));
+    }
+
+    /// The padded probe's kernel-rendered answer and the bytes the
+    /// production reader consumed for it, or `None` when no padded
+    /// probe ran. Tests assert the filed entry matches the answer
+    /// and the consumed bytes crossed the asserted boundary, proving
+    /// the padding was really in the proof's path.
+    pub fn take_last_overlay_probe_for_test()
+    -> Option<(Option<p11scope_manifest::maps::ObjectKey>, u64)> {
+        LAST_OVERLAY_PROBE.with(|slot| slot.replace(None))
     }
 }
 
@@ -228,6 +280,151 @@ fn read_mountinfo_for_prearm<R: std::io::Read>(
         return read_mountinfo(reader.chain(synthetic.as_bytes()), budget);
     }
     read_mountinfo(reader, budget)
+}
+
+/// Generates at least `padding_bytes` of synthetic maps lines: each
+/// is a well-formed line over the never-mapped `0x1000..0x2000`
+/// range (an mmap without a hint never lands there on x86-64, so
+/// the probe's stop-at-match skips every one), each ~1 KiB to keep
+/// the line count — and the per-line work spend — proportional to
+/// the bytes. Malformed lines would fail the proof closed, so the
+/// generator keeps the exact five-field shape the probe parses.
+#[cfg(test)]
+fn synthetic_maps_padding(padding_bytes: usize) -> String {
+    let mut synthetic = String::new();
+    let mut index: u32 = 0;
+    while synthetic.len() < padding_bytes {
+        synthetic.push_str(&format!(
+            "0000000000001000-0000000000002000 r--p 00000000 00:01 999999999 /fake-p11-test-maps-padding-{:06}-{}\n",
+            index,
+            "x".repeat(900),
+        ));
+        index = index.saturating_add(1);
+    }
+    synthetic
+}
+
+/// A [`ProbeBudget`](p11scope_manifest::identity::ProbeBudget) that
+/// counts the bytes the probe read while delegating every decision
+/// to the wrapped budget, so tests can assert how far the proof
+/// reached without changing any allowance.
+#[cfg(test)]
+struct RecordingProbeBudget<'a> {
+    inner: &'a mut dyn p11scope_manifest::identity::ProbeBudget,
+    bytes: u64,
+}
+
+#[cfg(test)]
+impl<'a> RecordingProbeBudget<'a> {
+    fn new(inner: &'a mut dyn p11scope_manifest::identity::ProbeBudget) -> Self {
+        Self { inner, bytes: 0 }
+    }
+
+    fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+#[cfg(test)]
+impl p11scope_manifest::identity::ProbeBudget for RecordingProbeBudget<'_> {
+    fn probe_expired(&mut self) -> bool {
+        self.inner.probe_expired()
+    }
+
+    fn probe_allowed_io(&mut self, operation_bytes: u64, wanted: usize) -> usize {
+        self.inner.probe_allowed_io(operation_bytes, wanted)
+    }
+
+    fn probe_spend(&mut self) -> bool {
+        self.inner.probe_spend()
+    }
+
+    fn probe_record_io(&mut self, bytes: usize) {
+        self.bytes = self.bytes.saturating_add(bytes as u64);
+        self.inner.probe_record_io(bytes);
+    }
+}
+
+/// One private read-only probe page, unmapped on drop — the same
+/// guard the kernel probe keeps, for the padded test probe below.
+#[cfg(test)]
+struct PaddedProbeMapping {
+    base: *mut libc::c_void,
+    len: usize,
+}
+
+#[cfg(test)]
+impl Drop for PaddedProbeMapping {
+    fn drop(&mut self) {
+        // SAFETY: the padded probe mapped exactly this range with
+        // mmap, owns it exclusively, and Drop runs once.
+        unsafe {
+            libc::munmap(self.base, self.len);
+        }
+    }
+}
+
+/// A scripted overlay branch over the production budget-charged maps
+/// read: answers the overlayfs question affirmatively, mmaps one
+/// page of the held fd like the kernel probe, then runs the
+/// production bounded reader over test padding chained in front of
+/// the real maps. Only the branch selection and the padding are
+/// scripted; the mmap, the parse, the stop-at-match, the fail-closed
+/// rules and every budget charge are the production path. Records
+/// the kernel-rendered answer and the consumed bytes for the test.
+#[cfg(test)]
+struct PaddedOverlayProbe {
+    padding_bytes: usize,
+}
+
+#[cfg(test)]
+impl SelfMappingProbe for PaddedOverlayProbe {
+    fn fd_is_on_overlayfs(&self, _file: &std::fs::File) -> bool {
+        true
+    }
+
+    fn kernel_maps_key(
+        &self,
+        file: &std::fs::File,
+        budget: &mut dyn p11scope_manifest::identity::ProbeBudget,
+    ) -> Option<ObjectKey> {
+        use std::io::Read as _;
+        use std::os::fd::AsRawFd as _;
+        if !p11scope_manifest::identity::has_mappable_bytes(file) {
+            return None;
+        }
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        let len = usize::try_from(page).unwrap_or(4096).max(1);
+        // SAFETY: one private read-only page of a borrowed valid fd
+        // at offset 0; never PROT_EXEC; unmapped by the guard below.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            return None;
+        }
+        let _mapping = PaddedProbeMapping { base, len };
+        let Ok(maps) = std::fs::read("/proc/self/maps") else {
+            return None;
+        };
+        let padding = synthetic_maps_padding(self.padding_bytes);
+        let mut recording = RecordingProbeBudget::new(budget);
+        let mut input = padding.as_bytes().chain(maps.as_slice());
+        let answer = p11scope_manifest::identity::read_self_maps_key_for_reader(
+            base as u64,
+            &mut recording,
+            &mut input,
+        );
+        prearm_pin_test::record_overlay_probe_answer(answer, recording.bytes());
+        answer
+    }
 }
 
 /// Prefix of every prearm-worker refusal reason
@@ -2897,6 +3094,23 @@ impl PinnedObjects {
         self.by_id
             .values()
             .map(|entry| entry.file.as_raw_fd())
+            .collect()
+    }
+
+    /// (fd key, pin-time probed maps key, unproven flag) per filed
+    /// entry (test-only): for twins asserting a retry completes the
+    /// same maps proof the initial pin completes, end to end.
+    #[cfg(test)]
+    pub(crate) fn probed_maps_state_for_test(&self) -> Vec<(ObjectKey, Option<ObjectKey>, bool)> {
+        self.by_id
+            .values()
+            .map(|entry| {
+                (
+                    entry.raw.key,
+                    entry.probed_maps_key,
+                    entry.probed_maps_unproven,
+                )
+            })
             .collect()
     }
 
@@ -9751,7 +9965,27 @@ fn prove_prearm_requests_in_views(
         // differs (pre-6.8 overlay split), or latch the unproven note
         // when inconclusive. Same fd, same key as the filed entry
         // below, so the outcome is identical either way.
-        match self_mapped_fallback_detailed(&proved.file, key, budget, &KernelSelfMappingProbe) {
+        //
+        // Test-only: when the padded overlay injector armed a probe,
+        // the proof runs down the scripted overlay branch with padded
+        // maps input instead of the kernel branch. Production always
+        // takes the kernel branch.
+        #[cfg(test)]
+        let fallback = match prearm_pin_test::take_overlay_maps_padding() {
+            Some(padding_bytes) => self_mapped_fallback_detailed(
+                &proved.file,
+                key,
+                budget,
+                &PaddedOverlayProbe { padding_bytes },
+            ),
+            None => {
+                self_mapped_fallback_detailed(&proved.file, key, budget, &KernelSelfMappingProbe)
+            }
+        };
+        #[cfg(not(test))]
+        let fallback =
+            self_mapped_fallback_detailed(&proved.file, key, budget, &KernelSelfMappingProbe);
+        match fallback {
             SelfMappedFallback::Split(probed) => {
                 proved.meta.probed_maps_key = Some(probed);
             }

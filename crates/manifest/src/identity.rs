@@ -571,8 +571,20 @@ impl Drop for MappedProbe {
 /// line, bytes recorded) and stops at the mapping's line.
 #[cfg(feature = "identify")]
 pub fn read_self_maps_key_for(addr: u64, budget: &mut dyn ProbeBudget) -> Option<ObjectKey> {
-    use std::io::Read as _;
     let mut reader = std::fs::File::open("/proc/self/maps").ok()?;
+    read_self_maps_key_for_reader(addr, budget, &mut reader)
+}
+
+/// [`read_self_maps_key_for`] over an explicit maps input: the same
+/// bounded, budget-charged, stop-at-match read line by line.
+/// Production passes its own `/proc/self/maps`; tests pass padded
+/// inputs to prove the proof range without touching the host maps.
+#[cfg(feature = "identify")]
+pub fn read_self_maps_key_for_reader(
+    addr: u64,
+    budget: &mut dyn ProbeBudget,
+    reader: &mut dyn std::io::Read,
+) -> Option<ObjectKey> {
     let mut operation_bytes = 0u64;
     let mut pending = Vec::new();
     let mut chunk = vec![0u8; 4096];

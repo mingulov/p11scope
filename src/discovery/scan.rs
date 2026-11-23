@@ -18308,6 +18308,25 @@ int main(int argc, char **argv) {
         }
     }
 
+    /// The learned-pin retry total covers one full per-operation
+    /// proof allowance per bounded re-proof operation: the mountinfo
+    /// table cap plus the per-operation allowance the pin-time maps
+    /// probe actually reads under (not the ordinary maps scanner's
+    /// byte cap) plus EOF-lookahead margin. Every pass then offers
+    /// each operation the same range as the initial pass, so the
+    /// shared total never binds before the per-operation caps and a
+    /// retry never cuts a proof the initial pin completes.
+    #[test]
+    fn learned_retry_total_covers_each_operation_proof_range() {
+        assert_eq!(
+            LEARNED_RETRY_TOTAL_IO_BYTES,
+            MAX_MOUNTINFO_BYTES
+                .saturating_add(ScanLimits::default().per_object_bytes)
+                .saturating_add(READ_CHUNK as u64),
+            "the retry total derives from the caps its operations use"
+        );
+    }
+
     #[test]
     fn mountinfo_reader_proves_eof_at_the_exact_byte_cap_and_refuses_excess() {
         let mut exact =

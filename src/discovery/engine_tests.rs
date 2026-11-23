@@ -87996,6 +87996,194 @@ fn learned_pin_refuses_overlimit_mount_table() {
     );
 }
 
+/// Synthetic maps lines chained in front of the real maps for the
+/// padded overlay probe twins: 140 MiB sits past one aggregate pass
+/// under the old retry total (129 MiB shared by the mountinfo read
+/// and the probe) yet inside the per-operation proof allowance the
+/// pin-time probe actually reads under, so the initial pin proves
+/// it and a cut retry cannot.
+const OVERLAY_MAPS_PROBE_PADDING_BYTES: usize = 140 * 1024 * 1024;
+
+/// The initial pin completes the padded overlay maps proof: one
+/// 140 MiB padded probe, no race, stages with the proof complete
+/// (never the unproven note) and the filed key matching the probe's
+/// answer. Control for the retry twin below: the padding is
+/// well-formed and inside the initial pass's proof range.
+#[test]
+fn learned_pin_initial_completes_padded_overlay_maps_proof() {
+    let (fixture, _view, _module, _pins) = loaded_seed_provider();
+    let library = fixture._dir.path().join("seed-provider.so");
+    let file = std::fs::File::open(&library).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    tx.send(crate::fanotify::LearnMsg::Candidate(
+        crate::fanotify::LearnedCandidate {
+            file,
+            dev,
+            ino,
+            display_path: library.to_string_lossy().into_owned(),
+            loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+            loader_unknown_reason: None,
+            run_learned: false,
+            proving_retained: false,
+        },
+    ))
+    .unwrap();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.set_learned_rx_for_test(rx);
+    let _drain_alive = &tx;
+    crate::discovery::identity::prearm_pin_test::inject_overlay_maps_padding_for_pins(
+        1,
+        OVERLAY_MAPS_PROBE_PADDING_BYTES,
+    );
+    engine.service_learned_files();
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        1,
+        "the padded pin stages"
+    );
+    assert!(engine.learned_settled.contains(&(dev, ino)));
+    let (answer, consumed) =
+        crate::discovery::identity::prearm_pin_test::take_last_overlay_probe_for_test()
+            .expect("the padded overlay probe ran");
+    assert!(
+        consumed > OVERLAY_MAPS_PROBE_PADDING_BYTES as u64,
+        "the proof crossed the whole padding before answering: {consumed}"
+    );
+    let states = engine
+        .prearm_input
+        .as_ref()
+        .expect("the staged pin files its input")
+        .pins
+        .probed_maps_state_for_test();
+    assert_eq!(states.len(), 1, "one filed pin carries the proof");
+    let (fd_key, filed_key, unproven) = states[0];
+    assert!(
+        !unproven,
+        "the initial pin completes the padded proof: {states:?}"
+    );
+    match answer {
+        Some(rendered) if rendered != fd_key => assert_eq!(
+            filed_key,
+            Some(rendered),
+            "the proved split key files on the entry"
+        ),
+        Some(_) => assert_eq!(filed_key, None, "an agreeing rendering files no split key"),
+        None => panic!("the probe answered nothing on well-formed input"),
+    }
+    assert!(
+        !crate::discovery::identity::prearm_pin_test::overlay_maps_padding_armed_for_test(),
+        "the injector armed exactly the probes that ran"
+    );
+}
+
+/// A file-changed learned pin retries the padded overlay maps proof
+/// under the same per-pass proof range: the initial attempt requeues
+/// at the bracket, and the retry re-proves the settled file through
+/// the production pin path with the matching mapping past one
+/// aggregate pass, stages, and files the completed proof (never the
+/// unproven note) with no capture credit drawn.
+#[test]
+fn learned_pin_retry_completes_padded_overlay_maps_proof() {
+    let (fixture, _view, _module, _pins) = loaded_seed_provider();
+    let library = fixture._dir.path().join("seed-provider.so");
+    let file = std::fs::File::open(&library).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    tx.send(crate::fanotify::LearnMsg::Candidate(
+        crate::fanotify::LearnedCandidate {
+            file,
+            dev,
+            ino,
+            display_path: library.to_string_lossy().into_owned(),
+            loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+            loader_unknown_reason: None,
+            run_learned: false,
+            proving_retained: false,
+        },
+    ))
+    .unwrap();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.set_learned_rx_for_test(rx);
+    let _drain_alive = &tx;
+    crate::discovery::identity::prearm_pin_test::inject_overlay_maps_padding_for_pins(
+        1,
+        OVERLAY_MAPS_PROBE_PADDING_BYTES,
+    );
+    crate::discovery::identity::prearm_pin_test::inject_file_change_once();
+    engine.service_learned_files();
+    assert!(
+        !engine.pending_learned.is_empty(),
+        "the race requeues the candidate on the padded input"
+    );
+    assert_eq!(engine.learned_staged_files_for_test(), 0);
+    let attempted_before_retry = engine.budget.attempted_io_bytes();
+    engine.service_learned_files();
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        1,
+        "the retry stages past the padded proof"
+    );
+    assert!(engine.learned_settled.contains(&(dev, ino)));
+    assert_eq!(
+        engine.budget.attempted_io_bytes(),
+        attempted_before_retry,
+        "the padded re-proof drew no capture credit"
+    );
+    let (answer, consumed) =
+        crate::discovery::identity::prearm_pin_test::take_last_overlay_probe_for_test()
+            .expect("the padded overlay probe ran on the retry");
+    assert!(
+        consumed > OVERLAY_MAPS_PROBE_PADDING_BYTES as u64,
+        "the retry proof crossed the whole padding before answering: {consumed}"
+    );
+    let states = engine
+        .prearm_input
+        .as_ref()
+        .expect("the staged pin files its input")
+        .pins
+        .probed_maps_state_for_test();
+    assert_eq!(states.len(), 1, "one filed pin carries the proof");
+    let (fd_key, filed_key, unproven) = states[0];
+    assert!(
+        !unproven,
+        "the retry completes the padded proof it cut: {states:?}"
+    );
+    match answer {
+        Some(rendered) if rendered != fd_key => assert_eq!(
+            filed_key,
+            Some(rendered),
+            "the proved split key files on the entry"
+        ),
+        Some(_) => assert_eq!(filed_key, None, "an agreeing rendering files no split key"),
+        None => panic!("the retry probe answered nothing on well-formed input"),
+    }
+    assert!(
+        !crate::discovery::identity::prearm_pin_test::overlay_maps_padding_armed_for_test(),
+        "the injector armed exactly the probes that ran"
+    );
+    let public: Vec<_> = engine
+        .counters
+        .object_skips
+        .iter()
+        .map(render::capture_skipped_out)
+        .collect();
+    assert!(
+        !public
+            .iter()
+            .any(|skip| skip.reason == "prearm object unavailable"),
+        "no prearm gap after a padded retry stages: {public:?}"
+    );
+    assert!(
+        public
+            .iter()
+            .any(|skip| skip.name == "learned provider file"),
+        "the staged file files its first-use row: {public:?}"
+    );
+}
+
 /// A learned pin that keeps hitting the file-changed race files after
 /// a bounded number of retries instead of requeueing forever: a
 /// persistent failure is a real loss and must be disclosed, never

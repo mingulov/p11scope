@@ -32,6 +32,13 @@ pub(in crate::semantics_objects) struct Paid {
 pub(in crate::semantics_objects) struct Credit<'a> {
     left: usize,
     budget: &'a mut usize,
+    /// Test-only count of units this slice debited. The adapter harvests
+    /// it after each recovery slice into its cumulative recovery-units
+    /// counter, so tests observe every paid unit (journal leaves, model
+    /// rows, claim-probe deposits, doom decisions, empty-table probes),
+    /// not just the rows the leaf visitors name. Never authority.
+    #[cfg(test)]
+    spent_here: usize,
 }
 
 impl<'a> Credit<'a> {
@@ -40,12 +47,20 @@ impl<'a> Credit<'a> {
         Self {
             left: cap.min(*budget),
             budget,
+            #[cfg(test)]
+            spent_here: 0,
         }
     }
 
     /// Units left in this slice.
     pub(in crate::semantics_objects) fn left(&self) -> usize {
         self.left
+    }
+
+    /// Test-only: units this slice debited so far.
+    #[cfg(test)]
+    pub(in crate::semantics_objects) fn spent(&self) -> usize {
+        self.spent_here
     }
 
     /// Debit one unit, or `None` when the slice is spent (the caller
@@ -56,6 +71,10 @@ impl<'a> Credit<'a> {
         }
         self.left -= 1;
         *self.budget = self.budget.saturating_sub(1);
+        #[cfg(test)]
+        {
+            self.spent_here += 1;
+        }
         Some(Paid { _sealed: () })
     }
 }
@@ -69,10 +88,13 @@ mod tests {
         let mut budget = 3usize;
         let mut credit = Credit::slice(64, &mut budget);
         assert_eq!(credit.left(), 3);
+        assert_eq!(credit.spent(), 0);
         assert!(credit.pay().is_some() && credit.pay().is_some());
         assert_eq!(credit.left(), 1);
+        assert_eq!(credit.spent(), 2);
         assert!(credit.pay().is_some());
         assert!(credit.pay().is_none(), "a spent slice mints nothing");
+        assert_eq!(credit.spent(), 3, "every debited unit counts");
         assert_eq!(budget, 0);
         let mut budget = 100usize;
         let mut credit = Credit::slice(2, &mut budget);
@@ -81,6 +103,7 @@ mod tests {
             credit.pay().is_none(),
             "the slice cap binds below the budget"
         );
+        assert_eq!(credit.spent(), 2);
         assert_eq!(budget, 98);
     }
 

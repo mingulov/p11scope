@@ -1506,6 +1506,13 @@ impl ObjectSemantics {
         self.state.test_retire_units()
     }
 
+    /// Test-only: total retained bindings plus total retained call keys
+    /// across held domains (see the state accessor).
+    #[cfg(test)]
+    pub(crate) fn domain_rows_for_test(&self) -> (usize, usize) {
+        self.state.domain_rows_for_test()
+    }
+
     /// Test-only: `rows` live sessions, views and pending tickets under
     /// one domain (registered if absent).
     #[cfg(test)]

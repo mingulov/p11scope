@@ -14100,7 +14100,8 @@ fn delta_module_owned_by_stale_view(
 /// positive pin evidence from `original_generation_state`; anything
 /// else (poll failure, unreadable `/proc`, missing custody, a
 /// contradicted recheck) is `GenerationUnproven` and files the named
-/// not-proven gap instead. Constructed solely by `prove_stale_set`.
+/// not-proven gap instead. Constructed solely by the stale-set judge
+/// (`judge_stale_set`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GenerationProof {
     /// At least one affected original provably exited.
@@ -14144,10 +14145,10 @@ enum ChangedGenerationSite {
 }
 
 /// The ONE constructor for the changed-generation internal pair: it
-/// takes a `GenerationProof`, which only `prove_stale_set` can produce
-/// from positive pin evidence. No other path can file this label. Both
-/// proof variants file the same exit-or-change row, which never names
-/// which event proved it.
+/// takes a `GenerationProof`, which only the stale-set judge can
+/// produce from positive pin evidence. No other path can file this
+/// label. Both proof variants file the same exit-or-change row, which
+/// never names which event proved it.
 fn changed_generation_skip(proof: GenerationProof, site: ChangedGenerationSite) -> Skipped {
     // Total: a future proof variant must choose its row here.
     match proof {
@@ -29078,28 +29079,32 @@ impl Engine {
         }
     }
 
-    /// Decide an inventory preflight's stale views: `None` when the
-    /// generations merely ended (no newly-opened stale ID and every
-    /// retained stale view proves exit or change — the existing
-    /// proven-exit suppression, silent, which `queue_retirement` turns
-    /// into expected removals); otherwise the skip to file — the
+    /// Decide an inventory preflight's stale views in one observation:
+    /// the skip to file (`None` when the generations merely ended — no
+    /// newly-opened stale ID and every retained stale view proves exit
+    /// or change, the existing proven-exit suppression, silent, which
+    /// `queue_retirement` turns into expected removals — else the
     /// changed-generation label when at least one affected original
-    /// proves exit or change, else the named not-proven gap. Preserves
-    /// every loud/silent decision; only the label changes, and only
-    /// from unproven to unverified.
+    /// proves exit or change, else the named not-proven gap), plus
+    /// whether any retained stale view's fate is unproven (which gates
+    /// the named-target bail: a proven exit or change ends orderly
+    /// through retirement, but an unproven target generation must not
+    /// be observed further). Preserves every loud/silent decision;
+    /// only the label changes, and only from unproven to unverified.
     fn inventory_preflight_generation_skip(
         &self,
         retained_stale: &BTreeSet<ProcessViewId>,
         stale: &BTreeSet<ProcessViewId>,
         extra_views: &[&ProcessView],
         site: ChangedGenerationSite,
-    ) -> Option<Skipped> {
+    ) -> (Option<Skipped>, bool) {
         let newly_opened = stale.iter().any(|view| !retained_stale.contains(view));
         let verdict = self.judge_stale_set(stale, retained_stale, extra_views);
+        let retained_unproven = !verdict.all_retained_proven;
         if !newly_opened && verdict.all_retained_proven {
-            return None;
+            return (None, retained_unproven);
         }
-        match verdict.first_proof {
+        let skip = match verdict.first_proof {
             Some(proof) => Some(changed_generation_skip(proof, site)),
             None => Some(unproven_generation_skip(
                 verdict
@@ -29107,21 +29112,8 @@ impl Engine {
                     .unwrap_or(GenerationUnproven::Unknown),
                 site,
             )),
-        }
-    }
-
-    /// Whether any retained stale view's fate is unproven (its pin
-    /// could not judge exit or change). Gates the named-target bail:
-    /// a proven exit or change ends orderly through retirement, but an
-    /// unproven target generation must not be observed further.
-    fn retained_generation_unproven(
-        &self,
-        retained_stale: &BTreeSet<ProcessViewId>,
-        extra_views: &[&ProcessView],
-    ) -> bool {
-        retained_stale
-            .iter()
-            .any(|view| self.classify_stale_view(*view, extra_views).is_err())
+        };
+        (skip, retained_unproven)
     }
 
     #[track_caller]
@@ -34578,7 +34570,7 @@ impl Engine {
                 .collect();
             let extra_views: Vec<&ProcessView> =
                 new_views.iter().map(|(view, _, _)| view).collect();
-            let generation_skip = self.inventory_preflight_generation_skip(
+            let (generation_skip, _) = self.inventory_preflight_generation_skip(
                 &retained_stale,
                 &admission.stale_views,
                 &extra_views,
@@ -35042,14 +35034,12 @@ impl Engine {
                 .collect();
             let extra_views: Vec<&ProcessView> =
                 new_views.iter().map(|(view, _, _)| view).collect();
-            let generation_skip = self.inventory_preflight_generation_skip(
+            let (generation_skip, retained_unproven) = self.inventory_preflight_generation_skip(
                 &retained_stale,
                 &admission.stale_views,
                 &extra_views,
                 ChangedGenerationSite::PostRetirementPreflight,
             );
-            let retained_unproven =
-                self.retained_generation_unproven(&retained_stale, &extra_views);
             for (view, _, _) in new_views.iter() {
                 if admission.stale_views.contains(&view.id()) {
                     self.request_refresh(view.pid(), crate::attach::monotonic_ns());

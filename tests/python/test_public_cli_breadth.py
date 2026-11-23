@@ -95,17 +95,12 @@ UNCHECKED_INTERNAL_REASON = (
 # `unproven_generation_skip`): filed when a stale candidate or
 # inventory preflight cannot prove exit or change — the process may be
 # live and unchanged, so the failure proves neither event.
+# The candidate pair stands for the twins (the Rust projection test
+# pins all three internal pairs to the one row).
 UNVERIFIED_CANDIDATE_INTERNAL_REASON = (
     "candidate generation unverified before mutation; "
     "exit or change unproven, canonical identity, plan, and links "
     "were unchanged")
-UNVERIFIED_PREFLIGHT_INTERNAL_REASON = (
-    "an exact retained or newly opened process generation was "
-    "unverified during inventory preflight; exit or change unproven")
-UNVERIFIED_POST_INTERNAL_REASON = (
-    "an exact retained or newly opened process generation was "
-    "unverified during post-retirement preflight; exit or change "
-    "unproven")
 
 
 # The engine's terminal record-resolution mark (src/discovery/engine.rs

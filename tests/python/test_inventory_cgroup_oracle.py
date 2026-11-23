@@ -869,25 +869,33 @@ class TransactionReasonTests(unittest.TestCase):
     # deadline disclosure qualifies (CI-GAP-2). A transaction row
     # counts as a deadline only after its exact reason and shape are
     # validated: a missing, unknown or scan-incomplete reason fails
-    # on both substrates, including witness-available ext4, which
-    # has no degraded reason gate of its own. (name, drop, over,
-    # message).
+    # on both substrates. The degraded branch already refuses these
+    # rows through its reason list (pinned by the qualifier's
+    # truncated-transaction twin); the transaction gate closes the
+    # same hole on witness-available ext4, which has no degraded
+    # reason gate of its own. (name, drop, over, overlayfs message,
+    # witness-available message).
     CASES = [
         ("transaction drops reason", ("reason",), {},
+         "overlay published extra gap",
          "unrecognized cgroup transaction row"),
         ("transaction unknown reason", (),
          {"reason": "cgroup collection frobnicate exploded"},
+         "overlay published extra gap",
          "unrecognized cgroup transaction row"),
         ("transaction scan-incomplete reason", (),
          {"reason": SCAN_INCOMPLETE},
+         "overlay published extra gap",
          "unrecognized cgroup transaction row"),
     ]
 
     def test_unrecognized_transaction_reasons_fail_on_both_substrates(self):
         self.assertEqual(len(self.CASES), 3)
-        for modfs, base in (("overlayfs", decided_report),
-                            ("ext4", witness_available_report)):
-            for name, drop, over, message in self.CASES:
+        for modfs, base, pick in (("overlayfs", decided_report, 3),
+                                 ("ext4", witness_available_report, 4)):
+            for case in self.CASES:
+                name, drop, over = case[0], case[1], case[2]
+                message = case[pick]
                 with self.subTest(substrate=modfs, case=name):
                     report = base()
                     report["gaps"].append(

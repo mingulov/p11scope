@@ -281,6 +281,20 @@ pub(crate) struct RetainedCaller {
     pub lifecycle: CallerLifecycle,
 }
 
+/// What one bounded per-PID holder scan decided: the scan resolved
+/// (`Found`), the scan completed with zero or several holders
+/// (`Absent`, never the oldest), or the scan did not run to completion
+/// past the holder-scan allowance (`Deferred`, retried on a later
+/// batch). Every holder inspection costs one leaf unit; 64 units are
+/// one visit credit under INV-2, so a scan of `n` holders charges `n`
+/// units against the staging's holder pool and defers past it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HolderScan<T> {
+    Found(T),
+    Absent,
+    Deferred,
+}
+
 /// The live-incarnation lookup the binder reads (the caller adapter).
 pub(crate) trait CallerLookup<Pin> {
     fn live_caller(&self, pid: u32) -> Option<LiveCaller<'_, Pin>>;
@@ -301,6 +315,16 @@ pub(crate) trait CallerLookup<Pin> {
     fn exit_witnessed_caller(&self, _pid: u32, _event_ns: u64) -> Option<RetainedCaller> {
         None
     }
+    /// [`Self::exit_witnessed_caller`] against the holder-scan
+    /// allowance: lookups without a pool keep the legacy verdict and
+    /// never defer. The binder reads through this; the production gate
+    /// overrides it with the charged scan.
+    fn try_exit_witnessed_caller(&self, pid: u32, event_ns: u64) -> HolderScan<RetainedCaller> {
+        match self.exit_witnessed_caller(pid, event_ns) {
+            Some(witnessed) => HolderScan::Found(witnessed),
+            None => HolderScan::Absent,
+        }
+    }
 }
 
 /// The current exit-witness holder for decide-time revalidation: the
@@ -310,6 +334,16 @@ pub(crate) trait CallerLookup<Pin> {
 /// produced it, checked separately at decision time.
 pub(crate) trait ExitWitnessValidator {
     fn current_holder(&self, pid: u32, event_ns: u64) -> Option<CallerId>;
+    /// [`Self::current_holder`] against the holder-scan allowance:
+    /// validators without a pool keep the legacy verdict and never
+    /// defer. The binder decides through this; the production gate
+    /// overrides it with the charged scan.
+    fn try_current_holder(&self, pid: u32, event_ns: u64) -> HolderScan<CallerId> {
+        match self.current_holder(pid, event_ns) {
+            Some(holder) => HolderScan::Found(holder),
+            None => HolderScan::Absent,
+        }
+    }
 }
 
 impl<Source: ProcessSource> CallerLookup<Source::Pin> for CallerAdapter<Source> {
@@ -602,6 +636,13 @@ pub(crate) const RESIGHT_QUERIES_PER_PASS: usize = 64;
 /// visit allowance never reached keep their owed attempt for the
 /// next batch, in queue order.
 pub(crate) const RESIGHT_VISITS_PER_PASS: usize = 1_024;
+
+/// Holder inspections covered by one visit credit under INV-2: one
+/// positive credit is one bounded step of at most 64 leaf units, so
+/// a per-PID holder scan of `n` holders charges `n` units and one
+/// staging's holder pool holds [`RESIGHT_VISITS_PER_PASS`] credits.
+/// The 64/1,024 constants never move; the pool derives from them.
+pub(crate) const HOLDER_SCAN_UNITS_PER_VISIT: u64 = 64;
 
 /// What the cookie query said when the row was read, through the live
 /// incarnation's pin.
@@ -918,6 +959,12 @@ impl NativeBinder {
     #[cfg(test)]
     pub(crate) fn reuse_len_for_test(&self) -> usize {
         self.reuse_ns.len()
+    }
+
+    /// Test seam: re-sight attempts still owed, across domains.
+    #[cfg(test)]
+    pub(crate) fn owed_len_for_test(&self) -> usize {
+        self.domains.iter().map(|state| state.owed.len()).sum()
     }
 
     pub(crate) fn census(&self) -> &BindingCensus {
@@ -1417,6 +1464,7 @@ impl NativeBinder {
             let needs_retained = sighting
                 .as_ref()
                 .is_none_or(|sighting| matches!(sighting.query, CookieQuery::Exited));
+            let mut exit_deferred = false;
             let retained = needs_retained
                 .then(|| lookup.retained_callers(row.host_tgid))
                 .and_then(|held| {
@@ -1426,11 +1474,21 @@ impl NativeBinder {
                     retained_candidate(only, row.recorded_at_ns).then_some((*only, false))
                 })
                 .or_else(|| {
-                    (needs_retained && read_healthy)
-                        .then(|| lookup.exit_witnessed_caller(row.host_tgid, row.recorded_at_ns))
-                        .flatten()
-                        .filter(|witnessed| retained_candidate(witnessed, row.recorded_at_ns))
-                        .map(|witnessed| (witnessed, true))
+                    if !(needs_retained && read_healthy) {
+                        return None;
+                    }
+                    match lookup.try_exit_witnessed_caller(row.host_tgid, row.recorded_at_ns) {
+                        HolderScan::Found(witnessed)
+                            if retained_candidate(&witnessed, row.recorded_at_ns) =>
+                        {
+                            Some((witnessed, true))
+                        }
+                        HolderScan::Deferred => {
+                            exit_deferred = true;
+                            None
+                        }
+                        HolderScan::Found(_) | HolderScan::Absent => None,
+                    }
                 });
             let (retained, retained_is_exit) = retained
                 .map_or((None, false), |(snapshot, is_exit)| {
@@ -1440,8 +1498,10 @@ impl NativeBinder {
             // fallback joins the owed queue: the read-time lookup was
             // only good at read time, and the row must not decide
             // sightingless before a pass attempts it. (The pass above
-            // already ran, so the attempt lands on a later batch.)
-            let due = sighting.is_none() && retained.is_none();
+            // already ran, so the attempt lands on a later batch.) A
+            // row whose exit scan deferred past the holder pool joins
+            // too: the re-sight pass retries it with a fresh pool.
+            let due = (sighting.is_none() && retained.is_none()) || exit_deferred;
             if due {
                 state.owed.push_back(state.next_pos);
             }
@@ -1518,8 +1578,6 @@ impl NativeBinder {
             }
             match hit {
                 None => {
-                    pending.resight_due = false;
-                    pending.last_attempt = Some(current);
                     // The caller may have exited between the read and
                     // this pass: a retained lifetime that its exit
                     // evidence (arrived since the read) now closes
@@ -1530,8 +1588,22 @@ impl NativeBinder {
                     // carries that health and never resolves here,
                     // even on a healthy pass.
                     let event_ns = pending.row.recorded_at_ns;
-                    if pending.read_healthy
-                        && let Some(only) = lookup.exit_witnessed_caller(row_tgid, event_ns)
+                    let verdict = if pending.read_healthy {
+                        lookup.try_exit_witnessed_caller(row_tgid, event_ns)
+                    } else {
+                        HolderScan::Absent
+                    };
+                    if matches!(verdict, HolderScan::Deferred) {
+                        // The exit scan deferred past the holder pool:
+                        // the row keeps its owed attempt for the next
+                        // pass (the visit is spent, like a hit past
+                        // the query allowance).
+                        self.domains[index].owed.push_back(pos);
+                        continue;
+                    }
+                    pending.resight_due = false;
+                    pending.last_attempt = Some(current);
+                    if let HolderScan::Found(only) = verdict
                         && retained_candidate(&only, event_ns)
                     {
                         pending.retained = Some(only);
@@ -1920,7 +1992,7 @@ impl NativeBinder {
             let pending = state.pending.pop_front().expect("checked front");
             state.popped += 1;
             self.census.pending -= 1;
-            let binding = decide(
+            let outcome = decide(
                 state,
                 &pending,
                 &self.reuse_ns,
@@ -1928,7 +2000,19 @@ impl NativeBinder {
                 exit_validator,
                 &mut self.transitions,
             );
-            self.record(pending.row, binding);
+            match outcome {
+                DecideOutcome::Decided(binding) => self.record(pending.row, binding),
+                DecideOutcome::Hold => {
+                    // The front row's exit validation deferred past the
+                    // holder pool: the row keeps the front for the next
+                    // staging, and no later row decides past it.
+                    let state = &mut self.domains[index];
+                    state.popped -= 1;
+                    state.pending.push_front(pending);
+                    self.census.pending += 1;
+                    return;
+                }
+            }
         }
     }
 }
@@ -1941,7 +2025,7 @@ fn decide(
     clocks_comparable: bool,
     exit_validator: Option<&dyn ExitWitnessValidator>,
     transitions: &mut Vec<ExecTransition>,
-) -> Binding {
+) -> DecideOutcome {
     let row = &pending.row;
     let cookie = row.cookie();
     let exec = row.exec_id();
@@ -1952,14 +2036,14 @@ fn decide(
         .and_then(|execs| execs.get(&exec))
         .and_then(|seen| seen.bound)
     {
-        return Binding::Bound(caller);
+        return DecideOutcome::Decided(Binding::Bound(caller));
     }
     // Rule 1: a live incarnation answered through its held pidfd. A row
     // with no live answer falls back to the one unambiguous retained
     // incarnation; anything else keeps its live-miss gap.
     let Some(sighting) = &pending.sighting else {
         return pending.retained.as_ref().map_or(
-            Binding::Unbound(UnboundReason::NoLiveCaller),
+            DecideOutcome::Decided(Binding::Unbound(UnboundReason::NoLiveCaller)),
             |retained| {
                 decide_retained(
                     state,
@@ -1975,10 +2059,12 @@ fn decide(
     };
     let answered = match &sighting.query {
         CookieQuery::Cookie(answered) => *answered,
-        CookieQuery::NoCookie => return Binding::Unbound(UnboundReason::CookieMismatch),
+        CookieQuery::NoCookie => {
+            return DecideOutcome::Decided(Binding::Unbound(UnboundReason::CookieMismatch));
+        }
         CookieQuery::Exited => {
             return pending.retained.as_ref().map_or(
-                Binding::Unbound(UnboundReason::CallerExited),
+                DecideOutcome::Decided(Binding::Unbound(UnboundReason::CallerExited)),
                 |retained| {
                     decide_retained(
                         state,
@@ -1992,12 +2078,14 @@ fn decide(
                 },
             );
         }
-        CookieQuery::Unavailable(_) => return Binding::Unbound(UnboundReason::CookieUnavailable),
+        CookieQuery::Unavailable(_) => {
+            return DecideOutcome::Decided(Binding::Unbound(UnboundReason::CookieUnavailable));
+        }
     };
     // Rule 2: the same ticket of the same domain (equality includes the
     // domain: equal values from two domains are different tickets).
     if answered != cookie {
-        return Binding::Unbound(UnboundReason::CookieMismatch);
+        return DecideOutcome::Decided(Binding::Unbound(UnboundReason::CookieMismatch));
     }
     let caller = sighting.caller;
     // The incarnation already holds an image here: this row is not it. Under
@@ -2013,16 +2101,16 @@ fn decide(
                 (cookie, exec),
             ));
         }
-        return Binding::Unbound(if ended {
+        return DecideOutcome::Decided(Binding::Unbound(if ended {
             UnboundReason::ExecTransition
         } else {
             UnboundReason::ExecAmbiguous
-        });
+        }));
     }
     // Rule 3: never a row recorded before the admission, unless its
     // pre-admission window is provably clean (late binding).
     if row.recorded_at_ns < sighting.first_seen_ns && !state.late_window_clean(row) {
-        return Binding::Unbound(UnboundReason::BeforeAdmission);
+        return DecideOutcome::Decided(Binding::Unbound(UnboundReason::BeforeAdmission));
     }
     // Rule 4, coverage: an incarnation admitted before exec coverage began
     // may have exec'd unrecorded; only the revalidation pass makes it
@@ -2033,7 +2121,7 @@ fn decide(
             .as_ref()
             .is_some_and(|revalidated| revalidated.contains(&caller))
     {
-        return Binding::Unbound(UnboundReason::ExecCoverageGap);
+        return DecideOutcome::Decided(Binding::Unbound(UnboundReason::ExecCoverageGap));
     }
     // Rule 4: no exec of the tgid, and no lost lifecycle evidence, at or
     // after the admission (both horizons cover the row's insertion).
@@ -2042,13 +2130,13 @@ fn decide(
         .get(&row.host_tgid)
         .is_some_and(|&exec_ns| exec_ns >= sighting.first_seen_ns)
     {
-        return Binding::Unbound(UnboundReason::ExecAfterAdmission);
+        return DecideOutcome::Decided(Binding::Unbound(UnboundReason::ExecAfterAdmission));
     }
     if state
         .loss_ns
         .is_some_and(|loss_ns| loss_ns >= sighting.first_seen_ns)
     {
-        return Binding::Unbound(UnboundReason::LifecycleLoss);
+        return DecideOutcome::Decided(Binding::Unbound(UnboundReason::LifecycleLoss));
     }
     // Rule 5: no competing image of the ticket. A later sequence always
     // competes; an earlier one competes unless another incarnation holds it
@@ -2062,7 +2150,7 @@ fn decide(
         })
     });
     if competing {
-        return Binding::Unbound(UnboundReason::ExecAmbiguous);
+        return DecideOutcome::Decided(Binding::Unbound(UnboundReason::ExecAmbiguous));
     }
     state
         .cookies
@@ -2072,7 +2160,16 @@ fn decide(
         .or_default()
         .bound = Some(caller);
     state.callers.insert(caller, (cookie, exec));
-    Binding::Bound(caller)
+    DecideOutcome::Decided(Binding::Bound(caller))
+}
+
+/// What one decide step did with the front row: it decided
+/// (`Decided`), or its exit validation deferred past the holder pool
+/// (`Hold`, keeping the front for the next staging without advancing
+/// any deciding horizon past it).
+enum DecideOutcome {
+    Decided(Binding),
+    Hold,
 }
 
 /// The retained-identity fallback for one row with no live answer whose
@@ -2098,12 +2195,12 @@ fn decide_retained(
     reuse_ns: &HashMap<u32, u64>,
     clocks_comparable: bool,
     exit_validator: Option<&dyn ExitWitnessValidator>,
-) -> Binding {
+) -> DecideOutcome {
     // Without comparable clocks the exec/loss orderings below are
     // meaningless: hook stamps and admission stamps may not share a
     // clock. Fail closed with the live-miss gap.
     if !clocks_comparable {
-        return Binding::Unbound(miss);
+        return DecideOutcome::Decided(Binding::Unbound(miss));
     }
     let row = &pending.row;
     // An exit snapshot's read-time interval is stale once a later drain
@@ -2111,18 +2208,37 @@ fn decide_retained(
     // at decide time against the current witness, and refuse with the
     // live-miss gap unless it still resolves to this same holder. A
     // row read while unhealthy never binds through the exit path,
-    // even on a later healthy batch. The PID fallback skips both.
+    // even on a later healthy batch. The PID fallback skips both. A
+    // validation that defers past the holder pool holds the row for
+    // the next staging instead of deciding on a partial scan.
     if pending.retained_is_exit {
         if !pending.read_healthy {
-            return Binding::Unbound(miss);
+            return DecideOutcome::Decided(Binding::Unbound(miss));
         }
         let Some(validator) = exit_validator else {
-            return Binding::Unbound(miss);
+            return DecideOutcome::Decided(Binding::Unbound(miss));
         };
-        if validator.current_holder(row.host_tgid, row.recorded_at_ns) != Some(retained.id) {
-            return Binding::Unbound(miss);
+        match validator.try_current_holder(row.host_tgid, row.recorded_at_ns) {
+            HolderScan::Found(holder) if holder == retained.id => {}
+            HolderScan::Found(_) | HolderScan::Absent => {
+                return DecideOutcome::Decided(Binding::Unbound(miss));
+            }
+            HolderScan::Deferred => return DecideOutcome::Hold,
         }
     }
+    DecideOutcome::Decided(decide_retained_inner(state, pending, retained, miss, reuse_ns))
+}
+
+/// [`decide_retained`] past the exit revalidation: the reuse veto and
+/// the rules 4/5 checks against the retained admission.
+fn decide_retained_inner(
+    state: &mut DomainState,
+    pending: &Pending,
+    retained: &RetainedCaller,
+    miss: UnboundReason,
+    reuse_ns: &HashMap<u32, u64>,
+) -> Binding {
+    let row = &pending.row;
     // A recorded PID reuse at or after the retained admission voids the
     // retained identity even with no admitted successor: the turnover
     // window is ambiguous (which generation fired the row is unknown),

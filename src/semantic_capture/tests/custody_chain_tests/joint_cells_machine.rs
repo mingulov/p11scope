@@ -4126,12 +4126,13 @@ fn joint_pregrant_count_only_prefix_holds_for_late_begin() {
     );
 }
 
-/// The wall-time bound closes an extended quantum: disposal taints,
-/// the next bind discloses its taint refusal, the label reads
-/// linked-bootstrap, S1 still reduces, and no grant mints.
+/// The wall-time bound closes an extended quantum. Ruling O6-2b
+/// (superseding the O6-2 permanence): the open START is counted, named
+/// loss (`joint_pregrant_nonadmission_history_loss calls=1`), no D1
+/// refusal stages, S1 still reduces, and the next bind mints the
+/// grant: the image re-enters Joint above the disposal's fence.
 #[test]
 fn joint_pregrant_timeout_closes_and_discloses_tainted_birth() {
-    use crate::semantics_objects::journal::AttestationRefusal;
     let mut scene = pregrant_scene();
     publish_empty_first_quantum(&mut scene);
     let pid = std::process::id();
@@ -4154,30 +4155,15 @@ fn joint_pregrant_timeout_closes_and_discloses_tainted_birth() {
         .source_mut()
         .push_record(init_end.to_vec());
     assert_eq!(reach_any(&mut scene, &["BindingKeys"]), "BindingKeys");
-    let input = cloned_only_admission(&mut scene);
+    let _input = cloned_only_admission(&mut scene);
     scene.published();
+    // Ruling O6-2b: the disposal quarantined the image only up to its
+    // fence, so the next admission binds and mints the grant.
     assert!(
-        scene.machine.retained_drain_grant_for_test().is_none(),
-        "the tainted bind mints no grant"
+        scene.machine.retained_drain_grant_for_test().is_some(),
+        "the image recovers: the next bind mints the grant"
     );
-    let outcome = bind_probe_outcome(&mut scene, &input);
-    assert!(
-        matches!(outcome, Err(AttestationRefusal::ImageTainted)),
-        "disposal tainted the image: {outcome:?}"
-    );
-    let coordinator = &scene.scene.real.scene.coordinator;
-    let reasons: Vec<String> = coordinator
-        .registry()
-        .gaps()
-        .iter()
-        .filter(|gap| gap.subject == "Joint birth unavailable; retained S1")
-        .map(|gap| gap.reason.clone())
-        .collect();
-    assert_eq!(
-        reasons,
-        vec!["joint_birth_claim_ImageTainted".to_string()],
-        "the refused bind discloses its cause"
-    );
+    assert_pregrant_loss_disclosed(&scene.scene.real.scene, 1);
     // The init-time latch with the producers' value. The machine twin
     // cannot run the live init path, so it replicates the latch input
     // exactly; the privileged twin pins the production call site.
@@ -4204,13 +4190,12 @@ fn joint_pregrant_timeout_closes_and_discloses_tainted_birth() {
 
 /// The real 2 s timeout, without the pose seam: an open START holds
 /// the quantum, then a backdated first-poll stamp trips the actual
-/// wall-time comparison — the quantum closes, disposal taints, the
-/// next bind discloses ImageTainted, the label reads
-/// linked-bootstrap, S1 still reduces, and no grant mints. Kills a
-/// clock-comparison mutant the posed twin cannot see.
+/// wall-time comparison — the quantum closes, its open START is
+/// counted, named loss (ruling O6-2b), S1 still reduces, and the next
+/// bind mints the grant. Kills a clock-comparison mutant the posed
+/// twin cannot see.
 #[test]
 fn joint_pregrant_real_timeout_closes_and_taints() {
-    use crate::semantics_objects::journal::AttestationRefusal;
     let mut scene = pregrant_scene();
     publish_empty_first_quantum(&mut scene);
     let pid = std::process::id();
@@ -4238,30 +4223,15 @@ fn joint_pregrant_real_timeout_closes_and_taints() {
         .source_mut()
         .push_record(init_end.to_vec());
     assert_eq!(reach_any(&mut scene, &["BindingKeys"]), "BindingKeys");
-    let input = cloned_only_admission(&mut scene);
+    let _input = cloned_only_admission(&mut scene);
     scene.published();
+    // Ruling O6-2b: the disposal quarantined the image only up to its
+    // fence, so the next admission binds and mints the grant.
     assert!(
-        scene.machine.retained_drain_grant_for_test().is_none(),
-        "the tainted bind mints no grant"
+        scene.machine.retained_drain_grant_for_test().is_some(),
+        "the image recovers: the next bind mints the grant"
     );
-    let outcome = bind_probe_outcome(&mut scene, &input);
-    assert!(
-        matches!(outcome, Err(AttestationRefusal::ImageTainted)),
-        "disposal tainted the image: {outcome:?}"
-    );
-    let coordinator = &scene.scene.real.scene.coordinator;
-    let reasons: Vec<String> = coordinator
-        .registry()
-        .gaps()
-        .iter()
-        .filter(|gap| gap.subject == "Joint birth unavailable; retained S1")
-        .map(|gap| gap.reason.clone())
-        .collect();
-    assert_eq!(
-        reasons,
-        vec!["joint_birth_claim_ImageTainted".to_string()],
-        "the refused bind discloses its cause"
-    );
+    assert_pregrant_loss_disclosed(&scene.scene.real.scene, 1);
     let linked = scene.scene.producers.journal_linked();
     assert!(linked, "the twin runs linked producers");
     scene
@@ -4347,9 +4317,11 @@ fn running_hook_budget_drains_saturated_quantum_in_one_hook() {
 }
 
 /// F4: a pre-grant admission whose caller has a pending exit stages
-/// no D1 gap — the custody conversion wins and the peek skips the
-/// disclosure, so the input stages exactly the custody refusal and
-/// reduces no S1. Same taint setup as the timeout twin.
+/// no D1 gap — the custody conversion wins, so the input stages
+/// exactly the custody refusal and reduces no S1. Same timeout setup
+/// as the timeout twin; under ruling O6-2b its open START is counted
+/// loss whose fenced quarantine would lift, so the refused probe is
+/// posed with a permanent taint from another cause.
 #[test]
 fn joint_pregrant_custody_refused_input_stages_no_d1_gap() {
     let mut scene = pregrant_scene();
@@ -4375,9 +4347,33 @@ fn joint_pregrant_custody_refused_input_stages_no_d1_gap() {
         .push_record(init_end.to_vec());
     assert_eq!(reach_any(&mut scene, &["BindingKeys"]), "BindingKeys");
     let input = cloned_only_admission(&mut scene);
+    // Ruling O6-2b: the timeout disposal's quarantine is fenced and
+    // would lift for this bind, so the F4 premise (a refused probe the
+    // peek would disclose) is posed with a permanent taint from another
+    // cause, through the production taint route.
+    let (_, image, _, _) = input.journal_binding();
+    assert!(
+        scene
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .taint_lifts_at_fence_for_test((image.task_cookie, image.exec_id)),
+        "the pre-grant disposal alone never refuses the bind"
+    );
+    scene
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture_mut()
+        .adapter_mut()
+        .taint_image_for_test((image.task_cookie, image.exec_id));
     assert!(
         bind_probe_outcome(&mut scene, &input).is_err(),
-        "the disposed quantum tainted the image, so the peek would disclose"
+        "the permanently tainted image's peek would disclose"
     );
     // The exit lands after admission but before staging — the F4
     // conjunction: the staged input is Ok, the probe refuses, and the
@@ -4992,13 +4988,12 @@ fn joint_pregrant_unlinked_lane_closes_without_extension() {
 
 /// T8 (O6-6 F1), skewed order: an unlinked lane discloses once at
 /// the lane, never per birth. The skewed quantum closes at once (no
-/// extension) and disposal taints, but the tainted bind stages no D1
-/// row — the lane keeps its single O0 `joint_journal_unavailable`
-/// row, S1 still reduces exactly, the label reads unlinked, and no
-/// grant mints.
+/// extension) and its open START is counted loss (ruling O6-2b); the
+/// recovered bind stages no D1 row — the lane keeps its single O0
+/// `joint_journal_unavailable` row, S1 still reduces exactly, the
+/// label reads unlinked, and the grant mints with no feed.
 #[test]
 fn joint_pregrant_unlinked_lane_discloses_with_s1_exact() {
-    use crate::semantics_objects::journal::AttestationRefusal;
     let mut scene = unlinked_pregrant_scene();
     publish_empty_first_quantum(&mut scene);
     let pid = std::process::id();
@@ -5015,17 +5010,21 @@ fn joint_pregrant_unlinked_lane_discloses_with_s1_exact() {
         .source_mut()
         .push_record(init_end.to_vec());
     assert_eq!(reach_any(&mut scene, &["BindingKeys"]), "BindingKeys");
-    let input = cloned_only_admission(&mut scene);
+    let _input = cloned_only_admission(&mut scene);
     scene.published();
+    // Ruling O6-2b: the open START is counted loss and the fenced
+    // quarantine lifts, so the bind mints the grant exactly as on the
+    // ordinary-capture twin; the Births guard installs no feed.
     assert!(
-        scene.machine.retained_drain_grant_for_test().is_none(),
-        "no grant mints"
+        scene.machine.retained_drain_grant_for_test().is_some(),
+        "the recovered bind mints the drain grant"
     );
-    let outcome = bind_probe_outcome(&mut scene, &input);
-    assert!(
-        matches!(outcome, Err(AttestationRefusal::ImageTainted)),
-        "disposal tainted the image: {outcome:?}"
+    assert_eq!(
+        scene.scene.real.scene.coordinator.registry().joint_feeds(),
+        0,
+        "the Births guard installs no feed on an unlinked lane"
     );
+    assert_pregrant_loss_disclosed(&scene.scene.real.scene, 1);
     assert_unlinked_lane_disclosure(&scene.scene.real.scene);
 }
 
@@ -5034,7 +5033,6 @@ fn joint_pregrant_unlinked_lane_discloses_with_s1_exact() {
 /// lane disclosure, no D1 row, S1 exact, unlinked label, no grant.
 #[test]
 fn joint_pregrant_unlinked_begin_first_discloses_once_with_s1_exact() {
-    use crate::semantics_objects::journal::AttestationRefusal;
     let mut scene = unlinked_pregrant_scene();
     publish_empty_first_quantum(&mut scene);
     let pid = std::process::id();
@@ -5051,17 +5049,21 @@ fn joint_pregrant_unlinked_begin_first_discloses_once_with_s1_exact() {
         .source_mut()
         .push_record(init_end.to_vec());
     assert_eq!(reach_any(&mut scene, &["BindingKeys"]), "BindingKeys");
-    let input = cloned_only_admission(&mut scene);
+    let _input = cloned_only_admission(&mut scene);
     scene.published();
+    // Ruling O6-2b: the open START is counted loss and the fenced
+    // quarantine lifts, so the bind mints the grant exactly as on the
+    // ordinary-capture twin; the Births guard installs no feed.
     assert!(
-        scene.machine.retained_drain_grant_for_test().is_none(),
-        "no grant mints"
+        scene.machine.retained_drain_grant_for_test().is_some(),
+        "the recovered bind mints the drain grant"
     );
-    let outcome = bind_probe_outcome(&mut scene, &input);
-    assert!(
-        matches!(outcome, Err(AttestationRefusal::ImageTainted)),
-        "disposal tainted the image: {outcome:?}"
+    assert_eq!(
+        scene.scene.real.scene.coordinator.registry().joint_feeds(),
+        0,
+        "the Births guard installs no feed on an unlinked lane"
     );
+    assert_pregrant_loss_disclosed(&scene.scene.real.scene, 1);
     assert_unlinked_lane_disclosure(&scene.scene.real.scene);
 }
 
@@ -5092,6 +5094,30 @@ fn joint_pregrant_unlinked_ordinary_capture_discloses_once_with_s1_exact() {
         "the Births guard installs no feed on an unlinked lane"
     );
     assert_unlinked_lane_disclosure(&scene.scene.real.scene);
+}
+
+/// Ruling O6-2b: exactly one typed pre-grant loss row per disposed
+/// image, with the exact open-call count, and no D1 birth refusal.
+fn assert_pregrant_loss_disclosed(
+    scene: &crate::semantic_capture::tests::custody_chain_tests::CustodyScene,
+    calls: u64,
+) {
+    let gaps = scene.coordinator.registry().gaps();
+    let losses: Vec<&str> = gaps
+        .iter()
+        .filter(|gap| gap.reason.starts_with("joint_pregrant_"))
+        .map(|gap| gap.reason.as_str())
+        .collect();
+    assert_eq!(
+        losses,
+        vec![format!("joint_pregrant_nonadmission_history_loss calls={calls}").as_str()],
+        "one typed loss row with the exact count"
+    );
+    assert!(
+        gaps.iter()
+            .all(|gap| gap.reason != "joint_birth_claim_ImageTainted"),
+        "no permanent-taint birth refusal"
+    );
 }
 
 /// The honest unlinked shape: exactly one caller-less

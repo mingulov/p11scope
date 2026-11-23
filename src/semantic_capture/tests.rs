@@ -1849,6 +1849,24 @@ impl JointBirthHarness {
         self.drain.source_mut().push_record(begin.to_vec());
         self.drain.source_mut().push_record(end.to_vec());
     }
+    /// One BEGIN of the bound caller's own image whose return has not
+    /// arrived yet (a held call in flight at the quantum's close).
+    fn push_open_create(&mut self, sequence: u64) {
+        use crate::semantics_objects::journal::tests::{begin_bytes, function_id};
+        let (slot, endpoint) = self.fixture.endpoint_for("C_CreateObject");
+        let thread = if self.caller.is_some() { 2 } else { 1 };
+        let mut begin = begin_bytes(thread, sequence, function_id("C_CreateObject"), 0);
+        let pid = u64::from(self.io.pin.pid());
+        begin[24..32].copy_from_slice(&((pid << 32) | pid).to_le_bytes());
+        begin[32..40].copy_from_slice(&self.io.current_image.task_cookie.to_le_bytes());
+        begin[40..48].copy_from_slice(&self.io.current_image.exec_id.to_le_bytes());
+        begin[56..64].copy_from_slice(&(0x7000_0000 + endpoint.offset).to_le_bytes());
+        begin[64..68].copy_from_slice(&self.io.local.to_le_bytes());
+        begin[68..76].fill(0);
+        begin[76..78].copy_from_slice(&1u16.to_le_bytes());
+        begin[104..108].copy_from_slice(&slot.to_le_bytes());
+        self.drain.source_mut().push_record(begin.to_vec());
+    }
     fn collect(&mut self) -> crate::semantics_objects::journal::joint_driver::RawJointQuantum {
         crate::semantics_objects::journal::joint_driver::RawJointQuantum::collect_bounded_with_adapter(
                 &mut self.drain, &self.rows, 4_096, None, &BirthFault, &self.producers,
@@ -2220,6 +2238,70 @@ fn joint_pre_key_raw_disposal_does_not_taint_the_callers_own_image() {
     assert!(
         owner.adapter_mut().bind_admitted_key(&admitted).is_ok(),
         "the later binding of the same process is not refused"
+    );
+}
+
+/// Ruling O6-2b (live deferrals wp7 stop0 on a busy host): the first
+/// pre-grant quantum closed by the publication request still holds the
+/// caller's own BEGIN in flight (the held waiter). Before, the pre-key
+/// disposal tainted that image permanently: Joint never started and no
+/// gap named the loss. Now the open call is counted, named loss
+/// (`pregrant_nonadmission`, exact count), the image is quarantined
+/// only up to the disposal's fence, and the next admission binds.
+#[test]
+fn joint_pre_key_raw_disposal_with_an_open_call_recovers_at_the_next_bind() {
+    use crate::semantics_objects::journal::JournalGap;
+    use crate::semantics_objects::journal::joint_driver::{JointCaptureOwner, RawDisposeReason};
+
+    let mut harness = JointBirthHarness::new();
+    harness.push_create(1);
+    harness.push_open_create(2);
+    let mut raw = harness.collect();
+    let (_report, admitted) = harness.route(&mut raw);
+    let image = (
+        harness.io.current_image.task_cookie,
+        harness.io.current_image.exec_id,
+    );
+    let mut owner = JointCaptureOwner::from_existing_parts_for_test(
+        harness.adapter,
+        crate::semantics_objects::ObjectSemantics::new(),
+    );
+    let negative = raw
+        .dispose_without_ingest(
+            &mut owner,
+            &harness.producers,
+            RawDisposeReason::NoAdmission,
+        )
+        .unwrap_or_else(|(_, reason)| panic!("pre-key disposition: {reason:?}"));
+    assert_eq!(
+        negative.failure().map(|failure| failure.gap),
+        Some(JournalGap::PregrantNonAdmission),
+        "the open call's loss is named"
+    );
+    assert_eq!(
+        negative.pregrant_losses(),
+        &[1],
+        "one image, its exact open-call count"
+    );
+    assert!(
+        owner.adapter().voids_through_for_test(negative.frontier()),
+        "the disposed interval is fenced"
+    );
+    assert!(
+        owner.adapter().image_tainted_for_test(image),
+        "the image is quarantined until fresh proof"
+    );
+    assert!(
+        owner.adapter().taint_lifts_at_fence_for_test(image),
+        "the quarantine is never permanent"
+    );
+    assert!(
+        owner.adapter_mut().bind_admitted_key(&admitted).is_ok(),
+        "the next admission binds: the image re-enters Joint"
+    );
+    assert!(
+        !owner.adapter().image_tainted_for_test(image),
+        "the bind lifts the quarantine"
     );
 }
 

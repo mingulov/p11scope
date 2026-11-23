@@ -4349,20 +4349,30 @@ impl LiveJointMachine {
                     reason,
                 ) {
                     Ok(disposed) => {
-                        // F4: one debug line whenever a pre-grant
-                        // disposal taints an image, with the
-                        // close-reason counts for the R2 decision.
-                        #[cfg(debug_assertions)]
-                        if self.grant.is_none()
-                            && disposed.failure().is_some_and(|failure| {
-                                failure.gap
-                                    == crate::semantics_objects::journal::JournalGap::ImageTainted
-                            })
+                        // Ruling O6-2b: a pre-key disposal's open calls
+                        // are counted, named loss: one typed gap row per
+                        // image with its exact call count. The images
+                        // re-enter Joint at the next admission that
+                        // binds above the disposal's fence.
+                        if let Some(gap) = disposed.failure().map(|failure| failure.gap)
+                            && crate::semantics_objects::journal::joint_driver::pregrant_loss_gap_reason(gap, 0)
+                                .is_some()
                         {
+                            for &calls in disposed.pregrant_losses() {
+                                if let Some(reason) = crate::semantics_objects::journal::joint_driver::pregrant_loss_gap_reason(gap, calls) {
+                                    coordinator.note_scope_gap(
+                                        crate::inventory_present::JOINT_RETAINED_S1_SUBJECT.to_string(),
+                                        reason,
+                                    );
+                                }
+                            }
+                            // F4: the close-reason counts for the R2 decision.
+                            #[cfg(debug_assertions)]
                             eprintln!(
-                                "p11scope: pre-grant disposal tainted an image: \
-                                 reason={reason:?} closes={:?}",
+                                "p11scope: pre-grant disposal released open calls as loss: \
+                                 reason={reason:?} closes={:?} images={}",
                                 self.pregrant_close_counts,
+                                disposed.pregrant_losses().len(),
                             );
                         }
                         (

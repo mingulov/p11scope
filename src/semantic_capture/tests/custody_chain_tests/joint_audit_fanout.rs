@@ -18539,6 +18539,81 @@ fn joint_machine_staging_rearm_names_staging_cause_in_its_gap() {
     );
 }
 
+/// Early-refusal twin (round 4, wall fix): the live acc20m1 lane
+/// filled its 4,096 witness slots with installed-then-refused
+/// reseeds and stopped on provider storage at 450 s. A reseed
+/// birth in an unhealthy window now refuses BEFORE install: no
+/// grant, no witness, the same named gap, S1Only kept. Full live
+/// chain — the re-arm trips the gate, the void ends the feed, the
+/// rebirth refuses early, the lane publishes on.
+#[test]
+fn joint_machine_unhealthy_reseed_refuses_before_install() {
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture.refuse_at_audited(2);
+    assert_eq!(
+        fixture.rearm("semantic_unavailable"),
+        Some(false),
+        "the re-arm trips the health gate"
+    );
+    let installed_before = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_births_installed();
+    fixture.assert_recovers("unhealthy-early", 5);
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_births_installed(),
+        installed_before,
+        "the unhealthy rebirth installs nothing"
+    );
+    let gaps = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .staged_scope_gaps_for_test();
+    assert!(
+        gaps.iter().any(|(subject, reason)| {
+            subject == crate::inventory_present::JOINT_BIRTH_UNAVAILABLE_SUBJECT
+                && reason == "joint_birth_reseed_session_unhealthy"
+        }),
+        "the refused rebirth names the unhealthy session"
+    );
+    assert!(
+        gaps.iter().all(|(_, reason)| {
+            reason != crate::inventory_present::JOINT_REENTRY_COMPLETED_REASON
+        }),
+        "no recovery is claimed in the unhealthy window"
+    );
+    let modes: Vec<_> = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .instance_semantic_edges()
+        .map(|record| record.feed.mode())
+        .collect();
+    assert!(
+        !modes.is_empty(),
+        "the recovery quantum retains its feed"
+    );
+    assert!(
+        modes
+            .iter()
+            .all(|mode| *mode == crate::semantics_key_use::FeedMode::S1Only),
+        "the voided feed rides S1Only through the window: {modes:?}"
+    );
+}
+
 /// Trip twin: the running no-progress wedge latches, then re-arms past
 /// the stuck frame (owner partial-not-stop): the trip records its cause
 /// for the re-arm's counted gaps, and the re-arm clears the latch.

@@ -894,6 +894,8 @@ POSITIVE = [
     ("chain.walk", "parent-chain", chain_caller(launched_by=[
         {"pid": PARENT, "exe": "chain-parent", "start_time": PARENT_GEN}] + [
         {"pid": 50 + n, "exe": "sh", "start_time": 70 + n} for n in range(3)])),
+    ("chain.walk", "parent-chain", chain_caller(launched_by=[
+        {"pid": PARENT, "exe": "chain-parent", "start_time": PARENT_GEN}])),
 ]
 
 
@@ -1026,15 +1028,21 @@ ALLOWED = {
     ("run-prearm", ("*", 0, "discovery", 0, "sources", "*")): "free source name of another module",
     # A further ancestor's exe, its optional fields and the chain gap.
     ("parent-chain", ("report", "callers", 1, "launched_by", "*", "exe")): "a further ancestor's exe is nullable",
-    ("parent-chain", ("report", "callers", 1, "launched_by", "*", "label")): "optional by schema",
-    ("parent-chain", ("report", "callers", 1, "launched_by", "*", "folded")): "optional by schema",
-    ("parent-chain", ("report", "callers", 1, "launched_by", "*", "exe_gap")): "optional by schema",
     ("parent-chain", ("report", "callers", 1, "launched_by_gap")): "a gap object is optional when the chain is whole",
 }
 
 
+# Optional keys: deleting one passes; a wrong type there is still refused.
+OPTIONAL = {
+    ("parent-chain", ("report", "callers", 1, "launched_by", "*", key)) for key in ("label", "folded", "exe_gap")}
+
+
 def allowed(judge, path):
     return any(j == judge and matches(pattern, path, prefix=True) for j, pattern in ALLOWED)
+
+
+def optional(judge, path):
+    return any(j == judge and matches(pattern, path) for j, pattern in OPTIONAL)
 
 
 # A replacement that stays inside the field's type (a null in a nullable
@@ -1135,6 +1143,8 @@ class FieldFuzzTests(unittest.TestCase):
                             want = ("fail", "relation")
                         elif kind == "set" and value_decided(judge, full, item):
                             want = ("fail", "relation")
+                        elif kind == "delete" and optional(judge, full):
+                            want = ("pass", None)
                         elif allowed(judge, full) and record["verdict"] == "pass":
                             want = got
                         else:
@@ -1198,6 +1208,17 @@ class LoaderKernelTests(unittest.TestCase):
                 except Q.Refusal as refusal:
                     outcome = (refusal.rule, refusal.stage)
                 self.assertEqual(outcome, None if ok else ("record.stamp", "type"))
+
+    def test_contract_constants_are_pinned(self):
+        # Literal pins: a test that iterated the loader's own tuples would
+        # follow a dropped reason instead of refusing it.
+        self.assertEqual(Q.MAX_INPUT_BYTES, 64 * 1024 * 1024)
+        self.assertEqual(Q.PID_MAX, 4194304)
+        self.assertEqual(Q.SHED_REASONS, ("broken_pipe", "slow_reader", "write_error", "zero_write",
+                                          "invalid_descriptor"))
+        self.assertEqual(Q.CHAIN_GAP_REASONS, (
+            "launcher exited before read", "launcher hidden by /proc hidepid",
+            "parent chain truncated after 4 ancestors", "parent chain not sampled in cgroup transaction"))
 
     def test_rules_are_declared_once_and_never_invented(self):
         with self.assertRaises(KeyError):

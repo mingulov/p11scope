@@ -7393,6 +7393,49 @@ fn folded_gap_noise_pairs_match_their_filing_sites() {
     assert_eq!(projected.reason, "discovery unavailable");
 }
 
+/// Fix4 B3 type-boundary guard: the changed-generation proof is minted
+/// only inside the sealed discovery authority (`generation_proof`): its
+/// variant names appear nowhere else, so no filing site can fabricate a
+/// proof value without a pin read. Engine code may only move proof
+/// values and call the authority's judges. This reads the authority
+/// through the filesystem (not `include_str!`) so a missing module fails
+/// red instead of failing the build.
+#[test]
+fn generation_proof_construction_stays_inside_its_authority() {
+    let engine_source = include_str!("engine.rs");
+    let authority_path = format!(
+        "{}/src/discovery/generation_proof.rs",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let authority =
+        std::fs::read_to_string(&authority_path).expect("the sealed proof authority must exist");
+    // Only the authority names proof variants: a fabricating call site
+    // must name one, which fails here — and fails to compile, since the
+    // representation is private to the authority.
+    for marker in ["ProvenExit", "ProvenChange", "ProofKind"] {
+        assert!(
+            authority.contains(marker),
+            "the authority must mint {marker}"
+        );
+        assert!(
+            !engine_source.contains(marker),
+            "no filing site may name {marker}: minting stays inside the authority"
+        );
+    }
+    // No construction path outside the authority: engine code moves
+    // proof values and calls the judges, never builds a proof.
+    for marker in [
+        "GenerationProof::ProvenExit",
+        "GenerationProof::ProvenChange",
+        "GenerationProof {",
+    ] {
+        assert!(
+            !engine_source.contains(marker),
+            "no filing site may construct a proof: {marker} stays inside the authority"
+        );
+    }
+}
+
 /// Poll real /proc until `pid` reads zombie (state Z), bounded; panics past
 /// the bound. The child must already be killed (else this proves nothing).
 fn wait_until_zombie(pid: u32) {
@@ -15374,6 +15417,327 @@ fn inventory_preflight_unproven_newcomer_files_unverified_gap_not_changed() {
     assert!(
         engine.pin_probe_script.borrow().is_empty(),
         "the preflight proof probe consumed its scripted answer: {:?}",
+        engine.pin_probe_script.borrow()
+    );
+}
+
+/// Fix4 B1 RED twin (candidate filing site): a mixed stale set — one
+/// affected original with positive exit proof (a reaped child) beside
+/// one the pin cannot judge (a live child under an unprovable pin) —
+/// must file BOTH the legitimate changed-generation row for the proof
+/// AND the named unverified gap for the refusal. Pre-fix only the proof
+/// row reaches the published skips and the refusal disappears from the
+/// capture's reason vocabulary.
+#[test]
+fn candidate_mixed_proof_and_unproven_files_both_rows() {
+    let (_fixture, view, module, pins) = loaded_seed_provider();
+    let live_id = view.id();
+    let live_pid = view.pid();
+    // A second child, opened live, then reaped: positive exit proof.
+    let mut dead = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let dead_pid = dead.id();
+    let dead_id = ProcessViewId(live_id.0.checked_add(1).expect("a spare view ID"));
+    let dead_view = ProcessView::open(dead_id, dead_pid).unwrap();
+    dead.kill().unwrap();
+    dead.wait().unwrap();
+    let mut engine = Engine::empty();
+    engine.views.push(dead_view);
+    // Swap the seed view for its unprovable shape: same ID, same live
+    // pid, no pin evidence either way.
+    engine.views.push(
+        crate::process::unprovable_process_view_for_test(live_id, live_pid)
+            .expect("an unprovable view over the live seed child"),
+    );
+    let mut candidate = engine
+        .live_candidate(pins, vec![module.clone()], Vec::new())
+        .expect("a seed candidate builds");
+    candidate.views.insert(dead_id);
+    candidate.views.insert(live_id);
+    // Stage the seed's first attach target exactly like the loud guard:
+    // a non-empty delta forces the loud branch (the silence is for an
+    // empty delta over proven exits only).
+    let object = candidate
+        .pinned
+        .id_for_scanned(&module, module.key, &module.path)
+        .unwrap();
+    let owner = candidate
+        .plan
+        .modules
+        .iter()
+        .find(|summary| summary.object == object)
+        .unwrap()
+        .id;
+    let file_offset = ElfSnapshot::read(candidate.pinned.file_for(object).unwrap())
+        .unwrap()
+        .defined_symbol("C_GetFunctionList")
+        .unwrap()
+        .unwrap()
+        .file_offset;
+    let slot = candidate
+        .plan
+        .add_provisional_get_function_list(plan::ProvisionalGetFunctionList {
+            module: owner,
+            object,
+            object_path: module.path.clone(),
+            file_offset,
+        })
+        .unwrap()
+        .unwrap();
+    candidate.delta.new.push(slot);
+    assert!(
+        !candidate.delta.new.is_empty(),
+        "the seed candidate carries an attach target"
+    );
+    let mut session = ScriptedSession::default();
+    let mut additions_allowed = true;
+    let outcome = engine
+        .apply_candidate(&mut session, candidate, &mut additions_allowed, false, &[])
+        .expect("the aborted apply still returns");
+    assert!(
+        outcome.stale_views.contains(&dead_id) && outcome.stale_views.contains(&live_id),
+        "both views abort the apply as stale: {:?}",
+        outcome.stale_views
+    );
+    assert!(
+        !crate::process::generation_dead(live_pid),
+        "the seed child is still live and unchanged after the abort"
+    );
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live discovery generation"
+                && skip.reason
+                    == "candidate generation changed before mutation; canonical identity, plan, and links were unchanged"
+        }),
+        "the proven exit keeps its legitimate changed row: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live discovery generation"
+                && skip.reason
+                    == "candidate generation unverified before mutation; exit or change unproven, canonical identity, plan, and links were unchanged"
+        }),
+        "the unproven sibling files the named unverified gap beside the proof row: {:?}",
+        engine.counters.object_skips
+    );
+}
+
+/// Fix4 B2 RED twin (candidate filing site): a retained view whose
+/// original pidfd is ready (its child exited but stays an unreaped
+/// zombie, so `/proc` is still readable) yet whose start time was never
+/// retained (FD pressure at open) proves exit by the pidfd alone: the
+/// same authority every retirement path uses. A failed `/proc` re-read
+/// can never downgrade a ready pidfd to unproven. Pre-fix the candidate
+/// files the unverified gap for a proven exit.
+#[test]
+fn candidate_ready_pidfd_without_start_time_proves_exit_not_unverified() {
+    let (mut fixture, view, module, pins) = loaded_seed_provider();
+    let id = view.id();
+    let pid = view.pid();
+    let mut engine = Engine::empty();
+    // A pidfd-only pin over the live child: no retained start time.
+    let pin_view = crate::process::pidfd_only_process_view_for_test(id, pid)
+        .expect("a pidfd-only view over the live seed child");
+    assert!(
+        pin_view.retained_pin().pidfd_raw_for_test().is_some(),
+        "the twin holds a real pidfd, or it tests the wrong pin shape"
+    );
+    engine.views.push(pin_view);
+    let mut candidate = engine
+        .live_candidate(pins, vec![module.clone()], Vec::new())
+        .expect("a seed candidate builds");
+    candidate.views.insert(id);
+    // Stage the seed's first attach target exactly like the loud guard:
+    // a non-empty delta forces the loud branch (the silence is for an
+    // empty delta over proven exits only).
+    let object = candidate
+        .pinned
+        .id_for_scanned(&module, module.key, &module.path)
+        .unwrap();
+    let owner = candidate
+        .plan
+        .modules
+        .iter()
+        .find(|summary| summary.object == object)
+        .unwrap()
+        .id;
+    let file_offset = ElfSnapshot::read(candidate.pinned.file_for(object).unwrap())
+        .unwrap()
+        .defined_symbol("C_GetFunctionList")
+        .unwrap()
+        .unwrap()
+        .file_offset;
+    let slot = candidate
+        .plan
+        .add_provisional_get_function_list(plan::ProvisionalGetFunctionList {
+            module: owner,
+            object,
+            object_path: module.path.clone(),
+            file_offset,
+        })
+        .unwrap()
+        .unwrap();
+    candidate.delta.new.push(slot);
+    // Kill without reaping: the child stays a zombie (pidfd ready,
+    // `/proc` stat still readable with the same start time) while the
+    // pin holds no start time to compare it against — the exact shape
+    // whose `/proc` re-read fails.
+    fixture.child.kill().unwrap();
+    wait_until_zombie(pid);
+    assert!(
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok(),
+        "the child is a zombie, not reaped: its stat stays readable"
+    );
+    let mut session = ScriptedSession::default();
+    let mut additions_allowed = true;
+    let outcome = engine
+        .apply_candidate(&mut session, candidate, &mut additions_allowed, false, &[])
+        .expect("the aborted apply still returns");
+    assert!(
+        outcome.stale_views.contains(&id),
+        "the exited view aborts the apply as stale: {:?}",
+        outcome.stale_views
+    );
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live discovery generation"
+                && skip.reason
+                    == "candidate generation changed before mutation; canonical identity, plan, and links were unchanged"
+        }),
+        "a ready pidfd proves the exit and files the changed row: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        engine.counters.object_skips.iter().all(|skip| {
+            skip.reason
+                != "candidate generation unverified before mutation; exit or change unproven, canonical identity, plan, and links were unchanged"
+        }),
+        "a proven exit never files the unverified gap: {:?}",
+        engine.counters.object_skips
+    );
+}
+
+/// Fix4 B2 RED twin (both inventory preflights): a retained stale view
+/// whose original pidfd is ready but whose start time was never
+/// retained (zombie child, pidfd-only pin — the twin above) proves its
+/// exit at either preflight: with no newly-opened stale ID and every
+/// retained stale view proven, the preflight stays silent and the
+/// named-target bail stays off, exactly as before the stronger
+/// exit-vs-reuse distinction. Pre-fix the failed `/proc` re-read files
+/// the unverified gap and arms the bail even though the retirement code
+/// independently proves the exit.
+#[test]
+fn inventory_preflight_ready_pidfd_without_start_time_stays_silent() {
+    let mut zombie = spawn_execed_sleep();
+    let pid = zombie.id();
+    let id = ProcessViewId(0);
+    let view = crate::process::pidfd_only_process_view_for_test(id, pid)
+        .expect("a pidfd-only view over the live child");
+    assert!(
+        view.retained_pin().pidfd_raw_for_test().is_some(),
+        "the twin holds a real pidfd, or it tests the wrong pin shape"
+    );
+    // Kill without reaping: pidfd ready, stat still readable.
+    zombie.kill().unwrap();
+    wait_until_zombie(pid);
+    assert!(
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok(),
+        "the child is a zombie, not reaped: its stat stays readable"
+    );
+    let mut engine = Engine::empty();
+    engine.views.push(view);
+    let stale = BTreeSet::from([id]);
+    let retained_stale = BTreeSet::from([id]);
+    let extra: [&ProcessView; 0] = [];
+    for (site, label) in [
+        (ChangedGenerationSite::InventoryPreflight, "first preflight"),
+        (
+            ChangedGenerationSite::PostRetirementPreflight,
+            "post-retirement preflight",
+        ),
+    ] {
+        let (skip, retained_unproven) =
+            engine.inventory_preflight_generation_skip(&retained_stale, &stale, &extra, site);
+        assert!(
+            skip.is_none(),
+            "{label}: a ready pidfd proves the exit, so the preflight stays silent: {skip:?}"
+        );
+        assert!(
+            !retained_unproven,
+            "{label}: a proven retained exit never arms the named-target bail"
+        );
+    }
+    // Reap the zombie now that both preflights judged it.
+    zombie.wait().unwrap();
+}
+
+/// Fix4 B2 RED twin (named-target refusal): a named target whose stale
+/// report the pin cannot judge (scripted poll failure at the
+/// post-retirement preflight — the fault injection the review used)
+/// refuses the capture, but the refusal must name the unverified
+/// generation, never claim it changed: the pin proved neither exit nor
+/// change, and the target may be live and unchanged. The accompanying
+/// skip already says unverified; pre-fix the error claims "changed".
+#[test]
+fn named_target_unproven_generation_refuses_with_unverified_error() {
+    // The preflight kills and reaps this child; the proof probe is
+    // scripted to fail, so the exit is real but unproven.
+    let pid = spawn_execed_sleep().id();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Pid(pid);
+    engine.next_view_id = 1;
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(0), pid).unwrap());
+    engine.request_refresh(pid, None);
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    let mut session = ScriptedSession::default();
+    session.lose_generations_at_preflight([None, Some(pid)]);
+    // Fault injection: the pin cannot judge this generation (poll
+    // failure) at the post-retirement preflight.
+    engine
+        .pin_probe_script
+        .borrow_mut()
+        .extend([PinProbeAnswer::State(Some(Err(
+            "simulated pin poll failure".to_string(),
+        )))]);
+    let mut collect: Box<DiscoveryCollector<'_>> = Box::new(Engine::collect_discovery_records);
+    let mut tick_now = crate::attach::monotonic_ns;
+    let refreshed = engine.refresh_inventory(
+        &mut session,
+        &mut true,
+        &mut Vec::new(),
+        &mut PendingViewRetirements::new(),
+        &mut *collect,
+        &mut PauseClosure::new(true),
+        &mut tick_now,
+    );
+    let error = refreshed.expect_err("an unproven named generation refuses the capture");
+    let text = format!("{error:#}");
+    assert!(
+        text.contains("was unverified during inventory preflight"),
+        "the refusal names the unverified generation: {text}"
+    );
+    assert!(
+        !text.contains("changed"),
+        "the refusal never claims the generation changed: {text}"
+    );
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live inventory generation"
+                && skip.reason
+                    == "an exact retained or newly opened process generation was unverified during post-retirement preflight; exit or change unproven"
+        }),
+        "the refusal carries the named unverified gap: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        engine.pin_probe_script.borrow().is_empty(),
+        "the post-retirement proof probe consumed its scripted answer: {:?}",
         engine.pin_probe_script.borrow()
     );
 }

@@ -899,6 +899,21 @@ pub(crate) fn unprovable_process_view_for_test(
     Ok(view)
 }
 
+/// Tests-only: a view pinned by its original pidfd alone, with no
+/// retained start time — the shape `open` yields when the pidfd succeeds
+/// but the `/proc` start-time read does not. A ready pidfd over an
+/// exited original is exit proof even though the start-time
+/// exit-vs-reuse distinction is unavailable.
+#[cfg(test)]
+pub(crate) fn pidfd_only_process_view_for_test(
+    id: ProcessViewId,
+    pid: u32,
+) -> Result<ProcessView, String> {
+    let mut view = ProcessView::open(id, pid)?;
+    view.pin = Arc::new(PidPin::test_pidfd_only(pid));
+    Ok(view)
+}
+
 /// A view pinned by `/proc` start time only. An unreaped zombie still
 /// matches this weak generation check; it has no original pidfd authority
 /// for full-image custody or cold filesystem proof.

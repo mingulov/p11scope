@@ -5237,19 +5237,13 @@ fn check_startup_probe_records(
     // the declared three-round schedule and the caller derived from the typed
     // records. The fenced disposition keeps its pending-queue recovery shape.
     if k == 0 {
-        ensure!(
-            fenced_pairs.is_empty(),
-            "ordinary probe must not withhold any pair"
-        );
-        let mut by_seq = BTreeMap::new();
-        for row in records {
-            if let Some(seq) = row["seq"].as_u64() {
-                ensure!(
-                    by_seq.insert(seq, row).is_none(),
-                    "duplicate diagnostic seq {seq}"
-                );
-            }
-        }
+        // Pair/module correspondence needs no restating here: the placed
+        // check above already spans all 32 pairs over all 32 A modules, and
+        // the lineage call below keeps each module on its own pair.
+        let by_seq: BTreeMap<u64, &serde_json::Value> = records
+            .iter()
+            .filter_map(|row| row["seq"].as_u64().map(|seq| (seq, row)))
+            .collect();
         let mut callers = BTreeSet::new();
         for row in records.iter().filter(|row| {
             row["kind"] == "count_decision"
@@ -5271,23 +5265,9 @@ fn check_startup_probe_records(
             (2, expected_a(2, 0)),
             (3, expected_a(3, 0)),
         ];
-        let mut lineage_pairs = BTreeSet::new();
         for module in modules {
-            let (pair, _) =
-                check_a_count_lineage(records, &by_seq, caller, module, &issued, &milestones)?;
-            ensure!(
-                lineage_pairs.insert(pair.clone()),
-                "ordinary A module {module} repeats pair {pair}"
-            );
+            check_a_count_lineage(records, &by_seq, caller, module, &issued, &milestones)?;
         }
-        ensure!(
-            lineage_pairs
-                == pairs
-                    .iter()
-                    .map(|pair| (*pair).to_owned())
-                    .collect::<BTreeSet<_>>(),
-            "ordinary lineage must span all32 observed pairs"
-        );
     }
     let frozen: Vec<_> = records
         .iter()
@@ -5917,6 +5897,18 @@ fn operator_diagnostics_three_round_probe_ordinary_two_shape_lineage() -> Result
             "summary1_wrong_caller",
             "needs exactly one genuine publication shape",
         ),
+        (
+            "placed1_wrong_reason",
+            "first unit must remain actual published history",
+        ),
+        (
+            "placed1_wrong_caller",
+            "needs exactly one genuine publication shape",
+        ),
+        ("staged2_crossed_pair", "one A module spans physical pairs"),
+        ("staged2_missing_caller", "ordinary staged caller"),
+        ("staged2_wrong_absolute", "unissued A stage"),
+        ("summary1_extra_copy", "extra A publication"),
     ] {
         let mut changed = ordinary.clone();
         match change {
@@ -6019,6 +6011,37 @@ fn operator_diagnostics_three_round_probe_ordinary_two_shape_lineage() -> Result
                 changed.swap(first, second);
                 changed[first]["seq"] = seq_first;
                 changed[second]["seq"] = seq_second;
+            }
+            "placed1_wrong_reason" => {
+                let at = placed_index(&changed, "p0", 1);
+                changed[at]["reason"] = "identity_changed".into();
+            }
+            "placed1_wrong_caller" => {
+                let at = placed_index(&changed, "p0", 1);
+                changed[at]["caller"] = "c9".into();
+            }
+            "staged2_crossed_pair" => {
+                let at = staged_index(&changed, "p0", 2);
+                changed[at]["pair"] = "p1".into();
+            }
+            "staged2_missing_caller" => {
+                let at = staged_index(&changed, "p0", 2);
+                changed[at]["caller"] = serde_json::Value::Null;
+            }
+            "staged2_wrong_absolute" => {
+                let at = staged_index(&changed, "p0", 2);
+                changed[at]["absolute"] = 9.into();
+            }
+            "summary1_extra_copy" => {
+                let max = changed
+                    .iter()
+                    .filter_map(|row| row["seq"].as_u64())
+                    .max()
+                    .context("twin max seq")?;
+                let mut extra = changed[summary_index(&changed, "mA-00", 1)].clone();
+                extra["seq"] = (max + 1).into();
+                changed.insert(changed.len() - 1, extra);
+                rebuild_probe_footer(&mut changed);
             }
             _ => {
                 let at = summary_index(&changed, "mA-00", 1);

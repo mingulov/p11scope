@@ -1727,7 +1727,7 @@ impl SemanticBindingSet {
             return &self.bindings;
         }
         // A zero rotation reorders nothing: only a real reorder bumps.
-        if self.cursor % len != 0 {
+        if !self.cursor.is_multiple_of(len) {
             self.bindings.rotate_left(self.cursor % len);
             self.bump_revision();
         }

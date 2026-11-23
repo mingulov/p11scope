@@ -582,23 +582,13 @@ class OptimizationProofTests(unittest.TestCase):
     def test_heredocs_found(self):
         self.assertGreaterEqual(len(qualifier_heredocs()), 9)
 
-    # The run-prearm block keeps the assert statements its structural
-    # tests pin (HandoffPairTests, PrearmExactnessTests); -I still keeps
-    # an inherited PYTHONOPTIMIZE from stripping them.
-    PINNED_ASSERTS = ("detail=$(python3 -I - <<'PY' 2>&1",)
-
     def test_no_heredoc_uses_assert_statements(self):
-        exempt = 0
         for line, body in qualifier_heredocs():
-            if line.strip() in self.PINNED_ASSERTS:
-                exempt += 1
-                continue
             with self.subTest(invocation=line.strip()[:60]):
                 tree = ast.parse(body)
                 asserts = [node.lineno for node in ast.walk(tree)
                            if isinstance(node, ast.Assert)]
                 self.assertEqual(asserts, [], "assert statements are stripped by -O")
-        self.assertEqual(exempt, 1)
 
     def test_every_heredoc_runs_isolated(self):
         for line, _ in qualifier_heredocs():
@@ -733,6 +723,16 @@ class InventoryOverlayTests(unittest.TestCase):
                       "unproven=0 gaps=0", out)
 
 
+# Optimization level for the AST-compiled oracle pieces: -1 follows the
+# interpreter, and the Optimized* classes below force 2 (asserts and
+# docstrings stripped, as under python3 -OO).
+COMPILE_OPTIMIZE = -1
+
+
+def compile_oracle(module, label, mode):
+    return compile(module, label, mode, optimize=COMPILE_OPTIMIZE)
+
+
 def extract_handoff_oracle():
     """Extract the run-prearm python oracle block from the qualifier."""
     lines = QUAL.read_text().splitlines(keepends=True)
@@ -755,7 +755,7 @@ def load_handoff_pair():
     for node in tree.body:
         if isinstance(node, ast.FunctionDef) and node.name == "assert_handoff_pair":
             namespace = {}
-            exec(compile(ast.Module(body=[node], type_ignores=[]),
+            exec(compile_oracle(ast.Module(body=[node], type_ignores=[]),
                          "<handoff>", "exec"), namespace)
             return namespace["assert_handoff_pair"]
     raise AssertionError("assert_handoff_pair missing from the run-prearm oracle")
@@ -778,7 +778,7 @@ def load_pre68_dispatch(name, label):
     if name not in found:
         raise AssertionError(f"{name} missing from the run-prearm oracle")
     namespace = {}
-    exec(compile(ast.Module(body=nodes, type_ignores=[]),
+    exec(compile_oracle(ast.Module(body=nodes, type_ignores=[]),
                  label, "exec"), namespace)
     return namespace[name]
 
@@ -804,23 +804,25 @@ def load_prearm_counter():
     for node in tree.body:
         if isinstance(node, ast.FunctionDef) and node.name == "completed_calls":
             namespace = {}
-            exec(compile(ast.Module(body=[node], type_ignores=[]),
+            exec(compile_oracle(ast.Module(body=[node], type_ignores=[]),
                          "<prearm-counter>", "exec"), namespace)
             return namespace["completed_calls"]
     raise AssertionError("completed_calls missing from the run-prearm oracle")
 
 
 def load_prearm_gate():
-    """Compile the shipped `assert counts == (3, 3, 1)` gate (not a copy).
+    """Compile the shipped `if not (counts == (3, 3, 1))` gate (not a copy).
 
-    Returns a gate(counts) callable executing exactly that assertion:
+    Returns a gate(counts) callable executing exactly that check:
     healthy (3, 3, 1) passes, any other count raises AssertionError.
     """
     tree = ast.parse(extract_handoff_oracle())
     for node in tree.body:
-        if not isinstance(node, ast.Assert):
+        if not (isinstance(node, ast.If) and isinstance(node.test, ast.UnaryOp)
+                and isinstance(node.test.op, ast.Not) and not node.orelse
+                and len(node.body) == 1 and isinstance(node.body[0], ast.Raise)):
             continue
-        test = node.test
+        test = node.test.operand
         if not (isinstance(test, ast.Compare) and isinstance(test.left, ast.Name)
                 and test.left.id == "counts" and len(test.ops) == 1
                 and isinstance(test.ops[0], ast.Eq) and len(test.comparators) == 1):
@@ -829,7 +831,7 @@ def load_prearm_gate():
         if not (isinstance(compar, ast.Tuple)
                 and [getattr(elt, "value", None) for elt in compar.elts] == [3, 3, 1]):
             continue
-        code = compile(ast.Module(body=[node], type_ignores=[]),
+        code = compile_oracle(ast.Module(body=[node], type_ignores=[]),
                        "<prearm-gate>", "exec")
 
         def gate(counts, _code=code):
@@ -928,9 +930,9 @@ class HandoffPairTests(unittest.TestCase):
         # passive single pre_attach with end == attached_at.
         text = QUAL.read_text()
         for line in (
-            'assert held["unobserved_windows"] == [], held["unobserved_windows"]',
-            'assert windows and len(windows) == 1 and windows[0]["reason"] == "pre_attach", windows',
-            'assert windows[0]["end_ns"] == passive["attached_at_ns"], windows',
+            'if not (held["unobserved_windows"] == []): raise AssertionError(held["unobserved_windows"])',
+            'if not (windows and len(windows) == 1 and windows[0]["reason"] == "pre_attach"): raise AssertionError(windows)',
+            'if not (windows[0]["end_ns"] == passive["attached_at_ns"]): raise AssertionError(windows)',
         ):
             with self.subTest(line=line):
                 self.assertIn(line, text)
@@ -1122,6 +1124,49 @@ def run_judge_case(cell, release):
                               cwd=str(tmp))
         assert "JUDGE_RC=0" in proc.stdout, proc.stdout + proc.stderr
         return args_file.read_text().splitlines()
+
+
+class OptimizedCompile:
+    """Re-run a run-prearm class with its oracle pieces compiled at
+    optimize=2, so a check that -O would strip fails its negatives."""
+
+    @classmethod
+    def setUpClass(cls):
+        global COMPILE_OPTIMIZE
+        COMPILE_OPTIMIZE = 2
+        super().setUpClass()
+
+    @classmethod
+    def tearDownClass(cls):
+        global COMPILE_OPTIMIZE
+        COMPILE_OPTIMIZE = -1
+        super().tearDownClass()
+
+
+class OptimizedHandoffPairTests(OptimizedCompile, HandoffPairTests):
+    pass
+
+
+class OptimizedPre68DispatchTests(OptimizedCompile, Pre68DispatchTests):
+    pass
+
+
+class OptimizedPrearmExactnessTests(OptimizedCompile, PrearmExactnessTests):
+    pass
+
+
+class OptimizeLevelProofTests(unittest.TestCase):
+    def test_optimize_two_strips_assert_statements(self):
+        # The Optimized* classes only prove something if optimize=2
+        # really strips assert statements in this interpreter.
+        global COMPILE_OPTIMIZE
+        COMPILE_OPTIMIZE = 2
+        try:
+            exec(compile_oracle(ast.parse("assert False"), "<probe>", "exec"), {})
+        finally:
+            COMPILE_OPTIMIZE = -1
+        with self.assertRaises(AssertionError):
+            exec(compile_oracle(ast.parse("assert False"), "<probe>", "exec"), {})
 
 
 class JudgeFlagTests(unittest.TestCase):
@@ -1339,7 +1384,7 @@ def load_completed_calls():
     for node in tree.body:
         if isinstance(node, ast.FunctionDef) and node.name == "completed_calls":
             namespace = {}
-            exec(compile(ast.Module(body=[node], type_ignores=[]),
+            exec(compile_oracle(ast.Module(body=[node], type_ignores=[]),
                          "<completed>", "exec"), namespace)
             return namespace["completed_calls"]
     raise AssertionError("completed_calls missing from the run-prearm oracle")

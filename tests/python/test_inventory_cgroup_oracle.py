@@ -17,6 +17,7 @@ real code.
 import ast
 import json
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -36,6 +37,30 @@ REFRESH_RETAINED = ("the final-sample permit was not granted; "
 REFRESH_MEMBER_LOST = "the final-sample permit was not granted"
 DEADLINE = "cgroup collection deadline reached"
 PREP_INPUT_INTERRUPTED = "cgroup provider input comparison interrupted"
+# The other seven preparation reasons the producer files under the
+# same subject and shape (src/discovery/inventory_attach_set.rs
+# prepare_absorption): the qualifier validates all eight.
+PREP_INPUT_CEILING = "cgroup provider preparation input ceiling reached"
+PREP_INTERRUPTED_OR_ALLOWANCE = (
+    "cgroup provider preparation interrupted or allowance exhausted")
+PREP_INTERRUPTED_AFTER_RETENTION = (
+    "cgroup provider preparation interrupted after retention")
+PREP_RESOLUTION_INTERRUPTED = "cgroup provider resolution interrupted"
+PREP_COMPARISON_CEILING = (
+    "cgroup provider preparation comparison ceiling reached")
+PREP_IDENTITY_INTERRUPTED = (
+    "cgroup provider identity comparison interrupted")
+PREP_INTERRUPTED_BEFORE_COMPLETION = (
+    "cgroup provider preparation interrupted before completion")
+OTHER_PREP_REASONS = (
+    PREP_INPUT_CEILING,
+    PREP_INTERRUPTED_OR_ALLOWANCE,
+    PREP_INTERRUPTED_AFTER_RETENTION,
+    PREP_RESOLUTION_INTERRUPTED,
+    PREP_COMPARISON_CEILING,
+    PREP_IDENTITY_INTERRUPTED,
+    PREP_INTERRUPTED_BEFORE_COMPLETION,
+)
 PREP_SUBJECT = "cgroup provider preparation incomplete"
 DEADLINE_SUBJECT = "cgroup scope transaction incomplete"
 UNBOUND_SUBJECT = "used by an unidentified caller image"
@@ -95,8 +120,8 @@ def run_oracle_optimized(report, *, modfs, pin=None, modpath=MODPATH):
         (tmp / "in.wl").write_text(inside_wl)
         (tmp / "out.wl").write_text(outside_wl)
         proc = subprocess.run(
-            ["python3", "-I", "-O", "-", "r.json", "in.wl", "out.wl",
-             json.dumps(pin), modpath, modfs],
+            [sys.executable, "-I", "-O", "-", "r.json", "in.wl",
+             "out.wl", json.dumps(pin), modpath, modfs],
             input=block, capture_output=True, text=True, timeout=30,
             cwd=str(tmp))
     return proc.returncode, proc.stdout + proc.stderr
@@ -999,6 +1024,152 @@ class TransactionReasonTests(unittest.TestCase):
                 rc, out = run_oracle(report, modfs=modfs)
                 self.assertNotEqual(rc, 0, out)
                 self.assertIn(message, out)
+
+
+class CrossPairTests(unittest.TestCase):
+    # Fix6: the qualifier enforces a typed (subject, reason)
+    # allowlist on both branches and refuses every other pair. The
+    # degraded branch used to check reasons only (X1/X2), and the
+    # witness-available branch had no gate at all (X3). Each
+    # impossible pair below fails identically under optimization.
+    def test_prep_subject_with_fallback_reason_fails(self):
+        # X1: the fallback reason is filed only under the native
+        # activation-refused subject — a preparation row carrying
+        # it is impossible on both substrates.
+        for modfs, base, message in (
+                ("overlayfs", decided_report,
+                 "overlay published extra gap"),
+                ("ext4", witness_available_report,
+                 "unrecognized cgroup gap row")):
+            for optimized in (False, True):
+                with self.subTest(substrate=modfs,
+                                  optimized=optimized):
+                    report = base()
+                    report["gaps"].append(
+                        straddle_prep_row(over={"reason": NATIVE}))
+                    report["gaps"].append(straddle_deadline_row())
+                    run = (run_oracle_optimized if optimized
+                           else run_oracle)
+                    rc, out = run(report, modfs=modfs)
+                    self.assertNotEqual(rc, 0, out)
+                    self.assertIn(message, out)
+
+    def test_novel_subject_with_retained_reason_fails(self):
+        # X2: the retained reason is filed only under the native
+        # refresh-refused subject — a novel subject carrying it is
+        # impossible on both substrates, even with a deadline.
+        for modfs, base, message in (
+                ("overlayfs", decided_report,
+                 "overlay published extra gap"),
+                ("ext4", witness_available_report,
+                 "unrecognized cgroup gap row")):
+            for optimized in (False, True):
+                with self.subTest(substrate=modfs,
+                                  optimized=optimized):
+                    report = base()
+                    report["gaps"].append(
+                        {"caller": "c0", "module": None, "pid": 100,
+                         "reason": REFRESH_RETAINED,
+                         "subject": "novel gap", "repeats": 1})
+                    report["gaps"].append(straddle_deadline_row())
+                    run = (run_oracle_optimized if optimized
+                           else run_oracle)
+                    rc, out = run(report, modfs=modfs)
+                    self.assertNotEqual(rc, 0, out)
+                    self.assertIn(message, out)
+
+    def test_novel_prep_reason_with_valid_shape_fails(self):
+        # X3: a preparation-subject row with a ninth reason (here a
+        # near-miss of the filed one) and otherwise valid shape is
+        # impossible on both substrates, even with a deadline.
+        for modfs, base, message in (
+                ("overlayfs", decided_report,
+                 "overlay published extra gap"),
+                ("ext4", witness_available_report,
+                 "unrecognized cgroup gap row")):
+            for optimized in (False, True):
+                with self.subTest(substrate=modfs,
+                                  optimized=optimized):
+                    report = base()
+                    report["gaps"].append(
+                        straddle_prep_row(over={"reason":
+                            "cgroup provider input comparison "
+                            "interruptedly"}))
+                    report["gaps"].append(straddle_deadline_row())
+                    run = (run_oracle_optimized if optimized
+                           else run_oracle)
+                    rc, out = run(report, modfs=modfs)
+                    self.assertNotEqual(rc, 0, out)
+                    self.assertIn(message, out)
+
+    def test_other_prep_reasons_pass_with_deadline(self):
+        # The seven other filed preparation reasons carry the same
+        # producer shape and straddle the same run deadline, so each
+        # qualifies on both substrates, identically under -O.
+        self.assertEqual(len(OTHER_PREP_REASONS), 7)
+        for reason in OTHER_PREP_REASONS:
+            for modfs, base in (("overlayfs", decided_report),
+                                ("ext4", witness_available_report)):
+                for optimized in (False, True):
+                    with self.subTest(reason=reason,
+                                      substrate=modfs,
+                                      optimized=optimized):
+                        report = base()
+                        report["gaps"].append(
+                            straddle_prep_row(over={"reason": reason}))
+                        report["gaps"].append(straddle_deadline_row())
+                        run = (run_oracle_optimized if optimized
+                               else run_oracle)
+                        rc, out = run(report, modfs=modfs)
+                        self.assertEqual(rc, 0, out)
+
+    def test_unnamed_extra_gap_fails_witness_available(self):
+        # The witness-available branch refuses unnamed gaps too: a
+        # novel pair fails loudly instead of passing silently.
+        report = witness_available_report()
+        report["gaps"].append(
+            {"caller": None, "module": None, "pid": None,
+             "reason": "something new", "subject": "novel gap",
+             "repeats": 1})
+        for optimized in (False, True):
+            with self.subTest(optimized=optimized):
+                run = (run_oracle_optimized if optimized
+                       else run_oracle)
+                rc, out = run(report, modfs="ext4")
+                self.assertNotEqual(rc, 0, out)
+                self.assertIn("unrecognized cgroup gap row", out)
+
+    def test_member_lost_refresh_refusal_fails_witness_available(self):
+        # Only the facts-retained variant is a known deadline
+        # consequence on the witness-available branch too: the bare
+        # member-lost variant keeps failing loudly there.
+        report = witness_available_report()
+        report["gaps"].append(
+            {"caller": "c0", "module": None, "pid": 100,
+             "reason": REFRESH_MEMBER_LOST,
+             "subject": "native owner refresh refused",
+             "repeats": 1})
+        for optimized in (False, True):
+            with self.subTest(optimized=optimized):
+                run = (run_oracle_optimized if optimized
+                       else run_oracle)
+                rc, out = run(report, modfs="ext4")
+                self.assertNotEqual(rc, 0, out)
+                self.assertIn("unrecognized cgroup gap row", out)
+
+    def test_detached_unbound_gap_fails_witness_available(self):
+        # The named positive belongs to the owned module on the
+        # witness-available branch too; the same shape detached
+        # from it is an unexpected extra gap there.
+        report = witness_available_report()
+        report["gaps"][1]["module"] = None
+        for optimized in (False, True):
+            with self.subTest(optimized=optimized):
+                run = (run_oracle_optimized if optimized
+                       else run_oracle)
+                rc, out = run(report, modfs="ext4")
+                self.assertNotEqual(rc, 0, out)
+                self.assertIn("unrecognized cgroup gap row", out)
 
 
 class ExplicitRefusalTests(unittest.TestCase):

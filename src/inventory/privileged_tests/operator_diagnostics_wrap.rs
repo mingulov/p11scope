@@ -5230,10 +5230,63 @@ fn check_startup_probe_records(
             "recovery must retain the genuine second-read fence window on {pair}"
         );
     }
-    for pair in pairs.difference(&fenced_pairs) {
+    // Ordinary growth commits through the shared two-shape rule: unit 1
+    // resolves the pending queue to per-pair `placed`, while confirmed-Bound
+    // units stage `sole_owner` and commit via null-pair registry summaries.
+    // The rule is owned by `check_a_count_lineage`; this probe only supplies
+    // the declared three-round schedule and the caller derived from the typed
+    // records. The fenced disposition keeps its pending-queue recovery shape.
+    if k == 0 {
         ensure!(
-            placed(pair, 2, 1).len() == 1 && placed(pair, 3, 2).len() == 1,
-            "ordinary path must place all three unit advances on {pair}"
+            fenced_pairs.is_empty(),
+            "ordinary probe must not withhold any pair"
+        );
+        let mut by_seq = BTreeMap::new();
+        for row in records {
+            if let Some(seq) = row["seq"].as_u64() {
+                ensure!(
+                    by_seq.insert(seq, row).is_none(),
+                    "duplicate diagnostic seq {seq}"
+                );
+            }
+        }
+        let mut callers = BTreeSet::new();
+        for row in records.iter().filter(|row| {
+            row["kind"] == "count_decision"
+                && row["decision"] == "staged"
+                && row["module_id"]
+                    .as_str()
+                    .is_some_and(|module| modules.contains(module))
+        }) {
+            callers.insert(row["caller"].as_str().context("ordinary staged caller")?);
+        }
+        ensure!(
+            callers.len() == 1,
+            "ordinary growth needs one typed caller, got {callers:?}"
+        );
+        let caller = callers.into_iter().next().context("ordinary caller")?;
+        let issued = [1u64, 2, 3];
+        let milestones = [
+            (1u64, expected_a(1, 0)),
+            (2, expected_a(2, 0)),
+            (3, expected_a(3, 0)),
+        ];
+        let mut lineage_pairs = BTreeSet::new();
+        for module in modules {
+            let (pair, _) =
+                check_a_count_lineage(records, &by_seq, caller, module, &issued, &milestones)?;
+            ensure!(
+                lineage_pairs.insert(pair.clone()),
+                "ordinary A module {module} repeats pair {pair}"
+            );
+        }
+        ensure!(
+            lineage_pairs
+                == pairs
+                    .iter()
+                    .map(|pair| (*pair).to_owned())
+                    .collect::<BTreeSet<_>>(),
+            "ordinary lineage must span all32 observed pairs"
         );
     }
     let frozen: Vec<_> = records
@@ -5247,11 +5300,12 @@ fn check_startup_probe_records(
         "stop incomplete: {} third units still withheld at stop",
         frozen.len()
     );
-    // Terminal projection per path: ordinary edges read 3 (all three units
-    // placed); fenced edges read 2 (units 1 and 3 placed, unit 2 permanently
-    // withheld by the startup fence). There is no drain: each pair's growth
-    // installs on its own edge only, so no later publication carries one
-    // pair's edge past another's installs.
+    // Terminal projection per path: ordinary edges read 3 (unit 1 placed
+    // from the pending queue plus confirmed-Bound staged growth for units 2-3
+    // committed via registry summaries); fenced edges read 2 (units 1 and 3
+    // placed, unit 2 permanently withheld by the startup fence). There is no
+    // drain: each pair's growth installs on its own edge only, so no later
+    // publication carries one pair's edge past another's installs.
     let terminal = if k == 0 { 3 } else { 2 };
     ensure!(
         public_counts.iter().all(|count| *count == terminal),
@@ -5953,11 +6007,13 @@ fn operator_diagnostics_three_round_probe_ordinary_two_shape_lineage() -> Result
                 changed[at]["caller"] = "c9".into();
             }
             "summary1_seq_window" => {
-                // Swap the summary and next-stage rows while their seqs stay
-                // with their slots: the commit leaves its stage window but the
-                // document order and footer stay valid.
+                // Swap the two summaries while their seqs stay with their
+                // slots: each commit keeps its shape but leaves its stage
+                // window, while the document order and footer stay valid.
+                // (Summaries carry no observation link, so no earlier read
+                // clause can fire first.)
                 let first = summary_index(&changed, "mA-00", 1);
-                let second = staged_index(&changed, "p0", 3);
+                let second = summary_index(&changed, "mA-00", 2);
                 let seq_first = changed[first]["seq"].clone();
                 let seq_second = changed[second]["seq"].clone();
                 changed.swap(first, second);

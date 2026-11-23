@@ -676,6 +676,295 @@ class BrowserCells(unittest.TestCase):
                 "waited", gap.get("reason") or "",
                 "the settle gap does not name its wait")
 
+    @gate_system("chromium")
+    def test_cr_first_with_background_provider_covers_browser(self):
+        """CR-FIRST-BG-RSA (v0.8.0): observer-first key operations beside a
+        pre-existing SoftHSM caller; the late Chromium's RSA client-cert
+        signs populate with the rsa family (typed, exact). Closes the gap
+        that let Chromium's 0-sign loss through: every prior run named
+        bootstrap_unavailable with completed_signs=0 while TLS handshook."""
+        store, cred = self.seed()
+        bg = cells.start_soft_call(store.lib, self.work / "bg", env=store.env)
+        self.addCleanup(bg.stop)
+        key, cert = tls_server.make_server_credential(self.work / "srv")
+        with tls_server.FlowServer(cert=cert, key=key) as plain, \
+                tls_server.FlowServer(cert=cert, key=key, require_client_cert=True,
+                                      client_ca=cred.cert_pem) as cc:
+            result = cells.observe_first_system(
+                "CR-FIRST-BG-RSA", "chromium", self.work / "cell",
+                plain_url=plain.url, cc_url=cc.url, nss_credential=cred,
+                duration_seconds=90, extra_prefs=None)
+            self.assertGreaterEqual(
+                plain.requests_served, 1, "plain flow saw no request")
+            self.assertGreaterEqual(
+                cc.handshakes_ok, 1, "client-cert flow never handshook")
+            self.assertGreaterEqual(
+                cc.client_certs_presented, 1, "client cert never presented")
+        self.assertEqual(result.flow.get("observer_exit"), 0,
+                         f"observer failed: {result.observer_stderr_tail}")
+        bg.stop()
+        bg_calls = cells.soft_call_completed(bg.log.read_text())
+        self.assertIsNotNone(
+            bg_calls, "background caller left no STOP line (died mid-cell?)")
+        self.assertGreaterEqual(
+            bg_calls, 30,
+            "background caller made too few calls to pin its precondition")
+        with open(result.report_path, encoding="utf-8") as handle:
+            report = json.load(handle)
+        observations = report.get("object_observations") or {}
+        browser_modules = {
+            module.get("id")
+            for module in report.get("modules") or []
+            if any(str(path).endswith("libsoftokn3.so")
+                   for path in (module.get("paths") or []))
+        }
+        self.assertGreater(
+            len(browser_modules), 0, "browser softokn module missing")
+        browser_instances = {
+            instance.get("id")
+            for instance in report.get("instances") or []
+            if instance.get("module") in browser_modules
+        }
+        modules_by_id = {
+            module.get("id"): module for module in report.get("modules") or []
+        }
+        folded_browser_idents = []
+        for mid in browser_modules:
+            departed = (modules_by_id.get(mid) or {}).get("departed_use") or {}
+            for ident in departed.get("identities") or []:
+                exe = ((ident.get("exe") or {}).get("path") or "").lower()
+                if _folded_exe_names_chromium(exe):
+                    folded_browser_idents.append(ident)
+        if not browser_instances:
+            self.assertGreater(
+                len(folded_browser_idents), 0,
+                "browser softokn instance missing (neither live nor folded)")
+        if observations.get("reason") == "journal_unavailable":
+            self.assertEqual(
+                observations.get("status"), "unavailable",
+                "journal refusal must stay unavailable")
+            rows = observations.get("key_operations") or []
+            self.assertEqual(len(rows), 0, "journal refusal must carry zero rows")
+            return
+        birth_refusals = sorted(
+            (str(gap.get("caller")), str(gap.get("reason")),
+             gap.get("repeats", 1))
+            for gap in report.get("gaps") or []
+            if isinstance(gap, dict)
+            and gap.get("subject") == "Joint birth unavailable; retained S1")
+        rows = observations.get("key_operations") or []
+        reason = observations.get("reason")
+        never_covered = (
+            "late browser never covered (no live per-key tracking); "
+            f"birth refusals={birth_refusals}; "
+            f"observation gaps={observations.get('gaps')}")
+        if reason == "live_joint_feed_absent":
+            self.assertEqual(
+                observations.get("status"), "partial",
+                "live_joint_feed_absent must commit partial")
+            if _bootstrap_cover_missing(rows, browser_instances):
+                self.fail(never_covered)
+        elif reason == "bootstrap_unavailable":
+            self.assertEqual(
+                len(rows), 0,
+                "bootstrap_unavailable carries no retained rows; folded "
+                "rows must commit partial/live_joint_feed_absent")
+            self.fail(never_covered)
+        self.assertGreater(len(rows), 0, "no key-operation rows at all")
+        completed_signs = sum(
+            row.get("completed", 0) for row in rows
+            if row.get("category") == "sign")
+        self.assertGreaterEqual(
+            completed_signs, 1, "no completed client-cert signs observed")
+        expected_family = "rsa"
+        family_signs = _family_sign_completions(rows, expected_family)
+        self.assertGreaterEqual(
+            family_signs, 1,
+            f"no completed {expected_family} client-cert signs observed "
+            f"(completed_signs={completed_signs} all generic-secret?)")
+        bg_instances = {
+            instance.get("id")
+            for instance in report.get("instances") or []
+            if instance.get("module") not in browser_modules
+        }
+        bg_family = [row for row in rows
+                     if row.get("category") == "sign"
+                     and (row.get("inferred_family") or {}).get("value") == expected_family
+                     and row.get("instance") in bg_instances]
+        self.assertEqual(
+            len(bg_family), 0,
+            "background caller must not sign the client-cert family")
+        browser_rows = [row for row in rows
+                        if row.get("instance") in browser_instances]
+        if browser_instances:
+            self.assertGreater(
+                len(browser_rows), 0,
+                "no key-operation rows on the browser instance")
+            browser_family = [row for row in browser_rows
+                              if row.get("category") == "sign"
+                              and (row.get("inferred_family") or {}).get("value") == expected_family]
+            self.assertGreater(
+                len(browser_family), 0,
+                f"no {expected_family} sign rows on the browser instance")
+        else:
+            self.assertGreater(
+                len(folded_browser_idents), 0,
+                "no live browser rows and no folded browser callers")
+            folded_family = [row for row in rows
+                             if row.get("category") == "sign"
+                             and (row.get("inferred_family") or {}).get("value") == expected_family
+                             and _folded_sign_instance_counts(row.get("instance"),
+                                                              bg_instances)]
+            self.assertGreater(
+                len(folded_family), 0,
+                f"no {expected_family} sign rows outside background instances")
+        capture = (report.get("observation") or {}).get("semantic_capture") or {}
+        self.assertEqual(capture.get("events_lost"), 0, "semantic events lost")
+
+    @gate_system("chromium")
+    def test_cr_first_ec_with_background_provider_covers_browser(self):
+        """CR-FIRST-BG-EC (v0.8.0): same as CR-FIRST-BG-RSA for EC (P-256)
+        client-cert signs (ec family, typed, exact)."""
+        store = softhsm.SoftHSMStore(self.work / "softhsm")
+        cred = _generate_ec_credential(self.work / "cred")
+        store.seed_client_token("G33-Browser", cred)
+        bg = cells.start_soft_call(store.lib, self.work / "bg", env=store.env)
+        self.addCleanup(bg.stop)
+        key, cert = tls_server.make_server_credential(self.work / "srv")
+        with tls_server.FlowServer(cert=cert, key=key) as plain, \
+                tls_server.FlowServer(cert=cert, key=key, require_client_cert=True,
+                                      client_ca=cred.cert_pem) as cc:
+            result = cells.observe_first_system(
+                "CR-FIRST-BG-EC", "chromium", self.work / "cell",
+                plain_url=plain.url, cc_url=cc.url, nss_credential=cred,
+                duration_seconds=90, extra_prefs=None)
+            self.assertGreaterEqual(
+                plain.requests_served, 1, "plain flow saw no request")
+            self.assertGreaterEqual(
+                cc.handshakes_ok, 1, "client-cert flow never handshook")
+            self.assertGreaterEqual(
+                cc.client_certs_presented, 1, "client cert never presented")
+        self.assertEqual(result.flow.get("observer_exit"), 0,
+                         f"observer failed: {result.observer_stderr_tail}")
+        bg.stop()
+        bg_calls = cells.soft_call_completed(bg.log.read_text())
+        self.assertIsNotNone(
+            bg_calls, "background caller left no STOP line (died mid-cell?)")
+        self.assertGreaterEqual(
+            bg_calls, 30,
+            "background caller made too few calls to pin its precondition")
+        with open(result.report_path, encoding="utf-8") as handle:
+            report = json.load(handle)
+        observations = report.get("object_observations") or {}
+        browser_modules = {
+            module.get("id")
+            for module in report.get("modules") or []
+            if any(str(path).endswith("libsoftokn3.so")
+                   for path in (module.get("paths") or []))
+        }
+        self.assertGreater(
+            len(browser_modules), 0, "browser softokn module missing")
+        browser_instances = {
+            instance.get("id")
+            for instance in report.get("instances") or []
+            if instance.get("module") in browser_modules
+        }
+        modules_by_id = {
+            module.get("id"): module for module in report.get("modules") or []
+        }
+        folded_browser_idents = []
+        for mid in browser_modules:
+            departed = (modules_by_id.get(mid) or {}).get("departed_use") or {}
+            for ident in departed.get("identities") or []:
+                exe = ((ident.get("exe") or {}).get("path") or "").lower()
+                if _folded_exe_names_chromium(exe):
+                    folded_browser_idents.append(ident)
+        if not browser_instances:
+            self.assertGreater(
+                len(folded_browser_idents), 0,
+                "browser softokn instance missing (neither live nor folded)")
+        if observations.get("reason") == "journal_unavailable":
+            self.assertEqual(
+                observations.get("status"), "unavailable",
+                "journal refusal must stay unavailable")
+            rows = observations.get("key_operations") or []
+            self.assertEqual(len(rows), 0, "journal refusal must carry zero rows")
+            return
+        birth_refusals = sorted(
+            (str(gap.get("caller")), str(gap.get("reason")),
+             gap.get("repeats", 1))
+            for gap in report.get("gaps") or []
+            if isinstance(gap, dict)
+            and gap.get("subject") == "Joint birth unavailable; retained S1")
+        rows = observations.get("key_operations") or []
+        reason = observations.get("reason")
+        never_covered = (
+            "late browser never covered (no live per-key tracking); "
+            f"birth refusals={birth_refusals}; "
+            f"observation gaps={observations.get('gaps')}")
+        if reason == "live_joint_feed_absent":
+            self.assertEqual(
+                observations.get("status"), "partial",
+                "live_joint_feed_absent must commit partial")
+            if _bootstrap_cover_missing(rows, browser_instances):
+                self.fail(never_covered)
+        elif reason == "bootstrap_unavailable":
+            self.assertEqual(
+                len(rows), 0,
+                "bootstrap_unavailable carries no retained rows; folded "
+                "rows must commit partial/live_joint_feed_absent")
+            self.fail(never_covered)
+        self.assertGreater(len(rows), 0, "no key-operation rows at all")
+        completed_signs = sum(
+            row.get("completed", 0) for row in rows
+            if row.get("category") == "sign")
+        self.assertGreaterEqual(
+            completed_signs, 1, "no completed client-cert signs observed")
+        expected_family = "ec"
+        family_signs = _family_sign_completions(rows, expected_family)
+        self.assertGreaterEqual(
+            family_signs, 1,
+            f"no completed {expected_family} client-cert signs observed "
+            f"(completed_signs={completed_signs} all generic-secret?)")
+        bg_instances = {
+            instance.get("id")
+            for instance in report.get("instances") or []
+            if instance.get("module") not in browser_modules
+        }
+        bg_family = [row for row in rows
+                     if row.get("category") == "sign"
+                     and (row.get("inferred_family") or {}).get("value") == expected_family
+                     and row.get("instance") in bg_instances]
+        self.assertEqual(
+            len(bg_family), 0,
+            "background caller must not sign the client-cert family")
+        browser_rows = [row for row in rows
+                        if row.get("instance") in browser_instances]
+        if browser_instances:
+            self.assertGreater(
+                len(browser_rows), 0,
+                "no key-operation rows on the browser instance")
+            browser_family = [row for row in browser_rows
+                              if row.get("category") == "sign"
+                              and (row.get("inferred_family") or {}).get("value") == expected_family]
+            self.assertGreater(
+                len(browser_family), 0,
+                f"no {expected_family} sign rows on the browser instance")
+        else:
+            self.assertGreater(
+                len(folded_browser_idents), 0,
+                "no live browser rows and no folded browser callers")
+            folded_family = [row for row in rows
+                             if row.get("category") == "sign"
+                             and (row.get("inferred_family") or {}).get("value") == expected_family
+                             and _folded_sign_instance_counts(row.get("instance"),
+                                                              bg_instances)]
+            self.assertGreater(
+                len(folded_family), 0,
+                f"no {expected_family} sign rows outside background instances")
+        capture = (report.get("observation") or {}).get("semantic_capture") or {}
+        self.assertEqual(capture.get("events_lost"), 0, "semantic events lost")
+
     # -- Unprivileged counterexample twins (P2-2/P2-3; run everywhere) --
     #
     # Each twin drives a real seam (the common oracle, a named predicate,
@@ -2195,6 +2484,70 @@ def _folded_exe_names_firefox(exe_path):
     return exe_path.rsplit("/", 1)[-1].startswith("firefox")
 
 
+def _folded_exe_names_chromium(exe_path):
+    """True when a departed-use exe path names a folded Chromium caller.
+
+    ``exe_path`` is the already-lowered ``exe.path`` string. Anchored
+    to the binary basename (``chrome``), mirroring the Firefox
+    helper: a chromium directory component alone must not count.
+    ``startswith`` also matches ``chrome_crashpad_handler`` (same
+    bundle, never maps providers, so harmless for sign attribution).
+    """
+    return exe_path.rsplit("/", 1)[-1].startswith("chrome")
+
+
+def _family_sign_completions(rows, expected):
+    """Completed signs in exactly ``expected`` family (typed, exact).
+
+    Counts ``completed`` for rows with ``category == "sign"`` and
+    ``inferred_family.value == expected`` by exact string equality
+    (no substring, no case folding). A missing ``inferred_family``
+    or ``value`` never counts. Generic-secret (TLS-HMAC) rows never
+    count toward a client-cert family.
+    """
+    total = 0
+    for row in rows or []:
+        if row.get("category") != "sign":
+            continue
+        family = (row.get("inferred_family") or {}).get("value")
+        if family != expected:
+            continue
+        total += row.get("completed", 0)
+    return total
+
+
+def _generate_ec_credential(workdir):
+    """Self-signed EC (P-256) client credential with openssl.
+
+    Same ``softhsm.ClientCredential`` shape as the RSA generator so
+    the harness accepts it (mirrors the s2-browser-repeat driver).
+    """
+    workdir.mkdir(parents=True, exist_ok=True)
+    key_pem = workdir / "client-key.pem"
+    cert_pem = workdir / "client-cert.pem"
+    cert_der = workdir / "client-cert.der"
+    proc = subprocess.run(
+        ["openssl", "ecparam", "-genkey", "-name", "prime256v1",
+         "-noout", "-out", str(key_pem)],
+        capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        raise RuntimeError(f"openssl ecparam failed: {proc.stderr[-500:]}")
+    proc = subprocess.run(
+        ["openssl", "req", "-new", "-x509", "-key", str(key_pem),
+         "-out", str(cert_pem), "-days", "2", "-subj", "/CN=g33-client-ec"],
+        capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        raise RuntimeError(f"openssl req failed: {proc.stderr[-500:]}")
+    proc = subprocess.run(
+        ["openssl", "x509", "-in", str(cert_pem), "-outform", "DER",
+         "-out", str(cert_der)],
+        capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        raise RuntimeError(f"openssl x509 DER failed: {proc.stderr[-500:]}")
+    return softhsm.ClientCredential(
+        key_pem=key_pem, cert_pem=cert_pem, cert_der=cert_der)
+
+
 def _folded_sign_instance_counts(instance, bg_instances):
     """True when a sign row's instance counts as folded browser evidence.
 
@@ -2385,6 +2738,57 @@ class BrowserFoldedLeg(unittest.TestCase):
         self.assertTrue(_folded_exe_names_firefox("firefox-bin"))
         self.assertFalse(_folded_exe_names_firefox(""))
 
+    def test_folded_exe_matches_chromium_basename_only(self):
+        # A chromium directory component must not count: only the
+        # chrome binary basename names a folded Chromium caller.
+        self.assertFalse(_folded_exe_names_chromium(
+            "/tmp/chromium-profile-helper/python"))
+        self.assertFalse(_folded_exe_names_chromium(""))
+
+    def test_folded_exe_matches_chrome_binary(self):
+        # Playwright Chromium path plus the bare basename; crashpad
+        # (same bundle) matches by startswith but never maps providers.
+        self.assertTrue(_folded_exe_names_chromium(
+            "/home/u/.cache/ms-playwright/chromium-1248/chrome-linux64/chrome"))
+        self.assertTrue(_folded_exe_names_chromium("chrome"))
+        self.assertFalse(_folded_exe_names_chromium("firefox"))
+
+    def test_family_sign_counts_exact_family_only(self):
+        # Exact typed match: rsa rows count for rsa, ec and
+        # generic-secret rows never do; non-sign categories and
+        # missing families never count.
+        rows = [
+            {"category": "sign", "completed": 2,
+             "inferred_family": {"value": "rsa"}},
+            {"category": "sign", "completed": 5,
+             "inferred_family": {"value": "ec"}},
+            {"category": "sign", "completed": 7,
+             "inferred_family": {"value": "generic_secret"}},
+            {"category": "sign", "completed": 3},
+            {"category": "sign", "completed": 4,
+             "inferred_family": {}},
+            {"category": "verify", "completed": 9,
+             "inferred_family": {"value": "rsa"}},
+        ]
+        self.assertEqual(_family_sign_completions(rows, "rsa"), 2)
+        self.assertEqual(_family_sign_completions(rows, "ec"), 5)
+        self.assertEqual(_family_sign_completions(rows, "generic_secret"), 7)
+        self.assertEqual(_family_sign_completions([], "rsa"), 0)
+        self.assertEqual(_family_sign_completions(None, "rsa"), 0)
+
+    def test_family_sign_rejects_substring_and_case(self):
+        # "rsa" must not match "xrsa", "RSA", or "rsa-2048": exact
+        # equality only, or a wrong family would join rows.
+        rows = [
+            {"category": "sign", "completed": 1,
+             "inferred_family": {"value": "xrsa"}},
+            {"category": "sign", "completed": 1,
+             "inferred_family": {"value": "RSA"}},
+            {"category": "sign", "completed": 1,
+             "inferred_family": {"value": "rsa-2048"}},
+        ]
+        self.assertEqual(_family_sign_completions(rows, "rsa"), 0)
+
     def test_folded_sign_requires_attributed_instance(self):
         # An unattributed sign row (missing instance) must not count
         # as folded browser evidence; the live leg's instance join
@@ -2535,7 +2939,9 @@ class BrowserS1Oracle(unittest.TestCase):
     def test_system_first_cells_wire_browser_rows_oracle(self):
         found, missing = system_first_cells_missing_oracle(
             Path(__file__).read_text())
-        self.assertEqual(len(found), 1)
+        # FF-FIRST-BG plus CR-FIRST-BG-RSA/EC (v0.8.0 Chromium gap
+        # closure: Chromium signs with family, typed exact).
+        self.assertEqual(len(found), 3)
         self.assertEqual(missing, [])
 
     def test_attach_cells_require_no_opened_floor(self):

@@ -2448,9 +2448,10 @@ impl IngestedJointQuantum {
             // terminal is awaited past it. An UnboundStaging barrier made
             // only of BEGINs still in flight at this cut is future input
             // too: their returns, and the S1 calls that dispose or refuse
-            // their images, arrive in a later quantum. Each such row gets
-            // one grace frame; one that still bars a later frame retries
-            // toward the void shed.
+            // their images, arrive in a later quantum. A barrier whose
+            // oldest in-flight row is newer than the last granted frontier
+            // gets one grace frame; a row still barring a later frame
+            // retries toward the void shed.
             let wait = adapter.last_seal_wait();
             if failure.gap == JournalGap::BoundNotReady
                 && (seal_wait_advances_as_future(wait, false)

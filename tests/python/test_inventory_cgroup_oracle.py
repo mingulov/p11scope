@@ -185,7 +185,7 @@ INHERITED = (["python3", "-"], {"PYTHONOPTIMIZE": "1"})
 
 def run_oracle(report, *, modfs, pin=None, modpath=MODPATH, ledger=None,
                generations=None, inside_wl=None, outside_wl=None,
-               interpreter=PLAIN, report_text=None, inside_iters=ITERS,
+               interpreter=PLAIN, report_text=None, pin_text=None, inside_iters=ITERS,
                outside_iters=OUTSIDE_ITERS):
     """Run the extracted oracle against a fixture report."""
     if generations is None:
@@ -214,7 +214,8 @@ def run_oracle(report, *, modfs, pin=None, modpath=MODPATH, ledger=None,
             env.update(extra_env)
         proc = subprocess.run(
             argv + ["r.json", "in.wl", "out.wl",
-                    json.dumps(pin), str(inside_iters), str(outside_iters),
+                    json.dumps(pin) if pin_text is None else pin_text,
+                    str(inside_iters), str(outside_iters),
                     modpath, modfs,
                     str(generations[0]), str(generations[1])],
             input=block, capture_output=True, text=True, timeout=30,
@@ -2376,6 +2377,78 @@ class WorkloadLedgerTests(unittest.TestCase):
         ("not-json", "LEDGER {", "inside ledger is not JSON"),
         ("functions-null", _inside_with(functions=None), "inside ledger functions has type NoneType"),
     ]
+
+    def test_shared_ledger_rules_hold_on_both_paths(self):
+        # Each shared invariant is killed at both of its use sites.
+        def rows(pid, total):
+            return [{"name": n, "attempts": total, "successful": total} for n in FUNCTIONS]
+        sides = (("inside", 100, 2 * ITERS, "ledger"), ("outside", 102, OUTSIDE_ITERS, "outside"))
+        for what, pid, total, kind in sides:
+            def build(functions=None, text=None):
+                if text is not None:
+                    return text
+                record = {"schema": "p11scope/public-cli-ledger/v1", "pid": pid,
+                          "complete": True,
+                          "functions": rows(pid, total) if functions is None else functions}
+                return "LEDGER " + json.dumps(record)
+            def bad_success(value):
+                functions = rows(pid, total)
+                functions[0]["successful"] = value
+                return build(functions)
+            healthy = build()
+            cases = [
+                ("successful-bool", bad_success(True), "%s ledger function successful has type bool" % what),
+                ("successful-negative", bad_success(-1), "%s ledger 'C_GenerateRandom' successful -1 of %d attempts" % (what, total)),
+                ("successful-above", bad_success(total + 1), "%s ledger 'C_GenerateRandom' successful %d of %d attempts" % (what, total + 1, total)),
+                ("successful-short", bad_success(total - 1), "%s ledger 'C_GenerateRandom' successful %d of %d attempts" % (what, total - 1, total)),
+                ("duplicate-complete", healthy.replace('"complete": true', '"complete": false, "complete": true'),
+                 "%s ledger: duplicate JSON key 'complete'" % what),
+                ("duplicate-row-key", healthy.replace('"attempts": %d' % total, '"attempts": %d, "attempts": %d' % (total, total), 1),
+                 "%s ledger: duplicate JSON key 'attempts'" % what),
+            ]
+            for name, ledger, marker in cases:
+                with self.subTest(side=what, row=name):
+                    if kind == "ledger":
+                        self.fails(marker, ledger=ledger)
+                    else:
+                        self.fails(marker, outside_wl=outside_wl(ledger))
+
+    PROTOCOL_ROWS = [
+        ("two-inside-ready", "READY pid=100\nREADY pid=100\nCHILD pid=101\n", None,
+         "inside workload printed 2 READY lines"),
+        ("two-child", "READY pid=100\nCHILD pid=101\nCHILD pid=101\n", None,
+         "inside workload printed 2 CHILD lines"),
+        ("no-child", "READY pid=100\n", None, "inside workload printed 0 CHILD lines"),
+        ("ready-zero", "READY pid=0\nCHILD pid=101\n", None,
+         "inside workload READY line malformed: 'READY pid=0'"),
+        ("ready-suffix", "READY pid=100x\nCHILD pid=101\n", None,
+         "inside workload READY line malformed: 'READY pid=100x'"),
+        ("two-outside-ready", None, "READY pid=102\nREADY pid=102\n",
+         "outside workload printed 2 READY lines"),
+    ]
+
+    def test_each_protocol_line_row_fails(self):
+        for name, inside_head, outside_head, marker in self.PROTOCOL_ROWS:
+            with self.subTest(row=name):
+                kwargs = {}
+                if inside_head is not None:
+                    kwargs["inside_wl"] = inside_head + inside_ledger() + "\n"
+                if outside_head is not None:
+                    kwargs["outside_wl"] = outside_head + outside_ledger() + "\n"
+                self.fails(marker, **kwargs)
+
+    def test_duplicate_keys_in_report_and_pin_fail(self):
+        for modfs, witness in self.SHAPES:
+            with self.subTest(modfs=modfs, input="report"):
+                text = json.dumps(deferred_recovered_report(modfs_witness=witness))
+                text = text.replace('"scope": "cgroup"', '"scope": "pid", "scope": "cgroup"')
+                rc, out = run_oracle(None, modfs=modfs, report_text=text)
+                self.assertNotEqual(rc, 0, out)
+                self.assertIn("inventory report: duplicate JSON key 'scope'", out)
+        rc, out = run_oracle(deferred_recovered_report(modfs_witness=True), modfs="ext4",
+                             pin_text=json.dumps(PIN).replace('"ino": ', '"ino": 1, "ino": '))
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("provider pin: duplicate JSON key 'ino'", out)
 
     def test_each_inside_row_fails(self):
         for name, ledger, marker in self.INSIDE_ROWS:

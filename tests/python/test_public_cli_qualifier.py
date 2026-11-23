@@ -1285,6 +1285,16 @@ class WholePrearmBlockTests(unittest.TestCase):
                            "pair, 3/3 ledger and 3/3/1 trace")
         self.expect(twins, "6.8.0", ok=False, marker="late_discovery")
 
+    def test_duplicate_keys_fail(self):
+        twins = prearm_twins()
+        twins["held"][0][-1] = twins["held"][0][-1].replace(
+            '"discovery": ', '"discovery": [], "discovery": ')
+        self.expect(twins, "6.12.0", ok=False, marker="duplicate JSON key 'discovery'")
+        twins = prearm_twins()
+        twins["held"][1][-1] = twins["held"][1][-1].replace(
+            '"initializes": 3', '"initializes": 2, "initializes": 3')
+        self.expect(twins, "6.12.0", ok=False, marker="duplicate JSON key 'initializes'")
+
     def test_unparseable_release_fails(self):
         self.expect(prearm_twins(), "linux", ok=False,
                     marker="unparseable kernel release")

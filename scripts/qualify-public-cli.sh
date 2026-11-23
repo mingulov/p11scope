@@ -604,7 +604,14 @@ second_sigint() {
   report_ok=0
   if python3 -I - sigint2.json <<'PY' 2>/dev/null; then report_ok=1; fi
 import json,sys
-report=json.load(open(sys.argv[1]))
+def unique_keys(pairs):
+    # A repeated JSON object key fails instead of last-wins.
+    result={}
+    for key,value in pairs:
+        if key in result: raise AssertionError('duplicate JSON key %r' % (key,))
+        result[key]=value
+    return result
+report=json.loads(open(sys.argv[1]).read(),object_pairs_hook=unique_keys)
 if not (report.get('schema')=='p11scope/observed-profile/v3'): raise AssertionError('schema')
 evidence=report['evidence']
 if not (evidence.get('completeness')=='PARTIAL'): raise AssertionError('abandoned teardown cannot seal COMPLETE')
@@ -650,13 +657,26 @@ import json
 import os
 
 
+def unique_keys(pairs):
+    # A repeated JSON object key fails instead of last-wins.
+    result={}
+    for key,value in pairs:
+        if key in result: raise AssertionError('duplicate JSON key %r' % (key,))
+        result[key]=value
+    return result
+
+
+def strict(text):
+    return json.loads(text, object_pairs_hook=unique_keys)
+
+
 def load_jsonl(path):
     rows = []
     with open(path) as handle:
         for number, line in enumerate(handle):
             line = line.rstrip("\n")
             if not (line): raise AssertionError(f"{path}:{number}: blank line breaks the JSONL framing")
-            rows.append(json.loads(line))
+            rows.append(strict(line))
     return rows
 
 
@@ -670,7 +690,7 @@ for index, row in enumerate(stream):
 if not (stream[0]["kind"] == "started"): raise AssertionError(stream[0])
 if not (stream[-1]["kind"] == "ended"): raise AssertionError(stream[-1])
 # The stream and the -o report agree on the counts.
-report = json.load(open(os.environ["full_out"]))
+report = strict(open(os.environ["full_out"]).read())
 if not (report["schema"] == "p11scope/inventory/v1"): raise AssertionError(report.get("schema"))
 if not (report["observation"]["passes"] == stream[-1]["event"]["passes"]): raise AssertionError("passes agree")
 final = [row for row in stream if row["kind"] == "pass_committed"][-1]["event"]
@@ -696,7 +716,7 @@ for row in totals:
 if not (os.environ["rc2"] == "1"): raise AssertionError("early-close rc=%s" % os.environ["rc2"])
 with open("event-epipe.head", "rb") as handle:
     if not (handle.read(1) == b"{"): raise AssertionError("the head holds event bytes")
-epipe = json.load(open(os.environ["epipe_out"]))
+epipe = strict(open(os.environ["epipe_out"]).read())
 if not (epipe["schema"] == "p11scope/inventory/v1"): raise AssertionError(epipe.get("schema"))
 with open("event-epipe.stderr") as handle:
     if not ("shed" in handle.read()): raise AssertionError("the loss is reported on stderr")
@@ -815,10 +835,25 @@ cgroup_capture() {
     # never the bare "overlay" of /proc/mounts.
     module_fs=$(stat -f -c %T "$MODULE" 2>/dev/null || echo unknown)
     python3 -I - "$cell.$ext" "$cell-inside.wl" "$cell-outside.wl" "$before" "$inside_iters" "$outside_iters" "$MODULE" "$module_fs" "$gen" "$childgen" <<'PY' > "$cell.detail" 2>&1
-import json,sys
-report=json.load(open(sys.argv[1]))
+import json,re,sys
+# Every JSON input decodes strictly: a repeated object key would let a
+# later value silently replace an earlier one (last-wins), so it fails.
+def unique_keys(pairs):
+    result={}
+    for key,value in pairs:
+        if key in result: raise AssertionError('duplicate JSON key %r' % (key,))
+        result[key]=value
+    return result
+def strict_json(text,what):
+    try:
+        return json.loads(text,object_pairs_hook=unique_keys)
+    except ValueError:
+        raise AssertionError('%s is not JSON: %r' % (what,text[:200]))
+    except AssertionError as error:
+        raise AssertionError('%s: %s' % (what,error))
+report=strict_json(open(sys.argv[1]).read(),'inventory report')
 inside=open(sys.argv[2]).read(); outside=open(sys.argv[3]).read()
-pin=json.loads(sys.argv[4])
+pin=strict_json(sys.argv[4],'provider pin')
 inside_iters=int(sys.argv[5]); outside_iters=int(sys.argv[6])
 modpath=sys.argv[7]; modfs=sys.argv[8]
 # Every refusal below raises explicitly, never bare assert: the
@@ -831,9 +866,17 @@ def refuse_unless(condition, message):
         raise Refusal(message)
 refuse_unless(report.get('schema')=='p11scope/inventory/v1', 'inventory schema')
 refuse_unless(report.get('scope')=='cgroup', 'inventory scope')
-inside_pid=int([l for l in inside.splitlines() if l.startswith('READY pid=')][0].split('=')[1])
-child_pid=int([l for l in inside.splitlines() if l.startswith('CHILD pid=')][0].split('=')[1])
-outside_pid=int([l for l in outside.splitlines() if l.startswith('READY pid=')][0].split('=')[1])
+# Workload protocol lines: exactly one READY (and for the inside
+# parent one CHILD) line, each exactly "<TAG> pid=<positive int>".
+def protocol_pid(text,tag,what):
+    rows=[l for l in text.splitlines() if l.startswith(tag+' ')]
+    if len(rows)!=1: raise AssertionError('%s workload printed %d %s lines' % (what,len(rows),tag))
+    match=re.fullmatch(tag+r' pid=([1-9][0-9]*)',rows[0])
+    if match is None: raise AssertionError('%s workload %s line malformed: %r' % (what,tag,rows[0]))
+    return int(match.group(1))
+inside_pid=protocol_pid(inside,'READY','inside')
+child_pid=protocol_pid(inside,'CHILD','inside')
+outside_pid=protocol_pid(outside,'READY','outside')
 refuse_unless(sum(l.startswith('LEDGER ') for l in inside.splitlines())==1, 'inside ledger missing')
 refuse_unless(sum(l.startswith('LEDGER ') for l in outside.splitlines())==1, 'outside ledger missing (leak test invalid)')
 # Strict types while parsing: every field a typed record uses has
@@ -934,10 +977,7 @@ LEDGER_SCHEMA='p11scope/public-cli-ledger/v1'
 LEDGER_FUNCTIONS=['C_GenerateRandom','C_DigestInit','C_Digest','C_FindObjectsInit','C_FindObjects','C_FindObjectsFinal']
 def ledger_record(text,what,pid):
     line=[l for l in text.splitlines() if l.startswith('LEDGER ')][0][len('LEDGER '):]
-    try:
-        record=json.loads(line)
-    except ValueError:
-        raise AssertionError('%s ledger is not JSON: %r' % (what,line))
+    record=strict_json(line,'%s ledger' % what)
     typed(record,(dict,),'%s ledger' % what)
     if field(record,'schema',(str,),'%s ledger schema' % what)!=LEDGER_SCHEMA: raise AssertionError('%s ledger schema: %r' % (what,record['schema']))
     if field(record,'pid',(int,),'%s ledger pid' % what)!=pid: raise AssertionError('%s ledger pid %r is not the workload %d' % (what,record['pid'],pid))
@@ -946,8 +986,11 @@ def ledger_record(text,what,pid):
         field(f,'name',(str,),'%s ledger function name' % what)
     return record
 def ledger_names(record,what):
+    # The workloads only drive calls that succeed on their own token:
+    # every attempt of every row succeeded, exactly.
     for f in record['functions']:
-        field(f,'successful',(int,),'%s ledger function successful' % what)
+        if field(f,'successful',(int,),'%s ledger function successful' % what)!=f.get('attempts'):
+            raise AssertionError('%s ledger %r successful %r of %r attempts' % (what,f['name'],f['successful'],f.get('attempts')))
     names=[f['name'] for f in record['functions']]
     if names!=LEDGER_FUNCTIONS: raise AssertionError('%s ledger functions are not the six driven calls: %r' % (what,names))
 ledger=ledger_record(inside,'inside',inside_pid)
@@ -1255,6 +1298,14 @@ def assert_pre68_passive(module):
     if not (windows[0]["end_ns"] == module["attached_at_ns"]): raise AssertionError(windows)
     return "merged pre_attach"
 
+def unique_keys(pairs):
+    # A repeated JSON object key fails instead of last-wins.
+    result={}
+    for key,value in pairs:
+        if key in result: raise AssertionError('duplicate JSON key %r' % (key,))
+        result[key]=value
+    return result
+
 def load(name):
     # EVIDENCE rides the -o report file (default stdout omits the blob;
     # diagnostics go to stderr).
@@ -1263,11 +1314,11 @@ def load(name):
     evidence = None
     for line in text.splitlines():
         if line.startswith("EVIDENCE "):
-            evidence = json.loads(line[len("EVIDENCE "):])
+            evidence = json.loads(line[len("EVIDENCE "):], object_pairs_hook=unique_keys)
     if evidence is None:
         raise SystemExit(f"{name}: no EVIDENCE line")
     with open(f"run-prearm-{name}.wl") as handle:
-        ledger = [json.loads(line) for line in handle if line.strip()]
+        ledger = [json.loads(line, object_pairs_hook=unique_keys) for line in handle if line.strip()]
     return evidence, ledger, text
 
 def prearmed_module(evidence):
@@ -1347,7 +1398,14 @@ parent_chain_cell() {
   detail=$(python3 -I - "$cell.json" "$cell.stdout" "$cell-v.stdout" "$wl" "$wl_gen" "$parent" "$parent_gen" <<'PY' 2>&1
 import json,sys
 doc,concise,verbose,wl,wl_gen,parent,parent_gen=sys.argv[1:8]
-report=json.load(open(doc))
+def unique_keys(pairs):
+    # A repeated JSON object key fails instead of last-wins.
+    result={}
+    for key,value in pairs:
+        if key in result: raise AssertionError('duplicate JSON key %r' % (key,))
+        result[key]=value
+    return result
+report=json.loads(open(doc).read(),object_pairs_hook=unique_keys)
 wl=int(wl); wl_gen=int(wl_gen); parent=int(parent); parent_gen=int(parent_gen)
 callers=[c for c in report.get('callers',[]) if c.get('pid')==wl]
 if not (len(callers)==1): raise AssertionError('one incarnation for the workload')

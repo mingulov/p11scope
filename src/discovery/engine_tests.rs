@@ -103902,6 +103902,13 @@ fn carried_fix2_release_holds_only_named_ids() {
         1,
         "a named release holds its ID"
     );
+    // While the ID is held, allocation mints past it instead of reusing it.
+    let skipped = engine.allocate_view_id().unwrap();
+    assert_eq!(skipped, ProcessViewId(100), "allocation skips the held ID");
+    assert!(
+        engine.retired_view_ids.contains(&view_r.0),
+        "the held ID waits on the free list"
+    );
     // The rebuild re-owns the row under the carrier through a production
     // apply, freeing the numeric ID exactly.
     let rebuilt = engine
@@ -103975,6 +103982,20 @@ fn carried_fix2_release_holds_only_named_ids() {
     );
     let again = engine.allocate_view_id().unwrap();
     assert_eq!(again, recycled, "the ID keeps recycling after the commit");
+    // A rowless engine holds nothing even with a stale named entry: with
+    // no rows, no verdict can name anything.
+    let mut bare = Engine::empty();
+    bare.named_view_ids.insert(7);
+    bare.release_view_id(ProcessViewId(7));
+    assert!(
+        bare.retired_view_ids.contains(&7),
+        "the rowless release still recycles its ID"
+    );
+    assert_eq!(
+        bare.held_view_id_count(),
+        0,
+        "no rows means no held IDs, stale entries or not"
+    );
 }
 
 #[test]

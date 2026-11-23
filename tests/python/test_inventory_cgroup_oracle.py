@@ -705,6 +705,12 @@ def straddle_deadline_row(*, drop=(), over=None):
     return row
 
 
+# A real producer refusal under the same transaction subject: the
+# member scan did not complete, so the transaction publishes this
+# row instead of the deadline row. The qualifier must refuse it.
+SCAN_INCOMPLETE = "cgroup member scan was incomplete"
+
+
 # A producer-shaped budget refusal: neither straddle row may carry one.
 SPURIOUS_BUDGET = {"resource": "inventory_endpoints", "limit": 1,
                    "requested": 2}
@@ -854,6 +860,41 @@ class DeadlineOnlyShapeTests(unittest.TestCase):
                 rc, out = run_oracle(report, modfs=modfs)
                 self.assertNotEqual(rc, 0, out)
                 self.assertIn("malformed run deadline scope", out)
+
+
+class TransactionReasonTests(unittest.TestCase):
+    # The producer files every incomplete cgroup transaction under
+    # one fixed subject with many possible reasons
+    # (src/inspect_system/inventory_cgroup.rs), and only the named
+    # deadline disclosure qualifies (CI-GAP-2). A transaction row
+    # counts as a deadline only after its exact reason and shape are
+    # validated: a missing, unknown or scan-incomplete reason fails
+    # on both substrates, including witness-available ext4, which
+    # has no degraded reason gate of its own. (name, drop, over,
+    # message).
+    CASES = [
+        ("transaction drops reason", ("reason",), {},
+         "unrecognized cgroup transaction row"),
+        ("transaction unknown reason", (),
+         {"reason": "cgroup collection frobnicate exploded"},
+         "unrecognized cgroup transaction row"),
+        ("transaction scan-incomplete reason", (),
+         {"reason": SCAN_INCOMPLETE},
+         "unrecognized cgroup transaction row"),
+    ]
+
+    def test_unrecognized_transaction_reasons_fail_on_both_substrates(self):
+        self.assertEqual(len(self.CASES), 3)
+        for modfs, base in (("overlayfs", decided_report),
+                            ("ext4", witness_available_report)):
+            for name, drop, over, message in self.CASES:
+                with self.subTest(substrate=modfs, case=name):
+                    report = base()
+                    report["gaps"].append(
+                        straddle_deadline_row(drop=drop, over=over))
+                    rc, out = run_oracle(report, modfs=modfs)
+                    self.assertNotEqual(rc, 0, out)
+                    self.assertIn(message, out)
 
 
 if __name__ == "__main__":

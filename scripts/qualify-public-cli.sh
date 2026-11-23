@@ -877,6 +877,19 @@ retained=[g for g in report.get('gaps',[]) if g.get('reason')=='the final-sample
 if retained:
     assert any(g.get('reason')=='cgroup collection deadline reached' for g in report.get('gaps',[])), 'retained refresh without a run deadline: %r' % (retained,)
     assert len(set(g.get('caller') for g in retained))==len(retained), 'duplicate retained refresh for one caller: %r' % (retained,)
+# One scoped owner commit per transaction: when two members settle in
+# the same pass, one activates and the other defers by name and stages
+# again from fresh proof on a later pass. The deferral is a delay, never
+# a resting state: the named caller must end with an activated native
+# owner. This runs on every substrate, like the retained check above.
+deferred_reason='only one native owner activation per transaction; the staged owner is deferred to a later pass; scan-pinned fallback retained'
+def deferral(g):
+    return g.get('reason')==deferred_reason and g.get('subject')=='native owner activation refused'
+for g in report.get('gaps',[]):
+    if deferral(g):
+        c=callers.get(g.get('caller'))
+        recovered=c is not None and c.get('pid')==g.get('pid') and (c.get('image') or {}).get('authority')=='native_exact'
+        assert recovered, 'deferred activation never recovered: %r' % (g,)
 if degraded:
     # The published degraded (overlay or no-witness) shape keeps the
     # named unproven gap per inside caller (PARTIAL coverage via the
@@ -888,7 +901,7 @@ if degraded:
     for g in unproven:
         assert g.get('subject')==modpath, 'overlay unproven subject'
         assert g.get('pid')==pidof[g.get('caller')], 'overlay unproven pid'
-    rest=[g for g in report.get('gaps',[]) if not (g.get('reason') or '').startswith('original_file_unproven: kernel witness unavailable') and g.get('subject')!='module admission changed' and not named_unbound(g)]
+    rest=[g for g in report.get('gaps',[]) if not (g.get('reason') or '').startswith('original_file_unproven: kernel witness unavailable') and g.get('subject')!='module admission changed' and not named_unbound(g) and not deferral(g)]
     # The per-caller activation refusal plus, when a pass straddles
     # the run deadline, the designed collection bound (ruling CI-GAP-2,
     # confirmed docs/superpowers/decisions/2026-11-06-schedule-dl10.md),
@@ -901,6 +914,8 @@ if degraded:
     # The bare member-lost variant (no retention suffix: the member
     # died after the final sample of a still-complete transaction)
     # is deliberately NOT known here: it fails loudly below.
+    # A recovered same-pass activation deferral (checked above) is
+    # the designed one-commit-per-transaction disclosure.
     # The unproven member gaps degrade per caller without incompleting
     # the shared transaction, so 'cgroup member scan was incomplete'
     # is deliberately NOT known here: its reappearance fails loudly

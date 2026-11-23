@@ -5735,7 +5735,8 @@ fn operator_diagnostics_three_round_probe_checks_fence_and_physical_pair() -> Re
             "fence_reason_stopped" => changed[66]["reason"] = "capture_stopped".into(),
             "shared_module" => changed[4]["module_id"] = "mA-00".into(),
             "foreign_module" => changed[2]["module_id"] = "mX".into(),
-            _ => changed[193]["kinds"][0]["retained"] = 95.into(),
+            "kind_counter_lie" => changed[193]["kinds"][0]["retained"] = 95.into(),
+            _ => panic!("twin has no mutation for {change}"),
         }
         ensure!(
             check_startup_probe_records(&changed, &primary, 123, &modules, &calls, k).is_err(),
@@ -5909,6 +5910,7 @@ fn operator_diagnostics_three_round_probe_ordinary_two_shape_lineage() -> Result
         ("staged2_missing_caller", "ordinary staged caller"),
         ("staged2_wrong_absolute", "unissued A stage"),
         ("summary1_extra_copy", "extra A publication"),
+        ("placed2_spurious_retired_shape", "extra A publication"),
     ] {
         let mut changed = ordinary.clone();
         match change {
@@ -6043,10 +6045,30 @@ fn operator_diagnostics_three_round_probe_ordinary_two_shape_lineage() -> Result
                 changed.insert(changed.len() - 1, extra);
                 rebuild_probe_footer(&mut changed);
             }
-            _ => {
+            "placed2_spurious_retired_shape" => {
+                // The literal retired emission: a per-pair placed(2,1)
+                // alongside the correct two-shape records must fail at the
+                // extra-publication clause, never earlier.
+                let max = changed
+                    .iter()
+                    .filter_map(|row| row["seq"].as_u64())
+                    .max()
+                    .context("twin max seq")?;
+                let mut extra = changed[placed_index(&changed, "p0", 1)].clone();
+                extra["absolute"] = 2.into();
+                extra["base"] = 1.into();
+                extra["after"] = 1.into();
+                extra["through"] = 2.into();
+                extra["edge_total"] = 2.into();
+                extra["seq"] = (max + 1).into();
+                changed.insert(changed.len() - 1, extra);
+                rebuild_probe_footer(&mut changed);
+            }
+            "summary1_wrong_caller" => {
                 let at = summary_index(&changed, "mA-00", 1);
                 changed[at]["caller"] = "c9".into();
             }
+            _ => panic!("twin has no mutation for {change}"),
         }
         match check_startup_probe_records(&changed, &terminal, 123, &modules, &calls, 0) {
             Ok(_) => bail!("false ordinary evidence accepted: {change}"),
@@ -6846,7 +6868,15 @@ fn operator_diagnostics_wrap_twin_probe_double_placed_fence_fails() -> Result<()
     footer["kinds"][3]["produced"] = serde_json::json!(before + 1);
     fenced.push(footer);
     let terminal = vec![2u64; 32];
-    ensure!(check_startup_probe_records(&fenced, &terminal, 123, &modules, &calls, 32).is_err());
+    match check_startup_probe_records(&fenced, &terminal, 123, &modules, &calls, 32) {
+        Ok(_) => bail!("double-placed fence accepted"),
+        Err(error) => ensure!(
+            error
+                .to_string()
+                .contains("withheld second round cannot also be placed"),
+            "double-placed negative died on the wrong clause: {error}"
+        ),
+    }
     Ok(())
 }
 
@@ -6865,7 +6895,7 @@ fn operator_diagnostics_three_round_probe_rejects_frozen_third_unit() -> Result<
         "observation_ref":{"seq":130,"status":"retained"}}),
     );
     let mut footer = footer;
-    footer["records_written"] = serde_json::json!(rows.len() as u64);
+    footer["records_written"] = serde_json::json!(rows.len() as u64 - 1);
     let before = footer["kinds"][2]["retained"]
         .as_u64()
         .context("decision retained")?;
@@ -6873,7 +6903,13 @@ fn operator_diagnostics_three_round_probe_rejects_frozen_third_unit() -> Result<
     footer["kinds"][2]["produced"] = serde_json::json!(before + 1);
     rows.push(footer);
     let terminal = vec![2u64; 32];
-    ensure!(check_startup_probe_records(&rows, &terminal, 123, &modules, &calls, 32).is_err());
+    match check_startup_probe_records(&rows, &terminal, 123, &modules, &calls, 32) {
+        Ok(_) => bail!("frozen third unit accepted"),
+        Err(error) => ensure!(
+            error.to_string().contains("still withheld at stop"),
+            "frozen negative died on the wrong clause: {error}"
+        ),
+    }
     Ok(())
 }
 

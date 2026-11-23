@@ -9,10 +9,14 @@ env, never through interpolation inside a run: block), diffs the checkout
 against the dev merge-base, and writes one `run_<job>` output per gated
 job plus the shared `selection` document the gate job consumes.
 
-Fail-closed throughout: an unknown ref class, event, path, tier or Base
-setting selects the full tier; any `.github/` or `scripts/ci/` change does
-too. A BPF-crate, toolchain or lockfile change on the quick tier adds the
-full BPF matrix, every guest kernel and the journal/counter flavours.
+Automatic selection fails closed throughout: an unknown ref class,
+event, path or Base setting selects the full tier, and any `.github/`
+or `scripts/ci/` change does too. A BPF-crate, toolchain or lockfile
+change on the quick tier adds the full BPF matrix, every guest kernel
+and the journal/counter flavours. An explicit dispatch tier is honored
+over the diff instead: the operator asked for exactly that set, the run
+is still labelled by its tier, and release checks reject anything but
+full-tier records.
 """
 
 import json
@@ -397,17 +401,21 @@ def decide_tier(event, ref, tier_input, classes):
     """(tier, bpf_extra): the tier for this run.
 
     tier_input is the validated dispatch tier (quick, integration or
-    full). Pushes to development branches run the quick tier unless the
-    diff touches CI, an unknown path, or nothing determinable; BPF,
-    toolchain and lockfile classes add the BPF set. Everything else,
-    including every pull request and schedule, runs the full tier.
+    full). An explicit dispatch tier is honored over the diff: the
+    operator asked for exactly that set, the run is still labelled by
+    its tier, and release checks reject anything but full-tier
+    records. Automatic selection fails closed instead: pushes to
+    development branches run the quick tier unless the diff touches
+    CI, an unknown path, or nothing determinable; BPF, toolchain and
+    lockfile classes add the BPF set. Everything else, including every
+    pull request, runs the full tier.
     """
     if event == "schedule":
         return "schedule", False
-    if classes is None or "ci" in classes or "unknown" in classes:
-        return "full", True
     if event == "workflow_dispatch":
         return tier_input, tier_input != "quick"
+    if classes is None or "ci" in classes or "unknown" in classes:
+        return "full", True
     if event == "push" and (ref.startswith("refs/heads/test/")
                             or ref.startswith("refs/heads/task/")):
         extra = bool({"bpf", "toolchain", "lockfile"} & set(classes))

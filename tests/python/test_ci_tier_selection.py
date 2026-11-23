@@ -458,10 +458,18 @@ class TierSelectionTests(unittest.TestCase):
                               release_preview=True)
         self.assertEqual(
             states(selection)["release-preview"], "selected")
-        # An explicit quick dispatch still fails closed on CI diffs.
+
+    def test_explicit_dispatch_tier_wins_over_diff(self):
+        # The operator asked for exactly that set: a quick dispatch on
+        # a CI-affecting diff still selects quick (labelled
+        # quick-green, never release-qualifying). Pushes stay
+        # fail-closed; this override is dispatch-only.
         selection, _ = select("ci", "workflow_dispatch",
                               "refs/heads/test/cand", {"ci"},
                               tier_input="quick")
+        self.assertEqual(selection["tier"], "quick")
+        self.assertEqual(states(selection)["coverage"], "not-selected")
+        selection, _ = select("ci", "push", "refs/heads/test/cand", {"ci"})
         self.assertEqual(selection["tier"], "full")
 
     def test_unknown_tier_and_misplaced_tier_fail(self):

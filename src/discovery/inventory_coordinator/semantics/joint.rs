@@ -1996,6 +1996,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.semantic_bindings.bindings.get(at)
     }
 
+    /// The absence-scan revision for Idle invalidation: bumped only when
+    /// binding membership, order, scope or providers actually change.
+    pub(crate) fn semantic_absence_revision(&self) -> u64 {
+        self.semantic_bindings.absence_revision()
+    }
+
     pub(crate) fn prepare_staged_semantic_batch(
         &mut self,
         lane: &mut AttestedSemanticLane,

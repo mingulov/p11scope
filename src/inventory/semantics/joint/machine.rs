@@ -1382,14 +1382,23 @@ pub(crate) struct LiveJointMachine {
     absence_entry: usize,
     /// Whether the Idle absence scan completed within this Idle episode.
     /// Set when the scan exhausts its bindings; cleared whenever a poll
-    /// advances a non-Idle phase, on re-arm, and when pre-advance staging
-    /// or discovery acts (conservative: new inputs may need a scan).
-    /// While set, Idle skips the scan and runs the void every poll,
-    /// instead of re-scanning already-dispatched bindings/targets/entries
-    /// every cycle (each re-scan costs polls but dispatches nothing new:
-    /// births, bindings, targets and scopes change only outside Idle or
-    /// via the scan itself). Never authority.
+    /// advances a non-Idle phase, on re-arm, when pre-advance staging
+    /// or discovery acts (conservative: new inputs may need a scan),
+    /// and when the admission revision or required-target count moves
+    /// between Idle polls (a direct binder can admit without staging
+    /// EVENTS or entering a non-Idle phase). While set, Idle skips the
+    /// scan and runs the void every poll, instead of re-scanning
+    /// already-dispatched bindings/targets/entries every cycle (each
+    /// re-scan costs polls but dispatches nothing new). Never authority.
     absence_done: bool,
+    /// Sampled absence-scan inputs from the last Idle poll: the
+    /// coordinator's admission revision plus the lane's required-target
+    /// count. Compared at every Idle poll; any move invalidates the
+    /// completed flag and restarts a partial scan from scratch, so a
+    /// caller admitted between polls is examined before collection.
+    /// Never authority.
+    absence_revision: u64,
+    absence_required: usize,
     /// Consecutive running Idle ticks that yielded on an ingest-break
     /// void the semantic pool could not pay for (reset when one applies).
     unpaid_void_yields: u32,
@@ -1546,6 +1555,8 @@ impl LiveJointMachine {
             absence_after: None,
             absence_entry: 0,
             absence_done: false,
+            absence_revision: 0,
+            absence_required: 0,
             unpaid_void_yields: 0,
             demand: None,
             prepared_base: 0,
@@ -3228,6 +3239,33 @@ impl LiveJointMachine {
     #[cfg(test)]
     pub(crate) fn retained_births_for_test(&self) -> &RetainedJointBirths {
         &self.births
+    }
+
+    /// Test-only read of the Idle absence-scan episode state: whether the
+    /// scan completed, its sampled admission revision and required-target
+    /// count, and its resume cursors. Admission twins assert the completed
+    /// flag clears and the cursors restart when a caller is admitted
+    /// between polls; pacing twins assert they keep skipping when inputs
+    /// stand. Never authority.
+    #[cfg(test)]
+    pub(crate) fn absence_episode_for_test(
+        &self,
+    ) -> (
+        bool,
+        u64,
+        usize,
+        usize,
+        Option<crate::discovery::identity::PinnedObjectId>,
+        usize,
+    ) {
+        (
+            self.absence_done,
+            self.absence_revision,
+            self.absence_required,
+            self.absence_binding,
+            self.absence_after,
+            self.absence_entry,
+        )
     }
 
     #[cfg(test)]

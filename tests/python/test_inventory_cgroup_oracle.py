@@ -156,7 +156,7 @@ INHERITED = (["python3", "-"], {"PYTHONOPTIMIZE": "1"})
 
 def run_oracle(report, *, modfs, pin=None, modpath=MODPATH, ledger=None,
                generations=None, inside_wl=None, outside_wl=None,
-               interpreter=PLAIN, report_text=None,
+               interpreter=PLAIN, report_text=None, inside_iters=ITERS,
                outside_iters=OUTSIDE_ITERS):
     """Run the extracted oracle against a fixture report."""
     if generations is None:
@@ -185,7 +185,7 @@ def run_oracle(report, *, modfs, pin=None, modpath=MODPATH, ledger=None,
             env.update(extra_env)
         proc = subprocess.run(
             argv + ["r.json", "in.wl", "out.wl",
-                    json.dumps(pin), str(outside_iters),
+                    json.dumps(pin), str(inside_iters), str(outside_iters),
                     modpath, modfs,
                     str(generations[0]), str(generations[1])],
             input=block, capture_output=True, text=True, timeout=30,
@@ -677,13 +677,20 @@ class CountReconciliationTests(unittest.TestCase):
         self.assertIn("inside parent counted 1508 entries, drove 1507", out)
 
     def test_count_follows_the_ledger(self):
-        # The driven amount comes from the ledger, not a constant.
+        # The driven amount comes from the ledger, and the ledger must
+        # report exactly the launched iterations (ruled 2026-11-23: a
+        # reconciling ledger with another total is refused).
         report = self.report(True)
         report["edges"][0]["entries"] = counted(6 * 100 + 7)
         report["edges"][1]["entries"] = counted(6 * 100 + 7)
         rc, out = run_oracle(report, modfs="ext4",
-                             ledger=inside_ledger(iters=100))
+                             ledger=inside_ledger(iters=100), inside_iters=100)
         self.assertEqual(rc, 0, out)
+        rc, out = run_oracle(report, modfs="ext4",
+                             ledger=inside_ledger(iters=100))
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("inside ledger attempts 200 are not two members of 250 "
+                      "launched iterations", out)
         rc, out = run_oracle(report, modfs="ext4")
         self.assertNotEqual(rc, 0, out)
         self.assertIn("inside parent counted 607 entries, drove 1507", out)
@@ -1501,11 +1508,16 @@ class WorkloadLedgerTests(unittest.TestCase):
                 self.fails(marker, outside_wl=outside_wl(ledger))
 
     def test_launch_lines_drive_the_checked_iterations(self):
-        # The oracle's expected outside attempts and the workload launch
-        # share one shell variable.
+        # The oracle's expected attempts and the workload launches share
+        # the same shell variables.
         text = QUAL.read_text()
+        self.assertIn('asuser "$CFORK" "$MODULE" "$inside_iters" 200', text)
         self.assertIn('"$GATED" "$MODULE" "$outside_iters" 200 "$outside_gate"', text)
-        self.assertIn('"$before" "$outside_iters" "$MODULE"', text)
+        self.assertIn('"$before" "$inside_iters" "$outside_iters" "$MODULE"', text)
+
+    def test_inside_iterations_come_from_the_shell(self):
+        self.fails("inside ledger attempts 500 are not two members of 249 "
+                   "launched iterations", inside_iters=249)
 
     def test_outside_iterations_come_from_the_shell(self):
         self.fails("outside ledger C_GenerateRandom attempts 500, drove 400",

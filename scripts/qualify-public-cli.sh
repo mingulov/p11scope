@@ -752,10 +752,10 @@ cgroup_capture() {
   SOFTHSM2_CONF=$tokdir/outside/softhsm2.conf softhsm2-util --init-token --free --label qual --so-pin 5678 --pin 1234 >/dev/null || { result "$cell" 0 'cgroup token init failed' failed; return 1; }
   chown -R "$RUNUID:$RUNGID" "$tokdir/child/tokens" "$tokdir/outside/tokens" || { result "$cell" 0 'cgroup token chown failed' failed; return 1; }
   chmod 644 "$tokdir/child/softhsm2.conf" "$tokdir/outside/softhsm2.conf" || { result "$cell" 0 'cgroup token conf failed' failed; return 1; }
-  # The outside workload's iterations: the oracle checks its ledger
-  # against exactly this count.
-  local outside_iters=500
-  P11SCOPE_CGROUP_FORK_CHILD_CONF=$tokdir/child/softhsm2.conf asuser "$CFORK" "$MODULE" 250 200 "$inside_gate" > "$cell-inside.wl" 2>&1 & inside=$!; register "$inside" && gen=${CHILDREN[$inside]}
+  # Launched iterations (per inside member, and for the outside
+  # workload): the oracle checks each ledger against exactly these.
+  local inside_iters=250 outside_iters=500
+  P11SCOPE_CGROUP_FORK_CHILD_CONF=$tokdir/child/softhsm2.conf asuser "$CFORK" "$MODULE" "$inside_iters" 200 "$inside_gate" > "$cell-inside.wl" 2>&1 & inside=$!; register "$inside" && gen=${CHILDREN[$inside]}
   asuser_conf "$tokdir/outside/softhsm2.conf" "$GATED" "$MODULE" "$outside_iters" 200 "$outside_gate" > "$cell-outside.wl" 2>&1 & outside=$!; register "$outside" || true
   local inside_ready=0 outside_ready=0 in_cgroup=0
   if waitfor "$cell-inside.wl" "^READY pid=$inside$" "$inside" "$READY_TICKS"; then
@@ -814,13 +814,13 @@ cgroup_capture() {
     # stat(1) spells the type "overlayfs" (coreutils S_MAGIC_OVERLAYFS),
     # never the bare "overlay" of /proc/mounts.
     module_fs=$(stat -f -c %T "$MODULE" 2>/dev/null || echo unknown)
-    python3 -I - "$cell.$ext" "$cell-inside.wl" "$cell-outside.wl" "$before" "$outside_iters" "$MODULE" "$module_fs" "$gen" "$childgen" <<'PY' > "$cell.detail" 2>&1
+    python3 -I - "$cell.$ext" "$cell-inside.wl" "$cell-outside.wl" "$before" "$inside_iters" "$outside_iters" "$MODULE" "$module_fs" "$gen" "$childgen" <<'PY' > "$cell.detail" 2>&1
 import json,sys
 report=json.load(open(sys.argv[1]))
 inside=open(sys.argv[2]).read(); outside=open(sys.argv[3]).read()
 pin=json.loads(sys.argv[4])
-outside_iters=int(sys.argv[5])
-modpath=sys.argv[6]; modfs=sys.argv[7]
+inside_iters=int(sys.argv[5]); outside_iters=int(sys.argv[6])
+modpath=sys.argv[7]; modfs=sys.argv[8]
 if not (report.get('schema')=='p11scope/inventory/v1'): raise AssertionError('inventory schema')
 if not (report.get('scope')=='cgroup'): raise AssertionError('inventory scope')
 inside_pid=int([l for l in inside.splitlines() if l.startswith('READY pid=')][0].split('=')[1])
@@ -950,6 +950,7 @@ if not (len(functions)==6 and len(attempts)==1): raise AssertionError('inside le
 total=attempts.pop()[1]
 if not (type(total) is int and total>0 and total%2==0): raise AssertionError('inside ledger attempts not split per member: %r' % (total,))
 ledger_names(ledger,'inside')
+if total!=2*inside_iters: raise AssertionError('inside ledger attempts %d are not two members of %d launched iterations' % (total,inside_iters))
 driven=6*(total//2)+7
 # The outside workload is the exclusion control: only a complete run
 # that drove its calls proves that its absence is an exclusion.
@@ -958,7 +959,7 @@ if outside_ledger.get('complete') is not True: raise AssertionError('outside led
 ledger_names(outside_ledger,'outside')
 for f in outside_ledger['functions']:
     if field(f,'attempts',(int,),'outside ledger function attempts')!=outside_iters: raise AssertionError('outside ledger %s attempts %r, drove %d' % (f['name'],f['attempts'],outside_iters))
-expected=[('inside parent',inside_pid,sys.argv[8]),('fork child',child_pid,sys.argv[9])]
+expected=[('inside parent',inside_pid,sys.argv[9]),('fork child',child_pid,sys.argv[10])]
 # One typed record per published caller: identity, live state, final
 # authority and its edges with their exactness flags.
 callers={c['id']:c for c in report.get('callers',[])}

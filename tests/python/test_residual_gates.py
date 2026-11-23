@@ -459,10 +459,13 @@ class ResidualGates(unittest.TestCase):
         self.assertIn("workflow_dispatch", on_block)
         for job in ("privileged-e2e", "release-preview"):
             block = text.split(f"\n  {job}:\n", 1)[1]
-            gate = block.splitlines()[0].strip()
+            header = block.split("    runs-on:", 1)[0]
+            gates = [line.strip() for line in header.splitlines()
+                     if line.strip().startswith("if: ")]
+            self.assertEqual(len(gates), 1, f"{job} must carry one job gate")
             self.assertTrue(
-                gate.startswith("if: ${{ github.event_name == 'workflow_dispatch'"),
-                f"{job}: {gate}",
+                gates[0].startswith("if: ${{ github.event_name == 'workflow_dispatch'"),
+                f"{job}: {gates[0]}",
             )
 
     def test_release_preview_passes_an_evidence_root(self):

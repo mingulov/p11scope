@@ -9,6 +9,7 @@
 //! path lists. Event fds, pidfds and readlink strings of files that fail
 //! the provider test never leave this module.
 
+use crate::process::LoaderPid;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
@@ -110,19 +111,20 @@ pub(crate) struct LearnedCandidate {
     /// `/proc/<loader>/exe` at first sight, or the finite reason below.
     pub(crate) loader_exe: Option<String>,
     pub(crate) loader_unknown_reason: Option<&'static str>,
-    /// The loading process at first sight: the reuse-immune pidfd pid
-    /// when it is still alive, else the event-time metadata pid (the
-    /// same tally pid the `Load` message carries). Staging resolves
-    /// the held fd's mount through this process's mount table when
-    /// the observer's table does not name it (a provider loaded from
-    /// a private mount namespace): mount IDs are exact-matched, so a
-    /// reused or dead pid only misses, never misattributes. `None`
-    /// when no pid could be read, and always `None` for run-learned
-    /// files, which keep proving through the observer table: the
-    /// loader fallback is drain-only by scope, so a run-learned file
-    /// on a foreign mount still skips with the named missing-mount
-    /// reason instead of healing.
-    pub(crate) loader_pid: Option<u32>,
+    /// The loading process's pinned incarnation at first sight,
+    /// captured from the event pidfd while it provably still lived
+    /// (pid, start time, mount namespace). Staging resolves the held
+    /// fd's mount through this process's mount table only while the
+    /// pin still verifies — exit, PID reuse or a namespace move
+    /// refuses with the named gap instead of consulting another
+    /// process's table. `None` when the loader was already gone (the
+    /// metadata pid still tallies the load, but never authorizes a
+    /// lookup), and always `None` for run-learned files, which keep
+    /// proving through the observer table: the loader fallback is
+    /// drain-only by scope, so a run-learned file on a foreign mount
+    /// still skips with the named missing-mount reason instead of
+    /// healing.
+    pub(crate) loader_pid: Option<LoaderPid>,
     /// Synthesized by owned-run scan learning (E1) rather than the
     /// fanotify drain: the proving mapper is a transient descendant,
     /// so transient scan coverage does not exempt the file from
@@ -1653,6 +1655,26 @@ fn tally_pid(event: &ParsedFanotifyEvent, pidfd: Option<&OwnedFd>) -> Option<u32
     u32::try_from(event.pid).ok().filter(|pid| *pid > 0)
 }
 
+/// Captures the loading process's mount pin from the event pidfd: the
+/// reuse-immune pid plus its start time and mount namespace, bracketed
+/// by pidfd liveness exactly like [`loader_exe_for_pidfd`], so a
+/// recycled pid is never pinned. `None` when the loader is already
+/// gone or any proof read fails — the candidate then proves through
+/// the observer table only, and a foreign mount refuses with the
+/// named gap instead of healing through an unproven table.
+fn capture_loader_mount_pin(pidfd: BorrowedFd<'_>) -> Option<LoaderPid> {
+    if pidfd_exited(pidfd) {
+        return None;
+    }
+    let pid = pid_of_pidfd(pidfd)?;
+    let start_time = crate::process::process_start_time(pid).ok()?;
+    let mount_namespace = crate::process::mount_namespace_id(pid).ok()?;
+    if pidfd_exited(pidfd) || pid_of_pidfd(pidfd) != Some(pid) {
+        return None;
+    }
+    Some(LoaderPid::new(pid, start_time, mount_namespace))
+}
+
 /// Shutdown coordination between the learner handle and the drain
 /// thread: `shutdown` stops the loop, `lost_tail` records an
 /// unsent/unread tail so the engine files loss loudly instead of
@@ -2124,7 +2146,9 @@ impl DrainCtx<'_> {
             display_path,
             loader_exe,
             loader_unknown_reason,
-            loader_pid: tally,
+            loader_pid: pidfd
+                .as_ref()
+                .and_then(|pidfd| capture_loader_mount_pin(pidfd.as_fd())),
             run_learned: false,
             proving_retained: false,
         };
@@ -3113,6 +3137,36 @@ mod tests {
         let (exe, reason) = super::loader_exe_for_pidfd(pidfd.as_fd());
         assert_eq!(exe, None, "an exited loader is never named");
         assert_eq!(reason, Some(super::LOADER_EXE_UNREADABLE_REASON));
+    }
+
+    /// The mount pin captures the live loader's incarnation from its
+    /// pidfd; once the loader exits, the same pidfd captures nothing —
+    /// an exited (potentially recycled) pid is never pinned.
+    #[test]
+    fn learn_loader_mount_pin_needs_a_live_pidfd() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pidfd = test_pidfd(child.id());
+        let pin = super::capture_loader_mount_pin(pidfd.as_fd());
+        assert_eq!(pin.map(|pin| pin.pid()), Some(child.id()));
+        assert_eq!(pin.map(|pin| pin.verify()), Some(Ok(())));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        // The pidfd turns readable at exit; give the bracket a moment
+        // only if the scheduler has not delivered it yet.
+        for _ in 0..200 {
+            if super::pidfd_exited(pidfd.as_fd()) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            super::capture_loader_mount_pin(pidfd.as_fd()),
+            None,
+            "an exited loader is never pinned"
+        );
     }
 
     /// Kernel-handed fds get CLOEXEC explicitly, not by propagation.

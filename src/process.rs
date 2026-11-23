@@ -393,7 +393,7 @@ pub struct MountNamespaceId {
     pub inode: u64,
 }
 
-fn mount_namespace_id(pid: u32) -> Result<MountNamespaceId, String> {
+pub(crate) fn mount_namespace_id(pid: u32) -> Result<MountNamespaceId, String> {
     mount_namespace_id_io(pid).map_err(|error| {
         if matches!(error.raw_os_error(), Some(libc::EACCES | libc::EPERM)) {
             crate::caps::note_lacking(&crate::caps::TARGET_READ_BITS);
@@ -420,6 +420,99 @@ fn ensure_same_mount_namespace(
         Ok(())
     } else {
         Err("process mount namespace changed during discovery".into())
+    }
+}
+
+/// The loading process's pinned identity for one loader mount-table
+/// lookup: the pid the event pidfd named while it provably still lived,
+/// its `/proc` start time (clock ticks since boot, unique per process
+/// incarnation), and its mount namespace. The drain captures this from
+/// its event-owned pidfd; staging re-proves it before and after reading
+/// the loader's mount table, and refuses on any mismatch instead of
+/// consulting a table that no longer belongs to the loader. Carried by
+/// value — unlike [`PidPin`] it holds no descriptor, so queued
+/// candidates pin an incarnation without spending file descriptors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LoaderPid {
+    pid: u32,
+    start_time: u64,
+    mount_namespace: MountNamespaceId,
+}
+
+/// Why a [`LoaderPid`] no longer binds its lookup: the process exited
+/// or its pid was reused (the start time differs or is unreadable), or
+/// it moved to another mount namespace. Callers refuse with the
+/// existing named gap either way; the kinds exist so tests prove each
+/// trigger refuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoaderPidMismatch {
+    ExitedOrReused,
+    NamespaceChanged,
+}
+
+impl LoaderPid {
+    pub(crate) fn new(pid: u32, start_time: u64, mount_namespace: MountNamespaceId) -> Self {
+        Self {
+            pid,
+            start_time,
+            mount_namespace,
+        }
+    }
+
+    pub(crate) fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// Re-proves the pinned incarnation right now: the pid's current
+    /// start time and mount namespace must both still match what the
+    /// drain captured. Any read failure — including the process being
+    /// gone — is a mismatch: doubt refuses, never consults.
+    pub(crate) fn verify(&self) -> Result<(), LoaderPidMismatch> {
+        let current_start = process_start_time(self.pid).ok();
+        if current_start != Some(self.start_time) {
+            return Err(LoaderPidMismatch::ExitedOrReused);
+        }
+        let current_namespace = mount_namespace_id(self.pid).ok();
+        if current_namespace != Some(self.mount_namespace) {
+            return Err(LoaderPidMismatch::NamespaceChanged);
+        }
+        Ok(())
+    }
+
+    /// Pins one pid's claimed incarnation for tests, without pidfd
+    /// bracketing (the test, not the drain, vouches for the pid).
+    #[cfg(test)]
+    pub(crate) fn for_test(pid: u32, start_time: u64, mount_namespace: MountNamespaceId) -> Self {
+        Self::new(pid, start_time, mount_namespace)
+    }
+
+    /// The current test process's live pin. `None` when its proof reads
+    /// fail — the test then cannot run.
+    #[cfg(test)]
+    pub(crate) fn for_self_for_test() -> Option<Self> {
+        let pid = std::process::id();
+        Some(Self::new(
+            pid,
+            process_start_time(pid).ok()?,
+            mount_namespace_id(pid).ok()?,
+        ))
+    }
+
+    /// A pin for an unallocated pid: every proof read fails, so
+    /// verification always refuses.
+    #[cfg(test)]
+    pub(crate) fn dead_for_test(pid: u32) -> Self {
+        Self::new(pid, 0, MountNamespaceId { device: 0, inode: 0 })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_time_for_test(&self) -> u64 {
+        self.start_time
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mount_namespace_for_test(&self) -> MountNamespaceId {
+        self.mount_namespace
     }
 }
 
@@ -2421,6 +2514,42 @@ mod tests {
     use std::os::unix::process::ExitStatusExt as _;
     use std::process::Command;
     use std::time::{Duration, Instant};
+
+    /// A loader pin verifies its live incarnation and refuses every
+    /// other shape: a changed start time (exit or PID reuse, however
+    /// the pid was reallocated), a changed mount namespace, and an
+    /// unallocated pid. Each trigger refuses even though the pid
+    /// itself may still name a live process.
+    #[test]
+    fn loader_pid_pin_verifies_the_live_self_and_rejects_a_changed_incarnation() {
+        let live = LoaderPid::for_self_for_test().expect("pin the live test process");
+        assert_eq!(live.verify(), Ok(()));
+        let reused = LoaderPid::for_test(
+            live.pid(),
+            live.start_time_for_test().wrapping_add(1),
+            live.mount_namespace_for_test(),
+        );
+        assert_eq!(reused.verify(), Err(LoaderPidMismatch::ExitedOrReused));
+        let moved_namespace = {
+            let namespace = live.mount_namespace_for_test();
+            LoaderPid::for_test(
+                live.pid(),
+                live.start_time_for_test(),
+                MountNamespaceId {
+                    device: namespace.device ^ 1,
+                    inode: namespace.inode,
+                },
+            )
+        };
+        assert_eq!(
+            moved_namespace.verify(),
+            Err(LoaderPidMismatch::NamespaceChanged)
+        );
+        assert_eq!(
+            LoaderPid::dead_for_test(u32::MAX).verify(),
+            Err(LoaderPidMismatch::ExitedOrReused)
+        );
+    }
 
     #[test]
     fn tracker_tasks_row_moves_with_admission() {

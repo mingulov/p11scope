@@ -39,7 +39,8 @@ use crate::discovery::scan::{
 };
 use crate::manifest_input::{MAX_OBJECTS, MAX_TOTAL_OBJECT_BYTES, validate_structure};
 use crate::process::{
-    MappedOpenError, MountNamespaceId, MountTableCache, ProcessView, ProcessViewId,
+    LoaderPid, LoaderPidMismatch, MappedOpenError, MountNamespaceId, MountTableCache, ProcessView,
+    ProcessViewId,
 };
 use crate::semantics_edge::resources::{
     OWNED_ALLOCATION_PADDING, ResourceLease, SemanticResourceRefusal, SemanticResourceReserver,
@@ -9578,45 +9579,82 @@ fn identity_of_manifest(
     }
 }
 
+/// Re-proves a loader pin for one mount-table lookup: the pinned
+/// incarnation must still live in its pinned mount namespace. The
+/// refusal names the trigger without naming the pid — finite and
+/// path-free — and the caller keeps the first error text, so refused
+/// files report exactly as before.
+fn verify_loader_pin(pin: &LoaderPid) -> Result<(), String> {
+    pin.verify().map_err(|mismatch| {
+        match mismatch {
+            LoaderPidMismatch::ExitedOrReused => {
+                "loader process exited or its pid was reused; mount lookup refused"
+            }
+            LoaderPidMismatch::NamespaceChanged => {
+                "loader process left its mount namespace; mount lookup refused"
+            }
+        }
+        .to_string()
+    })
+}
+
 /// Resolves a learned file's mount through its loading process's mount
 /// table: the observer's table never names a mount it cannot see (a
 /// provider loaded from a private mount namespace), while the loader's
-/// table names the exact mount the fd was opened through. Mount IDs
-/// are exact-matched, never substituted: a dead or reused pid, an
-/// unreadable table, or a mount ID the loader's table does not name
-/// all miss rather than misattribute. The read is budgeted like every
-/// other mount-table read (paced: at most one per learned staging
-/// that misses the observer's table, inside the learned file/tick
-/// bounds), and identity parsing stays in this module.
+/// table names the exact mount the fd was opened through. The pin
+/// captured at event time is re-proved before and after the lookup, so
+/// a substituted process that merely sees the same mount is refused
+/// rather than consulted: mount IDs are exact-matched within the
+/// proven table only. An unreadable table, or a mount ID the loader's
+/// table does not name, misses rather than misattributes. The read is
+/// budgeted like every other mount-table read (paced: at most one per
+/// learned staging that misses the observer's table, inside the
+/// learned file/tick bounds), and identity parsing stays in this
+/// module.
 fn identity_of_in_loader_table(
     file: &std::fs::File,
-    loader_pid: u32,
+    pin: &LoaderPid,
     budget: &mut CaptureWorkBudget,
 ) -> Result<MappingFileKey, String> {
-    let table = std::fs::File::open(format!("/proc/{loader_pid}/mountinfo"))
+    identity_of_in_loader_table_with_verifier(file, pin, budget, verify_loader_pin)
+}
+
+/// [`identity_of_in_loader_table`] with the pin check injected, so
+/// tests script a loader that vanishes mid-lookup: production always
+/// passes [`verify_loader_pin`].
+fn identity_of_in_loader_table_with_verifier(
+    file: &std::fs::File,
+    pin: &LoaderPid,
+    budget: &mut CaptureWorkBudget,
+    mut verify: impl FnMut(&LoaderPid) -> Result<(), String>,
+) -> Result<MappingFileKey, String> {
+    verify(pin)?;
+    let table = std::fs::File::open(format!("/proc/{}/mountinfo", pin.pid()))
         .map_err(|error| format!("cannot open loader mount table: {error}"))
         .and_then(|table| read_mountinfo(table, budget))?;
-    mapping_file_key_in_mountinfo(file, &table)
-        .map_err(|error| format!("mapping identity unavailable: {error}"))
+    let key = mapping_file_key_in_mountinfo(file, &table)
+        .map_err(|error| format!("mapping identity unavailable: {error}"))?;
+    verify(pin)?;
+    Ok(key)
 }
 
 /// [`identity_of_manifest`] with the learned-file fallback: when the
 /// retained (observer or view) table does not name the fd's mount and
-/// the drain read a loader pid, one budgeted resolution through the
+/// the drain pinned the loader, one budgeted resolution through the
 /// loader's table follows. Success returns the loader-resolved key;
 /// any fallback failure keeps the first error text byte-for-byte, so
 /// refused files report exactly as before. Any other first error, or
-/// no loader pid, returns the first result untouched.
+/// no loader pin, returns the first result untouched.
 fn identity_with_loader_fallback(
     file: &std::fs::File,
     retained_mountinfo: Option<&str>,
-    loader_pid: Option<u32>,
+    loader_pid: Option<LoaderPid>,
     budget: &mut CaptureWorkBudget,
 ) -> Result<MappingFileKey, String> {
     let first = identity_of_manifest(file, retained_mountinfo);
     match (&first, loader_pid) {
-        (Err(error), Some(pid)) if is_missing_mount_id_error(error) => {
-            match identity_of_in_loader_table(file, pid, budget) {
+        (Err(error), Some(pin)) if is_missing_mount_id_error(error) => {
+            match identity_of_in_loader_table(file, &pin, budget) {
                 Ok(key) => Ok(key),
                 Err(_) => first,
             }
@@ -10447,14 +10485,15 @@ impl PrearmPinError {
 pub(crate) struct PrearmPinRequest {
     open: PathBuf,
     display: String,
-    /// The loading process for a learned file, when the drain read one:
-    /// staging resolves the held fd's mount through this process's
-    /// mount table when the observer's table does not name it (a
+    /// The loading process's pinned incarnation for a learned file,
+    /// when the drain captured one: staging resolves the held fd's
+    /// mount through this process's mount table while the pin still
+    /// verifies, when the observer's table does not name it (a
     /// provider loaded from a private mount namespace). Operator pins
     /// carry `None` (observer or view table by scope); run-learned
     /// files carry `None` too (observer table, unchanged — the loader
     /// fallback is drain-only by scope).
-    loader_pid: Option<u32>,
+    loader_pid: Option<LoaderPid>,
 }
 
 impl PrearmPinRequest {
@@ -10468,12 +10507,13 @@ impl PrearmPinRequest {
     }
 
     /// Opens `open`, records `display` (learned files: the held fd plus
-    /// the readlink spelling), resolving a foreign mount through
-    /// `loader_pid`'s table when the observer's table misses it.
+    /// the readlink spelling), resolving a foreign mount through the
+    /// pinned loader's table while the pin verifies, when the
+    /// observer's table misses it.
     pub(crate) fn open_with_display(
         open: PathBuf,
         display: String,
-        loader_pid: Option<u32>,
+        loader_pid: Option<LoaderPid>,
     ) -> Self {
         Self {
             open,
@@ -16565,7 +16605,7 @@ mod tests {
         let found = identity_with_loader_fallback(
             &file,
             Some(stale),
-            Some(std::process::id()),
+            Some(LoaderPid::for_self_for_test().expect("pin the live test process")),
             &mut CaptureWorkBudget::default(),
         )
         .expect("the loader table must heal the foreign mount id");
@@ -16598,6 +16638,9 @@ mod tests {
         let stale = "999999 1 8:1 / /other rw - ext4 /dev/other rw\n";
         // A substitute: another live process in the shared mount
         // namespace, never the loader — its table names the same mount.
+        // The pin claims the substitute's pid with a different
+        // incarnation's start time: exactly what a PID reuse leaves
+        // behind, without waiting for the kernel to recycle the number.
         let substitute = LiveChild(
             std::process::Command::new("sleep")
                 .arg("30")
@@ -16607,10 +16650,18 @@ mod tests {
                 .spawn()
                 .expect("spawn a substitute process sharing the mount namespace"),
         );
+        let pid = substitute.0.id();
+        let pin = LoaderPid::for_test(
+            pid,
+            crate::process::process_start_time(pid)
+                .expect("read the substitute start time")
+                .wrapping_add(1),
+            crate::process::mount_namespace_id(pid).expect("read the substitute mount namespace"),
+        );
         let error = identity_with_loader_fallback(
             &file,
             Some(stale),
-            Some(substitute.0.id()),
+            Some(pin),
             &mut CaptureWorkBudget::default(),
         )
         .expect_err("a substituted loader must not resolve the foreign mount id");
@@ -16624,6 +16675,102 @@ mod tests {
         );
     }
 
+    /// A loader that exited after the drain pinned it refuses the
+    /// lookup: the pin's incarnation is gone, so its table — even if
+    /// the pid number already named another process — is never read.
+    #[test]
+    fn an_exited_loader_pin_refuses_the_lookup() {
+        let file = open_regular(Path::new("/bin/sh")).unwrap();
+        let observer = mapping_file_key(&file).unwrap();
+        let stale = "999999 1 8:1 / /other rw - ext4 /dev/other rw\n";
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn a short-lived loader");
+        let pid = child.id();
+        let pin = LoaderPid::for_test(
+            pid,
+            crate::process::process_start_time(pid).expect("read the loader start time"),
+            crate::process::mount_namespace_id(pid).expect("read the loader mount namespace"),
+        );
+        child.kill().expect("stop the loader before the lookup");
+        child.wait().expect("reap the loader before the lookup");
+        let error = identity_with_loader_fallback(
+            &file,
+            Some(stale),
+            Some(pin),
+            &mut CaptureWorkBudget::default(),
+        )
+        .expect_err("an exited loader must not resolve the foreign mount id");
+        assert_eq!(
+            error,
+            format!(
+                "mapping identity unavailable: fd mount {} is missing from the mount table",
+                observer.mount_id
+            ),
+            "a refused exit keeps the first error text byte-for-byte"
+        );
+    }
+
+    /// The pin refusal names its trigger without naming the pid: exit
+    /// or reuse, and namespace departure, refuse with distinct finite
+    /// reasons (the fallback caller still keeps the first error text).
+    #[test]
+    fn loader_pin_mismatch_names_the_refusal_trigger() {
+        let file = open_regular(Path::new("/bin/sh")).unwrap();
+        let mut budget = CaptureWorkBudget::default();
+        assert_eq!(
+            identity_of_in_loader_table(&file, &LoaderPid::dead_for_test(u32::MAX), &mut budget,)
+                .unwrap_err(),
+            "loader process exited or its pid was reused; mount lookup refused",
+        );
+        let live = LoaderPid::for_self_for_test().expect("pin the live test process");
+        let namespace = live.mount_namespace_for_test();
+        let moved_pin = LoaderPid::for_test(
+            live.pid(),
+            live.start_time_for_test(),
+            MountNamespaceId {
+                device: namespace.device ^ 1,
+                inode: namespace.inode,
+            },
+        );
+        assert_eq!(
+            identity_of_in_loader_table(&file, &moved_pin, &mut budget,).unwrap_err(),
+            "loader process left its mount namespace; mount lookup refused",
+        );
+    }
+
+    /// The pin brackets the lookup on both sides: a loader that was
+    /// alive at the pre-check but is gone after the table read still
+    /// refuses — its row is never trusted. The injected verifier runs
+    /// exactly twice, before the open and after the resolution.
+    #[test]
+    fn loader_pin_brackets_the_lookup_before_and_after() {
+        let file = open_regular(Path::new("/bin/sh")).unwrap();
+        let pin = LoaderPid::for_self_for_test().expect("pin the live test process");
+        let mut budget = CaptureWorkBudget::default();
+        let mut calls = 0;
+        let error = identity_of_in_loader_table_with_verifier(
+            &file,
+            &pin,
+            &mut budget,
+            |_| {
+                calls += 1;
+                if calls == 1 {
+                    Ok(())
+                } else {
+                    Err("injected post-lookup exit".to_string())
+                }
+            },
+        )
+        .expect_err("a loader lost mid-lookup must not resolve");
+        assert_eq!(error, "injected post-lookup exit");
+        assert_eq!(calls, 2, "the pin is proved before and after the lookup");
+    }
+
     #[test]
     fn a_gone_loader_keeps_the_observer_error() {
         let file = open_regular(Path::new("/bin/sh")).unwrap();
@@ -16632,7 +16779,7 @@ mod tests {
         let error = identity_with_loader_fallback(
             &file,
             Some(stale),
-            Some(u32::MAX),
+            Some(LoaderPid::dead_for_test(u32::MAX)),
             &mut CaptureWorkBudget::default(),
         )
         .expect_err("a loader that is already gone must still fail");
@@ -16680,7 +16827,7 @@ mod tests {
         let error = identity_with_loader_fallback(
             &file,
             Some(&corrupt),
-            Some(std::process::id()),
+            Some(LoaderPid::for_self_for_test().expect("pin the live test process")),
             &mut CaptureWorkBudget::default(),
         )
         .expect_err("an invalid mount device must still fail");
@@ -16702,7 +16849,7 @@ mod tests {
         let error = identity_with_loader_fallback(
             &file,
             Some(stale),
-            Some(std::process::id()),
+            Some(LoaderPid::for_self_for_test().expect("pin the live test process")),
             &mut budget,
         )
         .expect_err("a stopped budget must refuse the loader read");

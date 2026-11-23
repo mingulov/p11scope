@@ -88852,7 +88852,9 @@ fn learned_candidate_with_loader_pid_stages_through_the_observer_table() {
         display_path: library.to_string_lossy().into_owned(),
         loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
         loader_unknown_reason: None,
-        loader_pid: Some(std::process::id()),
+        loader_pid: Some(
+            crate::process::LoaderPid::for_self_for_test().expect("pin the live test process"),
+        ),
         run_learned: false,
         proving_retained: false,
     });
@@ -88891,7 +88893,7 @@ fn learned_candidate_with_dead_loader_pid_stages_through_the_observer_table() {
         display_path: library.to_string_lossy().into_owned(),
         loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
         loader_unknown_reason: None,
-        loader_pid: Some(u32::MAX),
+        loader_pid: Some(crate::process::LoaderPid::dead_for_test(u32::MAX)),
         run_learned: false,
         proving_retained: false,
     });

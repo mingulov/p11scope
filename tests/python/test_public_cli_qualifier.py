@@ -1163,10 +1163,160 @@ class OptimizeLevelProofTests(unittest.TestCase):
         COMPILE_OPTIMIZE = 2
         try:
             exec(compile_oracle(ast.parse("assert False"), "<probe>", "exec"), {})
+            COMPILE_OPTIMIZE = 0
+            with self.assertRaises(AssertionError):
+                exec(compile_oracle(ast.parse("assert False"), "<probe>", "exec"), {})
         finally:
             COMPILE_OPTIMIZE = -1
-        with self.assertRaises(AssertionError):
-            exec(compile_oracle(ast.parse("assert False"), "<probe>", "exec"), {})
+
+
+PREARM_RUNNER = (
+    "import platform, sys\n"
+    "platform.release = lambda: sys.argv[1]\n"
+    "exec(compile(open(sys.argv[2]).read(), '<run-prearm>', 'exec'))\n")
+
+
+def prearm_trace(counts=(3, 3, 1)):
+    names = ("C_Initialize", "C_Finalize", "C_GetFunctionList")
+    rows = []
+    for name, count in zip(names, counts):
+        rows += ['1.0 "w" (PID 1, TID 1) %s -> CKR_OK 1.0us' % name] * count
+    return rows
+
+
+def prearm_evidence(windows, *, sources=("prearm", "scan"), attached=50,
+                    extra=None):
+    mods = [{"sources": ["scan"], "unobserved_windows": [],
+             "attached_at_ns": 7}]
+    mods.append({"sources": list(sources), "unobserved_windows": windows,
+                 "attached_at_ns": attached})
+    if extra:
+        mods.append(extra)
+    return {"discovery": mods}
+
+
+PRE_ATTACH = [{"reason": "pre_attach", "start_ns": 10, "end_ns": 50}]
+HANDOFF = [{"reason": "late_discovery", "start_ns": 10, "end_ns": 50},
+           {"reason": "mapped_unattached", "start_ns": 10, "end_ns": 60}]
+
+
+def prearm_twins():
+    held_text = ["noise"] + prearm_trace() + [
+        "EVIDENCE " + json.dumps(prearm_evidence([]))]
+    passive_text = ["EVIDENCE " + json.dumps(prearm_evidence(PRE_ATTACH))]
+    ledger = [json.dumps({"initializes": 1, "finalizes": 1}), "",
+              json.dumps({"initializes": 3, "finalizes": 3})]
+    return {"held": [held_text, list(ledger)],
+            "passive": [passive_text, list(ledger)]}
+
+
+class WholePrearmBlockTests(unittest.TestCase):
+    """The whole run-prearm block (top-level checks included) against
+    twin files, under the plain, -O and inherited-PYTHONOPTIMIZE
+    interpreters, with a faked kernel release."""
+
+    MODES = (("plain", ["python3", "-I"], None),
+             ("-O", ["python3", "-O", "-I"], None),
+             ("PYTHONOPTIMIZE", ["python3"], {"PYTHONOPTIMIZE": "1"}))
+    GE68 = "held [] with 3/3 ledger and 3/3/1 trace; passive keeps single pre_attach"
+
+    def run_block(self, twins, release, argv, extra_env):
+        with tempfile.TemporaryDirectory() as tmp_name:
+            tmp = Path(tmp_name)
+            (tmp / "block.py").write_text(extract_handoff_oracle())
+            for name, (text, ledger) in twins.items():
+                (tmp / ("run-prearm-%s.txt" % name)).write_text("\n".join(text) + "\n")
+                (tmp / ("run-prearm-%s.wl" % name)).write_text("\n".join(ledger) + "\n")
+            env = None
+            if extra_env is not None:
+                import os
+                env = {k: v for k, v in os.environ.items()
+                       if not k.startswith("PYTHON")}
+                env.update(extra_env)
+            proc = subprocess.run(argv + ["-c", PREARM_RUNNER, release, "block.py"],
+                                  cwd=tmp, capture_output=True, text=True,
+                                  timeout=30, env=env)
+            return proc.returncode, proc.stdout + proc.stderr
+
+    def expect(self, twins, release, *, ok, marker):
+        for label, argv, extra_env in self.MODES:
+            with self.subTest(mode=label, release=release):
+                rc, out = self.run_block(twins, release, argv, extra_env)
+                if ok:
+                    self.assertEqual(rc, 0, out)
+                    self.assertEqual(out.strip(), marker)
+                else:
+                    self.assertNotEqual(rc, 0, out)
+                    self.assertIn(marker, out)
+
+    def test_healthy_twins_qualify_on_each_kernel_branch(self):
+        for release in ("6.8.0", "6.12x", "7.2.9-200.fc44.x86_64"):
+            self.expect(prearm_twins(), release, ok=True, marker=self.GE68)
+        for release in ("6.7.12", "6.6.157"):
+            self.expect(prearm_twins(), release, ok=True,
+                        marker="pre-6.8 exact: held merged [], passive merged "
+                               "pre_attach, 3/3 ledger and 3/3/1 trace")
+
+    def test_handoff_pair_qualifies_only_before_6_8(self):
+        twins = prearm_twins()
+        twins["held"][0][-1] = "EVIDENCE " + json.dumps(prearm_evidence(HANDOFF))
+        twins["passive"][0][-1] = "EVIDENCE " + json.dumps(prearm_evidence(HANDOFF))
+        self.expect(twins, "6.6.0", ok=True,
+                    marker="pre-6.8 exact: held handoff pair, passive handoff "
+                           "pair, 3/3 ledger and 3/3/1 trace")
+        self.expect(twins, "6.8.0", ok=False, marker="late_discovery")
+
+    def test_unparseable_release_fails(self):
+        self.expect(prearm_twins(), "linux", ok=False,
+                    marker="unparseable kernel release")
+
+    def mutate_rows(self):
+        def evidence(name, ev):
+            def go(twins):
+                twins[name][0][-1] = "EVIDENCE " + json.dumps(ev)
+            return go
+
+        def trace(counts):
+            def go(twins):
+                twins["held"][0][1:-1] = prearm_trace(counts)
+            return go
+
+        def ledger(row):
+            def go(twins):
+                twins["held"][1][-1] = json.dumps(row)
+            return go
+
+        def no_evidence(twins):
+            twins["passive"][0] = ["no evidence here"]
+
+        two_prearmed = prearm_evidence([], extra={"sources": ["prearm"],
+                                                  "unobserved_windows": [],
+                                                  "attached_at_ns": 1})
+        return [
+            ("no-evidence-line", no_evidence, "passive: no EVIDENCE line"),
+            ("two-prearmed", evidence("held", two_prearmed), "one pre-armed module, got 2"),
+            ("held-window", evidence("held", prearm_evidence(PRE_ATTACH)), "pre_attach"),
+            ("held-no-scan", evidence("held", prearm_evidence([], sources=("prearm",))), "['prearm']"),
+            ("ledger-short", ledger({"initializes": 2, "finalizes": 3}), "'initializes': 2"),
+            ("ledger-fin", ledger({"initializes": 3, "finalizes": 4}), "'finalizes': 4"),
+            ("trace-init", trace((2, 3, 1)), "(2, 3, 1)"),
+            ("trace-fin", trace((3, 4, 1)), "(3, 4, 1)"),
+            ("trace-gfl", trace((3, 3, 2)), "(3, 3, 2)"),
+            ("passive-no-scan", evidence("passive", prearm_evidence(PRE_ATTACH, sources=("prearm",))), "['prearm']"),
+            ("passive-empty", evidence("passive", prearm_evidence([])), "[]"),
+            ("passive-two", evidence("passive", prearm_evidence(PRE_ATTACH * 2)), "pre_attach"),
+            ("passive-reason", evidence("passive", prearm_evidence(
+                [dict(PRE_ATTACH[0], reason="late_discovery")])), "late_discovery"),
+            ("passive-end", evidence("passive", prearm_evidence(PRE_ATTACH, attached=51)), "'end_ns': 50"),
+        ]
+
+    def test_each_refused_twin_fails_on_each_kernel_branch(self):
+        for name, mutate, marker in self.mutate_rows():
+            for release in ("6.12.0", "6.6.0"):
+                with self.subTest(row=name):
+                    twins = prearm_twins()
+                    mutate(twins)
+                    self.expect(twins, release, ok=False, marker=marker)
 
 
 class JudgeFlagTests(unittest.TestCase):

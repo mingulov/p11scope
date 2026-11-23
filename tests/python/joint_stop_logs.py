@@ -36,8 +36,14 @@ FAILED_SUMMARY = ("test result: FAILED. 0 passed; 1 failed; 0 ignored; "
 S1_RECEIPT = "no joint feeds with S1 seal (producers unlinked, zero installs)"
 UNATTRIBUTED_RECEIPT = ("no joint feeds without S1 seal (producers linked, "
                         "zero installs unexplained)")
+STARVED_RECEIPT = ("no joint feeds from the linked session: the held "
+                   "caller's birth receipt was deferred (no_receipt) or "
+                   "refused (partition) and no later birth bound")
 RECEIPTS = {"s1-precluded": S1_RECEIPT,
+            "no-feeds-receipt-starved": STARVED_RECEIPT,
             "no-feeds-unattributed": UNATTRIBUTED_RECEIPT}
+LINKED_NO_FEED = ("no-feeds-receipt-starved", "no-feeds-unattributed")
+JOIN_QUANTA = 32
 BACKTRACE = [
     "",
     "Stack backtrace:",
@@ -72,26 +78,42 @@ def healthy_outcome(ms):
 
 def no_feed_probe(branch="no-feeds-unattributed"):
     """A no-feed probe as the cell samples it."""
+    starved = branch == "no-feeds-receipt-starved"
+    gaps = [{"subject": "joint birth unavailable",
+             "reason": "joint_birth_original_mismatch", "count": 1}]
+    if starved:
+        gaps = [{"subject": "semantic admission deferred",
+                 "reason": "semantic_unavailable:no_receipt", "count": 1},
+                {"subject": "semantic receipt refused",
+                 "reason": "partition", "count": 1}]
     return {"joint_feeds": 0,
-            "journal_linked": branch == "no-feeds-unattributed",
+            "journal_linked": branch in LINKED_NO_FEED,
             "backstop_routed": 0, "birth_capacity": None,
             "drive": "live=1 gated=0 finished=0 ticks=3 feeds=0",
-            "gaps": [{"subject": "joint birth unavailable",
-                      "reason": "joint_birth_original_mismatch",
-                      "count": 1}]}
+            "gaps": gaps, "no_receipt": 2 if starved else 0,
+            "partition": 1 if starved else 0, "shed": 18 if starved else 0}
+
+
+def join_of(branch):
+    """The join the cell spends before deciding `branch`."""
+    if branch is None:
+        return None
+    return JOIN_QUANTA if branch in LINKED_NO_FEED else 0
 
 
 def case_record(k, branch="linked", outcome="healthy", completed=None,
-                no_feed="sampled"):
+                no_feed="sampled", join="spent"):
     if outcome == "healthy":
         outcome = healthy_outcome(offset_of(k)) if branch == "linked" else None
     if completed is None:
         completed = outcome is not None and branch == "linked"
     if no_feed == "sampled":
         no_feed = no_feed_probe(branch) if branch in RECEIPTS else None
+    if join == "spent":
+        join = join_of(branch)
     return {"name": "wp7-stop%d" % k, "index": k, "prep": k // 4,
-            "offset_ms": offset_of(k), "branch": branch, "outcome": outcome,
-            "no_feed": no_feed, "completed": completed}
+            "offset_ms": offset_of(k), "branch": branch, "join_quanta": join,
+            "outcome": outcome, "no_feed": no_feed, "completed": completed}
 
 
 def record(cases, terminal):

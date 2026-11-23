@@ -25,14 +25,18 @@ types, no floats, no duplicate keys):
    "cases": [{"name": "wp7-stopK", "index": K, "prep": K // 4,
               "offset_ms": (0, 1, 5, 20)[K % 4],
               "branch": null | "linked" | "s1-precluded"
+                        | "no-feeds-receipt-starved"
                         | "no-feeds-unattributed",
+              "join_quanta": null | int,
               "outcome": null | OUTCOME,
               "no_feed": null | {"joint_feeds": int, "journal_linked": bool,
                                  "backstop_routed": int,
                                  "birth_capacity": null | TEXT,
                                  "drive": TEXT,
                                  "gaps": [{"subject": TEXT, "reason": TEXT,
-                                           "count": int}]},
+                                           "count": int}],
+                                 "no_receipt": int, "partition": int,
+                                 "shed": int},
               "completed": bool}],
    "terminal": {"kind": "qualified"} | {"kind": "narrowed"}
              | {"kind": "precluded" | "no-feed", "case": K,
@@ -41,6 +45,15 @@ types, no floats, no duplicate keys):
              | {"kind": "case-failed", "case": K | null,
                 "stage": "setup" | "drive" | "check",
                 "check": null | CHECK, "error": TEXT}}
+
+join_quanta is how many quanta the cell serviced after q1, with the
+call still held, before its linkage decision (null exactly before a
+linkage). It never exceeds JOIN_QUANTA (the cell's STOP_JOIN_QUANTA),
+and a linked no-feed branch (receipt-starved or unattributed) must
+have spent all of it: one quantum is never a no-feed verdict. A
+linked no-feed case is receipt-starved exactly when its probe counts a
+`no_receipt` deferral or a `partition` receipt refusal; that cause is
+named but never accepted.
 
 OUTCOME is the StopOutcome struct field for field. The validator
 recomputes the cell's stop checks (at-q, latch, abandon, terminal,
@@ -89,16 +102,22 @@ SUMMARY_RE = re.compile(
 NO_FEED = {
     "s1-precluded":
         "no joint feeds with S1 seal (producers unlinked, zero installs)",
+    "no-feeds-receipt-starved":
+        "no joint feeds from the linked session: the held caller's birth "
+        "receipt was deferred (no_receipt) or refused (partition) and no "
+        "later birth bound",
     "no-feeds-unattributed":
         "no joint feeds without S1 seal (producers linked, zero installs "
         "unexplained)",
 }
+LINKED_NO_FEED = ("no-feeds-receipt-starved", "no-feeds-unattributed")
+JOIN_QUANTA = 32
 BRANCHES = ("linked",) + tuple(NO_FEED)
 STOP_CHECKS = ("at-q", "latch", "abandon", "terminal", "reconcile")
 STAGES = ("setup", "drive", "check")
 BEGINS = ("polling", "published-at-begin", "abandoned-at-begin", "not-begun")
 FINISHES = ("published", "abandoned", "not-begun", "unpublished")
-OUTCOME_BRANCHES = ("linked", "s1", "unattributed")
+OUTCOME_BRANCHES = ("linked", "s1", "receipt-starved", "unattributed")
 U64_MAX = 2 ** 64 - 1
 
 # Every check the validator applies, by the reason it reports. The
@@ -109,11 +128,11 @@ CHECKS = (
     "summary-status", "record-missing", "record-duplicate",
     "record-misplaced", "record-json", "record-schema", "record-cell",
     "selection", "case-sequence", "case-branch", "case-outcome",
-    "no-feed-probe",
+    "no-feed-probe", "join-bound", "no-feed-cause",
     "completion", "terminal-status", "terminal-case", "qualified-count",
     "unexpected-pass",
     "precluded-binding", "no-feed-binding", "s1-after-linked",
-    "no-feed-unattributed", "wedge-binding", "wedge-unexpected",
+    "no-feed-receipt-starved", "no-feed-unattributed", "wedge-binding", "wedge-unexpected",
     "case-failed-binding", "narrowed",
 )
 
@@ -288,6 +307,24 @@ def _judge(record, status, expect_wedge, check):
               (case["no_feed"] is not None) == (case["branch"] in NO_FEED),
               "wp7-stop%d: a no-feed probe on branch %r (the cell samples "
               "one exactly on a no-feed case)" % (k, case["branch"]))
+        join = case["join_quanta"]
+        check("join-bound",
+              (join is None) == (case["branch"] is None)
+              and (join is None or join <= JOIN_QUANTA)
+              and (case["branch"] not in LINKED_NO_FEED
+                   or join == JOIN_QUANTA),
+              "wp7-stop%d: join_quanta %r on branch %r (at most %d; a linked "
+              "no-feed verdict spends all %d)"
+              % (k, join, case["branch"], JOIN_QUANTA, JOIN_QUANTA))
+        probe = case["no_feed"]
+        if case["branch"] in LINKED_NO_FEED and probe is not None:
+            starved = probe["no_receipt"] + probe["partition"] > 0
+            check("no-feed-cause",
+                  (case["branch"] == "no-feeds-receipt-starved") == starved,
+                  "wp7-stop%d: branch %r contradicts its typed cause "
+                  "(no_receipt=%d partition=%d)"
+                  % (k, case["branch"], probe["no_receipt"],
+                     probe["partition"]))
         failing = first_failing_check(outcome) if outcome else "absent"
         check("completion",
               case["completed"] == (outcome is not None and failing is None)
@@ -337,6 +374,15 @@ def _judge(record, status, expect_wedge, check):
         probe = _probe_text(open_case["no_feed"])
         check("s1-after-linked", branch != "s1-precluded",
               "wp7-stop%d sealed S1 after linked cases; %s" % (last, probe))
+        check("no-feed-receipt-starved",
+              branch != "no-feeds-receipt-starved",
+              "wp7-stop%d: %s; no_receipt=%d partition=%d shed=%d after %d "
+              "join quanta; %s"
+              % (last, NO_FEED["no-feeds-receipt-starved"],
+                 open_case["no_feed"]["no_receipt"],
+                 open_case["no_feed"]["partition"],
+                 open_case["no_feed"]["shed"], open_case["join_quanta"],
+                 probe))
         check("no-feed-unattributed", branch != "no-feeds-unattributed",
               "wp7-stop%d: %s; %s" % (last, NO_FEED["no-feeds-unattributed"],
                                       probe))
@@ -472,7 +518,7 @@ OUTCOME_FIELDS = {
 CASE_FIELDS = {
     "name": _is_str, "index": _is_u64, "prep": _is_u64,
     "offset_ms": _is_u64, "branch": _opt(_one_of(*BRANCHES)),
-    "outcome": lambda v: True, "no_feed": lambda v: True,
+    "join_quanta": _opt(_is_u64), "outcome": lambda v: True, "no_feed": lambda v: True,
     "completed": lambda v: type(v) is bool,
 }
 GAP_FIELDS = {"subject": _is_str, "reason": _is_str, "count": _is_u64}
@@ -480,6 +526,7 @@ PROBE_FIELDS = {
     "joint_feeds": _is_u64, "journal_linked": lambda v: type(v) is bool,
     "backstop_routed": _is_u64, "birth_capacity": _opt(_is_str),
     "drive": _is_str, "gaps": lambda v: type(v) is list,
+    "no_receipt": _is_u64, "partition": _is_u64, "shed": _is_u64,
 }
 TERMINAL_FIELDS = {
     "qualified": {}, "narrowed": {},

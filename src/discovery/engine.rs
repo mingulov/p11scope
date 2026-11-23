@@ -34952,7 +34952,12 @@ impl Engine {
                 self.scan_inputs.remove(view);
             }
             if matches!(self.scope, Scope::Pid(_)) && retained_unproven {
-                bail!("the named process generation changed during inventory preflight");
+                // The pin proved neither exit nor change — the target
+                // may be live and unchanged — so the refusal names the
+                // unverified generation, never a change.
+                bail!(
+                    "the named process generation was unverified during inventory preflight; exit or change unproven"
+                );
             }
             return Ok(changed);
         }

@@ -46,9 +46,11 @@ pub(crate) struct GenerationProof {
 impl GenerationProof {
     /// Mint a proof from a live pin read: the ONLY production mint
     /// path. Positive exit/reuse evidence becomes a proof; every other
-    /// outcome becomes the reason proof is unavailable.
+    /// outcome becomes the reason proof is unavailable. The observation
+    /// is the discovery one: a ready original pidfd already proves the
+    /// exit, so a failed `/proc` re-read can never downgrade it.
     pub(crate) fn judge_pin(pin: &PidPin) -> Result<Self, GenerationUnproven> {
-        classify_generation_state(Some(pin.original_generation_state()))
+        classify_generation_state(Some(pin.original_discovery_state()))
     }
 
     /// Mint a proof from a scripted pin answer (fault injection for

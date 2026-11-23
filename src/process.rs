@@ -744,6 +744,10 @@ impl ProcessView {
         self.pin.original_generation_state()
     }
 
+    pub(crate) fn original_discovery_state(&self) -> Result<OriginalGenerationState, String> {
+        self.pin.original_discovery_state()
+    }
+
     /// Whether this view's original thread group has exited or can never
     /// run user code again (see `PidPin::final_exit_in_progress`).
     pub(crate) fn final_exit_in_progress(&self) -> bool {
@@ -1592,6 +1596,30 @@ impl PidPin {
                 self.pid
             )
         })
+    }
+
+    /// Discovery stale-set observation: a ready original pidfd already
+    /// proves the generation exited — the same authority
+    /// `original_exited` and every retirement path use — so no `/proc`
+    /// re-read is needed to confirm it, and a failed re-read can never
+    /// downgrade it to unproven. A quiet pidfd likewise proves the
+    /// generation is current without a re-read. Only a pin without a
+    /// pidfd needs the start-time distinction between exit and reuse,
+    /// which delegates to `original_generation_state`. Callers that
+    /// depend on the stronger exit-vs-reuse distinction for terminal
+    /// authority keep using `original_generation_state`.
+    pub(crate) fn original_discovery_state(&self) -> Result<OriginalGenerationState, String> {
+        if let Some(fd) = &self.pidfd {
+            return match pidfd_ready(fd) {
+                Ok(true) => Ok(OriginalGenerationState::Exited),
+                Ok(false) => Ok(OriginalGenerationState::Current),
+                Err(error) => Err(format!(
+                    "cannot poll the original pidfd of pid {}: {error}",
+                    self.pid
+                )),
+            };
+        }
+        self.original_generation_state()
     }
 
     /// Proves that this pin retained the original pidfd and that the kernel
@@ -2755,6 +2783,71 @@ int main(int argc, char **argv) {
                 .kind(),
             io::ErrorKind::Other,
             "missing retained start time is unknown, never exit"
+        );
+    }
+
+    /// Mutation caught: a ready original pidfd is exit proof for the
+    /// discovery stale set even when the `/proc` re-read cannot run —
+    /// a pidfd-only pin (no retained start time) over an exited
+    /// original proves exit, never unproven. A quiet pidfd is current
+    /// without a re-read; a pin without a pidfd keeps the start-time
+    /// distinction, and the stronger exit-vs-reuse classifier keeps
+    /// refusing the pidfd-only shape for terminal authority.
+    #[test]
+    fn original_discovery_state_trusts_a_ready_pidfd_without_a_reread() {
+        let mut live = Command::new("sleep")
+            .arg("30")
+            .die_with_parent()
+            .spawn()
+            .unwrap();
+        let pid = live.id();
+        let pin = PidPin::test_pidfd_only(pid);
+        assert!(
+            pin.pidfd_raw_for_test().is_some(),
+            "the twin holds a real pidfd, or it tests the wrong pin shape"
+        );
+        assert_eq!(
+            pin.original_discovery_state().unwrap(),
+            OriginalGenerationState::Current
+        );
+        // Kill without reaping: the pidfd turns ready over a zombie
+        // whose stat stays readable, while no start time was retained.
+        live.kill().unwrap();
+        for _ in 0..200 {
+            if generation_dead(pid) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            generation_dead(pid),
+            "the child reads dead before the discovery observation"
+        );
+        assert!(
+            std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok(),
+            "the child is a zombie, not reaped: its stat stays readable"
+        );
+        assert_eq!(
+            pin.original_discovery_state().unwrap(),
+            OriginalGenerationState::Exited
+        );
+        assert!(
+            pin.original_generation_state().is_err(),
+            "the stronger classifier keeps refusing without a start time"
+        );
+        live.wait().unwrap();
+        // A pin without a pidfd keeps delegating: a changed start time
+        // still reads reuse, never exit.
+        let own = process_start_time(std::process::id()).unwrap();
+        let reused = PidPin {
+            shared_charge: None,
+            pid: std::process::id(),
+            pidfd: None,
+            start_time: Some(own.wrapping_add(1)),
+        };
+        assert_eq!(
+            reused.original_discovery_state().unwrap(),
+            OriginalGenerationState::Reused
         );
     }
 

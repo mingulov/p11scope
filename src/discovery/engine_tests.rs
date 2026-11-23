@@ -7059,6 +7059,42 @@ fn folded_pairs_publish_and_project_with_every_record_kept() {
         ),
         (
             "live discovery generation",
+            "candidate generation unverified before mutation; a pin read was denied, exit or change unproven, canonical identity, plan, and links were unchanged",
+        ),
+        (
+            "live inventory generation",
+            "an exact retained or newly opened process generation was unverified during inventory preflight; a pin read was denied, exit or change unproven",
+        ),
+        (
+            "live inventory generation",
+            "an exact retained or newly opened process generation was unverified during post-retirement preflight; a pin read was denied, exit or change unproven",
+        ),
+        (
+            "live discovery generation",
+            "candidate generation unverified before mutation; no generation pin was retained, exit or change unproven, canonical identity, plan, and links were unchanged",
+        ),
+        (
+            "live inventory generation",
+            "an exact retained or newly opened process generation was unverified during inventory preflight; no generation pin was retained, exit or change unproven",
+        ),
+        (
+            "live inventory generation",
+            "an exact retained or newly opened process generation was unverified during post-retirement preflight; no generation pin was retained, exit or change unproven",
+        ),
+        (
+            "live discovery generation",
+            "candidate generation unverified before mutation; the stale report was contradicted, exit or change unproven, canonical identity, plan, and links were unchanged",
+        ),
+        (
+            "live inventory generation",
+            "an exact retained or newly opened process generation was unverified during inventory preflight; the stale report was contradicted, exit or change unproven",
+        ),
+        (
+            "live inventory generation",
+            "an exact retained or newly opened process generation was unverified during post-retirement preflight; the stale report was contradicted, exit or change unproven",
+        ),
+        (
+            "live discovery generation",
             "a stale generation report was contradicted or unprovable on pin recheck; retirement deferred",
         ),
         (
@@ -7149,7 +7185,7 @@ fn folded_pairs_publish_and_project_with_every_record_kept() {
             .filter(|reason| **reason
                 == "process generation unverified mid-flight; exit or change unproven")
             .count(),
-        3,
+        12,
         "{reasons:?}"
     );
     assert_eq!(
@@ -7176,8 +7212,8 @@ fn folded_pairs_publish_and_project_with_every_record_kept() {
     );
 }
 
-/// Drift guard for all twelve folded gap-noise pairs (three
-/// mid-flight changed, three unverified-generation, one
+/// Drift guard for all twenty-one folded gap-noise pairs (three
+/// mid-flight changed, twelve unverified-generation, one
 /// stale-deferral, one permission-refusal, one unreadable-member, one
 /// terminal record-resolution, two loader-context): filing sites
 /// without a cheap live seam pin their exact strings in source, so a
@@ -7219,6 +7255,51 @@ fn folded_gap_noise_pairs_match_their_filing_sites() {
         (
             "live inventory generation",
             "an exact retained or newly opened process generation was unverified during post-retirement preflight; exit or change unproven",
+            "process generation unverified mid-flight; exit or change unproven",
+        ),
+        (
+            "live discovery generation",
+            "candidate generation unverified before mutation; a pin read was denied, exit or change unproven, canonical identity, plan, and links were unchanged",
+            "process generation unverified mid-flight; exit or change unproven",
+        ),
+        (
+            "live inventory generation",
+            "an exact retained or newly opened process generation was unverified during inventory preflight; a pin read was denied, exit or change unproven",
+            "process generation unverified mid-flight; exit or change unproven",
+        ),
+        (
+            "live inventory generation",
+            "an exact retained or newly opened process generation was unverified during post-retirement preflight; a pin read was denied, exit or change unproven",
+            "process generation unverified mid-flight; exit or change unproven",
+        ),
+        (
+            "live discovery generation",
+            "candidate generation unverified before mutation; no generation pin was retained, exit or change unproven, canonical identity, plan, and links were unchanged",
+            "process generation unverified mid-flight; exit or change unproven",
+        ),
+        (
+            "live inventory generation",
+            "an exact retained or newly opened process generation was unverified during inventory preflight; no generation pin was retained, exit or change unproven",
+            "process generation unverified mid-flight; exit or change unproven",
+        ),
+        (
+            "live inventory generation",
+            "an exact retained or newly opened process generation was unverified during post-retirement preflight; no generation pin was retained, exit or change unproven",
+            "process generation unverified mid-flight; exit or change unproven",
+        ),
+        (
+            "live discovery generation",
+            "candidate generation unverified before mutation; the stale report was contradicted, exit or change unproven, canonical identity, plan, and links were unchanged",
+            "process generation unverified mid-flight; exit or change unproven",
+        ),
+        (
+            "live inventory generation",
+            "an exact retained or newly opened process generation was unverified during inventory preflight; the stale report was contradicted, exit or change unproven",
+            "process generation unverified mid-flight; exit or change unproven",
+        ),
+        (
+            "live inventory generation",
+            "an exact retained or newly opened process generation was unverified during post-retirement preflight; the stale report was contradicted, exit or change unproven",
             "process generation unverified mid-flight; exit or change unproven",
         ),
     ];
@@ -7358,6 +7439,15 @@ fn folded_gap_noise_pairs_match_their_filing_sites() {
         "candidate generation unverified before mutation; exit or change unproven, canonical identity, plan, and links were unchanged",
         "an exact retained or newly opened process generation was unverified during inventory preflight; exit or change unproven",
         "an exact retained or newly opened process generation was unverified during post-retirement preflight; exit or change unproven",
+        "candidate generation unverified before mutation; a pin read was denied, exit or change unproven, canonical identity, plan, and links were unchanged",
+        "an exact retained or newly opened process generation was unverified during inventory preflight; a pin read was denied, exit or change unproven",
+        "an exact retained or newly opened process generation was unverified during post-retirement preflight; a pin read was denied, exit or change unproven",
+        "candidate generation unverified before mutation; no generation pin was retained, exit or change unproven, canonical identity, plan, and links were unchanged",
+        "an exact retained or newly opened process generation was unverified during inventory preflight; no generation pin was retained, exit or change unproven",
+        "an exact retained or newly opened process generation was unverified during post-retirement preflight; no generation pin was retained, exit or change unproven",
+        "candidate generation unverified before mutation; the stale report was contradicted, exit or change unproven, canonical identity, plan, and links were unchanged",
+        "an exact retained or newly opened process generation was unverified during inventory preflight; the stale report was contradicted, exit or change unproven",
+        "an exact retained or newly opened process generation was unverified during post-retirement preflight; the stale report was contradicted, exit or change unproven",
     ] {
         assert_eq!(
             unproven_ctor.matches(reason).count(),
@@ -15552,6 +15642,164 @@ fn candidate_mixed_proof_and_unproven_files_both_rows() {
     );
 }
 
+/// Fix5 twin (candidate filing site, refusal multiplicity): a stale
+/// set with a proven exit (a reaped child, judged live) beside one
+/// refusal of EACH cause — a pin failure, a permission denial, a
+/// contradicted report (all scripted over live unprovable views) and
+/// a viewless ID with no custody at all — must file FIVE rows: the
+/// proof row plus one gap row per distinct cause. A judge that keeps
+/// only the first refusal, or a constructor that maps every cause to
+/// one pair, files fewer rows here.
+#[test]
+fn candidate_proof_with_all_four_refusal_causes_files_five_rows() {
+    let (_fixture, view, module, pins) = loaded_seed_provider();
+    let live_id = view.id();
+    let live_pid = view.pid();
+    let denied_id = ProcessViewId(live_id.0.checked_add(1).expect("a spare view ID"));
+    let denied_pid = spawn_execed_sleep().id();
+    let contradicted_id = ProcessViewId(live_id.0.checked_add(2).expect("a spare view ID"));
+    let contradicted_pid = spawn_execed_sleep().id();
+    // A fourth child, opened live, then reaped: positive exit proof,
+    // judged live (its ID sorts after the scripted views, so the
+    // script is exhausted before the judge reads its pin).
+    let mut dead = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let dead_pid = dead.id();
+    let dead_id = ProcessViewId(live_id.0.checked_add(3).expect("a spare view ID"));
+    let dead_view = ProcessView::open(dead_id, dead_pid).unwrap();
+    dead.kill().unwrap();
+    dead.wait().unwrap();
+    // A fifth stale ID with no view anywhere: no custody at all.
+    let custody_id = ProcessViewId(live_id.0.checked_add(4).expect("a spare view ID"));
+    let mut engine = Engine::empty();
+    engine.views.push(dead_view);
+    engine.views.push(
+        crate::process::unprovable_process_view_for_test(live_id, live_pid)
+            .expect("an unprovable view over the live seed child"),
+    );
+    engine.views.push(
+        crate::process::unprovable_process_view_for_test(denied_id, denied_pid)
+            .expect("an unprovable view over a live child"),
+    );
+    engine.views.push(
+        crate::process::unprovable_process_view_for_test(contradicted_id, contradicted_pid)
+            .expect("an unprovable view over a live child"),
+    );
+    // Stale-ID order: the three scripted views first (their live pins
+    // are unreadable anyway), the reaped view live-read last, the
+    // viewless ID judged without consuming an answer.
+    engine.pin_probe_script.borrow_mut().extend([
+        PinProbeAnswer::State(Some(Err("simulated pin poll failure".to_string()))),
+        PinProbeAnswer::State(Some(Err(
+            "simulated pin poll failure: Permission denied".to_string()
+        ))),
+        PinProbeAnswer::State(Some(Ok(crate::process::OriginalGenerationState::Current))),
+    ]);
+    let mut candidate = engine
+        .live_candidate(pins, vec![module.clone()], Vec::new())
+        .expect("a seed candidate builds");
+    for id in [live_id, denied_id, contradicted_id, dead_id, custody_id] {
+        candidate.views.insert(id);
+    }
+    // Stage the seed's first attach target exactly like the mixed
+    // twin: a non-empty delta forces the loud branch.
+    let object = candidate
+        .pinned
+        .id_for_scanned(&module, module.key, &module.path)
+        .unwrap();
+    let owner = candidate
+        .plan
+        .modules
+        .iter()
+        .find(|summary| summary.object == object)
+        .unwrap()
+        .id;
+    let file_offset = ElfSnapshot::read(candidate.pinned.file_for(object).unwrap())
+        .unwrap()
+        .defined_symbol("C_GetFunctionList")
+        .unwrap()
+        .unwrap()
+        .file_offset;
+    let slot = candidate
+        .plan
+        .add_provisional_get_function_list(plan::ProvisionalGetFunctionList {
+            module: owner,
+            object,
+            object_path: module.path.clone(),
+            file_offset,
+        })
+        .unwrap()
+        .unwrap();
+    candidate.delta.new.push(slot);
+    assert!(
+        !candidate.delta.new.is_empty(),
+        "the seed candidate carries an attach target"
+    );
+    let mut session = ScriptedSession::default();
+    let mut additions_allowed = true;
+    let outcome = engine
+        .apply_candidate(&mut session, candidate, &mut additions_allowed, false, &[])
+        .expect("the aborted apply still returns");
+    assert_eq!(
+        outcome.stale_views,
+        BTreeSet::from([live_id, denied_id, contradicted_id, dead_id, custody_id]),
+        "all five views abort the apply as stale"
+    );
+    for pid in [live_pid, denied_pid, contradicted_pid] {
+        assert!(
+            !crate::process::generation_dead(pid),
+            "a refused child is still live and unchanged after the abort: {pid}"
+        );
+    }
+    assert!(
+        engine.pin_probe_script.borrow().is_empty(),
+        "the three scripted views consumed their answers: {:?}",
+        engine.pin_probe_script.borrow()
+    );
+    let expected: BTreeSet<(String, String)> = BTreeSet::from([
+        (
+            "live discovery generation".to_string(),
+            "candidate generation changed before mutation; canonical identity, plan, and links were unchanged"
+                .to_string(),
+        ),
+        (
+            "live discovery generation".to_string(),
+            "candidate generation unverified before mutation; exit or change unproven, canonical identity, plan, and links were unchanged"
+                .to_string(),
+        ),
+        (
+            "live discovery generation".to_string(),
+            "candidate generation unverified before mutation; a pin read was denied, exit or change unproven, canonical identity, plan, and links were unchanged"
+                .to_string(),
+        ),
+        (
+            "live discovery generation".to_string(),
+            "candidate generation unverified before mutation; no generation pin was retained, exit or change unproven, canonical identity, plan, and links were unchanged"
+                .to_string(),
+        ),
+        (
+            "live discovery generation".to_string(),
+            "candidate generation unverified before mutation; the stale report was contradicted, exit or change unproven, canonical identity, plan, and links were unchanged"
+                .to_string(),
+        ),
+    ]);
+    let filed: BTreeSet<(String, String)> = engine
+        .counters
+        .object_skips
+        .iter()
+        .filter(|skip| skip.subject == "live discovery generation")
+        .map(|skip| (skip.subject.clone(), skip.reason.clone()))
+        .collect();
+    assert_eq!(
+        filed, expected,
+        "the candidate files one row per distinct refusal cause: {:?}",
+        engine.counters.object_skips
+    );
+}
+
 /// Fix4 B2 RED twin (candidate filing site): a retained view whose
 /// original pidfd is ready (its child exited but stays an unreaped
 /// zombie, so `/proc` is still readable) yet whose start time was never
@@ -15757,9 +16005,12 @@ fn inventory_preflight_mixed_set_files_both_rows_at_both_sites() {
             .unwrap_or_else(|| panic!("{label}: a mixed set files the changed row"));
         assert_eq!(proven.subject, "live inventory generation");
         assert_eq!(proven.reason, changed_reason);
-        let unproven = skips.unproven.as_ref().unwrap_or_else(|| {
-            panic!("{label}: a mixed set files the unverified gap beside the proof row")
-        });
+        assert_eq!(
+            skips.unproven.len(),
+            1,
+            "{label}: a mixed set files the unverified gap beside the proof row"
+        );
+        let unproven = &skips.unproven[0];
         assert_eq!(unproven.subject, "live inventory generation");
         assert_eq!(unproven.reason, unverified_reason);
         assert!(
@@ -15771,6 +16022,116 @@ fn inventory_preflight_mixed_set_files_both_rows_at_both_sites() {
         !crate::process::generation_dead(live_pid),
         "the newcomer child is still live and unchanged"
     );
+}
+
+/// Fix5 twin (both inventory preflights, all four causes): a stale
+/// set with a proven exit beside one refusal of EACH cause — a pin
+/// failure, a permission denial, a viewless ID with no custody, a
+/// contradicted report — publishes the proof row plus FOUR gap rows
+/// at either site, in cause order, without arming the named-target
+/// bail. Drives the shared helper directly with scripted answers (a
+/// tick-level set this varied is unreachable); the tick twins pin the
+/// helper's wiring to each filing loop.
+#[test]
+fn inventory_preflight_all_four_causes_file_five_rows_at_both_sites() {
+    // Four live children; the judge reads scripted answers, so the
+    // pins' live shape never matters.
+    let pids = [
+        spawn_execed_sleep().id(),
+        spawn_execed_sleep().id(),
+        spawn_execed_sleep().id(),
+        spawn_execed_sleep().id(),
+    ];
+    let mut engine = Engine::empty();
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(0), pids[0]).unwrap());
+    let newcomers = [
+        ProcessView::open(ProcessViewId(1), pids[1]).unwrap(),
+        ProcessView::open(ProcessViewId(2), pids[2]).unwrap(),
+        ProcessView::open(ProcessViewId(3), pids[3]).unwrap(),
+    ];
+    let stale = BTreeSet::from([
+        ProcessViewId(0),
+        ProcessViewId(1),
+        ProcessViewId(2),
+        ProcessViewId(3),
+        ProcessViewId(4),
+    ]);
+    let retained_stale = BTreeSet::from([ProcessViewId(0)]);
+    let extra = [&newcomers[0], &newcomers[1], &newcomers[2]];
+    for (site, changed_reason, unverified, label) in [
+        (
+            crate::discovery::generation_proof::ChangedGenerationSite::InventoryPreflight,
+            "an exact retained or newly opened process generation changed during inventory preflight",
+            [
+                "an exact retained or newly opened process generation was unverified during inventory preflight; exit or change unproven",
+                "an exact retained or newly opened process generation was unverified during inventory preflight; a pin read was denied, exit or change unproven",
+                "an exact retained or newly opened process generation was unverified during inventory preflight; no generation pin was retained, exit or change unproven",
+                "an exact retained or newly opened process generation was unverified during inventory preflight; the stale report was contradicted, exit or change unproven",
+            ],
+            "first preflight",
+        ),
+        (
+            crate::discovery::generation_proof::ChangedGenerationSite::PostRetirementPreflight,
+            "an exact retained or newly opened process generation changed during post-retirement preflight",
+            [
+                "an exact retained or newly opened process generation was unverified during post-retirement preflight; exit or change unproven",
+                "an exact retained or newly opened process generation was unverified during post-retirement preflight; a pin read was denied, exit or change unproven",
+                "an exact retained or newly opened process generation was unverified during post-retirement preflight; no generation pin was retained, exit or change unproven",
+                "an exact retained or newly opened process generation was unverified during post-retirement preflight; the stale report was contradicted, exit or change unproven",
+            ],
+            "post-retirement preflight",
+        ),
+    ] {
+        // Stale-ID order: the retained proof first, then the three
+        // scripted newcomers; the viewless ID judges without
+        // consuming an answer.
+        engine.pin_probe_script.borrow_mut().extend([
+            PinProbeAnswer::State(Some(Ok(crate::process::OriginalGenerationState::Exited))),
+            PinProbeAnswer::State(Some(Err("simulated pin poll failure".to_string()))),
+            PinProbeAnswer::State(Some(Err(
+                "simulated pin poll failure: Permission denied".to_string()
+            ))),
+            PinProbeAnswer::State(Some(Ok(crate::process::OriginalGenerationState::Current))),
+        ]);
+        let (skips, retained_unproven) =
+            engine.inventory_preflight_generation_skip(&retained_stale, &stale, &extra, site);
+        let proven = skips
+            .proven
+            .as_ref()
+            .unwrap_or_else(|| panic!("{label}: a mixed set files the changed row"));
+        assert_eq!(proven.subject, "live inventory generation");
+        assert_eq!(proven.reason, changed_reason);
+        let unproven: Vec<(&str, &str)> = skips
+            .unproven
+            .iter()
+            .map(|skip| (skip.subject.as_str(), skip.reason.as_str()))
+            .collect();
+        let expected: Vec<(&str, &str)> = unverified
+            .iter()
+            .map(|reason| ("live inventory generation", *reason))
+            .collect();
+        assert_eq!(
+            unproven, expected,
+            "{label}: one gap row per distinct cause, in cause order"
+        );
+        assert!(
+            !retained_unproven,
+            "{label}: a proven retained exit never arms the named-target bail"
+        );
+        assert!(
+            engine.pin_probe_script.borrow().is_empty(),
+            "{label}: the four known views consumed their answers: {:?}",
+            engine.pin_probe_script.borrow()
+        );
+    }
+    for pid in pids {
+        assert!(
+            !crate::process::generation_dead(pid),
+            "a refused child is still live and unchanged: {pid}"
+        );
+    }
 }
 
 /// Fix5 twin (first inventory preflight, tick-level): a retained child
@@ -16011,6 +16372,240 @@ fn inventory_preflight_mixed_tick_files_both_rows_at_post_retirement_preflight()
     assert_eq!(
         published, expected,
         "both rows survive publication: {:?}",
+        engine.plan.skipped
+    );
+}
+
+/// Fix5 twin (first inventory preflight, refusal multiplicity): a
+/// retained exit beside TWO independently refused newcomers — one pin
+/// failure, one permission denial — must file THREE rows: the proof
+/// row plus one gap row per distinct refusal cause. Two different
+/// losses stay two records even though both project to the same
+/// public row; a judge that keeps only the first refusal files two
+/// rows here. Both newcomers stay withheld and queued for refresh.
+#[test]
+fn inventory_preflight_two_refusals_file_two_gap_rows_at_first_preflight() {
+    let (mut engine, dir) = engine_over_cgroup_naming(&[]);
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    let mut session = ScriptedSession::default();
+    // Tick 1 admits the retained child.
+    let retained_pid = spawn_execed_sleep().id();
+    std::fs::write(dir.path().join("cgroup.procs"), format!("{retained_pid}\n")).unwrap();
+    refresh_inventory_with(&mut engine, &mut session);
+    assert_eq!(engine.views.len(), 1, "tick 1 admits the retained child");
+    assert_eq!(
+        engine.views[0].id(),
+        ProcessViewId(0),
+        "the retained child mints ID 0"
+    );
+    assert_eq!(engine.next_view_id, 1, "tick 1 mints one ID");
+    let calls_after_tick_1 = session.preflight_targets.borrow().len();
+    // Tick 2 admits two newcomers; the first preflight kills all three.
+    let newcomer_a = spawn_execed_sleep().id();
+    let newcomer_b = spawn_execed_sleep().id();
+    std::fs::write(
+        dir.path().join("cgroup.procs"),
+        format!("{retained_pid}\n{newcomer_a}\n{newcomer_b}\n"),
+    )
+    .unwrap();
+    session.lose_generation_batches_at_preflight([vec![retained_pid, newcomer_a, newcomer_b]]);
+    // Stale-ID order: the retained ID 0 first, then the newcomers.
+    engine.pin_probe_script.borrow_mut().extend([
+        PinProbeAnswer::State(Some(Ok(crate::process::OriginalGenerationState::Exited))),
+        PinProbeAnswer::State(Some(Err("simulated pin poll failure".to_string()))),
+        PinProbeAnswer::State(Some(Err(
+            "simulated pin poll failure: Permission denied".to_string()
+        ))),
+    ]);
+    refresh_inventory_with(&mut engine, &mut session);
+    assert_eq!(
+        session.preflight_targets.borrow().len(),
+        calls_after_tick_1 + 2,
+        "tick 2 tripped its first preflight (plus the stale tail's conservative replay)"
+    );
+    assert_eq!(engine.next_view_id, 3, "tick 2 minted both newcomer IDs");
+    for id in [1, 2] {
+        assert!(
+            engine.retired_view_ids.contains(&id),
+            "a dropped newcomer's ID returns to the pool: {:?}",
+            engine.retired_view_ids
+        );
+    }
+    for pid in [newcomer_a, newcomer_b] {
+        assert!(
+            !engine.views.iter().any(|view| view.pid() == pid),
+            "a refused newcomer stays withheld: {pid}"
+        );
+        assert!(
+            engine.refresh_requested.contains_key(&pid),
+            "a refused newcomer's pid is queued again: {pid}"
+        );
+    }
+    assert!(
+        engine.pin_probe_script.borrow().is_empty(),
+        "all three proof probes consumed their scripted answers: {:?}",
+        engine.pin_probe_script.borrow()
+    );
+    let expected: BTreeSet<(String, String)> = BTreeSet::from([
+        (
+            "live inventory generation".to_string(),
+            "an exact retained or newly opened process generation changed during inventory preflight"
+                .to_string(),
+        ),
+        (
+            "live inventory generation".to_string(),
+            "an exact retained or newly opened process generation was unverified during inventory preflight; exit or change unproven"
+                .to_string(),
+        ),
+        (
+            "live inventory generation".to_string(),
+            "an exact retained or newly opened process generation was unverified during inventory preflight; a pin read was denied, exit or change unproven"
+                .to_string(),
+        ),
+    ]);
+    let filed: BTreeSet<(String, String)> = engine
+        .counters
+        .object_skips
+        .iter()
+        .filter(|skip| skip.subject == "live inventory generation")
+        .map(|skip| (skip.subject.clone(), skip.reason.clone()))
+        .collect();
+    assert_eq!(
+        filed, expected,
+        "the first preflight files one row per distinct refusal: {:?}",
+        engine.counters.object_skips
+    );
+    engine
+        .publish_current_capture_facts()
+        .expect("publication runs");
+    let published: BTreeSet<(String, String)> = engine
+        .plan
+        .skipped
+        .iter()
+        .filter(|skip| skip.subject == "live inventory generation")
+        .map(|skip| (skip.subject.clone(), skip.reason.clone()))
+        .collect();
+    assert_eq!(
+        published, expected,
+        "all three rows survive publication: {:?}",
+        engine.plan.skipped
+    );
+}
+
+/// Fix5 twin (post-retirement preflight, refusal multiplicity): the
+/// same proof-plus-two-refusals batch at the post-retirement filing
+/// loop — three rows, both newcomers withheld and queued for
+/// refresh, all three published. The post-retirement loop keeps its
+/// own first-refusal-only mutant; this kills it.
+#[test]
+fn inventory_preflight_two_refusals_file_two_gap_rows_at_post_retirement_preflight() {
+    let (mut engine, dir) = engine_over_cgroup_naming(&[]);
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    let mut session = ScriptedSession::default();
+    // Tick 1 admits the retained child.
+    let retained_pid = spawn_execed_sleep().id();
+    std::fs::write(dir.path().join("cgroup.procs"), format!("{retained_pid}\n")).unwrap();
+    refresh_inventory_with(&mut engine, &mut session);
+    assert_eq!(engine.views.len(), 1, "tick 1 admits the retained child");
+    assert_eq!(
+        engine.views[0].id(),
+        ProcessViewId(0),
+        "the retained child mints ID 0"
+    );
+    assert_eq!(engine.next_view_id, 1, "tick 1 mints one ID");
+    let calls_after_tick_1 = session.preflight_targets.borrow().len();
+    // Tick 2 admits two newcomers; the post-retirement preflight kills
+    // all three (the first preflight call stays clean).
+    let newcomer_a = spawn_execed_sleep().id();
+    let newcomer_b = spawn_execed_sleep().id();
+    std::fs::write(
+        dir.path().join("cgroup.procs"),
+        format!("{retained_pid}\n{newcomer_a}\n{newcomer_b}\n"),
+    )
+    .unwrap();
+    session.lose_generation_batches_at_preflight([
+        Vec::new(),
+        vec![retained_pid, newcomer_a, newcomer_b],
+    ]);
+    // Stale-ID order: the retained ID 0 first, then the newcomers.
+    engine.pin_probe_script.borrow_mut().extend([
+        PinProbeAnswer::State(Some(Ok(crate::process::OriginalGenerationState::Exited))),
+        PinProbeAnswer::State(Some(Err("simulated pin poll failure".to_string()))),
+        PinProbeAnswer::State(Some(Err(
+            "simulated pin poll failure: Permission denied".to_string()
+        ))),
+    ]);
+    refresh_inventory_with(&mut engine, &mut session);
+    assert_eq!(
+        session.preflight_targets.borrow().len(),
+        calls_after_tick_1 + 3,
+        "tick 2 passed its first preflight, tripped its second, and replayed"
+    );
+    assert_eq!(engine.next_view_id, 3, "tick 2 minted both newcomer IDs");
+    for id in [1, 2] {
+        assert!(
+            engine.retired_view_ids.contains(&id),
+            "a dropped newcomer's ID returns to the pool: {:?}",
+            engine.retired_view_ids
+        );
+    }
+    for pid in [newcomer_a, newcomer_b] {
+        assert!(
+            !engine.views.iter().any(|view| view.pid() == pid),
+            "a refused newcomer stays withheld: {pid}"
+        );
+        assert!(
+            engine.refresh_requested.contains_key(&pid),
+            "a refused newcomer's pid is queued again: {pid}"
+        );
+    }
+    assert!(
+        engine.pin_probe_script.borrow().is_empty(),
+        "all three proof probes consumed their scripted answers: {:?}",
+        engine.pin_probe_script.borrow()
+    );
+    let expected: BTreeSet<(String, String)> = BTreeSet::from([
+        (
+            "live inventory generation".to_string(),
+            "an exact retained or newly opened process generation changed during post-retirement preflight"
+                .to_string(),
+        ),
+        (
+            "live inventory generation".to_string(),
+            "an exact retained or newly opened process generation was unverified during post-retirement preflight; exit or change unproven"
+                .to_string(),
+        ),
+        (
+            "live inventory generation".to_string(),
+            "an exact retained or newly opened process generation was unverified during post-retirement preflight; a pin read was denied, exit or change unproven"
+                .to_string(),
+        ),
+    ]);
+    let filed: BTreeSet<(String, String)> = engine
+        .counters
+        .object_skips
+        .iter()
+        .filter(|skip| skip.subject == "live inventory generation")
+        .map(|skip| (skip.subject.clone(), skip.reason.clone()))
+        .collect();
+    assert_eq!(
+        filed, expected,
+        "the post-retirement preflight files one row per distinct refusal: {:?}",
+        engine.counters.object_skips
+    );
+    engine
+        .publish_current_capture_facts()
+        .expect("publication runs");
+    let published: BTreeSet<(String, String)> = engine
+        .plan
+        .skipped
+        .iter()
+        .filter(|skip| skip.subject == "live inventory generation")
+        .map(|skip| (skip.subject.clone(), skip.reason.clone()))
+        .collect();
+    assert_eq!(
+        published, expected,
+        "all three rows survive publication: {:?}",
         engine.plan.skipped
     );
 }
@@ -46583,6 +47178,35 @@ fn named_unprovable_generation_refuses_unverified_before_attach() {
     assert_eq!(starts.get(), 0, "no attach action may follow the mismatch");
 }
 
+/// Fix5 control beside the precheck refusal twin: the same forced
+/// staleness with a readable live pin keeps the "changed" bail,
+/// pinned by its exact text — the stale report is positive
+/// exit-or-change evidence, and only a pin READ ERROR reroutes to
+/// the unverified refusal.
+#[test]
+fn named_readable_generation_keeps_changed_bail_before_attach() {
+    let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+    let stale = view.id();
+    let mut discovered = lifecycle_discovered(vec![view]);
+    let starts = Cell::new(0);
+    let error = start_retained_with(
+        &mut discovered,
+        true,
+        |_| vec![stale],
+        |_, _| {
+            starts.set(starts.get() + 1);
+            Ok(FakeSession(Default::default()))
+        },
+    )
+    .expect_err("a named generation change is fatal");
+    assert_eq!(
+        error.to_string(),
+        "the named process generation changed before attach",
+        "{error:#}"
+    );
+    assert_eq!(starts.get(), 0, "no attach action may follow the mismatch");
+}
+
 /// Fix5 twin (attach postcheck bail, tier-1 F1): the same unprovable
 /// named view going stale after the session starts must refuse as
 /// UNVERIFIED — never claim the generation changed while attaching.
@@ -46616,6 +47240,39 @@ fn named_unprovable_generation_refuses_unverified_while_attaching() {
     assert!(
         !error.to_string().contains("changed"),
         "the refusal never claims the generation changed: {error:#}"
+    );
+    assert_eq!(*log.borrow(), ["start", "drop"]);
+    assert!(!log.borrow().contains(&"consume"));
+}
+
+/// Fix5 control beside the postcheck refusal twin: the same forced
+/// staleness with a readable live pin keeps the "changed" bail,
+/// pinned by its exact text, and still drops the just-created session
+/// before any event consumption.
+#[test]
+fn named_readable_generation_keeps_changed_bail_while_attaching() {
+    let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+    let stale = view.id();
+    let mut discovered = lifecycle_discovered(vec![view]);
+    let checks = Cell::new(0);
+    let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let error = start_retained_with(
+        &mut discovered,
+        true,
+        |_| {
+            checks.set(checks.get() + 1);
+            (checks.get() == 2).then_some(stale).into_iter().collect()
+        },
+        |_, _| {
+            log.borrow_mut().push("start");
+            Ok(FakeSession(std::rc::Rc::clone(&log)))
+        },
+    )
+    .expect_err("a named generation change is fatal");
+    assert_eq!(
+        error.to_string(),
+        "the named process generation changed while attaching",
+        "{error:#}"
     );
     assert_eq!(*log.borrow(), ["start", "drop"]);
     assert!(!log.borrow().contains(&"consume"));
@@ -97978,11 +98635,12 @@ fn mo_bind_and_carry(pins: &mut PinnedObjects, modules: &[ScannedModule]) -> Vec
 /// How many currency-check refusals the engine recorded: a carried-riding
 /// candidate refused at the generation check records the loud `live
 /// discovery generation` marker — the changed row when an affected
-/// original proves exit or change, else the unverified row (the
-/// carried view has no retained pin to judge). An entry that returns
-/// early records nothing, and a refusal for any other cause records a
-/// different marker — so the count proves the entry attempted the
-/// apply and refused for that specific cause.
+/// original proves exit or change, else one unverified row per
+/// distinct refusal cause (the carried view has no retained pin to
+/// judge). An entry that returns early records nothing, and a refusal
+/// for any other cause records a different marker — so the count
+/// proves the entry attempted the apply and refused for that specific
+/// cause.
 fn mo_generation_markers(engine: &Engine) -> usize {
     engine
         .counters
@@ -97993,7 +98651,13 @@ fn mo_generation_markers(engine: &Engine) -> usize {
                 && (skip.reason
                     == "candidate generation changed before mutation; canonical identity, plan, and links were unchanged"
                     || skip.reason
-                        == "candidate generation unverified before mutation; exit or change unproven, canonical identity, plan, and links were unchanged")
+                        == "candidate generation unverified before mutation; exit or change unproven, canonical identity, plan, and links were unchanged"
+                    || skip.reason
+                        == "candidate generation unverified before mutation; a pin read was denied, exit or change unproven, canonical identity, plan, and links were unchanged"
+                    || skip.reason
+                        == "candidate generation unverified before mutation; no generation pin was retained, exit or change unproven, canonical identity, plan, and links were unchanged"
+                    || skip.reason
+                        == "candidate generation unverified before mutation; the stale report was contradicted, exit or change unproven, canonical identity, plan, and links were unchanged")
         })
         .count()
 }

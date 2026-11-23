@@ -14091,32 +14091,35 @@ fn delta_module_owned_by_stale_view(
 }
 
 /// One observation of a stale generation set: the first proof (if any
-/// affected original proves exit or change), the first unproven reason
-/// (otherwise), and whether every retained stale view proved (the
-/// inventory silence condition). Classified once so the silence check
-/// and the label share the observation — and so tests script one
-/// answer per stale ID.
+/// affected original proves exit or change), the distinct unproven
+/// causes (one row each, so two different losses stay two records),
+/// and whether every retained stale view proved (the inventory
+/// silence condition). Classified once so the silence check and the
+/// label share the observation — and so tests script one answer per
+/// stale ID.
 struct StaleSetVerdict {
     first_proof: Option<GenerationProof>,
-    first_unproven: Option<GenerationUnproven>,
+    unproven: BTreeSet<GenerationUnproven>,
     all_retained_proven: bool,
 }
 
 impl StaleSetVerdict {
     /// Publish a judged set: the changed row when any affected
-    /// original proves exit or change AND the unverified gap when any
-    /// is unproven — independently, so a mixed batch names both. This
-    /// moves proof values into the authority's constructors; it mints
-    /// none. Silence and the bail gate read the verdict, not these
-    /// rows.
+    /// original proves exit or change AND one unverified gap row per
+    /// distinct unproven cause — independently, so a mixed batch names
+    /// the proof and every different refusal. This moves proof values
+    /// into the authority's constructors; it mints none. Silence and
+    /// the bail gate read the verdict, not these rows.
     fn skips(&self, site: ChangedGenerationSite) -> GenerationSkips {
         GenerationSkips {
             proven: self
                 .first_proof
                 .map(|proof| changed_generation_skip(proof, site)),
             unproven: self
-                .first_unproven
-                .map(|unproven| unproven_generation_skip(unproven, site)),
+                .unproven
+                .iter()
+                .map(|unproven| unproven_generation_skip(*unproven, site))
+                .collect(),
         }
     }
 }
@@ -28918,9 +28921,9 @@ impl Engine {
     }
 
     /// Judge a stale generation set in one observation: the first proof
-    /// (if any affected original proves exit or change), the first
-    /// unproven reason (otherwise), and whether every retained stale
-    /// view proved. The single authority behind every
+    /// (if any affected original proves exit or change), the distinct
+    /// unproven causes (one row each), and whether every retained
+    /// stale view proved. The single authority behind every
     /// changed-generation label; staleness alone never proves.
     fn judge_stale_set(
         &self,
@@ -28930,7 +28933,7 @@ impl Engine {
     ) -> StaleSetVerdict {
         let mut verdict = StaleSetVerdict {
             first_proof: None,
-            first_unproven: None,
+            unproven: BTreeSet::new(),
             all_retained_proven: true,
         };
         for id in stale {
@@ -28939,7 +28942,7 @@ impl Engine {
                     verdict.first_proof.get_or_insert(proof);
                 }
                 Err(unproven) => {
-                    verdict.first_unproven.get_or_insert(unproven);
+                    verdict.unproven.insert(unproven);
                     if retained_stale.contains(id) {
                         verdict.all_retained_proven = false;
                     }

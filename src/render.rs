@@ -2295,10 +2295,12 @@ fn is_unreadable_not_checked_pair(subject: &str, reason: &str) -> bool {
         )
 }
 
-/// Whether an internal skip is one of the three unverified-generation
+/// Whether an internal skip is one of the twelve unverified-generation
 /// pairs: a stale candidate or inventory preflight the pin could not
 /// prove exited or changed, filed for a possibly still-live,
-/// unchanged process. Exact subject and reason, never prefix or
+/// unchanged process. One pair per refusal cause per site: two
+/// different losses stay two records even though all twelve fold to
+/// the same public row. Exact subject and reason, never prefix or
 /// substring: near misses stay generic. None must ever fold into the
 /// changed row: an unproven check proves neither exit nor change.
 fn is_generation_unverified_pair(subject: &str, reason: &str) -> bool {
@@ -2313,6 +2315,33 @@ fn is_generation_unverified_pair(subject: &str, reason: &str) -> bool {
         ) | (
             "live inventory generation",
             "an exact retained or newly opened process generation was unverified during post-retirement preflight; exit or change unproven",
+        ) | (
+            "live discovery generation",
+            "candidate generation unverified before mutation; a pin read was denied, exit or change unproven, canonical identity, plan, and links were unchanged",
+        ) | (
+            "live inventory generation",
+            "an exact retained or newly opened process generation was unverified during inventory preflight; a pin read was denied, exit or change unproven",
+        ) | (
+            "live inventory generation",
+            "an exact retained or newly opened process generation was unverified during post-retirement preflight; a pin read was denied, exit or change unproven",
+        ) | (
+            "live discovery generation",
+            "candidate generation unverified before mutation; no generation pin was retained, exit or change unproven, canonical identity, plan, and links were unchanged",
+        ) | (
+            "live inventory generation",
+            "an exact retained or newly opened process generation was unverified during inventory preflight; no generation pin was retained, exit or change unproven",
+        ) | (
+            "live inventory generation",
+            "an exact retained or newly opened process generation was unverified during post-retirement preflight; no generation pin was retained, exit or change unproven",
+        ) | (
+            "live discovery generation",
+            "candidate generation unverified before mutation; the stale report was contradicted, exit or change unproven, canonical identity, plan, and links were unchanged",
+        ) | (
+            "live inventory generation",
+            "an exact retained or newly opened process generation was unverified during inventory preflight; the stale report was contradicted, exit or change unproven",
+        ) | (
+            "live inventory generation",
+            "an exact retained or newly opened process generation was unverified during post-retirement preflight; the stale report was contradicted, exit or change unproven",
         )
     )
 }
@@ -20338,12 +20367,14 @@ pub(crate) mod tests {
         assert!(!text.contains("discovery step unavailable"), "{text}");
     }
 
-    /// Gap-noise fold: the three unverified-generation pairs project to
-    /// their own public row, which claims neither exit nor change. A
-    /// stale report the pin could not prove (poll failure, unreadable
-    /// `/proc`, missing custody, contradicted recheck) proves neither
-    /// event, so the pairs must never fold into the changed row; near
-    /// misses stay generic, and the text names the row with its count.
+    /// Gap-noise fold: the twelve unverified-generation pairs (three
+    /// sites times four refusal causes) project to their own public
+    /// row, which claims neither exit nor change. A stale report the
+    /// pin could not prove (poll failure, unreadable `/proc`, missing
+    /// custody, contradicted recheck) proves neither event, so the
+    /// pairs must never fold into the changed row; near misses stay
+    /// generic, and the text names the row with its count — one JSON
+    /// row per underlying record, so two different losses count twice.
     /// Fix3 RED twin: pre-fix these pairs project to generic.
     #[test]
     fn unverified_generation_pairs_project_to_their_own_row() {
@@ -20360,6 +20391,42 @@ pub(crate) mod tests {
             (
                 "live inventory generation",
                 "an exact retained or newly opened process generation was unverified during post-retirement preflight; exit or change unproven",
+            ),
+            (
+                "live discovery generation",
+                "candidate generation unverified before mutation; a pin read was denied, exit or change unproven, canonical identity, plan, and links were unchanged",
+            ),
+            (
+                "live inventory generation",
+                "an exact retained or newly opened process generation was unverified during inventory preflight; a pin read was denied, exit or change unproven",
+            ),
+            (
+                "live inventory generation",
+                "an exact retained or newly opened process generation was unverified during post-retirement preflight; a pin read was denied, exit or change unproven",
+            ),
+            (
+                "live discovery generation",
+                "candidate generation unverified before mutation; no generation pin was retained, exit or change unproven, canonical identity, plan, and links were unchanged",
+            ),
+            (
+                "live inventory generation",
+                "an exact retained or newly opened process generation was unverified during inventory preflight; no generation pin was retained, exit or change unproven",
+            ),
+            (
+                "live inventory generation",
+                "an exact retained or newly opened process generation was unverified during post-retirement preflight; no generation pin was retained, exit or change unproven",
+            ),
+            (
+                "live discovery generation",
+                "candidate generation unverified before mutation; the stale report was contradicted, exit or change unproven, canonical identity, plan, and links were unchanged",
+            ),
+            (
+                "live inventory generation",
+                "an exact retained or newly opened process generation was unverified during inventory preflight; the stale report was contradicted, exit or change unproven",
+            ),
+            (
+                "live inventory generation",
+                "an exact retained or newly opened process generation was unverified during post-retirement preflight; the stale report was contradicted, exit or change unproven",
             ),
         ];
         for (subject, reason) in &pairs {
@@ -20392,6 +20459,10 @@ pub(crate) mod tests {
                 "process view",
                 "candidate generation unverified before mutation; exit or change unproven, canonical identity, plan, and links were unchanged",
             ),
+            (
+                "live inventory generation",
+                "an exact retained or newly opened process generation was unverified during inventory preflight; a pin read was denied",
+            ),
         ] {
             let projected = capture_skipped_out(&Skipped {
                 subject: subject.into(),
@@ -20414,10 +20485,10 @@ pub(crate) mod tests {
             })
             .collect();
         ev.verdict();
-        assert_eq!(ev.skipped.len(), 3);
+        assert_eq!(ev.skipped.len(), 12);
         let text = scope_summary("pid", &reports_fixture(), &ev);
         assert!(
-            text.contains("process generation unverified mid-flight; exit or change unproven: 3"),
+            text.contains("process generation unverified mid-flight; exit or change unproven: 12"),
             "{text}"
         );
         assert!(!text.contains("discovery steps unavailable"), "{text}");

@@ -65,13 +65,14 @@ impl GenerationProof {
 }
 
 /// Why a stale generation could NOT be proven exited or changed: every
-/// other outcome of the pin check. All variants file the same named
-/// not-proven gap (never the changed label); the variant rides in
-/// diagnostics, never in the public row. Budget refusals never reach
-/// this classifier — the work ceiling stops the pass upstream and files
-/// the scan-budget row, which likewise claims neither event — so no
-/// budget variant exists here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// other outcome of the pin check. Each variant files its own named
+/// not-proven gap row (never the changed label): two different losses
+/// stay two records even though all project to the same public row,
+/// while same-cause losses share their one row. Budget refusals never
+/// reach this classifier — the work ceiling stops the pass upstream
+/// and files the scan-budget row, which likewise claims neither
+/// event — so no budget variant exists here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum GenerationUnproven {
     /// The pin check failed (pidfd poll error, `/proc` read error).
     PinFailure,
@@ -128,33 +129,67 @@ pub(crate) fn changed_generation_skip(
     }
 }
 
-/// The ONE constructor for the unverified-generation internal pair:
-/// every `GenerationUnproven` outcome at every site files the named
-/// not-proven gap, which claims neither exit nor change.
+/// The ONE constructor for the unverified-generation internal pairs:
+/// every `GenerationUnproven` outcome at every site files its own
+/// named not-proven gap row, which claims neither exit nor change.
+/// Twelve pairs (four causes times three sites): a pin failure keeps
+/// the legacy text, the other three causes name themselves, so two
+/// different losses never share a record.
 pub(crate) fn unproven_generation_skip(
     unproven: GenerationUnproven,
     site: ChangedGenerationSite,
 ) -> Skipped {
-    // Total: a future unproven outcome must map to the gap here, so no
-    // new failure mode can silently become an exit/change claim.
-    match unproven {
-        GenerationUnproven::PinFailure
-        | GenerationUnproven::PermissionDenied
-        | GenerationUnproven::MissingCustody
-        | GenerationUnproven::Contradicted => {}
-    }
-    let (subject, reason) = match site {
-        ChangedGenerationSite::Candidate => (
+    // Total: a future unproven outcome or site must choose its gap
+    // here, so no new failure mode can silently become an exit/change
+    // claim — or collapse into another cause's row.
+    let (subject, reason) = match (unproven, site) {
+        (GenerationUnproven::PinFailure, ChangedGenerationSite::Candidate) => (
             "live discovery generation",
             "candidate generation unverified before mutation; exit or change unproven, canonical identity, plan, and links were unchanged",
         ),
-        ChangedGenerationSite::InventoryPreflight => (
+        (GenerationUnproven::PinFailure, ChangedGenerationSite::InventoryPreflight) => (
             "live inventory generation",
             "an exact retained or newly opened process generation was unverified during inventory preflight; exit or change unproven",
         ),
-        ChangedGenerationSite::PostRetirementPreflight => (
+        (GenerationUnproven::PinFailure, ChangedGenerationSite::PostRetirementPreflight) => (
             "live inventory generation",
             "an exact retained or newly opened process generation was unverified during post-retirement preflight; exit or change unproven",
+        ),
+        (GenerationUnproven::PermissionDenied, ChangedGenerationSite::Candidate) => (
+            "live discovery generation",
+            "candidate generation unverified before mutation; a pin read was denied, exit or change unproven, canonical identity, plan, and links were unchanged",
+        ),
+        (GenerationUnproven::PermissionDenied, ChangedGenerationSite::InventoryPreflight) => (
+            "live inventory generation",
+            "an exact retained or newly opened process generation was unverified during inventory preflight; a pin read was denied, exit or change unproven",
+        ),
+        (GenerationUnproven::PermissionDenied, ChangedGenerationSite::PostRetirementPreflight) => (
+            "live inventory generation",
+            "an exact retained or newly opened process generation was unverified during post-retirement preflight; a pin read was denied, exit or change unproven",
+        ),
+        (GenerationUnproven::MissingCustody, ChangedGenerationSite::Candidate) => (
+            "live discovery generation",
+            "candidate generation unverified before mutation; no generation pin was retained, exit or change unproven, canonical identity, plan, and links were unchanged",
+        ),
+        (GenerationUnproven::MissingCustody, ChangedGenerationSite::InventoryPreflight) => (
+            "live inventory generation",
+            "an exact retained or newly opened process generation was unverified during inventory preflight; no generation pin was retained, exit or change unproven",
+        ),
+        (GenerationUnproven::MissingCustody, ChangedGenerationSite::PostRetirementPreflight) => (
+            "live inventory generation",
+            "an exact retained or newly opened process generation was unverified during post-retirement preflight; no generation pin was retained, exit or change unproven",
+        ),
+        (GenerationUnproven::Contradicted, ChangedGenerationSite::Candidate) => (
+            "live discovery generation",
+            "candidate generation unverified before mutation; the stale report was contradicted, exit or change unproven, canonical identity, plan, and links were unchanged",
+        ),
+        (GenerationUnproven::Contradicted, ChangedGenerationSite::InventoryPreflight) => (
+            "live inventory generation",
+            "an exact retained or newly opened process generation was unverified during inventory preflight; the stale report was contradicted, exit or change unproven",
+        ),
+        (GenerationUnproven::Contradicted, ChangedGenerationSite::PostRetirementPreflight) => (
+            "live inventory generation",
+            "an exact retained or newly opened process generation was unverified during post-retirement preflight; the stale report was contradicted, exit or change unproven",
         ),
     };
     Skipped {
@@ -163,15 +198,15 @@ pub(crate) fn unproven_generation_skip(
     }
 }
 
-/// Publication verdict: the changed row (proof) and the unverified
-/// gap (unproven) are independent — a mixed batch files both, so a
-/// proven exit beside an unproven sibling names the refusal instead of
-/// dropping it. Silence (no newly-opened stale ID, every retained
-/// stale view proven) files neither.
+/// Publication verdict: the changed row (proof) plus one unverified
+/// gap row per distinct unproven cause — a mixed batch files the
+/// proof and names every different refusal instead of dropping any.
+/// Silence (no newly-opened stale ID, every retained stale view
+/// proven) files none.
 #[derive(Debug, Clone)]
 pub(crate) struct GenerationSkips {
     pub(crate) proven: Option<Skipped>,
-    pub(crate) unproven: Option<Skipped>,
+    pub(crate) unproven: Vec<Skipped>,
 }
 
 impl GenerationSkips {
@@ -179,20 +214,19 @@ impl GenerationSkips {
     pub(crate) fn none() -> Self {
         Self {
             proven: None,
-            unproven: None,
+            unproven: Vec::new(),
         }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.proven.is_none() && self.unproven.is_none()
+        self.proven.is_none() && self.unproven.is_empty()
     }
 
     /// The rows to file, proof first: the batch proved an exit or
-    /// change AND left a refusal, in that order.
+    /// change AND left refusals, in that order; refusals follow in
+    /// cause order.
     pub(crate) fn iter(&self) -> impl Iterator<Item = &Skipped> {
-        [self.proven.as_ref(), self.unproven.as_ref()]
-            .into_iter()
-            .flatten()
+        self.proven.iter().chain(self.unproven.iter())
     }
 }
 

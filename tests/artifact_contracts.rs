@@ -12431,10 +12431,17 @@ fn hosted_pipeline_runs_one_full_matrix_per_commit() {
         "select((.name == \"lint\" or .name == \"coverage-report\" or .name == \"bpf-noninterference\") and .conclusion == \"success\")",
         "unique_by(.name) | length",
         "if [ \"$ran\" = 3 ]; then",
-        // An unfinished earlier run is waited for, never trusted.
-        "sleep 60",
+        // Only a completed successful run covers; anything else runs here.
+        "if [ \"$status\" = completed ] && [ \"$conclusion\" = success ]; then",
     ] {
         assert!(dedupe.contains(marker), "dedupe lacks {marker:?}");
+    }
+    // One API pass: dedupe never holds a runner polling for another run.
+    for marker in ["sleep", "deadline", "SECONDS", "while :; do"] {
+        assert!(
+            !dedupe.contains(marker),
+            "dedupe must not wait for earlier runs: {marker:?}"
+        );
     }
     assert!(dedupe.contains("DELIVERY_TASK: ${{ inputs.delivery_task || 'checks' }}"));
     let delivery_only = concat!(

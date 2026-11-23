@@ -52,7 +52,8 @@ endpoint=args[1]
 if endpoint.endswith('/runs/42'):
     value={'workflow_id':71}
 elif '/workflows/71/runs?' in endpoint:
-    rows=[] if os.environ['PRIOR']=='none' else [{'id':1,'status':'completed','conclusion':'success','event':'workflow_dispatch'}]
+    prior=os.environ['PRIOR']
+    rows=[] if prior=='none' else ([{'id':1,'status':'in_progress','conclusion':None,'event':'push'}] if prior=='active' else [{'id':1,'status':'completed','conclusion':'success','event':'workflow_dispatch'}])
     value={'workflow_runs':rows}
 elif endpoint.endswith('/runs/1/jobs?per_page=100'):
     names=['lint','coverage-report','bpf-noninterference'] if os.environ['PRIOR']=='ordinary' else ['dedupe','package-delivery / validate','package-delivery / package-full']
@@ -156,6 +157,17 @@ sys.stdout.write(answer.stdout)
         self.assertEqual(output, {"run": "true"})
         self.assertNotIn("already passed", summary)
         self.assertEqual(len(calls), 3)
+
+    def test_in_progress_prior_proceeds_without_waiting(self):
+        # One API pass: an unfinished earlier run never covers, and the
+        # matrix runs here instead of holding a runner polling for it.
+        # The 10s harness timeout is the wait detector: a dedupe that
+        # slept for the earlier run would time out instead of deciding.
+        result, output, summary, calls = self.dedupe(event="push", prior="active")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(output, {"run": "true"})
+        self.assertNotIn("already passed", summary)
+        self.assertEqual(len(calls), 2)
 
     def test_successful_ordinary_checks_still_dedupe_and_api_errors_run_checks(self):
         result, output, summary, _ = self.dedupe(event="push", prior="ordinary")

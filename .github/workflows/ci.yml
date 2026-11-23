@@ -100,17 +100,17 @@ env:
 jobs:
   # One full check matrix per commit. A push run whose exact commit already
   # passed the full matrix in an earlier push or dispatch run of this workflow
-  # skips its check and coverage jobs and names that run in its summary. While
-  # an earlier run on the commit is unfinished, this job waits for it (75
-  # minutes at most), so a cancelled or failed earlier run never leaves the
-  # commit without a result: the matrix then runs here. Pull requests (which
+  # skips its check and coverage jobs and names that run in its summary. The
+  # check is one API pass: this job never holds a runner waiting for another
+  # run. An earlier run that is still in progress does not cover this one,
+  # so the matrix runs here rather than waiting for it. Pull requests (which
   # test a merge commit) and default manual checks always run it; selected
   # delivery tasks opt out before the API query. Any API error runs checks.
   # A covering run must itself have run lint,
   # coverage-report and bpf-noninterference successfully.
   dedupe:
     runs-on: ubuntu-26.04
-    timeout-minutes: 90
+    timeout-minutes: 10
     permissions:
       actions: read
     env:
@@ -142,34 +142,25 @@ jobs:
           api="repos/$GITHUB_REPOSITORY/actions"
           workflow=$(gh api "$api/runs/$GITHUB_RUN_ID" --jq .workflow_id) \
             || decide true "cannot read this run; the check matrix runs"
-          deadline=$((SECONDS + 75 * 60))
-          while :; do
-            # Earlier push and dispatch runs of this workflow on this exact
-            # commit; a run id is assigned in creation order.
-            earlier=$(gh api "$api/workflows/$workflow/runs?head_sha=$GITHUB_SHA&per_page=100" \
-              --jq ".workflow_runs[] | select(.id < $GITHUB_RUN_ID and (.event == \"push\" or .event == \"workflow_dispatch\")) | \"\(.id) \(.status) \(.conclusion)\"") \
-              || decide true "cannot list the runs on $GITHUB_SHA; the check matrix runs"
-            active=
-            while read -r id status conclusion; do
-              [ -n "$id" ] || continue
-              if [ "$status" != completed ]; then
-                active="$active $id"
-              elif [ "$conclusion" = success ]; then
-                ran=$(gh api "$api/runs/$id/jobs?per_page=100" \
-                  --jq '[.jobs[] | select((.name == "lint" or .name == "coverage-report" or .name == "bpf-noninterference") and .conclusion == "success")] | unique_by(.name) | length') \
-                  || ran=0
-                if [ "$ran" = 3 ]; then
-                  decide false "commit $GITHUB_SHA already passed the full check matrix in $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$id; this run skips it"
-                fi
+          # Earlier push and dispatch runs of this workflow on this exact
+          # commit; a run id is assigned in creation order. One pass only:
+          # an earlier run that has not completed successfully does not
+          # cover this one, so the matrix runs here instead of waiting.
+          earlier=$(gh api "$api/workflows/$workflow/runs?head_sha=$GITHUB_SHA&per_page=100" \
+            --jq ".workflow_runs[] | select(.id < $GITHUB_RUN_ID and (.event == \"push\" or .event == \"workflow_dispatch\")) | \"\(.id) \(.status) \(.conclusion)\"") \
+            || decide true "cannot list the runs on $GITHUB_SHA; the check matrix runs"
+          while read -r id status conclusion; do
+            [ -n "$id" ] || continue
+            if [ "$status" = completed ] && [ "$conclusion" = success ]; then
+              ran=$(gh api "$api/runs/$id/jobs?per_page=100" \
+                --jq '[.jobs[] | select((.name == "lint" or .name == "coverage-report" or .name == "bpf-noninterference") and .conclusion == "success")] | unique_by(.name) | length') \
+                || ran=0
+              if [ "$ran" = 3 ]; then
+                decide false "commit $GITHUB_SHA already passed the full check matrix in $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$id; this run skips it"
               fi
-            done <<<"$earlier"
-            [ -n "$active" ] \
-              || decide true "no earlier run covers $GITHUB_SHA; the check matrix runs"
-            [ "$SECONDS" -lt "$deadline" ] \
-              || decide true "earlier run(s)$active unfinished after 75 minutes; the check matrix runs"
-            echo "dedupe: waiting for earlier run(s) on $GITHUB_SHA:$active"
-            sleep 60
-          done
+            fi
+          done <<<"$earlier"
+          decide true "no earlier run covers $GITHUB_SHA; the check matrix runs"
   package-delivery:
     name: package-delivery
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.delivery_task == 'packages' }}

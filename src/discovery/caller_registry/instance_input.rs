@@ -1895,7 +1895,8 @@ impl CallerRegistry {
             | Mutation::RecordGap { .. }
             | Mutation::RecordKeyedGap { .. }
             | Mutation::RecordAggregatedUnrouted { .. }
-            | Mutation::RecordTerminalRetryExcluded { .. } => {
+            | Mutation::RecordTerminalRetryExcluded { .. }
+            | Mutation::DropFoldReceipt { .. } => {
                 unreachable!("only original registration/call rows enter this index")
             }
         }

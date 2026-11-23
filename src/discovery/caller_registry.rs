@@ -3896,6 +3896,15 @@ enum Mutation {
         /// Newly excluded calls for this cause.
         excluded: u64,
     },
+    DropFoldReceipt {
+        /// The retained identity-retry fold whose owed mark released
+        /// without a retraction (terminal settlement, re-refusal, or
+        /// revival: the fold stands, so no rollback will ever need its
+        /// landing receipt). Applies in stage order like the insert
+        /// that records it, so a discard staged after an unapplied
+        /// insert still consumes the receipt it records.
+        fold_id: u64,
+    },
 }
 
 /// A publication is applied but its original frame has not finished. This
@@ -5848,18 +5857,31 @@ impl CallerRegistry {
         std::mem::take(&mut self.pending_count_decisions)
     }
 
-    /// Drop the unconsumed landing receipt for a retained fold whose
-    /// owed mark releases without a retraction (terminal settlement or
-    /// revival: the fold stands, so no rollback will ever need it).
-    /// Retractions consume their own receipt at apply time instead.
+    /// Stage the drop of the unconsumed landing receipt for a
+    /// retained fold whose owed mark releases without a retraction
+    /// (terminal settlement, re-refusal, or revival: the fold stands,
+    /// so no rollback will ever need it). The drop rides the same
+    /// ordered mutation stream as the insert that records the receipt
+    /// and the retraction that consumes it, so a release staged before
+    /// the insert applies still consumes it. Retractions consume their
+    /// own receipt at apply time instead; a fold takes exactly one of
+    /// the two paths.
     pub(crate) fn drop_fold_receipt(&mut self, fold_id: u64) {
-        self.fold_landings.remove(&fold_id);
+        self.staged.push(Mutation::DropFoldReceipt { fold_id });
     }
 
     /// Test-only: live fold receipts awaiting their retraction.
     #[cfg(test)]
     pub(crate) fn fold_receipts_for_test(&self) -> usize {
         self.fold_landings.len()
+    }
+
+    /// Test-only: the authoritative per-cause terminal totals —
+    /// cause text to (excluded calls, settlements) — exactly as the
+    /// ordered application summed them, independent of gap retention.
+    #[cfg(test)]
+    pub(crate) fn terminal_retry_totals_for_test(&self) -> BTreeMap<String, (u64, u64)> {
+        self.terminal_retry_totals.clone()
     }
 
     /// Stage one global health regression (a native identity, pair, or
@@ -6487,6 +6509,18 @@ impl CallerRegistry {
     /// `enter_terminal_phase`) may use [`TERMINAL_GAP_RESERVE`] headroom
     /// rows above it, so a per-drain flood can never crowd out the
     /// stop-time disclosures.
+    /// Retained gap rows that count against the `--max-gaps` bound
+    /// (and the terminal headroom above it): every row except the
+    /// guaranteed per-cause terminal aggregates, which publish outside
+    /// the ordinary budget however full it is. Each live cause holds
+    /// exactly one row in `gaps` (rewritten in place as settlements
+    /// accumulate), so the guaranteed count is the live index size.
+    fn budgeted_gaps_len(&self) -> usize {
+        self.gaps
+            .len()
+            .saturating_sub(self.terminal_retry_gap_index.len())
+    }
+
     fn push_gap_as(&mut self, gap: RegistryGap, terminal: bool) {
         if let Some(&index) = self.gap_index.get(&gap) {
             self.gap_repeats[index] = self.gap_repeats[index].saturating_add(1);
@@ -6497,7 +6531,7 @@ impl CallerRegistry {
         } else {
             self.limits.max_gaps
         };
-        if self.gaps.len() >= cap {
+        if self.budgeted_gaps_len() >= cap {
             let fingerprint = self.suppressed_hasher.hash_one(&gap);
             if self.suppressed_seen.contains(&fingerprint) {
                 return;
@@ -7067,6 +7101,12 @@ impl CallerRegistry {
             } => self.push_aggregated_unrouted(subject, total, labels, bindings, terminal),
             Mutation::RecordTerminalRetryExcluded { cause, excluded } => {
                 self.push_terminal_retry_excluded(cause, excluded);
+            }
+            Mutation::DropFoldReceipt { fold_id } => {
+                // Ordered with the insert that records it: a release
+                // staged before the insert applies still lands after
+                // it here, so no orphan receipt survives.
+                self.fold_landings.remove(&fold_id);
             }
             Mutation::RecordKeyedGap {
                 key,

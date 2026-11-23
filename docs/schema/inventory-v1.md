@@ -989,6 +989,11 @@ and never proves an app identity. See the app identity rows of
   `repeats` counts all of their recordings. Repeats consume no `--max-gaps` budget and are never
   `gaps_suppressed`; only distinct gaps past the bound are, and each
   distinct suppressed gap counts once however often it recurs. The
+  per-cause `identity retry terminal` aggregates publish outside the
+  ordinary budget: each live cause holds exactly one guaranteed row
+  (rewritten in place as settlements accumulate), which consumes no
+  `--max-gaps` slot and no stop-time headroom row in either arrival
+  order. The
   registry remembers up to 4096 suppressed gaps for this (64-bit
   keyed-hash fingerprints of the identity fields); past that, a
   recurrence of an unremembered suppressed gap counts again, so

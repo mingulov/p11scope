@@ -1739,8 +1739,9 @@ pub(crate) struct NativeStop<L> {
     /// The last staged batch left re-sight attempts owed: the terminal
     /// refresh reads on for them instead of finishing at once.
     staged_resight_owed: bool,
-    /// The last staged Finish left terminal settlement owed: the stop
-    /// machine stages Finish again instead of retiring at once.
+    /// The last staged Finish left finish work owed (pending-row
+    /// flush, terminal settlement, or cleanup): the stop machine
+    /// stages Finish again instead of retiring at once.
     staged_settlement_owed: bool,
 }
 

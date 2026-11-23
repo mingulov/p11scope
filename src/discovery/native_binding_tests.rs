@@ -2760,6 +2760,37 @@ fn identity_retry_flush_at_finish_flips_the_outcome() {
     );
 }
 
+#[test]
+fn finish_credit_flushes_at_most_its_allowance_then_resumes() {
+    // One bounded binder credit flushes at most its allowance and
+    // reports whether rows still wait: 65 pending rows take a 64-row
+    // credit plus a 1-row resume, with the census exact throughout.
+    let mut run = Run::new();
+    let d = run.domain;
+    let rows: Vec<WitnessRow> = (0..65)
+        .map(|i| row(d, 100 + i, 1, T + i as u32, 1_500))
+        .collect();
+    run.read(rows);
+    assert_eq!(run.binder.census().pending, 65);
+    let first = run.binder.finish_credit(d, 64);
+    assert_eq!((first.flushed, first.owed), (64, true));
+    assert_eq!(run.binder.take_decisions().len(), 64);
+    assert_eq!(run.binder.census().pending, 1);
+    let second = run.binder.finish_credit(d, 64);
+    assert_eq!((second.flushed, second.owed), (1, false));
+    assert_eq!(run.binder.take_decisions().len(), 1);
+    let census = run.binder.census();
+    assert_eq!(
+        (
+            census.rows,
+            census.bound,
+            census.unbound_total(),
+            census.pending
+        ),
+        (65, 0, 65, 0)
+    );
+}
+
 /// The retry completion clock answers just past the re-sight pass's
 /// horizons: a re-pended row waits for fresher horizons, then binds once
 /// they arrive.

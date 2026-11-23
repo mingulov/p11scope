@@ -610,6 +610,15 @@ pub(crate) enum ResightOutcome {
     Incomplete,
 }
 
+/// What one bounded Finish credit did: how many still-waiting rows
+/// it flushed, and whether more rows still wait (the caller stages
+/// Finish again while `owed` holds).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FinishCredit {
+    pub flushed: usize,
+    pub owed: bool,
+}
+
 /// Cookie queries charged to one witness batch's re-sight work: one
 /// query (pidfd liveness checks and a BPF map syscall) is one slow
 /// unit under the INV-2 step contract. The re-sight pass and the
@@ -2050,14 +2059,41 @@ impl NativeBinder {
             .is_some_and(|index| !self.domains[*index].owed.is_empty())
     }
 
+    /// No later evidence will arrive for `domain`: drain every row it
+    /// still waits on. Production Finish stages one
+    /// [`Self::finish_credit`] per action instead; this wrapper drains
+    /// fully for callers with no credit loop (tests; kept for future
+    /// one-shot stops).
+    #[cfg_attr(not(test), allow(dead_code))] // Only tests drain without a credit loop today.
     pub(crate) fn finish(&mut self, domain: NativeDomainId) {
+        while self.finish_credit(domain, usize::MAX).owed {}
+    }
+
+    /// One bounded Finish credit for `domain`: mark it finished, drop
+    /// its owed and retained queues (memory-only bulk frees — no
+    /// dropped value reads or computes, so the INV-2 amendment lets
+    /// them land in one step), then flush at most `max_flush` still
+    /// waiting rows as unbound. Returns the flushed count and whether
+    /// more rows still wait: the caller stages Finish again while
+    /// `owed` holds. Every flushed row stages exactly like any other
+    /// decision; only the bound is new.
+    pub(crate) fn finish_credit(
+        &mut self,
+        domain: NativeDomainId,
+        max_flush: usize,
+    ) -> FinishCredit {
         let index = self.domain_index(domain);
         self.domains[index].finished = true;
         self.domains[index].owed.clear();
         // Retained rows were already decided and disclosed; their folds
         // stand and no re-observation follows the domain's end.
         self.domains[index].retry.clear();
-        while let Some(pending) = self.domains[index].pending.pop_front() {
+        let mut flushed = 0usize;
+        while flushed < max_flush {
+            let Some(pending) = self.domains[index].pending.pop_front() else {
+                break;
+            };
+            flushed += 1;
             self.domains[index].popped += 1;
             // A flushed re-observation waited internally (its first
             // verdict stayed public), so only a first decision leaves
@@ -2080,6 +2116,8 @@ impl NativeBinder {
             };
             self.record(pending.row, Binding::Unbound(reason), retry);
         }
+        let owed = !self.domains[index].pending.is_empty();
+        FinishCredit { flushed, owed }
     }
 
     fn record(&mut self, row: WitnessRow, binding: Binding, retry: DecisionRetry) {

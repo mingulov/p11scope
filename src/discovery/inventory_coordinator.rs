@@ -704,10 +704,18 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// domain latches loss and `exec_pruned_overflow` counts it. A
     /// completed gap-free sweep expires only the tombstones pruned
     /// before the sweep began (no older row can still arrive; a sweep
-    /// with gaps proves nothing).
-    exec_pruned: HashMap<DomainCookie, u64>,
+    /// with gaps proves nothing). Per-domain maps: a finished domain's
+    /// whole sub-map drops at once (a memory-only bulk free, never a
+    /// cross-domain filter scan); the cap counts every domain's rows.
+    exec_pruned: HashMap<NativeDomainId, HashMap<DomainCookie, u64>>,
     exec_pruned_cap: usize,
     exec_pruned_overflow: u64,
+    /// Test-only: EXEC tombstone expiry sweeps run. Witness sweeps run
+    /// it; the Finish path never does (its zero sweep instant expires
+    /// nothing, and expiry work belongs to sweeps, not to the finish
+    /// credit).
+    #[cfg(test)]
+    expire_sweep_calls: usize,
     /// Domains with EXEC evidence loss (binder loss or stash shed):
     /// their still-unjoined images read `exec_record_lost`.
     exec_loss_domains: HashSet<NativeDomainId>,
@@ -763,7 +771,10 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// so pruning never double-counts it. Past the bound a due row is
     /// folded into `pair_dropped_totals` and `pair_prune_overflow`
     /// counts it once, so neither the map nor the counters grow.
-    pair_dropped_tombstones: HashMap<PairKey, PrunedPairBase>,
+    /// Per-domain maps: a finished domain's whole sub-map drops at
+    /// once (a memory-only bulk free); the cap counts every domain's
+    /// rows.
+    pair_dropped_tombstones: HashMap<NativeDomainId, HashMap<PairKey, PrunedPairBase>>,
     /// Exact aggregate of pruned dropped-pair bases per key class
     /// (domain and object): rows and saturating base total. Counts stay
     /// exact when the per-pair rows leave the map.
@@ -1427,6 +1438,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             exec_pruned: HashMap::new(),
             exec_pruned_cap: MAX_PRUNED_EXEC_TOMBSTONES,
             exec_pruned_overflow: 0,
+            #[cfg(test)]
+            expire_sweep_calls: 0,
             exec_loss_domains: HashSet::new(),
             exe_resolver: ExeResolver::new(),
             exe_probe_cache: HashMap::new(),
@@ -4534,7 +4547,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 0,
             ),
             exec_pruned: counter_row(
-                self.exec_pruned.len(),
+                self.exec_pruned_total(),
                 size_of::<(DomainCookie, u64)>(),
                 HEAP_MAP_ENTRY,
             ),
@@ -4554,7 +4567,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 0,
             ),
             pair_tombstones: counter_row(
-                self.pair_dropped_tombstones.len(),
+                self.dropped_pair_tombstones_total(),
                 size_of::<(PairKey, PrunedPairBase)>(),
                 0,
             ),
@@ -5691,9 +5704,48 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// The bounded tombstone set keeps the distinction exact; past the
     /// bound the domain latches EXEC loss (conservative for every
     /// unjoined image there) and the overflow is counted.
+    /// Every retained EXEC tombstone row, across domains: the
+    /// `exec_pruned_cap` counts the whole nested map, not one domain.
+    fn exec_pruned_total(&self) -> usize {
+        self.exec_pruned.values().map(HashMap::len).sum()
+    }
+
+    /// Every retained dropped-pair tombstone row, across domains: the
+    /// `pair_prune_cap` counts the whole nested map, not one domain.
+    fn dropped_pair_tombstones_total(&self) -> usize {
+        self.pair_dropped_tombstones
+            .values()
+            .map(HashMap::len)
+            .sum()
+    }
+
+    /// Whether a pruned EXEC tombstone is remembered for `cookie`.
+    fn has_exec_tombstone(&self, cookie: &DomainCookie) -> bool {
+        self.exec_pruned
+            .get(&cookie.domain())
+            .is_some_and(|tombstones| tombstones.contains_key(cookie))
+    }
+
+    /// Whether a pruned dropped-pair tombstone keeps `key`'s exact base.
+    fn has_dropped_pair_tombstone(&self, key: &PairKey) -> bool {
+        self.pair_dropped_tombstones
+            .get(&key.image.domain())
+            .is_some_and(|tombstones| tombstones.contains_key(key))
+    }
+
+    /// The pruned dropped-pair tombstone keeping `key`'s exact base, if any.
+    fn dropped_pair_tombstone(&self, key: &PairKey) -> Option<&PrunedPairBase> {
+        self.pair_dropped_tombstones
+            .get(&key.image.domain())
+            .and_then(|tombstones| tombstones.get(key))
+    }
+
     fn note_exec_pruned(&mut self, cookie: DomainCookie, now_ns: u64) {
-        if self.exec_pruned.len() < self.exec_pruned_cap {
-            self.exec_pruned.insert(cookie, now_ns);
+        if self.exec_pruned_total() < self.exec_pruned_cap {
+            self.exec_pruned
+                .entry(cookie.domain())
+                .or_default()
+                .insert(cookie, now_ns);
             return;
         }
         self.exec_pruned_overflow = self.exec_pruned_overflow.saturating_add(1);
@@ -5740,8 +5792,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             // One due row leaves the map here exactly once: the
             // tombstone keeps the exact base while the bound has room,
             // otherwise the row is aggregate-only and counted.
-            if self.pair_dropped_tombstones.len() < self.pair_prune_cap {
+            if self.dropped_pair_tombstones_total() < self.pair_prune_cap {
                 self.pair_dropped_tombstones
+                    .entry(key.image.domain())
+                    .or_default()
                     .insert(key, PrunedPairBase { base, base_since });
             } else {
                 self.pair_prune_overflow = self.pair_prune_overflow.saturating_add(1);
@@ -5899,7 +5953,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// keeps `sum(live targets) + aggregate` exact and lets a later
     /// re-prune count the base exactly once.
     fn take_pruned_pair_base(&mut self, key: &PairKey) -> Option<PrunedPairBase> {
-        let pruned = self.pair_dropped_tombstones.remove(key)?;
+        let pruned = self
+            .pair_dropped_tombstones
+            .get_mut(&key.image.domain())?
+            .remove(key)?;
         let class = PairKeyClass {
             domain: key.image.domain(),
             object: key.object,
@@ -5951,13 +6008,19 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// Test-only: pruned EXEC-stash tombstones remembered.
     #[cfg(test)]
     pub(crate) fn exec_pruned_for_test(&self) -> usize {
-        self.exec_pruned.len()
+        self.exec_pruned_total()
     }
 
     /// Test-only: tombstone-overflow prunes counted (sticky).
     #[cfg(test)]
     pub(crate) fn exec_pruned_overflow_for_test(&self) -> u64 {
         self.exec_pruned_overflow
+    }
+
+    /// Test-only: EXEC tombstone expiry sweeps run so far.
+    #[cfg(test)]
+    pub(crate) fn expire_sweep_calls_for_test(&self) -> usize {
+        self.expire_sweep_calls
     }
 
     /// Test-only: domains that latched EXEC loss.
@@ -5984,7 +6047,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// Test-only: pruned dropped-pair tombstones remembered.
     #[cfg(test)]
     pub(crate) fn dropped_pair_tombstones_for_test(&self) -> usize {
-        self.pair_dropped_tombstones.len()
+        self.dropped_pair_tombstones_total()
     }
 
     /// Test-only: dropped rows the tombstone bound kept in the map.
@@ -8161,22 +8224,22 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // No fold-landing refresh: each retraction consumes exactly its
         // own keyed receipt at apply time, so no scan runs here.
         // A completed witness sweep proves no older row for its domain is
-        // still in flight; a Finish means no later evidence at all. Both
-        // release departed tombstones only after this batch's decisions
-        // are staged below. The sweep's beginning is read before staging
-        // (staging clears it on completion): only tombstones pruned
-        // before it began expire, and only on a gap-free sweep.
+        // still in flight, so departed tombstones pruned before it began
+        // expire after this batch's decisions stage below. The sweep's
+        // beginning is read before staging (staging clears it on
+        // completion): only tombstones pruned before it began expire,
+        // and only on a gap-free sweep. Finish runs no expiry sweep:
+        // its zero sweep instant expires nothing, and expiry work
+        // belongs to sweeps, never to the finish credit.
         let tombstone_cleanup = match &batch {
             NativeBatch::Witness(batch) if batch.sweep_completed => Some((
                 batch.domain,
-                false,
                 self.capture
                     .as_ref()
                     .and_then(|capture| capture.sweep_began_ns)
                     .unwrap_or(batch.health_read_ns),
                 !batch.sweep_gaps,
             )),
-            NativeBatch::Finish { domain } => Some((*domain, true, 0, true)),
             _ => None,
         };
         // The domain this batch stages (semantic batches stage none):
@@ -8188,6 +8251,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             NativeBatch::Semantic(_) => None,
         };
         let mut hook_events = Vec::new();
+        // A Finish batch's pending-row flush (domain, rows still owed):
+        // the settlement queue below shares its credit.
+        let mut finish_flush: Option<(NativeDomainId, bool)> = None;
         match batch {
             NativeBatch::Witness(batch) => {
                 // The binder absorbs before the batch's health is noted:
@@ -8249,7 +8315,18 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     ));
                 }
             }
-            NativeBatch::Finish { domain } => self.binder.finish(domain),
+            NativeBatch::Finish { domain } => {
+                // One shared finish credit: the pending-row flush below
+                // and the settlement queue after staging draw from the
+                // same [`FINISH_SETTLEMENT_PER_CREDIT`] allowance, so a
+                // Finish stages at most one credit of work however deep
+                // both queues run. The receipt reports the combined
+                // continuation below.
+                let credit = self
+                    .binder
+                    .finish_credit(domain, FINISH_SETTLEMENT_PER_CREDIT);
+                finish_flush = Some((domain, credit.owed));
+            }
             NativeBatch::Semantic(batch) => self.stage_semantic_batch(batch),
         }
         let mut receipt = self.stage_binder_output(identity, now_ns);
@@ -8258,11 +8335,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             receipt.resight_owed = self.binder.resight_owed(domain);
         }
         self.reconcile_count_eligibility(identity, &mut RecoveryWorkBudget::new());
-        if let Some((domain, finished, began_ns, gap_free)) = tombstone_cleanup {
+        if let Some((domain, began_ns, gap_free)) = tombstone_cleanup {
             self.expire_exec_tombstones(domain, began_ns, gap_free);
-            if finished {
-                receipt.settlement_owed = self.finish_native_domain(domain);
-            }
+        }
+        if let Some((domain, flush_owed)) = finish_flush {
+            // Staged decisions (flush rows, and any re-refusal or
+            // endpoint-loss settlement each one carries) spent the
+            // credit first; the settlement queue takes the remainder.
+            let settle_budget = FINISH_SETTLEMENT_PER_CREDIT.saturating_sub(receipt.decided);
+            receipt.settlement_owed = self.finish_native_domain(domain, settle_budget, flush_owed);
         }
         receipt
     }
@@ -8273,16 +8354,26 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// later. Tombstones pruned after the sweep began wait for a later
     /// sweep that proves them.
     fn expire_exec_tombstones(&mut self, domain: NativeDomainId, began_ns: u64, gap_free: bool) {
+        #[cfg(test)]
+        {
+            self.expire_sweep_calls = self.expire_sweep_calls.saturating_add(1);
+        }
         // A sweep with gaps proves nothing about the rows it skipped
         // (see `WitnessBatch.sweep_gaps`); only a gap-free sweep
-        // expires, and only tombstones pruned before it began.
-        if !gap_free || self.exec_pruned.is_empty() {
+        // expires, and only tombstones pruned before it began. Only
+        // witness sweeps call here; the per-domain sub-map keeps the
+        // scan inside the swept domain.
+        if !gap_free {
+            return;
+        }
+        let Some(tombstones) = self.exec_pruned.get_mut(&domain) else {
+            return;
+        };
+        if tombstones.is_empty() {
             return;
         }
         let pending = self.binder.pending_cookies(domain);
-        self.exec_pruned.retain(|cookie, pruned_ns| {
-            cookie.domain() != domain || pending.contains(cookie) || *pruned_ns >= began_ns
-        });
+        tombstones.retain(|cookie, pruned_ns| pending.contains(cookie) || *pruned_ns >= began_ns);
     }
 
     /// The domain will produce no more evidence: retained retry pairs
@@ -8290,14 +8381,24 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// terminal per-cause totals, then release their held absolutes
     /// (their folds stand: no re-observation follows the domain's
     /// end) and prune normally afterwards. Settlement pops at most
-    /// [`FINISH_SETTLEMENT_PER_CREDIT`] owed keys per call from the
-    /// domain's queue — live ones settle, stale ones (already released
-    /// by a re-decision) skip — and returns whether work remains: the
-    /// caller stages Finish again while it does. The tombstone and
-    /// latch cleanup below is withheld until the queue drains, so no
-    /// finish publication lands over unsettled pairs.
-    fn finish_native_domain(&mut self, domain: NativeDomainId) -> bool {
-        for _ in 0..FINISH_SETTLEMENT_PER_CREDIT {
+    /// `settle_budget` owed keys from the domain's queue — the
+    /// remainder of the shared [`FINISH_SETTLEMENT_PER_CREDIT`]
+    /// allowance after the pending-row flush staged — live ones
+    /// settle, stale ones (already released by a re-decision) skip.
+    /// Returns whether work remains: the caller stages Finish again
+    /// while it does. The tombstone and latch cleanup below is
+    /// withheld until the flush and the queue both drain, so no
+    /// finish publication lands over unsettled pairs and no
+    /// later-flushed row reads dropped departed state. Cleanup drops
+    /// each finished domain's whole sub-map at once (memory-only bulk
+    /// frees, never cross-domain filter scans).
+    fn finish_native_domain(
+        &mut self,
+        domain: NativeDomainId,
+        settle_budget: usize,
+        flush_owed: bool,
+    ) -> bool {
+        for _ in 0..settle_budget {
             let Some(key) = self
                 .retry_finish_queue
                 .get_mut(&domain)
@@ -8319,14 +8420,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         {
             self.retry_finish_queue.remove(&domain);
         }
-        if self.retry_finish_queue.contains_key(&domain) {
+        if flush_owed || self.retry_finish_queue.contains_key(&domain) {
             return true;
         }
-        self.exec_pruned
-            .retain(|cookie, _| cookie.domain() != domain);
+        self.exec_pruned.remove(&domain);
         self.exec_loss_domains.remove(&domain);
-        self.pair_dropped_tombstones
-            .retain(|key, _| key.image.domain() != domain);
+        self.pair_dropped_tombstones.remove(&domain);
         false
     }
 
@@ -8746,7 +8845,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             let dropped = matches!(
                 self.pair_targets.get(&key),
                 Some(PairTarget::Dropped { .. })
-            ) || self.pair_dropped_tombstones.contains_key(&key);
+            ) || self.has_dropped_pair_tombstone(&key);
             // A pair the binder retained for re-observation keeps
             // merging absolutes while dropped (re-observed, never
             // staged: the target arms below still ignore it), so a
@@ -8811,7 +8910,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             let dropped = matches!(
                 self.pair_targets.get(&key),
                 Some(PairTarget::Dropped { .. })
-            ) || self.pair_dropped_tombstones.contains_key(&key);
+            ) || self.has_dropped_pair_tombstone(&key);
             // Keep the refresh PRE bound for future base coverage and
             // the common POST bound for this count's observation. Neither
             // claims exactly when this particular pair was looked up.
@@ -9623,7 +9722,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let retry_target_ok = matches!(
             self.pair_targets.get(&key),
             Some(PairTarget::Dropped { .. })
-        ) || self.pair_dropped_tombstones.contains_key(&key);
+        ) || self.has_dropped_pair_tombstone(&key);
         let owed_fold = self
             .retry_owed
             .get(&key)
@@ -9713,13 +9812,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 // tombstone consume below keeps the class aggregate
                 // exact). It is checked before the late computation so
                 // a discarded gap can never stage.
-                if retry_rule && self.pair_dropped_tombstones.contains_key(&key) {
+                if retry_rule && self.has_dropped_pair_tombstone(&key) {
                     if self.seeded_first_sight(row, caller) {
                         (1, 1, held_first, held_first)
                     } else {
                         (0, 0, 0, held_first)
                     }
-                } else if let Some(pruned) = self.pair_dropped_tombstones.get(&key) {
+                } else if let Some(pruned) = self.dropped_pair_tombstone(&key) {
                     (
                         pruned.base,
                         pruned.base,
@@ -9866,9 +9965,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 
     /// Release a retained mark whose fold stands (re-refusal, revival,
-    /// or terminal settlement: no retraction follows): drop its
-    /// unconsumed landing receipt so the keyed store never grows past
-    /// live retained folds. One hash removal, never a scan.
+    /// or terminal settlement: no retraction follows): stage the drop
+    /// of its unconsumed landing receipt in the ordered mutation
+    /// stream, so the keyed store never grows past live retained
+    /// folds even when the insert has not applied yet. One staged
+    /// mutation, never a scan.
     fn release_retry_standing(&mut self, key: &PairKey) {
         if let Some(owed) = self.retry_owed.remove(key)
             && let Some(fold) = owed.fold
@@ -11066,8 +11167,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .get(key)
             .map(|count| (count.count, count.anchor_ns))
             .or_else(|| {
-                self.pair_dropped_tombstones
-                    .get(key)
+                self.dropped_pair_tombstone(key)
                     .map(|pruned| (pruned.base, pruned.base_since))
             })
             .or_else(|| match self.pair_targets.get(key) {
@@ -11251,7 +11351,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         });
                         self.resolve_unbound_exe(stashed, learned, all_learned)
                     }
-                    None if self.exec_pruned.contains_key(&cookie)
+                    None if self.has_exec_tombstone(&cookie)
                         || self.exec_evidence_lost(cookie.domain()) =>
                     {
                         UnboundExe {
@@ -13610,11 +13710,12 @@ pub(crate) struct NativeReceipt {
     /// reads on while this holds instead of finishing at the first
     /// exact refresh. Always false for semantic batches.
     pub resight_owed: bool,
-    /// The finished domain still owes terminal settlement: finish
-    /// pops at most [`FINISH_SETTLEMENT_PER_CREDIT`] owed pairs per
-    /// staging action, so the caller stages Finish again while this
-    /// holds instead of publishing over unsettled pairs. Always false
-    /// except on `Finish` batches with a drained queue remaining.
+    /// The finished domain still owes finish work: one Finish credit
+    /// covers at most [`FINISH_SETTLEMENT_PER_CREDIT`] units across
+    /// the pending-row flush and the terminal settlement queue, so
+    /// the caller stages Finish again while this holds instead of
+    /// publishing over unsettled pairs. Always false except on
+    /// `Finish` batches with flush, settlement, or cleanup remaining.
     pub settlement_owed: bool,
 }
 
@@ -25777,7 +25878,10 @@ exit 0
         row.entry_count = 3;
         native.witness(vec![row]);
         let domain = native.domain;
-        native.scene.coordinator.finish_native_domain(domain);
+        native
+            .scene
+            .coordinator
+            .finish_native_domain(domain, FINISH_SETTLEMENT_PER_CREDIT, false);
         native
             .scene
             .coordinator
@@ -30209,24 +30313,6 @@ exit 0
         // drops it. RED: the base drops it on the first Finish, whose
         // settlement queue is empty.
         let (mut native, _) = NativeScene::new();
-        let cookie = DomainCookie::scripted(native.domain, 41);
-        native.scene.coordinator.exec_pruned.insert(cookie, 1_000);
-        native
-            .scene
-            .coordinator
-            .exec_loss_domains
-            .insert(native.domain);
-        native.scene.coordinator.pair_dropped_tombstones.insert(
-            PairKey {
-                image: cookie,
-                exec: 1,
-                object: 0,
-            },
-            PrunedPairBase {
-                base: 5,
-                base_since: 100,
-            },
-        );
         let rows: Vec<WitnessRow> = (0..65)
             .map(|i| {
                 let mut row = native.row(100 + i, 1, 5000 + i as u32, 40, 1);
@@ -30236,6 +30322,38 @@ exit 0
             .collect();
         let staged = native.read(rows);
         assert_eq!(staged.decided, 0, "no horizon yet: all 65 stay pending");
+        // Seed departed state after the read's sweep (which would
+        // expire it): the Finish continuation owns it now.
+        let cookie = DomainCookie::scripted(native.domain, 41);
+        native
+            .scene
+            .coordinator
+            .exec_pruned
+            .entry(native.domain)
+            .or_default()
+            .insert(cookie, 1_000);
+        native
+            .scene
+            .coordinator
+            .exec_loss_domains
+            .insert(native.domain);
+        native
+            .scene
+            .coordinator
+            .pair_dropped_tombstones
+            .entry(native.domain)
+            .or_default()
+            .insert(
+                PairKey {
+                    image: cookie,
+                    exec: 1,
+                    object: 0,
+                },
+                PrunedPairBase {
+                    base: 5,
+                    base_since: 100,
+                },
+            );
         let domain = native.domain;
         let first = native.stage(NativeBatch::Finish { domain });
         assert_eq!(first.decided, 64, "one Finish flushes at most one credit");
@@ -30899,6 +31017,409 @@ exit 0
             "the exact projected aggregate row"
         );
         assert_eq!(registry.gap_repeats()[position], 1);
+    }
+
+    #[test]
+    fn finish_runs_no_tombstone_expiry_sweep() {
+        // Expiry work belongs to sweeps, never to the finish credit:
+        // witness sweeps run the tombstone expiry (positive control),
+        // while two Finish credits that flush 65 rows and settle a
+        // queue run none.
+        let mut native = retained_with_growth();
+        let sweeps = native.scene.coordinator.expire_sweep_calls_for_test();
+        assert!(sweeps >= 1, "witness sweeps run expiry: {sweeps}");
+        let fresh: Vec<WitnessRow> = (0..65)
+            .map(|i| {
+                let mut row = native.row(200 + i, 1, 5000 + i as u32, 40, 1);
+                row.entry_count = 1;
+                row
+            })
+            .collect();
+        native.read(fresh);
+        let before_finish = native.scene.coordinator.expire_sweep_calls_for_test();
+        assert!(
+            before_finish > sweeps,
+            "the fresh read sweeps too: {before_finish} > {sweeps}"
+        );
+        let domain = native.domain;
+        let first = native.stage(NativeBatch::Finish { domain });
+        assert_eq!(first.decided, 64);
+        assert!(first.settlement_owed);
+        let second = native.stage(NativeBatch::Finish { domain });
+        assert_eq!(second.decided, 1);
+        assert_eq!(
+            native.scene.coordinator.expire_sweep_calls_for_test(),
+            before_finish,
+            "no Finish credit runs expiry"
+        );
+        native.scene.coordinator.commit_batch(false).unwrap();
+    }
+
+    #[test]
+    fn terminal_retry_totals_type_each_cause_exactly() {
+        // Typed per-cause oracle: two retained rows (3 -> 13 and 5 ->
+        // 25) settle under different causes — the first re-refuses
+        // against a competing image, the second finishes standing.
+        // The authoritative totals name each cause with its exact
+        // (excluded, settlements), and each cause projects exactly one
+        // row with repeats 1.
+        let (mut native, _) = NativeScene::new();
+        for (pid, start) in [(9, 600), (10, 700)] {
+            native.scene.source.spawn(pid, start);
+            native.scene.source.set_leader_exit_observation(
+                pid,
+                crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+            );
+        }
+        let mut first = native.row(41, 1, 9, 40, 1);
+        first.entry_count = 3;
+        let mut second = native.row(42, 1, 10, 40, 1);
+        second.entry_count = 5;
+        native.witness(vec![first, second]);
+        native.counts_read(Vec::new(), vec![(41, 1, 1, 13), (42, 1, 1, 25)]);
+        for (pid, at) in [(9, 50), (10, 50)] {
+            native
+                .scene
+                .coordinator
+                .adapter
+                .admit(pid, ImageAuthority::ScanPinned, at)
+                .unwrap();
+            native.scene.project(pid, 60);
+        }
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.answer(9, 600, 41);
+        let mut competitor = native.row(41, 2, 9, 1_000, 0);
+        competitor.entry_count = 5;
+        native.read(vec![competitor]);
+        native.drain();
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let domain = native.domain;
+        native.stage(NativeBatch::Finish { domain });
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let totals = native
+            .scene
+            .coordinator
+            .registry
+            .terminal_retry_totals_for_test();
+        let mut expected = std::collections::BTreeMap::new();
+        expected.insert("re-refusal (exec_ambiguous)".to_string(), (10, 1));
+        expected.insert("domain finish".to_string(), (20, 1));
+        assert_eq!(totals, expected, "each cause types its exact total");
+        let registry = &native.scene.coordinator.registry;
+        let terminal: Vec<(usize, &RegistryGap)> = registry
+            .gaps()
+            .iter()
+            .enumerate()
+            .filter(|(_, gap)| gap.subject == "identity retry terminal")
+            .collect();
+        assert_eq!(terminal.len(), 2, "one projected row per cause");
+        for (position, _) in &terminal {
+            assert_eq!(
+                registry.gap_repeats()[*position],
+                1,
+                "a summed row carries repeats 1"
+            );
+        }
+        let reasons: Vec<&str> = terminal
+            .iter()
+            .map(|(_, gap)| gap.reason.as_str())
+            .collect();
+        assert!(
+            reasons.contains(
+                &expected_terminal_aggregate(10, "re-refusal (exec_ambiguous)", 1)
+                    .reason
+                    .as_str()
+            ),
+            "the re-refusal row projects exactly: {reasons:?}"
+        );
+        assert!(
+            reasons.contains(
+                &expected_terminal_aggregate(20, "domain finish", 1)
+                    .reason
+                    .as_str()
+            ),
+            "the finish row projects exactly: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn terminal_retry_totals_sum_settlements_per_cause() {
+        // Typed per-cause oracle, multi-settlement cause: two retained
+        // rows (3 -> 13 and 5 -> 25) finish together, so the one
+        // finish cause sums (30, 2) and projects one exact row.
+        let (mut native, _) = NativeScene::new();
+        for (pid, start) in [(9, 600), (10, 700)] {
+            native.scene.source.spawn(pid, start);
+            native.scene.source.set_leader_exit_observation(
+                pid,
+                crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+            );
+        }
+        let mut first = native.row(41, 1, 9, 40, 1);
+        first.entry_count = 3;
+        let mut second = native.row(42, 1, 10, 40, 1);
+        second.entry_count = 5;
+        native.witness(vec![first, second]);
+        native.counts_read(Vec::new(), vec![(41, 1, 1, 13), (42, 1, 1, 25)]);
+        for (pid, at) in [(9, 50), (10, 50)] {
+            native
+                .scene
+                .coordinator
+                .adapter
+                .admit(pid, ImageAuthority::ScanPinned, at)
+                .unwrap();
+            native.scene.project(pid, 60);
+        }
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let domain = native.domain;
+        native.stage(NativeBatch::Finish { domain });
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let totals = native
+            .scene
+            .coordinator
+            .registry
+            .terminal_retry_totals_for_test();
+        let mut expected = std::collections::BTreeMap::new();
+        expected.insert("domain finish".to_string(), (30, 2));
+        assert_eq!(totals, expected, "settlements sum under their cause");
+        let registry = &native.scene.coordinator.registry;
+        let position = registry
+            .gaps()
+            .iter()
+            .position(|gap| gap.subject == "identity retry terminal")
+            .expect("the aggregate row publishes");
+        assert_eq!(
+            registry.gaps()[position],
+            expected_terminal_aggregate(30, "domain finish", 2),
+            "the exact projected aggregate row"
+        );
+        assert_eq!(registry.gap_repeats()[position], 1);
+    }
+
+    #[test]
+    fn terminal_retry_totals_type_endpoint_loss_cause() {
+        // Typed per-cause oracle, endpoint-loss leg: the retained
+        // row's stagings resolve to no module, so the entire 43-call
+        // held subtotal discloses under exactly `endpoint resolution
+        // loss` with one settlement, and projects one exact row.
+        let scene = CaptureScene::new(2);
+        let mut native = NativeScene::over(scene, 0);
+        native.scene.source.spawn(9, 600);
+        native.scene.source.set_leader_exit_observation(
+            9,
+            crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+        );
+        let mut row = native.row(41, 1, 9, 40, 1);
+        row.endpoint = crate::discovery::inventory_attach_set::EndpointId(999);
+        row.entry_count = 3;
+        native.read(vec![row]);
+        native.drain();
+        native.read(Vec::new());
+        native.counts_read(Vec::new(), vec![(41, 1, 1, 43)]);
+        native
+            .scene
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.answer(9, 600, 41);
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let totals = native
+            .scene
+            .coordinator
+            .registry
+            .terminal_retry_totals_for_test();
+        let mut expected = std::collections::BTreeMap::new();
+        expected.insert("endpoint resolution loss".to_string(), (43, 1));
+        assert_eq!(totals, expected, "the held subtotal types its cause");
+        let registry = &native.scene.coordinator.registry;
+        let position = registry
+            .gaps()
+            .iter()
+            .position(|gap| gap.subject == "identity retry terminal")
+            .expect("the aggregate row publishes");
+        assert_eq!(
+            registry.gaps()[position],
+            expected_terminal_aggregate(43, "endpoint resolution loss", 1),
+            "the exact projected aggregate row"
+        );
+        assert_eq!(registry.gap_repeats()[position], 1);
+    }
+
+    #[test]
+    fn standing_release_consumes_only_its_own_receipt() {
+        // Per-fold drop isolation: two retained folds commit; the
+        // first re-refuses (its standing release drops exactly its
+        // receipt) while the second stays retained (its receipt
+        // survives for its own later retraction). A drop that cleared
+        // or misaddressed receipts would orphan or wipe the survivor.
+        let (mut native, _) = NativeScene::new();
+        for (pid, start) in [(9, 600), (10, 700)] {
+            native.scene.source.spawn(pid, start);
+            native.scene.source.set_leader_exit_observation(
+                pid,
+                crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+            );
+        }
+        let mut first = native.row(41, 1, 9, 40, 1);
+        first.entry_count = 3;
+        let mut second = native.row(42, 1, 10, 40, 1);
+        second.entry_count = 5;
+        native.witness(vec![first, second]);
+        native.counts_read(Vec::new(), vec![(41, 1, 1, 13), (42, 1, 1, 5)]);
+        for (pid, at) in [(9, 50), (10, 50)] {
+            native
+                .scene
+                .coordinator
+                .adapter
+                .admit(pid, ImageAuthority::ScanPinned, at)
+                .unwrap();
+            native.scene.project(pid, 60);
+        }
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            native.scene.coordinator.registry.fold_receipts_for_test(),
+            2,
+            "both inserts record keyed receipts"
+        );
+        native.answer(9, 600, 41);
+        let mut competitor = native.row(41, 2, 9, 1_000, 0);
+        competitor.entry_count = 5;
+        native.read(vec![competitor]);
+        native.drain();
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            terminal_retry_total(&native),
+            10,
+            "only the refused growth settles"
+        );
+        assert_eq!(
+            native.scene.coordinator.registry.fold_receipts_for_test(),
+            1,
+            "the survivor's receipt stands while the released fold's is gone"
+        );
+        let unbound = native.module_unbound().expect("both folds stand");
+        assert_eq!((unbound.rows, unbound.entries), (2, 8));
+        // The survivor rebinds cleanly, consuming exactly its receipt.
+        native.answer(10, 700, 42);
+        native.read(Vec::new());
+        native.drain();
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            native.scene.coordinator.registry.fold_receipts_for_test(),
+            0,
+            "the survivor's retraction consumes the last receipt"
+        );
+        let unbound = native.module_unbound().expect("the refused fold stands");
+        assert_eq!((unbound.rows, unbound.entries), (1, 3));
+    }
+
+    #[test]
+    fn finishing_one_domain_keeps_other_domains_tombstones() {
+        // Per-domain departed state: finishing a domain drops exactly
+        // its own EXEC tombstones, latch, and pair tombstones, while a
+        // never-staged sibling domain's rows stay byte-identical.
+        let (mut native, _) = NativeScene::new();
+        let other = NativeDomainId::mint();
+        let cookie = DomainCookie::scripted(native.domain, 41);
+        native
+            .scene
+            .coordinator
+            .exec_pruned
+            .entry(native.domain)
+            .or_default()
+            .insert(cookie, 1_000);
+        let other_cookie = DomainCookie::scripted(other, 42);
+        native
+            .scene
+            .coordinator
+            .exec_pruned
+            .entry(other)
+            .or_default()
+            .insert(other_cookie, 2_000);
+        native
+            .scene
+            .coordinator
+            .exec_loss_domains
+            .insert(native.domain);
+        native.scene.coordinator.exec_loss_domains.insert(other);
+        let key = PairKey {
+            image: cookie,
+            exec: 1,
+            object: 0,
+        };
+        native
+            .scene
+            .coordinator
+            .pair_dropped_tombstones
+            .entry(native.domain)
+            .or_default()
+            .insert(
+                key,
+                PrunedPairBase {
+                    base: 5,
+                    base_since: 100,
+                },
+            );
+        let other_key = PairKey {
+            image: other_cookie,
+            exec: 1,
+            object: 0,
+        };
+        native
+            .scene
+            .coordinator
+            .pair_dropped_tombstones
+            .entry(other)
+            .or_default()
+            .insert(
+                other_key,
+                PrunedPairBase {
+                    base: 7,
+                    base_since: 200,
+                },
+            );
+        let domain = native.domain;
+        native.stage(NativeBatch::Finish { domain });
+        let coordinator = &native.scene.coordinator;
+        assert!(
+            !coordinator.exec_pruned.contains_key(&domain),
+            "the finished domain's EXEC sub-map drops"
+        );
+        assert_eq!(
+            coordinator
+                .exec_pruned
+                .get(&other)
+                .and_then(|map| map.get(&other_cookie)),
+            Some(&2_000),
+            "the sibling domain's EXEC tombstone stays"
+        );
+        assert!(
+            !coordinator.exec_loss_domains.contains(&domain),
+            "the finished domain's latch drops"
+        );
+        assert!(
+            coordinator.exec_loss_domains.contains(&other),
+            "the sibling domain's latch stays"
+        );
+        assert!(
+            !coordinator.pair_dropped_tombstones.contains_key(&domain),
+            "the finished domain's pair sub-map drops"
+        );
+        assert_eq!(
+            coordinator
+                .pair_dropped_tombstones
+                .get(&other)
+                .and_then(|map| map.get(&other_key))
+                .map(|pruned| (pruned.base, pruned.base_since)),
+            Some((7, 200)),
+            "the sibling domain's pair tombstone stays"
+        );
     }
 
     /// The retry completion stamp lands strictly between the re-pend
@@ -41999,23 +42520,35 @@ int main(void) {
     fn finishing_a_domain_drops_its_departed_tombstones() {
         let (mut native, _caller) = NativeScene::new();
         let cookie = DomainCookie::scripted(native.domain, 41);
-        native.scene.coordinator.exec_pruned.insert(cookie, 1_000);
+        native
+            .scene
+            .coordinator
+            .exec_pruned
+            .entry(native.domain)
+            .or_default()
+            .insert(cookie, 1_000);
         native
             .scene
             .coordinator
             .exec_loss_domains
             .insert(native.domain);
-        native.scene.coordinator.pair_dropped_tombstones.insert(
-            PairKey {
-                image: cookie,
-                exec: 1,
-                object: 0,
-            },
-            PrunedPairBase {
-                base: 5,
-                base_since: 100,
-            },
-        );
+        native
+            .scene
+            .coordinator
+            .pair_dropped_tombstones
+            .entry(native.domain)
+            .or_default()
+            .insert(
+                PairKey {
+                    image: cookie,
+                    exec: 1,
+                    object: 0,
+                },
+                PrunedPairBase {
+                    base: 5,
+                    base_since: 100,
+                },
+            );
         native.stage(NativeBatch::Finish {
             domain: native.domain,
         });

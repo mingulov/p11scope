@@ -26,26 +26,27 @@
 #     session, so 0 is the default; set 1 to re-arm the expectation if
 #     the wedge returns.
 #   The Joint row is judged by scripts/ci/joint_stop_verdict.py, one
-#     fail-closed parser shared with scripts/run-privileged-lib-tests.sh
-#     (its docstring holds the grammar). It qualifies only an exit-0 run
-#     with a strict one-test libtest pass summary as the terminal record
-#     and the twelve wp7-stop cases in order, each exactly once as
-#     linked tag, offset diagnostic bound to the case's offset with
-#     finish=published, and completion marker, with no error, no-feed
-#     record or stray framing. It records environment-precluded only
-#     for a normal libtest failure (exit 101, strict one-test failure
-#     summary) whose sole terminal error is the first case's own S1
-#     receipt right after its S1 tag (this holds whatever
+#     fail-closed validator shared with scripts/run-privileged-lib-tests.sh
+#     (its docstring holds the record schema). The cell owns its verdict:
+#     it prints exactly one P11SCOPE_STOP_VERDICT=<json> record built
+#     from its own case ledger, and the validator reads only that record,
+#     the exit status and the strict libtest summary (no other log line
+#     counts). It qualifies only an exit-0 run with a one-test pass
+#     summary and a record of the full selection whose twelve cases all
+#     completed (each outcome passing the stop checks). It records
+#     environment-precluded only for a normal libtest failure (exit 101,
+#     one-test failure summary) whose record holds case 0 alone,
+#     unlinked and undriven, with the S1 receipt (whatever
 #     JOINT_EXPECTED_FAILURE says), and expected-failure only under
-#     JOINT_EXPECTED_FAILURE=1 for the terminal Published-then-WoundDown
-#     error of the linked case in progress, bound to its offset.
+#     JOINT_EXPECTED_FAILURE=1 for a wedge record (the last case's
+#     outcome fails first at the Published-then-WoundDown check).
 #     Everything else fails the row with the validator's named reason
 #     in brackets: a signal or other exit status, a missing, malformed,
-#     duplicated or non-terminal summary, a zero-test or foreign run,
-#     a malformed or embedded record, a stray or mismatched no-feed
-#     receipt, competing errors, an out-of-order, duplicated, short or
-#     mixed case sequence, the unattributed no-feed cause, an
-#     unexpected pass under 1, or a wedge under 0.
+#     duplicated or non-terminal summary, a missing, duplicated,
+#     misplaced or malformed record, a record for another cell, a
+#     narrowed, short, out-of-order or contradictory case list, the
+#     unattributed no-feed cause, S1 after linked cases, an unexpected
+#     pass under 1, or a wedge under 0.
 #   The entry forces the full 12-case matrix: inherited WP7_STOP_PREPS /
 #     WP7_STOP_OFFSETS narrowing is unset for the cell (direct libtest
 #     runs keep narrowing for exploration) and the cell runs with

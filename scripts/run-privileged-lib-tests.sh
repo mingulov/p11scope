@@ -808,10 +808,10 @@ manifest_getter_privileged_tests::privileged_getter_only_manifest_function_list_
 # runs as a long cell). The runner unsets the cell's narrowing
 # selectors for exactly these cells and judges their logs with the
 # shared fail-closed validator scripts/ci/joint_stop_verdict.py (exit
-# status, strict terminal summary, all 12 cases in order with exact
-# records), so inherited WP7_STOP_PREPS / WP7_STOP_OFFSETS narrowing,
-# a malformed summary or a contradictory record can never qualify as
-# the full matrix. Direct libtest runs keep narrowing for
+# status, strict terminal summary and the cell's one verdict record:
+# all 12 cases of the full selection completed), so inherited
+# WP7_STOP_PREPS / WP7_STOP_OFFSETS narrowing, a malformed summary or a
+# contradictory record can never qualify as the full matrix. Direct libtest runs keep narrowing for
 # exploration.
 FULL_MATRIX_TESTS=(
 inventory::joint_stop_races_privileged_tests::privileged_joint_stop_after_last_waiter_resolves_publishes_final_lp64
@@ -844,7 +844,8 @@ attach::inventory::activation::privileged_tests::privileged_inventory_multi_n819
 # unreachable (collected ticks resolve waiters same tick); the invariant
 # lives in the machine twins named in tests/ignored-tests.json. The
 # runner unsets WP7_STOP_PREPS / WP7_STOP_OFFSETS for this cell and
-# requires all 12 stop-completion lines for a pass (FULL_MATRIX_TESTS).
+# requires its verdict record to show all 12 cases completed for a pass
+# (FULL_MATRIX_TESTS).
 inventory::joint_stop_races_privileged_tests::privileged_joint_stop_after_last_waiter_resolves_publishes_final_lp64
 # G21 default-ring wrap needs 266 changing observed rounds per leg (532 per
 # two-leg cell; 260 counted + 4 shared + fence + proof per leg, 264 without
@@ -2152,11 +2153,10 @@ main() {
         if [ -n "${full_matrix_set[$name]+present}" ]; then
             # Full-matrix cells: the shared fail-closed validator
             # (scripts/ci/joint_stop_verdict.py, also the S3 judge)
-            # parses the whole log: exit status, strict framing and
-            # terminal summary, and all 12 cases in order, each exactly
-            # once as linked tag, bound offset diagnostic and completion
-            # marker, with no error, no-feed or stray record. Only its
-            # qualified verdict passes; anything else fails with the
+            # reads the exit status, the strict terminal summary and the
+            # cell's one P11SCOPE_STOP_VERDICT record (built by the cell
+            # from its own case ledger); no other log line counts. Only
+            # its qualified verdict passes; anything else fails with the
             # validator's named reason.
             joint_verdict=()
             verdict_rc=0

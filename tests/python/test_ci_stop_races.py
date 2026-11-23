@@ -5,16 +5,16 @@
 Exercises `scripts/ci/stop-races.sh` without privileged runs: the
 joint row through the shared fail-closed validator
 (scripts/ci/joint_stop_verdict.py; its per-class table lives in
-test_joint_stop_verdict.py) end to end, with logs in the real pinned
-libtest framing (wedge, S1 preclusion, unattributed no-feed cause,
-full-matrix pass, short, incomplete, malformed and mixed matrices,
-competing terminal errors, signal exits, malformed or non-terminal
-summaries, receipt-only passes, inherited narrowing, unexpected pass,
-unmapped failure, missing test binary), via a verbatim copy of the
-entry and the validator with stubbed qualify/id/library-test, and the
-early prerequisite rows (non-root, missing observer) via the real
-entry. The harness must also flag a ledger that appears between the
-pre-kill check and the signal.
+test_joint_stop_verdict.py) end to end. Each log is the real pinned
+libtest framing around the cell's single verdict record (wedge, S1
+preclusion, unattributed no-feed cause, full-matrix pass, short,
+incomplete, misplaced and contradictory records, signal exits,
+malformed or non-terminal summaries, receipt-only passes, inherited
+narrowing, unexpected pass, unmapped failure, missing test binary),
+replayed through a verbatim copy of the entry and the validator with
+stubbed qualify/id/library-test, and the early prerequisite rows
+(non-root, missing observer) via the real entry. The harness must also
+flag a ledger that appears between the pre-kill check and the signal.
 """
 
 import json
@@ -33,14 +33,18 @@ HARNESS = ROOT / "scripts/qualify-stop-races.sh"
 
 sys.path.insert(0, str(ROOT / "tests/python"))
 from joint_stop_logs import (  # noqa: E402
-    FAILED_SUMMARY, S1_ERROR, UNATTRIBUTED_ERROR, case_head,
-    case_outcome, frame, matrix_body, offset_of, s1_body, unattributed_body,
-    wedge_body, wedge_error,
+    FAILED_SUMMARY, S1_RECEIPT, UNATTRIBUTED_RECEIPT,
+    case_failed_record, case_record, frame,
+    healthy_outcome, log_for, no_feed_record, offset_of, passing,
+    precluded, precluded_record, qualified_record, record, record_line,
+    wedge_outcome, wedge_record, wedged,
 )
 
-# The Rust cell's terminal wedge text (src/inventory/
-# joint_stop_races_privileged_tests.rs, check_stop_outcome).
-WEDGE_TEXT = "Published then WoundDown"
+
+def edited(rec, change):
+    change(rec)
+    return rec
+
 
 SWEEP_CELLS = (
     "stop-race-sweep.profile-pid",
@@ -140,34 +144,37 @@ kill -s "$STUB_SIGNAL" $$
 
 
 def full_matrix_log():
-    """A passing 12-case matrix log in the real framing: each case's
-    linkage tag, offset diagnostic and post-stop completion marker."""
-    return frame(matrix_body(), True)
+    """A passing 12-case matrix log: the qualified record."""
+    return passing()
 
 
 def one_case_log():
-    """A passing one-case log: only the first case ran."""
-    return frame(matrix_body(range(1)), True)
+    """A passing record that holds only the first case."""
+    return log_for(edited(qualified_record(),
+                          lambda r: r.update(cases=r["cases"][:1])))
 
 
 def linked_but_incomplete_log():
     """Twelve linked cases, but case 7 never completed its stop."""
-    body = [line for line in matrix_body()
-            if line != "P11SCOPE_STOP_COMPLETE=wp7-stop7"]
-    return frame(body, True)
+    rec = qualified_record()
+    rec["cases"][7]["completed"] = False
+    return log_for(rec)
 
 
 def malformed_completion_log():
-    """Case 7's completion line is embedded in a diagnostic instead of
-    standing as an exact line."""
-    body = [("JOINT_STOP wp7-stop7: P11SCOPE_STOP_COMPLETE=wp7-stop7 "
-             "emitted late") if line == "P11SCOPE_STOP_COMPLETE=wp7-stop7"
-            else line for line in matrix_body()]
-    return frame(body, True)
+    """The record glued behind a diagnostic instead of opening its line."""
+    rec = qualified_record()
+    return log_for(rec).replace(
+        "\n" + record_line(rec), "\nJOINT_STOP wp7-stop7: " + record_line(rec))
 
 
-def failed_log(body):
-    return frame(body, False)
+def failed_log(rec):
+    return log_for(rec, ok=False)
+
+
+def text_only_log(lines, ok=False):
+    """Free text with no verdict record (the old grammar's evidence)."""
+    return frame(lines, ok)
 
 
 def run_mapping(*, log, rc, expect_fail, libtest=True, list_mode="always",
@@ -252,15 +259,12 @@ class CiStopRacesTests(unittest.TestCase):
         self.assertEqual(proc.returncode, exit_code, proc.stdout + proc.stderr)
 
     def test_wedge_signature_maps_expected_failure(self):
-        log = failed_log(wedge_body())
-        self.assertIn(WEDGE_TEXT, log)
-        proc, rows, joint = run_mapping(log=log, rc=101, expect_fail=True)
+        proc, rows, joint = run_mapping(log=wedged(), rc=101, expect_fail=True)
         self.assert_row(proc, rows, joint, "expected-failure", "wedge")
 
     def test_preclusion_tag_maps_environment_precluded(self):
-        log = failed_log(s1_body())
-        self.assertNotIn(WEDGE_TEXT, log)
-        proc, rows, joint = run_mapping(log=log, rc=101, expect_fail=True)
+        proc, rows, joint = run_mapping(log=precluded(), rc=101,
+                                        expect_fail=True)
         self.assert_row(proc, rows, joint, "environment-precluded",
                         "s1-first-case")
 
@@ -268,27 +272,24 @@ class CiStopRacesTests(unittest.TestCase):
         proc, rows, joint = run_mapping(
             log=full_matrix_log(), rc=0, expect_fail=False)
         self.assert_row(proc, rows, joint, "qualified", "full-matrix")
-        self.assertIn("linked joint stop", joint["detail"])
+        self.assertIn("stop cases completed", joint["detail"])
 
     def test_one_case_pass_does_not_qualify_as_the_full_matrix(self):
         proc, rows, joint = run_mapping(
             log=one_case_log(), rc=0, expect_fail=False)
-        self.assert_row(proc, rows, joint, "failed", "matrix-short")
-        self.assertIn("wp7-stop", joint["detail"])
+        self.assert_row(proc, rows, joint, "failed", "qualified-count")
+        self.assertIn("1 of 12", joint["detail"])
 
     def test_linked_but_incomplete_case_does_not_qualify(self):
         proc, rows, joint = run_mapping(
             log=linked_but_incomplete_log(), rc=0, expect_fail=False)
-        self.assert_row(proc, rows, joint, "failed", "text-binding")
-        self.assertIn("wp7-stop", joint["detail"])
-        self.assertIn("7", joint["detail"])
+        self.assert_row(proc, rows, joint, "failed", "completion")
+        self.assertIn("wp7-stop7", joint["detail"])
 
     def test_malformed_completion_marker_does_not_qualify(self):
         proc, rows, joint = run_mapping(
             log=malformed_completion_log(), rc=0, expect_fail=False)
-        self.assert_row(proc, rows, joint, "failed", "record-malformed")
-        self.assertIn("wp7-stop", joint["detail"])
-        self.assertIn("7", joint["detail"])
+        self.assert_row(proc, rows, joint, "failed", "record-misplaced")
 
     def test_qualifying_entry_ignores_inherited_matrix_narrowing(self):
         proc, rows, joint = run_mapping(
@@ -298,291 +299,252 @@ class CiStopRacesTests(unittest.TestCase):
         self.assert_row(proc, rows, joint, "qualified", "full-matrix")
 
     def test_unattributed_no_feed_run_fails_with_its_cause(self):
-        log = failed_log(unattributed_body(4))
-        self.assertNotIn(WEDGE_TEXT, log)
-        self.assertNotIn("s1-precluded", log)
+        log = failed_log(no_feed_record(4, "no-feeds-unattributed"))
         proc, rows, joint = run_mapping(log=log, rc=101, expect_fail=False)
         self.assert_row(proc, rows, joint, "failed", "no-feed-unattributed")
         self.assertIn("unattributed", joint["detail"])
 
     def test_old_collapsed_s1_tag_without_receipt_fails(self):
-        # The archived probe tag with the collapsed message (no
-        # producer-seal receipt) is ambiguous, never environmental.
-        log = failed_log(s1_body(error="Error: wp7-stop0: no joint feeds "
-                                 "from the linked session; not attempted"))
-        self.assertNotIn(WEDGE_TEXT, log)
-        proc, rows, joint = run_mapping(log=log, rc=101, expect_fail=False)
-        self.assert_row(proc, rows, joint, "failed", "receipt-mismatch")
-        self.assertIn("ambiguous", joint["detail"])
+        # A preclusion whose receipt is the archived collapsed message
+        # is ambiguous, never environmental.
+        rec = precluded_record()
+        rec["terminal"]["receipt"] = "no joint feeds from the linked session"
+        proc, rows, joint = run_mapping(log=failed_log(rec), rc=101,
+                                        expect_fail=False)
+        self.assert_row(proc, rows, joint, "failed", "no-feed-binding")
 
     def test_embedded_s1_tag_does_not_preclude(self):
-        log = failed_log([
-            "JOINT_STOP wp7-stop0: P11SCOPE_CELL_BRANCH=wp7-stop0:s1-precluded "
-            "emitted late", S1_ERROR.format(k=0)])
-        self.assertNotIn(WEDGE_TEXT, log)
+        # The old free-text tag and receipt alone carry no verdict.
+        log = text_only_log([
+            "JOINT_STOP wp7-stop0: P11SCOPE_CELL_BRANCH=wp7-stop0:s1-precluded",
+            "Error: wp7-stop0: %s; not attempted" % S1_RECEIPT])
         proc, rows, joint = run_mapping(log=log, rc=101, expect_fail=False)
-        self.assert_row(proc, rows, joint, "failed", "record-malformed")
+        self.assert_row(proc, rows, joint, "failed", "record-missing")
 
     def test_suffixed_s1_lookalike_does_not_preclude(self):
-        log = failed_log([
-            "P11SCOPE_CELL_BRANCH=wp7-stop7:s1-precluded-suspected",
-            S1_ERROR.format(k=7)])
-        self.assertNotIn(WEDGE_TEXT, log)
-        proc, rows, joint = run_mapping(log=log, rc=101, expect_fail=False)
-        self.assert_row(proc, rows, joint, "failed", "record-malformed")
+        rec = precluded_record()
+        rec["cases"][0]["branch"] = "s1-precluded-suspected"
+        proc, rows, joint = run_mapping(log=failed_log(rec), rc=101,
+                                        expect_fail=False)
+        self.assert_row(proc, rows, joint, "failed", "record-schema")
 
     def test_s1_after_seven_linked_completions_fails(self):
-        # Seven cases linked and completed, then an S1 tag: preclusion
-        # holds only before any linked case.
-        log = failed_log(s1_body(7))
-        self.assertNotIn(WEDGE_TEXT, log)
-        proc, rows, joint = run_mapping(log=log, rc=101, expect_fail=False)
+        proc, rows, joint = run_mapping(log=failed_log(no_feed_record(7)),
+                                        rc=101, expect_fail=False)
         self.assert_row(proc, rows, joint, "failed", "s1-after-linked")
-        self.assertIn("before any linked case", joint["detail"])
+        self.assertIn("after linked cases", joint["detail"])
 
     def test_s1_with_linked_tags_fails(self):
-        log = failed_log(s1_body(1))
-        self.assertNotIn(WEDGE_TEXT, log)
-        proc, rows, joint = run_mapping(log=log, rc=101, expect_fail=False)
+        proc, rows, joint = run_mapping(log=failed_log(no_feed_record(1)),
+                                        rc=101, expect_fail=False)
         self.assert_row(proc, rows, joint, "failed", "s1-after-linked")
-        self.assertIn("mixed", joint["detail"])
 
     def test_s1_without_receipt_fails(self):
-        log = failed_log(["P11SCOPE_CELL_BRANCH=wp7-stop0:s1-precluded",
-                          "Error: wp7-stop0: q1 fixture failed"])
-        self.assertNotIn(WEDGE_TEXT, log)
-        self.assertNotIn("producers unlinked", log)
-        proc, rows, joint = run_mapping(log=log, rc=101, expect_fail=False)
-        self.assert_row(proc, rows, joint, "failed", "receipt-mismatch")
-        self.assertIn("ambiguous", joint["detail"])
+        rec = precluded_record()
+        rec["terminal"]["receipt"] = ""
+        proc, rows, joint = run_mapping(log=failed_log(rec), rc=101,
+                                        expect_fail=False)
+        self.assert_row(proc, rows, joint, "failed", "no-feed-binding")
 
     def test_s1_with_unattributed_mixed_fails(self):
-        log = failed_log(["P11SCOPE_CELL_BRANCH=wp7-stop0:s1-precluded",
-                          "P11SCOPE_CELL_BRANCH=wp7-stop1:no-feeds-unattributed",
-                          UNATTRIBUTED_ERROR.format(k=1)])
-        self.assertNotIn(WEDGE_TEXT, log)
-        proc, rows, joint = run_mapping(log=log, rc=101, expect_fail=False)
-        self.assert_row(proc, rows, joint, "failed", "sequence")
+        rec = no_feed_record(1, "no-feeds-unattributed")
+        rec["cases"][0] = case_record(0, "s1-precluded")
+        proc, rows, joint = run_mapping(log=failed_log(rec), rc=101,
+                                        expect_fail=False)
+        self.assert_row(proc, rows, joint, "failed", "case-branch")
 
     def test_s1_with_wedge_mixed_fails_under_expect_one(self):
-        log = failed_log(s1_body() + [
-            "JOINT_STOP wp7-stop0: finish wedges: %s" % WEDGE_TEXT])
-        proc, rows, joint = run_mapping(log=log, rc=101, expect_fail=True)
-        self.assert_row(proc, rows, joint, "failed", "text-reserved")
+        rec = precluded_record()
+        rec["terminal"] = {"kind": "wedge", "case": 0}
+        proc, rows, joint = run_mapping(log=failed_log(rec), rc=101,
+                                        expect_fail=True)
+        self.assert_row(proc, rows, joint, "failed", "wedge-binding")
 
     def test_pass_with_s1_tag_fails(self):
-        log = frame(matrix_body() + [
-            "P11SCOPE_CELL_BRANCH=wp7-stop0:s1-precluded"], True)
-        proc, rows, joint = run_mapping(log=log, rc=0, expect_fail=False)
-        self.assert_row(proc, rows, joint, "failed", "sequence")
+        rec = qualified_record()
+        rec["cases"][3] = case_record(3, "s1-precluded")
+        proc, rows, joint = run_mapping(log=log_for(rec), rc=0,
+                                        expect_fail=False)
+        self.assert_row(proc, rows, joint, "failed", "case-branch")
 
     def test_pass_with_first_case_s1_tag_fails(self):
-        log = frame(["P11SCOPE_CELL_BRANCH=wp7-stop0:s1-precluded"], True)
-        proc, rows, joint = run_mapping(log=log, rc=0, expect_fail=False)
-        self.assert_row(proc, rows, joint, "failed", "pass-with-no-feed")
-        self.assertIn("never precludes", joint["detail"])
+        rec = record([case_record(0, "s1-precluded")], {"kind": "qualified"})
+        proc, rows, joint = run_mapping(log=log_for(rec), rc=0,
+                                        expect_fail=False)
+        self.assert_row(proc, rows, joint, "failed", "terminal-case")
 
     def test_two_passed_does_not_qualify(self):
-        log = frame(matrix_body(), True, summary=(
+        log = passing(summary=(
             "test result: ok. 2 passed; 0 failed; 0 ignored; "
             "0 measured; 0 filtered out; finished in 180.00s"))
         proc, rows, joint = run_mapping(log=log, rc=0, expect_fail=False)
         self.assert_row(proc, rows, joint, "failed", "summary-counts")
 
     def test_out_of_range_s1_tag_does_not_preclude(self):
-        log = failed_log(["P11SCOPE_CELL_BRANCH=wp7-stop12:s1-precluded",
-                          S1_ERROR.format(k=12)])
-        self.assertNotIn(WEDGE_TEXT, log)
-        proc, rows, joint = run_mapping(log=log, rc=101, expect_fail=False)
-        self.assert_row(proc, rows, joint, "failed", "record-malformed")
+        rec = precluded_record()
+        rec["cases"][0].update(index=12, name="wp7-stop12", prep=3)
+        rec["terminal"]["case"] = 12
+        proc, rows, joint = run_mapping(log=failed_log(rec), rc=101,
+                                        expect_fail=False)
+        self.assert_row(proc, rows, joint, "failed", "case-sequence")
 
     def test_unattributed_embedded_maps_to_generic_fail(self):
-        log = failed_log([
+        log = text_only_log([
             "JOINT_STOP wp7-stop4: P11SCOPE_CELL_BRANCH=wp7-stop4:"
             "no-feeds-unattributed emitted late",
-            UNATTRIBUTED_ERROR.format(k=4)])
-        self.assertNotIn(WEDGE_TEXT, log)
-        self.assertNotIn("s1-precluded", log)
+            "Error: wp7-stop4: %s; not attempted" % UNATTRIBUTED_RECEIPT])
         proc, rows, joint = run_mapping(log=log, rc=101, expect_fail=False)
-        self.assert_row(proc, rows, joint, "failed", "record-malformed")
+        self.assert_row(proc, rows, joint, "failed", "record-missing")
 
     def test_s1_tag_with_mismatched_receipt_case_fails(self):
-        # Case-0 tag with a case-7 terminal error: the tag and its
-        # receipt name different cases, so the preclusion is unproven.
-        log = failed_log(s1_body(error=S1_ERROR.format(k=7)))
-        self.assertNotIn(WEDGE_TEXT, log)
-        proc, rows, joint = run_mapping(log=log, rc=101, expect_fail=False)
-        self.assert_row(proc, rows, joint, "failed", "receipt-mismatch")
+        # Case-0 S1 with a terminal naming case 7: unbound preclusion.
+        rec = precluded_record()
+        rec["terminal"]["case"] = 7
+        proc, rows, joint = run_mapping(log=failed_log(rec), rc=101,
+                                        expect_fail=False)
+        self.assert_row(proc, rows, joint, "failed", "terminal-case")
 
     def test_lone_later_s1_preclusion_fails(self):
-        # A case-7 tag and error with no earlier records: the
-        # qualifying entry runs the matrix in order and the first
-        # error ends it, so a lone later preclusion is impossible.
-        log = failed_log(["P11SCOPE_CELL_BRANCH=wp7-stop7:s1-precluded",
-                          S1_ERROR.format(k=7)])
-        self.assertNotIn(WEDGE_TEXT, log)
-        proc, rows, joint = run_mapping(log=log, rc=101, expect_fail=False)
-        self.assert_row(proc, rows, joint, "failed", "sequence")
+        # A lone case-7 record: the matrix opens case 0 first.
+        rec = no_feed_record(7)
+        rec["cases"] = rec["cases"][7:]
+        proc, rows, joint = run_mapping(log=failed_log(rec), rc=101,
+                                        expect_fail=False)
+        self.assert_row(proc, rows, joint, "failed", "case-sequence")
 
     def test_s1_receipt_inside_diagnostic_fails(self):
-        # Case-0 tag with the receipt substring inside a diagnostic
-        # line instead of standing as the full terminal error.
-        log = failed_log(["P11SCOPE_CELL_BRANCH=wp7-stop0:s1-precluded",
-                          "JOINT_STOP wp7-stop0: diagnostic "
-                          + S1_ERROR.format(k=0)[len("Error: "):] + " seen",
-                          "Error: wp7-stop0: q1 fixture failed"])
-        self.assertNotIn(WEDGE_TEXT, log)
+        # The receipt in free text never turns a case failure into a
+        # preclusion: only the record's terminal counts.
+        rec = case_failed_record(0, "drive", error="q1 fixture failed")
+        log = frame(["JOINT_STOP wp7-stop0: diagnostic %s seen" % S1_RECEIPT,
+                     "", record_line(rec)], False)
         proc, rows, joint = run_mapping(log=log, rc=101, expect_fail=False)
-        self.assert_row(proc, rows, joint, "failed", "receipt-stray")
+        self.assert_row(proc, rows, joint, "failed", "case-failed")
 
     def test_s1_with_conflicting_unattributed_receipt_fails(self):
-        # Case-0 tag and error plus a contradictory unattributed
-        # error without its tag: the run claims both seals.
-        log = failed_log(s1_body() + [UNATTRIBUTED_ERROR.format(k=0)])
-        self.assertNotIn(WEDGE_TEXT, log)
-        proc, rows, joint = run_mapping(log=log, rc=101, expect_fail=False)
-        self.assert_row(proc, rows, joint, "failed", "error-count")
+        rec = precluded_record()
+        rec["terminal"]["receipt"] = UNATTRIBUTED_RECEIPT
+        proc, rows, joint = run_mapping(log=failed_log(rec), rc=101,
+                                        expect_fail=False)
+        self.assert_row(proc, rows, joint, "failed", "no-feed-binding")
 
     def test_mixed_unattributed_wedge_fails_under_expect_one(self):
-        # Explicit unattributed tag and receipt plus a wedge-text
-        # diagnostic: under expectation this is the unattributed
-        # cause, never an expected failure.
-        log = failed_log(unattributed_body(4)[:-1] + [
-            "JOINT_STOP wp7-stop4: diagnostic %s seen" % WEDGE_TEXT,
-            UNATTRIBUTED_ERROR.format(k=4)])
-        proc, rows, joint = run_mapping(log=log, rc=101, expect_fail=True)
-        self.assert_row(proc, rows, joint, "failed", "text-reserved")
+        rec = no_feed_record(4, "no-feeds-unattributed")
+        rec["terminal"] = {"kind": "wedge", "case": 4}
+        proc, rows, joint = run_mapping(log=failed_log(rec), rc=101,
+                                        expect_fail=True)
+        self.assert_row(proc, rows, joint, "failed", "wedge-binding")
 
     def test_malformed_pass_summary_fails(self):
-        # Full 12-case matrix but a malformed libtest summary: the
-        # pass count carries a suffix and failures are nonzero.
-        log = frame(matrix_body(), True, summary=(
+        log = passing(summary=(
             "test result: ok. 1 passed_suspected; 9 failed; 0 ignored; "
             "0 measured; 0 filtered out; finished in 180.00s"))
         proc, rows, joint = run_mapping(log=log, rc=0, expect_fail=False)
         self.assert_row(proc, rows, joint, "failed", "summary-malformed")
 
     def test_pass_followed_by_failed_terminal_fails(self):
-        # A valid summary followed by a failed terminal result: one
-        # terminal summary only.
-        log = frame(matrix_body(), True, tail=[FAILED_SUMMARY])
+        log = passing(tail=[FAILED_SUMMARY])
         proc, rows, joint = run_mapping(log=log, rc=0, expect_fail=False)
         self.assert_row(proc, rows, joint, "failed", "summary-duplicate")
 
     def test_garbage_after_the_ignored_count_fails(self):
-        log = frame(matrix_body(), True, summary=(
+        log = passing(summary=(
             "test result: ok. 1 passed; 0 failed; 0 ignored; 9 failed; "
             "garbage"))
         proc, rows, joint = run_mapping(log=log, rc=0, expect_fail=False)
         self.assert_row(proc, rows, joint, "failed", "summary-malformed")
 
     def test_error_after_a_healthy_summary_fails(self):
-        log = frame(matrix_body(), True,
-                    tail=["Error: joint cleanup failed"])
+        log = passing(tail=["Error: joint cleanup failed"])
         proc, rows, joint = run_mapping(log=log, rc=0, expect_fail=False)
         self.assert_row(proc, rows, joint, "failed", "summary-not-terminal")
 
     def test_s1_receipt_then_a_later_different_error_fails(self):
-        # The real-framed S1 pair, then a different terminal error
-        # before the same footer: competing errors never preclude.
-        log = failed_log(s1_body() + [
-            "Error: wp7-stop0: joint cleanup failed"])
+        # A second record after the preclusion: the cell prints one.
+        log = log_for(precluded_record()).replace(
+            "\nError: ", "\n" + record_line(case_failed_record(
+                0, "drive", error="joint cleanup failed")) + "\nError: ", 1)
         proc, rows, joint = run_mapping(log=log, rc=101, expect_fail=False)
-        self.assert_row(proc, rows, joint, "failed", "error-count")
+        self.assert_row(proc, rows, joint, "failed", "record-duplicate")
 
     def test_unprefixed_s1_receipt_then_a_different_error_fails(self):
-        log = failed_log(["P11SCOPE_CELL_BRANCH=wp7-stop0:s1-precluded",
-                          S1_ERROR.format(k=0)[len("Error: "):],
-                          "Error: wp7-stop0: joint cleanup failed"])
+        rec = case_failed_record(0, "drive", error="joint cleanup failed")
+        log = frame([S1_RECEIPT, "", record_line(rec)], False)
         proc, rows, joint = run_mapping(log=log, rc=101, expect_fail=False)
-        self.assert_row(proc, rows, joint, "failed", "receipt-stray")
+        self.assert_row(proc, rows, joint, "failed", "case-failed")
 
     def test_s1_log_with_a_non_libtest_status_fails(self):
-        # A clean S1 control log with exit 137 (the child status a
-        # SIGKILL leaves): never a libtest failure.
         proc, rows, joint = run_mapping(
-            log=failed_log(s1_body()), rc=137, expect_fail=False)
+            log=precluded(), rc=137, expect_fail=False)
         self.assert_row(proc, rows, joint, "failed", "exit-status")
 
     def test_s1_log_with_a_real_signal_exit_fails(self):
         proc, rows, joint = run_mapping(
-            log=failed_log(s1_body()), rc=0, expect_fail=False,
+            log=precluded(), rc=0, expect_fail=False,
             stub_body=STUB_LIBTEST_SIGNAL, extra_env={"STUB_SIGNAL": "KILL"})
         self.assert_row(proc, rows, joint, "failed", "exit-status")
         self.assertIn("137", joint["detail"])
 
     def test_receipt_only_pass_fails_for_both_causes(self):
-        for receipt in (UNATTRIBUTED_ERROR.format(k=0),
-                        S1_ERROR.format(k=0)):
-            for line, reason in ((receipt, "error-count"),
-                                 (receipt[len("Error: "):], "receipt-stray")):
-                with self.subTest(line=line):
-                    log = frame(matrix_body() + [line], True)
-                    proc, rows, joint = run_mapping(
-                        log=log, rc=0, expect_fail=False)
-                    self.assert_row(proc, rows, joint, "failed", reason)
+        for rec in (precluded_record(),
+                    no_feed_record(0, "no-feeds-unattributed")):
+            with self.subTest(cause=rec["terminal"]["cause"]):
+                proc, rows, joint = run_mapping(
+                    log=log_for(rec, ok=True), rc=0, expect_fail=False)
+                self.assert_row(proc, rows, joint, "failed",
+                                "terminal-status")
 
     def test_wedge_arm_refuses_an_unrelated_terminal_error(self):
-        # A linked case, a diagnostic with the wedge text, then an
-        # unrelated terminal error: under expectation that is a
-        # failure, not the wedge.
-        log = failed_log(case_head(0) + case_outcome(0) + [
-            "JOINT_STOP wp7-stop0: diagnostic %s" % WEDGE_TEXT,
-            "Error: wp7-stop0: q1 fixture failed"])
-        proc, rows, joint = run_mapping(log=log, rc=101, expect_fail=True)
-        self.assert_row(proc, rows, joint, "failed", "text-reserved")
+        proc, rows, joint = run_mapping(
+            log=failed_log(case_failed_record(0, "drive",
+                                              error="q1 fixture failed")),
+            rc=101, expect_fail=True)
+        self.assert_row(proc, rows, joint, "failed", "case-failed")
 
     def test_wedge_evidence_anywhere_in_an_s1_log_refuses(self):
-        # Contradictory wedge evidence before the tag, between the tag
-        # and its receipt, or after the receipt: a preclusion log holds
-        # nothing but the case-0 tag and its receipt.
-        diag = "JOINT_STOP wp7-stop0: finish wedges: %s" % WEDGE_TEXT
-        body = s1_body()
-        for label, lines, reason in (
-                ("before-tag", body[:-2] + [diag] + body[-2:],
-                 "text-reserved"),
-                ("between", body[:-1] + [diag] + body[-1:], "text-reserved"),
-                ("after", body + [diag], "text-reserved"),
-                ("plain-between",
-                 body[:-1] + ["JOINT_STOP wp7-stop0: late"] + body[-1:],
-                 "evidence-after-preclusion")):
+        # A preclusion is case 0 alone, unlinked and undriven: a
+        # collected outcome, a linked branch or an earlier case refuses.
+        linked = precluded_record()
+        linked["cases"][0].update(branch="linked")
+        earlier = no_feed_record(1)
+        earlier["terminal"]["kind"] = "precluded"
+        driven = precluded_record()
+        driven["cases"][0]["outcome"] = wedge_outcome(0)
+        for label, rec, reason in (
+                ("outcome", driven, "case-outcome"),
+                ("linked", linked, "no-feed-binding"),
+                ("earlier-case", earlier, "precluded-binding")):
             for expect in (False, True):
                 with self.subTest(position=label, expect=expect):
                     proc, rows, joint = run_mapping(
-                        log=failed_log(lines), rc=101, expect_fail=expect)
+                        log=failed_log(rec), rc=101, expect_fail=expect)
                     self.assert_row(proc, rows, joint, "failed", reason)
 
     def test_wedge_arm_refuses_a_successful_or_malformed_terminal(self):
         k = 5
-        head = matrix_body(range(k)) + case_head(k)
-        cases = (
-            ("success", head + case_outcome(k, "published") + [
-                wedge_error(offset_of(k), "published", latched=True,
-                            wound="joined", taken=True)], "wedge-success"),
-            ("truncated", wedge_body()[:-1] + [
-                "Error: offset %d: the finish must reach Published then "
-                "WoundDown: offset=%d begin=polling finish=unpublished "
-                % (offset_of(k), offset_of(k))],
-             "wedge-record"),
-            ("marker", wedge_body()[:-1] + [
-                wedge_error(offset_of(k)) + " P11SCOPE_STOP_COMPLETE=wp7-stop5"],
-             "terminal-reserved"))
-        for label, lines, reason in cases:
+        success = wedge_record(k)
+        success["cases"][k]["outcome"] = healthy_outcome(offset_of(k))
+        at_q = wedge_record(k)
+        at_q["cases"][k]["outcome"]["api_a"] = 1
+        undriven = wedge_record(k)
+        undriven["cases"][k]["outcome"] = None
+        for label, rec, reason in (
+                ("success", success, "completion"),
+                ("at-q-first", at_q, "wedge-binding"),
+                ("undriven", undriven, "wedge-binding")):
             with self.subTest(case=label):
                 proc, rows, joint = run_mapping(
-                    log=failed_log(lines), rc=101, expect_fail=True)
+                    log=failed_log(rec), rc=101, expect_fail=True)
                 self.assert_row(proc, rows, joint, "failed", reason)
 
     def test_malformed_no_feed_branch_record_on_a_pass_refuses(self):
-        for line in ("P11SCOPE_CELL_BRANCH:wp7-stop0:no-feeds-unattributed",
-                     "P11SCOPE_CELL_BRANCHwp7-stop0:s1-precluded",
-                     "JOINT_STOP note: no-feeds-unattributed"):
-            with self.subTest(line=line):
+        for branch in ("no-feeds-unattributed:", "linked ", "S1"):
+            with self.subTest(branch=branch):
+                rec = qualified_record()
+                rec["cases"][0]["branch"] = branch
                 proc, rows, joint = run_mapping(
-                    log=frame(matrix_body() + [line], True), rc=0,
-                    expect_fail=False)
-                self.assert_row(proc, rows, joint, "failed",
-                                "record-malformed")
+                    log=log_for(rec), rc=0, expect_fail=False)
+                self.assert_row(proc, rows, joint, "failed", "record-schema")
 
     def test_missing_validator_fails_the_joint_row(self):
         proc, rows, joint = run_mapping(
@@ -596,10 +558,7 @@ class CiStopRacesTests(unittest.TestCase):
         self.assert_row(proc, rows, joint, "failed", "unexpected-pass")
 
     def test_failure_without_signature_fails(self):
-        log = failed_log(matrix_body(range(2)) + case_head(2) + [
-            "Error: offset 5: two-owner reconciliation failed: entered 2"])
-        self.assertNotIn(WEDGE_TEXT, log)
-        self.assertNotIn("s1-precluded", log)
+        log = failed_log(case_failed_record(2))
         proc, rows, joint = run_mapping(log=log, rc=101, expect_fail=True)
         self.assert_row(proc, rows, joint, "failed", "case-failed")
 
@@ -608,7 +567,7 @@ class CiStopRacesTests(unittest.TestCase):
                "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; "
                "0 filtered out; finished in 0.00s\n\n")
         proc, rows, joint = run_mapping(log=log, rc=0, expect_fail=False)
-        self.assert_row(proc, rows, joint, "failed", "header")
+        self.assert_row(proc, rows, joint, "failed", "summary-counts")
 
     def test_unignored_cell_fails_the_joint_row(self):
         proc, rows, joint = run_mapping(
@@ -623,9 +582,8 @@ class CiStopRacesTests(unittest.TestCase):
         self.assert_row(proc, rows, joint, "qualified", "full-matrix")
 
     def test_wedge_signature_under_expect_zero_names_the_wedge(self):
-        log = failed_log(wedge_body())
-        self.assertNotIn("s1-precluded", log)
-        proc, rows, joint = run_mapping(log=log, rc=101, expect_fail=False)
+        proc, rows, joint = run_mapping(log=wedged(), rc=101,
+                                        expect_fail=False)
         self.assert_row(proc, rows, joint, "failed", "wedge-unexpected")
         self.assertIn("wedge", joint["detail"].lower())
         self.assertNotIn("without the wedge signature", joint["detail"])

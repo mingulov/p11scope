@@ -40,8 +40,8 @@ RUNNER = ROOT / "scripts" / "run-privileged-lib-tests.sh"
 BTRFS_HELPER = ROOT / "scripts" / "ci" / "prepare-btrfs-tmpdir.sh"
 sys.path.insert(0, str(ROOT / "tests" / "python"))
 from joint_stop_logs import (  # noqa: E402
-    CELL as JOINT_CELL, FAILED_SUMMARY, OK_SUMMARY, S1_ERROR,
-    UNATTRIBUTED_ERROR, frame, matrix_body,
+    CELL as JOINT_CELL, FAILED_SUMMARY, OK_SUMMARY, case_record, log_for,
+    no_feed_record, passing, precluded_record, qualified_record, record_line,
 )
 CHECKER_MOD = runpy.run_path(str(CHECKER))
 
@@ -1675,72 +1675,75 @@ class IgnoredTestsTests(unittest.TestCase):
         return lines
 
     def test_full_matrix_gate_verbatim_block_judges_completion_fixtures(self):
-        # A full matrix passes; a linked-but-incomplete one (case 7
-        # linked, never completed) fails naming 7; a diagnostic-embedded
-        # completion line fails; a full matrix with an S1 preclusion tag
-        # fails; a narrowed one-case pass fails as matrix-short.
-        incomplete = [line for line in matrix_body()
-                      if line != "P11SCOPE_STOP_COMPLETE=wp7-stop7"]
-        embedded = [("JOINT_STOP wp7-stop7: P11SCOPE_STOP_COMPLETE=wp7-stop7 "
-                     "emitted late")
-                    if line == "P11SCOPE_STOP_COMPLETE=wp7-stop7" else line
-                    for line in matrix_body()]
-        mixed = matrix_body() + ["P11SCOPE_CELL_BRANCH=wp7-stop0:s1-precluded"]
+        # A full matrix record passes; a record whose case 7 never
+        # completed fails naming it; a record glued behind a diagnostic
+        # fails; a record with an S1 case inside the matrix fails; a
+        # record holding one case fails as short.
+        incomplete = qualified_record()
+        incomplete["cases"][7]["completed"] = False
+        glued = log_for(qualified_record(), threaded=False).replace(
+            "\n" + record_line(qualified_record()),
+            "\nJOINT_STOP wp7-stop7: " + record_line(qualified_record()))
+        mixed = qualified_record()
+        mixed["cases"][3] = case_record(3, "s1-precluded")
+        short = qualified_record()
+        short["cases"] = short["cases"][:1]
         lines = self._run_verdict_block([
-            ("full", frame(matrix_body(), True, threaded=False), 0, True),
-            ("incomplete", frame(incomplete, True, threaded=False), 0, True),
-            ("embedded", frame(embedded, True, threaded=False), 0, True),
-            ("mixed", frame(mixed, True, threaded=False), 0, True),
-            ("short", frame(matrix_body(range(1)), True, threaded=False), 0,
-             True),
+            ("full", passing(threaded=False), 0, True),
+            ("incomplete", log_for(incomplete, threaded=False), 0, True),
+            ("embedded", glued, 0, True),
+            ("mixed", log_for(mixed, threaded=False), 0, True),
+            ("short", log_for(short, threaded=False), 0, True),
         ])
         self.assertIn("verdict=PASS", lines[0], lines)
         self.assertIn("note=@@>", lines[0], lines)
         self.assertIn("verdict=FAIL", lines[1], lines)
-        self.assertIn("[text-binding]", lines[1], lines)
+        self.assertIn("[completion]", lines[1], lines)
         self.assertIn("wp7-stop7", lines[1], lines)
         self.assertIn("verdict=FAIL", lines[2], lines)
-        self.assertIn("[record-malformed]", lines[2], lines)
-        self.assertIn("wp7-stop7", lines[2], lines)
+        self.assertIn("[record-misplaced]", lines[2], lines)
         self.assertIn("verdict=FAIL", lines[3], lines)
-        self.assertIn("[sequence]", lines[3], lines)
+        self.assertIn("[case-branch]", lines[3], lines)
         self.assertIn("verdict=FAIL", lines[4], lines)
-        self.assertIn("[matrix-short]", lines[4], lines)
+        self.assertIn("[qualified-count]", lines[4], lines)
 
     def test_full_matrix_verdict_requires_a_strict_terminal_result(self):
         # The verdict and the printed result line come from the one
-        # validated terminal summary: a malformed pass summary, garbage
-        # after the ignored count, a valid summary followed by a failed
-        # one, a healthy summary followed by an error, a pass carrying a
-        # no-feed receipt of either cause (with or without the Error
-        # prefix), and an exit-0 log after a signal-shaped status all
-        # fail with the validator's reason. Generic cells keep their
-        # own strict full-line summary check.
+        # validated terminal summary and the cell's one record: a
+        # malformed pass summary, garbage after the ignored count, a
+        # valid summary followed by a failed one, a healthy summary
+        # followed by an error, a pass carrying a no-feed record of
+        # either cause, a forged record in free text, and a
+        # signal-shaped status all fail with the validator's reason.
+        # Generic cells keep their own strict full-line summary check.
         ok = OK_SUMMARY
+        stem = qualified_record()
+        stem["cases"][0]["branch"] = "no-feeds-unattributed:"
+        forged = passing(threaded=False).replace(
+            "\nJOINT_R16 r16-map", "\nchild: " + record_line(
+                no_feed_record(0, "no-feeds-unattributed"))
+            + "\nJOINT_R16 r16-map", 1)
         cases = [
-            ("healthy", frame(matrix_body(), True, threaded=False), 0, True),
-            ("healthy-threaded", frame(matrix_body(), True), 0, True),
-            ("malformed", frame(matrix_body(), True, threaded=False, summary=(
+            ("healthy", passing(threaded=False), 0, True),
+            ("healthy-threaded", passing(), 0, True),
+            ("malformed", passing(threaded=False, summary=(
                 "test result: ok. 1 passed_suspected; 9 failed; 0 ignored; "
                 "0 measured; 0 filtered out; finished in 180.00s")), 0, True),
-            ("garbage", frame(matrix_body(), True, threaded=False, summary=(
+            ("garbage", passing(threaded=False, summary=(
                 "test result: ok. 1 passed; 0 failed; 0 ignored; 9 failed; "
                 "garbage")), 0, True),
-            ("valid-then-failed", frame(matrix_body(), True, threaded=False,
-                                        tail=[FAILED_SUMMARY]), 0, True),
-            ("then-error", frame(matrix_body(), True, threaded=False,
-                                 tail=["Error: joint cleanup failed"]), 0,
+            ("valid-then-failed", passing(threaded=False,
+                                          tail=[FAILED_SUMMARY]), 0, True),
+            ("then-error", passing(threaded=False,
+                                   tail=["Error: joint cleanup failed"]), 0,
              True),
-            ("unattributed-receipt", frame(
-                matrix_body() + [UNATTRIBUTED_ERROR.format(k=0)], True,
+            ("unattributed-receipt", log_for(
+                no_feed_record(0, "no-feeds-unattributed"), ok=True,
                 threaded=False), 0, True),
-            ("unattributed-text", frame(
-                matrix_body() + [UNATTRIBUTED_ERROR.format(k=0)[7:]], True,
-                threaded=False), 0, True),
-            ("s1-receipt", frame(
-                matrix_body() + [S1_ERROR.format(k=0)], True,
-                threaded=False), 0, True),
-            ("signal", frame(matrix_body(), True, threaded=False), 137, True),
+            ("unattributed-text", forged, 0, True),
+            ("s1-receipt", log_for(precluded_record(), ok=True,
+                                   threaded=False), 0, True),
+            ("signal", passing(threaded=False), 137, True),
             ("generic-ok", "\nrunning 1 test\ntest x ... ok\n\n" + ok + "\n",
              0, False),
             ("generic-garbage", "\nrunning 1 test\ntest x ... ok\n\n"
@@ -1752,13 +1755,11 @@ class IgnoredTestsTests(unittest.TestCase):
              + ok + "\nError: fixture cleanup failed\n", 0, False),
             ("generic-two-summaries", "\nrunning 1 test\n" + FAILED_SUMMARY
              + "\ntest x ... ok\n\n" + ok + "\n", 0, False),
-            ("branch-stem-colon", frame(
-                matrix_body()
-                + ["P11SCOPE_CELL_BRANCH:wp7-stop0:no-feeds-unattributed"],
-                True, threaded=False), 0, True),
-            ("branch-stem-bare", frame(
-                matrix_body() + ["P11SCOPE_CELL_BRANCHwp7-stop0:s1-precluded"],
-                True, threaded=False), 0, True),
+            ("branch-stem-colon", log_for(stem, threaded=False), 0, True),
+            ("branch-stem-bare", passing(threaded=False).replace(
+                "\n" + record_line(qualified_record()),
+                "\nP11SCOPE_CELL_BRANCH" + record_line(qualified_record())),
+             0, True),
         ]
         lines = self._run_verdict_block(cases)
         want = {
@@ -1767,16 +1768,16 @@ class IgnoredTestsTests(unittest.TestCase):
             "garbage": ("FAIL", "summary-malformed"),
             "valid-then-failed": ("FAIL", "summary-duplicate"),
             "then-error": ("FAIL", "summary-not-terminal"),
-            "unattributed-receipt": ("FAIL", "error-count"),
-            "unattributed-text": ("FAIL", "receipt-stray"),
-            "s1-receipt": ("FAIL", "error-count"),
+            "unattributed-receipt": ("FAIL", "terminal-status"),
+            "unattributed-text": ("FAIL", "record-duplicate"),
+            "s1-receipt": ("FAIL", "terminal-status"),
             "signal": ("FAIL", "exit-status"),
             "generic-ok": ("PASS", None), "generic-garbage": ("FAIL", None),
             "generic-prefix": ("FAIL", None),
             "generic-then-error": ("FAIL", None),
             "generic-two-summaries": ("FAIL", None),
-            "branch-stem-colon": ("FAIL", "record-malformed"),
-            "branch-stem-bare": ("FAIL", "record-malformed"),
+            "branch-stem-colon": ("FAIL", "record-schema"),
+            "branch-stem-bare": ("FAIL", "record-misplaced"),
         }
         for (label, _body, _rc, _full), line in zip(cases, lines):
             verdict, reason = want[label]

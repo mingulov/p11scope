@@ -1458,6 +1458,8 @@ fn drive<L: CaptureLane<PidPin>>(
 /// Collected terminal state of one stop-offset sub-case. Every finish loop
 /// is bounded and every outcome is collected, never ensured mid-drive, so
 /// a wedged finish reports its full state instead of hanging the cell.
+/// It serializes field for field into the cell's verdict record.
+#[derive(serde::Serialize)]
 struct StopOutcome {
     offset_ms: u64,
     begin: String,
@@ -1531,6 +1533,7 @@ fn run_stop_offset(
     prep: Prep,
     offset_ms: u64,
     index: usize,
+    case: &mut StopCaseRecord,
 ) -> Result<StopOutcome> {
     use crate::inventory_promotion::lifecycle::NativeCompletionSource as _;
     let tag = format!("wp7-stop{index}");
@@ -1683,6 +1686,7 @@ fn run_stop_offset(
     // environmental tag, while the unattributed default (zero feeds,
     // no latched seal) gets its own tag and cause.
     let branch = joint_branch(&coordinator);
+    case.link(&branch);
     if let Some(reason) = no_feed_reason(&branch) {
         let feed_tag = no_feed_branch_tag(&branch).expect("a reason implies a tag");
         eprintln!("P11SCOPE_CELL_BRANCH={tag}:{feed_tag}");
@@ -1964,13 +1968,48 @@ fn run_stop_offset(
 /// `joint_machine_finish_after_pass_refresh_resolution_publishes_unlinked`
 /// and `joint_machine_finish_at_q_expiry_storage_refusal_still_latches`.
 /// `WP7_STOP_PREPS` / `WP7_STOP_OFFSETS` (comma-separated indices,
-/// default all) narrow the matrix for exploration. The qualifying
-/// entries (the long campaign runner and the S3 suite) unset both and
-/// require all 12 post-stop completion lines by exact full-line match;
-/// pre-stop linkage tags alone never qualify.
+/// default all) narrow the matrix for exploration; a narrowed run is
+/// never qualified.
+///
+/// The test owns its verdict: whatever happens (pass, preclusion, wedge
+/// or any other failure), it ends by printing exactly one
+/// `P11SCOPE_STOP_VERDICT=<json>` line built from its own case ledger
+/// (see `StopVerdictRecord`), and the qualifying entries (the long
+/// campaign runner and the S3 suite, through
+/// scripts/ci/joint_stop_verdict.py) judge only that record, the exit
+/// status and the libtest summary. A panic prints no record and
+/// therefore never qualifies.
 #[test]
 #[ignore = "privileged: linked Joint stop coverage (12-case matrix)"]
 fn privileged_joint_stop_after_last_waiter_resolves_publishes_final_lp64() -> Result<()> {
+    let mut ledger = StopLedger::default();
+    let result = run_stop_matrix(&mut ledger);
+    let record = ledger.finish(&result);
+    // The leading newline keeps the record on its own line even when
+    // single-threaded libtest left `test NAME ... ` unterminated.
+    eprintln!("\n{}", stop_verdict_line(&record));
+    result
+}
+
+/// Full matrix: three prep shapes times four stop offsets, with the full
+/// assert set on every combination; the first failure ends the cell.
+const STOP_PREPS: [Prep; 3] = [Prep::Services(1), Prep::ServicesPolls(1, 1), Prep::FullQ2];
+const STOP_OFFSETS_MS: [u64; 4] = [0, 1, 5, 20];
+const STOP_CASES: usize = STOP_PREPS.len() * STOP_OFFSETS_MS.len();
+/// Line marker of the cell's single verdict record.
+const STOP_VERDICT_MARKER: &str = "P11SCOPE_STOP_VERDICT=";
+/// Schema identifier of the record; scripts/ci/joint_stop_verdict.py
+/// accepts exactly this version.
+const STOP_VERDICT_SCHEMA: &str = "p11scope.joint-stop-verdict/1";
+/// The record names its cell, so a record from another cell (or a
+/// renamed one) never qualifies this one.
+const STOP_CELL: &str = "inventory::joint_stop_races_privileged_tests::\
+     privileged_joint_stop_after_last_waiter_resolves_publishes_final_lp64";
+
+fn run_stop_matrix(ledger: &mut StopLedger) -> Result<()> {
+    let want_preps = stop_matrix_selector("WP7_STOP_PREPS", STOP_PREPS.len())?;
+    let want_offsets = stop_matrix_selector("WP7_STOP_OFFSETS", STOP_OFFSETS_MS.len())?;
+    ledger.select(want_preps.clone(), want_offsets.clone());
     let workload = JointWorkload::build()?;
     let soft_manifest = provider_joint_manifest(
         workload.workload.dir.path(),
@@ -1984,29 +2023,24 @@ fn privileged_joint_stop_after_last_waiter_resolves_publishes_final_lp64() -> Re
         &["C_SignInit", "C_Sign"],
         "wp7-held.dr37.json",
     )?;
-    // Full matrix: three prep shapes times four stop offsets, with
-    // the full assert set on every combination; the first failure ends
-    // the cell. The journal-build run narrows this to the wedging prep
-    // once the matrix shows which prep wedges.
-    const PREPS: [Prep; 3] = [Prep::Services(1), Prep::ServicesPolls(1, 1), Prep::FullQ2];
-    const OFFSETS_MS: [u64; 4] = [0, 1, 5, 20];
-    let want_preps = stop_matrix_selector("WP7_STOP_PREPS", PREPS.len())?;
-    let want_offsets = stop_matrix_selector("WP7_STOP_OFFSETS", OFFSETS_MS.len())?;
-    for (prep_index, prep) in PREPS.iter().enumerate() {
+    for (prep_index, prep) in STOP_PREPS.iter().enumerate() {
         if !want_preps.contains(&prep_index) {
             continue;
         }
-        for (offset_index, offset) in OFFSETS_MS.iter().enumerate() {
+        for (offset_index, offset) in STOP_OFFSETS_MS.iter().enumerate() {
             if !want_offsets.contains(&offset_index) {
                 continue;
             }
+            let index = prep_index * STOP_OFFSETS_MS.len() + offset_index;
+            let case = ledger.open(index);
             run_stop_case(
                 &workload,
                 &soft_manifest,
                 &held_manifest,
                 *prep,
                 *offset,
-                prep_index * OFFSETS_MS.len() + offset_index,
+                index,
+                case,
             )?;
         }
     }
@@ -2035,16 +2069,9 @@ fn stop_matrix_selector(name: &str, len: usize) -> Result<Vec<usize>> {
         .collect()
 }
 
-/// Qualification evidence for one stop case: the completion line for
-/// `index`, returned only after `check_stop_outcome` succeeds. A
-/// caller that discards the error gets no line: the `?` propagates
-/// the failure instead of emitting anyway.
-fn stop_completion_line(outcome: &StopOutcome, offset_ms: u64, index: usize) -> Result<String> {
-    check_stop_outcome(outcome, offset_ms)?;
-    Ok(format!("P11SCOPE_STOP_COMPLETE=wp7-stop{index}"))
-}
-
-/// One prep times one offset: run the stop and check the full assert set.
+/// One prep times one offset: run the stop, collect its outcome into the
+/// case record and judge it there. The case is completed only by
+/// `StopCaseRecord::judge` after the full assert set passed.
 fn run_stop_case(
     workload: &JointWorkload,
     soft_manifest: &Path,
@@ -2052,6 +2079,7 @@ fn run_stop_case(
     prep: Prep,
     offset_ms: u64,
     index: usize,
+    case: &mut StopCaseRecord,
 ) -> Result<()> {
     let outcome = run_stop_offset(
         workload,
@@ -2060,6 +2088,7 @@ fn run_stop_case(
         prep,
         offset_ms,
         index,
+        case,
     )?;
     eprintln!("JOINT_STOP outcome: {outcome}");
     eprintln!(
@@ -2071,70 +2100,21 @@ fn run_stop_case(
         },
         outcome.finish,
     );
-    // Qualification evidence: this marker prints only after every
-    // stop check passed, so the qualifying entries prove the stop
-    // completed rather than merely linked.
-    let marker = stop_completion_line(&outcome, offset_ms, index)?;
-    eprintln!("{marker}");
-    Ok(())
+    case.collect(outcome);
+    case.judge()
 }
 
-/// The stop cell must prove each case finished its stop: pin the
-/// completion marker in `run_stop_case`, emitted only after
-/// `check_stop_outcome` succeeds, so a path that returns early after
-/// the pre-stop linkage diagnostic cannot qualify. The pin reads the
-/// case body above its own body (never its own literals), strips
-/// line comments, and requires the propagated helper call before the
-/// emission, so a discarded error or a commented-out emission cannot
-/// satisfy it.
-#[test]
-fn stop_case_emits_a_completion_marker_after_its_checks() {
-    let source = include_str!("joint_stop_races_privileged_tests.rs");
-    let head = source
-        .split_once("fn stop_case_emits_a_completion_marker_after_its_checks(")
-        .expect("the pin keeps its name")
-        .0;
-    assert_eq!(
-        head.matches("fn run_stop_case(").count(),
-        1,
-        "the stop case is defined once above the pin"
-    );
-    let body = head
-        .split_once("fn run_stop_case(")
-        .expect("the stop case keeps its name")
-        .1
-        .split_once("\n}\n")
-        .expect("top-level fns close at column 0")
-        .0;
-    let code: String = body
-        .lines()
-        .filter_map(|line| {
-            let code = line.split("//").next().unwrap_or("");
-            (!code.trim().is_empty()).then(|| code.to_string())
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let checks = code.find("stop_completion_line(&outcome, offset_ms, index)?");
-    let marker = code.find("P11SCOPE_STOP_COMPLETE=wp7-stop");
-    // The helper formats the marker; the case prints the returned
-    // line exactly. Either the helper call plus the exact print of
-    // its returned line, or a direct propagated check plus a
-    // formatted emission, satisfies the order; a discarded error
-    // (no `?`), a comment-only marker, or an unrelated print after
-    // the check never does.
-    let direct_checks = code.find("check_stop_outcome(&outcome, offset_ms)?");
-    let direct_emit = code.find("eprintln!(\"P11SCOPE_STOP_COMPLETE=wp7-stop");
-    match (checks, marker, direct_checks, direct_emit) {
-        (Some(helper_at), _, _, _) => assert!(
-            code[helper_at..].contains("eprintln!(\"{marker}\")"),
-            "the helper line is printed exactly: {code}"
-        ),
-        (_, _, Some(checks_at), Some(emit_at)) => assert!(
-            emit_at > checks_at,
-            "the completion marker follows the propagated stop checks: {code}"
-        ),
-        _ => panic!("run_stop_case propagates the checks then marks completion: {code}"),
-    }
+/// The stop checks in their order. A wedge is a case whose first
+/// failing check is `Terminal` (the finish did not reach Published,
+/// then WoundDown, while the earlier checks held).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum StopCheck {
+    AtQ,
+    Latch,
+    Abandon,
+    Terminal,
+    Reconcile,
 }
 
 /// Full assert set for one stop case, over its collected outcome: the
@@ -2143,8 +2123,31 @@ fn stop_case_emits_a_completion_marker_after_its_checks() {
 /// two-owner reconciliation must hold on every passing case: A-side
 /// publication alone cannot excuse a B-side silent loss.
 fn check_stop_outcome(outcome: &StopOutcome, offset_ms: u64) -> Result<()> {
-    // (b) The at-Q tick publishes the stashed calls: A's resolved
-    // calls reach its edge, or the equation discloses shed loudly.
+    match stop_check_failure(outcome, offset_ms) {
+        None => Ok(()),
+        Some((_, error)) => Err(error),
+    }
+}
+
+/// The first failing stop check and its error, or `None` when the case
+/// passes every check.
+fn stop_check_failure(outcome: &StopOutcome, offset_ms: u64) -> Option<(StopCheck, anyhow::Error)> {
+    type Check = fn(&StopOutcome, u64) -> Result<()>;
+    const CHECKS: [(StopCheck, Check); 5] = [
+        (StopCheck::AtQ, check_stop_at_q),
+        (StopCheck::Latch, check_stop_latch),
+        (StopCheck::Abandon, check_stop_abandon),
+        (StopCheck::Terminal, check_stop_terminal),
+        (StopCheck::Reconcile, check_stop_reconcile),
+    ];
+    CHECKS
+        .into_iter()
+        .find_map(|(check, run)| run(outcome, offset_ms).err().map(|error| (check, error)))
+}
+
+/// (b) The at-Q tick publishes the stashed calls: A's resolved calls
+/// reach its edge, or the equation discloses shed loudly.
+fn check_stop_at_q(outcome: &StopOutcome, offset_ms: u64) -> Result<()> {
     if outcome.api_a == outcome.a_semantic {
         eprintln!("JOINT_STOP offset={offset_ms}: at-Q published (api_a == a_semantic)");
     } else if outcome.reconciled && outcome.lane_shed > 0 {
@@ -2157,8 +2160,12 @@ fn check_stop_outcome(outcome: &StopOutcome, offset_ms: u64) -> Result<()> {
             "offset {offset_ms}: the at-Q tick did not publish the stashed calls: {outcome}"
         );
     }
-    // (a) A latched machine names its code twice: abandon gap and run
-    // error. A clean finish holds no first error at all.
+    Ok(())
+}
+
+/// (a) A latched machine names its code twice: abandon gap and run
+/// error. A clean finish holds no first error at all.
+fn check_stop_latch(outcome: &StopOutcome, offset_ms: u64) -> Result<()> {
     if outcome.latched {
         let code = outcome
             .latch_code
@@ -2185,9 +2192,13 @@ fn check_stop_outcome(outcome: &StopOutcome, offset_ms: u64) -> Result<()> {
         );
         eprintln!("JOINT_STOP offset={offset_ms}: no latch (clean finish path)");
     }
-    // (c) An abandon with resolved calls still in the lane stash is
-    // counted in the stop or named in a gap, never silent; and no
-    // abandon gap appears without an abandonment.
+    Ok(())
+}
+
+/// (c) An abandon with resolved calls still in the lane stash is counted
+/// in the stop or named in a gap, never silent; and no abandon gap
+/// appears without an abandonment.
+fn check_stop_abandon(outcome: &StopOutcome, offset_ms: u64) -> Result<()> {
     let abandoned = outcome.finish.contains("abandoned") || outcome.begin.contains("abandoned");
     if abandoned && outcome.stash_floor.is_some() {
         ensure!(
@@ -2205,21 +2216,303 @@ fn check_stop_outcome(outcome: &StopOutcome, offset_ms: u64) -> Result<()> {
             outcome.finish, outcome.stash_floor,
         );
     }
-    // Primary: the finish reaches Published, then WoundDown.
+    Ok(())
+}
+
+/// Primary: the finish reaches Published, then WoundDown.
+fn check_stop_terminal(outcome: &StopOutcome, offset_ms: u64) -> Result<()> {
     ensure!(
-        outcome.finish == "published" && outcome.wound == "joined" && outcome.taken,
+        stop_reached_wound_down(outcome),
         "offset {offset_ms}: the finish must reach Published then WoundDown: {outcome}"
     );
-    // (d) The two-owner reconciliation holds on every passing case:
-    // every entered call on both edges is attributed, refused or
-    // disclosed-shed, never silently lost. After the terminal check so
-    // a wedged finish keeps its wedge diagnostic.
+    Ok(())
+}
+
+fn stop_reached_wound_down(outcome: &StopOutcome) -> bool {
+    outcome.finish == "published" && outcome.wound == "joined" && outcome.taken
+}
+
+/// (d) The two-owner reconciliation holds on every passing case: every
+/// entered call on both edges is attributed, refused or disclosed-shed,
+/// never silently lost. After the terminal check so a wedged finish
+/// keeps its wedge diagnostic.
+fn check_stop_reconcile(outcome: &StopOutcome, offset_ms: u64) -> Result<()> {
     ensure!(
         outcome.reconciled,
         "offset {offset_ms}: two-owner reconciliation failed: {}",
         outcome.reconcile_detail,
     );
     Ok(())
+}
+
+/// The cell's single verdict record, built only from the test's own
+/// case ledger (never from log text): the selection, every opened case
+/// with its collected outcome and completion, and one typed terminal.
+#[derive(serde::Serialize)]
+struct StopVerdictRecord {
+    schema: &'static str,
+    cell: &'static str,
+    /// `None` when the selectors themselves were refused.
+    selection: Option<StopSelection>,
+    cases: Vec<StopCaseRecord>,
+    terminal: StopTerminal,
+}
+
+#[derive(Clone, PartialEq, Eq, serde::Serialize)]
+struct StopSelection {
+    preps: Vec<usize>,
+    offsets: Vec<usize>,
+}
+
+/// One opened case. `branch` is set once at the linkage decision
+/// (`linked`, or the no-feed tag), `outcome` once after a linked drive,
+/// and `completed` only by `judge` after every stop check passed.
+#[derive(serde::Serialize)]
+struct StopCaseRecord {
+    name: String,
+    index: usize,
+    prep: usize,
+    offset_ms: u64,
+    branch: Option<&'static str>,
+    outcome: Option<StopOutcome>,
+    completed: bool,
+    #[serde(skip)]
+    failed_check: Option<StopCheck>,
+}
+
+/// How the cell ended. The variants are built only by
+/// `StopLedger::finish`, which asserts the combinations that cannot
+/// describe a real run: a preclusion is the first case's S1 tag with
+/// nothing linked or collected; a wedge is a linked, collected case
+/// whose first failing check is the terminal one (never a success).
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+enum StopTerminal {
+    /// Every case of the full selection completed.
+    Qualified,
+    /// Every selected case completed, but the selection was narrowed.
+    Narrowed,
+    /// Case 0 sealed S1 before anything was linked: environmental.
+    Precluded {
+        case: usize,
+        cause: &'static str,
+        receipt: &'static str,
+    },
+    /// Any other no-feed case (unattributed, or S1 after a linked case).
+    NoFeed {
+        case: usize,
+        cause: &'static str,
+        receipt: &'static str,
+    },
+    /// The last case failed exactly at the Published-then-WoundDown check.
+    Wedge { case: usize },
+    /// Any other failure; `case` is `None` before the first case opened.
+    CaseFailed {
+        case: Option<usize>,
+        stage: &'static str,
+        check: Option<StopCheck>,
+        error: String,
+    },
+}
+
+#[derive(Default)]
+struct StopLedger {
+    selection: Option<StopSelection>,
+    cases: Vec<StopCaseRecord>,
+}
+
+impl StopLedger {
+    fn select(&mut self, preps: Vec<usize>, offsets: Vec<usize>) {
+        assert!(self.selection.is_none(), "the matrix selects once");
+        self.selection = Some(StopSelection { preps, offsets });
+    }
+
+    /// Open case `index`; only after the previous case completed, in
+    /// matrix order.
+    fn open(&mut self, index: usize) -> &mut StopCaseRecord {
+        assert!(index < STOP_CASES, "case {index} is outside the matrix");
+        assert!(
+            self.cases
+                .last()
+                .is_none_or(|last| last.completed && last.index < index),
+            "case {index} opens only after the previous case completed"
+        );
+        self.cases.push(StopCaseRecord {
+            name: format!("wp7-stop{index}"),
+            index,
+            prep: index / STOP_OFFSETS_MS.len(),
+            offset_ms: STOP_OFFSETS_MS[index % STOP_OFFSETS_MS.len()],
+            branch: None,
+            outcome: None,
+            completed: false,
+            failed_check: None,
+        });
+        self.cases.last_mut().expect("just pushed")
+    }
+
+    fn full_selection(&self) -> bool {
+        self.selection.as_ref().is_some_and(|selection| {
+            selection.preps == (0..STOP_PREPS.len()).collect::<Vec<_>>()
+                && selection.offsets == (0..STOP_OFFSETS_MS.len()).collect::<Vec<_>>()
+        })
+    }
+
+    fn finish(self, result: &Result<()>) -> StopVerdictRecord {
+        let terminal = match result {
+            Ok(()) => {
+                assert!(
+                    self.cases.iter().all(|case| case.completed),
+                    "a passing matrix completed every opened case"
+                );
+                if self.full_selection() && self.cases.len() == STOP_CASES {
+                    StopTerminal::Qualified
+                } else {
+                    StopTerminal::Narrowed
+                }
+            }
+            Err(error) => self.failure_terminal(error),
+        };
+        StopVerdictRecord {
+            schema: STOP_VERDICT_SCHEMA,
+            cell: STOP_CELL,
+            selection: self.selection,
+            cases: self.cases,
+            terminal,
+        }
+    }
+
+    fn failure_terminal(&self, error: &anyhow::Error) -> StopTerminal {
+        let error = format!("{error:#}");
+        let Some(last) = self.cases.last() else {
+            return StopTerminal::CaseFailed {
+                case: None,
+                stage: "setup",
+                check: None,
+                error,
+            };
+        };
+        assert!(!last.completed, "a failing matrix fails in its open case");
+        match (last.branch, &last.outcome, last.failed_check) {
+            (None, _, _) => {
+                assert!(last.outcome.is_none(), "no outcome before linkage");
+                StopTerminal::CaseFailed {
+                    case: Some(last.index),
+                    stage: "setup",
+                    check: None,
+                    error,
+                }
+            }
+            (Some("linked"), None, _) => StopTerminal::CaseFailed {
+                case: Some(last.index),
+                stage: "drive",
+                check: None,
+                error,
+            },
+            (Some("linked"), Some(outcome), Some(StopCheck::Terminal)) => {
+                assert!(
+                    !stop_reached_wound_down(outcome),
+                    "a wedge never describes a finish that reached WoundDown"
+                );
+                StopTerminal::Wedge { case: last.index }
+            }
+            (Some("linked"), Some(_), check) => {
+                assert!(check.is_some(), "a collected case fails only in a check");
+                StopTerminal::CaseFailed {
+                    case: Some(last.index),
+                    stage: "check",
+                    check,
+                    error,
+                }
+            }
+            (Some(tag), outcome, check) => {
+                assert!(
+                    outcome.is_none() && check.is_none(),
+                    "a no-feed case is never driven"
+                );
+                let receipt = no_feed_receipt(tag);
+                let first_and_full =
+                    self.cases.len() == 1 && last.index == 0 && self.full_selection();
+                if tag == "s1-precluded" && first_and_full {
+                    StopTerminal::Precluded {
+                        case: last.index,
+                        cause: tag,
+                        receipt,
+                    }
+                } else {
+                    StopTerminal::NoFeed {
+                        case: last.index,
+                        cause: tag,
+                        receipt,
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl StopCaseRecord {
+    /// Record the linkage decision, once, before anything is driven.
+    fn link(&mut self, branch: &JointBranch) {
+        assert!(self.branch.is_none(), "{}: linked once", self.name);
+        self.branch = Some(no_feed_branch_tag(branch).unwrap_or("linked"));
+    }
+
+    /// Record the collected outcome of a linked drive, once.
+    fn collect(&mut self, outcome: StopOutcome) {
+        assert_eq!(
+            self.branch,
+            Some("linked"),
+            "{}: only a linked case collects an outcome",
+            self.name
+        );
+        assert!(
+            self.outcome.is_none(),
+            "{}: one outcome per case",
+            self.name
+        );
+        assert_eq!(
+            outcome.offset_ms, self.offset_ms,
+            "{}: the outcome belongs to the case's offset",
+            self.name
+        );
+        self.outcome = Some(outcome);
+    }
+
+    /// Run the full assert set; the case completes only when every
+    /// check passes.
+    fn judge(&mut self) -> Result<()> {
+        let outcome = self
+            .outcome
+            .as_ref()
+            .expect("a case is judged after its outcome is collected");
+        match stop_check_failure(outcome, self.offset_ms) {
+            None => {
+                self.completed = true;
+                Ok(())
+            }
+            Some((check, error)) => {
+                self.failed_check = Some(check);
+                Err(error)
+            }
+        }
+    }
+}
+
+/// The receipt text of a no-feed tag (the cause the case's error names).
+fn no_feed_receipt(tag: &str) -> &'static str {
+    let branch = match tag {
+        "s1-precluded" => JointBranch::S1,
+        "no-feeds-unattributed" => JointBranch::Unattributed,
+        other => panic!("not a no-feed tag: {other}"),
+    };
+    no_feed_reason(&branch).expect("a no-feed branch names its cause")
+}
+
+/// The single record line: the marker, then the compact JSON (which
+/// escapes every control character, so the record is one line).
+fn stop_verdict_line(record: &StopVerdictRecord) -> String {
+    let json = serde_json::to_string(record).expect("the verdict record serializes");
+    format!("{STOP_VERDICT_MARKER}{json}")
 }
 
 /// The stop cell must evaluate on the linked journal session: pin the
@@ -2353,28 +2646,308 @@ fn stop_outcome_accepts_a_counted_and_disclosed_shed() {
     check_stop_outcome(&outcome, outcome.offset_ms).expect("a counted and disclosed shed passes");
 }
 
+fn healthy_stop_outcome_at(offset_ms: u64) -> StopOutcome {
+    let mut outcome = healthy_stop_outcome();
+    outcome.offset_ms = offset_ms;
+    outcome
+}
+
+fn full_stop_ledger() -> StopLedger {
+    let mut ledger = StopLedger::default();
+    ledger.select(
+        (0..STOP_PREPS.len()).collect(),
+        (0..STOP_OFFSETS_MS.len()).collect(),
+    );
+    ledger
+}
+
+/// Open `index`, link it, collect `outcome` and judge it.
+fn judge_stop_case(ledger: &mut StopLedger, index: usize, outcome: StopOutcome) -> Result<()> {
+    let case = ledger.open(index);
+    case.link(&JointBranch::Linked);
+    case.collect(outcome);
+    case.judge()
+}
+
+fn completed_stop_cases(ledger: &mut StopLedger, count: usize) {
+    for index in 0..count {
+        let offset = STOP_OFFSETS_MS[index % STOP_OFFSETS_MS.len()];
+        judge_stop_case(ledger, index, healthy_stop_outcome_at(offset))
+            .expect("a healthy case completes");
+    }
+}
+
+fn stop_terminal_of(ledger: StopLedger, result: Result<()>) -> StopTerminal {
+    ledger.finish(&result).terminal
+}
+
 #[test]
-fn stop_completion_line_emits_only_after_successful_checks() {
-    // Healthy outcome emits its indexed line; a failed stop outcome
-    // returns the check error with no line. A caller that discards
-    // the error (`let _ =`) gets no line either, so the pin plus this
-    // behavioral twin fail the discard mutation.
-    let healthy = healthy_stop_outcome();
-    let line = stop_completion_line(&healthy, healthy.offset_ms, 3)
-        .expect("a healthy outcome emits its completion line");
-    assert_eq!(line, "P11SCOPE_STOP_COMPLETE=wp7-stop3");
-    let mut failed = healthy_stop_outcome();
+fn stop_case_completes_only_after_every_check_passes() {
+    let mut ledger = full_stop_ledger();
+    judge_stop_case(&mut ledger, 0, healthy_stop_outcome_at(0)).expect("healthy");
+    assert!(ledger.cases[0].completed, "a passing case completes");
+    let mut failed = healthy_stop_outcome_at(1);
     failed.reconciled = false;
-    failed.reconcile_detail =
-        "wp7-stop3-stop: every entered call is attributed or refused on its own \
-         caller with no shed: caller deficits sum 1"
-            .to_string();
-    let error = stop_completion_line(&failed, failed.offset_ms, 3)
-        .expect_err("a failed stop outcome emits no completion line");
-    let text = format!("{error:?}");
+    failed.reconcile_detail = "caller deficits sum 1".to_string();
+    let error = judge_stop_case(&mut ledger, 1, failed).expect_err("a failed check");
     assert!(
-        text.contains("reconciliation"),
-        "the failure carries the check error: {text}"
+        format!("{error:?}").contains("reconciliation"),
+        "the case error carries the check error: {error:?}"
+    );
+    assert!(!ledger.cases[1].completed, "a failed case never completes");
+    assert_eq!(ledger.cases[1].failed_check, Some(StopCheck::Reconcile));
+}
+
+#[test]
+fn stop_check_failure_names_the_first_failing_check() {
+    let offset = 5;
+    assert!(stop_check_failure(&healthy_stop_outcome_at(offset), offset).is_none());
+    let mut at_q = healthy_stop_outcome_at(offset);
+    at_q.api_a = 1;
+    at_q.finish = "unpublished".to_string();
+    assert_eq!(
+        stop_check_failure(&at_q, offset).map(|failure| failure.0),
+        Some(StopCheck::AtQ),
+        "an at-Q failure precedes the terminal check"
+    );
+    let mut latch = healthy_stop_outcome_at(offset);
+    latch.first_error = Some("boom".to_string());
+    assert_eq!(
+        stop_check_failure(&latch, offset).map(|failure| failure.0),
+        Some(StopCheck::Latch)
+    );
+    let mut abandon = healthy_stop_outcome_at(offset);
+    abandon.abandon_gap = Some("for lane stop: x".to_string());
+    assert_eq!(
+        stop_check_failure(&abandon, offset).map(|failure| failure.0),
+        Some(StopCheck::Abandon)
+    );
+    let mut wedge = healthy_stop_outcome_at(offset);
+    wedge.wound = "unwound".to_string();
+    assert_eq!(
+        stop_check_failure(&wedge, offset).map(|failure| failure.0),
+        Some(StopCheck::Terminal)
+    );
+    let mut reconcile = healthy_stop_outcome_at(offset);
+    reconcile.reconciled = false;
+    assert_eq!(
+        stop_check_failure(&reconcile, offset).map(|failure| failure.0),
+        Some(StopCheck::Reconcile)
+    );
+}
+
+/// One shared record pins both sides: the Rust ledger serializes a
+/// healthy full matrix to exactly the fixture the Python validator
+/// table builds its rows from.
+#[test]
+fn stop_verdict_record_matches_the_shared_qualified_fixture() {
+    let mut ledger = full_stop_ledger();
+    completed_stop_cases(&mut ledger, STOP_CASES);
+    let record = ledger.finish(&Ok(()));
+    assert_eq!(record.terminal, StopTerminal::Qualified);
+    let line = stop_verdict_line(&record);
+    assert!(!line.contains('\n'), "the record is one line");
+    let json = line
+        .strip_prefix(STOP_VERDICT_MARKER)
+        .expect("the line opens with the marker");
+    let produced: serde_json::Value = serde_json::from_str(json).expect("the record is JSON");
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/joint-stop-verdict-qualified.json"
+    ))
+    .expect("the fixture is JSON");
+    assert_eq!(
+        produced, fixture,
+        "the record drifts from the shared fixture"
+    );
+}
+
+#[test]
+fn stop_verdict_qualifies_only_the_full_selection() {
+    let mut ledger = StopLedger::default();
+    ledger.select(vec![0], (0..STOP_OFFSETS_MS.len()).collect());
+    completed_stop_cases(&mut ledger, STOP_OFFSETS_MS.len());
+    assert_eq!(stop_terminal_of(ledger, Ok(())), StopTerminal::Narrowed);
+}
+
+#[test]
+fn stop_verdict_precludes_only_a_first_case_s1_seal() {
+    let not_attempted = || Err(anyhow::anyhow!("wp7-stopN: no joint feeds; not attempted"));
+    let mut ledger = full_stop_ledger();
+    ledger.open(0).link(&JointBranch::S1);
+    assert_eq!(
+        stop_terminal_of(ledger, not_attempted()),
+        StopTerminal::Precluded {
+            case: 0,
+            cause: "s1-precluded",
+            receipt: "no joint feeds with S1 seal (producers unlinked, zero installs)",
+        }
+    );
+    // S1 after a linked case is a failure, not an environment.
+    let mut ledger = full_stop_ledger();
+    completed_stop_cases(&mut ledger, 1);
+    ledger.open(1).link(&JointBranch::S1);
+    assert!(matches!(
+        stop_terminal_of(ledger, not_attempted()),
+        StopTerminal::NoFeed {
+            case: 1,
+            cause: "s1-precluded",
+            ..
+        }
+    ));
+    // A narrowed run's first case is not the matrix's first case.
+    let mut ledger = StopLedger::default();
+    ledger.select(vec![0], vec![0]);
+    ledger.open(0).link(&JointBranch::S1);
+    assert!(matches!(
+        stop_terminal_of(ledger, not_attempted()),
+        StopTerminal::NoFeed { case: 0, .. }
+    ));
+    // The unattributed default never precludes.
+    let mut ledger = full_stop_ledger();
+    ledger.open(0).link(&JointBranch::Unattributed);
+    assert!(matches!(
+        stop_terminal_of(ledger, not_attempted()),
+        StopTerminal::NoFeed {
+            case: 0,
+            cause: "no-feeds-unattributed",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn stop_verdict_wedge_is_only_a_terminal_check_failure() {
+    let mut ledger = full_stop_ledger();
+    completed_stop_cases(&mut ledger, 2);
+    let mut wedged = healthy_stop_outcome_at(5);
+    wedged.finish = "unpublished".to_string();
+    let result = judge_stop_case(&mut ledger, 2, wedged);
+    assert_eq!(
+        stop_terminal_of(ledger, result),
+        StopTerminal::Wedge { case: 2 }
+    );
+    // An earlier failing check is a case failure even when the finish
+    // also wedged.
+    let mut ledger = full_stop_ledger();
+    let mut at_q = healthy_stop_outcome_at(0);
+    at_q.api_a = 1;
+    at_q.finish = "unpublished".to_string();
+    let result = judge_stop_case(&mut ledger, 0, at_q);
+    assert!(matches!(
+        stop_terminal_of(ledger, result),
+        StopTerminal::CaseFailed {
+            case: Some(0),
+            stage: "check",
+            check: Some(StopCheck::AtQ),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn stop_verdict_names_setup_and_drive_failures() {
+    let error = || Err(anyhow::anyhow!("setup broke"));
+    assert!(matches!(
+        stop_terminal_of(StopLedger::default(), error()),
+        StopTerminal::CaseFailed {
+            case: None,
+            stage: "setup",
+            check: None,
+            ..
+        }
+    ));
+    let mut ledger = full_stop_ledger();
+    ledger.open(0);
+    assert!(matches!(
+        stop_terminal_of(ledger, error()),
+        StopTerminal::CaseFailed {
+            case: Some(0),
+            stage: "setup",
+            ..
+        }
+    ));
+    let mut ledger = full_stop_ledger();
+    ledger.open(0).link(&JointBranch::Linked);
+    match stop_terminal_of(ledger, error()) {
+        StopTerminal::CaseFailed {
+            case: Some(0),
+            stage: "drive",
+            check: None,
+            error,
+        } => assert_eq!(error, "setup broke"),
+        other => panic!("a linked case without an outcome failed in its drive: {other:?}"),
+    }
+}
+
+#[test]
+#[should_panic(expected = "opens only after the previous case completed")]
+fn stop_ledger_refuses_a_case_after_an_unfinished_one() {
+    let mut ledger = full_stop_ledger();
+    ledger.open(0).link(&JointBranch::Linked);
+    ledger.open(1);
+}
+
+#[test]
+#[should_panic(expected = "only a linked case collects an outcome")]
+fn stop_ledger_refuses_an_outcome_on_a_no_feed_case() {
+    let mut ledger = full_stop_ledger();
+    let case = ledger.open(0);
+    case.link(&JointBranch::S1);
+    case.collect(healthy_stop_outcome_at(0));
+}
+
+#[test]
+#[should_panic(expected = "the outcome belongs to the case's offset")]
+fn stop_ledger_refuses_an_outcome_from_another_offset() {
+    let mut ledger = full_stop_ledger();
+    let case = ledger.open(0);
+    case.link(&JointBranch::Linked);
+    case.collect(healthy_stop_outcome_at(20));
+}
+
+#[test]
+#[should_panic(expected = "linked once")]
+fn stop_ledger_refuses_a_second_linkage_decision() {
+    let mut ledger = full_stop_ledger();
+    let case = ledger.open(0);
+    case.link(&JointBranch::Linked);
+    case.link(&JointBranch::S1);
+}
+
+/// The matrix cell prints its record on every return path: the body
+/// runs the matrix into a result (no `?`), builds the record from the
+/// ledger, prints its line, then returns the result. The pin reads the
+/// cell above its own body and strips line comments.
+#[test]
+fn stop_cell_prints_its_record_before_returning() {
+    let source = include_str!("joint_stop_races_privileged_tests.rs");
+    let head = source
+        .split_once("fn stop_cell_prints_its_record_before_returning(")
+        .expect("the pin keeps its name")
+        .0;
+    let body = head
+        .split_once("fn privileged_joint_stop_after_last_waiter_resolves_publishes_final_lp64(")
+        .expect("the cell keeps its name")
+        .1
+        .split_once("\n}\n")
+        .expect("top-level fns close at column 0")
+        .0;
+    let code: Vec<&str> = body
+        .lines()
+        .map(|line| line.split("//").next().unwrap_or("").trim())
+        .filter(|line| !line.is_empty())
+        .collect();
+    assert_eq!(
+        code,
+        [
+            ") -> Result<()> {",
+            "let mut ledger = StopLedger::default();",
+            "let result = run_stop_matrix(&mut ledger);",
+            "let record = ledger.finish(&result);",
+            "eprintln!(\"\\n{}\", stop_verdict_line(&record));",
+            "result",
+        ],
+        "the cell prints its record on every path"
     );
 }
 

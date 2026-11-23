@@ -1,16 +1,31 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
-"""Joint linked-stop cell log builders with real libtest framing.
+"""Joint linked-stop cell logs: verdict records in real libtest framing.
 
 Shared by test_joint_stop_verdict.py (the table), test_ci_stop_races.py
-(S3) and test_ignored_tests.py (LONG). The framing is the pinned
-1.99.1 libtest pretty `--nocapture` output, in both the threaded form
-(S3's default) and the `--test-threads=1` form (LONG), where the first
-output line is glued to the `test NAME ... ` prefix and the verdict
-stands on its own line. The record lines are the ones the Rust cell
-prints (src/inventory/joint_stop_races_privileged_tests.rs).
+(S3) and test_ignored_tests.py (LONG). The cell prints one
+`P11SCOPE_STOP_VERDICT=<json>` record built from its case ledger
+(src/inventory/joint_stop_races_privileged_tests.rs); the healthy full
+matrix record is the shared fixture
+tests/fixtures/joint-stop-verdict-qualified.json, which the Rust
+twin `stop_verdict_record_matches_the_shared_qualified_fixture`
+serializes byte for byte. Every other record here is that fixture
+edited the way the ledger would build it.
+
+The framing is the pinned 1.99.1 libtest pretty `--nocapture` output,
+threaded (S3's default) and `--test-threads=1` (LONG, where the first
+output line is glued to the `test NAME ... ` prefix). A failing cell's
+returned error and its backtrace follow the record, as libtest prints
+them after the test function returns.
 """
 
+import copy
+import json
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+FIXTURE = ROOT / "tests" / "fixtures" / "joint-stop-verdict-qualified.json"
+MARKER = "P11SCOPE_STOP_VERDICT="
 CELL = ("inventory::joint_stop_races_privileged_tests::"
         "privileged_joint_stop_after_last_waiter_resolves_publishes_final_lp64")
 OFFSETS_MS = (0, 1, 5, 20)
@@ -18,11 +33,11 @@ OK_SUMMARY = ("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; "
               "12231 filtered out; finished in 148.83s")
 FAILED_SUMMARY = ("test result: FAILED. 0 passed; 1 failed; 0 ignored; "
                   "0 measured; 12231 filtered out; finished in 11.68s")
-S1_ERROR = ("Error: wp7-stop{k}: no joint feeds with S1 seal "
-            "(producers unlinked, zero installs); not attempted")
-UNATTRIBUTED_ERROR = ("Error: wp7-stop{k}: no joint feeds without S1 seal "
-                      "(producers linked, zero installs unexplained); "
-                      "not attempted")
+S1_RECEIPT = "no joint feeds with S1 seal (producers unlinked, zero installs)"
+UNATTRIBUTED_RECEIPT = ("no joint feeds without S1 seal (producers linked, "
+                        "zero installs unexplained)")
+RECEIPTS = {"s1-precluded": S1_RECEIPT,
+            "no-feeds-unattributed": UNATTRIBUTED_RECEIPT}
 BACKTRACE = [
     "",
     "Stack backtrace:",
@@ -30,6 +45,7 @@ BACKTRACE = [
     "   1: p11scope::inventory::joint_stop_races_privileged_tests::run_stop_offset",
     "             at ./nptl/pthread_create.c:454:8",
 ]
+# Free-text diagnostics the cell prints; the validator never reads them.
 PREAMBLE = [
     "JOINT_R16 r16-lane step=started live=1 gated=0 finished=0 ticks=0",
     "JOINT_R16 r16-map round=0 mapped=2/2",
@@ -40,72 +56,122 @@ def offset_of(k):
     return OFFSETS_MS[k % 4]
 
 
-def case_head(k):
-    """Pre-stop lines of case k up to its linked tag."""
-    return ["JOINT_STOP wp7-stop%d: prep=Services(1) done; stopping in %d ms"
-            % (k, offset_of(k)),
-            "P11SCOPE_CELL_BRANCH=wp7-stop%d:linked" % k]
+def qualified_record():
+    with open(FIXTURE, encoding="utf-8") as stream:
+        return json.load(stream)
 
 
-def outcome_record(ms, finish="published", latched=True, wound="joined",
-                   taken=True):
-    """The Rust StopOutcome Display for one case."""
-    return ("offset=%d begin=polling finish=%s (3 polls) first_error=None "
-            "latched=%s latch=%s h0=committed wound=%s (2 polls) taken=%s "
-            "minted=true stash=None stop_counts=Some((2, 0)) api_a=2 "
-            "a_sem=2 shed=0 reconciled=true abandon_gap=%s branch=linked"
-            % (ms, finish, "true" if latched else "false",
-               'Some("latched")' if latched else "None", wound,
-               "true" if taken else "false",
-               'Some("latched")' if latched else "None"))
+_QUALIFIED = qualified_record()
 
 
-def case_outcome(k, finish="published", latch="latched", offset=None):
-    """Outcome print plus the offset branch diagnostic of case k."""
-    ms = offset_of(k) if offset is None else offset
-    return ["JOINT_STOP outcome: " + outcome_record(
-                ms, finish, latched=latch == "latched"),
-            "P11SCOPE_CELL_BRANCH=offset%d:%s:%s" % (ms, latch, finish)]
+def healthy_outcome(ms):
+    outcome = copy.deepcopy(_QUALIFIED["cases"][0]["outcome"])
+    outcome["offset_ms"] = ms
+    return outcome
 
 
-def case_lines(k, finish="published"):
-    """One completed case: linked, offset diagnostic, checks, marker."""
-    return (case_head(k) + case_outcome(k, finish)
-            + ["JOINT_STOP offset=%d: at-Q published (api_a == a_semantic)"
-               % offset_of(k),
-               "P11SCOPE_STOP_COMPLETE=wp7-stop%d" % k])
+def case_record(k, branch="linked", outcome="healthy", completed=None):
+    if outcome == "healthy":
+        outcome = healthy_outcome(offset_of(k)) if branch == "linked" else None
+    if completed is None:
+        completed = outcome is not None and branch == "linked"
+    return {"name": "wp7-stop%d" % k, "index": k, "prep": k // 4,
+            "offset_ms": offset_of(k), "branch": branch, "outcome": outcome,
+            "completed": completed}
 
 
-def matrix_body(cases=range(12)):
-    body = list(PREAMBLE)
-    for k in cases:
-        body += case_lines(k)
-    return body
+def record(cases, terminal):
+    built = copy.deepcopy(_QUALIFIED)
+    built["cases"] = cases
+    built["terminal"] = terminal
+    return built
 
 
-def s1_body(k=0, error=None):
-    return (matrix_body(range(k)) + ["P11SCOPE_CELL_BRANCH=wp7-stop%d:s1-precluded" % k]
-            + [S1_ERROR.format(k=k) if error is None else error])
+def completed_cases(count):
+    return [case_record(k) for k in range(count)]
 
 
-def unattributed_body(k=0):
-    return (matrix_body(range(k))
-            + ["P11SCOPE_CELL_BRANCH=wp7-stop%d:no-feeds-unattributed" % k,
-               UNATTRIBUTED_ERROR.format(k=k)])
+def no_feed_record(k=0, cause="s1-precluded"):
+    kind = "precluded" if (k == 0 and cause == "s1-precluded") else "no-feed"
+    return record(completed_cases(k) + [case_record(k, cause)],
+                  {"kind": kind, "case": k, "cause": cause,
+                   "receipt": RECEIPTS[cause]})
 
 
-def wedge_error(ms, finish="unpublished", own=None, latched=False,
-                wound="unwound", taken=False):
-    return ("Error: offset %d: the finish must reach Published then "
-            "WoundDown: %s" % (ms, outcome_record(
-                ms if own is None else own, finish, latched=latched,
-                wound=wound, taken=taken)))
+def precluded_record():
+    return no_feed_record(0)
 
 
-def wedge_body(k=5, finish="unpublished"):
-    return (matrix_body(range(k)) + case_head(k)
-            + case_outcome(k, finish, latch="no-latch")
-            + [wedge_error(offset_of(k), finish)])
+def wedge_outcome(k, finish="unpublished"):
+    outcome = healthy_outcome(offset_of(k))
+    outcome.update(finish=finish, wound="unwound", taken=False)
+    return outcome
+
+
+def wedge_record(k=5, finish="unpublished"):
+    return record(completed_cases(k) + [case_record(k, outcome=wedge_outcome(
+        k, finish), completed=False)], {"kind": "wedge", "case": k})
+
+
+def case_failed_record(k=3, stage="check", check="reconcile", error=None):
+    if stage == "setup":
+        last = [case_record(k, branch=None, outcome=None)] if k is not None \
+            else []
+    elif stage == "drive":
+        last = [case_record(k, outcome=None)]
+    else:
+        outcome = healthy_outcome(offset_of(k))
+        outcome.update(reconciled=False,
+                       reconcile_detail="caller deficits sum 1")
+        last = [case_record(k, outcome=outcome, completed=False)]
+    return record(completed_cases(k or 0) + last,
+                  {"kind": "case-failed", "case": k, "stage": stage,
+                   "check": check if stage == "check" else None,
+                   "error": error or "offset %d: two-owner reconciliation "
+                   "failed" % offset_of(k or 0)})
+
+
+def record_line(rec):
+    """The cell's record line (compact JSON, like serde_json)."""
+    return MARKER + json.dumps(rec, separators=(",", ":"))
+
+
+def human_lines(rec):
+    """The free-text diagnostics a run with this record prints."""
+    lines = list(PREAMBLE)
+    for case in rec["cases"]:
+        k = case["index"]
+        lines.append("JOINT_STOP wp7-stop%d: prep=Services(1) done; "
+                     "stopping in %d ms" % (k, case["offset_ms"]))
+        branch = case["branch"]
+        if branch is not None:
+            lines.append("P11SCOPE_CELL_BRANCH=wp7-stop%d:%s" % (k, branch))
+        if case["outcome"] is not None:
+            lines.append("JOINT_STOP outcome: offset=%d finish=%s"
+                         % (case["offset_ms"], case["outcome"]["finish"]))
+    return lines
+
+
+def error_lines(rec):
+    """libtest's print of the returned error, after the record."""
+    terminal = rec["terminal"]
+    if terminal["kind"] in ("qualified", "narrowed"):
+        return []
+    if terminal["kind"] in ("precluded", "no-feed"):
+        text = "wp7-stop%s: %s; not attempted" % (terminal["case"],
+                                                  terminal["receipt"])
+    elif terminal["kind"] == "wedge":
+        text = ("offset %d: the finish must reach Published then WoundDown"
+                % offset_of(int(terminal["case"])))
+    else:
+        text = str(terminal.get("error", terminal.get("kind")))
+    return ["Error: " + text] + BACKTRACE
+
+
+def body_for(rec, before=(), after=()):
+    """Diagnostics, the record on its own line, then the error print."""
+    return (human_lines(rec) + list(before) + ["", record_line(rec)]
+            + list(after) + error_lines(rec))
 
 
 def frame(body, ok, threaded=True, summary=None, cell=CELL, trailer=None,
@@ -130,9 +196,20 @@ def frame(body, ok, threaded=True, summary=None, cell=CELL, trailer=None,
     return "\n".join(lines) + "\n"
 
 
+def log_for(rec, ok=None, **kwargs):
+    """A whole cell log carrying `rec`; ok defaults from the terminal."""
+    if ok is None:
+        ok = rec["terminal"]["kind"] == "qualified"
+    return frame(body_for(rec), ok, **kwargs)
+
+
 def passing(**kwargs):
-    return frame(matrix_body(), True, **kwargs)
+    return log_for(qualified_record(), **kwargs)
 
 
 def precluded(**kwargs):
-    return frame(s1_body(), False, **kwargs)
+    return log_for(precluded_record(), **kwargs)
+
+
+def wedged(k=5, **kwargs):
+    return log_for(wedge_record(k), **kwargs)

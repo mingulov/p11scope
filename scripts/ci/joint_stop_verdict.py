@@ -1,68 +1,57 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
 # SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
-"""Fail-closed qualification of the Joint linked-stop matrix cell log.
+"""Fail-closed qualification of the Joint linked-stop matrix cell.
 
-One parser and validator for both qualifying entries (the S3 suite,
+One validator for both qualifying entries (the S3 suite,
 scripts/ci/stop-races.sh, and the long campaign runner,
-scripts/run-privileged-lib-tests.sh). The input is the cell's
-`--exact NAME --ignored --nocapture` libtest log and the child's exit
-status as the shell saw it (128+N for a signal). The output is one JSON
-object: qualification, reason, detail and the validated summary line.
+scripts/run-privileged-lib-tests.sh). The Rust cell
+(src/inventory/joint_stop_races_privileged_tests.rs) owns its verdict:
+on every return path it prints exactly one line
+
+  P11SCOPE_STOP_VERDICT=<json>
+
+built from its own case ledger, never from log text. This validator
+reads only three things: the child's exit status as the shell saw it
+(128+N for a signal), the strict libtest summary, and that one record.
+No other log line is interpreted; free text can neither qualify nor
+disqualify a run, so diagnostics placed anywhere cannot forge evidence.
+
+Record schema (p11scope.joint-stop-verdict/1; exact keys, exact JSON
+types, no floats, no duplicate keys):
+
+  {"schema": "p11scope.joint-stop-verdict/1", "cell": NAME,
+   "selection": null | {"preps": [int], "offsets": [int]},
+   "cases": [{"name": "wp7-stopK", "index": K, "prep": K // 4,
+              "offset_ms": (0, 1, 5, 20)[K % 4],
+              "branch": null | "linked" | "s1-precluded"
+                        | "no-feeds-unattributed",
+              "outcome": null | OUTCOME, "completed": bool}],
+   "terminal": {"kind": "qualified"} | {"kind": "narrowed"}
+             | {"kind": "precluded" | "no-feed", "case": K,
+                "cause": TAG, "receipt": TEXT}
+             | {"kind": "wedge", "case": K}
+             | {"kind": "case-failed", "case": K | null,
+                "stage": "setup" | "drive" | "check",
+                "check": null | CHECK, "error": TEXT}}
+
+OUTCOME is the StopOutcome struct field for field. The validator
+recomputes the cell's stop checks (at-q, latch, abandon, terminal,
+reconcile, in the Rust order) from each outcome, so a record can only
+claim what its own data shows: a completed case passes every check, a
+wedge fails first at the terminal check, a check failure names the
+first failing check.
 
 Qualification is one of:
-  qualified             exit 0, a strict one-test pass summary, and the
-                        twelve cases in order, each exactly once as
-                        linked tag, offset diagnostic (bound to the
-                        case's offset, finish=published) and completion
-                        marker, with no error, no-feed or stray record;
-  environment-precluded exit 101, a strict one-test failure summary, and
-                        exactly the first case's S1 tag followed by its
-                        own S1 receipt as the single terminal error;
-  expected-failure      (only with --expect-wedge 1) exit 101 and the
-                        terminal error is the Published-then-WoundDown
-                        terminal check of the linked case in progress,
-                        bound to that case's offset;
+  qualified             exit 0, a `1 passed` summary, a full selection
+                        and all twelve cases completed in order;
+  environment-precluded exit 101, a `1 failed` summary, and only case 0,
+                        unlinked and undriven, with the S1 receipt;
+  expected-failure      (only with --expect-wedge 1) exit 101 and a wedge
+                        terminal on the last opened case;
   failed                everything else, with a named reason (the
                         fail-closed default is `case-failed`).
 
-Grammar of the log (pinned libtest pretty format, both the threaded
-form and the --test-threads=1 form, where the first output line is
-glued to the `test NAME ... ` prefix and the verdict stands alone):
-
-  log      := blank* "running 1 test" body outcome trailer summary blank*
-  outcome  := "test NAME ... ok|FAILED"   (threaded)
-            | "ok|FAILED"                 (single thread)
-  trailer  := blank                                           (ok)
-            | blank "failures:" blank "failures:" "    NAME" blank  (FAILED)
-  summary  := "test result: ok|FAILED. P passed; F failed; I ignored;
-               M measured; N filtered out; finished in S.SSs"
-  body     := free text, plus records:
-              P11SCOPE_CELL_BRANCH=wp7-stopK:(linked|s1-precluded|
-                                              no-feeds-unattributed)
-              P11SCOPE_CELL_BRANCH=offsetMS:(latched|no-latch):FINISH
-              P11SCOPE_STOP_COMPLETE=wp7-stopK
-              Error: MESSAGE  [backtrace block]   (terminal only)
-
-Position rules (evidence is judged where it stands, before or after
-the deciding record):
-  - any line carrying a record stem (P11SCOPE_CELL_BRANCH,
-    P11SCOPE_STOP_COMPLETE, whatever separator follows) or a no-feed
-    word (s1-precluded, no-feeds-unattributed) must be a full record;
-  - the no-feed receipt text and the wedge phrase belong only to the
-    terminal error; a summary only to the trailer;
-  - a no-feed tag is followed directly by its receipt: a preclusion
-    log holds nothing but setup output, the case-0 tag and its receipt;
-  - diagnostics naming wp7-stopN sit inside case N (its prep before
-    the tag, or its linked stage); stop outcome and check diagnostics
-    sit in their case's linked or offset stage, bound to its offset;
-    nothing names a case after the full matrix;
-  - the terminal error carries no reserved record; only a backtrace
-    block follows it, itself free of records and receipts;
-  - a wedge terminal is one whole linked StopOutcome record (each field
-    once), bound to the case's offset, finish and latch, and describing
-    a failed stop (not published+joined+taken).
-Stray libtest framing, competing errors and a second summary fail too.
 Each check has a name (the reason it reports); the table-driven suite
 tests/python/test_joint_stop_verdict.py disables each check in turn
 and requires some row to turn red.
@@ -80,75 +69,44 @@ import json
 import re
 import sys
 
-CASES = 12
+SCHEMA = "p11scope.joint-stop-verdict/1"
+MARKER = "P11SCOPE_STOP_VERDICT="
+PREPS = 3
 OFFSETS_MS = (0, 1, 5, 20)
-CASE = r"(0|[1-9]|1[01])"
-OFFSET = r"(0|1|5|20)"
-COUNT = r"(0|[1-9][0-9]*)"
-
+CASES = PREPS * len(OFFSETS_MS)
+COUNT = r"(0|[1-9][0-9]{0,19})"
 SUMMARY_RE = re.compile(
     r"test result: (ok|FAILED)\. " + COUNT + r" passed; " + COUNT
     + r" failed; " + COUNT + r" ignored; " + COUNT + r" measured; "
-    + COUNT + r" filtered out; finished in [0-9]+\.[0-9]{2}s")
-BRANCH_RE = re.compile(
-    r"P11SCOPE_CELL_BRANCH=wp7-stop" + CASE
-    + r":(linked|s1-precluded|no-feeds-unattributed)")
-OFFSET_RE = re.compile(
-    r"P11SCOPE_CELL_BRANCH=offset" + OFFSET
-    + r":(latched|no-latch):(published|abandoned|not-begun|unpublished)")
-COMPLETE_RE = re.compile(r"P11SCOPE_STOP_COMPLETE=wp7-stop" + CASE)
-# Reserved record stems: any line carrying one must be a full record,
-# whatever separator follows the stem.
-RECORD_STEMS = ("P11SCOPE_CELL_BRANCH", "P11SCOPE_STOP_COMPLETE")
-# No-feed branch words: outside a full branch record they are a
-# malformed no-feed record, never free text.
-NO_FEED_WORDS = ("s1-precluded", "no-feeds-unattributed")
-RECEIPT_TEXT = "no joint feeds"
-# Decision text owned by the terminal records; never free text.
-WEDGE_PHRASE = "Published then WoundDown"
-S1_RECEIPT = ("Error: wp7-stop{k}: no joint feeds with S1 seal "
-              "(producers unlinked, zero installs); not attempted")
-UNATTRIBUTED_RECEIPT = ("Error: wp7-stop{k}: no joint feeds without S1 seal "
-                        "(producers linked, zero installs unexplained); "
-                        "not attempted")
-# The Rust terminal check's error with the StopOutcome Display
-# (src/inventory/joint_stop_races_privileged_tests.rs).
-WEDGE_HEAD_RE = re.compile(
-    r"Error: offset " + OFFSET
-    + r": the finish must reach Published then WoundDown: (.*)")
-OUTCOME_RE = re.compile(
-    r"offset=" + OFFSET + r" begin=(\S+) finish=(published|abandoned|"
-    r"not-begun|unpublished) \(([0-9]+) polls\) first_error=(None|Some\(.*\)) "
-    r"latched=(true|false) latch=(None|Some\(.*\)) h0=(\S+) "
-    r"wound=(joined|unwound|wound-refused:.*) \(([0-9]+) polls\) "
-    r"taken=(true|false) minted=(true|false) stash=(None|Some\(.*\)) "
-    r"stop_counts=(.*) api_a=([0-9]+) a_sem=([0-9]+) shed=([0-9]+) "
-    r"reconciled=(true|false) abandon_gap=(None|Some\(.*\)) branch=(linked)")
-OUTCOME_KEYS = (" begin=", " finish=", " first_error=", " latched=",
-                " latch=", " h0=", " wound=", " taken=", " minted=",
-                " stash=", " stop_counts=", " api_a=", " a_sem=", " shed=",
-                " reconciled=", " abandon_gap=", " branch=")
-# Case-bound diagnostics: legal only inside the linked case they name.
-OUTCOME_LINE_RE = re.compile(r"JOINT_STOP (outcome: offset=|offset=)"
-                             + OFFSET + r"\b.*")
-CASE_MENTION_RE = re.compile(r"wp7-stop([0-9]+)")
-BACKTRACE_HEAD = "Stack backtrace:"
-BACKTRACE_FRAME_RE = re.compile(r" +([0-9]+: \S.*|at \S.*)")
-BACKTRACE_NOTE_RE = re.compile(r"note: Some details are omitted, .*")
+    + COUNT + r" filtered out; finished in [0-9]{1,10}\.[0-9]{2}s")
+NO_FEED = {
+    "s1-precluded":
+        "no joint feeds with S1 seal (producers unlinked, zero installs)",
+    "no-feeds-unattributed":
+        "no joint feeds without S1 seal (producers linked, zero installs "
+        "unexplained)",
+}
+BRANCHES = ("linked",) + tuple(NO_FEED)
+STOP_CHECKS = ("at-q", "latch", "abandon", "terminal", "reconcile")
+STAGES = ("setup", "drive", "check")
+BEGINS = ("polling", "published-at-begin", "abandoned-at-begin", "not-begun")
+FINISHES = ("published", "abandoned", "not-begun", "unpublished")
+OUTCOME_BRANCHES = ("linked", "s1", "unattributed")
+U64_MAX = 2 ** 64 - 1
 
 # Every check the validator applies, by the reason it reports. The
 # table suite disables each in turn (mutation proof).
 CHECKS = (
-    "exit-status", "header", "summary-missing", "summary-duplicate",
+    "exit-status", "summary-missing", "summary-duplicate",
     "summary-malformed", "summary-not-terminal", "summary-counts",
-    "summary-status", "outcome", "failures-list", "stray-framing",
-    "record-malformed", "receipt-stray", "error-count",
-    "error-not-terminal", "sequence", "offset-binding", "finish-binding",
-    "matrix-short", "pass-with-no-feed", "unexpected-pass",
-    "s1-after-linked", "receipt-mismatch", "no-feed-unattributed",
-    "wedge-binding", "wedge-unexpected", "text-reserved", "text-binding",
-    "evidence-after-preclusion", "terminal-reserved", "wedge-record",
-    "wedge-success",
+    "summary-status", "record-missing", "record-duplicate",
+    "record-misplaced", "record-json", "record-schema", "record-cell",
+    "selection", "case-sequence", "case-branch", "case-outcome",
+    "completion", "terminal-status", "terminal-case", "qualified-count",
+    "unexpected-pass",
+    "precluded-binding", "no-feed-binding", "s1-after-linked",
+    "no-feed-unattributed", "wedge-binding", "wedge-unexpected",
+    "case-failed-binding", "narrowed",
 )
 
 
@@ -157,6 +115,10 @@ class Refusal(Exception):
         super().__init__(reason)
         self.reason = reason
         self.detail = detail
+
+
+class Malformed(Exception):
+    """A schema or JSON violation, with its path."""
 
 
 def verdict(qualification, reason, detail, result_line=""):
@@ -175,6 +137,44 @@ def classify(text, status, cell, expect_wedge=False, disabled=frozenset()):
     except Refusal as refusal:
         return verdict("failed", refusal.reason, refusal.detail,
                        state["result_line"])
+    except (KeyError, IndexError, TypeError) as error:
+        # Reachable only with checks disabled (the mutation proof):
+        # an unvalidated record still never qualifies.
+        return verdict("failed", "case-failed",
+                       "unjudgeable record: %r" % (error,),
+                       state["result_line"])
+
+
+def first_failing_check(outcome):
+    """The Rust cell's stop checks in order (stop_check_failure)."""
+    o = outcome
+    if not (o["api_a"] == o["a_semantic"]
+            or (o["reconciled"] and o["lane_shed"] > 0)):
+        return "at-q"
+    if o["latched"]:
+        code, gap, error = o["latch_code"], o["abandon_gap"], o["first_error"]
+        if code is None or gap is None or code not in gap \
+                or error is None or code not in error:
+            return "latch"
+    elif o["first_error"] is not None:
+        return "latch"
+    abandoned = "abandoned" in o["finish"] or "abandoned" in o["begin"]
+    if abandoned and o["stash_floor"] is not None:
+        if not (o["api_a"] == o["a_semantic"]
+                or o["abandon_gap"] is not None):
+            return "abandon"
+    elif o["abandon_gap"] is not None:
+        return "abandon"
+    if not reached_wound_down(o):
+        return "terminal"
+    if not o["reconciled"]:
+        return "reconcile"
+    return None
+
+
+def reached_wound_down(outcome):
+    return (outcome["finish"] == "published" and outcome["wound"] == "joined"
+            and outcome["taken"] is True)
 
 
 def _classify(text, status, cell, expect_wedge, disabled, state):
@@ -187,18 +187,8 @@ def _classify(text, status, cell, expect_wedge, disabled, state):
           "libtest failure (101): a signal, abort or harness error"
           % status)
     lines = text.split("\n")
-    if lines and lines[-1] == "":
-        lines.pop()
 
-    # Header: blank lines, then exactly one selected test.
-    first = 0
-    while first < len(lines) and lines[first] == "":
-        first += 1
-    check("header", first < len(lines) and lines[first] == "running 1 test",
-          "the log does not open with `running 1 test` (zero or several "
-          "tests selected, or unframed output)")
-
-    # Summary: exactly one, full-line, terminal.
+    # The libtest summary: exactly one, full-line, terminal, one test.
     summaries = [i for i, line in enumerate(lines) if "test result:" in line]
     check("summary-missing", bool(summaries),
           "no libtest summary (unfinished transcript)")
@@ -211,292 +201,284 @@ def _classify(text, status, cell, expect_wedge, disabled, state):
     match = SUMMARY_RE.fullmatch(summary)
     check("summary-malformed", match is not None,
           "malformed libtest summary: %r" % summary[:200])
-    tail = [line for line in lines[at + 1:] if line != ""]
-    check("summary-not-terminal", not tail,
-          "content after the libtest summary: %r" % (tail[:1] or [""])[0][:200])
-    passed_run = None
-    if match is not None:
-        word = match.group(1)
-        counts = tuple(match.group(i) for i in range(2, 6))
-        want = ("1", "0", "0", "0") if word == "ok" else ("0", "1", "0", "0")
-        check("summary-counts", counts == want,
-              "summary counts %s are not exactly one %s test"
-              % (tuple(c[:12] for c in counts),
-                 "passing" if word == "ok" else "failing"))
-        check("summary-status",
-              (word == "ok" and status == 0)
-              or (word == "FAILED" and status == 101),
-              "summary %s disagrees with exit status %s" % (word, status))
-        passed_run = word == "ok"
-    if passed_run is None:
-        passed_run = status == 0
-    word = "ok" if passed_run else "FAILED"
+    check("summary-not-terminal",
+          all(line == "" for line in lines[at + 1:]),
+          "output follows the libtest summary")
+    passed = match is not None and match.group(1) == "ok"
+    counts = tuple(int(group) for group in match.groups()[1:5]) \
+        if match else None
+    check("summary-counts",
+          counts in ((1, 0, 0, 0), (0, 1, 0, 0))
+          and (counts == (1, 0, 0, 0)) == passed,
+          "the summary does not report exactly one run test: %r"
+          % summary[:200])
+    check("summary-status", passed == (status == 0),
+          "summary %r disagrees with exit status %s" % (summary[:80], status))
 
-    # Trailer before the summary.
-    end = at
-    if passed_run:
-        trailer = [""]
-    else:
-        trailer = ["", "failures:", "", "failures:", "    " + cell, ""]
-    observed = lines[max(end - len(trailer), 0):end]
-    check("failures-list", observed == trailer,
-          "the libtest trailer before the summary is not the %s trailer "
-          "for exactly %s" % (word, cell))
-    end = max(end - len(trailer), first + 1)
+    # The record: exactly one line carrying the marker, at its start.
+    carrying = [line for line in lines if MARKER in line]
+    check("record-missing", bool(carrying),
+          "no verdict record (the cell panicked, was killed, or is not "
+          "the record-emitting build)")
+    check("record-duplicate", len(carrying) <= 1,
+          "%d verdict records; the cell prints exactly one"
+          % len(carrying))
+    line = carrying[-1] if carrying else MARKER + "null"
+    check("record-misplaced", line.startswith(MARKER),
+          "the verdict marker does not open its line: %r" % line[:200])
+    try:
+        record = _parse(line[line.index(MARKER) + len(MARKER):])
+    except Malformed as error:
+        check("record-json", False, "the verdict record is not strict "
+              "JSON: %s" % error)
+        record = None
+    try:
+        _validate_schema(record)
+    except Malformed as error:
+        check("record-schema", False,
+              "the verdict record breaks the schema: %s" % error)
+        raise Refusal("case-failed", "unreadable record (schema checks "
+                      "disabled)")
+    check("record-cell", record["cell"] == cell,
+          "the record names cell %r, not %r" % (record["cell"][:200], cell))
+    result = _judge(record, status, expect_wedge, check)
+    result["result_line"] = summary
+    return result
 
-    # Outcome: threaded line or single-thread verdict.
-    start_prefix = "test %s ... " % cell
-    timeout_line = "test %s has been running for over 60 seconds" % cell
-    body_start = first + 1
-    outcome = lines[end - 1] if end - 1 >= body_start else ""
-    body = []
-    if outcome == start_prefix + word:
-        body = lines[body_start:end - 1]
-    elif outcome == word and body_start < end - 1 \
-            and lines[body_start].startswith(start_prefix):
-        body = ([lines[body_start][len(start_prefix):]]
-                + lines[body_start + 1:end - 1])
-    else:
-        check("outcome", False,
-              "no `test %s ... %s` outcome agreeing with the summary"
-              % (cell, word))
-        body = lines[body_start:end]
-    body = [line for line in body if line != timeout_line]
 
-    # Body records, in order. Free text is allowed only where it carries
-    # no evidence: reserved stems and no-feed words must form full
-    # records, receipts and the wedge phrase belong to the terminal
-    # error, and case-bound diagnostics must sit inside the linked case
-    # they name. Positions are checked against the case sequence below.
-    items = []
-    errors = []
-    for index, line in enumerate(body):
-        if line.startswith("Error: "):
-            errors.append(index)
-            items.append(("error", index, None))
-            continue
-        check("stray-framing",
-              not (line in ("ok", "FAILED") or line.startswith("test ")
-                   or line.startswith("running ") or line == "failures:"),
-              "stray libtest framing inside the cell output: %r" % line[:200])
-        if any(stem in line for stem in RECORD_STEMS) \
-                or any(word in line for word in NO_FEED_WORDS):
-            branch = BRANCH_RE.fullmatch(line)
-            offset = OFFSET_RE.fullmatch(line)
-            complete = COMPLETE_RE.fullmatch(line)
-            check("record-malformed", branch or offset or complete,
-                  "malformed or embedded record: %r" % line[:200])
-            if branch:
-                items.append(("tag", int(branch.group(1)), branch.group(2)))
-            elif offset:
-                items.append(("offset", int(offset.group(1)),
-                              (offset.group(3), offset.group(2))))
-            elif complete:
-                items.append(("complete", int(complete.group(1)), None))
-            continue
-        check("receipt-stray", RECEIPT_TEXT not in line,
-              "no-feed receipt outside the terminal error: %r" % line[:200])
-        check("text-reserved", WEDGE_PHRASE not in line
-              and "test result:" not in line,
-              "terminal decision text inside a diagnostic: %r" % line[:200])
-        items.append(("text", index, line))
+def _judge(record, status, expect_wedge, check):
+    selection = record["selection"]
+    check("selection",
+          selection == {"preps": list(range(PREPS)),
+                        "offsets": list(range(len(OFFSETS_MS)))},
+          "the run's selection is not the full matrix: %r" % (selection,))
+    cases = record["cases"]
+    terminal = record["terminal"]
+    kind = terminal["kind"]
+    check("case-sequence", len(cases) <= CASES and all(
+        case["index"] == k and case["name"] == "wp7-stop%d" % k
+        and case["prep"] == k // len(OFFSETS_MS)
+        and case["offset_ms"] == OFFSETS_MS[k % len(OFFSETS_MS)]
+        for k, case in enumerate(cases)),
+        "the cases are not the matrix in order (index, name, prep, "
+        "offset)")
+    last = len(cases) - 1
+    for k, case in enumerate(cases):
+        check("case-branch",
+              case["branch"] == "linked" or k == last,
+              "wp7-stop%d: an unlinked branch %r before the last opened "
+              "case" % (k, case["branch"]))
+        outcome = case["outcome"]
+        check("case-outcome",
+              (outcome is None or (case["branch"] == "linked"
+                                   and outcome["offset_ms"]
+                                   == case["offset_ms"]))
+              and (outcome is not None or k == last),
+              "wp7-stop%d: an outcome on an unlinked case, from another "
+              "offset, or missing before the last opened case" % k)
+        failing = first_failing_check(outcome) if outcome else "absent"
+        check("completion",
+              case["completed"] == (outcome is not None and failing is None)
+              and (case["completed"] or k == last),
+              "wp7-stop%d: completed=%s contradicts its outcome (first "
+              "failing check: %s), or an earlier case is open"
+              % (k, case["completed"], failing))
+    open_case = cases[last] if cases else None
+    check("terminal-status", (kind == "qualified") == (status == 0),
+          "terminal %r with exit status %s" % (kind, status))
+    check("terminal-case",
+          (kind in ("qualified", "narrowed"))
+          == (open_case is not None and open_case["completed"])
+          and terminal.get("case", last if cases else None)
+          == (last if cases else None),
+          "terminal %r does not bind the last opened case" % kind)
 
-    if passed_run:
-        check("error-count", not errors,
-              "a passing run carries an Error record: %r"
-              % (body[errors[0]][:200] if errors else ""))
-        terminal = None
-    else:
-        check("error-count", len(errors) == 1,
-              "a failing run needs exactly one terminal Error record, "
-              "saw %d (panic, abort or competing errors)" % len(errors))
-        terminal = body[errors[-1]] if errors else None
-        if errors:
-            after = body[errors[-1] + 1:]
-            check("error-not-terminal", _backtrace_only(after),
-                  "content after the terminal error: %r"
-                  % next((line for line in after if line), "")[:200])
-    for index in errors[:-1] if not passed_run else errors:
-        check("receipt-stray", RECEIPT_TEXT not in body[index],
-              "no-feed receipt outside the terminal error: %r"
-              % body[index][:200])
-    if terminal is not None:
-        check("terminal-reserved",
-              not any(stem in terminal for stem in RECORD_STEMS)
-              and not any(word in terminal for word in NO_FEED_WORDS)
-              and "test result:" not in terminal,
-              "the terminal error embeds a reserved record: %r"
-              % terminal[:200])
-
-    # Case sequence: linked, offset diagnostic, completion; in order.
-    next_case = 0
-    phase = "start"
-    current = None
-    nofeed = None
-    finish = None
-    latch = None
-    for kind, value, extra in items:
-        if kind == "error":
-            # The terminal error decides; what follows it is the
-            # backtrace block, checked above.
-            break
-        if kind == "text":
-            if extra != "":
-                _check_text(check, extra, phase, next_case, current)
-            continue
-        if phase == "start" and kind == "tag" and value == next_case:
-            current = value
-            if extra == "linked":
-                phase = "linked"
-            else:
-                phase = "nofeed"
-                nofeed = (value, extra)
-            continue
-        if phase == "linked" and kind == "offset":
-            check("offset-binding", value == OFFSETS_MS[current % 4],
-                  "wp7-stop%d ran at offset %d ms, not its matrix offset "
-                  "%d ms" % (current, value, OFFSETS_MS[current % 4]))
-            phase = "offset"
-            finish, latch = extra
-            continue
-        if phase == "offset" and kind == "complete" and value == current:
-            check("finish-binding", finish == "published",
-                  "wp7-stop%d completed with finish=%s, not published"
-                  % (current, finish))
-            next_case += 1
-            phase = "done" if next_case == CASES else "start"
-            continue
-        check("sequence", False,
-              "case record out of order, duplicated or mismatched: %s "
-              "wp7-stop%s after phase %s of wp7-stop%s"
-              % (kind, value, phase, current))
-
-    if passed_run:
-        check("pass-with-no-feed", phase != "nofeed",
-              "joint cell passed with a no-feed preclusion tag "
-              "(regression); a pass never precludes")
-        missing = [str(k) for k in range(next_case, CASES)]
-        check("matrix-short", phase == "done",
-              "joint cell passed without the full stop matrix (missing "
-              "completed cases: %s); the qualifying entry forces all 12 "
-              "wp7-stop cases" % " ".join(missing))
+    if kind == "qualified":
+        check("qualified-count", len(cases) == CASES,
+              "a qualified terminal over %d of %d cases"
+              % (len(cases), CASES))
         check("unexpected-pass", not expect_wedge,
               "joint cell unexpectedly passed under "
               "JOINT_EXPECTED_FAILURE=1; set 0 once the wedge is gone")
         return verdict("qualified", "full-matrix",
-                       "linked joint stop reaches Published then WoundDown "
-                       "(12-case matrix)", summary)
-
-    terminal = terminal or ""
-    if phase == "nofeed":
-        k, tag = nofeed
-        if tag == "s1-precluded" and terminal == S1_RECEIPT.format(k=k):
-            check("s1-after-linked", k == 0,
-                  "joint cell mixed linked operation with an S1 preclusion "
-                  "at wp7-stop%d (regression); preclusion holds only "
-                  "before any linked case" % k)
-            return verdict("environment-precluded", "s1-first-case",
-                           "environment-precluded: S1 seal without joint "
-                           "feeds (producers unlinked, zero installs)",
-                           summary)
-        if tag == "no-feeds-unattributed" \
-                and terminal == UNATTRIBUTED_RECEIPT.format(k=k):
-            check("no-feed-unattributed", False,
-                  "joint cell produced no feeds without an S1 seal "
-                  "(unattributed: producers linked, zero installs "
-                  "unexplained) at wp7-stop%d; not environmental" % k)
-        check("receipt-mismatch", False,
-              "wp7-stop%d %s tag without its own matching terminal "
-              "receipt (ambiguous): %r" % (k, tag, terminal[:200]))
-    check("receipt-mismatch", RECEIPT_TEXT not in terminal,
-          "no-feed receipt without its case tag (ambiguous): %r"
-          % terminal[:200])
-    wedge = WEDGE_HEAD_RE.fullmatch(terminal)
-    if wedge and phase == "offset":
-        want = OFFSETS_MS[current % 4]
-        outcome = OUTCOME_RE.fullmatch(wedge.group(2))
-        check("wedge-record",
-              outcome is not None
-              and all(wedge.group(2).count(key) == 1 for key in OUTCOME_KEYS),
-              "wedge terminal is not one whole linked StopOutcome record: %r"
-              % terminal[:300])
-        if outcome is not None:
-            check("wedge-binding",
-                  int(wedge.group(1)) == want
-                  and int(outcome.group(1)) == want
-                  and outcome.group(3) == finish
-                  and outcome.group(6) == ("true" if latch == "latched"
-                                           else "false"),
-                  "wedge error does not belong to wp7-stop%d (offset %d ms, "
-                  "finish=%s, %s): %r"
-                  % (current, want, finish, latch, terminal[:200]))
-            check("wedge-success",
-                  not (outcome.group(3) == "published"
-                       and outcome.group(9) == "joined"
-                       and outcome.group(11) == "true"),
-                  "wedge terminal describes a successful stop (published, "
-                  "joined, taken); the terminal check cannot fail on it: %r"
-                  % terminal[:200])
+                       "all %d stop cases completed" % CASES)
+    if kind == "narrowed":
+        check("narrowed", False,
+              "the cell reports a narrowed matrix")
+    if kind in ("precluded", "no-feed"):
+        branch = open_case["branch"] if open_case else None
+        check("no-feed-binding",
+              open_case is not None and branch in NO_FEED
+              and terminal["cause"] == branch
+              and terminal["receipt"] == NO_FEED[branch]
+              and open_case["outcome"] is None,
+              "the no-feed terminal does not match its case's branch, "
+              "receipt or undriven state")
+        first_s1 = len(cases) == 1 and branch == "s1-precluded"
+        check("precluded-binding", (kind == "precluded") == first_s1,
+              "a %s terminal where the S1 seal %s the first and only case"
+              % (kind, "is" if first_s1 else "is not"))
+        if kind == "precluded":
+            return verdict(
+                "environment-precluded", "s1-first-case",
+                "wp7-stop0: %s; not attempted" % NO_FEED["s1-precluded"])
+        check("s1-after-linked", branch != "s1-precluded",
+              "wp7-stop%d sealed S1 after linked cases" % last)
+        check("no-feed-unattributed", branch != "no-feeds-unattributed",
+              "wp7-stop%d: %s" % (last, NO_FEED["no-feeds-unattributed"]))
+    if kind == "wedge":
+        outcome = open_case["outcome"] if open_case else None
+        check("wedge-binding",
+              outcome is not None and open_case["branch"] == "linked"
+              and first_failing_check(outcome) == "terminal",
+              "the wedge terminal's case did not fail first at the "
+              "Published-then-WoundDown check")
         check("wedge-unexpected", expect_wedge,
-              "wedge reproduced under JOINT_EXPECTED_FAILURE=0 "
-              "(regression); set 1 to re-arm the expectation")
+              "wp7-stop%d wedged: the finish did not reach Published "
+              "then WoundDown" % last)
         return verdict("expected-failure", "wedge",
-                       "expected failure: joint finish wedges at "
-                       "wp7-stop%d (task/v060-joint-wedge owns the fix)"
-                       % current, summary)
-    # Fail-closed default: a failure that is none of the classified
-    # outcomes above. Not a check (nothing to disable): it is what is
-    # left when every accept path refused.
-    where = ("after the full matrix" if phase == "done"
-             else "at wp7-stop%d" % current if current is not None
-             else "before the first case")
-    raise Refusal("case-failed", "joint cell failed %s without the wedge "
-                  "signature (regression or new failure): %r"
-                  % (where, terminal[:300]))
+                       "wp7-stop%d wedged (expected)" % last)
+    if kind == "case-failed":
+        stage = terminal["stage"]
+        if open_case is None:
+            bound = stage == "setup" and terminal["check"] is None
+        elif stage == "setup":
+            bound = open_case["branch"] is None and terminal["check"] is None
+        elif stage == "drive":
+            bound = (open_case["branch"] == "linked"
+                     and open_case["outcome"] is None
+                     and terminal["check"] is None)
+        else:
+            outcome = open_case["outcome"]
+            failing = first_failing_check(outcome) if outcome else None
+            bound = (open_case["branch"] == "linked" and outcome is not None
+                     and failing not in (None, "terminal")
+                     and terminal["check"] == failing)
+        check("case-failed-binding", bound,
+              "the case-failed terminal (stage %s, check %s) contradicts "
+              "its case" % (stage, terminal["check"]))
+    where = "before the first case" if open_case is None \
+        else "wp7-stop%d" % last
+    raise Refusal("case-failed", "%s failed: %s"
+                  % (where, _excerpt(terminal.get("error", kind))))
 
 
-def _check_text(check, line, phase, next_case, current):
-    """Position rules for free text: no evidence after a no-feed tag,
-    and case-bound diagnostics only inside the case they name."""
-    check("evidence-after-preclusion", phase != "nofeed",
-          "output after the no-feed tag of wp7-stop%s; the tag must be "
-          "followed directly by its receipt: %r" % (current, line[:200]))
-    bound = next_case if phase == "start" else current
-    for mention in CASE_MENTION_RE.findall(line):
-        check("text-binding", phase != "done" and int(mention) == bound,
-              "diagnostic names wp7-stop%s outside that case (phase %s of "
-              "wp7-stop%s): %r" % (mention, phase, bound, line[:200]))
-    outcome = OUTCOME_LINE_RE.fullmatch(line)
-    if outcome is not None:
-        stage = "linked" if outcome.group(1).startswith("outcome") else "offset"
-        check("text-binding",
-              phase == stage and current is not None
-              and int(outcome.group(2)) == OFFSETS_MS[current % 4],
-              "stop outcome diagnostic outside its linked case's %s stage: "
-              "%r" % (stage, line[:200]))
-    if re.search(r"wp7-stop[0-9]+: finish=", line):
-        check("text-binding", phase == "linked",
-              "stop finish diagnostic outside a linked case: %r" % line[:200])
+def _excerpt(text):
+    return repr(text[:300])
 
 
-def _backtrace_only(after):
-    """Only blank lines and one anyhow backtrace block may follow."""
-    rest = [line for line in after]
-    while rest and rest[0] == "":
-        rest.pop(0)
-    if not rest:
-        return True
-    if rest[0] != BACKTRACE_HEAD:
-        return False
-    for line in rest[1:]:
-        if any(stem in line for stem in RECORD_STEMS) \
-                or RECEIPT_TEXT in line or WEDGE_PHRASE in line:
-            return False
-        if line == "" or BACKTRACE_FRAME_RE.fullmatch(line) \
-                or BACKTRACE_NOTE_RE.fullmatch(line):
-            continue
-        return False
-    return True
+def _parse(raw):
+    def pairs(items):
+        keys = [key for key, _ in items]
+        if len(keys) != len(set(keys)):
+            raise Malformed("duplicate key in %r" % sorted(keys))
+        return dict(items)
+
+    def parse_int(digits):
+        if len(digits.lstrip("-")) > 20:
+            raise Malformed("integer of %d digits" % len(digits))
+        return int(digits)
+
+    def refuse(token):
+        raise Malformed("non-integer number %r" % token[:40])
+
+    try:
+        return json.loads(raw, object_pairs_hook=pairs, parse_int=parse_int,
+                          parse_float=refuse, parse_constant=refuse)
+    except Malformed:
+        raise
+    except (ValueError, RecursionError) as error:
+        raise Malformed(str(error)[:200])
+
+
+def _is_u64(value):
+    return type(value) is int and 0 <= value <= U64_MAX
+
+
+def _is_str(value):
+    return type(value) is str
+
+
+def _opt(test):
+    return lambda value: value is None or test(value)
+
+
+def _one_of(*allowed):
+    return lambda value: _is_str(value) and value in allowed
+
+
+def _keys(value, expected, path):
+    if type(value) is not dict:
+        raise Malformed("%s is not an object" % path)
+    if set(value) != set(expected):
+        raise Malformed("%s keys %r, want %r"
+                        % (path, sorted(value), sorted(expected)))
+    for key, test in expected.items():
+        if not test(value[key]):
+            raise Malformed("%s.%s has a bad value %r"
+                            % (path, key, value[key]))
+
+
+def _list_of(test, length=None):
+    def check(value):
+        return (type(value) is list and all(test(item) for item in value)
+                and (length is None or len(value) == length))
+    return check
+
+
+def _wound(value):
+    return _is_str(value) and (value in ("joined", "unwound")
+                               or value.startswith("wound-refused:"))
+
+
+OUTCOME_FIELDS = {
+    "offset_ms": _is_u64, "begin": _one_of(*BEGINS),
+    "finish_polls": _is_u64, "finish": _one_of(*FINISHES),
+    "first_error": _opt(_is_str), "latched": lambda v: type(v) is bool,
+    "latch_code": _opt(_is_str), "h0_stop": _is_str, "wound": _wound,
+    "wound_polls": _is_u64, "taken": lambda v: type(v) is bool,
+    "minted": lambda v: type(v) is bool, "stash_floor": _opt(_is_u64),
+    "stop_counts": _list_of(_is_u64, 4), "api_a": _is_u64,
+    "a_semantic": _is_u64, "lane_shed": _is_u64,
+    "reconciled": lambda v: type(v) is bool, "reconcile_detail": _is_str,
+    "abandon_gap": _opt(_is_str), "branch": _one_of(*OUTCOME_BRANCHES),
+}
+CASE_FIELDS = {
+    "name": _is_str, "index": _is_u64, "prep": _is_u64,
+    "offset_ms": _is_u64, "branch": _opt(_one_of(*BRANCHES)),
+    "outcome": lambda v: True, "completed": lambda v: type(v) is bool,
+}
+TERMINAL_FIELDS = {
+    "qualified": {}, "narrowed": {},
+    "precluded": {"case": _is_u64, "cause": _is_str, "receipt": _is_str},
+    "no-feed": {"case": _is_u64, "cause": _is_str, "receipt": _is_str},
+    "wedge": {"case": _is_u64},
+    "case-failed": {"case": _opt(_is_u64), "stage": _one_of(*STAGES),
+                    "check": _opt(_one_of(*STOP_CHECKS)), "error": _is_str},
+}
+
+
+def _validate_schema(record):
+    _keys(record, {"schema": lambda v: v == SCHEMA, "cell": _is_str,
+                   "selection": lambda v: True, "cases": lambda v: True,
+                   "terminal": lambda v: True}, "record")
+    if record["selection"] is not None:
+        _keys(record["selection"], {"preps": _list_of(_is_u64),
+                                    "offsets": _list_of(_is_u64)},
+              "selection")
+    if type(record["cases"]) is not list:
+        raise Malformed("cases is not a list")
+    for k, case in enumerate(record["cases"]):
+        _keys(case, CASE_FIELDS, "cases[%d]" % k)
+        if case["outcome"] is not None:
+            _keys(case["outcome"], OUTCOME_FIELDS, "cases[%d].outcome" % k)
+    terminal = record["terminal"]
+    if type(terminal) is not dict or \
+            terminal.get("kind") not in TERMINAL_FIELDS:
+        raise Malformed("terminal has no known kind")
+    fields = dict(TERMINAL_FIELDS[terminal["kind"]])
+    fields["kind"] = _is_str
+    _keys(terminal, fields, "terminal")
 
 
 def main(argv):

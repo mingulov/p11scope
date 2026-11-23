@@ -2,16 +2,22 @@
 # SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Table-driven qualification suite for scripts/ci/joint_stop_verdict.py.
 
-One row per accepted shape and per malformed or contradictory input
-class of the Joint linked-stop cell log. Each row names the exact
-qualification and reason the fail-closed validator must return. The
-mutation test disables every named check in turn and requires at
-least one row to turn red, so no check is dead weight; the coverage
-test requires every check to be the refusing reason of some row.
+The Joint linked-stop cell prints one verdict record built from its own
+case ledger; the validator judges only that record, the exit status
+and the libtest summary. One row per accepted shape and per malformed
+or contradictory class, each expressed as the record (and framing) it
+would produce, with the exact qualification and reason the validator
+must return. Every class the reviews found against the old free-text
+grammar (rounds 2 to 9) has a row here in record form. The mutation
+test disables every named check in turn and requires some row to turn
+red; the coverage test requires every check to be the refusing reason
+of some row.
 
 Run: python3 -I tests/python/test_joint_stop_verdict.py -v
 """
 
+import copy
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -21,469 +27,406 @@ sys.path.insert(0, str(ROOT / "scripts/ci"))
 sys.path.insert(0, str(ROOT / "tests/python"))
 import joint_stop_verdict as jv  # noqa: E402
 from joint_stop_logs import (  # noqa: E402
-    BACKTRACE, CELL, FAILED_SUMMARY, OK_SUMMARY, PREAMBLE, S1_ERROR,
-    UNATTRIBUTED_ERROR, case_head, case_lines, case_outcome, frame,
-    matrix_body, offset_of, passing, precluded, s1_body, unattributed_body,
-    wedge_body, wedge_error,
+    CELL, MARKER, OK_SUMMARY, PREAMBLE, S1_RECEIPT, UNATTRIBUTED_RECEIPT,
+    body_for, case_failed_record, case_record, frame, healthy_outcome,
+    log_for, no_feed_record, offset_of, passing, precluded,
+    precluded_record, qualified_record, record_line, wedge_outcome,
+    wedge_record, wedged,
 )
 
 Q, X, P, F = "qualified", "expected-failure", "environment-precluded", "failed"
-WEDGE = "Published then WoundDown"
 
 
-def replace_line(text, old, new):
-    assert text.count(old) == 1, old
-    return text.replace(old, new)
+def edited(rec, change):
+    """A deep copy of `rec` after `change(copy)`."""
+    rec = copy.deepcopy(rec)
+    change(rec)
+    return rec
 
 
-def full_with(extra_tail_body):
-    """A full matrix whose body ends with extra lines."""
-    return frame(matrix_body() + list(extra_tail_body), True)
+def case_set(k, **fields):
+    def change(rec):
+        rec["cases"][k].update(fields)
+    return change
 
 
-def body_edit(body, old, new):
-    """Replace (or drop, when new is None) the first line equal to old."""
-    body = list(body)
-    index = body.index(old)
-    if new is None:
-        del body[index]
-    else:
-        body[index] = new
-    return body
+def outcome_set(k, **fields):
+    def change(rec):
+        rec["cases"][k]["outcome"].update(fields)
+    return change
 
 
-def matrix_without(k):
-    body = []
-    for line in matrix_body():
-        if line != "P11SCOPE_STOP_COMPLETE=wp7-stop%d" % k:
-            body.append(line)
-    return body
+def raw_log(record_text, ok=True, rec=None):
+    """A log whose record line is `record_text` verbatim."""
+    rec = rec or qualified_record()
+    body = body_for(rec)
+    at = body.index(record_line(rec))
+    body[at] = record_text
+    return frame(body, ok)
 
 
-# (id, log, status, expect_wedge, qualification, reason, origin)
+def with_body(rec, before=(), after=(), ok=None, **kwargs):
+    if ok is None:
+        ok = rec["terminal"]["kind"] == "qualified"
+    return frame(body_for(rec, before, after), ok, **kwargs)
+
+
+QR = qualified_record()
+PR = precluded_record()
+WR = wedge_record(5)
+
+
+def summary_with(text):
+    return passing(summary=text)
+
+
 ROWS = [
-    # ---- accepted shapes ------------------------------------------------
-    ("pass-threaded", passing(), 0, False, Q, "full-matrix", "positive"),
+    # --- controls ---------------------------------------------------
+    ("pass-threaded", passing(), 0, False, Q, "full-matrix", "control"),
     ("pass-single-thread", passing(threaded=False), 0, False, Q,
-     "full-matrix", "positive (LONG framing)"),
-    ("pass-with-timeout-warning",
-     frame(matrix_body()[:3] + ["test %s has been running for over 60 "
-                                "seconds" % CELL] + matrix_body()[3:], True),
-     0, False, Q, "full-matrix", "positive (slow runner)"),
-    ("s1-threaded", precluded(), 101, False, P, "s1-first-case", "positive"),
-    ("s1-single-thread", precluded(threaded=False), 101, False, P,
-     "s1-first-case", "positive (LONG framing)"),
-    ("s1-with-backtrace", frame(s1_body() + BACKTRACE, False), 101, False, P,
-     "s1-first-case", "positive (RUST_BACKTRACE set)"),
-    ("s1-under-expect-wedge", precluded(), 101, True, P, "s1-first-case",
-     "positive (preclusion holds whatever the expectation)"),
-    ("wedge-under-expect", frame(wedge_body(), False), 101, True, X, "wedge",
-     "positive (opt-in wedge arm)"),
-    ("wedge-single-thread", frame(wedge_body(), False, threaded=False), 101,
-     True, X, "wedge", "positive (LONG framing)"),
+     "full-matrix", "control"),
+    ("precluded-threaded", precluded(), 101, False, P, "s1-first-case",
+     "control"),
+    ("precluded-single-thread", precluded(threaded=False), 101, False, P,
+     "s1-first-case", "control"),
+    ("wedge-expected", wedged(), 101, True, X, "wedge", "control"),
+    ("wedge-expected-case0", wedged(0), 101, True, X, "wedge", "control"),
+    ("wedge-not-expected", wedged(), 101, False, F, "wedge-unexpected",
+     "control"),
+    ("pass-under-expected-wedge", passing(), 0, True, F, "unexpected-pass",
+     "r2-r6: an unexpected pass under JOINT_EXPECTED_FAILURE=1"),
+    ("unattributed-case0", log_for(no_feed_record(0, "no-feeds-unattributed")),
+     101, False, F, "no-feed-unattributed", "r2-r6: S1 vs unattributed"),
+    ("unattributed-case4", log_for(no_feed_record(4, "no-feeds-unattributed")),
+     101, False, F, "no-feed-unattributed", "r2-r6: S1 vs unattributed"),
+    ("s1-after-linked", log_for(no_feed_record(1)), 101, False, F,
+     "s1-after-linked", "r2-r6: S1 after a linked case"),
+    ("s1-after-seven-linked", log_for(no_feed_record(7)), 101, False, F,
+     "s1-after-linked", "r2-r6: S1 after a linked case"),
+    ("case-failed-check", log_for(case_failed_record(3)), 101, False, F,
+     "case-failed", "control"),
+    ("case-failed-drive", log_for(case_failed_record(2, "drive")), 101,
+     False, F, "case-failed", "control"),
+    ("case-failed-setup", log_for(case_failed_record(6, "setup")), 101,
+     False, F, "case-failed", "control"),
+    ("case-failed-before-first-case",
+     log_for(case_failed_record(None, "setup", error="softhsm missing")),
+     101, False, F, "case-failed", "control"),
+    ("narrowed-selection", log_for(edited(QR, lambda r: r.update(
+        selection={"preps": [0], "offsets": [0, 1, 2, 3]}, cases=r["cases"][:4],
+        terminal={"kind": "narrowed"})), ok=True), 0, False, F, "selection",
+     "r2-r6: a narrowed matrix never qualifies"),
+    ("selection-refused", log_for(case_failed_record(None, "setup",
+                                                     error="bad WP7_STOP_PREPS")
+                                  | {"selection": None}), 101, False, F,
+     "selection", "derived: refused selector"),
 
-    # ---- exit status ----------------------------------------------------
-    ("s1-log-signal-137", precluded(), 137, False, F, "exit-status",
-     "codex r7 #1 (signal exit)"),
-    ("pass-log-status-1", passing(), 1, False, F, "exit-status",
-     "derived (non-libtest status)"),
+    # --- free text is inert: only the record counts ----------------------
+    ("text-contradicting-outcome-ignored", with_body(QR, before=[
+        "JOINT_STOP outcome: offset=0 begin=polling finish=unpublished",
+        "P11SCOPE_CELL_BRANCH=offset0:latched:unpublished"]), 0, False, Q,
+     "full-matrix", "r9-1: contradictory diagnostics are not evidence"),
+    ("text-offset-2-diagnostic-ignored", with_body(QR, after=[
+        "JOINT_STOP offset=2: at-Q published (api_a == a_semantic)"]), 0,
+     False, Q, "full-matrix", "r9-1: misplaced diagnostics are not evidence"),
+    ("text-old-completion-markers-do-not-qualify", frame(
+        ["P11SCOPE_STOP_COMPLETE=wp7-stop%d" % k for k in range(12)], True),
+     0, False, F, "record-missing",
+     "r2-r6: completion lines alone never qualify"),
+    ("text-old-s1-receipt-does-not-preclude", frame(
+        ["P11SCOPE_CELL_BRANCH=wp7-stop0:s1-precluded",
+         "Error: wp7-stop0: %s; not attempted" % S1_RECEIPT], False), 101,
+     False, F, "record-missing", "r7: a receipt alone never precludes"),
+    ("text-post-link-edge-before-preclusion-ignored", with_body(PR, before=[
+        "JOINT_STOP wp7-stop0: edge_a joint=1 reduced=1 started=Some(1) "
+        "completed=Some(1) mechanisms=1"]), 101, False, P, "s1-first-case",
+     "r9-2: free-text edge lines are not linkage; the ledger is"),
 
-    # ---- header ---------------------------------------------------------
-    ("zero-tests-selected",
-     "\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; "
-     "0 measured; 0 filtered out; finished in 0.00s\n\n", 0, False, F,
-     "header", "codex r1 #3 (zero-test run)"),
-    ("unframed-pass", "\n".join(matrix_body() + [OK_SUMMARY]) + "\n", 0,
-     False, F, "header", "derived (stub-style unframed log)"),
-    ("garbage-before-header", "warning: x\n" + passing(), 0, False, F,
-     "header", "derived"),
+    # --- exit status and summary ----------------------------------------
+    ("signal-after-receipt", precluded(), 137, False, F, "exit-status",
+     "r7: S1 receipt then a signal"),
+    ("abort-on-pass", passing(), 134, False, F, "exit-status", "r2-r6"),
+    ("summary-missing", frame(body_for(QR), True, summary="", trailer=[]),
+     0, False, F, "summary-missing", "r7: unfinished transcript"),
+    ("summary-duplicate", passing(tail=[OK_SUMMARY]), 0, False, F,
+     "summary-duplicate", "r7"),
+    ("summary-in-body", with_body(QR, before=[OK_SUMMARY]), 0, False, F,
+     "summary-duplicate", "r7: a summary in free text"),
+    ("summary-suffix", summary_with(OK_SUMMARY + " extra"), 0, False, F,
+     "summary-malformed", "r7: malformed summary"),
+    ("summary-prefix", summary_with("x" + OK_SUMMARY), 0, False, F,
+     "summary-malformed", "r7: malformed summary"),
+    ("summary-huge-count", summary_with(
+        "test result: ok. " + "1" * 4301 + " passed; 0 failed; 0 ignored; "
+        "0 measured; 0 filtered out; finished in 1.00s"), 0, False, F,
+     "summary-malformed", "r8: oversized count"),
+    ("summary-not-terminal", passing(tail=["Error: late"]), 0, False, F,
+     "summary-not-terminal", "r7: output after the summary"),
+    ("summary-two-passed", summary_with(OK_SUMMARY.replace(
+        "1 passed", "2 passed")), 0, False, F, "summary-counts", "r7"),
+    ("summary-ignored", summary_with(
+        "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; "
+        "0 filtered out; finished in 0.00s"), 0, False, F, "summary-counts",
+     "r2-r6: an ignored cell is not a run"),
+    ("summary-ok-with-failure-count", summary_with(OK_SUMMARY.replace(
+        "1 passed; 0 failed", "0 passed; 1 failed")), 0, False, F,
+     "summary-counts", "derived"),
+    ("summary-failed-on-exit-0", log_for(QR, ok=False), 0, False, F,
+     "summary-status", "r7: summary contradicts the exit"),
+    ("summary-ok-on-exit-101", passing(), 101, False, F, "summary-status",
+     "r7: summary contradicts the exit"),
 
-    # ---- summary --------------------------------------------------------
-    ("unfinished-transcript",
-     "\n".join(["", "running 1 test"] + matrix_body()) + "\n", 0, False, F,
-     "summary-missing", "codex r7 #1 (unfinished transcript)"),
-    ("pass-then-failed-summary",
-     passing(tail=[FAILED_SUMMARY]), 0, False, F, "summary-duplicate",
-     "codex r6 #3 (earlier pass, failed terminal)"),
-    ("summary-inside-body",
-     full_with(["JOINT_STOP saw " + OK_SUMMARY]), 0, False, F,
-     "summary-duplicate", "derived (embedded summary)"),
-    ("summary-passed-suffix",
-     passing(summary="test result: ok. 1 passed_suspected; 9 failed; "
-             "0 ignored; 0 measured; 0 filtered out; finished in 1.00s"),
-     0, False, F, "summary-malformed", "codex r6 #3 (malformed prefix)"),
-    ("summary-garbage-after-ignored",
-     passing(summary="test result: ok. 1 passed; 0 failed; 0 ignored; "
-             "9 failed; garbage"),
-     0, False, F, "summary-malformed", "codex r7 #2 (suffix after ignored)"),
-    ("summary-truncated",
-     passing(summary="test result: ok. 1 passed; 0 failed; 0 ignored;"),
-     0, False, F, "summary-malformed", "codex r7 #2 (truncated)"),
-    ("summary-suffix-after-finished",
-     passing(summary=OK_SUMMARY + " garbage"), 0, False, F,
-     "summary-malformed", "derived (suffix after the full summary)"),
-    ("offset-diagnostic-suffixed",
-     frame(body_edit(matrix_body(), case_outcome(2)[1],
-                     case_outcome(2)[1] + "-late"), True),
-     0, False, F, "record-malformed", "derived (suffixed diagnostic)"),
-    ("linked-tag-suffixed",
-     frame(body_edit(matrix_body(), "P11SCOPE_CELL_BRANCH=wp7-stop3:linked",
-                     "P11SCOPE_CELL_BRANCH=wp7-stop3:linked-ish"), True),
-     0, False, F, "record-malformed", "derived (suffixed linked tag)"),
-    ("linked-then-other-case-s1",
-     frame(case_head(0) + ["P11SCOPE_CELL_BRANCH=wp7-stop1:s1-precluded",
-                           S1_ERROR.format(k=1)], False),
-     101, False, F, "sequence", "codex r5 (S1 beside a linked tag)"),
-    ("summary-bare-count", passing(summary="test result: ok. 1 passed"), 0,
-     False, F, "summary-malformed", "derived (old short form)"),
-    ("summary-leading-zero",
-     passing(summary="test result: ok. 01 passed; 0 failed; 0 ignored; "
-             "0 measured; 0 filtered out; finished in 1.00s"),
-     0, False, F, "summary-malformed", "derived (non-canonical count)"),
-    ("summary-then-error", passing(tail=["Error: joint cleanup failed"]), 0,
-     False, F, "summary-not-terminal", "codex r7 #2 (later error)"),
-    ("two-passed",
-     passing(summary="test result: ok. 2 passed; 0 failed; 0 ignored; "
-             "0 measured; 0 filtered out; finished in 1.00s"),
-     0, False, F, "summary-counts", "codex r6 (two passed)"),
-    ("pass-with-ignored",
-     passing(summary="test result: ok. 1 passed; 0 failed; 1 ignored; "
-             "0 measured; 0 filtered out; finished in 1.00s"),
-     0, False, F, "summary-counts", "derived"),
-    ("ok-summary-status-101", passing(), 101, False, F, "summary-status",
-     "derived (summary disagrees with status)"),
-    ("failed-summary-status-0", precluded(), 0, False, F, "summary-status",
-     "derived (summary disagrees with status)"),
-
-    # ---- outcome and trailer --------------------------------------------
-    ("outcome-other-test",
-     frame(matrix_body(), True, cell="other::test",
-           trailer=[""]), 0, False, F, "outcome", "derived (foreign test)"),
-    ("outcome-disagrees-with-summary",
-     replace_line(passing(), "test %s ... ok" % CELL,
-                  "test %s ... FAILED" % CELL), 0, False, F, "outcome",
+    # --- the record line -------------------------------------------------
+    ("record-missing-panic", frame(PREAMBLE + ["thread panicked"], False),
+     101, False, F, "record-missing", "derived: a panic prints no record"),
+    ("record-duplicate", with_body(QR, after=[record_line(QR)]), 0, False, F,
+     "record-duplicate", "r2-r6: duplicated evidence"),
+    ("record-duplicate-forged-precluded", with_body(QR, before=[
+        record_line(PR)]), 0, False, F, "record-duplicate",
+     "r8: evidence before the deciding record"),
+    ("record-marker-in-free-text", with_body(QR, before=[
+        "child said " + MARKER + "{}"]), 0, False, F, "record-duplicate",
+     "derived: a forged marker"),
+    ("record-glued", raw_log("JOINT_STOP x " + record_line(QR)), 0, False,
+     F, "record-misplaced", "r8: a malformed record stem"),
+    ("record-truncated", raw_log(record_line(QR)[:-7]), 0, False, F,
+     "record-json", "derived: truncated record"),
+    ("record-trailing-text", raw_log(record_line(QR) + " ok"), 0, False, F,
+     "record-json", "r8: a malformed record suffix"),
+    ("record-duplicate-key", raw_log(record_line(QR)[:-1]
+                                     + ',"cell":"%s"}' % CELL), 0, False, F,
+     "record-json", "derived: duplicate key"),
+    ("record-float", raw_log(record_line(QR).replace(
+        '"finish_polls":3', '"finish_polls":3.0', 1)), 0, False, F,
+     "record-json", "derived: float"),
+    ("record-nan", raw_log(record_line(QR).replace(
+        '"finish_polls":3', '"finish_polls":NaN', 1)), 0, False, F,
+     "record-json", "derived: NaN"),
+    ("record-huge-integer", raw_log(record_line(QR).replace(
+        '"finish_polls":3', '"finish_polls":' + "9" * 4301, 1)), 0, False,
+     F, "record-json", "r8: oversized count"),
+    ("record-extra-key", log_for(edited(QR, lambda r: r.update(extra=1))),
+     0, False, F, "record-schema", "derived"),
+    ("record-missing-key", log_for(edited(QR, lambda r: r.pop("selection"))),
+     0, False, F, "record-schema", "derived"),
+    ("record-schema-version", log_for(edited(QR, lambda r: r.update(
+        schema="p11scope.joint-stop-verdict/2"))), 0, False, F,
+     "record-schema", "derived"),
+    ("record-bool-index", log_for(edited(QR, case_set(1, index=True))), 0,
+     False, F, "record-schema", "derived: bool as int"),
+    ("record-int-completed", log_for(edited(QR, case_set(0, completed=1))),
+     0, False, F, "record-schema", "derived: int as bool"),
+    ("record-unknown-branch", log_for(edited(QR, case_set(
+        0, branch="linked="))), 0, False, F, "record-schema",
+     "r8: malformed branch stem"),
+    ("record-unknown-finish", log_for(edited(QR, outcome_set(
+        0, finish="done"))), 0, False, F, "record-schema", "derived"),
+    ("record-outcome-extra-field", log_for(edited(QR, outcome_set(
+        0, verdict="ok"))), 0, False, F, "record-schema", "derived"),
+    ("record-stop-counts-short", log_for(edited(QR, outcome_set(
+        0, stop_counts=[2, 0]))), 0, False, F, "record-schema", "derived"),
+    ("record-negative-count", log_for(edited(QR, outcome_set(
+        0, api_a=-1))), 0, False, F, "record-schema", "derived"),
+    ("record-unknown-terminal", log_for(edited(QR, lambda r: r.update(
+        terminal={"kind": "passed"})), ok=True), 0, False, F, "record-schema",
      "derived"),
-    ("failures-list-other-test",
-     replace_line(precluded(), "    " + CELL, "    other::test"), 101, False,
-     F, "failures-list", "derived"),
-    ("failures-list-missing",
-     frame(s1_body(), False, trailer=[""]), 101, False, F, "failures-list",
+    ("record-terminal-extra-field", log_for(edited(QR, lambda r: r.update(
+        terminal={"kind": "qualified", "case": 11}))), 0, False, F,
+     "record-schema", "derived"),
+    ("record-unknown-check", log_for(edited(case_failed_record(3), lambda r:
+                                            r["terminal"].update(
+                                                check="other"))), 101,
+     False, F, "record-schema", "derived"),
+    ("record-not-object", raw_log(MARKER + "[]"), 0, False, F,
+     "record-schema", "derived"),
+    ("record-other-cell", log_for(edited(QR, lambda r: r.update(
+        cell=CELL + "_other"))), 0, False, F, "record-cell",
+     "r8: the generic fallback judged another cell"),
+
+    # --- cases: sequence, branch, outcome, completion ------------------
+    ("matrix-short", log_for(edited(QR, lambda r: r.update(
+        cases=r["cases"][:11]))), 0, False, F, "qualified-count",
+     "r2-r6: short matrix"),
+    ("matrix-empty", log_for(edited(QR, lambda r: r.update(cases=[]))), 0,
+     False, F, "terminal-case", "r2-r6: linked tags alone"),
+    ("matrix-thirteen", log_for(edited(QR, lambda r: r["cases"].append(
+        case_record(12)))), 0, False, F, "case-sequence", "derived"),
+    ("case-duplicated", log_for(edited(QR, lambda r: r["cases"].__setitem__(
+        2, copy.deepcopy(r["cases"][1])))), 0, False, F, "case-sequence",
+     "r2-r6: duplicated case"),
+    ("case-out-of-order", log_for(edited(QR, lambda r: r["cases"].reverse())),
+     0, False, F, "case-sequence", "r2-r6: out of order"),
+    ("case-wrong-name", log_for(edited(QR, case_set(3, name="wp7-stop30"))),
+     0, False, F, "case-sequence", "derived"),
+    ("case-wrong-prep", log_for(edited(QR, case_set(4, prep=0))), 0, False,
+     F, "case-sequence", "derived"),
+    ("case-unsupported-offset", log_for(edited(QR, lambda r: (
+        case_set(0, offset_ms=2)(r), outcome_set(0, offset_ms=2)(r)))), 0,
+     False, F, "case-sequence", "r9-1: an unsupported offset"),
+    ("case-no-feed-mid-matrix", log_for(edited(QR, case_set(
+        3, branch="s1-precluded", outcome=None, completed=False))), 0, False,
+     F, "case-branch", "r2-r6: pass with a no-feed case"),
+    ("case-unlinked-mid-matrix", log_for(edited(QR, case_set(
+        3, branch=None))), 0, False, F, "case-branch", "derived"),
+    ("outcome-other-offset", log_for(edited(QR, outcome_set(
+        0, offset_ms=2))), 0, False, F, "case-outcome",
+     "r9-1: outcome bound to another offset"),
+    ("outcome-offset-of-neighbor", log_for(edited(QR, outcome_set(
+        1, offset_ms=5))), 0, False, F, "case-outcome", "r2-r6: offset"),
+    ("outcome-missing-mid-matrix", log_for(edited(QR, case_set(
+        2, outcome=None))), 0, False, F, "case-outcome",
+     "r2-r6: completion without a stop"),
+    ("completed-unpublished", log_for(edited(QR, outcome_set(
+        0, finish="unpublished"))), 0, False, F, "completion",
+     "r9-1: contradictory stop outcome"),
+    ("completed-unwound", log_for(edited(QR, outcome_set(
+        6, wound="unwound"))), 0, False, F, "completion",
+     "r9-1: contradictory stop outcome"),
+    ("completed-not-taken", log_for(edited(QR, outcome_set(
+        11, taken=False))), 0, False, F, "completion", "r9-1"),
+    ("completed-unreconciled", log_for(edited(QR, outcome_set(
+        4, reconciled=False))), 0, False, F, "completion", "r2-r6"),
+    ("completed-at-q-unpublished", log_for(edited(QR, outcome_set(
+        2, api_a=1))), 0, False, F, "completion", "derived"),
+    ("completed-latch-without-code", log_for(edited(QR, outcome_set(
+        8, latched=True))), 0, False, F, "completion", "derived"),
+    ("completed-error-without-latch", log_for(edited(QR, outcome_set(
+        9, first_error="boom"))), 0, False, F, "completion", "derived"),
+    ("completed-gap-without-abandon", log_for(edited(QR, outcome_set(
+        10, abandon_gap="for lane stop: x"))), 0, False, F, "completion",
      "derived"),
+    ("open-case-mid-matrix", log_for(edited(QR, case_set(
+        5, completed=False))), 0, False, F, "completion", "r2-r6"),
+    ("pass-with-shed-disclosed", log_for(edited(QR, outcome_set(
+        3, api_a=1, lane_shed=1))), 0, False, Q, "full-matrix",
+     "control: a disclosed shed passes"),
+    ("pass-latched-named-twice", log_for(edited(QR, outcome_set(
+        7, latched=True, latch_code="E7", abandon_gap="for exit: E7",
+        first_error="E7 latched", finish="published", stash_floor=1,
+        begin="abandoned-at-begin"))), 0, False, Q, "full-matrix",
+     "control: a latch named in gap and error"),
 
-    # ---- stray framing and records --------------------------------------
-    ("stray-ok-line", full_with(["ok"]), 0, False, F, "stray-framing",
+    # --- terminal binding ------------------------------------------------
+    ("qualified-on-exit-101", log_for(QR, ok=False), 101, False, F,
+     "terminal-status", "r7: a pass record in a failed run"),
+    ("precluded-on-exit-0", log_for(PR, ok=True), 0, False, F,
+     "terminal-status", "r7: a receipt-only pass"),
+    ("wedge-on-exit-0", log_for(WR, ok=True), 0, True, F, "terminal-status",
      "derived"),
-    ("second-running-line", full_with(["running 1 test"]), 0, False, F,
-     "stray-framing", "derived"),
-    ("complete-marker-in-diagnostic",
-     frame([("JOINT_STOP wp7-stop7: P11SCOPE_STOP_COMPLETE=wp7-stop7 "
-             "emitted late") if line == "P11SCOPE_STOP_COMPLETE=wp7-stop7"
-            else line for line in matrix_body()], True),
-     0, False, F, "record-malformed", "codex r4 #2 (embedded marker)"),
-    ("complete-marker-suffixed",
-     frame(["P11SCOPE_STOP_COMPLETE=wp7-stop7:linked-but-not-completed"
-            if line == "P11SCOPE_STOP_COMPLETE=wp7-stop7" else line
-            for line in matrix_body()], True),
-     0, False, F, "record-malformed", "codex r4 #2 (quoted marker)"),
-    ("embedded-s1-tag",
-     frame(list(matrix_body(range(0))) + [
-         "JOINT_STOP wp7-stop0: P11SCOPE_CELL_BRANCH=wp7-stop0:s1-precluded "
-         "emitted late", S1_ERROR.format(k=0)], False),
-     101, False, F, "record-malformed", "codex r5 #2 (embedded tag)"),
-    ("suffixed-s1-lookalike",
-     frame(["P11SCOPE_CELL_BRANCH=wp7-stop0:s1-precluded-suspected",
-            S1_ERROR.format(k=0)], False),
-     101, False, F, "record-malformed", "codex r5 #2 (lookalike tag)"),
-    ("out-of-range-case-tag",
-     frame(["P11SCOPE_CELL_BRANCH=wp7-stop12:s1-precluded",
-            S1_ERROR.format(k=12)], False),
-     101, False, F, "record-malformed", "codex r5 (out-of-range case)"),
-    ("embedded-unattributed-tag",
-     frame(["JOINT_STOP wp7-stop0: P11SCOPE_CELL_BRANCH=wp7-stop0:"
-            "no-feeds-unattributed emitted late",
-            UNATTRIBUTED_ERROR.format(k=0)], False),
-     101, False, F, "record-malformed", "codex r5 (embedded unattributed)"),
-    ("s1-receipt-in-diagnostic",
-     frame(["P11SCOPE_CELL_BRANCH=wp7-stop0:s1-precluded",
-            "JOINT_STOP wp7-stop0: diagnostic " + S1_ERROR.format(k=0)[7:]
-            + " seen", "Error: wp7-stop0: q1 fixture failed"], False),
-     101, False, F, "receipt-stray", "codex r6 #1 (receipt in diagnostic)"),
-    ("s1-receipt-unprefixed-then-other-error",
-     frame(["P11SCOPE_CELL_BRANCH=wp7-stop0:s1-precluded",
-            S1_ERROR.format(k=0)[7:],
-            "Error: wp7-stop0: joint cleanup failed"], False),
-     101, False, F, "receipt-stray",
-     "codex r7 #1 (earlier unprefixed receipt, later error)"),
-    ("pass-with-unattributed-receipt-text",
-     full_with([UNATTRIBUTED_ERROR.format(k=0)[7:]]), 0, False, F,
-     "receipt-stray", "codex r7 #3 (receipt only, no tag)"),
-    ("pass-with-s1-receipt-text",
-     full_with([S1_ERROR.format(k=0)[7:]]), 0, False, F, "receipt-stray",
-     "codex r7 #3 (receipt only, other cause)"),
+    ("qualified-with-open-last", log_for(edited(QR, case_set(
+        11, completed=False, outcome=wedge_outcome(11)))), 0, False, F,
+     "terminal-case", "derived"),
+    ("wedge-on-earlier-case", log_for(edited(WR, lambda r: r["terminal"]
+                                             .update(case=2))), 101, True,
+     F, "terminal-case", "r9-3: a wedge naming another case"),
+    ("case-failed-on-other-case", log_for(edited(case_failed_record(3),
+                                                 lambda r: r["terminal"]
+                                                 .update(case=1))), 101,
+     False, F, "terminal-case", "derived"),
+    ("case-failed-null-with-cases", log_for(edited(case_failed_record(3),
+                                                   lambda r: r["terminal"]
+                                                   .update(case=None))),
+     101, False, F, "terminal-case", "derived"),
 
-    # ---- error records --------------------------------------------------
-    ("pass-with-unattributed-error",
-     full_with([UNATTRIBUTED_ERROR.format(k=0)]), 0, False, F, "error-count",
-     "codex r7 #3 (Error receipt on a pass)"),
-    ("pass-with-error-line", full_with(["Error: joint cleanup failed"]), 0,
-     False, F, "error-count", "derived"),
-    ("s1-then-later-error",
-     frame(s1_body() + ["Error: wp7-stop0: joint cleanup failed"], False),
-     101, False, F, "error-count", "codex r7 #1 (competing terminal error)"),
-    ("s1-plus-unattributed-error",
-     frame(s1_body() + [UNATTRIBUTED_ERROR.format(k=0)], False), 101, False,
-     F, "error-count", "codex r6 #1 (conflicting receipt)"),
-    ("failure-by-panic",
-     frame(matrix_body(range(2)) + case_head(2) + [
-         "", "thread 'x' panicked at src/inventory/x.rs:1:1:", "boom",
-         "note: run with `RUST_BACKTRACE=1` environment variable to "
-         "display a backtrace"], False),
-     101, False, F, "error-count", "derived (panic, no terminal error)"),
-    ("diagnostic-after-error",
-     frame(s1_body() + ["JOINT_STOP late diagnostic"], False), 101, False, F,
-     "error-not-terminal", "derived"),
-    ("caused-by-after-error",
-     frame(s1_body() + ["", "Caused by:", "    io error"], False), 101,
-     False, F, "error-not-terminal", "derived"),
+    # --- preclusion -------------------------------------------------------
+    ("precluded-with-outcome", log_for(edited(PR, case_set(
+        0, outcome=healthy_outcome(0)))), 101, False, F, "case-outcome",
+     "r9-2: post-link evidence before a preclusion"),
+    ("precluded-linked-case", log_for(edited(PR, case_set(
+        0, branch="linked", outcome=None))), 101, False, F,
+     "no-feed-binding", "r9-2: preclusion of a linked case"),
+    ("precluded-wrong-receipt", log_for(edited(PR, lambda r: r["terminal"]
+                                               .update(receipt=S1_RECEIPT
+                                                       + " ok"))), 101,
+     False, F, "no-feed-binding", "r7: receipt mismatch"),
+    ("precluded-cause-unattributed", log_for(edited(PR, lambda r: r[
+        "terminal"].update(cause="no-feeds-unattributed",
+                           receipt=UNATTRIBUTED_RECEIPT))), 101, False, F,
+     "no-feed-binding", "r2-r6: S1 vs unattributed"),
+    ("precluded-unattributed-case", log_for(edited(no_feed_record(
+        0, "no-feeds-unattributed"), lambda r: r["terminal"].update(
+            kind="precluded"))), 101, False, F, "precluded-binding",
+     "r2-r6: unattributed claimed environmental"),
+    ("precluded-after-linked", log_for(edited(no_feed_record(1), lambda r:
+                                              r["terminal"].update(
+                                                  kind="precluded"))), 101,
+     False, F, "precluded-binding", "r9-2: evidence before the preclusion"),
+    ("no-feed-for-first-s1", log_for(edited(PR, lambda r: r["terminal"]
+                                            .update(kind="no-feed"))), 101,
+     False, F, "precluded-binding", "derived"),
+    ("no-feed-on-wedged-case", log_for(edited(WR, lambda r: r.update(
+        terminal={"kind": "no-feed", "case": 5, "cause": "s1-precluded",
+                  "receipt": S1_RECEIPT}))), 101, False, F,
+     "no-feed-binding", "r8: wedge before S1 mix"),
 
-    # ---- case sequence --------------------------------------------------
-    ("tags-then-markers-not-interleaved",
-     frame(["P11SCOPE_CELL_BRANCH=wp7-stop%d:linked" % k for k in range(12)]
-           + ["P11SCOPE_STOP_COMPLETE=wp7-stop%d" % k for k in range(12)],
-           True),
-     0, False, F, "sequence", "derived (old stub shape)"),
-    ("linked-but-incomplete-case",
-     frame(matrix_without(7), True), 0, False, F, "text-binding",
-     "codex r4 #2 (linked, never completed)"),
-    ("duplicated-case",
-     frame(matrix_body() + case_lines(11), True), 0, False, F, "text-binding",
-     "derived (case twice)"),
-    ("case-out-of-order",
-     frame(matrix_body(range(2)) + case_lines(3) + case_lines(2)
-           + matrix_body(range(4, 12))[len(matrix_body(range(0))):], True),
-     0, False, F, "text-binding", "derived"),
-    ("marker-for-other-case",
-     frame([("P11SCOPE_STOP_COMPLETE=wp7-stop4"
-             if line == "P11SCOPE_STOP_COMPLETE=wp7-stop3" else line)
-            for line in matrix_body()], True),
-     0, False, F, "sequence", "derived (mismatched marker)"),
-    ("lone-later-s1",
-     frame(["P11SCOPE_CELL_BRANCH=wp7-stop7:s1-precluded",
-            S1_ERROR.format(k=7)], False),
-     101, False, F, "sequence", "codex r6 #1 (impossible later case)"),
-    ("s1-after-full-matrix",
-     full_with(["P11SCOPE_CELL_BRANCH=wp7-stop0:s1-precluded"]), 0, False, F,
-     "sequence", "codex r5 (pass with S1 tag)"),
-    ("s1-then-unattributed-tags",
-     frame(["P11SCOPE_CELL_BRANCH=wp7-stop0:s1-precluded",
-            "P11SCOPE_CELL_BRANCH=wp7-stop1:no-feeds-unattributed",
-            UNATTRIBUTED_ERROR.format(k=1)], False),
-     101, False, F, "sequence", "codex r5 (mixed no-feed tags)"),
-    ("offset-diagnostic-missing",
-     frame(body_edit(matrix_body(), case_outcome(2)[1], None), True),
-     0, False, F, "text-binding", "derived (marker without its diagnostic)"),
-    ("offset-wrong-for-case",
-     frame(body_edit(matrix_body(), case_outcome(2)[1],
-                     case_outcome(2, offset=20)[1]), True),
-     0, False, F, "offset-binding", "derived (case bound to wrong offset)"),
-    ("completed-without-publish",
-     frame(matrix_body(range(3)) + case_head(3)
-           + case_outcome(3, "abandoned")
-           + ["P11SCOPE_STOP_COMPLETE=wp7-stop3"]
-           + matrix_body(range(4, 12))[2:], True),
-     0, False, F, "finish-binding", "derived (completion without publish)"),
-    ("one-case-pass", frame(matrix_body(range(1)), True), 0, False, F,
-     "matrix-short", "codex r3 #2 (narrowed matrix)"),
-    ("pass-ends-linked",
-     frame(matrix_body(range(11)) + case_head(11) + case_outcome(11), True),
-     0, False, F, "matrix-short", "derived (last case never completed)"),
-    ("pass-with-first-case-s1-tag",
-     frame(["P11SCOPE_CELL_BRANCH=wp7-stop0:s1-precluded"], True), 0, False,
-     F, "pass-with-no-feed", "codex r5 (a pass never precludes)"),
-    ("unexpected-pass", passing(), 0, True, F, "unexpected-pass",
-     "derived (pass under JOINT_EXPECTED_FAILURE=1)"),
+    # --- wedge ------------------------------------------------------------
+    ("wedge-describing-success", log_for(edited(WR, case_set(
+        5, outcome=healthy_outcome(offset_of(5))))), 101, True, F,
+     "completion", "r8/r9-3: a success-describing wedge"),
+    ("wedge-after-at-q-failure", log_for(edited(WR, outcome_set(
+        5, api_a=1))), 101, True, F, "wedge-binding",
+     "r9-3: a wedge the Rust check order cannot emit"),
+    ("wedge-after-latch-failure", log_for(edited(WR, outcome_set(
+        5, latched=True))), 101, True, F, "wedge-binding",
+     "r9-3: a wedge the Rust check order cannot emit"),
+    ("wedge-without-outcome", log_for(edited(WR, case_set(
+        5, outcome=None))), 101, True, F, "wedge-binding",
+     "r9-3: a wedge with no stop record"),
+    ("wedge-on-no-feed-case", log_for(edited(WR, case_set(
+        5, branch="s1-precluded", outcome=None))), 101, True, F,
+     "wedge-binding", "r8: wedge before S1 mix"),
+    ("wedge-reconcile-only", log_for(edited(WR, outcome_set(
+        5, finish="published", wound="joined", taken=True,
+        reconciled=False))), 101, True, F, "wedge-binding",
+     "r9-3: a reconciliation failure claimed as a wedge"),
 
-    # ---- failure classification -----------------------------------------
-    ("s1-after-seven-linked", frame(s1_body(7), False), 101, False, F,
-     "s1-after-linked", "codex r5 #2 (S1 after linked matrix)"),
-    ("s1-after-one-linked", frame(s1_body(1), False), 101, False, F,
-     "s1-after-linked", "codex r5 (S1 with linked tags)"),
-    ("unattributed-no-feed", frame(unattributed_body(4), False), 101, False,
-     F, "no-feed-unattributed", "codex r3 #3 (unattributed cause)"),
-    ("unattributed-first-case", frame(unattributed_body(0), False), 101,
-     True, F, "no-feed-unattributed",
-     "codex r6 #1 (unattributed under expectation)"),
-    ("unattributed-with-wedge-diagnostic",
-     frame(unattributed_body(0)[:-1] + [
-         "JOINT_STOP wp7-stop0: diagnostic Published then WoundDown seen",
-         UNATTRIBUTED_ERROR.format(k=0)], False),
-     101, True, F, "text-reserved",
-     "codex r6 #1 (mixed unattributed wedge)"),
-    ("old-collapsed-s1",
-     frame(s1_body(error="Error: wp7-stop0: no joint feeds from the linked "
-                   "session; not attempted"), False),
-     101, False, F, "receipt-mismatch", "codex r4/r5 (collapsed tag)"),
-    ("s1-tag-other-case-receipt",
-     frame(s1_body(error=S1_ERROR.format(k=7)), False), 101, False, F,
-     "receipt-mismatch", "codex r6 #1 (mismatched case)"),
-    ("s1-tag-unattributed-receipt",
-     frame(s1_body(error=UNATTRIBUTED_ERROR.format(k=0)), False), 101, False,
-     F, "receipt-mismatch", "derived (tag and receipt disagree)"),
-    ("s1-tag-other-error",
-     frame(s1_body(error="Error: wp7-stop0: q1 fixture failed"), False), 101,
-     False, F, "receipt-mismatch", "codex r5 (S1 without receipt)"),
-    ("receipt-without-tag",
-     frame(PREAMBLE + [S1_ERROR.format(k=0)], False), 101, False, F,
-     "receipt-mismatch", "derived (untagged receipt)"),
-    ("receipt-after-linked",
-     frame(case_head(0) + [S1_ERROR.format(k=0)], False), 101, False, F,
-     "receipt-mismatch", "derived (receipt for a linked case)"),
-    ("wedge-error-wrong-offset",
-     frame(wedge_body()[:-1] + [wedge_error(0)], False), 101, True, F,
-     "wedge-binding", "derived (wedge of another case)"),
-    ("wedge-error-wrong-finish",
-     frame(wedge_body()[:-1] + [wedge_error(offset_of(5), "abandoned")],
-           False),
-     101, True, F, "wedge-binding", "derived (wedge disagrees with finish)"),
-    ("wedge-under-expect-zero", frame(wedge_body(), False), 101, False, F,
-     "wedge-unexpected", "derived (wedge regression)"),
-    ("wedge-diagnostic-then-unrelated-error",
-     frame(matrix_body(range(0)) + case_head(0) + case_outcome(0) + [
-         "JOINT_STOP wp7-stop0: diagnostic Published then WoundDown",
-         "Error: wp7-stop0: q1 fixture failed"], False),
-     101, True, F, "text-reserved", "codex r7 #1 (wedge arm, wrong terminal)"),
-    ("wedge-without-offset-diagnostic",
-     frame(matrix_body(range(5)) + case_head(5)
-           + [wedge_error(offset_of(5))], False),
-     101, True, F, "case-failed", "derived (wedge before the outcome)"),
-    ("wedge-arm-unrelated-terminal",
-     frame(case_head(0) + case_outcome(0)
-           + ["Error: wp7-stop0: q1 fixture failed"], False),
-     101, True, F, "case-failed", "codex r7 #1 (wedge arm, wrong terminal)"),
-
-    # ---- evidence before or after the deciding record (codex r8) ---------
-    ("s1-wedge-diagnostic-before-tag",
-     frame(PREAMBLE + ["JOINT_STOP wp7-stop0: finish wedges: " + WEDGE,
-                       "P11SCOPE_CELL_BRANCH=wp7-stop0:s1-precluded",
-                       S1_ERROR.format(k=0)], False),
-     101, False, F, "text-reserved", "codex r8 #1 (wedge before receipt)"),
-    ("s1-wedge-diagnostic-before-preamble",
-     frame(["JOINT_STOP wp7-stop0: finish wedges: " + WEDGE] + s1_body(),
-           False),
-     101, True, F, "text-reserved", "codex r8 #1 (wedge before the tag)"),
-    ("s1-wedge-diagnostic-between-tag-and-receipt",
-     frame(s1_body()[:-1] + ["JOINT_STOP wp7-stop0: finish wedges: " + WEDGE,
-                             S1_ERROR.format(k=0)], False),
-     101, False, F, "text-reserved", "codex r8 #1 (between tag and receipt)"),
-    ("s1-diagnostic-between-tag-and-receipt",
-     frame(s1_body()[:-1] + ["JOINT_STOP wp7-stop0: late diagnostic",
-                             S1_ERROR.format(k=0)], False),
-     101, False, F, "evidence-after-preclusion",
-     "derived (anything between tag and receipt)"),
-    ("s1-outcome-before-tag",
-     frame(PREAMBLE + [case_outcome(0)[0]] + s1_body()[len(PREAMBLE):],
-           False),
-     101, False, F, "text-binding", "derived (stop outcome in a no-feed case)"),
-    ("s1-other-case-diagnostic-before-tag",
-     frame(PREAMBLE + ["JOINT_STOP wp7-stop7: q1 published in 2 polls"]
-           + s1_body()[len(PREAMBLE):], False),
-     101, False, F, "text-binding", "derived (another case's evidence)"),
-    ("finish-diagnostic-before-linked",
-     frame(PREAMBLE + ["JOINT_STOP wp7-stop0: finish=published after 3 polls"]
-           + matrix_body()[len(PREAMBLE):], True),
-     0, False, F, "text-binding", "derived (stop finish before linkage)"),
-    ("outcome-line-wrong-offset",
-     frame(body_edit(matrix_body(),
-                     "JOINT_STOP offset=5: at-Q published (api_a == a_semantic)",
-                     "JOINT_STOP offset=20: at-Q published (api_a == "
-                     "a_semantic)"), True),
-     0, False, F, "text-binding", "derived (check line of another offset)"),
-    ("diagnostic-after-full-matrix-names-a-case",
-     full_with(["JOINT_STOP wp7-stop3: late"]), 0, False, F, "text-binding",
-     "derived (evidence after the deciding record)"),
-    ("wedge-terminal-truncated",
-     frame(wedge_body()[:-1] + [
-         "Error: offset 1: the finish must reach Published then WoundDown: "
-         "offset=1 begin=polling finish=unpublished "], False),
-     101, True, F, "wedge-record", "codex r8 #2 (truncated terminal)"),
-    ("wedge-terminal-with-marker",
-     frame(wedge_body()[:-1] + [wedge_error(offset_of(5))
-                                + " P11SCOPE_STOP_COMPLETE=wp7-stop5"], False),
-     101, True, F, "terminal-reserved", "codex r8 #2 (embedded marker)"),
-    ("wedge-terminal-claims-success",
-     frame(matrix_body(range(5)) + case_head(5)
-           + case_outcome(5, "published", latch="latched")
-           + [wedge_error(offset_of(5), "published", latched=True,
-                          wound="joined", taken=True)], False),
-     101, True, F, "wedge-success", "codex r8 #2 (successful stop)"),
-    ("wedge-terminal-duplicated-field",
-     frame(wedge_body()[:-1] + [wedge_error(offset_of(5)).replace(
-         "first_error=None", 'first_error=Some(" taken=true ")')], False),
-     101, True, F, "wedge-record", "derived (field smuggled in a string)"),
-    ("wedge-terminal-not-linked",
-     frame(wedge_body()[:-1] + [wedge_error(offset_of(5)).replace(
-         "branch=linked", "branch=s1")], False),
-     101, True, F, "wedge-record", "derived (wedge outside a linked world)"),
-    ("wedge-terminal-latch-disagrees",
-     frame(wedge_body()[:-1] + [wedge_error(offset_of(5), latched=True)],
-           False),
-     101, True, F, "wedge-binding", "derived (latch disagrees with diag)"),
-    ("terminal-embeds-a-tag",
-     frame(case_head(0) + [
-         "Error: wp7-stop0: P11SCOPE_CELL_BRANCH=wp7-stop0:s1-precluded"],
-           False),
-     101, False, F, "terminal-reserved", "derived (record inside the error)"),
-    ("backtrace-carries-a-receipt",
-     frame(s1_body() + ["", "Stack backtrace:", "   0: "
-                        + S1_ERROR.format(k=0)[7:]], False),
-     101, False, F, "receipt-stray", "derived (evidence after the error)"),
-    ("pass-branch-stem-colon",
-     full_with(["P11SCOPE_CELL_BRANCH:wp7-stop0:no-feeds-unattributed"]), 0,
-     False, F, "record-malformed", "codex r8 #3 (wrong separator)"),
-    ("pass-branch-stem-no-separator",
-     full_with(["P11SCOPE_CELL_BRANCHwp7-stop0:s1-precluded"]), 0, False, F,
-     "record-malformed", "codex r8 #3 (missing separator)"),
-    ("pass-linked-stem-colon",
-     full_with(["P11SCOPE_CELL_BRANCH:wp7-stop3:linked"]), 0, False, F,
-     "record-malformed", "codex r8 #3 (stem rule alone, no no-feed word)"),
-    ("pass-no-feed-word-in-diagnostic",
-     full_with(["JOINT_STOP note: s1-precluded"]), 0, False, F,
-     "record-malformed", "codex r8 #3 (no-feed word without a record)"),
-    ("pass-complete-stem-colon",
-     full_with(["P11SCOPE_STOP_COMPLETE:wp7-stop3"]), 0, False, F,
-     "record-malformed", "derived (wrong separator on the marker)"),
-    ("summary-oversized-count",
-     passing(summary="test result: ok. " + "1" * 4301 + " passed; 0 failed; "
-             "0 ignored; 0 measured; 0 filtered out; finished in 1.00s"),
-     0, False, F, "summary-counts", "codex r8 #5 (oversized count)"),
-    ("failure-after-full-matrix",
-     frame(matrix_body() + ["Error: joint cleanup failed"], False), 101,
-     False, F, "case-failed", "derived (error after all cases)"),
-    ("failure-before-first-case",
-     frame(PREAMBLE + ["Error: cannot build the joint workload"], False),
-     101, False, F, "case-failed", "derived (setup failure)"),
+    # --- case-failed binding ----------------------------------------------
+    ("case-failed-wrong-check", log_for(edited(case_failed_record(3),
+                                               lambda r: r["terminal"]
+                                               .update(check="at-q"))), 101,
+     False, F, "case-failed-binding", "derived"),
+    ("case-failed-hiding-a-wedge", log_for(edited(WR, lambda r: r.update(
+        terminal={"kind": "case-failed", "case": 5, "stage": "check",
+                  "check": "terminal", "error": "x"}))), 101, False, F,
+     "case-failed-binding", "derived"),
+    ("case-failed-setup-on-linked", log_for(edited(case_failed_record(
+        2, "drive"), lambda r: r["terminal"].update(stage="setup"))), 101,
+     False, F, "case-failed-binding", "derived"),
+    ("case-failed-drive-with-outcome", log_for(edited(case_failed_record(3),
+                                                      lambda r: r[
+                                                          "terminal"].update(
+                                                          stage="drive",
+                                                          check=None))),
+     101, False, F, "case-failed-binding", "derived"),
+    ("case-failed-check-before-cases", log_for(edited(case_failed_record(
+        None, "setup", error="x"), lambda r: r["terminal"].update(
+            stage="check", check="at-q"))), 101, False, F,
+     "case-failed-binding", "derived"),
+    ("narrowed-on-full-selection", log_for(edited(QR, lambda r: r.update(
+        terminal={"kind": "narrowed"})), ok=True), 0, False, F,
+     "terminal-status", "derived"),
+    ("narrowed-on-exit-101", log_for(edited(QR, lambda r: r.update(
+        terminal={"kind": "narrowed"})), ok=False), 101, False, F,
+     "narrowed", "derived"),
 ]
-
-
-def _check_rows():
-    ids = [row[0] for row in ROWS]
-    assert len(ids) == len(set(ids)), "duplicate row ids"
 
 
 class JointStopVerdictTableTests(unittest.TestCase):
     def run_row(self, row, disabled=frozenset()):
-        _id, log, status, expect, _q, _r, _o = row
+        _, log, status, expect, _, _, _ = row
         return jv.classify(log, status, CELL, expect_wedge=expect,
                            disabled=disabled)
 
+    def test_row_ids_are_unique(self):
+        ids = [row[0] for row in ROWS]
+        self.assertEqual(len(ids), len(set(ids)))
+
     def test_every_row_has_its_exact_verdict(self):
-        _check_rows()
         for row in ROWS:
-            with self.subTest(row=row[0], origin=row[6]):
+            with self.subTest(row=row[0]):
                 got = self.run_row(row)
                 self.assertEqual((got["qualification"], got["reason"]),
                                  (row[4], row[5]), got["detail"])
-                self.assertTrue(got["detail"])
 
     def test_every_check_refuses_some_row(self):
         reasons = {row[5] for row in ROWS if row[4] == F}
@@ -508,20 +451,11 @@ class JointStopVerdictTableTests(unittest.TestCase):
                                 % name)
 
     def test_disabling_a_check_can_open_an_accept_path(self):
-        # The checks guard accept paths: disabling each sole-guard check
-        # lets some malformed row through as an acceptance, so the table
-        # holds the input each gate exists to stop. The other checks are
-        # layered (a later check refuses their rows second); the red
-        # test above covers them.
+        # Sole-guard checks: disabling each lets some refused row through
+        # as an acceptance, so the table holds the input each gate exists
+        # to stop. The other checks are layered behind a later check.
         accepts = {Q, X, P}
-        for name in ("summary-malformed", "summary-not-terminal",
-                     "summary-counts", "summary-status", "failures-list",
-                     "stray-framing", "record-malformed", "error-count", "error-not-terminal", "sequence",
-                     "offset-binding", "finish-binding", "matrix-short",
-                     "unexpected-pass", "s1-after-linked", "wedge-binding",
-                     "wedge-unexpected", "text-reserved", "text-binding",
-                     "evidence-after-preclusion", "wedge-record",
-                     "wedge-success"):
+        for name in SOLE_GUARDS:
             with self.subTest(check=name):
                 opened = [row[0] for row in ROWS
                           if row[4] == F and row[5] == name
@@ -530,60 +464,70 @@ class JointStopVerdictTableTests(unittest.TestCase):
                 self.assertTrue(opened, "no row of %s becomes an "
                                 "acceptance when it is disabled" % name)
 
-    def test_grammar_matches_the_rust_emitters(self):
-        # The validator's grammar is the Rust cell's output: pin each
-        # literal it relies on in the emitter source, so a drift in
-        # the cell fails here instead of silently failing (or passing)
-        # the live qualification.
+    def test_validator_mirrors_the_rust_record(self):
+        # The record's producer is the Rust ledger; pin the literals the
+        # validator relies on in its source, so a drift fails here.
         rust = (ROOT / "src/inventory/joint_stop_races_privileged_tests.rs"
                 ).read_text(encoding="utf-8")
         for literal in (
-                'const OFFSETS_MS: [u64; 4] = [0, 1, 5, 20];',
-                'const PREPS: [Prep; 3] = [',
-                'prep_index * OFFSETS_MS.len() + offset_index,',
-                'let tag = format!("wp7-stop{index}");',
-                'eprintln!("P11SCOPE_CELL_BRANCH={tag}:{feed_tag}");',
-                'anyhow::bail!("{tag}: {reason}; not attempted");',
-                'eprintln!("P11SCOPE_CELL_BRANCH={tag}:linked");',
-                '"P11SCOPE_CELL_BRANCH=offset{offset_ms}:{}:{}",',
-                'Ok(format!("P11SCOPE_STOP_COMPLETE=wp7-stop{index}"))',
+                'const STOP_VERDICT_MARKER: &str = "%s";' % jv.MARKER,
+                'const STOP_VERDICT_SCHEMA: &str = "%s";' % jv.SCHEMA,
+                'const STOP_OFFSETS_MS: [u64; 4] = [0, 1, 5, 20];',
+                'const STOP_PREPS: [Prep; 3] = [',
+                'let index = prep_index * STOP_OFFSETS_MS.len() + offset_index;',
+                'name: format!("wp7-stop{index}"),',
+                'prep: index / STOP_OFFSETS_MS.len(),',
+                '#[serde(tag = "kind", rename_all = "kebab-case")]',
                 'JointBranch::S1 => Some("s1-precluded"),',
                 'JointBranch::Unattributed => Some("no-feeds-unattributed"),',
-                '"offset {offset_ms}: the finish must reach Published then '
-                'WoundDown: {outcome}"',
-                '"offset={} begin={} finish={} ({} polls) first_error={:?} '
-                'latched={} latch={:?} \\',
-                '"published".to_string()', '"abandoned".to_string()',
-                '"not-begun".to_string()', '"unpublished".to_string()',
-                '"latched"', '"no-latch"'):
+                'stage: "setup",', 'stage: "drive",', 'stage: "check",',
+                '(StopCheck::AtQ, check_stop_at_q),',
+                '(StopCheck::Latch, check_stop_latch),',
+                '(StopCheck::Abandon, check_stop_abandon),',
+                '(StopCheck::Terminal, check_stop_terminal),',
+                '(StopCheck::Reconcile, check_stop_reconcile),',
+                S1_RECEIPT, UNATTRIBUTED_RECEIPT):
             with self.subTest(literal=literal):
                 self.assertIn(literal, rust)
-        self.assertIn(jv.S1_RECEIPT.format(k=0)[len("Error: wp7-stop0: "):
-                                                -len("; not attempted")],
-                      rust)
-        self.assertIn(jv.UNATTRIBUTED_RECEIPT.format(k=0)[
-            len("Error: wp7-stop0: "):-len("; not attempted")], rust)
+        self.assertEqual(jv.NO_FEED, {"s1-precluded": S1_RECEIPT,
+                                      "no-feeds-unattributed":
+                                          UNATTRIBUTED_RECEIPT})
         self.assertEqual(jv.OFFSETS_MS, (0, 1, 5, 20))
         self.assertEqual(jv.CASES, 3 * 4)
+        self.assertEqual(sorted(jv.OUTCOME_FIELDS),
+                         sorted(QR["cases"][0]["outcome"]))
+
+    def test_stop_check_mirror_matches_the_rust_twins(self):
+        # The cases of the Rust twin
+        # stop_check_failure_names_the_first_failing_check.
+        def failing(**fields):
+            outcome = healthy_outcome(5)
+            outcome.update(fields)
+            return jv.first_failing_check(outcome)
+        self.assertIsNone(failing())
+        self.assertEqual(failing(api_a=1, finish="unpublished"), "at-q")
+        self.assertEqual(failing(first_error="boom"), "latch")
+        self.assertEqual(failing(abandon_gap="for lane stop: x"), "abandon")
+        self.assertEqual(failing(wound="unwound"), "terminal")
+        self.assertEqual(failing(reconciled=False), "reconcile")
+        self.assertIsNone(failing(api_a=1, lane_shed=1))
 
     def test_unknown_disabled_check_is_refused(self):
         with self.assertRaises(ValueError):
             jv.classify(passing(), 0, CELL, disabled=frozenset(["nope"]))
 
     def test_cli_prints_the_row_verdict(self):
-        import json
         import subprocess
         import tempfile
         with tempfile.TemporaryDirectory() as raw:
             path = Path(raw) / "joint-cell.log"
             for log, status, expect, want in (
                     (passing(), 0, "0", Q), (precluded(), 101, "0", P),
-                    (frame(wedge_body(), False), 101, "1", X),
-                    (precluded(), 137, "0", F),
-                    (passing(summary="test result: ok. " + "1" * 4301
-                             + " passed; 0 failed; 0 ignored; 0 measured; "
-                             "0 filtered out; finished in 1.00s"), 0, "0",
-                     F)):
+                    (wedged(), 101, "1", X), (precluded(), 137, "0", F),
+                    (summary_with("test result: ok. " + "1" * 4301
+                                  + " passed; 0 failed; 0 ignored; 0 "
+                                  "measured; 0 filtered out; finished in "
+                                  "1.00s"), 0, "0", F)):
                 path.write_text(log, encoding="utf-8")
                 proc = subprocess.run(
                     [sys.executable, "-I", str(ROOT / "scripts/ci/"
@@ -601,6 +545,15 @@ class JointStopVerdictTableTests(unittest.TestCase):
                 capture_output=True, text=True, timeout=30)
             self.assertEqual(proc.returncode, 2)
 
+
+SOLE_GUARDS = (
+    "summary-not-terminal", "summary-counts",
+    "summary-duplicate", "record-duplicate", "record-misplaced",
+    "record-cell", "case-sequence",
+    "case-outcome", "completion", "terminal-status", "terminal-case",
+    "qualified-count", "unexpected-pass", "precluded-binding",
+    "no-feed-binding", "wedge-binding", "wedge-unexpected",
+)
 
 if __name__ == "__main__":
     unittest.main()

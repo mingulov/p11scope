@@ -2252,6 +2252,24 @@ impl CallerRegistry {
         semantics.feed.reseed_eligible()
     }
 
+    /// Whether this pass's pending grant for the admitted key would
+    /// reseed its voided feed: the same gates, in the same order, as
+    /// the reseed arm of the birth application (linked journal,
+    /// reseed eligibility, session health, then the feed's own
+    /// acceptance of the receipt).
+    fn joint_reseed_will_accept(
+        &self,
+        input: &AdmittedInstanceCall,
+        feed: &crate::semantics_key_use::JointStaging,
+    ) -> bool {
+        self.joint_grants.get(&input.key).is_some_and(|grant| {
+            self.journal_linked()
+                && self.joint_reseed_eligible(&input.key)
+                && self.reseed_session_healthy()
+                && feed.reselect_refusal(&grant.receipt).is_none()
+        })
+    }
+
     /// Whether a reseed may arm now: the session published a full
     /// health window of clean passes since its last stuck-session
     /// abandon. Reseeds only — first-time arms never wait (F6
@@ -2554,12 +2572,19 @@ impl CallerRegistry {
         }
     }
 
-    /// Tick one quantum off every feed's stuck-degrade cooldown. The
-    /// machine calls this every Births phase beside the reseed queue
-    /// scan; the scan itself is bounded by the registry limit.
+    /// Tick one quantum off every feed's stuck-degrade cooldown, and
+    /// lift the stuck bar of every feed whose cooldown is served while
+    /// the session is healthy. The machine calls this every Births
+    /// phase beside the reseed queue scan; the scan itself is bounded
+    /// by the registry limit.
     pub(crate) fn tick_reseed_cooldowns(&mut self) {
+        // A served cooldown in a healthy session lifts the stuck bar
+        // (fresh proof of health; no void needed), so the reseed queue
+        // scan right after this tick can offer the fresh birth.
+        let healthy = self.reseed_session_healthy();
         for record in self.instance_state.semantics.values_mut() {
             record.feed.tick_reseed_cooldown();
+            record.feed.lift_settled_stuck_bar(healthy);
         }
     }
 
@@ -2718,12 +2743,18 @@ impl CallerRegistry {
             // unregistered key with a grant: its first original is not
             // an S1Only subject (disposing it would refuse the journal
             // key the new feed is about to seal).
+            // Likewise a voided feed whose pending grant this pass's
+            // reseed will accept: its originals belong to the reseeded
+            // segment, and disposing them as S1-only subjects would
+            // refuse the very key the reseed seals (seen live: every
+            // post-void reseed died DomainTainted on its own traffic).
             Some(id) => self.instance_state.semantics.get(id).is_none_or(|record| {
                 record.caller == input.caller
                     && record.feed.mode() == FeedMode::S1Only
                     && !(self.joint_grants.contains_key(&input.key)
                         && record.feed.upgrade_eligible()
                         && self.joint_upgrade_eligible(&input.key))
+                    && !self.joint_reseed_will_accept(input, &record.feed)
             }),
             None => !self.joint_grants.contains_key(&input.key),
         }
@@ -2925,6 +2956,15 @@ impl CallerRegistry {
             .semantics
             .get(&id)
             .map(|record| record.feed.mode())
+    }
+
+    /// Tests-only: whether one feed's fresh reseeds are stuck-barred.
+    #[cfg(test)]
+    pub(crate) fn feed_stuck_barred_for_test(&self, id: RegistryInstanceId) -> Option<bool> {
+        self.instance_state
+            .semantics
+            .get(&id)
+            .map(|record| record.feed.fresh_reseed_barred_for_test())
     }
 
     /// Tests-only: pose one feed's mode (a disjoint S1-only history
@@ -6612,6 +6652,107 @@ mod journal_unavailable_tests {
                     s1_call("C_Sign", RV_OK, MECHANISM),
                 )),
             "a touched registration stays an S1Only subject despite a grant"
+        );
+    }
+
+    /// A voided feed's original staged in the pass whose grant the
+    /// reseed will accept is not an S1-only subject: disposing it would
+    /// refuse the very key the reseed seals (live, every post-void
+    /// reseed died DomainTainted on its own traffic). Each reseed gate
+    /// alone keeps the original an S1-only subject: no grant, a grant
+    /// below the void fence, or an unhealthy session.
+    #[test]
+    fn reseed_grant_original_is_not_an_s1only_subject() {
+        // One domain: every grant re-scripts the same proof at a later
+        // cut, so only the gate under test can refuse the reseed.
+        let base = birth_receipt_with_cut(41);
+        let at = |cut| {
+            BootstrapReceipt::scripted(base.proof(), base.birth(), cut, base.closure_generation())
+        };
+        let mut scene = UnlinkedScene::new();
+        scene.registry.note_journal_linked(true);
+        let key = scene.key(1);
+        let (_, id) = scene.register(1);
+        scene
+            .registry
+            .note_instance(AdmittedInstance::scripted(key.clone(), scene.caller));
+        assert!(scene.registry.install_joint_receipt(key.clone(), at(41)));
+        scene.registry.publish();
+        assert_eq!(scene.registry.feed_mode_for_test(id), Some(FeedMode::Joint));
+        scene.registry.pose_void_ended_feed_for_test(&key, 50);
+        let caller = scene.caller;
+        let call = |ordinal| {
+            AdmittedInstanceCall::scripted(
+                key.clone(),
+                caller,
+                ordinal,
+                s1_call("C_Sign", RV_OK, MECHANISM),
+            )
+        };
+        assert!(
+            scene.registry.admitted_feed_is_s1only(&call(60)),
+            "control: a voided feed without a grant stages S1-only subjects"
+        );
+
+        let reoffer = |scene: &mut UnlinkedScene, cut| {
+            scene
+                .registry
+                .note_instance(AdmittedInstance::scripted(key.clone(), caller));
+            assert!(scene.registry.install_joint_receipt(key.clone(), at(cut)));
+        };
+        reoffer(&mut scene, 45);
+        assert!(
+            scene.registry.admitted_feed_is_s1only(&call(60)),
+            "a below-fence grant will not reseed: the original stays a subject"
+        );
+        scene.registry.publish();
+        assert_eq!(
+            scene.registry.feed_mode_for_test(id),
+            Some(FeedMode::S1Only)
+        );
+
+        scene.registry.pose_session_unhealthy_for_test();
+        reoffer(&mut scene, 60);
+        assert!(
+            scene.registry.admitted_feed_is_s1only(&call(61)),
+            "an unhealthy session will not reseed: the original stays a subject"
+        );
+        scene.registry.publish();
+        assert_eq!(
+            scene.registry.feed_mode_for_test(id),
+            Some(FeedMode::S1Only)
+        );
+
+        let mut healthy = UnlinkedScene::new();
+        healthy.registry.note_journal_linked(true);
+        let key = healthy.key(1);
+        let (_, id) = healthy.register(1);
+        healthy
+            .registry
+            .note_instance(AdmittedInstance::scripted(key.clone(), healthy.caller));
+        assert!(healthy.registry.install_joint_receipt(key.clone(), at(41)));
+        healthy.registry.publish();
+        healthy.registry.pose_void_ended_feed_for_test(&key, 50);
+        healthy
+            .registry
+            .note_instance(AdmittedInstance::scripted(key.clone(), healthy.caller));
+        assert!(healthy.registry.install_joint_receipt(key.clone(), at(60)));
+        assert!(
+            !healthy
+                .registry
+                .admitted_feed_is_s1only(&AdmittedInstanceCall::scripted(
+                    key.clone(),
+                    healthy.caller,
+                    61,
+                    s1_call("C_Sign", RV_OK, MECHANISM),
+                )),
+            "the reseed pass's original belongs to the reseeded segment"
+        );
+        healthy.registry.publish();
+        assert_eq!(
+            healthy.registry.feed_mode_for_test(id),
+            Some(FeedMode::Joint),
+            "the predicted reseed is the one the birth applies"
         );
     }
 

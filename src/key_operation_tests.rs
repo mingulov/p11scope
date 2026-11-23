@@ -25872,6 +25872,101 @@ fn key_operation_health_gate_bars_only_reseeds_pristine_arms_still_arm() {
     assert_eq!(guarded.registry.joint_feeds(), 1);
 }
 
+/// RED twin (registry seam of the stuck-bar recovery): a reseeded
+/// feed that stuck-degrades is barred, and the Births-phase tick lifts
+/// the bar once its cooldown is served in a healthy session — with no
+/// void. An unhealthy window keeps it barred through the same ticks.
+#[test]
+fn key_operation_stuck_bar_lifts_on_served_cooldown_in_a_healthy_session() {
+    for healthy in [true, false] {
+        let mut guarded = GuardedScene::new();
+        let bootstrap = guarded.scene.bootstrap();
+        let joint_key = guarded.key(1);
+        assert!(
+            guarded
+                .registry
+                .install_joint_receipt(joint_key.clone(), bootstrap)
+        );
+        let (_, joint_id) = guarded.register(1);
+        let (facts, position) =
+            guarded.admit_shape(&ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0));
+        guarded.observe(&joint_key, position, facts);
+        guarded
+            .registry
+            .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+        let mut failure = guarded.scene.adapter.scripted_failure(
+            JournalGap::H3Loss,
+            &bootstrap,
+            crate::semantics_objects::ObjectEffects::default(),
+        );
+        failure.fence = Some(1);
+        let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+        let _ = guarded.registry.deliver_joint_algorithm_failure_for_test(
+            joint_id,
+            &failure,
+            &mut h3,
+            &guarded.scene.model,
+            guarded.scene.adapter.ledger_mut(),
+        );
+        let fresh = BootstrapReceipt::scripted(
+            bootstrap.proof(),
+            BirthKind::AttachObserved,
+            1,
+            bootstrap.closure_generation(),
+        );
+        assert!(
+            guarded
+                .registry
+                .install_joint_receipt(joint_key.clone(), fresh)
+        );
+        guarded.registry.note_instance(AdmittedInstance::scripted(
+            joint_key.clone(),
+            guarded.caller,
+        ));
+        guarded.registry.publish();
+        assert_eq!(
+            guarded.registry.feed_mode_for_test(joint_id),
+            Some(FeedMode::Joint),
+            "the voided feed reseeds"
+        );
+        for i in 0..u64::from(crate::semantics_key_use::RESEED_STUCK_DEGRADE_STREAK) {
+            guarded
+                .registry
+                .note_reseeded_stuck_passes(&[joint_id], (i + 1) * 1_000_000_000);
+        }
+        assert_eq!(
+            guarded.registry.feed_mode_for_test(joint_id),
+            Some(FeedMode::S1Only),
+            "four stuck passes degrade the reseed"
+        );
+        assert_eq!(
+            guarded.registry.feed_stuck_barred_for_test(joint_id),
+            Some(true)
+        );
+        if !healthy {
+            // A stuck-session abandon opens the unhealthy window.
+            guarded.registry.reset_quantum_touched_feeds();
+            let _ = guarded
+                .registry
+                .discard_quantum_touched_staged(guarded.scene.adapter.ledger_mut());
+        }
+        for _ in 0..crate::semantics_key_use::RESEED_COOLDOWN_PASSES - 1 {
+            guarded.registry.tick_reseed_cooldowns();
+        }
+        assert_eq!(
+            guarded.registry.feed_stuck_barred_for_test(joint_id),
+            Some(true),
+            "the cooldown is not served yet"
+        );
+        guarded.registry.tick_reseed_cooldowns();
+        assert_eq!(
+            guarded.registry.feed_stuck_barred_for_test(joint_id),
+            Some(!healthy),
+            "healthy={healthy}: a served cooldown lifts the bar only in a healthy session"
+        );
+    }
+}
+
 /// The proven-stuck abandon trips the same health window: a reseed
 /// right after a provenance-narrowed discard refuses with the health
 /// gap. Both re-arm discard seams feed the one gate.

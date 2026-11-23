@@ -38992,6 +38992,190 @@ fn joint_seal_refused_exact_fit_barrier_decides_at_zero() {
     );
 }
 
+/// Pre-barrier seal scans share the barrier's cursor: 97 clear rows plus
+/// an `AbandonReturnPending` wait, driven with one-unit seals. Each poll
+/// examines exactly one row (one birth evaluation plus one barrier visit,
+/// same cursor, resuming without rereading the prefix) and replay sizing
+/// walks no rows at all (O(1) from cardinalities). Total barrier visits
+/// and birth evaluations each equal the staged table; replay visits stay
+/// zero. Separate full scans per attempt would reread the prefix on every
+/// poll.
+#[test]
+fn joint_seal_prebarrier_scans_share_barrier_cursor() {
+    use crate::semantics_objects::journal::SealWait;
+    use crate::semantics_objects::journal::tests::abandon_bytes;
+    use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    let (target, pid) = fixture.replay_target();
+    let (open, ordinary) =
+        fixture
+            .scene
+            .encoded_with_rv(pid, 0, "C_SignUpdate", 2, pkcs11_types::CkRv::PENDING.0);
+    let (held, complete) = fixture.scene.encoded(pid, 0, "C_SignInit", 3);
+    let image = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .semantic_bindings()
+        .get(target.caller())
+        .unwrap()
+        .image();
+    let mut abandon = abandon_bytes(
+        u64::from(pid),
+        2,
+        JOURNAL_REASON_SYNC_RETURN_RESULT_LOST,
+        (image.task_cookie, image.exec_id),
+    );
+    abandon[24..32].copy_from_slice(&open[24..32]);
+    abandon[48..52].copy_from_slice(&open[104..108]);
+    abandon[56..64].copy_from_slice(&open[48..56]);
+    let source = fixture.scene.drain.source_mut();
+    source.push_record(open.to_vec());
+    source.push_record(ordinary[24..392].to_vec());
+    source.push_record(abandon.to_vec());
+    source.push_record(held.to_vec());
+    source.push_record(complete.to_vec());
+    let mut frame = fixture.audited(2, 2, &BirthFault);
+    assert!(
+        frame.failure_for_test().is_none(),
+        "clean audit: {:?}",
+        frame.failure_for_test()
+    );
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture_mut()
+        .adapter_mut()
+        .populate_foreign_open_rows_for_test(97);
+    let h0 = fixture.scene.real.h0.clone();
+    let mut births = NativeFrameBirths {
+        h0: &h0,
+        attached: &fixture.attached,
+        retained: &mut fixture.births,
+        seen: Vec::new(),
+        unreadable: false,
+    };
+    let mut ports = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_frame_ports(&fixture.scene.producers)
+        .unwrap();
+    frame.bind_targets(&ports).unwrap();
+    let diagnosis = ports.read().1.adapter().seal_stage_diagnosis();
+    let total = diagnosis.open_staged as usize + diagnosis.refused_staged as usize;
+    assert!(
+        total > 64,
+        "the staging table holds past one slice of rows: {total}"
+    );
+    let baseline_barrier = ports.read().1.adapter().barrier_row_visits_for_test();
+    let baseline_replay = ports.read().1.adapter().replay_sample_visits_for_test();
+    let baseline_birth = ports.read().1.adapter().birth_cover_evals_for_test();
+    assert_eq!(
+        frame.consumer_progress_for_test(),
+        (2, 0, 0),
+        "both consumers start pending"
+    );
+    let mut polls = 0usize;
+    loop {
+        assert!(
+            polls < total + 5,
+            "the one-credit scan decides within its row bound"
+        );
+        let before_barrier = ports.read().1.adapter().barrier_row_visits_for_test();
+        let before_replay = ports.read().1.adapter().replay_sample_visits_for_test();
+        let before_birth = ports.read().1.adapter().birth_cover_evals_for_test();
+        let mut remaining = 1;
+        let progress =
+            frame.seal_next_bounded(&mut ports, &mut births, &BirthFault, &mut remaining);
+        polls += 1;
+        let barrier = ports.read().1.adapter().barrier_row_visits_for_test() - before_barrier;
+        let replay = ports.read().1.adapter().replay_sample_visits_for_test() - before_replay;
+        let birth = ports.read().1.adapter().birth_cover_evals_for_test() - before_birth;
+        assert_eq!(
+            replay, 0,
+            "poll {polls} sizes replay without walking rows"
+        );
+        if progress == Ok(QuantumSealProgress::AwaitFutureInput) {
+            assert_eq!(
+                barrier, 0,
+                "the deciding poll reuses its completed scan with no new visits"
+            );
+            assert_eq!(
+                birth, 0,
+                "the deciding poll evaluates no new birth rows"
+            );
+            assert_eq!(
+                remaining, 0,
+                "the Future advance charges its paid decision credit"
+            );
+            assert_eq!(
+                ports.read().1.adapter().last_seal_wait(),
+                SealWait::AbandonReturnPending,
+                "the wait names its gate"
+            );
+            break;
+        }
+        assert_eq!(
+            progress,
+            Ok(QuantumSealProgress::LocalPending),
+            "poll {polls} yields with no seal decision"
+        );
+        assert_eq!(remaining, 0, "a yielded poll spends its whole slice");
+        assert_eq!(
+            barrier, 1,
+            "a budget-1 yielded poll examines exactly one row"
+        );
+        assert_eq!(
+            birth, 1,
+            "birth coverage shares the barrier's cursor (one evaluation per visited row)"
+        );
+        assert_eq!(
+            ports.read().1.adapter().last_seal_wait(),
+            SealWait::None,
+            "a yielded poll waits on nothing yet"
+        );
+        assert_eq!(
+            frame.consumer_progress_for_test(),
+            (2, 0, 0),
+            "a yielded poll advances no consumer"
+        );
+        assert!(
+            frame.active_seal_for_test().is_none(),
+            "a yielded poll sets no active delivery"
+        );
+    }
+    assert!(
+        polls > 1,
+        "a populated table yields instead of deciding in one poll"
+    );
+    assert_eq!(
+        ports.read().1.adapter().barrier_row_visits_for_test() - baseline_barrier,
+        total,
+        "the scan visits every staged row once across its polls"
+    );
+    assert_eq!(
+        ports.read().1.adapter().birth_cover_evals_for_test() - baseline_birth,
+        total,
+        "birth coverage evaluates every staged row once (same cursor, no separate scans)"
+    );
+    assert_eq!(
+        ports.read().1.adapter().replay_sample_visits_for_test() - baseline_replay,
+        0,
+        "replay sizing walks no rows"
+    );
+    assert_eq!(
+        frame.consumer_progress_for_test(),
+        (1, 1, 1),
+        "the consumer advances past the wait"
+    );
+}
+
 /// A failure-path yield that spent budget is progress at the
 /// delivery seam; a yield with no spend stays stuck. A transient
 /// take retry first records a real stale streak (1,

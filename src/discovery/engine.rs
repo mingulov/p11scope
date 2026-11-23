@@ -24468,20 +24468,24 @@ impl Engine {
         // pressure must still recover, and the re-proof must not spend
         // capture credit. The re-proof runs only two bounded operations
         // (the mountinfo re-read and the pin-time maps probe), so the
-        // budget keeps the normal per-operation proof limits with a
-        // total derived from their joint worst case — the same
-        // per-pass resumable semantics as the initial pin, never a
-        // smaller fixed cap: any table the initial pin accepts the
-        // retry also accepts, with room for EOF proof, and over-limit
-        // tables refuse identically on both paths. The budget dies
-        // with the attempt — no charge-back, like the identify batch
-        // allowance, with each retry recorded on the operator channel.
-        // First attempts keep the capture budget (normal accounting).
+        // budget keeps the normal per-operation proof allowance with a
+        // total derived from their joint worst case (64 MiB mountinfo
+        // plus the probe's full 256 MiB per-operation range plus
+        // lookahead margin) — the same per-pass resumable semantics as
+        // the initial pin, never a smaller fixed cap: any table the
+        // initial pin accepts the retry also accepts, with room for
+        // EOF proof, and the maps probe resumes from its own cursor
+        // under its full range instead of being cut by the mountinfo
+        // spend; over-limit tables refuse identically on both paths.
+        // The budget dies with the attempt — no charge-back, like the
+        // identify batch allowance, with each retry recorded on the
+        // operator channel. First attempts keep the capture budget
+        // (normal accounting).
         let retrying = self.learned_pin_retries.contains_key(&identity);
         let mut retry_budget;
         let budget = if retrying {
             retry_budget = CaptureWorkBudget::new(ScanLimits {
-                per_object_bytes: ScanLimits::default().per_object_bytes,
+                per_object_bytes: crate::discovery::scan::PROOF_PER_OPERATION_IO_BYTES,
                 total_bytes: crate::discovery::scan::LEARNED_RETRY_TOTAL_IO_BYTES,
             });
             &mut retry_budget

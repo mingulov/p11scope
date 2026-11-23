@@ -70,18 +70,27 @@ const MAX_MAPS_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_MAP_ENTRIES: usize = 1_048_576;
 const MAX_MOUNTINFO_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_MOUNTINFO_ENTRIES: usize = 1_048_576;
+/// One operation's proof allowance on every pass: the pin-time
+/// self-mapping probe reads through `allowed_io`, so its proof range
+/// is this per-operation leg (shared with `ScanLimits::default`, so
+/// the initial pin and every retry offer the same range), never the
+/// ordinary maps scanner's byte cap above.
+pub(crate) const PROOF_PER_OPERATION_IO_BYTES: u64 = 256 * 1024 * 1024;
 /// Worst-case re-proof I/O for one learned-pin retry: a full mount
-/// table plus a full maps scan plus a chunk of lookahead and margin.
-/// A retry re-proves only these two bounded operations (the mountinfo
-/// re-read and the pin-time maps probe) through its fresh isolated
-/// budget — never capture credit — so the total covers their joint
-/// worst case instead of the capture total. Any table the initial
-/// pin accepts (at most `MAX_MOUNTINFO_BYTES` under the same
-/// per-operation cap) fits with room for EOF proof; larger tables
-/// refuse identically on both paths. Derived from the caps above,
-/// never a smaller fixed number.
+/// table plus one full per-operation maps proof plus a chunk of
+/// lookahead and margin. A retry re-proves only these two bounded
+/// operations (the mountinfo re-read and the pin-time maps probe)
+/// through its fresh isolated budget — never capture credit — so the
+/// total covers their joint worst case instead of the capture total.
+/// The total stays above the mount-table cap plus the probe's full
+/// per-operation range, so each operation resumes its proof from its
+/// own cursor under the same allowance the initial pass used: the
+/// shared total never binds before the per-operation caps, and a
+/// retry never restarts or cuts a proof the initial pin completes.
+/// Over-limit tables refuse identically on both paths. Derived from
+/// the caps above, never a smaller fixed number.
 pub(crate) const LEARNED_RETRY_TOTAL_IO_BYTES: u64 =
-    MAX_MOUNTINFO_BYTES + MAX_MAPS_BYTES + READ_CHUNK as u64;
+    MAX_MOUNTINFO_BYTES + PROOF_PER_OPERATION_IO_BYTES + READ_CHUNK as u64;
 // ponytail: this independent ceiling is the calibration knob if real providers hit it.
 const DEFAULT_WORK_CEILING: u64 = 16 * 1024 * 1024;
 /// Production Inventory per-pass attempted-I/O window. Calibrated 2026-11-09:
@@ -684,7 +693,7 @@ impl Default for ScanLimits {
             // bytes on disk with 63,639,548 readable data bytes, so the
             // old 64 MiB allowance starved its snapshots; 256 MiB holds
             // it with margin while still bounding the worst case.
-            per_object_bytes: 256 * 1024 * 1024,
+            per_object_bytes: PROOF_PER_OPERATION_IO_BYTES,
             total_bytes: DETAILED_CAPTURE_IO_BYTES,
         }
     }

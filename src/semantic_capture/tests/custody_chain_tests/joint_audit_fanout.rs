@@ -8449,6 +8449,299 @@ fn drive_frame_seal_until_decided(
     }
 }
 
+/// Sampled void work at a void wait's start: every table the Idle void
+/// path can charge (absence scan inputs, staged rows, keys, claims,
+/// stuck scope, model rows, rejection backlog, taint marks). Sampled
+/// once, before the first poll; the bound below prices each part from
+/// the recovery charge model, never a bare constant.
+#[derive(Debug)]
+struct VoidSample {
+    absence_bindings: usize,
+    required_targets: usize,
+    birth_witnesses: usize,
+    open: usize,
+    refused: usize,
+    keys: usize,
+    max_queued: usize,
+    unbounded: usize,
+    scope_domains: usize,
+    stream_void: bool,
+    sessions: usize,
+    bindings: usize,
+    call_keys: usize,
+    deferred: usize,
+    releases: usize,
+    rej_queued: usize,
+    rej_active: bool,
+    taint_owed: bool,
+}
+
+fn sample_void(fixture: &MachineScene) -> VoidSample {
+    let coordinator = &fixture.scene.real.scene.coordinator;
+    let capture = coordinator.joint_capture();
+    let diagnosis = capture.adapter().seal_stage_diagnosis();
+    let model = capture.memory_lens();
+    let (bindings, call_keys) = capture.model().domain_rows_for_test();
+    let (rej_queued, rej_active) = capture.adapter().rejections_for_test();
+    let (scope_domains, _, stream_void) = capture
+        .adapter()
+        .void_scope_for_test()
+        .unwrap_or((0, 0, false));
+    let mut absence_bindings = 0usize;
+    while coordinator
+        .joint_absence_binding(absence_bindings)
+        .is_some()
+    {
+        absence_bindings += 1;
+    }
+    let births = fixture.machine.retained_births_for_test();
+    VoidSample {
+        absence_bindings,
+        required_targets: fixture.scene.real.lane.subset().required().len(),
+        birth_witnesses: births.pending_for_test().count() + births.ready_for_test().count(),
+        open: diagnosis.open_staged as usize,
+        refused: diagnosis.refused_staged as usize,
+        keys: capture.adapter().joint_void_diagnosis().keys_total as usize,
+        max_queued: capture.adapter().max_queued_claims_for_test(),
+        unbounded: capture.adapter().unbounded_open_for_test(),
+        scope_domains,
+        stream_void,
+        sessions: model.sessions.len as usize,
+        bindings,
+        call_keys,
+        deferred: model.deferred_pending.len as usize + model.deferred_detached.len as usize,
+        releases: model.deferred_releases.len as usize,
+        rej_queued,
+        rej_active,
+        taint_owed: capture.adapter().has_taint_overflow_pending(),
+    }
+}
+
+/// Derived Idle absence-scan bound: per binding, per required target, the
+/// scan examines retained entries until one matches or they exhaust (one
+/// poll each) plus one acquisition poll when none matches, then one poll
+/// to exhaust the binding. Entries grow by acquisitions (at most one per
+/// target dispatches it), so per-target polls price from the sampled
+/// witnesses plus the targets themselves. Cited to the Idle scan arms.
+fn void_scan_bound(bindings: usize, targets: usize, witnesses: usize) -> usize {
+    bindings.saturating_mul(
+        targets
+            .saturating_mul(
+                witnesses
+                    .saturating_add(bindings.saturating_mul(targets))
+                    .saturating_add(1),
+            )
+            .saturating_add(1),
+    )
+}
+
+/// Derived void-work units for one recovery pass over the sampled tables
+/// with `scope_domains` stuck domains (every key for a stream void):
+/// classify reads and probes, preserve reads/decisions/bases, fence plus
+/// model retirement, wipe reads/probes/applies, taint marks. Every term
+/// cites its recovery phase; counts are sampled, costs are the model's
+/// per-row charges (one unit per row/probe/decision, probes priced by
+/// queued claims, views priced as bindings).
+fn void_units_bound(sample: &VoidSample, scope_domains: usize) -> usize {
+    let open = sample.open;
+    let refused = sample.refused;
+    let keys = sample.keys;
+    let maxq = sample.max_queued;
+    let unbounded = sample.unbounded;
+    // Classify: one read per staged row, one probe per row (each probe
+    // prices its identity's queued claims), one poll to exhaust each table.
+    let classify = open
+        .saturating_mul(1usize.saturating_add(maxq))
+        .saturating_add(refused.saturating_mul(1usize.saturating_add(maxq)))
+        .saturating_add(2);
+    // Preserve: one read per wiped row (wiped ⊆ open); per unbounded row
+    // one decision plus one probe; per touched image (images with
+    // unbounded rows, at most one per row and images ⊆ keys) one basis
+    // touch plus one unit per listed key (key lists ⊆ keys).
+    let basis_images = keys.min(unbounded);
+    let preserve = open
+        .saturating_add(unbounded.saturating_mul(1usize.saturating_add(maxq)))
+        .saturating_add(basis_images.saturating_mul(1usize.saturating_add(keys)));
+    // One domain retirement (Void kind): start, views plus exhaust,
+    // sessions (find, clears plus end, exhaust; clears ≤ bindings),
+    // deferred origins plus exhausts, bindings plus exhaust, releases
+    // (exhaust free), finish. Per-domain rows price from the sampled
+    // global model rows (each domain holds at most the globals).
+    let retire = 1usize
+        .saturating_add(sample.bindings.saturating_add(1))
+        .saturating_add(
+            sample
+                .sessions
+                .saturating_mul(2)
+                .saturating_add(sample.bindings)
+                .saturating_add(1),
+        )
+        .saturating_add(if sample.deferred > 0 {
+            sample.deferred.saturating_add(2)
+        } else {
+            0
+        })
+        .saturating_add(sample.bindings.saturating_add(1))
+        .saturating_add(sample.releases)
+        .saturating_add(1);
+    // Fence: one unit per stuck domain plus its retirement.
+    let fence = scope_domains.saturating_mul(1usize.saturating_add(retire));
+    // Seal-time dooms (only with unbounded rows): every key may doom
+    // (Abandon retirement: the Void rows plus fenced and removed calls,
+    // each at most all call keys plus exhausts), and tainted images
+    // drain every staged row plus one exhaust.
+    let doom = if unbounded > 0 {
+        keys.saturating_mul(
+            retire.saturating_add(sample.call_keys.saturating_add(1).saturating_mul(2)),
+        )
+        .saturating_add(open.saturating_add(1).saturating_add(refused))
+    } else {
+        0
+    };
+    // Wipe: one read per wiped row (≤ open), one probe plus one apply
+    // per unbounded row (only unbounded rows need excuse decisions),
+    // one compact per refused row.
+    let wipe = open
+        .saturating_add(unbounded.saturating_mul(maxq.saturating_add(1)))
+        .saturating_add(refused);
+    // Taint-overflow marks (only when owed): one unit per key plus per
+    // image (images ⊆ keys) plus one cursor wrap.
+    let overflow = if sample.taint_owed {
+        keys.saturating_mul(2).saturating_add(1)
+    } else {
+        0
+    };
+    classify
+        .saturating_add(preserve)
+        .saturating_add(fence)
+        .saturating_add(doom)
+        .saturating_add(wipe)
+        .saturating_add(overflow)
+}
+
+/// Derived void-wait poll bound: the absence scan, the rejection backlog
+/// (each rejection at most a full pass over every key), the void's own
+/// pass over the stuck scope (every key for a stream void), plus one
+/// completion poll (free Done transitions spend nothing). Returns the
+/// bound with the scan allowance (pre-void polls spend no void units).
+fn void_poll_bound(sample: &VoidSample) -> (usize, usize) {
+    let scan = void_scan_bound(
+        sample.absence_bindings,
+        sample.required_targets,
+        sample.birth_witnesses,
+    );
+    let full_pass = void_units_bound(sample, sample.keys);
+    let rejections = sample
+        .rej_queued
+        .saturating_add(usize::from(sample.rej_active))
+        .saturating_mul(full_pass);
+    let scope = if sample.stream_void {
+        sample.keys
+    } else {
+        sample.scope_domains
+    };
+    let bound = scan
+        .saturating_add(rejections)
+        .saturating_add(void_units_bound(sample, scope))
+        .saturating_add(1);
+    (bound, scan)
+}
+
+/// Drive budget-1 machine polls until no void work stands, within a bound
+/// derived from the void charge model. Every poll with work outstanding
+/// must spend exactly one recovery unit, unless it is a pre-void absence
+/// scan poll (no recovery stood and no rejection pended, within the
+/// sampled scan allowance) or the completing poll (nothing outstanding
+/// after, spending nothing); anything else fails at once instead of
+/// burning the bound. The wait must start with work outstanding, so an
+/// already-clear void fails instead of passing vacuously. The machine
+/// leaves Idle only once the void clears. Returns the polls used.
+fn drive_void_polls(fixture: &mut MachineScene, sample: &VoidSample, label: &str) -> usize {
+    let (bound, scan) = void_poll_bound(sample);
+    let units_start = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .recovery_units_for_test();
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .void_outstanding_for_test(),
+        "{label}: the void wait starts with work outstanding ({sample:?})"
+    );
+    let mut polls = 0usize;
+    loop {
+        assert!(
+            polls < bound,
+            "{label}: the void wait lands within its derived bound (polls={polls} bound={bound} scan={scan} sample={sample:?})"
+        );
+        let capture = fixture.scene.real.scene.coordinator.joint_capture();
+        let units_before = capture.adapter().recovery_units_for_test();
+        let outstanding_before = capture.adapter().void_outstanding_for_test();
+        let recovery_before = capture
+            .adapter()
+            .scoped_recovery_progress_for_test()
+            .is_some();
+        let rejections_before = capture.adapter().rejections_for_test();
+        let phase_before = fixture.machine.diagnostic_snapshot_for_test().0;
+        let outcome = fixture.service(1).expect("the void drain never refuses");
+        polls += 1;
+        let capture = fixture.scene.real.scene.coordinator.joint_capture();
+        let units_after = capture.adapter().recovery_units_for_test();
+        let outstanding_after = capture.adapter().void_outstanding_for_test();
+        let recovery_after = capture
+            .adapter()
+            .scoped_recovery_progress_for_test()
+            .is_some();
+        let rejections_after = capture.adapter().rejections_for_test();
+        let phase_after = fixture.machine.diagnostic_snapshot_for_test().0;
+        assert!(
+            units_after >= units_before,
+            "{label}: poll {polls} never unspends void units (units {units_before}->{units_after})"
+        );
+        let spent = units_after - units_before;
+        let adapter = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter();
+        assert!(
+            !(adapter.stream_broken_for_test() || adapter.invalidated_for_test()),
+            "a scoped void breaks nothing and invalidates nothing"
+        );
+        assert!(
+            phase_after == "Idle" || !outstanding_after,
+            "{label}: poll {polls} leaves Idle only once the void clears (phase {phase_before}->{phase_after})"
+        );
+        let pre_void_poll = !recovery_before
+            && !recovery_after
+            && rejections_before == (0, false)
+            && rejections_after == (0, false)
+            && polls <= scan;
+        assert!(
+            spent == 1 || (spent == 0 && (pre_void_poll || !outstanding_after)),
+            "{label}: poll {polls} of {bound} spends its void unit or is the scan prefix or the completing poll (units {units_before}->{units_after}, outstanding {outstanding_before}->{outstanding_after}, recovery {recovery_before}->{recovery_after}, rejections {rejections_before:?}->{rejections_after:?}, phase {phase_before}->{phase_after}, outcome {outcome:?})"
+        );
+        if !outstanding_after {
+            eprintln!(
+                "{label}: void wait finished in {polls} polls (bound={bound} scan={scan} units={} sample={sample:?})",
+                units_after - units_start
+            );
+            return polls;
+        }
+    }
+}
+
 /// Keep the original A BEGIN unfinished while the same image's B has a real
 /// END. The next service call is the first visit to this original Audited
 /// frame: its actual target snapshot has not been bound yet.
@@ -22487,6 +22780,15 @@ fn joint_machine_rearm_fences_spanned_key_tracking_for_rebirth() {
     // quantum: no re-sync (the stream stays intact), and the feed's
     // fence is exactly the lost window.
     fixture.scene.push(pid, 0, "C_CreateObject", 5);
+    // The re-arm's scoped void drains first, within a bound derived from
+    // the void charge model with per-poll spend asserts; the follow-up
+    // collect below (unchanged loop) then fences the lost window.
+    let sample = sample_void(&fixture);
+    let void_polls = drive_void_polls(&mut fixture, &sample, "rearm void drain");
+    assert!(
+        void_polls > 1,
+        "the void drain spans polls instead of clearing in one"
+    );
     let mut fenced = false;
     for _ in 0..64 {
         fixture

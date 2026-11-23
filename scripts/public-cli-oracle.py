@@ -821,7 +821,8 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
         and evidence.get("pid_descendant_gaps", 0) == 0
         and _strategies.get("unavailable") == 1
         and _loader.get("hits") == 0)
-    # Learned first-use lane 2026-11-22 (fix3, Codex B2): a
+    # Learned first-use lane 2026-11-22 (controller brief: accept
+    # the legitimate counted first-use disclosure shape): a
     # file-changed learned pin that the retry stages files the one
     # fixed first-use row for its uncovered provider, with the
     # staged count in evidence.learned_staged_files. The honest
@@ -1108,6 +1109,15 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
             noise = (f"pid_descendant_gaps={gaps}; discovery_skips={skips}")
         else:
             noise = f"pid_descendant_gaps={gaps}"
+        if ok_learned_first_use:
+            # The summary names what qualified: the fixed first-use
+            # disclosure row plus its staged-file count, so a reader
+            # need not open the evidence to see the oracle authorized
+            # earlier unobserved calls for a staged provider.
+            rows = sum(1 for skip in skip_entries
+                       if skip == LEARNED_FIRST_USE_SKIP)
+            staged = evidence.get("learned_staged_files", 0)
+            noise += f"; learned_first_use={rows}; learned_staged_files={staged}"
         if gaps > 0 or skips > 0:
             return "owned-provider-counts-with-runner-noise", (
                 "owned physical-provider counts match independent successful ledger; "
@@ -1127,9 +1137,16 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
         gaps = evidence.get("pid_descendant_gaps", 0)
         skips = sum(1 for skip in evidence.get("skipped", [])
                     if skip == DISCLOSABLE_DISCOVERY_SKIP)
+        first_use = ""
+        if ok_learned_first_use:
+            rows = sum(1 for skip in skip_entries
+                       if skip == LEARNED_FIRST_USE_SKIP)
+            staged = evidence.get("learned_staged_files", 0)
+            first_use = (f"learned_first_use={rows}; "
+                         f"learned_staged_files={staged}; ")
         return "owned-provider-counts-with-ambient-gap", (
             "owned physical-provider counts match independent successful ledger; "
-            f"disclosed honest ambient gap: pid_descendant_gaps={gaps}; discovery_skips={skips}; "
+            f"disclosed honest ambient gap: pid_descendant_gaps={gaps}; discovery_skips={skips}; {first_use}"
             "per-caller attribution is not established")
     return "owned-provider-counts", ("owned physical-provider counts match independent successful ledger; "
                                      "per-caller attribution is not established")

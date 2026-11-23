@@ -2373,6 +2373,15 @@ pub(crate) struct JournalAdapter {
     /// `seal_stage_diagnosis` overwrites them.
     seal_stages: SealStageCounts,
     open: BTreeMap<JournalNativeKey, OpenEntry>,
+    /// Maintained open-population cardinalities for O(1) replay sizing:
+    /// unconverted begins, ends awaiting conversion, and staged
+    /// abandonments. Every open mutation below maintains them; replay
+    /// sizing reads them without walking rows, so retries size without
+    /// rereading the prefix. Debug builds recount and compare on every
+    /// sample to catch drift.
+    open_begins: usize,
+    open_terminals: usize,
+    open_abandoned: usize,
     floors: BTreeMap<u64, u64>,
     /// One ordered Session EVENTS/boot-clock namespace. Non-evicted
     /// physical-thread return fences complement native sequence floors:
@@ -2608,6 +2617,9 @@ impl JournalAdapter {
             seal_bootstrap: SealBootstrapCounts::default(),
             seal_stages: SealStageCounts::default(),
             open: BTreeMap::new(),
+            open_begins: 0,
+            open_terminals: 0,
+            open_abandoned: 0,
             floors: BTreeMap::new(),
             physical_return_floors: BTreeMap::new(),
             refused: Vec::new(),
@@ -3007,6 +3019,7 @@ impl JournalAdapter {
                 RetainedMember::Open(native),
             );
             assert!(self.open.insert(native, entry).is_none());
+            self.open_begins = self.open_begins.saturating_add(1);
         }
     }
 
@@ -3120,6 +3133,7 @@ impl JournalAdapter {
             RetainedMember::Open(native),
         );
         assert!(self.open.insert(native, entry).is_none());
+        self.open_begins = self.open_begins.saturating_add(1);
     }
 
     /// Test-only read of the adapter invalidation flag; see above.
@@ -3221,6 +3235,9 @@ impl JournalAdapter {
         let Some(entry) = self.open.get_mut(&native) else {
             return false;
         };
+        if entry.end.is_some() && !entry.end_converted {
+            self.open_terminals = self.open_terminals.saturating_sub(1);
+        }
         entry.end = None;
         true
     }
@@ -3672,10 +3689,19 @@ impl JournalAdapter {
                 collected_origin: None,
                 s1only_subject: None,
             },
-        ) && old.converted_ticket.is_none()
-        {
-            self.retained_member_dec(identity_of_begin(&old.begin), RetainedMember::Open(key));
+        ) {
+            if old.converted_ticket.is_none() {
+                self.open_begins = self.open_begins.saturating_sub(1);
+                self.retained_member_dec(identity_of_begin(&old.begin), RetainedMember::Open(key));
+            }
+            if old.end.is_some() && !old.end_converted {
+                self.open_terminals = self.open_terminals.saturating_sub(1);
+            }
+            if old.abandon.is_some() {
+                self.open_abandoned = self.open_abandoned.saturating_sub(1);
+            }
         }
+        self.open_begins = self.open_begins.saturating_add(1);
         self.retained_member_inc(inserted, RetainedMember::Open(key));
         JournalDisposition::BeginAdmitted
     }
@@ -3840,6 +3866,7 @@ impl JournalAdapter {
             return JournalDisposition::Contradiction(JournalContradiction::EndBeginMismatch);
         }
         self.open.get_mut(&key).expect("open entry").end = Some(StagedEnd { ordinal, end });
+        self.open_terminals = self.open_terminals.saturating_add(1);
         JournalDisposition::EndStaged
     }
 
@@ -3891,6 +3918,7 @@ impl JournalAdapter {
         }
         self.open.get_mut(&key).expect("open entry").abandon =
             Some(StagedAbandon { ordinal, abandon });
+        self.open_abandoned = self.open_abandoned.saturating_add(1);
         JournalDisposition::AbandonStaged
     }
 
@@ -4740,6 +4768,15 @@ impl JournalAdapter {
     /// Remove one open entry, keeping the S1-only subject index exact.
     fn take_open(&mut self, native: JournalNativeKey) -> Option<OpenEntry> {
         let removed = self.open.remove(&native)?;
+        if removed.converted_ticket.is_none() {
+            self.open_begins = self.open_begins.saturating_sub(1);
+        }
+        if removed.end.is_some() && !removed.end_converted {
+            self.open_terminals = self.open_terminals.saturating_sub(1);
+        }
+        if removed.abandon.is_some() {
+            self.open_abandoned = self.open_abandoned.saturating_sub(1);
+        }
         if removed.s1only_subject.is_some() {
             self.s1only_open.remove(&native);
         }
@@ -4749,6 +4786,9 @@ impl JournalAdapter {
     /// Drop every open entry (a bulk free) and the S1-only subject index.
     fn clear_open(&mut self) {
         self.open.clear();
+        self.open_begins = 0;
+        self.open_terminals = 0;
+        self.open_abandoned = 0;
         self.s1only_open.clear();
     }
 
@@ -11062,6 +11102,7 @@ impl JournalAdapter {
                     entry.negative_return |=
                         !super::state::return_leaves_no_lifecycle_effect(function, claim.rv);
                     entry.converted_ticket = Some(token);
+                    self.open_begins = self.open_begins.saturating_sub(1);
                     entry.converted_for = Some(key);
                     entry.call_key = Some(call_key);
                     // A per-call disposal settles nothing in the legacy
@@ -11222,6 +11263,7 @@ impl JournalAdapter {
                     .get_mut(&native)
                     .expect("staged terminal")
                     .end_converted = true;
+                self.open_terminals = self.open_terminals.saturating_sub(1);
             }
             if let Some(staged) = entry.abandon
                 && staged.ordinal <= frontier

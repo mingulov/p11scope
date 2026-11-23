@@ -601,7 +601,7 @@ class InventoryOverlayTests(unittest.TestCase):
         cases.append(("dropped-unproven", dropped, "overlayfs",
                       "overlay unproven caller cover"))
         leaked = overlay_published_report()
-        leaked["callers"].append({"id": "c2", "pid": 102})
+        leaked["callers"].append(dict(workload_callers()[1], id="c2", pid=102))
         cases.append(("outside-leak", leaked, "overlayfs",
                       "outside workload leaked into cgroup inventory"))
         edgeless = overlay_published_report()

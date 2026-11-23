@@ -546,7 +546,7 @@ class DeferredActivationTests(unittest.TestCase):
         del report["callers"][1]["image"]
         rc, out = run_oracle(report, modfs="overlayfs")
         self.assertNotEqual(rc, 0, out)
-        self.assertIn("deferred activation never recovered", out)
+        self.assertIn("caller image has type NoneType", out)
 
     def test_callerless_deferral_fails(self):
         report = deferred_recovered_report()
@@ -814,7 +814,7 @@ def _retained(**override):
 
 def _admission_note(**override):
     gap = {"caller": "c1", "module": "m0", "pid": 101,
-           "reason": MODPATH + ": admission changed from candidate to admitted",
+           "reason": MODPATH + ": admission changed from unresolved to admitted",
            "subject": "module admission changed", "repeats": 1}
     gap.update(override)
     return gap
@@ -838,6 +838,37 @@ def _duplicate_caller_id(report):
     hidden["pid"] = 102
     hidden["start_time"] = 5002
     report["callers"].insert(0, hidden)
+
+
+def _null_child_identity(report):
+    # Codex r5 F1: a null id with matching null references.
+    report["callers"][1]["id"] = None
+    report["edges"][1]["caller"] = None
+    report["gaps"][-1]["caller"] = None
+
+
+def _set(path, value):
+    """Mutation setting report[path...] = value (missing keys deleted)."""
+    def mutate(report):
+        node = report
+        for key in path[:-1]:
+            node = node[key]
+        if value is _DELETE:
+            del node[path[-1]]
+        else:
+            node[path[-1]] = value
+    return mutate
+
+
+_DELETE = object()
+
+
+def _duplicate_module_id(report):
+    # Codex r5 N3: a module row with the owned id but another identity,
+    # ahead of the real row.
+    shadow = json.loads(json.dumps(report["modules"][0]))
+    shadow["identity"]["inode"] = 1
+    report["modules"].insert(0, shadow)
 
 
 class ExpectedTableTests(unittest.TestCase):
@@ -901,11 +932,60 @@ class ExpectedTableTests(unittest.TestCase):
         ("admission-note-misframed", _add_gaps(_admission_note(reason="admission changed")),
          "admission note attribution"),
         ("duplicate-caller-id", _duplicate_caller_id, "duplicate caller id"),
+        ("duplicate-module-id", _duplicate_module_id, "duplicate module id"),
+        ("deadline-with-pid", _add_gaps(dict(_deadline(), pid=100)),
+         "collection deadline attribution"),
+        # Codex r5 F1: strict types while parsing.
+        ("null-id-and-references", _null_child_identity,
+         "caller id has type NoneType"),
+        ("caller-pid-string", _set(["callers", 1, "pid"], "101"),
+         "caller pid has type str"),
+        ("caller-pid-bool", _set(["callers", 1, "pid"], True),
+         "caller pid has type bool"),
+        ("caller-start-missing", _set(["callers", 1, "start_time"], _DELETE),
+         "caller start_time has type NoneType"),
+        ("caller-retired-int", _set(["callers", 1, "retired"], 0),
+         "caller retired has type int"),
+        ("caller-authority-missing", _set(["callers", 1, "image", "authority"], _DELETE),
+         "caller authority has type NoneType"),
+        ("module-id-null", _set(["modules", 0, "id"], None),
+         "module id has type NoneType"),
+        ("edge-caller-null", _set(["edges", 1, "caller"], None),
+         "edge caller has type NoneType"),
+        ("edge-module-int", _set(["edges", 1, "module"], 0),
+         "edge module has type int"),
+        ("edge-count-string", _set(["edges", 1, "entries", "count"], "1507"),
+         "edge count has type str"),
+        ("edge-coverage-missing", _set(["edges", 1, "entries", "coverage"], _DELETE),
+         "edge coverage has type NoneType"),
+        ("gap-pid-string", _set(["gaps", -1, "pid"], "101"),
+         "gap pid has type str"),
+        ("gap-caller-int", _set(["gaps", -1, "caller"], 1),
+         "gap caller has type int"),
+        ("gap-subject-null", _set(["gaps", -1, "subject"], None),
+         "gap subject has type NoneType"),
+        # Codex r5 N2: only the producer's upward transitions.
+        ("admission-note-empty-transition",
+         _add_gaps(_admission_note(reason=MODPATH + ": admission changed from ")),
+         "admission note attribution"),
+        ("admission-note-unknown-state",
+         _add_gaps(_admission_note(reason=MODPATH + ": admission changed from candidate to admitted")),
+         "admission note attribution"),
+        ("admission-note-downward",
+         _add_gaps(_admission_note(reason=MODPATH + ": admission changed from admitted to refused")),
+         "admission note attribution"),
+        ("admission-note-other-path",
+         _add_gaps(_admission_note(reason="/other.so: admission changed from refused to admitted")),
+         "admission note attribution"),
     ]
 
     ACCEPTED = [
         ("retained-with-deadline", _add_gaps(_deadline(), _retained())),
         ("admission-note", _add_gaps(_admission_note())),
+        ("admission-note-refused-up",
+         _add_gaps(_admission_note(reason=MODPATH + ": admission changed from refused to admitted (export agreement; 68 endpoints)"))),
+        ("admission-note-unresolved-to-refused",
+         _add_gaps(_admission_note(reason=MODPATH + ": admission changed from unresolved to refused"))),
     ]
 
     def test_each_named_allowance_passes_with_its_attribution(self):
@@ -987,7 +1067,7 @@ class NeverSettledTests(unittest.TestCase):
         del report["callers"][0]["image"]
         rc, out = run_oracle(report, modfs="overlayfs")
         self.assertNotEqual(rc, 0, out)
-        self.assertIn("native activation never recovered", out)
+        self.assertIn("caller image has type NoneType", out)
 
     def test_settle_refusal_at_another_pid_fails(self):
         report = decided_report()

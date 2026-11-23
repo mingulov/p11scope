@@ -111,7 +111,11 @@ def overlay_published_report():
                      "identity": {"device": {"major": 8, "minor": 1},
                                   "inode": 42, "sha256": "ab" * 32},
                      "admission": {"state": "admitted"}}],
-        "callers": [{"id": "c0", "pid": 100}, {"id": "c1", "pid": 101}],
+        # Each refused caller recovers to an activated native owner
+        # (recover and continue); a resting refusal fails the cell.
+        "callers": [
+            {"id": "c0", "pid": 100, "image": {"authority": "native_exact"}},
+            {"id": "c1", "pid": 101, "image": {"authority": "native_exact"}}],
         "edges": [{"caller": "c0", "module": "m0"},
                   {"caller": "c1", "module": "m0"}],
         "gaps": [

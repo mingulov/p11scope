@@ -762,7 +762,12 @@ cgroup_capture() {
     "$P" "${args[@]}" > "$cell.stdout" 2> "$cell.stderr" & pp=$!; register "$pp" || true
     local observer_started=0
     if [ "$kind" = inventory ]; then
-      sleep 2; alive "$pp" && observer_started=1 && capturing=1
+      # Release the gates only after the first pass committed (its
+      # endpoints attached): a fixed sleep let a loaded host run the
+      # whole workload before attach, so no row was ever read.
+      if waitfor "$cell.stderr" '^p11scope: pass 0: ' "$pp" "$READY_TICKS" && alive "$inside" && alive "$outside" && alive "$pp"; then
+        observer_started=1; capturing=1
+      fi
     else
       if waitfor "$cell.stderr" 'p11scope: capturing:' "$pp" "$READY_TICKS" && alive "$inside" && alive "$outside" && alive "$pp"; then
         capturing=1; observer_started=1
@@ -885,11 +890,20 @@ if retained:
 deferred_reason='only one native owner activation per transaction; the staged owner is deferred to a later pass; scan-pinned fallback retained'
 def deferral(g):
     return g.get('reason')==deferred_reason and g.get('subject')=='native owner activation refused'
+def recovered(g):
+    c=callers.get(g.get('caller'))
+    return c is not None and c.get('pid')==g.get('pid') and (c.get('image') or {}).get('authority')=='native_exact'
 for g in report.get('gaps',[]):
     if deferral(g):
-        c=callers.get(g.get('caller'))
-        recovered=c is not None and c.get('pid')==g.get('pid') and (c.get('image') or {}).get('authority')=='native_exact'
-        assert recovered, 'deferred activation never recovered: %r' % (g,)
+        assert recovered(g), 'deferred activation never recovered: %r' % (g,)
+# Recover and continue: a caller refused for want of a settled expected
+# image retries from fresh proof every pass and must end activated. A
+# refusal that rests (the caller stays scan-pinned) fails the cell on
+# every substrate.
+settle_reason='no settled expected native image for this caller in the acquisition domain; scan-pinned fallback retained'
+for g in report.get('gaps',[]):
+    if g.get('reason')==settle_reason and g.get('subject')=='native owner activation refused':
+        assert recovered(g), 'native activation never recovered: %r' % (g,)
 if degraded:
     # The published degraded (overlay or no-witness) shape keeps the
     # named unproven gap per inside caller (PARTIAL coverage via the

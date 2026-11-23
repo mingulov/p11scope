@@ -923,16 +923,19 @@ retained=[g for g in report.get('gaps',[]) if g.get('reason')=='the final-sample
 if retained:
     refuse_unless(deadline, 'retained refresh without a run deadline: %r' % (retained,))
     refuse_unless(len(set(g.get('caller') for g in retained))==len(retained), 'duplicate retained refresh for one caller: %r' % (retained,))
-# The interrupted provider-input comparison only comes with a
-# run-deadline straddle on every substrate: the pass was cancelled
-# mid-preparation, so the deadline gap must be present in the same
-# run. This runs outside the degraded branch so a
-# witness-available report cannot smuggle a lone interrupted row
-# past the qualifier; a budget or fence interruption without a
-# deadline is a different phenomenon and stays loud.
-# The prep row carries the same producer shape as the deadline row
-# above (fixed subject, explicit nulls, positive count, deduped).
-prep=[g for g in report.get('gaps',[]) if g.get('reason')=='cgroup provider input comparison interrupted']
+# A preparation failure only comes with a run-deadline straddle
+# on every substrate: the pass was cancelled mid-preparation, so the
+# deadline gap must be present in the same run. This runs outside the
+# degraded branch so a witness-available report cannot smuggle a lone
+# preparation row past the qualifier; a budget or fence interruption
+# without a deadline is a different phenomenon and stays loud.
+# The producer files eight reasons under this subject and shape
+# (src/discovery/inventory_attach_set.rs prepare_absorption); each
+# prep row carries the same producer shape as the deadline row above
+# (fixed subject, explicit nulls, positive count, deduped), and a
+# ninth reason fails closed in the allowlist below.
+prep_reasons={'cgroup provider preparation input ceiling reached','cgroup provider preparation interrupted or allowance exhausted','cgroup provider preparation interrupted after retention','cgroup provider resolution interrupted','cgroup provider preparation comparison ceiling reached','cgroup provider identity comparison interrupted','cgroup provider input comparison interrupted','cgroup provider preparation interrupted before completion'}
+prep=[g for g in report.get('gaps',[]) if g.get('reason') in prep_reasons]
 if prep:
     for g in prep:
         refuse_unless(g.get('subject')=='cgroup provider preparation incomplete', 'malformed interrupted preparation row: %r' % (g,))
@@ -941,6 +944,27 @@ if prep:
         refuse_unless(type(g.get('repeats')) is int and g.get('repeats')>=1, 'malformed interrupted preparation count: %r' % (g,))
     refuse_unless(len(prep)==1, 'duplicate interrupted preparation rows: %r' % (prep,))
     refuse_unless(deadline, 'interrupted preparation without a run deadline: %r' % (prep,))
+# Typed (subject, reason) allowlist: every remaining gap — everything
+# except the unproven prefix rows, the admission-change notes, and the
+# named unbound positive — must be one of these producer-exact pairs.
+# The per-caller activation refusal plus, when a pass straddles the
+# run deadline, the designed collection bound (ruling CI-GAP-2,
+# confirmed docs/superpowers/decisions/2026-11-06-schedule-dl10.md),
+# plus the staged-refresh facts-retained refusal (one row per owning
+# caller) and the eight preparation failures above. A reason under the
+# wrong subject (the fallback reason under a preparation subject, the
+# retained reason under a novel subject) or a ninth preparation reason
+# fails loudly here, on both branches.
+# The bare member-lost variant (no retention suffix: the member died
+# after the final sample of a still-complete transaction) is
+# deliberately NOT allowed here: it fails loudly below.
+# The unproven member gaps degrade per caller without incompleting
+# the shared transaction, so 'cgroup member scan was incomplete' is
+# deliberately NOT allowed here: its reappearance fails loudly below
+# instead of hiding.
+allowed_pairs={('native owner activation refused','no settled expected native image for this caller in the acquisition domain; scan-pinned fallback retained'),('cgroup scope transaction incomplete','cgroup collection deadline reached'),('native owner refresh refused','the final-sample permit was not granted; prior owner facts retained')}
+allowed_pairs|={('cgroup provider preparation incomplete',reason) for reason in prep_reasons}
+rest=[g for g in report.get('gaps',[]) if not (g.get('reason') or '').startswith('original_file_unproven: kernel witness unavailable') and g.get('subject')!='module admission changed' and not named_unbound(g)]
 if degraded:
     # The published degraded (overlay or no-witness) shape keeps the
     # named unproven gap per inside caller (PARTIAL coverage via the
@@ -952,30 +976,10 @@ if degraded:
     for g in unproven:
         refuse_unless(g.get('subject')==modpath, 'overlay unproven subject')
         refuse_unless(g.get('pid')==pidof[g.get('caller')], 'overlay unproven pid')
-    rest=[g for g in report.get('gaps',[]) if not (g.get('reason') or '').startswith('original_file_unproven: kernel witness unavailable') and g.get('subject')!='module admission changed' and not named_unbound(g)]
-    # The per-caller activation refusal plus, when a pass straddles
-    # the run deadline, the designed collection bound (ruling CI-GAP-2,
-    # confirmed docs/superpowers/decisions/2026-11-06-schedule-dl10.md),
-    # plus the named module-level positive (excluded above).
-    # A straddling pass also refuses a staged refresh of an
-    # already-active owner by name (a permit-missing refresh refuses
-    # at any outcome) and retains its facts: the incomplete
-    # transaction marks nobody, the disclosure names the caller, and
-    # the owner's data stays published. One row per owning caller.
-    # A pass cancelled mid-preparation discloses its interrupted
-    # input comparison by name (run 44960926490, v7.3.1 leg):
-    # the deadline bound above plus this row is the designed
-    # straddle shape, guarded by the deadline presence check above.
-    # The bare member-lost variant (no retention suffix: the member
-    # died after the final sample of a still-complete transaction)
-    # is deliberately NOT known here: it fails loudly below.
-    # The unproven member gaps degrade per caller without incompleting
-    # the shared transaction, so 'cgroup member scan was incomplete'
-    # is deliberately NOT known here: its reappearance fails loudly
-    # below instead of hiding.
-    known={'no settled expected native image for this caller in the acquisition domain; scan-pinned fallback retained','cgroup collection deadline reached','the final-sample permit was not granted; prior owner facts retained','cgroup provider input comparison interrupted'}
-    refuse_unless(all(g.get('reason') in known for g in rest), 'overlay published extra gap: %r' % rest)
+    refuse_unless(all((g.get('subject'),g.get('reason')) in allowed_pairs for g in rest), 'overlay published extra gap: %r' % rest)
     refuse_unless(len(report.get('gaps',[]))>0, 'overlay published shape carries no gaps')
+else:
+    refuse_unless(all((g.get('subject'),g.get('reason')) in allowed_pairs for g in rest), 'unrecognized cgroup gap row: %r' % rest)
 print('inventory cgroup: inside=%d child=%d outside=%d excluded module=%s admission=%s unproven=%d gaps=%d' % (inside_pid,child_pid,outside_pid,owned,state,len(unproven),len(report.get('gaps',[]))))
 PY
     rc=$?

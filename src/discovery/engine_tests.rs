@@ -103910,7 +103910,10 @@ fn carried_fix2_release_holds_only_named_ids() {
         "the held ID waits on the free list"
     );
     // The rebuild re-owns the row under the carrier through a production
-    // apply, freeing the numeric ID exactly.
+    // apply, freeing the numeric ID exactly. A ghost entry poisons the
+    // named set first, so the exact-set assert below proves the commit
+    // refresh rebuilt it (neither stale nor empty passes).
+    engine.named_view_ids.insert(1000);
     let rebuilt = engine
         .inventory_candidate(&BTreeSet::from([view_r]), &[], &[], Vec::new(), &empty)
         .unwrap();
@@ -103924,9 +103927,10 @@ fn carried_fix2_release_holds_only_named_ids() {
         0,
         "a carrier-owned row holds no numeric ID"
     );
-    assert!(
-        !engine.named_view_ids.contains(&view_r.0),
-        "the commit refresh unnames the re-owned ID"
+    assert_eq!(
+        engine.named_view_ids,
+        BTreeSet::from([MO_VIEW_L, Engine::CARRIED_VIEW_ID.0]),
+        "the commit refresh rebuilds the named set exactly"
     );
     // The freed ID recycles into a rowless view, which exits at once: the
     // rowless release holds nothing and the ID recycles again immediately.

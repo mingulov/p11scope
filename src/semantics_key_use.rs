@@ -7620,4 +7620,70 @@ mod tests {
         feed.reseeded_cooldown = 3;
         assert!(!feed.reselect_segment_doomed(&old_proof));
     }
+
+    /// The association refuses early exactly the births the reseed
+    /// arm would refuse as stuck-barred: a superseding fresh proof
+    /// onto a stuck-degraded feed. Same-proof retries, unbarred
+    /// feeds, foreign lineages and segment-doomed births all proceed
+    /// (the arm decides those). The probe omits the arm's cut checks
+    /// (NoProgress/BelowFence) by design: the birth cut is not
+    /// available pre-consume, and the bar blocks the arm however
+    /// stale the cut is — in the double-blocked corner the probe
+    /// names the bar where the arm would name the cut, and both
+    /// blockers are real.
+    #[test]
+    fn reseed_stuck_barred_names_only_barred_reseeds() {
+        fn barred(old: BootstrapReceipt) -> JointStaging {
+            let mut feed = JointStaging::select_s1_only();
+            feed.selected_receipt = Some(old);
+            feed.degraded_window = Some(DegradedWindow::Loss);
+            feed.segment_resumable = false;
+            feed.fresh_reseed_barred = true;
+            feed
+        }
+        let old_proof = proof(71, 3, 9);
+        let old = receipt(old_proof);
+        // Fresh proof onto a stuck-degraded feed: barred.
+        let feed = barred(old);
+        assert!(feed.reseed_stuck_barred(&proof(71, 4, 9)));
+        // Same proof retries past the bar (F6 narrowness): allowed.
+        let feed = barred(old);
+        assert!(!feed.reseed_stuck_barred(&old_proof));
+        // Unbarred feed: allowed.
+        let mut feed = barred(old);
+        feed.fresh_reseed_barred = false;
+        assert!(!feed.reseed_stuck_barred(&proof(71, 4, 9)));
+        // A foreign lineage refuses Foreign at the arm, not barred:
+        // allowed here.
+        let feed = barred(old);
+        assert!(!feed.reseed_stuck_barred(&proof(72, 4, 9)));
+        // Same incarnation but another era is another domain (also
+        // Foreign at the arm): allowed here.
+        let feed = barred(old);
+        assert!(!feed.reseed_stuck_barred(&proof(71, 3, 10)));
+        // A fallback-closed proof-destroyed segment refuses Segment
+        // at the arm (same proof), not barred: allowed here.
+        let mut feed = barred(old);
+        feed.degraded_window = Some(DegradedWindow::Fallback);
+        assert!(!feed.reseed_stuck_barred(&old_proof));
+        // ...while a superseding incarnation bypasses the segment
+        // doom and reaches the bar: barred.
+        let mut feed = barred(old);
+        feed.degraded_window = Some(DegradedWindow::Fallback);
+        assert!(feed.reseed_stuck_barred(&proof(71, 4, 9)));
+        // No selected receipt: nothing to reseed onto (the arm
+        // refuses NoSegment instead): allowed here.
+        let mut feed = barred(old);
+        feed.selected_receipt = None;
+        assert!(!feed.reseed_stuck_barred(&proof(71, 4, 9)));
+        // No degraded window (pristine feed): allowed.
+        let mut feed = barred(old);
+        feed.degraded_window = None;
+        assert!(!feed.reseed_stuck_barred(&proof(71, 4, 9)));
+        // A cooling feed is not reseedable yet (the arm refuses
+        // NoSegment instead): allowed here.
+        let mut feed = barred(old);
+        feed.reseeded_cooldown = 3;
+        assert!(!feed.reseed_stuck_barred(&proof(71, 4, 9)));
+    }
 }

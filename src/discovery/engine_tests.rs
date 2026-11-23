@@ -15689,11 +15689,11 @@ fn inventory_preflight_ready_pidfd_without_start_time_stays_silent() {
             "post-retirement preflight",
         ),
     ] {
-        let (skip, retained_unproven) =
+        let (skips, retained_unproven) =
             engine.inventory_preflight_generation_skip(&retained_stale, &stale, &extra, site);
         assert!(
-            skip.is_none(),
-            "{label}: a ready pidfd proves the exit, so the preflight stays silent: {skip:?}"
+            skips.is_empty(),
+            "{label}: a ready pidfd proves the exit, so the preflight stays silent: {skips:?}"
         );
         assert!(
             !retained_unproven,
@@ -15702,6 +15702,76 @@ fn inventory_preflight_ready_pidfd_without_start_time_stays_silent() {
     }
     // Reap the zombie now that both preflights judged it.
     zombie.wait().unwrap();
+}
+
+/// Fix4 B1 twin (both inventory preflights): a mixed stale set — a
+/// retained original with positive exit proof (a reaped child) beside
+/// a newcomer the pin cannot judge (a live child under an unprovable
+/// pin) — publishes BOTH the legitimate changed-generation row and the
+/// named unverified gap at either site, without arming the named-target
+/// bail (no retained fate is unproven). A tick-level mixed set is
+/// unreachable — any pre-dead view trips the first preflight, and the
+/// session kills one pid per preflight — so this drives the preflights'
+/// shared helper directly with live pins; the singleton tick-level
+/// twins pin the helper's wiring to each site.
+#[test]
+fn inventory_preflight_mixed_set_files_both_rows_at_both_sites() {
+    let mut dead = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let dead_pid = dead.id();
+    let retained_id = ProcessViewId(0);
+    let dead_view = ProcessView::open(retained_id, dead_pid).unwrap();
+    dead.kill().unwrap();
+    dead.wait().unwrap();
+    let live = spawn_execed_sleep();
+    let live_pid = live.id();
+    let newcomer_id = ProcessViewId(1);
+    let newcomer = crate::process::unprovable_process_view_for_test(newcomer_id, live_pid)
+        .expect("an unprovable newcomer over the live child");
+    let mut engine = Engine::empty();
+    engine.views.push(dead_view);
+    let stale = BTreeSet::from([retained_id, newcomer_id]);
+    let retained_stale = BTreeSet::from([retained_id]);
+    let extra = [&newcomer];
+    for (site, changed_reason, unverified_reason, label) in [
+        (
+            crate::discovery::generation_proof::ChangedGenerationSite::InventoryPreflight,
+            "an exact retained or newly opened process generation changed during inventory preflight",
+            "an exact retained or newly opened process generation was unverified during inventory preflight; exit or change unproven",
+            "first preflight",
+        ),
+        (
+            crate::discovery::generation_proof::ChangedGenerationSite::PostRetirementPreflight,
+            "an exact retained or newly opened process generation changed during post-retirement preflight",
+            "an exact retained or newly opened process generation was unverified during post-retirement preflight; exit or change unproven",
+            "post-retirement preflight",
+        ),
+    ] {
+        let (skips, retained_unproven) =
+            engine.inventory_preflight_generation_skip(&retained_stale, &stale, &extra, site);
+        let proven = skips
+            .proven
+            .as_ref()
+            .unwrap_or_else(|| panic!("{label}: a mixed set files the changed row"));
+        assert_eq!(proven.subject, "live inventory generation");
+        assert_eq!(proven.reason, changed_reason);
+        let unproven = skips.unproven.as_ref().unwrap_or_else(|| {
+            panic!("{label}: a mixed set files the unverified gap beside the proof row")
+        });
+        assert_eq!(unproven.subject, "live inventory generation");
+        assert_eq!(unproven.reason, unverified_reason);
+        assert!(
+            !retained_unproven,
+            "{label}: a proven retained exit never arms the named-target bail"
+        );
+    }
+    assert!(
+        !crate::process::generation_dead(live_pid),
+        "the newcomer child is still live and unchanged"
+    );
 }
 
 /// Fix4 B2 RED twin (named-target refusal): a named target whose stale

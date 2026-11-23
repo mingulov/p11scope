@@ -20,8 +20,8 @@ use crate::cli::CaptureArgs;
 use crate::discovery::attribution;
 use crate::discovery::elf_needed;
 use crate::discovery::generation_proof::{
-    ChangedGenerationSite, GenerationProof, GenerationUnproven, changed_generation_skip,
-    is_permission_denial, unproven_generation_skip,
+    ChangedGenerationSite, GenerationProof, GenerationSkips, GenerationUnproven,
+    changed_generation_skip, is_permission_denial, unproven_generation_skip,
 };
 use crate::discovery::handle_table::{DeferredReason, Filing, HandleTable};
 use crate::discovery::hooks::{HookAbi, HookRegistry};
@@ -14102,6 +14102,25 @@ struct StaleSetVerdict {
     all_retained_proven: bool,
 }
 
+impl StaleSetVerdict {
+    /// Publish a judged set: the changed row when any affected
+    /// original proves exit or change AND the unverified gap when any
+    /// is unproven — independently, so a mixed batch names both. This
+    /// moves proof values into the authority's constructors; it mints
+    /// none. Silence and the bail gate read the verdict, not these
+    /// rows.
+    fn skips(&self, site: ChangedGenerationSite) -> GenerationSkips {
+        GenerationSkips {
+            proven: self
+                .first_proof
+                .map(|proof| changed_generation_skip(proof, site)),
+            unproven: self
+                .first_unproven
+                .map(|unproven| unproven_generation_skip(unproven, site)),
+        }
+    }
+}
+
 fn validate_loader_record_context<'a>(
     registry: &'a mut LoaderRegistry,
     terminal_owner: Option<LoaderContextId>,
@@ -19684,14 +19703,16 @@ impl Engine {
             } else {
                 // Staleness alone never proves: the changed label
                 // needs positive exit/change proof from at least one
-                // affected original, else the named not-proven gap.
-                let skip = match self.prove_stale_set(&outcome.stale_views, extra_views) {
-                    Ok(proof) => changed_generation_skip(proof, ChangedGenerationSite::Candidate),
-                    Err(unproven) => {
-                        unproven_generation_skip(unproven, ChangedGenerationSite::Candidate)
-                    }
-                };
-                self.mark_partial(&skip.subject, &skip.reason);
+                // affected original, and the named not-proven gap
+                // files whenever any affected original is unproven —
+                // independently, so a mixed batch names both. (The
+                // candidate path has no retained/newcomer partition:
+                // its silence gate already ran.)
+                let verdict =
+                    self.judge_stale_set(&outcome.stale_views, &BTreeSet::new(), extra_views);
+                for skip in verdict.skips(ChangedGenerationSite::Candidate).iter() {
+                    self.mark_partial(&skip.subject, &skip.reason);
+                }
             }
             if crate::run::capture_diagnostics_on() && carries_run_learned {
                 eprintln!("p11scope: run-learned apply refused on stale generation");
@@ -28928,60 +28949,33 @@ impl Engine {
         verdict
     }
 
-    /// Prove a stale generation set for the changed-generation label:
-    /// `Ok` when at least one affected original has positive exit or
-    /// reuse proof, else the first unproven reason.
-    fn prove_stale_set(
-        &self,
-        stale: &BTreeSet<ProcessViewId>,
-        extra_views: &[&ProcessView],
-    ) -> Result<GenerationProof, GenerationUnproven> {
-        // The candidate path has no retained/newcomer partition (its
-        // silence gate already ran); only proof-or-unproven matters.
-        let verdict = self.judge_stale_set(stale, &BTreeSet::new(), extra_views);
-        match verdict.first_proof {
-            Some(proof) => Ok(proof),
-            None => Err(verdict
-                .first_unproven
-                .unwrap_or(GenerationUnproven::Unknown)),
-        }
-    }
-
     /// Decide an inventory preflight's stale views in one observation:
-    /// the skip to file (`None` when the generations merely ended — no
+    /// the rows to file (none when the generations merely ended — no
     /// newly-opened stale ID and every retained stale view proves exit
     /// or change, the existing proven-exit suppression, silent, which
     /// `queue_retirement` turns into expected removals — else the
     /// changed-generation label when at least one affected original
-    /// proves exit or change, else the named not-proven gap), plus
-    /// whether any retained stale view's fate is unproven (which gates
-    /// the named-target bail: a proven exit or change ends orderly
-    /// through retirement, but an unproven target generation must not
-    /// be observed further). Preserves every loud/silent decision;
-    /// only the label changes, and only from unproven to unverified.
+    /// proves exit or change AND the named not-proven gap when any
+    /// affected original is unproven, independently, so a mixed batch
+    /// names both), plus whether any retained stale view's fate is
+    /// unproven (which gates the named-target bail: a proven exit or
+    /// change ends orderly through retirement, but an unproven target
+    /// generation must not be observed further). Preserves every
+    /// loud/silent decision; only mixed batches gain a row.
     fn inventory_preflight_generation_skip(
         &self,
         retained_stale: &BTreeSet<ProcessViewId>,
         stale: &BTreeSet<ProcessViewId>,
         extra_views: &[&ProcessView],
         site: ChangedGenerationSite,
-    ) -> (Option<Skipped>, bool) {
+    ) -> (GenerationSkips, bool) {
         let newly_opened = stale.iter().any(|view| !retained_stale.contains(view));
         let verdict = self.judge_stale_set(stale, retained_stale, extra_views);
         let retained_unproven = !verdict.all_retained_proven;
         if !newly_opened && verdict.all_retained_proven {
-            return (None, retained_unproven);
+            return (GenerationSkips::none(), retained_unproven);
         }
-        let skip = match verdict.first_proof {
-            Some(proof) => Some(changed_generation_skip(proof, site)),
-            None => Some(unproven_generation_skip(
-                verdict
-                    .first_unproven
-                    .unwrap_or(GenerationUnproven::Unknown),
-                site,
-            )),
-        };
-        (skip, retained_unproven)
+        (verdict.skips(site), retained_unproven)
     }
 
     #[track_caller]
@@ -34438,7 +34432,7 @@ impl Engine {
                 .collect();
             let extra_views: Vec<&ProcessView> =
                 new_views.iter().map(|(view, _, _)| view).collect();
-            let (generation_skip, _) = self.inventory_preflight_generation_skip(
+            let (generation_skips, _) = self.inventory_preflight_generation_skip(
                 &retained_stale,
                 &admission.stale_views,
                 &extra_views,
@@ -34451,9 +34445,12 @@ impl Engine {
                     failed_refresh_pids.insert(view.pid());
                 }
             }
-            match generation_skip {
-                Some(skip) => self.mark_live_loss(&skip.subject, &skip.reason),
-                None => self.invalidate_causal_timing(),
+            if generation_skips.is_empty() {
+                self.invalidate_causal_timing();
+            } else {
+                for skip in generation_skips.iter() {
+                    self.mark_live_loss(&skip.subject, &skip.reason);
+                }
             }
             changed |= self.process_discovery_records(
                 session,
@@ -34902,7 +34899,7 @@ impl Engine {
                 .collect();
             let extra_views: Vec<&ProcessView> =
                 new_views.iter().map(|(view, _, _)| view).collect();
-            let (generation_skip, retained_unproven) = self.inventory_preflight_generation_skip(
+            let (generation_skips, retained_unproven) = self.inventory_preflight_generation_skip(
                 &retained_stale,
                 &admission.stale_views,
                 &extra_views,
@@ -34914,10 +34911,14 @@ impl Engine {
                     failed_refresh_pids.insert(view.pid());
                 }
             }
-            match generation_skip {
-                Some(skip) => self.mark_live_loss(&skip.subject, &skip.reason),
-                None if !admission.stale_views.is_empty() => self.invalidate_causal_timing(),
-                None => {}
+            if generation_skips.is_empty() {
+                if !admission.stale_views.is_empty() {
+                    self.invalidate_causal_timing();
+                }
+            } else {
+                for skip in generation_skips.iter() {
+                    self.mark_live_loss(&skip.subject, &skip.reason);
+                }
             }
             let outcome = ApplyOutcome {
                 stale_views: retained_stale,

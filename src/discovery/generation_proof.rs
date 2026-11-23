@@ -166,6 +166,39 @@ pub(crate) fn unproven_generation_skip(
     }
 }
 
+/// Publication verdict: the changed row (proof) and the unverified
+/// gap (unproven) are independent — a mixed batch files both, so a
+/// proven exit beside an unproven sibling names the refusal instead of
+/// dropping it. Silence (no newly-opened stale ID, every retained
+/// stale view proven) files neither.
+#[derive(Debug, Clone)]
+pub(crate) struct GenerationSkips {
+    pub(crate) proven: Option<Skipped>,
+    pub(crate) unproven: Option<Skipped>,
+}
+
+impl GenerationSkips {
+    /// The silent verdict: every stale generation merely ended.
+    pub(crate) fn none() -> Self {
+        Self {
+            proven: None,
+            unproven: None,
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.proven.is_none() && self.unproven.is_none()
+    }
+
+    /// The rows to file, proof first: the batch proved an exit or
+    /// change AND left a refusal, in that order.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &Skipped> {
+        [self.proven.as_ref(), self.unproven.as_ref()]
+            .into_iter()
+            .flatten()
+    }
+}
+
 /// Map one pin verdict to proof or unproven reason: `None` (no view
 /// retained, or a scripted missing answer) has no custody; `Current`
 /// contradicts the stale report; an error is a permission denial when

@@ -832,6 +832,12 @@ child_pid=int([l for l in inside.splitlines() if l.startswith('CHILD pid=')][0].
 outside_pid=int([l for l in outside.splitlines() if l.startswith('READY pid=')][0].split('=')[1])
 refuse_unless(sum(l.startswith('LEDGER ') for l in inside.splitlines())==1, 'inside ledger missing')
 refuse_unless(sum(l.startswith('LEDGER ') for l in outside.splitlines())==1, 'outside ledger missing (leak test invalid)')
+# Ids are unique in the raw arrays before any index is built: a
+# repeated id would let one row hide another (the diff reader refuses
+# the same shape).
+for kind in ('callers','modules'):
+    ids=[x.get('id') for x in report.get(kind,[])]
+    refuse_unless(len(ids)==len(set(ids)), 'duplicate %s id: %r' % (kind[:-1],ids))
 modules={m['id']:m for m in report.get('modules',[])}
 owned=None
 for mid,m in modules.items():
@@ -926,12 +932,19 @@ def classify(g):
     if reason in activation_refusals: return 'activation'
     if g.get('subject')==ACTIVATION: return 'unexpected-activation'
     if reason.startswith(UNPROVEN): return 'unproven'
-    if g.get('subject')=='module admission changed' and g.get('module')==owned: return 'admission-note'
+    if g.get('subject')=='module admission changed': return 'admission-note'
     if named_unbound(g): return 'unbound'
-    if reason==DEADLINE and g.get('subject')=='cgroup scope transaction incomplete' and g.get('caller') is None: return 'deadline'
-    if reason==RETAINED and g.get('subject')=='native owner refresh refused' and g.get('caller') in workload: return 'retained'
+    if reason==DEADLINE: return 'deadline'
+    if reason==RETAINED: return 'retained'
     if reason in prep_reasons and g.get('subject')=='cgroup provider preparation incomplete': return 'prep'
     return None
+# Each allowance carries exactly the producer's attribution: a
+# per-caller row names a workload caller at that caller's own pid and
+# the module its producer sets (none, or the owned module for an
+# admission note).
+def at_workload(g,module=None):
+    r=workload.get(g.get('caller'))
+    return r is not None and g.get('pid')==r['pid'] and g.get('module')==module
 gaps=report.get('gaps',[])
 kinds=[(classify(g),g) for g in gaps]
 degraded=modfs=='overlayfs' or any(k=='unproven' for k,_ in kinds)
@@ -945,15 +958,20 @@ for kind,g in kinds:
     # caller id must be a workload caller at the row's pid.
     if kind=='activation':
         refuse_unless(g.get('subject')==ACTIVATION, 'activation refusal under another subject: %r' % (g,))
-        r=workload.get(g.get('caller'))
-        refuse_unless(r is not None and r['pid']==g.get('pid') and r['authority']=='native_exact', '%s: %r' % (activation_refusals[g['reason']],g))
+        refuse_unless(at_workload(g) and workload[g['caller']]['authority']=='native_exact', '%s: %r' % (activation_refusals[g['reason']],g))
     refuse_unless(kind!='unexpected-activation', 'unexpected activation refusal: %r' % (g,))
+    if kind=='retained':
+        refuse_unless(g.get('subject')=='native owner refresh refused' and at_workload(g), 'retained refresh attribution: %r' % (g,))
+    if kind=='deadline':
+        refuse_unless(g.get('subject')=='cgroup scope transaction incomplete' and g.get('caller') is None and g.get('pid') is None and g.get('module') is None, 'collection deadline attribution: %r' % (g,))
+    if kind=='admission-note':
+        refuse_unless(at_workload(g,owned) and (g.get('reason') or '').startswith(modpath+': admission changed from '), 'admission note attribution: %r' % (g,))
 # The run-deadline row carries the same producer shape with or
-# without a companion gap: the fixed subject (gated by the
-# classifier above), explicitly present null caller/module/pid
-# keys, an explicitly present null budget (the row records no
-# budget refusal), and a positive integer recording count. The
-# producer dedupes identical rows, so duplicates are malformed.
+# without a companion gap: the fixed subject and null attribution
+# (gated by the loop above), explicitly present keys, an explicitly
+# present null budget (the row records no budget refusal), and a
+# positive integer recording count. The producer dedupes identical
+# rows, so duplicates are malformed.
 deadline_rows=[g for k,g in kinds if k=='deadline']
 if deadline_rows:
     for g in deadline_rows:
@@ -1002,6 +1020,7 @@ if degraded:
     refuse_unless(sorted(g.get('caller') for g in unproven)==want, 'overlay unproven caller cover')
     for g in unproven:
         refuse_unless(g.get('subject')==modpath, 'overlay unproven subject')
+        refuse_unless(g.get('module') is None, 'overlay unproven module')
         refuse_unless(g.get('pid')==workload[g.get('caller')]['pid'], 'overlay unproven pid')
     refuse_unless(len(gaps)>0, 'overlay published shape carries no gaps')
 print('inventory cgroup: inside=%d child=%d outside=%d excluded module=%s admission=%s unproven=%d gaps=%d' % (inside_pid,child_pid,outside_pid,owned,state,len(unproven),len(report.get('gaps',[]))))

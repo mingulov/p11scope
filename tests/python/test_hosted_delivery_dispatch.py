@@ -182,7 +182,9 @@ sys.stdout.write(answer.stdout)
         jobs = workflow()["jobs"]
         for identifier, flag in (("release-preview", "release_preview"), ("privileged-e2e", "privileged_e2e")):
             with self.subTest(identifier=identifier):
-                self.assertEqual(jobs[identifier]["if"], "${{ github.event_name == 'workflow_dispatch' && inputs.delivery_task == 'checks' && inputs." + flag + " }}")
+                output = "run_" + identifier.replace("-", "_")
+                self.assertEqual(jobs[identifier]["needs"], "select")
+                self.assertEqual(jobs[identifier]["if"], "${{ github.event_name == 'workflow_dispatch' && inputs.delivery_task == 'checks' && inputs." + flag + " && needs.select.outputs." + output + " == 'true' }}")
 
     def test_invalid_manual_delivery_choice_fails_without_side_effects(self):
         result, output, _, calls = self.dedupe(task="other")

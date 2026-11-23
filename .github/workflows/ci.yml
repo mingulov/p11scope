@@ -161,6 +161,45 @@ jobs:
             fi
           done <<<"$earlier"
           decide true "no earlier run covers $GITHUB_SHA; the check matrix runs"
+  # Tier and cell selection for this run. Reads the GitHub context from the
+  # environment (dispatch inputs arrive through env, never through
+  # interpolation inside a run: block), diffs the checkout against the dev
+  # merge-base, and publishes one run_<job> output per gated job plus the
+  # selection document the gate consumes. Needs dedupe: a run an earlier
+  # covering commit deduped selects nothing. Fails closed: any unknown
+  # input, path, event or ref class selects the full tier.
+  select:
+    needs: dedupe
+    runs-on: ubuntu-26.04
+    outputs:
+      tier: ${{ steps.choose.outputs.tier }}
+      base: ${{ steps.choose.outputs.base }}
+      path_classes: ${{ steps.choose.outputs.path_classes }}
+      run_lint: ${{ steps.choose.outputs.run_lint }}
+      run_audit: ${{ steps.choose.outputs.run_audit }}
+      run_tests: ${{ steps.choose.outputs.run_tests }}
+      run_bpf_noninterference: ${{ steps.choose.outputs.run_bpf_noninterference }}
+      run_contracts: ${{ steps.choose.outputs.run_contracts }}
+      run_scripts: ${{ steps.choose.outputs.run_scripts }}
+      run_archive_log: ${{ steps.choose.outputs.run_archive_log }}
+      run_coverage: ${{ steps.choose.outputs.run_coverage }}
+      run_coverage_report: ${{ steps.choose.outputs.run_coverage_report }}
+      run_privileged_e2e: ${{ steps.choose.outputs.run_privileged_e2e }}
+      run_release_preview: ${{ steps.choose.outputs.run_release_preview }}
+      selection: ${{ steps.choose.outputs.selection }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The full graph: selection diffs the merge-base with the dev tip.
+          fetch-depth: 0
+      - id: choose
+        env:
+          P11SCOPE_CI_WORKFLOW: ci
+          P11SCOPE_CI_DELIVERY_TASK: ${{ inputs.delivery_task || 'checks' }}
+          P11SCOPE_CI_DEDUPE_RUN: ${{ needs.dedupe.outputs.run }}
+          P11SCOPE_CI_RELEASE_PREVIEW: ${{ inputs.release_preview }}
+          P11SCOPE_CI_PRIVILEGED_E2E: ${{ inputs.privileged_e2e }}
+        run: python3 -I scripts/ci/select-cells.py
   package-delivery:
     name: package-delivery
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.delivery_task == 'packages' }}
@@ -198,8 +237,8 @@ jobs:
   # P0 configurations), both clippy profiles, the diagnostic-object
   # inventory test, feature host-admission regressions and script lints.
   lint:
-    needs: dedupe
-    if: needs.dedupe.outputs.run == 'true'
+    needs: [dedupe, select]
+    if: needs.dedupe.outputs.run == 'true' && needs.select.outputs.run_lint == 'true'
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -364,8 +403,8 @@ jobs:
   # reconstructs the pinned sources and fetches both Cargo roots exactly like
   # every other job.
   audit:
-    needs: dedupe
-    if: needs.dedupe.outputs.run == 'true'
+    needs: [dedupe, select]
+    if: needs.dedupe.outputs.run == 'true' && needs.select.outputs.run_audit == 'true'
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -407,8 +446,8 @@ jobs:
   # The workspace test gate minus artifact_contracts (the contracts shards
   # run that target), plus the standalone vendored-dependency unit tests.
   tests:
-    needs: dedupe
-    if: needs.dedupe.outputs.run == 'true'
+    needs: [dedupe, select]
+    if: needs.dedupe.outputs.run == 'true' && needs.select.outputs.run_tests == 'true'
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -489,8 +528,8 @@ jobs:
   # Reuse the tests runner slot. Failure of tests still permits this independent
   # diagnostic, while cancellation and a deduplicated run suppress it.
   bpf-noninterference:
-    needs: [dedupe, tests]
-    if: ${{ !cancelled() && needs.dedupe.outputs.run == 'true' }}
+    needs: [dedupe, tests, select]
+    if: ${{ !cancelled() && needs.dedupe.outputs.run == 'true' && needs.select.outputs.run_bpf_noninterference == 'true' }}
     runs-on: ubuntu-26.04
     timeout-minutes: 150
     steps:
@@ -778,8 +817,8 @@ jobs:
   # (pinned by hosted_pipeline_partitions_the_workspace_test_gate).
   contracts:
     name: contracts-${{ matrix.shard }}
-    needs: dedupe
-    if: needs.dedupe.outputs.run == 'true'
+    needs: [dedupe, select]
+    if: needs.dedupe.outputs.run == 'true' && needs.select.outputs.run_contracts == 'true'
     runs-on: ubuntu-26.04
     strategy:
       fail-fast: false
@@ -836,8 +875,8 @@ jobs:
   # tests/python suite. The UNRUN block is this job's first step after
   # checkout, so the lane list reaches the log even if a later step fails.
   scripts:
-    needs: dedupe
-    if: needs.dedupe.outputs.run == 'true'
+    needs: [dedupe, select]
+    if: needs.dedupe.outputs.run == 'true' && needs.select.outputs.run_scripts == 'true'
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1117,22 +1156,48 @@ jobs:
   # token gets actions: read and nothing else; upload-artifact uses the runtime
   # token, not GITHUB_TOKEN. It neither restores nor saves a cache.
   archive-log:
-    needs: [lint, audit, tests, bpf-noninterference, contracts, scripts]
+    needs: [lint, audit, tests, bpf-noninterference, contracts, scripts, select]
     # Not always(): a cancelled run's log is truncated by definition, and
     # publishing it produces an artifact that looks like evidence of a
     # completed job and is not. Failures still archive. A run the dedupe job
-    # skipped has no check job log to keep, so it archives nothing.
-    if: ${{ !cancelled() && !contains(needs.*.result, 'skipped') }}
+    # skipped selects nothing, so it archives nothing; a tier that skipped a
+    # check job archives the rest, naming each skipped job in the log.
+    if: ${{ !cancelled() && needs.select.outputs.run_archive_log == 'true' }}
     runs-on: ubuntu-26.04
     permissions:
       actions: read
     env:
       GH_TOKEN: ${{ github.token }}
       CHECK_JOBS: lint audit tests bpf-noninterference contracts-1 contracts-2 contracts-3 contracts-4 contracts-5 contracts-6 contracts-7 contracts-8 scripts
+      SELECTION: ${{ needs.select.outputs.selection }}
     steps:
+      # The check jobs this run's tier selected, one API name per line
+      # (contracts expands to its shards). The fetch loop below skips
+      # every other CHECK_JOBS entry loudly instead of failing on the
+      # skipped job's missing log.
+      - name: List the selected check-job names
+        shell: bash
+        run: |
+          SELECTION="$SELECTION" python3 -c '
+          import json, os
+          jobs = json.loads(os.environ["SELECTION"])["jobs"]
+          names = []
+          for job in ("lint", "audit", "tests", "bpf-noninterference",
+                      "scripts"):
+              if jobs[job]["state"] == "selected":
+                  names.append(job)
+          if jobs["contracts"]["state"] == "selected":
+              names.extend(jobs["contracts"]["names"])
+          print("\n".join(names))
+          ' >"$RUNNER_TEMP/selected-jobs.txt"
+          cat "$RUNNER_TEMP/selected-jobs.txt"
       - run: |
           mkdir "$RUNNER_TEMP/checks-logs"
           for job in $CHECK_JOBS; do
+            if ! grep -Fxq "$job" "$RUNNER_TEMP/selected-jobs.txt"; then
+              echo "job $job: not selected by this run's tier; no log to keep"
+              continue
+            fi
             # The jobs list can flake (a transient 502 killed a real run's
             # archive) or carry one name twice after a rerun, so fetch
             # id+created_at pairs with the same bounded 3x5s retry the log
@@ -1207,7 +1272,8 @@ jobs:
   # matrix or failed count/window oracle fails rather than becoming a skip.
   # Endpoint/WIDE/population scale and long soaks are separate qualifications.
   privileged-e2e:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.delivery_task == 'checks' && inputs.privileged_e2e }}
+    needs: select
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.delivery_task == 'checks' && inputs.privileged_e2e && needs.select.outputs.run_privileged_e2e == 'true' }}
     runs-on: ubuntu-26.04
     timeout-minutes: 60
     steps:
@@ -1391,7 +1457,8 @@ jobs:
   # suffice (passwordless sudo covers the receipt steps); no special labels
   # needed.
   release-preview:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.delivery_task == 'checks' && inputs.release_preview }}
+    needs: select
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.delivery_task == 'checks' && inputs.release_preview && needs.select.outputs.run_release_preview == 'true' }}
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1749,8 +1816,8 @@ jobs:
   # runs at most 20 jobs at once, and 12 check jobs + 7 coverage shards (+1
   # release-preview on dispatch) stays within it.
   coverage:
-    needs: dedupe
-    if: needs.dedupe.outputs.run == 'true'
+    needs: [dedupe, select]
+    if: needs.dedupe.outputs.run == 'true' && needs.select.outputs.run_coverage == 'true'
     runs-on: ubuntu-26.04
     env:
       # Full DWARF plus coverage makes the self-inspecting test executable
@@ -1823,7 +1890,8 @@ jobs:
           compression-level: 1
           retention-days: 1
   coverage-report:
-    needs: coverage
+    needs: [coverage, select]
+    if: needs.select.outputs.run_coverage_report == 'true'
     runs-on: ubuntu-26.04
     env:
       CARGO_PROFILE_TEST_DEBUG: line-tables-only

@@ -634,9 +634,9 @@ fn assert_bpf_snapshot_dependency_preparation(driver: &str) -> Result<(), String
 
 fn assert_hosted_bpf_noninterference(ci: &str) -> Result<(), String> {
     let block = job_block(ci, "bpf-noninterference");
-    let condition = "    needs: [dedupe, tests]\n    if: ${{ !cancelled() && needs.dedupe.outputs.run == 'true' }}\n";
+    let condition = "    needs: [dedupe, tests, select]\n    if: ${{ !cancelled() && needs.dedupe.outputs.run == 'true' && needs.select.outputs.run_bpf_noninterference == 'true' }}\n";
     if !block.starts_with(condition) {
-        return Err("BPF comparison must follow tests, including failed tests, unless cancelled/deduplicated".into());
+        return Err("BPF comparison must follow tests, including failed tests, unless cancelled/deduplicated/deselected".into());
     }
     for marker in [
         "    runs-on: ubuntu-26.04\n",
@@ -10400,9 +10400,10 @@ fn block_under<'a>(source: &'a str, header: &str) -> &'a str {
 }
 
 /// The hosted check jobs that together replaced the single `checks-and-e2e`
-/// job. They run on every push and pull request; the BPF comparison follows
-/// tests. Every one gates the run: `archive-log` keeps each one's log and `quarantine`
-/// fires when any one fails.
+/// job. Lint, audit, tests, contracts and scripts run on every push and
+/// pull request; the BPF comparison follows tests and is tier-selected.
+/// Every selected one gates the run: `archive-log` keeps each selected
+/// log and `quarantine` fires when any one fails.
 const CHECK_JOBS: [&str; 6] = [
     "lint",
     "audit",
@@ -10454,8 +10455,9 @@ fn hosted_pipeline_requires_exact_default_bpf_comparison() {
         );
     }
     for marker in [
-        "needs: [dedupe, tests]",
-        "!cancelled() && needs.dedupe.outputs.run == 'true'",
+        "needs: [dedupe, tests, select]",
+        "!cancelled() && needs.dedupe.outputs.run == 'true' && needs.select.outputs.run_bpf_noninterference == 'true'",
+        " && needs.select.outputs.run_bpf_noninterference == 'true'",
         "fetch-depth: 0",
         // Pinned baseline v0.6.0 tag: the v0.6.0 release objects, plus
         // the reviewed PQC parameter-set allowed transition for the
@@ -11473,11 +11475,17 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
     // `hosted_pipeline_partitions_the_workspace_test_gate`; its own
     // `--self-test` is an ordinary step of the checks job).
     let partition_helper = "scripts/ci-test-partition.py";
+    // Tier selection is orchestration, not a lane: the select job names
+    // the selector, whose exact invocation the tier contract pins (as the
+    // partition test does for the helper above).
+    let orchestration_helpers = ["scripts/ci/select-cells.py"];
     let outside_line_admitted = |line: &str| {
         let scripts = named_scripts(line);
         let dependency_only = !scripts.is_empty()
             && scripts.iter().all(|script| {
-                dependency_helpers.contains(&script.as_str()) || script == partition_helper
+                dependency_helpers.contains(&script.as_str())
+                    || script == partition_helper
+                    || orchestration_helpers.contains(&script.as_str())
             });
         line.starts_with('#') || !names_lane(line) || dependency_only
     };
@@ -12024,15 +12032,25 @@ fn hosted_pipeline_retains_the_job_log() {
         }
     }
     let needs = format!("    needs: [{}]\n", CHECK_JOBS.join(", "));
+    let archive_needs = format!("    needs: [{}, select]\n", CHECK_JOBS.join(", "));
     let listed = format!("      CHECK_JOBS: {}\n", names.join(" "));
     for required in [
-        needs.as_str(),
+        archive_needs.as_str(),
         listed.as_str(),
+        // The tier-aware fetch: only selected check jobs have logs, so the
+        // selection names them (contracts expands to its shards) and the
+        // loop skips the rest loudly instead of failing on a missing log.
+        "SELECTION: ${{ needs.select.outputs.selection }}\n",
+        "- name: List the selected check-job names\n",
+        "if jobs[job][\"state\"] == \"selected\":",
+        "names.extend(jobs[\"contracts\"][\"names\"])",
         "for job in $CHECK_JOBS; do",
+        "grep -Fxq \"$job\" \"$RUNNER_TEMP/selected-jobs.txt\"",
+        "not selected by this run's tier; no log to keep",
         // Not always(): a cancelled run must not publish a truncated log under
-        // the same artifact name as a complete one. A deduplicated run skips
-        // every check job and has no log to keep.
-        "    if: ${{ !cancelled() && !contains(needs.*.result, 'skipped') }}\n",
+        // the same artifact name as a complete one. A deduplicated run
+        // selects nothing and has no log to keep.
+        "    if: ${{ !cancelled() && needs.select.outputs.run_archive_log == 'true' }}\n",
         "- uses: actions/upload-artifact@",
         "if-no-files-found: error\n",
         "/actions/jobs/$JOB_ID/logs\"",
@@ -12179,8 +12197,10 @@ fn hosted_pipeline_partitions_the_workspace_test_gate() {
         assert!(block.contains(marker), "the coverage gate lacks {marker:?}");
     }
     assert!(
-        report.starts_with("    needs: coverage\n"),
-        "coverage-report must wait for every coverage shard"
+        report.starts_with(
+            "    needs: [coverage, select]\n    if: needs.select.outputs.run_coverage_report == 'true'\n"
+        ),
+        "coverage-report must wait for every coverage shard plus selection"
     );
     // Line tables only: full DWARF plus coverage pushes the self-inspecting
     // test executable past the scanner's object limit.
@@ -12374,11 +12394,12 @@ fn hosted_caches_hold_only_tool_binaries_and_build_products() {
 }
 
 /// One full ordinary check matrix per commit; manual delivery opts out.
-/// Every check and coverage job waits on
-/// the dedupe job and runs only when it says so (coverage-report follows the
-/// coverage shards). Dedupe reads the manual selection or the Actions API,
-/// and the workflow groups by event and ref so a push cancels only the
-/// overtaken development-branch run, never an agent's dispatch.
+/// Every check and coverage job waits on the dedupe and select jobs and
+/// runs only when both say so (coverage-report follows the coverage
+/// shards plus selection). Dedupe reads the manual selection or the
+/// Actions API, and the workflow groups by event and ref so a push
+/// cancels only the overtaken development-branch run, never an agent's
+/// dispatch.
 #[test]
 fn hosted_pipeline_runs_one_full_matrix_per_commit() {
     let ci = read(".github/workflows/ci.yml");
@@ -12393,21 +12414,25 @@ fn hosted_pipeline_runs_one_full_matrix_per_commit() {
         "only a push to a development branch cancels its overtaken run; \
          dispatches and other refs sequence instead of cancelling"
     );
-    let gate = "    needs: dedupe\n    if: needs.dedupe.outputs.run == 'true'\n";
     for job in CARGO_JOBS {
         let block = job_block(&ci, job);
         if job == "coverage-report" {
-            assert!(block.starts_with("    needs: coverage\n"));
+            assert!(block.starts_with(
+                "    needs: [coverage, select]\n    if: needs.select.outputs.run_coverage_report == 'true'\n"
+            ));
         } else if job == "contracts" {
             assert!(block.starts_with(&format!(
-                "    name: contracts-${{{{ matrix.shard }}}}\n{gate}"
+                "    name: contracts-${{{{ matrix.shard }}}}\n    needs: [dedupe, select]\n    if: needs.dedupe.outputs.run == 'true' && needs.select.outputs.run_contracts == 'true'\n"
             )));
         } else if job == "bpf-noninterference" {
             assert_hosted_bpf_noninterference(&ci).unwrap();
         } else {
+            let output = job.replace('-', "_");
             assert!(
-                block.starts_with(gate),
-                "{job} must run only when dedupe says so"
+                block.starts_with(&format!(
+                    "    needs: [dedupe, select]\n    if: needs.dedupe.outputs.run == 'true' && needs.select.outputs.run_{output} == 'true'\n"
+                )),
+                "{job} must run only when dedupe and selection say so"
             );
         }
     }

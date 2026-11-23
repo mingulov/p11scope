@@ -87,6 +87,7 @@ RUN = [
     ("test_ci_dependency_selection.py", []),
     ("test_ci_stop_races.py", []),
     ("test_ci_test_partition.py", []),
+    ("test_ci_tier_selection.py", []),
     ("test_counter_object.py", []),
     ("test_counter_timing_object.py", []),
     ("test_counter_softhsm_parity.py", []),

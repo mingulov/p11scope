@@ -15,7 +15,7 @@ WORKFLOW = ".github/workflows/ci.yml"
 # Keep this in step with ci.yml. The registered orchestration suite checks
 # the ordinary jobs and both expanded matrices against this contract.
 REQUIRED_JOBS = {
-    "dedupe", "lint", "audit", "tests", "bpf-noninterference", "scripts", "archive-log",
+    "dedupe", "select", "lint", "audit", "tests", "bpf-noninterference", "scripts", "archive-log",
     *(f"contracts-{index}" for index in range(1, 9)),
     "coverage (rest)", *(f"coverage (contracts:{index}/6)" for index in range(1, 7)),
     "coverage-report",

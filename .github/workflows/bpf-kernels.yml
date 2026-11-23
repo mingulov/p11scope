@@ -64,11 +64,46 @@ env:
   BPF_EXPECT_COUNTER_OBJECTS: "1"
   BPF_EXPECT_JOURNAL: "1"
 jobs:
+  # Tier and cell selection for this run. Reads the GitHub context from the
+  # environment (dispatch inputs arrive through env, never through
+  # interpolation inside a run: block), diffs the checkout against the dev
+  # merge-base, and publishes one run_<job> output per gated job, the
+  # dynamic kernel matrices, and the selection document the gate consumes.
+  # Fails closed: any unknown input, path, event or ref class selects the
+  # full tier.
+  select:
+    runs-on: ubuntu-26.04
+    outputs:
+      tier: ${{ steps.choose.outputs.tier }}
+      base: ${{ steps.choose.outputs.base }}
+      path_classes: ${{ steps.choose.outputs.path_classes }}
+      run_kvm_probe: ${{ steps.choose.outputs.run_kvm_probe }}
+      run_bpf_load_build: ${{ steps.choose.outputs.run_bpf_load_build }}
+      run_bpf_load_kernels: ${{ steps.choose.outputs.run_bpf_load_kernels }}
+      run_bpf_load_gate1_build: ${{ steps.choose.outputs.run_bpf_load_gate1_build }}
+      run_bpf_load_gate1_kernels: ${{ steps.choose.outputs.run_bpf_load_gate1_kernels }}
+      run_lib_cells_kernels: ${{ steps.choose.outputs.run_lib_cells_kernels }}
+      run_bpf_load_host: ${{ steps.choose.outputs.run_bpf_load_host }}
+      matrix_bpf_load: ${{ steps.choose.outputs.matrix_bpf_load }}
+      matrix_bpf_gate1: ${{ steps.choose.outputs.matrix_bpf_gate1 }}
+      matrix_lib_cells: ${{ steps.choose.outputs.matrix_lib_cells }}
+      selection: ${{ steps.choose.outputs.selection }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The full graph: selection diffs the merge-base with the dev tip.
+          fetch-depth: 0
+      - id: choose
+        env:
+          P11SCOPE_CI_WORKFLOW: bpf-kernels
+        run: python3 -I scripts/ci/select-cells.py
   # The canary: prove /dev/kvm is usable, print the host facts the guest
   # jobs depend on, and boot one v6.6.157 guest with uname -r, timed.
   # FAILs honestly when KVM is absent; nothing after the facts is a guess.
   kvm-probe:
+    needs: select
     runs-on: ubuntu-26.04
+    if: needs.select.outputs.run_kvm_probe == 'true'
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -158,7 +193,9 @@ jobs:
   # their sha256, as a 1-day artifact. The toolchain, apt, bpf-linker and
   # dependency-preparation steps are copied from ci.yml's tests job.
   bpf-load-build:
+    needs: select
     runs-on: ubuntu-26.04
+    if: needs.select.outputs.run_bpf_load_build == 'true'
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -327,22 +364,17 @@ jobs:
   # FAIL, never a skip: the driver exits nonzero and the step has no
   # guard that could swallow it.
   bpf-load-kernels:
-    needs: bpf-load-build
+    needs: [bpf-load-build, select]
     runs-on: ubuntu-26.04
+    if: needs.select.outputs.run_bpf_load_kernels == 'true'
     timeout-minutes: 30
     strategy:
       fail-fast: false
-      matrix:
-        kernel: [v6.6.157, v6.12.111, v6.18.58, v7.3.1, v7.4-rc2]
-        include:
-          # Combined refusal controls, never an old positive campaign.
-          - kernel: v6.1.188
-            refusal_control: true
-          # 5.15 follows the same fallback/refusal contract (OD32) and additionally
-          # runs the identity cell for its denied branch.
-          - kernel: v5.15.221
-            refusal_control: true
-            denial_branch: denied
+      # Single-sourced in scripts/ci/select-cells.py: the five positives
+      # plus the combined refusal controls (6.1/5.15, never an old
+      # positive campaign; 5.15 additionally runs the identity cell for
+      # its denied branch under the same fallback/refusal contract).
+      matrix: ${{ fromJSON(needs.select.outputs.matrix_bpf_load) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -473,7 +505,9 @@ jobs:
   # different runners, and the key must never serve a gate-0 target
   # tree (or vice versa) as a warm cache.
   bpf-load-gate1-build:
+    needs: select
     runs-on: ubuntu-26.04
+    if: needs.select.outputs.run_bpf_load_gate1_build == 'true'
     timeout-minutes: 60
     env:
       P11SCOPE_LOADER_GATE: "1"
@@ -643,13 +677,15 @@ jobs:
   # that cannot boot, a refused load, a missing table or a nonzero
   # doctor exit is a FAIL, never a skip.
   bpf-load-gate1-kernels:
-    needs: bpf-load-gate1-build
+    needs: [bpf-load-gate1-build, select]
     runs-on: ubuntu-26.04
+    if: needs.select.outputs.run_bpf_load_gate1_kernels == 'true'
     timeout-minutes: 30
     strategy:
       fail-fast: false
-      matrix:
-        kernel: [v6.6.157, v6.12.111, v6.18.58, v7.3.1, v7.4-rc2]
+      # Single-sourced in scripts/ci/select-cells.py: the five positives,
+      # including the newest mainline cell.
+      matrix: ${{ fromJSON(needs.select.outputs.matrix_bpf_gate1) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -788,13 +824,14 @@ jobs:
   # hazard probe (scripts/ci/lib-cells-vng.sh). One guest per kernel; the
   # script judges every cell and exits nonzero on any failure.
   lib-cells-kernels:
-    needs: bpf-load-build
+    needs: [bpf-load-build, select]
     runs-on: ubuntu-26.04
+    if: needs.select.outputs.run_lib_cells_kernels == 'true'
     timeout-minutes: 45
     strategy:
       fail-fast: false
-      matrix:
-        kernel: [v6.6.157, v6.12.111]
+      # Single-sourced in scripts/ci/select-cells.py.
+      matrix: ${{ fromJSON(needs.select.outputs.matrix_lib_cells) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -881,8 +918,9 @@ jobs:
   # No VM: load every BPF program on the runner kernel itself with sudo
   # and file the same table.
   bpf-load-host:
-    needs: bpf-load-build
+    needs: [bpf-load-build, select]
     runs-on: ubuntu-26.04
+    if: needs.select.outputs.run_bpf_load_host == 'true'
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

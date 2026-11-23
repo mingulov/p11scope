@@ -204,24 +204,23 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
                 self.assertIn("--exact-selectors", line)
 
     def test_summary_proves_every_cell_ran_once_and_passed(self):
-        summary = self.yml.split("privileged-summary:", 1)
-        self.assertEqual(len(summary), 2, "no privileged-summary job")
-        body = summary[1]
-        self.assertIn("needs: [privileged-build, privileged-shard]", body)
-        self.assertIn("if: ${{ !cancelled() }}", body)
+        body = job_body(self.yml, "privileged-summary")
+        self.assertIn("needs: [privileged-build, privileged-shard, select]",
+                      body)
+        self.assertIn("if: ${{ !cancelled() && github.event_name != "
+                      "'schedule' && needs.select.outputs."
+                      "run_privileged_summary == 'true' }}", body)
         self.assertIn('diff -u "$RUNNER_TEMP/want.txt" "$RUNNER_TEMP/ran.txt"', body)
         self.assertIn("MISSING results for shard", body)
         self.assertIn("awk '$1 != \"PASS\"'", body)
 
     def test_guest_kernels_have_pinned_sums(self):
-        match = re.search(r"kernel:\s*\[host,([^\]]*)\]", self.yml)
-        self.assertIsNotNone(match, "public-cli has no host + guest kernel matrix")
-        guests = [k.strip() for k in match.group(1).split(",") if k.strip()]
-        self.assertTrue(guests)
-        sums = ROOT / "tests" / "fixtures" / "vng-kernel-sha256sums"
-        for kernel in guests:
-            self.assertTrue((sums / f"{kernel}.sums").is_file(), f"missing sums for {kernel}")
-        self.assertIn("sha256sum --check", self.yml)
+        # Guest lists live in the selector (tier contract pins them and
+        # their sums files); this pins the workflow half: public-cli
+        # verifies every guest download before the first boot.
+        job = job_body(self.yml, "public-cli")
+        self.assertIn("sha256sum --check", job)
+        self.assertIn("kernel deb set changed", job)
 
     def test_concurrency_cancels_only_test_and_task_pushes(self):
         # The group carries the event, so a push can never cancel an
@@ -243,7 +242,7 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
         ):
             with self.subTest(job=job):
                 body = job_body(self.yml, job)
-                self.assertIn("needs: privileged-build", body)
+                self.assertIn("needs: [privileged-build, select]", body)
                 self.assertIn(flag, body)
                 self.assertIn(package, body)
                 # Selectors derive from the curated --list section with
@@ -507,10 +506,12 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
         self.assertIn("privileged-build-journal:", self.yml)
         shard_needs = re.search(r"privileged-shard:\s*\n\s*needs:\s*([^\n]+)", self.yml)
         self.assertIsNotNone(shard_needs, "privileged-shard has no needs")
-        self.assertEqual(shard_needs.group(1).strip(), "privileged-build")
+        self.assertEqual(shard_needs.group(1).strip(),
+                         "[privileged-build, select]")
         second_needs = re.search(r"privileged-second-flavor:\s*\n\s*needs:\s*([^\n]+)", self.yml)
         self.assertIsNotNone(second_needs, "privileged-second-flavor has no needs")
-        self.assertEqual(second_needs.group(1).strip(), "privileged-build-journal")
+        self.assertEqual(second_needs.group(1).strip(),
+                         "[privileged-build-journal, select]")
 
     def test_proof_build_is_cached(self):
         self.assertIn("target/proof/debug/.fingerprint", self.yml)
@@ -779,17 +780,10 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
         self.assertIn("minimal.log", job)
 
     def test_witness_cli_matrix_runs_host_and_the_five_pinned_guests(self):
+        # Guest lists live in the selector (tier contract pins them and
+        # their sums files); this pins the workflow half: witness-cli
+        # verifies every guest download before the first boot.
         job = job_body(self.yml, "witness-cli")
-        match = re.search(r"kernel:\s*\[(.*?)\]", job)
-        self.assertIsNotNone(match, "witness-cli has no kernel matrix")
-        kernels = [kernel.strip() for kernel in match.group(1).split(",")]
-        self.assertEqual(kernels,
-                         ["host", "v6.6.157", "v6.12.111", "v6.18.58", "v7.3.1",
-                          "v7.4-rc2"])
-        sums = ROOT / "tests" / "fixtures" / "vng-kernel-sha256sums"
-        for kernel in kernels[1:]:
-            self.assertTrue((sums / f"{kernel}.sums").is_file(),
-                            f"missing sums for {kernel}")
         self.assertIn("sha256sum --check", job)
         self.assertIn("kernel deb set changed", job)
 
@@ -940,7 +934,7 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
                                         ("pkcs11-check-full", "full", "180")):
             with self.subTest(job=job_name):
                 job = job_body(self.yml, job_name)
-                self.assertIn("needs: release-build", job)
+                self.assertIn("needs: [release-build, select]", job)
                 self.assertIn("runs-on: ubuntu-26.04", job)
                 self.assertIn(f"timeout-minutes: {timeout}", job)
                 self.assertIn("pkcs11-check==0.2.3", job)
@@ -1002,14 +996,16 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
                                   "bare unhashed pip install remains")
 
     def test_schedule_runs_only_release_build_and_full(self):
-        # Every job except release-build and the two FULL jobs skips on
-        # schedule, so the nightly runs only the FULL suites on main.
+        # Every job except select, release-build and the two FULL jobs
+        # skips on schedule, so the nightly runs only the FULL suites on
+        # main. Select runs to publish the schedule selection for the gate.
         names = [match.group(1) for match in
                  re.finditer(r"^  ([a-z][a-z0-9-]*):\s*$", self.yml, re.M)]
         jobs = [name for name in names
                 if name not in ("push", "pull_request", "schedule", "workflow_dispatch")]
         # Top-level keys that are not jobs (permissions, env, etc.) never
         # match the job pattern above because they carry values.
+        self.assertIn("select", jobs)
         self.assertIn("release-build", jobs)
         self.assertIn("pkcs11-check-smoke", jobs)
         self.assertIn("pkcs11-check-full", jobs)
@@ -1018,7 +1014,7 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
         for name in jobs:
             body = job_body(self.yml, name)
             with self.subTest(job=name):
-                if name in ("release-build", "pkcs11-check-full",
+                if name in ("select", "release-build", "pkcs11-check-full",
                             "pkcs11-check-providers-full"):
                     continue
                 self.assertIn("github.event_name != 'schedule'", body,

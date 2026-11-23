@@ -116,9 +116,59 @@ env:
   # Keep in step with the privileged-shard matrix below.
   SHARDS: 8
 jobs:
-  privileged-build:
+  # Tier and cell selection for this run. Reads the GitHub context from the
+  # environment (dispatch inputs arrive through env, never through
+  # interpolation inside a run: block), diffs the checkout against the dev
+  # merge-base, and publishes one run_<job> output per gated job, the
+  # dynamic kernel matrices, and the selection document the gate consumes.
+  # Fails closed: any unknown input, path, event or ref class selects the
+  # full tier.
+  select:
     runs-on: ubuntu-26.04
-    if: github.event_name != 'schedule'
+    outputs:
+      tier: ${{ steps.choose.outputs.tier }}
+      base: ${{ steps.choose.outputs.base }}
+      path_classes: ${{ steps.choose.outputs.path_classes }}
+      run_privileged_build: ${{ steps.choose.outputs.run_privileged_build }}
+      run_privileged_build_journal: ${{ steps.choose.outputs.run_privileged_build_journal }}
+      run_privileged_shard: ${{ steps.choose.outputs.run_privileged_shard }}
+      run_privileged_summary: ${{ steps.choose.outputs.run_privileged_summary }}
+      run_privileged_second_flavor: ${{ steps.choose.outputs.run_privileged_second_flavor }}
+      run_privileged_counter_flavor: ${{ steps.choose.outputs.run_privileged_counter_flavor }}
+      run_privileged_btrfs: ${{ steps.choose.outputs.run_privileged_btrfs }}
+      run_privileged_overlay: ${{ steps.choose.outputs.run_privileged_overlay }}
+      run_release_build: ${{ steps.choose.outputs.run_release_build }}
+      run_system_scale: ${{ steps.choose.outputs.run_system_scale }}
+      run_public_cli: ${{ steps.choose.outputs.run_public_cli }}
+      run_public_cli_ia32: ${{ steps.choose.outputs.run_public_cli_ia32 }}
+      run_legacy32_shape: ${{ steps.choose.outputs.run_legacy32_shape }}
+      run_root_integration: ${{ steps.choose.outputs.run_root_integration }}
+      run_witness_cli: ${{ steps.choose.outputs.run_witness_cli }}
+      run_run_tree: ${{ steps.choose.outputs.run_run_tree }}
+      run_browser_cells: ${{ steps.choose.outputs.run_browser_cells }}
+      run_container_image: ${{ steps.choose.outputs.run_container_image }}
+      run_pkcs11_check_smoke: ${{ steps.choose.outputs.run_pkcs11_check_smoke }}
+      run_pkcs11_check_full: ${{ steps.choose.outputs.run_pkcs11_check_full }}
+      run_pkcs11_check_providers: ${{ steps.choose.outputs.run_pkcs11_check_providers }}
+      run_pkcs11_check_providers_full: ${{ steps.choose.outputs.run_pkcs11_check_providers_full }}
+      matrix_public_cli: ${{ steps.choose.outputs.matrix_public_cli }}
+      matrix_witness_cli: ${{ steps.choose.outputs.matrix_witness_cli }}
+      matrix_run_tree: ${{ steps.choose.outputs.matrix_run_tree }}
+      selection: ${{ steps.choose.outputs.selection }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The full graph: selection diffs the merge-base with the dev tip.
+          fetch-depth: 0
+      - id: choose
+        env:
+          P11SCOPE_CI_WORKFLOW: privileged-tests
+          P11SCOPE_CI_PKCS11_FULL: ${{ inputs.pkcs11_check_full }}
+        run: python3 -I scripts/ci/select-cells.py
+  privileged-build:
+    needs: select
+    runs-on: ubuntu-26.04
+    if: ${{ github.event_name != 'schedule' && needs.select.outputs.run_privileged_build == 'true' }}
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -243,8 +293,9 @@ jobs:
   # plus birth marker the default (ruling CP-1), the second flavor
   # becomes P11SCOPE_JOURNAL=0 P11SCOPE_BIRTH_MARKER=0.
   privileged-build-journal:
+    needs: select
     runs-on: ubuntu-26.04
-    if: github.event_name != 'schedule'
+    if: ${{ github.event_name != 'schedule' && needs.select.outputs.run_privileged_build_journal == 'true' }}
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -328,9 +379,9 @@ jobs:
           if-no-files-found: error
           retention-days: 1
   privileged-shard:
-    needs: privileged-build
+    needs: [privileged-build, select]
     runs-on: ubuntu-26.04
-    if: github.event_name != 'schedule'
+    if: ${{ github.event_name != 'schedule' && needs.select.outputs.run_privileged_shard == 'true' }}
     timeout-minutes: 75
     strategy:
       fail-fast: false
@@ -411,8 +462,8 @@ jobs:
   # floor file stops a quiet curation shrink and the branch table judges
   # which dual-outcome arm each cell took.
   privileged-summary:
-    needs: [privileged-build, privileged-shard]
-    if: ${{ !cancelled() && github.event_name != 'schedule' }}
+    needs: [privileged-build, privileged-shard, select]
+    if: ${{ !cancelled() && github.event_name != 'schedule' && needs.select.outputs.run_privileged_summary == 'true' }}
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
@@ -513,9 +564,9 @@ jobs:
   # selectors. A SKIP fails the job. Pending cells (the five, until WU-2a
   # lands) may be absent from the binary, but must PASS when present.
   privileged-second-flavor:
-    needs: privileged-build-journal
+    needs: [privileged-build-journal, select]
     runs-on: ubuntu-26.04
-    if: github.event_name != 'schedule'
+    if: ${{ github.event_name != 'schedule' && needs.select.outputs.run_privileged_second_flavor == 'true' }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -605,9 +656,9 @@ jobs:
   # wide companions, the twins flip back to positive and this campaign
   # stays as the FULL positive.
   privileged-counter-flavor:
-    needs: privileged-build-journal
+    needs: [privileged-build-journal, select]
     runs-on: ubuntu-26.04
-    if: github.event_name != 'schedule'
+    if: ${{ github.event_name != 'schedule' && needs.select.outputs.run_privileged_counter_flavor == 'true' }}
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -697,9 +748,9 @@ jobs:
   # The discover btrfs-subvolume cell rides the same job on a second
   # loop mount, as the runner user (the fence refuses root).
   privileged-btrfs:
-    needs: privileged-build
+    needs: [privileged-build, select]
     runs-on: ubuntu-26.04
-    if: github.event_name != 'schedule'
+    if: ${{ github.event_name != 'schedule' && needs.select.outputs.run_privileged_btrfs == 'true' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -801,9 +852,9 @@ jobs:
   # overlays and fails loud elsewhere). The xino parity cell already
   # runs in the default shards.
   privileged-overlay:
-    needs: privileged-build
+    needs: [privileged-build, select]
     runs-on: ubuntu-26.04
-    if: github.event_name != 'schedule'
+    if: ${{ github.event_name != 'schedule' && needs.select.outputs.run_privileged_overlay == 'true' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -878,7 +929,9 @@ jobs:
   # system-scale cells, the public CLI cells on the runner kernel and in
   # virtme-ng guests, and the real-browser cells.
   release-build:
+    needs: select
     runs-on: ubuntu-26.04
+    if: needs.select.outputs.run_release_build == 'true'
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -936,9 +989,9 @@ jobs:
   # real-providers and WP-7 stop-races run here later through
   # scripts/ci/run-cell-script.sh, packed into this job's 45-minute budget.
   system-scale:
-    needs: release-build
+    needs: [release-build, select]
     runs-on: ubuntu-26.04
-    if: github.event_name != 'schedule'
+    if: ${{ github.event_name != 'schedule' && needs.select.outputs.run_system_scale == 'true' }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1096,16 +1149,17 @@ jobs:
   # `nobody` user with exactly the minimal setcap set) rides the same
   # host + guest matrix through the same template.
   public-cli:
-    needs: release-build
+    needs: [release-build, select]
     runs-on: ubuntu-26.04
-    if: github.event_name != 'schedule'
+    if: ${{ github.event_name != 'schedule' && needs.select.outputs.run_public_cli == 'true' }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
-      matrix:
-        # Newest mainline first-class: add each new release (7.4-rc2 now;
-        # re-point at the 7.4 final when it ships).
-        kernel: [host, v6.6.157, v6.12.111, v6.18.58, v7.3.1, v7.4-rc2]
+      # Single-sourced in scripts/ci/select-cells.py: the quick tier
+      # runs host plus two guests, the full tier every pinned guest.
+      # Newest mainline stays first-class: add each new release in the
+      # selector (re-point at the 7.4 final when it ships).
+      matrix: ${{ fromJSON(needs.select.outputs.matrix_public_cli) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1374,9 +1428,9 @@ jobs:
   # provider the main legs use, so it stays separate. The main legs
   # keep both ia32 cells as declared expected-failures.
   public-cli-ia32:
-    needs: release-build
+    needs: [release-build, select]
     runs-on: ubuntu-26.04
-    if: github.event_name != 'schedule'
+    if: ${{ github.event_name != 'schedule' && needs.select.outputs.run_public_cli_ia32 == 'true' }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1421,9 +1475,9 @@ jobs:
   # SoftHSM 2.6.1 is the control (a 2.7 stock would fail for the shape
   # reason, so the job asserts the 2.6.x stock first).
   legacy32-shape:
-    needs: release-build
+    needs: [release-build, select]
     runs-on: ubuntu-26.04
-    if: github.event_name != 'schedule'
+    if: ${{ github.event_name != 'schedule' && needs.select.outputs.run_legacy32_shape == 'true' }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1491,9 +1545,9 @@ jobs:
   # all qualified; the script judges the branch of each cell, not just
   # its exit code). Root-required, consistent with the cell template.
   root-integration:
-    needs: release-build
+    needs: [release-build, select]
     runs-on: ubuntu-26.04
-    if: github.event_name != 'schedule'
+    if: ${{ github.event_name != 'schedule' && needs.select.outputs.run_root_integration == 'true' }}
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1621,14 +1675,15 @@ jobs:
   # public-cli: the host runner kernel plus the five pinned guests; the
   # guest legs run the same host-built test binary inside vng.
   witness-cli:
+    needs: select
     runs-on: ubuntu-26.04
-    if: github.event_name != 'schedule'
+    if: ${{ github.event_name != 'schedule' && needs.select.outputs.run_witness_cli == 'true' }}
     timeout-minutes: 75
     strategy:
       fail-fast: false
-      matrix:
-        # Newest mainline first-class, like public-cli above.
-        kernel: [host, v6.6.157, v6.12.111, v6.18.58, v7.3.1, v7.4-rc2]
+      # Single-sourced in scripts/ci/select-cells.py: the quick tier
+      # runs host plus two guests, the full tier every pinned guest.
+      matrix: ${{ fromJSON(needs.select.outputs.matrix_witness_cli) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1755,13 +1810,15 @@ jobs:
   # the four pinned guests; the guest legs run the same host-built test
   # binary inside vng.
   run-tree:
+    needs: select
     runs-on: ubuntu-26.04
-    if: github.event_name != 'schedule'
+    if: ${{ github.event_name != 'schedule' && needs.select.outputs.run_run_tree == 'true' }}
     timeout-minutes: 75
     strategy:
       fail-fast: false
-      matrix:
-        kernel: [host, v6.6.157, v6.12.111, v6.18.58, v7.3.1]
+      # Single-sourced in scripts/ci/select-cells.py: the quick tier
+      # runs host plus two guests, the full tier every pinned guest.
+      matrix: ${{ fromJSON(needs.select.outputs.matrix_run_tree) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1899,9 +1956,9 @@ jobs:
   # a SoftHSM token, observed by the release binary as root, in strict
   # mode (a missing prerequisite fails instead of skipping).
   browser-cells:
-    needs: release-build
+    needs: [release-build, select]
     runs-on: ubuntu-26.04
-    if: github.event_name != 'schedule'
+    if: ${{ github.event_name != 'schedule' && needs.select.outputs.run_browser_cells == 'true' }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1951,8 +2008,9 @@ jobs:
   # (which shares the host's /var/lib/docker) is not something the
   # harness provides.
   container-image:
+    needs: select
     runs-on: ubuntu-26.04
-    if: github.event_name != 'schedule'
+    if: ${{ github.event_name != 'schedule' && needs.select.outputs.run_container_image == 'true' }}
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -2031,8 +2089,8 @@ jobs:
   # every push (host kernel) as a required cell; skips on schedule (the
   # FULL job owns the nightly).
   pkcs11-check-smoke:
-    needs: release-build
-    if: github.event_name != 'schedule'
+    needs: [release-build, select]
+    if: ${{ github.event_name != 'schedule' && needs.select.outputs.run_pkcs11_check_smoke == 'true' }}
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
@@ -2088,8 +2146,8 @@ jobs:
   # on push. Its green on the exact SHA gates release tags
   # (package-preview validates accepted_pkcs11_full_run_id).
   pkcs11-check-full:
-    needs: release-build
-    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.pkcs11_check_full)
+    needs: [release-build, select]
+    if: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.pkcs11_check_full)) && needs.select.outputs.run_pkcs11_check_full == 'true' }}
     runs-on: ubuntu-26.04
     timeout-minutes: 180
     steps:
@@ -2152,8 +2210,8 @@ jobs:
   # kernel) as a required cell, ~10 min per matrix leg; skips on schedule
   # (the FULL job owns the nightly).
   pkcs11-check-providers:
-    needs: release-build
-    if: github.event_name != 'schedule'
+    needs: [release-build, select]
+    if: ${{ github.event_name != 'schedule' && needs.select.outputs.run_pkcs11_check_providers == 'true' }}
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     strategy:
@@ -2242,8 +2300,8 @@ jobs:
   # dispatch (pkcs11_check_full input); never on push. Gated exactly like
   # pkcs11-check-full but not release-gating.
   pkcs11-check-providers-full:
-    needs: release-build
-    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.pkcs11_check_full)
+    needs: [release-build, select]
+    if: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.pkcs11_check_full)) && needs.select.outputs.run_pkcs11_check_providers_full == 'true' }}
     runs-on: ubuntu-26.04
     timeout-minutes: 300
     strategy:

@@ -9,12 +9,14 @@ could leave bpf-kernels.yml behind with no test noticing. These tests
 pin the two-way agreement instead of the values: whatever ci.yml pins
 for bpf-linker, the nightly and release toolchains, clang and the
 actions revisions, bpf-kernels.yml must carry the same. They also pin
-that every matrix kernel has a checked-in vng download sums file, and
-no unknown sums file escapes review. Historical 5.15 sums remain pinned.
+that every selector-listed kernel has a well-formed vng download sums
+file, and no unknown sums file escapes review. Kernel lists themselves
+live in scripts/ci/select-cells.py (tier contract).
 
 Run: python3 -I tests/python/test_bpf_kernels_contract.py -v
 """
 
+import importlib.util
 import json
 import re
 import sys
@@ -28,6 +30,11 @@ BPF_YML = ROOT / ".github" / "workflows" / "bpf-kernels.yml"
 RELEASE_RUST_VERSION = ROOT / ".release-rust-version"
 SUMS_DIR = ROOT / "tests" / "fixtures" / "vng-kernel-sha256sums"
 RC_VECTORS = ROOT / "tests" / "fixtures" / "rc-match-vectors.json"
+
+_SPEC = importlib.util.spec_from_file_location(
+    "select_cells", ROOT / "scripts" / "ci" / "select-cells.py")
+SELECT = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(SELECT)
 
 SUMS_LINE = re.compile(r"^[0-9a-f]{64}  (\S+)$")
 DEB_NAME = re.compile(r"^linux-(image-unsigned|modules)-[^-]+-.*_amd64\.deb$")
@@ -116,28 +123,16 @@ def check_action_pins(ci_text, bpf_text):
     return problems
 
 
-def matrix_kernels(bpf_text):
-    """The bpf-load-kernels matrix values, e.g. ['v5.15.221', ...]."""
-    match = re.search(r"kernel:\s*\[(.*?)\]", bpf_text)
-    if not match:
-        return []
-    return [kernel.strip() for kernel in match.group(1).split(",")
-            if kernel.strip()]
-
-
-def gate1_kernels(bpf_text):
-    """The bpf-load-gate1-kernels matrix values.
-
-    The gate-0 pin reads the first kernel list only, so a cell dropped
-    from the gate-1 job alone would pass it; this reads the gate-1
-    job's own matrix instead.
-    """
-    match = re.search(r"bpf-load-gate1-kernels:.*?matrix:\n\s+kernel: \[(.*?)\]",
-                      bpf_text, re.S)
-    if not match:
-        return []
-    return [kernel.strip() for kernel in match.group(1).split(",")
-            if kernel.strip()]
+def selected_kernels():
+    """Every kernel the selector lists: BPF positives, refusal rows,
+    lib cells and CLI guests. Kernel matrices render through dynamic
+    matrices, so the sums contract reads the selector, not YAML."""
+    kernels = list(SELECT.BPF_POSITIVE_KERNELS)
+    kernels += [row["kernel"] for row in SELECT.BPF_REFUSAL_ROWS]
+    kernels += list(SELECT.LIB_CELL_KERNELS)
+    for guests in SELECT.CLI_FULL_KERNELS.values():
+        kernels += [kernel for kernel in guests if kernel != "host"]
+    return kernels
 
 
 def deb_matches_kernel(deb, kernel):
@@ -170,14 +165,12 @@ def deb_matches_kernel(deb, kernel):
     return False
 
 
-def check_kernel_sums(bpf_text, sums_dir, other_kernels=()):
-    """Every matrix kernel has a well-formed sums file; no sums file
-    names an unknown kernel; historical 5.15 checksums are retained."""
+def check_kernel_sums(kernels, sums_dir):
+    """Every selector-listed kernel has a well-formed sums file; no
+    sums file names an unknown kernel."""
     problems = []
-    kernels = matrix_kernels(bpf_text)
-    kernels += re.findall(r"- kernel: (v[0-9.]+)\n\s+refusal_control: true", bpf_text)
     if not kernels:
-        return ["bpf-kernels.yml names no matrix kernels"]
+        return ["the selector lists no kernels"]
     for kernel in kernels:
         path = sums_dir / f"{kernel}.sums"
         if not path.is_file():
@@ -204,9 +197,9 @@ def check_kernel_sums(bpf_text, sums_dir, other_kernels=()):
         if not seen:
             problems.append(f"{path.name}: no deb sums recorded")
     if sums_dir.is_dir():
-        known = set(kernels) | set(other_kernels)
+        known = set(kernels)
         extra = sorted(path.name for path in sums_dir.glob("*.sums")
-                       if path.stem not in known and path.stem != "v5.15.221")
+                       if path.stem not in known)
         for name in extra:
             problems.append(f"sums file outside the matrix: {name}")
     return problems
@@ -370,12 +363,7 @@ class BpfKernelsContractTests(unittest.TestCase):
         self.assertEqual([], check_action_pins(self.ci, self.bpf))
 
     def test_kernel_sums_cover_the_matrix(self):
-        # privileged-tests.yml's public-cli guests share the sums directory.
-        priv = (ROOT / ".github" / "workflows" / "privileged-tests.yml").read_text(encoding="utf-8")
-        match = re.search(r"kernel:\s*\[host,([^\]]*)\]", priv)
-        others = [k.strip() for k in match.group(1).split(",")] if match else []
-        self.assertTrue(others, "privileged-tests.yml names no guest kernels")
-        self.assertEqual([], check_kernel_sums(self.bpf, SUMS_DIR, others))
+        self.assertEqual([], check_kernel_sums(selected_kernels(), SUMS_DIR))
 
     def test_deb_names_match_stable_and_rc_tags(self):
         # The same shared vectors the shell release_ok runs (multi-marker
@@ -396,30 +384,26 @@ class BpfKernelsContractTests(unittest.TestCase):
                                  vector["expected"])
 
     def test_active_positives_and_combined_stock_refusals_are_separate(self):
-        self.assertEqual(matrix_kernels(self.bpf),
-                         ["v6.6.157", "v6.12.111", "v6.18.58", "v7.3.1",
-                          "v7.4-rc2"])
-        controls = re.findall(r"- kernel: (v[0-9.]+)\n\s+refusal_control: true", self.bpf)
-        self.assertEqual(controls, ["v6.1.188", "v5.15.221"])
+        # Kernel lists live in the selector (tier contract pins them);
+        # this pins the workflow half: the positive and refusal legs
+        # split on the matrix flag, and the refusal driver runs once.
+        rows = SELECT.BPF_REFUSAL_ROWS
+        self.assertEqual([row["kernel"] for row in rows],
+                         ["v6.1.188", "v5.15.221"])
         self.assertEqual(self.bpf.count("scripts/check-multi-host-refusal.py"), 1)
         self.assertIn("if: matrix.refusal_control != true", self.bpf)
         self.assertIn("if: matrix.refusal_control == true", self.bpf)
 
     def test_gate1_matrix_pins_the_newest_mainline_cell(self):
-        expected = ["v6.6.157", "v6.12.111", "v6.18.58", "v7.3.1",
-                    "v7.4-rc2"]
-        self.assertEqual(gate1_kernels(self.bpf), expected)
-        # Negative control: dropping the cell from the gate-1 job
-        # alone must change what this pin reads, while the gate-0 pin
-        # still sees all five (it reads the first list only).
-        match = re.search(r"bpf-load-gate1-kernels:.*?kernel: \[(.*?)\]",
-                          self.bpf, re.S)
-        self.assertTrue(match, "bpf-load-gate1-kernels names no matrix")
-        dropped = (self.bpf[:match.start(1)]
-                   + match.group(1).replace(", v7.4-rc2", "")
-                   + self.bpf[match.end(1):])
-        self.assertEqual(gate1_kernels(dropped), expected[:-1])
-        self.assertEqual(matrix_kernels(dropped), expected)
+        # The gate-1 job renders the selector's gate-1 matrix, whose
+        # positives end at the newest mainline cell (the tier contract
+        # pins the full list and the YAML reference).
+        self.assertEqual(SELECT.BPF_POSITIVE_KERNELS[-1], "v7.4-rc2")
+        _, matrices = SELECT.build_selection(
+            "bpf-kernels", "push", "refs/heads/dev/v0.8.0", "a" * 40,
+            "full", {"known"}, "dev/v0.8.0")
+        self.assertEqual(matrices["matrix_bpf_gate1"]["kernel"],
+                         SELECT.BPF_POSITIVE_KERNELS)
 
     def test_tag_pushes_trigger_nothing(self):
         self.assertEqual([], check_no_tag_triggers(self.bpf))
@@ -450,31 +434,33 @@ class BpfKernelsContractTests(unittest.TestCase):
                       check_no_tag_triggers(dropped_pr))
 
     def test_lib_cells_run_in_66_and_612_guests(self):
-        match = re.search(r"lib-cells-kernels:.*?matrix:\n\s+kernel: \[(.*?)\]",
-                          self.bpf, re.S)
-        self.assertTrue(match, "lib-cells-kernels names no matrix kernels")
-        kernels = [kernel.strip() for kernel in match.group(1).split(",")]
-        self.assertEqual(kernels, ["v6.6.157", "v6.12.111"])
+        # The guest list lives in the selector (tier contract pins it);
+        # this pins the workflow half: the vng driver runs twice (boot
+        # check plus cells) in a job with a C toolchain.
+        self.assertEqual(SELECT.LIB_CELL_KERNELS,
+                         ["v6.6.157", "v6.12.111"])
         self.assertEqual(self.bpf.count("scripts/ci/lib-cells-vng.sh"), 2)
-        job = self.bpf[match.start():self.bpf.index("bpf-load-host:")]
+        job = self.bpf[self.bpf.index("  lib-cells-kernels:"):
+                       self.bpf.index("  bpf-load-host:")]
         self.assertIn("gcc", job)
 
     def test_lib_cells_job_installs_the_provider_toolchain(self):
         # The guest shares the runner rootfs, so the provider cells see
         # only what this job installs: SoftHSM plus the p11-kit headers
         # the privileged test shards install.
-        match = re.search(r"lib-cells-kernels:.*?matrix:\n\s+kernel: \[(.*?)\]",
-                          self.bpf, re.S)
-        self.assertTrue(match, "lib-cells-kernels names no matrix kernels")
-        job = self.bpf[match.start():self.bpf.index("bpf-load-host:")]
+        job = self.bpf[self.bpf.index("  lib-cells-kernels:"):
+                       self.bpf.index("  bpf-load-host:")]
         for package in ("softhsm2", "libp11-kit-dev"):
             with self.subTest(package=package):
                 self.assertIn(package, job)
 
     def test_only_515_runs_the_denial_cell_for_its_denied_branch(self):
-        branches = re.findall(r"- kernel: (v[0-9.]+)\n\s+refusal_control: true\n(?:\s+#.*\n)*\s+denial_branch: (\w+)",
-                              self.bpf)
-        self.assertEqual(branches, [("v5.15.221", "denied")])
+        # The refusal rows live in the selector (tier contract pins
+        # them); this pins that only 5.15 carries the denied branch and
+        # the workflow passes it to the refusal driver.
+        denied = [row["kernel"] for row in SELECT.BPF_REFUSAL_ROWS
+                  if row.get("denial_branch") == "denied"]
+        self.assertEqual(denied, ["v5.15.221"])
         self.assertIn("--denial \"${{ matrix.denial_branch }}\"", self.bpf)
 
     def test_concurrency_cancels_only_test_and_task_pushes(self):

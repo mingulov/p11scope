@@ -27,7 +27,7 @@ FULL_RUN_ID = 43
 PRIV_WORKFLOW_ID = 72
 FULL_JOB = "pkcs11-check-full"
 REQUIRED = (
-    "dedupe", "lint", "audit", "tests", "bpf-noninterference", "scripts", "archive-log",
+    "dedupe", "select", "lint", "audit", "tests", "bpf-noninterference", "scripts", "archive-log",
     "contracts-1", "contracts-2", "contracts-3", "contracts-4",
     "contracts-5", "contracts-6", "contracts-7", "contracts-8",
     "coverage (rest)", "coverage (contracts:1/6)", "coverage (contracts:2/6)",

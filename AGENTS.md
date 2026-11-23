@@ -157,15 +157,25 @@ Honor authorization already given for the task, check ownership of resources,
 and clean up only resources created by the experiment. Do not disturb an
 unrelated browser, service, VM, container or another agent's capture.
 
-Hosted CI runs privileged tests: GitHub runners provide passwordless root,
-BTF and KVM. `.github/workflows/privileged-tests.yml` runs on every branch push (tag pushes trigger nothing: a release tag rides the commit the branch push already ran):
+Hosted CI is tiered (owner 2026-11-23): pushes to `test/*` and `task/*`
+run the quick tier (lint, audit, tests, contracts, scripts, the privileged
+build/shards/summary, the cheap installed cells, bpf-load-host, and the CLI
+cells on host + v6.6 + v7.3.1); a BPF-crate, toolchain or lockfile change
+adds the full BPF matrix, every guest kernel and the journal/counter
+flavours. Pushes to `dev/*`, `main` and any other branch, pull requests
+and dispatches run the full tier (coverage, every kernel, browsers,
+container image). A `.github/` or `scripts/ci/` change, or any
+unclassified path, runs the full tier. Tag pushes trigger nothing: a
+release tag rides the commit the branch push already ran. GitHub runners
+provide passwordless root, BTF and KVM:
 - the curated privileged library cells (`scripts/run-privileged-lib-tests.sh`,
   sharded, with a coverage check);
 - the system-scale capture cells;
 - the public CLI cells on the runner kernel and in virtme-ng guests;
-- real Firefox and Chromium cells (Playwright, strict).
+- real Firefox and Chromium cells (Playwright, strict; full tier only).
 
-`bpf-kernels.yml` loads every program across kernels. Keep both green for
+`bpf-kernels.yml` loads every program across kernels on the full tier
+(quick runs bpf-load-host). Keep both green for
 capture, attachment, BPF, discovery and lifecycle changes, and add a cell when
 a mode or scope ships. Kernels, distributions, long cells and quiet performance
 runs that CI lacks still need authorized hosts.

@@ -39334,6 +39334,10 @@ fn prefault_manifest_getter_data_keeps_progress_across_a_spent_frame_before_enum
         .expect("a deferred pass saves its cursor")
         .clone();
     assert_eq!(cursor.ranges.len(), 2, "the ranges survive the yield");
+    assert!(
+        !cursor.enumerated,
+        "the yield happens before enumeration runs"
+    );
     assert_eq!(
         cursor.ranges[0].next_addr, ranges[0].1,
         "the finished range stays finished"
@@ -39437,6 +39441,10 @@ fn prefault_manifest_getter_data_keeps_progress_when_the_frame_expires_mid_enume
         .expect("a deferred pass saves its cursor")
         .clone();
     assert_eq!(cursor.ranges.len(), 2, "the ranges survive the yield");
+    assert!(
+        !cursor.enumerated,
+        "the yield happens during enumeration, before the merge"
+    );
     assert_eq!(
         cursor.ranges[0].next_addr,
         low as u64 + 65536,
@@ -39514,6 +39522,10 @@ fn prefault_manifest_getter_data_keeps_progress_when_the_frame_expires_mid_index
         .expect("a deferred pass saves its cursor")
         .clone();
     assert_eq!(cursor.ranges.len(), 66, "the ranges survive the yield");
+    assert!(
+        !cursor.enumerated,
+        "the yield restores carried ranges, before the merge"
+    );
     assert_eq!(
         cursor.ranges[0].next_addr, ranges[0].1,
         "the finished range stays finished"
@@ -39595,6 +39607,10 @@ fn prefault_manifest_getter_data_keeps_progress_when_the_frame_expires_mid_merge
         .expect("a deferred pass saves its cursor")
         .clone();
     assert_eq!(cursor.ranges.len(), 66, "the ranges survive the yield");
+    assert!(
+        !cursor.enumerated,
+        "the yield restores carried ranges, before the merge completes"
+    );
     assert_eq!(
         cursor.ranges[0].next_addr, ranges[0].1,
         "the finished range stays finished"
@@ -39665,6 +39681,7 @@ fn prefault_manifest_getter_data_keeps_progress_when_the_frame_expires_mid_proof
         "premise: the first pass warms one range and defers"
     );
     engine.set_prefault_frame_trip_for_test(GetterPrefaultStrideSite::Proof, 1);
+    let proof_before = engine.prefault_proof_attempts_for_test();
     let outcome = engine.prefault_manifest_getter_data(id, &sites);
     assert_eq!(
         outcome,
@@ -39677,6 +39694,15 @@ fn prefault_manifest_getter_data_keeps_progress_when_the_frame_expires_mid_proof
         .expect("a deferred pass saves its cursor")
         .clone();
     assert_eq!(cursor.ranges.len(), 2, "the ranges survive the yield");
+    assert!(
+        cursor.enumerated,
+        "reconciliation completed before the proof yield"
+    );
+    assert_eq!(
+        engine.prefault_proof_attempts_for_test(),
+        proof_before,
+        "the yield happens before any further proof"
+    );
     assert_eq!(
         cursor.ranges[0].next_addr, ranges[0].1,
         "the finished range stays finished"
@@ -39739,6 +39765,10 @@ fn prefault_manifest_getter_data_keeps_progress_when_the_frame_expires_mid_read(
         .expect("a deferred pass saves its cursor")
         .clone();
     assert_eq!(cursor.ranges.len(), 2, "the ranges survive the yield");
+    assert!(
+        cursor.enumerated,
+        "reconciliation completed before the read yield"
+    );
     assert_eq!(
         cursor.ranges[0].next_addr,
         low as u64 + 65536,

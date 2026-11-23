@@ -281,6 +281,15 @@ pub(crate) mod test_seam {
         body()
     }
 
+    /// An observer in the initial PID namespace with its own `/proc`:
+    /// the agreeing numbering, independent of the test host.
+    pub(crate) fn initial() -> PidNumbering {
+        PidNumbering {
+            observer: super::ObserverPidNs::Initial,
+            proc_view: super::ProcView::Own,
+        }
+    }
+
     /// An observer in a nested PID namespace with its own `/proc`.
     pub(crate) fn nested() -> PidNumbering {
         PidNumbering {

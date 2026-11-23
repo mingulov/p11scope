@@ -72,9 +72,11 @@ const MAX_MOUNTINFO_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_MOUNTINFO_ENTRIES: usize = 1_048_576;
 /// One operation's proof allowance on every pass: the pin-time
 /// self-mapping probe reads through `allowed_io`, so its proof range
-/// is this per-operation leg (shared with `ScanLimits::default`, so
-/// the initial pin and every retry offer the same range), never the
-/// ordinary maps scanner's byte cap above.
+/// is this per-operation leg, never the ordinary maps scanner's byte
+/// cap above. Equal to `ScanLimits::default().per_object_bytes` —
+/// the initial pin and every retry offer the same range — pinned by
+/// `learned_retry_total_covers_each_operation_proof_range`, which
+/// derives the retry total from the default and fails on any drift.
 pub(crate) const PROOF_PER_OPERATION_IO_BYTES: u64 = 256 * 1024 * 1024;
 /// Worst-case re-proof I/O for one learned-pin retry: a full mount
 /// table plus one full per-operation maps proof plus a chunk of
@@ -693,7 +695,9 @@ impl Default for ScanLimits {
             // bytes on disk with 63,639,548 readable data bytes, so the
             // old 64 MiB allowance starved its snapshots; 256 MiB holds
             // it with margin while still bounding the worst case.
-            per_object_bytes: PROOF_PER_OPERATION_IO_BYTES,
+            // Numeric literal: the artifact contract parses this
+            // expression to check the docs quote it.
+            per_object_bytes: 256 * 1024 * 1024,
             total_bytes: DETAILED_CAPTURE_IO_BYTES,
         }
     }

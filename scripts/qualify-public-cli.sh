@@ -867,12 +867,6 @@ degraded=modfs=='overlayfs' or no_witness
 owned_other=[g for g in owned_gaps if g.get('subject')!='module admission changed' and not named_unbound(g)]
 assert owned_other==[], 'inventory gaps about owned module: %r' % owned_other
 unproven=[]
-# The facts-retained refresh refusal only comes with a
-# run-deadline straddle on every substrate: the deadline gap must
-# be present in the same run, and at most one retained row per
-# owning caller. This runs outside the degraded branch so a
-# witness-available report cannot smuggle a lone or duplicated
-# retained row past the qualifier.
 # The run-deadline row carries the same producer shape with or
 # without a companion gap: a clean preparation pass can still hit
 # the run deadline (the retained-refresh shape proves it), so the
@@ -892,6 +886,21 @@ if deadline:
         assert 'budget' in g and g['budget'] is None, 'malformed run deadline budget: %r' % (g,)
         assert type(g.get('repeats')) is int and g.get('repeats')>=1, 'malformed run deadline count: %r' % (g,)
     assert len(deadline)==1, 'duplicate run deadline rows: %r' % (deadline,)
+# The producer files every incomplete transaction under the one
+# fixed subject with many possible reasons (operator stop, shared
+# work allowance, membership, process, generation, scan, deep-scan
+# limit, deadline), and only the named deadline disclosure
+# qualifies (CI-GAP-2). A transaction row counts as a deadline
+# only after its exact reason and shape are validated above. The
+# degraded branch below already refuses any other reason —
+# missing, unknown, or a real refusal like the member scan —
+# through its reason list; witness-available reports have no such
+# gate, so this one closes the same hole there. Scoped to
+# transaction rows on the non-degraded branch only.
+if not degraded:
+    tx=[g for g in report.get('gaps',[]) if g.get('subject')=='cgroup scope transaction incomplete']
+    for g in tx:
+        assert g.get('reason')=='cgroup collection deadline reached', 'unrecognized cgroup transaction row: %r' % (g,)
 # The facts-retained refresh refusal only comes with a
 # run-deadline straddle on every substrate: the deadline gap must
 # be present in the same run, and at most one retained row per

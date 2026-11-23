@@ -81,6 +81,14 @@ INSIDE_LEDGER = "LEDGER " + json.dumps({
                             "C_FindObjectsFinal")]})
 
 
+OUTSIDE_LEDGER = "LEDGER " + json.dumps({
+    "schema": "p11scope/public-cli-ledger/v1", "pid": 102, "complete": True,
+    "functions": [{"name": n, "attempts": 500, "successful": 500}
+                  for n in ("C_GenerateRandom", "C_DigestInit", "C_Digest",
+                            "C_FindObjectsInit", "C_FindObjects",
+                            "C_FindObjectsFinal")]})
+
+
 GENERATIONS = {100: 5000, 101: 5001}
 
 
@@ -163,7 +171,7 @@ def run_oracle(report, *, modfs="overlayfs", pin=None):
     if pin is None:
         pin = {"dev": [0, 0], "ino": 0, "sha256": "00"}
     inside_wl = "READY pid=100\nCHILD pid=101\n%s\n" % INSIDE_LEDGER
-    outside_wl = "READY pid=102\nLEDGER y\n"
+    outside_wl = "READY pid=102\n%s\n" % OUTSIDE_LEDGER
     with tempfile.TemporaryDirectory() as raw:
         tmp = Path(raw)
         (tmp / "r.json").write_text(json.dumps(report))
@@ -171,7 +179,7 @@ def run_oracle(report, *, modfs="overlayfs", pin=None):
         (tmp / "out.wl").write_text(outside_wl)
         proc = subprocess.run(
             ["python3", "-I", "-", "r.json", "in.wl", "out.wl",
-             json.dumps(pin), MODPATH, modfs,
+             json.dumps(pin), "500", MODPATH, modfs,
              str(GENERATIONS[100]), str(GENERATIONS[101])],
             input=block, capture_output=True, text=True, timeout=30,
             cwd=str(tmp))
@@ -514,7 +522,8 @@ class GenerationHandoffTests(unittest.TestCase):
     def run_invocation(self, gen, childgen, report=None, optimize=False):
         body = (
             "cell=inventory-cgroup; ext=json; module_fs=overlayfs\n"
-            "%sMODULE=%s\nbefore='%s'\ngen=%s; childgen=%s\n%s"
+            "%sMODULE=%s\nbefore='%s'\ngen=%s; childgen=%s\n"
+            "outside_iters=500\n%s"
             "echo RC=$?\ncat \"$cell.detail\"\n"
             % ("export PYTHONOPTIMIZE=1\n" if optimize else "",
                MODPATH, json.dumps(PUBLISHED_PIN), gen, childgen,
@@ -526,7 +535,7 @@ class GenerationHandoffTests(unittest.TestCase):
             (tmp / "inventory-cgroup-inside.wl").write_text(
                 "READY pid=100\nCHILD pid=101\n%s\n" % INSIDE_LEDGER)
             (tmp / "inventory-cgroup-outside.wl").write_text(
-                "READY pid=102\nLEDGER y\n")
+                "READY pid=102\n%s\n" % OUTSIDE_LEDGER)
             proc = subprocess.run(["bash", "-u", "-c", body],
                                   capture_output=True, text=True,
                                   timeout=30, cwd=raw)

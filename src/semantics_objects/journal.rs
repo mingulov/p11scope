@@ -5128,6 +5128,41 @@ impl JournalAdapter {
     /// Test-only: whether the image's quarantine lifts at the current
     /// void fence (clean, or evidence at or below it).
     #[cfg(test)]
+    /// Test-only: mark one retained open original as an S1-only subject
+    /// of its image's unminted base key (the pre-grant shape the scoped
+    /// recovery meets: `binding_scoped_key` falls back to incarnation 0
+    /// when the binding never minted a key). Returns that key's image.
+    #[cfg(test)]
+    pub(crate) fn pose_unminted_s1only_subject_for_test(
+        &mut self,
+        native: JournalNativeKey,
+    ) -> (u64, u64) {
+        let tag = self
+            .resource_producers
+            .as_ref()
+            .map_or(0, |producers| producers.native_domain().journal_tag());
+        let mut entry = self.open.get_mut(&native).expect("retained original");
+        let key = JournalDomainKey {
+            domain_tag: tag,
+            caller: 0,
+            cookie: entry.image.0,
+            exec: entry.image.1,
+            router: 0,
+            incarnation: 0,
+        };
+        entry.s1only_subject = Some(key);
+        self.s1only_open.insert(native);
+        assert!(!self.keys.contains_key(&key), "the subject key is unminted");
+        key.image()
+    }
+
+    /// Test-only: the image taint's recorded evidence (None: no taint
+    /// entry; Some(None): permanent).
+    #[cfg(test)]
+    pub(crate) fn taint_evidence_for_test(&self, image: (u64, u64)) -> Option<Option<u64>> {
+        self.taint_evidence.get(&image).copied()
+    }
+
     pub(crate) fn taint_lifts_at_fence_for_test(&self, image: (u64, u64)) -> bool {
         !self.image_taint_blocks(image, *self.voided_through)
     }
@@ -36820,6 +36855,50 @@ pub(crate) mod tests {
             .attest_key(&admitted)
             .expect("the image re-enters Joint above the fence");
         assert!(!scene.adapter.is_tainted((COOKIE, EXEC)), "lifted");
+    }
+
+    /// Site table, S1-only subject without a minted key: an S1-only
+    /// original whose subject key was never minted is an affecting call
+    /// no Joint feed owns, so the image's object state is unprovable for
+    /// the rest of that image's life (a new exec is a new image). The
+    /// taint is permanent by design and disclosed at every later birth
+    /// claim on the image (`joint_birth_claim_ImageTainted`); no void or
+    /// later quiet cut may lift it. The live-shaped twin is
+    /// `key_operation_s1only_sibling_mixed_loss_overrides_proof_refusal`.
+    #[test]
+    fn object_journal_unminted_s1only_subject_taints_its_image_permanently() {
+        let mut scene = Scene::new(image_default());
+        let sign = function_id("C_SignInit");
+        let mut begin = begin_bytes(1, 1, sign, 0);
+        put_u64(&mut begin, 88, 0x9090_9090_9090_9090);
+        begin[126] = 1;
+        let _ = scene.ingest(&begin);
+        let end = end_bytes(
+            &begin,
+            p11scope_ebpf_common::object_wire::OBJECT_ACTION_ACCESS,
+            0,
+            ENTRY_NS + 50,
+        );
+        let _ = scene.ingest(&end);
+        let image = scene.adapter.pose_unminted_s1only_subject_for_test((1, 1));
+        let frontier = scene.adapter.consumed_through;
+        let (failure, pending) = scene
+            .adapter
+            .refuse_s1only_subjects(&mut scene.model)
+            .expect("one S1-only subject");
+        assert!(pending.is_none(), "settles inline");
+        assert_eq!(failure.gap, JournalGap::ImageTainted);
+        assert!(scene.adapter.is_tainted(image), "the image is tainted");
+        assert_eq!(
+            scene.adapter.taint_evidence_for_test(image),
+            Some(None),
+            "the taint carries no fence: no void can lift it"
+        );
+        // Even a void past every consumed ordinal leaves it in place.
+        *scene.adapter.voided_through.edit() = frontier.saturating_add(1_000);
+        assert!(!scene.adapter.taint_lifts_at_fence_for_test(image));
+        assert!(!scene.adapter.lift_fenced_image_taint(image));
+        assert!(scene.adapter.is_tainted(image), "still tainted");
     }
 
     /// Twin: a state-changing pre-grant-released call that returns only

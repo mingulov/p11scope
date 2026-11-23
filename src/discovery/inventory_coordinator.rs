@@ -36948,7 +36948,8 @@ int main(void) {
     }
 
     /// Every staged use edge belongs to `holder`: exact attribution
-    /// with no caller edge anywhere else.
+    /// with no caller edge anywhere else. Only edges with a positive
+    /// count count: projection leaves a zero-count edge per holder.
     fn assert_only_holder_edged(native: &NativeScene, holder: CallerId) {
         let edges: Vec<(CallerId, u64)> = native
             .scene
@@ -36956,6 +36957,7 @@ int main(void) {
             .registry
             .edges()
             .map(|edge| (edge.caller, edge.entry_count))
+            .filter(|&(_, count)| count > 0)
             .collect();
         assert!(!edges.is_empty(), "the bound rows edged their holder");
         for &(held, _) in &edges {
@@ -36965,12 +36967,14 @@ int main(void) {
 
     /// The staged use edges belong exactly to `holders`, one edge per
     /// holder: every row bound its own holder, nothing else edged.
+    /// Only edges with a positive count count (see above).
     fn assert_holders_edged(native: &NativeScene, holders: &[CallerId]) {
         let mut edged: Vec<CallerId> = native
             .scene
             .coordinator
             .registry
             .edges()
+            .filter(|edge| edge.entry_count > 0)
             .map(|edge| edge.caller)
             .collect();
         edged.sort();
@@ -37696,10 +37700,10 @@ int main(void) {
                 1,
                 "the drain holds exactly the row past the pool"
             );
-            let census = bound_census(&native);
+            native.scene.coordinator.commit_batch(false).unwrap();
             assert_eq!(
-                (census.0, census.1),
-                (60, 59),
+                bound_census(&native),
+                (60, 59, 1),
                 "59 rows decided, the held row waits"
             );
             native.witness(Vec::new());
@@ -37812,10 +37816,10 @@ int main(void) {
                 1,
                 "the gated row holds while its hook is deferred"
             );
-            let census = bound_census(&native);
+            native.scene.coordinator.commit_batch(false).unwrap();
             assert_eq!(
-                (census.0, census.1),
-                (1, 0),
+                bound_census(&native),
+                (1, 0, 1),
                 "the gated row waits undecided"
             );
             // The next lifecycle drain completes the small hook; the
@@ -37830,7 +37834,7 @@ int main(void) {
                     .coordinator
                     .registry
                     .edges()
-                    .all(|edge| edge.caller != gated[0]),
+                    .all(|edge| edge.caller != gated[0] || edge.entry_count == 0),
                 "the gated row edged nothing"
             );
             assert!(

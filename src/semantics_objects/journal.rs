@@ -3005,6 +3005,83 @@ impl JournalAdapter {
         }
     }
 
+    /// Test-only: stage foreign refused rows above every cut (clear,
+    /// barring nothing), each with its census membership, so a bounded
+    /// seal scan ends in its refused phase. The barrier visits opens by
+    /// key then refused by index, so these rows are always the scan's
+    /// tail: a final refused row spending the last credit pins the
+    /// exact-fit boundary (clear at zero must yield before settlement).
+    #[cfg(test)]
+    pub(crate) fn populate_foreign_refused_rows_for_test(&mut self, rows: usize) {
+        let template = *self.open.values().next().expect("a retained open entry");
+        let foreign = (
+            template.image.0 ^ 0x5eed_0001,
+            template.image.1 ^ 0x5eed_0001,
+        );
+        assert!(
+            !self.image_keys.contains_key(&foreign),
+            "foreign refused image stays unbound"
+        );
+        for index in 0..rows as u64 {
+            let refused = RefusedBegin {
+                cut: u64::MAX / 2 + index,
+                image: foreign,
+                pid_tgid: 0x0100_0001,
+                function: 0,
+                slot: 0,
+                session: 0,
+                mechanism: 0,
+                slot_id: 0,
+                user_type: 0,
+                capture: 0,
+                flags: 0,
+                entry_ns: u64::MAX / 2 + 10_000 + index,
+                session_status: 0,
+                layout: 0,
+                corroborated_return: None,
+            };
+            self.retained_refused_inc(&refused);
+            self.refused.push(refused);
+        }
+    }
+
+    /// Test-only: stage one unbound refused barrier row at the end of the
+    /// refused table, on a foreign image at `frontier` so it bars every
+    /// seal past it. A bounded scan must visit every clear before it;
+    /// unlike a clear exact-fit, a barrier exact-fit decides at zero
+    /// (a retry advances nothing, so no settlement credit is owed).
+    #[cfg(test)]
+    pub(crate) fn populate_unbound_refused_barrier_row_for_test(&mut self, frontier: u64) {
+        let template = *self.open.values().next().expect("a retained open entry");
+        let foreign = (
+            template.image.0 ^ 0x5eed_0002,
+            template.image.1 ^ 0x5eed_0002,
+        );
+        assert!(
+            !self.image_keys.contains_key(&foreign),
+            "unbound refused image stays unbound"
+        );
+        let refused = RefusedBegin {
+            cut: frontier,
+            image: foreign,
+            pid_tgid: 0x0100_0002,
+            function: 0,
+            slot: 0,
+            session: 0,
+            mechanism: 0,
+            slot_id: 0,
+            user_type: 0,
+            capture: 0,
+            flags: 0,
+            entry_ns: u64::MAX / 2 + 20_000,
+            session_status: 0,
+            layout: 0,
+            corroborated_return: None,
+        };
+        self.retained_refused_inc(&refused);
+        self.refused.push(refused);
+    }
+
     /// Test-only: stage one unbound barrier row at the end of the open
     /// table (native `(u64::MAX, 0)`, past every
     /// [`Self::populate_foreign_open_rows_for_test`] clear), on the same

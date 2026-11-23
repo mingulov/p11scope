@@ -2311,6 +2311,17 @@ pub(crate) struct JournalAdapter {
     /// instead of reading every row synchronously before charging.
     #[cfg(test)]
     barrier_row_visits: std::cell::Cell<usize>,
+    /// Test-only count of open rows scanned by replay sizing. Sizing must
+    /// be O(1) from maintained cardinalities, never three full table walks
+    /// before the first barrier debit. Never authority.
+    #[cfg(test)]
+    replay_sample_visits: std::cell::Cell<usize>,
+    /// Test-only count of staging rows examined by birth-coverage checks.
+    /// Coverage shares the barrier's cursor (one evaluation per visited row,
+    /// resuming without rereading the prefix), never a separate full scan
+    /// per seal attempt. Never authority.
+    #[cfg(test)]
+    birth_cover_evals: std::cell::Cell<usize>,
     /// Test-only cumulative paid units through adapter recovery slices
     /// (voids, deferred rejections, taint drains), harvested from each
     /// slice's credit after it runs. Every journal leaf, model row,
@@ -2590,6 +2601,10 @@ impl JournalAdapter {
             awaits_terminal_checks: std::cell::Cell::new(0),
             #[cfg(test)]
             barrier_row_visits: std::cell::Cell::new(0),
+            #[cfg(test)]
+            replay_sample_visits: std::cell::Cell::new(0),
+            #[cfg(test)]
+            birth_cover_evals: std::cell::Cell::new(0),
             #[cfg(test)]
             test_recovery_units: std::cell::Cell::new(0),
             inline_credit: SCOPED_RECOVERY_SLICE,
@@ -2972,6 +2987,21 @@ impl JournalAdapter {
     #[cfg(test)]
     pub(crate) fn barrier_row_visits_for_test(&self) -> usize {
         self.barrier_row_visits.get()
+    }
+
+    /// Test-only count of open rows scanned by replay sizing so far.
+    /// Sizing must stay O(1) (zero), never three full walks per attempt.
+    #[cfg(test)]
+    pub(crate) fn replay_sample_visits_for_test(&self) -> usize {
+        self.replay_sample_visits.get()
+    }
+
+    /// Test-only count of staging rows examined by birth-coverage checks
+    /// so far. Coverage shares the barrier's cursor, so this equals the
+    /// barrier visits on a clear table (one evaluation per visited row).
+    #[cfg(test)]
+    pub(crate) fn birth_cover_evals_for_test(&self) -> usize {
+        self.birth_cover_evals.get()
     }
 
     /// Test-only: stage `rows` synthetic unconverted open entries cloned
@@ -10173,10 +10203,16 @@ impl JournalAdapter {
         birth_cut: u64,
     ) -> bool {
         self.open.values().all(|entry| {
+            #[cfg(test)]
+            self.birth_cover_evals
+                .set(self.birth_cover_evals.get().saturating_add(1));
             entry.image != image
                 || entry.begin_ordinal > birth_cut
                 || !(self.converts_here(key, live, entry) || entry.converted_for == Some(key))
         }) && self.refused.iter().all(|refused| {
+            #[cfg(test)]
+            self.birth_cover_evals
+                .set(self.birth_cover_evals.get().saturating_add(1));
             refused.image != image
                 || refused.cut > birth_cut
                 || !self.refused_converts_here(key, live, refused)

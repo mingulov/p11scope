@@ -204,6 +204,13 @@ impl ReplayBounds {
             .values()
             .filter(|entry| entry.abandon.is_some())
             .count();
+        #[cfg(test)]
+        adapter.replay_sample_visits.set(
+            adapter
+                .replay_sample_visits
+                .get()
+                .saturating_add(adapter.open.len().saturating_mul(3)),
+        );
         let pending = model.replay_pending_count();
         let steps = refused
             .checked_add(usize::from(refused != 0))?

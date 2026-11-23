@@ -1046,6 +1046,22 @@ impl ModelState {
         self.test_retire_units
     }
 
+    /// Test-only: total retained bindings plus total retained call keys
+    /// across held domains. A domain retirement visits at most these
+    /// many views/bindings (views are bindings) and call tickets,
+    /// so a void bound samples this for its fence term.
+    #[cfg(test)]
+    pub(super) fn domain_rows_for_test(&self) -> (usize, usize) {
+        self.domains
+            .values()
+            .fold((0usize, 0usize), |(bindings, calls), state| {
+                (
+                    bindings.saturating_add(state.bindings.len()),
+                    calls.saturating_add(state.keys.len()),
+                )
+            })
+    }
+
     /// Test-only: give one held (registering if absent) domain `rows`
     /// live sessions, each with one live view, plus `rows` pending call
     /// tickets, so a retirement has many model rows under one domain.

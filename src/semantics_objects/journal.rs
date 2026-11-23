@@ -2287,6 +2287,15 @@ pub(crate) struct JournalAdapter {
     /// instead of reading every row synchronously before charging.
     #[cfg(test)]
     barrier_row_visits: std::cell::Cell<usize>,
+    /// Test-only cumulative paid units through adapter recovery slices
+    /// (voids, deferred rejections, taint drains), harvested from each
+    /// slice's credit after it runs. Every journal leaf, model row,
+    /// claim-probe deposit unit, doom decision and empty-table probe
+    /// counts; the leaf and retire visitors name strict subsets. A
+    /// budget-1 Idle poll with void work outstanding must advance this
+    /// by exactly one, so a void stall fails at its poll. Never authority.
+    #[cfg(test)]
+    test_recovery_units: std::cell::Cell<usize>,
     /// The inline allowance a deciding call may spend on its own
     /// rejection (at most one credit; a budgeted caller lowers it to
     /// what its service budget has left) and what the last deciding
@@ -2550,6 +2559,8 @@ impl JournalAdapter {
             awaits_terminal_checks: std::cell::Cell::new(0),
             #[cfg(test)]
             barrier_row_visits: std::cell::Cell::new(0),
+            #[cfg(test)]
+            test_recovery_units: std::cell::Cell::new(0),
             inline_credit: SCOPED_RECOVERY_SLICE,
             inline_spent: 0,
             barrier_scan: None,
@@ -2817,6 +2828,103 @@ impl JournalAdapter {
     #[cfg(test)]
     pub(crate) fn leaf_visits_for_test(&self) -> usize {
         self.test_leaf_visits.get()
+    }
+
+    /// Test-only cumulative paid units through adapter recovery slices
+    /// so far: every unit a void, deferred rejection or taint drain
+    /// debited, harvested per slice. Journal leaves and model retire
+    /// units are subsets; claim-probe deposits, doom decisions and
+    /// empty-table probes make up the rest.
+    #[cfg(test)]
+    pub(crate) fn recovery_units_for_test(&self) -> usize {
+        self.test_recovery_units.get()
+    }
+
+    /// Test-only: void work outstanding on the next Idle tick. Deferred
+    /// rejections always drain first (even on a terminal adapter); past
+    /// them, a terminal adapter (invalidated, stopped, consumed through)
+    /// reports no void, while a healthy one works while a stream break,
+    /// a scoped break, a recovery, or taint-overflow marks stand. The
+    /// Idle void path spends the tick's budget while this holds (or
+    /// reports no void once it clears), so a budget-1 driver asserts
+    /// exactly one spent unit per outstanding poll.
+    #[cfg(test)]
+    pub(crate) fn void_outstanding_for_test(&self) -> bool {
+        if self.rejection_pending() {
+            return true;
+        }
+        if self.invalidated || self.stopped || self.consumed_through == u64::MAX {
+            return false;
+        }
+        self.stream_broken
+            || self.scoped_break.is_some()
+            || self.scoped_recovery.is_some()
+            || self.has_taint_overflow_pending()
+    }
+
+    /// Test-only maximum queued claims on one staged identity. A claim
+    /// probe over an identity (no image) prices exactly its queued
+    /// claims, so this bounds every classify/wipe probe in a void.
+    #[cfg(test)]
+    pub(crate) fn max_queued_claims_for_test(&self) -> usize {
+        self.claims
+            .values()
+            .map(|claimants| claimants.values().map(VecDeque::len).sum::<usize>())
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Test-only count of staged open entries carrying an unbounded
+    /// abandonment (the same predicate the preservation read uses).
+    /// Only these rows can need a preservation basis, a doom decision
+    /// or a wipe excuse probe; settled rows cost their reads alone.
+    #[cfg(test)]
+    pub(crate) fn unbounded_open_for_test(&self) -> usize {
+        self.open
+            .values()
+            .filter(|entry| {
+                entry.abandon.as_ref().is_some_and(|staged| {
+                    abandon_disposition(staged.abandon.reason())
+                        == Some(AbandonDisposition::UnboundedInvalidation)
+                })
+            })
+            .count()
+    }
+
+    /// Test-only deferred-rejection backlog: queued plans plus whether a
+    /// recovery cursor is active. The void drains these before its own
+    /// recovery under the same budget, so a void bound samples this.
+    #[cfg(test)]
+    pub(crate) fn rejections_for_test(&self) -> (usize, bool) {
+        (self.rejection_queue.len(), self.rejection_active.is_some())
+    }
+
+    /// Test-only pending void scope: stuck domain keys and stuck images
+    /// from the active recovery, else the pending scoped break, plus
+    /// whether the active recovery voids the whole stream (a stream
+    /// recovery carries an empty scope and fences every key instead);
+    /// `None` when no void stands. A scoped fence visits each stuck
+    /// domain once.
+    #[cfg(test)]
+    pub(crate) fn void_scope_for_test(&self) -> Option<(usize, usize, bool)> {
+        if let Some(recovery) = self.scoped_recovery.as_ref() {
+            return Some((
+                recovery.scope.domains.len(),
+                recovery.scope.images.len(),
+                recovery.stream,
+            ));
+        }
+        let scope = self.scoped_break.as_ref()?;
+        Some((scope.domains.len(), scope.images.len(), false))
+    }
+
+    /// Test-only harvest of one finished recovery slice's debited units
+    /// into the cumulative counter.
+    #[cfg(test)]
+    fn harvest_recovery_units(&self, credit: &Credit<'_>) {
+        let spent = credit.spent();
+        self.test_recovery_units
+            .set(self.test_recovery_units.get() + spent);
     }
 
     /// Test-only count of terminal-input checks so far.
@@ -4386,11 +4494,15 @@ impl JournalAdapter {
         let mut credit = Credit::slice(SCOPED_RECOVERY_SLICE, budget);
         while !self.taint_overflow_pending.is_empty() {
             let Some(paid) = credit.pay() else {
+                #[cfg(test)]
+                self.harvest_recovery_units(&credit);
                 return false;
             };
             self.taint_overflow_step(paid);
         }
         self.taint_overflow_after = None;
+        #[cfg(test)]
+        self.harvest_recovery_units(&credit);
         true
     }
 
@@ -10161,12 +10273,17 @@ impl JournalAdapter {
         budget: &mut usize,
     ) -> bool {
         let mut credit = Credit::slice(SCOPED_RECOVERY_SLICE, budget);
-        super::recovery_cursor::run_slice(
-            &mut leaves::JournalLeaves::new(self),
-            &mut model.state.leaves(),
+        let mut journal = leaves::JournalLeaves::new(&mut *self);
+        let mut model_leaves = model.state.leaves();
+        let done = super::recovery_cursor::run_slice(
+            &mut journal,
+            &mut model_leaves,
             recovery,
             &mut credit,
-        )
+        );
+        #[cfg(test)]
+        self.harvest_recovery_units(&credit);
+        done
     }
 
     /// The one preservation decision for an unbounded abandonment

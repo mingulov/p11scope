@@ -1033,6 +1033,12 @@ pub(crate) struct SemanticBindingSet {
     cursor: usize,
     limit: usize,
     provider_limit: usize,
+    /// Monotonic revision of the absence-scan inputs (binding membership,
+    /// order, per-binding scope and provider associations). Bumped only
+    /// when one of those inputs actually changes — never on a no-op
+    /// re-proof — so an Idle episode can tell a real admission from an
+    /// unchanged refresh without rescanning. Never authority.
+    revision: u64,
     refresh_cursor: Option<(CallerId, PinnedObjectId)>,
     /// Registry module-find evaluations during selection (test count).
     #[cfg(test)]
@@ -1139,6 +1145,7 @@ impl SemanticBindingSet {
             cursor: 0,
             limit: MAX_INSTANCES,
             provider_limit: MAX_INSTANCES,
+            revision: 0,
             refresh_cursor: None,
             #[cfg(test)]
             refresh_find_visits: 0,
@@ -1151,6 +1158,11 @@ impl SemanticBindingSet {
             refused_successors: HashMap::new(),
             install_lease: None,
         }
+    }
+
+    /// The current absence-scan revision for Idle invalidation.
+    pub(crate) fn absence_revision(&self) -> u64 {
+        self.revision
     }
 
     /// Install pre-reserved destination storage for a newly promoted

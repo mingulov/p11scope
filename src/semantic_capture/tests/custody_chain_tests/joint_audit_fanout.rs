@@ -20781,6 +20781,291 @@ fn idle_recovery_yields_collection_when_budget_spent() {
     }
 }
 
+/// An Idle admission between polls rescans before collection: after the
+/// re-arm's first absence scan completes with the scoped void outstanding,
+/// a direct binder admits a second caller without staging EVENTS. The next
+/// Idle polls must examine the admitted caller's eligible target before any
+/// void unit or collection runs — the cached completion flag and its cursors
+/// reset on the admission revision move. The unchanged-input re-arm twin
+/// keeps guarding the pacing (no rescan without an admission).
+#[test]
+fn joint_machine_idle_admission_between_polls_rescans_before_collection() {
+    use crate::discovery::caller_registry::CallerId;
+    use crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding;
+
+    // Rearm prefix (void outstanding, Idle) — the re-arm fence shape.
+    let mut fixture = MachineScene::new(1);
+    assert!(
+        fixture.scene.producers.journal_linked(),
+        "the fence is a linked-lane mechanism"
+    );
+    fixture.prime(1);
+    let pid = std::process::id();
+    fixture.scene.push(pid, 0, "C_SignInit", 2);
+    fixture.scene.push(pid, 0, "C_SignUpdate", 3);
+    fixture.scene.push(pid, 0, "C_SignFinal", 4);
+    fixture.reach_phase("Births");
+    fixture.reach_phase("Audited");
+    let mut applied = false;
+    for _ in 0..64 {
+        match fixture.service(1) {
+            Ok(crate::inventory_semantics::JointServiceProgress::Published) => break,
+            Ok(crate::inventory_semantics::JointServiceProgress::Pending) => {}
+            Err(reason) => panic!("the healthy commit must not refuse: {reason:?}"),
+        }
+        if fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .joint_publication_applied()
+        {
+            applied = true;
+            break;
+        }
+    }
+    assert!(applied, "the fenced quantum applies before the refusal");
+    fixture.native.fail_native_once = Some(SemanticRefusal::Unavailable);
+    assert_eq!(
+        fixture.service(1024),
+        Err(SemanticRefusal::Unavailable),
+        "the posed refusal latches mid-tracking"
+    );
+    assert_eq!(
+        fixture.machine.disposition_reason(),
+        Some(SemanticRefusal::Unavailable)
+    );
+    assert_eq!(
+        fixture.rearm("semantic_unavailable"),
+        Some(false),
+        "the tracked quantum re-arms (no demand was bound)"
+    );
+    assert_eq!(fixture.machine.diagnostic_snapshot_for_test().0, "Idle");
+    fixture.scene.push(pid, 0, "C_CreateObject", 5);
+
+    // Drive three polls to complete the first scan with the void
+    // outstanding: two scan polls spend no void units, the third sets the
+    // completion flag and voids one unit without collecting.
+    let units_start = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .recovery_units_for_test();
+    let reads_start = fixture.native.absence_reads.len();
+    let collect_start = fixture.native.collect_calls;
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .void_outstanding_for_test(),
+        "the re-arm leaves void work outstanding"
+    );
+    for poll in 1..=2 {
+        let units_before = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .recovery_units_for_test();
+        fixture.service(1).expect("the scan never refuses");
+        let units_after = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .recovery_units_for_test();
+        assert_eq!(
+            units_after, units_before,
+            "scan poll {poll} spends no void units"
+        );
+        assert_eq!(
+            fixture.native.collect_calls, collect_start,
+            "no collection runs during the scan"
+        );
+        assert_eq!(
+            fixture.machine.diagnostic_snapshot_for_test().0,
+            "Idle",
+            "the scan stays Idle"
+        );
+    }
+    fixture.service(1).expect("the completing poll never refuses");
+    let (done, _, _, binding, after, entry) = fixture.machine.absence_episode_for_test();
+    assert!(done, "the first absence scan completes");
+    assert_eq!(
+        (binding, after, entry),
+        (0, None, 0),
+        "completion resets the cursors"
+    );
+    let units_after_scan = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .recovery_units_for_test();
+    assert_eq!(
+        units_after_scan,
+        units_start + 1,
+        "the completing poll voids one unit"
+    );
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .void_outstanding_for_test(),
+        "void work still stands after the scan"
+    );
+    assert_eq!(
+        fixture.native.collect_calls, collect_start,
+        "no collection runs before the void drains"
+    );
+    let reads_after_scan = fixture.native.absence_reads.len();
+    assert!(
+        reads_after_scan >= reads_start,
+        "the scan ran (it may skip the born binding without acquiring)"
+    );
+
+    // Admit a second caller between polls without staging EVENTS.
+    let rev_before = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .semantic_absence_revision();
+    let caller_b = CallerId(424242);
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .semantic_bindings()
+            .get(caller_b)
+            .is_none(),
+        "the admitted caller is fresh"
+    );
+    let (domain, pin_b, image_b, module_b) = {
+        let coordinator = &fixture.scene.real.scene.coordinator;
+        let binding_a = coordinator
+            .joint_absence_binding(0)
+            .expect("the first binding stands");
+        let domain = fixture.scene.real.lane.domain();
+        assert_eq!(
+            binding_a.domain(),
+            domain,
+            "the first binding is eligible on this lane"
+        );
+        let image_a = binding_a.image();
+        let image_b = p11scope_ebpf_common::ImageIdentity {
+            task_cookie: image_a.task_cookie.wrapping_add(1000),
+            exec_id: image_a.exec_id,
+        };
+        let module_b = fixture.scene.real.modules[0].0.clone();
+        (domain, binding_a.pin(), image_b, module_b)
+    };
+    let binding_b = SemanticCallerBinding::scripted(caller_b, module_b, domain, image_b, pin_b);
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .semantic_bindings_mut()
+        .insert_for_test(binding_b)
+        .expect("the fresh caller binds");
+    let rev_after = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .semantic_absence_revision();
+    assert_eq!(
+        rev_after,
+        rev_before.wrapping_add(1),
+        "admission bumps the revision once"
+    );
+
+    // The rescan must examine the admitted caller before any void unit
+    // or collection runs. A cached completion would void/collect first.
+    let units_before_rescan = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .recovery_units_for_test();
+    let collect_before_rescan = fixture.native.collect_calls;
+    let reads_before_rescan = fixture.native.absence_reads.len();
+    for poll in 1..=5 {
+        let units_before = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .recovery_units_for_test();
+        let collect_before = fixture.native.collect_calls;
+        fixture.service(1).expect("the rescan never refuses");
+        let units_after = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .recovery_units_for_test();
+        let new_reads = &fixture.native.absence_reads[reads_before_rescan..];
+        if new_reads.iter().any(|(_, image, _)| *image == image_b) {
+            assert_eq!(
+                units_after, units_before_rescan,
+                "the rescan spends no void units before examining the admitted caller"
+            );
+            assert_eq!(
+                fixture.native.collect_calls, collect_before_rescan,
+                "no collection starts before the rescan examines the admitted caller"
+            );
+            assert_eq!(
+                fixture.machine.diagnostic_snapshot_for_test().0,
+                "Idle",
+                "the rescan stays Idle"
+            );
+            return;
+        }
+        assert_eq!(
+            units_after, units_before,
+            "rescan poll {poll} spends no void units before examining the admitted caller"
+        );
+        assert_eq!(
+            fixture.native.collect_calls, collect_before,
+            "no collection starts before the rescan examines the admitted caller"
+        );
+        assert_eq!(
+            fixture.machine.diagnostic_snapshot_for_test().0,
+            "Idle",
+            "the rescan stays Idle"
+        );
+    }
+    panic!("the admitted caller's eligible target must be examined within five polls and before any void or collection");
+}
+
 /// E9b: a scoped void sheds barrier-causing unbound staging — a stuck
 /// foreign call (in-flight, never attested) bars seals; the trip
 /// re-arms with scoped recovery that sheds the barrier with loss

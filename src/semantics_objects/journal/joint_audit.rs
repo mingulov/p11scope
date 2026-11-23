@@ -70,12 +70,14 @@ pub(crate) struct IngestedJointQuantum {
     /// stale cursor never skips a newly stuck consumer.
     park_cursor: usize,
     parked_total: usize,
-    /// Production-seal barrier work for this frame's frontier: the
-    /// resumable scan cursor while it runs, plus the completed
-    /// Barrier/Clear decision once it finishes. Both survive
-    /// same-frame retries; staging/binding membership changes drop
-    /// them on next use. Inline, no heap beyond the frame's prepaid
-    /// storage.
+    /// Production-seal scan work for this frame's frontier: the
+    /// resumable paid scan while it runs, plus its final facts and
+    /// prepaid decision credit once it finishes. Both survive same-frame
+    /// retries under an identical input stamp; any change to any seal
+    /// input drops them on next use. Its per-identity aggregates and
+    /// disposal set are bounded by the staged tables
+    /// ([`super::MAX_UNSETTLED_STAGED`] rows) and replace the same
+    /// transient maps the synchronous seal passes built per attempt.
     seal_barrier: super::SealBarrierState,
     // Nested buffers always drop before their own reservation.
     failure_storage: Option<ResourceLease>,
@@ -1356,6 +1358,14 @@ impl IngestedJointQuantum {
         (self.pending, self.future, self.cursor)
     }
 
+    /// This frame's held seal scan (identities aggregated, units
+    /// prepaid toward the decision, whether every row and identity was
+    /// examined), or `None` when none is held.
+    #[cfg(test)]
+    pub(crate) fn seal_scan_for_test(&self) -> Option<super::SealScanProgress> {
+        self.seal_barrier.progress_for_test()
+    }
+
     /// Watchdog park cursors (resume index, parked total) for
     /// delivery tests. Reset on any frame advance and when a park
     /// run completes.
@@ -1539,9 +1549,9 @@ impl IngestedJointQuantum {
             SealFailureScope::AffectedDomains(purported),
         );
         let healthy_refused = adapter.keys[&healthy.key].refused;
-        adapter.keys.get_mut(&healthy.key).unwrap().refused = true;
+        adapter.keys.edit().get_mut(&healthy.key).unwrap().refused = true;
         assert_eq!(self.pending_refused_proof(adapter, healthy.key), None);
-        adapter.keys.get_mut(&healthy.key).unwrap().refused = healthy_refused;
+        adapter.keys.edit().get_mut(&healthy.key).unwrap().refused = healthy_refused;
         self.raw_failure.as_mut().unwrap().scope =
             SealFailureScope::AffectedDomains(vec![image.domain()]);
         assert_eq!(self.pending_refused_proof(adapter, exact.key), None);
@@ -1552,6 +1562,7 @@ impl IngestedJointQuantum {
         // all still qualify against the original immutable union.
         adapter
             .keys
+            .edit()
             .get_mut(&exact.key)
             .unwrap()
             .s1only_original_refused = false;
@@ -1562,19 +1573,20 @@ impl IngestedJointQuantum {
         self.raw_failure.as_mut().unwrap().gap = original_gap;
         adapter
             .keys
+            .edit()
             .get_mut(&exact.key)
             .unwrap()
             .s1only_original_refused = true;
 
-        adapter.keys.get_mut(&exact.key).unwrap().era = exact.era.checked_add(1).unwrap();
+        adapter.keys.edit().get_mut(&exact.key).unwrap().era = exact.era.checked_add(1).unwrap();
         assert_eq!(self.pending_refused_proof(adapter, exact.key), None);
-        adapter.keys.get_mut(&exact.key).unwrap().era = exact.era;
-        adapter.keys.get_mut(&exact.key).unwrap().era_ended = true;
+        adapter.keys.edit().get_mut(&exact.key).unwrap().era = exact.era;
+        adapter.keys.edit().get_mut(&exact.key).unwrap().era_ended = true;
         assert_eq!(self.pending_refused_proof(adapter, exact.key), None);
-        adapter.keys.get_mut(&exact.key).unwrap().era_ended = false;
-        adapter.keys.get_mut(&exact.key).unwrap().refused = false;
+        adapter.keys.edit().get_mut(&exact.key).unwrap().era_ended = false;
+        adapter.keys.edit().get_mut(&exact.key).unwrap().refused = false;
         assert_eq!(self.pending_refused_proof(adapter, exact.key), None);
-        adapter.keys.get_mut(&exact.key).unwrap().refused = true;
+        adapter.keys.edit().get_mut(&exact.key).unwrap().refused = true;
 
         assert!(self.raw_failure.as_ref().unwrap().h3_voided.is_none());
         self.raw_failure.as_mut().unwrap().h3_voided = Some(self.audit.h0_below);
@@ -2392,7 +2404,6 @@ impl IngestedJointQuantum {
             outcome_storage(&outcome).is_some_and(|actual| actual <= bytes),
             "retained seal result exceeds its checked preflight bound"
         );
-        let target = self.consumers[index].target;
         let (_, owner, _, _, _) = ports.split();
         let adapter = owner.adapter();
         if let Err(failure) = &outcome {
@@ -2429,13 +2440,14 @@ impl IngestedJointQuantum {
             // rejection, so no fill ran between the seal and this
             // settle): remember its decision instead of re-scanning
             // staging. Only an undecided wait consults the terminal
-            // fallback, and a decided UnboundStaging barrier is still
-            // present, so no terminal is awaited past it.
+            // fallback, which the same paid seal scan decided, and a
+            // decided UnboundStaging barrier is still present, so no
+            // terminal is awaited past it.
             let wait = adapter.last_seal_wait();
             if failure.gap == JournalGap::BoundNotReady
                 && (seal_wait_advances_as_future(wait, false)
                     || (wait != super::SealWait::UnboundStaging
-                        && adapter.awaits_future_terminal(target.bootstrap(), self.frontier)))
+                        && adapter.last_seal_awaits_terminal()))
             {
                 // This original target advanced without a delivery. Charge
                 // the same shared slice so later targets and the machine's
@@ -2573,10 +2585,26 @@ impl IngestedJointQuantum {
                     diagnosis.note_other();
                     return Ok(QuantumSealProgress::LocalPending);
                 }
-                let state = if owner
-                    .adapter()
-                    .awaits_future_terminal(target.bootstrap(), self.frontier)
-                {
+                // The terminal check is the seal's paid scan (one unit per
+                // staged row and identity, resuming under an identical
+                // stamp); the advance below takes its own credit after it.
+                let Some(awaits) = owner.adapter().awaits_future_terminal_bounded(
+                    &mut self.seal_barrier,
+                    target.bootstrap(),
+                    self.frontier,
+                    &self.audit,
+                    remaining,
+                ) else {
+                    diagnosis.note_other();
+                    return Ok(QuantumSealProgress::DeliveryReady);
+                };
+                if *remaining == 0 {
+                    // The finished scan stays cached: the next service
+                    // advances with a paid credit and zero new visits.
+                    diagnosis.note_other();
+                    return Ok(QuantumSealProgress::DeliveryReady);
+                }
+                let state = if awaits {
                     ConsumerState::Future
                 } else {
                     // Acquisition verified every retained physical owner once.

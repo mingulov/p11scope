@@ -185,46 +185,31 @@ pub(super) struct ReplayBounds {
 }
 
 impl ReplayBounds {
+    /// Sizing reads only O(1) cardinalities: the open table's own exact
+    /// counts plus three lengths. The arithmetic below receives numbers,
+    /// never the adapter, so it cannot walk a row; the counts' exactness
+    /// differential lives in tests (`OpenTable::recount_for_test`), never
+    /// in a seal poll.
     pub(super) fn sample(adapter: &JournalAdapter, model: &ObjectSemantics) -> Option<Self> {
-        // O(1) exact bounds from maintained cardinalities: every open
-        // mutation maintains its begins/terminals/abandoned counts, so
-        // sizing reads them without walking rows and retries size without
-        // rereading the prefix. Debug builds recount and compare to catch
-        // drift.
-        #[cfg(debug_assertions)]
-        {
-            let recount_begins = adapter
-                .open
-                .values()
-                .filter(|entry| entry.converted_ticket.is_none())
-                .count();
-            let recount_terminals = adapter
-                .open
-                .values()
-                .filter(|entry| entry.end.is_some() && !entry.end_converted)
-                .count();
-            let recount_abandoned = adapter
-                .open
-                .values()
-                .filter(|entry| entry.abandon.is_some())
-                .count();
-            debug_assert_eq!(
-                (
-                    adapter.open_begins,
-                    adapter.open_terminals,
-                    adapter.open_abandoned
-                ),
-                (recount_begins, recount_terminals, recount_abandoned),
-                "maintained replay cardinalities match a recount"
-            );
-        }
-        let refused = adapter.refused.len();
-        let begins = adapter.open_begins;
-        let terminals = adapter.open_terminals;
+        Self::from_cardinalities(
+            adapter.open.counts(),
+            adapter.open.len(),
+            adapter.refused.len(),
+            model.replay_pending_count(),
+        )
+    }
+
+    fn from_cardinalities(
+        counts: super::seal_inputs::OpenCounts,
+        calls: usize,
+        refused: usize,
+        pending: usize,
+    ) -> Option<Self> {
+        let begins = counts.begins;
+        let terminals = counts.terminals;
         // Every staged abandonment may own one terminal step: a bounded
         // loss or a per-call disposal (dooming ones never convert).
-        let abandoned = adapter.open_abandoned;
-        let pending = model.replay_pending_count();
+        let abandoned = counts.abandoned;
         let steps = refused
             .checked_add(usize::from(refused != 0))?
             .checked_add(begins)?
@@ -232,10 +217,7 @@ impl ReplayBounds {
             .checked_add(abandoned)?
             .checked_add(pending.checked_add(begins)?.checked_mul(2)?)?
             .checked_add(2)?;
-        Some(Self {
-            calls: adapter.open.len(),
-            steps,
-        })
+        Some(Self { calls, steps })
     }
 
     /// The original table is already included in the existing result bound.

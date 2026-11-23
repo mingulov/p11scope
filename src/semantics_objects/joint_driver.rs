@@ -2941,10 +2941,8 @@ impl RawJointQuantum {
             // The disposed affecting records are lost history: fence
             // the whole consumed interval so no later birth or seal
             // can certify across it.
-            owner.adapter.voided_through = owner
-                .adapter
-                .voided_through
-                .max(owner.adapter.consumed_through);
+            let fenced = (*owner.adapter.voided_through).max(owner.adapter.consumed_through);
+            *owner.adapter.voided_through.edit() = fenced;
         }
         if contiguous && !unlocalized {
             owner.adapter.stream_boundary = self.cuts.as_ref().and_then(|cuts| cuts.end.clone());
@@ -3021,7 +3019,7 @@ impl RawJointQuantum {
             {
                 // This is the only production origin transfer: the same
                 // charged H0 table and exact successfully retained END.
-                let entry = adapter
+                let mut entry = adapter
                     .open
                     .get_mut(&(end.thread(), end.sequence()))
                     .expect("the actual END was just retained");

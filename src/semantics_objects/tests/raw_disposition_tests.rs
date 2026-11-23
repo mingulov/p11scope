@@ -643,7 +643,7 @@ fn joint_linked_broken_stream_resyncs_above_a_fenced_loss() {
         "the re-sync clears the broken stream"
     );
     assert_eq!(
-        owner.adapter.voided_through, lost_through,
+        *owner.adapter.voided_through, lost_through,
         "the fence lands exactly on the consumed history, never above it"
     );
 }
@@ -778,7 +778,7 @@ fn joint_linked_ingest_break_voids_then_resyncs_above_a_fence() {
     );
     assert!(collect(&mut owner).is_ok(), "the next collect re-syncs");
     assert_eq!(
-        owner.adapter.voided_through, 7,
+        *owner.adapter.voided_through, 7,
         "fenced at the consumed history"
     );
     assert!(!(owner.adapter.stream_broken || owner.adapter.invalidated));

@@ -5557,9 +5557,11 @@ fn startup_probe_validator_fixture(fenced: bool) -> Vec<serde_json::Value> {
             let module = format!("mA-{pair:02}");
             seq += 1;
             let obs_seq = seq;
+            let pre = round * 40 + 70;
+            let post = round * 40 + 80;
             rows.push(
                 serde_json::json!({"kind":"count_observation","pid":123,"pair":name,
-                "seq":obs_seq,"absolute":round,"pre":round*40+70,"post":round*40+80}),
+                "seq":obs_seq,"absolute":round,"pre":pre,"post":post}),
             );
             seq += 1;
             if fenced && round == 2 {
@@ -5569,12 +5571,47 @@ fn startup_probe_validator_fixture(fenced: bool) -> Vec<serde_json::Value> {
                     "through":2,"absolute":2,
                     "observation_ref":{"seq":obs_seq,"status":"retained"}}),
                 );
-            } else {
+            } else if fenced {
                 rows.push(
                     serde_json::json!({"kind":"publication","decision":"placed","reason":"sole_owner",
                     "pair":name,"seq":seq,"module_id":module,"absolute":round,"base":round-1,
                     "staged":1,"observation_ref":{"seq":obs_seq,"status":"retained"},
                     "baseline_pre":150,"baseline_post":160}),
+                );
+            } else if round == 1 {
+                // Pending-queue resolution: the staged pending half plus its
+                // per-pair placed commit, exactly as captured live.
+                let pending = format!("h{}", pair + 1);
+                rows.push(
+                    serde_json::json!({"kind":"count_decision","decision":"staged",
+                    "reason":"pending_publication","pair":name,"module_id":module,
+                    "seq":seq,"caller":"c0","absolute":1,"base":0,"staged":1,
+                    "after":0,"through":1,"pending":pending,"pre":pre,"post":post,
+                    "observation_ref":{"seq":obs_seq,"status":"retained"}}),
+                );
+                seq += 1;
+                rows.push(
+                    serde_json::json!({"kind":"publication","decision":"placed","reason":"sole_owner",
+                    "pair":name,"seq":seq,"module_id":module,"caller":"c0",
+                    "absolute":1,"base":0,"staged":1,"edge_total":1,
+                    "after":0,"through":1,"pending":pending,"pre":pre,"post":post,
+                    "observation_ref":{"seq":obs_seq,"status":"retained"}}),
+                );
+            } else {
+                // Confirmed-Bound growth: staged sole_owner plus the null-pair
+                // registry commit summary, exactly as captured live.
+                rows.push(
+                    serde_json::json!({"kind":"count_decision","decision":"staged",
+                    "reason":"sole_owner","pair":name,"module_id":module,
+                    "seq":seq,"caller":"c0","absolute":round,"base":round-1,"staged":1,
+                    "after":round-1,"through":round,"pre":pre,"post":post,
+                    "observation_ref":{"seq":obs_seq,"status":"retained"}}),
+                );
+                seq += 1;
+                rows.push(
+                    serde_json::json!({"kind":"publication","reason":"context_unavailable",
+                    "context_unavailable":true,"seq":seq,"module_id":module,"caller":"c0",
+                    "base":round-1,"staged":1,"edge_total":round}),
                 );
             }
         }
@@ -5670,6 +5707,275 @@ fn operator_diagnostics_three_round_probe_checks_fence_and_physical_pair() -> Re
             check_startup_probe_records(&changed, &primary, 123, &modules, &calls, k).is_err(),
             "false startup-fence evidence accepted: {change}"
         );
+    }
+    Ok(())
+}
+
+/// Twin helper: refresh the probe footer counters after adding or removing a
+/// body row, so a negative fails on its shape clause rather than the footer.
+fn rebuild_probe_footer(rows: &mut Vec<serde_json::Value>) {
+    let names = [
+        "count_observation",
+        "ownership_transition",
+        "count_decision",
+        "publication",
+        "capture_health",
+    ];
+    let kinds: Vec<_> = names
+        .iter()
+        .map(|name| {
+            let count = rows[1..rows.len() - 1]
+                .iter()
+                .filter(|row| row["kind"] == *name)
+                .count();
+            serde_json::json!({"produced":count,"retained":count,"evicted":0,"filtered":0,"omitted":0})
+        })
+        .collect();
+    let last = rows.len() - 1;
+    rows[last]["kinds"] = serde_json::Value::Array(kinds);
+    rows[last]["records_written"] = serde_json::json!(rows.len() as u64 - 2);
+}
+
+/// RED twin for the ordinary two-shape rule: unit 1 resolves the pending queue
+/// (staged `pending_publication` plus per-pair placed) while confirmed-Bound
+/// units 2-3 stage `sole_owner` and commit via null-pair registry summaries,
+/// exactly as captured live. The retired per-pair placed demand for units 2-3
+/// matches nothing on these typed records; the corrected validator accepts
+/// them. Every single-clause negative must fail with its own clause message.
+#[test]
+fn operator_diagnostics_three_round_probe_ordinary_two_shape_lineage() -> Result<()> {
+    let calls = [(90, 110), (130, 150), (170, 190)];
+    let modules = twin_probe_modules();
+    let ordinary = startup_probe_validator_fixture(false);
+    let terminal = vec![3u64; 32];
+    // RED proof: the retired demand (per-pair placed for confirmed growth)
+    // matches nothing on the live two-shape records.
+    for pair in 0..32 {
+        let name = format!("p{pair}");
+        for (absolute, base) in [(2u64, 1u64), (3, 2)] {
+            let placed: Vec<_> = ordinary
+                .iter()
+                .filter(|row| {
+                    row["kind"] == "publication"
+                        && row["decision"] == "placed"
+                        && row["pair"] == name.as_str()
+                        && row["absolute"] == absolute
+                        && row["base"] == base
+                })
+                .collect();
+            ensure!(
+                placed.is_empty(),
+                "retired placed({absolute},{base}) demand unexpectedly met on {name}"
+            );
+        }
+    }
+    let facts = check_startup_probe_records(&ordinary, &terminal, 123, &modules, &calls, 0)?;
+    ensure!(facts["path"] == "ordinary" && facts["fenced_pairs"] == 0);
+    ensure!(facts["published"] == 3);
+    let staged_index = |rows: &[serde_json::Value], pair: &str, absolute: u64| {
+        rows.iter()
+            .position(|row| {
+                row["kind"] == "count_decision"
+                    && row["decision"] == "staged"
+                    && row["pair"] == pair
+                    && row["absolute"] == absolute
+            })
+            .unwrap_or_else(|| panic!("twin staged row {pair}/{absolute}"))
+    };
+    let placed_index = |rows: &[serde_json::Value], pair: &str, absolute: u64| {
+        rows.iter()
+            .position(|row| {
+                row["kind"] == "publication"
+                    && row["decision"] == "placed"
+                    && row["pair"] == pair
+                    && row["absolute"] == absolute
+            })
+            .unwrap_or_else(|| panic!("twin placed row {pair}/{absolute}"))
+    };
+    let summary_index = |rows: &[serde_json::Value], module: &str, base: u64| {
+        rows.iter()
+            .position(|row| {
+                row["kind"] == "publication"
+                    && row["module_id"] == module
+                    && row["decision"].is_null()
+                    && row["base"] == base
+            })
+            .unwrap_or_else(|| panic!("twin summary {module}/{base}"))
+    };
+    // Each negative must fail with its own clause message (killing proof);
+    // the passing positive above shows no clause over-fires.
+    for (change, message) in [
+        ("staged2_wrong_base", "A stage differs from issued growth"),
+        ("staged3_wrong_staged", "A stage differs from issued growth"),
+        (
+            "staged2_wrong_reason",
+            "needs exactly one genuine publication shape",
+        ),
+        ("staged2_crossed_module", "missing A stage"),
+        ("staged2_unretained_oref", "original read is not retained"),
+        (
+            "staged2_wrong_oref_seq",
+            "decision substituted its original pair/caller/read",
+        ),
+        (
+            "staged2_wrong_through",
+            "A stage differs from issued growth",
+        ),
+        (
+            "staged3_wrong_pre",
+            "decision substituted its original pair/caller/read",
+        ),
+        (
+            "placed1_pending_mismatch",
+            "needs exactly one genuine publication shape",
+        ),
+        (
+            "staged1_wrong_reason",
+            "needs exactly one genuine publication shape",
+        ),
+        (
+            "summary1_wrong_edge_total",
+            "needs exactly one genuine publication shape",
+        ),
+        (
+            "summary1_pair_not_null",
+            "needs exactly one genuine publication shape",
+        ),
+        (
+            "summary1_missing",
+            "needs exactly one genuine publication shape",
+        ),
+        (
+            "summary2_wrong_reason",
+            "needs exactly one genuine publication shape",
+        ),
+        ("staged2_missing", "missing A stage"),
+        ("staged2_duplicate", "duplicate A stage"),
+        (
+            "staged2_wrong_caller",
+            "ordinary growth needs one typed caller",
+        ),
+        (
+            "summary1_seq_window",
+            "needs exactly one genuine publication shape",
+        ),
+        (
+            "summary1_wrong_caller",
+            "needs exactly one genuine publication shape",
+        ),
+    ] {
+        let mut changed = ordinary.clone();
+        match change {
+            "staged2_wrong_base" => {
+                let at = staged_index(&changed, "p0", 2);
+                changed[at]["base"] = 0.into();
+            }
+            "staged3_wrong_staged" => {
+                let at = staged_index(&changed, "p0", 3);
+                changed[at]["staged"] = 2.into();
+            }
+            "staged2_wrong_reason" => {
+                let at = staged_index(&changed, "p0", 2);
+                changed[at]["reason"] = "pending_publication".into();
+            }
+            "staged2_crossed_module" => {
+                let at = staged_index(&changed, "p0", 2);
+                changed[at]["module_id"] = "mA-01".into();
+            }
+            "staged2_unretained_oref" => {
+                let at = staged_index(&changed, "p0", 2);
+                changed[at]["observation_ref"]["status"] = "filtered".into();
+            }
+            "staged2_wrong_oref_seq" => {
+                let first = changed
+                    .iter()
+                    .find(|row| {
+                        row["kind"] == "count_observation"
+                            && row["pair"] == "p0"
+                            && row["absolute"] == 1
+                    })
+                    .and_then(|row| row["seq"].as_u64())
+                    .context("twin first observation")?;
+                let at = staged_index(&changed, "p0", 2);
+                changed[at]["observation_ref"]["seq"] = first.into();
+            }
+            "staged2_wrong_through" => {
+                let at = staged_index(&changed, "p0", 2);
+                changed[at]["through"] = 3.into();
+            }
+            "staged3_wrong_pre" => {
+                let at = staged_index(&changed, "p0", 3);
+                changed[at]["pre"] = 1.into();
+            }
+            "placed1_pending_mismatch" => {
+                let at = placed_index(&changed, "p0", 1);
+                changed[at]["pending"] = "hx".into();
+            }
+            "staged1_wrong_reason" => {
+                let at = staged_index(&changed, "p0", 1);
+                changed[at]["reason"] = "sole_owner".into();
+            }
+            "summary1_wrong_edge_total" => {
+                let at = summary_index(&changed, "mA-00", 1);
+                changed[at]["edge_total"] = 9.into();
+            }
+            "summary1_pair_not_null" => {
+                let at = summary_index(&changed, "mA-00", 1);
+                changed[at]["pair"] = "p0".into();
+            }
+            "summary1_missing" => {
+                let at = summary_index(&changed, "mA-00", 1);
+                changed.remove(at);
+                rebuild_probe_footer(&mut changed);
+            }
+            "summary2_wrong_reason" => {
+                let at = summary_index(&changed, "mA-00", 2);
+                changed[at]["reason"] = "sole_owner".into();
+            }
+            "staged2_missing" => {
+                let at = staged_index(&changed, "p0", 2);
+                changed.remove(at);
+                rebuild_probe_footer(&mut changed);
+            }
+            "staged2_duplicate" => {
+                let max = changed
+                    .iter()
+                    .filter_map(|row| row["seq"].as_u64())
+                    .max()
+                    .context("twin max seq")?;
+                let mut extra = changed[staged_index(&changed, "p0", 2)].clone();
+                extra["seq"] = (max + 1).into();
+                changed.insert(changed.len() - 1, extra);
+                rebuild_probe_footer(&mut changed);
+            }
+            "staged2_wrong_caller" => {
+                let at = staged_index(&changed, "p0", 2);
+                changed[at]["caller"] = "c9".into();
+            }
+            "summary1_seq_window" => {
+                // Swap the summary and next-stage rows while their seqs stay
+                // with their slots: the commit leaves its stage window but the
+                // document order and footer stay valid.
+                let first = summary_index(&changed, "mA-00", 1);
+                let second = staged_index(&changed, "p0", 3);
+                let seq_first = changed[first]["seq"].clone();
+                let seq_second = changed[second]["seq"].clone();
+                changed.swap(first, second);
+                changed[first]["seq"] = seq_first;
+                changed[second]["seq"] = seq_second;
+            }
+            _ => {
+                let at = summary_index(&changed, "mA-00", 1);
+                changed[at]["caller"] = "c9".into();
+            }
+        }
+        match check_startup_probe_records(&changed, &terminal, 123, &modules, &calls, 0) {
+            Ok(_) => bail!("false ordinary evidence accepted: {change}"),
+            Err(error) => ensure!(
+                error.to_string().contains(message),
+                "negative {change} died on the wrong clause: {error}"
+            ),
+        }
     }
     Ok(())
 }

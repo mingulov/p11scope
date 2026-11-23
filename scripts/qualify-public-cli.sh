@@ -185,7 +185,7 @@ finish_quiet() {
 }
 touch_quiet() { : >> "$1"; }
 result() {
-  python3 - "$1" "$2" "$3" "${4:-command-contract}" <<'PY' | tee -a results.jsonl
+  python3 -I - "$1" "$2" "$3" "${4:-command-contract}" <<'PY' | tee -a results.jsonl
 import json,sys
 print(json.dumps({'cell':sys.argv[1],'pass':sys.argv[2]=='1','detail':sys.argv[3],'qualification':sys.argv[4]}))
 PY
@@ -220,7 +220,7 @@ pin() {
   python3 -I "$HERE/mapped-provider-pin.py" "$MODULE"
 }
 receipt() {
-  python3 - "$cell" "$scope" "$wl" "$gen" "$readygen" "$ready" "$capturing" "$released" "$observer_rc" "$workload_rc" "$before" "$after" <<'PY' > "$cell.receipt.json"
+  python3 -I - "$cell" "$scope" "$wl" "$gen" "$readygen" "$ready" "$capturing" "$released" "$observer_rc" "$workload_rc" "$before" "$after" <<'PY' > "$cell.receipt.json"
 import json,re,sys
 cell,scope,pid,gen,rgen,ready,capturing,released,observer,workload,before,after=sys.argv[1:]
 lines=open(cell+'.wl').read().splitlines()
@@ -524,7 +524,7 @@ system_cell() {
   gated system system "$GATED" profile --system --module "$MODULE" --duration 25 -o "$OUT/system.json"
 }
 summary() {
-  python3 - "$@" <<'PY' | tee summary.txt
+  python3 -I - "$@" <<'PY' | tee summary.txt
 import json,sys
 rows=[json.loads(line) for line in open('results.jsonl')]
 expected=sys.argv[1:]; ids=[row['cell'] for row in rows]
@@ -602,18 +602,18 @@ second_sigint() {
   done
   publish_output sigint2.json || cleanup_ok=0
   report_ok=0
-  if python3 - sigint2.json <<'PY' 2>/dev/null; then report_ok=1; fi
+  if python3 -I - sigint2.json <<'PY' 2>/dev/null; then report_ok=1; fi
 import json,sys
 report=json.load(open(sys.argv[1]))
-assert report.get('schema')=='p11scope/observed-profile/v3', 'schema'
+if not (report.get('schema')=='p11scope/observed-profile/v3'): raise AssertionError('schema')
 evidence=report['evidence']
-assert evidence.get('completeness')=='PARTIAL', 'abandoned teardown cannot seal COMPLETE'
+if not (evidence.get('completeness')=='PARTIAL'): raise AssertionError('abandoned teardown cannot seal COMPLETE')
 stop=evidence['stop_quiescence']
 proven=stop.get('state')=='proven' and stop.get('post_q_events') is False and stop.get('post_q_discovery') is False
-assert evidence.get('drain_proven') is proven, 'drain_proven must match the stop-gate evidence'
+if not (evidence.get('drain_proven') is proven): raise AssertionError('drain_proven must match the stop-gate evidence')
 samples=evidence.get('scheduling',{}).get('inter_drain_gap',{}).get('samples')
-assert isinstance(samples,int) and samples>0, 'report must carry this capture live-loop drain samples'
-assert evidence.get('child_still_running') is False, 'owned child must be settled, not still running'
+if not (isinstance(samples,int) and samples>0): raise AssertionError('report must carry this capture live-loop drain samples')
+if not (evidence.get('child_still_running') is False): raise AssertionError('owned child must be settled, not still running')
 PY
   result second-sigint "$([ "$custody" = 1 ] && [ "$cleanup_ok" = 1 ] && [ "$rc" = 130 ] && [ "$report_ok" = 1 ] && grep -qa 'p11scope: cleanup incomplete' sig2.stderr && ! grep -qa panicked sig2.stderr && echo 1 || echo 0)" "rc=$rc child_custody=$custody child=${child:-unknown} cleanup_complete=$cleanup_ok report_ok=$report_ok"
 }
@@ -645,7 +645,7 @@ inventory_event_stdout() {
   terminate "$wl"
   publish_output event-stdout.json || true
   publish_output event-epipe.json || true
-  full_out=$full_out epipe_out=$epipe_out rc1=$rc1 rc2=$rc2 python3 - <<'PY' > event-stdout.judge 2>&1 && judge_rc=0
+  full_out=$full_out epipe_out=$epipe_out rc1=$rc1 rc2=$rc2 python3 -I - <<'PY' > event-stdout.judge 2>&1 && judge_rc=0
 import json
 import os
 
@@ -655,51 +655,51 @@ def load_jsonl(path):
     with open(path) as handle:
         for number, line in enumerate(handle):
             line = line.rstrip("\n")
-            assert line, f"{path}:{number}: blank line breaks the JSONL framing"
+            if not (line): raise AssertionError(f"{path}:{number}: blank line breaks the JSONL framing")
             rows.append(json.loads(line))
     return rows
 
 
 # Full run: stdout is pure JSONL, sequenced, started to ended.
-assert os.environ["rc1"] == "0", "full run rc=%s" % os.environ["rc1"]
+if not (os.environ["rc1"] == "0"): raise AssertionError("full run rc=%s" % os.environ["rc1"])
 stream = load_jsonl("event-stdout.jsonl")
-assert len(stream) >= 3, "started, a pass marker and ended"
+if not (len(stream) >= 3): raise AssertionError("started, a pass marker and ended")
 for index, row in enumerate(stream):
-    assert row["schema"] == "p11scope/inventory-events/v1", row
-    assert row["seq"] == index, "seq %s != %s" % (row["seq"], index)
-assert stream[0]["kind"] == "started", stream[0]
-assert stream[-1]["kind"] == "ended", stream[-1]
+    if not (row["schema"] == "p11scope/inventory-events/v1"): raise AssertionError(row)
+    if not (row["seq"] == index): raise AssertionError("seq %s != %s" % (row["seq"], index))
+if not (stream[0]["kind"] == "started"): raise AssertionError(stream[0])
+if not (stream[-1]["kind"] == "ended"): raise AssertionError(stream[-1])
 # The stream and the -o report agree on the counts.
 report = json.load(open(os.environ["full_out"]))
-assert report["schema"] == "p11scope/inventory/v1", report.get("schema")
-assert report["observation"]["passes"] == stream[-1]["event"]["passes"], "passes agree"
+if not (report["schema"] == "p11scope/inventory/v1"): raise AssertionError(report.get("schema"))
+if not (report["observation"]["passes"] == stream[-1]["event"]["passes"]): raise AssertionError("passes agree")
 final = [row for row in stream if row["kind"] == "pass_committed"][-1]["event"]
 for key in ["callers", "modules", "edges"]:
-    assert len(report[key]) == final["totals"][key], (key, len(report[key]), final["totals"])
+    if not (len(report[key]) == final["totals"][key]): raise AssertionError((key, len(report[key]), final["totals"]))
 # Totals kept their cadence: a couple of snapshots, never none. The
 # cadence is anchored at `started`, not at a pass number: on a slow
 # attach the first pass commits after the interval is already due, so
 # the first totals legitimately trails pass 0.
 totals = [row for row in stream if row["kind"] == "totals"]
-assert 1 <= len(totals) <= 4, "totals count %d" % len(totals)
+if not (1 <= len(totals) <= 4): raise AssertionError("totals count %d" % len(totals))
 last_at = stream[0]["at_ns"]
 for row in totals:
     position = stream.index(row)
     marker = [r for r in stream[:position] if r["kind"] == "pass_committed"][-1]["event"]
-    assert marker["pass"] == row["event"]["pass"], (marker["pass"], row["event"])
-    assert row["event"]["passes"] == row["event"]["pass"] + 1, row["event"]
+    if not (marker["pass"] == row["event"]["pass"]): raise AssertionError((marker["pass"], row["event"]))
+    if not (row["event"]["passes"] == row["event"]["pass"] + 1): raise AssertionError(row["event"])
     for key in ["callers", "modules", "edges"]:
-        assert row["event"][key] == marker["totals"][key], (key, row["event"], marker["totals"])
-    assert row["at_ns"] - last_at >= 2_000_000_000, row
+        if not (row["event"][key] == marker["totals"][key]): raise AssertionError((key, row["event"], marker["totals"]))
+    if not (row["at_ns"] - last_at >= 2_000_000_000): raise AssertionError(row)
     last_at = row["at_ns"]
 # Early close: the observer sheds, reports, keeps its report, exits 1.
-assert os.environ["rc2"] == "1", "early-close rc=%s" % os.environ["rc2"]
+if not (os.environ["rc2"] == "1"): raise AssertionError("early-close rc=%s" % os.environ["rc2"])
 with open("event-epipe.head", "rb") as handle:
-    assert handle.read(1) == b"{", "the head holds event bytes"
+    if not (handle.read(1) == b"{"): raise AssertionError("the head holds event bytes")
 epipe = json.load(open(os.environ["epipe_out"]))
-assert epipe["schema"] == "p11scope/inventory/v1", epipe.get("schema")
+if not (epipe["schema"] == "p11scope/inventory/v1"): raise AssertionError(epipe.get("schema"))
 with open("event-epipe.stderr") as handle:
-    assert "shed" in handle.read(), "the loss is reported on stderr"
+    if not ("shed" in handle.read()): raise AssertionError("the loss is reported on stderr")
 print("ok lines=%d totals=%d" % (len(stream), len(totals)))
 PY
   result inventory-event-stdout "$([ "$judge_rc" = 0 ] && echo 1 || echo 0)" "rc1=$rc1 rc2=$rc2 $(tail -n 1 event-stdout.judge 2>/dev/null | head -c 300)"
@@ -811,7 +811,7 @@ cgroup_capture() {
     # stat(1) spells the type "overlayfs" (coreutils S_MAGIC_OVERLAYFS),
     # never the bare "overlay" of /proc/mounts.
     module_fs=$(stat -f -c %T "$MODULE" 2>/dev/null || echo unknown)
-    python3 - "$cell.$ext" "$cell-inside.wl" "$cell-outside.wl" "$before" "$MODULE" "$module_fs" "$gen" "$childgen" <<'PY' > "$cell.detail" 2>&1
+    python3 -I - "$cell.$ext" "$cell-inside.wl" "$cell-outside.wl" "$before" "$MODULE" "$module_fs" "$gen" "$childgen" <<'PY' > "$cell.detail" 2>&1
 import json,sys
 report=json.load(open(sys.argv[1]))
 inside=open(sys.argv[2]).read(); outside=open(sys.argv[3]).read()
@@ -847,8 +847,25 @@ for c in typed(report.get('callers'),(list,),'callers'):
     typed(c.get('start_time_unit'),(str,),'caller start_time_unit')
     typed(c.get('retired'),(bool,),'caller retired')
     typed(typed(c.get('image'),(dict,),'caller image').get('authority'),(str,),'caller authority')
+MISSING=object()
+def field(obj,key,types,what):
+    # Presence first: a nullable field is published as an explicit null,
+    # never left out.
+    value=obj.get(key,MISSING)
+    if value is MISSING: raise AssertionError('%s missing' % what)
+    return typed(value,types,what)
 for m in typed(report.get('modules'),(list,),'modules'):
     typed(typed(m,(dict,),'module').get('id'),(str,),'module id')
+    # The physical identity matches the pin by exact JSON integers: a
+    # float token, a numeric string or a bool never stands for an inode
+    # or device number.
+    ident=field(m,'identity',(dict,),'module identity')
+    dev=field(ident,'device',(dict,),'module device')
+    field(dev,'major',(int,),'module device major')
+    field(dev,'minor',(int,),'module device minor')
+    field(ident,'inode',(int,),'module inode')
+    field(ident,'sha256',(str,NONE),'module sha256')
+    field(field(m,'admission',(dict,),'module admission'),'state',(str,),'module admission state')
 for e in typed(report.get('edges'),(list,),'edges'):
     typed(e,(dict,),'edge')
     typed(e.get('caller'),(str,),'edge caller')
@@ -857,29 +874,36 @@ for e in typed(report.get('edges'),(list,),'edges'):
     typed(n.get('count'),(int,),'edge count')
     cov=typed(n.get('coverage'),(dict,),'edge coverage')
     typed(cov.get('state'),(str,),'edge coverage state')
-    typed(cov.get('lossy'),(bool,NONE),'edge coverage lossy')
+    field(cov,'lossy',(bool,NONE),'edge coverage lossy')
     typed(n.get('observation'),(str,),'edge observation')
     typed(n.get('saturated'),(bool,),'edge saturated')
     typed(n.get('in_flight'),(bool,),'edge in_flight')
 for g in typed(report.get('gaps'),(list,),'gaps'):
     typed(g,(dict,),'gap')
-    typed(g.get('caller'),(str,NONE),'gap caller')
-    typed(g.get('pid'),(int,NONE),'gap pid')
-    typed(g.get('module'),(str,NONE),'gap module')
-    typed(g.get('subject'),(str,),'gap subject')
-    typed(g.get('reason'),(str,NONE),'gap reason')
+    field(g,'caller',(str,NONE),'gap caller')
+    field(g,'pid',(int,NONE),'gap pid')
+    field(g,'module',(str,NONE),'gap module')
+    field(g,'subject',(str,),'gap subject')
+    field(g,'reason',(str,NONE),'gap reason')
 # Ids are unique in the raw arrays before any index is built: a
 # repeated id would let one row hide another (the diff reader refuses
 # the same shape).
 for kind in ('callers','modules'):
     ids=[x.get('id') for x in report.get(kind,[])]
     refuse_unless(len(ids)==len(set(ids)), 'duplicate %s id: %r' % (kind[:-1],ids))
+# The pin is typed at the comparison boundary too.
+typed(pin,(dict,),'pin')
+pin_dev=field(pin,'dev',(list,),'pin dev')
+refuse_unless(len(pin_dev)==2, 'pin dev is not [major, minor]: %r' % (pin_dev,))
+for part in pin_dev:
+    typed(part,(int,),'pin dev')
+field(pin,'ino',(int,),'pin ino')
+field(pin,'sha256',(str,),'pin sha256')
 modules={m['id']:m for m in report.get('modules',[])}
 owned=None
 for mid,m in modules.items():
-    ident=m.get('identity',{})
-    dev=ident.get('device',{})
-    if [dev.get('major'),dev.get('minor')]==pin['dev'] and ident.get('inode')==pin['ino'] and ident.get('sha256')==pin['sha256']:
+    ident=m['identity']; dev=ident['device']
+    if [dev['major'],dev['minor']]==pin_dev and ident['inode']==pin['ino'] and ident['sha256']==pin['sha256']:
         owned=mid; break
 # Data-always: the scan-pinned fallback publishes the found module
 # with its named gap on every filesystem — an empty view never
@@ -1136,7 +1160,7 @@ run_prearm() {
     publish_output "run-prearm-$name.txt" || rc=1
     [ "$rc" = 0 ] || { result run-prearm 0 "$name twin failed rc=$rc" prearm-exactness; return 1; }
   done
-  detail=$(python3 - <<'PY' 2>&1
+  detail=$(python3 -I - <<'PY' 2>&1
 import json
 import platform
 
@@ -1283,35 +1307,35 @@ parent_chain_cell() {
   [ "$observer_rc" = 0 ] || { result "$cell" 0 "verbose observer rc=$observer_rc" failed; terminate "$parent" || true; terminate "$wl" || true; return 1; }
   publish_output "$cell-v.json" || { result "$cell" 0 'output copy failed' failed; terminate "$parent" || true; terminate "$wl" || true; return 1; }
   local detail
-  detail=$(python3 - "$cell.json" "$cell.stdout" "$cell-v.stdout" "$wl" "$wl_gen" "$parent" "$parent_gen" <<'PY' 2>&1
+  detail=$(python3 -I - "$cell.json" "$cell.stdout" "$cell-v.stdout" "$wl" "$wl_gen" "$parent" "$parent_gen" <<'PY' 2>&1
 import json,sys
 doc,concise,verbose,wl,wl_gen,parent,parent_gen=sys.argv[1:8]
 report=json.load(open(doc))
 wl=int(wl); wl_gen=int(wl_gen); parent=int(parent); parent_gen=int(parent_gen)
 callers=[c for c in report.get('callers',[]) if c.get('pid')==wl]
-assert len(callers)==1, 'one incarnation for the workload'
+if not (len(callers)==1): raise AssertionError('one incarnation for the workload')
 c=callers[0]
-assert c.get('start_time')==wl_gen, 'caller generation unchanged'
+if not (c.get('start_time')==wl_gen): raise AssertionError('caller generation unchanged')
 lb=c.get('launched_by')
-assert isinstance(lb,list) and 1<=len(lb)<=4, 'walk keeps 1..=4 ancestors'
-assert lb[0]['pid']==parent and lb[0]['exe']=='chain-parent' and lb[0]['start_time']==parent_gen, \
-    'named parent first: %r' % (lb[0],)
+if not (isinstance(lb,list) and 1<=len(lb)<=4): raise AssertionError('walk keeps 1..=4 ancestors')
+if not (lb[0]['pid']==parent and lb[0]['exe']=='chain-parent' and lb[0]['start_time']==parent_gen): raise AssertionError('named parent first: %r' % (lb[0],))
 for a in lb:
-    assert a['pid']!=1, 'init is never shown as the launcher: %r' % (a,)
+    if not (a['pid']!=1): raise AssertionError('init is never shown as the launcher: %r' % (a,))
 for a in lb[1:]:
-    assert a['pid']>0 and isinstance(a['start_time'],int), 'ancestor generation: %r' % (a,)
-assert c.get('launched_by_origin')=='chain', 'real chain origin: %r' % (c.get('launched_by_origin'),)
-assert c.get('launched_by_unit') is None, 'no unit beside a real chain'
+    if not (a['pid']>0 and isinstance(a['start_time'],int)): raise AssertionError('ancestor generation: %r' % (a,))
+if not (c.get('launched_by_origin')=='chain'): raise AssertionError('real chain origin: %r' % (c.get('launched_by_origin'),))
+if not (c.get('launched_by_unit') is None): raise AssertionError('no unit beside a real chain')
 gap=c.get('launched_by_gap')
 if gap is not None:
-    assert gap['subject']=='caller parent chain', gap
-    assert gap['reason'] in ('launcher exited before read',
-        'launcher hidden by /proc hidepid',
-        'parent chain truncated after 4 ancestors',
-        'parent chain not sampled in cgroup transaction'), gap
+    if not (gap['subject']=='caller parent chain'): raise AssertionError(gap)
+    if not (gap['reason'] in ('launcher exited before read',
+                    'launcher hidden by /proc hidepid',
+                    'parent chain truncated after 4 ancestors',
+                    'parent chain not sampled in cgroup transaction')):
+        raise AssertionError(gap)
 concise_text=open(concise).read(); verbose_text=open(verbose).read()
-assert 'gated (from chain-parent)' in concise_text, 'concise one-hop'
-assert 'gated <- chain-parent' in verbose_text, 'verbose chain'
+if not ('gated (from chain-parent)' in concise_text): raise AssertionError('concise one-hop')
+if not ('gated <- chain-parent' in verbose_text): raise AssertionError('verbose chain')
 print('chain to chain-parent with %d ancestors; concise and -v agree' % len(lb))
 PY
 ) || { result "$cell" 0 "$(printf '%.600s' "$detail")" failed; terminate "$parent" || true; terminate "$wl" || true; return 1; }
@@ -1422,7 +1446,7 @@ gated profile-pid pid "$GATED" profile --pid @PID@ --duration 12 -o "$OUT/profil
 # The semantic assertions reuse the independently captured receipt, with their
 # own cell binding; they cannot turn a failed capture into a second PASS.
 for cell in names-pid verdict-pid; do
-  python3 - "$cell" <<'PY' > "$cell.receipt.json"
+  python3 -I - "$cell" <<'PY' > "$cell.receipt.json"
 import json,sys
 d=json.load(open('profile-pid.receipt.json')); d['cell']=sys.argv[1]; print(json.dumps(d))
 PY

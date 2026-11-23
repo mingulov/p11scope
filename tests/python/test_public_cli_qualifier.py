@@ -582,13 +582,23 @@ class OptimizationProofTests(unittest.TestCase):
     def test_heredocs_found(self):
         self.assertGreaterEqual(len(qualifier_heredocs()), 9)
 
+    # The run-prearm block keeps the assert statements its structural
+    # tests pin (HandoffPairTests, PrearmExactnessTests); -I still keeps
+    # an inherited PYTHONOPTIMIZE from stripping them.
+    PINNED_ASSERTS = ("detail=$(python3 -I - <<'PY' 2>&1",)
+
     def test_no_heredoc_uses_assert_statements(self):
+        exempt = 0
         for line, body in qualifier_heredocs():
+            if line.strip() in self.PINNED_ASSERTS:
+                exempt += 1
+                continue
             with self.subTest(invocation=line.strip()[:60]):
                 tree = ast.parse(body)
                 asserts = [node.lineno for node in ast.walk(tree)
                            if isinstance(node, ast.Assert)]
                 self.assertEqual(asserts, [], "assert statements are stripped by -O")
+        self.assertEqual(exempt, 1)
 
     def test_every_heredoc_runs_isolated(self):
         for line, _ in qualifier_heredocs():

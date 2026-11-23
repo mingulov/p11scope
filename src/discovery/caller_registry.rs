@@ -3888,6 +3888,14 @@ enum Mutation {
         /// `terminal_phase` captured at stage time (see `RecordGap`).
         terminal: bool,
     },
+    RecordTerminalRetryExcluded {
+        /// The terminal cause text (`domain finish`, `endpoint
+        /// resolution loss`, or `re-refusal (<code>)`): settlements
+        /// sharing it sum into one per-cause row at apply time.
+        cause: String,
+        /// Newly excluded calls for this cause.
+        excluded: u64,
+    },
 }
 
 /// A publication is applied but its original frame has not finished. This
@@ -4158,6 +4166,20 @@ pub(crate) struct CallerRegistry {
     /// Aggregated markers already counted as suppressed: a suppressed
     /// aggregate counts once, not once per merged placement.
     suppressed_demoted_placed: BTreeSet<(ModuleKey, &'static str)>,
+    /// Authoritative per-cause totals of identity-retry terminal
+    /// exclusions: cause text -> (excluded calls, settlements). Every
+    /// terminal settlement adds here at apply time, independent of
+    /// generic gap-detail retention, so a full gap quota can never
+    /// hide excluded calls or their cause. Bounded by the finite
+    /// terminal cause enum (finish, endpoint loss, one re-refusal
+    /// code each).
+    terminal_retry_totals: BTreeMap<String, (u64, u64)>,
+    /// Where each nonzero per-cause total publishes: cause text ->
+    /// its row in `gaps`. The row rewrites in place as settlements
+    /// accumulate (repeats stays 1: consumers read the summed total,
+    /// never count by repeats). Retention is guaranteed, never
+    /// budgeted: at most one row per finite cause.
+    terminal_retry_gap_index: BTreeMap<String, usize>,
     /// Terminal/stop-time phase: set once the lane stops. Gaps staged
     /// from now on carry the terminal flag and may use the headroom
     /// above the bound; gaps staged before it keep the plain bound
@@ -4218,14 +4240,16 @@ pub(crate) struct CallerRegistry {
     /// Distinct images (with their host pids) the run-wide bound
     /// turned away, saturating. Sticky.
     unidentified_pids_dropped: u64,
-    /// Actual image-set landings of retained identity-retry folds, one
-    /// `(fold id, module landed, run-wide landed)` per applied
-    /// single-module insert: the ordered application — not the
-    /// note-time committed snapshot — decides whether an insert lands,
-    /// so a retraction staged in the same publication (or a later one
-    /// via the coordinator's drain) rolls back exactly what landed.
-    /// Drained by the coordinator; bounded by folds per publication.
-    fold_landings: Vec<(u64, bool, bool)>,
+    /// Actual image-set landings of retained identity-retry folds, keyed
+    /// by fold id: the ordered application — not the note-time
+    /// committed snapshot — decides whether an insert lands, so the
+    /// matching retraction consumes exactly its own receipt and rolls
+    /// back exactly what landed. A receipt lives from its insert's
+    /// apply until its retraction consumes it (same publication or a
+    /// later one); folds that never retract (terminal settlement,
+    /// revival) drop it when their owed mark releases. Bounded by
+    /// live retained folds.
+    fold_landings: HashMap<u64, (bool, bool)>,
     /// Distinct folded mechanism rows across all per-module departed
     /// aggregates: the run-wide [`MAX_FOLDED_MECHANISMS_GLOBAL`]
     /// budget. Monotonic: folds never leave the aggregate.
@@ -4489,6 +4513,8 @@ impl CallerRegistry {
             suppressed_aggregates: HashSet::new(),
             demoted_placed_aggregates: BTreeMap::new(),
             suppressed_demoted_placed: BTreeSet::new(),
+            terminal_retry_totals: BTreeMap::new(),
+            terminal_retry_gap_index: BTreeMap::new(),
             terminal_phase: false,
             staged: Vec::new(),
             joint_publication: None,
@@ -4505,7 +4531,7 @@ impl CallerRegistry {
             unidentified_images: HashMap::new(),
             unidentified_images_saturated: false,
             unidentified_pids_dropped: 0,
-            fold_landings: Vec::new(),
+            fold_landings: HashMap::new(),
             folded_mechs_global: 0,
             folded_identities_global: 0,
             pending_count_decisions: Vec::new(),
@@ -5822,13 +5848,18 @@ impl CallerRegistry {
         std::mem::take(&mut self.pending_count_decisions)
     }
 
-    /// Drains the actual image-set landings the last publication applied,
-    /// in apply order: one `(fold id, module landed, run-wide landed)`
-    /// per retained-fold insert. The coordinator refreshes its stored
-    /// folds from these, so a later retraction rolls back exactly what
-    /// the ordered application landed.
-    pub(crate) fn take_fold_landings(&mut self) -> Vec<(u64, bool, bool)> {
-        std::mem::take(&mut self.fold_landings)
+    /// Drop the unconsumed landing receipt for a retained fold whose
+    /// owed mark releases without a retraction (terminal settlement or
+    /// revival: the fold stands, so no rollback will ever need it).
+    /// Retractions consume their own receipt at apply time instead.
+    pub(crate) fn drop_fold_receipt(&mut self, fold_id: u64) {
+        self.fold_landings.remove(&fold_id);
+    }
+
+    /// Test-only: live fold receipts awaiting their retraction.
+    #[cfg(test)]
+    pub(crate) fn fold_receipts_for_test(&self) -> usize {
+        self.fold_landings.len()
     }
 
     /// Stage one global health regression (a native identity, pair, or
@@ -6000,6 +6031,18 @@ impl CallerRegistry {
             labels,
             bindings,
             terminal,
+        });
+    }
+
+    /// Stage one identity-retry terminal exclusion for its per-cause
+    /// aggregate: settlements sharing `cause` sum into one counted row
+    /// at apply time, published through the existing gap rows with
+    /// guaranteed retention (at most one row per finite cause), never
+    /// through the generic budgeted detail that a full quota sheds.
+    pub(crate) fn record_terminal_retry_excluded(&mut self, cause: String, excluded: u64) {
+        self.staged.push(Mutation::RecordTerminalRetryExcluded {
+            cause,
+            excluded,
         });
     }
 
@@ -6562,6 +6605,59 @@ impl CallerRegistry {
         }
     }
 
+    /// Merge one identity-retry terminal exclusion into its per-cause
+    /// aggregate: the authoritative total grows here at apply time no
+    /// matter how full the generic detail store is, and the cause's one
+    /// published row rewrites in place with the new sum (repeats stays
+    /// 1: a summed row must not count settlements there). The row's
+    /// retention is guaranteed outside the generic budget — at most one
+    /// row per finite cause — so a saturated quota hides neither the
+    /// excluded calls nor their cause. The reason leads with the summed
+    /// count, like every counted gap.
+    fn push_terminal_retry_excluded(&mut self, cause: String, excluded: u64) {
+        let entry = self
+            .terminal_retry_totals
+            .entry(cause.clone())
+            .or_insert((0, 0));
+        entry.0 = entry.0.saturating_add(excluded);
+        entry.1 = entry.1.saturating_add(1);
+        let (total, settlements) = *entry;
+        let reason = format!(
+            "{total} calls observed while retained for identity retry are excluded at {cause} \
+             (aggregated over {settlements} settlements; each row keeps its first placement)"
+        );
+        let gap = RegistryGap {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: IDENTITY_RETRY_TERMINAL.into(),
+            reason,
+            budget: None,
+        };
+        if let Some(&index) = self.terminal_retry_gap_index.get(&cause)
+            && let Some(retained) = self.gaps.get_mut(index)
+            && retained.subject == IDENTITY_RETRY_TERMINAL
+        {
+            let old = std::mem::replace(&mut retained.reason, gap.reason.clone());
+            self.gap_index.remove(&RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: IDENTITY_RETRY_TERMINAL.into(),
+                reason: old,
+                budget: None,
+            });
+            self.gap_index.insert(gap, index);
+            return;
+        }
+        self.terminal_retry_gap_index.remove(&cause);
+        let index = self.gaps.len();
+        self.gap_index.insert(gap.clone(), index);
+        self.gaps.push(gap);
+        self.gap_repeats.push(1);
+        self.terminal_retry_gap_index.insert(cause, index);
+    }
+
     fn apply(
         &mut self,
         mutation: Mutation,
@@ -6750,20 +6846,13 @@ impl CallerRegistry {
                 landed_global,
                 fold_id,
             } => {
-                // A same-publication insert receipt for this fold wins
-                // over the carried flags: the fold's own insert staged
-                // strictly before its retraction, so an earlier apply
-                // in this publication already recorded the actual
-                // landing. Otherwise the carried flags (refreshed from
-                // the insert publication's drain) decide.
+                // The fold's own insert receipt wins over the carried
+                // flags and is consumed here: the insert applied strictly
+                // before its retraction (same publication or an earlier
+                // one), so the keyed record already holds the actual
+                // landing. Otherwise the carried flags decide.
                 let (landed_module, landed_global) = fold_id
-                    .and_then(|id| {
-                        self.fold_landings
-                            .iter()
-                            .rev()
-                            .find(|(known, _, _)| *known == id)
-                            .map(|(_, module, global)| (*module, *global))
-                    })
+                    .and_then(|id| self.fold_landings.remove(&id))
                     .unwrap_or((landed_module, landed_global));
                 self.apply_retract_unbound_fold(
                     &module,
@@ -6978,6 +7067,9 @@ impl CallerRegistry {
                 bindings,
                 terminal,
             } => self.push_aggregated_unrouted(subject, total, labels, bindings, terminal),
+            Mutation::RecordTerminalRetryExcluded { cause, excluded } => {
+                self.push_terminal_retry_excluded(cause, excluded);
+            }
             Mutation::RecordKeyedGap {
                 key,
                 caller,
@@ -7624,10 +7716,11 @@ impl CallerRegistry {
         // The ordered application decides the landing: a retraction
         // staged earlier in this same publication already freed its
         // slot, and an insert staged earlier already took it. Record
-        // the actual per-set result for the fold's retraction.
+        // the actual per-set result keyed by fold id for the fold's
+        // retraction to consume.
         if let Some(fold_id) = fold_id {
             self.fold_landings
-                .push((fold_id, landed_module, landed_global));
+                .insert(fold_id, (landed_module, landed_global));
         }
         if unidentified {
             let module = self.modules.get(&id).expect("indexed module");

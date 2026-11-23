@@ -1622,10 +1622,14 @@ impl<L> NativeLane<L> {
             ));
         }
         let domain = self.capture.domain();
-        events.extend(
-            host.stage_native(NativeBatch::Finish { domain }, &mut self.capture, now_ns())
-                .events,
-        );
+        loop {
+            let receipt =
+                host.stage_native(NativeBatch::Finish { domain }, &mut self.capture, now_ns());
+            events.extend(receipt.events);
+            if !receipt.settlement_owed {
+                break;
+            }
+        }
         let retirement = match (retired, poll_error, self.capture.cleanup()) {
             (true, _, Some(cleanup)) => Retirement::Closed(cleanup),
             (true, _, None) => Retirement::Closed(CleanupSummary::default()),
@@ -1735,6 +1739,9 @@ pub(crate) struct NativeStop<L> {
     /// The last staged batch left re-sight attempts owed: the terminal
     /// refresh reads on for them instead of finishing at once.
     staged_resight_owed: bool,
+    /// The last staged Finish left terminal settlement owed: the stop
+    /// machine stages Finish again instead of retiring at once.
+    staged_settlement_owed: bool,
 }
 
 // Both variants move the same native owner; returning Pending must remain
@@ -1770,6 +1777,7 @@ impl<L> NativeStop<L> {
             retirement_budget: Duration::ZERO,
             retirement: None,
             staged_resight_owed: false,
+            staged_settlement_owed: false,
         }
     }
 
@@ -1847,6 +1855,7 @@ impl<L> NativeStop<L> {
                     .expect("one original read awaits staging");
                 let receipt = host.stage_native(batch, &mut self.lane.capture, now_ns());
                 self.staged_resight_owed = receipt.resight_owed;
+                self.staged_settlement_owed = receipt.settlement_owed;
                 self.events.extend(receipt.events);
                 // The next phase's original window starts after this
                 // staging action, exactly once, even if it used the slice.
@@ -1907,7 +1916,13 @@ impl<L> NativeStop<L> {
                             NativeStopPhase::PostWitness
                         };
                     }
-                    NativeAfterStage::Finish => self.phase = NativeStopPhase::RetirementGap,
+                    NativeAfterStage::Finish => {
+                        self.phase = if self.staged_settlement_owed {
+                            NativeStopPhase::Finish
+                        } else {
+                            NativeStopPhase::RetirementGap
+                        };
+                    }
                 }
             }
             NativeStopPhase::PreDrain => {

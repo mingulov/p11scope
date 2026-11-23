@@ -1386,9 +1386,12 @@ impl NativeBinder {
     /// re-sighted by later witness batches until they decide, so a
     /// caller admitted before the horizons arrive still binds (late
     /// binding); rows with a retained fallback keep their read-time
-    /// verdict path. Each batch visits at most
-    /// [`RESIGHT_VISITS_PER_PASS`] owed rows and queries at most
-    /// [`RESIGHT_QUERIES_PER_PASS`] of them, and reports
+    /// verdict path. The re-sight pass, the identity-retry pass, and
+    /// first sight of this batch's own rows share one per-action
+    /// budget of [`RESIGHT_QUERIES_PER_PASS`] queries (and
+    /// [`RESIGHT_VISITS_PER_PASS`] pass visits): a live hit past the
+    /// query allowance defers to the owed queue instead of spending
+    /// outside the bound. The batch reports
     /// [`ResightOutcome::Incomplete`] when owed rows remain; the next
     /// batch resumes with them. A re-sighted row decides only once both
     /// horizons started strictly after its query completed.
@@ -1488,22 +1491,40 @@ impl NativeBinder {
                 .or_default();
             seen.last_t0_ns = seen.last_t0_ns.max(row.recorded_at_ns);
             seen.last_tgid = row.host_tgid;
-            let sighting = lookup.live_caller(row.host_tgid).map(|caller| Sighting {
-                caller: caller.id,
-                first_seen_ns: caller.first_seen_ns,
-                query: identity.query_cookie(row.domain, caller.pin),
-                // A read-time sighting is decided against the row's
-                // read; only a late sighting carries its own query
-                // completion threshold.
-                late: false,
-                sighted_ns: None,
-            });
+            // First sight draws from the same per-action query budget
+            // as both passes above: a live hit past the allowance
+            // defers its query to the owed queue (a later pass
+            // re-sights it) instead of spending outside the bound.
+            // The row, its read stamp, and its cookie sequence stay —
+            // only the query waits.
+            let live = lookup.live_caller(row.host_tgid);
+            let deferred = live.is_some() && budget.queries == 0;
+            if live.is_some() && !deferred {
+                budget.queries -= 1;
+            }
+            let sighting = match (live, deferred) {
+                (Some(caller), false) => Some(Sighting {
+                    caller: caller.id,
+                    first_seen_ns: caller.first_seen_ns,
+                    query: identity.query_cookie(row.domain, caller.pin),
+                    // A read-time sighting is decided against the
+                    // row's read; only a late sighting carries its
+                    // own query completion threshold.
+                    late: false,
+                    sighted_ns: None,
+                }),
+                _ => None,
+            };
             // A row with no live answer may still bind through the one
             // unambiguous retained incarnation; anything else keeps its
-            // live-miss gap at decision time.
-            let needs_retained = sighting
-                .as_ref()
-                .is_none_or(|sighting| matches!(sighting.query, CookieQuery::Exited));
+            // live-miss gap at decision time. A deferred row skips the
+            // fallback on purpose: its live query is still owed, so a
+            // later pass must attempt it rather than deciding from
+            // retained evidence the read never consulted.
+            let needs_retained = !deferred
+                && sighting
+                    .as_ref()
+                    .is_none_or(|sighting| matches!(sighting.query, CookieQuery::Exited));
             let retained = needs_retained
                 .then(|| lookup.retained_callers(row.host_tgid))
                 .and_then(|held| {
@@ -1517,6 +1538,9 @@ impl NativeBinder {
             // only good at read time, and the row must not decide
             // sightingless before a pass attempts it. (The pass above
             // already ran, so the attempt lands on a later batch.)
+            // A deferred first sight joins it too: its live query is
+            // still owed, and a later pass re-sights it within the
+            // same per-action bound.
             let due = sighting.is_none() && retained.is_none();
             if due {
                 state.owed.push_back(state.next_pos);
@@ -1604,10 +1628,23 @@ impl NativeBinder {
                     budget.queries -= 1;
                     pending.resight_due = false;
                     pending.last_attempt = Some(current);
+                    let query = identity.query_cookie(pending.row.domain, caller.pin);
+                    // An exited hit falls back to the one unambiguous
+                    // retained incarnation, exactly like the read loop:
+                    // a deferred first sight decides from the same
+                    // evidence it would have seen at read time.
+                    if matches!(&query, CookieQuery::Exited) {
+                        let held = lookup.retained_callers(pending.row.host_tgid);
+                        if let [only] = held.as_slice()
+                            && retained_candidate(only, pending.row.recorded_at_ns)
+                        {
+                            pending.retained = Some(*only);
+                        }
+                    }
                     pending.sighting = Some(Sighting {
                         caller: caller.id,
                         first_seen_ns: caller.first_seen_ns,
-                        query: identity.query_cookie(pending.row.domain, caller.pin),
+                        query,
                         late: true,
                         sighted_ns: None,
                     });
@@ -1636,6 +1673,7 @@ impl NativeBinder {
                 let rel = pos.saturating_sub(state.popped) as usize;
                 if let Some(pending) = state.pending.get_mut(rel) {
                     pending.sighting = None;
+                    pending.retained = None;
                     pending.last_attempt = None;
                     pending.resight_due = true;
                 }
@@ -1674,13 +1712,16 @@ impl NativeBinder {
     /// normal horizons-plus-§3.3 path then decides it from current
     /// proof, one to two batches later. Anything else — a miss, a
     /// mismatched or unavailable answer, an exited hit without a
-    /// fallback, a hit past the query budget, or an unstamped query
-    /// under a modeled clock — keeps its place for a later pass,
-    /// pushed back behind the rows this pass never reached, so the
-    /// next batch resumes fairly. A re-pended row decides through the
-    /// full §3.3 rules, never around them: PID reuse answers another
-    /// ticket and never re-pends, and an exec or loss since the
-    /// admission refuses at re-decision.
+    /// fallback, or an unstamped query under a modeled clock — keeps
+    /// its place for a later pass, pushed back behind the rows this
+    /// pass never reached. A hit past the query budget instead stops
+    /// this pass with the hit preserved at the head: unqueried live
+    /// rows stay ahead of attempted failures, so a matching tail
+    /// behind persistent mismatches is queried on a later pass
+    /// instead of starving behind the same requeued failures. A
+    /// re-pended row decides through the full §3.3 rules, never around
+    /// them: PID reuse answers another ticket and never re-pends, and
+    /// an exec or loss since the admission refuses at re-decision.
     fn retry_pass<Pin>(
         &mut self,
         index: usize,
@@ -1703,10 +1744,12 @@ impl NativeBinder {
                 continue;
             };
             if budget.queries == 0 {
-                // A hit past the query budget stays queued for the
-                // next pass while later rows are still visited.
-                self.domains[index].retry.push_back(candidate);
-                continue;
+                // A hit past the query budget stops this pass with
+                // the hit preserved at the head: the next pass
+                // queries it first instead of re-spending the whole
+                // allowance on the same attempted failures.
+                self.domains[index].retry.push_front(candidate);
+                break;
             }
             budget.queries -= 1;
             let query = identity.query_cookie(candidate.row.domain, hit.pin);

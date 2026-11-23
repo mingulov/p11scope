@@ -78,7 +78,7 @@ use crate::scope::inventory_cgroup::{CgroupWalkLimits, CgroupWalkState, Collecti
 use p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT;
 use p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT_MAPPINGS;
 use p11scope_ebpf_common::inventory_callers::CallerEvidence;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -746,6 +746,15 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// unbound verdict), on the domain's finish, or never for a row
     /// that never re-decides (its fold stands, honestly).
     retry_owed: HashMap<PairKey, RetryOwed>,
+    /// Per-domain finish-settlement queues: every `retry_owed` insert
+    /// appends its key here in insertion order, and domain finish pops
+    /// at most [`FINISH_SETTLEMENT_PER_CREDIT`] keys per staging action
+    /// (settle live ones, skip stale ones already released by a
+    /// re-decision), so terminal settlement resumes across actions
+    /// instead of scanning and settling synchronously. Entries are
+    /// appended once and popped once; a domain's queue empties exactly
+    /// when its settlement completes.
+    retry_finish_queue: HashMap<NativeDomainId, VecDeque<PairKey>>,
     /// Next retained-fold id: keys each fold's actual-landing receipt
     /// from the ordered registry application.
     next_fold_id: u64,
@@ -1011,6 +1020,11 @@ const MAX_PRUNED_PAIR_TOMBSTONES: usize = 65_536;
 /// a missing record then reads `exec_record_lost`, never
 /// `no_exec_record`.
 const MAX_PRUNED_EXEC_TOMBSTONES: usize = 65_536;
+/// Terminal settlement work per staging credit: domain finish pops at
+/// most this many owed keys per action (settle live ones, skip stale
+/// ones), so finish settlement resumes across actions instead of
+/// settling a whole domain synchronously in one stage.
+const FINISH_SETTLEMENT_PER_CREDIT: usize = 64;
 
 /// Scan-learned exe-probe cache: one entry per distinct caller path
 /// at most, so the retained set cannot outnumber admitted callers
@@ -1420,6 +1434,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             pair_counts: HashMap::new(),
             pair_targets: HashMap::new(),
             retry_owed: HashMap::new(),
+            retry_finish_queue: HashMap::new(),
             next_fold_id: 0,
             pair_dropped_tombstones: HashMap::new(),
             pair_dropped_totals: HashMap::new(),
@@ -8143,10 +8158,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // value.
         self.binder
             .set_exit_clocks_comparable(self.exit_clocks_comparable);
-        // Refresh retained folds from the ordered application's actual
-        // image-set landings before any decision staged below can
-        // retract one.
-        self.refresh_fold_landings();
+        // No fold-landing refresh: each retraction consumes exactly its
+        // own keyed receipt at apply time, so no scan runs here.
         // A completed witness sweep proves no older row for its domain is
         // still in flight; a Finish means no later evidence at all. Both
         // release departed tombstones only after this batch's decisions
@@ -8248,7 +8261,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         if let Some((domain, finished, began_ns, gap_free)) = tombstone_cleanup {
             self.expire_exec_tombstones(domain, began_ns, gap_free);
             if finished {
-                self.finish_native_domain(domain);
+                receipt.settlement_owed = self.finish_native_domain(domain);
             }
         }
         receipt
@@ -8272,31 +8285,49 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         });
     }
 
-    /// The domain will produce no more evidence: drop its departed
-    /// tombstone maps (both would otherwise live for the whole capture)
-    /// and its EXEC-loss latch. Pair totals stay: they are the exact
-    /// counted aggregate, not per-pair revival state. Retained retry
-    /// pairs disclose the calls they observed while dropped as
-    /// terminal gaps, then release their held absolutes (their folds
-    /// stand: no re-observation follows the domain's end) and prune
-    /// normally afterwards.
-    fn finish_native_domain(&mut self, domain: NativeDomainId) {
+    /// The domain will produce no more evidence: retained retry pairs
+    /// disclose the calls they observed while dropped through the
+    /// terminal per-cause totals, then release their held absolutes
+    /// (their folds stand: no re-observation follows the domain's
+    /// end) and prune normally afterwards. Settlement pops at most
+    /// [`FINISH_SETTLEMENT_PER_CREDIT`] owed keys per call from the
+    /// domain's queue — live ones settle, stale ones (already released
+    /// by a re-decision) skip — and returns whether work remains: the
+    /// caller stages Finish again while it does. The tombstone and
+    /// latch cleanup below is withheld until the queue drains, so no
+    /// finish publication lands over unsettled pairs.
+    fn finish_native_domain(&mut self, domain: NativeDomainId) -> bool {
+        for _ in 0..FINISH_SETTLEMENT_PER_CREDIT {
+            let Some(key) = self
+                .retry_finish_queue
+                .get_mut(&domain)
+                .and_then(|queue| queue.pop_front())
+            else {
+                break;
+            };
+            if !self.retry_owed.contains_key(&key) {
+                continue;
+            }
+            self.settle_retry_terminal(&key, RetryTerminalCause::Finish);
+            self.release_retry_standing(&key);
+            self.pair_counts.remove(&key);
+        }
+        if self
+            .retry_finish_queue
+            .get(&domain)
+            .is_some_and(|queue| queue.is_empty())
+        {
+            self.retry_finish_queue.remove(&domain);
+        }
+        if self.retry_finish_queue.contains_key(&domain) {
+            return true;
+        }
         self.exec_pruned
             .retain(|cookie, _| cookie.domain() != domain);
         self.exec_loss_domains.remove(&domain);
         self.pair_dropped_tombstones
             .retain(|key, _| key.image.domain() != domain);
-        let owed: Vec<PairKey> = self
-            .retry_owed
-            .keys()
-            .filter(|key| key.image.domain() == domain)
-            .copied()
-            .collect();
-        for key in owed {
-            self.settle_retry_terminal(&key, RetryTerminalCause::Finish);
-            self.retry_owed.remove(&key);
-            self.pair_counts.remove(&key);
-        }
+        false
     }
 
     /// `LEADER_EXIT` records (H6 slice 2): a leader exit whose generation
@@ -8675,6 +8706,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             events,
             decided,
             resight_owed: false,
+            settlement_owed: false,
         }
     }
 
@@ -9624,7 +9656,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             );
         let retry_rule = retry_rebind && retry_target_ok && retry_place_ok && retry_reuse_ok;
         if retry_rebind && !retry_rule {
-            self.retry_owed.remove(&key);
+            self.release_retry_standing(&key);
         }
         let (base, staged, staged_ns, base_since) = match self.pair_targets.get(&key) {
             Some(PairTarget::Pending {
@@ -9809,29 +9841,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// bound bucket. Only `NoLiveCaller` rows are ever retained, so
     /// the fold's reason code is constant; a fold exists exactly for
     /// a module first bucket, so the fold retraction covers that move
-    /// and every other bucket retracts on its own.
-    /// Refresh retained folds whose inserts the last publication
-    /// applied: replace the note-time landing prediction with the
-    /// ordered application's actual per-set result, so a later
-    /// retraction rolls back exactly what landed. Folds whose owed
-    /// marks already released (revival, terminal settlement) are gone
-    /// and need nothing.
-    fn refresh_fold_landings(&mut self) {
-        let landings = self.registry.take_fold_landings();
-        if landings.is_empty() {
-            return;
-        }
-        for (id, landed_module, landed_global) in landings {
-            for owed in self.retry_owed.values_mut() {
-                if let Some(fold) = owed.fold.as_mut().filter(|fold| fold.id == id) {
-                    fold.image_landed_module = landed_module;
-                    fold.image_landed_global = landed_global;
-                    break;
-                }
-            }
-        }
-    }
-
+    /// and every other bucket retracts on its own. The retraction
+    /// consumes the fold's own keyed receipt at apply time, so the
+    /// carried prediction flags below are fallback only.
     fn release_retry_for_bind(&mut self, key: PairKey) {
         let Some(owed) = self.retry_owed.remove(&key) else {
             return;
@@ -9853,14 +9865,27 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
     }
 
+    /// Release a retained mark whose fold stands (re-refusal, revival,
+    /// or terminal settlement: no retraction follows): drop its
+    /// unconsumed landing receipt so the keyed store never grows past
+    /// live retained folds. One hash removal, never a scan.
+    fn release_retry_standing(&mut self, key: &PairKey) {
+        if let Some(owed) = self.retry_owed.remove(key)
+            && let Some(fold) = owed.fold
+        {
+            self.registry.drop_fold_receipt(fold.id);
+        }
+    }
+
     /// Settle a retained identity-retry row that places nothing: the
     /// held absolute grew past the accounted one while the row waited,
-    /// and no re-observation will ever place the difference. Disclose
-    /// exactly that growth as a named counted gap for the terminal
-    /// cause; the row keeps its first verdict and placement, the fold
-    /// (when one stands) is untouched, and a later revival still
-    /// rebases past the full held absolute. Nothing held past the
-    /// accounted absolute discloses nothing.
+    /// and no re-observation will ever place the difference. Add
+    /// exactly that growth to the terminal cause's authoritative
+    /// per-cause total, published with guaranteed retention; the row
+    /// keeps its first verdict and placement, the fold (when one
+    /// stands) is untouched, and a later revival still rebases past
+    /// the full held absolute. Nothing held past the accounted
+    /// absolute discloses nothing.
     fn settle_retry_terminal(&mut self, key: &PairKey, cause: RetryTerminalCause) {
         let Some(owed) = self.retry_owed.get(key) else {
             return;
@@ -9880,24 +9905,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             RetryTerminalCause::EndpointLoss => "endpoint resolution loss".to_string(),
             RetryTerminalCause::Finish => "domain finish".to_string(),
         };
-        let standing = if accounted > 0 {
-            format!(
-                "the row keeps its first placement and its accounted absolute of {accounted} stands"
-            )
-        } else {
-            "the row keeps its first placement, which supplied no count carrier, so the gap counts the entire held subtotal"
-                .to_string()
-        };
-        self.registry.record_gap(RegistryGap {
-            caller: None,
-            module: None,
-            pid: None,
-            subject: crate::discovery::caller_registry::IDENTITY_RETRY_TERMINAL.into(),
-            reason: format!(
-                "{excluded} calls observed while retained for identity retry are excluded at {cause_text}; {standing}"
-            ),
-            budget: None,
-        });
+        // Per-cause aggregate, never a budgeted detail row: the total
+        // for this cause stays published with guaranteed retention no
+        // matter how full the generic gap quota is.
+        self.registry
+            .record_terminal_retry_excluded(cause_text, excluded);
     }
 
     /// Stages one pending pair's held count for publication-time
@@ -11147,7 +11159,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     let key = PairKey::of(&row);
                     self.settle_retry_terminal(&key, RetryTerminalCause::EndpointLoss);
                     self.drop_pair_count(&row, DiagnosticReason::NotAdmitted, false);
-                    self.retry_owed.remove(&key);
+                    self.release_retry_standing(&key);
                     return Ok(());
                 }
                 // A retained row keeps its held absolute as the
@@ -11160,8 +11172,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     // bucket; the owed mark remembers it for the move.
                     // No count carrier yet: a terminal settlement
                     // accounts the entire held subtotal.
+                    let key = PairKey::of(&row);
+                    self.retry_finish_queue
+                        .entry(key.image.domain())
+                        .or_default()
+                        .push_back(key);
                     self.retry_owed.insert(
-                        PairKey::of(&row),
+                        key,
                         RetryOwed {
                             fold: None,
                             placement: FirstPlacement::Unresolved,
@@ -11202,7 +11219,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     let key = PairKey::of(&row);
                     self.settle_retry_terminal(&key, RetryTerminalCause::ReRefused(reason));
                     self.drop_pair_count(&row, diagnostic_binding_reason(reason), false);
-                    self.retry_owed.remove(&key);
+                    self.release_retry_standing(&key);
                     return Ok(());
                 }
                 // The dropped absolute folds into the single module's
@@ -11322,7 +11339,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     ),
                 }
                 if let Some(owed) = owed {
-                    self.retry_owed.insert(PairKey::of(&row), owed);
+                    let key = PairKey::of(&row);
+                    self.retry_finish_queue
+                        .entry(key.image.domain())
+                        .or_default()
+                        .push_back(key);
+                    self.retry_owed.insert(key, owed);
                 }
             }
         }
@@ -13588,6 +13610,12 @@ pub(crate) struct NativeReceipt {
     /// reads on while this holds instead of finishing at the first
     /// exact refresh. Always false for semantic batches.
     pub resight_owed: bool,
+    /// The finished domain still owes terminal settlement: finish
+    /// pops at most [`FINISH_SETTLEMENT_PER_CREDIT`] owed pairs per
+    /// staging action, so the caller stages Finish again while this
+    /// holds instead of publishing over unsettled pairs. Always false
+    /// except on `Finish` batches with a drained queue remaining.
+    pub settlement_owed: bool,
 }
 
 /// One CALLER_USE pair (C7 C4): the image that owns the row plus the
@@ -13637,13 +13665,12 @@ struct PairKeyClass {
 /// One staged single-module unbound fold owed to a retained
 /// identity-retry row: the module, folded entries, and image cookie
 /// a retry bind retracts, so the edge carries the calls exactly once.
-/// The landing flags record whether the fold's image insert landed in
-/// each image set (a saturated set drops it): the retraction
-/// subtracts only landed calls, so it never eats another fold's.
-/// Predicted at note time from committed state, then refreshed from
-/// the ordered application's actual landings (a retraction staged in
-/// the same publication as another fold's insert sees the freed or
-/// taken slot); the fold id keys the receipt.
+/// The landing flags predict whether the fold's image insert lands in
+/// each image set (a saturated set drops it): fallback only. The
+/// retraction consumes the fold's own keyed receipt at apply time —
+/// the ordered application's actual per-set result — so it subtracts
+/// only landed calls and never eats another fold's. The fold id keys
+/// that receipt.
 #[derive(Debug, Clone)]
 struct RetryFold {
     id: u64,
@@ -29973,6 +30000,73 @@ exit 0
         assert_eq!((unbound.rows, unbound.entries), (65, 65));
     }
 
+    #[test]
+    fn retracting_fold_consumes_only_its_own_receipt() {
+        // Keyed receipts: two retained folds commit (two live receipts);
+        // rebinding the first consumes exactly its receipt while the
+        // second's stays for its own later retraction — no eager drain
+        // scans the owed marks, and no retraction scans the receipt
+        // store. Both rebinds land exact with no ghost.
+        let (mut native, _) = NativeScene::new();
+        for (pid, start) in [(9, 600), (10, 700)] {
+            native.scene.source.spawn(pid, start);
+            native.scene.source.set_leader_exit_observation(
+                pid,
+                crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+            );
+        }
+        let mut first = native.row(41, 1, 9, 40, 1);
+        first.entry_count = 3;
+        let mut second = native.row(42, 1, 10, 40, 1);
+        second.entry_count = 5;
+        native.witness(vec![first, second]);
+        native.counts_read(Vec::new(), vec![(41, 1, 1, 3), (42, 1, 1, 5)]);
+        for (pid, at) in [(9, 50), (10, 50)] {
+            native
+                .scene
+                .coordinator
+                .adapter
+                .admit(pid, ImageAuthority::ScanPinned, at)
+                .unwrap();
+            native.scene.project(pid, 60);
+        }
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            native.scene.coordinator.registry.fold_receipts_for_test(),
+            2,
+            "both inserts record keyed receipts"
+        );
+        native.answer(9, 600, 41);
+        native.answer(10, 700, 99);
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            native.scene.coordinator.registry.fold_receipts_for_test(),
+            1,
+            "only the rebound fold's receipt is consumed"
+        );
+        let census = native.scene.coordinator.registry.witness_census();
+        assert_eq!((census.rows, census.bound, census.unbound_total()), (2, 1, 1));
+        native.answer(10, 700, 42);
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            native.scene.coordinator.registry.fold_receipts_for_test(),
+            0,
+            "the second retraction consumes the last receipt"
+        );
+        let census = native.scene.coordinator.registry.witness_census();
+        assert_eq!((census.rows, census.bound, census.unbound_total()), (2, 2, 0));
+        assert_eq!(
+            native.module_unbound(),
+            None,
+            "both folds retract with no ghost"
+        );
+        let registry = &native.scene.coordinator.registry;
+        let edges: Vec<u64> = registry.edges().map(|edge| edge.entry_count).collect();
+        assert_eq!(edges.iter().sum::<u64>(), 8, "3 + 5 carried exactly once");
+    }
+
     /// The retry completion stamp lands strictly between the re-pend
     /// batch's horizons and the next batch's: the re-pended row waits
     /// exactly one batch, then decides together with the newly read row
@@ -30482,13 +30576,18 @@ exit 0
         let fold_calls = unbound.as_ref().map(|unbound| unbound.entries).unwrap_or(0);
         let mut gap_calls = 0u64;
         let mut gap_rows = 0usize;
-        for gap in registry.gaps() {
+        for (gap, repeats) in registry
+            .gaps()
+            .iter()
+            .zip(registry.gap_repeats().iter())
+        {
             if gap.subject == "identity retry terminal" {
                 gap_rows += 1;
                 let first = gap.reason.split_whitespace().next().unwrap_or("?");
-                gap_calls += first.parse::<u64>().unwrap_or_else(|_| {
+                let count: u64 = first.parse().unwrap_or_else(|_| {
                     panic!("{name}: terminal gap without a leading count: {gap:?}")
                 });
+                gap_calls = gap_calls.saturating_add(count.saturating_mul(*repeats));
             }
         }
         assert_eq!(gap_rows, expect.terminal_rows, "{name}: terminal gap rows");

@@ -3372,3 +3372,76 @@ fn fresh_read_and_retry_share_the_action_allowance() {
         (65, 65, 0, 0)
     );
 }
+
+#[test]
+fn mixed_resight_retry_and_fresh_share_one_allowance() {
+    // Triple mix: retained retries, owed first re-sights, and fresh
+    // uncached live rows in one servicing batch share the single
+    // 64-query action allowance, and every row eventually decides
+    // across later actions within the same bound.
+    let mut run = Run::new();
+    let d = run.domain;
+    let retained: Vec<WitnessRow> = (0..40)
+        .map(|i| row(d, 100 + i, 1, T + i as u32, 1_500))
+        .collect();
+    run.read(retained);
+    run.settle();
+    assert_eq!(run.verdicts().len(), 40);
+    assert_eq!(run.binder.retry_len_for_test(d), 40);
+    let owed: Vec<WitnessRow> = (0..20)
+        .map(|i| row(d, 200 + i, 1, T + 100 + i as u32, 1_500))
+        .collect();
+    run.read(owed);
+    assert_eq!(run.verdicts(), Vec::new(), "owed rows wait");
+    for i in 0..40 {
+        run.world.admit(T + i as u32, 1, 1_000 + i as u32, 2_000);
+        run.world.answer(T + i as u32, 1, d, cookie(d, 100 + i));
+    }
+    for i in 0..20 {
+        run.world
+            .admit(T + 100 + i as u32, 1, 2_000 + i as u32, 2_000);
+        run.world
+            .answer(T + 100 + i as u32, 1, d, cookie(d, 200 + i));
+    }
+    run.world.admit(T + 200, 1, 3_000, 2_000);
+    run.world.answer(T + 200, 1, d, cookie(d, 300));
+    run.world.admit(T + 201, 1, 3_001, 2_000);
+    run.world.answer(T + 201, 1, d, cookie(d, 301));
+    let queries_before = run.world.queries;
+    run.drain(&[]);
+    run.read(vec![
+        row(d, 300, 1, T + 200, 1_500),
+        row(d, 301, 1, T + 201, 1_500),
+    ]);
+    let batch_queries = run.world.queries - queries_before;
+    assert!(
+        batch_queries <= 64,
+        "one action spends at most 64 queries, saw {batch_queries}"
+    );
+    let mut decided = run.verdicts().len();
+    for _ in 0..8 {
+        if run.binder.census().pending == 0 && run.binder.retry_len_for_test(d) == 0 {
+            break;
+        }
+        let queries_before = run.world.queries;
+        run.drain(&[]);
+        run.read(Vec::new());
+        let batch_queries = run.world.queries - queries_before;
+        assert!(
+            batch_queries <= 64,
+            "resume spends at most 64 queries, saw {batch_queries}"
+        );
+        decided += run.verdicts().len();
+    }
+    assert_eq!(decided, 62, "40 retries + 20 re-sights + 2 fresh decide");
+    let census = run.binder.census();
+    assert_eq!(
+        (
+            census.rows,
+            census.bound,
+            census.unbound_total(),
+            census.pending
+        ),
+        (62, 62, 0, 0)
+    );
+}

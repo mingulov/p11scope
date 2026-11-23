@@ -38232,6 +38232,450 @@ fn joint_seal_barrier_scan_reuses_completed_barrier_across_retries() {
     );
 }
 
+/// A refused exact-fit clear yields before Future settlement: foreign
+/// clear rows plus one foreign refused tail share the frame with an
+/// `AbandonReturnPending` wait, and each one-unit seal examines exactly
+/// one row. The final refused row spends the last credit and must yield
+/// with no decision — LocalPending, zero remaining, no wait, no advance —
+/// instead of settling the Future at zero (which underflows the shared
+/// slice). The next poll reuses the completed clear with zero new visits
+/// and advances the Future with its paid decision credit. A two-credit
+/// control on a fresh frame decides without the extra yield.
+#[test]
+fn joint_seal_refused_exact_fit_yields_before_future_settlement() {
+    use crate::semantics_objects::journal::SealWait;
+    use crate::semantics_objects::journal::tests::abandon_bytes;
+    use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+
+    fn build_fixture(
+        foreign_opens: usize,
+        foreign_refused: usize,
+    ) -> (
+        CanonicalFanoutScene,
+        IngestedJointQuantum,
+        crate::semantics_objects::journal::SealStageCounts,
+    ) {
+        let mut fixture = CanonicalFanoutScene::prior_sealed();
+        let (target, pid) = fixture.replay_target();
+        let (open, ordinary) =
+            fixture
+                .scene
+                .encoded_with_rv(pid, 0, "C_SignUpdate", 2, pkcs11_types::CkRv::PENDING.0);
+        let (held, complete) = fixture.scene.encoded(pid, 0, "C_SignInit", 3);
+        let image = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .semantic_bindings()
+            .get(target.caller())
+            .unwrap()
+            .image();
+        let mut abandon = abandon_bytes(
+            u64::from(pid),
+            2,
+            JOURNAL_REASON_SYNC_RETURN_RESULT_LOST,
+            (image.task_cookie, image.exec_id),
+        );
+        abandon[24..32].copy_from_slice(&open[24..32]);
+        abandon[48..52].copy_from_slice(&open[104..108]);
+        abandon[56..64].copy_from_slice(&open[48..56]);
+        let source = fixture.scene.drain.source_mut();
+        source.push_record(open.to_vec());
+        source.push_record(ordinary[24..392].to_vec());
+        source.push_record(abandon.to_vec());
+        source.push_record(held.to_vec());
+        source.push_record(complete.to_vec());
+        let frame = fixture.audited(2, 2, &BirthFault);
+        assert!(
+            frame.failure_for_test().is_none(),
+            "clean audit: {:?}",
+            frame.failure_for_test()
+        );
+        {
+            let adapter = fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture_mut()
+                .adapter_mut();
+            if foreign_opens > 0 {
+                adapter.populate_foreign_open_rows_for_test(foreign_opens);
+            }
+            if foreign_refused > 0 {
+                adapter.populate_foreign_refused_rows_for_test(foreign_refused);
+            }
+        }
+        let diagnosis = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .seal_stage_diagnosis();
+        (fixture, frame, diagnosis)
+    }
+
+    // Sample the base shape to pick an odd total with a refused tail,
+    // so the two-credit control fits its final row plus the Future in
+    // one poll while the one-credit boundary still exact-fits.
+    let (_, _, base) = build_fixture(0, 0);
+    let base_total = base.open_staged as usize + base.refused_staged as usize;
+    let (foreign_opens, foreign_refused) = if base_total % 2 == 0 {
+        (0usize, 1usize)
+    } else {
+        (1usize, 1usize)
+    };
+
+    // One-unit boundary: every row yields, the exact-fit yields, the
+    // next poll advances the Future with zero new visits.
+    let (mut fixture, mut frame, diagnosis) =
+        build_fixture(foreign_opens, foreign_refused);
+    let total = diagnosis.open_staged as usize + diagnosis.refused_staged as usize;
+    assert_eq!(
+        total % 2,
+        1,
+        "the exact-fit table holds an odd row count: {total}"
+    );
+    assert!(
+        diagnosis.refused_staged >= 1,
+        "the scan ends in its refused phase"
+    );
+    let h0 = fixture.scene.real.h0.clone();
+    let mut births = NativeFrameBirths {
+        h0: &h0,
+        attached: &fixture.attached,
+        retained: &mut fixture.births,
+        seen: Vec::new(),
+        unreadable: false,
+    };
+    let mut ports = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_frame_ports(&fixture.scene.producers)
+        .unwrap();
+    frame.bind_targets(&ports).unwrap();
+    let baseline_visits = ports.read().1.adapter().barrier_row_visits_for_test();
+    assert_eq!(
+        frame.consumer_progress_for_test(),
+        (2, 0, 0),
+        "both consumers start pending"
+    );
+    for poll in 1..=total {
+        let before_visits = ports.read().1.adapter().barrier_row_visits_for_test();
+        let before_unbound = ports
+            .read()
+            .1
+            .adapter()
+            .seal_stage_diagnosis()
+            .unbound_staging;
+        let mut remaining = 1;
+        let progress =
+            frame.seal_next_bounded(&mut ports, &mut births, &BirthFault, &mut remaining);
+        let visits = ports.read().1.adapter().barrier_row_visits_for_test() - before_visits;
+        assert_eq!(
+            progress,
+            Ok(QuantumSealProgress::LocalPending),
+            "poll {poll} of {total} yields with no seal decision"
+        );
+        assert_eq!(remaining, 0, "a yielded poll spends its whole slice");
+        assert_eq!(
+            visits, 1,
+            "a budget-1 yielded poll examines exactly one row"
+        );
+        assert_eq!(
+            ports.read().1.adapter().last_seal_wait(),
+            SealWait::None,
+            "a yielded poll waits on nothing yet"
+        );
+        assert_eq!(
+            ports
+                .read()
+                .1
+                .adapter()
+                .seal_stage_diagnosis()
+                .unbound_staging,
+            before_unbound,
+            "a yielded poll counts no barrier gate"
+        );
+        assert_eq!(
+            frame.consumer_progress_for_test(),
+            (2, 0, 0),
+            "a yielded poll advances no consumer"
+        );
+        assert!(
+            frame.active_seal_for_test().is_none(),
+            "a yielded poll sets no active delivery"
+        );
+    }
+    assert_eq!(
+        ports.read().1.adapter().barrier_row_visits_for_test() - baseline_visits,
+        total,
+        "the clear scan visits every staged row once across its polls"
+    );
+    let before_visits = ports.read().1.adapter().barrier_row_visits_for_test();
+    let mut remaining = 1;
+    let progress =
+        frame.seal_next_bounded(&mut ports, &mut births, &BirthFault, &mut remaining);
+    let visits = ports.read().1.adapter().barrier_row_visits_for_test() - before_visits;
+    assert_eq!(
+        progress,
+        Ok(QuantumSealProgress::AwaitFutureInput),
+        "the poll after exact-fit advances the Future"
+    );
+    assert_eq!(
+        visits, 0,
+        "reusing the completed clear visits no new rows"
+    );
+    assert_eq!(
+        remaining, 0,
+        "the Future advance charges its paid decision credit"
+    );
+    assert_eq!(
+        ports.read().1.adapter().last_seal_wait(),
+        SealWait::AbandonReturnPending,
+        "the wait names its gate"
+    );
+    assert_eq!(
+        frame.consumer_progress_for_test(),
+        (1, 1, 1),
+        "the consumer advances past the wait"
+    );
+    assert!(
+        frame.active_seal_for_test().is_none(),
+        "a Future wait sets no active delivery"
+    );
+
+    // Two-credit control: the same odd shape decides without the extra
+    // yield, its final poll charging one scan row plus the Future.
+    let (mut fixture, mut frame, diagnosis) =
+        build_fixture(foreign_opens, foreign_refused);
+    let total = diagnosis.open_staged as usize + diagnosis.refused_staged as usize;
+    let h0 = fixture.scene.real.h0.clone();
+    let mut births = NativeFrameBirths {
+        h0: &h0,
+        attached: &fixture.attached,
+        retained: &mut fixture.births,
+        seen: Vec::new(),
+        unreadable: false,
+    };
+    let mut ports = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_frame_ports(&fixture.scene.producers)
+        .unwrap();
+    frame.bind_targets(&ports).unwrap();
+    let baseline_visits = ports.read().1.adapter().barrier_row_visits_for_test();
+    let mut polls = 0usize;
+    loop {
+        assert!(
+            polls < total,
+            "the two-credit scan decides within its row bound"
+        );
+        let before_visits = ports.read().1.adapter().barrier_row_visits_for_test();
+        let mut remaining = 2;
+        let progress =
+            frame.seal_next_bounded(&mut ports, &mut births, &BirthFault, &mut remaining);
+        polls += 1;
+        let visits = ports.read().1.adapter().barrier_row_visits_for_test() - before_visits;
+        assert!(
+            visits <= 2,
+            "poll {polls} examines at most its two-unit budget: {visits}"
+        );
+        if progress == Ok(QuantumSealProgress::AwaitFutureInput) {
+            assert_eq!(
+                visits + 1,
+                2 - remaining,
+                "the deciding poll charges its scan plus the one-unit Future advance"
+            );
+            assert_eq!(
+                ports.read().1.adapter().last_seal_wait(),
+                SealWait::AbandonReturnPending,
+                "the wait names its gate"
+            );
+            break;
+        }
+        assert_eq!(
+            progress,
+            Ok(QuantumSealProgress::LocalPending),
+            "poll {polls} yields with no seal decision"
+        );
+        assert_eq!(remaining, 0, "a yielded poll spends its whole slice");
+        assert_eq!(
+            visits, 2,
+            "a yielded two-credit poll examines a full slice"
+        );
+    }
+    assert_eq!(
+        ports.read().1.adapter().barrier_row_visits_for_test() - baseline_visits,
+        total,
+        "the control visits every staged row once"
+    );
+    assert_eq!(
+        frame.consumer_progress_for_test(),
+        (1, 1, 1),
+        "the control advances past the wait"
+    );
+}
+
+/// A refused exact-fit barrier decides at zero: the same odd shape as
+/// the clear twin but with its refused tail barring, each one-unit seal
+/// yields until the final poll visits the barrier and waits
+/// `UnboundStaging` as a retry (DeliveryReady, scan-only charge, no
+/// advance). Unlike a clear, a barrier owes no settlement credit, so no
+/// extra yield stands between the scan and its decision.
+#[test]
+fn joint_seal_refused_exact_fit_barrier_decides_at_zero() {
+    use crate::semantics_objects::journal::SealWait;
+    use crate::semantics_objects::journal::tests::abandon_bytes;
+    use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    let (target, pid) = fixture.replay_target();
+    let (open, ordinary) =
+        fixture
+            .scene
+            .encoded_with_rv(pid, 0, "C_SignUpdate", 2, pkcs11_types::CkRv::PENDING.0);
+    let (held, complete) = fixture.scene.encoded(pid, 0, "C_SignInit", 3);
+    let image = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .semantic_bindings()
+        .get(target.caller())
+        .unwrap()
+        .image();
+    let mut abandon = abandon_bytes(
+        u64::from(pid),
+        2,
+        JOURNAL_REASON_SYNC_RETURN_RESULT_LOST,
+        (image.task_cookie, image.exec_id),
+    );
+    abandon[24..32].copy_from_slice(&open[24..32]);
+    abandon[48..52].copy_from_slice(&open[104..108]);
+    abandon[56..64].copy_from_slice(&open[48..56]);
+    let source = fixture.scene.drain.source_mut();
+    source.push_record(open.to_vec());
+    source.push_record(ordinary[24..392].to_vec());
+    source.push_record(abandon.to_vec());
+    source.push_record(held.to_vec());
+    source.push_record(complete.to_vec());
+    let mut frame = fixture.audited(2, 2, &BirthFault);
+    assert!(
+        frame.failure_for_test().is_none(),
+        "clean audit: {:?}",
+        frame.failure_for_test()
+    );
+    let frontier = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .consumed_through_for_test();
+    {
+        let adapter = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture_mut()
+            .adapter_mut();
+        adapter.populate_foreign_open_rows_for_test(1);
+        adapter.populate_unbound_refused_barrier_row_for_test(frontier);
+    }
+    let h0 = fixture.scene.real.h0.clone();
+    let mut births = NativeFrameBirths {
+        h0: &h0,
+        attached: &fixture.attached,
+        retained: &mut fixture.births,
+        seen: Vec::new(),
+        unreadable: false,
+    };
+    let mut ports = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_frame_ports(&fixture.scene.producers)
+        .unwrap();
+    frame.bind_targets(&ports).unwrap();
+    let diagnosis = ports.read().1.adapter().seal_stage_diagnosis();
+    let total = diagnosis.open_staged as usize + diagnosis.refused_staged as usize;
+    let baseline_visits = ports.read().1.adapter().barrier_row_visits_for_test();
+    let mut polls = 0usize;
+    loop {
+        assert!(
+            polls < total + 2,
+            "the bounded scan reaches its refused barrier"
+        );
+        let before_visits = ports.read().1.adapter().barrier_row_visits_for_test();
+        let mut remaining = 1;
+        let progress =
+            frame.seal_next_bounded(&mut ports, &mut births, &BirthFault, &mut remaining);
+        polls += 1;
+        let visits = ports.read().1.adapter().barrier_row_visits_for_test() - before_visits;
+        assert_eq!(
+            visits, 1,
+            "poll {polls} examines exactly one row"
+        );
+        if progress == Ok(QuantumSealProgress::DeliveryReady)
+            && ports.read().1.adapter().last_seal_wait() == SealWait::UnboundStaging
+        {
+            assert_eq!(
+                visits,
+                1 - remaining,
+                "the deciding poll charges only its scan (a retry advances nothing)"
+            );
+            assert_eq!(remaining, 0, "the barrier scan spends its exact-fit credit");
+            assert!(
+                frame.active_seal_for_test().is_none(),
+                "a retry holds no positive delivery"
+            );
+            break;
+        }
+        assert_eq!(
+            progress,
+            Ok(QuantumSealProgress::LocalPending),
+            "poll {polls} yields before reaching the refused barrier"
+        );
+        assert_eq!(remaining, 0, "a yielded poll spends its whole slice");
+        assert_eq!(
+            ports.read().1.adapter().last_seal_wait(),
+            SealWait::None,
+            "a yielded poll waits on nothing yet"
+        );
+    }
+    assert_eq!(
+        ports.read().1.adapter().barrier_row_visits_for_test() - baseline_visits,
+        total,
+        "the refused barrier visits every staged row once to reach it"
+    );
+    assert_eq!(
+        ports
+            .read()
+            .1
+            .adapter()
+            .seal_stage_diagnosis()
+            .unbound_staging,
+        1,
+        "the decided barrier counts its gate once"
+    );
+    assert_eq!(
+        frame.consumer_progress_for_test(),
+        (2, 0, 0),
+        "a barrier retry advances no consumer"
+    );
+}
+
 /// A failure-path yield that spent budget is progress at the
 /// delivery seam; a yield with no spend stays stuck. A transient
 /// take retry first records a real stale streak (1,

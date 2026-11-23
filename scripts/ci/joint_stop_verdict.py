@@ -26,7 +26,14 @@ types, no floats, no duplicate keys):
               "offset_ms": (0, 1, 5, 20)[K % 4],
               "branch": null | "linked" | "s1-precluded"
                         | "no-feeds-unattributed",
-              "outcome": null | OUTCOME, "completed": bool}],
+              "outcome": null | OUTCOME,
+              "no_feed": null | {"joint_feeds": int, "journal_linked": bool,
+                                 "backstop_routed": int,
+                                 "birth_capacity": null | TEXT,
+                                 "drive": TEXT,
+                                 "gaps": [{"subject": TEXT, "reason": TEXT,
+                                           "count": int}]},
+              "completed": bool}],
    "terminal": {"kind": "qualified"} | {"kind": "narrowed"}
              | {"kind": "precluded" | "no-feed", "case": K,
                 "cause": TAG, "receipt": TEXT}
@@ -102,6 +109,7 @@ CHECKS = (
     "summary-status", "record-missing", "record-duplicate",
     "record-misplaced", "record-json", "record-schema", "record-cell",
     "selection", "case-sequence", "case-branch", "case-outcome",
+    "no-feed-probe",
     "completion", "terminal-status", "terminal-case", "qualified-count",
     "unexpected-pass",
     "precluded-binding", "no-feed-binding", "s1-after-linked",
@@ -276,6 +284,10 @@ def _judge(record, status, expect_wedge, check):
               and (outcome is not None or k == last),
               "wp7-stop%d: an outcome on an unlinked case, from another "
               "offset, or missing before the last opened case" % k)
+        check("no-feed-probe",
+              (case["no_feed"] is not None) == (case["branch"] in NO_FEED),
+              "wp7-stop%d: a no-feed probe on branch %r (the cell samples "
+              "one exactly on a no-feed case)" % (k, case["branch"]))
         failing = first_failing_check(outcome) if outcome else "absent"
         check("completion",
               case["completed"] == (outcome is not None and failing is None)
@@ -322,10 +334,12 @@ def _judge(record, status, expect_wedge, check):
             return verdict(
                 "environment-precluded", "s1-first-case",
                 "wp7-stop0: %s; not attempted" % NO_FEED["s1-precluded"])
+        probe = _probe_text(open_case["no_feed"])
         check("s1-after-linked", branch != "s1-precluded",
-              "wp7-stop%d sealed S1 after linked cases" % last)
+              "wp7-stop%d sealed S1 after linked cases; %s" % (last, probe))
         check("no-feed-unattributed", branch != "no-feeds-unattributed",
-              "wp7-stop%d: %s" % (last, NO_FEED["no-feeds-unattributed"]))
+              "wp7-stop%d: %s; %s" % (last, NO_FEED["no-feeds-unattributed"],
+                                      probe))
     if kind == "wedge":
         outcome = open_case["outcome"] if open_case else None
         check("wedge-binding",
@@ -361,6 +375,18 @@ def _judge(record, status, expect_wedge, check):
         else "wp7-stop%d" % last
     raise Refusal("case-failed", "%s failed: %s"
                   % (where, _excerpt(terminal.get("error", kind))))
+
+
+def _probe_text(probe):
+    """One-line summary of a no-feed probe for the verdict detail."""
+    if probe is None:
+        return "no probe"
+    gaps = ", ".join("%s/%s x%d" % (gap["subject"], gap["reason"],
+                                    gap["count"]) for gap in probe["gaps"])
+    return ("feeds=%d linked=%s backstop=%d capacity=%s gaps=[%s] drive=%s"
+            % (probe["joint_feeds"], probe["journal_linked"],
+               probe["backstop_routed"], probe["birth_capacity"], gaps,
+               probe["drive"]))[:1500]
 
 
 def _excerpt(text):
@@ -446,7 +472,14 @@ OUTCOME_FIELDS = {
 CASE_FIELDS = {
     "name": _is_str, "index": _is_u64, "prep": _is_u64,
     "offset_ms": _is_u64, "branch": _opt(_one_of(*BRANCHES)),
-    "outcome": lambda v: True, "completed": lambda v: type(v) is bool,
+    "outcome": lambda v: True, "no_feed": lambda v: True,
+    "completed": lambda v: type(v) is bool,
+}
+GAP_FIELDS = {"subject": _is_str, "reason": _is_str, "count": _is_u64}
+PROBE_FIELDS = {
+    "joint_feeds": _is_u64, "journal_linked": lambda v: type(v) is bool,
+    "backstop_routed": _is_u64, "birth_capacity": _opt(_is_str),
+    "drive": _is_str, "gaps": lambda v: type(v) is list,
 }
 TERMINAL_FIELDS = {
     "qualified": {}, "narrowed": {},
@@ -472,6 +505,10 @@ def _validate_schema(record):
         _keys(case, CASE_FIELDS, "cases[%d]" % k)
         if case["outcome"] is not None:
             _keys(case["outcome"], OUTCOME_FIELDS, "cases[%d].outcome" % k)
+        if case["no_feed"] is not None:
+            _keys(case["no_feed"], PROBE_FIELDS, "cases[%d].no_feed" % k)
+            for g, gap in enumerate(case["no_feed"]["gaps"]):
+                _keys(gap, GAP_FIELDS, "cases[%d].no_feed.gaps[%d]" % (k, g))
     terminal = record["terminal"]
     if type(terminal) is not dict or \
             terminal.get("kind") not in TERMINAL_FIELDS:

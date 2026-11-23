@@ -505,7 +505,7 @@ class CiStopRacesTests(unittest.TestCase):
         # A preclusion is case 0 alone, unlinked and undriven: a
         # collected outcome, a linked branch or an earlier case refuses.
         linked = precluded_record()
-        linked["cases"][0].update(branch="linked")
+        linked["cases"][0].update(branch="linked", no_feed=None)
         earlier = no_feed_record(1)
         earlier["terminal"]["kind"] = "precluded"
         driven = precluded_record()

@@ -18,6 +18,7 @@ Run: python3 -I tests/python/test_joint_stop_verdict.py -v
 
 import copy
 import json
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -29,7 +30,7 @@ import joint_stop_verdict as jv  # noqa: E402
 from joint_stop_logs import (  # noqa: E402
     CELL, MARKER, OK_SUMMARY, PREAMBLE, S1_RECEIPT, UNATTRIBUTED_RECEIPT,
     body_for, case_failed_record, case_record, frame, healthy_outcome,
-    log_for, no_feed_record, offset_of, passing, precluded,
+    log_for, no_feed_probe, no_feed_record, offset_of, passing, precluded,
     precluded_record, qualified_record, record_line, wedge_outcome,
     wedge_record, wedged,
 )
@@ -333,7 +334,7 @@ ROWS = [
         0, outcome=healthy_outcome(0)))), 101, False, F, "case-outcome",
      "r9-2: post-link evidence before a preclusion"),
     ("precluded-linked-case", log_for(edited(PR, case_set(
-        0, branch="linked", outcome=None))), 101, False, F,
+        0, branch="linked", outcome=None, no_feed=None))), 101, False, F,
      "no-feed-binding", "r9-2: preclusion of a linked case"),
     ("precluded-wrong-receipt", log_for(edited(PR, lambda r: r["terminal"]
                                                .update(receipt=S1_RECEIPT
@@ -359,6 +360,20 @@ ROWS = [
                   "receipt": S1_RECEIPT}))), 101, False, F,
      "no-feed-binding", "r8: wedge before S1 mix"),
 
+    ("no-feed-without-probe", log_for(edited(no_feed_record(
+        4, "no-feeds-unattributed"), case_set(4, no_feed=None))), 101, False,
+     F, "no-feed-probe", "live r10: a no-feed refusal names its evidence"),
+    ("probe-on-linked-case", log_for(edited(QR, case_set(
+        2, no_feed=no_feed_probe()))), 0, False, F, "no-feed-probe",
+     "derived"),
+    ("probe-bad-gap-count", log_for(edited(no_feed_record(
+        4, "no-feeds-unattributed"), lambda r: r["cases"][4]["no_feed"][
+            "gaps"][0].update(count="1"))), 101, False, F, "record-schema",
+     "derived"),
+    ("probe-extra-field", log_for(edited(PR, lambda r: r["cases"][0][
+        "no_feed"].update(pid=7))), 101, False, F, "record-schema",
+     "derived"),
+
     # --- wedge ------------------------------------------------------------
     ("wedge-describing-success", log_for(edited(WR, case_set(
         5, outcome=healthy_outcome(offset_of(5))))), 101, True, F,
@@ -373,7 +388,8 @@ ROWS = [
         5, outcome=None))), 101, True, F, "wedge-binding",
      "r9-3: a wedge with no stop record"),
     ("wedge-on-no-feed-case", log_for(edited(WR, case_set(
-        5, branch="s1-precluded", outcome=None))), 101, True, F,
+        5, branch="s1-precluded", outcome=None,
+        no_feed=no_feed_probe("s1-precluded")))), 101, True, F,
      "wedge-binding", "r8: wedge before S1 mix"),
     ("wedge-reconcile-only", log_for(edited(WR, outcome_set(
         5, finish="published", wound="joined", taken=True,
@@ -496,6 +512,12 @@ class JointStopVerdictTableTests(unittest.TestCase):
         self.assertEqual(jv.CASES, 3 * 4)
         self.assertEqual(sorted(jv.OUTCOME_FIELDS),
                          sorted(QR["cases"][0]["outcome"]))
+        probe = rust.split("struct NoFeedProbe {", 1)[1].split("\n}", 1)[0]
+        self.assertEqual(sorted(re.findall(r"^    (\w+):", probe, re.M)),
+                         sorted(jv.PROBE_FIELDS))
+        gap = rust.split("struct NoFeedGap {", 1)[1].split("\n}", 1)[0]
+        self.assertEqual(sorted(re.findall(r"^    (\w+):", gap, re.M)),
+                         sorted(jv.GAP_FIELDS))
 
     def test_stop_check_mirror_matches_the_rust_twins(self):
         # The cases of the Rust twin
@@ -511,6 +533,13 @@ class JointStopVerdictTableTests(unittest.TestCase):
         self.assertEqual(failing(wound="unwound"), "terminal")
         self.assertEqual(failing(reconciled=False), "reconcile")
         self.assertIsNone(failing(api_a=1, lane_shed=1))
+
+    def test_no_feed_detail_names_the_sampled_evidence(self):
+        got = jv.classify(log_for(no_feed_record(4, "no-feeds-unattributed")),
+                          101, CELL)
+        self.assertEqual(got["reason"], "no-feed-unattributed")
+        self.assertIn("joint_birth_original_mismatch x1", got["detail"])
+        self.assertIn("feeds=0 linked=True", got["detail"])
 
     def test_unknown_disabled_check_is_refused(self):
         with self.assertRaises(ValueError):

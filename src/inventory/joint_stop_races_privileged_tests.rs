@@ -496,6 +496,18 @@ fn joint_drive_line(
     tag: &str,
     step: &str,
 ) {
+    eprintln!(
+        "JOINT_R16 {tag} step={step} {}",
+        joint_drive_text(lane, coordinator)
+    );
+}
+
+/// The drive-state fields of one JOINT_R16 line (also the no-feed
+/// probe's `drive`).
+fn joint_drive_text(
+    lane: &crate::inventory_semantics::AttestedSemanticLane,
+    coordinator: &InventoryCoordinator<OsProcessSource>,
+) -> String {
     let (live, gated, finished, ticks, phase, demand, work, base, staging) =
         lane.joint_drive_state_for_test();
     let work = work.map_or_else(
@@ -506,8 +518,8 @@ fn joint_drive_line(
     let stuck = lane.joint_stuck_diagnostic_for_test();
     let stuck = stuck.as_deref().unwrap_or("-");
     let trip = lane.joint_guard_trip_for_test().unwrap_or("-");
-    eprintln!(
-        "JOINT_R16 {tag} step={step} live={} gated={} finished={} ticks={ticks} \
+    format!(
+        "live={} gated={} finished={} ticks={ticks} \
          phase={phase} demand={demand} work={work} base={base} staging={staging} \
          revision={} feeds={} stuck={stuck} trip={trip}",
         u8::from(live),
@@ -515,7 +527,59 @@ fn joint_drive_line(
         u8::from(finished),
         coordinator.registry().published_revision(),
         coordinator.registry().joint_feeds(),
-    );
+    )
+}
+
+/// What the cell sampled when a case produced no Joint feeds: the two
+/// branch inputs, the unlinked-backstop count, the first birth
+/// capacity refusal, the drive state and every registry gap by
+/// (subject, reason) with its count. Carried in the verdict record so
+/// a no-feed refusal names its evidence instead of "unexplained".
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct NoFeedProbe {
+    joint_feeds: u64,
+    journal_linked: bool,
+    backstop_routed: u64,
+    birth_capacity: Option<String>,
+    drive: String,
+    gaps: Vec<NoFeedGap>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct NoFeedGap {
+    subject: String,
+    reason: String,
+    count: u64,
+}
+
+fn no_feed_probe(
+    lane: &crate::inventory_semantics::AttestedSemanticLane,
+    coordinator: &InventoryCoordinator<OsProcessSource>,
+) -> NoFeedProbe {
+    let registry = coordinator.registry();
+    let mut counts: BTreeMap<(String, String), u64> = BTreeMap::new();
+    for gap in registry.gaps().iter() {
+        *counts
+            .entry((gap.subject.clone(), gap.reason.clone()))
+            .or_default() += 1;
+    }
+    NoFeedProbe {
+        joint_feeds: registry.joint_feeds() as u64,
+        journal_linked: registry.journal_linked(),
+        backstop_routed: registry.joint_backstop_routed(),
+        birth_capacity: registry
+            .first_birth_capacity()
+            .map(|latch| format!("{latch:?}")),
+        drive: joint_drive_text(lane, coordinator),
+        gaps: counts
+            .into_iter()
+            .map(|((subject, reason), count)| NoFeedGap {
+                subject,
+                reason,
+                count,
+            })
+            .collect(),
+    }
 }
 
 /// Drive one Running transaction to publication through the real lane
@@ -1687,6 +1751,9 @@ fn run_stop_offset(
     // no latched seal) gets its own tag and cause.
     let branch = joint_branch(&coordinator);
     case.link(&branch);
+    if no_feed_reason(&branch).is_some() {
+        case.note_no_feed(no_feed_probe(&lane, &coordinator));
+    }
     if let Some(reason) = no_feed_reason(&branch) {
         let feed_tag = no_feed_branch_tag(&branch).expect("a reason implies a tag");
         eprintln!("P11SCOPE_CELL_BRANCH={tag}:{feed_tag}");
@@ -2275,6 +2342,8 @@ struct StopCaseRecord {
     offset_ms: u64,
     branch: Option<&'static str>,
     outcome: Option<StopOutcome>,
+    /// Set exactly on a no-feed case: the evidence behind its branch.
+    no_feed: Option<NoFeedProbe>,
     completed: bool,
     #[serde(skip)]
     failed_check: Option<StopCheck>,
@@ -2344,6 +2413,7 @@ impl StopLedger {
             offset_ms: STOP_OFFSETS_MS[index % STOP_OFFSETS_MS.len()],
             branch: None,
             outcome: None,
+            no_feed: None,
             completed: false,
             failed_check: None,
         });
@@ -2429,6 +2499,10 @@ impl StopLedger {
                     outcome.is_none() && check.is_none(),
                     "a no-feed case is never driven"
                 );
+                assert!(
+                    last.no_feed.is_some(),
+                    "a no-feed case carries the evidence it sampled"
+                );
                 let receipt = no_feed_receipt(tag);
                 let first_and_full =
                     self.cases.len() == 1 && last.index == 0 && self.full_selection();
@@ -2455,6 +2529,17 @@ impl StopCaseRecord {
     fn link(&mut self, branch: &JointBranch) {
         assert!(self.branch.is_none(), "{}: linked once", self.name);
         self.branch = Some(no_feed_branch_tag(branch).unwrap_or("linked"));
+    }
+
+    /// Record what a no-feed case sampled, once, after its linkage.
+    fn note_no_feed(&mut self, probe: NoFeedProbe) {
+        assert!(
+            self.branch.is_some_and(|branch| branch != "linked"),
+            "{}: only a no-feed case carries a no-feed probe",
+            self.name
+        );
+        assert!(self.no_feed.is_none(), "{}: one probe per case", self.name);
+        self.no_feed = Some(probe);
     }
 
     /// Record the collected outcome of a linked drive, once.
@@ -2677,6 +2762,23 @@ fn completed_stop_cases(ledger: &mut StopLedger, count: usize) {
     }
 }
 
+/// Link `case` to a no-feed branch with a sampled probe, as the drive does.
+fn link_no_feed(case: &mut StopCaseRecord, branch: JointBranch) {
+    case.link(&branch);
+    case.note_no_feed(NoFeedProbe {
+        joint_feeds: 0,
+        journal_linked: matches!(branch, JointBranch::Unattributed),
+        backstop_routed: 0,
+        birth_capacity: None,
+        drive: "live=1".to_string(),
+        gaps: vec![NoFeedGap {
+            subject: "s".to_string(),
+            reason: "r".to_string(),
+            count: 1,
+        }],
+    });
+}
+
 fn stop_terminal_of(ledger: StopLedger, result: Result<()>) -> StopTerminal {
     ledger.finish(&result).terminal
 }
@@ -2773,7 +2875,7 @@ fn stop_verdict_qualifies_only_the_full_selection() {
 fn stop_verdict_precludes_only_a_first_case_s1_seal() {
     let not_attempted = || Err(anyhow::anyhow!("wp7-stopN: no joint feeds; not attempted"));
     let mut ledger = full_stop_ledger();
-    ledger.open(0).link(&JointBranch::S1);
+    link_no_feed(ledger.open(0), JointBranch::S1);
     assert_eq!(
         stop_terminal_of(ledger, not_attempted()),
         StopTerminal::Precluded {
@@ -2785,7 +2887,7 @@ fn stop_verdict_precludes_only_a_first_case_s1_seal() {
     // S1 after a linked case is a failure, not an environment.
     let mut ledger = full_stop_ledger();
     completed_stop_cases(&mut ledger, 1);
-    ledger.open(1).link(&JointBranch::S1);
+    link_no_feed(ledger.open(1), JointBranch::S1);
     assert!(matches!(
         stop_terminal_of(ledger, not_attempted()),
         StopTerminal::NoFeed {
@@ -2797,14 +2899,14 @@ fn stop_verdict_precludes_only_a_first_case_s1_seal() {
     // A narrowed run's first case is not the matrix's first case.
     let mut ledger = StopLedger::default();
     ledger.select(vec![0], vec![0]);
-    ledger.open(0).link(&JointBranch::S1);
+    link_no_feed(ledger.open(0), JointBranch::S1);
     assert!(matches!(
         stop_terminal_of(ledger, not_attempted()),
         StopTerminal::NoFeed { case: 0, .. }
     ));
     // The unattributed default never precludes.
     let mut ledger = full_stop_ledger();
-    ledger.open(0).link(&JointBranch::Unattributed);
+    link_no_feed(ledger.open(0), JointBranch::Unattributed);
     assert!(matches!(
         stop_terminal_of(ledger, not_attempted()),
         StopTerminal::NoFeed {
@@ -2903,6 +3005,30 @@ fn stop_ledger_refuses_an_outcome_from_another_offset() {
     let case = ledger.open(0);
     case.link(&JointBranch::Linked);
     case.collect(healthy_stop_outcome_at(20));
+}
+
+#[test]
+#[should_panic(expected = "carries the evidence it sampled")]
+fn stop_ledger_refuses_a_no_feed_terminal_without_its_probe() {
+    let mut ledger = full_stop_ledger();
+    ledger.open(0).link(&JointBranch::Unattributed);
+    let _ = stop_terminal_of(ledger, Err(anyhow::anyhow!("not attempted")));
+}
+
+#[test]
+#[should_panic(expected = "only a no-feed case carries a no-feed probe")]
+fn stop_ledger_refuses_a_probe_on_a_linked_case() {
+    let mut ledger = full_stop_ledger();
+    let case = ledger.open(0);
+    case.link(&JointBranch::Linked);
+    case.note_no_feed(NoFeedProbe {
+        joint_feeds: 0,
+        journal_linked: true,
+        backstop_routed: 0,
+        birth_capacity: None,
+        drive: String::new(),
+        gaps: Vec::new(),
+    });
 }
 
 #[test]

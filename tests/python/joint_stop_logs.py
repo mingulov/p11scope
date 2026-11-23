@@ -70,14 +70,28 @@ def healthy_outcome(ms):
     return outcome
 
 
-def case_record(k, branch="linked", outcome="healthy", completed=None):
+def no_feed_probe(branch="no-feeds-unattributed"):
+    """A no-feed probe as the cell samples it."""
+    return {"joint_feeds": 0,
+            "journal_linked": branch == "no-feeds-unattributed",
+            "backstop_routed": 0, "birth_capacity": None,
+            "drive": "live=1 gated=0 finished=0 ticks=3 feeds=0",
+            "gaps": [{"subject": "joint birth unavailable",
+                      "reason": "joint_birth_original_mismatch",
+                      "count": 1}]}
+
+
+def case_record(k, branch="linked", outcome="healthy", completed=None,
+                no_feed="sampled"):
     if outcome == "healthy":
         outcome = healthy_outcome(offset_of(k)) if branch == "linked" else None
     if completed is None:
         completed = outcome is not None and branch == "linked"
+    if no_feed == "sampled":
+        no_feed = no_feed_probe(branch) if branch in RECEIPTS else None
     return {"name": "wp7-stop%d" % k, "index": k, "prep": k // 4,
             "offset_ms": offset_of(k), "branch": branch, "outcome": outcome,
-            "completed": completed}
+            "no_feed": no_feed, "completed": completed}
 
 
 def record(cases, terminal):

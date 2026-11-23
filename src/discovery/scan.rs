@@ -6846,6 +6846,15 @@ fn record_module_cursor(
     );
 }
 
+// Test-only: force the pre-open facts consult on. Production gates it
+// on 9p read-only mounts (whose files lib tests never see); tests run
+// on tmpfs and drive the consult with real range identity instead.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FORCE_PREOPEN_FACTS_CONSULT: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
 /// Read (or reuse the cached) ELF export facts for one opened file
 /// under its pin bracket. `key` is the group's maps identity. A repeat
 /// scan of the unchanged file reuses the cached facts — or the cached

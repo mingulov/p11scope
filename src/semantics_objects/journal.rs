@@ -22955,6 +22955,11 @@ pub(crate) mod tests {
             Some(4),
             "the completion cut is the abandonment ordinal"
         );
+        assert_eq!(
+            scene.adapter.test_drain_proof_visits_for_test(),
+            1,
+            "the conversion seal derives the one open drain"
+        );
         assert!(
             scene.adapter.open.contains_key(&(1, 1)),
             "converted opener must remain staged while the holder pins the watermark"
@@ -23022,6 +23027,11 @@ pub(crate) mod tests {
         assert!(
             scene.adapter.open.is_empty(),
             "both calls release once the model need is served"
+        );
+        assert_eq!(
+            scene.adapter.test_drain_proof_visits_for_test(),
+            1,
+            "a converted drain costs no re-derivation on later seals"
         );
     }
 
@@ -23118,6 +23128,188 @@ pub(crate) mod tests {
             sessions.iter().all(|view| view.state != SessionState::Live),
             "the ordinary lifecycle leaves nothing live: {:?}",
             sessions.iter().map(|view| view.state).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn object_journal_drained_open_keeps_loss_when_end_or_abandon_splits_window() {
+        // Two window-blocker shapes with no BEGIN inside the drained
+        // window: a close whose END lands between the opener's observed
+        // return and its abandonment, and a sibling abandonment there
+        // (an effect-free drain completing on its own). Both must keep
+        // the counted loss and never complete the opener out of order;
+        // the seal refuses or records the loss per the pre-existing
+        // void mechanics for each shape.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+        // A close that began before the return but ends inside the
+        // window: only its END sits between return and abandonment.
+        {
+            let mut scene = Scene::new(image_default());
+            let open = function_id("C_OpenSession");
+            let close = function_id("C_CloseSession");
+            scene.attest_function("C_OpenSession");
+            let proof = scene.attest_function("C_CloseSession");
+            let closer = begin_bytes(1, 1, close, 0);
+            assert_eq!(scene.ingest(&closer), JournalDisposition::BeginAdmitted);
+            let begin = begin_bytes(1, 2, open, 0);
+            assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+            assert_eq!(
+                scene.ingest_ordinary(ordinary_for(&begin, 0)),
+                JournalDisposition::ReturnObserved
+            );
+            assert_eq!(
+                scene.ingest(&end_bytes_absent(&closer, 0, ENTRY_NS + 80)),
+                JournalDisposition::EndStaged
+            );
+            let abandon =
+                abandon_bytes(1, 2, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
+            assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+            let mut pad = ordinary_for(&begin, 0);
+            pad.slot = 99;
+            scene.ingest_ordinary(pad);
+            let bootstrap = scene.bootstrap(proof, 0);
+            let success = scene
+                .seal(&bootstrap)
+                .expect("an END-blocked drain keeps its loss and seals");
+            assert_eq!(success.prefix.settled().len(), 2);
+            let opener = success
+                .prefix
+                .settled()
+                .iter()
+                .find(|call| call.begin_cut == 2)
+                .expect("the blocked opener settles");
+            assert!(
+                opener.abandoned && opener.end_cut.is_none(),
+                "the blocked opener keeps its loss, never completes: {:?}",
+                opener
+            );
+            assert!(
+                !success
+                    .effects
+                    .effects
+                    .iter()
+                    .any(|effect| matches!(effect, ObjectEffect::SessionOpened { .. })),
+                "no session opens out of order: {:?}",
+                success.effects.effects
+            );
+            assert!(
+                scene.model.project().sessions.is_empty(),
+                "no session survives the blocked drain"
+            );
+        }
+        // A sibling drain completing between the opener's return and
+        // its abandonment: only its ABANDON sits in the window.
+        {
+            let mut scene = Scene::new(image_default());
+            let open = function_id("C_OpenSession");
+            let update = function_id("C_SignUpdate");
+            scene.attest_function("C_SignUpdate");
+            let proof = scene.attest_function("C_OpenSession");
+            let sibling = begin_bytes(1, 1, update, 0);
+            assert_eq!(scene.ingest(&sibling), JournalDisposition::BeginAdmitted);
+            assert_eq!(
+                scene.ingest_ordinary(ordinary_for(&sibling, 0)),
+                JournalDisposition::ReturnObserved
+            );
+            let begin = begin_bytes(1, 2, open, 0);
+            assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+            assert_eq!(
+                scene.ingest_ordinary(ordinary_for(&begin, 0)),
+                JournalDisposition::ReturnObserved
+            );
+            let sibling_abandon =
+                abandon_bytes(1, 1, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
+            assert_eq!(
+                scene.ingest(&sibling_abandon),
+                JournalDisposition::AbandonStaged
+            );
+            let abandon =
+                abandon_bytes(1, 2, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
+            assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+            let mut pad = ordinary_for(&begin, 0);
+            pad.slot = 99;
+            scene.ingest_ordinary(pad);
+            let bootstrap = scene.bootstrap(proof, 0);
+            let success = scene
+                .seal(&bootstrap)
+                .expect("an ABANDON-blocked drain keeps its loss and seals");
+            assert_eq!(success.prefix.settled().len(), 2);
+            let sibling_row = success
+                .prefix
+                .settled()
+                .iter()
+                .find(|call| call.begin_cut == 1)
+                .expect("the sibling drain settles");
+            assert!(
+                !sibling_row.abandoned && sibling_row.end_cut == Some(5),
+                "the effect-free sibling still completes: {:?}",
+                sibling_row
+            );
+            let opener = success
+                .prefix
+                .settled()
+                .iter()
+                .find(|call| call.begin_cut == 3)
+                .expect("the blocked opener settles");
+            assert!(
+                opener.abandoned && opener.end_cut.is_none(),
+                "the blocked opener keeps its loss, never completes: {:?}",
+                opener
+            );
+            assert!(
+                !success
+                    .effects
+                    .effects
+                    .iter()
+                    .any(|effect| matches!(effect, ObjectEffect::SessionOpened { .. })),
+                "no session opens out of order: {:?}",
+                success.effects.effects
+            );
+            assert!(
+                scene.model.project().sessions.is_empty(),
+                "no session survives the blocked drain"
+            );
+        }
+    }
+
+    #[test]
+    fn object_journal_tail_needing_call_never_drains_its_return() {
+        // A result-carrying (object) call keeps the counted loss when
+        // its END is gone: the corroborated return cannot complete it
+        // without the tail the abandonment took, so the drain path
+        // never applies and the seal records the Ticket loss.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+        let mut scene = Scene::new(image_default());
+        let create = function_id("C_CreateObject");
+        let proof = scene.attest_function("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        assert_eq!(
+            scene.ingest_ordinary(ordinary_for(&begin, 0)),
+            JournalDisposition::ReturnObserved
+        );
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        let mut pad = ordinary_for(&begin, 0);
+        pad.slot = 99;
+        scene.ingest_ordinary(pad);
+        let bootstrap = scene.bootstrap(proof, 0);
+        let success = scene.seal(&bootstrap).expect("a lone loss seals");
+        assert_eq!(success.prefix.settled().len(), 1);
+        assert!(
+            success.prefix.settled()[0].abandoned,
+            "the tail-needing call keeps its loss: {:?}",
+            success.prefix.settled()[0]
+        );
+        assert_eq!(
+            scene
+                .adapter
+                .keys
+                .get(&proof.key)
+                .expect("sealed key")
+                .bounded_upper,
+            Some(2),
+            "the Ticket bound names the observed return"
         );
     }
 

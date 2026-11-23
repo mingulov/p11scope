@@ -333,7 +333,9 @@ pub(crate) trait CallerLookup<Pin> {
 /// Health-independent: the row carries the health of the read that
 /// produced it, checked separately at decision time.
 pub(crate) trait ExitWitnessValidator {
-    fn current_holder(&self, pid: u32, event_ns: u64) -> Option<CallerId>;
+    fn current_holder(&self, _pid: u32, _event_ns: u64) -> Option<CallerId> {
+        None
+    }
     /// [`Self::current_holder`] against the holder-scan allowance:
     /// validators without a pool keep the legacy verdict and never
     /// defer. The binder decides through this; the production gate

@@ -118,7 +118,10 @@ pub(crate) struct LearnedCandidate {
     /// a private mount namespace): mount IDs are exact-matched, so a
     /// reused or dead pid only misses, never misattributes. `None`
     /// when no pid could be read, and always `None` for run-learned
-    /// files, which prove through their scan view instead.
+    /// files, which keep proving through the observer table: the
+    /// loader fallback is drain-only by scope, so a run-learned file
+    /// on a foreign mount still skips with the named missing-mount
+    /// reason instead of healing.
     pub(crate) loader_pid: Option<u32>,
     /// Synthesized by owned-run scan learning (E1) rather than the
     /// fanotify drain: the proving mapper is a transient descendant,

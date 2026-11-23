@@ -10451,7 +10451,9 @@ pub(crate) struct PrearmPinRequest {
     /// staging resolves the held fd's mount through this process's
     /// mount table when the observer's table does not name it (a
     /// provider loaded from a private mount namespace). Operator pins
-    /// and run-learned files carry `None` (observer or view tables).
+    /// carry `None` (observer or view table by scope); run-learned
+    /// files carry `None` too (observer table, unchanged — the loader
+    /// fallback is drain-only by scope).
     loader_pid: Option<u32>,
 }
 

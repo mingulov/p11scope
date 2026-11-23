@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use p11scope_manifest::elf::ElfAbi;
 use p11scope_manifest::identity::{
     IdentityKind, InspectedObject, MappingFileKey, OpenObjectError, SelfMappedFallback,
-    fd_mount_id, inspect_file_with_reader_exporting, is_missing_mount_id_error, mapping_file_key,
+    fd_mount_id, inspect_file_with_reader_exporting, is_missing_mount_id_error,
     mapping_file_key_in_mountinfo, open_object, open_object_errno, open_regular,
 };
 use p11scope_manifest::manifest::{Manifest, Resolution};
@@ -13078,6 +13078,7 @@ mod raw_key_index_tests;
 pub(crate) mod test_fixture {
     use super::*;
     use crate::discovery::scan::{ScannedEntry, ScannedTable};
+    use p11scope_manifest::identity::mapping_file_key;
 
     pub(crate) const SHA: &str = "b4e608e4";
     /// The inode and the two overlay device numbers a two-container docker run
@@ -13826,7 +13827,7 @@ mod tests {
     };
     use super::*;
     use crate::discovery::scan::ScannedEntry;
-    use p11scope_manifest::identity::{IdentityKind, ObjectIdentity};
+    use p11scope_manifest::identity::{IdentityKind, ObjectIdentity, mapping_file_key};
     use p11scope_manifest::manifest::{
         Acquisition, FunctionRecord, ObjectRecord, ProvenanceObject, SurfaceRecord, SurfaceSource,
         Version, WalkOutcome,

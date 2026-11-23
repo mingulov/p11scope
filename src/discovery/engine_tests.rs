@@ -22641,6 +22641,78 @@ fn owned_tree_watch_repeat_after_file_overwrite_rereads_the_file() {
     sleeper.wait().expect("reap sleeper");
 }
 
+/// Manifest getter targets always take the full path: a member with a
+/// getter-matched mapping re-opens that mapping every visit (its getter
+/// logic needs the open file) while other mappings reuse proven facts.
+/// Hybrid: the reuse comparison is red before (everything re-opens) and
+/// green after (only the getter target does); the re-read floor passes
+/// both, and a consult that ignores the getter list fails it (it would
+/// open nothing). The member is `sh` (three mappings); the getter list
+/// names its executable only.
+#[test]
+fn owned_tree_watch_repeat_getter_match_takes_full_path() {
+    use std::os::unix::fs::MetadataExt as _;
+    let dir = tempfile::tempdir().expect("watch cgroup dir");
+    let mut sleeper = std::process::Command::new("sh")
+        .args(["-c", "sleep 30"])
+        .spawn()
+        .expect("spawn shell");
+    let exe = std::fs::metadata(format!("/proc/{}/exe", sleeper.id())).expect("stat shell exe");
+    std::fs::write(
+        dir.path().join("cgroup.procs"),
+        format!("{}\n", sleeper.id()),
+    )
+    .expect("write cgroup.procs");
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 7,
+        path: dir.path().into(),
+        dir: Arc::new(File::open(dir.path()).expect("open watch dir")),
+    };
+    engine.owned_run_pid = Some(std::process::id());
+    engine.owned_watch_run_budget_ns = u64::MAX;
+    engine
+        .budget
+        .set_getter_objects(vec![(exe.dev(), exe.ino())]);
+    crate::discovery::scan::FORCE_PREOPEN_FACTS_CONSULT.with(|force| force.set(true));
+    let first = 1_000u64;
+    let count_first = std::rc::Rc::new(std::cell::Cell::new(0u32));
+    {
+        let count_first = count_first.clone();
+        crate::discovery::identity::provider_metadata_read_test::observe(
+            move |_| count_first.set(count_first.get() + 1),
+            || engine.owned_tree_watch(Some(first)),
+        );
+    }
+    assert!(
+        count_first.get() > 4,
+        "the first visit reads provider metadata (non-vacuous): {}",
+        count_first.get()
+    );
+    let count_second = std::rc::Rc::new(std::cell::Cell::new(0u32));
+    {
+        let count_second = count_second.clone();
+        crate::discovery::identity::provider_metadata_read_test::observe(
+            move |_| count_second.set(count_second.get() + 1),
+            || engine.owned_tree_watch(Some(first + OWNED_WATCH_SCAN_MIN_NS)),
+        );
+    }
+    assert!(
+        count_second.get() > 0,
+        "the getter-matched mapping is re-opened (not served from cache): {}",
+        count_second.get()
+    );
+    assert!(
+        count_second.get() * 2 < count_first.get(),
+        "only the getter target re-opens (other mappings reuse): first={} second={}",
+        count_first.get(),
+        count_second.get()
+    );
+    crate::discovery::scan::FORCE_PREOPEN_FACTS_CONSULT.with(|force| force.set(false));
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
 /// Rotation reaches every member, not just the extremes: with three
 /// unproven members the middle pid scans within three runs instead
 /// of starving behind the newest and oldest.

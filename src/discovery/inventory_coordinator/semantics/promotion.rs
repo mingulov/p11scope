@@ -27,6 +27,10 @@ trait AdmissionStorage {
     ) -> Result<(), SemanticBindingRefusal>;
     fn take_successor(&mut self, caller: CallerId) -> Option<PublishedSemanticSuccessor>;
     fn insert_refused_successor(&mut self, caller: CallerId, successor: PublishedSemanticSuccessor);
+    /// Bump the absence-scan revision after a real change to a retained
+    /// binding (new provider, scope flip). Live storage bumps; staged
+    /// storage is never scanned, so it ignores the call.
+    fn bump_revision(&mut self);
 }
 
 impl AdmissionStorage for SemanticBindingSet {
@@ -78,6 +82,9 @@ impl AdmissionStorage for SemanticBindingSet {
         successor: PublishedSemanticSuccessor,
     ) {
         self.refused_successors.insert(caller, successor);
+    }
+    fn bump_revision(&mut self) {
+        SemanticBindingSet::bump_revision(self);
     }
 }
 
@@ -170,6 +177,9 @@ impl AdmissionStorage for SingleCallerStorage {
         self.check(caller);
         assert!(self.refused_successor.is_none());
         self.refused_successor = Some(successor);
+    }
+    fn bump_revision(&mut self) {
+        // Staged storage is never absence-scanned.
     }
 }
 
@@ -503,6 +513,7 @@ fn consume_in_storage<Source: ProcessSource>(
         {
             return Err(Refusal::NoLiveCaller);
         }
+        let mut cut_cleared = false;
         if let Some(existing) = storage.binding_mut(caller) {
             if existing.domain != receipt.domain() {
                 return Err(Refusal::DomainConflict);
@@ -516,8 +527,12 @@ fn consume_in_storage<Source: ProcessSource>(
                 // Re-arm negative loss tracking under this exact binding's
                 // fresh scope proof. Provider refusal below must keep its
                 // positive scope eligibility suspended.
+                cut_cleared = existing.suspension_cut;
                 existing.suspension_cut = false;
             }
+        }
+        if cut_cleared {
+            storage.bump_revision();
         }
         // Proven current membership ends the previous scope-loss episode
         // independently of provider permission. An expired owner receipt
@@ -539,10 +554,26 @@ fn consume_in_storage<Source: ProcessSource>(
         if !exact_reproof && storage.provider_count() >= storage.provider_limit() {
             return Err(Refusal::Capacity);
         }
-        if let Some(existing) = storage.binding_mut(caller) {
-            existing.providers.insert(provider, registry)?;
-            existing.scope_current = true;
-            existing.suspension_cut = false;
+        if storage.binding(caller).is_some() {
+            // A no-op re-proof (same provider, scope already current, cut
+            // already clear) changes no absence input and bumps nothing,
+            // so Idle keeps skipping on refresh. A new provider or a scope
+            // flip bumps once.
+            let new_provider = !exact_reproof;
+            let changed = {
+                let existing = storage
+                    .binding_mut(caller)
+                    .expect("checked binding still present");
+                let scope_changed = !existing.scope_current;
+                let cut_changed = existing.suspension_cut;
+                existing.providers.insert(provider, registry)?;
+                existing.scope_current = true;
+                existing.suspension_cut = false;
+                new_provider || scope_changed || cut_changed
+            };
+            if changed {
+                storage.bump_revision();
+            }
             return Ok(());
         }
         if storage.binding_count() >= storage.binding_limit() {

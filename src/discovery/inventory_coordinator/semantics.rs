@@ -1132,6 +1132,14 @@ impl SemanticBindingSet {
         self.revision
     }
 
+    /// Bump the absence-scan revision after one of its inputs actually
+    /// changed. Callers bump only on real changes (new/removed/reordered
+    /// bindings, new providers, scope flips) — never on no-op re-proofs —
+    /// so Idle rescans on admission but keeps skipping on refresh.
+    pub(crate) fn bump_revision(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+    }
+
     /// Install pre-reserved destination storage for a newly promoted
     /// domain (DR37 allocation-free install): the capacity's paid
     /// collections become this set's bindings, index and supported
@@ -1209,6 +1217,7 @@ impl SemanticBindingSet {
             {
                 self.refresh_cursor = None;
             }
+            self.bump_revision();
         }
         removed.into_iter().collect()
     }
@@ -1327,6 +1336,7 @@ impl SemanticBindingSet {
         }
         self.index.insert(binding.caller, self.bindings.len());
         self.bindings.push(binding);
+        self.bump_revision();
         Ok(())
     }
 
@@ -1450,14 +1460,24 @@ impl SemanticBindingSet {
         {
             custody.refuse(SemanticBindingRefusal::NoLiveCaller);
         }
-        if let Some(binding) = self.index.get(&destination).copied() {
-            let binding = &mut self.bindings[binding];
-            if binding.domain != custody.domain || !Arc::ptr_eq(&binding.pin, &custody.pin) {
-                binding.scope_current = false;
-                binding.suspension_cut = false;
-                custody.refuse(SemanticBindingRefusal::ImageUnproven(
-                    UnboundReason::ExecAmbiguous,
-                ));
+        if let Some(at) = self.index.get(&destination).copied() {
+            let changed = {
+                let binding = &mut self.bindings[at];
+                if binding.domain != custody.domain || !Arc::ptr_eq(&binding.pin, &custody.pin)
+                {
+                    let changed = binding.scope_current || binding.suspension_cut;
+                    binding.scope_current = false;
+                    binding.suspension_cut = false;
+                    custody.refuse(SemanticBindingRefusal::ImageUnproven(
+                        UnboundReason::ExecAmbiguous,
+                    ));
+                    changed
+                } else {
+                    false
+                }
+            };
+            if changed {
+                self.bump_revision();
             }
         }
         if self
@@ -1549,7 +1569,11 @@ impl SemanticBindingSet {
         if take == len {
             return &self.bindings;
         }
-        self.bindings.rotate_left(self.cursor % len);
+        // A zero rotation reorders nothing: only a real reorder bumps.
+        if self.cursor % len != 0 {
+            self.bindings.rotate_left(self.cursor % len);
+            self.bump_revision();
+        }
         self.cursor = take;
         self.index.clear();
         for (at, binding) in self.bindings.iter().enumerate() {
@@ -2515,15 +2539,20 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// A failed fresh membership proof is a persistent suspension, not only
     /// a one-publication loss marker. History retains its original custody.
     pub(crate) fn suspend_semantic_scope_except(&mut self, allowed: &BTreeSet<CallerId>) {
+        let mut changed = false;
         for binding in &mut self.semantic_bindings.bindings {
             if (binding.scope_current || !binding.suspension_cut)
                 && !allowed.contains(&binding.caller)
             {
+                changed |= binding.scope_current || binding.suspension_cut;
                 binding.scope_current = false;
                 binding.suspension_cut = false;
                 self.registry.note_member_unscanned(binding.caller);
                 self.tail_uncertain.insert(binding.caller);
             }
+        }
+        if changed {
+            self.semantic_bindings.bump_revision();
         }
     }
 }
@@ -3421,7 +3450,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             ));
             if !binding.scope_current {
                 let at = self.semantic_bindings.index[&caller];
+                // Cut was false here (false+true continued above), so this
+                // false->true flip always changes the absence inputs.
                 self.semantic_bindings.bindings[at].suspension_cut = true;
+                self.semantic_bindings.bump_revision();
             }
             if !domains.contains(&domain) {
                 domains.push(domain);

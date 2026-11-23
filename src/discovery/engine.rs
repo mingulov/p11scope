@@ -28594,20 +28594,25 @@ impl Engine {
                         closure.fail();
                     }
                 }
-                Err(_) => {
+                Err(error) => {
                     closure.fail();
                     if self.record_generation_ended(origin) {
                         self.invalidate_causal_timing();
+                    } else if is_work_ceiling_refusal(&format!("{error:#}")) {
+                        // A definite budget refusal keeps the ceiling
+                        // reason so it projects to the scan-budget row,
+                        // whatever discarded the record.
+                        self.mark_live_loss("live terminal record", WORK_CEILING_REASON);
                     } else {
                         // A dispatch error with no exit proof is not
                         // evidence the generation exited or changed —
-                        // the error is discarded, so nothing proves
-                        // either — and files the same pair as the
-                        // live record-resolution arm, never the
-                        // changed-generation row.
+                        // and a consumed terminal record that failed
+                        // exact resolution is not ambient noise: it
+                        // files its own named pair, never the generic
+                        // live row nor the changed-generation row.
                         self.mark_live_loss(
-                            "live discovery record",
-                            "a structurally valid private record failed exact live resolution",
+                            "live terminal record",
+                            "a structurally valid terminal record failed exact resolution",
                         );
                     }
                 }

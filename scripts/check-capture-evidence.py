@@ -663,20 +663,23 @@ PREARM_OBJECT_UNAVAILABLE = "prearm object unavailable"
 DISCOVERY_TRANSPORT_UNAVAILABLE = "discovery transport unavailable"
 # Gap-noise folds: mid-flight changed generations, the live
 # stale-deferral mark, permission refusals, unreadable members,
-# unverified generations, scan-budget stops and loader-context misses
-# project to these finite reasons instead of the generic redaction
-# (render.rs `capture_skipped_out` fold arms). Each folds exact
-# internal pairs only; folding renames rows, never drops them. The
-# validator must accept what the producer emits. Neither mid-flight
-# row claims an exit: proven exits are ordinary ends and file no
-# public row. The permission, unreadable and unverified rows claim
-# neither exit nor change: a refused, failed or unproven read proves
-# neither.
+# unverified generations, terminal record failures, scan-budget stops
+# and loader-context misses project to these finite reasons instead
+# of the generic redaction (render.rs `capture_skipped_out` fold
+# arms). Each folds exact internal pairs only; folding renames rows,
+# never drops them. The validator must accept what the producer
+# emits. Neither mid-flight row claims an exit: proven exits are
+# ordinary ends and file no public row. The permission, unreadable
+# and unverified rows claim neither exit nor change: a refused,
+# failed or unproven read proves neither. The terminal row is a named
+# loss, never ambient noise: only the pre-existing live pair stays
+# generic.
 MID_FLIGHT_REASON = "process exited or changed mid-flight"
 STALE_DEFERRAL_REASON = "stale process report deferred mid-flight"
 PERMISSION_REFUSAL_REASON = "process unreadable mid-flight; permission denied"
 UNREADABLE_NOT_CHECKED_REASON = "process unreadable mid-flight; not checked this pass"
 GENERATION_UNVERIFIED_REASON = "process generation unverified mid-flight; exit or change unproven"
+TERMINAL_RECORD_UNRESOLVED_REASON = "terminal discovery record failed exact resolution"
 # Retired by the mid-flight split: earlier candidates fold every
 # mid-flight pair to this one row. Still accepted so archived
 # captures keep validating; the producer no longer emits it.
@@ -874,6 +877,7 @@ DISCOVERY_REASONS = {
     PERMISSION_REFUSAL_REASON,
     UNREADABLE_NOT_CHECKED_REASON,
     GENERATION_UNVERIFIED_REASON,
+    TERMINAL_RECORD_UNRESOLVED_REASON,
     RETIRED_MID_FLIGHT_EXIT_REASON,
     SCAN_BUDGET_REASON,
     LOADER_CONTEXT_REASON,

@@ -2039,15 +2039,17 @@ pub(crate) const LEARNED_UNMARKED_REASON: &str = "some filesystems were not mark
 const DISCOVERY_UNAVAILABLE: &str = "discovery unavailable";
 /// Gap-noise folds: mid-flight changed generations, the live
 /// stale-deferral mark, permission refusals, unreadable members,
-/// unverified generations, scan-budget stops and loader-context
-/// misses project to these finite public reasons instead of the
-/// generic redaction. Each folds exact internal pairs only (the
-/// ceiling by its fixed reason sentence, whatever subject filed it);
-/// function subjects always keep their entry row, and folding renames
-/// rows, never drops them. Neither mid-flight row claims an exit:
-/// proven exits are ordinary ends and file no public row. The
-/// permission, unreadable and unverified rows claim neither exit nor
-/// change: a refused, failed or unproven read proves neither.
+/// unverified generations, terminal record failures, scan-budget
+/// stops and loader-context misses project to these finite public
+/// reasons instead of the generic redaction. Each folds exact
+/// internal pairs only (the ceiling by its fixed reason sentence,
+/// whatever subject filed it); function subjects always keep their
+/// entry row, and folding renames rows, never drops them. Neither
+/// mid-flight row claims an exit: proven exits are ordinary ends and
+/// file no public row. The permission, unreadable and unverified rows
+/// claim neither exit nor change: a refused, failed or unproven read
+/// proves neither. The terminal row is a named loss, never ambient
+/// noise: only the pre-existing live pair stays generic.
 const MID_FLIGHT_REASON: &str = "process exited or changed mid-flight";
 /// The live stale-deferral mark's own public reason: it is filed
 /// for a possibly still-live process with retirement deferred, so
@@ -2068,6 +2070,10 @@ const UNREADABLE_NOT_CHECKED_REASON: &str = "process unreadable mid-flight; not 
 /// or changed.
 const GENERATION_UNVERIFIED_REASON: &str =
     "process generation unverified mid-flight; exit or change unproven";
+/// The terminal record-resolution mark's own public reason: a consumed
+/// terminal record that failed exact resolution is a named loss, never
+/// ambient noise, so it must never fold into the generic row.
+const TERMINAL_RECORD_UNRESOLVED_REASON: &str = "terminal discovery record failed exact resolution";
 const SCAN_BUDGET_REASON: &str = "scan budget exhausted";
 const LOADER_CONTEXT_REASON: &str = "no unique attached loader context";
 const ENTRY_UNAVAILABLE: &str = "function entry unavailable";
@@ -2311,6 +2317,20 @@ fn is_generation_unverified_pair(subject: &str, reason: &str) -> bool {
     )
 }
 
+/// Whether an internal skip is the terminal record-resolution pair:
+/// a consumed terminal record that failed exact resolution. Exact
+/// subject and reason, never prefix or substring: near misses stay
+/// generic. It must never fold into the generic row: the fault is a
+/// named loss, not ambient noise. The pre-existing live
+/// record-resolution pair keeps its generic row.
+fn is_terminal_record_pair(subject: &str, reason: &str) -> bool {
+    (subject, reason)
+        == (
+            "live terminal record",
+            "a structurally valid terminal record failed exact resolution",
+        )
+}
+
 /// Whether an internal skip is one of the two no-unique-loader-context
 /// pairs (exact): kept distinct from the ceiling row, a different
 /// operator action.
@@ -2426,6 +2446,8 @@ pub fn capture_skipped_out(s: &Skipped) -> SkippedOut {
         UNREADABLE_NOT_CHECKED_REASON
     } else if is_generation_unverified_pair(&s.subject, &s.reason) {
         GENERATION_UNVERIFIED_REASON
+    } else if is_terminal_record_pair(&s.subject, &s.reason) {
+        TERMINAL_RECORD_UNRESOLVED_REASON
     } else if s
         .reason
         .contains(crate::discovery::scan::WORK_CEILING_REASON)
@@ -4946,6 +4968,7 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
                             && skip.reason != PERMISSION_REFUSAL_REASON
                             && skip.reason != UNREADABLE_NOT_CHECKED_REASON
                             && skip.reason != GENERATION_UNVERIFIED_REASON
+                            && skip.reason != TERMINAL_RECORD_UNRESOLVED_REASON
                             && skip.reason != SCAN_BUDGET_REASON
                             && skip.reason != LOADER_CONTEXT_REASON
                         {
@@ -4989,6 +5012,7 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
                     PERMISSION_REFUSAL_REASON,
                     UNREADABLE_NOT_CHECKED_REASON,
                     GENERATION_UNVERIFIED_REASON,
+                    TERMINAL_RECORD_UNRESOLVED_REASON,
                     SCAN_BUDGET_REASON,
                     LOADER_CONTEXT_REASON,
                     LEARNED_FIRST_RUN_REASON,

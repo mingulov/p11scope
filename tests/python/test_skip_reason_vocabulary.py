@@ -54,14 +54,15 @@ PRODUCER_CONSTANTS = (
     "DISCOVERY_TRANSPORT_UNAVAILABLE",
     # Gap-noise folds: mid-flight changed generations, the
     # stale-deferral mark, permission refusals, unreadable members,
-    # unverified generations, scan-budget stops and loader-context
-    # misses file under discovery subject with finite reasons
-    # instead of the generic redaction.
+    # unverified generations, terminal record failures, scan-budget
+    # stops and loader-context misses file under discovery subject
+    # with finite reasons instead of the generic redaction.
     "MID_FLIGHT_REASON",
     "STALE_DEFERRAL_REASON",
     "PERMISSION_REFUSAL_REASON",
     "UNREADABLE_NOT_CHECKED_REASON",
     "GENERATION_UNVERIFIED_REASON",
+    "TERMINAL_RECORD_UNRESOLVED_REASON",
     "SCAN_BUDGET_REASON",
     "LOADER_CONTEXT_REASON",
     # Run-tree scope gaps: survivors, degradation, unreadable
@@ -103,7 +104,7 @@ def producer_reasons():
 
     Entry granularity (function subjects and the one gated null) renders
     "null pointer" or ENTRY_UNAVAILABLE; discovery scope renders one of the
-    twenty-three discovery reasons; the run-tree scope renders one of its three
+    twenty-four discovery reasons; the run-tree scope renders one of its three
     reasons under its own subject, and the learned-file scope renders one
     of its ten reasons under its own subject. The split mirrors
     `capture_skipped_out`'s branches; the strings themselves come from the
@@ -135,6 +136,7 @@ def producer_reasons():
         const["PERMISSION_REFUSAL_REASON"],
         const["UNREADABLE_NOT_CHECKED_REASON"],
         const["GENERATION_UNVERIFIED_REASON"],
+        const["TERMINAL_RECORD_UNRESOLVED_REASON"],
         const["SCAN_BUDGET_REASON"],
         const["LOADER_CONTEXT_REASON"],
     }
@@ -157,7 +159,7 @@ def producer_reasons():
     }
     assert (
         len(entry) == 2
-        and len(discovery) == 23
+        and len(discovery) == 24
         and len(run_tree) == 3
         and len(learned) == 10
     ), const
@@ -216,12 +218,12 @@ class SkipReasonVocabularyTests(unittest.TestCase):
             self.assertIn(reason, doc, f"schema doc omits {reason!r}")
 
     def test_oracle_skip_constants_match_canonical_vocabulary(self):
-        # The public-cli oracle names six discovery-skip rows (the
-        # disclosable deferral and the five mid-flight rows); a drift
-        # between its hardcoded copies and the producer vocabulary
-        # would fail closed (safe) but silently stop qualifying, so
-        # pin every row to the canonical subject and discovery
-        # reasons.
+        # The public-cli oracle names seven discovery-skip rows (the
+        # disclosable deferral, the five mid-flight rows and the
+        # terminal row); a drift between its hardcoded copies and the
+        # producer vocabulary would fail closed (safe) but silently
+        # stop qualifying, so pin every row to the canonical subject
+        # and discovery reasons.
         _, discovery, _, _ = producer_reasons()
         for key in (
             "DISCLOSABLE_DISCOVERY_SKIP",
@@ -230,6 +232,7 @@ class SkipReasonVocabularyTests(unittest.TestCase):
             "PERMISSION_REFUSAL_SKIP",
             "UNREADABLE_NOT_CHECKED_SKIP",
             "GENERATION_UNVERIFIED_SKIP",
+            "TERMINAL_RECORD_SKIP",
         ):
             row = ORACLE[key]
             self.assertEqual(row["name"], CHECKER["DISCOVERY_SUBJECT"], key)

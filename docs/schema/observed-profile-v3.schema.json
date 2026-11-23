@@ -607,6 +607,7 @@
                   "process unreadable mid-flight; permission denied",
                   "process unreadable mid-flight; not checked this pass",
                   "process generation unverified mid-flight; exit or change unproven",
+                  "terminal discovery record failed exact resolution",
                   "process exited mid-flight",
                   "scan budget exhausted",
                   "no unique attached loader context",

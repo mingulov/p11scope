@@ -1193,7 +1193,7 @@ exactly:
   The counts ride in `evidence.deep_scan_selection`, never in the
   reason, which carries no digits.
 
-Gap-noise folds file under the discovery subject with seven finite
+Gap-noise folds file under the discovery subject with eight finite
 reasons (in addition to the v2 list and the reasons above). Each
 record is `{name: "discovery subject", reason}` with `reason` exactly
 one of:
@@ -1228,6 +1228,12 @@ one of:
   contradicted recheck) while the process may be live and
   unchanged. This row never claims either event; only proven
   exit or change files the changed row above.
+- `terminal discovery record failed exact resolution`: the terminal
+  record-resolution pair — a consumed terminal record that failed
+  exact resolution without exit proof. A named loss, never ambient
+  noise: it fails closed everywhere, while the pre-existing live
+  record-resolution pair keeps its generic row. A definite budget
+  refusal files the scan-budget row instead.
 - `scan budget exhausted`: a work-ceiling stop, bare or wrapped in
   a scan refusal, whatever subject filed it — including a member
   the exhausted budget never read. Function subjects keep

@@ -7176,14 +7176,14 @@ fn folded_pairs_publish_and_project_with_every_record_kept() {
     );
 }
 
-/// Drift guard for all eleven folded gap-noise pairs (three
+/// Drift guard for all twelve folded gap-noise pairs (three
 /// mid-flight changed, three unverified-generation, one
-/// stale-deferral, one permission-refusal, one unreadable-member, two
-/// loader-context): filing sites without a cheap live seam pin their
-/// exact strings in source, so a reword must update the projection
-/// allowlist in the same patch instead of silently unfolding back to
-/// generic. Each pair also asserts its `capture_skipped_out`
-/// projection.
+/// stale-deferral, one permission-refusal, one unreadable-member, one
+/// terminal record-resolution, two loader-context): filing sites
+/// without a cheap live seam pin their exact strings in source, so a
+/// reword must update the projection allowlist in the same patch
+/// instead of silently unfolding back to generic. Each pair also
+/// asserts its `capture_skipped_out` projection.
 #[test]
 fn folded_gap_noise_pairs_match_their_filing_sites() {
     let source = include_str!("engine.rs");
@@ -7364,9 +7364,28 @@ fn folded_gap_noise_pairs_match_their_filing_sites() {
             "the retired changed-generation mark must stay out of the filing source: {retired}"
         );
     }
-    // The terminal and live record-resolution arms file one shared
-    // pair, which stays generic: an unresolvable record proves
-    // neither exit nor change.
+    // The terminal record-resolution arm files its own named pair,
+    // pinned in source like the folds above: a consumed terminal
+    // record that failed exact resolution is a named loss, never
+    // ambient noise. The pre-existing live pair keeps its generic
+    // row; neither proves exit or change.
+    for marker in [
+        "\"live terminal record\"",
+        "\"a structurally valid terminal record failed exact resolution\"",
+    ] {
+        assert!(
+            source.contains(marker),
+            "the terminal filing site must keep {marker}"
+        );
+    }
+    let projected = crate::render::capture_skipped_out(&Skipped {
+        subject: "live terminal record".into(),
+        reason: "a structurally valid terminal record failed exact resolution".into(),
+    });
+    assert_eq!(
+        projected.reason,
+        "terminal discovery record failed exact resolution"
+    );
     let projected = crate::render::capture_skipped_out(&Skipped {
         subject: "live discovery record".into(),
         reason: "a structurally valid private record failed exact live resolution".into(),

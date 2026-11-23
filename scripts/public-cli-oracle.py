@@ -81,16 +81,18 @@ DISCLOSABLE_DISCOVERY_SKIP = {"name": "discovery subject", "reason": "discovery 
 # pairs to the changed reason, the live stale-deferral mark to its
 # own deferral reason, the permission-refusal mark to its own
 # permission row, the unreadable-member mark to its own unreadable
-# row, and the three unverified-generation pairs to their own
-# unverified row (never dropped, never a pid). No row proves an
-# exit — the changed row covers proven exit-or-change, the deferral
-# row is filed for a possibly still-live process, and the permission,
-# unreadable and unverified rows for a possibly still-live, unchanged
-# process whose read was denied, failed, or unproven — so an exit
-# excuse requires proof the process actually exited, which no public
-# row carries. The oracle therefore never qualifies any of these
-# rows: any report containing one fails closed at the gap gate, in
-# every mode. Kept as named constants so the vocabulary pin
+# row, the three unverified-generation pairs to their own unverified
+# row, and the terminal record-resolution pair to its own terminal
+# row (never dropped, never a pid). No row proves an exit — the
+# changed row covers proven exit-or-change, the deferral row is filed
+# for a possibly still-live process, the permission, unreadable and
+# unverified rows for a possibly still-live, unchanged process whose
+# read was denied, failed, or unproven, and the terminal row for a
+# consumed record that failed exact resolution — so an exit excuse
+# requires proof the process actually exited, which no public row
+# carries. The oracle therefore never qualifies any of these rows:
+# any report containing one fails closed at the gap gate, in every
+# mode. Kept as named constants so the vocabulary pin
 # (test_skip_reason_vocabulary.py) keeps them tied to the producer.
 # (Historical constant name: the changed row no longer claims an
 # exit.)
@@ -99,6 +101,7 @@ STALE_DEFERRAL_SKIP = {"name": "discovery subject", "reason": "stale process rep
 PERMISSION_REFUSAL_SKIP = {"name": "discovery subject", "reason": "process unreadable mid-flight; permission denied"}
 UNREADABLE_NOT_CHECKED_SKIP = {"name": "discovery subject", "reason": "process unreadable mid-flight; not checked this pass"}
 GENERATION_UNVERIFIED_SKIP = {"name": "discovery subject", "reason": "process generation unverified mid-flight; exit or change unproven"}
+TERMINAL_RECORD_SKIP = {"name": "discovery subject", "reason": "terminal discovery record failed exact resolution"}
 # R1 fixed row: live attached counting slots a mid-capture global
 # retirement detached with no same-apply reattach. The affected-slot
 # count rides in evidence.coverage_retired_slots, never in the reason.

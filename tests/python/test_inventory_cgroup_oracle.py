@@ -1631,6 +1631,47 @@ def _unknown_gap(report):
                            "repeats": 1})
 
 
+def _deadline():
+    return {"caller": None, "module": None, "pid": None, "reason": DEADLINE,
+            "subject": "cgroup scope transaction incomplete", "repeats": 1}
+
+
+def _retained(**override):
+    gap = {"caller": "c1", "module": None, "pid": 101,
+           "reason": REFRESH_RETAINED,
+           "subject": "native owner refresh refused", "repeats": 1}
+    gap.update(override)
+    return gap
+
+
+def _admission_note(**override):
+    gap = {"caller": "c1", "module": "m0", "pid": 101,
+           "reason": MODPATH + ": admission changed from candidate to admitted",
+           "subject": "module admission changed", "repeats": 1}
+    gap.update(override)
+    return gap
+
+
+def _add_gaps(*gaps):
+    def mutate(report):
+        report["gaps"].extend(gaps)
+    return mutate
+
+
+def _deferral_on(**override):
+    def mutate(report):
+        report["gaps"][-1].update(override)
+    return mutate
+
+
+def _duplicate_caller_id(report):
+    # Codex r4 F2: a copy of c1 at the outside pid, ahead of the real row.
+    hidden = workload_caller("c1", 101)
+    hidden["pid"] = 102
+    hidden["start_time"] = 5002
+    report["callers"].insert(0, hidden)
+
+
 class ExpectedTableTests(unittest.TestCase):
     """One typed record per workload caller against the ledger table.
 
@@ -1669,7 +1710,65 @@ class ExpectedTableTests(unittest.TestCase):
         ("third-pid-caller", _third_pid_caller,
          "unexpected caller outside the workload"),
         ("unknown-gap", _unknown_gap, "published extra gap"),
+        # Codex r4 F1: each named allowance carries exactly the
+        # producer's attribution (caller, pid, module).
+        ("retained-at-excluded-pid", _add_gaps(_deadline(), _retained(pid=102)),
+         "retained refresh attribution"),
+        ("retained-on-owned-module", _add_gaps(_deadline(), _retained(module="m0")),
+         "retained refresh attribution"),
+        ("retained-unknown-caller", _add_gaps(_deadline(), _retained(caller="c9")),
+         "retained refresh attribution"),
+        ("deadline-with-caller", _add_gaps(dict(_deadline(), caller="c0", pid=100)),
+         "collection deadline attribution"),
+        ("deadline-on-owned-module", _add_gaps(dict(_deadline(), module="m0")),
+         "collection deadline attribution"),
+        ("activation-on-owned-module", _deferral_on(module="m0"),
+         "deferred activation never recovered"),
+        ("activation-at-excluded-pid", _deferral_on(pid=102),
+         "deferred activation never recovered"),
+        ("admission-note-at-excluded-pid", _add_gaps(_admission_note(pid=102)),
+         "admission note attribution"),
+        ("admission-note-unknown-caller", _add_gaps(_admission_note(caller="c9")),
+         "admission note attribution"),
+        ("admission-note-misframed", _add_gaps(_admission_note(reason="admission changed")),
+         "admission note attribution"),
+        ("duplicate-caller-id", _duplicate_caller_id, "duplicate caller id"),
     ]
+
+    ACCEPTED = [
+        ("retained-with-deadline", _add_gaps(_deadline(), _retained())),
+        ("admission-note", _add_gaps(_admission_note())),
+    ]
+
+    def test_each_named_allowance_passes_with_its_attribution(self):
+        for name, mutate in self.ACCEPTED:
+            for modfs, witness in (("overlayfs", False), ("ext4", True)):
+                with self.subTest(row=name, modfs=modfs):
+                    report = deferred_recovered_report(modfs_witness=witness)
+                    mutate(report)
+                    rc, out = run_oracle(report, modfs=modfs)
+                    self.assertEqual(rc, 0, out)
+
+    def test_swapped_generations_fail(self):
+        # Codex r4 N3: parent and child generations are not interchangeable.
+        for modfs, witness in (("overlayfs", False), ("ext4", True)):
+            with self.subTest(modfs=modfs):
+                rc, out = run_oracle(
+                    deferred_recovered_report(modfs_witness=witness),
+                    modfs=modfs,
+                    generations=(GENERATIONS[101], GENERATIONS[100]))
+                self.assertNotEqual(rc, 0, out)
+                self.assertIn("inside parent start time 5000 is not the "
+                              "workload generation 5001", out)
+
+    def test_unproven_row_on_the_owned_module_fails(self):
+        report = deferred_recovered_report()
+        for g in report["gaps"]:
+            if (g.get("reason") or "").startswith("original_file_unproven"):
+                g["module"] = "m0"
+        rc, out = run_oracle(report, modfs="overlayfs")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("overlay unproven module", out)
 
     def test_recovered_report_passes(self):
         for modfs, witness in (("overlayfs", False), ("ext4", True)):

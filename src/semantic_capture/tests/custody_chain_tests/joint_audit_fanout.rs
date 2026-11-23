@@ -20900,7 +20900,9 @@ fn joint_machine_idle_admission_between_polls_rescans_before_collection() {
             "the scan stays Idle"
         );
     }
-    fixture.service(1).expect("the completing poll never refuses");
+    fixture
+        .service(1)
+        .expect("the completing poll never refuses");
     let (done, _, _, binding, after, entry) = fixture.machine.absence_episode_for_test();
     assert!(done, "the first absence scan completes");
     assert_eq!(
@@ -21018,10 +21020,7 @@ fn joint_machine_idle_admission_between_polls_rescans_before_collection() {
     // restart from scratch without spending void units or collecting.
     fixture.service(1).expect("the rescan never refuses");
     let (done, _, _, _, _, _) = fixture.machine.absence_episode_for_test();
-    assert!(
-        !done,
-        "admission clears the completed flag for a rescan"
-    );
+    assert!(!done, "admission clears the completed flag for a rescan");
     assert_eq!(
         fixture
             .scene
@@ -40884,7 +40883,7 @@ fn joint_seal_refused_exact_fit_yields_before_future_settlement() {
     // one poll while the one-credit boundary still exact-fits.
     let (_, _, base) = build_fixture(0, 0);
     let base_total = base.open_staged as usize + base.refused_staged as usize;
-    let (foreign_opens, foreign_refused) = if base_total % 2 == 0 {
+    let (foreign_opens, foreign_refused) = if base_total.is_multiple_of(2) {
         (0usize, 1usize)
     } else {
         (1usize, 1usize)
@@ -40892,8 +40891,7 @@ fn joint_seal_refused_exact_fit_yields_before_future_settlement() {
 
     // One-unit boundary: every row yields, the exact-fit yields, the
     // next poll advances the Future with zero new visits.
-    let (mut fixture, mut frame, diagnosis) =
-        build_fixture(foreign_opens, foreign_refused);
+    let (mut fixture, mut frame, diagnosis) = build_fixture(foreign_opens, foreign_refused);
     let total = diagnosis.open_staged as usize + diagnosis.refused_staged as usize;
     assert_eq!(
         total % 2,
@@ -40980,18 +40978,14 @@ fn joint_seal_refused_exact_fit_yields_before_future_settlement() {
     );
     let before_visits = ports.read().1.adapter().barrier_row_visits_for_test();
     let mut remaining = 1;
-    let progress =
-        frame.seal_next_bounded(&mut ports, &mut births, &BirthFault, &mut remaining);
+    let progress = frame.seal_next_bounded(&mut ports, &mut births, &BirthFault, &mut remaining);
     let visits = ports.read().1.adapter().barrier_row_visits_for_test() - before_visits;
     assert_eq!(
         progress,
         Ok(QuantumSealProgress::AwaitFutureInput),
         "the poll after exact-fit advances the Future"
     );
-    assert_eq!(
-        visits, 0,
-        "reusing the completed clear visits no new rows"
-    );
+    assert_eq!(visits, 0, "reusing the completed clear visits no new rows");
     assert_eq!(
         remaining, 0,
         "the Future advance charges its paid decision credit"
@@ -41013,8 +41007,7 @@ fn joint_seal_refused_exact_fit_yields_before_future_settlement() {
 
     // Two-credit control: the same odd shape decides without the extra
     // yield, its final poll charging one scan row plus the Future.
-    let (mut fixture, mut frame, diagnosis) =
-        build_fixture(foreign_opens, foreign_refused);
+    let (mut fixture, mut frame, diagnosis) = build_fixture(foreign_opens, foreign_refused);
     let total = diagnosis.open_staged as usize + diagnosis.refused_staged as usize;
     let h0 = fixture.scene.real.h0.clone();
     let mut births = NativeFrameBirths {
@@ -41068,10 +41061,7 @@ fn joint_seal_refused_exact_fit_yields_before_future_settlement() {
             "poll {polls} yields with no seal decision"
         );
         assert_eq!(remaining, 0, "a yielded poll spends its whole slice");
-        assert_eq!(
-            visits, 2,
-            "a yielded two-credit poll examines a full slice"
-        );
+        assert_eq!(visits, 2, "a yielded two-credit poll examines a full slice");
     }
     assert_eq!(
         ports.read().1.adapter().barrier_row_visits_for_test() - baseline_visits,
@@ -41184,10 +41174,7 @@ fn joint_seal_refused_exact_fit_barrier_decides_at_zero() {
             frame.seal_next_bounded(&mut ports, &mut births, &BirthFault, &mut remaining);
         polls += 1;
         let visits = ports.read().1.adapter().barrier_row_visits_for_test() - before_visits;
-        assert_eq!(
-            visits, 1,
-            "poll {polls} examines exactly one row"
-        );
+        assert_eq!(visits, 1, "poll {polls} examines exactly one row");
         if progress == Ok(QuantumSealProgress::DeliveryReady)
             && ports.read().1.adapter().last_seal_wait() == SealWait::UnboundStaging
         {
@@ -41342,19 +41329,13 @@ fn joint_seal_prebarrier_scans_share_barrier_cursor() {
         let barrier = ports.read().1.adapter().barrier_row_visits_for_test() - before_barrier;
         let replay = ports.read().1.adapter().replay_sample_visits_for_test() - before_replay;
         let birth = ports.read().1.adapter().birth_cover_evals_for_test() - before_birth;
-        assert_eq!(
-            replay, 0,
-            "poll {polls} sizes replay without walking rows"
-        );
+        assert_eq!(replay, 0, "poll {polls} sizes replay without walking rows");
         if progress == Ok(QuantumSealProgress::AwaitFutureInput) {
             assert_eq!(
                 barrier, 0,
                 "the deciding poll reuses its completed scan with no new visits"
             );
-            assert_eq!(
-                birth, 0,
-                "the deciding poll evaluates no new birth rows"
-            );
+            assert_eq!(birth, 0, "the deciding poll evaluates no new birth rows");
             assert_eq!(
                 remaining, 0,
                 "the Future advance charges its paid decision credit"

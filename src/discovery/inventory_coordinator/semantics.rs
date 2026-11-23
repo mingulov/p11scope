@@ -1620,8 +1620,7 @@ impl SemanticBindingSet {
         if let Some(at) = self.index.get(&destination).copied() {
             let changed = {
                 let binding = &mut self.bindings[at];
-                if binding.domain != custody.domain || !Arc::ptr_eq(&binding.pin, &custody.pin)
-                {
+                if binding.domain != custody.domain || !Arc::ptr_eq(&binding.pin, &custody.pin) {
                     let changed = binding.scope_current || binding.suspension_cut;
                     binding.scope_current = false;
                     binding.suspension_cut = false;

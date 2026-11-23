@@ -3513,9 +3513,7 @@ impl LiveJointMachine {
                 // before collection. Unchanged inputs keep skipping.
                 let cur_revision = coordinator.semantic_absence_revision();
                 let cur_required = lane.subset().required().len();
-                if cur_revision != self.absence_revision
-                    || cur_required != self.absence_required
-                {
+                if cur_revision != self.absence_revision || cur_required != self.absence_required {
                     self.absence_done = false;
                     self.absence_binding = 0;
                     self.absence_after = None;

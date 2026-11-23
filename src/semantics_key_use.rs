@@ -409,10 +409,14 @@ pub(crate) struct PoppedHead {
 }
 
 /// Stuck passes at most this far apart (ns) chain into one streak;
-/// a longer gap (two healthy passes at least) breaks it. Passes run
-/// ~2 s, so scattered stuck passes across healthy work never
-/// accumulate while a sustained wedge chains.
-pub(crate) const RESEED_STUCK_STREAK_GAP_NS: u64 = 5_000_000_000;
+/// a longer gap breaks it. Fifteen seconds is 2.5 audit no-progress
+/// periods (the 6 s trip horizon): trip-paced stuck abandons chain
+/// and degrade, while minute-scattered transients across healthy
+/// work never accumulate. (Was one 2 s pass period; live, trip-paced
+/// stuck broke every streak, staged forever, and died on the re-arm
+/// bound. The duty bound below is unchanged: it counts streak
+/// length, not gap width.)
+pub(crate) const RESEED_STUCK_STREAK_GAP_NS: u64 = 15_000_000_000;
 
 /// Consecutive stuck passes that degrade a reseeded segment back to
 /// S1 (see [`JointStaging::note_reseeded_stuck_pass`]).
@@ -816,6 +820,57 @@ impl JointStaging {
         let same_domain = new_proof.object_domain() == old.domain();
         let superseding = !same_domain && new_proof.reseed_supersedes(&old.proof());
         same_domain && !superseding
+    }
+
+    /// Whether the reseed arm would refuse a birth carrying this proof
+    /// as stuck-barred: a superseding fresh incarnation onto a feed
+    /// whose audits stuck-degraded without an intervening void. The
+    /// birth association consults this before native consume so
+    /// barred reseeds refuse early instead of installing grants and
+    /// retaining witnesses no staging can ever consume (live: 4,066
+    /// installed-then-barred reseeds filled the witness table and
+    /// stopped the lane on provider storage). Mirrors
+    /// [`Self::try_reselect_joint`]'s bar gate and its prefix
+    /// (eligibility, lineage, segment doom): same-proof retries,
+    /// unbarred feeds, foreign lineages and segment-doomed births
+    /// all proceed to the arm's own decision. The arm's cut checks
+    /// (NoProgress, BelowFence) are deliberately omitted: the birth
+    /// cut is not available pre-consume, and the bar blocks the arm
+    /// however stale the cut is — in that double-blocked corner the
+    /// probe names the bar where the arm would name the cut, and
+    /// both blockers are real. Read-only: the arm still decides.
+    pub(crate) fn reseed_stuck_barred(
+        &self,
+        new_proof: &crate::semantics_objects::journal::JournalDomainProof,
+    ) -> bool {
+        let Some(old) = self.selected_receipt.as_ref() else {
+            return false;
+        };
+        if !self.reseed_eligible() {
+            return false;
+        }
+        let same_domain = new_proof.object_domain() == old.domain();
+        let superseding = !same_domain && new_proof.reseed_supersedes(&old.proof());
+        if !same_domain && !superseding {
+            return false;
+        }
+        if !superseding
+            && matches!(self.degraded_window, Some(DegradedWindow::Fallback))
+            && !self.segment_resumable
+        {
+            return false;
+        }
+        superseding && self.fresh_reseed_barred
+    }
+
+    /// Test-only fenced void-ending pose: the end state a fenced
+    /// void delivery leaves (S1Only with the retained receipt, a
+    /// recorded fence, no trip, no cooldown), via the production
+    /// close. The reseed queue and Joint count move at the registry
+    /// pose beside this one.
+    #[cfg(test)]
+    pub(crate) fn pose_void_ended_for_test(&mut self, fence: u64) {
+        self.close_segment(true, false, Some(fence));
     }
 
     /// Tests-only fallback segment pose: the association's

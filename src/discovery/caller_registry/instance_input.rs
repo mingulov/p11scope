@@ -307,6 +307,22 @@ impl JointRegistrationPlan<'_> {
         self.registry
             .joint_reselect_segment_doomed(input, new_proof)
     }
+
+    /// Route the stuck-bar probe through the live plan (same borrow
+    /// rule as above).
+    pub(crate) fn joint_reselect_stuck_barred(
+        &self,
+        input: &AdmittedInstanceCall,
+        new_proof: &crate::semantics_objects::journal::JournalDomainProof,
+    ) -> bool {
+        self.registry.joint_reselect_stuck_barred(input, new_proof)
+    }
+
+    /// Route the unhealthy-window probe through the live plan (same
+    /// borrow rule as above).
+    pub(crate) fn joint_reselect_unhealthy(&self, input: &AdmittedInstanceCall) -> bool {
+        self.registry.joint_reselect_unhealthy(input)
+    }
 }
 
 impl crate::discovery::caller_registry::CallerRegistry {
@@ -2969,6 +2985,78 @@ impl CallerRegistry {
             .get(&input.key)
             .and_then(|id| self.instance_state.semantics.get(id))
             .is_some_and(|record| record.feed.reselect_segment_doomed(new_proof))
+    }
+
+    /// Whether the reseed arm would refuse a birth carrying this proof
+    /// as stuck-barred (see the feed predicate). Unregistered keys
+    /// have no feed to bar.
+    pub(crate) fn joint_reselect_stuck_barred(
+        &self,
+        input: &AdmittedInstanceCall,
+        new_proof: &crate::semantics_objects::journal::JournalDomainProof,
+    ) -> bool {
+        self.instance_state
+            .by_key
+            .get(&input.key)
+            .and_then(|id| self.instance_state.semantics.get(id))
+            .is_some_and(|record| record.feed.reseed_stuck_barred(new_proof))
+    }
+
+    /// Whether a reseed onto this key's feed would wait out the
+    /// unhealthy window: the feed is reseed-eligible but the session
+    /// has not published a full health window since its last
+    /// stuck-session abandon. Unregistered keys have no feed to gate.
+    pub(crate) fn joint_reselect_unhealthy(&self, input: &AdmittedInstanceCall) -> bool {
+        self.instance_state
+            .by_key
+            .get(&input.key)
+            .and_then(|id| self.instance_state.semantics.get(id))
+            .is_some_and(|record| record.feed.reseed_eligible() && !self.reseed_session_healthy())
+    }
+
+    /// Test-only fenced void-ending pose for one feed: the end
+    /// state a fenced void delivery leaves (mode, window, fence,
+    /// Joint count and one queued reseed birth), without retiring
+    /// the test image the way a stream break does — the live
+    /// scoped-void shape a rebirth twin needs, which borrowing
+    /// (model plus ledger plus registry) keeps the direct delivery
+    /// from posing. Projection, gaps and refused counts stay
+    /// untouched (irrelevant to the birth path under test).
+    #[cfg(test)]
+    pub(crate) fn pose_void_ended_feed_for_test(&mut self, key: &InstanceKey, fence: u64) {
+        let Some(id) = self.instance_state.by_key.get(key).copied() else {
+            return;
+        };
+        let Some(record) = self.instance_state.semantics.get_mut(&id) else {
+            return;
+        };
+        let was_joint = record.feed.mode() == FeedMode::Joint;
+        record.feed.pose_void_ended_for_test(fence);
+        if !was_joint {
+            return;
+        }
+        self.joint_feeds = self.joint_feeds.saturating_sub(1);
+        let Some(image) = self
+            .instance_state
+            .records
+            .get(&id)
+            .map(|record| record.key.image)
+        else {
+            return;
+        };
+        if self.joint_reseed_queue.len() < crate::discovery::instances::MAX_PENDING {
+            self.joint_reseed_queue.push(image);
+        }
+    }
+
+    /// Test-only health trip pose: the counter value a stuck-session
+    /// abandon leaves (see the discard trip). The direct association
+    /// twin cannot run a real discard (model plus ledger plus
+    /// registry borrowing); the trip itself is pinned at registry
+    /// level, where the ledger is available.
+    #[cfg(test)]
+    pub(crate) fn pose_session_unhealthy_for_test(&mut self) {
+        self.passes_since_session_abandon = 0;
     }
 
     /// Tests-only fallback segment pose for one applied key's feed.

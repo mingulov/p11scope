@@ -1339,7 +1339,7 @@ fn an_exit_snapshot_decides_only_against_a_validator() {
         }
 
         fn exit_witnessed_caller(&self, pid: u32, event_ns: u64) -> Option<RetainedCaller> {
-            (pid == T && event_ns == 1_500).then(|| RetainedCaller {
+            (pid == T && event_ns == 1_500).then_some(RetainedCaller {
                 id: CallerId(7),
                 first_seen_ns: 1_000,
                 last_seen_ns: 2_000,

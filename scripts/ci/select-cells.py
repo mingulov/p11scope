@@ -284,6 +284,7 @@ UNIVERSE = {
     ],
     "privileged-tests": [
         "select",
+        "nightly-dispatch",
         "privileged-build",
         "privileged-build-journal",
         "privileged-shard",
@@ -351,6 +352,7 @@ GATED = {
         "release-preview",
     ],
     "privileged-tests": [
+        "nightly-dispatch",
         "privileged-build",
         "privileged-build-journal",
         "privileged-shard",
@@ -488,11 +490,11 @@ def select_privileged(tier, bpf_extra, event, pkcs11_full,
     if event == "schedule":
         jobs.update(_deselected(
             [job for job in UNIVERSE["privileged-tests"] if job != "select"],
-            "the schedule runs release-build plus the FULL suites only"))
-        jobs["release-build"] = ("selected", None)
-        jobs["pkcs11-check-full"] = ("selected", None)
-        jobs["pkcs11-check-providers-full"] = ("selected", None)
+            "the schedule only dispatches the nightly set to the dev tip"))
+        jobs["nightly-dispatch"] = ("selected", None)
         return jobs
+    jobs["nightly-dispatch"] = (
+        "not-selected", "the nightly dispatch runs on schedule only")
     quick_only = tier == "quick" and not bpf_extra \
         and "bpf-matrix" not in cells and "counter-flavor" not in cells
     jobs.update(_selected([

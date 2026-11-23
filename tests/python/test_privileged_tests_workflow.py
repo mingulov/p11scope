@@ -19,10 +19,15 @@ Run: python3 -I tests/python/test_privileged_tests_workflow.py -v
 
 import importlib.util
 import json
+import os
 import re
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+
+import yaml
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[2]
@@ -346,19 +351,22 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
         self.assertIn("long|all", self.yml)
         self.assertIn("--include-long", self.yml)
         # Schedules run only on the default branch, so the weekly lib
-        # campaign is a dispatch on the dev tip. The nightly schedule here
-        # (owner 2026-11-14) runs only release-build plus pkcs11-check-full
-        # on main; every other job skips on schedule.
+        # campaign is a dispatch on the dev tip, and the nightly FULLs
+        # ride an integration dispatch there too: the FULL jobs run on
+        # dispatch with the flag (or the integration tier) only, never
+        # on schedule or push.
         self.assertIn("schedules run only on the default branch", self.yml.lower())
         self.assertIn("schedule:", self.yml)
         self.assertIn("- cron: '17 3 * * *'", self.yml)
         self.assertIn("pkcs11_check_full:", self.yml)
         full = job_body(self.yml, "pkcs11-check-full")
-        self.assertIn("github.event_name == 'schedule'", full)
-        self.assertIn("inputs.pkcs11_check_full", full)
+        self.assertNotIn("schedule", full)
+        self.assertIn("github.event_name == 'workflow_dispatch' "
+                      "&& inputs.pkcs11_check_full", full)
         providers_full = job_body(self.yml, "pkcs11-check-providers-full")
-        self.assertIn("github.event_name == 'schedule'", providers_full)
-        self.assertIn("inputs.pkcs11_check_full", providers_full)
+        self.assertNotIn("schedule", providers_full)
+        self.assertIn("github.event_name == 'workflow_dispatch' "
+                      "&& inputs.pkcs11_check_full", providers_full)
         smoke = job_body(self.yml, "pkcs11-check-smoke")
         self.assertIn("github.event_name != 'schedule'", smoke)
         providers = job_body(self.yml, "pkcs11-check-providers")
@@ -995,11 +1003,10 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
                     self.assertIn("--require-hashes", line,
                                   "bare unhashed pip install remains")
 
-    def test_schedule_runs_only_release_build_and_full(self):
-        # Every job except select, gate, release-build and the two FULL
-        # jobs skips on schedule, so the nightly runs only the FULL suites
-        # on main. Select runs to publish the schedule selection for the
-        # gate, which judges it like any other run.
+    def test_schedule_dispatches_the_nightly_set_only(self):
+        # Every job except select, gate and nightly-dispatch skips on
+        # schedule: the nightly run dispatches the full set to the dev
+        # tip and runs nothing on main.
         names = [match.group(1) for match in
                  re.finditer(r"^  ([a-z][a-z0-9-]*):\s*$", self.yml, re.M)]
         jobs = [name for name in names
@@ -1008,6 +1015,7 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
         # match the job pattern above because they carry values.
         self.assertIn("select", jobs)
         self.assertIn("gate", jobs)
+        self.assertIn("nightly-dispatch", jobs)
         self.assertIn("release-build", jobs)
         self.assertIn("pkcs11-check-smoke", jobs)
         self.assertIn("pkcs11-check-full", jobs)
@@ -1016,15 +1024,123 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
         for name in jobs:
             body = job_body(self.yml, name)
             with self.subTest(job=name):
-                if name in ("select", "gate", "release-build",
-                            "pkcs11-check-full",
-                            "pkcs11-check-providers-full"):
+                if name in ("select", "gate", "nightly-dispatch"):
                     continue
-                self.assertIn("github.event_name != 'schedule'", body,
-                              f"{name} must skip on schedule")
+                skip = ("github.event_name != 'schedule'" in body
+                        or "github.event_name == 'workflow_dispatch'" in body)
+                self.assertTrue(
+                    skip, f"{name} must skip on schedule: exclude it or "
+                    "require dispatch")
         release = job_body(self.yml, "release-build")
-        self.assertNotIn("github.event_name", release,
-                         "release-build must run on schedule for FULL")
+        self.assertIn("github.event_name != 'schedule'", release,
+                      "release-build must skip on schedule: the FULL suites "
+                      "run on the dispatched dev tip, not on main")
+        dispatch = job_body(self.yml, "nightly-dispatch")
+        self.assertIn("github.event_name == 'schedule'", dispatch)
+        self.assertNotIn("!= 'schedule'", dispatch)
+
+    def test_nightly_dispatch_targets_the_dev_tip(self):
+        job = yaml.safe_load(self.yml)["jobs"]["nightly-dispatch"]
+        self.assertEqual(job["needs"], "select")
+        self.assertEqual(
+            job["if"],
+            "${{ github.event_name == 'schedule' "
+            "&& needs.select.outputs.run_nightly_dispatch == 'true' }}")
+        self.assertEqual(job["permissions"],
+                         {"contents": "read", "actions": "write"})
+        self.assertEqual(job["steps"][0]["with"]["fetch-depth"], 0)
+        body = job_body(self.yml, "nightly-dispatch")
+        for marker in (".github/ci-nightly-ref",
+                       "nightly ref is not a dev branch",
+                       'git fetch --no-tags origin "$ref"',
+                       "cannot fetch the nightly target",
+                       "git rev-parse FETCH_HEAD",
+                       "for workflow in ci.yml privileged-tests.yml "
+                       "bpf-kernels.yml; do",
+                       'gh workflow run "$workflow" --ref "$ref" '
+                       "-f tier=integration",
+                       "## nightly dispatch"):
+            self.assertIn(marker, body)
+
+    def dispatch_shell(self, ref="dev/v0.8.0", fetch="ok", gh_fail=""):
+        """Run the nightly-dispatch shell with stubbed gh and git."""
+        body = yaml.safe_load(self.yml)["jobs"]["nightly-dispatch"][
+            "steps"][1]["run"]
+        with tempfile.TemporaryDirectory(prefix="nightly-") as name:
+            base = Path(name)
+            tools = base / "tools"
+            tools.mkdir()
+            (tools / "gh").write_text(
+                "#!" + sys.executable + "\n"
+                "import json, os, sys\n"
+                "from pathlib import Path\n"
+                "base = Path(os.environ['STUB'])\n"
+                "with (base / 'calls').open('a') as out:\n"
+                "    out.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+                "if os.environ.get('GH_FAIL'):\n"
+                "    sys.exit(7)\n")
+            (tools / "git").write_text(
+                "#!" + sys.executable + "\n"
+                "import json, os, sys\n"
+                "from pathlib import Path\n"
+                "base = Path(os.environ['STUB'])\n"
+                "with (base / 'calls').open('a') as out:\n"
+                "    out.write(json.dumps(['git', *sys.argv[1:]]) + '\\n')\n"
+                "if sys.argv[1] == 'fetch' and os.environ.get('FETCH') != 'ok':\n"
+                "    sys.exit(11)\n"
+                "if sys.argv[1:3] == ['rev-parse', 'FETCH_HEAD']:\n"
+                "    sys.stdout.write('e' * 40 + '\\n')\n"
+                "if sys.argv[1] == 'show':\n"
+                "    sys.stdout.write('2026-11-23 03:17:00 +0000\\n')\n")
+            (tools / "gh").chmod(0o755)
+            (tools / "git").chmod(0o755)
+            work = base / "work"
+            (work / ".github").mkdir(parents=True)
+            (work / ".github" / "ci-nightly-ref").write_text(ref + "\n")
+            summary = base / "summary.md"
+            env = {**os.environ,
+                   "PATH": str(tools) + os.pathsep + os.environ["PATH"],
+                   "STUB": str(base), "FETCH": fetch, "GH_FAIL": gh_fail,
+                   "GITHUB_STEP_SUMMARY": str(summary)}
+            result = subprocess.run(["bash", "-c", body], cwd=work, env=env,
+                                    text=True, capture_output=True,
+                                    timeout=30)
+            calls = [json.loads(line) for line in
+                     (base / "calls").read_text().splitlines()] \
+                if (base / "calls").is_file() else []
+            text = summary.read_text() if summary.is_file() else ""
+            return result, calls, text
+
+    def test_nightly_dispatch_shell(self):
+        result, calls, summary = self.dispatch_shell()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            [call for call in calls if call[0] != "git"],
+            [["workflow", "run", name, "--ref", "dev/v0.8.0",
+              "-f", "tier=integration"]
+             for name in ("ci.yml", "privileged-tests.yml",
+                          "bpf-kernels.yml")])
+        self.assertIn("## nightly dispatch", summary)
+        self.assertIn("target: dev/v0.8.0", summary)
+        self.assertIn("sha: " + "e" * 40, summary)
+        self.assertIn("committed: 2026-11-23 03:17:00 +0000", summary)
+
+    def test_nightly_dispatch_refuses_without_dispatching(self):
+        result, calls, summary = self.dispatch_shell(ref="main")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not a dev branch", result.stderr)
+        self.assertEqual([call for call in calls if call[0] != "git"], [])
+        self.assertEqual(summary, "")
+        result, calls, _ = self.dispatch_shell(fetch="fail")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cannot fetch", result.stderr)
+        self.assertEqual([call for call in calls if call[0] != "git"], [])
+        result, calls, _ = self.dispatch_shell(gh_fail="yes")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("dispatch of ci.yml to dev/v0.8.0 failed",
+                      result.stderr)
+        self.assertEqual(len([call for call in calls if call[0] != "git"]),
+                         1)
 
 
 if __name__ == "__main__":

@@ -173,7 +173,9 @@ passed/failed/cancelled/not-selected); the gate fails on any failed,
 cancelled or required-but-not-run job, and its summary names every
 skipped cell. Quick results are labelled quick-green and never qualify
 a release: release checks require full- or integration-tier gate
-records from all three workflows on the exact SHA. Tag pushes trigger
+records from all three workflows on the exact SHA. The nightly schedule
+dispatches the full set (integration tier) to the current dev tip named
+by `.github/ci-nightly-ref` and runs nothing on main. Tag pushes trigger
 nothing: a release tag rides the commit the branch push already ran.
 GitHub runners provide passwordless root, BTF and KVM:
 - the curated privileged library cells (`scripts/run-privileged-lib-tests.sh`,

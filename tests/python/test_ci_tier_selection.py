@@ -585,17 +585,20 @@ class TierSelectionTests(unittest.TestCase):
             self.assertIn("deduped",
                           selection["jobs"][job]["reason"])
 
-    def test_schedule_keeps_the_current_nightly_set(self):
+    def test_schedule_dispatches_the_nightly_set_only(self):
         selection, _ = select("privileged-tests", "schedule",
                               "refs/heads/main", {"known"})
         self.assertEqual(selection["tier"], "schedule")
         current = states(selection)
-        for job in ("release-build", "pkcs11-check-full",
+        self.assertEqual(current["nightly-dispatch"], "selected")
+        for job in ("release-build", "privileged-build", "privileged-shard",
+                    "pkcs11-check-smoke", "pkcs11-check-full",
                     "pkcs11-check-providers-full"):
-            self.assertEqual(current[job], "selected", job)
-        for job in ("privileged-build", "privileged-shard",
-                    "pkcs11-check-smoke"):
             self.assertEqual(current[job], "not-selected", job)
+        selection, _ = select("privileged-tests", "push",
+                              "refs/heads/test/x", {"known"})
+        self.assertEqual(
+            states(selection)["nightly-dispatch"], "not-selected")
 
     def test_unknown_workflow_fails(self):
         with self.assertRaisesRegex(ValueError, "unknown workflow"):
@@ -736,6 +739,31 @@ class TierSelectionTests(unittest.TestCase):
         path = ROOT / ".github" / "ci-nightly-ref"
         self.assertTrue(path.is_file())
         self.assertEqual(SELECT.read_base_branch(), "dev/v0.8.0")
+
+    def test_nightly_ref_validation(self):
+        saved = SELECT.NIGHTLY_REF_FILE
+        with tempfile.TemporaryDirectory(prefix="nightly-ref-") as base:
+            SELECT.NIGHTLY_REF_FILE = Path(base) / "ci-nightly-ref"
+            try:
+                self.assertIsNone(SELECT.read_base_branch())
+                cases = [
+                    ("dev/v0.8.0\n", "dev/v0.8.0"),
+                    ("# nightly target\ndev/v0.8.0\n", "dev/v0.8.0"),
+                    ("dev/v0.8.0\ndev/v0.9.0\n", None),
+                    ("main\n", None),
+                    ("test/x\n", None),
+                    ("../escape\n", None),
+                    ("dev/\n", None),
+                    ("", None),
+                    ("# only a comment\n", None),
+                ]
+                for contents, expected in cases:
+                    with self.subTest(contents=contents):
+                        SELECT.NIGHTLY_REF_FILE.write_text(
+                            contents, encoding="utf-8")
+                        self.assertEqual(SELECT.read_base_branch(), expected)
+            finally:
+                SELECT.NIGHTLY_REF_FILE = saved
 
     def make_repo(self, base):
         """A fixture repo: dev branch plus a feature branch off it."""

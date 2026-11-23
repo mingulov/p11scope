@@ -51,18 +51,19 @@ name: privileged-tests
 #   pack into system-scale and WP-4/WP-5 into public-cli through
 #   scripts/ci/run-cell-script.sh (which validates results.jsonl with
 #   scripts/ci/check-cell-results.py); the pkcs11-check external suite
-#   keeps its own jobs because the FULL suite has its own nightly
-#   schedule: pkcs11-check-smoke (--marker smoke, few minutes) on every
-#   push, pkcs11-check-full (no marker, ~45 min per leg) nightly plus
-#   manual dispatch, both with identical-result, observer-clean,
+#   keeps its own jobs because the FULL suite runs apart from pushes:
+#   pkcs11-check-smoke (--marker smoke, few minutes) on every push,
+#   pkcs11-check-full (no marker, ~45 min per leg) on manual dispatch
+#   and the integration tier, both with identical-result, observer-clean,
 #   oracle-subset and default-coverage checks. The FULL green on the exact
 #   SHA gates release tags (package-preview validates it).
 #   pkcs11-check-providers runs the same smoke shape as a kryoptic +
 #   Haskoki + NSS-softokn matrix next to the SoftHSM smoke (pinned
 #   artifacts, system libnss3 for the NSS tool probe, ~10 min
 #   per leg on every push); pkcs11-check-providers-full runs the full
-#   suite per provider nightly plus manual dispatch, gated exactly like
-#   pkcs11-check-full but not release-gating. Per provider: suite alone,
+#   suite per provider on manual dispatch and the integration tier,
+#   gated exactly like pkcs11-check-full but not release-gating.
+#   Per provider: suite alone,
 #   under `p11scope run` and under `p11scope run --manifest`, a discover
 #   manifest assertion (kryoptic's multi-table row is
 #   kryoptic-multi-table) and an inventory --pid workload; a provider
@@ -70,10 +71,11 @@ name: privileged-tests
 #   its cell.
 # Weekly lib campaign: workflow_dispatch input campaign selects default,
 # long (--include-long) or all (long plus the fixture-skip groups once
-# WP-2 adds them). GitHub schedules run only on the default branch, so the
-# weekly lib run is a dispatch on the dev tip; the nightly schedule here
-# runs only release-build plus the two FULL jobs on main (every other job
-# skips on schedule).
+# WP-2 adds them). Dispatch inputs tier, cells and kernels select the
+# cell set (see scripts/ci/select-cells.py). GitHub schedules run only
+# on the default branch, so the nightly schedule here only dispatches
+# the full set (integration tier) to the current dev tip named by
+# .github/ci-nightly-ref; every other job skips on schedule.
 on:
   # Release tags ride the commit a branch push already ran (RELEASING.md
   # pushes main and the tag together): tag pushes trigger nothing, so a
@@ -87,8 +89,8 @@ on:
       - '**'
   pull_request:
   schedule:
-    # Nightly FULL pkcs11-check on main (schedules run only on the default
-    # branch): release-build plus the two FULL jobs; every other job skips.
+    # Nightly dispatch to the dev tip (schedules run only on the default
+    # branch): nightly-dispatch alone; every other job skips.
     - cron: '17 3 * * *'
   workflow_dispatch:
     inputs:
@@ -142,6 +144,7 @@ jobs:
       tier: ${{ steps.choose.outputs.tier }}
       base: ${{ steps.choose.outputs.base }}
       path_classes: ${{ steps.choose.outputs.path_classes }}
+      run_nightly_dispatch: ${{ steps.choose.outputs.run_nightly_dispatch }}
       run_privileged_build: ${{ steps.choose.outputs.run_privileged_build }}
       run_privileged_build_journal: ${{ steps.choose.outputs.run_privileged_build_journal }}
       run_privileged_shard: ${{ steps.choose.outputs.run_privileged_shard }}
@@ -181,6 +184,46 @@ jobs:
           P11SCOPE_CI_KERNELS: ${{ inputs.kernels }}
           P11SCOPE_CI_PKCS11_FULL: ${{ inputs.pkcs11_check_full }}
         run: python3 -I scripts/ci/select-cells.py
+  # Nightly: schedules run only on the default branch, but main sits
+  # still while development moves on the dev branch, so this job runs
+  # nothing on main and instead dispatches the full set (integration
+  # tier: the full matrix plus the FULL pkcs11 suites and the
+  # release-preview privacy gate) to the current dev tip named by the
+  # checked-in .github/ci-nightly-ref. Dispatching needs actions:write;
+  # nothing else in this workflow writes.
+  nightly-dispatch:
+    needs: select
+    if: ${{ github.event_name == 'schedule' && needs.select.outputs.run_nightly_dispatch == 'true' }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - shell: bash
+        run: |
+          set -euo pipefail
+          ref=$(cat .github/ci-nightly-ref)
+          case "$ref" in
+            dev/*) ;;
+            *) echo "refusing: nightly ref is not a dev branch: $ref" >&2; exit 1 ;;
+          esac
+          git fetch --no-tags origin "$ref" \
+            || { echo "refusing: cannot fetch the nightly target $ref" >&2; exit 1; }
+          tip=$(git rev-parse FETCH_HEAD)
+          date=$(git show -s --format=%ci FETCH_HEAD)
+          echo "nightly target: $ref $tip ($date)"
+          for workflow in ci.yml privileged-tests.yml bpf-kernels.yml; do
+            gh workflow run "$workflow" --ref "$ref" -f tier=integration \
+              || { echo "dispatch of $workflow to $ref failed" >&2; exit 1; }
+          done
+          printf '## nightly dispatch\n\ntarget: %s\nsha: %s\ncommitted: %s\n' \
+            "$ref" "$tip" "$date" >>"$GITHUB_STEP_SUMMARY"
   privileged-build:
     needs: select
     runs-on: ubuntu-26.04
@@ -947,7 +990,7 @@ jobs:
   release-build:
     needs: select
     runs-on: ubuntu-26.04
-    if: needs.select.outputs.run_release_build == 'true'
+    if: ${{ github.event_name != 'schedule' && needs.select.outputs.run_release_build == 'true' }}
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -2103,7 +2146,7 @@ jobs:
   # checks (scripts/ci/pkcs11-check-cell.sh). Exact selector --marker
   # smoke (four files, ~133 tests, few minutes); no blanket skips. Runs on
   # every push (host kernel) as a required cell; skips on schedule (the
-  # FULL job owns the nightly).
+  # schedule only dispatches the nightly set to the dev tip).
   pkcs11-check-smoke:
     needs: [release-build, select]
     if: ${{ github.event_name != 'schedule' && needs.select.outputs.run_pkcs11_check_smoke == 'true' }}
@@ -2157,13 +2200,14 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
   # pkcs11-check FULL under p11scope: the same three legs with the full
-  # default suite (no --marker, ~45 min per leg, ~2.5 h total). Runs
-  # nightly on main plus manual dispatch (pkcs11_check_full input); never
-  # on push. Its green on the exact SHA gates release tags
+  # default suite (no --marker, ~45 min per leg, ~2.5 h total). Runs on
+  # manual dispatch (pkcs11_check_full input) and the integration tier
+  # (which the nightly schedule dispatches to the dev tip); never on
+  # push. Its green on the exact SHA gates release tags
   # (package-preview validates accepted_pkcs11_full_run_id).
   pkcs11-check-full:
     needs: [release-build, select]
-    if: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.pkcs11_check_full)) && needs.select.outputs.run_pkcs11_check_full == 'true' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.pkcs11_check_full && needs.select.outputs.run_pkcs11_check_full == 'true' }}
     runs-on: ubuntu-26.04
     timeout-minutes: 180
     steps:
@@ -2224,7 +2268,7 @@ jobs:
   # on the manifest leg or the inventory leg fails its cell; kryoptic's
   # discover row is kryoptic-multi-table. Runs on every push (host
   # kernel) as a required cell, ~10 min per matrix leg; skips on schedule
-  # (the FULL job owns the nightly).
+  # (the schedule only dispatches the nightly set to the dev tip).
   pkcs11-check-providers:
     needs: [release-build, select]
     if: ${{ github.event_name != 'schedule' && needs.select.outputs.run_pkcs11_check_providers == 'true' }}
@@ -2312,12 +2356,13 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
   # Provider-matrix FULL under p11scope: the same per-provider legs with
-  # the full default suite (no --marker). Runs nightly on main plus manual
-  # dispatch (pkcs11_check_full input); never on push. Gated exactly like
+  # the full default suite (no --marker). Runs on manual dispatch
+  # (pkcs11_check_full input) and the integration tier (which the nightly
+  # schedule dispatches to the dev tip); never on push. Gated exactly like
   # pkcs11-check-full but not release-gating.
   pkcs11-check-providers-full:
     needs: [release-build, select]
-    if: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.pkcs11_check_full)) && needs.select.outputs.run_pkcs11_check_providers_full == 'true' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.pkcs11_check_full && needs.select.outputs.run_pkcs11_check_providers_full == 'true' }}
     runs-on: ubuntu-26.04
     timeout-minutes: 300
     strategy:
@@ -2388,7 +2433,7 @@ jobs:
   # cancelled or required-but-not-run job. Needs every job and always
   # runs; the record and summary name every skipped cell.
   gate:
-    needs: [select, privileged-build, privileged-build-journal, privileged-shard, privileged-summary, privileged-second-flavor, privileged-counter-flavor, privileged-btrfs, privileged-overlay, release-build, system-scale, public-cli, public-cli-ia32, legacy32-shape, root-integration, witness-cli, run-tree, browser-cells, container-image, pkcs11-check-smoke, pkcs11-check-full, pkcs11-check-providers, pkcs11-check-providers-full]
+    needs: [select, nightly-dispatch, privileged-build, privileged-build-journal, privileged-shard, privileged-summary, privileged-second-flavor, privileged-counter-flavor, privileged-btrfs, privileged-overlay, release-build, system-scale, public-cli, public-cli-ia32, legacy32-shape, root-integration, witness-cli, run-tree, browser-cells, container-image, pkcs11-check-smoke, pkcs11-check-full, pkcs11-check-providers, pkcs11-check-providers-full]
     if: ${{ always() }}
     runs-on: ubuntu-26.04
     permissions:

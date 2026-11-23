@@ -1380,6 +1380,16 @@ pub(crate) struct LiveJointMachine {
     absence_binding: usize,
     absence_after: Option<PinnedObjectId>,
     absence_entry: usize,
+    /// Whether the Idle absence scan completed within this Idle episode.
+    /// Set when the scan exhausts its bindings; cleared whenever a poll
+    /// advances a non-Idle phase, on re-arm, and when pre-advance staging
+    /// or discovery acts (conservative: new inputs may need a scan).
+    /// While set, Idle skips the scan and runs the void every poll,
+    /// instead of re-scanning already-dispatched bindings/targets/entries
+    /// every cycle (each re-scan costs polls but dispatches nothing new:
+    /// births, bindings, targets and scopes change only outside Idle or
+    /// via the scan itself). Never authority.
+    absence_done: bool,
     /// Consecutive running Idle ticks that yielded on an ingest-break
     /// void the semantic pool could not pay for (reset when one applies).
     unpaid_void_yields: u32,
@@ -1535,6 +1545,7 @@ impl LiveJointMachine {
             absence_binding: 0,
             absence_after: None,
             absence_entry: 0,
+            absence_done: false,
             unpaid_void_yields: 0,
             demand: None,
             prepared_base: 0,
@@ -2040,6 +2051,10 @@ impl LiveJointMachine {
         }
         self.phase = Some(Phase::Idle);
         self.state = RunState::Runnable;
+        // A re-armed Idle episode re-scans absence from scratch (the
+        // refusal discarded stuck feeds and recorded a break; covers the
+        // latch-at-Idle case where no non-Idle poll cleared the flag).
+        self.absence_done = false;
         self.audit_no_progress_polls = 0;
         self.finish_no_progress_polls = 0;
         self.finish_no_progress_since = None;
@@ -2767,9 +2782,9 @@ fn stage_events_ahead<I: JointMachineIo>(
     coordinator: &mut InventoryCoordinator<OsProcessSource>,
     budget: &mut JointWorkBudget,
     stop: Option<usize>,
-) {
+) -> usize {
     if !budget.available() || budget.remaining_actions <= 1 {
-        return;
+        return 0;
     }
     let quantum = (budget.remaining_actions - 1).min(crate::events::LIVE_POLL_QUANTUM);
     let outcome = io.stage_events(lane, quantum, stop);
@@ -2780,6 +2795,7 @@ fn stage_events_ahead<I: JointMachineIo>(
             EVENTS_STAGE_SATURATED_REASON.to_string(),
         );
     }
+    outcome.staged
 }
 
 impl LiveJointMachine {
@@ -2806,7 +2822,11 @@ impl LiveJointMachine {
         if let RunState::DispositionRequired(reason) = self.state {
             return Err(reason);
         }
-        stage_events_ahead(io, lane, coordinator, budget, None);
+        if stage_events_ahead(io, lane, coordinator, budget, None) > 0 {
+            // Conservative: staged events may feed new absence inputs, so
+            // the next Idle poll re-scans instead of trusting the flag.
+            self.absence_done = false;
+        }
         // Production v0.5.0 installs this machine with no journal producer.
         // Service its own DISCOVERY even while a raw/audited original waits,
         // leaving linked Joint's records and every Finish-Q bound untouched.
@@ -2815,7 +2835,14 @@ impl LiveJointMachine {
             let work = (budget.remaining_actions - 1)
                 .min(crate::discovery::engine::LIVE_DISCOVERY_DRAIN_QUANTUM);
             match io.service_unlinked_discovery(lane, work, budget.deadline) {
-                Ok(records) if records <= work => budget.spend(records),
+                Ok(records) if records <= work => {
+                    budget.spend(records);
+                    if records > 0 {
+                        // Conservative: discovery may map new absence
+                        // targets (see above).
+                        self.absence_done = false;
+                    }
+                }
                 _ => {
                     self.state = RunState::DispositionRequired(SemanticRefusal::Unavailable);
                     return Err(SemanticRefusal::Unavailable);
@@ -3390,6 +3417,12 @@ impl LiveJointMachine {
         q: Option<&CollectedFinishQ>,
         acquisition: Option<&mut dyn ImageAcquisition>,
     ) -> (Phase, Result<Step, SemanticRefusal>) {
+        if !matches!(phase, Phase::Idle) {
+            // A non-Idle poll ends any Idle episode: the next Idle
+            // episode re-scans absence from scratch (new births,
+            // bindings, targets or scopes may have arrived outside Idle).
+            self.absence_done = false;
+        }
         match phase {
             phase @ (Phase::FinishStopReady(_) | Phase::FinishStopReport { .. }) => {
                 self.advance_finish_stop(phase, lane, coordinator, io, budget, q)
@@ -3402,8 +3435,8 @@ impl LiveJointMachine {
                 // No collection, binder or New can precede this scan. One
                 // accepted current image is paired with one real attached
                 // target per action; no Mapped-only selector/cross-product.
-                if q.is_none()
-                    && self.grant.is_some()
+                let scan_open = q.is_none() && self.grant.is_some() && !self.absence_done;
+                if scan_open
                     && let Some((binding, adapter)) =
                         coordinator.joint_absence_parts(self.absence_binding)
                 {
@@ -3495,10 +3528,15 @@ impl LiveJointMachine {
                             return (Phase::Idle, Ok(Step::Continue));
                         }
                     }
+                } else if scan_open {
+                    // The scan ran out of bindings: mark it complete for
+                    // this Idle episode and reset the cursors for the next
+                    // episode's fresh scan.
+                    self.absence_done = true;
+                    self.absence_binding = 0;
+                    self.absence_after = None;
+                    self.absence_entry = 0;
                 }
-                self.absence_binding = 0;
-                self.absence_after = None;
-                self.absence_entry = 0;
                 // A Joint fault never stops S1: a linked stream broken
                 // while ingesting fences the consumed history and
                 // re-syncs above it on this collect, refusing no key.

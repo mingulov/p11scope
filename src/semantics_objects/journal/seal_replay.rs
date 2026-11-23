@@ -186,18 +186,44 @@ pub(super) struct ReplayBounds {
 
 impl ReplayBounds {
     pub(super) fn sample(adapter: &JournalAdapter, model: &ObjectSemantics) -> Option<Self> {
-        // O(1) conservative bounds from maintained cardinalities: each
-        // filtered count is at most the open population, so the worst-case
-        // exact sum (all opens unconverted with ends and abandonments) is
-        // the safe upper bound. No table walks, so retries size without
-        // rereading the prefix.
+        // O(1) exact bounds from maintained cardinalities: every open
+        // mutation maintains its begins/terminals/abandoned counts, so
+        // sizing reads them without walking rows and retries size without
+        // rereading the prefix. Debug builds recount and compare to catch
+        // drift.
+        #[cfg(debug_assertions)]
+        {
+            let recount_begins = adapter
+                .open
+                .values()
+                .filter(|entry| entry.converted_ticket.is_none())
+                .count();
+            let recount_terminals = adapter
+                .open
+                .values()
+                .filter(|entry| entry.end.is_some() && !entry.end_converted)
+                .count();
+            let recount_abandoned = adapter
+                .open
+                .values()
+                .filter(|entry| entry.abandon.is_some())
+                .count();
+            debug_assert_eq!(
+                (
+                    adapter.open_begins,
+                    adapter.open_terminals,
+                    adapter.open_abandoned
+                ),
+                (recount_begins, recount_terminals, recount_abandoned),
+                "maintained replay cardinalities match a recount"
+            );
+        }
         let refused = adapter.refused.len();
-        let opens = adapter.open.len();
-        let begins = opens;
-        let terminals = opens;
+        let begins = adapter.open_begins;
+        let terminals = adapter.open_terminals;
         // Every staged abandonment may own one terminal step: a bounded
         // loss or a per-call disposal (dooming ones never convert).
-        let abandoned = opens;
+        let abandoned = adapter.open_abandoned;
         let pending = model.replay_pending_count();
         let steps = refused
             .checked_add(usize::from(refused != 0))?

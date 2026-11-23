@@ -3169,6 +3169,110 @@ mod tests {
         );
     }
 
+    /// The drain confines a dead loader's metadata pid to the tally: a
+    /// provider opened by an already-exited loader still tallies its
+    /// event-time pid on the `Load` message, but the candidate carries
+    /// no mount pin — the metadata pid never authorizes a lookup.
+    #[test]
+    fn learn_dead_loader_metadata_pid_tallies_but_pins_nothing() {
+        use std::os::unix::io::IntoRawFd as _;
+        // A provider-positive fixture: one entry export is enough.
+        let dir = tempfile::tempdir().unwrap();
+        let c = dir.path().join("m3.c");
+        let so = dir.path().join("libm3.so");
+        std::fs::write(
+            &c,
+            "unsigned long C_GetFunctionList(void **out){ (void)out; return 5; }\n",
+        )
+        .unwrap();
+        assert!(
+            std::process::Command::new("gcc")
+                .args(["-shared", "-fPIC", "-o"])
+                .arg(&so)
+                .arg(&c)
+                .status()
+                .unwrap()
+                .success(),
+            "the fixture provider must compile"
+        );
+        // The metadata pid: a live process that is never the loader.
+        let mut live = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let metadata_pid = live.id();
+        // The event pidfd: already exited before the drain runs.
+        let mut dead = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pidfd = test_pidfd(dead.id());
+        dead.kill().unwrap();
+        dead.wait().unwrap();
+        for _ in 0..200 {
+            if super::pidfd_exited(pidfd.as_fd()) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            super::pidfd_exited(pidfd.as_fd()),
+            "exit makes the pidfd readable"
+        );
+        let (tx, rx) = std::sync::mpsc::sync_channel::<super::LearnMsg>(16);
+        let state = std::sync::Arc::new(super::LearnShutdownState::default());
+        let null = std::fs::File::open("/dev/null").unwrap();
+        let mut ctx = super::DrainCtx {
+            group: std::os::unix::io::AsRawFd::as_raw_fd(&null),
+            tx: &tx,
+            state: &state,
+            self_pid: std::process::id(),
+            fionread_unit: super::FANOTIFY_META_LEN,
+            fionread_exact: true,
+            cache: super::LearnCache::new(),
+            stats: super::DrainStats::default(),
+            ignore_marks: 0,
+            marked_this_period: std::collections::HashSet::new(),
+        };
+        // The drain takes ownership of both kernel-handed fds.
+        let file = std::fs::File::open(&so).unwrap();
+        let event = super::ParsedFanotifyEvent {
+            fd: file.into_raw_fd(),
+            pid: metadata_pid as i32,
+            pidfd: Some(pidfd.into_raw_fd()),
+            overflow: false,
+            total_len: 32,
+        };
+        assert!(
+            ctx.process_event(event, super::SendWindow::Live),
+            "the proved provider sends"
+        );
+        // The live child served its purpose (its pid is already
+        // tallied into the buffered messages); reap it before asserting.
+        live.kill().unwrap();
+        live.wait().unwrap();
+        match rx.try_recv().expect("the tally load arrives first") {
+            super::LearnMsg::Load { pid, .. } => assert_eq!(
+                pid, metadata_pid,
+                "the tally keeps the event-time metadata pid"
+            ),
+            _ => panic!("expected the tally Load first"),
+        }
+        match rx.try_recv().expect("the candidate arrives second") {
+            super::LearnMsg::Candidate(candidate) => assert_eq!(
+                candidate.loader_pid, None,
+                "a dead pidfd pins nothing: the metadata pid never authorizes the lookup"
+            ),
+            _ => panic!("expected the candidate second"),
+        }
+    }
+
     /// Kernel-handed fds get CLOEXEC explicitly, not by propagation.
     #[test]
     fn learn_set_cloexec_sets_the_flag() {

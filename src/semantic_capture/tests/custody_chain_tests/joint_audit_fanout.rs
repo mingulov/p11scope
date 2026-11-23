@@ -1985,7 +1985,29 @@ impl MachineScene {
     }
 
     fn published_labeled(&mut self, label: &str, frozen: Option<bool>) {
-        for _ in 0..512 {
+        // The machine's non-seal work allowance (births, audit, replay,
+        // publication: 512 one-unit services, unchanged) plus one paid
+        // seal advance from the seal charge model over the largest
+        // tables seen so far: the seal meters every row, identity and
+        // prepaid application unit at one per service.
+        let mut services = 0usize;
+        let mut peak = 0usize;
+        loop {
+            let (rows, keys) = {
+                let adapter = self.scene.real.scene.coordinator.joint_capture().adapter();
+                let diagnosis = adapter.seal_stage_diagnosis();
+                (
+                    diagnosis.open_staged as usize + diagnosis.refused_staged as usize,
+                    adapter.key_count_for_test(),
+                )
+            };
+            peak = peak.max(crate::semantics_objects::journal::seal_advance_units_bound(
+                rows, keys,
+            ));
+            if services >= 512 + peak {
+                break;
+            }
+            services += 1;
             let progress = self.service(1).unwrap_or_else(|reason| {
                 self.publication_failed(label, frozen, Some(reason));
             });
@@ -8306,23 +8328,25 @@ fn joint_machine_collected_finish_budget_refusal_preserves_originals() {
     assert_eq!(ending.finish.as_ref().unwrap().stops, 1);
 }
 
-/// Derived seal-poll bound from the barrier charge model: one seal
-/// advance costs its barrier scan (`rows` units, one per staged row)
-/// plus one decision unit, spread across polls of `budget_per_poll`
-/// units each. `advances` counts the seal advances the wait needs.
-/// Callers sample `rows` from the live `seal_stage_diagnosis` at the
-/// wait's start and prove per-poll progress inside the loop, so the
-/// bound can never hide a liveness bug. Never a bare constant.
-fn seal_poll_bound(rows: usize, budget_per_poll: usize, advances: usize) -> usize {
+/// Derived seal-poll bound from the seal charge model
+/// ([`crate::semantics_objects::journal::seal_advance_units_bound`]):
+/// one seal advance pays one unit per staged row and identity, its
+/// prepaid decision work and one settlement credit, spread across polls
+/// of `budget_per_poll` units each. `advances` counts the seal advances
+/// the wait needs and `keys` the bound keys. Callers sample `rows` from
+/// the live `seal_stage_diagnosis` at the wait's start and prove
+/// per-poll progress (one paid scan unit or a decision) inside the loop,
+/// so the bound can never hide a liveness bug. Never a bare constant.
+fn seal_poll_bound(rows: usize, keys: usize, budget_per_poll: usize, advances: usize) -> usize {
     assert!(budget_per_poll > 0, "a seal poll needs a nonzero budget");
-    rows.saturating_add(1)
+    crate::semantics_objects::journal::seal_advance_units_bound(rows, keys)
         .saturating_mul(advances)
         .div_ceil(budget_per_poll)
 }
 
 /// Drive one-unit machine polls until `done`, within a bound derived
-/// from the barrier charge model. Every poll must charge and advance
-/// the barrier cursor (new row visits) or decide (consumer progress
+/// from the seal charge model. Every poll must pay a seal scan unit
+/// (a row, identity or prepaid decision unit) or decide (consumer progress
 /// moves, the wait finishes, or the service leaves `Pending`); a poll
 /// that does neither fails at once instead of burning the bound.
 /// Returns the polls used and the final outcome. The wait must start
@@ -8339,7 +8363,15 @@ fn drive_machine_seal_polls(
     Result<crate::inventory_semantics::JointServiceProgress, SemanticRefusal>,
 ) {
     use crate::inventory_semantics::JointServiceProgress;
-    let bound = seal_poll_bound(rows, 1, advances);
+    let keys = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .key_count_for_test();
+    let bound = seal_poll_bound(rows, keys, 1, advances);
     assert!(
         !done(fixture),
         "{label}: the seal wait starts undecided (rows={rows})"
@@ -8357,7 +8389,7 @@ fn drive_machine_seal_polls(
             .coordinator
             .joint_capture()
             .adapter()
-            .barrier_row_visits_for_test();
+            .seal_scan_units_for_test();
         let progress_before = fixture.machine.retained_consumer_progress_for_test();
         let outcome = fixture.service(1);
         polls += 1;
@@ -8368,7 +8400,7 @@ fn drive_machine_seal_polls(
             .coordinator
             .joint_capture()
             .adapter()
-            .barrier_row_visits_for_test();
+            .seal_scan_units_for_test();
         let progress_after = fixture.machine.retained_consumer_progress_for_test();
         let finished = done(fixture);
         assert!(
@@ -8376,7 +8408,7 @@ fn drive_machine_seal_polls(
                 || progress_after != progress_before
                 || finished
                 || !matches!(outcome, Ok(JointServiceProgress::Pending)),
-            "{label}: poll {polls} of {bound} charged and advanced the barrier cursor or decided (visits {visits_before}->{visits_after}, progress {progress_before:?}->{progress_after:?}, outcome {outcome:?})"
+            "{label}: poll {polls} of {bound} paid a seal scan unit or decided (units {visits_before}->{visits_after}, progress {progress_before:?}->{progress_after:?}, outcome {outcome:?})"
         );
         if finished || !matches!(outcome, Ok(JointServiceProgress::Pending)) {
             eprintln!("{label}: seal wait finished in {polls} polls (bound={bound} rows={rows})");
@@ -8387,8 +8419,8 @@ fn drive_machine_seal_polls(
 
 /// Drive one-unit frame seals until one decides (anything but
 /// `LocalPending`), within a bound derived from the barrier charge
-/// model. Every yielded poll must spend its whole slice examining
-/// exactly one row with no consumer advance; anything else fails at
+/// model. Every yielded poll must spend its whole slice paying exactly
+/// one scan unit with no consumer advance; anything else fails at
 /// once instead of burning the bound. Returns the polls used, the
 /// deciding outcome, its remaining budget, and the rows the deciding
 /// poll examined.
@@ -8402,7 +8434,8 @@ fn drive_frame_seal_until_decided(
     rows: usize,
     label: &str,
 ) -> (usize, QuantumSealProgress, usize, usize) {
-    let bound = seal_poll_bound(rows, 1, 1);
+    let keys = ports.read().1.adapter().key_count_for_test();
+    let bound = seal_poll_bound(rows, keys, 1, 1);
     let mut polls = 0usize;
     loop {
         assert!(
@@ -8410,6 +8443,7 @@ fn drive_frame_seal_until_decided(
             "{label}: the frame seal decides within its derived bound (polls={polls} bound={bound} rows={rows})"
         );
         let before_visits = ports.read().1.adapter().barrier_row_visits_for_test();
+        let before_units = ports.read().1.adapter().seal_scan_units_for_test();
         let before_progress = frame.consumer_progress_for_test();
         let mut remaining = 1;
         let outcome = frame
@@ -8417,6 +8451,7 @@ fn drive_frame_seal_until_decided(
             .unwrap();
         polls += 1;
         let visits = ports.read().1.adapter().barrier_row_visits_for_test() - before_visits;
+        let units = ports.read().1.adapter().seal_scan_units_for_test() - before_units;
         if !matches!(outcome, QuantumSealProgress::LocalPending) {
             eprintln!(
                 "{label}: frame seal decided in {polls} polls (bound={bound} rows={rows} outcome={outcome:?})"
@@ -8428,8 +8463,12 @@ fn drive_frame_seal_until_decided(
             "{label}: a yielded poll spends its whole slice"
         );
         assert_eq!(
-            visits, 1,
-            "{label}: a budget-1 yielded poll examines exactly one row"
+            units, 1,
+            "{label}: a budget-1 yielded poll pays exactly one scan unit"
+        );
+        assert!(
+            visits <= 1,
+            "{label}: a budget-1 yielded poll examines at most one row"
         );
         assert_eq!(
             frame.consumer_progress_for_test(),
@@ -37853,10 +37892,14 @@ fn joint_seal_abandon_return_pending_waits_as_future_input() {
         Ok(QuantumSealProgress::AwaitFutureInput),
         "the uncorroborated bound waits as future input"
     );
+    let scan = frame
+        .seal_scan_for_test()
+        .expect("the frame holds its finished scan");
+    assert!(scan.done && scan.identities > 0, "{scan:?}");
     assert_eq!(
         remaining,
-        10 - total - 1,
-        "the finished frame charges its barrier scan plus the one-unit Future advance"
+        10 - (total + scan.identities + scan.prepaid) - 1,
+        "the finished frame pays one unit per row, identity and prepaid unit plus the one-unit Future advance"
     );
     assert_eq!(
         ports.read().1.adapter().last_seal_wait(),
@@ -37942,10 +37985,17 @@ fn joint_seal_floors_past_frontier_waits_as_future_input() {
         Ok(QuantumSealProgress::AwaitFutureInput),
         "the repeat at an unchanged frontier waits as future input"
     );
+    let scan = frame
+        .seal_scan_for_test()
+        .expect("the frame holds its finished scan");
+    assert!(
+        scan.done,
+        "the floors wait decides on a finished scan: {scan:?}"
+    );
     assert_eq!(
         remaining,
-        10 - total - 1,
-        "the finished frame charges its barrier scan plus the one-unit Future advance"
+        10 - (total + scan.identities + scan.prepaid) - 1,
+        "the finished frame pays one unit per row, identity and prepaid unit plus the one-unit Future advance"
     );
     assert_eq!(
         ports.read().1.adapter().last_seal_wait(),
@@ -38059,10 +38109,14 @@ fn joint_seal_future_wait_skips_terminal_scan_with_populated_staging() {
         Ok(QuantumSealProgress::AwaitFutureInput),
         "the uncorroborated bound waits as future input"
     );
+    let scan = frame
+        .seal_scan_for_test()
+        .expect("the frame holds its finished scan");
+    assert!(scan.done && scan.identities > 0, "{scan:?}");
     assert_eq!(
         remaining,
-        1000 - total - 1,
-        "the finished frame charges its barrier scan plus the one-unit Future advance"
+        1000 - (total + scan.identities + scan.prepaid) - 1,
+        "the finished frame pays one unit per row, identity and prepaid unit plus the one-unit Future advance"
     );
     assert_eq!(
         ports.read().1.adapter().last_seal_wait(),
@@ -38247,13 +38301,16 @@ fn joint_seal_barrier_scan_yields_across_bounded_polls_when_clear() {
         (2, 0, 0),
         "both consumers start pending"
     );
+    let keys = ports.read().1.adapter().key_count_for_test();
+    let bound = seal_poll_bound(total, keys, 10, 1);
     let mut polls = 0;
     loop {
         assert!(
-            polls < 20,
-            "the bounded scan finishes within twenty ten-unit polls"
+            polls < bound,
+            "the bounded scan finishes within its charge-model bound {bound}"
         );
         let before_visits = ports.read().1.adapter().barrier_row_visits_for_test();
+        let before_units = ports.read().1.adapter().seal_scan_units_for_test();
         let before_unbound = ports
             .read()
             .1
@@ -38265,15 +38322,16 @@ fn joint_seal_barrier_scan_yields_across_bounded_polls_when_clear() {
             frame.seal_next_bounded(&mut ports, &mut births, &BirthFault, &mut remaining);
         polls += 1;
         let visits = ports.read().1.adapter().barrier_row_visits_for_test() - before_visits;
+        let units = ports.read().1.adapter().seal_scan_units_for_test() - before_units;
         assert!(
-            visits <= 10,
-            "poll {polls} examines at most its ten-unit budget: {visits}"
+            visits <= units && units <= 10,
+            "poll {polls} pays at most its ten-unit budget, one per row visited: {visits}/{units}"
         );
         if progress == Ok(QuantumSealProgress::AwaitFutureInput) {
             assert_eq!(
-                visits + 1,
+                units + 1,
                 10 - remaining,
-                "the deciding poll charges its scan plus the one-unit Future advance"
+                "the deciding poll charges its paid scan units plus the one-unit Future advance"
             );
             assert_eq!(
                 ports.read().1.adapter().last_seal_wait(),
@@ -38289,8 +38347,8 @@ fn joint_seal_barrier_scan_yields_across_bounded_polls_when_clear() {
         );
         assert_eq!(remaining, 0, "a yielded poll spends its whole slice");
         assert_eq!(
-            visits, 10,
-            "a yielded poll examines a full slice before yielding"
+            units, 10,
+            "a yielded poll pays a full slice of scan units before yielding"
         );
         assert_eq!(
             ports.read().1.adapter().last_seal_wait(),
@@ -38547,15 +38605,15 @@ fn joint_seal_barrier_scan_reuses_completed_barrier_across_retries() {
     );
 }
 
-/// A refused exact-fit clear yields before Future settlement: foreign
-/// clear rows plus one foreign refused tail share the frame with an
-/// `AbandonReturnPending` wait, and each one-unit seal examines exactly
-/// one row. The final refused row spends the last credit and must yield
-/// with no decision — LocalPending, zero remaining, no wait, no advance —
-/// instead of settling the Future at zero (which underflows the shared
-/// slice). The next poll reuses the completed clear with zero new visits
-/// and advances the Future with its paid decision credit. A two-credit
-/// control on a fresh frame decides without the extra yield.
+/// An exact-fit clear yields before Future settlement: one foreign
+/// refused row shares the frame with an `AbandonReturnPending` wait, and
+/// each one-unit seal pays exactly one scan unit (rows, then identities).
+/// The final unit spends the last credit and must yield with no decision
+/// — LocalPending, zero remaining, no wait, no advance — instead of
+/// settling the Future at zero (which underflows the shared slice). The
+/// next poll reuses the completed clear with zero new visits or units and
+/// advances the Future with its paid decision credit. A two-credit
+/// control with an odd paid-unit total decides without the extra yield.
 #[test]
 fn joint_seal_refused_exact_fit_yields_before_future_settlement() {
     use crate::semantics_objects::journal::SealWait;
@@ -38633,29 +38691,15 @@ fn joint_seal_refused_exact_fit_yields_before_future_settlement() {
         (fixture, frame, diagnosis)
     }
 
-    // Sample the base shape to pick an odd total with a refused tail,
-    // so the two-credit control fits its final row plus the Future in
-    // one poll while the one-credit boundary still exact-fits.
-    let (_, _, base) = build_fixture(0, 0);
-    let base_total = base.open_staged as usize + base.refused_staged as usize;
-    let (foreign_opens, foreign_refused) = if base_total.is_multiple_of(2) {
-        (0usize, 1usize)
-    } else {
-        (1usize, 1usize)
-    };
-
-    // One-unit boundary: every row yields, the exact-fit yields, the
-    // next poll advances the Future with zero new visits.
+    // One-unit boundary: every paid unit (rows, then identities) yields,
+    // the exact-fit yield spends the last unit, the next poll advances
+    // the Future with zero new visits or units.
+    let (foreign_opens, foreign_refused) = (0usize, 1usize);
     let (mut fixture, mut frame, diagnosis) = build_fixture(foreign_opens, foreign_refused);
     let total = diagnosis.open_staged as usize + diagnosis.refused_staged as usize;
-    assert_eq!(
-        total % 2,
-        1,
-        "the exact-fit table holds an odd row count: {total}"
-    );
     assert!(
         diagnosis.refused_staged >= 1,
-        "the scan ends in its refused phase"
+        "the row phase ends in its refused tail"
     );
     let h0 = fixture.scene.real.h0.clone();
     let mut births = NativeFrameBirths {
@@ -38674,13 +38718,21 @@ fn joint_seal_refused_exact_fit_yields_before_future_settlement() {
         .unwrap();
     frame.bind_targets(&ports).unwrap();
     let baseline_visits = ports.read().1.adapter().barrier_row_visits_for_test();
+    let keys = ports.read().1.adapter().key_count_for_test();
+    let bound = seal_poll_bound(total, keys, 1, 1);
     assert_eq!(
         frame.consumer_progress_for_test(),
         (2, 0, 0),
         "both consumers start pending"
     );
-    for poll in 1..=total {
+    let mut polls = 0usize;
+    loop {
+        assert!(
+            polls < bound,
+            "the scan finishes within its charge-model bound {bound}"
+        );
         let before_visits = ports.read().1.adapter().barrier_row_visits_for_test();
+        let before_units = ports.read().1.adapter().seal_scan_units_for_test();
         let before_unbound = ports
             .read()
             .1
@@ -38690,16 +38742,22 @@ fn joint_seal_refused_exact_fit_yields_before_future_settlement() {
         let mut remaining = 1;
         let progress =
             frame.seal_next_bounded(&mut ports, &mut births, &BirthFault, &mut remaining);
+        polls += 1;
         let visits = ports.read().1.adapter().barrier_row_visits_for_test() - before_visits;
+        let units = ports.read().1.adapter().seal_scan_units_for_test() - before_units;
         assert_eq!(
             progress,
             Ok(QuantumSealProgress::LocalPending),
-            "poll {poll} of {total} yields with no seal decision"
+            "poll {polls} yields with no seal decision"
         );
         assert_eq!(remaining, 0, "a yielded poll spends its whole slice");
         assert_eq!(
-            visits, 1,
-            "a budget-1 yielded poll examines exactly one row"
+            units, 1,
+            "a budget-1 yielded poll pays exactly one scan unit"
+        );
+        assert!(
+            visits <= 1,
+            "a budget-1 yielded poll examines at most one row"
         );
         assert_eq!(
             ports.read().1.adapter().last_seal_wait(),
@@ -38725,22 +38783,39 @@ fn joint_seal_refused_exact_fit_yields_before_future_settlement() {
             frame.active_seal_for_test().is_none(),
             "a yielded poll sets no active delivery"
         );
+        if frame.seal_scan_for_test().is_some_and(|scan| scan.done) {
+            break;
+        }
     }
+    let scan = frame.seal_scan_for_test().expect("held scan");
+    let identities = scan.identities;
+    assert!(identities > 0, "the clear scan aggregated its identities");
+    assert_eq!(
+        polls,
+        total + identities + scan.prepaid,
+        "the exact fit: one yielded poll per paid row, identity and prepaid unit"
+    );
     assert_eq!(
         ports.read().1.adapter().barrier_row_visits_for_test() - baseline_visits,
         total,
         "the clear scan visits every staged row once across its polls"
     );
     let before_visits = ports.read().1.adapter().barrier_row_visits_for_test();
+    let before_units = ports.read().1.adapter().seal_scan_units_for_test();
     let mut remaining = 1;
     let progress = frame.seal_next_bounded(&mut ports, &mut births, &BirthFault, &mut remaining);
     let visits = ports.read().1.adapter().barrier_row_visits_for_test() - before_visits;
+    let units = ports.read().1.adapter().seal_scan_units_for_test() - before_units;
     assert_eq!(
         progress,
         Ok(QuantumSealProgress::AwaitFutureInput),
         "the poll after exact-fit advances the Future"
     );
-    assert_eq!(visits, 0, "reusing the completed clear visits no new rows");
+    assert_eq!(
+        (visits, units),
+        (0, 0),
+        "reusing the completed clear visits no new rows and pays no scan unit"
+    );
     assert_eq!(
         remaining, 0,
         "the Future advance charges its paid decision credit"
@@ -38760,8 +38835,10 @@ fn joint_seal_refused_exact_fit_yields_before_future_settlement() {
         "a Future wait sets no active delivery"
     );
 
-    // Two-credit control: the same odd shape decides without the extra
-    // yield, its final poll charging one scan row plus the Future.
+    // Two-credit control: an odd paid-unit total (rows + identities;
+    // foreign rows add rows, not identities) decides without the extra
+    // yield, its final poll paying one scan unit plus the Future.
+    let foreign_opens = usize::from((total + identities).is_multiple_of(2));
     let (mut fixture, mut frame, diagnosis) = build_fixture(foreign_opens, foreign_refused);
     let total = diagnosis.open_staged as usize + diagnosis.refused_staged as usize;
     let h0 = fixture.scene.real.h0.clone();
@@ -38781,27 +38858,29 @@ fn joint_seal_refused_exact_fit_yields_before_future_settlement() {
         .unwrap();
     frame.bind_targets(&ports).unwrap();
     let baseline_visits = ports.read().1.adapter().barrier_row_visits_for_test();
+    let keys = ports.read().1.adapter().key_count_for_test();
+    let bound = seal_poll_bound(total, keys, 2, 1);
     let mut polls = 0usize;
     loop {
         assert!(
-            polls < total,
-            "the two-credit scan decides within its row bound"
+            polls < bound,
+            "the two-credit scan decides within its charge-model bound {bound}"
         );
-        let before_visits = ports.read().1.adapter().barrier_row_visits_for_test();
+        let before_units = ports.read().1.adapter().seal_scan_units_for_test();
         let mut remaining = 2;
         let progress =
             frame.seal_next_bounded(&mut ports, &mut births, &BirthFault, &mut remaining);
         polls += 1;
-        let visits = ports.read().1.adapter().barrier_row_visits_for_test() - before_visits;
+        let units = ports.read().1.adapter().seal_scan_units_for_test() - before_units;
         assert!(
-            visits <= 2,
-            "poll {polls} examines at most its two-unit budget: {visits}"
+            units <= 2,
+            "poll {polls} pays at most its two-unit budget: {units}"
         );
         if progress == Ok(QuantumSealProgress::AwaitFutureInput) {
             assert_eq!(
-                visits + 1,
-                2 - remaining,
-                "the deciding poll charges its scan plus the one-unit Future advance"
+                (units, remaining),
+                (1, 0),
+                "the odd total's deciding poll pays its last scan unit plus the one-unit Future advance"
             );
             assert_eq!(
                 ports.read().1.adapter().last_seal_wait(),
@@ -38816,7 +38895,7 @@ fn joint_seal_refused_exact_fit_yields_before_future_settlement() {
             "poll {polls} yields with no seal decision"
         );
         assert_eq!(remaining, 0, "a yielded poll spends its whole slice");
-        assert_eq!(visits, 2, "a yielded two-credit poll examines a full slice");
+        assert_eq!(units, 2, "a yielded two-credit poll pays a full slice");
     }
     assert_eq!(
         ports.read().1.adapter().barrier_row_visits_for_test() - baseline_visits,
@@ -38979,14 +39058,13 @@ fn joint_seal_refused_exact_fit_barrier_decides_at_zero() {
     );
 }
 
-/// Pre-barrier seal scans share the barrier's cursor: 97 clear rows plus
-/// an `AbandonReturnPending` wait, driven with one-unit seals. Each poll
-/// examines exactly one row (one birth evaluation plus one barrier visit,
-/// same cursor, resuming without rereading the prefix) and replay sizing
-/// walks no rows at all (O(1) from cardinalities). Total barrier visits
-/// and birth evaluations each equal the staged table; replay visits stay
-/// zero. Separate full scans per attempt would reread the prefix on every
-/// poll.
+/// Every seal pass shares one paid, resumable scan: 97 clear rows plus
+/// an `AbandonReturnPending` wait, driven with one-unit seals. Each
+/// yielded poll debits exactly one scan unit (one row or one identity,
+/// resuming without rereading the prefix); the deciding poll debits none
+/// and visits no row. Total units equal rows plus identities and total
+/// row visits equal the staged table. The poll bound comes from the
+/// charge model, never a bare constant.
 #[test]
 fn joint_seal_prebarrier_scans_share_barrier_cursor() {
     use crate::semantics_objects::journal::SealWait;
@@ -39060,9 +39138,14 @@ fn joint_seal_prebarrier_scans_share_barrier_cursor() {
         total > 64,
         "the staging table holds past one slice of rows: {total}"
     );
+    let scene_image = (image.task_cookie, image.exec_id);
+    let bound = ports
+        .read()
+        .1
+        .adapter()
+        .seal_charge_bound_for_test(scene_image);
     let baseline_barrier = ports.read().1.adapter().barrier_row_visits_for_test();
-    let baseline_replay = ports.read().1.adapter().replay_sample_visits_for_test();
-    let baseline_birth = ports.read().1.adapter().birth_cover_evals_for_test();
+    let baseline_units = ports.read().1.adapter().seal_scan_units_for_test();
     assert_eq!(
         frame.consumer_progress_for_test(),
         (2, 0, 0),
@@ -39071,26 +39154,23 @@ fn joint_seal_prebarrier_scans_share_barrier_cursor() {
     let mut polls = 0usize;
     loop {
         assert!(
-            polls < total + 5,
-            "the one-credit scan decides within its row bound"
+            polls < bound,
+            "the one-credit scan decides within its charge-model bound {bound}"
         );
         let before_barrier = ports.read().1.adapter().barrier_row_visits_for_test();
-        let before_replay = ports.read().1.adapter().replay_sample_visits_for_test();
-        let before_birth = ports.read().1.adapter().birth_cover_evals_for_test();
+        let before_units = ports.read().1.adapter().seal_scan_units_for_test();
         let mut remaining = 1;
         let progress =
             frame.seal_next_bounded(&mut ports, &mut births, &BirthFault, &mut remaining);
         polls += 1;
         let barrier = ports.read().1.adapter().barrier_row_visits_for_test() - before_barrier;
-        let replay = ports.read().1.adapter().replay_sample_visits_for_test() - before_replay;
-        let birth = ports.read().1.adapter().birth_cover_evals_for_test() - before_birth;
-        assert_eq!(replay, 0, "poll {polls} sizes replay without walking rows");
+        let units = ports.read().1.adapter().seal_scan_units_for_test() - before_units;
         if progress == Ok(QuantumSealProgress::AwaitFutureInput) {
             assert_eq!(
                 barrier, 0,
                 "the deciding poll reuses its completed scan with no new visits"
             );
-            assert_eq!(birth, 0, "the deciding poll evaluates no new birth rows");
+            assert_eq!(units, 0, "the deciding poll debits no scan unit");
             assert_eq!(
                 remaining, 0,
                 "the Future advance charges its paid decision credit"
@@ -39109,12 +39189,12 @@ fn joint_seal_prebarrier_scans_share_barrier_cursor() {
         );
         assert_eq!(remaining, 0, "a yielded poll spends its whole slice");
         assert_eq!(
-            barrier, 1,
-            "a budget-1 yielded poll examines exactly one row"
+            units, 1,
+            "poll {polls}: a one-unit yield debits exactly one scan unit"
         );
-        assert_eq!(
-            birth, 1,
-            "birth coverage shares the barrier's cursor (one evaluation per visited row)"
+        assert!(
+            barrier <= 1,
+            "a budget-1 yielded poll examines at most one row"
         );
         assert_eq!(
             ports.read().1.adapter().last_seal_wait(),
@@ -39140,15 +39220,13 @@ fn joint_seal_prebarrier_scans_share_barrier_cursor() {
         total,
         "the scan visits every staged row once across its polls"
     );
+    let progress = frame.seal_scan_for_test();
+    let (identities, prepaid) = progress.map_or((0, 0), |scan| (scan.identities, scan.prepaid));
+    assert!(identities > 0, "the clear scan aggregated its identities");
     assert_eq!(
-        ports.read().1.adapter().birth_cover_evals_for_test() - baseline_birth,
-        total,
-        "birth coverage evaluates every staged row once (same cursor, no separate scans)"
-    );
-    assert_eq!(
-        ports.read().1.adapter().replay_sample_visits_for_test() - baseline_replay,
-        0,
-        "replay sizing walks no rows"
+        ports.read().1.adapter().seal_scan_units_for_test() - baseline_units,
+        total + identities + prepaid,
+        "the scan pays exactly one unit per staged row, identity and prepaid unit (no rereads)"
     );
     assert_eq!(
         frame.consumer_progress_for_test(),

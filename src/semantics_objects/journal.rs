@@ -31,7 +31,9 @@ mod native_producer_tests;
 mod reservations;
 #[cfg(all(test, p11scope_journal_roots))]
 mod root_proof_tests;
+mod seal_inputs;
 mod seal_replay;
+use seal_inputs::{OpenTable, Tracked};
 use seal_replay::ReplayPreparation;
 pub(crate) use seal_replay::{SealBatchDelivery, SealReplayPhase, SealReplayStep};
 
@@ -828,19 +830,6 @@ struct JournalDeathMarks {
     tainted: bool,
     /// Clean close.
     ended: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AttributionReadiness {
-    /// Every staged call is attributed and this key's claims cover its own.
-    Ready,
-    /// A claim can still arrive: the seal waits (`BoundNotReady`).
-    Pending,
-    /// A staged call no claim can ever name: the seal ends named,
-    /// carrying the unmatched evidence (`Some` wiped ordinal when
-    /// every unmatched entry evidences void-released history, `None`
-    /// once any evidences unknown effects).
-    Unmatched(Option<u64>),
 }
 
 /// Whether one unclaimed staged call's END sits at an H0 position the
@@ -2099,13 +2088,13 @@ impl PreservedBasis {
     }
 }
 
-/// Outcome of one bounded pre-barrier scan (birth coverage plus barrier,
-/// same cursor, one evaluation per visited row).
+/// Outcome of one bounded production-seal scan (every staged-row
+/// predicate a seal decides on, one cursor, one paid unit per visit).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum BarrierCheck {
     /// Unbound staging bars seals (birth covers, barrier stands).
     Barrier,
-    /// No barrier stands (birth covers, no barrier).
+    /// No barrier stands and every row and identity was examined.
     Clear,
     /// Birth does not cover retained staged history for this key.
     BirthMismatch,
@@ -2113,45 +2102,275 @@ pub(crate) enum BarrierCheck {
     Yielded,
 }
 
-/// Resumable pre-barrier-scan cursors: open resumes by key (valid
-/// across table mutations); refused resumes by index, restarting
-/// when its length moved. A barrier found early waits for birth
-/// verification of the remaining rows (`saw_barrier`), since a later
-/// birth failure wins.
+/// Resumable watchdog barrier-scan cursor (park check): open resumes by
+/// key, refused by index. Its inputs stamp drops it whenever any
+/// barrier input (open, refused, image bindings) changed, so a visited
+/// prefix never stands for rows that changed under it.
 #[derive(Clone, Debug)]
 pub(crate) struct BarrierScan {
+    stamp: (u64, u64, u64, u64),
     open_after: Option<JournalNativeKey>,
     refused_index: usize,
-    refused_len: usize,
     refused_phase: bool,
-    saw_barrier: bool,
 }
 
-/// One completed production-seal pre-barrier decision, retained for its
-/// frame while the same key, birth cut, frontier and staging/binding
-/// membership stand. Unbound entries never convert (no key names their
-/// image), so conversion alone never flips the barrier half; any
-/// membership change (ingest, wipe, new attestation) changes a length
-/// below and drops the decision. A new frame starts with no decision.
+/// The revisions of every adapter input a production seal scan or its
+/// decision reads. Each field is a [`Tracked`] or [`OpenTable`]
+/// wrapper whose only mutable access bumps its revision, so equal
+/// revisions prove no input changed since the scan stamped them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct SealBarrierDecision {
+pub(crate) struct SealInputRevision {
+    open: u64,
+    refused: u64,
+    image_keys: u64,
+    claims: u64,
+    keys: u64,
+    tainted_images: u64,
+    taint_evidence: u64,
+    taint_overflow: u64,
+    sightings: u64,
+    voided_through: u64,
+    void_wiped: u64,
+}
+
+/// What a production seal scan serves: a seal attempt (birth coverage
+/// refuses early), or the disposed-frame terminal check (no birth).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SealScanMode {
+    Seal,
+    AwaitsOnly,
+}
+
+/// The exact inputs one scan's partial and completed answers depend
+/// on: every adapter input's revision plus the seal target. A scan
+/// whose stamp differs from the current one is dropped whole (cursor,
+/// accumulators, identity facts, prepaid credit) and restarts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SealScanStamp {
+    inputs: SealInputRevision,
     frontier: u64,
-    barrier: bool,
-    open_len: usize,
-    refused_len: usize,
-    image_keys_len: usize,
     key: JournalDomainKey,
     birth_cut: u64,
+    mode: SealScanMode,
 }
 
-/// Production-seal barrier work held by its frame: the resumable
-/// cursor while a scan runs, plus the completed decision once it
-/// finishes. Both survive same-frame retries; staging membership
-/// changes invalidate them on next use.
+/// Resume position of one production seal scan.
+#[derive(Clone, Copy, Debug)]
+enum SealScanPhase {
+    /// Open rows past the key (`None` starts at the first).
+    Open { after: Option<JournalNativeKey> },
+    /// Refused begins from the index.
+    Refused { index: usize },
+    /// Per-identity claim coverage past the identity.
+    Identities { after: Option<CallIdentity> },
+    /// Every row and identity examined: the facts are final.
+    Done,
+}
+
+/// Per-identity aggregates over this image's staged rows: the same
+/// counts the attribution, terminal and invocation-claim checks keyed
+/// by identity before, gathered on the one paid row visit.
+#[derive(Clone, Copy, Default)]
+struct IdentityFacts {
+    /// Staged calls at or below the frontier attributing here
+    /// (unconverted opens plus refused begins).
+    mine: u64,
+    /// Of those, unconverted opens (the terminal check's count).
+    mine_open: usize,
+    /// Contradiction evidence over the open `mine` rows: the latest
+    /// void-wiped ordinal, or permanent once any row has none.
+    evidence_max: u64,
+    evidence_perm: bool,
+    /// The last such open row's staged END at or below the frontier.
+    candidate_end: Option<p11scope_ebpf_common::Event>,
+    /// Every retained staged BEGIN of this identity (any key, any
+    /// conversion state).
+    total: usize,
+}
+
+impl std::fmt::Debug for IdentityFacts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IdentityFacts")
+            .field("mine", &self.mine)
+            .field("mine_open", &self.mine_open)
+            .field("evidence_max", &self.evidence_max)
+            .field("evidence_perm", &self.evidence_perm)
+            .field("candidate_end", &self.candidate_end.is_some())
+            .field("total", &self.total)
+            .finish()
+    }
+}
+
+/// The first invocation-claim validation failure in identity order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClaimValidation {
+    /// Two staged BEGINs share an identity, or the claim count is not
+    /// exactly one: taint the identity's image.
+    Ambiguous((u64, u64)),
+    /// The claim's admission or END fingerprint is not loss-audited.
+    H3Pending,
+}
+
+/// Every fact a seal decides on after the barrier, accumulated over
+/// one paid scan instead of one synchronous table pass per gate.
+#[derive(Clone, Copy, Debug)]
+struct SealScanFacts {
+    birth_mismatch: bool,
+    barrier: bool,
+    attribution_pending: bool,
+    unmatched_perm: bool,
+    unmatched_max: Option<u64>,
+    claims_cover: bool,
+    terminal_blocked: bool,
+    terminal_waiting: bool,
+    terminal_uncovered: bool,
+    staged_history: bool,
+    history_through: bool,
+    pending_bound: Option<u64>,
+    held: Option<u64>,
+    dooming: bool,
+    doom_capable: bool,
+    abandon_unready: bool,
+    refused_unready: bool,
+    validation: Option<ClaimValidation>,
+}
+
+impl Default for SealScanFacts {
+    fn default() -> Self {
+        Self {
+            birth_mismatch: false,
+            barrier: false,
+            attribution_pending: false,
+            unmatched_perm: false,
+            unmatched_max: None,
+            claims_cover: true,
+            terminal_blocked: false,
+            terminal_waiting: false,
+            terminal_uncovered: false,
+            staged_history: false,
+            history_through: false,
+            pending_bound: None,
+            held: None,
+            dooming: false,
+            doom_capable: false,
+            abandon_unready: false,
+            refused_unready: false,
+            validation: None,
+        }
+    }
+}
+
+impl SealScanFacts {
+    fn note_unmatched(&mut self, evidence: Option<u64>) {
+        match evidence {
+            None => self.unmatched_perm = true,
+            Some(at) => {
+                self.unmatched_max = Some(self.unmatched_max.map_or(at, |kept| kept.max(at)));
+            }
+        }
+    }
+
+    /// Whether the frontier's staging waits only on a future terminal
+    /// (the settlement's fallback for undecided waits).
+    fn awaits_terminal(&self) -> bool {
+        !self.barrier && !self.terminal_blocked && self.terminal_waiting && !self.terminal_uncovered
+    }
+}
+
+/// One seal outcome decided over a clear scan's final facts, before
+/// its own table work runs (prepaid first, see
+/// [`JournalAdapter::seal_decision_cost`]).
+#[derive(Clone, Copy, Debug)]
+enum SealDecision {
+    /// A staged call no claim can ever name: taint the image.
+    Unmatched(Option<u64>),
+    /// A gate that waits on more input.
+    Wait(SealStageGate, SealWait),
+    CutExhausted,
+    /// A completed era with no new history seals empty.
+    CompletedEra,
+    /// A staged unbounded abandonment refuses the key.
+    Doom {
+        capable: bool,
+    },
+    /// An ambiguous invocation claim taints its image.
+    Ambiguous((u64, u64)),
+    H3Pending,
+    /// Every rule passed: convert and settle under this model fence.
+    Convert {
+        fence: Option<u64>,
+    },
+}
+
+/// Test-only upper bound on the paid units one production seal advance
+/// charges over `rows` staged rows and `keys` keys of its image, from
+/// the charge model: one unit per row, at most one per identity (each
+/// identity comes from a row), the largest prepaid decision (conversion
+/// visits each open row [`SEAL_CONVERT_OPEN_PASSES`] times and each
+/// refused row fewer, plus the key list; a taint drain visits each row
+/// twice; a doom's live set visits each key twice), plus the one
+/// settlement credit. Tests derive poll bounds from this.
+#[cfg(test)]
+pub(crate) fn seal_advance_units_bound(rows: usize, keys: usize) -> usize {
+    let prepay = (rows * SEAL_CONVERT_OPEN_PASSES + keys)
+        .max(rows * 2)
+        .max(keys * 2);
+    rows + rows + prepay + 1
+}
+
+/// Open-table passes one conversion makes after its prepay: the begin
+/// selection, the terminal delta, the frozen replay table, the
+/// terminal actions, the settled open list, and pruning's earliest-open
+/// pass and removal pass.
+const SEAL_CONVERT_OPEN_PASSES: usize = 7;
+/// Refused-table passes one conversion makes: the cut selection, the
+/// corroborated upper and the compaction.
+const SEAL_CONVERT_REFUSED_PASSES: usize = 3;
+
+/// One production seal scan held by its frame across polls: stamp,
+/// resume phase, accumulated facts, the per-identity aggregates, the
+/// per-call disposals it classified, and the credit prepaid toward the
+/// decided outcome's own table work.
+#[derive(Clone, Debug)]
+struct SealScan {
+    stamp: SealScanStamp,
+    phase: SealScanPhase,
+    facts: SealScanFacts,
+    identities: BTreeMap<CallIdentity, IdentityFacts>,
+    disposable: BTreeSet<JournalNativeKey>,
+    prepaid: usize,
+}
+
+/// Test-only view of one held seal scan.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SealScanProgress {
+    /// Distinct identities the scan aggregated (its identity-phase
+    /// units).
+    pub(crate) identities: usize,
+    /// Units prepaid toward the decided outcome's own table work.
+    pub(crate) prepaid: usize,
+    /// Whether every row and identity was examined.
+    pub(crate) done: bool,
+}
+
+/// Production-seal scan work held by its frame: the resumable scan and,
+/// once it finishes, its final facts. Both survive same-frame retries
+/// while the stamp stands; any input change drops them on next use.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SealBarrierState {
-    cursor: Option<BarrierScan>,
-    decision: Option<SealBarrierDecision>,
+    scan: Option<SealScan>,
+}
+
+impl SealBarrierState {
+    #[cfg(test)]
+    pub(crate) fn progress_for_test(&self) -> Option<SealScanProgress> {
+        self.scan.as_ref().map(|scan| SealScanProgress {
+            identities: scan.identities.len(),
+            prepaid: scan.prepaid,
+            done: matches!(scan.phase, SealScanPhase::Done),
+        })
+    }
 }
 
 /// One production-seal attempt: either a decided seal outcome, or a
@@ -2248,6 +2467,10 @@ pub(crate) struct JournalAdapter {
     /// The current seal attempt's wait cause (internal; never authority
     /// and never user-visible text). Reset at every seal attempt.
     seal_wait: std::cell::Cell<SealWait>,
+    /// Whether the current seal attempt's decided wait could only be
+    /// grounded by a future terminal, from the same paid scan that
+    /// decided it (internal; never authority). Reset with `seal_wait`.
+    seal_awaits_terminal: std::cell::Cell<bool>,
     limits: JournalLimits,
     consumed_through: u64,
     stream_boundary: Option<crate::events::EventsConsumptionCut>,
@@ -2295,17 +2518,18 @@ pub(crate) struct JournalAdapter {
     /// instead of reading every row synchronously before charging.
     #[cfg(test)]
     barrier_row_visits: std::cell::Cell<usize>,
-    /// Test-only count of open rows scanned by replay sizing. Sizing must
-    /// be O(1) from maintained cardinalities, never three full table walks
-    /// before the first barrier debit. Never authority.
+    /// Test-only count of paid production-seal scan units: every row,
+    /// identity and prepaid decision unit the scan debits. A one-unit
+    /// poll that yields must advance this by exactly one. Never
+    /// authority.
     #[cfg(test)]
-    replay_sample_visits: std::cell::Cell<usize>,
-    /// Test-only count of staging rows examined by birth-coverage checks.
-    /// Coverage shares the barrier's cursor (one evaluation per visited row,
-    /// resuming without rereading the prefix), never a separate full scan
-    /// per seal attempt. Never authority.
+    seal_scan_units: std::cell::Cell<usize>,
+    /// Test-only count of rows a decided seal's application visited
+    /// after its prepay (taint drains, live-set builds, conversion and
+    /// pruning passes), to prove the prepay covers them. Never
+    /// authority.
     #[cfg(test)]
-    birth_cover_evals: std::cell::Cell<usize>,
+    seal_apply_visits: std::cell::Cell<usize>,
     /// Test-only cumulative paid units through adapter recovery slices
     /// (voids, deferred rejections, taint drains), harvested from each
     /// slice's credit after it runs. Every journal leaf, model row,
@@ -2372,16 +2596,13 @@ pub(crate) struct JournalAdapter {
     /// never authority. Gauges in the stored copy are stale until
     /// `seal_stage_diagnosis` overwrites them.
     seal_stages: SealStageCounts,
-    open: BTreeMap<JournalNativeKey, OpenEntry>,
+    open: OpenTable,
     /// Maintained open-population cardinalities for O(1) replay sizing:
     /// unconverted begins, ends awaiting conversion, and staged
     /// abandonments. Every open mutation below maintains them; replay
     /// sizing reads them without walking rows, so retries size without
     /// rereading the prefix. Debug builds recount and compare on every
     /// sample to catch drift.
-    open_begins: usize,
-    open_terminals: usize,
-    open_abandoned: usize,
     floors: BTreeMap<u64, u64>,
     /// One ordered Session EVENTS/boot-clock namespace. Non-evicted
     /// physical-thread return fences complement native sequence floors:
@@ -2393,19 +2614,19 @@ pub(crate) struct JournalAdapter {
     /// policy bound, 5,266,144 bytes. Count enforcement is active; full
     /// H9 shared-byte enforcement remains an explicit separate carry.
     physical_return_floors: BTreeMap<u64, u64>,
-    refused: Vec<RefusedBegin>,
-    keys: BTreeMap<JournalDomainKey, JournalDomainState>,
+    refused: Tracked<Vec<RefusedBegin>>,
+    keys: Tracked<BTreeMap<JournalDomainKey, JournalDomainState>>,
     /// Death evidence for dead keys (one entry per dead key, bounded
     /// by the key table): when each death was recorded and whether
     /// any refusal grounds in a capable frame. Lives outside the
     /// size-pinned per-key state; incarnation minting reads it.
     death_marks: BTreeMap<JournalDomainKey, JournalDeathMarks>,
-    image_keys: BTreeMap<(u64, u64), Vec<JournalDomainKey>>,
+    image_keys: Tracked<BTreeMap<(u64, u64), Vec<JournalDomainKey>>>,
     /// Individually retained taints, capped at the sighting bound (the
     /// same image population). Past the cap, `taint_overflow` latches
     /// and every untracked image counts as tainted — the conservative
     /// bounded fallback: no per-image retention, no silent admission.
-    tainted_images: BTreeSet<(u64, u64)>,
+    tainted_images: Tracked<BTreeSet<(u64, u64)>>,
     /// Taint evidence per retained tainted image: `Some(ordinal)` when
     /// every contradiction evidences explicitly voided history (a
     /// void-wiped invocation's ordinal — re-presented voided records
@@ -2415,8 +2636,8 @@ pub(crate) struct JournalAdapter {
     /// lifts for fresh births at/above the void fence covering it; a
     /// `None` taint never lifts. Same cap as the taint set; entries
     /// leave with their taint.
-    taint_evidence: BTreeMap<(u64, u64), Option<u64>>,
-    taint_overflow: bool,
+    taint_evidence: Tracked<BTreeMap<(u64, u64), Option<u64>>>,
+    taint_overflow: Tracked<bool>,
     /// Taint-overflow key marks still owed: images whose taint
     /// overflowed the retained set, each with its resume cursor
     /// into its per-image key list. The irreversible refusal
@@ -2467,12 +2688,13 @@ pub(crate) struct JournalAdapter {
     /// `untaint_shed_image` inserts.
     lifted_images: BTreeSet<(u64, u64)>,
     contradictions: JournalContradictionDiagnosis,
-    sightings: BTreeMap<(u64, u64), ImageSighting>,
+    sightings: Tracked<BTreeMap<(u64, u64), ImageSighting>>,
     /// Exact physical invocation claims, qualified by native domain,
     /// image, caller/router and era authority. A deque represents
     /// duplicate/colliding inputs only; conversion never selects a
     /// winner by FIFO rank. Counts remain bounded by unsettled work.
-    claims: BTreeMap<CallIdentity, BTreeMap<JournalDomainKey, VecDeque<AdmittedJournalClaim>>>,
+    claims:
+        Tracked<BTreeMap<CallIdentity, BTreeMap<JournalDomainKey, VecDeque<AdmittedJournalClaim>>>>,
     claim_counts: usize,
     /// Incremental census of staged BEGINs by entry-invariant identity:
     /// unconverted opens (by native key, whose shape later gains an END)
@@ -2500,10 +2722,6 @@ pub(crate) struct JournalAdapter {
     test_claim_calls: u64,
     #[cfg(test)]
     test_prune_runs: u64,
-    /// Test-only seal-validation census visits: retained entries
-    /// scanned while attributing staged calls.
-    #[cfg(test)]
-    test_seal_census_visits: usize,
     /// Test-only phase trace: `None` (off) by default; `Some` records
     /// one sample per claim while enabled.
     #[cfg(test)]
@@ -2524,7 +2742,7 @@ pub(crate) struct JournalAdapter {
     /// (inclusive): births naming a cut below it refuse, so a key
     /// created after a void cannot certify the voided interval.
     /// Monotone; every fence-voiding seal advances it.
-    voided_through: u64,
+    voided_through: Tracked<u64>,
     /// Exact native invocations the most recent `void_staged` wiped,
     /// with the consumed ordinal each was wiped at. Replaced at every
     /// void (an admission from an older wipe falls to the cause-neutral
@@ -2532,7 +2750,7 @@ pub(crate) struct JournalAdapter {
     /// (`limits.open_calls`) and never identity authority by itself.
     /// The wiped ordinal scopes taint evidence: a contradiction on a
     /// wiped invocation evidences voided history, never fresh proof.
-    void_wiped: BTreeMap<JournalNativeKey, u64>,
+    void_wiped: Tracked<BTreeMap<JournalNativeKey, u64>>,
     /// Last sealed checked-fault epoch: the cumulative chain. Each
     /// seal's collection must open at this epoch and the seal-time
     /// re-read must still show the audited one; a move anywhere in
@@ -2569,6 +2787,7 @@ impl JournalAdapter {
     pub(crate) fn with_ledger(limits: JournalLimits, ledger: StagingLedger) -> Self {
         Self {
             seal_wait: std::cell::Cell::new(SealWait::None),
+            seal_awaits_terminal: std::cell::Cell::new(false),
             limits,
             consumed_through: 0,
             stream_boundary: None,
@@ -2588,9 +2807,9 @@ impl JournalAdapter {
             #[cfg(test)]
             barrier_row_visits: std::cell::Cell::new(0),
             #[cfg(test)]
-            replay_sample_visits: std::cell::Cell::new(0),
+            seal_scan_units: std::cell::Cell::new(0),
             #[cfg(test)]
-            birth_cover_evals: std::cell::Cell::new(0),
+            seal_apply_visits: std::cell::Cell::new(0),
             #[cfg(test)]
             test_recovery_units: std::cell::Cell::new(0),
             inline_credit: SCOPED_RECOVERY_SLICE,
@@ -2616,27 +2835,24 @@ impl JournalAdapter {
             reentry_quarantine_ends: 0,
             seal_bootstrap: SealBootstrapCounts::default(),
             seal_stages: SealStageCounts::default(),
-            open: BTreeMap::new(),
-            open_begins: 0,
-            open_terminals: 0,
-            open_abandoned: 0,
+            open: OpenTable::default(),
             floors: BTreeMap::new(),
             physical_return_floors: BTreeMap::new(),
-            refused: Vec::new(),
-            keys: BTreeMap::new(),
+            refused: Tracked::new(Vec::new()),
+            keys: Tracked::new(BTreeMap::new()),
             death_marks: BTreeMap::new(),
-            image_keys: BTreeMap::new(),
-            tainted_images: BTreeSet::new(),
-            taint_evidence: BTreeMap::new(),
-            taint_overflow: false,
+            image_keys: Tracked::new(BTreeMap::new()),
+            tainted_images: Tracked::new(BTreeSet::new()),
+            taint_evidence: Tracked::new(BTreeMap::new()),
+            taint_overflow: Tracked::new(false),
             taint_overflow_pending: BTreeMap::new(),
             taint_overflow_after: None,
             shed_only_taints: BTreeSet::new(),
             derived_absent: BTreeMap::new(),
             lifted_images: BTreeSet::new(),
             contradictions: JournalContradictionDiagnosis::default(),
-            sightings: BTreeMap::new(),
-            claims: BTreeMap::new(),
+            sightings: Tracked::new(BTreeMap::new()),
+            claims: Tracked::new(BTreeMap::new()),
             claim_counts: 0,
             retained_counts: BTreeMap::new(),
             retained_census_drift: false,
@@ -2648,15 +2864,14 @@ impl JournalAdapter {
             #[cfg(test)]
             test_prune_runs: 0,
             #[cfg(test)]
-            test_seal_census_visits: 0,
             #[cfg(test)]
             test_phase_trace: None,
             #[cfg(test)]
             test_prune_oracle: false,
             last_audit_failure: None,
             h3_voided_below: 0,
-            voided_through: 0,
-            void_wiped: BTreeMap::new(),
+            voided_through: Tracked::new(0),
+            void_wiped: Tracked::new(BTreeMap::new()),
             last_fault: None,
             drain_pins: BTreeMap::new(),
             invalidated: false,
@@ -2681,6 +2896,8 @@ impl JournalAdapter {
     /// Remove actual retained values before refunding their physical role.
     /// The fixed ledger bounds this scan; collecting keys never allocates.
     fn remove_open_where(&mut self, mut remove: impl FnMut(&JournalNativeKey, &OpenEntry) -> bool) {
+        #[cfg(test)]
+        self.note_seal_apply_visits(self.open.len());
         let mut keys = [(0, 0); MAX_UNSETTLED_STAGED];
         let mut count = 0;
         for (key, entry) in &self.open {
@@ -2729,13 +2946,13 @@ impl JournalAdapter {
     /// strictly below the voided ordinal refuse (`BelowVoidFence`).
     #[cfg(test)]
     pub(crate) fn voids_through_for_test(&self, ordinal: ConsumptionOrdinal) -> bool {
-        self.voided_through >= ordinal.0
+        *self.voided_through >= ordinal.0
     }
 
     /// Test-only read of the exact void fence.
     #[cfg(test)]
     pub(crate) fn voided_through_for_test(&self) -> u64 {
-        self.voided_through
+        *self.voided_through
     }
 
     /// Test-only route to the production image taint, for a stashed
@@ -2976,19 +3193,38 @@ impl JournalAdapter {
         self.barrier_row_visits.get()
     }
 
-    /// Test-only count of open rows scanned by replay sizing so far.
-    /// Sizing must stay O(1) (zero), never three full walks per attempt.
+    /// Test-only count of paid production-seal scan units so far: every
+    /// row, identity and prepaid decision unit.
     #[cfg(test)]
-    pub(crate) fn replay_sample_visits_for_test(&self) -> usize {
-        self.replay_sample_visits.get()
+    pub(crate) fn seal_scan_units_for_test(&self) -> usize {
+        self.seal_scan_units.get()
     }
 
-    /// Test-only count of staging rows examined by birth-coverage checks
-    /// so far. Coverage shares the barrier's cursor, so this equals the
-    /// barrier visits on a clear table (one evaluation per visited row).
+    /// Test-only upper bound on the paid units one production seal of
+    /// `key`'s image can charge, from the charge model over the live
+    /// tables: one unit per staged row, at most one per identity (each
+    /// identity comes from a staged row), the largest prepaid decision
+    /// (conversion), plus the one settlement credit. Tests derive their
+    /// poll bounds from this, never from a bare constant.
     #[cfg(test)]
-    pub(crate) fn birth_cover_evals_for_test(&self) -> usize {
-        self.birth_cover_evals.get()
+    pub(crate) fn seal_charge_bound_for_test(&self, image: (u64, u64)) -> usize {
+        let rows = self.open.len() + self.refused.len();
+        let keys = self.image_keys.get(&image).map_or(0, Vec::len);
+        seal_advance_units_bound(rows, keys)
+    }
+
+    /// Test-only count of bound keys (every image), for derived seal
+    /// poll bounds.
+    #[cfg(test)]
+    pub(crate) fn key_count_for_test(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// Test-only count of rows decided seals' applications visited after
+    /// their prepay so far.
+    #[cfg(test)]
+    pub(crate) fn seal_apply_visits_for_test(&self) -> usize {
+        self.seal_apply_visits.get()
     }
 
     /// Test-only: stage `rows` synthetic unconverted open entries cloned
@@ -3019,7 +3255,6 @@ impl JournalAdapter {
                 RetainedMember::Open(native),
             );
             assert!(self.open.insert(native, entry).is_none());
-            self.open_begins = self.open_begins.saturating_add(1);
         }
     }
 
@@ -3059,7 +3294,7 @@ impl JournalAdapter {
                 corroborated_return: None,
             };
             self.retained_refused_inc(&refused);
-            self.refused.push(refused);
+            self.refused.edit().push(refused);
         }
     }
 
@@ -3097,7 +3332,7 @@ impl JournalAdapter {
             corroborated_return: None,
         };
         self.retained_refused_inc(&refused);
-        self.refused.push(refused);
+        self.refused.edit().push(refused);
     }
 
     /// Test-only: stage one unbound barrier row at the end of the open
@@ -3133,7 +3368,6 @@ impl JournalAdapter {
             RetainedMember::Open(native),
         );
         assert!(self.open.insert(native, entry).is_none());
-        self.open_begins = self.open_begins.saturating_add(1);
     }
 
     /// Test-only read of the adapter invalidation flag; see above.
@@ -3206,7 +3440,7 @@ impl JournalAdapter {
         native: JournalNativeKey,
         origin: Option<joint_driver::CollectedCallOrigin>,
     ) -> bool {
-        let Some(entry) = self.open.get_mut(&native) else {
+        let Some(mut entry) = self.open.get_mut(&native) else {
             return false;
         };
         entry.collected_origin = origin;
@@ -3221,7 +3455,7 @@ impl JournalAdapter {
         native: JournalNativeKey,
         function: u32,
     ) -> bool {
-        let Some(entry) = self.open.get_mut(&native) else {
+        let Some(mut entry) = self.open.get_mut(&native) else {
             return false;
         };
         entry.function = function;
@@ -3232,12 +3466,9 @@ impl JournalAdapter {
     /// so the disposal path's expected-absent branch can be exercised.
     #[cfg(test)]
     pub(crate) fn clear_open_end_for_test(&mut self, native: JournalNativeKey) -> bool {
-        let Some(entry) = self.open.get_mut(&native) else {
+        let Some(mut entry) = self.open.get_mut(&native) else {
             return false;
         };
-        if entry.end.is_some() && !entry.end_converted {
-            self.open_terminals = self.open_terminals.saturating_sub(1);
-        }
         entry.end = None;
         true
     }
@@ -3306,15 +3537,6 @@ impl JournalAdapter {
         self.test_claim_calls = 0;
         self.test_claim_scan_visits = 0;
         self.test_prune_runs = 0;
-        self.test_seal_census_visits = 0;
-    }
-
-    /// Test-only read of the seal-validation census visits: retained
-    /// entries scanned while attributing staged calls. Production
-    /// pays nothing for this.
-    #[cfg(test)]
-    pub(crate) fn test_seal_census_visits_for_test(&self) -> usize {
-        self.test_seal_census_visits
     }
 
     /// Test-only phase-trace switch: off by default; while on, every
@@ -3494,7 +3716,7 @@ impl JournalAdapter {
     /// untracked image is untrackable even when the sighting table has
     /// room: a taint that cannot be retained must still refuse.
     fn note_sighting(&mut self, image: (u64, u64), affecting: bool, ordinal: u64) -> bool {
-        if let Some(sighting) = self.sightings.get_mut(&image) {
+        if let Some(sighting) = self.sightings.edit().get_mut(&image) {
             sighting.first_seen = sighting.first_seen.min(ordinal);
             if affecting {
                 sighting.first_affecting = Some(
@@ -3505,13 +3727,13 @@ impl JournalAdapter {
             }
             return true;
         }
-        if self.taint_overflow {
+        if *self.taint_overflow {
             return false;
         }
         if self.sightings.len() >= self.limits.image_sightings {
             return false;
         }
-        self.sightings.insert(
+        self.sightings.edit().insert(
             image,
             ImageSighting {
                 first_seen: ordinal,
@@ -3574,7 +3796,7 @@ impl JournalAdapter {
                 return JournalDisposition::Contradiction(JournalContradiction::UnclosedEndpoint);
             }
         }
-        if self.image_taint_blocks(image, self.voided_through)
+        if self.image_taint_blocks(image, *self.voided_through)
             && !(call_establishes_object_proof(function)
                 && self.quarantine_recovery_candidate(image))
         {
@@ -3689,19 +3911,10 @@ impl JournalAdapter {
                 collected_origin: None,
                 s1only_subject: None,
             },
-        ) {
-            if old.converted_ticket.is_none() {
-                self.open_begins = self.open_begins.saturating_sub(1);
-                self.retained_member_dec(identity_of_begin(&old.begin), RetainedMember::Open(key));
-            }
-            if old.end.is_some() && !old.end_converted {
-                self.open_terminals = self.open_terminals.saturating_sub(1);
-            }
-            if old.abandon.is_some() {
-                self.open_abandoned = self.open_abandoned.saturating_sub(1);
-            }
+        ) && old.converted_ticket.is_none()
+        {
+            self.retained_member_dec(identity_of_begin(&old.begin), RetainedMember::Open(key));
         }
-        self.open_begins = self.open_begins.saturating_add(1);
         self.retained_member_inc(inserted, RetainedMember::Open(key));
         JournalDisposition::BeginAdmitted
     }
@@ -3724,7 +3937,7 @@ impl JournalAdapter {
         }
         let refused = RefusedBegin::of_begin(ordinal, begin, image);
         self.retained_refused_inc(&refused);
-        self.refused.push(refused);
+        self.refused.edit().push(refused);
         JournalDisposition::BeginRefusedCapacity
     }
 
@@ -3814,7 +4027,7 @@ impl JournalAdapter {
             );
             return JournalDisposition::Contradiction(JournalContradiction::TerminalBeforeBegin);
         };
-        if self.image_taint_blocks(entry.image, self.voided_through)
+        if self.image_taint_blocks(entry.image, *self.voided_through)
             && !call_establishes_object_proof(entry.function)
         {
             return JournalDisposition::Refused;
@@ -3866,7 +4079,6 @@ impl JournalAdapter {
             return JournalDisposition::Contradiction(JournalContradiction::EndBeginMismatch);
         }
         self.open.get_mut(&key).expect("open entry").end = Some(StagedEnd { ordinal, end });
-        self.open_terminals = self.open_terminals.saturating_add(1);
         JournalDisposition::EndStaged
     }
 
@@ -3903,7 +4115,7 @@ impl JournalAdapter {
             );
             return JournalDisposition::Contradiction(JournalContradiction::TerminalBeforeBegin);
         };
-        if self.image_taint_blocks(entry.image, self.voided_through) {
+        if self.image_taint_blocks(entry.image, *self.voided_through) {
             return JournalDisposition::Refused;
         }
         if entry.end.is_some() || entry.abandon.is_some() {
@@ -3918,7 +4130,6 @@ impl JournalAdapter {
         }
         self.open.get_mut(&key).expect("open entry").abandon =
             Some(StagedAbandon { ordinal, abandon });
-        self.open_abandoned = self.open_abandoned.saturating_add(1);
         JournalDisposition::AbandonStaged
     }
 
@@ -3995,14 +4206,14 @@ impl JournalAdapter {
             return JournalDisposition::Contradiction(JournalContradiction::AmbiguousReturn);
         }
         if let Some((key, _, _)) = matches.first() {
-            let entry = self.open.get_mut(key).expect("matched open entry");
+            let mut entry = self.open.get_mut(key).expect("matched open entry");
             entry.corroborated_return = Some(ordinal);
             entry.negative_return |=
                 !super::state::return_leaves_no_lifecycle_effect(entry.function, event.rv);
             return JournalDisposition::ReturnObserved;
         }
         if let Some(index) = refused_matches.first() {
-            self.refused[*index].corroborated_return = Some(ordinal);
+            self.refused.edit()[*index].corroborated_return = Some(ordinal);
             return JournalDisposition::ReturnObserved;
         }
         JournalDisposition::OrdinaryCounted
@@ -4014,7 +4225,7 @@ impl JournalAdapter {
     /// is never silently admitted).
     fn is_tainted(&self, image: (u64, u64)) -> bool {
         self.tainted_images.contains(&image)
-            || (self.taint_overflow && !self.sightings.contains_key(&image))
+            || (*self.taint_overflow && !self.sightings.contains_key(&image))
     }
 
     /// Taint one image permanently: attestation for it is refused, its keys'
@@ -4385,6 +4596,8 @@ impl JournalAdapter {
     /// Drop one tainted image's staged rows (the synchronous drain for
     /// [`Self::taint_image_at`]).
     fn taint_image_drain(&mut self, image: (u64, u64)) {
+        #[cfg(test)]
+        self.note_seal_apply_visits(self.open.len());
         // Opens dropped by this taint leave their terminals
         // expected-absent: record their keys so the unmatched
         // terminals do not promote a shed-taint to permanent. The
@@ -4400,13 +4613,15 @@ impl JournalAdapter {
             self.note_derived_absence(image, key, function);
         }
         self.remove_open_where(|_, entry| entry.image == image);
+        #[cfg(test)]
+        self.note_seal_apply_visits(self.refused.len().saturating_mul(2));
         let dropped: Vec<RefusedBegin> = self
             .refused
             .iter()
             .filter(|refused| refused.image == image)
             .copied()
             .collect();
-        self.refused.retain(|refused| refused.image != image);
+        self.refused.edit().retain(|refused| refused.image != image);
         for refused in &dropped {
             self.retained_refused_dec(refused);
         }
@@ -4424,7 +4639,7 @@ impl JournalAdapter {
     /// closed). A lifted image is recorded for the Exec-to-attach
     /// birth fallback.
     pub(crate) fn untaint_shed_image(&mut self, image: (u64, u64)) {
-        if self.taint_overflow || !self.tainted_images.contains(&image) {
+        if *self.taint_overflow || !self.tainted_images.contains(&image) {
             return;
         }
         if !self.shed_only_taints.contains(&image) {
@@ -4435,8 +4650,8 @@ impl JournalAdapter {
         {
             return;
         }
-        self.tainted_images.remove(&image);
-        self.taint_evidence.remove(&image);
+        self.tainted_images.edit().remove(&image);
+        self.taint_evidence.edit().remove(&image);
         self.shed_only_taints.remove(&image);
         self.lifted_images.insert(image);
         // The lift keeps neutral absences but purges state-changing
@@ -4511,7 +4726,7 @@ impl JournalAdapter {
     /// never reseeds — the shed-then-bind refusal without a lift stays.
     /// Untracked images never reseed.
     pub(crate) fn novelty_broken_reseed_eligible(&self, image: (u64, u64)) -> bool {
-        if self.image_taint_blocks(image, self.voided_through) {
+        if self.image_taint_blocks(image, *self.voided_through) {
             return false;
         }
         let Some(sighting) = self.sightings.get(&image) else {
@@ -4519,7 +4734,7 @@ impl JournalAdapter {
         };
         sighting
             .first_affecting
-            .is_none_or(|at| at <= self.voided_through)
+            .is_none_or(|at| at <= *self.voided_through)
     }
 
     /// Promote one image's taint to permanent for independent
@@ -4548,11 +4763,11 @@ impl JournalAdapter {
         if !self.tainted_images.contains(&image)
             && self.tainted_images.len() >= self.limits.image_sightings
         {
-            if !self.taint_overflow {
-                self.taint_overflow = true;
+            if !*self.taint_overflow {
+                *self.taint_overflow.edit() = true;
                 self.claims_prune_dirty = true;
             }
-            if self.sightings.remove(&image).is_some() {
+            if self.sightings.edit().remove(&image).is_some() {
                 self.claims_prune_dirty = true;
             }
             if self.image_keys.contains_key(&image) {
@@ -4560,10 +4775,11 @@ impl JournalAdapter {
             }
             return;
         }
-        if self.tainted_images.insert(image) {
+        if self.tainted_images.edit().insert(image) {
             self.claims_prune_dirty = true;
         }
         self.taint_evidence
+            .edit()
             .entry(image)
             .and_modify(|kept| {
                 *kept = match (*kept, evidence) {
@@ -4584,7 +4800,7 @@ impl JournalAdapter {
     /// ever fenced anything.
     fn image_taint_blocks(&self, image: (u64, u64), fence: u64) -> bool {
         if !self.tainted_images.contains(&image) {
-            return self.taint_overflow && !self.sightings.contains_key(&image);
+            return *self.taint_overflow && !self.sightings.contains_key(&image);
         }
         if fence == 0 {
             return true;
@@ -4605,16 +4821,16 @@ impl JournalAdapter {
         if !self.tainted_images.contains(&image) {
             return false;
         }
-        let lifts = self.voided_through > 0
+        let lifts = *self.voided_through > 0
             && self
                 .taint_evidence
                 .get(&image)
-                .is_some_and(|evidence| evidence.is_some_and(|at| at <= self.voided_through));
+                .is_some_and(|evidence| evidence.is_some_and(|at| at <= *self.voided_through));
         if !lifts {
             return false;
         }
-        self.tainted_images.remove(&image);
-        self.taint_evidence.remove(&image);
+        self.tainted_images.edit().remove(&image);
+        self.taint_evidence.edit().remove(&image);
         self.shed_only_taints.remove(&image);
         self.reentry_taint_lifts = self.reentry_taint_lifts.saturating_add(1);
         self.claims_prune_dirty = true;
@@ -4742,7 +4958,8 @@ impl JournalAdapter {
         // Bind future births at void time, like reject_audit: births
         // naming a cut below the void refuse even when their key did
         // not exist at the void, without waiting for the re-sync.
-        self.voided_through = self.voided_through.max(upper);
+        let fenced = (*self.voided_through).max(upper);
+        *self.voided_through.edit() = fenced;
         SealFailure {
             take_failed: None,
             scope: self.affected_failure_scope(),
@@ -4768,15 +4985,6 @@ impl JournalAdapter {
     /// Remove one open entry, keeping the S1-only subject index exact.
     fn take_open(&mut self, native: JournalNativeKey) -> Option<OpenEntry> {
         let removed = self.open.remove(&native)?;
-        if removed.converted_ticket.is_none() {
-            self.open_begins = self.open_begins.saturating_sub(1);
-        }
-        if removed.end.is_some() && !removed.end_converted {
-            self.open_terminals = self.open_terminals.saturating_sub(1);
-        }
-        if removed.abandon.is_some() {
-            self.open_abandoned = self.open_abandoned.saturating_sub(1);
-        }
         if removed.s1only_subject.is_some() {
             self.s1only_open.remove(&native);
         }
@@ -4786,9 +4994,6 @@ impl JournalAdapter {
     /// Drop every open entry (a bulk free) and the S1-only subject index.
     fn clear_open(&mut self) {
         self.open.clear();
-        self.open_begins = 0;
-        self.open_terminals = 0;
-        self.open_abandoned = 0;
         self.s1only_open.clear();
     }
 
@@ -4836,7 +5041,7 @@ impl JournalAdapter {
                 return;
             };
             let lived = self.key_is_live(key);
-            if let Some(state) = self.keys.get_mut(&key) {
+            if let Some(state) = self.keys.edit().get_mut(&key) {
                 state.tainted = true;
                 self.note_tainted_mark(key);
             }
@@ -4861,7 +5066,7 @@ impl JournalAdapter {
             assert_eq!(claim.admission, original.admission);
             assert_eq!(claim.return_ns, original.return_ns);
         }
-        if let Some(state) = self.keys.get_mut(&key) {
+        if let Some(state) = self.keys.edit().get_mut(&key) {
             state.s1only_original_refused = true;
         }
         self.ledger.release_h8open(entry.begin_ordinal);
@@ -6365,7 +6570,8 @@ impl JournalAdapter {
                 return Err(BirthCutRefusal::Gap);
             }
             if linked {
-                self.voided_through = self.voided_through.max(self.consumed_through);
+                let fenced = (*self.voided_through).max(self.consumed_through);
+                *self.voided_through.edit() = fenced;
                 // Diagnostic-only (Task 0): the re-sync above fenced
                 // one void. The fence is unchanged.
                 self.void_resync = self.void_resync.saturating_add(1);
@@ -6638,7 +6844,7 @@ impl BootstrapReceipt {
             .get(&grant.proof.key)
             .map(|state| state.void_fence)
             .unwrap_or(0)
-            .max(adapter.voided_through);
+            .max(*adapter.voided_through);
         if grant.birth_cut < fenced_through {
             return Err(BirthRefusal::BelowVoidFence);
         }
@@ -7142,7 +7348,7 @@ impl JournalAdapter {
             .get(&key)
             .map(|state| state.void_fence)
             .unwrap_or(0)
-            .max(self.voided_through);
+            .max(*self.voided_through);
         if self.image_taint_blocks((key.cookie, key.exec), fenced_through)
             && self.quarantine_end_applies(admitted).is_none()
         {
@@ -7555,7 +7761,7 @@ impl JournalAdapter {
                             })
                     })
                 });
-        if let std::collections::btree_map::Entry::Vacant(vacant) = self.keys.entry(key) {
+        if let std::collections::btree_map::Entry::Vacant(vacant) = self.keys.edit().entry(key) {
             if minted_incarnation {
                 self.reentry_incarnations = self.reentry_incarnations.saturating_add(1);
                 if quarantine_matters {
@@ -7571,6 +7777,7 @@ impl JournalAdapter {
             // current post-fence proof instead.
             vacant.insert(JournalDomainState::default());
             self.image_keys
+                .edit()
                 .entry((key.cookie, key.exec))
                 .or_default()
                 .push(key);
@@ -7890,7 +8097,7 @@ impl JournalAdapter {
         let resource = admitted
             .joint_resource_origin()
             .expect("checked original END");
-        let entry = self
+        let mut entry = self
             .open
             .get_mut(&resource.invocation())
             .expect("checked physical original");
@@ -8013,12 +8220,14 @@ impl JournalAdapter {
         self.keys
             .get(&key)
             .is_some_and(|state| !state.refused && !state.tainted && !state.era_ended)
-            && !self.image_taint_blocks((key.cookie, key.exec), self.voided_through)
+            && !self.image_taint_blocks((key.cookie, key.exec), *self.voided_through)
     }
 
     /// Live keys bound for one image: the attribution set a seal
     /// partitions staged calls over.
     fn live_keys_for_image(&self, image: (u64, u64)) -> Vec<JournalDomainKey> {
+        #[cfg(test)]
+        self.note_seal_apply_visits(self.image_keys.get(&image).map_or(0, Vec::len));
         self.image_keys
             .get(&image)
             .cloned()
@@ -8186,6 +8395,7 @@ impl JournalAdapter {
         // physical invocation (same thread, same entry time) are an
         // ambiguity even when their returned words differ.
         self.claims
+            .edit()
             .entry(identity)
             .or_default()
             .entry(key)
@@ -8227,7 +8437,7 @@ impl JournalAdapter {
             .copied()
             .filter(|key| self.key_is_live(*key))
             .collect();
-        self.claims.retain(|_, claimants| {
+        self.claims.edit().retain(|_, claimants| {
             claimants.retain(|key, _| live.contains(key));
             !claimants.is_empty()
         });
@@ -8265,7 +8475,7 @@ impl JournalAdapter {
     ) -> Option<AdmittedJournalClaim> {
         let mut vacated = false;
         let mut popped = None;
-        if let Some(claimants) = self.claims.get_mut(identity) {
+        if let Some(claimants) = self.claims.edit().get_mut(identity) {
             if let Some(ordinals) = claimants.get_mut(&key) {
                 popped = ordinals.pop_front();
                 if let Some(claim) = popped {
@@ -8283,7 +8493,7 @@ impl JournalAdapter {
             vacated = claimants.is_empty();
         }
         if vacated {
-            self.claims.remove(identity);
+            self.claims.edit().remove(identity);
         }
         popped
     }
@@ -8785,7 +8995,8 @@ impl JournalAdapter {
                 // The voided consumption interval binds future keys too:
                 // births naming a cut below it refuse even when their key
                 // did not exist at the void.
-                self.voided_through = self.voided_through.max(self.consumed_through);
+                let fenced = (*self.voided_through).max(self.consumed_through);
+                *self.voided_through.edit() = fenced;
                 if gap == JournalGap::H3Loss {
                     // Forgive the voided H0 interval: re-presented
                     // barriers at or below it wait for clean
@@ -8910,6 +9121,7 @@ impl JournalAdapter {
     ) -> SealAttempt {
         let (audit, bootstrap, frontier) = input.into_parts();
         self.seal_wait.set(SealWait::None);
+        self.seal_awaits_terminal.set(false);
         let requested = self.retained_failure_domain(bootstrap);
         let attempt = (|| {
             if let Err(failure) = self.check_seal_entry(audit, frontier.0) {
@@ -8982,7 +9194,7 @@ impl JournalAdapter {
         }
         if self.image_taint_blocks(
             (key.cookie, key.exec),
-            state.void_fence.max(self.voided_through),
+            state.void_fence.max(*self.voided_through),
         ) {
             self.note_seal_stage(SealStageGate::ImageTainted);
             return SealAttempt::Decided(Err(self.failure(JournalGap::ImageTainted)));
@@ -9055,7 +9267,7 @@ impl JournalAdapter {
         // current retained truth: moved native evidence or a chain break
         // between attestation and seal still refuses. The fence is the
         // same global-aware fence attestation used, so the two agree.
-        let fenced_through = state.void_fence.max(self.voided_through);
+        let fenced_through = state.void_fence.max(*self.voided_through);
         if let Err(refusal) = self.verify_birth(
             &bootstrap.proof(),
             bootstrap.birth(),
@@ -9089,13 +9301,6 @@ impl JournalAdapter {
             self.note_bootstrap_arm(SealBootstrapArm::Pin);
             return SealAttempt::Decided(Err(self.failure(JournalGap::BootstrapMismatch)));
         }
-        // The birth covers all retained staged history for the key:
-        // conversion proves staged begins, so a cut at or above any of
-        // them would certify history the birth excludes. A sibling
-        // key's staging belongs to its own birth. Coverage shares the
-        // barrier's cursor below (one evaluation per visited row).
-        let image = (key.cookie, key.exec);
-        let live = self.live_keys_for_image(image);
         if frontier < state.sealed_through {
             self.note_seal_stage(SealStageGate::FrontierRegression);
             return SealAttempt::Decided(Err(self.failure(JournalGap::FrontierRegression)));
@@ -9118,21 +9323,26 @@ impl JournalAdapter {
             self.note_seal_stage(SealStageGate::BelowFence);
             return SealAttempt::Decided(Err(self.failure(JournalGap::BootstrapMismatch)));
         }
-        // Unclaimed staged history barriers every seal past it: an
-        // entry no bound key can account for is never silently
-        // excluded. It drops only through an explicit void or a
-        // recorded refusal disposal (image taint, disposed raw, or
-        // refused S1-only subjects), each with its gap and ledger
-        // accounting. Birth coverage rides the same cursor (a birth
-        // failure wins even past an early barrier).
-        match self.scan_seal_barrier(
+        let image = (key.cookie, key.exec);
+        // One paid scan decides every staged-row gate below. The birth
+        // covers all retained staged history for the key (conversion
+        // proves staged begins, so a cut at or above any of them would
+        // certify history the birth excludes; a sibling key's staging
+        // belongs to its own birth). Unclaimed staged history barriers
+        // every seal past it: an entry no bound key can account for is
+        // never silently excluded. It drops only through an explicit
+        // void or a recorded refusal disposal (image taint, disposed
+        // raw, or refused S1-only subjects), each with its gap and
+        // ledger accounting. A birth failure wins even past an early
+        // barrier.
+        match self.scan_seal_inputs(
             barrier,
             frontier,
             budget,
             key,
-            &live,
-            image,
             bootstrap.birth_cut(),
+            audit,
+            SealScanMode::Seal,
         ) {
             BarrierCheck::Barrier => {
                 self.note_seal_stage(SealStageGate::UnboundStaging);
@@ -9144,163 +9354,246 @@ impl JournalAdapter {
                 self.note_bootstrap_arm(SealBootstrapArm::Covers);
                 return SealAttempt::Decided(Err(self.failure(JournalGap::BootstrapMismatch)));
             }
-            BarrierCheck::Clear => {
-                // The scan spent from the shared slice; re-bound the
-                // inline allowance to what remains so a later doom or
-                // void never spends past the service budget.
-                self.inline_credit = (*budget).min(SCOPED_RECOVERY_SLICE);
-                if *budget == 0 {
-                    // The final row spent the last credit: the completed
-                    // clear stays cached, but post-barrier seal work and
-                    // its Future settlement need a paid decision credit
-                    // of their own. Yield so the same frame resumes with
-                    // fresh budget (re-running entry, fault and birth
-                    // checks) instead of settling at zero.
-                    return SealAttempt::Yielded;
-                }
-            }
             BarrierCheck::Yielded => return SealAttempt::Yielded,
+            BarrierCheck::Clear => {}
         }
+        let scan = barrier.scan.as_mut().expect("a finished seal scan");
+        let facts = scan.facts;
+        let decision = Self::seal_decision(
+            &facts,
+            state,
+            bootstrap.proof().era,
+            bootstrap.birth_cut(),
+            frontier,
+            completed,
+        );
+        // The decided outcome's own table work (a taint drain, the doom's
+        // live set, conversion and pruning) is paid row by row first,
+        // resuming across polls under the same stamp.
+        let owed = self.seal_decision_cost(&decision, image);
+        if !self.prepay_seal_decision(scan, owed, budget) {
+            return SealAttempt::Yielded;
+        }
+        // The scan spent from the shared slice; re-bound the inline
+        // allowance to what remains so a later doom or void never spends
+        // past the service budget.
+        self.inline_credit = (*budget).min(SCOPED_RECOVERY_SLICE);
+        if *budget == 0 {
+            // The last row or prepaid unit spent the last credit: the
+            // finished scan stays cached, but applying the decision and
+            // its Future settlement need a paid decision credit of their
+            // own. Yield so the same frame resumes with fresh budget
+            // (re-running entry, fault and birth checks) instead of
+            // settling at zero.
+            return SealAttempt::Yielded;
+        }
+        self.seal_awaits_terminal.set(facts.awaits_terminal());
+        let disposable = &barrier
+            .scan
+            .as_ref()
+            .expect("a finished seal scan")
+            .disposable;
+        SealAttempt::Decided(self.apply_seal_decision(
+            model, decision, key, bootstrap, frontier, replay, disposable,
+        ))
+    }
+
+    /// The seal's gates after a clear scan, in their fixed priority:
+    /// attribution, fresh-birth history, model floors, the held pin, a
+    /// completed era, abandonment dooms, return readiness, invocation
+    /// claims, then conversion. O(1) over the scan's final facts.
+    fn seal_decision(
+        facts: &SealScanFacts,
+        state: &JournalDomainState,
+        era: u64,
+        birth_cut: u64,
+        frontier: u64,
+        completed: bool,
+    ) -> SealDecision {
         // With sibling keys, every staged entry for this image needs
         // its attribution: this key's entries convert, a sibling's
         // wait for their own seal, and unclaimed shapes (or live
         // collisions) hold the seal until admission authority names
-        // them.
-        match self.attribution_readiness(key, &live, frontier, audit) {
-            AttributionReadiness::Ready => {}
-            AttributionReadiness::Pending => {
-                self.note_seal_stage(SealStageGate::AttributionPending);
-                return SealAttempt::Decided(Err(self.wait(SealWait::AttributionPending)));
-            }
-            AttributionReadiness::Unmatched(evidence) => {
-                // No claim can ever name this staged call: the image's
-                // history cannot be accounted for under any key. End the
-                // attempt named (like duplicate claims) instead of holding.
-                self.taint_image_at(image, TaintCause::ClaimUnmatched, evidence);
-                self.note_seal_stage(SealStageGate::ClaimUnmatched);
-                return SealAttempt::Decided(Err(self.failure(JournalGap::ClaimUnmatched)));
-            }
+        // them. A staged call no claim can ever name ends the attempt
+        // named instead of holding.
+        if facts.unmatched_perm || facts.unmatched_max.is_some() {
+            let evidence = if facts.unmatched_perm {
+                None
+            } else {
+                facts.unmatched_max
+            };
+            return SealDecision::Unmatched(evidence);
+        }
+        if facts.attribution_pending || !facts.claims_cover {
+            return SealDecision::Wait(
+                SealStageGate::AttributionPending,
+                SealWait::AttributionPending,
+            );
         }
         // A fresh birth (no pinned cut for this era) must ground its
         // authority in new staged history: naming the void fence with
         // an advanced frontier but no convertible begin above the cut
         // certifies nothing, so the seal waits instead of succeeding
-        // vacantly. Structural mismatches above keep priority: only a
-        // well-formed but history-less resumption waits.
-        if !state.bootstraps.contains_key(&bootstrap.proof().era)
-            && !self.has_staged_history(key, &live, bootstrap.birth_cut(), frontier)
-        {
-            self.note_seal_stage(SealStageGate::FreshBirthNoHistory);
-            return SealAttempt::Decided(Err(self.wait(SealWait::FreshBirthNoHistory)));
+        // vacantly.
+        if !state.bootstraps.contains_key(&era) && !facts.staged_history {
+            return SealDecision::Wait(
+                SealStageGate::FreshBirthNoHistory,
+                SealWait::FreshBirthNoHistory,
+            );
         }
         // The model's bootstrap authority is derived, not supplied:
         // strictly above the birth, the last sealed frontier, the void
-        // fence and every recorded or pending loss bound. Held calls
-        // pinning below those floors make the seal a continuation: it
-        // claims no new bootstrap (the model keeps its floor and held
-        // calls still apply under it) instead of presenting a fence the
-        // model must refuse. Only floors past the frontier wait for more
+        // fence and every recorded or pending loss bound (this key's
+        // staged bounded abandonments and refused begins with their
+        // corroborating returns in the frontier). Held calls pinning
+        // below those floors make the seal a continuation: it claims no
+        // new bootstrap. Only floors past the frontier wait for more
         // history — a repeated seal at an unchanged frontier never
-        // succeeds vacuously. Staged inputs are kept for a later seal.
-        // Pending loss bounds: this key's staged bounded abandonments
-        // and refused begins with their corroborating returns in the
-        // frontier. Calls this seal removes never apply, so they leave
-        // the held pin alone. A sibling key's bounds belong to its own
-        // fence.
-        let mut pending_bounds = Vec::new();
-        for entry in self.open.values() {
-            if self.abandons_here(key, &live, entry)
-                && entry.begin_ordinal <= frontier
-                && let Some(staged) = entry.abandon
-                && staged.ordinal <= frontier
-                && staged.abandon.reason() == JOURNAL_REASON_SYNC_RETURN_RESULT_LOST
-                && let Some(at) = entry.corroborated_return
-                && at <= frontier
-            {
-                pending_bounds.push(at);
-            }
-        }
-        for refused in &self.refused {
-            if self.refused_converts_here(key, &live, refused)
-                && refused.cut <= frontier
-                && let Some(at) = refused.corroborated_return
-                && at <= frontier
-            {
-                pending_bounds.push(at);
-            }
-        }
+        // succeeds vacuously.
         let floors = match derive_model_floors(
-            bootstrap.birth_cut(),
+            birth_cut,
             state.sealed_through,
             state.void_fence,
             state.bounded_upper,
-            &pending_bounds,
+            facts.pending_bound.as_slice(),
         ) {
             Ok(floors) => floors,
             Err(gap) => {
                 debug_assert_eq!(gap, JournalGap::CutExhausted);
-                self.note_seal_stage(SealStageGate::CutExhausted);
-                return SealAttempt::Decided(Err(self.failure(gap)));
+                return SealDecision::CutExhausted;
             }
         };
-        // Held pin: the earliest staged begin this seal keeps. Bounded
-        // losses removed below contribute their bound instead of their
-        // begin; everything else convertible here may still apply. A
-        // sibling key's held calls pin its own fence, never this one. A
-        // pin below the floors continues without claiming; at or above
-        // them the seal claims the floors as new authority.
-        let held = self
-            .open
-            .values()
-            .filter(|entry| {
-                (self.converts_here(key, &live, entry) || entry.converted_for == Some(key))
-                    && !(entry.abandon.is_some_and(|staged| {
-                        staged.ordinal <= frontier
-                            && staged.abandon.reason() == JOURNAL_REASON_SYNC_RETURN_RESULT_LOST
-                            && entry.corroborated_return.is_some_and(|at| at <= frontier)
-                    }))
-            })
-            .map(|entry| entry.begin_ordinal)
-            .min();
         if floors > frontier {
-            self.note_seal_stage(SealStageGate::FloorsPastFrontier);
-            return SealAttempt::Decided(Err(self.wait(SealWait::FloorsPastFrontier)));
+            return SealDecision::Wait(
+                SealStageGate::FloorsPastFrontier,
+                SealWait::FloorsPastFrontier,
+            );
         }
-        let fence = match held {
+        let fence = match facts.held {
             Some(pinned) if pinned < floors => None,
             _ => Some(floors),
         };
-        // A completed era (its sealed successful C_Finalize ended the
-        // model domain with nothing left unfinished) has nothing left
-        // to prove: with no new history for this key it seals empty,
-        // like an idle key, never reaching the ended model domain. New
-        // history after it cannot be proved under the ended domain and
-        // keeps the ordinary path's refusal.
-        if completed && !self.has_history_through(key, &live, frontier) {
-            return SealAttempt::Decided(self.seal_completed_era(key, bootstrap, frontier, replay));
+        // A completed era has nothing left to prove: with no new history
+        // for this key it seals empty, like an idle key, never reaching
+        // the ended model domain.
+        if completed && !facts.history_through {
+            return SealDecision::CompletedEra;
         }
-        let outcome = self.seal_validated(model, key, bootstrap, frontier, fence, audit, replay);
-        if outcome.is_ok() {
-            self.note_seal_stage(SealStageGate::Success);
+        // Unbounded abandonment of this key's mutating calls staged at or
+        // below the frontier refuses this key permanently; effect-free
+        // ones with neutral returns dispose per call inside conversion.
+        if facts.dooming {
+            return SealDecision::Doom {
+                capable: facts.doom_capable,
+            };
         }
-        SealAttempt::Decided(outcome)
+        // This key's bounded abandonments, and its refused begins, need
+        // their corroborating returns within the frontier.
+        if facts.abandon_unready {
+            return SealDecision::Wait(
+                SealStageGate::AbandonReturnPending,
+                SealWait::AbandonReturnPending,
+            );
+        }
+        if facts.refused_unready {
+            return SealDecision::Wait(
+                SealStageGate::RefusedReturnPending,
+                SealWait::RefusedReturnPending,
+            );
+        }
+        match facts.validation {
+            Some(ClaimValidation::Ambiguous(image)) => SealDecision::Ambiguous(image),
+            Some(ClaimValidation::H3Pending) => SealDecision::H3Pending,
+            None => SealDecision::Convert { fence },
+        }
     }
 
-    /// Whether any staged wire truth for one key sits at or below a
-    /// frontier: a begin converting here or already converted for it,
-    /// or a refused begin converting here.
-    fn has_history_through(
-        &self,
+    /// Rows a decided seal's own application visits, prepaid one unit
+    /// per row before it runs: an image taint's synchronous drain (two
+    /// passes over each table), the doom's live-set build (two passes
+    /// over the image's keys), or conversion with settlement and
+    /// pruning ([`SEAL_CONVERT_OPEN_PASSES`] open passes,
+    /// [`SEAL_CONVERT_REFUSED_PASSES`] refused passes, one key pass).
+    /// Waits and refusals without table work owe nothing.
+    fn seal_decision_cost(&self, decision: &SealDecision, image: (u64, u64)) -> usize {
+        let keys = self.image_keys.get(&image).map_or(0, Vec::len);
+        match decision {
+            SealDecision::Unmatched(_) | SealDecision::Ambiguous(_) => self
+                .open
+                .len()
+                .saturating_add(self.refused.len())
+                .saturating_mul(2),
+            SealDecision::Doom { .. } => keys.saturating_mul(2),
+            SealDecision::Convert { .. } => self
+                .open
+                .len()
+                .saturating_mul(SEAL_CONVERT_OPEN_PASSES)
+                .saturating_add(
+                    self.refused
+                        .len()
+                        .saturating_mul(SEAL_CONVERT_REFUSED_PASSES),
+                )
+                .saturating_add(keys),
+            SealDecision::Wait(..)
+            | SealDecision::CutExhausted
+            | SealDecision::CompletedEra
+            | SealDecision::H3Pending => 0,
+        }
+    }
+
+    /// Apply one prepaid seal decision.
+    #[allow(clippy::too_many_arguments)] // The decided outcome carries its key's bootstrap, frontier, prepaid replay storage and classified disposals.
+    fn apply_seal_decision(
+        &mut self,
+        model: &mut ObjectSemantics,
+        decision: SealDecision,
         key: JournalDomainKey,
-        live: &[JournalDomainKey],
+        bootstrap: &BootstrapReceipt,
         frontier: u64,
-    ) -> bool {
-        self.open
-            .values()
-            .any(|entry| entry.begin_ordinal <= frontier && self.abandons_here(key, live, entry))
-            || self.refused.iter().any(|refused| {
-                refused.cut <= frontier && self.refused_converts_here(key, live, refused)
-            })
+        replay: Option<ReplayPreparation>,
+        disposable: &BTreeSet<JournalNativeKey>,
+    ) -> Result<SealSuccess, SealFailure> {
+        let image = (key.cookie, key.exec);
+        match decision {
+            SealDecision::Unmatched(evidence) => {
+                self.taint_image_at(image, TaintCause::ClaimUnmatched, evidence);
+                self.note_seal_stage(SealStageGate::ClaimUnmatched);
+                Err(self.failure(JournalGap::ClaimUnmatched))
+            }
+            SealDecision::Wait(gate, wait) => {
+                self.note_seal_stage(gate);
+                Err(self.wait(wait))
+            }
+            SealDecision::CutExhausted => {
+                self.note_seal_stage(SealStageGate::CutExhausted);
+                Err(self.failure(JournalGap::CutExhausted))
+            }
+            SealDecision::CompletedEra => self.seal_completed_era(key, bootstrap, frontier, replay),
+            SealDecision::Doom { capable } => {
+                self.note_seal_stage(SealStageGate::DomainTainted);
+                let live = self.live_keys_for_image(image);
+                Err(self.doom_key_for_abandonment(model, key, bootstrap, &live, capable))
+            }
+            SealDecision::Ambiguous(tainted) => {
+                // Do not let pruning/void turn this ambiguity into a later
+                // singleton winner. Taint preserves every claim unconsumed.
+                self.taint_image(tainted, TaintCause::ClaimAmbiguity);
+                self.note_seal_stage(SealStageGate::ImageTainted);
+                Err(self.failure(JournalGap::ImageTainted))
+            }
+            SealDecision::H3Pending => {
+                self.note_seal_stage(SealStageGate::H3Pending);
+                Err(self.failure(JournalGap::H3Pending))
+            }
+            SealDecision::Convert { fence } => {
+                let outcome =
+                    self.seal_validated(model, key, bootstrap, frontier, fence, replay, disposable);
+                if outcome.is_ok() {
+                    self.note_seal_stage(SealStageGate::Success);
+                }
+                outcome
+            }
+        }
     }
 
     /// The empty success of a completed era: nothing settles, no
@@ -9332,7 +9625,7 @@ impl JournalAdapter {
             prefix.replay_steps = steps;
             prefix.replay_index = Some(index);
         }
-        let state = self.keys.get_mut(&key).expect("sealed key");
+        let state = self.keys.edit().get_mut(&key).expect("sealed key");
         state.sealed_through = frontier;
         self.note_seal_stage(SealStageGate::Success);
         Ok(SealSuccess {
@@ -9448,7 +9741,7 @@ impl JournalAdapter {
                 effects.effects.extend(refused.effects);
             }
             let lived = self.key_is_live(key);
-            self.keys.get_mut(&key).expect("doomed key").refused = true;
+            self.keys.edit().get_mut(&key).expect("doomed key").refused = true;
             self.note_refused_mark(key, capable);
             self.claims_prune_dirty |= lived;
         }
@@ -9468,7 +9761,7 @@ impl JournalAdapter {
             .map(|(key, state)| (*key, state.era, state.model_registered))
             .collect();
         for (key, era, registered) in live {
-            let state = self.keys.get_mut(&key).expect("fenced key");
+            let state = self.keys.edit().get_mut(&key).expect("fenced key");
             state.void_fence = state.void_fence.max(upper);
             if !registered {
                 continue;
@@ -9498,24 +9791,73 @@ impl JournalAdapter {
         self.has_unbound_staging(self.consumed_through)
     }
 
+    /// The revisions of every seal-scan input. Equal values prove no
+    /// staged row, refused begin, binding, claim, key state, taint,
+    /// sighting, void fence or wipe record changed in between.
+    fn seal_input_revision(&self) -> SealInputRevision {
+        SealInputRevision {
+            open: self.open.revision(),
+            refused: self.refused.revision(),
+            image_keys: self.image_keys.revision(),
+            claims: self.claims.revision(),
+            keys: self.keys.revision(),
+            tainted_images: self.tainted_images.revision(),
+            taint_evidence: self.taint_evidence.revision(),
+            taint_overflow: self.taint_overflow.revision(),
+            sightings: self.sightings.revision(),
+            voided_through: self.voided_through.revision(),
+            void_wiped: self.void_wiped.revision(),
+        }
+    }
+
+    /// Whether one claimant is a live key of `image`: exactly membership
+    /// in [`Self::live_keys_for_image`] as an indexed lookup. Keys are
+    /// never removed and the one key insertion also lists the key under
+    /// its own image, so the image's key list holds exactly the keys
+    /// whose (cookie, exec) is that image.
+    fn live_for_image(&self, image: (u64, u64), claimant: &JournalDomainKey) -> bool {
+        (claimant.cookie, claimant.exec) == image && self.key_is_live(*claimant)
+    }
+
+    /// Test-only: count one paid seal-scan unit (row, identity or
+    /// prepaid decision unit).
+    #[cfg(test)]
+    fn note_seal_scan_unit(&self) {
+        self.seal_scan_units
+            .set(self.seal_scan_units.get().saturating_add(1));
+    }
+
+    /// Test-only: count one table pass of a decided seal's application
+    /// (rows it visits after its prepay), for the prepay bound.
+    #[cfg(test)]
+    fn note_seal_apply_visits(&self, rows: usize) {
+        self.seal_apply_visits
+            .set(self.seal_apply_visits.get().saturating_add(rows));
+    }
+
     /// One bounded barrier scan: unbound staging at or below the
     /// consumed frontier, in stride slices through the budget with a
     /// resumable cursor. Yields when the budget exhausts; resumes
-    /// next tick (open resumes by key, valid across table mutations;
-    /// refused restarts when its length moved).
+    /// next tick only while its barrier inputs (open, refused, image
+    /// bindings, consumed frontier) are unchanged, restarting otherwise.
     pub(crate) fn has_seal_barrier_bounded(&mut self, budget: &mut usize) -> BarrierCheck {
-        let mut scan = self.barrier_scan.take().unwrap_or(BarrierScan {
-            open_after: None,
-            refused_index: 0,
-            refused_len: self.refused.len(),
-            refused_phase: false,
-            saw_barrier: false,
-        });
-        if scan.refused_len != self.refused.len() {
-            scan.refused_index = 0;
-            scan.refused_len = self.refused.len();
-        }
         let frontier = self.consumed_through;
+        let stamp = (
+            self.open.revision(),
+            self.refused.revision(),
+            self.image_keys.revision(),
+            frontier,
+        );
+        let mut scan = self
+            .barrier_scan
+            .take()
+            .filter(|scan| scan.stamp == stamp)
+            .unwrap_or(BarrierScan {
+                stamp,
+                open_after: None,
+                refused_index: 0,
+                refused_phase: false,
+            });
         loop {
             if *budget == 0 {
                 self.barrier_scan = Some(scan);
@@ -9552,7 +9894,6 @@ impl JournalAdapter {
                 if examined < allowance {
                     scan.refused_phase = true;
                     scan.refused_index = 0;
-                    scan.refused_len = self.refused.len();
                     continue;
                 }
             } else {
@@ -9575,152 +9916,456 @@ impl JournalAdapter {
         }
     }
 
-    /// One bounded production-seal pre-barrier scan for a frame's
-    /// frontier: birth coverage plus barrier, same cursor, charging the
-    /// frame's shared slice per examined row and resuming across retries.
-    /// Each visited row evaluates both predicates (one unit covers the
-    /// constant work); a birth failure wins immediately, while a barrier
-    /// found early waits for birth verification of the remaining rows.
-    /// A completed decision is retained while the same key, birth cut,
-    /// frontier and staging/binding membership stand, so same-target
-    /// retries reuse it with zero new visits; any change drops it and
-    /// restarts. Yields (saving its cursor, deciding nothing) when the
-    /// budget exhausts.
-    #[allow(clippy::too_many_arguments)] // One pre-barrier scan carries its key's birth inputs with its frontier and slice.
-    fn scan_seal_barrier(
+    /// The current stamp for one production seal scan.
+    fn seal_scan_stamp(
+        &self,
+        frontier: u64,
+        key: JournalDomainKey,
+        birth_cut: u64,
+        mode: SealScanMode,
+    ) -> SealScanStamp {
+        SealScanStamp {
+            inputs: self.seal_input_revision(),
+            frontier,
+            key,
+            birth_cut,
+            mode,
+        }
+    }
+
+    /// One bounded production-seal scan: every staged-row predicate the
+    /// seal decides on (birth coverage, barrier, attribution, terminal
+    /// wait, history, loss bounds, held pin, abandonment classes,
+    /// return readiness), then the per-identity claim checks, through
+    /// one resumable cursor that pays one unit of `budget` per visited
+    /// row or identity before reading it. A birth failure wins at once
+    /// in seal mode; a barrier decides after every row (a later birth
+    /// failure wins) and skips the identity phase. The scan resumes only
+    /// under an identical stamp: any change to any input, the frontier,
+    /// key, birth cut or mode drops every partial and completed answer
+    /// and restarts. A finished scan answers retries with zero visits.
+    #[allow(clippy::too_many_arguments)] // One scan carries its key's birth inputs with its frontier, slice, audit and mode.
+    fn scan_seal_inputs(
         &self,
         state: &mut SealBarrierState,
         frontier: u64,
         budget: &mut usize,
         key: JournalDomainKey,
-        live: &[JournalDomainKey],
-        image: (u64, u64),
         birth_cut: u64,
+        audit: &JournalAuditReceipt,
+        mode: SealScanMode,
     ) -> BarrierCheck {
-        if let Some(decision) = state.decision {
-            if decision.frontier == frontier
-                && decision.open_len == self.open.len()
-                && decision.refused_len == self.refused.len()
-                && decision.image_keys_len == self.image_keys.len()
-                && decision.key == key
-                && decision.birth_cut == birth_cut
-            {
-                return if decision.barrier {
-                    BarrierCheck::Barrier
-                } else {
-                    BarrierCheck::Clear
-                };
-            }
-            state.decision = None;
-            state.cursor = None;
+        let stamp = self.seal_scan_stamp(frontier, key, birth_cut, mode);
+        if state.scan.as_ref().is_some_and(|scan| scan.stamp != stamp) {
+            state.scan = None;
         }
-        let mut scan = state.cursor.take().unwrap_or(BarrierScan {
-            open_after: None,
-            refused_index: 0,
-            refused_len: self.refused.len(),
-            refused_phase: false,
-            saw_barrier: false,
+        let scan = state.scan.get_or_insert_with(|| SealScan {
+            stamp,
+            phase: SealScanPhase::Open { after: None },
+            facts: SealScanFacts::default(),
+            identities: BTreeMap::new(),
+            disposable: BTreeSet::new(),
+            prepaid: 0,
         });
-        if scan.refused_len != self.refused.len() {
-            scan.refused_index = 0;
-            scan.refused_len = self.refused.len();
-        }
+        let image = (key.cookie, key.exec);
         loop {
-            if *budget == 0 {
-                state.cursor = Some(scan);
-                return BarrierCheck::Yielded;
-            }
-            let allowance = SCOPED_RECOVERY_SLICE.min(*budget);
-            let mut examined = 0usize;
-            if !scan.refused_phase {
-                let range = match scan.open_after {
-                    None => self.open.range((
-                        std::ops::Bound::<JournalNativeKey>::Unbounded,
-                        std::ops::Bound::<JournalNativeKey>::Unbounded,
-                    )),
-                    Some(last) => self
-                        .open
-                        .range((std::ops::Bound::Excluded(last), std::ops::Bound::Unbounded)),
-                };
-                for (native, entry) in range {
-                    if examined >= allowance {
-                        break;
-                    }
-                    examined += 1;
-                    #[cfg(test)]
-                    self.barrier_row_visits
-                        .set(self.barrier_row_visits.get().saturating_add(1));
-                    #[cfg(test)]
-                    self.birth_cover_evals
-                        .set(self.birth_cover_evals.get().saturating_add(1));
-                    scan.open_after = Some(*native);
-                    if entry.image == image
-                        && entry.begin_ordinal <= birth_cut
-                        && (self.converts_here(key, live, entry)
-                            || entry.converted_for == Some(key))
-                    {
-                        *budget = budget.saturating_sub(examined);
-                        state.cursor = None;
-                        return BarrierCheck::BirthMismatch;
-                    }
-                    if entry.converted_ticket.is_none()
-                        && entry.begin_ordinal <= frontier
-                        && !self.image_keys.contains_key(&entry.image)
-                    {
-                        scan.saw_barrier = true;
-                    }
-                }
-                *budget = budget.saturating_sub(examined);
-                if examined < allowance {
-                    scan.refused_phase = true;
-                    scan.refused_index = 0;
-                    scan.refused_len = self.refused.len();
-                    continue;
-                }
-            } else {
-                while scan.refused_index < self.refused.len() && examined < allowance {
-                    let refused = &self.refused[scan.refused_index];
-                    scan.refused_index += 1;
-                    examined += 1;
-                    #[cfg(test)]
-                    self.barrier_row_visits
-                        .set(self.barrier_row_visits.get().saturating_add(1));
-                    #[cfg(test)]
-                    self.birth_cover_evals
-                        .set(self.birth_cover_evals.get().saturating_add(1));
-                    if refused.image == image
-                        && refused.cut <= birth_cut
-                        && self.refused_converts_here(key, live, refused)
-                    {
-                        *budget = budget.saturating_sub(examined);
-                        state.cursor = None;
-                        return BarrierCheck::BirthMismatch;
-                    }
-                    if refused.cut <= frontier && !self.image_keys.contains_key(&refused.image) {
-                        scan.saw_barrier = true;
-                    }
-                }
-                *budget = budget.saturating_sub(examined);
-                if examined < allowance || scan.refused_index >= self.refused.len() {
-                    let barrier = scan.saw_barrier;
-                    state.decision = Some(SealBarrierDecision {
-                        frontier,
-                        barrier,
-                        open_len: self.open.len(),
-                        refused_len: self.refused.len(),
-                        image_keys_len: self.image_keys.len(),
-                        key,
-                        birth_cut,
-                    });
-                    state.cursor = None;
-                    return if barrier {
+            match scan.phase {
+                SealScanPhase::Done => {
+                    return if scan.facts.birth_mismatch {
+                        BarrierCheck::BirthMismatch
+                    } else if scan.facts.barrier {
                         BarrierCheck::Barrier
                     } else {
                         BarrierCheck::Clear
                     };
                 }
+                SealScanPhase::Open { after } => {
+                    let range = match after {
+                        None => self.open.range((
+                            std::ops::Bound::<JournalNativeKey>::Unbounded,
+                            std::ops::Bound::<JournalNativeKey>::Unbounded,
+                        )),
+                        Some(last) => self
+                            .open
+                            .range((std::ops::Bound::Excluded(last), std::ops::Bound::Unbounded)),
+                    };
+                    let mut finished = true;
+                    for (native, entry) in range {
+                        if *budget == 0 {
+                            finished = false;
+                            break;
+                        }
+                        *budget -= 1;
+                        #[cfg(test)]
+                        {
+                            self.note_seal_scan_unit();
+                            self.barrier_row_visits
+                                .set(self.barrier_row_visits.get().saturating_add(1));
+                        }
+                        scan.phase = SealScanPhase::Open {
+                            after: Some(*native),
+                        };
+                        self.visit_seal_open(scan, image, *native, entry, audit);
+                        if scan.facts.birth_mismatch {
+                            scan.phase = SealScanPhase::Done;
+                            break;
+                        }
+                    }
+                    if !finished {
+                        return BarrierCheck::Yielded;
+                    }
+                    if !scan.facts.birth_mismatch {
+                        scan.phase = SealScanPhase::Refused { index: 0 };
+                    }
+                }
+                SealScanPhase::Refused { mut index } => {
+                    while index < self.refused.len() {
+                        if *budget == 0 {
+                            scan.phase = SealScanPhase::Refused { index };
+                            return BarrierCheck::Yielded;
+                        }
+                        *budget -= 1;
+                        #[cfg(test)]
+                        {
+                            self.note_seal_scan_unit();
+                            self.barrier_row_visits
+                                .set(self.barrier_row_visits.get().saturating_add(1));
+                        }
+                        let refused = self.refused[index];
+                        index += 1;
+                        self.visit_seal_refused(scan, image, &refused);
+                        if scan.facts.birth_mismatch {
+                            break;
+                        }
+                    }
+                    scan.phase = if scan.facts.birth_mismatch || scan.facts.barrier {
+                        SealScanPhase::Done
+                    } else {
+                        SealScanPhase::Identities { after: None }
+                    };
+                }
+                SealScanPhase::Identities { mut after } => {
+                    loop {
+                        let next = match after {
+                            None => scan.identities.iter().next(),
+                            Some(last) => scan
+                                .identities
+                                .range((
+                                    std::ops::Bound::Excluded(last),
+                                    std::ops::Bound::Unbounded,
+                                ))
+                                .next(),
+                        };
+                        let Some((identity, slot)) =
+                            next.map(|(identity, slot)| (*identity, *slot))
+                        else {
+                            break;
+                        };
+                        if *budget == 0 {
+                            scan.phase = SealScanPhase::Identities { after };
+                            return BarrierCheck::Yielded;
+                        }
+                        *budget -= 1;
+                        #[cfg(test)]
+                        self.note_seal_scan_unit();
+                        self.visit_seal_identity(&mut scan.facts, key, &identity, &slot, audit);
+                        after = Some(identity);
+                    }
+                    scan.phase = SealScanPhase::Done;
+                }
             }
         }
+    }
+
+    /// Bounded terminal-wait check for a disposed frame's selected
+    /// target: the same paid scan as a seal (no birth check), resuming
+    /// from `state` under an identical stamp. `None` when the budget
+    /// exhausted mid-scan; a finished scan answers retries with zero
+    /// visits.
+    pub(super) fn awaits_future_terminal_bounded(
+        &self,
+        state: &mut SealBarrierState,
+        bootstrap: &BootstrapReceipt,
+        frontier: ConsumptionOrdinal,
+        audit: &JournalAuditReceipt,
+        budget: &mut usize,
+    ) -> Option<bool> {
+        match self.scan_seal_inputs(
+            state,
+            frontier.0,
+            budget,
+            bootstrap.proof().key,
+            bootstrap.birth_cut(),
+            audit,
+            SealScanMode::AwaitsOnly,
+        ) {
+            BarrierCheck::Yielded => None,
+            _ => Some(
+                state
+                    .scan
+                    .as_ref()
+                    .is_some_and(|scan| scan.facts.awaits_terminal()),
+            ),
+        }
+    }
+
+    /// One paid open-row visit: every seal predicate on this row, with
+    /// the constant indexed lookups (claims for its identity, key
+    /// liveness, image binding) that decide it.
+    fn visit_seal_open(
+        &self,
+        scan: &mut SealScan,
+        image: (u64, u64),
+        native: JournalNativeKey,
+        entry: &OpenEntry,
+        audit: &JournalAuditReceipt,
+    ) {
+        let stamp = scan.stamp;
+        let (key, frontier, birth_cut) = (stamp.key, stamp.frontier, stamp.birth_cut);
+        let facts = &mut scan.facts;
+        let unconverted = entry.converted_ticket.is_none();
+        let within = entry.begin_ordinal <= frontier;
+        if unconverted && within && !self.image_keys.contains_key(&entry.image) {
+            facts.barrier = true;
+        }
+        let shape = shape_of_entry(entry);
+        let identity = shape.identity;
+        if identity.image == image {
+            scan.identities.entry(identity).or_default().total += 1;
+        }
+        if entry.image != image {
+            return;
+        }
+        let attribution =
+            self.attribute_call_by(key, &shape, |claimant| self.live_for_image(image, claimant));
+        let converts = unconverted && attribution == CallAttribution::Mine;
+        let ours = converts || entry.converted_for == Some(key);
+        if stamp.mode == SealScanMode::Seal && entry.begin_ordinal <= birth_cut && ours {
+            facts.birth_mismatch = true;
+            return;
+        }
+        if unconverted && within {
+            match attribution {
+                CallAttribution::Mine => {
+                    let slot = scan.identities.entry(identity).or_default();
+                    slot.mine += 1;
+                    slot.mine_open += 1;
+                    match self.contradiction_evidence(native) {
+                        None => slot.evidence_perm = true,
+                        Some(at) => slot.evidence_max = slot.evidence_max.max(at),
+                    }
+                    slot.candidate_end = entry
+                        .end
+                        .filter(|end| end.ordinal <= frontier)
+                        .map(|end| end.end.payload_base().event);
+                }
+                CallAttribution::Sibling => {}
+                CallAttribution::Unclaimed => {
+                    let claimed = self.identity_claimed(&identity);
+                    if claimed || admission_disposed_unclaimed(entry, audit) {
+                        facts.note_unmatched(self.contradiction_evidence(native));
+                    } else {
+                        facts.attribution_pending = true;
+                    }
+                    if claimed
+                        || entry.end.is_some()
+                        || entry.abandon.is_some()
+                        || entry.corroborated_return.is_some()
+                    {
+                        facts.terminal_blocked = true;
+                    } else {
+                        facts.terminal_waiting = true;
+                    }
+                }
+            }
+        }
+        if converts && entry.begin_ordinal > birth_cut && within {
+            facts.staged_history = true;
+        }
+        if within && ours {
+            facts.history_through = true;
+        }
+        let bounded_lost = entry.abandon.is_some_and(|staged| {
+            staged.ordinal <= frontier
+                && staged.abandon.reason() == JOURNAL_REASON_SYNC_RETURN_RESULT_LOST
+        });
+        if ours
+            && within
+            && bounded_lost
+            && let Some(at) = entry.corroborated_return
+            && at <= frontier
+        {
+            facts.pending_bound = Some(facts.pending_bound.map_or(at, |kept| kept.max(at)));
+        }
+        if ours && !(bounded_lost && entry.corroborated_return.is_some_and(|at| at <= frontier)) {
+            facts.held = Some(
+                facts
+                    .held
+                    .map_or(entry.begin_ordinal, |kept| kept.min(entry.begin_ordinal)),
+            );
+        }
+        if ours
+            && within
+            && let Some(staged) = entry.abandon.as_ref().filter(|staged| {
+                staged.ordinal <= frontier
+                    && abandon_disposition(staged.abandon.reason())
+                        == Some(AbandonDisposition::UnboundedInvalidation)
+            })
+        {
+            if self.abandonment_disposes_here(entry) {
+                scan.disposable.insert(native);
+            } else {
+                facts.dooming = true;
+                facts.doom_capable |= !Self::abandon_proves_frame_dead(staged.abandon.reason());
+            }
+        }
+        if ours
+            && within
+            && bounded_lost
+            && entry.corroborated_return.is_none_or(|at| at > frontier)
+        {
+            facts.abandon_unready = true;
+        }
+    }
+
+    /// One paid refused-begin visit: every seal predicate on this row.
+    fn visit_seal_refused(&self, scan: &mut SealScan, image: (u64, u64), refused: &RefusedBegin) {
+        let stamp = scan.stamp;
+        let (key, frontier, birth_cut) = (stamp.key, stamp.frontier, stamp.birth_cut);
+        let facts = &mut scan.facts;
+        let within = refused.cut <= frontier;
+        if within && !self.image_keys.contains_key(&refused.image) {
+            facts.barrier = true;
+        }
+        let shape = refused.shape();
+        let identity = shape.identity;
+        if identity.image == image {
+            scan.identities.entry(identity).or_default().total += 1;
+        }
+        if refused.image != image {
+            return;
+        }
+        let attribution =
+            self.attribute_call_by(key, &shape, |claimant| self.live_for_image(image, claimant));
+        let converts = attribution == CallAttribution::Mine;
+        if stamp.mode == SealScanMode::Seal && refused.cut <= birth_cut && converts {
+            facts.birth_mismatch = true;
+            return;
+        }
+        if within {
+            facts.terminal_blocked = true;
+            match attribution {
+                CallAttribution::Mine => {
+                    let slot = scan.identities.entry(identity).or_default();
+                    slot.mine += 1;
+                    // Capacity artifacts carry no native key: a multiset
+                    // collision on one evidences unknown effects.
+                    slot.evidence_perm = true;
+                }
+                CallAttribution::Sibling => {}
+                CallAttribution::Unclaimed => {
+                    if self.identity_claimed(&identity) {
+                        facts.note_unmatched(None);
+                    } else {
+                        facts.attribution_pending = true;
+                    }
+                }
+            }
+        }
+        if converts && within {
+            facts.history_through = true;
+            if refused.cut > birth_cut {
+                facts.staged_history = true;
+            }
+            match refused.corroborated_return {
+                Some(at) if at <= frontier => {
+                    facts.pending_bound = Some(facts.pending_bound.map_or(at, |kept| kept.max(at)));
+                }
+                _ => facts.refused_unready = true,
+            }
+        }
+    }
+
+    /// One paid identity visit: claim coverage for attribution and the
+    /// terminal wait, and the first invocation-claim validation failure
+    /// in identity order.
+    fn visit_seal_identity(
+        &self,
+        facts: &mut SealScanFacts,
+        key: JournalDomainKey,
+        identity: &CallIdentity,
+        slot: &IdentityFacts,
+        audit: &JournalAuditReceipt,
+    ) {
+        let claims = self
+            .claims
+            .get(identity)
+            .and_then(|claimants| claimants.get(&key));
+        let have = claims.map_or(0, VecDeque::len);
+        if slot.mine > 0 && (have as u64) < slot.mine {
+            if slot.mine > 1 {
+                facts.note_unmatched((!slot.evidence_perm).then_some(slot.evidence_max));
+            } else {
+                facts.claims_cover = false;
+            }
+        }
+        if slot.mine_open > 0 && have < slot.mine_open {
+            facts.terminal_uncovered = true;
+        }
+        if facts.validation.is_some() || slot.mine == 0 {
+            return;
+        }
+        // Two staged BEGINs sharing one entry-time identity are an
+        // ambiguity whatever their other words: one claim never covers
+        // both.
+        let Some(claim) = claims
+            .filter(|_| slot.total == 1 && have == 1)
+            .and_then(VecDeque::front)
+        else {
+            facts.validation = Some(ClaimValidation::Ambiguous(identity.image));
+            return;
+        };
+        // Only the loss-audited ordered prefix may make this physical
+        // return irreversible. Zero H0 watermarks exist solely in the
+        // explicitly scripted algorithm audit factory.
+        let covered = match audit.h3 {
+            H3DispositionEvidence::Clean {
+                staged_max,
+                pending_floor,
+            } => {
+                staged_max >= claim.admission
+                    && pending_floor.is_none_or(|floor| floor > claim.admission)
+                    && (audit.h0_below == 0 || claim.admission < audit.h0_below)
+            }
+            _ => false,
+        };
+        // The END corroborates the claim's full return-time fingerprint
+        // exactly; only the BEGIN side is enrichment-aware.
+        let end_mismatch = slot.candidate_end.is_some_and(|end| {
+            end.duration_ns == 0
+                || end.ts_ns.checked_sub(end.duration_ns) != Some(identity.entry_ns)
+                || end.ts_ns != claim.return_ns
+                || !fingerprint_matches_event(&claim.returned, &end)
+        });
+        if !covered || end_mismatch {
+            facts.validation = Some(ClaimValidation::H3Pending);
+        }
+    }
+
+    /// Pay `owed` units of a decided seal's own table work toward its
+    /// prepaid balance, one unit per row it will visit, resuming across
+    /// polls. True once fully paid.
+    fn prepay_seal_decision(&self, scan: &mut SealScan, owed: usize, budget: &mut usize) -> bool {
+        while scan.prepaid < owed {
+            if *budget == 0 {
+                return false;
+            }
+            *budget -= 1;
+            scan.prepaid += 1;
+            #[cfg(test)]
+            self.note_seal_scan_unit();
+        }
+        true
     }
 
     /// Clear pinned bootstrap cuts for one image's keys (reseed): a
@@ -9732,7 +10377,7 @@ impl JournalAdapter {
     pub(crate) fn clear_bootstraps_for_reseed(&mut self, cookie: u64, exec: u64) {
         if let Some(keys) = self.image_keys.get(&(cookie, exec)).cloned() {
             for key in keys {
-                if let Some(state) = self.keys.get_mut(&key) {
+                if let Some(state) = self.keys.edit().get_mut(&key) {
                     state.bootstraps.clear();
                 }
             }
@@ -9742,6 +10387,7 @@ impl JournalAdapter {
     /// Whether staged wire truth no bound key can account for sits at
     /// or below a frontier: an open begin or refused begin whose image
     /// was never attested. Such entries barrier every seal past them.
+    #[cfg(test)] // Synchronous oracle for the paid seal scan's differential tests.
     fn has_unbound_staging(&self, frontier: u64) -> bool {
         self.open.values().any(|entry| {
             #[cfg(test)]
@@ -9758,115 +10404,7 @@ impl JournalAdapter {
         })
     }
 
-    /// Whether every staged entry for one image at or below a frontier
-    /// is attributed under a sealing key: this key's entries, a
-    /// sibling's (left for their own seal), or solely dead claims. An
-    /// unclaimed shape or a live collision holds the seal while its claim
-    /// can still arrive; multiset claim counts must cover this key's
-    /// staged entries — including under a sole live key.
-    ///
-    /// A staged call no claim can ever name is `Unmatched`, never an
-    /// unbounded hold: a claim on its own entry-time identity that does
-    /// not name it (the identity is one invocation, and a second claim on
-    /// it taints), two staged calls sharing one entry-time identity with
-    /// too few claims (the missing one can never be filed without
-    /// tainting), or an END whose H0 position the audit shows disposed
-    /// with no claim filed for it.
-    fn attribution_readiness(
-        &self,
-        key: JournalDomainKey,
-        live: &[JournalDomainKey],
-        frontier: u64,
-        audit: &JournalAuditReceipt,
-    ) -> AttributionReadiness {
-        let image = (key.cookie, key.exec);
-        let mut needs: BTreeMap<CallIdentity, (u64, u64, bool)> = BTreeMap::new();
-        let mut pending = false;
-        let mut unmatched_perm = false;
-        let mut unmatched_max: Option<u64> = None;
-        let mut note_unmatched = |evidence: Option<u64>| match evidence {
-            None => unmatched_perm = true,
-            Some(at) => unmatched_max = Some(unmatched_max.map_or(at, |kept| kept.max(at))),
-        };
-        for (native, entry) in self.open.iter() {
-            if entry.image != image
-                || entry.converted_ticket.is_some()
-                || entry.begin_ordinal > frontier
-            {
-                continue;
-            }
-            let shape = shape_of_entry(entry);
-            match self.attribute_call(key, &shape, live) {
-                CallAttribution::Mine => {
-                    let slot = needs.entry(shape.identity).or_default();
-                    slot.0 += 1;
-                    match self.contradiction_evidence(*native) {
-                        None => slot.2 = true,
-                        Some(at) => slot.1 = slot.1.max(at),
-                    }
-                }
-                CallAttribution::Sibling => {}
-                CallAttribution::Unclaimed => {
-                    if self.identity_claimed(&shape.identity)
-                        || admission_disposed_unclaimed(entry, audit)
-                    {
-                        note_unmatched(self.contradiction_evidence(*native));
-                        continue;
-                    }
-                    pending = true;
-                }
-            }
-        }
-        for refused in &self.refused {
-            if refused.image != image || refused.cut > frontier {
-                continue;
-            }
-            let shape = refused.shape();
-            match self.attribute_call(key, &shape, live) {
-                CallAttribution::Mine => {
-                    let slot = needs.entry(shape.identity).or_default();
-                    slot.0 += 1;
-                    // Capacity artifacts carry no native key: a
-                    // multiset collision on one evidences unknown
-                    // effects, never voided history alone.
-                    slot.2 = true;
-                }
-                CallAttribution::Sibling => {}
-                CallAttribution::Unclaimed => {
-                    if self.identity_claimed(&shape.identity) {
-                        note_unmatched(None);
-                        continue;
-                    }
-                    pending = true;
-                }
-            }
-        }
-        let mut covered = true;
-        for (identity, (need, max, perm)) in needs {
-            let have = self
-                .claims
-                .get(&identity)
-                .and_then(|claimants| claimants.get(&key))
-                .map(|ordinals| ordinals.len() as u64)
-                .unwrap_or(0);
-            if have < need {
-                if need > 1 {
-                    note_unmatched((!perm).then_some(max));
-                    continue;
-                }
-                covered = false;
-            }
-        }
-        if unmatched_perm || unmatched_max.is_some() {
-            let evidence = if unmatched_perm { None } else { unmatched_max };
-            AttributionReadiness::Unmatched(evidence)
-        } else if pending || !covered {
-            AttributionReadiness::Pending
-        } else {
-            AttributionReadiness::Ready
-        }
-    }
-
+    #[cfg(test)] // Synchronous oracle for the paid seal scan's differential tests.
     fn awaits_future_terminal(
         &self,
         bootstrap: &BootstrapReceipt,
@@ -9945,20 +10483,6 @@ impl JournalAdapter {
             && self.attribute_call(key, &refused.shape(), live) == CallAttribution::Mine
     }
 
-    /// Whether one staged open entry's abandonment disposes under a
-    /// sealing key: converting here, or already converted for it. An
-    /// abandonment staged on an already-converted call refuses and
-    /// disposes exactly like one on a converting call — conversion
-    /// never outruns abandonment authority.
-    fn abandons_here(
-        &self,
-        key: JournalDomainKey,
-        live: &[JournalDomainKey],
-        entry: &OpenEntry,
-    ) -> bool {
-        self.converts_here(key, live, entry) || entry.converted_for == Some(key)
-    }
-
     /// The single per-call disposal rule for one staged unbounded
     /// abandonment (seal partition, batch and sliced preservation, scoped
     /// wipe). The function must be effect-free
@@ -9983,6 +10507,7 @@ impl JournalAdapter {
     /// key: every convertible-or-converted begin and refused cut sits
     /// strictly above it. A sibling key's staging belongs to its own
     /// birth, and other images are irrelevant to this one.
+    #[cfg(test)] // Synchronous oracle for the paid seal scan's differential tests.
     fn birth_covers_staged(
         &self,
         key: JournalDomainKey,
@@ -9991,41 +10516,13 @@ impl JournalAdapter {
         birth_cut: u64,
     ) -> bool {
         self.open.values().all(|entry| {
-            #[cfg(test)]
-            self.birth_cover_evals
-                .set(self.birth_cover_evals.get().saturating_add(1));
             entry.image != image
                 || entry.begin_ordinal > birth_cut
                 || !(self.converts_here(key, live, entry) || entry.converted_for == Some(key))
         }) && self.refused.iter().all(|refused| {
-            #[cfg(test)]
-            self.birth_cover_evals
-                .set(self.birth_cover_evals.get().saturating_add(1));
             refused.image != image
                 || refused.cut > birth_cut
                 || !self.refused_converts_here(key, live, refused)
-        })
-    }
-
-    /// Whether convertible wire truth for one key sits strictly above a
-    /// cut at or below a frontier: an open begin or a refused begin
-    /// this seal would cover. A fresh birth needs one; an advanced
-    /// frontier alone certifies nothing.
-    fn has_staged_history(
-        &self,
-        key: JournalDomainKey,
-        live: &[JournalDomainKey],
-        birth_cut: u64,
-        frontier: u64,
-    ) -> bool {
-        self.open.values().any(|entry| {
-            self.converts_here(key, live, entry)
-                && entry.begin_ordinal > birth_cut
-                && entry.begin_ordinal <= frontier
-        }) || self.refused.iter().any(|refused| {
-            self.refused_converts_here(key, live, refused)
-                && refused.cut > birth_cut
-                && refused.cut <= frontier
         })
     }
 
@@ -10042,8 +10539,8 @@ impl JournalAdapter {
         // table clears. The set is replaced, not accumulated: it stays
         // bounded by the open-table limit, and an admission older than
         // the latest void is classified cause-neutrally.
-        self.void_wiped.clear();
-        self.void_wiped.extend(
+        self.void_wiped.edit().clear();
+        self.void_wiped.edit().extend(
             self.open
                 .iter()
                 .map(|(native, entry)| (*native, entry.begin_ordinal)),
@@ -10077,12 +10574,12 @@ impl JournalAdapter {
         }
         self.clear_open();
         self.ledger.release_all_h8open();
-        self.refused.clear();
+        self.refused.edit().clear();
         self.retained_counts.clear();
         self.retained_census_drift = false;
-        self.claims.clear();
+        self.claims.edit().clear();
         self.claim_counts = 0;
-        for state in self.keys.values_mut() {
+        for state in self.keys.edit().values_mut() {
             state.bootstraps.clear();
         }
     }
@@ -10097,7 +10594,7 @@ impl JournalAdapter {
         bytes: usize,
         lease: crate::semantics_edge::resources::ResourceLease,
     ) -> ScopedRecovery {
-        self.void_wiped.clear();
+        self.void_wiped.edit().clear();
         ScopedRecovery {
             scope,
             stream: false,
@@ -10142,7 +10639,7 @@ impl JournalAdapter {
         bytes: usize,
         lease: crate::semantics_edge::resources::ResourceLease,
     ) -> ScopedRecovery {
-        self.void_wiped.clear();
+        self.void_wiped.edit().clear();
         ScopedRecovery {
             scope: ScopedWatchdogBreak::default(),
             stream: true,
@@ -10345,7 +10842,7 @@ impl JournalAdapter {
         );
         if stream {
             // The synchronous void rebuilt the wipe record at the void.
-            self.void_wiped.clear();
+            self.void_wiped.edit().clear();
         }
         let phase = match plan.mode {
             RecoveryMode::AuditVoid { .. } | RecoveryMode::RefuseAll | RecoveryMode::Break => {
@@ -10634,6 +11131,12 @@ impl JournalAdapter {
         self.seal_wait.get()
     }
 
+    /// Whether the last decided seal wait could only be grounded by a
+    /// future terminal, decided on the same paid scan as the wait.
+    pub(crate) fn last_seal_awaits_terminal(&self) -> bool {
+        self.seal_awaits_terminal.get()
+    }
+
     fn failure(&self, gap: JournalGap) -> SealFailure {
         SealFailure {
             take_failed: None,
@@ -10669,7 +11172,7 @@ impl JournalAdapter {
         let ticket =
             self.issue_doom_rejection(key, live, super::state::DomainRetirement::abandon(domain));
         let lived = self.key_is_live(key);
-        self.keys.get_mut(&key).expect("sealed key").refused = true;
+        self.keys.edit().get_mut(&key).expect("sealed key").refused = true;
         self.note_refused_mark(key, capable);
         self.claims_prune_dirty |= lived;
         let mut failure = SealFailure {
@@ -10694,84 +11197,14 @@ impl JournalAdapter {
         bootstrap: &BootstrapReceipt,
         frontier: u64,
         model_fence: Option<u64>,
-        audit: &JournalAuditReceipt,
         replay: Option<ReplayPreparation>,
+        disposable: &BTreeSet<JournalNativeKey>,
     ) -> Result<SealSuccess, SealFailure> {
-        let image = (key.cookie, key.exec);
-        let live = self.live_keys_for_image(image);
-        // Unbounded abandonment of this key's mutating calls staged
-        // at or below the frontier refuses this key permanently:
-        // invalidate its proof (reported), mark it, dispose its
-        // staged entries, and refuse the seal. Already-converted
-        // calls count: their abandonments refuse and dispose here,
-        // never prune silently. A sibling's abandonment belongs to
-        // its own seal; unclaimed shapes barriered before conversion.
-        //
-        // Effect-free abandonments whose observed return evidence is
-        // itself neutral dispose per-call instead
-        // ([`Self::abandonment_disposes_here`]): each names its own loss
-        // gap while the key keeps sealing its other calls. One other
-        // abandonment still dooms the whole key (fail closed). This pass
-        // only classifies: nothing is removed, released or consumed
-        // before invocation-claim validation below, and the disposal
-        // itself runs inside conversion, where the replay builder gives
-        // its effects and its exact call an original terminal step.
-        let mut dooming = false;
-        let mut capable = false;
-        let mut disposable: BTreeSet<JournalNativeKey> = BTreeSet::new();
-        for (native, entry) in &self.open {
-            let Some(staged) = entry.abandon.as_ref().filter(|staged| {
-                staged.ordinal <= frontier
-                    && abandon_disposition(staged.abandon.reason())
-                        == Some(AbandonDisposition::UnboundedInvalidation)
-            }) else {
-                continue;
-            };
-            if !self.abandons_here(key, &live, entry) || entry.begin_ordinal > frontier {
-                continue;
-            }
-            if self.abandonment_disposes_here(entry) {
-                disposable.insert(*native);
-            } else {
-                dooming = true;
-                // A doom grounded in any capable frame never mints
-                // past it; only an exit-grounded doom does.
-                capable |= !Self::abandon_proves_frame_dead(staged.abandon.reason());
-            }
-        }
-        if dooming {
-            self.note_seal_stage(SealStageGate::DomainTainted);
-            return Err(self.doom_key_for_abandonment(model, key, bootstrap, &live, capable));
-        }
-        // This key's bounded abandonments need their corroborating
-        // returns within the frontier; otherwise the bound is not ready
-        // and the seal waits. Already-converted calls wait here too,
-        // instead of tainting as a model surprise below.
-        let unready = self.open.values().any(|entry| {
-            self.abandons_here(key, &live, entry)
-                && entry.begin_ordinal <= frontier
-                && entry.abandon.is_some_and(|staged| {
-                    staged.ordinal <= frontier
-                        && staged.abandon.reason() == JOURNAL_REASON_SYNC_RETURN_RESULT_LOST
-                        && entry.corroborated_return.is_none_or(|at| at > frontier)
-                })
-        });
-        if unready {
-            self.note_seal_stage(SealStageGate::AbandonReturnPending);
-            return Err(self.wait(SealWait::AbandonReturnPending));
-        }
-        // Every refused begin of this key at or below the frontier needs
-        // its bound within the frontier; otherwise the seal waits.
-        let refused_unready = self.refused.iter().any(|refused| {
-            self.refused_converts_here(key, &live, refused)
-                && refused.cut <= frontier
-                && refused.corroborated_return.is_none_or(|at| at > frontier)
-        });
-        if refused_unready {
-            self.note_seal_stage(SealStageGate::RefusedReturnPending);
-            return Err(self.wait(SealWait::RefusedReturnPending));
-        }
-        self.validate_invocation_claims(key, &live, frontier, audit)?;
+        // Every structural rule (doom, return readiness, invocation
+        // claims) was decided on the seal's paid scan; effect-free
+        // abandonments it classified as disposable dispose inside
+        // conversion, where the replay builder gives their effects and
+        // their exact call an original terminal step.
         let outcome = self.convert_and_settle(
             model,
             key,
@@ -10779,7 +11212,7 @@ impl JournalAdapter {
             frontier,
             model_fence,
             replay,
-            &disposable,
+            disposable,
         );
         if let Err(failure) = &outcome {
             match failure.gap {
@@ -10798,103 +11231,11 @@ impl JournalAdapter {
         outcome
     }
 
-    fn validate_invocation_claims(
-        &mut self,
-        key: JournalDomainKey,
-        live: &[JournalDomainKey],
-        frontier: u64,
-        audit: &JournalAuditReceipt,
-    ) -> Result<(), SealFailure> {
-        let mut candidates: BTreeMap<CallIdentity, (usize, Option<p11scope_ebpf_common::Event>)> =
-            BTreeMap::new();
-        for entry in self.open.values() {
-            if entry.begin_ordinal <= frontier && self.converts_here(key, live, entry) {
-                let value = candidates
-                    .entry(identity_of_begin(&entry.begin))
-                    .or_default();
-                value.0 += 1;
-                value.1 = entry
-                    .end
-                    .filter(|end| end.ordinal <= frontier)
-                    .map(|end| end.end.payload_base().event);
-            }
-        }
-        for entry in &self.refused {
-            if entry.cut <= frontier && self.refused_converts_here(key, live, entry) {
-                candidates.entry(entry.identity()).or_default().0 += 1;
-            }
-        }
-        // One census pass over retained entries replaces the
-        // per-candidate recount: identical totals, O(retained) per
-        // seal instead of O(candidates x retained). Converted entries
-        // still count, exactly as the recount saw them.
-        let mut totals: BTreeMap<CallIdentity, usize> = BTreeMap::new();
-        for entry in self.open.values() {
-            #[cfg(test)]
-            {
-                self.test_seal_census_visits += 1;
-            }
-            *totals.entry(identity_of_begin(&entry.begin)).or_default() += 1;
-        }
-        for entry in &self.refused {
-            #[cfg(test)]
-            {
-                self.test_seal_census_visits += 1;
-            }
-            *totals.entry(entry.identity()).or_default() += 1;
-        }
-        for (identity, (_, end)) in candidates {
-            // Two staged BEGINs sharing one entry-time identity (same
-            // thread, same entry time) are an ambiguity whatever their
-            // other words: one claim never covers both.
-            let count = totals.get(&identity).copied().unwrap_or(0);
-            let claims = &self.claims[&identity][&key];
-            if count != 1 || claims.len() != 1 {
-                // Do not let pruning/void turn this ambiguity into a later
-                // singleton winner. Taint preserves every claim unconsumed.
-                self.taint_image(identity.image, TaintCause::ClaimAmbiguity);
-                self.note_seal_stage(SealStageGate::ImageTainted);
-                return Err(self.failure(JournalGap::ImageTainted));
-            }
-            let claim = claims.front().expect("one exact claim");
-            // Only the loss-audited ordered prefix may make this
-            // physical return irreversible. Zero H0 watermarks exist
-            // solely in the explicitly scripted algorithm audit factory.
-            let covered = match audit.h3 {
-                H3DispositionEvidence::Clean {
-                    staged_max,
-                    pending_floor,
-                } => {
-                    staged_max >= claim.admission
-                        && pending_floor.is_none_or(|floor| floor > claim.admission)
-                        && (audit.h0_below == 0 || claim.admission < audit.h0_below)
-                }
-                _ => false,
-            };
-            if !covered {
-                self.note_seal_stage(SealStageGate::H3Pending);
-                return Err(self.failure(JournalGap::H3Pending));
-            }
-            // The END corroborates the claim's full return-time
-            // fingerprint exactly; only the BEGIN side is enrichment-aware.
-            if let Some(end) = end
-                && (end.duration_ns == 0
-                    || end.ts_ns.checked_sub(end.duration_ns) != Some(identity.entry_ns)
-                    || end.ts_ns != claim.return_ns
-                    || !fingerprint_matches_event(&claim.returned, &end))
-            {
-                self.note_seal_stage(SealStageGate::H3Pending);
-                return Err(self.failure(JournalGap::H3Pending));
-            }
-        }
-        Ok(())
-    }
-
     /// Taint one key for a model surprise at the current consumption
     /// point, recording the death ordinal for incarnation fencing.
     fn surprise_taint_key(&mut self, key: JournalDomainKey) {
         let lived = self.key_is_live(key);
-        self.keys.get_mut(&key).expect("sealed key").tainted = true;
+        self.keys.edit().get_mut(&key).expect("sealed key").tainted = true;
         self.note_tainted_mark(key);
         self.claims_prune_dirty |= lived;
     }
@@ -10946,6 +11287,7 @@ impl JournalAdapter {
             });
         }
         self.keys
+            .edit()
             .get_mut(&key)
             .expect("sealed key")
             .model_registered = true;
@@ -10954,6 +11296,8 @@ impl JournalAdapter {
         // lost-outcome bound clears them once every refused begin is
         // corroborated. Conversion consumes one claim count per
         // refused begin; a sibling's refusals stay staged.
+        #[cfg(test)]
+        self.note_seal_apply_visits(self.refused.len());
         let mut refused_cuts: Vec<u64> = self
             .refused
             .iter()
@@ -10976,6 +11320,8 @@ impl JournalAdapter {
             }
         }
         if !refused_cuts.is_empty() {
+            #[cfg(test)]
+            self.note_seal_apply_visits(self.refused.len().saturating_mul(2));
             let upper = self
                 .refused
                 .iter()
@@ -11001,7 +11347,7 @@ impl JournalAdapter {
                     // The model fences this upper too; the adapter keeps
                     // the running maximum so the bootstrap rule stays
                     // sufficient on its own evidence.
-                    let retained = self.keys.get_mut(&key).expect("sealed key");
+                    let retained = self.keys.edit().get_mut(&key).expect("sealed key");
                     retained.bounded_upper =
                         Some(retained.bounded_upper.map_or(upper, |kept| kept.max(upper)));
                 }
@@ -11026,7 +11372,7 @@ impl JournalAdapter {
                     kept.push(*refused);
                 }
             }
-            self.refused = kept;
+            *self.refused.edit() = kept;
             for refused in &consumed {
                 self.retained_refused_dec(refused);
                 self.consume_claim(&refused.identity(), key);
@@ -11034,6 +11380,8 @@ impl JournalAdapter {
         }
         // This key's begins in cut order, then their terminals. A
         // sibling's begins stay staged for their own seal.
+        #[cfg(test)]
+        self.note_seal_apply_visits(self.open.len());
         let mut begins: Vec<(JournalNativeKey, u64)> = self
             .open
             .iter()
@@ -11095,14 +11443,13 @@ impl JournalAdapter {
                     debug_assert_eq!(popped, Some(claim));
                     let (session, mechanism) = sealed_fingerprint(&entry.begin);
                     self.retained_member_dec(identity, RetainedMember::Open(native));
-                    let entry = self.open.get_mut(&native).expect("staged begin");
+                    let mut entry = self.open.get_mut(&native).expect("staged begin");
                     // The claim leaves the store here: a negative return
                     // it carried stays with the original as disposal
                     // evidence (the flag only ever sets).
                     entry.negative_return |=
                         !super::state::return_leaves_no_lifecycle_effect(function, claim.rv);
                     entry.converted_ticket = Some(token);
-                    self.open_begins = self.open_begins.saturating_sub(1);
                     entry.converted_for = Some(key);
                     entry.call_key = Some(call_key);
                     // A per-call disposal settles nothing in the legacy
@@ -11145,6 +11492,8 @@ impl JournalAdapter {
         // already begin-ordered; search only that unchanged prefix, then append
         // older fresh terminals once. This avoids a scan per terminal.
         let converted_begins = settled.len();
+        #[cfg(test)]
+        self.note_seal_apply_visits(self.open.len());
         for (native, entry) in self
             .open
             .iter()
@@ -11191,6 +11540,8 @@ impl JournalAdapter {
         settled.sort_unstable_by_key(|summary| summary.begin_cut);
         let settled_len = settled.len();
         if let Some(replay) = &mut replay {
+            #[cfg(test)]
+            self.note_seal_apply_visits(self.open.len());
             let retained = self
                 .open
                 .values()
@@ -11228,6 +11579,8 @@ impl JournalAdapter {
         // Terminals for this key's converted begins: ends complete,
         // bounded abandonments dispose through the lost-outcome bound.
         // A sibling's converted terminals belong to its own seal.
+        #[cfg(test)]
+        self.note_seal_apply_visits(self.open.len());
         let mut terminals: Vec<(JournalNativeKey, u64)> = Vec::new();
         for (native, entry) in &self.open {
             if entry.converted_for != Some(key) {
@@ -11263,7 +11616,6 @@ impl JournalAdapter {
                     .get_mut(&native)
                     .expect("staged terminal")
                     .end_converted = true;
-                self.open_terminals = self.open_terminals.saturating_sub(1);
             }
             if let Some(staged) = entry.abandon
                 && staged.ordinal <= frontier
@@ -11294,7 +11646,7 @@ impl JournalAdapter {
                         start..effects.effects.len(),
                     );
                 }
-                let retained = self.keys.get_mut(&key).expect("sealed key");
+                let retained = self.keys.edit().get_mut(&key).expect("sealed key");
                 retained.bounded_upper =
                     Some(retained.bounded_upper.map_or(at, |kept| kept.max(at)));
             }
@@ -11340,6 +11692,8 @@ impl JournalAdapter {
         // terminal at or below the frontier. A per-seal list would omit
         // calls held across seals and contradict the settlement; a
         // sibling's opens belong to its own prefix.
+        #[cfg(test)]
+        self.note_seal_apply_visits(self.open.len());
         let open: Vec<CallKey> = self
             .open
             .values()
@@ -11403,7 +11757,11 @@ impl JournalAdapter {
         });
         if ended {
             let lived = self.key_is_live(key);
-            self.keys.get_mut(&key).expect("sealed key").era_ended = true;
+            self.keys
+                .edit()
+                .get_mut(&key)
+                .expect("sealed key")
+                .era_ended = true;
             self.note_ended_mark(key);
             self.claims_prune_dirty |= lived;
             return Err(SealFailure {
@@ -11436,11 +11794,20 @@ impl JournalAdapter {
             prefix.replay_index = Some(index);
         }
         debug_assert!(prefix.settled_len <= prefix.settled.len());
-        self.keys.get_mut(&key).expect("sealed key").sealed_through = frontier;
+        self.keys
+            .edit()
+            .get_mut(&key)
+            .expect("sealed key")
+            .sealed_through = frontier;
         if model.domain_completed(domain) {
-            self.keys.get_mut(&key).expect("sealed key").era_completed = true;
+            self.keys
+                .edit()
+                .get_mut(&key)
+                .expect("sealed key")
+                .era_completed = true;
         }
         self.keys
+            .edit()
             .get_mut(&key)
             .expect("sealed key")
             .bootstraps
@@ -11456,6 +11823,8 @@ impl JournalAdapter {
     /// pruned. A sibling key's staging is never pruned here; staged
     /// inputs above the watermark stay for the next seal.
     fn prune_settled(&mut self, key: JournalDomainKey, frontier: u64) {
+        #[cfg(test)]
+        self.note_seal_apply_visits(self.open.len());
         let earliest_open = self
             .open
             .values()
@@ -17976,7 +18345,7 @@ pub(crate) mod tests {
         );
         assert!(!(scene.adapter.invalidated || scene.adapter.stream_broken));
         assert_eq!(
-            scene.adapter.voided_through, lost_through,
+            *scene.adapter.voided_through, lost_through,
             "the fence is exactly the consumed history"
         );
 
@@ -18888,7 +19257,7 @@ pub(crate) mod tests {
         );
         // The overflow latches; unrecorded newcomers still count as
         // tainted and refuse, while tracked images keep working.
-        assert!(scene.adapter.taint_overflow);
+        assert!(*scene.adapter.taint_overflow);
         assert!(scene.adapter.is_tainted((1050, EXEC)));
         assert!(!scene.adapter.is_tainted((COOKIE, EXEC)));
         assert!(!scene.adapter.is_tainted((1000, EXEC)));
@@ -21001,8 +21370,13 @@ pub(crate) mod tests {
                                     && !scene.adapter.is_tainted((COOKIE, EXEC))
                                     && let Some(key) = scene.adapter.keys.keys().next().copied()
                                 {
-                                    scene.adapter.keys.get_mut(&key).expect("key held").refused =
-                                        true;
+                                    scene
+                                        .adapter
+                                        .keys
+                                        .edit()
+                                        .get_mut(&key)
+                                        .expect("key held")
+                                        .refused = true;
                                     let admitted = keepup_admit_fresh(&mut scene, fresh_thread);
                                     fresh_thread += 1;
                                     scene
@@ -21309,7 +21683,13 @@ pub(crate) mod tests {
         assert_eq!(scene.adapter.claim_counts, 8);
         assert!(!scene.adapter.claims_prune_dirty);
         let key = *scene.adapter.keys.keys().next().expect("one key");
-        scene.adapter.keys.get_mut(&key).expect("key held").refused = true;
+        scene
+            .adapter
+            .keys
+            .edit()
+            .get_mut(&key)
+            .expect("key held")
+            .refused = true;
         assert!(!scene.adapter.claims_prune_dirty);
         // Make room and push for the dead key: rule (b) announces it.
         let (fp, _) = scene
@@ -21469,8 +21849,9 @@ pub(crate) mod tests {
     #[test]
     fn joint_keepup_seal_validation_census_is_linear_in_retained() {
         // The live-feed seal attributes every converting call: with a
-        // full open table the attribution census must visit each
-        // retained entry once, not once per candidate.
+        // full open table the paid seal scan visits each retained entry
+        // and each identity once, not once per candidate, and its
+        // prepaid conversion is linear in the table.
         use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
         const OPENS: usize = 1_024;
         let mut scene = Scene::new(image_default());
@@ -21485,12 +21866,20 @@ pub(crate) mod tests {
         assert_eq!(scene.adapter.claim_counts, OPENS);
         let bootstrap = scene.bootstrap(proof, 0);
         scene.adapter.reset_test_claim_costs_for_test();
+        let bound = scene.adapter.seal_charge_bound_for_test((COOKIE, EXEC));
+        let visits = scene.adapter.barrier_row_visits_for_test();
+        let units = scene.adapter.seal_scan_units_for_test();
         let success = scene.seal(&bootstrap).expect("full table seals");
         assert_eq!(success.prefix.settled().len(), OPENS);
         assert_eq!(
-            scene.adapter.test_seal_census_visits_for_test(),
+            scene.adapter.barrier_row_visits_for_test() - visits,
             OPENS,
-            "one census visit per retained entry, not per candidate"
+            "one scan visit per retained entry, not per candidate"
+        );
+        let units = scene.adapter.seal_scan_units_for_test() - units;
+        assert!(
+            units >= 2 * OPENS && units <= bound,
+            "rows + identities + linear prepay: {units} within {bound}"
         );
     }
 
@@ -24616,6 +25005,7 @@ pub(crate) mod tests {
             .owner
             .adapter_mut()
             .keys
+            .edit()
             .get_mut(&proof.key)
             .expect("attested key")
             .model_registered = true;
@@ -24664,6 +25054,7 @@ pub(crate) mod tests {
             .owner
             .adapter_mut()
             .keys
+            .edit()
             .get_mut(&proof.key)
             .expect("attested key")
             .model_registered = true;
@@ -24705,6 +25096,7 @@ pub(crate) mod tests {
             .owner
             .adapter_mut()
             .keys
+            .edit()
             .get_mut(&proof.key)
             .expect("attested key")
             .model_registered = true;
@@ -24781,6 +25173,7 @@ pub(crate) mod tests {
             .owner
             .adapter_mut()
             .keys
+            .edit()
             .get_mut(&proof.key)
             .expect("attested key")
             .model_registered = true;
@@ -24856,6 +25249,7 @@ pub(crate) mod tests {
             .owner
             .adapter_mut()
             .keys
+            .edit()
             .get_mut(&proof.key)
             .expect("attested key")
             .model_registered = true;
@@ -24937,6 +25331,7 @@ pub(crate) mod tests {
             .owner
             .adapter_mut()
             .keys
+            .edit()
             .get_mut(&proof.key)
             .expect("attested key")
             .model_registered = true;
@@ -25019,6 +25414,7 @@ pub(crate) mod tests {
             .owner
             .adapter_mut()
             .keys
+            .edit()
             .get_mut(&proof.key)
             .expect("attested key")
             .model_registered = true;
@@ -25058,6 +25454,7 @@ pub(crate) mod tests {
             let claim = keepup_claim_for_begin(&staged, staged.session_word());
             adapter
                 .claims
+                .edit()
                 .entry(identity_of_begin(&staged))
                 .or_default()
                 .entry(key)
@@ -25130,6 +25527,7 @@ pub(crate) mod tests {
             .owner
             .adapter_mut()
             .keys
+            .edit()
             .get_mut(&proof.key)
             .expect("attested key")
             .model_registered = true;
@@ -26206,6 +26604,7 @@ pub(crate) mod tests {
             scene
                 .adapter
                 .claims
+                .edit()
                 .entry(identity_of_begin(&staged))
                 .or_default()
                 .entry(sibling)
@@ -26347,6 +26746,7 @@ pub(crate) mod tests {
             scene
                 .adapter
                 .claims
+                .edit()
                 .entry(refused.identity())
                 .or_default()
                 .entry(sibling)
@@ -29641,11 +30041,11 @@ pub(crate) mod tests {
             let (begin, end) = producer_agreement_pair("C_SignInit", |_, _| {});
             assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
             assert_eq!(scene.ingest(&end), JournalDisposition::EndStaged);
+            let staged = *scene.adapter.open.keys().next().expect("staged");
             scene
                 .adapter
                 .open
-                .values_mut()
-                .next()
+                .get_mut(&staged)
                 .expect("staged")
                 .collected_origin = origin.map(CollectedCallOrigin::scripted);
             let staged_max = scene.fixture.next_token.max(h0_below.saturating_sub(1));
@@ -32231,6 +32631,7 @@ pub(crate) mod tests {
         scene
             .adapter
             .keys
+            .edit()
             .get_mut(&proof.key)
             .expect("key held")
             .refused = true;
@@ -33218,5 +33619,461 @@ pub(crate) mod tests {
                 .expect_err("moved native truth refuses the seal");
             assert_eq!(failure.gap, JournalGap::BootstrapMismatch);
         }
+    }
+
+    // ---- Paid, versioned production-seal scan ----
+
+    /// One scene staged for a production seal: `calls` healthy create
+    /// calls on distinct threads, their claims prepared and the
+    /// collection audited once.
+    fn metered_seal_scene(calls: usize) -> (Scene, BootstrapReceipt, JournalAuditReceipt) {
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+        let mut scene = Scene::new(image_default());
+        let create = function_id("C_CreateObject");
+        for thread in 1..=calls as u64 {
+            let begin = begin_bytes(thread, 1, create, 0);
+            assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+            let end = end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50);
+            assert_eq!(scene.ingest(&end), JournalDisposition::EndStaged);
+        }
+        let proof = scene.attest_calls(calls);
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.install_observed_closure();
+        scene.prepare_claims();
+        let audit = scene.audit();
+        let cell = ScriptedFaultCell::steady(audit.fault_after);
+        scene
+            .adapter
+            .audit_collected(&mut scene.model, &audit, &cell)
+            .expect("clean collection audits");
+        (scene, bootstrap, audit)
+    }
+
+    /// One bounded production seal poll on a held scan.
+    fn metered_seal_poll(
+        scene: &mut Scene,
+        audit: &JournalAuditReceipt,
+        bootstrap: &BootstrapReceipt,
+        barrier: &mut SealBarrierState,
+        budget: &mut usize,
+    ) -> SealAttempt {
+        scene.adapter.seal_wait.set(SealWait::None);
+        scene.adapter.seal_awaits_terminal.set(false);
+        let frontier = scene.adapter.consumed_frontier();
+        let mut births =
+            ScriptedBirthSource::once(SessionBirthEvidence::scripted_for_receipt(bootstrap));
+        scene.adapter.seal_domain_inner(
+            &mut scene.model,
+            audit,
+            bootstrap,
+            frontier,
+            &mut births,
+            None,
+            barrier,
+            budget,
+        )
+    }
+
+    /// One direct scan step under the scene's key and frontier.
+    fn metered_scan(
+        scene: &Scene,
+        audit: &JournalAuditReceipt,
+        bootstrap: &BootstrapReceipt,
+        state: &mut SealBarrierState,
+        budget: usize,
+    ) -> (BarrierCheck, usize) {
+        let before = scene.adapter.barrier_row_visits_for_test();
+        let mut budget = budget;
+        let check = scene.adapter.scan_seal_inputs(
+            state,
+            scene.adapter.consumed_frontier().0,
+            &mut budget,
+            bootstrap.proof().key,
+            bootstrap.birth_cut(),
+            audit,
+            SealScanMode::Seal,
+        );
+        (check, scene.adapter.barrier_row_visits_for_test() - before)
+    }
+
+    /// Finding 1: a one-credit conversion on a table past one slice pays
+    /// every row, identity and prepaid application unit one per poll;
+    /// the deciding poll visits no row and debits no scan unit, and the
+    /// application's own row visits never exceed what was prepaid. The
+    /// poll bound comes from the charge model.
+    #[test]
+    fn seal_metered_one_credit_conversion_prepays_its_apply() {
+        let (mut scene, bootstrap, audit) = metered_seal_scene(101);
+        let image = (COOKIE, EXEC);
+        let rows = scene.adapter.open.len() + scene.adapter.refused.len();
+        assert!(rows > SCOPED_RECOVERY_SLICE, "past one slice: {rows}");
+        let bound = scene.adapter.seal_charge_bound_for_test(image);
+        let mut barrier = SealBarrierState::default();
+        let units0 = scene.adapter.seal_scan_units_for_test();
+        let mut polls = 0usize;
+        let outcome = loop {
+            assert!(
+                polls < bound,
+                "decides within the charge-model bound {bound}"
+            );
+            let visits = scene.adapter.barrier_row_visits_for_test();
+            let units = scene.adapter.seal_scan_units_for_test();
+            let applied = scene.adapter.seal_apply_visits_for_test();
+            let mut budget = 1;
+            let attempt =
+                metered_seal_poll(&mut scene, &audit, &bootstrap, &mut barrier, &mut budget);
+            polls += 1;
+            let visits = scene.adapter.barrier_row_visits_for_test() - visits;
+            let units = scene.adapter.seal_scan_units_for_test() - units;
+            match attempt {
+                SealAttempt::Yielded => {
+                    assert_eq!(units, 1, "poll {polls}: one unit per yielded poll");
+                    assert!(visits <= 1, "poll {polls}: at most one row");
+                    assert_eq!(budget, 0, "poll {polls}: the slice is spent");
+                    assert_eq!(
+                        scene.adapter.seal_apply_visits_for_test(),
+                        applied,
+                        "poll {polls}: nothing applies before the decision"
+                    );
+                }
+                SealAttempt::Decided(outcome) => {
+                    assert_eq!(visits, 0, "the deciding poll visits no row");
+                    assert_eq!(units, 0, "the deciding poll debits no scan unit");
+                    let apply = scene.adapter.seal_apply_visits_for_test() - applied;
+                    let prepaid = barrier.progress_for_test().expect("held scan").prepaid;
+                    assert!(apply > 0, "conversion visits its tables");
+                    assert!(
+                        apply <= prepaid,
+                        "application visits {apply} are covered by the prepay {prepaid}"
+                    );
+                    break outcome;
+                }
+            }
+        };
+        let success = outcome.expect("the metered conversion seals");
+        assert_eq!(success.prefix.settled().len(), rows);
+        let progress = barrier.progress_for_test().expect("held scan");
+        assert_eq!(
+            scene.adapter.seal_scan_units_for_test() - units0,
+            rows + progress.identities + progress.prepaid,
+            "rows + identities + prepay, each paid once"
+        );
+        assert!(
+            polls > SCOPED_RECOVERY_SLICE,
+            "one unit per poll across the table"
+        );
+        assert_eq!(
+            scene.adapter.open.counts(),
+            scene.adapter.open.recount_for_test()
+        );
+    }
+
+    /// Twin: the same conversion with one unbounded poll decides at once
+    /// and pays the same units (the meter is the cost, not a pacing
+    /// artefact).
+    #[test]
+    fn seal_metered_unbounded_poll_pays_the_same_units() {
+        let (mut scene, bootstrap, audit) = metered_seal_scene(101);
+        let mut barrier = SealBarrierState::default();
+        let rows = scene.adapter.open.len() + scene.adapter.refused.len();
+        let units0 = scene.adapter.seal_scan_units_for_test();
+        let mut budget = usize::MAX;
+        let SealAttempt::Decided(outcome) =
+            metered_seal_poll(&mut scene, &audit, &bootstrap, &mut barrier, &mut budget)
+        else {
+            panic!("an unbounded poll decides");
+        };
+        outcome.expect("seals");
+        let progress = barrier.progress_for_test().expect("held scan");
+        assert_eq!(
+            scene.adapter.seal_scan_units_for_test() - units0,
+            rows + progress.identities + progress.prepaid
+        );
+        assert_eq!(
+            usize::MAX - budget,
+            rows + progress.identities + progress.prepaid
+        );
+    }
+
+    /// Finding 2, class twin: a no-op edit of each tracked seal input
+    /// drops both a partial and a completed scan (full rescan), while
+    /// the untouched control resumes (partial) or answers with zero
+    /// visits (completed). One row per tracked input.
+    #[test]
+    fn seal_scan_drops_on_every_tracked_input_edit() {
+        type Edit = fn(&mut JournalAdapter);
+        let edits: [(&str, Edit); 12] = [
+            ("none", |_| {}),
+            ("open", |a| {
+                let k = *a.open.keys().next().unwrap();
+                drop(a.open.get_mut(&k));
+            }),
+            ("refused", |a| {
+                a.refused.edit();
+            }),
+            ("image_keys", |a| {
+                a.image_keys.edit();
+            }),
+            ("claims", |a| {
+                a.claims.edit();
+            }),
+            ("keys", |a| {
+                a.keys.edit();
+            }),
+            ("tainted_images", |a| {
+                a.tainted_images.edit();
+            }),
+            ("taint_evidence", |a| {
+                a.taint_evidence.edit();
+            }),
+            ("taint_overflow", |a| {
+                a.taint_overflow.edit();
+            }),
+            ("sightings", |a| {
+                a.sightings.edit();
+            }),
+            ("voided_through", |a| {
+                a.voided_through.edit();
+            }),
+            ("void_wiped", |a| {
+                a.void_wiped.edit();
+            }),
+        ];
+        for (name, edit) in edits {
+            // Partial scan.
+            let (mut scene, bootstrap, audit) = metered_seal_scene(101);
+            let rows = scene.adapter.open.len() + scene.adapter.refused.len();
+            let mut state = SealBarrierState::default();
+            let (check, visits) = metered_scan(&scene, &audit, &bootstrap, &mut state, 3);
+            assert_eq!((check, visits), (BarrierCheck::Yielded, 3), "{name}");
+            edit(&mut scene.adapter);
+            let (check, visits) = metered_scan(&scene, &audit, &bootstrap, &mut state, usize::MAX);
+            assert_eq!(check, BarrierCheck::Clear, "{name}");
+            let want = if name == "none" { rows - 3 } else { rows };
+            assert_eq!(visits, want, "{name}: partial scan after the edit");
+            // Completed scan.
+            edit(&mut scene.adapter);
+            let (check, visits) = metered_scan(&scene, &audit, &bootstrap, &mut state, usize::MAX);
+            assert_eq!(check, BarrierCheck::Clear, "{name}");
+            let want = if name == "none" { 0 } else { rows };
+            assert_eq!(visits, want, "{name}: completed scan after the edit");
+        }
+    }
+
+    /// Finding 2, semantic twin: a latched barrier drops when the
+    /// barring image gains its key (the cached Barrier would hold the
+    /// seal forever).
+    #[test]
+    fn seal_scan_barrier_drops_when_the_image_gains_a_key() {
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        let strange_image = ImageIdentity {
+            task_cookie: COOKIE + 9,
+            exec_id: EXEC,
+        };
+        let strange = begin_bytes_image(2, 1, create, 0, (COOKIE + 9, EXEC));
+        scene.ingest(&strange);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.prepare_claims();
+        let audit = scene.audit();
+        let mut state = SealBarrierState::default();
+        let (check, _) = metered_scan(&scene, &audit, &bootstrap, &mut state, usize::MAX);
+        assert_eq!(check, BarrierCheck::Barrier);
+        let (check, visits) = metered_scan(&scene, &audit, &bootstrap, &mut state, usize::MAX);
+        assert_eq!(
+            (check, visits),
+            (BarrierCheck::Barrier, 0),
+            "the latch answers retries"
+        );
+        let mut other = AttestationFixture::new(strange_image);
+        scene
+            .adapter
+            .attest_key(&other.admit())
+            .expect("the barring image attests");
+        let (check, visits) = metered_scan(&scene, &audit, &bootstrap, &mut state, usize::MAX);
+        assert_ne!(check, BarrierCheck::Barrier, "a bound image no longer bars");
+        assert!(visits > 0, "the stale latch was rescanned");
+    }
+
+    /// Finding 2, semantic twin: a completed Clear rescans after a new
+    /// claim of the same cardinality class arrives (the attribution it
+    /// decided on changed).
+    #[test]
+    fn seal_scan_clear_rescans_after_a_claim_arrives() {
+        let (mut scene, bootstrap, audit) = metered_seal_scene(1);
+        let rows = scene.adapter.open.len() + scene.adapter.refused.len();
+        let mut state = SealBarrierState::default();
+        let (check, _) = metered_scan(&scene, &audit, &bootstrap, &mut state, usize::MAX);
+        assert_eq!(check, BarrierCheck::Clear);
+        let (_, visits) = metered_scan(&scene, &audit, &bootstrap, &mut state, usize::MAX);
+        assert_eq!(visits, 0, "an unchanged completed scan is reused");
+        scene.attest();
+        scene.prepare_claims();
+        let (_, visits) = metered_scan(&scene, &audit, &bootstrap, &mut state, usize::MAX);
+        assert_eq!(visits, rows, "a claim arrival rescans every row");
+    }
+
+    /// Finding 2, semantic twin: a completed scan rescans when its key's
+    /// liveness changes (a refused key attributes nothing).
+    #[test]
+    fn seal_scan_rescans_when_key_liveness_changes() {
+        let (mut scene, bootstrap, audit) = metered_seal_scene(1);
+        let rows = scene.adapter.open.len() + scene.adapter.refused.len();
+        let mut state = SealBarrierState::default();
+        metered_scan(&scene, &audit, &bootstrap, &mut state, usize::MAX);
+        let key = bootstrap.proof().key;
+        scene.adapter.keys.edit().get_mut(&key).unwrap().refused = true;
+        let (_, visits) = metered_scan(&scene, &audit, &bootstrap, &mut state, usize::MAX);
+        assert_eq!(visits, rows, "a liveness change rescans");
+    }
+
+    /// The indexed liveness lookup equals membership in the image's
+    /// live key list, for every key and image, before and after keys
+    /// stop.
+    #[test]
+    fn seal_live_for_image_matches_live_key_list() {
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let other_image = ImageIdentity {
+            task_cookie: COOKIE + 1,
+            exec_id: EXEC,
+        };
+        let mut other = AttestationFixture::new(other_image);
+        scene.adapter.attest_key(&other.admit()).expect("attests");
+        let check = |adapter: &JournalAdapter| {
+            let images: Vec<(u64, u64)> = adapter.image_keys.keys().copied().collect();
+            for image in images.iter().copied().chain([(COOKIE + 7, EXEC)]) {
+                let live = adapter.live_keys_for_image(image);
+                for key in adapter.keys.keys() {
+                    assert_eq!(
+                        adapter.live_for_image(image, key),
+                        live.contains(key),
+                        "{image:?} {key:?}"
+                    );
+                }
+            }
+        };
+        check(&scene.adapter);
+        scene
+            .adapter
+            .keys
+            .edit()
+            .get_mut(&proof.key)
+            .unwrap()
+            .refused = true;
+        check(&scene.adapter);
+    }
+
+    /// The maintained open-table counts equal a recount after every
+    /// mutation class: begin, end, abandon, synthetic rows, conversion,
+    /// removal and clear.
+    #[test]
+    fn seal_open_counts_match_recount_at_every_mutation() {
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_ENTRY_COLLISION;
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+        let same = |scene: &Scene, at: &str| {
+            assert_eq!(
+                scene.adapter.open.counts(),
+                scene.adapter.open.recount_for_test(),
+                "{at}"
+            );
+        };
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        same(&scene, "begin");
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        same(&scene, "end");
+        let doomed = begin_bytes(2, 1, create, 0);
+        scene.ingest(&doomed);
+        scene.ingest(&abandon_bytes(
+            2,
+            1,
+            JOURNAL_REASON_ENTRY_COLLISION,
+            (COOKIE, EXEC),
+        ));
+        same(&scene, "abandon");
+        scene.adapter.populate_foreign_open_rows_for_test(5);
+        same(&scene, "synthetic");
+        let bootstrap = scene.bootstrap(proof, 0);
+        let _ = scene.seal(&bootstrap);
+        same(&scene, "seal");
+        let k = *scene.adapter.open.keys().next().unwrap();
+        scene.adapter.open.remove(&k);
+        same(&scene, "remove");
+        scene.adapter.open.clear();
+        same(&scene, "clear");
+        assert_eq!(
+            scene.adapter.open.counts(),
+            seal_inputs::OpenCounts::default()
+        );
+    }
+
+    /// The disposed-frame terminal check is metered: one unit per poll
+    /// on a table past one slice, resuming, then answering with zero
+    /// visits once finished.
+    #[test]
+    fn seal_awaits_only_scan_is_metered() {
+        let (scene, bootstrap, audit) = metered_seal_scene(101);
+        let rows = scene.adapter.open.len() + scene.adapter.refused.len();
+        let frontier = scene.adapter.consumed_frontier();
+        let mut state = SealBarrierState::default();
+        let units0 = scene.adapter.seal_scan_units_for_test();
+        let mut polls = 0usize;
+        let bound = scene.adapter.seal_charge_bound_for_test((COOKIE, EXEC));
+        loop {
+            assert!(polls < bound, "finishes within the charge-model bound");
+            let units = scene.adapter.seal_scan_units_for_test();
+            let mut budget = 1;
+            let answer = scene.adapter.awaits_future_terminal_bounded(
+                &mut state,
+                &bootstrap,
+                frontier,
+                &audit,
+                &mut budget,
+            );
+            polls += 1;
+            let spent = scene.adapter.seal_scan_units_for_test() - units;
+            match answer {
+                None => assert_eq!((spent, budget), (1, 0), "poll {polls}"),
+                Some(_) => {
+                    assert!(spent <= 1, "the finishing poll pays at most its unit");
+                    break;
+                }
+            }
+        }
+        let progress = state.progress_for_test().expect("held scan");
+        assert!(progress.done);
+        assert_eq!(
+            scene.adapter.seal_scan_units_for_test() - units0,
+            rows + progress.identities
+        );
+        let before = scene.adapter.seal_scan_units_for_test();
+        let mut budget = 1;
+        assert!(
+            scene
+                .adapter
+                .awaits_future_terminal_bounded(
+                    &mut state,
+                    &bootstrap,
+                    frontier,
+                    &audit,
+                    &mut budget
+                )
+                .is_some()
+        );
+        assert_eq!(
+            scene.adapter.seal_scan_units_for_test(),
+            before,
+            "cached answer"
+        );
+        assert_eq!(budget, 1);
     }
 }

@@ -507,7 +507,7 @@ impl<'a> JournalLeaves<'a> {
     fn refuse_key(&mut self, key: JournalDomainKey, capable: bool) -> Option<DomainRetirement> {
         let lived = self.adapter.key_is_live(key);
         let (era, registered) = {
-            let state = self.adapter.keys.get_mut(&key).expect("refused key");
+            let state = self.adapter.keys.edit().get_mut(&key).expect("refused key");
             state.refused = true;
             (state.era, state.model_registered)
         };
@@ -548,7 +548,7 @@ impl<'a> JournalLeaves<'a> {
                 (entry.image, entry.function, entry.begin_ordinal);
             self.adapter.note_derived_absence(image, native, function);
             self.drop_open(native);
-            self.adapter.void_wiped.insert(native, begin_ordinal);
+            self.adapter.void_wiped.edit().insert(native, begin_ordinal);
         }
         Some(native)
     }
@@ -588,7 +588,7 @@ impl<'a> JournalLeaves<'a> {
             self.adapter.retained_refused_dec(&refused);
         } else {
             if *write != read {
-                self.adapter.refused[*write] = refused;
+                self.adapter.refused.edit()[*write] = refused;
             }
             *write += 1;
         }
@@ -596,13 +596,13 @@ impl<'a> JournalLeaves<'a> {
 
     /// Drop the compacted tail (a bulk free).
     pub(in crate::semantics_objects) fn truncate_refused(&mut self, write: usize) {
-        self.adapter.refused.truncate(write);
+        self.adapter.refused.edit().truncate(write);
     }
 
     /// Drop every claim and the retained census (bulk frees, stream
     /// recoveries only).
     pub(in crate::semantics_objects) fn clear_claims_and_census(&mut self) {
-        self.adapter.claims.clear();
+        self.adapter.claims.edit().clear();
         self.adapter.claim_counts = 0;
         self.adapter.retained_counts.clear();
     }
@@ -616,7 +616,7 @@ impl<'a> JournalLeaves<'a> {
         _paid: Paid,
     ) -> Option<DomainRetirement> {
         self.visit();
-        let state = self.adapter.keys.get_mut(&key)?;
+        let state = self.adapter.keys.edit().get_mut(&key)?;
         state.void_fence = state.void_fence.max(upper);
         if !state.model_registered {
             return None;
@@ -646,7 +646,7 @@ impl<'a> JournalLeaves<'a> {
         self.visit();
         if mode == RecoveryMode::RefuseAll {
             let lived = self.adapter.key_is_live(key);
-            let state = self.adapter.keys.get_mut(&key).expect("refused key");
+            let state = self.adapter.keys.edit().get_mut(&key).expect("refused key");
             state.bootstraps.clear();
             let scope = JournalDomainProof {
                 key,
@@ -671,7 +671,7 @@ impl<'a> JournalLeaves<'a> {
                 count_unregistered: false,
             });
         }
-        let state = self.adapter.keys.get_mut(&key).expect("fenced key");
+        let state = self.adapter.keys.edit().get_mut(&key).expect("fenced key");
         state.void_fence = state.void_fence.max(upper);
         let pending_unregistered = state.bootstraps.is_empty() && !state.model_registered;
         state.bootstraps.clear();
@@ -752,7 +752,10 @@ impl<'a> JournalLeaves<'a> {
             self.adapter
                 .note_derived_absence(entry.image, native, entry.function);
         }
-        self.adapter.void_wiped.insert(native, entry.begin_ordinal);
+        self.adapter
+            .void_wiped
+            .edit()
+            .insert(native, entry.begin_ordinal);
     }
 
     // ---- Stop and scope ------------------------------------------------
@@ -812,6 +815,7 @@ impl<'a> JournalLeaves<'a> {
         let lived = self.adapter.key_is_live(key);
         self.adapter
             .keys
+            .edit()
             .get_mut(&key)
             .expect("stopped key")
             .refused = true;
@@ -824,7 +828,7 @@ impl<'a> JournalLeaves<'a> {
     pub(in crate::semantics_objects) fn stop_clear(&mut self, _paid: Paid) {
         self.adapter.clear_open();
         self.adapter.ledger.release_all_h8open();
-        self.adapter.refused.clear();
+        self.adapter.refused.edit().clear();
         self.adapter.retained_counts.clear();
         self.adapter.retained_census_drift = false;
     }
@@ -843,7 +847,8 @@ impl<'a> JournalLeaves<'a> {
                 self.adapter.retained_census_drift = false;
                 if stream {
                     self.adapter.invalidated = true;
-                    self.adapter.voided_through = self.adapter.voided_through.max(upper);
+                    let fenced = (*self.adapter.voided_through).max(upper);
+                    *self.adapter.voided_through.edit() = fenced;
                 }
             }
             RecoveryMode::AuditVoid { .. } | RecoveryMode::RefuseAll => {
@@ -900,7 +905,7 @@ impl<'a> JournalLeaves<'a> {
             return Some(refused.shape());
         }
         if *write != read {
-            self.adapter.refused[*write] = refused;
+            self.adapter.refused.edit()[*write] = refused;
         }
         *write += 1;
         None
@@ -996,7 +1001,7 @@ impl<'a> JournalLeaves<'a> {
             .and_then(|claimants| claimants.keys().next().copied());
         let Some(claimant) = first else {
             // Every queue dropped: the emptied identity leaves (O(1)).
-            self.adapter.claims.remove(&identity);
+            self.adapter.claims.edit().remove(&identity);
             return ClaimsStep::Visited(identity);
         };
         let Some(_unit) = credit.pay() else {
@@ -1006,6 +1011,7 @@ impl<'a> JournalLeaves<'a> {
         let queue = self
             .adapter
             .claims
+            .edit()
             .get_mut(&identity)
             .and_then(|claimants| claimants.remove(&claimant))
             .expect("visited claimant");

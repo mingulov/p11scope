@@ -1129,6 +1129,16 @@ pub struct Engine {
     /// bookkeeping only; the downstream getter-read counter stays
     /// independent.
     getter_prefault_refused_ranges: u64,
+    /// Cumulative warmup ranges abandoned when the pass could not open
+    /// target memory: proven and still-pending ranges alike, counted
+    /// beside the deduped named gap. Best-effort bookkeeping only.
+    getter_prefault_mem_unopenable_ranges: u64,
+    /// Cumulative warmup ranges ended by a short target read, counted
+    /// beside the deduped named gap. Best-effort bookkeeping only.
+    getter_prefault_short_read_ranges: u64,
+    /// Cumulative warmup ranges ended by a target read error, counted
+    /// beside the deduped named gap. Best-effort bookkeeping only.
+    getter_prefault_failed_read_ranges: u64,
     /// Test-only scripted warmup proof and per-pass caps. Production has
     /// no seam: proof always comes from the pinned identity owner and
     /// the target's `map_files` entries.
@@ -14198,9 +14208,16 @@ struct GetterPrefaultTestSeam {
     /// Ranges whose `read_at` fails with a simulated I/O error (the
     /// attempt still spends its read credit and is recorded).
     fail_reads: BTreeSet<(u64, u64)>,
+    /// Ranges whose `read_at` returns a simulated short read (`len - 1`
+    /// bytes): the attempt spends its read credit, records `ok` and ends
+    /// its range through the same result path as a production short read.
+    short_reads: BTreeSet<(u64, u64)>,
     /// Every read attempt in order: `(addr, len, ok)`. Recorded for
     /// real and simulated reads alike; production has no seam.
     record_attempts: RefCell<Vec<(u64, usize, bool)>>,
+    /// Attempted proof steps so far: held lookups, batch stats and
+    /// read-time re-proofs alike, scripted or live, successes and errors.
+    proof_attempts: Cell<u64>,
     /// Per-pass overrides; `None` keeps the production constant.
     reads_per_pass: Option<usize>,
     proofs_per_pass: Option<usize>,
@@ -14208,6 +14225,33 @@ struct GetterPrefaultTestSeam {
     /// reports a stop after this many more loop checks (and stays
     /// tripped). Counts loop checks only, never the maps snapshot's.
     loop_checks_until_trip: Cell<Option<u32>>,
+    /// Deterministic custody-loss interleaving: the first `after`
+    /// read-time re-proofs read their scripted verdicts normally, every
+    /// later re-proof returns `to` instead (simulating a remap
+    /// mid-pass). Persists once armed; `None` disables.
+    reproof_flip: Cell<Option<(u64, Option<FileIdentity>)>>,
+    /// Deterministic frame-trip countdown: after this many more stride
+    /// polls at `site`, the warmup latches real frame-spent state (see
+    /// `getter_prefault_latch_frame_trip`). One-shot per arming; `None`
+    /// disables. Other sites' polls never count down.
+    frame_trip: Cell<Option<(GetterPrefaultStrideSite, u32)>>,
+    /// Scripted target-memory open failure: the lazy mem open fails
+    /// through the same handler as a production open failure.
+    fail_mem_open: Cell<bool>,
+}
+
+/// Test-only warmup frame-poll sites (see
+/// `GetterPrefaultTestSeam::frame_trip`): enumeration strides, the
+/// carried-index build, the merge, the per-range proof poll and the
+/// per-chunk read poll.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GetterPrefaultStrideSite {
+    Enum,
+    Index,
+    Merge,
+    Proof,
+    Read,
 }
 
 impl Engine {
@@ -14440,6 +14484,9 @@ impl Engine {
             getter_pass_owed: BTreeSet::new(),
             getter_prefault_cursors: BTreeMap::new(),
             getter_prefault_refused_ranges: 0,
+            getter_prefault_mem_unopenable_ranges: 0,
+            getter_prefault_short_read_ranges: 0,
+            getter_prefault_failed_read_ranges: 0,
             #[cfg(test)]
             getter_prefault_for_test: None,
             selection_claims: BTreeMap::new(),
@@ -26871,6 +26918,8 @@ impl Engine {
         let mut candidates = Vec::new();
         for (at, mapping) in maps.iter().enumerate() {
             if at > 0 && at % Self::GETTER_PREFAULT_ENUM_STRIDE == 0 {
+                #[cfg(test)]
+                self.getter_prefault_latch_frame_trip(GetterPrefaultStrideSite::Enum);
                 if self.frame_work_exhausted() {
                     let carried_bytes = self
                         .getter_prefault_cursors
@@ -27033,6 +27082,8 @@ impl Engine {
             {
                 continue;
             }
+            #[cfg(test)]
+            self.getter_prefault_latch_frame_trip(GetterPrefaultStrideSite::Proof);
             if self.frame_work_exhausted() {
                 Self::store_prefault_resume(&mut cursor);
                 self.getter_prefault_cursors.insert(view, cursor);
@@ -27049,6 +27100,8 @@ impl Engine {
                     return Deferred { frame_spent: false };
                 }
                 proofs_spent += 1;
+                #[cfg(test)]
+                self.getter_prefault_note_proof_attempts(1);
                 slot.insert(self.getter_prefault_held(object).ok());
             }
             let Some(held) = held_cache[&object] else {
@@ -27097,6 +27150,8 @@ impl Engine {
                 return Deferred { frame_spent: false };
             }
             proofs_spent += take;
+            #[cfg(test)]
+            self.getter_prefault_note_proof_attempts(take as u64);
             let _ = proofs_spent;
             let addrs: Vec<(u64, u64)> = slow[..take]
                 .iter()
@@ -27153,6 +27208,8 @@ impl Engine {
                 return Complete;
             }
             let range = (cursor.ranges[index].start, cursor.ranges[index].end);
+            #[cfg(test)]
+            self.getter_prefault_note_proof_attempts(1);
             let confirmed = self
                 .getter_prefault_reproof_identity(position, range)
                 .is_ok_and(|identity| identity == held.identity);
@@ -27187,10 +27244,24 @@ impl Engine {
             }
             return Complete;
         }
-        let mem = self.views[position].with_filesystem(&mut self.budget, |filesystem, _| {
-            Ok(filesystem.open_memory())
-        });
-        let Ok(mem) = mem.map_err(|_| ()).and_then(|inner| inner.map_err(|_| ())) else {
+        #[cfg(test)]
+        let scripted_open_failure = self
+            .getter_prefault_for_test
+            .as_ref()
+            .is_some_and(|seam| seam.fail_mem_open.get());
+        #[cfg(not(test))]
+        let scripted_open_failure = false;
+        let mem = if scripted_open_failure {
+            Err(())
+        } else {
+            self.views[position]
+                .with_filesystem(&mut self.budget, |filesystem, _| {
+                    Ok(filesystem.open_memory())
+                })
+                .map_err(|_| ())
+                .and_then(|inner| inner.map_err(|_| ()))
+        };
+        let Ok(mem) = mem else {
             return Complete;
         };
         let mut chunk = [0u8; Self::GETTER_PREFAULT_CHUNK];
@@ -27214,6 +27285,8 @@ impl Engine {
             let end = cursor.ranges[index].end;
             let mut addr = cursor.ranges[index].next_addr.clamp(start, end);
             while addr < end {
+                #[cfg(test)]
+                self.getter_prefault_latch_frame_trip(GetterPrefaultStrideSite::Read);
                 if self.frame_work_exhausted() {
                     cursor.ranges[index].next_addr = addr;
                     cursor.op_bytes = op_bytes;
@@ -27236,22 +27309,30 @@ impl Engine {
                     return Complete;
                 }
                 #[cfg(test)]
-                let simulated_failure = self
+                let (simulated_failure, simulated_short) = self
                     .getter_prefault_for_test
                     .as_ref()
-                    .is_some_and(|seam| seam.fail_reads.contains(&(start, end)));
+                    .map_or((false, false), |seam| {
+                        (
+                            seam.fail_reads.contains(&(start, end)),
+                            seam.short_reads.contains(&(start, end)),
+                        )
+                    });
                 #[cfg(not(test))]
-                let simulated_failure = false;
-                if simulated_failure {
-                    #[cfg(test)]
-                    if let Some(seam) = self.getter_prefault_for_test.as_ref() {
-                        seam.record_attempts.borrow_mut().push((addr, len, false));
-                    }
-                    reads_spent += 1;
-                    cursor.ranges[index].next_addr = end;
-                    break;
-                }
-                match mem.read_at(&mut chunk[..len], addr) {
+                let (simulated_failure, simulated_short) = (false, false);
+                // One credit and one result path for simulated and
+                // production outcomes alike: the scripted failure and the
+                // scripted short read below reach the same arms as the
+                // real `read_at` errors, so the twins pin the production
+                // arms instead of a fixture-only branch.
+                let outcome: std::io::Result<usize> = if simulated_failure {
+                    Err(std::io::Error::other("scripted warmup read failure"))
+                } else if simulated_short {
+                    Ok(len.saturating_sub(1))
+                } else {
+                    mem.read_at(&mut chunk[..len], addr)
+                };
+                match outcome {
                     Ok(read) => {
                         #[cfg(test)]
                         if let Some(seam) = self.getter_prefault_for_test.as_ref() {
@@ -27421,6 +27502,20 @@ impl Engine {
     ) -> std::io::Result<FileIdentity> {
         #[cfg(test)]
         if let Some(seam) = self.getter_prefault_for_test.as_ref() {
+            if let Some((remaining, flipped)) = seam.reproof_flip.get() {
+                if remaining == 0 {
+                    return flipped.map_or_else(
+                        || {
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::PermissionDenied,
+                                "scripted flipped unreadable range",
+                            ))
+                        },
+                        Ok,
+                    );
+                }
+                seam.reproof_flip.set(Some((remaining - 1, flipped)));
+            }
             if seam.reproof_ranges.contains_key(&range) {
                 return Self::getter_prefault_scripted_one(&seam.reproof_ranges, &range);
             }
@@ -27469,6 +27564,41 @@ impl Engine {
             self.budget.set_deadline(Some(0));
         }
         self.budget.check_deadline_now().is_some()
+    }
+
+    /// Test-only frame-trip countdown for one stride site: when the armed
+    /// site's remaining polls reach zero, latches real frame-spent state
+    /// (`frame_deadline_ns = Some(0)`, one-shot) so the production
+    /// `frame_work_exhausted` poll below alone decides. Other sites'
+    /// polls never count down. Production has no trip.
+    #[cfg(test)]
+    fn getter_prefault_latch_frame_trip(&mut self, site: GetterPrefaultStrideSite) {
+        let Some(seam) = self.getter_prefault_for_test.as_ref() else {
+            return;
+        };
+        let Some((armed, remaining)) = seam.frame_trip.get() else {
+            return;
+        };
+        if armed != site {
+            return;
+        }
+        if remaining > 0 {
+            seam.frame_trip.set(Some((armed, remaining - 1)));
+        }
+        if remaining <= 1 {
+            self.frame_deadline_ns = Some(0);
+            seam.frame_trip.set(None);
+        }
+    }
+
+    /// Test-only proof-attempt tally: counts attempted held lookups,
+    /// batch stats and read-time re-proofs, successes and errors alike.
+    #[cfg(test)]
+    fn getter_prefault_note_proof_attempts(&self, count: u64) {
+        if let Some(seam) = self.getter_prefault_for_test.as_ref() {
+            seam.proof_attempts
+                .set(seam.proof_attempts.get().saturating_add(count));
+        }
     }
 
     /// Restarts the view's warmup cursor when it enumerated a different
@@ -27571,6 +27701,49 @@ impl Engine {
             .extend(ranges);
     }
 
+    /// Test-only: short the `read_at` for these ranges with a simulated
+    /// short read (`len - 1` bytes) through the shared result path (the
+    /// attempt still spends its read credit and records `ok`).
+    #[cfg(test)]
+    fn set_prefault_short_reads_for_test(&mut self, ranges: Vec<(u64, u64)>) {
+        self.getter_prefault_for_test
+            .get_or_insert_default()
+            .short_reads
+            .extend(ranges);
+    }
+
+    /// Test-only: fail the warmup's lazy target-memory open through the
+    /// same handler as a production open failure.
+    #[cfg(test)]
+    fn set_prefault_fail_mem_open_for_test(&mut self) {
+        self.getter_prefault_for_test
+            .get_or_insert_default()
+            .fail_mem_open
+            .set(true);
+    }
+
+    /// Test-only: after `after` more read-time re-proofs, every later
+    /// re-proof returns `to` instead of its scripted verdict
+    /// (deterministic custody-loss interleaving; `None` reads as
+    /// unreadable). Persists once armed.
+    #[cfg(test)]
+    fn set_prefault_reproof_flip_for_test(&mut self, after: u64, to: Option<FileIdentity>) {
+        self.getter_prefault_for_test
+            .get_or_insert_default()
+            .reproof_flip
+            .set(Some((after, to)));
+    }
+
+    /// Test-only: after `after` more frame polls at `site`, latch real
+    /// frame-spent state (one-shot; other sites never count down).
+    #[cfg(test)]
+    fn set_prefault_frame_trip_for_test(&mut self, site: GetterPrefaultStrideSite, after: u32) {
+        self.getter_prefault_for_test
+            .get_or_insert_default()
+            .frame_trip
+            .set(Some((site, after)));
+    }
+
     /// Test-only: every read attempt so far, in order, as
     /// `(addr, len, ok)`. Empty without the seam.
     #[cfg(test)]
@@ -27578,6 +27751,17 @@ impl Engine {
         self.getter_prefault_for_test
             .as_ref()
             .map(|seam| seam.record_attempts.borrow().clone())
+            .unwrap_or_default()
+    }
+
+    /// Test-only: attempted proof steps so far (held lookups, batch
+    /// stats and read-time re-proofs, successes and errors alike). Zero
+    /// without the seam.
+    #[cfg(test)]
+    fn prefault_proof_attempts_for_test(&self) -> u64 {
+        self.getter_prefault_for_test
+            .as_ref()
+            .map(|seam| seam.proof_attempts.get())
             .unwrap_or_default()
     }
 

@@ -111,6 +111,12 @@ class TierSelectionTests(unittest.TestCase):
                                  f"{SELECT.output_name(job)} == 'true'")
                     self.assertIn(predicate, jobs[job].get("if", ""),
                                   f"{name} {job} lacks its run predicate")
+                    needs = jobs[job].get("needs", [])
+                    if isinstance(needs, str):
+                        needs = [needs]
+                    self.assertIn("select", needs,
+                                  f"{name} {job} must need select for its "
+                                  "predicate")
                 for job in sorted(universe - gated):
                     text = workflow_text(name)
                     start = text.index(f"  {job}:")
@@ -237,6 +243,39 @@ class TierSelectionTests(unittest.TestCase):
                                 for job in SELECT.GATED[name])
                 expected.update(matrices)
                 self.assertEqual(keys, expected)
+
+    def test_run_outputs_follow_job_states(self):
+        cases = (
+            ("privileged-tests", "push", "refs/heads/test/x",
+             {"run_public_cli": "true",
+              "run_browser_cells": "false",
+              "run_privileged_counter_flavor": "false",
+              "run_nightly_dispatch": "false"}),
+            ("ci", "push", "refs/heads/test/x",
+             {"run_lint": "true",
+              "run_bpf_noninterference": "false",
+              "run_coverage": "false",
+              # Conditional jobs emit true: their own fuller condition
+              # decides, and the predicate only deselects them.
+              "run_archive_log": "true"}),
+        )
+        for workflow, event, ref, expected in cases:
+            with self.subTest(workflow=workflow):
+                selection, matrices = select(
+                    workflow, event, ref, {"known"})
+                with tempfile.TemporaryDirectory(
+                        prefix="select-values-") as directory:
+                    path = str(Path(directory) / "outputs")
+                    os.environ["GITHUB_OUTPUT"] = path
+                    try:
+                        SELECT.write_outputs(selection, matrices)
+                    finally:
+                        del os.environ["GITHUB_OUTPUT"]
+                    values = dict(
+                        line.split("=", 1) for line in
+                        Path(path).read_text(encoding="utf-8").splitlines())
+                for output, value in expected.items():
+                    self.assertEqual(values[output], value, output)
 
     def test_selection_document_shape(self):
         selection, _ = select("ci", "push", "refs/heads/test/x", {"known"})

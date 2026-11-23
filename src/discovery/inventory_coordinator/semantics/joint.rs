@@ -784,6 +784,8 @@ enum BirthRefusal {
     OriginalMismatch,
     Install(crate::discovery::caller_registry::instance_input::JointReceiptInstallRefusal),
     SegmentUnresumable,
+    StuckBarred,
+    SessionUnhealthy,
 }
 
 impl BirthRefusal {
@@ -824,6 +826,10 @@ impl BirthRefusal {
             Self::OriginalMismatch => "joint_birth_original_mismatch".into(),
             Self::Install(refusal) => format!("joint_birth_install_{refusal:?}"),
             Self::SegmentUnresumable => "joint_birth_install_segment_unresumable".into(),
+            // Same strings as the post-install arm refusals they
+            // mirror: early or late, the gap names one blocker.
+            Self::StuckBarred => "joint_birth_reseed_stuck_barred".into(),
+            Self::SessionUnhealthy => "joint_birth_reseed_session_unhealthy".into(),
         }
     }
 }
@@ -1783,6 +1789,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             // feed mutation happens between here and the consume
             // gate below, so the verdict cannot go stale.
             let segment_doomed = registrations.joint_reselect_segment_doomed(input, &proof);
+            let stuck_barred = registrations.joint_reselect_stuck_barred(input, &proof);
+            let unhealthy = registrations.joint_reselect_unhealthy(input);
             let reservation = match registrations.reserve(input, &batch.registrations) {
                 Ok(reservation) => reservation,
                 Err(refusal) => {
@@ -1812,6 +1820,23 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     continue;
                 }
             };
+            // Early gates before native consume, in the arm's own
+            // precedence (health, then segment doom, then the stuck
+            // bar): each refuses here — final, never deferred —
+            // instead of installing a grant and retaining a witness
+            // only for the arm to refuse it. Live, installed-then-
+            // refused reseeds filled the 4,096 witness slots and
+            // stopped the lane on provider storage; the probes keep
+            // the table for births that can arm. A queued rebirth
+            // retries from the next fresh proof (refinds re-offer;
+            // voids lift the bar; clean passes open the window).
+            // Worst case a probe misses and the arm refuses as before.
+            if unhealthy {
+                drop(reservation);
+                drop(slot);
+                association[first].refusal = Some((caller, BirthRefusal::SessionUnhealthy));
+                continue;
+            }
             // Last gate before native consume: a same-proof birth for
             // a fallback-closed proof-destroyed feed would install a
             // grant and retain a witness only for the drain to
@@ -1823,6 +1848,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 drop(reservation);
                 drop(slot);
                 association[first].refusal = Some((caller, BirthRefusal::SegmentUnresumable));
+                continue;
+            }
+            if stuck_barred {
+                drop(reservation);
+                drop(slot);
+                association[first].refusal = Some((caller, BirthRefusal::StuckBarred));
                 continue;
             }
             let absence = slot.take_absence();

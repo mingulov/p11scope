@@ -88871,6 +88871,37 @@ fn learned_candidate_with_loader_pid_stages_through_the_observer_table() {
     );
 }
 
+/// Ordering proof for the loader fallback: a candidate whose loader
+/// table is unreadable (a dead pid) still stages when the observer's
+/// table names the mount — the loader table is consulted only after
+/// an observer miss, never first. A loader-first reordering, or an
+/// unconditional loader read that fails staging, fails here.
+#[test]
+fn learned_candidate_with_dead_loader_pid_stages_through_the_observer_table() {
+    let (fixture, _view, _module, _pins) = loaded_seed_provider();
+    let library = fixture._dir.path().join("seed-provider.so");
+    let file = std::fs::File::open(&library).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.stage_learned_candidate(crate::fanotify::LearnedCandidate {
+        file,
+        dev,
+        ino,
+        display_path: library.to_string_lossy().into_owned(),
+        loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+        loader_unknown_reason: None,
+        loader_pid: Some(u32::MAX),
+        run_learned: false,
+        proving_retained: false,
+    });
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        1,
+        "a dead loader table must not disturb observer-table staging"
+    );
+}
+
 /// A fanotify queue overflow files one aggregate gap: some short-lived
 /// loads may not have been learned, counted but never per-file.
 #[test]

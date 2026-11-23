@@ -37,6 +37,7 @@ use crate::attach::capture::{
     ReadWindow, ScopeCustody, WitnessBatch, WitnessRow,
 };
 use crate::capacity::InventoryBudget;
+use crate::discovery::caller_registry::DEFAULT_MAX_CALLERS;
 #[cfg(test)]
 use crate::discovery::caller_registry::DEFAULT_MAX_GAPS;
 use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
@@ -54,8 +55,9 @@ use crate::discovery::inventory_attach_set::{
 };
 use crate::discovery::native_binding::{
     BinderLimits, Binding, BoundImage, CallerLookup, CurrentBindingCheck, CurrentBindingRequest,
-    CurrentBindingSighting, Decision, ExecTransition, ExitWitnessValidator, LiveCaller,
-    NativeBinder, NativeIdentity, RetainedCaller, UnboundReason,
+    CurrentBindingSighting, Decision, ExecTransition, ExitWitnessValidator,
+    HOLDER_SCAN_UNITS_PER_VISIT, HolderScan, LiveCaller, NativeBinder, NativeIdentity,
+    RESIGHT_VISITS_PER_PASS, RetainedCaller, UnboundReason,
 };
 use crate::discovery::scan::{
     INVENTORY_WINDOW_IO_BYTES, InventoryDiscoveryLimits, InventoryRetainedLimits,
@@ -78,7 +80,8 @@ use crate::scope::inventory_cgroup::{CgroupWalkLimits, CgroupWalkState, Collecti
 use p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT;
 use p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT_MAPPINGS;
 use p11scope_ebpf_common::inventory_callers::CallerEvidence;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::cell::Cell;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1018,6 +1021,12 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// stamped inside `[alive, exit)` is that caller's. One entry per
     /// retained record at most; removed when its record folds.
     leader_exit_witness: HashMap<CallerId, u64>,
+    /// The staging's holder-scan pool, reset at each staging entry:
+    /// every per-PID holder inspection charges one unit against it.
+    holder_pool: HolderScanBudget,
+    /// Leader-exit hooks that did not fit their staging's pool, in
+    /// arrival order, with the pids they gate and blind.
+    deferred_hooks: DeferredExitHooks,
     pending_leader_exits: BTreeMap<CallerId, leader_exit::PendingLeaderExit<Source::Pin>>,
     leader_exit_cursor: Option<CallerId>,
     /// Whether BPF hook timestamps and observer admission stamps share
@@ -1579,6 +1588,272 @@ fn collapse_hint_misses(
     kept
 }
 
+/// One staging's holder-scan pool: every per-PID holder inspection
+/// costs one leaf unit and 64 units are one visit credit (INV-2), so
+/// the pool holds [`RESIGHT_VISITS_PER_PASS`] credits (65,536 units),
+/// derived from the existing constants, never a raise. Every
+/// leader-exit scan in the staging — stamping, read and re-sight
+/// resolution, decide-time validation — pre-charges its whole
+/// per-PID list from this pool and defers past it, so one staging
+/// inspects at most 65,536 holders however hot a pid runs. Interior
+/// mutability: the gate charges through a shared borrow while the
+/// binder runs. Any single pid's list (at most [`DEFAULT_MAX_CALLERS`]
+/// holders) fits a fresh pool, so a deferred scan always completes
+/// on retry and no intra-scan cursor can strand work: the row-level
+/// owed queue, the pending front and the deferred-hook queue below
+/// are the cursors.
+struct HolderScanBudget {
+    spent: Cell<u64>,
+    deferrals: Cell<u64>,
+}
+
+impl HolderScanBudget {
+    fn new() -> Self {
+        Self {
+            spent: Cell::new(0),
+            deferrals: Cell::new(0),
+        }
+    }
+
+    fn limit() -> u64 {
+        RESIGHT_VISITS_PER_PASS as u64 * HOLDER_SCAN_UNITS_PER_VISIT
+    }
+
+    fn reset(&self) {
+        self.spent.set(0);
+        self.deferrals.set(0);
+    }
+
+    /// Charge `units` holder inspections, or defer: false past the
+    /// pool (counting one deferral for the named exhaustion gap).
+    fn try_charge(&self, units: usize) -> bool {
+        let units = units as u64;
+        let next = self.spent.get().saturating_add(units);
+        if next > Self::limit() {
+            self.note_deferral();
+            return false;
+        }
+        self.spent.set(next);
+        true
+    }
+
+    /// One scan deferred without charging (its pid's stamps are
+    /// incomplete): counts for the same named gap.
+    fn note_deferral(&self) {
+        self.deferrals.set(self.deferrals.get().saturating_add(1));
+    }
+
+    fn deferrals(&self) -> u64 {
+        self.deferrals.get()
+    }
+}
+
+/// Deferred leader-exit hooks: stamps that did not fit their
+/// staging's holder pool, in arrival order. The next lifecycle
+/// staging drains them first on its fresh pool — at least 16
+/// full-size hooks per staging, so every queued hook stamps within
+/// a bounded number of stagings — while their pids' resolutions
+/// hold (a hook that arrives out of order can shrink an exit the
+/// partial stamps show wide, so deciding on partial stamps could
+/// bind where the complete stamps refuse). Past the queue bound the
+/// hook is dropped and its pid is exit-blinded: its rows fail
+/// closed with their live-miss gaps under the named loss gap, and
+/// past [`DEFAULT_MAX_CALLERS`] blinded pids a capture-wide latch
+/// covers the rest. Bounded: the queue, the per-pid counts and the
+/// blind set.
+const MAX_DEFERRED_EXIT_HOOKS: usize = 1_024;
+
+/// What one deferred-hook push decided.
+enum DeferredPush {
+    /// Queued behind the earlier hooks.
+    Queued,
+    /// The queue was full: the pid just turned exit-blind (file the
+    /// named loss gap).
+    BlindTransition,
+    /// The blind set was full: the capture-wide latch just set (file
+    /// the named latch gap).
+    LatchTransition,
+    /// The pid was already blind: nothing to file.
+    AlreadyBlind,
+}
+
+/// Whether a pid's exit stamps are usable for a resolution right
+/// now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitHookState {
+    /// Every arrived hook stamped: scan against the pool.
+    Ready,
+    /// Hooks still queued: hold for the drain that stamps them.
+    Deferred,
+    /// Hooks were dropped (or the latch set): fail closed with no
+    /// snapshot, under the named loss gap.
+    Blinded,
+}
+
+struct DeferredExitHooks {
+    queue: VecDeque<(u32, u64)>,
+    counts: HashMap<u32, usize>,
+    blinded: HashSet<u32>,
+    latched: bool,
+}
+
+impl DeferredExitHooks {
+    fn new() -> Self {
+        Self {
+            queue: VecDeque::new(),
+            counts: HashMap::new(),
+            blinded: HashSet::new(),
+            latched: false,
+        }
+    }
+
+    fn hook_state(&self, pid: u32) -> ExitHookState {
+        if self.latched || self.blinded.contains(&pid) {
+            ExitHookState::Blinded
+        } else if self.counts.contains_key(&pid) {
+            ExitHookState::Deferred
+        } else {
+            ExitHookState::Ready
+        }
+    }
+
+    fn push_deferred(&mut self, pid: u32, hook_ts_ns: u64) -> DeferredPush {
+        if self.latched || self.blinded.contains(&pid) {
+            return DeferredPush::AlreadyBlind;
+        }
+        if self.queue.len() >= MAX_DEFERRED_EXIT_HOOKS {
+            if self.blinded.len() >= DEFAULT_MAX_CALLERS {
+                self.latched = true;
+                return DeferredPush::LatchTransition;
+            }
+            self.blinded.insert(pid);
+            return DeferredPush::BlindTransition;
+        }
+        self.queue.push_back((pid, hook_ts_ns));
+        *self.counts.entry(pid).or_default() += 1;
+        DeferredPush::Queued
+    }
+
+    /// The next queued hook without consuming it: the drain stamps it
+    /// only when it fits, and otherwise stops with the queue intact.
+    fn peek_for_drain(&self) -> Option<(u32, u64)> {
+        self.queue.front().copied()
+    }
+
+    /// Consume the hook [`Self::peek_for_drain`] returned after it
+    /// stamped (or was dropped for a blinded pid).
+    fn pop_drained(&mut self) {
+        let Some((pid, _)) = self.queue.pop_front() else {
+            return;
+        };
+        if let Some(count) = self.counts.get_mut(&pid) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.counts.remove(&pid);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn queue_len_for_test(&self) -> usize {
+        self.queue.len()
+    }
+
+    #[cfg(test)]
+    fn blinded_len_for_test(&self) -> usize {
+        self.blinded.len()
+    }
+
+    #[cfg(test)]
+    fn latched_for_test(&self) -> bool {
+        self.latched
+    }
+}
+
+#[cfg(test)]
+mod holder_scan_state_tests {
+    use super::{
+        DeferredExitHooks, DeferredPush, ExitHookState, HolderScanBudget, MAX_DEFERRED_EXIT_HOOKS,
+    };
+
+    #[test]
+    fn holder_pool_holds_1024_credits_of_64_units() {
+        assert_eq!(HolderScanBudget::limit(), 65_536);
+        let pool = HolderScanBudget::new();
+        assert!(pool.try_charge(65_536));
+        assert_eq!(pool.deferrals(), 0);
+        assert!(!pool.try_charge(1));
+        assert_eq!(pool.deferrals(), 1);
+        pool.reset();
+        assert_eq!(pool.deferrals(), 0);
+        assert!(pool.try_charge(1_100));
+    }
+
+    #[test]
+    fn deferred_hooks_gate_until_the_drain() {
+        let mut hooks = DeferredExitHooks::new();
+        assert_eq!(hooks.hook_state(7), ExitHookState::Ready);
+        assert!(matches!(
+            hooks.push_deferred(7, 100),
+            DeferredPush::Queued
+        ));
+        assert!(matches!(
+            hooks.push_deferred(7, 200),
+            DeferredPush::Queued
+        ));
+        assert_eq!(hooks.hook_state(7), ExitHookState::Deferred);
+        assert_eq!(hooks.hook_state(9), ExitHookState::Ready);
+        assert_eq!(hooks.peek_for_drain(), Some((7, 100)));
+        hooks.pop_drained();
+        assert_eq!(hooks.hook_state(7), ExitHookState::Deferred);
+        assert_eq!(hooks.peek_for_drain(), Some((7, 200)));
+        hooks.pop_drained();
+        assert_eq!(hooks.hook_state(7), ExitHookState::Ready);
+        assert_eq!(hooks.peek_for_drain(), None);
+        hooks.pop_drained();
+    }
+
+    #[test]
+    fn deferred_hook_overflow_blinds_then_latches() {
+        assert_eq!(MAX_DEFERRED_EXIT_HOOKS, 1_024);
+        let mut hooks = DeferredExitHooks::new();
+        for i in 0..1_024 {
+            assert!(matches!(
+                hooks.push_deferred(7, i),
+                DeferredPush::Queued
+            ));
+        }
+        assert_eq!(hooks.queue_len_for_test(), 1_024);
+        assert!(matches!(
+            hooks.push_deferred(7, 1_024),
+            DeferredPush::BlindTransition
+        ));
+        assert_eq!(hooks.hook_state(7), ExitHookState::Blinded);
+        assert!(matches!(
+            hooks.push_deferred(7, 1_025),
+            DeferredPush::AlreadyBlind
+        ));
+        for pid in 8..(8 + 4_095) {
+            assert!(matches!(
+                hooks.push_deferred(pid, 0),
+                DeferredPush::BlindTransition
+            ));
+        }
+        assert_eq!(hooks.blinded_len_for_test(), 4_096);
+        assert!(!hooks.latched_for_test());
+        assert!(matches!(
+            hooks.push_deferred(500_000, 0),
+            DeferredPush::LatchTransition
+        ));
+        assert!(hooks.latched_for_test());
+        assert_eq!(hooks.hook_state(9), ExitHookState::Blinded);
+        assert!(matches!(
+            hooks.push_deferred(500_001, 0),
+            DeferredPush::AlreadyBlind
+        ));
+    }
+}
+
 /// The binder's caller lookup with the retained-identity fallback
 /// gated: live incarnations always resolve; retained history resolves
 /// only while the fallback is allowed (PID scope, held custody or a
@@ -1592,6 +1867,12 @@ struct RetainedGate<'a, Source: ProcessSource> {
     /// in system scope (see `InventoryCoordinator::leader_exit_witness`).
     exit_witness: &'a HashMap<CallerId, u64>,
     exit_allowed: bool,
+    /// The staging's holder-scan pool: every scan below pre-charges
+    /// its whole per-PID list and defers past it.
+    pool: &'a HolderScanBudget,
+    /// Queued and dropped exit hooks: resolutions hold for a pid
+    /// with queued hooks and fail closed for a blinded one.
+    hooks: &'a DeferredExitHooks,
 }
 
 impl<'a, Source: ProcessSource> CallerLookup<Source::Pin> for RetainedGate<'a, Source> {
@@ -1607,9 +1888,26 @@ impl<'a, Source: ProcessSource> CallerLookup<Source::Pin> for RetainedGate<'a, S
         }
     }
 
-    fn exit_witnessed_caller(&self, pid: u32, event_ns: u64) -> Option<RetainedCaller> {
+    fn try_exit_witnessed_caller(&self, pid: u32, event_ns: u64) -> HolderScan<RetainedCaller> {
         if !self.exit_allowed {
-            return None;
+            return HolderScan::Absent;
+        }
+        match self.hooks.hook_state(pid) {
+            // Hooks were dropped for this pid: the stamps can never
+            // complete, so the row fails closed with no snapshot under
+            // the named loss gap (never a partial-scan verdict).
+            ExitHookState::Blinded => return HolderScan::Absent,
+            // Hooks still queued: the stamps are incomplete and an
+            // out-of-order hook could shrink them, so the row holds
+            // for the drain that stamps them.
+            ExitHookState::Deferred => {
+                self.pool.note_deferral();
+                return HolderScan::Deferred;
+            }
+            ExitHookState::Ready => {}
+        }
+        if !self.pool.try_charge(self.adapter.proven_count(pid)) {
+            return HolderScan::Deferred;
         }
         // Exactly one proven interval may contain the event: hooks can
         // drain out of order, so an older holder's transiently wide
@@ -1620,12 +1918,16 @@ impl<'a, Source: ProcessSource> CallerLookup<Source::Pin> for RetainedGate<'a, S
             .leader_proven(pid)
             .filter_map(|(id, alive_ns)| Some((id, alive_ns, *self.exit_witness.get(&id)?)))
             .filter(|&(_, alive_ns, exit_ns)| alive_ns <= event_ns && event_ns < exit_ns);
-        let (id, alive_ns, exit_ns) = containing.next()?;
+        let Some((id, alive_ns, exit_ns)) = containing.next() else {
+            return HolderScan::Absent;
+        };
         if containing.next().is_some() {
-            return None;
+            return HolderScan::Absent;
         }
-        let record = self.adapter.record(id)?;
-        Some(RetainedCaller {
+        let Some(record) = self.adapter.record(id) else {
+            return HolderScan::Absent;
+        };
+        HolderScan::Found(RetainedCaller {
             id,
             // The proven interval, never the scan-window stamps.
             first_seen_ns: alive_ns,
@@ -1640,22 +1942,36 @@ impl<'a, Source: ProcessSource> CallerLookup<Source::Pin> for RetainedGate<'a, S
 }
 
 impl<Source: ProcessSource> ExitWitnessValidator for RetainedGate<'_, Source> {
-    fn current_holder(&self, pid: u32, event_ns: u64) -> Option<CallerId> {
+    fn try_current_holder(&self, pid: u32, event_ns: u64) -> HolderScan<CallerId> {
         // Decide-time revalidation: the same exactly-one containment
         // as the resolve path, against the current stamps, without
         // the batch health gate (the row carries the health of the
         // read that produced it). A shrunk exit or a later
-        // overlapping holder refuses here.
+        // overlapping holder refuses here; a scan past the pool
+        // holds the row instead of deciding on a partial scan.
+        match self.hooks.hook_state(pid) {
+            ExitHookState::Blinded => return HolderScan::Absent,
+            ExitHookState::Deferred => {
+                self.pool.note_deferral();
+                return HolderScan::Deferred;
+            }
+            ExitHookState::Ready => {}
+        }
+        if !self.pool.try_charge(self.adapter.proven_count(pid)) {
+            return HolderScan::Deferred;
+        }
         let mut containing = self
             .adapter
             .leader_proven(pid)
             .filter_map(|(id, alive_ns)| Some((id, alive_ns, *self.exit_witness.get(&id)?)))
             .filter(|&(_, alive_ns, exit_ns)| alive_ns <= event_ns && event_ns < exit_ns);
-        let (id, _, _) = containing.next()?;
+        let Some((id, _, _)) = containing.next() else {
+            return HolderScan::Absent;
+        };
         if containing.next().is_some() {
-            return None;
+            return HolderScan::Absent;
         }
-        Some(id)
+        HolderScan::Found(id)
     }
 }
 
@@ -2059,6 +2375,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             pending_successors: BTreeMap::new(),
             leader_link_loss_noted: BTreeSet::new(),
             leader_exit_witness: HashMap::new(),
+            holder_pool: HolderScanBudget::new(),
+            deferred_hooks: DeferredExitHooks::new(),
             pending_leader_exits: BTreeMap::new(),
             leader_exit_cursor: None,
             exit_clocks_comparable: exit_clocks_comparable(),
@@ -4645,14 +4963,18 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     pub(crate) fn note_extend_receipt(&mut self, receipt: &ExtendReceipt) {
         // Exec coverage is the binder's, whatever capture coverage holds.
         if let Some(coverage) = receipt.exec_coverage {
+            self.holder_pool.reset();
             let gate = RetainedGate {
                 adapter: &self.adapter,
                 allowed: false,
                 exit_witness: &self.leader_exit_witness,
                 exit_allowed: false,
+                pool: &self.holder_pool,
+                hooks: &self.deferred_hooks,
             };
             self.binder
                 .note_exec_coverage_with_validator(coverage, Some(&gate));
+            self.record_holder_pool_exhaustion();
         }
         // Keymeta Task 7 (spec §17.4): the attach-side counted
         // `info_return_deferred` gap rides every receipt into the
@@ -10352,11 +10674,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 // rows (a stamped pending row withholds the proven-clean
                 // instant). Absorption stages no registry mutation, so
                 // staging order is unchanged.
+                self.holder_pool.reset();
                 let gate = RetainedGate {
                     adapter: &self.adapter,
                     allowed: self.retained_fallback_allowed(&batch),
                     exit_witness: &self.leader_exit_witness,
                     exit_allowed: self.exit_witness_allowed(&batch),
+                    pool: &self.holder_pool,
+                    hooks: &self.deferred_hooks,
                 };
                 // An incomplete re-sight pass resumes on the next
                 // witness batch (the owed attempts persist in the
@@ -10370,6 +10695,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     &mut *identity,
                     Some(&gate),
                 );
+                self.record_holder_pool_exhaustion();
                 self.note_witness_batch(&batch);
                 self.record_witness_integrity(&batch);
                 // Counts merge before the binder's decisions stage, so a
@@ -10394,6 +10720,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 // witness, which includes this batch's own hooks.
                 // (Absorption reads only EXEC records, horizons and
                 // failures, so the order is otherwise unobservable.)
+                // Stamping and the absorption below share one fresh
+                // holder pool, the deferred hooks draining first.
+                self.holder_pool.reset();
                 self.note_leader_exits(&batch);
                 let gate = RetainedGate {
                     adapter: &self.adapter,
@@ -10402,9 +10731,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     // Resolve runs on witness batches only; the
                     // validator below ignores this health gate.
                     exit_allowed: false,
+                    pool: &self.holder_pool,
+                    hooks: &self.deferred_hooks,
                 };
                 self.binder
                     .absorb_lifecycle_with_validator(&batch, Some(&gate));
+                self.record_holder_pool_exhaustion();
                 // Stash EXEC exe identities before the hook loop (the
                 // join is numbering-independent: domain and ticket,
                 // never the pid) and latch any lifecycle loss first,
@@ -10505,18 +10837,105 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// (a reused pid's) never replaces it. A missing own exit is ring
     /// loss, which vetoes the retained decision. System scope only: a
     /// cgroup filter can drop the own exit without any loss count.
-    /// Without comparable clocks nothing is stamped. Bounded by the
-    /// pid's proven incarnations, never a walk of every caller.
+    /// Without comparable clocks nothing is stamped. The scan
+    /// pre-charges the pid's whole proven list against the staging's
+    /// holder pool and defers the hook past it — never a partial
+    /// stamp, so a deferred hook gates its pid's resolutions until
+    /// the drain stamps it.
     fn note_leader_exit_witness(&mut self, pid: u32, hook_ts_ns: u64) {
         if !self.exit_clocks_comparable || !matches!(self.engine.scope, Scope::System) {
             return;
         }
+        if self.deferred_hooks.hook_state(pid) == ExitHookState::Blinded {
+            // Hooks for a blinded pid change nothing: its rows
+            // already fail closed under the named loss gap.
+            return;
+        }
+        if !self.holder_pool.try_charge(self.adapter.proven_count(pid)) {
+            self.push_deferred_hook(pid, hook_ts_ns);
+            return;
+        }
+        self.stamp_leader_exit_hook(pid, hook_ts_ns);
+    }
+
+    /// The stamping scan itself, after [`Self::note_leader_exit_witness`]
+    /// charged it: earliest-hook-wins per holder. Hook order is
+    /// irrelevant (a minimum over arrived hooks), so a fresh hook may
+    /// stamp while older hooks for its pid still queue.
+    fn stamp_leader_exit_hook(&mut self, pid: u32, hook_ts_ns: u64) {
         for (id, alive_ns) in self.adapter.leader_proven(pid) {
             if alive_ns <= hook_ts_ns {
                 let exit_ns = self.leader_exit_witness.entry(id).or_insert(hook_ts_ns);
                 *exit_ns = (*exit_ns).min(hook_ts_ns);
             }
         }
+    }
+
+    /// Queues a hook the holder pool could not stamp, filing the
+    /// named loss gap when the queue overflows into a blinded pid or
+    /// the capture-wide latch.
+    fn push_deferred_hook(&mut self, pid: u32, hook_ts_ns: u64) {
+        match self.deferred_hooks.push_deferred(pid, hook_ts_ns) {
+            DeferredPush::Queued | DeferredPush::AlreadyBlind => {}
+            DeferredPush::BlindTransition => {
+                self.registry.record_gap(RegistryGap {
+                    caller: None,
+                    module: None,
+                    pid: Some(pid),
+                    subject: "deferred leader-exit hook dropped".into(),
+                    reason: "a leader-exit hook arrived while 1,024 hooks were already \
+                         deferred past the holder pool; the pid's exit evidence is \
+                         incomplete, so its rows keep their live-miss gaps"
+                        .into(),
+                    budget: Some(BudgetRefusal {
+                        resource: "deferred_exit_hooks",
+                        limit: MAX_DEFERRED_EXIT_HOOKS,
+                        requested: MAX_DEFERRED_EXIT_HOOKS + 1,
+                    }),
+                });
+            }
+            DeferredPush::LatchTransition => {
+                self.registry.record_gap(RegistryGap {
+                    caller: None,
+                    module: None,
+                    pid: None,
+                    subject: "exit evidence loss latched".into(),
+                    reason: "deferred leader-exit hooks overflowed past 4,096 blinded pids; \
+                         exit evidence is incomplete capture-wide, so exit rows keep \
+                         their live-miss gaps"
+                        .into(),
+                    budget: Some(BudgetRefusal {
+                        resource: "exit_blinded_pids",
+                        limit: DEFAULT_MAX_CALLERS,
+                        requested: DEFAULT_MAX_CALLERS + 1,
+                    }),
+                });
+            }
+        }
+    }
+
+    /// Files the named exhaustion gap when this staging deferred any
+    /// holder scan: the owed rows, held decisions and unstamped exits
+    /// retry on a later batch. Stable text, so repeats aggregate.
+    fn record_holder_pool_exhaustion(&mut self) {
+        if self.holder_pool.deferrals() == 0 {
+            return;
+        }
+        self.registry.record_gap(RegistryGap {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: "holder scan pool exhausted".into(),
+            reason: "a per-PID holder scan deferred past the staging's holder-scan pool \
+                 (1,024 visit credits of 64 units); the owed rows, held decisions and \
+                 unstamped exits retry on a later batch"
+                .into(),
+            budget: Some(BudgetRefusal {
+                resource: "holder_scan_units",
+                limit: HolderScanBudget::limit() as usize,
+                requested: HolderScanBudget::limit() as usize + 1,
+            }),
+        });
     }
 
     /// Whether this witness batch may resolve rows through a witnessed
@@ -10543,6 +10962,22 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     fn note_leader_exits(&mut self, batch: &DiscoveryBatch) {
         if !crate::pidns::numbering().agrees() {
             return;
+        }
+        // Deferred hooks stamp first on the fresh pool, in arrival
+        // order; the first hook past the pool stops the drain with
+        // the queue intact for the next lifecycle staging. Hooks for
+        // a pid blinded after they queued are dropped: their stamps
+        // could never complete a resolution.
+        while let Some((pid, hook)) = self.deferred_hooks.peek_for_drain() {
+            if self.deferred_hooks.hook_state(pid) == ExitHookState::Blinded {
+                self.deferred_hooks.pop_drained();
+                continue;
+            }
+            if !self.holder_pool.try_charge(self.adapter.proven_count(pid)) {
+                break;
+            }
+            self.deferred_hooks.pop_drained();
+            self.stamp_leader_exit_hook(pid, hook);
         }
         // All records drained after stop share one finite allowance.
         // Unproved final records are disposed, never queued for retry.
@@ -10858,6 +11293,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         if due.is_empty() {
             return Vec::new();
         }
+        self.holder_pool.reset();
         for (domain, coverage_start) in due {
             let revalidated = self.adapter.revalidate_admitted_before(coverage_start);
             let gate = RetainedGate {
@@ -10865,6 +11301,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 allowed: false,
                 exit_witness: &self.leader_exit_witness,
                 exit_allowed: false,
+                pool: &self.holder_pool,
+                hooks: &self.deferred_hooks,
             };
             self.binder.note_revalidation_with_validator(
                 domain,
@@ -10873,6 +11311,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 Some(&gate),
             );
         }
+        self.record_holder_pool_exhaustion();
         self.stage_binder_output(identity, pass_start_ns).events
     }
 
@@ -43863,19 +44302,22 @@ int main(void) {
     /// Admits and retires `generations` proven holders of `pid` in
     /// order through the production detection path, with distinct
     /// start times and increasing detection stamps (holder `i` is
-    /// proven alive at `1_000 + i * 100`). Returns the holders
-    /// oldest-first. Nothing is staged: the caller finishes the scene
-    /// (coverage, attach, scope) after populating every hot pid.
+    /// proven alive at `1_000 + i * 100`). Each generation is
+    /// projected while live, so its bound rows edge it after it
+    /// retires. Returns the holders oldest-first. The scene must
+    /// already carry coverage and the attach set; the caller commits
+    /// after populating every hot pid.
     fn admit_hot_pid(scene: &mut CaptureScene, pid: u32, generations: usize) -> Vec<CallerId> {
         assert!((2..=4000).contains(&generations));
         let mut holders = Vec::with_capacity(generations);
         for i in 0..generations {
+            let stamp = 1_000 + i as u64 * 100;
             scene.source.spawn(pid, 500 + i as u64);
             scene.coordinator.adapter.reconcile_detected(
                 &[pid].into_iter().collect(),
                 &mut |_| ImageAuthority::ScanPinned,
                 50,
-                &mut || Some(1_000 + i as u64 * 100),
+                &mut || Some(stamp),
             );
             let caller = scene
                 .coordinator
@@ -43883,6 +44325,7 @@ int main(void) {
                 .live_id(pid)
                 .expect("hot generation admitted");
             holders.push(caller);
+            scene.project(pid, stamp + 10);
             scene.source.kill(pid);
             scene.coordinator.adapter.reconcile(
                 &BTreeSet::new(),
@@ -43912,13 +44355,12 @@ int main(void) {
     /// attach, system scope and comparable exit clocks.
     fn hot_pid_system_native(generations: usize) -> (NativeScene, Vec<CallerId>) {
         let mut scene = CaptureScene::new(2);
-        let holders = admit_hot_pid(&mut scene, 7, generations);
         scene
             .coordinator
             .begin_capture_coverage(CaptureScopeCoverage::System);
         let mut native = NativeScene::over(scene, 0);
         native.scene.attach_all(100, ScopeCustody::System);
-        native.scene.project(7, 120);
+        let holders = admit_hot_pid(&mut native.scene, 7, generations);
         native.scene.coordinator.commit_batch(false).unwrap();
         native.scene.coordinator.engine.scope = Scope::System;
         native.scene.coordinator.exit_clocks_comparable = true;
@@ -44803,14 +45245,13 @@ int main(void) {
         // the named exhaustion gap and no caller edge.
         agreeing(|| {
             let mut scene = CaptureScene::new(2);
-            let _storm = admit_hot_pid(&mut scene, 7, 1100);
-            let gated = admit_hot_pid(&mut scene, 9, 700);
             scene
                 .coordinator
                 .begin_capture_coverage(CaptureScopeCoverage::System);
             let mut native = NativeScene::over(scene, 0);
             native.scene.attach_all(100, ScopeCustody::System);
-            native.scene.project(7, 120);
+            let _storm = admit_hot_pid(&mut native.scene, 7, 1100);
+            let gated = admit_hot_pid(&mut native.scene, 9, 700);
             native.scene.coordinator.commit_batch(false).unwrap();
             native.scene.coordinator.engine.scope = Scope::System;
             native.scene.coordinator.exit_clocks_comparable = true;
@@ -44902,12 +45343,14 @@ int main(void) {
                 .adapter
                 .live_id(8)
                 .expect("control admitted");
+            native.scene.project(8, 250);
             native.scene.source.kill(8);
             native.scene.coordinator.adapter.reconcile(
                 &BTreeSet::new(),
                 &mut |_| ImageAuthority::ScanPinned,
                 500,
             );
+            native.scene.coordinator.commit_batch(false).unwrap();
             let storm: Vec<u64> = (0..1100).map(|i| 200_000 + i).collect();
             let at = native.stamps.tick();
             native.stage(NativeBatch::Lifecycle(leader_exit_drain_many(

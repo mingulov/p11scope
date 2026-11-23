@@ -2367,3 +2367,29 @@ jobs:
           path: ${{ github.workspace }}/pkcs11-check-providers-full-${{ matrix.provider }}-out/
           if-no-files-found: warn
           retention-days: 30
+  # The gate: judges every job against the selection, writes the
+  # p11scope/ci-gate/v1 record, and fails the run on any failed,
+  # cancelled or required-but-not-run job. Needs every job and always
+  # runs; the record and summary name every skipped cell.
+  gate:
+    needs: [select, privileged-build, privileged-build-journal, privileged-shard, privileged-summary, privileged-second-flavor, privileged-counter-flavor, privileged-btrfs, privileged-overlay, release-build, system-scale, public-cli, public-cli-ia32, legacy32-shape, root-integration, witness-cli, run-tree, browser-cells, container-image, pkcs11-check-smoke, pkcs11-check-full, pkcs11-check-providers, pkcs11-check-providers-full]
+    if: ${{ always() }}
+    runs-on: ubuntu-26.04
+    permissions:
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      P11SCOPE_CI_WORKFLOW: privileged-tests
+      GATE_SELECTION: ${{ needs.select.outputs.selection }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The gate script only; no test runs here.
+          fetch-depth: 1
+      - run: python3 -I scripts/ci/gate-record.py --record "$RUNNER_TEMP/gate.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: privileged-tests-gate
+          path: ${{ runner.temp }}/gate.json
+          if-no-files-found: error
+          retention-days: 90

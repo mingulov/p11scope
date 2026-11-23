@@ -8,6 +8,14 @@ on:
         description: Completed successful ci.yml run on this exact commit (positive decimal ID)
         type: string
         required: true
+      accepted_privileged_run_id:
+        description: Completed successful privileged-tests.yml run on this exact commit (positive decimal ID)
+        type: string
+        required: true
+      accepted_bpf_run_id:
+        description: Completed successful bpf-kernels.yml run on this exact commit (positive decimal ID)
+        type: string
+        required: true
       accepted_pkcs11_full_run_id:
         description: Completed successful pkcs11-check-full run on this exact commit (positive decimal ID); required when the commit carries a release tag
         type: string
@@ -26,6 +34,14 @@ on:
     inputs:
       accepted_ci_run_id:
         description: Completed successful ci.yml run on this exact commit (positive decimal ID)
+        type: string
+        required: true
+      accepted_privileged_run_id:
+        description: Completed successful privileged-tests.yml run on this exact commit (positive decimal ID)
+        type: string
+        required: true
+      accepted_bpf_run_id:
+        description: Completed successful bpf-kernels.yml run on this exact commit (positive decimal ID)
         type: string
         required: true
       accepted_pkcs11_full_run_id:
@@ -67,6 +83,8 @@ jobs:
           EXPECTED_REPOSITORY: ${{ github.repository }}
           EXPECTED_SHA: ${{ github.sha }}
           ACCEPTED_CI_RUN_ID: ${{ inputs.accepted_ci_run_id }}
+          ACCEPTED_PRIVILEGED_RUN_ID: ${{ inputs.accepted_privileged_run_id }}
+          ACCEPTED_BPF_RUN_ID: ${{ inputs.accepted_bpf_run_id }}
           ACCEPTED_PKCS11_FULL_RUN_ID: ${{ inputs.accepted_pkcs11_full_run_id }}
           CAPTURE_MODE: ${{ inputs.capture_mode }}
           BUILD_JOBS: ${{ inputs.jobs }}
@@ -86,6 +104,8 @@ jobs:
           accepted=$(python3 -I scripts/check-package-preview-ci.py \
             --repository "$EXPECTED_REPOSITORY" --sha "$EXPECTED_SHA" \
             --accepted-ci-run-id "$ACCEPTED_CI_RUN_ID" \
+            --accepted-privileged-run-id "$ACCEPTED_PRIVILEGED_RUN_ID" \
+            --accepted-bpf-run-id "$ACCEPTED_BPF_RUN_ID" \
             "${full_args[@]}" \
             --capture-mode "$CAPTURE_MODE" --jobs "$BUILD_JOBS")
           printf '%s\n' "$accepted" >>"$GITHUB_OUTPUT"

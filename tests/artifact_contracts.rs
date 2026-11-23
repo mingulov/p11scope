@@ -11475,10 +11475,10 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
     // `hosted_pipeline_partitions_the_workspace_test_gate`; its own
     // `--self-test` is an ordinary step of the checks job).
     let partition_helper = "scripts/ci-test-partition.py";
-    // Tier selection is orchestration, not a lane: the select job names
-    // the selector, whose exact invocation the tier contract pins (as the
-    // partition test does for the helper above).
-    let orchestration_helpers = ["scripts/ci/select-cells.py"];
+    // Tier selection is orchestration, not a lane: the select and gate
+    // jobs name their scripts, whose exact invocations the tier contract
+    // pins (as the partition test does for the helper above).
+    let orchestration_helpers = ["scripts/ci/select-cells.py", "scripts/ci/gate-record.py"];
     let outside_line_admitted = |line: &str| {
         let scripts = named_scripts(line);
         let dependency_only = !scripts.is_empty()

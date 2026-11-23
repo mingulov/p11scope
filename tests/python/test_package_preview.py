@@ -24,7 +24,10 @@ RUN_ID = 42
 WORKFLOW_ID = 71
 ATTEMPT = 2
 FULL_RUN_ID = 43
+PRIV_RUN_ID = 44
 PRIV_WORKFLOW_ID = 72
+BPF_RUN_ID = 45
+BPF_WORKFLOW_ID = 73
 FULL_JOB = "pkcs11-check-full"
 REQUIRED = (
     "dedupe", "select", "lint", "audit", "tests", "bpf-noninterference", "scripts", "archive-log",
@@ -32,7 +35,7 @@ REQUIRED = (
     "contracts-5", "contracts-6", "contracts-7", "contracts-8",
     "coverage (rest)", "coverage (contracts:1/6)", "coverage (contracts:2/6)",
     "coverage (contracts:3/6)", "coverage (contracts:4/6)",
-    "coverage (contracts:5/6)", "coverage (contracts:6/6)", "coverage-report",
+    "coverage (contracts:5/6)", "coverage (contracts:6/6)", "coverage-report", "gate",
 )
 
 
@@ -87,31 +90,81 @@ class PackagePreviewTests(unittest.TestCase):
             "head_commit": {"id": self.sha, "tree_id": self.tree},
         }
         self.full_jobs = [self.job(500, FULL_JOB, run_id=FULL_RUN_ID)]
+        self.priv_run = {
+            "id": PRIV_RUN_ID, "workflow_id": PRIV_WORKFLOW_ID,
+            "path": ".github/workflows/privileged-tests.yml",
+            "status": "completed", "conclusion": "success", "head_sha": self.sha,
+            "run_attempt": ATTEMPT, "repository": {"full_name": REPOSITORY},
+            "head_repository": {"full_name": REPOSITORY},
+            "head_commit": {"id": self.sha, "tree_id": self.tree},
+        }
+        self.bpf_run = {
+            "id": BPF_RUN_ID, "workflow_id": BPF_WORKFLOW_ID,
+            "path": ".github/workflows/bpf-kernels.yml",
+            "status": "completed", "conclusion": "success", "head_sha": self.sha,
+            "run_attempt": ATTEMPT, "repository": {"full_name": REPOSITORY},
+            "head_repository": {"full_name": REPOSITORY},
+            "head_commit": {"id": self.sha, "tree_id": self.tree},
+        }
+        self.gate_ci = self.gate_record("ci")
+        self.gate_priv = self.gate_record("privileged-tests")
+        self.gate_bpf = self.gate_record("bpf-kernels")
         (self.bin / "gh").write_text('''#!/usr/bin/env python3
-import json, os, pathlib, sys
+import json, os, pathlib, re, shutil, sys
 api = pathlib.Path(os.environ["FAKE_API"])
 with open(os.environ["FAKE_REQUESTS"], "a") as out:
     out.write(json.dumps(sys.argv[1:]) + "\\n")
+if sys.argv[1:3] == ["run", "download"]:
+    args = sys.argv[1:]
+    def value(option):
+        return args[args.index(option) + 1]
+    fixture = api / ("gate-" + value("--name") + ".json")
+    if not fixture.is_file():
+        sys.exit(3)
+    target = pathlib.Path(value("--dir")) / value("--name")
+    target.mkdir(parents=True)
+    shutil.copyfile(fixture, target / "gate.json")
+    sys.exit(0)
+assert sys.argv[1] == "api"
 path = sys.argv[-1]
 if "/attempts/" in path:
     page = path.rsplit("page=", 1)[1]
     name = ("full-jobs-" if f"/runs/{FULL_RUN_ID}/" in path else "jobs-") + page
 elif path.endswith("/workflows/privileged-tests.yml"):
     name = "priv-workflow"
+elif path.endswith("/workflows/bpf-kernels.yml"):
+    name = "bpf-workflow"
 elif "/workflows/" in path:
     name = "workflow"
-elif f"/runs/{FULL_RUN_ID}" in path and "/attempts/" not in path:
-    name = "full-run"
 else:
-    count = api / "run-count"
+    rid = re.search(r"/runs/(\\d+)$", path).group(1)
+    count = api / f"run-count-{rid}"
     number = int(count.read_text()) + 1 if count.exists() else 1
     count.write_text(str(number))
-    name = "run-final" if number > 1 and (api / "run-final").exists() else "run"
+    final = api / f"run-{rid}-final"
+    name = f"run-{rid}" + ("-final" if number > 1 and final.exists() else "")
 if (api / (name + ".fail")).exists():
     sys.exit(29)
 sys.stdout.write((api / name).read_text())
 '''.replace("FULL_RUN_ID", str(FULL_RUN_ID)))
         (self.bin / "gh").chmod(0o700)
+
+    def gate_record(self, workflow, tier="full"):
+        return {
+            "schema": "p11scope/ci-gate/v1", "workflow": workflow,
+            "sha": self.sha, "base": "dev/v0.8.0", "tier": tier,
+            "bpf_extra": False, "path_classes": ["known"],
+            "event": "push", "ref": "refs/heads/dev/v0.8.0",
+            "verdict": "pass", "label": "full-green",
+            "jobs": {
+                "lint": {"status": "passed",
+                         "children": {"lint": "success"}},
+                "coverage": {"status": "not-selected",
+                             "reason": "coverage runs on the full tier only",
+                             "children": {}},
+            },
+            "unknown_jobs": [],
+        }
 
     def git(self, *args):
         return subprocess.check_output(["git", "-c", "core.hooksPath=/dev/null", *args],
@@ -128,25 +181,48 @@ sys.stdout.write((api / name).read_text())
 
     def write_api(self):
         (self.api / "workflow").write_text(json.dumps({"id": WORKFLOW_ID, "path": ".github/workflows/ci.yml"}))
-        (self.api / "run").write_text(json.dumps(self.run))
+        (self.api / f"run-{RUN_ID}").write_text(json.dumps(self.run))
         for index in range(0, max(1, len(self.jobs)), 100):
             (self.api / f"jobs-{index // 100 + 1}").write_text(json.dumps({
                 "total_count": len(self.jobs), "jobs": self.jobs[index:index + 100],
             }))
         (self.api / "priv-workflow").write_text(json.dumps(
             {"id": PRIV_WORKFLOW_ID, "path": ".github/workflows/privileged-tests.yml"}))
-        (self.api / "full-run").write_text(json.dumps(self.full_run))
+        (self.api / f"run-{PRIV_RUN_ID}").write_text(json.dumps(self.priv_run))
+        (self.api / "bpf-workflow").write_text(json.dumps(
+            {"id": BPF_WORKFLOW_ID, "path": ".github/workflows/bpf-kernels.yml"}))
+        (self.api / f"run-{BPF_RUN_ID}").write_text(json.dumps(self.bpf_run))
+        (self.api / f"run-{FULL_RUN_ID}").write_text(json.dumps(self.full_run))
         (self.api / "full-jobs-1").write_text(json.dumps({
             "total_count": len(self.full_jobs), "jobs": self.full_jobs,
         }))
+        (self.api / "gate-ci-gate.json").write_text(json.dumps(self.gate_ci))
+        (self.api / "gate-privileged-tests-gate.json").write_text(json.dumps(self.gate_priv))
+        (self.api / "gate-bpf-kernels-gate.json").write_text(json.dumps(self.gate_bpf))
 
-    def validate(self, *extra):
+    def validate(self, *extra, drop=()):
         self.assertTrue(HELPER.is_file(), "the package CI validation helper is missing")
         self.write_api()
+        for name in drop:
+            (self.api / name).unlink()
         return subprocess.run([
             sys.executable, "-I", str(HELPER), "--repository", REPOSITORY,
-            "--sha", self.sha, "--accepted-ci-run-id", str(RUN_ID), *extra,
-        ], cwd=self.repo, env=self.env, text=True, capture_output=True, timeout=10)
+            "--sha", self.sha, "--accepted-ci-run-id", str(RUN_ID),
+            "--accepted-privileged-run-id", str(PRIV_RUN_ID),
+            "--accepted-bpf-run-id", str(BPF_RUN_ID), *extra,
+        ], cwd=self.repo, env=self.env, text=True, capture_output=True, timeout=30)
+
+    def requested(self):
+        """Stub calls with download dirs normalized away (they are tempdirs)."""
+        described = []
+        for line in self.requests.read_text().splitlines():
+            call = json.loads(line)
+            if call[:2] == ["run", "download"]:
+                described.append(f"download run {call[2]} artifact "
+                                 f"{call[call.index('--name') + 1]}")
+            else:
+                described.append(call[-1])
+        return described
 
     def outputs(self, result):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -165,12 +241,20 @@ sys.stdout.write((api / name).read_text())
             {"mode": "full", "artifact": "release-preview-public-assets", "public": "public"},
             {"mode": "p0", "artifact": "release-preview-public-assets-p0", "public": "public-p0"},
         ]})
-        calls = [json.loads(line) for line in self.requests.read_text().splitlines()]
-        self.assertEqual([call[-1] for call in calls], [
+        self.assertEqual(self.requested(), [
             f"repos/{REPOSITORY}/actions/workflows/ci.yml",
             f"repos/{REPOSITORY}/actions/runs/42",
             f"repos/{REPOSITORY}/actions/runs/42/attempts/2/jobs?per_page=100&page=1",
             f"repos/{REPOSITORY}/actions/runs/42",
+            "download run 42 artifact ci-gate",
+            f"repos/{REPOSITORY}/actions/workflows/privileged-tests.yml",
+            f"repos/{REPOSITORY}/actions/runs/44",
+            "download run 44 artifact privileged-tests-gate",
+            f"repos/{REPOSITORY}/actions/runs/44",
+            f"repos/{REPOSITORY}/actions/workflows/bpf-kernels.yml",
+            f"repos/{REPOSITORY}/actions/runs/45",
+            "download run 45 artifact bpf-kernels-gate",
+            f"repos/{REPOSITORY}/actions/runs/45",
         ])
 
     def test_selected_mode_and_canonical_jobs_are_published(self):
@@ -183,13 +267,20 @@ sys.stdout.write((api / name).read_text())
     def test_full_run_validates_on_the_exact_sha(self):
         output = self.outputs(self.validate("--accepted-pkcs11-full-run-id", str(FULL_RUN_ID)))
         self.assertEqual(output["sha"], self.sha)
-        calls = [json.loads(line) for line in self.requests.read_text().splitlines()]
-        self.assertEqual([call[-1] for call in calls], [
+        self.assertEqual(self.requested(), [
             f"repos/{REPOSITORY}/actions/workflows/ci.yml",
             f"repos/{REPOSITORY}/actions/runs/42",
             f"repos/{REPOSITORY}/actions/runs/42/attempts/2/jobs?per_page=100&page=1",
             f"repos/{REPOSITORY}/actions/runs/42",
+            "download run 42 artifact ci-gate",
             f"repos/{REPOSITORY}/actions/workflows/privileged-tests.yml",
+            f"repos/{REPOSITORY}/actions/runs/44",
+            "download run 44 artifact privileged-tests-gate",
+            f"repos/{REPOSITORY}/actions/runs/44",
+            f"repos/{REPOSITORY}/actions/workflows/bpf-kernels.yml",
+            f"repos/{REPOSITORY}/actions/runs/45",
+            "download run 45 artifact bpf-kernels-gate",
+            f"repos/{REPOSITORY}/actions/runs/45",
             f"repos/{REPOSITORY}/actions/runs/43",
             f"repos/{REPOSITORY}/actions/runs/43/attempts/2/jobs?per_page=100&page=1",
             f"repos/{REPOSITORY}/actions/runs/43",
@@ -198,11 +289,14 @@ sys.stdout.write((api / name).read_text())
     def test_full_required_but_missing_refuses_after_ci(self):
         result = self.validate("--require-pkcs11-full")
         self.assert_refused(result)
-        calls = [json.loads(line) for line in self.requests.read_text().splitlines()]
-        # CI validated first (four calls), then the missing FULL ID refused
-        # before any FULL API call.
-        self.assertEqual(len(calls), 4)
-        self.assertTrue(all("privileged-tests" not in call[-1] for call in calls))
+        described = self.requested()
+        # CI validated first (four API calls), then the missing FULL ID
+        # refused before any gate download or privileged, BPF or FULL call.
+        self.assertEqual(len(described), 4)
+        self.assertTrue(all("download" not in call
+                            and "privileged" not in call
+                            and "bpf-kernels" not in call
+                            and "/runs/43" not in call for call in described))
 
     def test_full_wrong_run_job_or_sha_refuses(self):
         baseline_run = copy.deepcopy(self.full_run)
@@ -232,9 +326,70 @@ sys.stdout.write((api / name).read_text())
                 self.assert_refused(self.validate(
                     "--accepted-pkcs11-full-run-id", str(FULL_RUN_ID)))
 
+    def test_quick_tier_gate_records_refuse(self):
+        # Quick results never qualify a release, even with green jobs.
+        for attribute in ("gate_ci", "gate_priv", "gate_bpf"):
+            with self.subTest(attribute=attribute):
+                record = copy.deepcopy(getattr(self, attribute))
+                record["tier"] = "quick"
+                setattr(self, attribute, record)
+                self.assert_refused(self.validate())
+                setattr(self, attribute, self.gate_record(
+                    record["workflow"]))
+        self.gate_bpf["tier"] = "schedule"
+        self.assert_refused(self.validate())
+
+    def test_gate_verdict_jobs_and_identity_refuse(self):
+        baseline = copy.deepcopy(self.gate_ci)
+        mutations = (
+            {"verdict": "fail"},
+            {"schema": "p11scope/ci-gate/v0"},
+            {"workflow": "privileged-tests"},
+            {"sha": "a" * 40},
+            {"unknown_jobs": ["mystery-job"]},
+            {"jobs": {}},
+            {"jobs": {"lint": {"status": "failed",
+                               "children": {"lint": "failure"}}}},
+            {"jobs": {"lint": {"status": "cancelled",
+                               "children": {"lint": "cancelled"}}}},
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                self.gate_ci = {**copy.deepcopy(baseline), **mutation}
+                self.assert_refused(self.validate())
+        self.gate_ci = copy.deepcopy(baseline)
+
+    def test_missing_gate_artifact_refuses(self):
+        for name in ("gate-ci-gate.json", "gate-privileged-tests-gate.json",
+                     "gate-bpf-kernels-gate.json"):
+            with self.subTest(name=name):
+                self.assert_refused(self.validate(drop=(name,)))
+
+    def test_privileged_and_bpf_run_identity_refuse(self):
+        for attribute, run_id in (("priv_run", PRIV_RUN_ID),
+                                  ("bpf_run", BPF_RUN_ID)):
+            baseline = copy.deepcopy(getattr(self, attribute))
+            path = baseline["path"]
+            mutations = (
+                {"id": 46}, {"workflow_id": 74},
+                {"path": ".github/workflows/ci.yml"},
+                {"conclusion": "failure"},
+                {"head_sha": "a" * 40},
+                {"head_commit": {"id": self.sha, "tree_id": "b" * 40}},
+            )
+            for mutation in mutations:
+                with self.subTest(run=run_id, mutation=mutation):
+                    setattr(self, attribute,
+                            {**copy.deepcopy(baseline), **mutation})
+                    self.assert_refused(self.validate())
+            setattr(self, attribute, baseline)
+            self.assertEqual(getattr(self, attribute)["path"], path)
+
     def test_invalid_inputs_refuse_before_api_or_outputs(self):
         cases = [["--jobs", value] for value in ("", "0", "17", "01", "+2", "2\n", "2.0")]
         cases += [["--accepted-ci-run-id", value] for value in ("", "0", "-1", "01", "1\n")]
+        cases += [["--accepted-privileged-run-id", value] for value in ("", "0", "-1", "01", "1\n")]
+        cases += [["--accepted-bpf-run-id", value] for value in ("", "0", "-1", "01", "1\n")]
         cases += [["--accepted-pkcs11-full-run-id", value] for value in ("0", "-1", "01", "1\n", "abc")]
         cases += [["--capture-mode", "unknown"], ["--sha", "a" * 39],
                   ["--repository", "owner/repo?query=1"], ["--repository", "../repo"],
@@ -324,10 +479,12 @@ sys.stdout.write((api / name).read_text())
         self.assertTrue(HELPER.is_file(), "the package CI validation helper is missing")
         self.write_api()
         command = [sys.executable, "-I", str(HELPER), "--repository", REPOSITORY,
-                   "--sha", self.sha, "--accepted-ci-run-id", "42"]
-        for name, contents in (("run.fail", ""), ("run", "not json"),
-                               ("run", '{"id": 42, "id": 42}'),
-                               ("run", json.dumps({**self.run, "invalid": float("nan")})),
+                   "--sha", self.sha, "--accepted-ci-run-id", "42",
+                   "--accepted-privileged-run-id", str(PRIV_RUN_ID),
+                   "--accepted-bpf-run-id", str(BPF_RUN_ID)]
+        for name, contents in (("run-42.fail", ""), ("run-42", "not json"),
+                               ("run-42", '{"id": 42, "id": 42}'),
+                               ("run-42", json.dumps({**self.run, "invalid": float("nan")})),
                                ("jobs-1", '{"total_count": 24, "jobs": []}'),
                                ("jobs-1", '{"total_count": true, "jobs": []}'),
                                ("workflow", '{"id": 71, "path": "other.yml"}')):
@@ -335,14 +492,14 @@ sys.stdout.write((api / name).read_text())
                 self.write_api()
                 (self.api / name).write_text(contents)
                 result = subprocess.run(command, cwd=self.repo, env=self.env, text=True,
-                                        capture_output=True, timeout=10)
+                                        capture_output=True, timeout=30)
                 self.assert_refused(result)
-                (self.api / "run.fail").unlink(missing_ok=True)
+                (self.api / "run-42.fail").unlink(missing_ok=True)
         self.write_api()
-        (self.api / "run-count").unlink(missing_ok=True)
-        (self.api / "run-final").write_text(json.dumps({**self.run, "run_attempt": 3}))
+        (self.api / "run-count-42").unlink(missing_ok=True)
+        (self.api / "run-42-final").write_text(json.dumps({**self.run, "run_attempt": 3}))
         result = subprocess.run(command, cwd=self.repo, env=self.env, text=True,
-                                capture_output=True, timeout=10)
+                                capture_output=True, timeout=30)
         self.assert_refused(result)
 
     def test_real_validation_shell_emits_outputs_only_after_acceptance(self):
@@ -358,10 +515,15 @@ sys.stdout.write((api / name).read_text())
         self.run.update(head_sha=self.sha, head_commit={"id": self.sha, "tree_id": self.tree})
         for job in self.jobs:
             job["head_sha"] = self.sha
+        self.priv_run.update(head_sha=self.sha, head_commit={"id": self.sha, "tree_id": self.tree})
+        self.bpf_run.update(head_sha=self.sha, head_commit={"id": self.sha, "tree_id": self.tree})
+        for record in (self.gate_ci, self.gate_priv, self.gate_bpf):
+            record["sha"] = self.sha
         self.write_api()
         output = self.base / "github-output"
         env = {**self.env, "EXPECTED_REPOSITORY": REPOSITORY, "EXPECTED_SHA": self.sha,
-               "ACCEPTED_CI_RUN_ID": "42", "ACCEPTED_PKCS11_FULL_RUN_ID": "",
+               "ACCEPTED_CI_RUN_ID": "42", "ACCEPTED_PRIVILEGED_RUN_ID": str(PRIV_RUN_ID),
+               "ACCEPTED_BPF_RUN_ID": str(BPF_RUN_ID), "ACCEPTED_PKCS11_FULL_RUN_ID": "",
                "CAPTURE_MODE": "p0", "BUILD_JOBS": "3",
                "GITHUB_OUTPUT": str(output)}
         command = ["bash", "--noprofile", "--norc", "-c", step("Validate accepted ordinary CI", "validate")["run"]]
@@ -389,14 +551,19 @@ sys.stdout.write((api / name).read_text())
         self.tree = self.git("rev-parse", "HEAD^{tree}").strip()
         self.run.update(head_sha=self.sha, head_commit={"id": self.sha, "tree_id": self.tree})
         self.full_run.update(head_sha=self.sha, head_commit={"id": self.sha, "tree_id": self.tree})
+        self.priv_run.update(head_sha=self.sha, head_commit={"id": self.sha, "tree_id": self.tree})
+        self.bpf_run.update(head_sha=self.sha, head_commit={"id": self.sha, "tree_id": self.tree})
         for job in self.jobs + self.full_jobs:
             job["head_sha"] = self.sha
+        for record in (self.gate_ci, self.gate_priv, self.gate_bpf):
+            record["sha"] = self.sha
         self.write_api()
         output = self.base / "github-output-tag"
         command = ["bash", "--noprofile", "--norc", "-c", step("Validate accepted ordinary CI", "validate")["run"]]
         # Untagged without a FULL ID: CI alone validates.
         env = {**self.env, "EXPECTED_REPOSITORY": REPOSITORY, "EXPECTED_SHA": self.sha,
-               "ACCEPTED_CI_RUN_ID": "42", "ACCEPTED_PKCS11_FULL_RUN_ID": "",
+               "ACCEPTED_CI_RUN_ID": "42", "ACCEPTED_PRIVILEGED_RUN_ID": str(PRIV_RUN_ID),
+               "ACCEPTED_BPF_RUN_ID": str(BPF_RUN_ID), "ACCEPTED_PKCS11_FULL_RUN_ID": "",
                "CAPTURE_MODE": "both", "BUILD_JOBS": "2",
                "GITHUB_OUTPUT": str(output)}
         untagged = subprocess.run(command, cwd=self.repo, env=env, text=True, capture_output=True, timeout=10)
@@ -536,13 +703,17 @@ else:
         trigger = document.get("on", document.get(True))
         self.assertEqual(set(trigger), {"workflow_dispatch", "workflow_call"})
         inputs = trigger["workflow_dispatch"]["inputs"]
-        self.assertEqual(set(inputs), {"accepted_ci_run_id", "accepted_pkcs11_full_run_id",
+        self.assertEqual(set(inputs), {"accepted_ci_run_id", "accepted_privileged_run_id",
+                                       "accepted_bpf_run_id", "accepted_pkcs11_full_run_id",
                                        "capture_mode", "jobs"})
         self.assertTrue(inputs["accepted_ci_run_id"]["required"])
+        self.assertTrue(inputs["accepted_privileged_run_id"]["required"])
+        self.assertTrue(inputs["accepted_bpf_run_id"]["required"])
         self.assertFalse(inputs["accepted_pkcs11_full_run_id"].get("required", False))
         self.assertEqual(str(inputs["accepted_pkcs11_full_run_id"].get("default", "")), "")
         call_inputs = trigger["workflow_call"]["inputs"]
-        self.assertEqual(set(call_inputs), {"accepted_ci_run_id", "accepted_pkcs11_full_run_id",
+        self.assertEqual(set(call_inputs), {"accepted_ci_run_id", "accepted_privileged_run_id",
+                                            "accepted_bpf_run_id", "accepted_pkcs11_full_run_id",
                                             "capture_mode", "jobs"})
         self.assertEqual(inputs["capture_mode"]["options"], ["full", "p0", "both"])
         self.assertEqual(inputs["capture_mode"]["default"], "both")

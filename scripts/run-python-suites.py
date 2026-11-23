@@ -86,6 +86,7 @@ RUN = [
     ("test_canary_observer_verbosity.py", []),
     ("test_ci_dependency_selection.py", []),
     ("test_ci_stop_races.py", []),
+    ("test_ci_gate_record.py", []),
     ("test_ci_test_partition.py", []),
     ("test_ci_tier_selection.py", []),
     ("test_counter_object.py", []),

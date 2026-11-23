@@ -996,9 +996,10 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
                                   "bare unhashed pip install remains")
 
     def test_schedule_runs_only_release_build_and_full(self):
-        # Every job except select, release-build and the two FULL jobs
-        # skips on schedule, so the nightly runs only the FULL suites on
-        # main. Select runs to publish the schedule selection for the gate.
+        # Every job except select, gate, release-build and the two FULL
+        # jobs skips on schedule, so the nightly runs only the FULL suites
+        # on main. Select runs to publish the schedule selection for the
+        # gate, which judges it like any other run.
         names = [match.group(1) for match in
                  re.finditer(r"^  ([a-z][a-z0-9-]*):\s*$", self.yml, re.M)]
         jobs = [name for name in names
@@ -1006,6 +1007,7 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
         # Top-level keys that are not jobs (permissions, env, etc.) never
         # match the job pattern above because they carry values.
         self.assertIn("select", jobs)
+        self.assertIn("gate", jobs)
         self.assertIn("release-build", jobs)
         self.assertIn("pkcs11-check-smoke", jobs)
         self.assertIn("pkcs11-check-full", jobs)
@@ -1014,7 +1016,8 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
         for name in jobs:
             body = job_body(self.yml, name)
             with self.subTest(job=name):
-                if name in ("select", "release-build", "pkcs11-check-full",
+                if name in ("select", "gate", "release-build",
+                            "pkcs11-check-full",
                             "pkcs11-check-providers-full"):
                     continue
                 self.assertIn("github.event_name != 'schedule'", body,

@@ -6,9 +6,11 @@
 import argparse
 from datetime import datetime
 import json
+import os
 import re
 import subprocess
 import sys
+import tempfile
 
 
 WORKFLOW = ".github/workflows/ci.yml"
@@ -18,10 +20,25 @@ REQUIRED_JOBS = {
     "dedupe", "select", "lint", "audit", "tests", "bpf-noninterference", "scripts", "archive-log",
     *(f"contracts-{index}" for index in range(1, 9)),
     "coverage (rest)", *(f"coverage (contracts:{index}/6)" for index in range(1, 7)),
-    "coverage-report",
+    "coverage-report", "gate",
 }
 PRIV_WORKFLOW = ".github/workflows/privileged-tests.yml"
 PRIV_FULL_JOB = "pkcs11-check-full"
+BPF_WORKFLOW = ".github/workflows/bpf-kernels.yml"
+GATE_SCHEMA = "p11scope/ci-gate/v1"
+# Release checks require a full-tier gate record from each workflow on the
+# exact SHA; quick-tier records never qualify. The artifact name is the
+# gate job's upload in each workflow.
+GATE_ARTIFACT = {
+    WORKFLOW: "ci-gate",
+    PRIV_WORKFLOW: "privileged-tests-gate",
+    BPF_WORKFLOW: "bpf-kernels-gate",
+}
+GATE_WORKFLOW_NAME = {
+    WORKFLOW: "ci",
+    PRIV_WORKFLOW: "privileged-tests",
+    BPF_WORKFLOW: "bpf-kernels",
+}
 
 
 def require(condition, message):
@@ -81,23 +98,27 @@ def check_run(run, repository, run_id, workflow_id, sha, tree):
     return attempt
 
 
-def check_priv_run(run, repository, run_id, workflow_id, sha, tree):
-    require(type(run.get("id")) is int and run["id"] == run_id, "wrong FULL run")
+def check_named_run(run, repository, run_id, workflow_id, expected_path, label, sha, tree):
+    require(type(run.get("id")) is int and run["id"] == run_id, f"wrong {label} run")
     require(type(run.get("workflow_id")) is int and run["workflow_id"] == workflow_id
-            and run.get("path") == PRIV_WORKFLOW, "wrong FULL workflow")
+            and run.get("path") == expected_path, f"wrong {label} workflow")
     require(run.get("status") == "completed" and run.get("conclusion") == "success",
-            "selected FULL run is not completed successfully")
-    require(run.get("head_sha") == sha, "FULL run is on a different SHA")
+            f"selected {label} run is not completed successfully")
+    require(run.get("head_sha") == sha, f"{label} run is on a different SHA")
     for key in ("repository", "head_repository"):
         value = run.get(key)
         require(isinstance(value, dict) and value.get("full_name") == repository,
-                "FULL run is from a different repository")
+                f"{label} run is from a different repository")
     commit = run.get("head_commit")
     require(isinstance(commit, dict) and commit.get("id") == sha and commit.get("tree_id") == tree,
-            "FULL run does not match the checkout commit and tree")
+            f"{label} run does not match the checkout commit and tree")
     attempt = run.get("run_attempt")
-    require(positive(attempt), "invalid FULL run attempt")
+    require(positive(attempt), f"invalid {label} run attempt")
     return attempt
+
+
+def check_priv_run(run, repository, run_id, workflow_id, sha, tree):
+    return check_named_run(run, repository, run_id, workflow_id, PRIV_WORKFLOW, "FULL", sha, tree)
 
 
 def timestamp(value):
@@ -192,6 +213,43 @@ def check_full_job(repository, run_id, attempt, sha):
     check_gate(jobs[PRIV_FULL_JOB])
 
 
+def download_gate_record(repository, run_id, workflow_path, directory):
+    artifact = GATE_ARTIFACT[workflow_path]
+    result = subprocess.run(["gh", "run", "download", str(run_id),
+                             "--name", artifact, "--repo", repository,
+                             "--dir", directory],
+                            text=True, capture_output=True, timeout=120)
+    require(result.returncode == 0,
+            f"gate record {artifact} is missing from run {run_id}")
+    path = os.path.join(directory, artifact, "gate.json")
+    try:
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+    except OSError:
+        raise ValueError(f"gate record {artifact} has no gate.json")
+    record = json.loads(text, object_pairs_hook=unique_object,
+                        parse_constant=lambda _: require(False, "invalid gate JSON constant"))
+    require(isinstance(record, dict), "gate record is not an object")
+    return record
+
+
+def check_gate_record(record, workflow_path, sha):
+    require(record.get("schema") == GATE_SCHEMA, "gate record has the wrong schema")
+    require(record.get("workflow") == GATE_WORKFLOW_NAME[workflow_path],
+            "gate record is for a different workflow")
+    require(record.get("sha") == sha, "gate record is on a different SHA")
+    require(record.get("tier") in ("full", "integration"),
+            "gate record is not a full-tier record")
+    require(record.get("verdict") == "pass", "gate record is not passing")
+    require(record.get("unknown_jobs") == [], "gate record lists unknown jobs")
+    jobs = record.get("jobs")
+    require(isinstance(jobs, dict) and jobs, "gate record has no jobs")
+    for name, entry in jobs.items():
+        require(isinstance(entry, dict), "invalid gate record job")
+        require(entry.get("status") in ("passed", "not-selected"),
+                f"gate record job {name} did not pass")
+
+
 def canonical(pattern, description):
     def parse(value):
         if not re.fullmatch(pattern, value):
@@ -208,6 +266,10 @@ def main():
     parser.add_argument("--sha", required=True, type=canonical(r"[0-9a-f]{40}", "expected a full commit SHA"))
     parser.add_argument("--accepted-ci-run-id", required=True,
                         type=canonical(r"[1-9][0-9]*", "expected a positive decimal CI run ID"))
+    parser.add_argument("--accepted-privileged-run-id", required=True,
+                        type=canonical(r"[1-9][0-9]*", "expected a positive decimal privileged-tests run ID"))
+    parser.add_argument("--accepted-bpf-run-id", required=True,
+                        type=canonical(r"[1-9][0-9]*", "expected a positive decimal bpf-kernels run ID"))
     parser.add_argument("--accepted-pkcs11-full-run-id", default="",
                         type=canonical(r"(|[1-9][0-9]*)", "expected empty or a positive decimal FULL run ID"))
     parser.add_argument("--require-pkcs11-full", action="store_true",
@@ -230,11 +292,42 @@ def main():
         full_id = args.accepted_pkcs11_full_run_id
         if args.require_pkcs11_full and not full_id:
             raise ValueError("a release tag needs a FULL pkcs11-check run ID")
-        if full_id:
+        with tempfile.TemporaryDirectory(prefix="gate-records-") as tmp:
+            check_gate_record(download_gate_record(args.repository, run_id, WORKFLOW, tmp),
+                              WORKFLOW, args.sha)
             priv_workflow = api(f"repos/{args.repository}/actions/workflows/privileged-tests.yml")
             priv_id = priv_workflow.get("id")
             require(positive(priv_id) and priv_workflow.get("path") == PRIV_WORKFLOW,
-                    "invalid FULL workflow identity")
+                    "invalid privileged-tests workflow identity")
+            priv_run_id = int(args.accepted_privileged_run_id)
+            priv_endpoint = f"repos/{args.repository}/actions/runs/{priv_run_id}"
+            priv_attempt = check_named_run(api(priv_endpoint), args.repository, priv_run_id,
+                                           priv_id, PRIV_WORKFLOW, "privileged gate",
+                                           args.sha, tree)
+            check_gate_record(download_gate_record(args.repository, priv_run_id,
+                                                   PRIV_WORKFLOW, tmp),
+                              PRIV_WORKFLOW, args.sha)
+            require(check_named_run(api(priv_endpoint), args.repository, priv_run_id,
+                                    priv_id, PRIV_WORKFLOW, "privileged gate",
+                                    args.sha, tree) == priv_attempt,
+                    "privileged gate run attempt changed while validating")
+            bpf_workflow = api(f"repos/{args.repository}/actions/workflows/bpf-kernels.yml")
+            bpf_id = bpf_workflow.get("id")
+            require(positive(bpf_id) and bpf_workflow.get("path") == BPF_WORKFLOW,
+                    "invalid bpf-kernels workflow identity")
+            bpf_run_id = int(args.accepted_bpf_run_id)
+            bpf_endpoint = f"repos/{args.repository}/actions/runs/{bpf_run_id}"
+            bpf_attempt = check_named_run(api(bpf_endpoint), args.repository, bpf_run_id,
+                                          bpf_id, BPF_WORKFLOW, "BPF gate",
+                                          args.sha, tree)
+            check_gate_record(download_gate_record(args.repository, bpf_run_id,
+                                                   BPF_WORKFLOW, tmp),
+                              BPF_WORKFLOW, args.sha)
+            require(check_named_run(api(bpf_endpoint), args.repository, bpf_run_id,
+                                    bpf_id, BPF_WORKFLOW, "BPF gate",
+                                    args.sha, tree) == bpf_attempt,
+                    "BPF gate run attempt changed while validating")
+        if full_id:
             full_run_id = int(full_id)
             full_endpoint = f"repos/{args.repository}/actions/runs/{full_run_id}"
             full_attempt = check_priv_run(api(full_endpoint), args.repository, full_run_id,

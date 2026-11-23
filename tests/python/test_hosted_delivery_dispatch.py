@@ -21,6 +21,8 @@ ROOT = Path(__file__).resolve().parents[2]
 CALLS = {
     "packages": ("package-delivery", "package-preview", {
         "accepted_ci_run_id": "${{ inputs.accepted_ci_run_id }}",
+        "accepted_privileged_run_id": "${{ inputs.accepted_privileged_run_id }}",
+        "accepted_bpf_run_id": "${{ inputs.accepted_bpf_run_id }}",
         "capture_mode": "${{ inputs.capture_mode }}", "jobs": "${{ inputs.delivery_jobs }}"}),
     "docker": ("docker-delivery", "docker-runtime", {"preview_run_id": "${{ inputs.artifact_run_id }}"}),
     "kubernetes": ("kubernetes-delivery", "kubernetes-runtime", {
@@ -92,7 +94,8 @@ sys.stdout.write(answer.stdout)
         self.assertEqual(inputs["delivery_jobs"]["default"], "2")
         self.assertEqual(inputs["run_k2"]["type"], "boolean")
         self.assertEqual(inputs["run_k2"]["default"], "false")
-        for name in ("accepted_ci_run_id", "artifact_run_id"):
+        for name in ("accepted_ci_run_id", "accepted_privileged_run_id",
+                     "accepted_bpf_run_id", "artifact_run_id"):
             self.assertEqual(inputs[name]["type"], "string")
         self.assertEqual(data["jobs"]["dedupe"]["env"]["DELIVERY_TASK"], "${{ inputs.delivery_task || 'checks' }}")
 
@@ -115,7 +118,7 @@ sys.stdout.write(answer.stdout)
                 self.assertFalse({"needs", "steps", "runs-on", "secrets"} & job.keys())
 
     def test_reusable_inputs_use_supported_types_and_preserve_direct_dispatch(self):
-        expected = {"package-preview": {"accepted_ci_run_id": "string", "accepted_pkcs11_full_run_id": "string", "capture_mode": "string", "jobs": "string"},
+        expected = {"package-preview": {"accepted_ci_run_id": "string", "accepted_privileged_run_id": "string", "accepted_bpf_run_id": "string", "accepted_pkcs11_full_run_id": "string", "capture_mode": "string", "jobs": "string"},
                     "docker-runtime": {"preview_run_id": "string"},
                     "kubernetes-runtime": {"candidate_sha": "string", "artifact_run_id": "string", "run_k2": "boolean"}}
         for name, types in expected.items():

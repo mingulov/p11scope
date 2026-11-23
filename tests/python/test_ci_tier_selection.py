@@ -39,14 +39,14 @@ WORKFLOWS = ("ci", "privileged-tests", "bpf-kernels")
 SUMS_DIR = ROOT / "tests" / "fixtures" / "vng-kernel-sha256sums"
 
 # Universe jobs with no run_ predicate in their YAML, pinned by name:
-# the mechanism (select, and ci's always-first dedupe), the
+# the mechanism (select, gate, and ci's always-first dedupe), the
 # failure-driven quarantine, and the delivery calls (pinned independent
 # of every check job by the delivery contract).
 EXCUSED = {
-    "ci": {"dedupe", "select", "quarantine", "package-delivery",
+    "ci": {"dedupe", "select", "gate", "quarantine", "package-delivery",
            "docker-delivery", "kubernetes-delivery"},
-    "privileged-tests": {"select"},
-    "bpf-kernels": {"select"},
+    "privileged-tests": {"select", "gate"},
+    "bpf-kernels": {"select", "gate"},
 }
 
 # Dynamic kernel matrices per workflow: job id to select output name.
@@ -146,6 +146,34 @@ class TierSelectionTests(unittest.TestCase):
                                 for job_name in SELECT.GATED[name])
                 expected.update(DYNAMIC_MATRICES.get(name, {}).values())
                 self.assertEqual(set(job["outputs"]), expected)
+
+    def test_gate_job_wiring(self):
+        for name in WORKFLOWS:
+            with self.subTest(workflow=name):
+                jobs = workflow_jobs(name)
+                gate = jobs["gate"]
+                self.assertEqual(set(gate["needs"]),
+                                 set(jobs) - {"gate"})
+                self.assertEqual(gate["if"], "${{ always() }}")
+                self.assertEqual(gate["permissions"], {"actions": "read"})
+                self.assertEqual(gate["env"]["P11SCOPE_CI_WORKFLOW"], name)
+                self.assertEqual(gate["env"]["GATE_SELECTION"],
+                                 "${{ needs.select.outputs.selection }}")
+                steps = gate["steps"]
+                self.assertEqual(steps[0]["with"]["fetch-depth"], 1)
+                self.assertEqual(
+                    steps[1]["run"],
+                    'python3 -I scripts/ci/gate-record.py --record '
+                    '"$RUNNER_TEMP/gate.json"')
+                upload = steps[2]
+                self.assertTrue(upload["uses"].startswith(
+                    "actions/upload-artifact@"))
+                self.assertEqual(upload["with"]["name"], f"{name}-gate")
+                self.assertEqual(upload["with"]["path"],
+                                 "${{ runner.temp }}/gate.json")
+                self.assertEqual(upload["with"]["if-no-files-found"],
+                                 "error")
+                self.assertEqual(upload["with"]["retention-days"], 90)
 
     def test_no_inputs_interpolation_inside_run_blocks(self):
         # Dispatch inputs travel through env into the selector; a

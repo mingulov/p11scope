@@ -230,6 +230,7 @@ UNIVERSE = {
         "package-delivery",
         "docker-delivery",
         "kubernetes-delivery",
+        "gate",
     ],
     "privileged-tests": [
         "select",
@@ -255,6 +256,7 @@ UNIVERSE = {
         "pkcs11-check-full",
         "pkcs11-check-providers",
         "pkcs11-check-providers-full",
+        "gate",
     ],
     "bpf-kernels": [
         "select",
@@ -265,12 +267,13 @@ UNIVERSE = {
         "bpf-load-gate1-kernels",
         "lib-cells-kernels",
         "bpf-load-host",
+        "gate",
     ],
 }
 
 # Static matrix children per job, for the gate's count check. Dynamic
 # kernel matrices report their emitted length instead; contracts names
-# its shards explicitly (see NAMES below).
+# its shards explicitly in the selection document.
 STATIC_CHILDREN = {
     "privileged-shard": 8,
     "coverage": 7,
@@ -539,6 +542,9 @@ def build_selection(workflow, event, ref, sha, tier_input, classes,
         states = select_privileged(tier, bpf_extra, event, pkcs11_full)
     else:
         states = select_bpf(tier, bpf_extra)
+    # The gate always runs (needs all, if: always); the record excludes
+    # its own writer, and the run conclusion judges it instead.
+    states["gate"] = ("selected", None)
     kernels = cli_kernels(tier, bpf_extra)
     matrices = {f"matrix_{job.replace('-', '_')}": {"kernel": kernels[job]}
                 for job in CLI_FULL_KERNELS}

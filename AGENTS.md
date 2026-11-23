@@ -165,9 +165,15 @@ adds the full BPF matrix, every guest kernel and the journal/counter
 flavours. Pushes to `dev/*`, `main` and any other branch, pull requests
 and dispatches run the full tier (coverage, every kernel, browsers,
 container image). A `.github/` or `scripts/ci/` change, or any
-unclassified path, runs the full tier. Tag pushes trigger nothing: a
-release tag rides the commit the branch push already ran. GitHub runners
-provide passwordless root, BTF and KVM:
+unclassified path, runs the full tier. Each workflow ends in a gate job
+that writes a `p11scope/ci-gate/v1` record (tier plus per-job
+passed/failed/cancelled/not-selected); the gate fails on any failed,
+cancelled or required-but-not-run job, and its summary names every
+skipped cell. Quick results are labelled quick-green and never qualify
+a release: release checks require full- or integration-tier gate
+records from all three workflows on the exact SHA. Tag pushes trigger
+nothing: a release tag rides the commit the branch push already ran.
+GitHub runners provide passwordless root, BTF and KVM:
 - the curated privileged library cells (`scripts/run-privileged-lib-tests.sh`,
   sharded, with a coverage check);
 - the system-scale capture cells;

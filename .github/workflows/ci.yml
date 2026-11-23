@@ -52,12 +52,15 @@ on:
         default: false
 permissions:
   contents: read
-# Per ref, so a branch that moves sequences its queued runs. Several refs at
-# one commit (a release branch and main) each start a run; tag pushes trigger
-# nothing. The dedupe job below lets only the first run the check matrix.
+# Per workflow, event and ref, so a push can never cancel an agent's
+# dispatch on the same branch. Pushes to development branches cancel the
+# run a newer push overtook; every other event sequences its runs. Several
+# refs at one commit (a release branch and main) each start a run; tag
+# pushes trigger nothing. The dedupe job below lets only the first run
+# the check matrix.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: false
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' && (startsWith(github.ref, 'refs/heads/test/') || startsWith(github.ref, 'refs/heads/task/')) }}
 # The cargo-installed CI tools. Each version is read by both the install step
 # and its cache key, so a version bump can never be served an older binary.
 env:

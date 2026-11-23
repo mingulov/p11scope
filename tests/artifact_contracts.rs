@@ -12377,14 +12377,21 @@ fn hosted_caches_hold_only_tool_binaries_and_build_products() {
 /// Every check and coverage job waits on
 /// the dedupe job and runs only when it says so (coverage-report follows the
 /// coverage shards). Dedupe reads the manual selection or the Actions API,
-/// and the workflow keeps its per-ref group that sequences a moved branch's
-/// runs instead of cancelling them.
+/// and the workflow groups by event and ref so a push cancels only the
+/// overtaken development-branch run, never an agent's dispatch.
 #[test]
 fn hosted_pipeline_runs_one_full_matrix_per_commit() {
     let ci = read(".github/workflows/ci.yml");
     assert!(
-        ci.contains("\nconcurrency:\n  group: ci-${{ github.ref }}\n  cancel-in-progress: false\n"),
-        "a branch that moves must sequence its runs instead of cancelling them"
+        ci.contains(concat!(
+            "\nconcurrency:\n",
+            "  group: ci-${{ github.event_name }}-${{ github.ref }}\n",
+            "  cancel-in-progress: ${{ github.event_name == 'push' && ",
+            "(startsWith(github.ref, 'refs/heads/test/') || ",
+            "startsWith(github.ref, 'refs/heads/task/')) }}\n",
+        )),
+        "only a push to a development branch cancels its overtaken run; \
+         dispatches and other refs sequence instead of cancelling"
     );
     let gate = "    needs: dedupe\n    if: needs.dedupe.outputs.run == 'true'\n";
     for job in CARGO_JOBS {

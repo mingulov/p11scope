@@ -477,8 +477,17 @@ class BpfKernelsContractTests(unittest.TestCase):
         self.assertEqual(branches, [("v5.15.221", "denied")])
         self.assertIn("--denial \"${{ matrix.denial_branch }}\"", self.bpf)
 
-    def test_kernel_workflow_preserves_existing_concurrency_policy(self):
-        self.assertIn("cancel-in-progress: true", self.bpf)
+    def test_concurrency_cancels_only_test_and_task_pushes(self):
+        # The group carries the event, so a push can never cancel an
+        # agent's dispatch; only pushes to development branches cancel
+        # the run a newer push overtook.
+        self.assertIn(
+            "concurrency:\n"
+            "  group: bpf-kernels-${{ github.event_name }}-${{ github.ref }}\n"
+            "  cancel-in-progress: ${{ github.event_name == 'push' && "
+            "(startsWith(github.ref, 'refs/heads/test/') || "
+            "startsWith(github.ref, 'refs/heads/task/')) }}",
+            self.bpf)
 
     def test_positive_load_commands_request_multi(self):
         driver = (ROOT / "scripts/check-bpf-load-kernels.sh").read_text()

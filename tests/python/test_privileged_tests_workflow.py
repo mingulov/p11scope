@@ -223,8 +223,17 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
             self.assertTrue((sums / f"{kernel}.sums").is_file(), f"missing sums for {kernel}")
         self.assertIn("sha256sum --check", self.yml)
 
-    def test_workflow_cancels_superseded_runs(self):
-        self.assertIn("cancel-in-progress: true", self.yml)
+    def test_concurrency_cancels_only_test_and_task_pushes(self):
+        # The group carries the event, so a push can never cancel an
+        # agent's dispatch; only pushes to development branches cancel
+        # the run a newer push overtook.
+        self.assertIn(
+            "concurrency:\n"
+            "  group: privileged-tests-${{ github.event_name }}-${{ github.ref }}\n"
+            "  cancel-in-progress: ${{ github.event_name == 'push' && "
+            "(startsWith(github.ref, 'refs/heads/test/') || "
+            "startsWith(github.ref, 'refs/heads/task/')) }}",
+            self.yml)
 
     def test_filesystem_jobs_run_their_curated_groups(self):
         for job, flag, package, section in (

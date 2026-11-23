@@ -43,9 +43,12 @@ on:
   pull_request:
 permissions:
   contents: read
+# Per workflow, event and ref, so a push can never cancel an agent's
+# dispatch on the same branch. Pushes to development branches cancel the
+# run a newer push overtook; every other event sequences its runs.
 concurrency:
-  group: bpf-kernels-${{ github.ref }}
-  cancel-in-progress: true
+  group: bpf-kernels-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' && (startsWith(github.ref, 'refs/heads/test/') || startsWith(github.ref, 'refs/heads/task/')) }}
 # Tool versions, read by both the install step and the cache key (as in
 # ci.yml), so a version bump can never be served an older binary.
 env:

@@ -1462,125 +1462,49 @@ fn privileged_profile_system_learned_provider_second_round_catches_oneshots() {
     );
 }
 
-/// Two-phase private-mount-namespace loader. Usage:
-/// `loader MODULE GO_FILE LEDGER_FILE POST_CALLS`.
-/// Dlopens the module and issues one pre-attach `C_Initialize` (missed:
-/// no probe for this file can exist yet), prints `READY pid=N`, blocks
-/// until `GO_FILE` appears, issues `POST_CALLS` `C_GetInfo` calls plus
-/// one `C_Finalize`, writes one `LEDGER ...` line (post-GO calls only)
-/// to the ledger file and stdout, prints `DONE` and exits 0 (3 on any
-/// call-count drift or setup failure).
-const PRIVATE_LOADER_C: &str = r#"
+/// Private-mount-namespace file holder. Usage: `holder PATH`. Opens
+/// the file (no mapping: scans cannot see an unmapped open) and
+/// sleeps, so the private namespace and its mount table stay alive
+/// for the whole capture. Prints `READY pid=N` and exits 3 on any
+/// setup failure.
+const MNT_HOLDER_C: &str = r#"
 #define _POSIX_C_SOURCE 200809L
-#include <dlfcn.h>
+#include <fcntl.h>
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <time.h>
 #include <unistd.h>
-
-typedef unsigned long ck_ulong_t;
-typedef ck_ulong_t ck_rv_t;
-
-typedef ck_rv_t (*c_initialize_t)(void *);
-typedef ck_rv_t (*c_finalize_t)(void *);
-typedef ck_rv_t (*c_get_info_t)(unsigned char *);
-
-static void *need_symbol(void *handle, const char *name)
-{
-    dlerror();
-    void *symbol = dlsym(handle, name);
-    const char *error = dlerror();
-    if (error != NULL || symbol == NULL) {
-        fprintf(stderr, "private-loader: missing %s\n", name);
-        exit(3);
-    }
-    return symbol;
-}
 
 int main(int argc, char **argv)
 {
-    if (sizeof(unsigned long) != 8 || sizeof(void *) != 8) {
-        fprintf(stderr, "private-loader: LP64 only\n");
-        return 3;
-    }
-    if (argc != 5) {
-        fprintf(stderr, "usage: %s MODULE GO_FILE LEDGER_FILE POST_CALLS\n", argv[0]);
+    if (argc != 2) {
+        fprintf(stderr, "usage: %s PATH\n", argv[0]);
         return 2;
     }
-    const char *module = argv[1];
-    const char *go_file = argv[2];
-    const char *ledger_file = argv[3];
-    long post_calls = strtol(argv[4], NULL, 10);
-    if (post_calls < 1 || post_calls > 1000) {
-        fprintf(stderr, "private-loader: bad post-call count\n");
-        return 2;
-    }
-    void *handle = dlopen(module, RTLD_NOW | RTLD_LOCAL);
-    if (handle == NULL) {
-        fprintf(stderr, "private-loader: cannot open %s: %s\n", module, dlerror());
-        return 3;
-    }
-    c_initialize_t c_initialize = need_symbol(handle, "C_Initialize");
-    c_finalize_t c_finalize = need_symbol(handle, "C_Finalize");
-    c_get_info_t c_get_info = need_symbol(handle, "C_GetInfo");
-    ck_rv_t rv = c_initialize(NULL);
-    if (rv != 0) {
-        fprintf(stderr, "private-loader: C_Initialize failed: 0x%lx\n", rv);
+    int fd = open(argv[1], O_RDONLY);
+    if (fd < 0) {
+        fprintf(stderr, "holder: cannot open %s\n", argv[1]);
         return 3;
     }
     printf("READY pid=%d\n", (int)getpid());
     fflush(stdout);
-    {
-        struct timespec wait5ms = { 0, 5000000 };
-        while (access(go_file, F_OK) != 0)
-            nanosleep(&wait5ms, NULL);
-    }
-    unsigned char info[256];
-    long get_info = 0;
-    for (long i = 0; i < post_calls; i++) {
-        memset(info, 0, sizeof info);
-        c_get_info(info);
-        get_info++;
-    }
-    rv = c_finalize(NULL);
-    if (rv != 0) {
-        fprintf(stderr, "private-loader: C_Finalize failed: 0x%lx\n", rv);
-        return 3;
-    }
-    FILE *ledger = fopen(ledger_file, "w");
-    if (!ledger) {
-        fprintf(stderr, "private-loader: cannot write ledger\n");
-        return 3;
-    }
-    fprintf(ledger, "LEDGER C_GetInfo=%ld C_Finalize=1\n", get_info);
-    fclose(ledger);
-    printf("LEDGER C_GetInfo=%ld C_Finalize=1\n", get_info);
-    printf("DONE\n");
-    fflush(stdout);
-    if (get_info != post_calls) {
-        fprintf(stderr, "private-loader: counts drifted\n");
-        return 3;
-    }
+    sleep(300);
     return 0;
 }
 "#;
 
-/// Compiles the private-namespace loader with the system compiler.
-fn build_private_loader(dir: &Path) -> PathBuf {
-    let src = dir.join("p28-private-loader.c");
-    std::fs::write(&src, PRIVATE_LOADER_C).expect("write loader source");
-    let out = dir.join("p28-private-loader");
+/// Compiles the holder with the system compiler.
+fn build_mnt_holder(dir: &Path) -> PathBuf {
+    let src = dir.join("p28-mnt-holder.c");
+    std::fs::write(&src, MNT_HOLDER_C).expect("write holder source");
+    let out = dir.join("p28-mnt-holder");
     let compile = Command::new("gcc")
         .args(["-O2", "-o"])
         .arg(&out)
         .arg(&src)
-        .arg("-ldl")
         .output()
-        .expect("execute gcc for the loader");
+        .expect("execute gcc for the holder");
     assert!(
         compile.status.success(),
-        "loader compile failed: {}",
+        "holder compile failed: {}",
         String::from_utf8_lossy(&compile.stderr)
     );
     out
@@ -1600,11 +1524,7 @@ impl TmpfsMount {
             .arg(path)
             .status()
             .expect("spawn mount");
-        assert!(
-            status.success(),
-            "mount tmpfs at {}",
-            path.display()
-        );
+        assert!(status.success(), "mount tmpfs at {}", path.display());
         Self {
             path: path.to_path_buf(),
         }
@@ -1618,58 +1538,128 @@ impl Drop for TmpfsMount {
 }
 
 /// The private-mount verdict, factored out so its negative controls
-/// run unprivileged: the post-GO `C_GetInfo` total and `C_Finalize`
-/// for the private copy's sha, the pre-attach `C_Initialize` (which
-/// must stay missed), calls outside the ledger (spurious), the
-/// record's opens-before-staging tally, and the staged learned-file
-/// count.
+/// run unprivileged: the learned staging markers (the record names
+/// its first loader, exactly one pre-attach load, at least one file
+/// staged, the named first-use gap) plus ledger-exact counts with no
+/// calls outside the ledger.
 fn learned_private_mount_accepts(
-    caught_getinfo: u64,
-    caught_finalize: u64,
-    caught_init: u64,
-    spurious: u64,
+    loader_named: bool,
     pre_attach_loads: Option<u64>,
     staged: Option<u64>,
+    first_use_gap: bool,
+    counts_exact: bool,
+    spurious: u64,
 ) -> bool {
-    caught_getinfo == 20
-        && caught_finalize == 1
-        && caught_init == 0
-        && spurious == 0
+    loader_named
         && pre_attach_loads == Some(1)
         && staged.is_some_and(|staged| staged >= 1)
+        && first_use_gap
+        && counts_exact
+        && spurious == 0
 }
 
 /// Negative controls for the verdict above: only the complete
 /// private-mount round may pass.
 #[test]
 fn learned_private_mount_oracle_requires_the_full_round() {
-    assert!(learned_private_mount_accepts(20, 1, 0, 0, Some(1), Some(1)));
-    assert!(!learned_private_mount_accepts(19, 1, 0, 0, Some(1), Some(1)));
-    assert!(!learned_private_mount_accepts(21, 1, 0, 0, Some(1), Some(1)));
-    assert!(!learned_private_mount_accepts(20, 0, 0, 0, Some(1), Some(1)));
-    assert!(!learned_private_mount_accepts(20, 1, 1, 0, Some(1), Some(1)));
-    assert!(!learned_private_mount_accepts(20, 1, 0, 1, Some(1), Some(1)));
-    assert!(!learned_private_mount_accepts(20, 1, 0, 0, Some(0), Some(1)));
-    assert!(!learned_private_mount_accepts(20, 1, 0, 0, Some(2), Some(1)));
-    assert!(!learned_private_mount_accepts(20, 1, 0, 0, None, Some(1)));
-    assert!(!learned_private_mount_accepts(20, 1, 0, 0, Some(1), Some(0)));
-    assert!(!learned_private_mount_accepts(20, 1, 0, 0, Some(1), None));
+    assert!(learned_private_mount_accepts(
+        true,
+        Some(1),
+        Some(1),
+        true,
+        true,
+        0
+    ));
+    assert!(!learned_private_mount_accepts(
+        false,
+        Some(1),
+        Some(1),
+        true,
+        true,
+        0
+    ));
+    assert!(!learned_private_mount_accepts(
+        true,
+        Some(0),
+        Some(1),
+        true,
+        true,
+        0
+    ));
+    assert!(!learned_private_mount_accepts(
+        true,
+        Some(2),
+        Some(1),
+        true,
+        true,
+        0
+    ));
+    assert!(!learned_private_mount_accepts(
+        true,
+        None,
+        Some(1),
+        true,
+        true,
+        0
+    ));
+    assert!(!learned_private_mount_accepts(
+        true,
+        Some(1),
+        Some(0),
+        true,
+        true,
+        0
+    ));
+    assert!(!learned_private_mount_accepts(
+        true,
+        Some(1),
+        None,
+        true,
+        true,
+        0
+    ));
+    assert!(!learned_private_mount_accepts(
+        true,
+        Some(1),
+        Some(1),
+        false,
+        true,
+        0
+    ));
+    assert!(!learned_private_mount_accepts(
+        true,
+        Some(1),
+        Some(1),
+        true,
+        false,
+        0
+    ));
+    assert!(!learned_private_mount_accepts(
+        true,
+        Some(1),
+        Some(1),
+        true,
+        true,
+        1
+    ));
 }
 
-/// A provider loaded from a private mount namespace (owner
+/// A provider learned from a private mount namespace (owner
 /// acceptance): a tmpfs the observer sees is mounted before the
-/// capture, so its superblock is marked at startup; the loader runs
-/// under `unshare -m`, so its mount table carries the clone mount
-/// with an ID the observer's table never holds. The learned staging
-/// must resolve that ID through the loading process's mount table —
-/// through the observer's table it reads "fd mount N is missing from
-/// the mount table" and the file is lost.
+/// capture, so its superblock is marked at startup; a holder in a
+/// private namespace (`unshare -m`) opens the provider copy there,
+/// so its mount table carries the clone mount with an ID the
+/// observer's table never holds. The learned staging must resolve
+/// that ID through the loading process's mount table — through the
+/// observer's table it reads "fd mount N is missing from the mount
+/// table" and the file is lost.
 ///
-/// The loader is long-lived across staging on purpose: it issues one
-/// pre-attach call, waits for GO, and only then issues the twenty
-/// counted calls, so the verdict separates the named miss from the
-/// exact post-attach counts. The capture is `profile --system` with
-/// no `--module`: learning alone must find the file.
+/// The opener never maps the file, so no scan can cover it before
+/// staging: learning wins deterministically (no scan/learn race).
+/// Once staged, an ordinary workload maps the same copy from the
+/// observer's namespace and its ledger-exact calls prove the staged
+/// file counts. The capture is `profile --system` with no `--module`:
+/// learning alone must find the file.
 #[test]
 #[ignore = "privileged: learned provider from a private mount namespace is learned and counted (root, BPF, SoftHSM, unshare, mount)"]
 fn privileged_profile_system_learned_provider_private_mount_is_learned_and_counted() {
@@ -1719,18 +1709,37 @@ fn privileged_profile_system_learned_provider_private_mount_is_learned_and_count
             }
         }
     }
+    /// Waits up to `budget` for `needle`, consuming lines; false on
+    /// timeout (the caller fails on the verdict, with the report).
+    fn wait_line_within(
+        capture: &mut GuardedChild,
+        what: &str,
+        needle: &str,
+        budget: Duration,
+    ) -> bool {
+        let deadline = Instant::now() + budget;
+        loop {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            let line = next_line_within(capture, what, Duration::from_secs(60));
+            if line.contains(needle) {
+                return true;
+            }
+        }
+    }
 
     let dir = tempfile::tempdir().expect("cell dir");
     let conf = init_token(dir.path());
     // Tmpfs mounted before the capture: the observer marks its
-    // superblock at startup. The loader's private namespace clones
+    // superblock at startup. The holder's private namespace clones
     // the mount with a new ID on the same superblock, so opens
     // still queue events while the ID stays foreign.
     let mnt = dir.path().join("mnt");
     let _tmpfs = TmpfsMount::mount(&mnt);
     // Brand-new provider file with a per-copy trailing nonce, so
     // inode and sha256 are unique to the cell and counts for its sha
-    // can only come from this cell's loader.
+    // can only come from this cell's workload.
     let copy = mnt.join(format!("libprivatemnt-{}-p28.so", std::process::id()));
     std::fs::copy(softhsm_path(), &copy).expect("copy provider to tmpfs");
     {
@@ -1744,7 +1753,8 @@ fn privileged_profile_system_learned_provider_private_mount_is_learned_and_count
         trailer[8..12].copy_from_slice(&std::process::id().to_le_bytes());
         file.write_all(&trailer).expect("append unseen bytes");
     }
-    let loader = build_private_loader(dir.path());
+    let holder = build_mnt_holder(dir.path());
+    let workload = build_workload(dir.path());
     let go = dir.path().join("GO");
     let ledger = dir.path().join("ledger");
 
@@ -1768,80 +1778,89 @@ fn privileged_profile_system_learned_provider_private_mount_is_learned_and_count
     let mut capture = GuardedChild::new(child, stderr);
     wait_line(&mut capture, "capture ready", READY_LINE);
 
-    // The loader runs in a private mount namespace: no fork, so the
-    // child pid is the loader pid and kill-on-drop reaches it.
-    let mut loader_child = Command::new("unshare")
+    // The holder opens the copy in a private mount namespace and
+    // never maps it: no fork, so the child pid is the holder pid
+    // and kill-on-drop reaches it.
+    let mut holder_child = Command::new("unshare")
         .args(["-m"])
-        .arg(&loader)
+        .arg(&holder)
         .arg(&copy)
-        .arg(&go)
-        .arg(&ledger)
-        .arg("20")
-        .env("SOFTHSM2_CONF", &conf)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
-        .expect("spawn private-namespace loader");
-    let loader_pid = loader_child.id();
-    let loader_stdout = loader_child.stdout.take().expect("loader stdout");
-    let mut loader_guarded = GuardedChild::new(loader_child, loader_stdout);
-    let ready = loader_guarded.next_line("loader READY");
+        .expect("spawn private-namespace holder");
+    let holder_pid = holder_child.id();
+    let holder_stdout = holder_child.stdout.take().expect("holder stdout");
+    let mut holder_guarded = GuardedChild::new(holder_child, holder_stdout);
+    let ready = holder_guarded.next_line("holder READY");
     let ready_pid: u32 = ready
         .strip_prefix("READY pid=")
-        .unwrap_or_else(|| panic!("loader ready: {ready:?}"))
+        .unwrap_or_else(|| panic!("holder ready: {ready:?}"))
         .trim()
         .parse()
-        .expect("loader ready pid");
+        .expect("holder ready pid");
     assert_eq!(
-        ready_pid, loader_pid,
-        "unshare must exec the loader without forking"
+        ready_pid, holder_pid,
+        "unshare must exec the holder without forking"
     );
-    // Twin preconditions, proved while the loader is still alive: it
-    // sits in another mount namespace, and its tmpfs mount ID is
-    // absent from the observer's table (the red shape) but present
-    // in its own (the fix's resolution source).
+    // Twin preconditions, proved while the holder is still alive: it
+    // sits in another mount namespace, its tmpfs mount ID is absent
+    // from the observer's table (the red shape) but present in its
+    // own (the fix's resolution source), and it maps nothing (no
+    // scan can cover the file before staging).
     let observer_ns = std::fs::read_link("/proc/self/ns/mnt").expect("observer mount ns");
-    let loader_ns =
-        std::fs::read_link(format!("/proc/{loader_pid}/ns/mnt")).expect("loader mount ns");
-    assert_ne!(observer_ns, loader_ns, "the loader needs its own mount namespace");
+    let holder_ns =
+        std::fs::read_link(format!("/proc/{holder_pid}/ns/mnt")).expect("holder mount ns");
+    assert_ne!(
+        observer_ns, holder_ns,
+        "the holder needs its own mount namespace"
+    );
     let mnt_spelling = mnt.to_str().expect("utf8 mnt");
-    let loader_mounts =
-        std::fs::read_to_string(format!("/proc/{loader_pid}/mountinfo")).expect("loader mounts");
-    let loader_row = loader_mounts
+    let holder_mounts =
+        std::fs::read_to_string(format!("/proc/{holder_pid}/mountinfo")).expect("holder mounts");
+    let holder_row = holder_mounts
         .lines()
         .find(|line| line.split_whitespace().nth(4) == Some(mnt_spelling))
-        .unwrap_or_else(|| panic!("loader mounts its tmpfs at {mnt_spelling}"));
-    let loader_mnt_id = loader_row.split_whitespace().next().expect("loader mount id");
+        .unwrap_or_else(|| panic!("holder mounts its tmpfs at {mnt_spelling}"));
+    let holder_mnt_id = holder_row
+        .split_whitespace()
+        .next()
+        .expect("holder mount id");
     let observer_mounts = std::fs::read_to_string("/proc/self/mountinfo").expect("observer mounts");
     assert!(
         !observer_mounts
             .lines()
-            .any(|line| line.split_whitespace().next() == Some(loader_mnt_id)),
-        "the loader mount ID must be foreign to the observer: {loader_mnt_id}"
+            .any(|line| line.split_whitespace().next() == Some(holder_mnt_id)),
+        "the holder mount ID must be foreign to the observer: {holder_mnt_id}"
+    );
+    let holder_maps =
+        std::fs::read_to_string(format!("/proc/{holder_pid}/maps")).expect("holder maps");
+    assert!(
+        !holder_maps.contains("libprivatemnt-"),
+        "the holder must map nothing of the copy"
     );
 
-    // Wait for the learning event itself (the diagnostics staging line
-    // names the copy), then a few ordinary frames for the expedited
-    // attach, so the post-GO calls measure steady-state catching.
-    wait_line(&mut capture, "learned staging", "libprivatemnt-");
-    std::thread::sleep(Duration::from_secs(10));
-    std::fs::write(&go, b"go\n").expect("release the loader");
-    let done = loop {
-        let line = next_line_within(&mut loader_guarded, "loader DONE", Duration::from_secs(60));
-        if line.contains("DONE") {
-            break line;
-        }
-    };
-    assert!(done.contains("DONE"), "loader finishes: {done:?}");
-    let status = loader_guarded.wait_expect("loader exit");
-    assert!(status.success(), "loader exits clean: {status}");
-    let driven = read_ledger_file(&ledger);
-    assert_eq!(
-        driven.get("C_GetInfo").copied().unwrap_or(0),
-        20,
-        "the loader issued its post-GO calls: {driven:?}"
+    // The learning event itself (the diagnostics staging line names
+    // the copy): bounded, so an unlearned file fails on the verdict
+    // below instead of hanging. Then a few ordinary frames for the
+    // expedited attach, so the workload measures steady-state
+    // catching, not arm latency.
+    let staged_seen = wait_line_within(
+        &mut capture,
+        "learned staging",
+        "libprivatemnt-",
+        Duration::from_secs(300),
     );
+    std::thread::sleep(Duration::from_secs(10));
+    // The workload maps the same copy from the observer's namespace
+    // and issues its ledger-exact sequence after staging.
+    let (mut driven, _workload_pid) =
+        spawn_workload(&workload, &copy, &go, &ledger, &conf, false, false);
+    std::fs::write(&go, b"go\n").expect("release the workload");
+    let workload_status = driven.wait_expect("workload exit");
+    assert!(workload_status.success(), "workload exits clean");
+    let ledger_counts = read_ledger_file(&ledger);
     // Operator stop: the report must still be written (data-always).
     // SAFETY: signalling our own capture child.
     assert_eq!(
@@ -1865,51 +1884,52 @@ fn privileged_profile_system_learned_provider_private_mount_is_learned_and_count
     let profile: serde_json::Value = serde_json::from_str(&text).expect("profile is JSON");
 
     let record = module_record(&profile, &copy);
-    let calls = function_calls(&profile, record_sha256(record));
-    let caught_getinfo = calls.get("C_GetInfo").copied().unwrap_or(0);
-    let caught_finalize = calls.get("C_Finalize").copied().unwrap_or(0);
-    let caught_init = calls.get("C_Initialize").copied().unwrap_or(0);
-    let spurious: u64 = calls
+    let observed = function_calls(&profile, record_sha256(record));
+    let mut counts_exact = true;
+    for (name, want) in &ledger_counts {
+        if observed.get(name).copied().unwrap_or(0) != *want {
+            counts_exact = false;
+        }
+    }
+    let spurious: u64 = observed
         .iter()
-        .filter(|(name, _)| *name != "C_GetInfo" && *name != "C_Finalize")
+        .filter(|(name, _)| !ledger_counts.contains_key(*name))
         .map(|(_, count)| count)
         .sum();
     // The provider is listed with the program that first loaded it.
-    let first = record
-        .get("first_loaded_by")
-        .unwrap_or_else(|| panic!("learned module names its first loader: {record}"));
-    let exe = first.get("exe").and_then(|exe| exe.as_str());
-    let unknown = first
-        .get("exe_unknown_reason")
-        .and_then(|reason| reason.as_str());
-    assert!(
-        exe.is_some_and(|exe| exe.ends_with("p28-private-loader"))
-            || unknown == Some("loader exe link unreadable"),
-        "first loader named or finitely unknown: {first}"
-    );
+    let first = record.get("first_loaded_by");
+    let loader_named = first.is_some_and(|first| {
+        let exe = first.get("exe").and_then(|exe| exe.as_str());
+        let unknown = first
+            .get("exe_unknown_reason")
+            .and_then(|reason| reason.as_str());
+        exe.is_some_and(|exe| exe.ends_with("p28-mnt-holder"))
+            || unknown == Some("loader exe link unreadable")
+    });
     let pre_attach_loads = first
-        .get("pre_attach_loads")
+        .and_then(|first| first.get("pre_attach_loads"))
         .and_then(|loads| loads.as_u64());
     let staged = profile["evidence"]["learned_staged_files"].as_u64();
+    let first_use_gap =
+        text.contains("learned provider file") && text.contains("learned after its first use");
+    assert!(
+        staged_seen,
+        "the learned staging line must name the copy (the file was not learned)"
+    );
     assert!(
         learned_private_mount_accepts(
-            caught_getinfo,
-            caught_finalize,
-            caught_init,
-            spurious,
+            loader_named,
             pre_attach_loads,
-            staged
+            staged,
+            first_use_gap,
+            counts_exact,
+            spurious
         ),
-        "every post-GO call must be counted and the pre-attach call stays \
-         a named miss; C_GetInfo for the copy = {caught_getinfo}, \
-         C_Finalize = {caught_finalize}, C_Initialize = {caught_init} \
-         (all calls: {calls:?}), pre_attach_loads = {pre_attach_loads:?}, \
-         staged = {staged:?} (evidence: {})",
+        "the private-mount file must be learned and counted; loader named = \
+         {loader_named} ({first:?}), pre_attach_loads = {pre_attach_loads:?}, staged = \
+         {staged:?}, first-use gap = {first_use_gap}, counts exact = {counts_exact} \
+         (observed: {observed:?}, ledger: {ledger_counts:?}), spurious = {spurious} \
+         (evidence: {})",
         profile["evidence"]
-    );
-    // The first use is a named miss, not silent.
-    assert!(
-        text.contains("learned provider file") && text.contains("learned after its first use"),
-        "first use must be a named gap"
     );
 }

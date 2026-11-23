@@ -103582,6 +103582,30 @@ fn carried_fix2_restore_refreshes_held_ids() {
         0,
         "the restore drops the stale held ID"
     );
+    // Named verdicts: the restore rebuilds the named set too, so a stale
+    // ghost entry cannot make a later release hold a rowless ID.
+    let mut engine = setup();
+    let snapshot = engine.start_publication_snapshot();
+    engine.named_view_ids.insert(999);
+    assert!(
+        engine.named_view_ids.contains(&999),
+        "stale: a ghost ID pollutes the named set"
+    );
+    engine.restore_start_publication(snapshot);
+    assert!(
+        !engine.named_view_ids.contains(&999),
+        "the restore rebuilds the named set"
+    );
+    engine.release_view_id(ProcessViewId(999));
+    assert!(
+        engine.retired_view_ids.contains(&999),
+        "the ghost still returns to the free list"
+    );
+    assert_eq!(
+        engine.held_view_id_count(),
+        1,
+        "releasing the ghost holds nothing (only R stays held)"
+    );
 }
 
 #[test]
@@ -103842,12 +103866,13 @@ fn carried_fix2_owned_learn_rotates_past_unstageable_head() {
 }
 
 #[test]
-fn carried_fix2_release_overholds_rowless_id_until_commit() {
-    // Release/refresh duality: a release inserts its ID into the held set
-    // unconditionally — superset-safe, since the next commit refresh drops
-    // IDs no row names — so release pays no per-release table scan. A
-    // rowless release over-holds (allocation mints past it) until the commit
-    // refresh corrects the set and the ID recycles.
+fn carried_fix2_release_holds_only_named_ids() {
+    // Release exactness without the per-release scan: a release holds its
+    // ID exactly when a committed row still names it (read from the
+    // maintained named set, O(log n)) — a rowless release recycles at once
+    // with no commit in between, and the commit refresh keeps the verdicts
+    // exact. Dropping the insert, the named refresh, or the verdict (always
+    // insert / never insert) fails one of the phases below.
     let parts = mo_shared_pin_parts();
     let mut pins = parts.pins;
     let (bound, skipped) = bind_scanned_modules(&[parts.module_r, parts.module_l], &mut pins);
@@ -103869,10 +103894,16 @@ fn carried_fix2_release_overholds_rowless_id_until_commit() {
     }
     let view_r = ProcessViewId(MO_VIEW_R);
     let empty: BTreeSet<ProcessViewId> = BTreeSet::new();
-    // R exits and its row rides under the carrier through a production
-    // apply, freeing the numeric ID exactly.
+    // R exits while its row still names it: the release holds the ID.
     engine.views.retain(|view| view.id() != view_r);
     engine.release_view_id(view_r);
+    assert_eq!(
+        engine.held_view_id_count(),
+        1,
+        "a named release holds its ID"
+    );
+    // The rebuild re-owns the row under the carrier through a production
+    // apply, freeing the numeric ID exactly.
     let rebuilt = engine
         .inventory_candidate(&BTreeSet::from([view_r]), &[], &[], Vec::new(), &empty)
         .unwrap();
@@ -103886,8 +103917,12 @@ fn carried_fix2_release_overholds_rowless_id_until_commit() {
         0,
         "a carrier-owned row holds no numeric ID"
     );
+    assert!(
+        !engine.named_view_ids.contains(&view_r.0),
+        "the commit refresh unnames the re-owned ID"
+    );
     // The freed ID recycles into a rowless view, which exits at once: the
-    // release names no row, yet the ID over-holds until the next commit.
+    // rowless release holds nothing and the ID recycles again immediately.
     let recycled = engine.allocate_view_id().unwrap();
     assert_eq!(recycled, view_r, "the freed ID recycles first");
     engine
@@ -103908,21 +103943,25 @@ fn carried_fix2_release_overholds_rowless_id_until_commit() {
     );
     assert_eq!(
         engine.held_view_id_count(),
-        1,
-        "a rowless release still holds its ID until the commit refresh"
+        0,
+        "a rowless release holds nothing"
     );
-    // While over-held, allocation mints past the ID instead of reusing it.
-    let minted = engine.allocate_view_id().unwrap();
+    let reused = engine.allocate_view_id().unwrap();
     assert_eq!(
-        minted,
-        ProcessViewId(100),
-        "allocation mints past the over-held ID"
+        reused, recycled,
+        "the rowless release recycles at once, with no commit between"
     );
-    assert!(
-        engine.retired_view_ids.contains(&recycled.0),
-        "the over-held ID waits on the free list"
+    // A further rowless release plus a commit keep the verdicts exact.
+    engine
+        .views
+        .push(ProcessView::open(reused, std::process::id()).unwrap());
+    engine.views.retain(|view| view.id() != reused);
+    engine.release_view_id(reused);
+    assert_eq!(
+        engine.held_view_id_count(),
+        0,
+        "the second rowless release holds nothing either"
     );
-    // The next commit refreshes the set: the ID recycles again.
     let freed = engine
         .inventory_candidate(&empty, &[], &[], Vec::new(), &empty)
         .unwrap();
@@ -103932,13 +103971,10 @@ fn carried_fix2_release_overholds_rowless_id_until_commit() {
     assert_eq!(
         engine.held_view_id_count(),
         0,
-        "the commit refresh corrects the over-hold"
+        "the commit refresh keeps the rowless ID free"
     );
-    let reused = engine.allocate_view_id().unwrap();
-    assert_eq!(
-        reused, recycled,
-        "the corrected ID recycles once the commit refreshes"
-    );
+    let again = engine.allocate_view_id().unwrap();
+    assert_eq!(again, recycled, "the ID keeps recycling after the commit");
 }
 
 #[test]
@@ -104122,4 +104158,138 @@ fn carried_fix2_churn_tick_drops_proven_unmapped_carrier() {
             "the live row keeps the slot attached (redundant)"
         );
     }
+}
+
+#[test]
+fn carried_fix2_selection_deferred_keeps_carrier() {
+    // Absence selection arm: a last tick that left enumerated members
+    // outside the desired set blocks carrier retirement even with empty
+    // marks, empty queues and spare view capacity — an unselected member
+    // is unscanned with no mark and no queued work (cooling members are
+    // the isolated shape). A clean selection re-proves absence and the
+    // carrier drops. Needs the stash field, so it lands with the fix; the
+    // arm-drop mutation kills it.
+    let key = overlay_key(784);
+    let me = std::process::id();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    let empty: BTreeSet<ProcessViewId> = BTreeSet::new();
+    let id_r = engine.allocate_view_id_for_newcomer(me).unwrap();
+    let view_r = ProcessView::open(id_r, me).unwrap();
+    let mut module = overlay_module(key);
+    module.view = id_r;
+    let mut pins = overlay_view_pin(&module, 6700, OVERLAY_SHA, 1, false);
+    record_scan_ownership(&mut pins, id_r, key, &module.path);
+    pins.prove_scanned_entries_for_test(std::slice::from_ref(&module));
+    let seed = engine
+        .inventory_candidate(
+            &empty,
+            &[],
+            &[(view_r, vec![module], pins)],
+            Vec::new(),
+            &empty,
+        )
+        .unwrap();
+    engine.plan = seed.plan;
+    engine.pinned = seed.pinned;
+    engine.modules = seed.modules;
+    engine.views.push(ProcessView::open(id_r, me).unwrap());
+    let object = engine
+        .modules
+        .iter()
+        .find(|module| module.scanned.view == id_r)
+        .expect("the seed row commits")
+        .object;
+    engine.newcomer_first_seen.insert(424246, None);
+    let removed = engine
+        .inventory_candidate(&BTreeSet::from([id_r]), &[], &[], Vec::new(), &empty)
+        .unwrap();
+    engine.plan = removed.plan;
+    engine.pinned = removed.pinned;
+    engine.modules = removed.modules;
+    engine.views.retain(|view| view.id() != id_r);
+    engine.release_view_id(id_r);
+    assert!(
+        engine.modules.iter().any(|module| {
+            module.scanned.view == Engine::CARRIED_VIEW_ID && module.object == object
+        }),
+        "the carrier commits under the pending mark"
+    );
+    engine.newcomer_first_seen.remove(&424246);
+    assert!(
+        engine.newcomer_first_seen.is_empty(),
+        "no timing mark remains"
+    );
+    assert!(
+        engine.refresh_requested.is_empty(),
+        "no refresh request waits"
+    );
+    assert!(engine.held_back.is_empty(), "no held-back retry waits");
+    assert!(
+        engine.views.len() < engine.max_scan_pids,
+        "view capacity is spare"
+    );
+    // The last selection left a member outside the desired set.
+    engine.last_selection_deferred_any = true;
+    engine.plan_rebuild_stable = true;
+    let held = engine
+        .inventory_candidate(&empty, &[], &[], Vec::new(), &empty)
+        .unwrap();
+    assert!(
+        held.modules.iter().any(|module| {
+            module.scanned.view == Engine::CARRIED_VIEW_ID && module.object == object
+        }),
+        "a deferring selection keeps the carrier (cached path)"
+    );
+    engine.set_disable_empty_tick_fast_path_for_test(true);
+    let held_full = engine
+        .inventory_candidate(&empty, &[], &[], Vec::new(), &empty)
+        .unwrap();
+    assert!(
+        held_full.built_by_full_rebuild,
+        "the twin takes the full rebuild"
+    );
+    assert!(
+        held_full.modules.iter().any(|module| {
+            module.scanned.view == Engine::CARRIED_VIEW_ID && module.object == object
+        }),
+        "a deferring selection keeps the carrier (full rebuild)"
+    );
+    // Control: a clean selection re-proves absence; the carrier drops.
+    engine.set_disable_empty_tick_fast_path_for_test(false);
+    engine.last_selection_deferred_any = false;
+    engine.plan_rebuild_stable = true;
+    let freed = engine
+        .inventory_candidate(&empty, &[], &[], Vec::new(), &empty)
+        .unwrap();
+    assert!(
+        freed.modules.iter().all(|module| {
+            module.scanned.view != Engine::CARRIED_VIEW_ID || module.object != object
+        }),
+        "a clean selection re-proves absence and retires the carrier"
+    );
+}
+
+#[test]
+fn carried_fix2_selection_stash_tracks_deferral() {
+    // Stash production wiring: an over-cap inventory tick stashes a
+    // deferral (three listed members over two slots), and the next
+    // under-cap tick clears it. Dropping or freezing the stash fails
+    // one of the two transitions.
+    let child_a = SettledChild::spawn();
+    let child_b = SettledChild::spawn();
+    let child_c = SettledChild::spawn();
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[child_a.id(), child_b.id(), child_c.id()]);
+    engine.max_scan_pids = 2;
+    refresh_inventory_once_changed(&mut engine);
+    assert!(
+        engine.last_selection_deferred_any,
+        "the over-cap tick stashes its deferral"
+    );
+    engine.max_scan_pids = 1024;
+    refresh_inventory_once_changed(&mut engine);
+    assert!(
+        !engine.last_selection_deferred_any,
+        "the under-cap tick clears the stash"
+    );
 }

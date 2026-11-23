@@ -539,6 +539,12 @@ pub struct Engine {
     /// Test-only: see `owned_learn_file_probes_for_test`.
     #[cfg(test)]
     owned_learn_stage_attempts_for_test: u64,
+    /// Rotation offset into the owned-run proof list for the next
+    /// [`Self::learn_owned_proofs`] apply: each apply starts at
+    /// `cursor % proofs.len()` and advances the cursor past the proofs it
+    /// attempted, so a persistently unstageable head cannot starve the tail
+    /// across applies (bounded rotation, no queue, no stale pins).
+    owned_learn_cursor: u64,
     /// Fresh tables the per-module merge cap dropped (counted overflow,
     /// never silent). Drops are only possible past 64 distinct tables
     /// for one module, far above any legitimate provider surface.
@@ -654,6 +660,26 @@ pub struct Engine {
     /// count without sweeping the module tables every pass (INV-2: no
     /// per-pass compute scan). Bounded by the ID space.
     held_view_ids: BTreeSet<u32>,
+    /// Every view a committed row currently names (live, retired and
+    /// reserved alike). Rebuilt by [`Self::refresh_held_view_ids`]
+    /// beside the held set — row naming changes only where modules are
+    /// assigned, so it stays exact between commits — and read by
+    /// [`Self::release_view_id`] for its O(log n) held verdict, so
+    /// release pays no per-release table scan either. Bounded by the
+    /// committed rows.
+    named_view_ids: BTreeSet<u32>,
+    /// Whether the last inventory selection left any enumerated scope
+    /// member outside the desired set (stashed once per tick, beside the
+    /// selection itself, so every path — pressure, zero-cap, over-cap and
+    /// under-cap — maintains it). An unselected member is unscanned with
+    /// no arrival mark and no queued work, so
+    /// [`Self::carried_absence_proven`] requires this to be false: spare
+    /// view capacity alone cannot prove no unscanned member sits outside
+    /// the admitted set (cooling and otherwise excluded members are the
+    /// isolated shape). Same freshness as the arrival marks and queues:
+    /// last tick's membership state; no carrier exists before the first
+    /// tick stashes it.
+    last_selection_deferred_any: bool,
     /// `--max-scan-pids`: how many scope members each scan pass covers.
     max_scan_pids: usize,
     loader_registry: LoaderRegistry,
@@ -13164,7 +13190,8 @@ fn merge_scanned_module_counted(
 /// Whether these live rows for one pinned object preserve everything a
 /// riding carrier still supplies: every export, every table entry and
 /// NULL hole, and every interface, with at least the carrier's
-/// corroboration per table. Identity alone never retires a carrier —
+/// live-return and manifest flags per table. Identity alone never
+/// retires a carrier —
 /// an exports-only or truncated rescan of the same file must not drop
 /// the probes only the carrier decodes. Entry comparison is by stable
 /// file offsets (never generation-local addresses); interface links are
@@ -14590,6 +14617,7 @@ impl Engine {
             owned_learn_file_probes_for_test: 0,
             #[cfg(test)]
             owned_learn_stage_attempts_for_test: 0,
+            owned_learn_cursor: 0,
             merge_tables_dropped: 0,
             learned_frame_owed: false,
             owned_watch_unproven: BTreeMap::new(),
@@ -14617,6 +14645,8 @@ impl Engine {
             next_view_id: 0,
             retired_view_ids: Vec::new(),
             held_view_ids: BTreeSet::new(),
+            named_view_ids: BTreeSet::new(),
+            last_selection_deferred_any: false,
             max_scan_pids: MAX_SCAN_PIDS,
             loader_registry: LoaderRegistry::default(),
             owned_initial_exec: None,
@@ -16974,6 +17004,9 @@ impl Engine {
             .rposition(|id| !self.held_view_ids.contains(id));
         if let Some(index) = pick {
             let reused = self.retired_view_ids.remove(index);
+            // No-op by construction: the pick skipped held IDs, so the
+            // reused ID is never in the set. Kept so reuse maintains the
+            // set at this same boundary if the pick ever changes.
             self.held_view_ids.remove(&reused);
             return Ok(ProcessViewId(reused));
         }
@@ -17078,13 +17111,23 @@ impl Engine {
         if !self.retired_view_ids.contains(&id.0) {
             self.retired_view_ids.push(id.0);
         }
-        // Maintain the held set incrementally: a released ID whose row
-        // still names it stays held until a commit re-owns or drops
-        // that row (which refreshes the whole set).
-        if self.modules.iter().any(|module| module.scanned.view == id) {
-            self.held_view_ids.insert(id.0);
-        } else {
-            self.held_view_ids.remove(&id.0);
+        // Maintain the held set incrementally from the maintained
+        // named set: a released ID whose row still names it stays held
+        // until a commit re-owns or drops that row (which refreshes both
+        // sets). O(log n), no per-release table scan — and exact, so a
+        // rowless release recycles at once. No removal branch: naming is
+        // stable between commits, so a rowless verdict always finds the
+        // ID already unheld. The empty-modules path skips consulting (no
+        // row names anything); the lazy rebuild heals modules assigned
+        // without a refresh (test seams only — production assigns
+        // modules only beside a refresh) once per bypass.
+        if !self.modules.is_empty() {
+            if self.named_view_ids.is_empty() {
+                self.refresh_held_view_ids();
+            }
+            if self.named_view_ids.contains(&id.0) {
+                self.held_view_ids.insert(id.0);
+            }
         }
         // `exploratory_dirty` is deliberately NOT cleared here: IDs are
         // reused, and a reused dirty ID stays non-rotatable — the capture
@@ -24345,19 +24388,33 @@ impl Engine {
     /// duplicate, stat, eventual close), so each apply attempts at
     /// most one [`GRAPH_STRIDE`] of proofs; deferred proofs
     /// regenerate from committed and carried rows on the next apply,
-    /// which is the resume cursor — no queue, no stale pins. Proofs
-    /// whose exact (pinned object, scan identity) key already
-    /// staged, settled, or refused skip the duplicate/stat before
-    /// either check while their tables still harvest, so a repeat
-    /// apply over an already-settled carrier performs no file
+    /// and the start offset rotates past the proofs this apply
+    /// attempted — a true resume cursor with no queue and no stale
+    /// pins, so a persistently unstageable head cannot starve the
+    /// tail. Proofs whose exact (pinned object, scan identity) key
+    /// already staged, settled, or refused skip the duplicate/stat
+    /// before either check while their tables still harvest, so a
+    /// repeat apply over an already-settled carrier performs no file
     /// operation at all.
     fn learn_owned_proofs(&mut self, pins: &mut PinnedObjects, proofs: &[OwnedLearnProof]) {
         use std::os::unix::fs::MetadataExt as _;
         if self.owned_run_pid.is_none() || !matches!(self.scope, Scope::Cgroup { .. }) {
             return;
         }
+        // Bounded rotation: start where the last apply stopped (modulo
+        // the current list). Attempts consume the stride whether or not
+        // they reach a file — INV-2 bounds attempts, not just successes —
+        // and failures never mark terminally, so without rotation a full
+        // stride of unstageable head proofs (stable order) would starve
+        // every later proof on every apply.
+        let total = proofs.len();
+        let start = if total == 0 {
+            0
+        } else {
+            (self.owned_learn_cursor as usize) % total
+        };
         let mut staged_this_apply: usize = 0;
-        for proof in proofs {
+        for proof in proofs.iter().cycle().skip(start).take(total) {
             // The direct child's own files need no learning: its view
             // spans the run, so its scan-owned slots never retire
             // mid-run, and staging them would file a first-use gap for
@@ -24444,6 +24501,9 @@ impl Engine {
             // later applies skip before the duplicate/stat.
             self.note_owned_learned_staged(key);
         }
+        self.owned_learn_cursor = self
+            .owned_learn_cursor
+            .wrapping_add(staged_this_apply as u64);
     }
 
     /// Remembers one owned-run proof's exact key as staged, settled,
@@ -32495,20 +32555,23 @@ impl Engine {
     }
 
     /// Whether a carried object with no live row is proven unmapped:
-    /// no arrival-timing mark waits, no queued or deferred discovery
-    /// work could still map it, and spare view capacity proves no
-    /// unscanned member sits outside the admitted set. Timing marks
-    /// alone never prove absence: over-cap passes leave enumerated
-    /// members unadmitted with no mark, and mark insertion itself
-    /// refuses at its cap. The capacity arm subsumes the mark-cap
-    /// hole (marks only drop under a flood that fills every view
-    /// slot, and retention holds while full); once drained, every
+    /// no arrival-timing mark waits, no queued or deferred discovery work
+    /// could still map it, the last selection desired every enumerated
+    /// member, and spare view capacity remains. Timing marks alone never
+    /// prove absence: over-cap passes leave enumerated members unadmitted
+    /// with no mark, and mark insertion itself refuses at its cap — and
+    /// spare capacity alone never proves it either, since selection
+    /// excludes cooling and otherwise deferred members without marking
+    /// them. The selection arm (the stashed last-tick deferral bit) is the
+    /// exact signal the proof needs; the capacity arm stays as
+    /// defense-in-depth (retention holds while full). Once drained, every
     /// listed pid is desired and admitted, so absence re-proves.
     fn carried_absence_proven(&self) -> bool {
         self.newcomer_first_seen.is_empty()
             && self.refresh_requested.is_empty()
             && self.held_back.is_empty()
             && self.views.len() < self.max_scan_pids
+            && !self.last_selection_deferred_any
     }
 
     /// True when a committed carried row would drop on a full rebuild:
@@ -32550,11 +32613,12 @@ impl Engine {
             })
     }
 
-    /// Rebuilds [`Self::held_view_ids`] from committed state: every
-    /// retired ID a committed row still names. Runs once per commit
-    /// (linear in modules plus retired IDs, beside the rebuild that
-    /// already costs that); releases and allocations maintain the set
-    /// incrementally, and every other reader takes the count O(1).
+    /// Rebuilds [`Self::held_view_ids`] and [`Self::named_view_ids`]
+    /// from committed state: every view a committed row names, and every
+    /// retired ID among them. Runs once per commit (linear in modules
+    /// plus retired IDs, beside the rebuild that already costs that);
+    /// releases and allocations maintain the held set incrementally
+    /// from the named set, and every other reader takes the count O(1).
     fn refresh_held_view_ids(&mut self) {
         let named: BTreeSet<u32> = self
             .modules
@@ -32567,6 +32631,7 @@ impl Engine {
             .copied()
             .filter(|id| named.contains(id))
             .collect();
+        self.named_view_ids = named;
     }
 
     /// Retired IDs the free list cannot hand out: a numeric ID whose
@@ -33634,11 +33699,13 @@ impl Engine {
     /// Whether this ID names a real process generation. The reserved
     /// owners ([`Self::CARRIED_VIEW_ID`], [`Self::RUN_LEARNED_VIEW_ID`])
     /// and the probationary sentinel are their own typed identities:
-    /// they name no generation, no `ProcessView` ever carries them, and
-    /// they must never be compared as generations. Every currency set
-    /// and every staleness check filters through this one predicate, so
-    /// a stable reserved row can never read as a lost generation and
-    /// refuse a checked-clean admission.
+    /// they name no generation, never a live or committed view (the
+    /// probationary probe opens a transient scratch view under the
+    /// sentinel and discards it after the probe), and they must never
+    /// be compared as generations. Every currency set and every
+    /// staleness check filters through this one predicate, so a stable
+    /// reserved row can never read as a lost generation and refuse a
+    /// checked-clean admission.
     pub(crate) fn is_process_generation_view(id: ProcessViewId) -> bool {
         id != Self::CARRIED_VIEW_ID
             && id != Self::RUN_LEARNED_VIEW_ID
@@ -34659,8 +34726,15 @@ impl Engine {
                 if self.scheduler.begin_under_cap_tick() {
                     self.queue_polling_rescans(&desired_pids);
                 }
-                (desired_pids.into_iter().collect(), false)
+                (desired_pids.iter().copied().collect(), false)
             };
+        // The absence proof's selection arm: any enumerated member left
+        // outside the desired set is unscanned with no arrival mark and no
+        // queued work (cooling members are the isolated shape — admitted
+        // long ago, evicted since, waiting out the cooldown unmarked and
+        // unqueued). Stashed once per tick beside the selection, so all
+        // four paths above maintain it with no dual bookkeeping.
+        self.last_selection_deferred_any = desired_pids.iter().any(|pid| !desired.contains(pid));
         // Only new candidates count: known views are retained, not selected.
         // The zero-cap short-circuit keeps its exact historical skip; the
         // scheduler publishes the ordinary/reconcile gaps itself.

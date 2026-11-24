@@ -2394,12 +2394,15 @@ sign-off at 0.9.x; Task 2 reviews `rv-v080-keymeta-t2` +
 `rv-v080-keymeta-t2-sr` + `hy4-rv-v080-keymeta-t2` with 8 fix
 rounds including the codex B1 fetch-mask over-read fix; Task 3
 join/publication landed). The Task 4 `--key-sizes` canary passed on
-2026-11-24 (live sentinel run, lane v080-keysizes-canary on Fedora
-kernel 7.2.9, 6/6 passes with latest rev debee08c1: S/V protocols on
-LP64,
-the marker absent from the JSON report, the event log, the observer
-log and every owned BPF map including `EVIDENCE_START`, with
-positive controls and published RSA-2048 sizes; the committed cell
+2026-11-24 (live sentinel runs, lane v080-keysizes-canary on Fedora
+kernel 7.2.9: the committed cell passed 3/3 at rev c6f684673 after
+6/6 across earlier verdict revisions: S/V protocols on LP64,
+the marker absent from the JSON report, the event log, the verbose
+observer log and all 66 dumpable owned BPF maps including
+`EVIDENCE_START` (raw+hex scan; rings drain into the scanned outputs
+and task-storage identity maps are undumpable and unread), with
+positive controls on every scanner and published RSA-2048 sizes; the
+committed cell
 is `privileged_inventory_pid_key_sizes_canary_no_payload_leak`).
 The Task 5 live matrix remains an explicit outstanding item.**
 This section scopes section version 7 of

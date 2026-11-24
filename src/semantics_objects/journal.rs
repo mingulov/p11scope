@@ -7714,8 +7714,10 @@ impl JournalAdapter {
     /// its seals keep refusing). At most one incarnation per binding
     /// is ever live.
     /// Retained incarnations of one admission binding: the live one
-    /// when any is live, and the latest minted. The per-image list
-    /// appends in mint order, so one pass finds both.
+    /// when any is live, and the latest minted. One indexed lookup
+    /// (`binding_latest`, kept at mint) finds both, since only the
+    /// latest incarnation can be live; the image key list is never
+    /// walked per bind (INV-2).
     fn binding_incarnations(
         &self,
         base: JournalDomainKey,

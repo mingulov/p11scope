@@ -14175,7 +14175,8 @@ struct GetterPrefaultCursor {
 
 impl GetterPrefaultCursor {
     /// Cumulative bytes read for `object` (zero when nothing read for
-    /// it yet).
+    /// it yet). Test-only: production reads the pass-local map inline.
+    #[cfg(test)]
     fn op_bytes_for(&self, object: PinnedObjectId) -> u64 {
         self.op_bytes.get(&object).copied().unwrap_or(0)
     }

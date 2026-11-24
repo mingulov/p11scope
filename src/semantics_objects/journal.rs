@@ -30190,8 +30190,6 @@ pub(crate) mod tests {
     /// key inherited can make an unvisited row a possible straddler.
     #[test]
     fn object_journal_unfenced_mismatch_flags_no_straddler_bound() {
-        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
-
         let mut scene = Scene::new(image_default());
         let proof = scene.attest_function("C_CreateObject");
         assert_eq!(proof.key.incarnation, 0, "control: no predecessor");
@@ -30201,8 +30199,9 @@ pub(crate) mod tests {
         scene.ingest(&first);
         scene.ingest(&second);
         let birth_cut = scene.adapter.consumed_through;
-        scene.ingest(&end_bytes(&first, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 70));
-        scene.ingest(&end_bytes(&second, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 71));
+        // Both calls stay open at the seal: the open scan decides on
+        // the first with the second unvisited past it.
+        assert_eq!(scene.adapter.open.len(), 2, "control: two open rows");
         let birth = scene.bootstrap(proof, birth_cut);
         let gap = scene.seal(&birth).err().map(|failure| failure.gap);
         let marks = scene

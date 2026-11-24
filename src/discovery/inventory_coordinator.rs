@@ -1857,11 +1857,7 @@ mod holder_scan_state_tests {
             "the front spends its reservation"
         );
         assert!(!pool.try_charge(1), "the spent pool refuses past the limit");
-        assert_eq!(
-            pool.deferrals(),
-            1,
-            "only the over-limit refusal exhausts"
-        );
+        assert_eq!(pool.deferrals(), 1, "only the over-limit refusal exhausts");
     }
 
     #[test]
@@ -45926,10 +45922,7 @@ int main(void) {
                 3,
                 "the deferred re-sight keeps every row owed"
             );
-            assert_eq!(
-                native.cookies.queries, 0,
-                "a deferred scan queries nothing"
-            );
+            assert_eq!(native.cookies.queries, 0, "a deferred scan queries nothing");
             // A live successor arrives before the retry and would
             // answer the deferred rows' tickets.
             native.scene.source.spawn(7, 1600);
@@ -46795,14 +46788,8 @@ int main(void) {
             // Every holder folds while the hook queues: the visit
             // finds no holders left.
             native.scene.coordinator.note_rendered_callers(&doomed);
-            let receipt = native
-                .scene
-                .coordinator
-                .retire_rendered_callers(600, None);
-            assert_eq!(
-                receipt.retired, 1100,
-                "every holder folds before the drain"
-            );
+            let receipt = native.scene.coordinator.retire_rendered_callers(600, None);
+            assert_eq!(receipt.retired, 1100, "every holder folds before the drain");
             assert_eq!(
                 native.scene.coordinator.adapter.proven_count(9),
                 0,

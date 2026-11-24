@@ -115,7 +115,12 @@ fn cell_short_read() -> CellResult {
     if only_module(&first, "pass 1")?.tables_scan_finished {
         return Err("pass 1 grants finished-scan from a truncated snapshot".into());
     }
-    if carried.cursor_counts() != (1, 1) {
+    if carried.cursor_counts()
+        != (CursorCounts {
+            cursors: 1,
+            unfinished: 1,
+        })
+    {
         return Err(format!(
             "pass 1 must carry one unfinished cursor, got {:?}",
             carried.cursor_counts()
@@ -130,7 +135,7 @@ fn cell_short_read() -> CellResult {
             fixture.log.borrow()
         ));
     }
-    if carried.cursor_counts().1 != 0 {
+    if carried.cursor_counts().unfinished != 0 {
         return Err("fully acquired passes must converge".into());
     }
     let mut roomy_fixture = BracketFixture::new(8, true);
@@ -204,7 +209,7 @@ fn cell_budget_stop_before_bracket() -> CellResult {
     fixture.log.borrow_mut().clear();
     let (second, carried) = armed_scan_pass(&mut fixture, ROOMY_LIMITS, carried);
     let second = second.map_err(|e| format!("pass 2 failed: {e}"))?;
-    if carried.cursor_counts().1 != 0 {
+    if carried.cursor_counts().unfinished != 0 {
         return Err("recovery must converge".into());
     }
     let mut roomy_fixture = BracketFixture::new(8, true);
@@ -267,7 +272,12 @@ fn cell_header_before_cursor() -> CellResult {
     if only_module(&first, "pass 1")?.tables_scan_finished {
         return Err("pass 1 grants finished-scan from a short snapshot".into());
     }
-    if carried.cursor_counts() != (1, 1) {
+    if carried.cursor_counts()
+        != (CursorCounts {
+            cursors: 1,
+            unfinished: 1,
+        })
+    {
         return Err(format!(
             "pass 1 must carry one unfinished cursor, got {:?}",
             carried.cursor_counts()
@@ -276,7 +286,7 @@ fn cell_header_before_cursor() -> CellResult {
     fixture.maps_reads = 0;
     let (second, carried) = armed_scan_pass(&mut fixture, ROOMY_LIMITS, carried);
     let second = second.map_err(|e| format!("pass 2 failed: {e}"))?;
-    if carried.cursor_counts().1 != 0 {
+    if carried.cursor_counts().unfinished != 0 {
         return Err(format!(
             "fully acquired passes must converge: {}",
             summarize(&second)
@@ -473,7 +483,12 @@ fn cell_interface_before_table() -> CellResult {
     if only_module(&first, "pass 1")?.tables_scan_finished {
         return Err("pass 1 grants finished-scan below the late table".into());
     }
-    if carried.cursor_counts() != (1, 1) {
+    if carried.cursor_counts()
+        != (CursorCounts {
+            cursors: 1,
+            unfinished: 1,
+        })
+    {
         return Err(format!(
             "pass 1 must carry one unfinished cursor, got {:?}",
             carried.cursor_counts()
@@ -481,7 +496,7 @@ fn cell_interface_before_table() -> CellResult {
     }
     let (second, carried) = fixture.pass(ROOMY_LIMITS, carried);
     let second = second.map_err(|e| format!("pass 2 failed: {e}"))?;
-    if carried.cursor_counts().1 != 0 {
+    if carried.cursor_counts().unfinished != 0 {
         return Err(format!(
             "fully acquired passes must converge: {}",
             summarize(&second)

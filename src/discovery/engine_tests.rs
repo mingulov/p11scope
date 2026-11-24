@@ -23108,12 +23108,14 @@ fn owned_tree_watch_repeat_in_foreign_mount_ns_skips_consult() {
     sleeper.wait().expect("reap sleeper");
 }
 
-/// Replacing a mapped file by rename misses: the path names a new
-/// inode, so the consult key changes and the repeat does not serve the
-/// old file's facts. Unlike overwrite (same inode, re-read), the
-/// renamed path fails the opened-file identity guard, so the twin
-/// asserts the hit delta (all but the renamed group hit) instead of
-/// re-read bytes. An always-hit cache would hit the renamed group too.
+/// Replacing a mapped file by rename never consults: the maps render
+/// the mapping deleted, the group joins via `map_files`, and the
+/// call-site gate keeps the joined group off the consult entirely, so
+/// no key Miss occurs (unlike overwrite, which Misses on its pin
+/// change). The joined group then takes the full path and the identity
+/// guard refuses the renamed path without re-reading, so the twin
+/// asserts the exact `2H - 1` hit delta (all but the renamed group
+/// hit). It kills a disabled consult via `H > 0`, not a key mutant.
 #[test]
 fn owned_tree_watch_repeat_after_file_replace_by_rename_misses() {
     let dir = tempfile::tempdir().expect("watch cgroup dir");
@@ -63309,7 +63311,7 @@ fn pressure_services_unprotected_request_before_original_head() {
     let mut oracle_collect = Engine::collect_discovery_records;
     let mut oracle_diverted = Vec::new();
     let oracle_decoy_before = oracle.refresh_queue[&oracle_decoy].clone();
-    let oracle_cold_cache = oracle.budget.retained_counts().4;
+    let oracle_cold_cache = oracle.budget.retained_counts().exports;
     assert_eq!(oracle_cold_cache, 0, "the bare refusal starts cold");
     let oracle_scans_before = oracle.deep_scans;
     let oracle_work_before = oracle.budget.work_units_count();
@@ -63337,7 +63339,7 @@ fn pressure_services_unprotected_request_before_original_head() {
         Some(&oracle_decoy_before),
         "the bare refusal preserves its request serial and age"
     );
-    let oracle_warm_cache = oracle.budget.retained_counts().4;
+    let oracle_warm_cache = oracle.budget.retained_counts().exports;
     assert!(
         oracle_warm_cache > oracle_cold_cache,
         "the real refused scan warms shared ELF facts"
@@ -63395,7 +63397,7 @@ fn pressure_services_unprotected_request_before_original_head() {
         .work_units_count()
         .saturating_sub(oracle_work_before);
     assert_eq!(
-        oracle.budget.retained_counts().4,
+        oracle.budget.retained_counts().exports,
         oracle_warm_cache,
         "the bare completion reuses the warmed ELF facts"
     );

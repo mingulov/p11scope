@@ -23464,11 +23464,11 @@ pub(crate) mod tests {
         );
         let carried = scene.coordinator.cgroup_file_facts.counts();
         assert_eq!(
-            carried.1, 128,
+            carried.export, 128,
             "the first pass fills the carried export map to its 128-entry ceiling: {carried:?}"
         );
         assert!(
-            carried.4 <= 16 << 20,
+            carried.bytes <= 16 << 20,
             "carried bytes stay within their 16 MiB ceiling: {carried:?}"
         );
 

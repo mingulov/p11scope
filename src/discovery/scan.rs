@@ -1537,32 +1537,54 @@ fn file_fact_bytes(
         .saturating_add(preopen)
 }
 
+/// Entry counts plus accounted bytes for the carried file-fact maps,
+/// for twins that assert the carried map is genuinely full. A named
+/// struct (never a positional tuple): adding a map must break every
+/// reader at compile time instead of silently shifting an index.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RetainedFileCounts {
+    pub(crate) inspection: usize,
+    pub(crate) export: usize,
+    pub(crate) refusal: usize,
+    pub(crate) loader: usize,
+    pub(crate) preopen: usize,
+    pub(crate) bytes: u64,
+}
+
+/// Carried decode-cursor counts. Named for the same reason as
+/// [`RetainedFileCounts`]: positional indexing would silently survive
+/// a shape change.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CursorCounts {
+    pub(crate) cursors: usize,
+    pub(crate) unfinished: usize,
+}
+
 impl RetainedFileFacts {
-    /// `(inspection, export, refusal, loader, preopen, accounted bytes)`
-    /// entry counts, for twins that assert the carried map is genuinely
-    /// full.
     #[cfg(test)]
-    pub(crate) fn counts(&self) -> (usize, usize, usize, usize, usize, u64) {
-        (
-            self.inspected_files.len(),
-            self.elf_export_facts.len(),
-            self.table_cap_refusals.len(),
-            self.loader_elf_facts.len(),
-            self.preopen_file_facts.len(),
-            self.retained_cache_bytes,
-        )
+    pub(crate) fn counts(&self) -> RetainedFileCounts {
+        RetainedFileCounts {
+            inspection: self.inspected_files.len(),
+            export: self.elf_export_facts.len(),
+            refusal: self.table_cap_refusals.len(),
+            loader: self.loader_elf_facts.len(),
+            preopen: self.preopen_file_facts.len(),
+            bytes: self.retained_cache_bytes,
+        }
     }
 
-    /// `(cursors, unfinished cursors)` entry counts.
     #[cfg(test)]
-    pub(crate) fn cursor_counts(&self) -> (usize, usize) {
-        (
-            self.decode_cursors.len(),
-            self.decode_cursors
+    pub(crate) fn cursor_counts(&self) -> CursorCounts {
+        CursorCounts {
+            cursors: self.decode_cursors.len(),
+            unfinished: self
+                .decode_cursors
                 .values()
                 .filter(|cursor| !cursor.complete)
                 .count(),
-        )
+        }
     }
 
     /// Test-only: every carried decode cursor with its key, so twins can
@@ -2023,6 +2045,21 @@ impl FileFactRetention<'_> {
         touched.current.insert(key);
         true
     }
+}
+
+/// Retained-cache entry counts plus accounted bytes on a live
+/// budget. A named struct (never a positional tuple): adding a cache
+/// must break every reader at compile time, like
+/// [`RetainedFileCounts`].
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BudgetRetainedCounts {
+    pub(crate) tables: usize,
+    pub(crate) runtime_tables: usize,
+    pub(crate) interfaces: usize,
+    pub(crate) inspected: usize,
+    pub(crate) exports: usize,
+    pub(crate) bytes: u64,
 }
 
 impl CaptureWorkBudget {
@@ -3096,15 +3133,15 @@ impl CaptureWorkBudget {
     }
 
     #[cfg(test)]
-    pub(crate) fn retained_counts(&self) -> (usize, usize, usize, usize, usize, u64) {
-        (
-            self.admitted_tables.len(),
-            self.admitted_runtime_tables.len(),
-            self.admitted_interfaces.len(),
-            self.inspected_files.len(),
-            self.elf_export_facts.len(),
-            self.retained_cache_bytes,
-        )
+    pub(crate) fn retained_counts(&self) -> BudgetRetainedCounts {
+        BudgetRetainedCounts {
+            tables: self.admitted_tables.len(),
+            runtime_tables: self.admitted_runtime_tables.len(),
+            interfaces: self.admitted_interfaces.len(),
+            inspected: self.inspected_files.len(),
+            exports: self.elf_export_facts.len(),
+            bytes: self.retained_cache_bytes,
+        }
     }
 
     #[cfg(test)]
@@ -22223,7 +22260,7 @@ int main(int argc, char **argv) {
         let first_receipt = budget.finish_window(first.clone()).unwrap();
         assert_eq!(first_receipt.work_units(), 2);
         assert_eq!(first_receipt.stop_reason(), Some(WORK_CEILING_REASON));
-        assert_eq!(budget.retained_counts().0, 1);
+        assert_eq!(budget.retained_counts().tables, 1);
         assert!(
             budget.checkpoint(first.clone()).is_err(),
             "finished token is stale"
@@ -22243,7 +22280,7 @@ int main(int argc, char **argv) {
         );
         assert!(budget.charge(1));
         assert_eq!(
-            budget.retained_counts().0,
+            budget.retained_counts().tables,
             1,
             "repeat key does not grow retention"
         );
@@ -22395,7 +22432,7 @@ int main(int argc, char **argv) {
             budget.finish_scan(scan).unwrap();
             budget.finish_window(token).unwrap();
         }
-        assert_eq!(budget.retained_counts().0, 513);
+        assert_eq!(budget.retained_counts().tables, 513);
         assert_eq!(budget.table_candidates_count(), 513);
         assert_eq!(budget.decoded_table_entries_count(), 513 * 68);
         assert_eq!(budget.work_units_count(), 513 * 68);
@@ -22416,7 +22453,7 @@ int main(int argc, char **argv) {
             .is_some(),
             "a repeat still traverses the actual decoder"
         );
-        assert_eq!(budget.retained_counts().0, 513);
+        assert_eq!(budget.retained_counts().tables, 513);
         assert_eq!(budget.table_candidates_count(), 514);
         assert_eq!(budget.decoded_table_entries_count(), 514 * 68);
         assert_eq!(budget.work_units_count(), 514 * 68);
@@ -22437,7 +22474,7 @@ int main(int argc, char **argv) {
             .is_err(),
             "the configured retained-key limit refuses one decoded candidate over"
         );
-        assert_eq!(budget.retained_counts().0, 513);
+        assert_eq!(budget.retained_counts().tables, 513);
         assert_eq!(budget.table_candidates_count(), 515);
         assert_eq!(budget.decoded_table_entries_count(), 515 * 68);
         assert_eq!(budget.work_units_count(), 515 * 68);
@@ -22495,10 +22532,10 @@ int main(int argc, char **argv) {
         };
         assert!(budget.note_elf_export_facts(key(1), facts.clone()));
         assert!(!budget.note_elf_export_facts(key(2), facts));
-        assert_eq!(budget.retained_counts().1, 1);
-        assert_eq!(budget.retained_counts().2, 1);
-        assert_eq!(budget.retained_counts().3, 1);
-        assert_eq!(budget.retained_counts().4, 1);
+        assert_eq!(budget.retained_counts().runtime_tables, 1);
+        assert_eq!(budget.retained_counts().interfaces, 1);
+        assert_eq!(budget.retained_counts().inspected, 1);
+        assert_eq!(budget.retained_counts().exports, 1);
 
         budget.finish_scan(scan).unwrap();
         budget.finish_window(token).unwrap();
@@ -22539,7 +22576,8 @@ int main(int argc, char **argv) {
             budget.note_inspected_file(key(inode), inspected.clone());
             budget.note_elf_export_facts(key(inode), facts.clone());
         }
-        let (_, _, _, inspected_len, exports_len, _) = budget.retained_counts();
+        let snapshot = budget.retained_counts();
+        let (inspected_len, exports_len) = (snapshot.inspected, snapshot.exports);
         assert!(
             inspected_len <= CAPTURE_INSPECTION_CACHE_ENTRIES,
             "inspected cache grew past its ceiling: {inspected_len}"
@@ -22579,7 +22617,8 @@ int main(int argc, char **argv) {
         for i in 0..200 {
             budget.note_elf_export_facts(key(i), facts.clone());
         }
-        let (_, _, _, _, exports_len, bytes) = budget.retained_counts();
+        let snapshot = budget.retained_counts();
+        let (exports_len, bytes) = (snapshot.exports, snapshot.bytes);
         assert!(
             bytes <= CAPTURE_RETAINED_CACHE_BYTES,
             "export cache bytes grew past the ceiling: {bytes}"
@@ -22736,7 +22775,7 @@ int main(int argc, char **argv) {
         let scan = budget.checkpoint(token.clone()).unwrap();
 
         assert!(budget.note_elf_export_facts(key, exact.clone()));
-        assert_eq!(budget.retained_counts().5, exact_bytes);
+        assert_eq!(budget.retained_counts().bytes, exact_bytes);
         let one_over = ElfExportFacts {
             abi: exact.abi,
             exports: vec![("C_GetFunctionList_".into(), 7)],
@@ -22747,7 +22786,7 @@ int main(int argc, char **argv) {
         assert_eq!(export_cache_bytes(&key, &one_over), exact_bytes + 1);
         assert!(!budget.note_elf_export_facts(key, one_over));
         assert_eq!(budget.elf_export_facts_for(&key), Some(exact));
-        assert_eq!(budget.retained_counts().5, exact_bytes);
+        assert_eq!(budget.retained_counts().bytes, exact_bytes);
 
         budget.finish_scan(scan).unwrap();
         budget.finish_window(token).unwrap();
@@ -22837,7 +22876,7 @@ int main(int argc, char **argv) {
         let scan = budget.checkpoint(token.clone()).unwrap();
 
         assert!(budget.note_loader_elf_facts(key, exact.clone()));
-        assert_eq!(budget.retained_counts().5, exact_bytes);
+        assert_eq!(budget.retained_counts().bytes, exact_bytes);
         let one_over = LoaderElfFacts {
             abi: exact.abi,
             hook: Err("e".into()),
@@ -22846,7 +22885,7 @@ int main(int argc, char **argv) {
         assert_eq!(loader_cache_bytes(&key, &one_over), exact_bytes + 1);
         assert!(!budget.note_loader_elf_facts(key, one_over));
         assert_eq!(budget.loader_elf_facts_for(&key), Some(exact));
-        assert_eq!(budget.retained_counts().5, exact_bytes);
+        assert_eq!(budget.retained_counts().bytes, exact_bytes);
 
         budget.finish_scan(scan).unwrap();
         budget.finish_window(token).unwrap();
@@ -23536,12 +23575,12 @@ int main(int argc, char **argv) {
             provider_facts_for(&file, key, &[], &mut first).unwrap();
             filled.push((file, key));
         }
-        let (_, _, _, _, exports, _) = first.retained_counts();
+        let exports = first.retained_counts().exports;
         assert_eq!(exports, 4, "the first pass fills the 4-entry export map");
         first.finish_scan(scan).unwrap();
         first.finish_window(window).unwrap();
         let carried = first.take_retained_file_facts();
-        assert_eq!(carried.counts().1, 4, "the carried export map is full");
+        assert_eq!(carried.counts().export, 4, "the carried export map is full");
 
         let newcomer_path = dir.path().join("newcomer.so");
         std::fs::copy("/bin/sh", &newcomer_path).unwrap();
@@ -23583,7 +23622,7 @@ int main(int argc, char **argv) {
             "a full carried cache must reclaim a dead entry and dedupe the newcomer"
         );
         assert_eq!(
-            second.retained_counts().4,
+            second.retained_counts().exports,
             4,
             "the newcomer replaced one carried entry, not grew the map"
         );
@@ -23593,7 +23632,7 @@ int main(int argc, char **argv) {
             "an entry this pass used is never reclaimed"
         );
         assert_eq!(
-            second.retained_counts().5,
+            second.retained_counts().bytes,
             second.retained_file_bytes_recount(),
             "reclamation keeps the retained byte counter exact"
         );
@@ -23646,7 +23685,8 @@ int main(int argc, char **argv) {
                 loader_facts.clone(),
             ));
         }
-        let (_, _, _, inspected_len, exports_len, _) = first.retained_counts();
+        let snapshot = first.retained_counts();
+        let (inspected_len, exports_len) = (snapshot.inspected, snapshot.exports);
         assert_eq!((inspected_len, exports_len), (4, 4));
         assert_eq!(first.loader_cache_len(), 4);
         first.finish_scan(scan).unwrap();
@@ -23654,7 +23694,12 @@ int main(int argc, char **argv) {
         let carried = first.take_retained_file_facts();
         let counts = carried.counts();
         assert_eq!(
-            (counts.0, counts.1, counts.2, counts.3),
+            (
+                counts.inspection,
+                counts.export,
+                counts.refusal,
+                counts.loader
+            ),
             (4, 4, 4, 4),
             "every carried map is full before the stale-entry pass"
         );
@@ -23721,7 +23766,7 @@ int main(int argc, char **argv) {
             "a loader entry this pass used is never reclaimed"
         );
         assert_eq!(
-            second.retained_counts().5,
+            second.retained_counts().bytes,
             second.retained_file_bytes_recount(),
             "reclamation keeps the retained byte counter exact"
         );
@@ -23771,7 +23816,7 @@ int main(int argc, char **argv) {
             ),
             "the first pass stores one pre-open entry"
         );
-        let bytes_before_take = first.retained_counts().5;
+        let bytes_before_take = first.retained_counts().bytes;
         assert!(
             bytes_before_take > 0,
             "storing accounts bytes: {bytes_before_take}"
@@ -23780,12 +23825,12 @@ int main(int argc, char **argv) {
         first.finish_window(window).unwrap();
         let carried = first.take_retained_file_facts();
         assert_eq!(
-            carried.counts().4,
+            carried.counts().preopen,
             1,
             "the carried bundle holds the pre-open entry"
         );
         assert_eq!(
-            carried.counts().5,
+            carried.counts().bytes,
             bytes_before_take,
             "the carried byte counter travels with its entries"
         );
@@ -23797,12 +23842,12 @@ int main(int argc, char **argv) {
             "install carries the pre-open map"
         );
         assert_eq!(
-            second.retained_counts().5,
+            second.retained_counts().bytes,
             second.retained_file_bytes_recount(),
             "install keeps the retained byte counter exact"
         );
         assert_eq!(
-            second.retained_counts().5,
+            second.retained_counts().bytes,
             bytes_before_take,
             "carried bytes survive the take/install round trip"
         );
@@ -23876,6 +23921,420 @@ int main(int argc, char **argv) {
         ] {
             assert!(!eligible, "a {name} group keeps the full path");
         }
+    }
+
+    /// Scan one live child through the production examined entry (the
+    /// real pre-open call site). Fails unless the maps bracket completed
+    /// and the shared budget never stopped, so a zero-hit third scan
+    /// names the guard, never a stopped or incomplete scan. Full-path
+    /// evidence comes from provider metadata reads (hinted runs and
+    /// observer-unmapped files never populate `examined`).
+    fn preopen_call_site_scan(
+        pid: u32,
+        hints: &[PathBuf],
+        hooks: &HookRegistry,
+        budget: &mut CaptureWorkBudget,
+    ) {
+        let view = ProcessView::open(ProcessViewId(0), pid).expect("the child view opens");
+        let (outcome, _, _, _) =
+            scan_process_view_examined(&ScanRequest { pid, hints, hooks }, &view, budget)
+                .expect("the child scan runs");
+        assert!(
+            outcome.mapping_scan_completed(),
+            "the scan bracket completed: {:?}",
+            outcome.skipped()
+        );
+        assert!(
+            budget.stopped_reason().is_none(),
+            "the shared budget never stops across the three scans"
+        );
+    }
+
+    /// One mapped shared library of a child, by absolute path: the
+    /// hint/exclude target these twins own without hard-coding a host
+    /// path.
+    fn preopen_call_site_mapped_so(pid: u32) -> String {
+        let maps = std::fs::read_to_string(format!("/proc/{pid}/maps"))
+            .expect("the child maps are readable");
+        maps.lines()
+            .filter_map(|line| line.rsplit(' ').next())
+            .find(|path| path.contains(".so") && std::path::Path::new(path).is_absolute())
+            .expect("the child maps at least one shared library")
+            .to_string()
+    }
+
+    /// A hinted run never consults: the first two plain scans store
+    /// then hit every group, while the third scan with a `--module`
+    /// hint takes the full path (re-opens) and adds zero hits.
+    /// Removing the hints clause serves the hinted group from cache.
+    #[test]
+    fn preopen_call_site_hinted_group_skips_consult() {
+        use crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild;
+        let _force = ForcePreopenConsultGuard::forced();
+        let child = OwnedStoppedChild::new();
+        let pid = child.id();
+        let so = preopen_call_site_mapped_so(pid);
+        let hooks = HookRegistry::builtin();
+        let mut budget = CaptureWorkBudget::default();
+        preopen_call_site_scan(pid, &[], &hooks, &mut budget);
+        assert_eq!(
+            budget.preopen_hits_for_test(),
+            0,
+            "the cold first scan misses every group"
+        );
+        preopen_call_site_scan(pid, &[], &hooks, &mut budget);
+        let hits = budget.preopen_hits_for_test();
+        assert!(
+            hits > 0,
+            "the plain repeat hits (entries stored and hittable): {hits}"
+        );
+        let hints = vec![PathBuf::from(&so)];
+        let (_, reads) =
+            metadata_reads_during(|| preopen_call_site_scan(pid, &hints, &hooks, &mut budget));
+        assert!(
+            reads > 0,
+            "the hinted group re-opens instead of hitting: {reads}"
+        );
+        assert_eq!(
+            budget.preopen_hits_for_test(),
+            hits,
+            "the hinted run consults nothing"
+        );
+    }
+
+    /// A narrowed-out group never consults: with a hint plus an
+    /// exclude present the narrowed groups reach the call site (no
+    /// early skip) and still take the full path. The narrowed clause
+    /// alone is redundant (a narrowed group is always a hinted run,
+    /// so the hints clause co-blocks), but the end-to-end property
+    /// must hold and any fail-open wiring serves hits here.
+    #[test]
+    fn preopen_call_site_narrowed_group_skips_consult() {
+        use crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild;
+        let _force = ForcePreopenConsultGuard::forced();
+        let child = OwnedStoppedChild::new();
+        let pid = child.id();
+        let so = preopen_call_site_mapped_so(pid);
+        // A resolvable exclude that matches no mapped file: it keeps
+        // narrowed groups on the call-site path without excluding the
+        // hinted file (hinted-plus-excluded would refuse the scan).
+        let scratch = tempfile::tempdir().unwrap();
+        let hooks = HookRegistry::builtin();
+        let mut budget = CaptureWorkBudget::default();
+        preopen_call_site_scan(pid, &[], &hooks, &mut budget);
+        assert_eq!(
+            budget.preopen_hits_for_test(),
+            0,
+            "the cold first scan misses every group"
+        );
+        preopen_call_site_scan(pid, &[], &hooks, &mut budget);
+        let hits = budget.preopen_hits_for_test();
+        assert!(
+            hits > 0,
+            "the plain repeat hits (entries stored and hittable): {hits}"
+        );
+        budget.set_excludes(vec![scratch.path().to_path_buf()]);
+        let hints = vec![PathBuf::from(&so)];
+        let (_, reads) =
+            metadata_reads_during(|| preopen_call_site_scan(pid, &hints, &hooks, &mut budget));
+        assert!(
+            reads > 0,
+            "the narrowed groups re-open instead of hitting: {reads}"
+        );
+        assert_eq!(
+            budget.preopen_hits_for_test(),
+            hits,
+            "narrowed groups never consult"
+        );
+    }
+
+    /// A custody-held scan never consults: the first two plain scans
+    /// store then hit, while the held third scan re-opens every group
+    /// via the full path and adds zero hits. Removing the custody
+    /// clause serves the held groups from cache.
+    #[test]
+    fn preopen_call_site_custody_scan_skips_consult() {
+        use crate::discovery::kernel_identity::ExaminedCustody;
+        use crate::discovery::sweep_attribution::{ReservationOwner, SegmentPolicy};
+        use crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild;
+        let _force = ForcePreopenConsultGuard::forced();
+        let child = OwnedStoppedChild::new();
+        let pid = child.id();
+        let hooks = HookRegistry::builtin();
+        let mut budget = CaptureWorkBudget::default();
+        preopen_call_site_scan(pid, &[], &hooks, &mut budget);
+        assert_eq!(
+            budget.preopen_hits_for_test(),
+            0,
+            "the cold first scan misses every group"
+        );
+        preopen_call_site_scan(pid, &[], &hooks, &mut budget);
+        let hits = budget.preopen_hits_for_test();
+        assert!(
+            hits > 0,
+            "the plain repeat hits (entries stored and hittable): {hits}"
+        );
+        let owner = ReservationOwner::for_examined(SegmentPolicy::from_headroom(64, 0, 0), 64);
+        let mut custody = ExaminedCustody::new(owner.clone(), BTreeMap::new());
+        let scan = custody.begin_scan();
+        let held = || {
+            let view = ProcessView::open(ProcessViewId(0), pid).expect("the child view opens");
+            scan_process_view_held(
+                &ScanRequest {
+                    pid,
+                    hints: &[],
+                    hooks: &hooks,
+                },
+                &view,
+                &mut budget,
+                &mut custody,
+                scan,
+            )
+            .expect("the held scan runs")
+        };
+        let ((outcome, _, _, _), reads) = metadata_reads_during(held);
+        assert!(
+            outcome.mapping_scan_completed(),
+            "the held scan bracket completed: {:?}",
+            outcome.skipped()
+        );
+        assert!(
+            budget.stopped_reason().is_none(),
+            "the shared budget never stops across the three scans"
+        );
+        assert!(
+            reads > 0,
+            "the held scan re-opens instead of hitting: {reads}"
+        );
+        assert_eq!(
+            budget.preopen_hits_for_test(),
+            hits,
+            "a custody-held scan consults nothing"
+        );
+    }
+
+    /// An `--exclude-module` path run never consults: the excluded
+    /// file is still opened for its attribution, but no group hits.
+    /// Removing the exclude-paths clause serves every group from
+    /// cache and records the excluded file examined instead.
+    #[test]
+    fn preopen_call_site_excluded_path_scan_skips_consult() {
+        use crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild;
+        let _force = ForcePreopenConsultGuard::forced();
+        let child = OwnedStoppedChild::new();
+        let pid = child.id();
+        let so = preopen_call_site_mapped_so(pid);
+        let hooks = HookRegistry::builtin();
+        let mut budget = CaptureWorkBudget::default();
+        preopen_call_site_scan(pid, &[], &hooks, &mut budget);
+        assert_eq!(
+            budget.preopen_hits_for_test(),
+            0,
+            "the cold first scan misses every group"
+        );
+        preopen_call_site_scan(pid, &[], &hooks, &mut budget);
+        let hits = budget.preopen_hits_for_test();
+        assert!(
+            hits > 0,
+            "the plain repeat hits (entries stored and hittable): {hits}"
+        );
+        budget.set_excludes(vec![PathBuf::from(&so)]);
+        let (_, reads) =
+            metadata_reads_during(|| preopen_call_site_scan(pid, &[], &hooks, &mut budget));
+        assert!(
+            reads > 0,
+            "the excluded run re-opens instead of hitting: {reads}"
+        );
+        assert_eq!(
+            budget.preopen_hits_for_test(),
+            hits,
+            "an excluded-paths run consults nothing"
+        );
+    }
+
+    /// A bare-name `--exclude-module` run never consults: same shape
+    /// as the path twin, through the exclude-names clause. Removing
+    /// that clause serves every group from cache.
+    #[test]
+    fn preopen_call_site_excluded_name_scan_skips_consult() {
+        use crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild;
+        let _force = ForcePreopenConsultGuard::forced();
+        let child = OwnedStoppedChild::new();
+        let pid = child.id();
+        let so = preopen_call_site_mapped_so(pid);
+        let name = std::path::Path::new(&so)
+            .file_name()
+            .expect("the mapped library has a file name");
+        let hooks = HookRegistry::builtin();
+        let mut budget = CaptureWorkBudget::default();
+        preopen_call_site_scan(pid, &[], &hooks, &mut budget);
+        assert_eq!(
+            budget.preopen_hits_for_test(),
+            0,
+            "the cold first scan misses every group"
+        );
+        preopen_call_site_scan(pid, &[], &hooks, &mut budget);
+        let hits = budget.preopen_hits_for_test();
+        assert!(
+            hits > 0,
+            "the plain repeat hits (entries stored and hittable): {hits}"
+        );
+        budget.set_excludes(vec![PathBuf::from(name)]);
+        let (_, reads) =
+            metadata_reads_during(|| preopen_call_site_scan(pid, &[], &hooks, &mut budget));
+        assert!(
+            reads > 0,
+            "the excluded run re-opens instead of hitting: {reads}"
+        );
+        assert_eq!(
+            budget.preopen_hits_for_test(),
+            hits,
+            "an excluded-names run consults nothing"
+        );
+    }
+
+    /// A replaced-file join never consults: after a rename over the
+    /// preloaded copy the maps render it deleted, the group joins via
+    /// `map_files`, and the call-site gate keeps it off the consult
+    /// even though a matching seeded entry exists. The other groups
+    /// hit, so the third-scan total is exactly `2H - 1`. Removing the
+    /// deleted clause hits the seed and misattributes the replaced
+    /// file as examined.
+    #[test]
+    fn preopen_call_site_deleted_join_skips_consult() {
+        use std::os::unix::fs::MetadataExt as _;
+        let _force = ForcePreopenConsultGuard::forced();
+        let dir = tempfile::tempdir().expect("preload dir");
+        let libc = ["usr/lib/x86_64-linux-gnu/libc.so.6", "usr/lib64/libc.so.6"]
+            .into_iter()
+            .map(|relative| std::path::PathBuf::from("/").join(relative))
+            .find(|candidate| candidate.is_file())
+            .expect("a system libc to copy");
+        let loader = [
+            "usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+            "usr/lib64/ld-linux-x86-64.so.2",
+        ]
+        .into_iter()
+        .map(|relative| std::path::PathBuf::from("/").join(relative))
+        .find(|candidate| candidate.is_file())
+        .expect("a system loader to rename with");
+        let copy = dir.path().join("preload-libc.so.6");
+        std::fs::copy(&libc, &copy).expect("copy libc for preloading");
+        let mut command = std::process::Command::new("sh");
+        command
+            .args(["-c", "LD_PRELOAD= sleep 30"])
+            .env("LD_PRELOAD", &copy);
+        crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild::harden_spawn(
+            &mut command,
+        );
+        let mut sleeper = command.spawn().expect("spawn preloaded shell");
+        let mut preloaded = false;
+        for _ in 0..100 {
+            let maps = std::fs::read_to_string(format!("/proc/{}/maps", sleeper.id()))
+                .expect("read sleeper maps");
+            if maps.lines().any(|line| line.contains("preload-libc.so.6")) {
+                preloaded = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            preloaded,
+            "the sleeper maps the preloaded copy (non-vacuous preload)"
+        );
+        let observer_ns = std::fs::read_link("/proc/self/ns/mnt").expect("read observer mount ns");
+        let member_ns = std::fs::read_link(format!("/proc/{}/ns/mnt", sleeper.id()))
+            .expect("read member mount ns");
+        assert_eq!(
+            observer_ns, member_ns,
+            "the member shares the observer mount namespace (same-ns consult)"
+        );
+        let pid = sleeper.id();
+        let hooks = HookRegistry::builtin();
+        let mut budget = CaptureWorkBudget::default();
+        preopen_call_site_scan(pid, &[], &hooks, &mut budget);
+        assert_eq!(
+            budget.preopen_hits_for_test(),
+            0,
+            "the cold first scan misses every group"
+        );
+        preopen_call_site_scan(pid, &[], &hooks, &mut budget);
+        let hits = budget.preopen_hits_for_test();
+        assert!(
+            hits > 0,
+            "the plain repeat hits (entries stored and hittable): {hits}"
+        );
+        let replacement = dir.path().join("replacement.so.6");
+        std::fs::copy(&loader, &replacement).expect("stage the replacement file");
+        std::fs::rename(&replacement, &copy).expect("rename over the preloaded copy");
+        let maps =
+            std::fs::read_to_string(format!("/proc/{pid}/maps")).expect("read replaced maps");
+        let line = maps
+            .lines()
+            .find(|line| line.contains("preload-libc.so.6"))
+            .expect("the replaced mapping is still rendered")
+            .to_string();
+        assert!(
+            line.contains("(deleted)"),
+            "the replaced mapping renders deleted (join precondition): {line}"
+        );
+        let mut parts = line.split_whitespace();
+        let _range = parts.next().expect("maps range");
+        let _perms = parts.next().expect("maps perms");
+        let _offset = parts.next().expect("maps offset");
+        let dev = parts.next().expect("maps device");
+        let inode: u64 = parts
+            .next()
+            .expect("maps inode")
+            .parse()
+            .expect("inode parses");
+        let mut dev_parts = dev.split(':');
+        let major =
+            u64::from_str_radix(dev_parts.next().expect("major"), 16).expect("major parses");
+        let minor =
+            u64::from_str_radix(dev_parts.next().expect("minor"), 16).expect("minor parses");
+        // The joined consult key: the observer namespace, the stale
+        // maps identity, and the replacement file's pin.
+        let target = std::fs::metadata(&copy).expect("stat the replacement file");
+        let ns_meta = std::fs::metadata("/proc/self/ns/mnt").expect("stat observer mount ns");
+        let seed_key = PreopenFileKey::for_target(
+            crate::process::MountNamespaceId {
+                device: ns_meta.dev(),
+                inode: ns_meta.ino(),
+            },
+            p11scope_manifest::maps::Device { major, minor },
+            inode,
+            &target,
+        );
+        let now_ns = crate::attach::monotonic_ns().expect("monotonic clock reads");
+        assert!(
+            budget.note_preopen_facts(
+                seed_key,
+                PreopenEntry {
+                    facts: ElfExportFacts {
+                        abi: p11scope_manifest::elf::ElfAbi::Lp64,
+                        exports: Vec::new(),
+                        getter_present: false,
+                        witness_fault: false,
+                        excluded_anchor_ranges: Vec::new(),
+                    },
+                    stored_ns: now_ns,
+                },
+            ),
+            "the deleted-join seed stores"
+        );
+        assert!(
+            budget.preopen_facts_for(&seed_key, now_ns).is_some(),
+            "the seed is hittable before the third scan"
+        );
+        preopen_call_site_scan(pid, &[], &hooks, &mut budget);
+        assert_eq!(
+            budget.preopen_hits_for_test(),
+            2 * hits - 1,
+            "the joined group never consults while the rest hit: second={hits}"
+        );
+        sleeper.kill().expect("kill sleeper");
+        sleeper.wait().expect("reap sleeper");
     }
 
     /// The same-root comparison behind the consult gate: the same
@@ -24095,6 +24554,14 @@ int main(int argc, char **argv) {
             !preopen_consult_forced(),
             "this twin runs with the consult unforced"
         );
+        let (magic, read_only) =
+            preopen_target_fs(&path).expect("the premise probe reads the host filesystem");
+        assert!(
+            magic != Some(p11scope_manifest::identity::OVERLAYFS_SUPER_MAGIC)
+                && !(magic == Some(NINE_P_MAGIC) && read_only),
+            "premise: this host's filesystem is consult-ineligible (magic={magic:?} \
+             read_only={read_only}); on overlayfs or 9p read-only this twin cannot pin the gate"
+        );
         assert!(
             matches!(
                 preopen_consult(
@@ -24120,7 +24587,8 @@ int main(int argc, char **argv) {
     fn preopen_consult_skips_unreadable_paths_when_forced() {
         use std::os::unix::ffi::OsStrExt as _;
         let _force = ForcePreopenConsultGuard::forced();
-        let missing = std::path::PathBuf::from("/tmp/p11scope-preopen-missing-7f3a.so");
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.so");
         assert!(
             std::fs::metadata(&missing).is_err(),
             "the probe path names no file"
@@ -24408,7 +24876,7 @@ int main(int argc, char **argv) {
         first.finish_scan(scan).unwrap();
         first.finish_window(window).unwrap();
         let carried = first.take_retained_file_facts();
-        assert_eq!(carried.counts().1, 2);
+        assert_eq!(carried.counts().export, 2);
 
         let mut second =
             CaptureWorkBudget::for_inventory(limits()).with_retained_file_facts(carried);
@@ -24427,14 +24895,14 @@ int main(int argc, char **argv) {
             "a value that cannot fit even after evicting every untouched entry is refused"
         );
         assert_eq!(
-            second.retained_counts().4,
+            second.retained_counts().exports,
             2,
             "a refused insertion leaves the carried entries intact"
         );
         assert_eq!(second.elf_export_facts_for(&key(1)), Some(facts.clone()));
         assert_eq!(second.elf_export_facts_for(&key(0)), Some(facts));
         assert_eq!(
-            second.retained_counts().5,
+            second.retained_counts().bytes,
             second.retained_file_bytes_recount(),
             "a refusal changes no retained bytes"
         );
@@ -24483,11 +24951,11 @@ int main(int argc, char **argv) {
         for inode in 1..=3u64 {
             assert!(first.note_elf_export_facts(key(inode), facts.clone()));
         }
-        assert_eq!(first.retained_counts().5, 3 * small_bytes);
+        assert_eq!(first.retained_counts().bytes, 3 * small_bytes);
         first.finish_scan(scan).unwrap();
         first.finish_window(window).unwrap();
         let carried = first.take_retained_file_facts();
-        assert_eq!(carried.counts().1, 3);
+        assert_eq!(carried.counts().export, 3);
 
         let mut second =
             CaptureWorkBudget::for_inventory(limits()).with_retained_file_facts(carried);
@@ -24497,7 +24965,8 @@ int main(int argc, char **argv) {
             second.note_elf_export_facts(key(9), medium.clone()),
             "reclamation keeps evicting until the insertion fits"
         );
-        let (_, _, _, _, exports, bytes) = second.retained_counts();
+        let snapshot = second.retained_counts();
+        let (exports, bytes) = (snapshot.exports, snapshot.bytes);
         assert_eq!(exports, 2, "two small entries made room for the medium one");
         assert!(bytes <= byte_limit);
         assert_eq!(bytes, second.retained_file_bytes_recount());
@@ -26441,7 +26910,10 @@ int main(int argc, char **argv) {
         );
         assert_eq!(
             budget.take_retained_file_facts().cursor_counts(),
-            (2, 1),
+            CursorCounts {
+                cursors: 2,
+                unfinished: 1,
+            },
             "the live unfinished plus the new completed cursor carry to the next pass"
         );
     }
@@ -26898,7 +27370,10 @@ int main(int argc, char **argv) {
         );
         assert_eq!(
             carried.cursor_counts(),
-            (1, 1),
+            CursorCounts {
+                cursors: 1,
+                unfinished: 1,
+            },
             "the truncated object carries an unfinished cursor, never a completed decode"
         );
         fixture.log.borrow_mut().clear();
@@ -26916,7 +27391,7 @@ int main(int argc, char **argv) {
             second.modules()[0].interfaces
         );
         assert_eq!(
-            carried.cursor_counts().1,
+            carried.cursor_counts().unfinished,
             0,
             "fully acquired passes converge"
         );
@@ -27091,7 +27566,10 @@ int main(int argc, char **argv) {
         let carried = first.take_retained_file_facts();
         assert_eq!(
             carried.cursor_counts(),
-            (1, 1),
+            CursorCounts {
+                cursors: 1,
+                unfinished: 1,
+            },
             "the 4 MiB of unread bytes keep the object unfinished"
         );
         let mut second = CaptureWorkBudget::new(limits).with_retained_file_facts(carried);
@@ -27115,7 +27593,7 @@ int main(int argc, char **argv) {
             "complete acquisition restores finished-scan evidence"
         );
         assert_eq!(
-            second.take_retained_file_facts().cursor_counts().1,
+            second.take_retained_file_facts().cursor_counts().unfinished,
             0,
             "fully acquired passes converge"
         );
@@ -27198,7 +27676,7 @@ int main(int argc, char **argv) {
                 .collect();
             names.sort();
             finished = outcome.modules()[0].tables_scan_finished;
-            if carried.cursor_counts().1 == 0 {
+            if carried.cursor_counts().unfinished == 0 {
                 break;
             }
         }
@@ -27237,7 +27715,7 @@ int main(int argc, char **argv) {
                 .collect();
             addresses.sort_unstable();
             finished = outcome.modules()[0].tables_scan_finished;
-            if carried.cursor_counts().1 == 0 {
+            if carried.cursor_counts().unfinished == 0 {
                 break;
             }
         }
@@ -27313,7 +27791,13 @@ int main(int argc, char **argv) {
         };
         let (first, carried) = armed_scan_pass(&mut fixture, limits, RetainedFileFacts::default());
         assert_eq!(first.unwrap().modules()[0].tables.len(), 1);
-        assert_eq!(carried.cursor_counts(), (1, 0));
+        assert_eq!(
+            carried.cursor_counts(),
+            CursorCounts {
+                cursors: 1,
+                unfinished: 0
+            }
+        );
         fixture.maps_b = fixture.maps_a.replace(
             "9000-a000 r-xp 00000000 08:01 999 /dependency.so",
             "9000-a000 r-xp 00000000 08:01 999 /replacement.so",
@@ -27493,7 +27977,13 @@ int main(int argc, char **argv) {
             first.modules()[0].tables[0].extension_impossible,
             "pass one proves the refutation"
         );
-        assert_eq!(carried.cursor_counts(), (1, 0));
+        assert_eq!(
+            carried.cursor_counts(),
+            CursorCounts {
+                cursors: 1,
+                unfinished: 0
+            }
+        );
         // The writable tail now decodes: identical head, valid extension,
         // mappings unchanged.
         for slot in 68..92 {
@@ -27657,7 +28147,13 @@ int main(int argc, char **argv) {
         };
         let (first, carried) = armed_scan_pass(&mut fixture, limits, RetainedFileFacts::default());
         assert_eq!(first.unwrap().modules()[0].tables.len(), 1);
-        assert_eq!(carried.cursor_counts(), (1, 0));
+        assert_eq!(
+            carried.cursor_counts(),
+            CursorCounts {
+                cursors: 1,
+                unfinished: 0
+            }
+        );
         let stripped: String = fixture
             .maps_a
             .lines()
@@ -28059,7 +28555,10 @@ int main(int argc, char **argv) {
             0,
             "a budget that never carried file facts keeps the O(1) refusal"
         );
-        assert_eq!(capture.retained_counts().4, CAPTURE_EXPORT_CACHE_ENTRIES);
+        assert_eq!(
+            capture.retained_counts().exports,
+            CAPTURE_EXPORT_CACHE_ENTRIES
+        );
 
         // The same refusal shape in a carried budget scans and reclaims,
         // so the guard cannot hide a missing eviction.
@@ -30456,7 +30955,10 @@ int main(int argc, char **argv) {
         assert!(!outcome.modules()[0].tables_scan_finished);
         assert_eq!(
             carried.cursor_counts(),
-            (1, 0),
+            CursorCounts {
+                cursors: 1,
+                unfinished: 0,
+            },
             "a fully decoded object waits on no later pass: {:?}",
             carried.decode_cursors_for_test()
         );
@@ -30467,7 +30969,13 @@ int main(int argc, char **argv) {
             "{:?}",
             outcome.skipped()
         );
-        assert_eq!(carried.cursor_counts(), (1, 0));
+        assert_eq!(
+            carried.cursor_counts(),
+            CursorCounts {
+                cursors: 1,
+                unfinished: 0
+            }
+        );
     }
 
     /// Cgroup inventory on an overlay rootfs: scoped collection

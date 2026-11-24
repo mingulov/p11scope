@@ -21381,6 +21381,40 @@ int main(int argc, char **argv) {
         );
     }
 
+    /// The observer-table resolve behind the examined-mode lower-file arm
+    /// (`scan_view_examined_mode`'s `LowerProven` re-derivation) strides
+    /// like every other production resolution: the same key as the
+    /// unmetered primitive on a live budget, and a loud ceiling refusal
+    /// once the allowance is spent — one unit of headroom covers the
+    /// table read's chunk spend, so the line-stride spend refuses.
+    #[test]
+    fn observer_table_resolve_refuses_on_an_exhausted_budget() {
+        let file = std::fs::File::open("/bin/sh").unwrap();
+        let key = crate::discovery::identity::identity_of(&file, &mut CaptureWorkBudget::default())
+            .expect("a live budget resolves the observer table");
+        let unmetered = p11scope_manifest::identity::mapping_file_key(&file).unwrap();
+        assert_eq!(
+            (key.device_major, key.device_minor, key.inode),
+            (
+                unmetered.device_major,
+                unmetered.device_minor,
+                unmetered.inode
+            ),
+            "the metered resolve binds the same file"
+        );
+
+        let mut budget = CaptureWorkBudget::default();
+        assert!(budget.charge(budget.work_ceiling() - 1));
+        let error = crate::discovery::identity::identity_of(&file, &mut budget).unwrap_err();
+        assert_eq!(error, WORK_CEILING_REASON);
+        assert_eq!(
+            budget.work_units_count(),
+            budget.work_ceiling(),
+            "the chunk spend lands, the line-stride spend refuses: {}",
+            budget.work_units_count()
+        );
+    }
+
     /// Fix A: admission charges each unique table once. Byte-identical
     /// repeats skip the candidate charge but still decode (per-view results
     /// are never served from a cache); byte-different tables charge again.

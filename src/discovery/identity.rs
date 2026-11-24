@@ -33,7 +33,7 @@ use super::handle_table::{AcquireOutcome, DeferredReason, Filing, HandleTable, H
 use super::refresh_queue::RetirementProof;
 use crate::discovery::scan::{
     COLLECTION_STOP_REASON, CaptureWorkBudget, INTERFACE_WINDOW_CEILING_REASON, IO_CEILING_REASON,
-    InspectedFileKey, MOUNTINFO_STRIDE, SCAN_CLOCK_REASON, SCAN_DEADLINE_REASON, ScannedEntry, ScannedModule,
+    InspectedFileKey, MOUNTINFO_BYTE_STRIDE, MOUNTINFO_STRIDE, SCAN_CLOCK_REASON, SCAN_DEADLINE_REASON, ScannedEntry, ScannedModule,
     Skipped, TABLE_WINDOW_CEILING_REASON, WORK_CEILING_REASON, read_maps_or_refuse, read_mountinfo,
     standard_function_names,
 };
@@ -9082,9 +9082,12 @@ pub(crate) fn identity_of(
 /// of at most [`MOUNTINFO_STRIDE`] lines per credit with a stop poll
 /// between strides: a whole-table scan would charge nothing and answer
 /// nothing until the end. Each row is spent before it is visited, so
-/// refusal precedes the work it refuses. Returns the matched row on an
-/// exact mount-id match, `Ok(None)` when the table does not name the
-/// id, and `Err` on budget refusal or stop.
+/// refusal precedes the work it refuses. Row bytes are scanned in
+/// [`MOUNTINFO_BYTE_STRIDE`] byte strides with a stop poll before
+/// looking past each boundary, so one row credit never covers a whole
+/// long row. Returns the matched row on an exact mount-id match,
+/// `Ok(None)` when the table does not name the id, and `Err` on
+/// budget refusal or stop.
 fn scan_mount_table_for_row_with<'table>(
     table: &'table str,
     mount_id: &str,
@@ -9099,6 +9102,12 @@ fn scan_mount_table_for_row_with<'table>(
     let bytes = table.as_bytes();
     let mut offset = 0usize;
     let mut first_stride = true;
+    // INV-2 byte strides (reader precedent): at most 8 KiB scanned
+    // per byte credit, with a stop poll before looking past each
+    // boundary, so a stop landing mid-row refuses without scanning
+    // the rest. Short-row totals are unchanged (the boundary is
+    // never reached).
+    let mut byte_stride_used = 0usize;
     loop {
         if !first_stride {
             if let Some(reason) = budget.stopped_reason() {
@@ -9126,16 +9135,38 @@ fn scan_mount_table_for_row_with<'table>(
             EXACT_ROWS_VISITED.with(|counter| counter.set(counter.get() + 1));
             let start = offset;
             while offset < bytes.len() && bytes[offset] != b'\n' {
+                if byte_stride_used == MOUNTINFO_BYTE_STRIDE {
+                    budget.spend(1).map_err(str::to_string)?;
+                    byte_stride_used = 0;
+                    if let Some(reason) = budget.stopped_reason() {
+                        return Err(reason.into());
+                    }
+                    if let Some(reason) = stop(budget) {
+                        return Err(reason.into());
+                    }
+                }
                 #[cfg(test)]
                 EXACT_BYTES_SCANNED.with(|counter| counter.set(counter.get() + 1));
+                byte_stride_used += 1;
                 offset += 1;
             }
             let end = offset;
             if offset < bytes.len() {
+                if byte_stride_used == MOUNTINFO_BYTE_STRIDE {
+                    budget.spend(1).map_err(str::to_string)?;
+                    byte_stride_used = 0;
+                    if let Some(reason) = budget.stopped_reason() {
+                        return Err(reason.into());
+                    }
+                    if let Some(reason) = stop(budget) {
+                        return Err(reason.into());
+                    }
+                }
                 #[cfg(test)]
                 EXACT_BYTES_SCANNED.with(|counter| counter.set(counter.get() + 1));
                 #[cfg(test)]
                 EXACT_NEWLINES_SCANNED.with(|counter| counter.set(counter.get() + 1));
+                byte_stride_used += 1;
                 offset += 1;
             }
             let mut row = &table[start..end];
@@ -9164,8 +9195,12 @@ fn scan_mount_table_for_row_with<'table>(
 /// parser — so the parse and every error string stay the shared
 /// implementation's, while no whole-table scan runs uncharged. One
 /// credit covers the fdinfo row, one the delegate's bounded re-read.
-/// INV-2: the fdinfo credit is spent before the fdinfo read, so an
-/// exhausted allowance refuses without issuing any I/O.
+/// The delegate input is truncated to one [`MOUNTINFO_BYTE_STRIDE`]
+/// on a character boundary: the shared parser reads only the early
+/// device field, so a long mountpoint never makes its whole-row
+/// re-read exceed the delegate credit. INV-2: the fdinfo credit is
+/// spent before the fdinfo read, so an exhausted allowance refuses
+/// without issuing any I/O.
 fn mapping_file_key_in_mountinfo_metered_with(
     file: &std::fs::File,
     mountinfo: &str,
@@ -9178,14 +9213,28 @@ fn mapping_file_key_in_mountinfo_metered_with(
     let mount_id = fd_mount_id(file)?;
     let row = scan_mount_table_for_row_with(mountinfo, &mount_id, budget, stop)?;
     budget.spend(1).map_err(str::to_string)?;
+    // Bound the delegate's whole-row re-read to its one credit: the
+    // device field sits in the row prefix, so truncating a long row
+    // keeps the parse while the over-long tail (mountpoint, options)
+    // the parser never reads is not re-scanned.
+    let bounded = row.map(|matched| {
+        if matched.len() <= MOUNTINFO_BYTE_STRIDE {
+            return matched;
+        }
+        let mut end = MOUNTINFO_BYTE_STRIDE;
+        while !matched.is_char_boundary(end) {
+            end -= 1;
+        }
+        &matched[..end]
+    });
     #[cfg(test)]
     DELEGATE_ROW_LEN.with(|counter| {
-        counter.set(row.map(|matched| matched.len() as u64).unwrap_or(0));
+        counter.set(bounded.map(|matched| matched.len() as u64).unwrap_or(0));
     });
     // An unmatched id resolves against the empty table, which the
     // shared parser refuses with its exact missing-mount error — no
     // error string is duplicated here.
-    mapping_file_key_in_mountinfo(file, row.unwrap_or(""))
+    mapping_file_key_in_mountinfo(file, bounded.unwrap_or(""))
 }
 
 fn identity_of_in_mountinfo(

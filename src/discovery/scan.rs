@@ -463,6 +463,58 @@ fn raw_anchor_overlaps_metadata(ranges: &[(u64, u64)], offset: u64, width: usize
     ranges.get(next).is_some_and(|(start, _)| *start < end)
 }
 
+/// Incremental UTF-8 validator for the mount-table reader: one O(1)
+/// step per byte inside the already-metered newline scan, so encoding
+/// is proved in bounded strides instead of one table-wide validation
+/// after the last poll. Accepts exactly valid UTF-8 (overlong,
+/// surrogate, and out-of-range sequences refused with the same
+/// second-byte restrictions `str` enforces); an incomplete tail
+/// refuses at EOF. The all-zero state is fresh (`remaining == 0`
+/// short-circuits `lo`/`hi`, and every multi-byte lead resets both),
+/// so the derived `Default` starts validation cleanly.
+#[derive(Debug, Default)]
+struct MountinfoUtf8 {
+    remaining: u8,
+    lo: u8,
+    hi: u8,
+}
+
+impl MountinfoUtf8 {
+    /// Feeds one byte; false when the byte is invalid in sequence.
+    fn next(&mut self, byte: u8) -> bool {
+        if self.remaining == 0 {
+            if byte < 0x80 {
+                return true;
+            }
+            let (remaining, lo, hi) = match byte {
+                0xC2..=0xDF => (1, 0x80, 0xBF),
+                0xE0 => (2, 0xA0, 0xBF),
+                0xE1..=0xEC | 0xEE..=0xEF => (2, 0x80, 0xBF),
+                0xED => (2, 0x80, 0x9F),
+                0xF0 => (3, 0x90, 0xBF),
+                0xF1..=0xF3 => (3, 0x80, 0xBF),
+                0xF4 => (3, 0x80, 0x8F),
+                _ => return false,
+            };
+            self.remaining = remaining;
+            self.lo = lo;
+            self.hi = hi;
+            true
+        } else if self.lo <= byte && byte <= self.hi {
+            self.remaining -= 1;
+            self.lo = 0x80;
+            self.hi = 0xBF;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn complete(&self) -> bool {
+        self.remaining == 0
+    }
+}
+
 pub(crate) fn read_mountinfo<R: Read>(
     reader: R,
     budget: &mut CaptureWorkBudget,
@@ -539,6 +591,10 @@ pub(crate) struct MountinfoProgress {
     table: Vec<u8>,
     observed_lines: usize,
     newline_count: usize,
+    /// Incremental UTF-8 validator state over `table`: persists across
+    /// resumable legs so a multi-byte sequence split by a leg boundary
+    /// still validates (and refuses) exactly once.
+    encoding: MountinfoUtf8,
 }
 
 impl MountinfoProgress {
@@ -633,9 +689,18 @@ fn read_mountinfo_pass<R: Read>(
             if let Some(reason) = deadline(budget) {
                 return Err(reason.into());
             }
-            return String::from_utf8(std::mem::take(&mut progress.table))
-                .map(MountinfoStep::Complete)
-                .map_err(|error| format!("mount table is not valid UTF-8: {error}"));
+            if !progress.encoding.complete() {
+                return Err("mount table is not valid UTF-8: incomplete sequence at end of table".into());
+            }
+            // SAFETY: every byte in `progress.table` passed through
+            // `progress.encoding` in the chunk loop of this or an
+            // earlier pass (the validator state persists in the
+            // progress across resumable legs), which accepts exactly
+            // valid UTF-8 and refuses otherwise (invalid in-loop,
+            // incomplete here), so the accumulated table is valid.
+            return Ok(MountinfoStep::Complete(unsafe {
+                String::from_utf8_unchecked(std::mem::take(&mut progress.table))
+            }));
         }
 
         let next_len = progress
@@ -660,7 +725,14 @@ fn read_mountinfo_pass<R: Read>(
         let mut pending_lines = 0usize;
         let mut lines_charged = 0usize;
         let mut byte_stride_used = 0usize;
-        for byte in chunk[..read].iter() {
+        let chunk_base = progress.table.len();
+        for (index, byte) in chunk[..read].iter().enumerate() {
+            if !progress.encoding.next(*byte) {
+                return Err(format!(
+                    "mount table is not valid UTF-8: invalid sequence at byte {}",
+                    chunk_base.saturating_add(index)
+                ));
+            }
             if pending_lines == MOUNTINFO_STRIDE {
                 if progress.observed_lines
                     .checked_add(lines_charged)

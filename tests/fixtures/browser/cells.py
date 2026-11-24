@@ -159,26 +159,46 @@ def child_tmpdir(browser: str, workdir: Path) -> Path:
 
 
 def run_direct(name: str, browser: str, workdir: Path, flow_url: str,
-               observe_module: Path, register_module: Path | None = None,
+               observe_module: Path | None = None,
+               register_module: Path | None = None,
                browser_env: dict | None = None,
                extra_browser_args: tuple[str, ...] = (),
-               duration_seconds: int = 120) -> CellResult:
+               duration_seconds: int = 120,
+               nss_credential=None,
+               nss_nickname: str = "g33-nss-client",
+               auto_select_cert: bool = True) -> CellResult:
     """Run one ``p11scope run`` cell with the tree supervisor as the owned child.
 
-    ``observe_module`` is the ``--module`` target (always the controlled
-    SoftHSM provider). ``register_module`` is the module registered in the
-    fresh profile; ``None`` builds the no-module failure twin (the browser
-    never maps the provider, so the cell expects zero rows for it).
-    ``browser_env`` (notably ``SOFTHSM2_CONF``) rides ``sudo VAR=value``
-    into the observer, whose ``run`` boundary forwards ``SOFTHSM2_CONF``
-    to the owned child.
+    ``observe_module`` is the ``--module`` target (the controlled SoftHSM
+    provider for absence twins); ``None`` omits ``--module`` so discovery
+    scans every PKCS#11-looking object the owned tree maps (the browser's
+    own NSS provider included). ``register_module`` is the module
+    registered in the fresh profile; ``None`` with an ``observe_module``
+    builds the no-module failure twin (the browser never maps the
+    provider, so the cell expects zero rows for it).
+    ``nss_credential`` (a ``softhsm.ClientCredential``) seeds the
+    browser's own empty-password NSS database with a usable client key
+    before launch (DEMO-4), so a CERT_REQUIRED flow signs with its own
+    softokn token and no PIN prompt can stall the handshake; Chromium
+    additionally gets the managed auto-select policy for ``flow_url``
+    (like ``launch_browser_context``) unless ``auto_select_cert`` is
+    False. ``browser_env`` (notably ``SOFTHSM2_CONF``) rides
+    ``sudo VAR=value`` into the observer, whose ``run`` boundary
+    forwards ``SOFTHSM2_CONF`` to the owned child.
     """
     _trusted_dir(workdir)
     report = workdir / "observed-profile.json"
     screenshot = workdir / "flow.png"
     binary = p11scope_bin()
+    nss_seeded = False
+    policy_path = None
     if browser == "firefox":
         profile = FirefoxProfile.create(workdir / "ffprofile", module_lib=register_module)
+        if nss_credential is not None:
+            from profiles import seed_nss_client_credential
+            seed_nss_client_credential(
+                profile.path, nss_credential, nss_nickname)
+            nss_seeded = True
         home = workdir / "home"
         home.mkdir(exist_ok=True)
         browser_argv = [
@@ -189,6 +209,25 @@ def run_direct(name: str, browser: str, workdir: Path, flow_url: str,
         child_env = {"HOME": str(home)}
     elif browser == "chromium":
         home = ChromiumHome.create(workdir / "home", module_lib=register_module).path
+        if nss_credential is not None:
+            from profiles import seed_nss_client_credential
+            seed_nss_client_credential(
+                home / ".pki" / "nssdb", nss_credential, nss_nickname)
+            nss_seeded = True
+        if auto_select_cert:
+            import atexit
+
+            from profiles import (
+                chrome_auto_select_patterns,
+                install_chrome_auto_select_policy,
+                remove_chrome_auto_select_policy,
+            )
+            installed = install_chrome_auto_select_policy(
+                chrome_auto_select_patterns(flow_url),
+                f"g33-run-{os.getpid()}",
+                workdir)
+            atexit.register(remove_chrome_auto_select_policy, installed)
+            policy_path = str(installed)
         browser_argv = [
             str(chromium_binary()), "--headless=new", "--no-sandbox", "--disable-gpu",
             # Flow servers use short-lived self-signed certs; trust is
@@ -210,7 +249,9 @@ def run_direct(name: str, browser: str, workdir: Path, flow_url: str,
     argv = ["sudo", "-n"]
     for key, value in (browser_env or {}).items():
         argv.append(f"{key}={value}")
-    argv += [str(binary), "run", "--module", str(observe_module)]
+    argv += [str(binary), "run"]
+    if observe_module is not None:
+        argv += ["--module", str(observe_module)]
     argv += [
         "-o", str(report), "--pause", PAUSE_POLICY[browser],
         "--duration", str(duration_seconds), "--kill-on-timeout",
@@ -236,7 +277,9 @@ def run_direct(name: str, browser: str, workdir: Path, flow_url: str,
         name=name, report_path=report,
         browser_exit=None,  # owned-child exit is inside the observer's verdict
         screenshot_bytes=shot_bytes,
-        flow={"observer_exit": proc.returncode, "flow_url": flow_url},
+        flow={"observer_exit": proc.returncode, "flow_url": flow_url,
+              "nss_seeded": nss_seeded,
+              "auto_select_policy": policy_path},
         observer_stderr_tail=_tail(proc.stderr),
     )
 

@@ -125,6 +125,38 @@ _VERDICTS_NEVER_MAPPED = ("concrete_gap",)
 #: signing setup and signing (init and one-shot share the boundary).
 _PINBOUND_ABSENT = ("C_Login", "C_SignInit", "C_Sign")
 
+#: Run-mode attached cells (CR-RUN-SIGN): the S1 floor causes plus the
+#: run-tree spawn-window caveats (the owned browser's short-lived
+#: descendants retire between admission passes; the pause gate may
+#: cover part of a spawn). A link loss or any other cause still fails:
+#: it could hide exactly the asserted signs.
+_GAPS_ATTACHED_RUN = _GAPS_ATTACHED_FLOOR | frozenset({
+    "pause_partial", "pid_descendant_gaps",
+})
+
+#: RSA mechanism family ids (numeric, exact): the verbatim RSA_IDS table
+#: from src/keymeta.rs (§4.2, the product's own family vocabulary). The
+#: CR-RUN-SIGN cell seeds an RSA client credential, so the TLS sign
+#: mechanism (PKCS#1 v1.5, PSS, or a hash-joined RSA id, TLS-version
+#: dependent) lands in this closed set whatever the stack negotiates.
+_RSA_FAMILY_IDS = frozenset({
+    0x00000001, 0x00000002, 0x00000003, 0x00000004, 0x00000005,
+    0x00000006, 0x00000007, 0x00000008, 0x00000009, 0x0000000b,
+    0x0000000c, 0x0000000d, 0x0000000e, 0x00000040, 0x00000041,
+    0x00000042, 0x00000043, 0x00000044, 0x00000045, 0x00000046,
+    0x00000047, 0x00000060, 0x00000061, 0x00000062, 0x00000063,
+    0x00000064, 0x00000065, 0x00000066, 0x00000067, 0x00001054,
+    0x00004001, 0x00004002,
+})
+
+#: Digest-only mechanism id for the hostile twin: CKM_SHA256, the shape
+#: a sign-missing capture shows (mechanism use without any sign family).
+_SHA256_MECHANISM_ID = 0x00000250
+
+#: Basename of the NSS softokn provider the browsers sign with. Matched
+#: exactly against evidence.discovery[] paths (never a substring).
+_SOFTOKN_BASENAME = "libsoftokn3.so"
+
 
 def _stall_outcomes(server) -> str:
     """One-line handshake summary for PINBOUND failure messages."""
@@ -219,7 +251,7 @@ class BrowserCells(unittest.TestCase):
 
     def check_report(self, result, store, floors=None, zero=False, attached=None,
                      allowed_gaps=(), allowed_verdicts=_VERDICTS_ATTACHED, absent=None,
-                     s1=None, qualify_nomod_link_loss=False):
+                     s1=None, qualify_nomod_link_loss=False, module_sha=None):
         """Common oracle: schema, identity, counts, loss, gaps, earned verdict.
 
         ``attached`` pins the probe state: True (hooked the mapped module),
@@ -232,6 +264,10 @@ class BrowserCells(unittest.TestCase):
         sets it. ``allowed_verdicts`` pins the verdict
         details the cell earned. ``absent`` names functions that must never
         have been called (returns, open entries, and unattributed rows).
+        ``module_sha`` overrides the module identity: a sha string or a
+        set of them (a discovery copy-up pair), resolved from the
+        report's own discovery list; None (the default) hashes
+        ``store.lib`` as before, and ``store`` itself may then be None.
         ``s1`` opts into the v0.5.0 S1 proof over the report's S1
         sections (no Joint content, no mechanism use, no logins,
         balanced sessions): a dict with ``sessions_opened_min`` for
@@ -239,13 +275,28 @@ class BrowserCells(unittest.TestCase):
         ``sessions_zero`` for never-mapped cells. Attach-drive cells
         must not set ``sessions_opened_min``: the browser opens its
         sessions at startup, strictly before capture, so floored calls
-        legitimately ride cached sessions. None (the twin default)
+        legitimately ride cached sessions. A ``sign_mechanisms`` entry
+        (``{"family_ids": [...], "min_calls": n}``) selects the run-sign
+        branch instead: the Joint negative and the session floor stay,
+        but the enumeration absence legs give way to the attributed
+        family-sign floor (mechanism use is the asserted property
+        here, not a violation). None (the twin default)
         skips the S1 checks.
         """
         report = oracle.load_report(result.report_path)
-        module_sha = oracle.sha256_of(store.lib)
-        counts = oracle.module_counts(report, module_sha)
-        opened = oracle.module_open_entries(report, module_sha)
+        if module_sha is None:
+            module_sha = {oracle.sha256_of(store.lib)}
+        elif isinstance(module_sha, str):
+            module_sha = {module_sha}
+        else:
+            module_sha = set(module_sha)
+        counts: dict = {}
+        opened: dict = {}
+        for sha in module_sha:
+            for name, calls in oracle.module_counts(report, sha).items():
+                counts[name] = counts.get(name, 0) + calls
+            for name, entries in oracle.module_open_entries(report, sha).items():
+                opened[name] = opened.get(name, 0) + entries
         failures = []
         failures += oracle.check_no_event_loss(report)
         failures += oracle.check_capture_intact(report)
@@ -256,8 +307,23 @@ class BrowserCells(unittest.TestCase):
         failures += oracle.check_skipped_structural(report)
         if s1 is not None:
             failures += oracle.check_no_joint_content(report)
-            failures += oracle.check_s1_mechanisms_absent(report)
-            failures += oracle.check_s1_logins_absent(report)
+            sign_mechanisms = s1.get("sign_mechanisms")
+            if sign_mechanisms is None:
+                failures += oracle.check_s1_mechanisms_absent(report)
+                failures += oracle.check_s1_logins_absent(report)
+            else:
+                family_ids = sign_mechanisms.get("family_ids")
+                min_calls = sign_mechanisms.get("min_calls")
+                if (not isinstance(family_ids, (list, tuple, set, frozenset))
+                        or not family_ids
+                        or not all(type(mid) is int for mid in family_ids)
+                        or type(min_calls) is not int or min_calls < 1):
+                    failures.append(
+                        "s1 sign_mechanisms malformed: need "
+                        "{family_ids: non-empty ints, min_calls: >= 1}")
+                else:
+                    failures += oracle.check_s1_sign_mechanisms(
+                        report, module_sha, family_ids, min_calls)
             failures += oracle.check_s1_sessions(
                 report, opened_min=s1.get("sessions_opened_min", 0),
                 zero=s1.get("sessions_zero", False))
@@ -490,6 +556,63 @@ class BrowserCells(unittest.TestCase):
                           allowed_gaps=_GAPS_ATTACHED_ABSENT, absent=_PINBOUND_ABSENT,
                           allowed_verdicts=_VERDICTS_ATTACHED_VERIFIED,
                           s1={})
+
+    @gate("chromium")
+    def test_cr_run_sign_observes_client_cert_signs(self):
+        """CR-RUN-SIGN: run-owned Chromium client-cert signs are observed.
+
+        ``p11scope run`` owns the browser from exec (no late discovery):
+        a CERT_REQUIRED screenshot flow against the browser's own
+        seeded NSS token (empty-password, so no PIN can stall it, and
+        no login is required) must show completed C_SignInit/C_Sign
+        calls plus an attributed RSA-family sign mechanism on the
+        softokn provider the report's own discovery list resolves.
+        Run reports carry no per-key rows (inventory-only); the sign
+        calls plus the attributed family mechanism are the run-visible
+        proof the handshake's private-key use was seen.
+        """
+        cred = softhsm.generate_client_credential(self.work / "cred")
+        key, cert = tls_server.make_server_credential(self.work / "srv")
+        with tls_server.FlowServer(cert=cert, key=key, require_client_cert=True,
+                                   client_ca=cred.cert_pem) as flow:
+            result = cells.run_direct(
+                "CR-RUN-SIGN", "chromium", self.work / "cell", flow.url,
+                observe_module=None, register_module=None,
+                browser_env=None,
+                extra_browser_args=CHROMIUM_STABLE_ARGS,
+                duration_seconds=RUN_DURATION,
+                nss_credential=cred, auto_select_cert=True)
+            self.assertGreaterEqual(
+                flow.client_certs_presented, 1,
+                "client cert never presented (no TLS sign happened)")
+            self.assertGreaterEqual(
+                flow.handshakes_ok, 1,
+                "client-cert flow never handshook (no TLS sign happened)")
+        self.assertEqual(result.flow.get("observer_exit"), 0,
+                         f"observer failed: {result.observer_stderr_tail}")
+        self.assertTrue(result.flow.get("nss_seeded"),
+                        "NSS credential was not seeded?!")
+        self.assertTrue(result.flow.get("auto_select_policy"),
+                        "auto-select policy was not installed?!")
+        self.assertGreater(result.screenshot_bytes, 0, "no screenshot bytes")
+        report = oracle.load_report(result.report_path)
+        shas, failures = oracle.discovery_module_shas(
+            report, _SOFTOKN_BASENAME)
+        if failures:
+            self.fail("CR-RUN-SIGN failed:\n"
+                      f"{json.dumps({'failures': failures}, indent=1)}")
+        self.assertGreater(
+            len(shas), 0,
+            "softokn never discovered (browser never mapped it, or "
+            "discovery missed it)")
+        self.check_report(
+            result, None, {"C_SignInit": 1, "C_Sign": 1}, attached=True,
+            allowed_gaps=_GAPS_ATTACHED_RUN,
+            allowed_verdicts=_VERDICTS_ATTACHED_VERIFIED,
+            module_sha=shas,
+            s1={"sessions_opened_min": 1,
+                "sign_mechanisms": {"family_ids": sorted(_RSA_FAMILY_IDS),
+                                    "min_calls": 1}})
 
     @gate_system("firefox")
     def test_ff_first_with_background_provider_covers_browser(self):
@@ -826,6 +949,40 @@ class BrowserCells(unittest.TestCase):
         if len(os.fsencode(shallow / "tmp")) + len(cells.CHROMIUM_SOCKET_SUFFIX) \
                 <= cells.SUN_PATH_MAX:
             self.assertEqual(cells.child_tmpdir("chromium", shallow), shallow / "tmp")
+
+    def _capture_run_direct_argv(self, **kwargs):
+        """Run ``run_direct`` against a fake observer; return its argv.
+
+        No browser, no profiler, no sudo: only the argv the real
+        observer would inherit (firefox branch, so no NSS seeding).
+        """
+        captured: dict = {}
+
+        def fake_run(argv, **_ignored):
+            captured["argv"] = list(argv)
+            return SimpleNamespace(returncode=0, stderr="")
+
+        workdir = self.work / "cell"
+        with patch("subprocess.run", side_effect=fake_run), \
+                patch.object(cells, "p11scope_bin",
+                             return_value=Path("/bin/p11scope")):
+            cells.run_direct("PROBE", "firefox", workdir,
+                             "http://127.0.0.1:1/", **kwargs)
+        return captured["argv"]
+
+    def test_run_direct_without_module_omits_narrowing(self):
+        """Twin: observe_module=None discovers everything (no --module)."""
+        argv = self._capture_run_direct_argv(observe_module=None)
+        self.assertNotIn("--module", argv)
+        self.assertIn("run", argv)
+
+    def test_run_direct_with_module_narrows(self):
+        """Guard: a named observe_module still narrows the scan."""
+        module = Path("/probe-test/libsoft-test.so")
+        argv = self._capture_run_direct_argv(observe_module=module)
+        self.assertIn("--module", argv)
+        at = argv.index("--module")
+        self.assertEqual(argv[at + 1], str(module))
 
     def test_launch_without_registered_module_scrubs_store_env(self):
         """Twin: an unregistered launch must not leak SOFTHSM2_CONF.
@@ -2027,6 +2184,18 @@ def require_s1_wiring(test):
         test.fail("S1 oracle not implemented: check_report has no s1 wiring")
 
 
+def require_sign_wiring(test):
+    """Fail naming the missing run-sign oracle (RED) once per check."""
+    for name in ("check_s1_sign_mechanisms", "discovery_module_shas"):
+        if not hasattr(oracle, name):
+            test.fail(f"run-sign oracle not implemented: oracle.{name} missing")
+    for name in ("module_sha",):
+        if name not in BrowserCells.check_report.__code__.co_varnames:
+            test.fail(
+                "run-sign oracle not implemented: "
+                f"check_report has no {name} wiring")
+
+
 def live_cells_missing_s1(source):
     """Live-cell methods with no s1-proven check_report call.
 
@@ -2525,11 +2694,174 @@ class BrowserS1Oracle(unittest.TestCase):
             case.check_report(clean, store, {"C_FindObjects": 1},
                               attached=True)
 
+    def _sign_mechanism_entry(self, mech_id, sha, calls):
+        """One mechanisms[] row with ``calls`` attributed to ``sha``."""
+        return {"mechanism": mech_id, "mechanism_hex": hex(mech_id),
+                "ops": ["sign"], "calls": calls, "errors": 0,
+                "by_module": [{"module": {"dev": [1, 2], "ino": 3,
+                                          "sha256": sha},
+                               "calls": calls, "errors": 0}]}
+
+    def test_s1_sign_mechanisms_healthy_accepted(self):
+        """Twin: an RSA sign mechanism attributed to softokn passes."""
+        require_sign_wiring(self)
+        sha = "ab" * 32
+        doc = {"mechanisms": [self._sign_mechanism_entry(0x40, sha, 3)]}
+        self.assertEqual(
+            oracle.check_s1_sign_mechanisms(doc, {sha}, _RSA_FAMILY_IDS, 1),
+            [])
+        # Two discovery shas (a copy-up pair) sum across both rows.
+        sha2 = "cd" * 32
+        doc = {"mechanisms": [
+            self._sign_mechanism_entry(0x40, sha, 1),
+            self._sign_mechanism_entry(0x43, sha2, 1)]}
+        self.assertEqual(
+            oracle.check_s1_sign_mechanisms(
+                doc, {sha, sha2}, _RSA_FAMILY_IDS, 2),
+            [])
+
+    def test_s1_sign_mechanisms_rejected(self):
+        """Twin: every non-sign shape fails the family leg (RED)."""
+        require_sign_wiring(self)
+        sha = "ab" * 32
+        other = "cd" * 32
+        cases = {
+            # Attributed to another module: not our provider's signs.
+            "wrong-sha": {"mechanisms": [
+                self._sign_mechanism_entry(0x40, other, 3)]},
+            # Digest-only: mechanism use with no sign family at all.
+            "digest-only": {"mechanisms": [
+                self._sign_mechanism_entry(_SHA256_MECHANISM_ID, sha, 9)]},
+            # Row totals without attribution: unprovable, fail closed.
+            "unattributed": {"mechanisms": [
+                {"mechanism": 0x40, "calls": 3, "errors": 0,
+                 "by_module": []}]},
+            # Malformed entries fail closed, never pass blind.
+            "malformed-entry": {"mechanisms": ["x"]},
+            "malformed-shape": {"mechanisms": {}},
+            "malformed-attribution": {"mechanisms": [
+                {"mechanism": 0x40, "calls": 3, "errors": 0,
+                 "by_module": [{"module": "x", "calls": 3,
+                                "errors": 0}]}]},
+            "missing-section": {},
+            "empty": {"mechanisms": []},
+        }
+        for name, doc in cases.items():
+            with self.subTest(name=name):
+                failures = oracle.check_s1_sign_mechanisms(
+                    doc, {sha}, _RSA_FAMILY_IDS, 1)
+                self.assertNotEqual(failures, [])
+        # Below the floor fails even when attributed and in-family.
+        doc = {"mechanisms": [self._sign_mechanism_entry(0x40, sha, 1)]}
+        self.assertNotEqual(
+            oracle.check_s1_sign_mechanisms(doc, {sha}, _RSA_FAMILY_IDS, 2),
+            [])
+
+    def test_discovery_module_shas_exact(self):
+        """Twin: softokn shas come from discovery[] by exact basename."""
+        require_sign_wiring(self)
+        sha = "ab" * 32
+        report = {"evidence": {"discovery": [
+            {"path": "/usr/lib64/libsoftokn3.so", "sha256": sha,
+             "dev": [0, 40], "ino": 11},
+            {"path": "/usr/lib64/pkcs11/libsofthsm2.so",
+             "sha256": "cd" * 32, "dev": [0, 41], "ino": 12},
+        ]}}
+        shas, failures = oracle.discovery_module_shas(
+            report, _SOFTOKN_BASENAME)
+        self.assertEqual(failures, [])
+        self.assertEqual(shas, {sha})
+        # Near-miss basenames never match: exact equality only.
+        for path in ("/usr/lib64/libsoftokn3.so.1",
+                     "/usr/lib64/mylibsoftokn3.so",
+                     "/usr/lib64/LIBsofTokN3.SO",
+                     "/usr/lib64/libsoftokn3.so.orig"):
+            with self.subTest(path=path):
+                shas, failures = oracle.discovery_module_shas(
+                    {"evidence": {"discovery": [
+                        {"path": path, "sha256": sha}]}},
+                    _SOFTOKN_BASENAME)
+                self.assertEqual(failures, [])
+                self.assertEqual(shas, set())
+        # A matching row with no usable digest fails closed (loud, not
+        # a silent empty set the cell would misread as unmapped).
+        for bad in (None, "", "ab" * 31, "zz" * 32, 42):
+            with self.subTest(sha=bad):
+                _shas, failures = oracle.discovery_module_shas(
+                    {"evidence": {"discovery": [
+                        {"path": "/usr/lib64/libsoftokn3.so",
+                         "sha256": bad}]}},
+                    _SOFTOKN_BASENAME)
+                self.assertNotEqual(failures, [])
+        # A missing discovery list fails closed too.
+        _shas, failures = oracle.discovery_module_shas(
+            {"evidence": {}}, _SOFTOKN_BASENAME)
+        self.assertNotEqual(failures, [])
+
+    def test_s1_sign_mechanisms_check_report_wiring(self):
+        """Twin: s1= with sign_mechanisms floors family signs, not absence.
+
+        The run-sign branch keeps the Joint negative and the session
+        floor but replaces the enumeration absence legs (mechanism use
+        and logins are the asserted property here, not a violation).
+        """
+        require_sign_wiring(self)
+        sha = "ab" * 32
+        rows = [BrowserCells._twin_row(["C_SignInit"], 1, sha),
+                BrowserCells._twin_row(["C_Sign"], 2, sha)]
+        mechanisms = [self._sign_mechanism_entry(0x40, sha, 2)]
+        _, result = self.s1_result(
+            "S1-SIGN", rows, BrowserCells._twin_evidence(), mechanisms,
+            healthy_sessions(), {})
+        case = BrowserCells("test_oracle_builder_healthy_accepted")
+        case.work = self.work
+        s1 = {"sessions_opened_min": 1,
+              "sign_mechanisms": {"family_ids": sorted(_RSA_FAMILY_IDS),
+                                  "min_calls": 1}}
+        case.check_report(result, None, {"C_SignInit": 1, "C_Sign": 1},
+                          attached=True, module_sha={sha}, s1=s1)
+        # Digest-only mechanisms fail the same wiring (RED).
+        hostile = [self._sign_mechanism_entry(
+            _SHA256_MECHANISM_ID, sha, 9)]
+        _, bad = self.s1_result(
+            "S1-SIGN-HOSTILE", rows, BrowserCells._twin_evidence(),
+            hostile, healthy_sessions(), {})
+        with self.assertRaises(AssertionError):
+            case.check_report(bad, None, {"C_SignInit": 1, "C_Sign": 1},
+                              attached=True, module_sha={sha}, s1=s1)
+        # A malformed sign_mechanisms spec fails closed (a test bug must
+        # never pass blind as a vacuous family leg).
+        for spec in ({"family_ids": [], "min_calls": 1},
+                     {"family_ids": [0x40], "min_calls": 0},
+                     {"family_ids": ["0x40"], "min_calls": 1},
+                     {"min_calls": 1},
+                     {"family_ids": [0x40]}):
+            with self.subTest(spec=spec):
+                with self.assertRaises(AssertionError):
+                    case.check_report(
+                        result, None, {"C_SignInit": 1, "C_Sign": 1},
+                        attached=True, module_sha={sha},
+                        s1={"sessions_opened_min": 1,
+                            "sign_mechanisms": spec})
+
+    def test_rsa_family_mirror_matches_product_table(self):
+        """Twin: the RSA mirror stays the 32-id keymeta.rs table.
+
+        The set itself is verified against src/keymeta.rs RSA_IDS at
+        commit time; this pins its size and anchor ids so an accidental
+        edit fails here instead of silently widening the family leg.
+        """
+        self.assertEqual(len(_RSA_FAMILY_IDS), 32)
+        for anchor in (0x00000001, 0x0000000e, 0x00000040, 0x00000047,
+                       0x00000060, 0x00000067, 0x00001054, 0x00004002):
+            self.assertIn(anchor, _RSA_FAMILY_IDS)
+        self.assertNotIn(_SHA256_MECHANISM_ID, _RSA_FAMILY_IDS)
+
     def test_live_cells_all_wire_s1_proof(self):
         require_s1_wiring(self)
         found, missing = live_cells_missing_s1(
             Path(__file__).read_text())
-        self.assertEqual(len(found), 5)
+        self.assertEqual(len(found), 6)
         self.assertEqual(missing, [])
 
     def test_system_first_cells_wire_browser_rows_oracle(self):

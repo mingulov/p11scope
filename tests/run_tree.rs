@@ -1822,19 +1822,19 @@ fn hold_cell_pins_accept_held_mapper_shape() {
 
 /// Unprearmed short-lived descendants under `--pause never`: 32 sequential
 /// grandchildren (each 300 ms linger, twice the auto-pause twin's 150 ms)
-/// with NO prearm hint. Frames admit (the pause never holds them back), so
-/// the first admitted mapper's frame scan commits the provider key before
-/// later run-learned proofs stage. Without the `run_learned` staging bypass
-/// those later proofs would hit the scan-covered exemption and vanish
-/// (coverage collapses below 0.95; measured mutant 0.87 vs fixed 1.0); with
-/// it the persistent piece stages and later mappers land. This cell pins
-/// that bypass at the committed level (the unit twin pins it faster); the
-/// auto-pause twin above cannot catch the regression (its frames never
-/// admit, so `scan_covered` stays empty either way). The 300 ms linger
-/// (vs 150 ms) is load-bearing for stability: `--pause never` admits,
-/// scans and arms every mapper (heavy under shared-host load), so 150 ms
-/// workers time out before slow frames (measured 0.54 coverage in the
-/// 8-cell gate); 300 ms survives and holds 1.0.
+/// with NO prearm hint. Frames admit (the pause never holds them back),
+/// and the first-map stop normally stages the provider before any frame
+/// admission commits the key, so the `run_learned` staging bypass rarely
+/// triggers here: a bypass-removal mutant still passes this cell with
+/// exact accounting fully ok (measured post-fix on sm1). The bypass
+/// itself is pinned deterministically by the unit twin
+/// (`learned_run_learned_scan_covered_file_still_stages`, which fails
+/// the same mutant); this cell covers exact accounting under
+/// never-pause admission instead. The 300 ms linger (vs 150 ms) is
+/// load-bearing for stability: `--pause never` admits, scans and arms
+/// every mapper (heavy under shared-host load), so 150 ms workers time
+/// out before slow frames (measured 0.54 coverage in the 8-cell gate);
+/// 300 ms survives and holds 1.0.
 /// Judged by exact accounting (owner ruling 2026-11-15), not a floor:
 /// every call that started after the report's disclosed pre-attach
 /// window must be observed (`assert_exact_first_use_accounting`).

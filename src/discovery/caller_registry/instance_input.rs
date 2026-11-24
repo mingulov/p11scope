@@ -8058,4 +8058,144 @@ mod staged_disposal_gate_tests {
         );
         assert_eq!(registry.assoc_fallback.census(), 0);
     }
+
+    /// The departed-caller fold must defer while a staged disposal is
+    /// in flight: two Joint feeds with two Bounded heads each, start
+    /// the disposal, yield mid-first-feed, fold the instance under
+    /// disposal and its neighbour, poll to completion, then assert
+    /// exact row counts and table invariants. Folding mid-disposal
+    /// drops the cursor's preserved reducer silently (rows lost) and
+    /// mutates the association fallback under budgeted cursors (chain
+    /// corruption); deferring keeps every head disposing exactly once.
+    #[test]
+    fn staged_disposal_fold_mid_disposal_defers_and_preserves() {
+        let mut registry = CallerRegistry::new(RegistryLimits::default_limits());
+        let pool = SemanticResourcePool::default();
+        let mut ledger = StagingLedger::with_resources(pool.reserver());
+        ledger.prepare_capacity().unwrap();
+        let domain = NativeDomainId::try_mint().expect("fresh domain");
+        let caller = CallerId(7);
+        let module_key = ModuleKey::Physical {
+            dev_major: 1,
+            dev_minor: 2,
+            ino: 3,
+            sha256: None,
+        };
+        let _module = registry.scripted_module_edge(module_key.clone(), caller);
+        let first = RegistryInstanceId::from_raw(0);
+        let second = RegistryInstanceId::from_raw(1);
+        for router in [0u64, 1] {
+            let key = InstanceKey::scripted(
+                domain,
+                ImageIdentity {
+                    task_cookie: 100 + router,
+                    exec_id: 1,
+                },
+                InstanceId::from_raw(router),
+                module_key.clone(),
+            );
+            registry.note_instance(AdmittedInstance::scripted(key, caller));
+            registry.publish();
+        }
+        assert!(
+            registry.feed_mode_for_test(first).is_some()
+                && registry.feed_mode_for_test(second).is_some(),
+            "both registrations retain their instances"
+        );
+        for (index, id) in [first, second].iter().enumerate() {
+            let record = registry
+                .instance_state
+                .semantics
+                .get_mut(id)
+                .expect("retained semantics");
+            record.feed = crate::semantics_key_use::JointStaging::select_joint_for_test();
+            // Ledger tickets are global across feeds sharing one ledger,
+            // so each feed stages its own positions.
+            for offset in 0..2u64 {
+                let position = (index as u64) * 2 + offset + 1;
+                let session = 6000 + position;
+                let facts = SemanticCall {
+                    function: "C_SignInit".into(),
+                    session,
+                    mechanism: 0x000d,
+                    capture: p11scope_ebpf_common::capture::MECHANISM_VALUE
+                        | p11scope_ebpf_common::capture::OUTPUT_NON_NULL,
+                    ts_ns: 100 * position,
+                    ..SemanticCall::default()
+                };
+                let origin = EffectOrigin {
+                    function: "C_SignInit".into(),
+                    session,
+                    ts_ns: 100 * position,
+                };
+                record
+                    .feed
+                    .stage(facts, origin, position, &mut ledger)
+                    .unwrap();
+            }
+        }
+        registry.start_staged_disposal();
+        let (done, spent) = registry.poll_staged_disposal(&mut ledger, 64);
+        assert!(!done, "two Bounded heads span several credits");
+        assert_eq!(spent, 64, "the first credit is fully consumed");
+        // The fold race: retire both instances while the first feed's
+        // disposal cursor (with its preserved reducer and budgeted
+        // association state) is in flight.
+        let folded_first = registry.take_instance_for_fold(first);
+        let folded_second = registry.take_instance_for_fold(second);
+        assert!(
+            folded_first.is_none() && folded_second.is_none(),
+            "both folds defer while the disposal is pending"
+        );
+        let deferred = registry
+            .staged_scope_gaps_for_test()
+            .into_iter()
+            .filter(|(subject, _)| subject == "fold deferred: staged disposal in flight")
+            .count();
+        assert_eq!(deferred, 2, "each deferred fold counts its gap");
+        let mut polls = 1usize;
+        loop {
+            let (done, spent) = registry.poll_staged_disposal(&mut ledger, 64);
+            assert!(spent <= 64, "poll {polls} spent {spent} above 64");
+            polls += 1;
+            if done {
+                break;
+            }
+            assert!(polls < 4096, "the disposal must complete");
+        }
+        // Exact rows: four Init heads dispose as four truncated Unknown
+        // rows beside four counted history disposals, nothing refused.
+        let mut unknown = 0u64;
+        for row in registry.joint_keyuse.unknown_counters().iter() {
+            unknown += row.unknown;
+        }
+        assert_eq!(unknown, 4, "four Init heads preserve four Unknown rows");
+        assert_eq!(
+            registry.joint_keyuse.evidence().rows_refused,
+            0,
+            "no preserved mint refuses"
+        );
+        let mut disposed = 0u64;
+        for id in [first, second] {
+            disposed += registry
+                .instance_state
+                .semantics
+                .get(&id)
+                .map_or(0, |record| record.feed.history_disposed());
+        }
+        assert_eq!(disposed, 4, "every staged head disposes exactly once");
+        assert_eq!(ledger.staged(), 0, "every H9 released");
+        assert_eq!(registry.assoc_fallback.census(), 0, "every assoc released");
+        assert_eq!(
+            registry.assoc_fallback.free_list_len_for_test(),
+            crate::semantics_objects::journal::MAX_UNSETTLED_STAGED,
+            "the fallback table is whole again"
+        );
+        // The deferred folds complete once the disposal clears.
+        assert!(
+            registry.take_instance_for_fold(first).is_some()
+                && registry.take_instance_for_fold(second).is_some(),
+            "deferred folds complete after the disposal"
+        );
+    }
 }

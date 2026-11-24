@@ -919,11 +919,12 @@ capture usually lands a clean run.
 
 ### `run` with many short-lived children can rarely miss seconds of calls
 
-Fixed in 0.7.2: `run`, `inventory --cgroup` and `inventory --system`
-captures no longer drop attached providers when processes turn over,
-so calls no longer go missing without a gap row. Verified on
-6.6.157 at 100/100 (waves and descendants) and on 6.12.111 and
-7.4-rc2 at 20/20 (7.3.1 was not re-run). Before 0.7.2, on several
+Fixed on dev for 0.8.0 (the unreleased 0.7.2 delta was folded into
+0.8.0; 0.7.2 never shipped): `run`, `inventory --cgroup` and
+`inventory --system` captures no longer drop attached providers when
+processes turn over, so calls no longer go missing without a gap row.
+Verified on 6.6.157 at 100/100 (waves and descendants) and on 6.12.111
+and 7.4-rc2 at 20/20 (7.3.1 was not re-run). Before the fix, on several
 kernels (seen on 6.6 and 7.3.1), a `p11scope run` capture with many
 short-lived child processes could rarely (about 1 in 15–30 runs in
 our tests) miss a few seconds of calls without recording a gap row

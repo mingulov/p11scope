@@ -41744,6 +41744,124 @@ fn merge_scanned_module_caps_tables_per_module_with_counted_overflow() {
 }
 
 #[test]
+fn merge_scanned_module_keeps_live_tables_past_the_merge_cap() {
+    // A live-returned table is proof — an observed export return — not a
+    // heuristic guess: the per-module cap bounds speculative tables, and
+    // a proven table survives it on both admission paths. Regression: the
+    // proxy's live table (1 live + 67 lookalikes) dropped past the cap
+    // and the run counted 0/N proxy-layer calls.
+    let table = |slot: u64| ScannedTable {
+        version: (3, 0),
+        walk: "full",
+        entries: vec![],
+        null_entries: vec![],
+        unpinned: vec![],
+        address: 0x1000 + slot,
+        file_offset: Some(slot),
+        live_return: false,
+        manifest_supported: false,
+        extension_impossible: false,
+    };
+    let live_table = |slot: u64| ScannedTable {
+        version: (3, 2),
+        walk: "full",
+        entries: vec![],
+        null_entries: vec![],
+        unpinned: vec![],
+        address: 0x7f00_0000 + slot,
+        file_offset: None,
+        live_return: true,
+        manifest_supported: false,
+        extension_impossible: false,
+    };
+    let module = |tables: Vec<ScannedTable>, interfaces: Vec<ScannedInterface>| ScannedModule {
+        key_is_identity: false,
+        module_hint: None,
+        mapped_identity: None,
+        double_loaded: false,
+        same_file_loads: 1,
+        pre_copy_up: None,
+        view: ProcessViewId(0),
+        mount_namespace: crate::process::MountNamespaceId {
+            device: 1,
+            inode: 2,
+        },
+        key: ObjectKey {
+            device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+            inode: 42,
+        },
+        path: "/opt/p.so".into(),
+        tables_scan_finished: true,
+        decoder_abi: None,
+        exports: vec![],
+        tables,
+        interfaces,
+    };
+    let interface = |table: Option<usize>| ScannedInterface {
+        index: 0,
+        name_class: "exact_standard",
+        name_lossy: None,
+        name_private: None,
+        flags: 0,
+        table,
+    };
+    let cap = MAX_MERGED_TABLES_PER_MODULE;
+    // Site 1: fresh entry with the live table last (the proxy shape: 67
+    // heuristics, then the observed table). The proven table sorts first
+    // and survives; heuristics fill the rest; the tail drops counted.
+    let mut tables: Vec<ScannedTable> = (0..cap as u64 + 3).map(table).collect();
+    tables.push(live_table(0));
+    let mut entered = Vec::new();
+    let dropped = merge_scanned_module(
+        &mut entered,
+        module(tables, vec![interface(Some(cap + 3))]),
+    );
+    assert_eq!(dropped, 4);
+    assert_eq!(entered.len(), 1);
+    assert_eq!(entered[0].tables.len(), cap);
+    assert!(
+        entered[0].tables[0].live_return,
+        "the proven table sorts first and survives entry truncation"
+    );
+    assert_eq!(
+        entered[0].tables.iter().filter(|t| t.live_return).count(),
+        1
+    );
+    assert_eq!(entered[0].interfaces.len(), 1);
+    assert_eq!(
+        entered[0].interfaces[0].table,
+        Some(0),
+        "the live table's interface follows it"
+    );
+    assert!(
+        !entered[0].tables_scan_finished,
+        "a truncating skip still clears the finished claim"
+    );
+    // Site 2: a full module (64 heuristics) admits a fresh live table:
+    // proof appends past the speculative cap, nothing drops, and the
+    // live-only union preserves the finished scan.
+    let mut merged = vec![module((0..cap as u64).map(table).collect(), vec![])];
+    assert!(merged[0].tables_scan_finished);
+    let dropped = merge_scanned_module(&mut merged, module(vec![live_table(1)], vec![]));
+    assert_eq!(dropped, 0);
+    assert_eq!(merged[0].tables.len(), cap + 1);
+    assert!(merged[0].tables[cap].live_return);
+    assert!(
+        merged[0].tables_scan_finished,
+        "a live-only union preserves the finished scan"
+    );
+    // The cap still binds speculation: a fresh heuristic past a full
+    // module drops and counts, even beside a proven table.
+    let dropped = merge_scanned_module(&mut merged, module(vec![table(10_000)], vec![]));
+    assert_eq!(dropped, 1);
+    assert_eq!(merged[0].tables.len(), cap + 1);
+    assert!(
+        !merged[0].tables_scan_finished,
+        "a dropped static table re-opens finished-ness"
+    );
+}
+
+#[test]
 fn rescan_same_table_new_address_unions_without_reopening_finished() {
     // Mode-B single-row trigger (v0.8.0): the same provider table (same
     // file offset, version and decoded content) re-decoded at a new

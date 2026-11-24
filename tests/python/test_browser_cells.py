@@ -655,7 +655,11 @@ class BrowserCells(unittest.TestCase):
             self.assertGreaterEqual(
                 flow.handshakes_ok, 1,
                 "client-cert flow never handshook (no TLS sign happened)")
-            handshakes = flow.handshakes_ok
+            # Exactness ties to presented certs, not handshakes: a
+            # completed handshake with an empty (or no) client
+            # certificate needs no private-key use, while every
+            # presented peer cert signs exactly once (CertificateVerify).
+            signs = flow.client_certs_presented
         self.assertEqual(result.flow.get("observer_exit"), 0,
                          f"observer failed: {result.observer_stderr_tail}")
         self.assertTrue(result.flow.get("nss_seeded"),
@@ -690,23 +694,23 @@ class BrowserCells(unittest.TestCase):
         # the TLS ground truth above carry the proof, and any new gap
         # cause still fails. No sessions floor: the sign's session may
         # legitimately have opened in the tolerated pre-attach window.
-        # Exactness is per-handshake: one client-cert handshake signs
-        # once (one C_SignInit + one C_Sign, two attributed family
-        # mechanism uses for the init and sign legs), nothing in flight
-        # at end, and the pair comes from distinct rows (no single
-        # aliased row may satisfy both).
+        # Exactness is per presented cert: each presented peer cert
+        # signs once (one C_SignInit + one C_Sign, two attributed
+        # family mechanism uses for the init and sign legs), nothing
+        # in flight at end, and the pair comes from distinct rows (no
+        # single aliased row may satisfy both).
         self.check_report(
             result, None, None, attached=True,
             allowed_gaps=_GAPS_ATTACHED_RUN,
             allowed_verdicts=("concrete_gap",),
             module_sha=shas,
             qualify_run_floor_skipped=True,
-            exact={"C_SignInit": handshakes, "C_Sign": handshakes},
+            exact={"C_SignInit": signs, "C_Sign": signs},
             exact_opened_zero=("C_SignInit", "C_Sign"),
             no_cross_alias=(("C_SignInit", "C_Sign"),),
             s1={"sign_mechanisms": {"family_ids": sorted(_RSA_FAMILY_IDS),
                                     "min_calls": 1,
-                                    "exact_calls": 2 * handshakes}})
+                                    "exact_calls": 2 * signs}})
 
     @gate_system("firefox")
     def test_ff_first_with_background_provider_covers_browser(self):

@@ -275,7 +275,7 @@ self_test() {
   # unreadable-input cases need an ordinary user.
   [ "$(id -u)" != 0 ] || {
     echo "qualify-release-matrix.sh: --self-test must run as a non-root user" >&2; return 64; }
-  python3 -I "$REPO/scripts/strict-selftest.py" "$REPO" scripts/qualify-release-matrix.sh self-test \
+  python3 -I -S "$REPO/scripts/strict-selftest.py" "$REPO" scripts/qualify-release-matrix.sh self-test \
     "$REPO/tests/python/test_release_matrix_contract.py"
 }
 

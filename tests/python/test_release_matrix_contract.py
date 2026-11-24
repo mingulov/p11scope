@@ -849,7 +849,7 @@ class MatrixContract(unittest.TestCase):
         shim = self.base / "python-shim"; shim.mkdir()
         (shim / "python3").write_text(
             "#!%s\nimport json, os, sys\n"
-            "if len(sys.argv) > 2 and sys.argv[2].endswith('/scripts/strict-selftest.py'):\n"
+            "if any(a.endswith('/scripts/strict-selftest.py') for a in sys.argv[1:4]):\n"
             "    print('strict argv: ' + json.dumps(sys.argv[1:])); sys.exit(0)\n"
             "os.execv(%r, [%r] + sys.argv[1:])\n" % (sys.executable, sys.executable, sys.executable))
         (shim / "python3").chmod(0o755)
@@ -898,7 +898,7 @@ class MatrixContract(unittest.TestCase):
                      {"PATH": "%s:%s" % (shim, os.environ.get("PATH", "")),
                       "P11SCOPE_MATRIX_SELF_TEST_K": "test_closure_scan_finds_each_reference_form"}, False,
                      (0, "strict argv: " + json.dumps(
-                         ["-I", str(root / "scripts/strict-selftest.py"), str(root),
+                         ["-I", "-S", str(root / "scripts/strict-selftest.py"), str(root),
                           "scripts/qualify-release-matrix.sh", "self-test",
                           str(root / "tests/python/test_release_matrix_contract.py")])))],
                 ("scripts/qualify-release-matrix.sh", "stage"): [
@@ -3742,7 +3742,7 @@ class StrictSelfTest(unittest.TestCase):
         'SELF = "scripts/runner_inputs.py"\n'
         'RUNNERS = {"r.sh": {"self-test": ("checkout", ("data/ok.txt", "suite.py", "helper_ok.py"))}}\n'
         'def required(runner, mode):\n    return RUNNERS[runner][mode][1]\n')
-    HEADER = ("import os, subprocess, sys, unittest\nfrom pathlib import Path\n"
+    HEADER = ("import os, shlex, subprocess, sys, unittest\nfrom pathlib import Path\n"
               "ROOT = Path(__file__).resolve().parent\n")
 
     def make_root(self, raw, body):
@@ -3756,11 +3756,13 @@ class StrictSelfTest(unittest.TestCase):
         (root / "suite.py").write_text(self.HEADER + body.replace("CHECKOUT", repr(str(root))))
         return root
 
-    def strict(self, root, *names, env=None):
-        result = subprocess.run([sys.executable, "-I", str(self.STRICT), str(root), "r.sh", "self-test",
+    def strict(self, root, *names, env=None, python=(sys.executable, "-I", "-S")):
+        # As the runners start it (python3 -I -S); LC_ALL=C keeps a child's
+        # error text fixed (hungerg r11i N1).
+        base = {k: v for k, v in os.environ.items() if not k.startswith(("GIT_", "PYTHON"))}
+        result = subprocess.run([*python, str(self.STRICT), str(root), "r.sh", "self-test",
                                  str(root / "suite.py"), *names], capture_output=True, text=True, timeout=60,
-                                cwd=root, env=dict({k: v for k, v in os.environ.items() if not k.startswith("GIT_")},
-                                                   **(env or {})))
+                                cwd=root, env=dict(base, LC_ALL="C", **(env or {})))
         return result.returncode, result.stdout + result.stderr
 
     def run_suite(self, body, *names, env=None):
@@ -3775,7 +3777,8 @@ class StrictSelfTest(unittest.TestCase):
             "        (ROOT / 'data/ok.txt').read_text()\n        open(ROOT / 'written', 'w').write('x')\n"
             "        assert os.environ['STRICT_PROBE_DIR'] == '/nowhere'\n"
             "        subprocess.run(['cat', str(ROOT / 'data/ok.txt')], check=True, capture_output=True)\n"
-            "        assert not [p for p in sys.path if 'site-packages' in p or 'dist-packages' in p], sys.path\n",
+            "        assert not [p for p in sys.path if 'site-packages' in p or 'dist-packages' in p], sys.path\n"
+            "        assert sys.flags.isolated and sys.flags.no_site and 'site' not in sys.modules\n",
             env={"STRICT_PROBE_DIR": "/nowhere"})
         self.assertEqual(rc, 0, text)
         self.assertIn("strict self-test passed: 1 tests, 0 skipped, run in a copy of its 5 declared inputs", text)
@@ -3788,6 +3791,13 @@ class StrictSelfTest(unittest.TestCase):
             self.assertIn("STRICT_PROBE_DIR", text)
         self.assertNotIn("inherited variables removed", self.run_suite(
             "class T(unittest.TestCase):\n    def test_a(self):\n        pass\n")[1])
+        # Source text naming the checkout is code, not a use of it.
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as raw:
+            root = self.make_root(raw, "")
+            (root / "suite.py").write_text(self.HEADER + "UNUSED = %r\nclass T(unittest.TestCase):\n"
+                                           "    def test_a(self):\n        pass\n" % str(root / "data/secret.txt"))
+            rc, text = self.strict(root)
+            self.assertEqual(rc, 0, text)
 
     def test_every_non_pass_fails(self):
         undeclared = "secret.txt"
@@ -3810,8 +3820,8 @@ class StrictSelfTest(unittest.TestCase):
             "relative": ("    def test_a(self):\n        open('data/secret.txt').read()\n", undeclared),
             "child argv": ("    def test_a(self):\n        subprocess.run(['cat', str(ROOT / 'data/secret.txt')],"
                            " check=True)\n", "1 errors"),
-            "child shell string": ("    def test_a(self):\n        subprocess.run('cat ' + str(ROOT / "
-                                   "'data/secret.txt'), shell=True, check=True)\n", "1 errors"),
+            "child shell string": ("    def test_a(self):\n        subprocess.run('cat ' + shlex.quote(str(ROOT / "
+                                   "'data/secret.txt')), shell=True, check=True)\n", "1 errors"),
             "child -c body": ("    def test_a(self):\n        subprocess.run([sys.executable, '-c', 'open(%r).read()'"
                               " % str(ROOT / 'data/secret.txt')], check=True)\n", "1 errors"),
             "import found only beside the runner": ("    def test_a(self):\n        import helper_scripts_only\n",
@@ -3913,6 +3923,129 @@ class StrictSelfTest(unittest.TestCase):
             self.assertEqual(rc, 1, text)
             self.assertIn("reached the checkout outside its declared copy (open", text)
 
+    def test_ambient_python_never_supplies_an_undeclared_module(self):
+        # codex r11i #1, hungerg r11i B1: site startup in a venv adds a
+        # directory (.pth path line) or preloads a module (.pth import line);
+        # PYTHONPATH reaches a child. None may stand in for helper_secret.
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as raw:
+            venv = Path(raw) / "venv"
+            subprocess.run([sys.executable, "-I", "-S", "-m", "venv", "--without-pip", str(venv)], check=True,
+                           capture_output=True, timeout=120)
+            python = str(venv / "bin/python3")
+            site_dir = subprocess.run([python, "-I", "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
+                                      capture_output=True, text=True, check=True).stdout.strip()
+            ambient = Path(raw) / "vendor"; ambient.mkdir()
+            (ambient / "helper_secret.py").write_text("VALUE = 'ambient'\n")
+            (ambient / "helper_ok.py").write_text("VALUE = 'ambient'\n")
+            healthy = ("class T(unittest.TestCase):\n    def test_a(self):\n"
+                       "        import helper_ok\n        assert helper_ok.VALUE == 1\n")
+            root = self.make_root(raw, healthy)
+            pth = Path(site_dir) / "ambient.pth"
+            pth.write_text(str(ambient) + "\n")
+            # The site startup is live in this venv (the premise of the rows).
+            seen = subprocess.run([python, "-I", "-c", "import helper_secret; print(helper_secret.VALUE)"],
+                                  capture_output=True, text=True).stdout
+            self.assertEqual(seen.strip(), "ambient")
+            launches = {"-I -S": (python, "-I", "-S"), "-I only (re-executes)": (python, "-I")}
+            for label, launch in launches.items():
+                with self.subTest(launch=label, row="declared module (healthy twin)"):
+                    (root / "suite.py").write_text(self.HEADER + healthy)
+                    rc, text = self.strict(root, python=launch)
+                    self.assertEqual(rc, 0, text)
+                    self.assertIn("strict self-test passed: 1 tests", text)
+                for line in (str(ambient), "import sys; sys.path.append(%r); import helper_secret" % str(ambient)):
+                    pth.write_text(line + "\n")
+                    with self.subTest(launch=label, pth=line.split(";")[0]):
+                        (root / "suite.py").write_text(self.HEADER + "class T(unittest.TestCase):\n"
+                                                       "    def test_a(self):\n        import helper_secret\n")
+                        rc, text = self.strict(root, python=launch)
+                        self.assertEqual(rc, 1, text)
+                        self.assertIn("No module named 'helper_secret'", text)
+                        self.assertNotIn("strict self-test passed", text)
+            pth.unlink()
+            (root / "suite.py").write_text(self.HEADER + "class T(unittest.TestCase):\n    def test_a(self):\n"
+                                           "        subprocess.run([sys.executable, '-c', 'import helper_secret'],"
+                                           " check=True)\n")
+            hostile = {"PYTHONPATH": str(ambient), "PYTHONSTARTUP": str(ambient / "x.py")}
+            rc, text = self.strict(root, env=hostile)
+            self.assertEqual(rc, 1, text)
+            self.assertIn("No module named 'helper_secret'", text)
+            (root / "suite.py").write_text(self.HEADER + healthy)
+            rc, text = self.strict(root, env=hostile)
+            self.assertEqual(rc, 0, text)
+            self.assertIn("inherited variables removed: PYTHONPATH, PYTHONSTARTUP", text)
+
+    def test_each_post_commit_check_refuses_before_the_suite(self):
+        # codex r11i #3: a git that reports a second commit, a dirty tree
+        # or a different index is refused by name, and the suite never runs.
+        git = shutil.which("git")
+        rows = {"rev-list": ("2", "the copy is not one commit (rev-list says '2')"),
+                "status": ("?? fixture-untracked", "the copy is not clean after its commit: '?? fixture-untracked'"),
+                "ls-files": ("data/ok.txt\nextra.txt\nhelper_ok.py\nr.sh\nscripts/runner_inputs.py\nsuite.py",
+                             "the copy's commit is not exactly its declared inputs")}
+        for verb, (reply, message) in rows.items():
+            with self.subTest(verb=verb), tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as raw:
+                ran = Path(raw) / "suite-ran"
+                root = self.make_root(raw, "class T(unittest.TestCase):\n    def test_a(self):\n"
+                                           "        open(%r, 'w').close()\n" % str(ran))
+                shim = Path(raw) / "bin"; shim.mkdir()
+                (shim / "git").write_text("#!/bin/sh\nfor a; do [ \"$a\" = %s ] && { printf '%%s\\n' %s; exit 0; };"
+                                          " done\nexec %s \"$@\"\n" % (verb, shlex.quote(reply), shlex.quote(git)))
+                (shim / "git").chmod(0o755)
+                rc, text = self.strict(root, env={"PATH": "%s:%s" % (shim, os.environ.get("PATH", ""))})
+                self.assertEqual(rc, 1, text)
+                self.assertIn("strict self-test failed: " + message, text)
+                self.assertFalse(ran.exists())
+                self.assertNotIn("test_a", text)
+
+    def test_every_spelling_of_a_checkout_alias_is_the_checkout(self):
+        # codex r11i #2, hungerg r11i B2: whole names with spaces or colons,
+        # shell words and --opt= values, relative aliases (from the
+        # invocation directory or from the copy) and ~ resolve as one path.
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as raw:
+            root = self.make_root(raw, "class T(unittest.TestCase):\n    def test_a(self):\n"
+                                       "        assert 'REPO_ALIAS' not in os.environ, os.environ['REPO_ALIAS']\n"
+                                       "        assert os.environ['UNRELATED'] == '/nowhere with space:x', 'kept'\n")
+            for name in ("alias with spaces", "alias:colon", "alias with: both"):
+                (Path(raw) / name).symlink_to(root)
+            spaced, colon, both = (str(Path(raw) / n) for n in ("alias with spaces", "alias:colon", "alias with: both"))
+            # The copy lies under RAW, so ../../checkout from it is the checkout.
+            values = {"spaces": spaced, "colon": colon, "spaces/data": spaced + "/data", "space and colon": both,
+                      "shell word": "cat %s" % shlex.quote(spaced + "/data/secret.txt"),
+                      "--opt= word": "tool --root=%s" % shlex.quote(spaced),
+                      # (a PATH-style list cannot hold a name with a colon)
+                      "pathsep list": "/usr/bin" + os.pathsep + spaced + "/data",
+                      "relative from the invocation directory": "../checkout/data",
+                      "relative from the copy": "../../checkout",
+                      "tilde": "~/checkout"}
+            for row, value in values.items():
+                with self.subTest(env=row):
+                    rc, text = self.strict(root, env={"REPO_ALIAS": value, "UNRELATED": "/nowhere with space:x",
+                                                      "TMPDIR": raw, "HOME": raw})
+                    self.assertEqual(rc, 0, text)
+                    self.assertEqual(text.split("inherited variables removed: ", 1)[1].split()[0], "REPO_ALIAS", text)
+            events = {"open, spaces": "open(%r).read()" % (spaced + "/data/ok.txt"),
+                      "open, colon": "open(%r).read()" % (colon + "/data/ok.txt"),
+                      "open, space and colon": "open(%r).read()" % (both + "/data/ok.txt"),
+                      "open, relative from the copy": "open('../../checkout/data/ok.txt').read()",
+                      "child argv, spaces": "subprocess.run(['true', %r])" % spaced,
+                      "child shell string, spaces": "subprocess.run('true ' + shlex.quote(%r), shell=True)" % spaced,
+                      "listdir, colon": "os.listdir(%r)" % colon}
+            for row, statement in events.items():
+                with self.subTest(event=row):
+                    (root / "suite.py").write_text(self.HEADER + "class T(unittest.TestCase):\n"
+                                                   "    def test_a(self):\n        %s\n" % statement)
+                    rc, text = self.strict(root, env={"TMPDIR": raw})
+                    self.assertEqual(rc, 1, text)
+                    self.assertIn("reached the checkout outside its declared copy", text)
+            with self.subTest(event="unrelated path with spaces (healthy twin)"):
+                other = Path(raw) / "other dir:x"; other.mkdir()
+                (root / "suite.py").write_text(self.HEADER + "class T(unittest.TestCase):\n    def test_a(self):\n"
+                                               "        os.listdir(%r); subprocess.run(['true', %r], check=True)\n"
+                                               % (str(other), str(other)))
+                rc, text = self.strict(root, env={"TMPDIR": raw})
+                self.assertEqual(rc, 0, text)
+
     def test_setup_refusals_are_named(self):
         with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as raw:
             root = self.make_root(raw, "class T(unittest.TestCase):\n    def test_a(self):\n        pass\n")
@@ -3929,7 +4062,7 @@ class StrictSelfTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as raw:
             root = self.make_root(raw, "class T(unittest.TestCase):\n    def test_a(self):\n        pass\n")
             (root / "other.py").write_text((root / "suite.py").read_text())
-            result = subprocess.run([sys.executable, "-I", str(self.STRICT), str(root), "r.sh", "self-test",
+            result = subprocess.run([sys.executable, "-I", "-S", str(self.STRICT), str(root), "r.sh", "self-test",
                                      str(root / "other.py")], capture_output=True, text=True, timeout=60)
             self.assertEqual(result.returncode, 1, result.stderr)
             self.assertIn("the suite other.py is not a declared input of r.sh self-test", result.stderr)
@@ -3953,10 +4086,10 @@ class StrictSelfTest(unittest.TestCase):
         self.assertEqual([l.strip() for l in body.splitlines() if l.strip() and not l.strip().startswith("#")], [
             '[ "$(id -u)" != 0 ] || {',
             'echo "qualify-release-matrix.sh: --self-test must run as a non-root user" >&2; return 64; }',
-            'python3 -I "$REPO/scripts/strict-selftest.py" "$REPO" scripts/qualify-release-matrix.sh self-test \\',
+            'python3 -I -S "$REPO/scripts/strict-selftest.py" "$REPO" scripts/qualify-release-matrix.sh self-test \\',
             '"$REPO/tests/python/test_release_matrix_contract.py"'])
         native = (ROOT / "scripts/qualify-inventory-native.sh").read_text()
-        self.assertIn('timeout 300 python3 -I "$REPO/scripts/strict-selftest.py" "$REPO" '
+        self.assertIn('timeout 300 python3 -I -S "$REPO/scripts/strict-selftest.py" "$REPO" '
                       'scripts/qualify-inventory-native.sh self-test \\\n'
                       '        "$REPO/tests/python/test_inventory_capacity_oracle.py" || die', native)
         # The oracle's own CapacityOracleTests self-test is strict too

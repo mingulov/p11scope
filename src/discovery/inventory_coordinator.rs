@@ -38711,7 +38711,15 @@ int main(void) {
             native.answer(7, 1600, 5059);
             let mut rows = hot_rows(&native, 0, 59);
             rows.push(native.row(5059, 7, 7, 500_000, 0));
-            native.witness(rows);
+            native.read(rows);
+            assert_eq!(
+                native.scene.coordinator.binder.owed_len_for_test(),
+                0,
+                "no live-bindable row defers on the read path"
+            );
+            native.drain();
+            native.read(Vec::new());
+            native.scene.coordinator.commit_batch(false).unwrap();
             assert_eq!(native.cookies.queries, 1, "only the successor row queries");
             assert_eq!(bound_census(&native), (60, 60, 0));
             let mut expected = holders[..59].to_vec();
@@ -38765,6 +38773,159 @@ int main(void) {
                 Some(1),
                 "the unhealthy read keeps today's live mismatch"
             );
+        });
+    }
+
+    #[test]
+    fn a_system_scope_readable_post_proof_image_observes_the_exec() {
+        // The post-proof re-sample also observes an image that was
+        // unreadable at admission: the proven record carries the fresh
+        // image with its exec observed, so the successor image's row
+        // binds instead of refusing on the admission-time unknown.
+        agreeing(|| {
+            let mut scene = CaptureScene::new(2);
+            scene.source.spawn(7, 500);
+            scene.source.hide_ancestor_exe(7);
+            let source = scene.source.clone();
+            scene.coordinator.adapter.reconcile_detected(
+                &[7].into_iter().collect(),
+                &mut |_| ImageAuthority::ScanPinned,
+                50,
+                &mut || {
+                    source.exec(7, 200, "/bin/successor");
+                    Some(200)
+                },
+            );
+            let caller = scene.coordinator.adapter.live_id(7).expect("admitted");
+            scene
+                .coordinator
+                .begin_capture_coverage(CaptureScopeCoverage::System);
+            let mut native = NativeScene::over(scene, 0);
+            native.scene.attach_all(100, ScopeCustody::System);
+            native.scene.project(7, 120);
+            native.scene.coordinator.commit_batch(false).unwrap();
+            native.scene.coordinator.engine.scope = Scope::System;
+            native.scene.coordinator.exit_clocks_comparable = true;
+            let record = native.scene.coordinator.adapter.record(caller).unwrap();
+            assert_eq!(
+                record.exe.as_ref().and_then(|exe| exe.path.as_deref()),
+                Some("/bin/successor"),
+                "the proven label is the post-proof image: {:?}",
+                record.exe
+            );
+            assert!(record.exec_observed, "the post-proof image counts observed");
+            assert_eq!(
+                native.scene.coordinator.adapter.leader_alive_ns(caller),
+                Some(200),
+                "the liveness proof still stands"
+            );
+            retire_then_exits(&mut native, &[450]);
+            let row = native.row(41, 1, 7, 300, 0);
+            native.witness(vec![row]);
+            assert_eq!(bound_census(&native), (1, 1, 0));
+            assert_only_holder_edged(&native, caller);
+        });
+    }
+
+    #[test]
+    fn a_system_scope_unhealthy_owed_row_queries_the_new_successor_first() {
+        // Resight-side health gate: a row read while unhealthy (owed,
+        // unsighted) whose exit stamps before a successor arrives still
+        // queries the successor first on re-sight — the exit snapshot
+        // of an unhealthy read never selects the retained path.
+        agreeing(|| {
+            let (mut native, _) = proven_system_native(false);
+            retire_then_exits(&mut native, &[]);
+            let row = native.row(41, 1, 7, 300, 0);
+            let NativeBatch::Witness(mut batch) = native.stamps.read(native.domain, vec![row])
+            else {
+                unreachable!("the scripted read constructs a witness batch");
+            };
+            batch.health.failures = vec!["scripted transport failure".into()];
+            native.stage(NativeBatch::Witness(batch));
+            let at = native.stamps.tick();
+            native.stage(NativeBatch::Lifecycle(leader_exit_drain(
+                native.domain,
+                at,
+                450,
+            )));
+            native.scene.source.spawn(7, 1600);
+            native.scene.coordinator.adapter.reconcile_detected(
+                &[7].into_iter().collect(),
+                &mut |_| ImageAuthority::ScanPinned,
+                300_000,
+                &mut || Some(400_000),
+            );
+            assert!(native.scene.coordinator.adapter.live_id(7).is_some());
+            native.scene.project(7, 400_010);
+            native.scene.coordinator.commit_batch(false).unwrap();
+            native.answer(7, 1600, 5059);
+            native.witness(Vec::new());
+            assert_eq!(
+                native.cookies.queries, 1,
+                "the unhealthy owed row spends its live query"
+            );
+            assert_eq!(bound_census(&native), (1, 0, 0));
+            assert_eq!(
+                native
+                    .scene
+                    .coordinator
+                    .registry
+                    .witness_census()
+                    .unbound
+                    .get(&UnboundReason::CookieMismatch)
+                    .copied(),
+                Some(1),
+                "the unhealthy owed row keeps today's live mismatch"
+            );
+        });
+    }
+
+    #[test]
+    fn a_system_scope_resight_live_row_spends_no_exit_scan() {
+        // The re-sight gate must not tax the live path: an owed row
+        // the live successor fired after its own admission re-sights
+        // through the live query with no exit scan charged.
+        agreeing(|| {
+            let (mut native, _) = proven_system_native(false);
+            retire_then_exits(&mut native, &[]);
+            let row = native.row(5059, 3, 7, 500_000, 0);
+            native.read(vec![row]);
+            native.scene.source.spawn(7, 1600);
+            native.scene.coordinator.adapter.reconcile_detected(
+                &[7].into_iter().collect(),
+                &mut |_| ImageAuthority::ScanPinned,
+                300_000,
+                &mut || Some(400_000),
+            );
+            let successor = native
+                .scene
+                .coordinator
+                .adapter
+                .live_id(7)
+                .expect("successor admitted");
+            native.scene.project(7, 400_010);
+            native.scene.coordinator.commit_batch(false).unwrap();
+            native.answer(7, 1600, 5059);
+            native.drain();
+            native.read(Vec::new());
+            assert_eq!(
+                native.scene.coordinator.holder_pool.spent_for_test(),
+                0,
+                "the live re-sight charges no exit scan"
+            );
+            assert_eq!(
+                native.cookies.queries, 1,
+                "the live re-sight spends its live query"
+            );
+            assert_eq!(
+                native.scene.coordinator.binder.owed_len_for_test(),
+                0,
+                "the live re-sight resolves without deferral"
+            );
+            native.witness(Vec::new());
+            assert_eq!(bound_census(&native), (1, 1, 0));
+            assert_only_holder_edged(&native, successor);
         });
     }
 

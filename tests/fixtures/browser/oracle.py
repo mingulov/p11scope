@@ -287,6 +287,50 @@ def check_skipped_structural(report: dict[str, Any]) -> list[str]:
     return failures
 
 
+#: The one learned-file reason a run-floor cell tolerates: the
+#: provider was first used before the pre-attach scan learned it
+#: (src/render.rs LEARNED_FIRST_RUN_REASON, verbatim). Every other
+#: learned-file reason (overflow, caps, unbound tables, unavailable
+#: learning, replaced files) stays refused: each hides unbounded loss.
+LEARNED_FIRST_USE_REASON = (
+    "a provider file was learned after its first use; "
+    "its earlier calls were not observed")
+
+#: Short-lived run-tree children that exited while discovery still
+#: walked them (src/render.rs MID_FLIGHT_REASON, verbatim).
+MID_FLIGHT_REASON = "process exited mid-flight"
+
+
+def check_skipped_run_floor(report: dict[str, Any]) -> list[str]:
+    """Skipped records a run-mode floor cell provably survives.
+
+    Beside the structural reasons (shared with the base check), two
+    run-tree timing classes pass: subjects that exited mid-flight
+    (owned short-lived descendants retiring between admission passes)
+    and the single learned-first-use record (the pre-attach window the
+    run-sign cells close with a spawn delay; the sign floors below it
+    are lower bounds, so window loss can only undercount, never invent
+    a sign). Any other record — a retire window, a detach gap, another
+    learned-file reason — fails: it could hide the asserted signs.
+    """
+    failures = []
+    for record in evidence(report).get("skipped") or []:
+        record = record or {}
+        name = record.get("name")
+        reason = record.get("reason")
+        if reason in STRUCTURAL_SKIPPED_REASONS:
+            continue
+        if name == "discovery subject" and reason == MID_FLIGHT_REASON:
+            continue
+        if (name == "learned provider file"
+                and reason == LEARNED_FIRST_USE_REASON):
+            continue
+        failures.append(
+            f"skipped record {name!r} reason {reason!r}: "
+            f"possible coverage gap, want run-floor timing only")
+    return failures
+
+
 def check_verdict(report: dict[str, Any], allowed: tuple[str, ...]) -> list[str]:
     """The verdict detail is one the cell earned during calibration."""
     failures = []
@@ -381,6 +425,86 @@ def check_s1_mechanisms_absent(report: dict[str, Any]) -> list[str]:
         else:
             failures.append("mechanisms section carries a malformed entry")
     return failures
+
+
+def check_s1_sign_mechanisms(report: dict[str, Any], module_shas,
+                             family_ids, min_calls: int) -> list[str]:
+    """Family sign mechanisms attributed to the module reach the floor.
+
+    ``module_shas`` is the discovery-resolved identity set of the signing
+    provider (one sha, or several for a copy-up pair); ``family_ids``
+    the closed numeric family (the product's own keymeta table mirror);
+    ``min_calls`` the attributed-call floor. Only ``by_module`` calls
+    whose module sha is in the set count: row totals without attribution
+    are unprovable and fail closed, as do a missing section, a non-list
+    section, and any malformed entry (the v3 schema always renders
+    ``mechanism``/``calls``/``errors`` u64s plus a ``by_module`` list).
+    """
+    if "mechanisms" not in report:
+        return ["mechanisms section missing: cannot verify sign mechanisms"]
+    mechanisms = report["mechanisms"]
+    if not isinstance(mechanisms, list):
+        return ["mechanisms section is not a list"]
+    shas = set(module_shas)
+    ids = set(family_ids)
+    total = 0
+    for entry in mechanisms:
+        if not isinstance(entry, dict):
+            return ["mechanisms section carries a malformed entry"]
+        if not _u64(entry.get("mechanism")):
+            return ["mechanisms section carries a malformed entry"]
+        by_module = entry.get("by_module")
+        if not isinstance(by_module, list):
+            return ["mechanisms section carries a malformed entry"]
+        if entry["mechanism"] not in ids:
+            continue
+        for part in by_module:
+            if not isinstance(part, dict):
+                return ["mechanisms section carries a malformed entry"]
+            module = part.get("module")
+            if not isinstance(module, dict):
+                return ["mechanisms section carries a malformed entry"]
+            if not _u64(part.get("calls")) or not _u64(part.get("errors")):
+                return ["mechanisms section carries a malformed entry"]
+            if module.get("sha256") in shas:
+                total += part["calls"]
+    if total < min_calls:
+        return [f"family sign mechanisms attributed to the module: "
+                f"observed {total}, want >= {min_calls}"]
+    return []
+
+
+def discovery_module_shas(report: dict[str, Any],
+                          basename: str) -> tuple[set[str], list[str]]:
+    """Sha256 set of discovery[] rows whose path basename is ``basename``.
+
+    The run-sign cells resolve the signing provider's identity from the
+    report's own discovery list (exact basename equality, never a
+    substring), so no host path is hard-coded. Returns (shas, failures):
+    a missing or non-list discovery list fails closed, as does a
+    matching row with no usable digest (absent, non-string, or not
+    64 lowercase hex) — loud, never a silent empty set the cell would
+    misread as unmapped. Non-dict entries and non-matching rows carry
+    no evidence either way and are skipped.
+    """
+    discovery = evidence(report).get("discovery")
+    if not isinstance(discovery, list):
+        return set(), ["evidence.discovery missing: cannot resolve "
+                       f"the {basename} module identity"]
+    shas: set[str] = set()
+    for row in discovery:
+        if not isinstance(row, dict):
+            continue
+        path = row.get("path")
+        if not isinstance(path, str) or path.rsplit("/", 1)[-1] != basename:
+            continue
+        digest = row.get("sha256")
+        if (not isinstance(digest, str) or len(digest) != 64
+                or any(c not in "0123456789abcdef" for c in digest)):
+            return set(), [f"discovery row for {path} carries no usable "
+                           f"sha256: cannot attribute its calls"]
+        shas.add(digest)
+    return shas, []
 
 
 def check_s1_logins_absent(report: dict[str, Any]) -> list[str]:

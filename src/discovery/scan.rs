@@ -650,7 +650,10 @@ fn read_mountinfo_pass<R: Read>(
         // rest. Line totals match the old whole-chunk scan exactly.
         // Byte strides bound 8 KiB runs that never complete 64 lines
         // (newline-free or long-line runs; short-line tables never hit
-        // them), and completing a line stride covers its bytes.
+        // them), and completing a line stride covers its bytes. A full
+        // stride completing exactly on the 8 KiB chunk edge still pays
+        // the boundary byte stride below: one conservative unit, since
+        // the post-loop line charge does not reset the byte meter.
         let prev_partial = progress.observed_lines > progress.newline_count;
         let mut first_newline_free = prev_partial;
         let mut chunk_newlines = 0usize;

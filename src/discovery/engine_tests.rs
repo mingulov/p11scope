@@ -40736,6 +40736,210 @@ fn merge_scanned_module_keeps_live_tables_past_the_merge_cap() {
 }
 
 #[test]
+fn merge_scanned_module_bounds_live_tables_past_the_live_allowance() {
+    // Proof admits past the speculative cap, but run-long live growth
+    // stays bounded too: past the live allowance (64, mirroring the
+    // speculative cap) fresh live tables drop and count instead of
+    // appending. A provider returning a fresh heap table per call must
+    // not grow one module without limit.
+    let table = |slot: u64| ScannedTable {
+        version: (3, 0),
+        walk: "full",
+        entries: vec![],
+        null_entries: vec![],
+        unpinned: vec![],
+        address: 0x1000 + slot,
+        file_offset: Some(slot),
+        live_return: false,
+        manifest_supported: false,
+        extension_impossible: false,
+    };
+    let live_table = |slot: u64| ScannedTable {
+        version: (3, 2),
+        walk: "full",
+        entries: vec![],
+        null_entries: vec![],
+        unpinned: vec![],
+        address: 0x7f00_0000 + slot,
+        file_offset: None,
+        live_return: true,
+        manifest_supported: false,
+        extension_impossible: false,
+    };
+    let module = |tables: Vec<ScannedTable>| ScannedModule {
+        key_is_identity: false,
+        module_hint: None,
+        mapped_identity: None,
+        double_loaded: false,
+        same_file_loads: 1,
+        pre_copy_up: None,
+        view: ProcessViewId(0),
+        mount_namespace: crate::process::MountNamespaceId {
+            device: 1,
+            inode: 2,
+        },
+        key: ObjectKey {
+            device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+            inode: 42,
+        },
+        path: "/opt/p.so".into(),
+        tables_scan_finished: true,
+        decoder_abi: None,
+        exports: vec![],
+        tables,
+        interfaces: vec![],
+    };
+    let cap = MAX_MERGED_TABLES_PER_MODULE;
+    let mut merged = vec![module((0..cap as u64).map(table).collect())];
+    let live: Vec<ScannedTable> = (0..cap as u64 + 6).map(live_table).collect();
+    let dropped = merge_scanned_module(&mut merged, module(live));
+    let live_kept = merged[0].tables.iter().filter(|t| t.live_return).count();
+    assert!(
+        live_kept <= cap,
+        "unbounded live returns stay bounded: kept {live_kept} live tables past a full module"
+    );
+    assert_eq!(dropped, 6, "live overflow past the allowance drops and counts");
+    assert_eq!(merged[0].tables.len(), cap + cap);
+    assert!(
+        merged[0].tables_scan_finished,
+        "a live-only union preserves the finished scan even when live tables drop"
+    );
+}
+
+#[test]
+fn merge_scanned_module_entry_bounds_live_tables_with_counted_overflow() {
+    // The entry path already bounds: a fresh module carrying more live
+    // tables than the allowance keeps the first 64 (live first) and
+    // drops the rest counted. Unreachable in production (publications
+    // carry exactly one table, scans never set live_return), pinned as
+    // defense in depth beside the union bound.
+    let live_table = |slot: u64| ScannedTable {
+        version: (3, 2),
+        walk: "full",
+        entries: vec![],
+        null_entries: vec![],
+        unpinned: vec![],
+        address: 0x7f00_0000 + slot,
+        file_offset: None,
+        live_return: true,
+        manifest_supported: false,
+        extension_impossible: false,
+    };
+    let module = |tables: Vec<ScannedTable>| ScannedModule {
+        key_is_identity: false,
+        module_hint: None,
+        mapped_identity: None,
+        double_loaded: false,
+        same_file_loads: 1,
+        pre_copy_up: None,
+        view: ProcessViewId(0),
+        mount_namespace: crate::process::MountNamespaceId {
+            device: 1,
+            inode: 2,
+        },
+        key: ObjectKey {
+            device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+            inode: 42,
+        },
+        path: "/opt/p.so".into(),
+        tables_scan_finished: true,
+        decoder_abi: None,
+        exports: vec![],
+        tables,
+        interfaces: vec![],
+    };
+    let cap = MAX_MERGED_TABLES_PER_MODULE;
+    let mut entered = Vec::new();
+    let dropped = merge_scanned_module(
+        &mut entered,
+        module((0..cap as u64 + 6).map(live_table).collect()),
+    );
+    assert_eq!(dropped, 6, "entry live overflow drops and counts");
+    assert_eq!(entered.len(), 1);
+    assert_eq!(entered[0].tables.len(), cap);
+    assert!(
+        entered[0].tables.iter().all(|t| t.live_return),
+        "a live-only entry keeps live tables"
+    );
+    assert!(
+        !entered[0].tables_scan_finished,
+        "a truncating skip still clears the finished claim"
+    );
+}
+
+#[test]
+fn merge_scanned_module_keeps_the_proxy_live_table_in_arrival_order() {
+    // The exact production arrival order: a 67-heuristic scan files
+    // first (3 speculative tables drop counted), then the one observed
+    // live publication unions in. The proven table survives with zero
+    // live overflow — the shape whose loss counted 0/N proxy-layer
+    // calls before the live-survival fix.
+    let table = |slot: u64| ScannedTable {
+        version: (3, 0),
+        walk: "full",
+        entries: vec![],
+        null_entries: vec![],
+        unpinned: vec![],
+        address: 0x1000 + slot,
+        file_offset: Some(slot),
+        live_return: false,
+        manifest_supported: false,
+        extension_impossible: false,
+    };
+    let live_table = |slot: u64| ScannedTable {
+        version: (3, 2),
+        walk: "full",
+        entries: vec![],
+        null_entries: vec![],
+        unpinned: vec![],
+        address: 0x7f00_0000 + slot,
+        file_offset: None,
+        live_return: true,
+        manifest_supported: false,
+        extension_impossible: false,
+    };
+    let module = |tables: Vec<ScannedTable>| ScannedModule {
+        key_is_identity: false,
+        module_hint: None,
+        mapped_identity: None,
+        double_loaded: false,
+        same_file_loads: 1,
+        pre_copy_up: None,
+        view: ProcessViewId(0),
+        mount_namespace: crate::process::MountNamespaceId {
+            device: 1,
+            inode: 2,
+        },
+        key: ObjectKey {
+            device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+            inode: 42,
+        },
+        path: "/opt/p.so".into(),
+        tables_scan_finished: true,
+        decoder_abi: None,
+        exports: vec![],
+        tables,
+        interfaces: vec![],
+    };
+    let cap = MAX_MERGED_TABLES_PER_MODULE;
+    let mut merged = Vec::new();
+    let dropped = merge_scanned_module(
+        &mut merged,
+        module((0..cap as u64 + 3).map(table).collect()),
+    );
+    assert_eq!(dropped, 3);
+    assert_eq!(merged[0].tables.len(), cap);
+    let dropped = merge_scanned_module(&mut merged, module(vec![live_table(1)]));
+    assert_eq!(dropped, 0, "the one proven table admits with zero overflow");
+    assert_eq!(merged[0].tables.len(), cap + 1);
+    assert_eq!(
+        merged[0].tables.iter().filter(|t| t.live_return).count(),
+        1,
+        "the proxy's proven live table survives the merge"
+    );
+}
+
+#[test]
 fn rescan_same_table_new_address_unions_without_reopening_finished() {
     // Mode-B single-row trigger (v0.8.0): the same provider table (same
     // file offset, version and decoded content) re-decoded at a new

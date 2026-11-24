@@ -45133,6 +45133,72 @@ int main(void) {
     }
 
     #[test]
+    fn no_retry_mark_settles_while_a_partly_charged_head_is_held() {
+        // The held head's last charge (its stash entry's staleness
+        // check, three units) may not fit what the learn left of the
+        // Finish credit, so the head holds with one or two units still
+        // unspent. Those units never settle a mark while the head is
+        // held: a re-observation queued behind it decides its mark
+        // first. Every cold-path count from 40 to 63 is driven, so each
+        // leftover 0, 1 and 2 occurs.
+        let mut held_with_verdict = 0;
+        for cold in 40..=63u64 {
+            let (mut native, _) = watched_native();
+            native.scene.source.spawn(9, 600);
+            native.scene.source.set_leader_exit_observation(
+                9,
+                crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+            );
+            let mut row = native.row(41, 1, 9, 40, 1);
+            row.entry_count = 3;
+            native.witness(vec![row]);
+            native.counts_read(Vec::new(), vec![(41, 1, 1, 43)]);
+            native
+                .scene
+                .coordinator
+                .adapter
+                .admit(9, ImageAuthority::ScanPinned, 50)
+                .unwrap();
+            native.scene.project(9, 60);
+            native.scene.coordinator.commit_batch(false).unwrap();
+            assert!(
+                !native.scene.coordinator.retry_owed.is_empty(),
+                "marked (setup pin)"
+            );
+            native.scene.coordinator.set_exe_index_dirs(Vec::new());
+            // The head's pid has a pre-admission stash entry.
+            native.scene.source.spawn(12, 700);
+            native.witness(vec![native.row(70, 1, 12, 1_000, 0)]);
+            let base = cold_exe_paths(&native);
+            if base > cold {
+                continue;
+            }
+            admit_cold_exe_callers(&mut native, (cold - base) as u32);
+            native.execs(vec![exec_record(77, 12, 800, 8, 99)]);
+            let staged = native.read(vec![native.row(77, 1, 12, 900, 0)]);
+            assert_eq!(staged.decided, 0, "no horizon yet: the row stays pending");
+            let domain = native.domain;
+            native.stage(NativeBatch::Finish { domain });
+            native.scene.coordinator.commit_batch(false).unwrap();
+            if native.scene.coordinator.held_stage.is_empty() {
+                continue;
+            }
+            if native.scene.coordinator.head_work.resolved.is_some() {
+                held_with_verdict += 1;
+            }
+            assert_eq!(
+                terminal_retry_total(&native),
+                0,
+                "nothing settles while the head is held ({cold} cold paths)"
+            );
+        }
+        assert!(
+            held_with_verdict >= 3,
+            "the head waits on its stash charge at three or more leftovers: {held_with_verdict}"
+        );
+    }
+
+    #[test]
     fn a_held_verdict_is_discarded_when_its_exec_is_restashed() {
         // The head's executable verdict completes in one Finish, but
         // the row's own stash read no longer fits that credit, so the

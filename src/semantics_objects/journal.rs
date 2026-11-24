@@ -27887,19 +27887,23 @@ pub(crate) mod tests {
     }
 
     /// How the call that refuses the successor's birth sits against
-    /// the predecessor's fallback fence.
+    /// the predecessor's fallback fence (each variant names its place
+    /// relative to that fence).
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     enum StraddleShape {
         /// BEGIN is the last ordinal at the fence, END after it.
-        BeginAtFence,
+        BeginAt,
         /// BEGIN strictly below the fence (later rows follow it), END
         /// after the fence.
-        BeginBelowFence,
+        BeginBelow,
         /// BEGIN and END both at or below the fence: not a straddler.
-        EndedBeforeFence,
+        EndedBefore,
+        /// BEGIN and an ABANDON both at or below the fence: the call
+        /// ended there without a return, so it is not a straddler.
+        AbandonedBefore,
         /// BEGIN above the fence, at or below the successor's birth
         /// cut: a plain birth mismatch, not a straddler.
-        BeginAboveFence,
+        BeginAbove,
     }
 
     /// Run one straddle shape: returns the seal's gap, the successor's
@@ -27920,14 +27924,23 @@ pub(crate) mod tests {
         let create = function_id("C_CreateObject");
         let call = begin_bytes(1, 3, create, 0);
         let begin_at = scene.adapter.consumed_through + 1;
-        if shape != StraddleShape::BeginAboveFence {
+        if shape != StraddleShape::BeginAbove {
             scene.ingest(&call);
             assert_eq!(scene.adapter.consumed_through, begin_at);
         }
-        if shape == StraddleShape::EndedBeforeFence {
+        if shape == StraddleShape::EndedBefore {
             scene.ingest(&end_bytes(&call, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 70));
         }
-        if shape == StraddleShape::BeginBelowFence {
+        if shape == StraddleShape::AbandonedBefore {
+            use p11scope_ebpf_common::object_journal::JOURNAL_REASON_EXEC_EXIT;
+            scene.ingest(&abandon_bytes(
+                1,
+                3,
+                JOURNAL_REASON_EXEC_EXIT,
+                (COOKIE, EXEC),
+            ));
+        }
+        if shape == StraddleShape::BeginBelow {
             // Unrelated rows land after the BEGIN, before the close.
             let other = begin_bytes(2, 9, function_id("C_GetAttributeValue"), 0);
             scene.ingest(&other);
@@ -27941,11 +27954,14 @@ pub(crate) mod tests {
         let reborn = scene.attest_function("C_CreateObject");
         assert_eq!(reborn.key.incarnation, proof.key.incarnation + 1);
         let mut birth_cut = fence;
-        if shape == StraddleShape::BeginAboveFence {
+        if shape == StraddleShape::BeginAbove {
             scene.ingest(&call);
             birth_cut = scene.adapter.consumed_through;
         }
-        if shape != StraddleShape::EndedBeforeFence {
+        if !matches!(
+            shape,
+            StraddleShape::EndedBefore | StraddleShape::AbandonedBefore
+        ) {
             scene.ingest(&end_bytes(&call, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 70));
         }
         let grant = SessionBirthGrant::scripted(
@@ -27979,10 +27995,11 @@ pub(crate) mod tests {
     #[test]
     fn object_journal_fallback_fence_straddler_is_never_attributed() {
         let rows = [
-            StraddleShape::BeginAtFence,
-            StraddleShape::BeginBelowFence,
-            StraddleShape::EndedBeforeFence,
-            StraddleShape::BeginAboveFence,
+            StraddleShape::BeginAt,
+            StraddleShape::BeginBelow,
+            StraddleShape::EndedBefore,
+            StraddleShape::AbandonedBefore,
+            StraddleShape::BeginAbove,
         ]
         .map(|shape| {
             let (gap, straddler, sealed, decision, begin_at) = fallback_fence_straddle(shape);
@@ -28003,10 +28020,11 @@ pub(crate) mod tests {
         assert_eq!(
             rows,
             [
-                (BeginAtFence, mismatch, Some(true), 0, 1, 1, true),
-                (BeginBelowFence, mismatch, Some(true), 0, 1, 1, true),
-                (EndedBeforeFence, mismatch, None, 0, 0, 1, true),
-                (BeginAboveFence, mismatch, None, 0, 0, 1, true),
+                (BeginAt, mismatch, Some(true), 0, 1, 1, true),
+                (BeginBelow, mismatch, Some(true), 0, 1, 1, true),
+                (EndedBefore, mismatch, None, 0, 0, 1, true),
+                (AbandonedBefore, mismatch, None, 0, 0, 1, true),
+                (BeginAbove, mismatch, None, 0, 0, 1, true),
             ],
             "straddlers refuse, convert nothing and are counted only when they cross the fence"
         );

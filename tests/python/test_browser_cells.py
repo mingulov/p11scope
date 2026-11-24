@@ -755,11 +755,17 @@ class BrowserCells(unittest.TestCase):
             self.assertGreaterEqual(
                 flow.handshakes_ok, 1,
                 "client-cert flow never handshook (no TLS sign happened)")
-            # Exactness ties to presented certs, not handshakes: a
+            # Exactness ties to owed signs, not raw handshakes: a
             # completed handshake with an empty (or no) client
-            # certificate needs no private-key use, while every
-            # presented peer cert signs exactly once (CertificateVerify).
-            signs = flow.client_certs_presented
+            # certificate needs no private-key use, and a resumed
+            # handshake reports its cached peer cert without signing.
+            # Each presented cert on a CertificateRequest connection
+            # signs exactly once (CertificateVerify).
+            signs = flow.signs_owed
+            self.assertGreaterEqual(
+                signs, 1,
+                "no owed sign witnessed (no presented cert on a "
+                "CertificateRequest connection)")
         self.assertEqual(result.flow.get("observer_exit"), 0,
                          f"observer failed: {result.observer_stderr_tail}")
         self.assertTrue(result.flow.get("nss_seeded"),
@@ -794,11 +800,11 @@ class BrowserCells(unittest.TestCase):
         # the TLS ground truth above carry the proof, and any new gap
         # cause still fails. No sessions floor: the sign's session may
         # legitimately have opened in the tolerated pre-attach window.
-        # Exactness is per presented cert: each presented peer cert
-        # signs once (one C_SignInit + one C_Sign, two attributed
-        # family mechanism uses for the init and sign legs), nothing
-        # in flight at end, and the pair comes from distinct rows (no
-        # single aliased row may satisfy both).
+        # Exactness is per owed sign: each owes one C_SignInit +
+        # one C_Sign and two attributed family mechanism uses (the
+        # init and sign legs), nothing in flight at end, and the
+        # pair comes from distinct rows (no single aliased row may
+        # satisfy both).
         self.check_report(
             result, None, None, attached=True,
             allowed_gaps=_GAPS_ATTACHED_RUN,
@@ -4485,6 +4491,48 @@ def _wait_tree_dead(pid, timeout):
         if time.monotonic() >= deadline:
             return False
         time.sleep(0.05)
+
+
+class FlowServerSignsOwed(unittest.TestCase):
+    """TLS ground-truth twins: unprivileged, run everywhere (no gate).
+
+    Each completed handshake that presented a non-empty peer cert on a
+    connection that saw CertificateRequest owes exactly one
+    private-key sign. Resumed handshakes (no request, cached cert)
+    and empty certs owe none.
+    """
+
+    def _socket(self, cert):
+        def getpeercert(binary_form=False):
+            if isinstance(cert, Exception):
+                raise cert
+            return cert
+
+        return SimpleNamespace(getpeercert=getpeercert)
+
+    def test_full_handshake_with_cert_owes_one_sign(self):
+        flow = tls_server.FlowServer()
+        flow.note_handshake_ok(self._socket(b"peer-cert"), cert_request_seen=True)
+        self.assertEqual(flow.handshakes_ok, 1)
+        self.assertEqual(flow.client_certs_presented, 1)
+        self.assertEqual(flow.signs_owed, 1)
+
+    def test_resumed_handshake_owes_no_sign(self):
+        flow = tls_server.FlowServer()
+        flow.note_handshake_ok(self._socket(b"cached-cert"), cert_request_seen=True)
+        flow.note_handshake_ok(self._socket(b"cached-cert"), cert_request_seen=False)
+        self.assertEqual(flow.handshakes_ok, 2)
+        self.assertEqual(flow.client_certs_presented, 2)
+        self.assertEqual(flow.signs_owed, 1)
+
+    def test_empty_or_missing_cert_owes_no_sign(self):
+        flow = tls_server.FlowServer()
+        flow.note_handshake_ok(self._socket(None), cert_request_seen=True)
+        flow.note_handshake_ok(
+            self._socket(OSError("no peer")), cert_request_seen=True)
+        self.assertEqual(flow.handshakes_ok, 2)
+        self.assertEqual(flow.client_certs_presented, 0)
+        self.assertEqual(flow.signs_owed, 0)
 
 
 class BrowserReapTree(unittest.TestCase):

@@ -174,6 +174,10 @@ class FlowServer:
     cert: the exact expected client-signature count),
     ``handshake_sessions`` (per-handshake ``reused``/``version``/
     ``presented`` records, in completion order),
+    ``signs_owed`` (completed handshakes that presented a non-empty
+    peer cert on a connection that saw CertificateRequest: each owes
+    exactly one private-key sign, since a resumed handshake sends no
+    request yet still reports its cached peer cert),
     ``empty_certs`` (full handshake with an empty client certificate),
     ``selection_stalls`` (peers that saw CertificateRequest and never
     finished: stuck at selection), ``client_cert_alerts``
@@ -200,6 +204,7 @@ class FlowServer:
     sessions_reused: int = 0
     full_presented: int = 0
     handshake_sessions: list[dict] = field(default_factory=list)
+    signs_owed: int = 0
     spoke_tls: int = 0
     client_hello_complete: int = 0
     cert_requests_sent: int = 0
@@ -228,7 +233,8 @@ class FlowServer:
             if len(self.handshake_errors) < 3:
                 self.handshake_errors.append(f"{outcome}: {detail}"[:200])
 
-    def note_handshake_ok(self, tls_conn: ssl.SSLSocket) -> None:
+    def note_handshake_ok(self, tls_conn: ssl.SSLSocket,
+                          *, cert_request_seen: bool) -> None:
         """Record one completed handshake, counting a presented peer cert.
 
         The peer certificate is read at handshake time, independently of
@@ -237,6 +243,10 @@ class FlowServer:
         handshake too: a resumed handshake presents the original cert
         without a CertificateVerify, so only full presented
         handshakes predict a client signature.
+        request is ever served. A presented cert on a connection that
+        saw CertificateRequest additionally owes one private-key sign:
+        a resumed handshake sends no request, so its cached peer cert
+        (still reported by ``getpeercert``) owes none.
         """
         self.handshakes_ok += 1
         try:
@@ -261,6 +271,8 @@ class FlowServer:
         self.handshake_sessions.append(
             {"reused": reused, "version": version, "presented": presented}
         )
+        if presented and cert_request_seen:
+            self.signs_owed += 1
 
     @property
     def port(self) -> int:
@@ -443,10 +455,11 @@ class FlowServer:
                     conn.close()
                     raise _HandshakeRefused(
                         f"{type(exc).__name__}: {outcome}") from exc
-                if bool(getattr(tls_progress, "cert_request_seen", False)):
+                cr_seen = bool(getattr(tls_progress, "cert_request_seen", False))
+                if cr_seen:
                     server.cert_requests_sent += 1
                 tls_conn.settimeout(None)
-                server.note_handshake_ok(tls_conn)
+                server.note_handshake_ok(tls_conn, cert_request_seen=cr_seen)
                 return tls_conn, client_address
 
         try:

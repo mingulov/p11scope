@@ -3922,6 +3922,47 @@ impl PinnedObjects {
         }
     }
 
+    /// Whether `source`'s pins for `module` contradict this store: any
+    /// shared raw observation (the module's own file or a table-entry
+    /// dependency) whose digests are both present, non-empty and
+    /// unequal. A missing digest proves no change (production pins
+    /// always carry one), mirroring the harvest generation check; a
+    /// conflict means aliasing here would bind the proof's tables
+    /// against a different physical file.
+    pub(crate) fn proving_pins_conflict(
+        &self,
+        source: &PinnedObjects,
+        module: &ScannedModule,
+    ) -> bool {
+        let mut raws = Vec::new();
+        if let Some(own) = RawObjectInstance::scanned(module, module.key, &module.path) {
+            raws.push(own);
+        }
+        for entry in module.tables.iter().flat_map(|table| &table.entries) {
+            if let Some(dep) = RawObjectInstance::scanned(module, entry.object, &entry.object_path)
+            {
+                raws.push(dep);
+            }
+        }
+        raws.iter().any(|raw| {
+            source
+                .digest_for_raw(raw)
+                .zip(self.digest_for_raw(raw))
+                .is_some_and(|(incoming, mine)| incoming != mine)
+        })
+    }
+
+    /// One raw observation's digest in this store, when an entry maps
+    /// it and carries a non-empty digest.
+    fn digest_for_raw(&self, raw: &RawObjectInstance) -> Option<&str> {
+        self.raw_to_id
+            .get(raw)
+            .copied()
+            .and_then(|id| self.summary(id))
+            .map(|summary| summary.sha256)
+            .filter(|digest| !digest.is_empty())
+    }
+
     /// Drops one view's ownership claims while keeping every pin
     /// resolvable: the except-carry shape (`remove_view_except` with a
     /// keep set) without the purge. In production only the central

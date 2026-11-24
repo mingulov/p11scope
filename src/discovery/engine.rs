@@ -24828,8 +24828,8 @@ impl Engine {
             {
                 let front = self.owned_learn_deferred.pop_front().expect("peeked above");
                 attempted_this_apply = attempted_this_apply.saturating_add(1);
-                if let Some(module) = self.harvest_prepare(&front.scan_pins, &front.proof) {
-                    self.harvest_commit(pins, module);
+                if let Some(module) = self.harvest_prepare(&front.scan_pins, pins, &front.proof) {
+                    self.harvest_commit(pins, module, Some(&front.scan_pins));
                 }
                 continue;
             }
@@ -25079,7 +25079,7 @@ impl Engine {
         loader_unknown_reason: Option<&'static str>,
         key: Option<OwnedLearnedKey>,
     ) {
-        let prepared = self.harvest_prepare(&entry.scan_pins, &entry.proof);
+        let prepared = self.harvest_prepare(&entry.scan_pins, target, &entry.proof);
         let Some(file) = entry.scan_pins.file_for(entry.proof.object) else {
             // Unreachable via the drain (unresolvable entries refuse
             // before their attempt): hand-built states still settle
@@ -25106,7 +25106,7 @@ impl Engine {
             entry.proving_retained,
         );
         if let Some(module) = prepared {
-            self.harvest_commit(target, module);
+            self.harvest_commit(target, module, Some(&entry.scan_pins));
         }
     }
 
@@ -25224,8 +25224,8 @@ impl Engine {
         // target are one store. Deferred proofs split them (stashed
         // proving pins as source, the draining store as target) via
         // prepare/commit directly.
-        if let Some(module) = self.harvest_prepare(pins, proof) {
-            self.harvest_commit(pins, module);
+        if let Some(module) = self.harvest_prepare(pins, pins, proof) {
+            self.harvest_commit(pins, module, None);
         }
     }
 
@@ -25239,6 +25239,7 @@ impl Engine {
     fn harvest_prepare(
         &mut self,
         source: &PinnedObjects,
+        target: &PinnedObjects,
         proof: &OwnedLearnProof,
     ) -> Option<ScannedModule> {
         if proof.module.tables.is_empty() && proof.module.interfaces.is_empty() {
@@ -25284,6 +25285,28 @@ impl Engine {
             if crate::run::capture_diagnostics_on() {
                 eprintln!(
                     "p11scope: run-learned tables for {} refused: a new file generation replaced the learned one",
+                    proof.path
+                );
+            }
+            return None;
+        }
+        // Target-identity check: the draining target may map the
+        // proof's raw observation to a different physical file than
+        // the stash proves (same maps key and path, different
+        // digest). Aliasing there would bind the old proof's tables
+        // against the target's different file, so the tables refuse
+        // loudly with a named gap (the file itself still stages
+        // below, as on the replaced-generation path) and nothing
+        // unions. Fresh proofs compare the store with itself and
+        // never refuse here.
+        if target.proving_pins_conflict(source, &proof.module) {
+            self.mark_partial(
+                crate::render::LEARNED_SKIP_SUBJECT,
+                "a deferred harvest conflicted with the draining store's different file at the same raw observation; its tables were refused",
+            );
+            if crate::run::capture_diagnostics_on() {
+                eprintln!(
+                    "p11scope: run-learned tables for {} refused: the draining store holds a different file at the same raw observation",
                     proof.path
                 );
             }
@@ -25365,12 +25388,41 @@ impl Engine {
     /// harvests after the candidate cloned committed pins, and the
     /// commit installs that clone: without the target aliases the
     /// commit drops the harvest and the next gap tick unbinds the
-    /// run-learned modules and retires every slot. The alias call is
-    /// idempotent, so filing unconditionally matches the old
-    /// gap-gated filing exactly (a target that already holds the
-    /// aliases from its clone gains nothing).
-    fn harvest_commit(&mut self, target: &mut PinnedObjects, module: ScannedModule) {
-        target.alias_scanned_module_under(&module, Self::RUN_LEARNED_VIEW_ID);
+    /// run-learned modules and retires every slot. A deferred
+    /// `remap_source` (always `Some` off the fresh path) absorbs
+    /// into the target before aliasing, since the target never saw
+    /// the proving entries; the alias call itself is idempotent, so
+    /// a target that already holds the aliases from its clone gains
+    /// nothing.
+    fn harvest_commit(
+        &mut self,
+        target: &mut PinnedObjects,
+        module: ScannedModule,
+        remap_source: Option<&PinnedObjects>,
+    ) {
+        match remap_source {
+            // Fresh proofs share their call's namespace: the target
+            // already holds the proving entries, so alias only.
+            None => target.alias_scanned_module_under(&module, Self::RUN_LEARNED_VIEW_ID),
+            // Deferred proofs split source (stashed proving pins)
+            // and target (the draining store, cloned before the
+            // drain absorbed): remap the proving entries into the
+            // target first, or the alias below is a no-op and the
+            // commit wipes the harvest while the union below keeps
+            // unbindable tables.
+            Some(source) => {
+                if !target.module_aliased_under(&module, Self::RUN_LEARNED_VIEW_ID) {
+                    let absorbed = target.absorb(source.clone());
+                    attribution::note_all(&absorbed);
+                    for skip in absorbed {
+                        if !self.counters.object_skips.contains(&skip) {
+                            self.counters.object_skips.push(skip);
+                        }
+                    }
+                    target.alias_scanned_module_under(&module, Self::RUN_LEARNED_VIEW_ID);
+                }
+            }
+        }
         let before = self.run_learned_modules.clone();
         let drops_before = self.merge_tables_dropped;
         // Display shape for the diagnostics below (normalization
@@ -25509,8 +25561,9 @@ impl Engine {
                 .as_ref()
                 .is_some_and(|key| self.owned_learned_staged.contains(key))
             {
-                if let Some(module) = self.harvest_prepare(&entry.scan_pins, &entry.proof) {
-                    self.harvest_commit(&mut scratch, module);
+                if let Some(module) = self.harvest_prepare(&entry.scan_pins, &scratch, &entry.proof)
+                {
+                    self.harvest_commit(&mut scratch, module, Some(&entry.scan_pins));
                 }
                 continue;
             }

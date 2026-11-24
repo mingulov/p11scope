@@ -3511,7 +3511,7 @@ fn carried_fix5_conflicting_target_refuses_harvest_tables() {
     // The draining target maps the same raw observation to a different
     // generation's bytes: aliasing there would bind old tables to a
     // new file.
-    let mut target = overlay_view_pin(&module, 8404, &sha_new, 1, false);
+    let target = overlay_view_pin(&module, 8404, &sha_new, 1, false);
     let target_object = target
         .id_for_scanned(&module, module.key, &module.path)
         .expect("the target resolves the same raw");

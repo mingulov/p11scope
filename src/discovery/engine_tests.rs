@@ -88434,6 +88434,81 @@ fn learned_terminal_record_without_scope_start_counts_but_carries_no_window() {
     );
 }
 
+/// A backwards clock never inverts the miss window: with a scope
+/// start past the end stamp the bounds clamp non-decreasing
+/// (document stays valid; the strict oracle still rejects the empty
+/// interval, failing loud on the broken clock instead of reading it).
+#[test]
+fn learned_terminal_record_clamps_inverted_window_bounds() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = dir.path().join("terminal.c");
+    let so = dir.path().join("libterminal4.so");
+    std::fs::write(
+        &c,
+        "unsigned long C_GetFunctionList(void **out){ (void)out; return 5; }\n",
+    )
+    .unwrap();
+    assert!(
+        std::process::Command::new("gcc")
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&so)
+            .arg(&c)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let file = std::fs::File::open(&so).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    tx.send(crate::fanotify::LearnMsg::Candidate(
+        crate::fanotify::LearnedCandidate {
+            file,
+            dev,
+            ino,
+            display_path: so.to_string_lossy().into_owned(),
+            loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+            loader_unknown_reason: None,
+            run_learned: false,
+            proving_retained: false,
+        },
+    ))
+    .unwrap();
+    drop(tx);
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.set_learned_rx_for_test(rx);
+    engine.set_scope_start_ns(Some(1000));
+    let session = ScriptedSession::default();
+    engine.finish_prearm_capture(
+        &session,
+        crate::render::PrearmWatchEnd::ScopeEnd,
+        &BTreeSet::new(),
+        &[],
+        Some(100),
+        &crate::metrics::KernelEvidence::default(),
+        0,
+        None,
+        false,
+        None,
+    );
+    let facts = engine.capture_facts();
+    let record = facts
+        .discovery
+        .modules
+        .iter()
+        .find(|module| module.path.ends_with("libterminal4.so"))
+        .expect("the terminally learned file is listed");
+    assert_eq!(
+        record.unobserved_windows,
+        Some(vec![crate::render::UnobservedWindow {
+            start_ns: 1000,
+            end_ns: 1000,
+            reason: crate::render::UnobservedReason::LearnedNeverScanned,
+        }]),
+        "inverted bounds clamp, never invert"
+    );
+}
+
 /// A candidate the pin worker refuses after the drain proved it
 /// settles without staging: no note, no staged count, the refusal is
 /// a recorded skip (never silence), and a later load for the same

@@ -65,8 +65,9 @@ must have ended with feeds, and a linked no-feed branch other than
 fell-back (receipt-starved, calls-shed or unattributed) must have
 spent all of the bound with no feed: one quantum is never a no-feed
 verdict. A linked no-feed case names its typed cause from its record:
-fell-back exactly when the join ended with feeds (they installed,
-then all fell back; `fallback` counts the named endings), else
+fell-back exactly when the join ended with feeds (they installed
+and none remained at linkage; endings in gaps; `fallback` counts the
+ordered-fallback endings), else
 receipt-starved exactly when the probe counts a `no_receipt` deferral
 of the held caller or a caller-less `partition` receipt refusal, else
 calls-shed exactly when calls not proven foreign were shed (`shed` >
@@ -122,7 +123,8 @@ NO_FEED = {
         "no joint feeds with S1 seal (producers unlinked, zero installs)",
     "no-feeds-fell-back":
         "no joint feeds from the linked session: feeds installed during the "
-        "join, then every feed fell back to S1 (counted in fallback)",
+        "join and none remained; endings in gaps (ordered fallbacks counted "
+        "in fallback)",
     "no-feeds-receipt-starved":
         "no joint feeds from the linked session: the held caller's birth "
         "admission was deferred (no_receipt) or a session birth receipt was "

@@ -496,6 +496,9 @@ ROWS = [
     ("starved-hiding-fallback", log_for(edited(no_feed_record(
         2, "no-feeds-receipt-starved"), case_set(2, join_feeds=1))), 101,
      False, F, "join-bound", "r12 F2"),
+    ("calls-shed-hiding-fallback", log_for(edited(no_feed_record(
+        2, "no-feeds-calls-shed"), case_set(2, join_feeds=2))), 101,
+     False, F, "join-bound", "feeds at the join's end are fell-back"),
     ("linked-early-without-feeds", log_for(edited(QR, case_set(
         3, join_feeds=0)), ok=True), 0, False, F, "join-bound",
      "r12 F2: a join ends early only on a feed or an S1 latch"),

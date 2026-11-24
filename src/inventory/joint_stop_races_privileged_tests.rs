@@ -1239,8 +1239,8 @@ fn no_feed_reason(branch: &JointBranch) -> Option<&'static str> {
         JointBranch::Linked => None,
         JointBranch::S1 => Some("no joint feeds with S1 seal (producers unlinked, zero installs)"),
         JointBranch::FellBack => Some(
-            "no joint feeds from the linked session: feeds installed during the join, then \
-             every feed fell back to S1 (counted in fallback)",
+            "no joint feeds from the linked session: feeds installed during the join and \
+             none remained; endings in gaps (ordered fallbacks counted in fallback)",
         ),
         JointBranch::ReceiptStarved => Some(
             "no joint feeds from the linked session: the held caller's birth admission was \
@@ -3514,7 +3514,7 @@ fn no_feed_tags_name_each_branch_cause() {
     );
     let fell_back = no_feed_reason(&JointBranch::FellBack).expect("a cause");
     assert!(
-        fell_back.contains("fell back") && fell_back.contains("fallback"),
+        fell_back.contains("none remained") && fell_back.contains("fallback"),
         "the fell-back cause names its count: {fell_back}"
     );
     assert_eq!(no_feed_receipt("no-feeds-fell-back"), fell_back);

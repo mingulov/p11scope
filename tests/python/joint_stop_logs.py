@@ -37,8 +37,8 @@ S1_RECEIPT = "no joint feeds with S1 seal (producers unlinked, zero installs)"
 UNATTRIBUTED_RECEIPT = ("no joint feeds without S1 seal (producers linked, "
                         "zero installs unexplained)")
 FELL_BACK_RECEIPT = ("no joint feeds from the linked session: feeds "
-                     "installed during the join, then every feed fell back "
-                     "to S1 (counted in fallback)")
+                     "installed during the join and none remained; endings "
+                     "in gaps (ordered fallbacks counted in fallback)")
 STARVED_RECEIPT = ("no joint feeds from the linked session: the held "
                    "caller's birth admission was deferred (no_receipt) or a "
                    "session birth receipt was refused (partition, "

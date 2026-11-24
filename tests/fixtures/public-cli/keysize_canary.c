@@ -245,6 +245,11 @@ int main(int argc, char **argv)
          * so any late BPF read would still carry the marker. */
         memset(sframe.sig, 0, sizeof sframe.sig);
         memset(vframe.sig, 0, sizeof vframe.sig);
+        /* Pace the rounds (200 ms): the six counted calls would otherwise
+         * complete in milliseconds, before the semantic lane's joint birth
+         * lands, flaking the run as bootstrap_unavailable. Threaded
+         * fixtures (mt_sign) get this pacing from thread overhead. */
+        usleep(200000);
     }
     printf("SENTINEL marker=%s signs=%ld verifies=%ld\n", CANARY_MARK, signs, verifies);
     printf("LEDGER {\"schema\":\"p11scope/public-cli-ledger/v2\",\"pid\":%d,\"complete\":true,"

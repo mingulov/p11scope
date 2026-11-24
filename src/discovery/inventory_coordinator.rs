@@ -10781,6 +10781,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         receipt.events.extend(hook_events);
         if let Some(domain) = resight_domain {
             receipt.resight_owed = self.binder.resight_owed(domain);
+            // Seamed: the binder reports held exit decisions once the
+            // continuation lands; until then no decision is ever owed.
+            receipt.decision_owed = false;
         }
         self.reconcile_count_eligibility(identity, &mut RecoveryWorkBudget::new());
         if let Some((domain, finished, began_ns, gap_free)) = tombstone_cleanup {
@@ -11760,6 +11763,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             events,
             decided,
             resight_owed: false,
+            decision_owed: false,
         }
     }
 
@@ -16547,6 +16551,11 @@ pub(crate) struct NativeReceipt {
     /// reads on while this holds instead of finishing at the first
     /// exact refresh. Always false for semantic batches.
     pub resight_owed: bool,
+    /// The staged domain still owes a covered exit decision: a front
+    /// row's validation deferred past the holder pool and holds for a
+    /// budgeted retry. The stop machine reads on while this holds,
+    /// like `resight_owed`. Always false for semantic batches.
+    pub decision_owed: bool,
 }
 
 /// One CALLER_USE pair (C7 C4): the image that owns the row plus the
@@ -46030,6 +46039,88 @@ int main(void) {
             assert_eq!(
                 fresh[0].budget, None,
                 "a queue-only hold carries no budget-overrun payload: {fresh:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_system_scope_held_exit_decision_is_owed_and_retried_first() {
+        // A covered exit decision that holds past the holder pool is
+        // reported as owed continuation, and the held front retries
+        // first on the next staging: even with 60 fresh hot rows
+        // arriving, the front's reservation decides it while the new
+        // rows defer behind it.
+        agreeing(|| {
+            let (mut native, holders) = hot_pid_system_native(1100);
+            stamp_hot_exits(&mut native, 7, 120);
+            native.read(hot_rows(&native, 0, 30));
+            native.read(hot_rows(&native, 30, 30));
+            native.read(Vec::new());
+            let receipt = native.stage(native.stamps.drain(native.domain));
+            assert_eq!(
+                native.scene.coordinator.binder.pending_rows().count(),
+                1,
+                "the drain holds exactly the row past the pool"
+            );
+            assert!(
+                receipt.decision_owed,
+                "the holding staging reports its owed decision"
+            );
+            assert!(
+                !receipt.resight_owed,
+                "no re-sight attempt is owed beside the held decision"
+            );
+            // Sixty fresh hot rows arrive with the held front still
+            // waiting: the front retries first and binds its holder,
+            // while two fresh rows defer past its reservation.
+            native.read(hot_rows(&native, 60, 60));
+            assert_eq!(
+                native.scene.coordinator.binder.owed_len_for_test(),
+                2,
+                "the reservation holds two fresh rows for the front"
+            );
+            native.scene.coordinator.commit_batch(false).unwrap();
+            assert_holders_edged(&native, &holders[..60]);
+            let receipt = native.stage(native.stamps.drain(native.domain));
+            assert!(
+                !receipt.decision_owed,
+                "no decision stays owed past the retry"
+            );
+        });
+    }
+
+    #[test]
+    fn a_system_scope_finish_conserves_a_held_exit_decision() {
+        // The terminal finish conserves a held exit decision exactly:
+        // the row files the named incomplete reason, nothing stays
+        // pending, and every row is bound or unbound.
+        agreeing(|| {
+            let (mut native, _) = hot_pid_system_native(1100);
+            stamp_hot_exits(&mut native, 7, 60);
+            native.read(hot_rows(&native, 0, 30));
+            native.read(hot_rows(&native, 30, 30));
+            native.read(Vec::new());
+            native.stage(native.stamps.drain(native.domain));
+            assert_eq!(
+                native.scene.coordinator.binder.pending_rows().count(),
+                1,
+                "the drain holds exactly the row past the pool"
+            );
+            let domain = native.domain;
+            native.stage(NativeBatch::Finish { domain });
+            native.scene.coordinator.commit_batch(false).unwrap();
+            let census = native.scene.coordinator.registry.witness_census();
+            assert_eq!(census.pending, 0);
+            assert_eq!(
+                census.unbound.get(&UnboundReason::EvidenceIncomplete),
+                Some(&1),
+                "the held row files the named incomplete reason"
+            );
+            let unbound: u64 = census.unbound.values().sum();
+            assert_eq!(
+                census.rows,
+                census.bound + unbound,
+                "every row is bound or unbound"
             );
         });
     }

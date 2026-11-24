@@ -1989,6 +1989,42 @@ pub(crate) struct NativeStop<L> {
     /// The last staged batch left re-sight attempts owed: the terminal
     /// refresh reads on for them instead of finishing at once.
     staged_resight_owed: bool,
+    /// The last staged batch left a covered exit decision owed: a held
+    /// front row waits for its budgeted retry. The terminal refresh
+    /// reads on for it like `staged_resight_owed`.
+    staged_decision_owed: bool,
+}
+
+/// What one terminal-refresh read decided: read on within the
+/// deadline, finish on an exact sweep, or report the refresh loss.
+/// Both stop drivers consult this one function, so a covered exit
+/// decision and an owed re-sight attempt hold the finish identically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminalRefreshStep {
+    ReadOn,
+    FinishExact,
+    RefreshLoss,
+}
+
+/// The shared terminal-refresh decision: an exact sweep with no
+/// continuation owed finishes at once; any owed continuation
+/// (re-sight attempts or held exit decisions) reads on within the
+/// deadline; past the deadline an exact sweep still finishes (never
+/// a refresh-loss misreport) while an inexact one reports the loss.
+pub(crate) fn terminal_refresh_step(
+    exact: bool,
+    continuation_owed: bool,
+    expired: bool,
+) -> TerminalRefreshStep {
+    if exact && !continuation_owed {
+        TerminalRefreshStep::FinishExact
+    } else if !expired {
+        TerminalRefreshStep::ReadOn
+    } else if exact {
+        TerminalRefreshStep::FinishExact
+    } else {
+        TerminalRefreshStep::RefreshLoss
+    }
 }
 
 // Both variants move the same native owner; returning Pending must remain
@@ -2027,6 +2063,7 @@ impl<L> NativeStop<L> {
             retirement_budget: Duration::ZERO,
             retirement: None,
             staged_resight_owed: false,
+            staged_decision_owed: false,
         }
     }
 
@@ -2110,6 +2147,7 @@ impl<L> NativeStop<L> {
                     .expect("one original read awaits staging");
                 let receipt = host.stage_native(batch, &mut self.lane.capture, now_ns());
                 self.staged_resight_owed = receipt.resight_owed;
+                self.staged_decision_owed = receipt.decision_owed;
                 self.events.extend(receipt.events);
                 // The next phase's original window starts after this
                 // staging action, exactly once, even if it used the slice.

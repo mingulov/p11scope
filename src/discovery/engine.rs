@@ -575,6 +575,16 @@ pub struct Engine {
     /// retired, cumulative per engine.
     #[cfg(test)]
     carrier_pins_reclaimed_for_test: u64,
+    /// Rowless carrier pins that qualified for reclaim but waited
+    /// past the per-rebuild cap ([`CARRIED_RETIRE_PER_ASSEMBLY`]).
+    /// The next rebuild re-evaluates them first (a pin that regained
+    /// rows or a co-owner drops out instead of reclaiming), so
+    /// bulk reject/bind losses pace at one stride per rebuild like
+    /// normalize drops. Non-empty defeats the quiet fast paths (see
+    /// [`Self::carried_rows_would_drop`]), so the rollover always
+    /// drains. Memory-only ids; each still pins its file until the
+    /// reclaiming rebuild.
+    carrier_reclaim_pending: BTreeSet<PinnedObjectId>,
     /// Rotation offset into the owned-run proof list for the next
     /// [`Self::learn_owned_proofs`] apply: each apply starts at
     /// `cursor % proofs.len()` and advances the cursor past the proofs it
@@ -14862,6 +14872,7 @@ impl Engine {
             held_refresh_skipped_for_test: 0,
             #[cfg(test)]
             carrier_pins_reclaimed_for_test: 0,
+            carrier_reclaim_pending: BTreeSet::new(),
             owned_learn_cursor: 0,
             owned_learn_deferred: VecDeque::new(),
             #[cfg(test)]
@@ -33413,11 +33424,20 @@ impl Engine {
     /// committed carrier is riding, never newly carried). The
     /// quiet-tick fast paths check this so they never shelter a
     /// droppable carrier; with no carriers committed the scan
-    /// short-circuits false. The verdict is cached by the exact
-    /// commit-epoch key (see `carried_drop_cache`): repeated quiet
-    /// checks over unchanged inputs pay O(1) instead of re-running the
-    /// nested interface/table scan every tick (INV-2).
+    /// short-circuits false. Rollover reclaim waits count as
+    /// would-drop too: rowless pins past the prune cap still pin
+    /// their files, and only a full rebuild drains them. The verdict
+    /// is cached by the exact commit-epoch key (see
+    /// `carried_drop_cache`): repeated quiet checks over unchanged
+    /// inputs pay O(1) instead of re-running the nested
+    /// interface/table scan every tick (INV-2). The rollover check
+    /// bypasses the cache (engine state, not a cache key).
     fn carried_rows_would_drop(&mut self) -> bool {
+        // Rollover first: outstanding reclaim work forces the full
+        // rebuild even with no rows left to drop.
+        if !self.carrier_reclaim_pending.is_empty() {
+            return true;
+        }
         // O(1) key first: with no carriers the answer is false without
         // consulting the cache at all.
         if !self
@@ -33536,17 +33556,21 @@ impl Engine {
     /// dependencies survive (a live row or any other owner keeps the
     /// pin). Runs once per rebuild, after every row-loss arm, so
     /// normalize, rejection and binding losses all retire through
-    /// this one path. Removes at most one normalize stride per
-    /// assembly (retirement paces there); closes ride the commit
-    /// swap, like the view-retirement reclaim. Returns how many pins
-    /// were removed.
+    /// this one path. Removes at most one stride per rebuild across
+    /// every row-loss arm (normalize caps its own drops upstream,
+    /// but rejection and binding drop uncapped, so the bound lives
+    /// here where the closes happen); qualifying pins past the cap
+    /// roll over to [`Self::carrier_reclaim_pending`] for the next
+    /// rebuild, which re-evaluates them first. Closes ride the
+    /// commit swap, like the view-retirement reclaim. Returns how
+    /// many pins were removed.
     fn prune_retired_carrier_pins(
         &mut self,
         pins: &mut PinnedObjects,
         pre_carriers: &BTreeSet<PinnedObjectId>,
         bound: &[ReconciledModule],
     ) -> usize {
-        if pre_carriers.is_empty() {
+        if pre_carriers.is_empty() && self.carrier_reclaim_pending.is_empty() {
             return 0;
         }
         let rowed: BTreeSet<PinnedObjectId> = bound.iter().map(|module| module.object).collect();
@@ -33574,12 +33598,22 @@ impl Engine {
             .iter()
             .map(|fallback| fallback.replacement)
             .collect();
+        // Rollover first (older losses drain before new ones), then
+        // this rebuild's newly rowless carriers, each in id order.
+        let mut candidates: Vec<PinnedObjectId> = Vec::new();
+        candidates.extend(self.carrier_reclaim_pending.iter().copied());
+        candidates.extend(
+            pre_carriers
+                .iter()
+                .copied()
+                .filter(|id| !self.carrier_reclaim_pending.contains(id)),
+        );
         let mut removed = 0usize;
-        for id in pre_carriers
-            .iter()
-            .copied()
-            .filter(|id| !rowed.contains(id))
-        {
+        let mut rolled: BTreeSet<PinnedObjectId> = BTreeSet::new();
+        for id in candidates {
+            if rowed.contains(&id) {
+                continue;
+            }
             if !claimless.contains(&id) {
                 continue;
             }
@@ -33602,6 +33636,10 @@ impl Engine {
             {
                 continue;
             }
+            if removed >= CARRIED_RETIRE_PER_ASSEMBLY {
+                rolled.insert(id);
+                continue;
+            }
             if pins.remove_unowned_object(id) {
                 removed = removed.saturating_add(1);
                 #[cfg(test)]
@@ -33610,7 +33648,11 @@ impl Engine {
                         self.carrier_pins_reclaimed_for_test.saturating_add(1);
                 }
             }
+            // A failed removal holds nothing (the entry is already
+            // gone, e.g. a rollover id from a discarded candidate):
+            // it drops here instead of rolling over again.
         }
+        self.carrier_reclaim_pending = rolled;
         removed
     }
 

@@ -3821,8 +3821,9 @@ impl PinnedObjects {
     /// scrubs defensively so a missed claimant cannot strand. Returns
     /// true when an entry was removed. Synchronous, like
     /// [`Self::remove_view_except`]: retirement paces at one stride
-    /// of drops per assembly upstream, so closes stay bounded
-    /// without a handoff.
+    /// of drops per assembly upstream and one stride of removals
+    /// per rebuild at the prune, so closes stay bounded without a
+    /// handoff.
     pub(crate) fn remove_unowned_object(&mut self, id: PinnedObjectId) -> bool {
         if !self.by_id.contains_key(&id) {
             return false;

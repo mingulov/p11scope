@@ -8126,9 +8126,7 @@ fn demotion_retirement_round5_folded_instances_stay_exact() {
 /// cursors), and folds it after the disposal completes.
 #[test]
 fn retire_defers_callers_with_instances_while_disposal_pending() {
-    use crate::discovery::caller_registry::instance_input::{
-        AdmittedInstance, FOLD_DEFERRED_DISPOSAL_SUBJECT, InstanceKey,
-    };
+    use crate::discovery::caller_registry::instance_input::{AdmittedInstance, InstanceKey};
     use p11scope_ebpf_common::ImageIdentity;
     let mut scene = Scene::shared();
     let caller = scene.caller;
@@ -8204,7 +8202,7 @@ fn retire_defers_callers_with_instances_while_disposal_pending() {
         .registry()
         .staged_scope_gaps_for_test()
         .into_iter()
-        .filter(|(subject, _)| subject == FOLD_DEFERRED_DISPOSAL_SUBJECT)
+        .filter(|(subject, _)| subject == "fold deferred: staged disposal in flight")
         .count();
     assert_eq!(deferred, 1, "the deferred caller counts its gap");
     assert!(

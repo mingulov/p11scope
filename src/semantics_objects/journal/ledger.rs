@@ -1169,6 +1169,23 @@ mod tests {
         ledger.release_h8open(1);
     }
 
+    /// A bulk H8 release while a budgeted H8 void owns the table fails
+    /// fast in debug builds, like the single-release arm above: the
+    /// stop-path teardown funnels through the same guard, never
+    /// straight to the table.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "no sync release while a budgeted void owns the table")]
+    fn shared_ledger_sync_release_all_while_void_pending_panics_in_debug() {
+        let pool = SemanticResourcePool::default();
+        let mut ledger = StagingLedger::with_resources(pool.reserver());
+        ledger.prepare_capacity().unwrap();
+        ledger.charge_h8open(1, 10).unwrap();
+        ledger.start_h8_void();
+        assert!(ledger.h8_void_pending());
+        ledger.release_all_h8open();
+    }
+
     #[test]
     fn shared_ledger_resumable_void_keeps_shared_model_and_merged_alias() {
         // One shared H8+Model operation, one merged H8+Model with two

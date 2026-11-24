@@ -6343,6 +6343,37 @@ impl CallerRegistry {
             .collect()
     }
 
+    /// Staged mutation count awaiting the next commit: for twins that
+    /// pin what a commit would apply at a phase boundary.
+    #[cfg(test)]
+    pub(crate) fn staged_len_for_test(&self) -> usize {
+        self.staged.len()
+    }
+
+    /// Staged mutations that can reach `invalidate_instance` on the
+    /// next commit (registration, call, loss, retirement and
+    /// caller/module absence paths): the void-entry proof twins pin
+    /// this at zero while a staged disposal pends. Conservative: some
+    /// counted arms invalidate only on refusal sub-paths.
+    #[cfg(test)]
+    pub(crate) fn staged_instance_invalidations_for_test(&self) -> usize {
+        self.staged
+            .iter()
+            .filter(|staged| {
+                matches!(
+                    staged,
+                    Mutation::NoteInstance(_)
+                        | Mutation::ObserveInstanceSemantic(_)
+                        | Mutation::InstanceSemanticLoss(_)
+                        | Mutation::RetireInstance(_)
+                        | Mutation::RetireCaller { .. }
+                        | Mutation::NoteModuleAbsent { .. }
+                        | Mutation::NoteMemberUnscanned { .. }
+                )
+            })
+            .count()
+    }
+
     /// Stage one gap for the module `key` names, resolving the ID at
     /// publication (F3-04): `record_gap` resolves eagerly against the
     /// committed snapshot, which misses a first-discovered module whose

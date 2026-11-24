@@ -14169,6 +14169,210 @@ fn joint_machine_void_staged_disposal_with_long_bucket_is_resumable() {
     assert_eq!(fixture.machine.disposition_reason(), None);
 }
 
+/// Drive a clean lane (two complete calls, no running call, H8
+/// drained by its publish) to its first `VoidingStaged` observation:
+/// with no sweep work the idle break takes the direct disposal entry.
+/// Returns the fixture at the entry plus whether the path passed
+/// through `Voiding`, so the caller pins its entry.
+fn drive_clean_break_to_first_voiding_staged() -> (MachineScene, bool) {
+    let mut fixture = MachineScene::new(2);
+    fixture.prime(2);
+    let pid = std::process::id();
+    let (begin_a, end_a) = fixture.scene.encoded(pid, 0, "C_SignInit", 3);
+    let (begin_b, end_b) = fixture.scene.encoded(pid, 1, "C_SignInit", 4);
+    for bytes in [
+        begin_a.to_vec(),
+        end_a.to_vec(),
+        begin_b.to_vec(),
+        end_b.to_vec(),
+    ] {
+        fixture.scene.drain.source_mut().push_record(bytes);
+    }
+    fixture.published_labeled("clean-complete-calls", None);
+    let roles = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .ledger()
+        .roles_for_test();
+    assert_eq!(
+        roles[1], 0,
+        "a clean publish drains H8, so the break takes the direct entry: {roles:?}"
+    );
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture_mut()
+        .adapter_mut()
+        .break_stream_for_test();
+    fixture.scene.push(pid, 1, "C_SignInit", 5);
+    let mut saw_voiding = false;
+    for _ in 0..512 {
+        fixture.service(1).expect("reaching the void never refuses");
+        let phase = fixture.machine.diagnostic_snapshot_for_test().0;
+        if phase == "Voiding" {
+            saw_voiding = true;
+        }
+        if phase == "VoidingStaged" {
+            return (fixture, saw_voiding);
+        }
+    }
+    panic!("the broken stream must reach VoidingStaged");
+}
+
+/// Drive a held-call lane with 65 colliding survivors to its first
+/// `VoidingStaged` observation, following the long-bucket twin: the
+/// retained H8 forces the sweep entry. Returns the fixture at the
+/// entry plus whether the path passed through `Voiding`, so the
+/// caller pins its entry.
+fn drive_held_break_to_first_voiding_staged() -> (MachineScene, bool) {
+    use crate::inventory_semantics::JointServiceProgress;
+    use crate::semantics_objects::journal::StagingLedger;
+    let mut fixture = MachineScene::new(2);
+    fixture.prime(2);
+    let prime_staged = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .ledger()
+        .staged_keys_for_test();
+    let pid = std::process::id();
+    let (begin_a, _end_a) = fixture.scene.encoded(pid, 0, "C_SignInit", 3);
+    let (begin_b, end_b) = fixture.scene.encoded(pid, 1, "C_SignInit", 4);
+    for bytes in [begin_a.to_vec(), begin_b.to_vec(), end_b.to_vec()] {
+        fixture.scene.drain.source_mut().push_record(bytes);
+    }
+    fixture.reach_phase("Audited");
+    let progress = fixture.service(1);
+    assert_eq!(
+        progress,
+        Ok(JointServiceProgress::Pending),
+        "the seal waits behind the running call"
+    );
+    fixture.published_labeled("held-behind-running-call", None);
+    let held_staged = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .ledger()
+        .staged_keys_for_test();
+    let mut new_keys = Vec::new();
+    for key in &held_staged {
+        if !prime_staged.contains(key) {
+            new_keys.push(*key);
+        }
+    }
+    assert_eq!(new_keys.len(), 1, "one held head staged");
+    let (held_ns, held_val) = new_keys[0];
+    let held_bucket = StagingLedger::staged_bucket_for_test(held_ns, held_val);
+    const SURVIVORS: usize = 65;
+    const MODEL_BASE: u64 = 800_000;
+    const MODEL_BYTES: u64 = 20;
+    let mut colliding = Vec::new();
+    for token in MODEL_BASE..(MODEL_BASE + 200_000) {
+        if StagingLedger::model_bucket_for_test(token) == held_bucket {
+            colliding.push(token);
+            if colliding.len() >= SURVIVORS {
+                break;
+            }
+        }
+    }
+    assert_eq!(colliding.len(), SURVIVORS, "65 colliding survivors exist");
+    let coordinator = &mut fixture.scene.real.scene.coordinator;
+    let ledger = coordinator.joint_capture_mut().ledger_mut();
+    for token in &colliding {
+        ledger.charge_model(*token, MODEL_BYTES).unwrap();
+    }
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture_mut()
+        .adapter_mut()
+        .break_stream_for_test();
+    fixture.scene.push(pid, 1, "C_SignInit", 5);
+    let mut saw_voiding = false;
+    for _ in 0..512 {
+        fixture.service(1).expect("reaching the void never refuses");
+        let phase = fixture.machine.diagnostic_snapshot_for_test().0;
+        if phase == "Voiding" {
+            saw_voiding = true;
+        }
+        if phase == "VoidingStaged" {
+            return (fixture, saw_voiding);
+        }
+    }
+    panic!("the broken stream must reach VoidingStaged");
+}
+
+/// The idle void entry starts its staged disposal with no
+/// instance-invalidating mutation staged: collection runs only after
+/// the disposal drains, so no commit can apply prestaged
+/// invalidations under the disposal's budgeted cursors.
+#[test]
+fn joint_machine_idle_void_entry_stages_no_instance_invalidations() {
+    let (mut fixture, saw_voiding) = drive_clean_break_to_first_voiding_staged();
+    assert!(
+        !saw_voiding,
+        "the idle break takes the direct disposal entry"
+    );
+    let registry = fixture.scene.real.scene.coordinator.registry();
+    assert!(
+        registry.staged_disposal_pending(),
+        "the disposal pends at the direct entry"
+    );
+    assert_eq!(
+        registry.staged_instance_invalidations_for_test(),
+        0,
+        "no prestaged invalidation can commit under the disposal (staged len {})",
+        registry.staged_len_for_test()
+    );
+    for _ in 0..512 {
+        fixture.service(1).expect("the disposal drains");
+        if fixture.machine.diagnostic_snapshot_for_test().0 != "VoidingStaged" {
+            return;
+        }
+    }
+    panic!("the direct-entry disposal must drain");
+}
+
+/// The post-sweep void entry starts its staged disposal with no
+/// instance-invalidating mutation staged, like the idle entry: the
+/// sweep completion stages nothing, so the disposal still runs
+/// before any collection.
+#[test]
+fn joint_machine_sweep_void_entry_stages_no_instance_invalidations() {
+    let (mut fixture, saw_voiding) = drive_held_break_to_first_voiding_staged();
+    assert!(saw_voiding, "the survivor break takes the sweep entry");
+    let registry = fixture.scene.real.scene.coordinator.registry();
+    assert!(
+        registry.staged_disposal_pending(),
+        "the disposal pends at the sweep entry"
+    );
+    assert_eq!(
+        registry.staged_instance_invalidations_for_test(),
+        0,
+        "no prestaged invalidation can commit under the disposal (staged len {})",
+        registry.staged_len_for_test()
+    );
+    for _ in 0..512 {
+        fixture.service(1).expect("the disposal drains");
+        if fixture.machine.diagnostic_snapshot_for_test().0 != "VoidingStaged" {
+            return;
+        }
+    }
+    panic!("the sweep-entry disposal must drain");
+}
+
 /// The linked-stream void with colliding retained H8 entries is resumable
 /// in Running mode: at most 64 leaf units per credit (INV-2), holding
 /// the fenced void and deferring collection until cleanup completes.

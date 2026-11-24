@@ -8234,7 +8234,11 @@ mod staged_disposal_gate_tests {
         let deferred = registry
             .staged_scope_gaps_for_test()
             .into_iter()
-            .filter(|(subject, _)| subject == "fold deferred: staged disposal in flight")
+            .filter(|(subject, reason)| {
+                subject == "fold deferred: staged disposal in flight"
+                    && reason
+                        == "the retired instance and its staged feeds remain in inventory while a void disposal drains; the fold retries after the disposal"
+            })
             .count();
         assert_eq!(deferred, 2, "each deferred fold counts its gap");
         let mut polls = 1usize;
@@ -8338,8 +8342,9 @@ mod staged_disposal_gate_tests {
             .staged_scope_gaps_for_test()
             .into_iter()
             .filter(|(subject, reason)| {
-                subject == STAGED_DISPOSAL_INSTANCE_LOST_SUBJECT
-                    && reason == STAGED_DISPOSAL_INSTANCE_LOST_REASON
+                subject == "staged disposal instance retired mid-disposal"
+                    && reason
+                        == "the instance under disposal was removed before its staged calls disposed; its preserved unknown-key rows are lost"
             })
             .count();
         assert_eq!(lost, 1, "the lost cursor counts exactly one named gap");

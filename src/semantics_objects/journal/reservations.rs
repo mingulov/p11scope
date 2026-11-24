@@ -2629,6 +2629,68 @@ mod tests {
     }
 
     #[test]
+    fn resource_reservations_unindexed_budgeted_pop_resumes_past_the_credit_window() {
+        // A vacancy past the 64-credit window must stay reachable: the
+        // scan resumes across retries instead of re-scanning from zero
+        // forever (a Yield without progress wedges the minting
+        // disposal, which re-polls with a fresh gate per credit).
+        let mut table = ReservationTable::<()>::try_new(MAX_INDEXED + 1).unwrap();
+        assert!(!table.indexed());
+        for at in 0..64 {
+            table.init_fresh_operation(at);
+        }
+        assert_eq!(table.census(), 64);
+        let mut found = None;
+        for retry in 0..300 {
+            let mut gate = LeafBudget::new(64);
+            match table.budgeted_free_pop(&mut gate) {
+                FreePopOutcome::Slot(at) => {
+                    found = Some(at);
+                    break;
+                }
+                FreePopOutcome::Full => {
+                    panic!("a vacancy at slot 64 must not refuse Full");
+                }
+                FreePopOutcome::Yield => {
+                    assert!(gate.spent() <= 64, "retry {retry} spent above INV-2");
+                }
+            }
+        }
+        assert_eq!(found, Some(64), "the retry scan reaches the vacancy");
+    }
+
+    #[test]
+    fn resource_reservations_unindexed_budgeted_pop_refuses_full_table_with_bounded_retries() {
+        // A truly full unindexed table refuses Full after bounded
+        // 64-credit retries — full coverage across calls — instead of
+        // yielding forever (no 64-credit gate covers 13,107 slots at
+        // once, so one call can never prove fullness alone).
+        let mut table = ReservationTable::<()>::try_new(MAX_INDEXED + 1).unwrap();
+        assert!(!table.indexed());
+        for at in 0..MAX_INDEXED + 1 {
+            table.init_fresh_operation(at);
+        }
+        assert_eq!(table.census(), MAX_INDEXED + 1);
+        let mut refused = false;
+        for retry in 0..300 {
+            let mut gate = LeafBudget::new(64);
+            match table.budgeted_free_pop(&mut gate) {
+                FreePopOutcome::Full => {
+                    refused = true;
+                    break;
+                }
+                FreePopOutcome::Slot(at) => {
+                    panic!("a full table must not offer slot {at}");
+                }
+                FreePopOutcome::Yield => {
+                    assert!(gate.spent() <= 64, "retry {retry} spent above INV-2");
+                }
+            }
+        }
+        assert!(refused, "bounded retries cover the full table and refuse");
+    }
+
+    #[test]
     fn resource_reservations_high_slot_release_preserves_colliding_chain_across_reuse() {
         // Three same-bucket Association keys with the middle member in
         // high slot 4,095: releasing it (plus its Raw sibling) must

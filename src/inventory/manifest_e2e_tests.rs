@@ -4077,14 +4077,17 @@ struct KeysizeCanaryMapScan {
     bytes: u64,
 }
 
-/// The one undumpable non-ring map: `THREAD_OWNER` task storage is
-/// keyed by live task, so `bpftool map dump` refuses it. Its value
-/// type (`struct thread_owner` in `crates/ebpf/native/task_owner.h`)
-/// holds identity/lease/counter words only — no length cell, no
-/// payload buffer — and userspace never reads it (`K::Unsupported` in
-/// `src/attach/inventory.rs`). Anything else undumpable fails closed.
-fn keysize_canary_is_identity_task_storage(name: &str, kind: &str) -> bool {
-    name == "THREAD_OWNER" && kind == "task_storage"
+/// Undumpable task storage: task-keyed maps refuse `bpftool map dump`
+/// by kernel construction, so the cell lists them instead of dumping.
+/// Every map of this class holds minted identity words only, never
+/// target-memory reads — `THREAD_OWNER` is the identity/lease/counter
+/// struct (`crates/ebpf/native/task_owner.h`, no length cell and no
+/// payload buffer), `TASK_COOKIE`/`TASK_COOKIE_B`/`ROOT_AFFILIATION`
+/// are single minted ticket words — and all of them load as
+/// `Map::Unsupported`, which no output renderer consumes. Anything
+/// else undumpable fails closed.
+fn keysize_canary_is_undumpable_task_storage(kind: &str) -> bool {
+    kind == "task_storage"
 }
 
 /// The length stash must be among the dumped maps: without
@@ -4138,8 +4141,8 @@ fn keysize_canary_scan_owned_maps(pid: u32, dump_dir: &Path) -> Result<KeysizeCa
             rings.push(format!("{name} ({id})"));
             continue;
         }
-        if keysize_canary_is_identity_task_storage(&name, &kind) {
-            task_storage.push(format!("{name} ({id})"));
+        if keysize_canary_is_undumpable_task_storage(&kind) {
+            task_storage.push(format!("{name} ({id}/{kind})"));
             continue;
         }
         let dump = Command::new("bpftool")
@@ -4229,22 +4232,16 @@ fn keysize_canary_evidence_start_cover_requires_the_stash() {
 }
 
 #[test]
-fn keysize_canary_identity_task_storage_matches_one_map() {
-    assert!(keysize_canary_is_identity_task_storage(
-        "THREAD_OWNER",
-        "task_storage"
-    ));
-    assert!(!keysize_canary_is_identity_task_storage(
-        "THREAD_OWNER",
-        "hash"
-    ));
-    assert!(!keysize_canary_is_identity_task_storage(
-        "EVIDENCE_START",
-        "task_storage"
-    ));
-    assert!(!keysize_canary_is_identity_task_storage(
-        "EVENTS", "ringbuf"
-    ));
+fn keysize_canary_task_storage_matches_the_whole_class() {
+    // Every task-storage map is undumpable, whatever its name.
+    assert!(keysize_canary_is_undumpable_task_storage("task_storage"));
+    // Every other kind dumps (or fails the cell trying).
+    for kind in ["hash", "array", "ringbuf", "percpu_array", "prog_array"] {
+        assert!(
+            !keysize_canary_is_undumpable_task_storage(kind),
+            "{kind} must not join the task-storage exclusion"
+        );
+    }
 }
 
 /// Task 4 privacy canary, live: `inventory --pid --capture native

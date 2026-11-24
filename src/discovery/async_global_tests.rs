@@ -1923,6 +1923,7 @@ fn async_global_ended_pid_retire_opens_no_coverage_window() {
         exec_preservations: Vec::new(),
         exec_completions: Vec::new(),
         built_by_full_rebuild: false,
+        modules_unchanged: false,
     };
     let outcome = engine
         .apply_candidate_with_ended(&mut session, candidate, &mut true, true, &[], Some(&ended))

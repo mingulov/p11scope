@@ -280,6 +280,7 @@ fn growth_candidate(
         exec_preservations: Vec::new(),
         exec_completions: Vec::new(),
         built_by_full_rebuild: false,
+        modules_unchanged: false,
     }
 }
 

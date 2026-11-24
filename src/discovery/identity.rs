@@ -3739,6 +3739,56 @@ impl PinnedObjects {
         self
     }
 
+    /// Whether any raw alias still names `id`: a view-owned raw mapping
+    /// to it, or a global (mount-namespace-less) raw mapping to it.
+    /// Carrier-pin reclaim keeps aliased ids even when claimless and
+    /// rowless (run-learned tables and global observations alias here).
+    pub(crate) fn object_has_raw_aliases(&self, id: PinnedObjectId) -> bool {
+        self.raw_to_id.iter().any(|(raw, mapped)| {
+            *mapped == id
+                && (raw.mount_namespace.is_none()
+                    || self.raw_ownership.values().any(|owned| owned.contains(raw)))
+        })
+    }
+
+    /// Removes one reclaimable carrier-only object: its entry, its raw
+    /// mappings, and any dangling claim/target/raw references to it.
+    /// The caller proves no row, claim, alias, slot, selection,
+    /// manifest, prearm or context owner still needs the id; this
+    /// scrubs defensively so a missed claimant cannot strand. Returns
+    /// true when an entry was removed. Synchronous, like
+    /// [`Self::remove_view_except`]: carrier detach retires at most a
+    /// few objects per tick (carriers merge by file), so closes stay
+    /// bounded without a handoff.
+    pub(crate) fn remove_unowned_object(&mut self, id: PinnedObjectId) -> bool {
+        if !self.by_id.contains_key(&id) {
+            return false;
+        }
+        self.bump_revision();
+        self.by_id.remove(&id);
+        let raws: Vec<RawObjectInstance> = self
+            .raw_to_id
+            .iter()
+            .filter(|&(_, mapped)| *mapped == id)
+            .map(|(raw, _)| raw.clone())
+            .collect();
+        for raw in &raws {
+            self.raw_to_id.remove(raw);
+        }
+        for owned in self.raw_ownership.values_mut() {
+            for raw in &raws {
+                owned.remove(raw);
+            }
+        }
+        self.scrub_proven_targets(std::iter::once(id));
+        for claims in self.ownership.values_mut() {
+            claims.tables.retain(|claimed| *claimed != id);
+            claims.targets.retain(|(claimed, _)| *claimed != id);
+            claims.pins.retain(|claimed| *claimed != id);
+        }
+        true
+    }
+
     /// Whether `module`'s own file raw and every table-entry
     /// dependency raw already file under `view` with live committed
     /// identities behind them. Learned tables consult this before

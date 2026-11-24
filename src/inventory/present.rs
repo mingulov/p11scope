@@ -2223,15 +2223,26 @@ fn inferred_row_detail(row: &crate::key_operation_projection::KeyAggRow) -> Opti
             if let Some((detail, tag)) = inferred.size.detail.as_ref() {
                 // An established mismatch pins no second side: the
                 // conflict still says so, naming the inferred value
-                // against the established label on the row.
+                // against the established label on the row. An
+                // `unknown` row carries no combined label, so its
+                // established conflict went through the key-type
+                // gate: the fragment names the type conflict instead
+                // of an `unknown` label.
                 let rest =
                     u64::from(inferred.size.conflict_detail.is_some()) + inferred.size.further;
                 if rest == 0 {
-                    fragments.push(format!(
-                        "size conflicting ({} vs established {})",
-                        size_verbose(detail, *tag),
-                        row.metadata_at_use
-                    ));
+                    if row.metadata_at_use == crate::key_operation_projection::METADATA_UNKNOWN {
+                        fragments.push(format!(
+                            "size conflicting ({} vs established key type)",
+                            size_verbose(detail, *tag)
+                        ));
+                    } else {
+                        fragments.push(format!(
+                            "size conflicting ({} vs established {})",
+                            size_verbose(detail, *tag),
+                            row.metadata_at_use
+                        ));
+                    }
                 } else {
                     fragments.push(format!(
                         "{}, +{rest} more conflicting size",

@@ -1485,7 +1485,12 @@ never imply S1 loss.
   remains, as does any stronger unknown, and under `-v` the row
   reads `size unsupported (outside admission bound)` only when
   that reason is set. A later classified size replaces a
-  detail-less `unsupported` with its value. On a rowless wrap or fresh-view unwrap
+  detail-less `unsupported` with its value, except forward-filled
+  parks, which still pin. When typed evidence arrives on a row
+  already holding a wrapped-vs-wrapped conflict, the typed detail
+  becomes the value while the earlier wrapped side stays pinned:
+  conflict sides may pair a typed detail with earlier wrapped
+  evidence. On a rowless wrap or fresh-view unwrap
   the above-bound observation
   leaves no park and contributes no wrapped-size evidence to the
   subsequent row.

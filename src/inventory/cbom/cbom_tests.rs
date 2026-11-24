@@ -1153,16 +1153,17 @@ fn cbom_limit_only_mac_mechanisms_classify_mac() {
         (0x1084, "CKM_AES_MAC_GENERAL"),
         (0x123, "CKM_DES_MAC"),
     ] {
-        let algorithm =
-            library_component(&document, &format!("p11scope:mechanism:0x{id:x}"));
-        assert_eq!(algorithm["name"], name, "0x{id:x} keeps its registered name");
+        let algorithm = library_component(&document, &format!("p11scope:mechanism:0x{id:x}"));
+        assert_eq!(
+            algorithm["name"], name,
+            "0x{id:x} keeps its registered name"
+        );
         assert_eq!(
             algorithm["description"],
             "Mechanism reported by the provider (C_GetMechanismInfo); no use observed."
         );
         assert_eq!(
-            algorithm["cryptoProperties"]["algorithmProperties"]["primitive"],
-            "mac",
+            algorithm["cryptoProperties"]["algorithmProperties"]["primitive"], "mac",
             "0x{id:x} classifies as a MAC"
         );
         assert!(

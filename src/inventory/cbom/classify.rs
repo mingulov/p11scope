@@ -75,7 +75,17 @@ fn primitive_of(
         // ECDH matched above; nothing else named `*DSA*` signs nothing.
         return (Some("signature"), None, None);
     }
-    if name.contains("HMAC") || name.contains("_CMAC") || name.contains("GMAC") {
+    if name.contains("HMAC")
+        || name.contains("_CMAC")
+        || name.contains("GMAC")
+        || name.contains("_MAC")
+    {
+        // Every registered `_MAC` spelling is a message
+        // authentication code (the `KEY_AND_MAC_DERIVE` key
+        // derivation spellings matched the kdf rule above); this
+        // must precede the block-cipher family fallback so
+        // `CKM_AES_MAC`/`CKM_DES_MAC` and their siblings never read
+        // as encryption.
         return (Some("mac"), None, None);
     }
     if name.contains("SHAKE") {

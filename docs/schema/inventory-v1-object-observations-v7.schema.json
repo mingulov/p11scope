@@ -1246,8 +1246,30 @@
               "additionalProperties": false,
               "properties": {
                 "kind": {"const": "ec"},
-                "curve": {"enum": ["p256", "p384", "p521"]},
-                "octets": {"enum": [64, 96, 132]},
+                "curve": {"const": "p256"},
+                "octets": {"const": 64},
+                "evidence": {"enum": ["sign_output", "verify_input"]}
+              }
+            },
+            {
+              "type": "object",
+              "required": ["kind", "curve", "octets", "evidence"],
+              "additionalProperties": false,
+              "properties": {
+                "kind": {"const": "ec"},
+                "curve": {"const": "p384"},
+                "octets": {"const": 96},
+                "evidence": {"enum": ["sign_output", "verify_input"]}
+              }
+            },
+            {
+              "type": "object",
+              "required": ["kind", "curve", "octets", "evidence"],
+              "additionalProperties": false,
+              "properties": {
+                "kind": {"const": "ec"},
+                "curve": {"const": "p521"},
+                "octets": {"const": 132},
                 "evidence": {"enum": ["sign_output", "verify_input"]}
               }
             },

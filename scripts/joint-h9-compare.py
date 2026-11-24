@@ -126,6 +126,9 @@ PQC_EVIDENCE = ("encapsulate_output", "decapsulate_input", "sign_output",
                 "verify_input")
 WRAP_EVIDENCE = ("wrap_output", "unwrap_input")
 EC_CURVES = ("p256", "p384", "p521")
+# Exact curve/width pairs (§10.2): a curve validates only
+# beside its own signature width, never a crossed pair.
+EC_CURVE_OCTETS = {"p256": 64, "p384": 96, "p521": 132}
 EDDSA_CURVES = ("ed25519", "ed448")
 DSA_LABELS = ("dsa_1024", "dsa_2048_224", "dsa_2048_256_or_3072")
 PQC_SETS = ("ml_kem_512", "ml_kem_768", "ml_kem_1024", "ml_dsa_44",
@@ -417,7 +420,7 @@ def _check_size_detail(detail, where):
                  f"{where}: unexpected fields")
         _require(detail["curve"] in EC_CURVES,
                  f"{where}: ec curve invalid")
-        _require(detail["octets"] in (64, 96, 132),
+        _require(detail["octets"] == EC_CURVE_OCTETS[detail["curve"]],
                  f"{where}: ec octets invalid")
         _require(detail["evidence"] in SIGN_EVIDENCE,
                  f"{where}: size detail evidence invalid")

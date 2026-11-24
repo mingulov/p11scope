@@ -240,6 +240,9 @@ PQC_EVIDENCE = ("encapsulate_output", "decapsulate_input", "sign_output",
                 "verify_input")
 WRAP_EVIDENCE = ("wrap_output", "unwrap_input")
 EC_CURVES = ("p256", "p384", "p521")
+# Exact curve/width pairs (§10.2): a curve validates only
+# beside its own signature width, never a crossed pair.
+EC_CURVE_OCTETS = {"p256": 64, "p384": 96, "p521": 132}
 EDDSA_CURVES = ("ed25519", "ed448")
 DSA_LABELS = ("dsa_1024", "dsa_2048_224", "dsa_2048_256_or_3072")
 PQC_SETS = ("ml_kem_512", "ml_kem_768", "ml_kem_1024", "ml_dsa_44", "ml_dsa_65",
@@ -658,8 +661,8 @@ def _check_size_detail(detail):
         _label(detail["evidence"], RSA_EVIDENCE, "size detail evidence")
     elif kind == "ec":
         _keys(detail, {"kind", "curve", "octets", "evidence"})
-        _label(detail["curve"], EC_CURVES, "size detail curve")
-        _require(detail["octets"] in (64, 96, 132), "invalid curve detail")
+        curve = _label(detail["curve"], EC_CURVES, "size detail curve")
+        _require(detail["octets"] == EC_CURVE_OCTETS[curve], "invalid curve detail")
         _label(detail["evidence"], SIGN_EVIDENCE, "size detail evidence")
     elif kind == "ec_class":
         _keys(detail, {"kind", "octets", "evidence"})

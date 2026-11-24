@@ -100,8 +100,9 @@ ChaCha20/RC4/Salsa20 stream ciphers, `_GCM`/`_CCM` authenticated
 encryption, RSA asymmetric encryption except signature spellings, DSA /
 ECDSA / EdDSA / ML-DSA / SLH-DSA signatures, DH/ECDH key agreement,
 HKDF/PBKDF/TLS-PRF key derivation, ML-KEM key encapsulation,
-SHA-2/SHA-3/MD2/MD5/RIPEMD/BLAKE2 hash, HMAC message authentication,
-SHAKE extendable output); mode/padding suffixes (`_CBC`, `_ECB`,
+SHA-2/SHA-3/MD2/MD5/RIPEMD/BLAKE2 hash, HMAC/CMAC/GMAC/`_MAC`
+message authentication, SHAKE extendable output); mode/padding
+suffixes (`_CBC`, `_ECB`,
 `_GCM`, `_CCM`, `_CTR`, `_CFB`, `_OFB`, `_OAEP`, `_PKCS`, `_PAD`) →
 `mode`/`padding`. `cryptoFunctions` comes from the input's observed
 operation categories (`sign`, `encrypt`, …), never from the name.

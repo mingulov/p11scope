@@ -711,8 +711,9 @@ omits the length programs); when the sizes start fails — for
 example a length program the verifier refuses — the journal retries
 without sizes behind a `key sizes unavailable` gap and key rows
 continue without operation-length sizes. The Task 4 privacy canary
-for `--key-sizes` ran on 2026-11-24 (rev e86bc2bd5, Fedora kernel
-7.2.9, 5/5 passes) and passed: a live `inventory --pid --capture
+for `--key-sizes` ran on 2026-11-24 (Fedora kernel 7.2.9, 6/6
+passes, latest rev debee08c1) and passed: a live `inventory --pid
+--capture
 native --key-operations --key-sizes` capture over a sentinel-guarded
 sign+verify workload (64-byte `K3YS1Z3CANARY!` guards with an
 embedded 256-valued collision word beside the S length cell and the

@@ -2394,8 +2394,9 @@ sign-off at 0.9.x; Task 2 reviews `rv-v080-keymeta-t2` +
 `rv-v080-keymeta-t2-sr` + `hy4-rv-v080-keymeta-t2` with 8 fix
 rounds including the codex B1 fetch-mask over-read fix; Task 3
 join/publication landed). The Task 4 `--key-sizes` canary passed on
-2026-11-24 (live sentinel run, lane v080-keysizes-canary, rev
-e86bc2bd5 on Fedora kernel 7.2.9, 5/5 passes: S/V protocols on LP64,
+2026-11-24 (live sentinel run, lane v080-keysizes-canary on Fedora
+kernel 7.2.9, 6/6 passes with latest rev debee08c1: S/V protocols on
+LP64,
 the marker absent from the JSON report, the event log, the observer
 log and every owned BPF map including `EVIDENCE_START`, with
 positive controls and published RSA-2048 sizes; the committed cell

@@ -1677,10 +1677,32 @@ fn learned_private_mount_oracle_requires_the_full_round() {
 /// `already scan-covered; not staged` refusal, or gap prose never
 /// match: the name is boundary-pinned (`/name (`), the shape is exact.
 fn is_fresh_staging_line_for(line: &str, file_name: &str) -> bool {
+    // The engine emits `p11scope: learned provider {display} (first
+    // loaded by {loader}): {loads} earlier loads missed; attached for
+    // later runs` exactly once per newly staged file. Only the display
+    // field names the file: the basename must end the display at a
+    // slash boundary, and the loader segment must keep its own
+    // "<loader>): <loads>" shape, so loader free text can never match.
+    const PREFIX: &str = "p11scope: learned provider ";
+    const MID: &str = " (first loaded by ";
+    const SUFFIX: &str = " earlier loads missed; attached for later runs";
     let line = line.trim_end();
-    line.starts_with("p11scope: learned provider ")
-        && line.contains(&format!("/{file_name} (first loaded by "))
-        && line.ends_with(" earlier loads missed; attached for later runs")
+    let Some(rest) = line.strip_prefix(PREFIX) else {
+        return false;
+    };
+    let Some(rest) = rest.strip_suffix(SUFFIX) else {
+        return false;
+    };
+    let Some(split) = rest.find(MID) else {
+        return false;
+    };
+    let (display, after) = rest.split_at(split);
+    let loader = &after[MID.len()..];
+    display
+        .strip_suffix(file_name)
+        .is_some_and(|prefix| prefix.ends_with('/'))
+        && loader.contains("): ")
+        && !loader.contains(MID)
 }
 
 /// Negative controls for the staging gate above: only the fresh
@@ -1758,6 +1780,12 @@ fn fresh_staging_line_rejects_malformed_staging_lines() {
         "p11scope: learned provider /tmp/cell/mnt/prefixlibprivatemnt-123-p28.so (first loaded by /tmp/cell/p28-mnt-holder): 1 earlier loads missed; attached for later runs\n",
         file_name,
     ));
+    // A display path carrying its own loader separator: the split
+    // would land inside the display, so the loader side must reject.
+    assert!(!is_fresh_staging_line_for(
+        "p11scope: learned provider /tmp/cell/mnt/libprivatemnt-123-p28.so (first loaded by impostor) (first loaded by /tmp/cell/p28-mnt-holder): 1 earlier loads missed; attached for later runs\n",
+        file_name,
+    ));
 }
 
 /// Whether the profile carries the learned first-use gap as a
@@ -1808,27 +1836,91 @@ fn first_use_gap_record_requires_the_structured_skip() {
     assert!(!has_first_use_gap_record(&serde_json::json!({})));
 }
 
+/// The workload ledger as one typed result: exactly the eight
+/// counters the C fixture emits, with the counts its loop dictates.
+/// Per iteration the fixture issues one `C_GetInfo`, one unconditional
+/// `C_GetSlotList` plus one more when the slot set is non-empty, one
+/// `C_GetSlotInfo`/`C_GetTokenInfo` per listed slot (at most 64 per
+/// iteration), and per listed slot one `C_GetMechanismList` plus one
+/// more — with one `C_GetMechanismInfo` — when the slot has
+/// mechanisms. An empty, partial, or impossible ledger never
+/// validates — comparing exact counts against silence, or against
+/// counts the fixture cannot emit, would pass on nothing observed.
+struct WorkloadLedger {
+    initialize: u64,
+    finalize: u64,
+    get_info: u64,
+    get_slot_list: u64,
+    get_slot_info: u64,
+    get_token_info: u64,
+    get_mechanism_list: u64,
+    get_mechanism_info: u64,
+}
+
+impl WorkloadLedger {
+    fn parse(ledger: &BTreeMap<String, u64>) -> Option<Self> {
+        const NAMES: [&str; 8] = [
+            "C_Initialize",
+            "C_Finalize",
+            "C_GetInfo",
+            "C_GetSlotList",
+            "C_GetSlotInfo",
+            "C_GetTokenInfo",
+            "C_GetMechanismList",
+            "C_GetMechanismInfo",
+        ];
+        if ledger.len() != NAMES.len() || NAMES.iter().any(|name| !ledger.contains_key(*name)) {
+            return None;
+        }
+        let get = |name: &str| ledger.get(name).copied().unwrap_or(0);
+        Some(Self {
+            initialize: get("C_Initialize"),
+            finalize: get("C_Finalize"),
+            get_info: get("C_GetInfo"),
+            get_slot_list: get("C_GetSlotList"),
+            get_slot_info: get("C_GetSlotInfo"),
+            get_token_info: get("C_GetTokenInfo"),
+            get_mechanism_list: get("C_GetMechanismList"),
+            get_mechanism_info: get("C_GetMechanismInfo"),
+        })
+    }
+
+    fn validates(&self) -> bool {
+        let iters = u64::from(ITERS);
+        if self.initialize != 1 || self.finalize != 1 || self.get_info != iters {
+            return false;
+        }
+        // One unconditional slot-list query per iteration, plus one per
+        // iteration with a non-empty slot set.
+        if !(iters..=2 * iters).contains(&self.get_slot_list) {
+            return false;
+        }
+        // Slot info and token info share one loop over the listed slots.
+        if self.get_slot_info != self.get_token_info {
+            return false;
+        }
+        let iters_with_slots = self.get_slot_list.saturating_sub(iters);
+        // Every iteration with slots lists 1..=64 of them.
+        if self.get_slot_info < iters_with_slots
+            || self.get_slot_info > iters_with_slots.saturating_mul(64)
+        {
+            return false;
+        }
+        // One mechanism-list query per listed slot, plus one per slot
+        // with mechanisms; mechanism info runs at most once per slot.
+        // (Saturating: absurd counts already fail the slot bounds above.)
+        let mech_want = self.get_slot_info.saturating_add(self.get_mechanism_info);
+        if self.get_mechanism_list != mech_want || self.get_mechanism_info > self.get_slot_info {
+            return false;
+        }
+        true
+    }
+}
+
 /// Whether the workload ledger has the known shape the C fixture
-/// emits: exactly the eight counters, one Initialize, one Finalize,
-/// and `ITERS` GetInfo calls. An empty or partial ledger never
-/// validates — comparing exact counts against silence would pass on
-/// nothing observed.
+/// emits, validated as one typed result (see [`WorkloadLedger`]).
 fn validate_workload_ledger(ledger: &BTreeMap<String, u64>) -> bool {
-    const NAMES: [&str; 8] = [
-        "C_Initialize",
-        "C_Finalize",
-        "C_GetInfo",
-        "C_GetSlotList",
-        "C_GetSlotInfo",
-        "C_GetTokenInfo",
-        "C_GetMechanismList",
-        "C_GetMechanismInfo",
-    ];
-    ledger.len() == NAMES.len()
-        && NAMES.iter().all(|name| ledger.contains_key(*name))
-        && ledger.get("C_Initialize").copied() == Some(1)
-        && ledger.get("C_Finalize").copied() == Some(1)
-        && ledger.get("C_GetInfo").copied() == Some(u64::from(ITERS))
+    WorkloadLedger::parse(ledger).is_some_and(|typed| typed.validates())
 }
 
 /// Negative controls for the ledger shape above: only the known
@@ -1916,6 +2008,23 @@ fn workload_ledger_validator_rejects_impossible_slot_list_counts() {
             "C_GetSlotList = {bad} is outside ITERS..=2*ITERS"
         );
     }
+    // Isolated bound violations: silent slots below the floor fail
+    // only the lower bound, and consistent slot counters above the cap
+    // fail only the upper bound.
+    let mut below_floor = good.clone();
+    below_floor.insert("C_GetSlotList".to_string(), u64::from(ITERS) - 1);
+    below_floor.insert("C_GetSlotInfo".to_string(), 0);
+    below_floor.insert("C_GetTokenInfo".to_string(), 0);
+    below_floor.insert("C_GetMechanismList".to_string(), 0);
+    below_floor.insert("C_GetMechanismInfo".to_string(), 0);
+    assert!(!validate_workload_ledger(&below_floor));
+    let mut above_cap = good.clone();
+    above_cap.insert("C_GetSlotList".to_string(), 2 * u64::from(ITERS) + 1);
+    above_cap.insert("C_GetSlotInfo".to_string(), u64::from(ITERS) + 1);
+    above_cap.insert("C_GetTokenInfo".to_string(), u64::from(ITERS) + 1);
+    above_cap.insert("C_GetMechanismList".to_string(), 2 * (u64::from(ITERS) + 1));
+    above_cap.insert("C_GetMechanismInfo".to_string(), u64::from(ITERS) + 1);
+    assert!(!validate_workload_ledger(&above_cap));
 }
 
 /// The C loop dictates the slot/mechanism relationships: slot info and

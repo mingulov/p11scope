@@ -906,20 +906,25 @@ fn carried_fix3_watch_backlog_refuses_loudly_when_full() {
         loader_unknown_reason: None,
         module,
     };
+    assert_eq!(
+        super::OWNED_LEARN_DEFERRED_CAP,
+        128,
+        "the backlog bound is two strides, pinned absolutely"
+    );
     for _ in 0..super::OWNED_LEARN_DEFERRED_CAP {
         engine.defer_owned_learn_proof(&proof, &view, &pins);
     }
     assert_eq!(
         engine.owned_learn_deferred.len(),
-        super::OWNED_LEARN_DEFERRED_CAP,
-        "the backlog fills to its cap"
+        128,
+        "the backlog fills to 128"
     );
     let skipped_before = engine.learned_cap_skipped();
     engine.defer_owned_learn_proof(&proof, &view, &pins);
     assert_eq!(
         engine.owned_learn_deferred.len(),
-        super::OWNED_LEARN_DEFERRED_CAP,
-        "past the cap nothing more queues"
+        128,
+        "the 129th proof queues nowhere"
     );
     assert_eq!(
         engine.learned_cap_skipped(),

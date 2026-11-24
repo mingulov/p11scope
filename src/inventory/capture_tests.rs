@@ -3563,26 +3563,32 @@ fn a_phased_stop_with_an_owed_exit_decision_past_its_deadline_finishes_exact() {
         .into_finite_stop(NativeStopDisposition::Completed, None)
         .ok()
         .expect("a completed pass admits the phased stop");
+    // Scripted stop clock: every step decides under the fixture's
+    // time, never the wall clock, so the run proves the expiry arm
+    // ran however slow the host is.
+    let t0 = Instant::now();
+    let scripted = std::cell::Cell::new(t0);
     let clock = LoopClock {
         deadline: None,
         stop: &|| false,
-        now: &Instant::now,
+        now: &|| scripted.get(),
         interval: Duration::ZERO,
         tick: Duration::from_millis(1),
         collection_tick: Duration::ZERO,
     };
-    let mut yielded = false;
+    let mut advanced = false;
     loop {
-        let now = Instant::now();
+        let now = scripted.get();
         match stop.step(&mut host, now, now + Duration::from_secs(60), &clock) {
             NativeStopProgress::Pending(next) => {
                 stop = next;
-                // Yield to the clock after the first terminal-refresh
-                // staging (past begin_stop: pass-time and terminal
-                // stages do not count): the cooperative driver then
-                // observes the expired deadline on its next step,
-                // like a real retained run that yields between steps.
-                if !yielded {
+                // Advance past the deadline after the first
+                // terminal-refresh staging (past begin_stop:
+                // pass-time and terminal stages do not count): the
+                // cooperative driver then observes the expired
+                // deadline on its next step, like a real retained
+                // run that yields between steps.
+                if !advanced {
                     let logged = entries(&log);
                     if let Some(stopped_at) = logged.iter().position(|entry| entry == "begin_stop")
                     {
@@ -3591,8 +3597,16 @@ fn a_phased_stop_with_an_owed_exit_decision_past_its_deadline_finishes_exact() {
                             .filter(|entry| *entry == "stage:witness")
                             .count();
                         if refresh_stages >= 1 {
-                            std::thread::sleep(Duration::from_millis(100));
-                            yielded = true;
+                            // The staging decided under a pre-deadline
+                            // clock, so its Stage arm must have yielded
+                            // ReadOn: the expiry arm below is the only
+                            // decider this run can reach.
+                            assert!(
+                                matches!(stop.phase, NativeStopPhase::PostWitness),
+                                "the first staging reads on for the expiry arm"
+                            );
+                            scripted.set(t0 + Duration::from_millis(100));
+                            advanced = true;
                         }
                     }
                 }
@@ -3600,7 +3614,7 @@ fn a_phased_stop_with_an_owed_exit_decision_past_its_deadline_finishes_exact() {
             NativeStopProgress::Stopped(_) => break,
         }
     }
-    assert!(yielded, "the run staged its terminal refresh");
+    assert!(advanced, "the run staged its terminal refresh");
     let log = entries(&log);
     let stopped_at = log.iter().position(|entry| entry == "begin_stop").unwrap();
     let reads = log[stopped_at..]
@@ -3642,24 +3656,28 @@ fn a_phased_stop_with_no_exact_refresh_past_its_deadline_reports_the_loss() {
         .into_finite_stop(NativeStopDisposition::Completed, None)
         .ok()
         .expect("a completed pass admits the phased stop");
+    // Scripted stop clock, like the exact twin: the loss below is
+    // the deadline re-entry's, never a read-straddling race, however
+    // slow the host is.
+    let t0 = Instant::now();
+    let scripted = std::cell::Cell::new(t0);
     let clock = LoopClock {
         deadline: None,
         stop: &|| false,
-        now: &Instant::now,
+        now: &|| scripted.get(),
         interval: Duration::ZERO,
         tick: Duration::from_millis(1),
         collection_tick: Duration::ZERO,
     };
-    let mut yielded = false;
+    let mut advanced = false;
     loop {
-        let now = Instant::now();
+        let now = scripted.get();
         match stop.step(&mut host, now, now + Duration::from_secs(60), &clock) {
             NativeStopProgress::Pending(next) => {
                 stop = next;
-                // Yield to the clock after the first terminal-refresh
-                // staging, like the exact twin: the loss below is the
-                // deadline re-entry's, not a read-straddling race.
-                if !yielded {
+                // Advance past the deadline after the first
+                // terminal-refresh staging, like the exact twin.
+                if !advanced {
                     let logged = entries(&log);
                     if let Some(stopped_at) = logged.iter().position(|entry| entry == "begin_stop")
                     {
@@ -3668,8 +3686,12 @@ fn a_phased_stop_with_no_exact_refresh_past_its_deadline_reports_the_loss() {
                             .filter(|entry| *entry == "stage:witness")
                             .count();
                         if refresh_stages >= 1 {
-                            std::thread::sleep(Duration::from_millis(100));
-                            yielded = true;
+                            assert!(
+                                matches!(stop.phase, NativeStopPhase::PostWitness),
+                                "the first staging reads on for the expiry arm"
+                            );
+                            scripted.set(t0 + Duration::from_millis(100));
+                            advanced = true;
                         }
                     }
                 }
@@ -3677,7 +3699,7 @@ fn a_phased_stop_with_no_exact_refresh_past_its_deadline_reports_the_loss() {
             NativeStopProgress::Stopped(_) => break,
         }
     }
-    assert!(yielded, "the run staged its terminal refresh");
+    assert!(advanced, "the run staged its terminal refresh");
     let log = entries(&log);
     let stopped_at = log.iter().position(|entry| entry == "begin_stop").unwrap();
     let reads = log[stopped_at..]

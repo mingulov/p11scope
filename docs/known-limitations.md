@@ -743,18 +743,23 @@ omits the length programs); when the sizes start fails — for
 example a length program the verifier refuses — the journal retries
 without sizes behind a `key sizes unavailable` gap and key rows
 continue without operation-length sizes. The Task 4 privacy canary
-for `--key-sizes` ran on 2026-11-24 (Fedora kernel 7.2.9, 6/6
-passes, latest rev debee08c1) and passed: a live `inventory --pid
---capture
-native --key-operations --key-sizes` capture over a sentinel-guarded
-sign+verify workload (64-byte `K3YS1Z3CANARY!` guards with an
-embedded 256-valued collision word beside the S length cell and the
-V buffers) found the marker in none of the JSON report, the event
-log, the observer log or any BPF map owned by the observer
-(including `EVIDENCE_START`), while both RSA-2048 sizes published
-from `sign_output`/`verify_input` evidence. The scanner's positive
-control (an injected marker copy it must find) and the size verdict
-keep the cell non-vacuous; the committed cell is
+for `--key-sizes` passed on 2026-11-24 (Fedora kernel 7.2.9): the
+committed cell passed 3/3 at rev c6f684673, after 6/6 across earlier
+verdict revisions with a manual map supplement. A live `inventory
+--pid --capture native --key-operations --key-sizes --verbose`
+capture over a sentinel-guarded sign+verify workload (pure repeated
+64-byte `K3YS1Z3CANARY!` guards around the S length cell and the V
+buffers, marked message inputs) found the marker in none of the JSON
+report, the event log, the verbose observer log or any of the 66
+dumpable BPF maps owned by the observer (raw+hex scan, including
+`EVIDENCE_START`), while both RSA-2048 sizes published from
+`sign_output`/`verify_input` evidence. The `EVENTS`/`DISCOVERY`/`INFO`
+ringbufs are not bpftool-dumpable and are covered via the scanned
+outputs they drain into; the task-storage identity maps are likewise
+undumpable, hold minted identity words only, and are never read.
+Positive controls on every scanner (an injected marker copy each must
+find) and the mirrored size verdict keep the cell non-vacuous; the
+committed cell is
 `privileged_inventory_pid_key_sizes_canary_no_payload_leak`.
 Live coverage is the S and V protocols on LP64; the remaining nine
 endpoints ride the same adapters with exact read-set twins at the

@@ -854,6 +854,11 @@ struct JournalDeathMarks {
     /// fallback close counts it as its own field (see
     /// [`FallbackFenceDecision::straddlers`]).
     straddler: Option<u64>,
+    /// The refusing seal stopped at its deciding mismatch with rows it
+    /// never paid for still staged: more straddlers may sit there, so
+    /// the close names its count as a lower bound
+    /// ([`FallbackFenceDecision::straddlers_at_least`]).
+    straddlers_unscanned: bool,
 }
 
 /// One proof-destroying fallback close's fence on a dead key: the
@@ -906,15 +911,21 @@ pub(crate) struct FallbackFenceDecision {
     /// close's replayed or disposed `calls` (which may include it), so
     /// the loss names its cause instead of folding silently into this
     /// close's count. A seal stops at its first birth mismatch, so at
-    /// most one per key.
+    /// most one per key: the exact count within the rows the seal
+    /// paid for.
     pub(crate) straddlers: u32,
+    /// The refusing seal stopped at its mismatch with rows past its
+    /// charge unvisited, so `straddlers` is a lower bound: the gap
+    /// prints `straddlers>=N` instead of an exact `straddlers=N`. Never
+    /// an undercount presented as exact.
+    pub(crate) straddlers_at_least: bool,
 }
 
 impl FallbackFenceDecision {
     /// The gap reason for this close, with the calls it disposed.
     pub(crate) fn gap_reason(&self, calls: u64) -> String {
         format!(
-            "install_segment_fallback_fenced calls={calls} fence={} chain={} backoff_passes={} successor={} straddlers={}",
+            "install_segment_fallback_fenced calls={calls} fence={} chain={} backoff_passes={} successor={} straddlers{}{}",
             self.fence,
             self.chain,
             self.backoff_passes,
@@ -923,6 +934,7 @@ impl FallbackFenceDecision {
             } else {
                 "capable_frame"
             },
+            if self.straddlers_at_least { ">=" } else { "=" },
             self.straddlers
         )
     }
@@ -2370,6 +2382,10 @@ struct SealScanFacts {
     /// fallback fence: its begin ordinal (see
     /// [`JournalDeathMarks::straddler`]).
     straddler_begin: Option<u64>,
+    /// The scan stopped at its deciding birth mismatch, under an
+    /// inherited fallback fence, with staged rows it never visited:
+    /// straddlers past the charge are unknown, not absent.
+    straddlers_unscanned: bool,
     barrier: bool,
     /// Some barrier row is settled history this frame already holds:
     /// an unbound open BEGIN with its terminal at or below the
@@ -2403,6 +2419,7 @@ impl Default for SealScanFacts {
         Self {
             birth_mismatch: false,
             straddler_begin: None,
+            straddlers_unscanned: false,
             barrier: false,
             barrier_settled: false,
             barrier_in_flight_min: None,
@@ -2830,6 +2847,24 @@ pub(crate) struct JournalAdapter {
     /// counts against ([`JournalAdapter::tick_fallback_backoff`]).
     fallback_pass: u64,
     image_keys: Tracked<BTreeMap<(u64, u64), Vec<JournalDomainKey>>>,
+    /// The latest minted incarnation of each admission binding, keyed
+    /// by the binding's incarnation-0 base (B2, round 13): resolving a
+    /// binding reads one entry instead of walking the image's whole
+    /// append-only key list (INV-2). Only the latest incarnation can
+    /// be live: a successor mints past a permanently dead latest
+    /// (refused, tainted or ended, flags that never clear), and the
+    /// quarantine-end mint retires its blocked latest first. Updated
+    /// beside the one `image_keys` append.
+    binding_latest: BTreeMap<JournalDomainKey, JournalDomainKey>,
+    /// Test-only count of binding-incarnation resolutions, for the
+    /// per-bind work bound.
+    #[cfg(test)]
+    binding_resolutions: std::cell::Cell<usize>,
+    /// Test-only one-shot: the next failure delivery replays as if a
+    /// head's reducer reservation had already failed (the production
+    /// `resource_failed` cursor state), so its heads dispose.
+    #[cfg(test)]
+    replay_resource_failure_once: bool,
     /// Individually retained taints, capped at the sighting bound (the
     /// same image population). Past the cap, `taint_overflow` latches
     /// and every untracked image counts as tainted — the conservative
@@ -3056,6 +3091,11 @@ impl JournalAdapter {
             death_marks: BTreeMap::new(),
             fallback_pass: 0,
             image_keys: Tracked::new(BTreeMap::new()),
+            binding_latest: BTreeMap::new(),
+            #[cfg(test)]
+            binding_resolutions: std::cell::Cell::new(0),
+            #[cfg(test)]
+            replay_resource_failure_once: false,
             tainted_images: Tracked::new(BTreeSet::new()),
             taint_evidence: Tracked::new(BTreeMap::new()),
             taint_overflow: Tracked::new(false),
@@ -7853,6 +7893,32 @@ impl JournalAdapter {
         &self,
         base: JournalDomainKey,
     ) -> (Option<JournalDomainKey>, Option<JournalDomainKey>) {
+        #[cfg(test)]
+        self.binding_resolutions
+            .set(self.binding_resolutions.get().saturating_add(1));
+        let latest = self
+            .binding_latest
+            .get(&JournalDomainKey {
+                incarnation: 0,
+                ..base
+            })
+            .copied();
+        let live = latest.filter(|key| self.key_is_live(*key));
+        #[cfg(test)]
+        debug_assert_eq!(
+            (live, latest),
+            self.binding_incarnations_by_scan(base),
+            "the binding index matches the image key list"
+        );
+        (live, latest)
+    }
+
+    /// Test oracle: the former full walk of the image's key list.
+    #[cfg(test)]
+    fn binding_incarnations_by_scan(
+        &self,
+        base: JournalDomainKey,
+    ) -> (Option<JournalDomainKey>, Option<JournalDomainKey>) {
         let mut live = None;
         let mut latest = None;
         if let Some(siblings) = self.image_keys.get(&(base.cookie, base.exec)) {
@@ -8087,11 +8153,16 @@ impl JournalAdapter {
             state.void_fence = state.void_fence.max(frontier);
         }
         let expires_at = self.fallback_pass.saturating_add(u64::from(wait));
-        self.death_marks.entry(key).or_default().fallback = Some(FallbackFenceMark {
+        let marks = self.death_marks.entry(key).or_default();
+        marks.fallback = Some(FallbackFenceMark {
             fence: frontier,
             chain,
             expires_at,
         });
+        // The close consumes this key's straddler tally: it names them
+        // once, and a later close never re-reports them.
+        let straddler = marks.straddler.take();
+        let straddlers_at_least = std::mem::take(&mut marks.straddlers_unscanned);
         Some(FallbackFenceDecision {
             fence: frontier,
             chain,
@@ -8100,11 +8171,8 @@ impl JournalAdapter {
                 .death_marks
                 .get(&key)
                 .is_some_and(|marks| marks.refused_capable == Some(true)),
-            straddlers: u32::from(
-                self.death_marks
-                    .get(&key)
-                    .is_some_and(|marks| marks.straddler.is_some()),
-            ),
+            straddlers: u32::from(straddler.is_some()),
+            straddlers_at_least,
         })
     }
 
@@ -8158,6 +8226,18 @@ impl JournalAdapter {
     /// the reseed cooldown tick.
     pub(crate) fn tick_fallback_backoff(&mut self) {
         self.fallback_pass = self.fallback_pass.saturating_add(1);
+    }
+
+    /// Arm the one-shot replay resource failure (see the field).
+    #[cfg(test)]
+    pub(crate) fn inject_replay_resource_failure_for_test(&mut self) {
+        self.replay_resource_failure_once = true;
+    }
+
+    /// Take the one-shot replay resource failure.
+    #[cfg(test)]
+    pub(crate) fn take_replay_resource_failure_for_test(&mut self) -> bool {
+        std::mem::take(&mut self.replay_resource_failure_once)
     }
 
     /// Whether a dead key's deaths are all recorded (capable
@@ -8467,6 +8547,16 @@ impl JournalAdapter {
                 .entry((key.cookie, key.exec))
                 .or_default()
                 .push(key);
+            let latest = self
+                .binding_latest
+                .entry(JournalDomainKey {
+                    incarnation: 0,
+                    ..key
+                })
+                .or_insert(key);
+            if key.incarnation >= latest.incarnation {
+                *latest = key;
+            }
         }
         let era = self.keys[&key].era;
         Ok(JournalDomainProof { key, era })
@@ -10167,16 +10257,19 @@ impl JournalAdapter {
                 self.note_bootstrap_arm(SealBootstrapArm::Covers);
                 // A straddler of the predecessor's fallback fence is kept
                 // for this key's own close to count (once per key).
-                if let Some(begin) = barrier
-                    .scan
-                    .as_ref()
-                    .and_then(|scan| scan.facts.straddler_begin)
-                {
+                let facts = barrier.scan.as_ref().map(|scan| scan.facts);
+                if let Some(begin) = facts.and_then(|facts| facts.straddler_begin) {
                     self.death_marks
                         .entry(key)
                         .or_default()
                         .straddler
                         .get_or_insert(begin);
+                }
+                if facts.is_some_and(|facts| facts.straddlers_unscanned) {
+                    self.death_marks
+                        .entry(key)
+                        .or_default()
+                        .straddlers_unscanned = true;
                 }
                 return SealAttempt::Decided(Err(self.failure(JournalGap::BootstrapMismatch)));
             }
@@ -10834,6 +10927,20 @@ impl JournalAdapter {
                         };
                         self.visit_seal_open(scan, image, *native, entry, audit);
                         if scan.facts.birth_mismatch {
+                            // Rows past the deciding one stay unpaid:
+                            // under an inherited fence they may hold
+                            // more straddlers (one peek, no visit).
+                            scan.facts.straddlers_unscanned =
+                                self.inherited_fallback_fence(key).is_some()
+                                    && (self
+                                        .open
+                                        .range((
+                                            std::ops::Bound::Excluded(*native),
+                                            std::ops::Bound::Unbounded,
+                                        ))
+                                        .next()
+                                        .is_some()
+                                        || !self.refused.is_empty());
                             scan.phase = SealScanPhase::Done;
                             break;
                         }
@@ -10862,6 +10969,9 @@ impl JournalAdapter {
                         index += 1;
                         self.visit_seal_refused(scan, image, &refused);
                         if scan.facts.birth_mismatch {
+                            scan.facts.straddlers_unscanned =
+                                self.inherited_fallback_fence(key).is_some()
+                                    && index < self.refused.len();
                             break;
                         }
                     }
@@ -11235,6 +11345,13 @@ impl JournalAdapter {
             for key in keys {
                 if let Some(state) = self.keys.edit().get_mut(&key) {
                     state.bootstraps.clear();
+                }
+                // A reseed starts a new episode: a straddler tallied
+                // by the refused earlier birth belongs to that episode
+                // and never reaches a later close.
+                if let Some(marks) = self.death_marks.get_mut(&key) {
+                    marks.straddler = None;
+                    marks.straddlers_unscanned = false;
                 }
             }
         }
@@ -29831,6 +29948,7 @@ pub(crate) mod tests {
                 backoff_passes: 0,
                 successor_allowed: true,
                 straddlers: 0,
+                straddlers_at_least: false,
             }
         );
         assert_eq!(
@@ -29909,6 +30027,10 @@ pub(crate) mod tests {
         /// BEGIN above the fence, at or below the successor's birth
         /// cut: a plain birth mismatch, not a straddler.
         BeginAbove,
+        /// Two calls BEGIN at or below the fence and END after it: the
+        /// seal pays for and counts the first, and stops with the
+        /// second unvisited, so the count is a lower bound.
+        TwoStraddlers,
     }
 
     /// Run one straddle shape: returns the seal's gap, the successor's
@@ -29916,6 +30038,7 @@ pub(crate) mod tests {
     /// close's decision.
     fn fallback_fence_straddle(
         shape: StraddleShape,
+        reseed_before_close: bool,
     ) -> (
         Option<JournalGap>,
         Option<u64>,
@@ -29936,6 +30059,10 @@ pub(crate) mod tests {
         if shape != StraddleShape::BeginAbove {
             scene.ingest(&call);
             assert_eq!(scene.adapter.consumed_through, begin_at);
+        }
+        let second = begin_bytes(1, 4, create, 0);
+        if shape == StraddleShape::TwoStraddlers {
+            scene.ingest(&second);
         }
         if shape == StraddleShape::EndedBefore {
             scene.ingest(&end_bytes(&call, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 70));
@@ -29991,6 +30118,9 @@ pub(crate) mod tests {
         ) {
             scene.ingest(&end_bytes(&call, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 70));
         }
+        if shape == StraddleShape::TwoStraddlers {
+            scene.ingest(&end_bytes(&second, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 71));
+        }
         let grant = SessionBirthGrant::scripted(
             reborn,
             BirthKind::AbsenceAppearance,
@@ -30006,6 +30136,10 @@ pub(crate) mod tests {
             .get(&reborn.key)
             .and_then(|marks| marks.straddler);
         let sealed = scene.adapter.keys[&reborn.key].sealed_through;
+        if reseed_before_close {
+            // A new episode: the reseed of the refused birth's image.
+            scene.adapter.clear_bootstraps_for_reseed(COOKIE, EXEC);
+        }
         let close_at = scene.adapter.consumed_through;
         let decision = scene
             .adapter
@@ -30030,19 +30164,27 @@ pub(crate) mod tests {
             StraddleShape::ReturnedBefore,
             StraddleShape::ReturnedAfter,
             StraddleShape::BeginAbove,
+            StraddleShape::TwoStraddlers,
         ]
         .map(|shape| {
-            let (gap, straddler, sealed, decision, begin_at) = fallback_fence_straddle(shape);
+            let (gap, straddler, sealed, decision, begin_at) =
+                fallback_fence_straddle(shape, false);
             (
                 shape,
                 gap,
                 straddler.map(|begin| begin == begin_at),
                 sealed,
-                decision.straddlers,
+                (decision.straddlers, decision.straddlers_at_least),
                 decision.chain,
-                decision
-                    .gap_reason(1)
-                    .ends_with(&format!(" straddlers={}", decision.straddlers)),
+                decision.gap_reason(1).ends_with(&format!(
+                    " straddlers{}{}",
+                    if decision.straddlers_at_least {
+                        ">="
+                    } else {
+                        "="
+                    },
+                    decision.straddlers
+                )),
             )
         });
         use StraddleShape::*;
@@ -30050,15 +30192,44 @@ pub(crate) mod tests {
         assert_eq!(
             rows,
             [
-                (BeginAt, mismatch, Some(true), 0, 1, 1, true),
-                (BeginBelow, mismatch, Some(true), 0, 1, 1, true),
-                (EndedBefore, mismatch, None, 0, 0, 1, true),
-                (AbandonedBefore, mismatch, None, 0, 0, 1, true),
-                (ReturnedBefore, mismatch, None, 0, 0, 1, true),
-                (ReturnedAfter, mismatch, Some(true), 0, 1, 1, true),
-                (BeginAbove, mismatch, None, 0, 0, 1, true),
+                (BeginAt, mismatch, Some(true), 0, (1, false), 1, true),
+                (BeginBelow, mismatch, Some(true), 0, (1, true), 1, true),
+                (EndedBefore, mismatch, None, 0, (0, false), 1, true),
+                (AbandonedBefore, mismatch, None, 0, (0, false), 1, true),
+                (ReturnedBefore, mismatch, None, 0, (0, false), 1, true),
+                (ReturnedAfter, mismatch, Some(true), 0, (1, false), 1, true),
+                (BeginAbove, mismatch, None, 0, (0, false), 1, true),
+                (TwoStraddlers, mismatch, Some(true), 0, (1, true), 1, true),
             ],
             "straddlers refuse, convert nothing and are counted only when they cross the fence"
+        );
+    }
+
+    /// B4 (round 13): a straddler tallied by a refused birth belongs to
+    /// that episode. A reseed of the image starts a new one, so the
+    /// key's later close reports no straddler; the same close without
+    /// the reseed still reports it (control).
+    #[test]
+    fn object_journal_reseed_clears_the_straddler_tally() {
+        let rows = [false, true].map(|reseed| {
+            let (gap, straddler, _, decision, begin_at) =
+                fallback_fence_straddle(StraddleShape::TwoStraddlers, reseed);
+            (
+                reseed,
+                gap,
+                straddler == Some(begin_at),
+                decision.straddlers,
+                decision.straddlers_at_least,
+            )
+        });
+        let mismatch = Some(JournalGap::BootstrapMismatch);
+        assert_eq!(
+            rows,
+            [
+                (false, mismatch, true, 1, true),
+                (true, mismatch, true, 0, false),
+            ],
+            "only the episode that refused reports its straddlers"
         );
     }
 
@@ -30136,6 +30307,7 @@ pub(crate) mod tests {
                 backoff_passes: RESEED_COOLDOWN_PASSES,
                 successor_allowed: true,
                 straddlers: 0,
+                straddlers_at_least: false,
             },
             "no progress: the next successor waits one cooldown unit"
         );

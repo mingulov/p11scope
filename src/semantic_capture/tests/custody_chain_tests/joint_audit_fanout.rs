@@ -30214,10 +30214,33 @@ fn joint_parked_retry_keeps_genuine_fault_loss() {
 /// (the live s12b/s12c finish stall).
 #[test]
 fn joint_seal_pending_across_stop_falls_back_with_named_stop_loss() {
+    seal_pending_across_stop(false);
+}
+
+/// The same stop, with the first fallback replay hitting a reducer
+/// resource failure: that feed's head disposes instead of replaying,
+/// and its capture-ended gap still counts it (`delivered_units`, never
+/// replayed heads only).
+#[test]
+fn joint_seal_pending_across_stop_counts_disposed_heads() {
+    seal_pending_across_stop(true);
+}
+
+fn seal_pending_across_stop(inject_resource_failure: bool) {
     let mut fixture = CanonicalFanoutScene::prior_sealed();
     fixture.push_two("C_SignInit", 2);
     let fault = FrameFault::clean();
     let mut frame = fixture.audited(2, 2, &fault);
+    if inject_resource_failure {
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture_mut()
+            .adapter_mut()
+            .inject_replay_resource_failure_for_test();
+    }
     let h0 = fixture.scene.real.h0.clone();
     let _ = h0.0.borrow_mut().capture.stop();
     assert!(
@@ -30273,10 +30296,13 @@ fn joint_seal_pending_across_stop_falls_back_with_named_stop_loss() {
     let feeds = fixture.feeds();
     assert_eq!(feeds.len(), 2);
     assert!(
-        feeds
-            .iter()
-            .all(|feed| feed.staged == 0 && feed.fallback && !feed.degraded),
-        "both staged calls replay as fallback rows"
+        feeds.iter().all(|feed| feed.staged == 0 && feed.fallback),
+        "both feeds fall back with nothing left staged"
+    );
+    assert_eq!(
+        feeds.iter().map(|feed| feed.disposed).sum::<u64>(),
+        u64::from(inject_resource_failure),
+        "only the injected resource failure disposes a head"
     );
     assert_eq!(
         first_take,
@@ -43645,6 +43671,75 @@ fn joint_birth_names_successor_backoff_before_install() {
 /// optionally with a fallback fence of `backoff` passes posed on the
 /// doomed proof's key; returns the birth-unavailable gap reasons.
 fn doomed_segment_birth_refusals(backoff: Option<u32>) -> Vec<String> {
+    let (reasons, _, reoffers) = doomed_segment_birth_refusals_with(backoff, None);
+    assert_eq!(reoffers, 0, "a doomed birth is final, never re-offered");
+    reasons
+}
+
+/// B3 (round 13): the deterministic early refusals (session health,
+/// segment doom with its backoff, the stuck bar) decide before any
+/// fallible per-key witness or registration reservation. The room is
+/// searched down to the least that still admits the batch's
+/// registration plan (one byte less defers the whole batch on plan
+/// storage), so the per-key witness reservation has nothing left: the
+/// doomed birth must still name its own refusal exactly once, with no
+/// per-key resource deferral and no re-offer.
+#[test]
+fn joint_birth_backoff_refusal_precedes_witness_reservation() {
+    const RESOURCE: &str = "joint_birth_deferred_resource_capacity";
+    for (backoff, reason) in [
+        (Some(5), "joint_birth_install_successor_backoff"),
+        (None, "joint_birth_install_segment_unresumable"),
+    ] {
+        // A batch-wide deferral (association or plan storage) names
+        // no caller; a per-key resource deferral names the birth's.
+        let plan_deferred = |room: usize| {
+            let (unavailable, deferred, _) =
+                doomed_segment_birth_refusals_with(backoff, Some(room));
+            unavailable.is_empty()
+                && !deferred.is_empty()
+                && deferred.iter().all(|(caller, _)| caller.is_none())
+        };
+        let (mut low, mut high) = (0usize, 1usize << 22);
+        assert!(plan_deferred(low), "{backoff:?}: no room defers the plan");
+        assert!(
+            !plan_deferred(high),
+            "{backoff:?}: ample room admits the plan"
+        );
+        while high - low > 1 {
+            let mid = low + (high - low) / 2;
+            if plan_deferred(mid) {
+                low = mid;
+            } else {
+                high = mid;
+            }
+        }
+        let (unavailable, deferred, reoffers) =
+            doomed_segment_birth_refusals_with(backoff, Some(high));
+        assert!(
+            deferred.iter().all(|(_, deferred)| deferred != RESOURCE),
+            "{backoff:?}: no per-key resource deferral at room {high}"
+        );
+        assert_eq!(
+            (unavailable, deferred, reoffers),
+            (vec![reason.to_string()], Vec::new(), 0),
+            "{backoff:?}: at the least plan room ({high}) the early refusal wins"
+        );
+    }
+}
+
+/// One birth-deferred gap: its caller (`None` for a batch-wide
+/// deferral) and reason.
+type DeferredBirthGap = (Option<CallerId>, String);
+
+/// [`doomed_segment_birth_refusals`] with the semantic resource room
+/// optionally clamped first; returns the birth-unavailable reasons, the
+/// birth-deferred reasons and the re-offer count. Without a clamp the
+/// helper also pins the no-install, no-consume, no-witness controls.
+fn doomed_segment_birth_refusals_with(
+    backoff: Option<u32>,
+    clamp_room: Option<usize>,
+) -> (Vec<String>, Vec<DeferredBirthGap>, usize) {
     use crate::inventory_present::JOINT_BIRTH_UNAVAILABLE_SUBJECT;
     use crate::inventory_semantics::RetainedJointBirths;
     use crate::semantics_objects::journal::{BirthKind, BootstrapReceipt, FallbackFence};
@@ -43718,6 +43813,14 @@ fn doomed_segment_birth_refusals(backoff: Option<u32>) -> Vec<String> {
             );
     }
     let installed_before: usize = scene.real.scene.coordinator.joint_births_installed() as usize;
+    if let Some(room) = clamp_room {
+        scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .clamp_semantic_resource_room_for_test(room);
+    }
     let mut births = RetainedJointBirths::new();
     let h0 = scene.real.h0.clone();
     let publisher = NativePublisher::build();
@@ -43763,7 +43866,17 @@ fn doomed_segment_birth_refusals(backoff: Option<u32>) -> Vec<String> {
         0,
         "no witness retains for the doomed birth"
     );
-    scene
+    let deferred = scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .staged_gaps_for_test()
+        .into_iter()
+        .filter(|gap| gap.subject == crate::inventory_present::JOINT_BIRTH_DEFERRED_SUBJECT)
+        .map(|gap| (gap.caller, gap.reason))
+        .collect();
+    let reasons = scene
         .real
         .scene
         .coordinator
@@ -43772,7 +43885,8 @@ fn doomed_segment_birth_refusals(backoff: Option<u32>) -> Vec<String> {
         .into_iter()
         .filter(|gap| gap.subject == JOINT_BIRTH_UNAVAILABLE_SUBJECT)
         .map(|gap| gap.reason)
-        .collect()
+        .collect();
+    (reasons, deferred, disposition.reoffers.len())
 }
 
 /// The machine's Births arm is the only pass unit that drains a

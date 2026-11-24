@@ -1953,7 +1953,31 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 self.registry.flip_unbound_exec_loss(batch.domain);
                 continue;
             }
-            self.exec_exe.insert(cookie, exec);
+            let replaced = self
+                .exec_exe
+                .insert(cookie, exec)
+                .is_some_and(|old| !old.same_image(&exec));
+            if replaced {
+                // A newer EXEC replaced the image's published one: the
+                // image names the new joined pair at once, provisionally
+                // without a path, until its queued resolution attaches
+                // the verdict (memory-only; never the superseded path).
+                let resolution = if (exec.dev, exec.ino) == (0, 0) {
+                    ExeResolution::ExeUnavailable
+                } else {
+                    ExeResolution::PathUnknown
+                };
+                self.registry.attach_unbound_exe(
+                    cookie,
+                    UnboundExe {
+                        dev: exec.dev,
+                        ino: exec.ino,
+                        path: None,
+                        resolution,
+                        identity_candidates: Vec::new(),
+                    },
+                );
+            }
             self.backfill_unbound_exe(cookie, exec);
         }
     }
@@ -45483,11 +45507,11 @@ int main(void) {
 
     #[test]
     fn a_held_backfill_never_attaches_a_superseded_exec_untrusted_reads() {
+        // Control: untrusted live reads cost nothing after the shared
+        // learn, so B always resolves in A's action and no commit can
+        // fall between them; A still never publishes.
         let waited = superseded_backfill_cells(false);
-        assert!(
-            waited >= 1,
-            "some pass commits with only B waiting (setup pin): {waited}"
-        );
+        assert_eq!(waited, 0, "untrusted reads leave no window: {waited}");
     }
 
     #[test]

@@ -1682,6 +1682,43 @@ fn privileged_run_tree_unprearmed_shortlived_descendants_reach_high_coverage() {
     );
 }
 
+/// Pins the hold cell's mechanism and verdict shape on an already
+/// exact-accounted profile: the first-map stop held a mapper until
+/// attach (a fast attach that merely beat every mapper would leave it
+/// zero), the verdict stays PARTIAL, and the learned file plus the
+/// retired-member gaps stay counted. Each pin panics naming itself.
+fn assert_hold_cell_pins(profile: &serde_json::Value) {
+    let evidence = profile.get("evidence").expect("evidence");
+    // The hold did it: at least the first mapper resumed attached.
+    let held = evidence
+        .get("member_stop_attached")
+        .and_then(|held| held.as_u64())
+        .expect("member_stop_attached");
+    assert!(
+        held >= 1,
+        "the first-map stop held a mapper until attach: {profile}"
+    );
+    // The verdict stays PARTIAL: members that retired before admission
+    // stay counted gaps (checked below).
+    assert_eq!(verdict(profile), "PARTIAL", "{profile}");
+    let learned = evidence
+        .get("learned_staged_files")
+        .and_then(|learned| learned.as_u64())
+        .expect("learned_staged_files");
+    assert!(
+        learned >= 1,
+        "the run staged the learned provider file: {profile}"
+    );
+    let gaps = evidence
+        .get("pid_descendant_gaps")
+        .and_then(|gaps| gaps.as_u64())
+        .expect("pid_descendant_gaps");
+    assert!(
+        gaps > 0,
+        "members that retired before admission stay counted: {profile}"
+    );
+}
+
 /// Unprearmed short-lived descendants under `--pause never`: 32 sequential
 /// grandchildren (each 1 iteration, 150 ms linger, the auto-pause twin's
 /// shape) with NO prearm hint. The pause policy governs the owned child
@@ -1748,34 +1785,39 @@ fn privileged_run_tree_unprearmed_shortlived_never_pause_holds_first_mappers() {
         early, 0,
         "calls entered before their first attach with the first-map stop armed: {profile}"
     );
-    // The hold did it: at least the first mapper resumed attached.
-    let held = evidence
-        .get("member_stop_attached")
-        .and_then(|held| held.as_u64())
-        .expect("member_stop_attached");
-    assert!(
-        held >= 1,
-        "the first-map stop held a mapper until attach: {profile}"
-    );
-    // The verdict stays PARTIAL: members that retired before admission
-    // stay counted gaps (checked below).
-    assert_eq!(verdict(&profile), "PARTIAL", "{profile}");
-    let learned = evidence
-        .get("learned_staged_files")
-        .and_then(|learned| learned.as_u64())
-        .expect("learned_staged_files");
-    assert!(
-        learned >= 1,
-        "the run staged the learned provider file: {profile}"
-    );
-    let gaps = evidence
-        .get("pid_descendant_gaps")
-        .and_then(|gaps| gaps.as_u64())
-        .expect("pid_descendant_gaps");
-    assert!(
-        gaps > 0,
-        "members that retired before admission stay counted: {profile}"
-    );
+    assert_hold_cell_pins(&profile);
+}
+
+/// The hold pin fires on a zero held count with everything else green:
+/// a fast attach that merely beat every mapper (PARTIAL, learned, gaps
+/// all nominal) fails exactly at the hold assertion, never passes as a
+/// held run. The live RED run fails earlier at zero-early, so this twin
+/// is the pin's failure-branch proof.
+#[test]
+#[should_panic(expected = "the first-map stop held a mapper until attach")]
+fn hold_cell_pins_reject_zero_held_count() {
+    assert_hold_cell_pins(&serde_json::json!({
+        "evidence": {
+            "member_stop_attached": 0,
+            "completeness": "PARTIAL",
+            "learned_staged_files": 1,
+            "pid_descendant_gaps": 3,
+        }
+    }));
+}
+
+/// The hold pins accept the healthy shape: held mappers, PARTIAL, the
+/// learned file and counted retired-member gaps.
+#[test]
+fn hold_cell_pins_accept_held_mapper_shape() {
+    assert_hold_cell_pins(&serde_json::json!({
+        "evidence": {
+            "member_stop_attached": 2,
+            "completeness": "PARTIAL",
+            "learned_staged_files": 1,
+            "pid_descendant_gaps": 3,
+        }
+    }));
 }
 
 /// Unprearmed short-lived descendants under `--pause never`: 32 sequential

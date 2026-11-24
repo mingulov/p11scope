@@ -1601,9 +1601,9 @@ impl NativeBinder {
                     .get(rel)
                     .map(|pending| pending.row.recorded_at_ns)
                     .expect("the row was just filtered present");
-                // The flag implies a healthy read (the read path sets it
-                // only there); an unhealthy exit snapshot refuses at
-                // decide time regardless.
+                // The flag implies a healthy read (both producers scan
+                // healthy rows only); an unhealthy exit snapshot refuses
+                // at decide time regardless.
                 debug_assert!(
                     self.domains[index]
                         .pending
@@ -1682,10 +1682,14 @@ impl NativeBinder {
                         HolderScan::Absent
                     };
                     if matches!(verdict, HolderScan::Deferred) {
-                        // The exit scan deferred past the holder pool:
-                        // the row keeps its owed attempt for the next
-                        // pass (the visit is spent, like a hit past
-                        // the query allowance).
+                        // The exit scan deferred past the holder pool
+                        // (or on queued hooks): the row keeps its owed
+                        // attempt for the next pass (the visit is
+                        // spent, like a hit past the query allowance),
+                        // tagged for the exit-first retry so a live
+                        // successor that arrives before the next pass
+                        // never jumps the row's own exit interval.
+                        pending.exit_retry_owed = true;
                         self.domains[index].owed.push_back(pos);
                         continue;
                     }

@@ -64,18 +64,26 @@ def judge_argv(judge, files, argv, env):
             "--parent-pid", parent, "--parent-gen", parent_gen]
 
 
+# Product reports sit in the run's private output directory (the shell's
+# setup_local_output); the loader reads them only from there.
+PRIVATE = "run-" + RUN_ID
+PRODUCT = {"sigint2.json", "full.json", "epipe.json", "r.json"}
+
+
 def run_block(judge, files, argv=(), env=None, mode=MODES[0], verdict_out=None):
     """Run one judge of the typed loader on fixture files."""
     _, interp, extra = mode
     files = dict(files)
-    named = judge_argv(judge, files, list(argv), env or {})
+    named = [PRIVATE + "/" + item if item in PRODUCT else item
+             for item in judge_argv(judge, files, list(argv), env or {})]
     with tempfile.TemporaryDirectory() as raw:
         tmp = Path(raw)
         cell = CELLS[judge]
         subprocess.run(["python3", "-I", str(RECORDS), "stamp", str(tmp / (cell + ".stamp")),
                         RUN_ID, cell], check=True)
+        (tmp / PRIVATE).mkdir()
         for name, text in files.items():
-            (tmp / name).write_text(text)
+            (tmp / PRIVATE / name if name in PRODUCT else tmp / name).write_text(text)
         full = {k: v for k, v in os.environ.items() if not k.startswith("PYTHON")}
         full.update(extra or {})
         proc = subprocess.run(interp + [str(RECORDS), judge, "--stamp", cell + ".stamp",
@@ -149,7 +157,8 @@ class SecondSigintReportTests(GuardCase):
             with self.subTest(field=path[0]):
                 report = sigint_report()
                 stop = report["evidence"]["stop_quiescence"]
-                stop[path[0]] = "pending" if path[0] == "state" else True
+                # The producer's own unproven shapes (src/render.rs).
+                stop[path[0]] = "unproven" if path[0] == "state" else True
                 report["evidence"]["drain_proven"] = False
                 self.check(report, ok=True)
 
@@ -158,11 +167,19 @@ class SecondSigintReportTests(GuardCase):
         ("schema", sig_set(["schema"], "p11scope/observed-profile/v2"), "schema"),
         ("complete", sig_set(E + ["completeness"], "COMPLETE"),
          "abandoned teardown cannot seal COMPLETE"),
-        ("drain-claimed-unproven-state", sig_set(E + ["stop_quiescence", "state"], "pending"),
+        ("drain-claimed-unproven-state", sig_set(E + ["stop_quiescence", "state"], "unproven"),
          "drain_proven must match the stop-gate evidence"),
+        ("drain-claimed-not-reached", sig_set(E + ["stop_quiescence", "state"], "not_reached"),
+         "drain_proven must match the stop-gate evidence"),
+        ("state-not-a-producer-state", sig_set(E + ["stop_quiescence", "state"], "pending"),
+         "stop_quiescence state 'pending' is not one of"),
+        ("post-discovery-null", sig_set(E + ["stop_quiescence", "post_q_discovery"], None),
+         "stop_quiescence post_q_discovery has type NoneType"),
+        ("post-events-null", sig_set(E + ["stop_quiescence", "post_q_events"], None),
+         "stop_quiescence post_q_events has type NoneType"),
         ("drain-claimed-post-events", sig_set(E + ["stop_quiescence", "post_q_events"], True),
          "drain_proven must match the stop-gate evidence"),
-        ("drain-claimed-post-discovery", sig_set(E + ["stop_quiescence", "post_q_discovery"], None),
+        ("drain-claimed-post-discovery", sig_set(E + ["stop_quiescence", "post_q_discovery"], True),
          "drain_proven must match the stop-gate evidence"),
         ("drain-denied", sig_set(E + ["drain_proven"], False),
          "drain_proven must match the stop-gate evidence"),

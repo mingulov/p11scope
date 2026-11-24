@@ -173,7 +173,9 @@ def run_oracle(report, *, modfs, pin=None, modpath=MODPATH, ledger=None,
     with tempfile.TemporaryDirectory() as raw:
         tmp = Path(raw)
         stamp(tmp, "inventory-cgroup")
-        (tmp / "r.json").write_text(
+        # The product report: only from the run's private output directory.
+        (tmp / ("run-" + RUN_ID)).mkdir()
+        (tmp / ("run-" + RUN_ID) / "r.json").write_text(
             json.dumps(report) if report_text is None else report_text)
         (tmp / "in.wl").write_text(inside_wl)
         (tmp / "out.wl").write_text(outside_wl)
@@ -187,7 +189,7 @@ def run_oracle(report, *, modfs, pin=None, modpath=MODPATH, ledger=None,
         proc = subprocess.run(
             argv + [str(RECORDS), "cgroup-inventory", "--stamp", "inventory-cgroup.stamp",
                     "--run-id", RUN_ID, "--verdict", "verdict.json", "--cell", "inventory-cgroup",
-                    "--report", "r.json", "--inside-wl", "in.wl", "--outside-wl", "out.wl",
+                    "--report", "run-%s/r.json" % RUN_ID, "--inside-wl", "in.wl", "--outside-wl", "out.wl",
                     "--pin", json.dumps(pin) if pin_text is None else pin_text,
                     "--inside-iters", str(inside_iters), "--outside-iters", str(outside_iters),
                     "--module", modpath, "--module-fs", modfs,

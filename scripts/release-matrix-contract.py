@@ -174,13 +174,18 @@ EXITS = {"version.log": "version", "doctor.log": "doctor", "qual.log": "qual",
          "backend/inv-pid.stderr": "inv_pid", "backend/inv-sys.stderr": "inv_sys"}
 RUNTIME_SOURCES = ("tests/fixtures/public-cli/inventory-ledger.c", "scripts/fixtures/exec_churn.c",
                    "tests/fixtures/public-cli/prearm-first-use.c")
+# Every sibling the staged shells resolve next to themselves (the public CLI
+# shell's helpers and fixture sources included; a static test pins them).
 SOURCE_FILES = ("scripts/release-matrix-contract.py", "scripts/qualify-release-matrix.sh",
                 "scripts/run-privileged-lib-tests.sh", "scripts/qualify-public-cli.sh",
                 "scripts/mapped-provider-pin.py", "scripts/public-cli-oracle.py", "scripts/system-scope-measure.py",
-                "scripts/check-capture-evidence.py",
+                "scripts/check-capture-evidence.py", "scripts/qualify_records.py",
+                "scripts/inventory-mt-oracle.py", "scripts/system-cell-census.py", "scripts/inventory-mt-gate.py",
                 "scripts/qualify-inventory-native.sh", "scripts/inventory-native-oracle.py",
                 "tests/fixtures/public-cli/gated.c", "tests/fixtures/public-cli/mt.c",
-                "tests/fixtures/public-cli/inventory-ledger.c", "tests/fixtures/public-cli/prearm-first-use.c")
+                "tests/fixtures/public-cli/inventory-ledger.c", "tests/fixtures/public-cli/prearm-first-use.c",
+                "tests/fixtures/public-cli/cgroup-fork.c", "tests/fixtures/public-cli/chain-parent.c",
+                "tests/fixtures/public-cli/mt_mixed.c", "tests/fixtures/public-cli/mt_fork.c")
 CANARY_SOURCE_FILES = ("scripts/verify-canaries.sh", "scripts/product-build.sh", "scripts/lib.sh",
     "scripts/lane-lib-oracle-1.py", "scripts/cleanup-traps.sh", "scripts/_loader.py",
     "scripts/capture-stopped-canary.py", "scripts/canary_process_custody.py",

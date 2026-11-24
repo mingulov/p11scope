@@ -27,11 +27,19 @@ ORACLE=$HERE/public-cli-oracle.py
 # Every structured-evidence decision below is one judge of the typed
 # loader (strict records, run-bound inputs, declared rules).
 RECORDS=$HERE/qualify_records.py
+# Every sibling this shell runs is staged with it (release-matrix-contract
+# SOURCE_FILES); a stage without one refuses here, before any cell.
+for _helper in public-cli-oracle.py qualify_records.py release-matrix-contract.py mapped-provider-pin.py \
+    inventory-mt-oracle.py system-cell-census.py inventory-mt-gate.py; do
+  [ -f "$HERE/$_helper" ] || { echo "qualify-public-cli.sh: required helper missing: $HERE/$_helper" >&2; exit 64; }
+done
+unset _helper
 CONTROL=0
 CONTROL_KIND=gated
 if [ "${1:-}" = --control-gated ]; then CONTROL=1; shift
 elif [ "${1:-}" = --control-second-sigint ]; then CONTROL=1; CONTROL_KIND=signal; shift
-elif [ "${1:-}" = --control-fifo ]; then CONTROL=1; CONTROL_KIND=fifo; shift; fi
+elif [ "${1:-}" = --control-fifo ]; then CONTROL=1; CONTROL_KIND=fifo; shift
+elif [ "${1:-}" = --control-event-stdout ]; then CONTROL=1; CONTROL_KIND=event; shift; fi
 # The cell filter is validated before any setup, so a typo fails before a
 # privileged campaign starts. Only the gated lifecycle cells are runnable
 # as a subset; derived and smoke cells stay full-campaign-only.
@@ -58,6 +66,9 @@ if [ "$CONTROL" = 1 ]; then
   elif [ "$CONTROL_KIND" = fifo ]; then
     [ $# = 3 ] || exit 64
     CONTROL_CELL=fifo-refused
+  elif [ "$CONTROL_KIND" = event ]; then
+    [ $# = 3 ] || exit 64
+    CONTROL_CELL=inventory-event-stdout
   else
     [ $# -ge 3 ] && [ $# -le 4 ] || exit 64
     CONTROL_CELL=${4:-profile-pid}
@@ -90,18 +101,30 @@ else
   READY_TICKS=1800; LEDGER_TICKS=600; EXIT_TICKS=1800
 fi
 mkdir -p "$OUT" && chmod 755 "$OUT" && OUT=$(realpath -e -- "$OUT") && cd "$OUT" || exit 64
-LOCAL_OUTPUT=$OUT
-if [ -n "${P11SCOPE_LOCAL_OUTPUT_ROOT:-}" ]; then
-  LOCAL_OUTPUT=$(python3 -I "$HERE/release-matrix-contract.py" --check-work-root "$P11SCOPE_LOCAL_OUTPUT_ROOT") || exit 64
-fi
+# This invocation's run id (a random nonce): every judged input must carry
+# a stamp of it, and it names the private producer-output directory.
+RUN_ID=$(cat /proc/sys/kernel/random/uuid) || exit 64
+# setup_local_output: the product writes only into this invocation's own
+# directory, created exclusively under $OUT or the configured local root,
+# so two invocations sharing a root never see each other's reports.
+setup_local_output() {
+  LOCAL_BASE=$OUT
+  if [ -n "${P11SCOPE_LOCAL_OUTPUT_ROOT:-}" ]; then
+    LOCAL_BASE=$(python3 -I "$HERE/release-matrix-contract.py" --check-work-root "$P11SCOPE_LOCAL_OUTPUT_ROOT") || return 1
+  fi
+  LOCAL_OUTPUT=$LOCAL_BASE/run-$RUN_ID
+  mkdir -m 755 -- "$LOCAL_OUTPUT"
+}
+setup_local_output || exit 64
 product_output() { printf '%s/%s\n' "$LOCAL_OUTPUT" "$1"; }
+# publish_output NAME: the published copy is this invocation's own
+# completed report (a hard link beside it, or a verified copy off a
+# separate local root); a missing report fails in both layouts.
 publish_output() {
-  [ "$LOCAL_OUTPUT" != "$OUT" ] || return 0
+  if [ "$LOCAL_BASE" = "$OUT" ]; then ln -f -- "$LOCAL_OUTPUT/$1" "$OUT/$1"; return; fi
   python3 -I "$HERE/release-matrix-contract.py" --copy-file "$LOCAL_OUTPUT/$1" "$OUT/$1"
 }
 : > results.jsonl
-# This invocation's run id: every judged input must carry a stamp of it.
-RUN_ID=$(cat /proc/sys/kernel/random/uuid) || exit 64
 # stamp_leg CELL PATH...: remove each destination, prove it absent, then
 # stamp the run; a judged input must be written at or after the stamp.
 stamp_leg() {
@@ -340,7 +363,7 @@ gated() {
   rm -f -- "$gate" "$cell.$ext" "$cell.wl" "$cell.stderr" "$cell.stdout" "$cell.receipt.json" "$cell.eventlog.jsonl" \
     "$cell.census.jsonl" "$cell.census.stop" "$cell.census.capturing" "$cell.census.settled" "$cell.census.ready" "$cell.census.stderr"
   local output; output=$(product_output "$cell.$ext")
-  [ "$LOCAL_OUTPUT" = "$OUT" ] || rm -f -- "$output"
+  rm -f -- "$output"
   local before after gen='' readygen='' wl pp='' ready=0 capturing=0 released=0 observer_rc=125 workload_rc=125
   local poll=waitfor settle=finish release=touch
   if [ "$scope" = system ]; then poll=waitfor_quiet settle=finish_quiet release=touch_quiet; fi
@@ -617,7 +640,7 @@ second_sigint() {
   done
   publish_output sigint2.json || cleanup_ok=0
   local judged=0 detail
-  detail=$(python3 -I "$RECORDS" second-sigint --stamp second-sigint.stamp --run-id "$RUN_ID" --verdict second-sigint.verdict.json --report sigint2.json --stderr sig2.stderr --rc "$rc" --custody "$custody" --cleanup "$cleanup_ok") && judged=1
+  detail=$(python3 -I "$RECORDS" second-sigint --stamp second-sigint.stamp --run-id "$RUN_ID" --verdict second-sigint.verdict.json --report "$output" --stderr sig2.stderr --rc "$rc" --custody "$custody" --cleanup "$cleanup_ok") && judged=1
   result second-sigint "$judged" "rc=$rc child_custody=$custody child=${child:-unknown} cleanup_complete=$cleanup_ok $(printf '%.300s' "$detail")"
 }
 fifo_refused() {
@@ -774,7 +797,7 @@ cgroup_capture() {
     # stat(1) spells the type "overlayfs" (coreutils S_MAGIC_OVERLAYFS),
     # never the bare "overlay" of /proc/mounts.
     module_fs=$(stat -f -c %T "$MODULE" 2>/dev/null || echo unknown)
-    python3 -I "$RECORDS" cgroup-inventory --stamp "$cell.stamp" --run-id "$RUN_ID" --verdict "$cell.verdict.json" --cell "$cell" --report "$cell.$ext" --inside-wl "$cell-inside.wl" --outside-wl "$cell-outside.wl" --pin "$before" --inside-iters "$inside_iters" --outside-iters "$outside_iters" --module "$MODULE" --module-fs "$module_fs" --inside-pid "$inside" --inside-gen "$gen" --child-pid "${child_owned}" --child-gen "$childgen" --outside-pid "$outside" > "$cell.detail" 2>&1
+    python3 -I "$RECORDS" cgroup-inventory --stamp "$cell.stamp" --run-id "$RUN_ID" --verdict "$cell.verdict.json" --cell "$cell" --report "$output" --inside-wl "$cell-inside.wl" --outside-wl "$cell-outside.wl" --pin "$before" --inside-iters "$inside_iters" --outside-iters "$outside_iters" --module "$MODULE" --module-fs "$module_fs" --inside-pid "$inside" --inside-gen "$gen" --child-pid "${child_owned}" --child-gen "$childgen" --outside-pid "$outside" > "$cell.detail" 2>&1
     rc=$?
     detail=$(cat "$cell.detail" 2>/dev/null || echo "inventory check failed rc=$rc")
     detail="$detail observer_rc=$observer_rc"
@@ -798,7 +821,7 @@ run_exact() {
   local cell=$1 fixture=$2 iters=$3
   rm -f -- "$cell.json" "$cell.wl" "$cell.stderr" "$cell.stdout" "$cell.receipt.json"
   local output; output=$(product_output "$cell.json")
-  [ "$LOCAL_OUTPUT" = "$OUT" ] || rm -f -- "$output"
+  rm -f -- "$output"
   local before after wl='' pp='' ready=0 capturing=0 released=0 observer_rc=125 workload_rc=125
   # Run-tree (v0.7.0): owned runs capture the command's child
   # processes at cgroup scope.
@@ -835,7 +858,7 @@ run_prearm() {
     ledger=$OUT/run-prearm-$name.wl
     output=$(product_output "run-prearm-$name.txt")
     rm -f -- "run-prearm-$name.txt" "run-prearm-$name.wl" "run-prearm-$name.stderr" "run-prearm-$name.stdout"
-    [ "$LOCAL_OUTPUT" = "$OUT" ] || rm -f -- "$output"
+    rm -f -- "$output"
     # The owned child runs demoted to SUDO_UID and opens the ledger
     # itself: pre-create it owned (same precedent as second-child.pid).
     : > "$ledger" && chown "$RUNUID:$RUNGID" "$ledger" && chmod 600 "$ledger" || { result run-prearm 0 "$name ledger setup failed" prearm-exactness; return 1; }
@@ -845,7 +868,7 @@ run_prearm() {
     publish_output "run-prearm-$name.txt" || rc=1
     [ "$rc" = 0 ] || { result run-prearm 0 "$name twin failed rc=$rc" prearm-exactness; return 1; }
   done
-  detail=$(python3 -I "$RECORDS" run-prearm --stamp run-prearm.stamp --run-id "$RUN_ID" --verdict run-prearm.verdict.json --held-report run-prearm-held.txt --held-ledger run-prearm-held.wl --passive-report run-prearm-passive.txt --passive-ledger run-prearm-passive.wl 2>&1) || { result run-prearm 0 "$(printf '%.600s' "$detail")" prearm-exactness; return 1; }
+  detail=$(python3 -I "$RECORDS" run-prearm --stamp run-prearm.stamp --run-id "$RUN_ID" --verdict run-prearm.verdict.json --held-report "$(product_output run-prearm-held.txt)" --held-ledger run-prearm-held.wl --passive-report "$(product_output run-prearm-passive.txt)" --passive-ledger run-prearm-passive.wl 2>&1) || { result run-prearm 0 "$(printf '%.600s' "$detail")" prearm-exactness; return 1; }
   result run-prearm 1 "$detail" prearm-exactness
 }
 # The launcher-chain cell (v0.7.0 parent-chain lane): a named parent
@@ -884,13 +907,14 @@ parent_chain_cell() {
   [ "$observer_rc" = 0 ] || { result "$cell" 0 "verbose observer rc=$observer_rc" failed; terminate "$parent" || true; terminate "$wl" || true; return 1; }
   publish_output "$cell-v.json" || { result "$cell" 0 'output copy failed' failed; terminate "$parent" || true; terminate "$wl" || true; return 1; }
   local detail
-  detail=$(python3 -I "$RECORDS" parent-chain --stamp "$cell.stamp" --run-id "$RUN_ID" --verdict "$cell.verdict.json" --report "$cell.json" --concise "$cell.stdout" --verbose "$cell-v.stdout" --workload-pid "$wl" --workload-gen "$wl_gen" --parent-pid "$parent" --parent-gen "$parent_gen" 2>&1) || { result "$cell" 0 "$(printf '%.600s' "$detail")" failed; terminate "$parent" || true; terminate "$wl" || true; return 1; }
+  detail=$(python3 -I "$RECORDS" parent-chain --stamp "$cell.stamp" --run-id "$RUN_ID" --verdict "$cell.verdict.json" --report "$output" --concise "$cell.stdout" --verbose "$cell-v.stdout" --workload-pid "$wl" --workload-gen "$wl_gen" --parent-pid "$parent" --parent-gen "$parent_gen" 2>&1) || { result "$cell" 0 "$(printf '%.600s' "$detail")" failed; terminate "$parent" || true; terminate "$wl" || true; return 1; }
   terminate "$parent" || true; terminate "$wl" || true
   result "$cell" 1 "$detail"
 }
 if [ "$CONTROL" = 1 ]; then
   if [ "$CONTROL_KIND" = signal ]; then second_sigint
   elif [ "$CONTROL_KIND" = fifo ]; then fifo_refused
+  elif [ "$CONTROL_KIND" = event ]; then inventory_event_stdout
   elif [ "$CONTROL_CELL" = system ]; then system_cell
   else gated "$CONTROL_CELL" pid "$GATED" profile --pid @PID@ --duration 1 -o "$OUT/$CONTROL_CELL.json"; fi
   summary "$CONTROL_CELL"; exit $?
@@ -1029,7 +1053,7 @@ sigint_exact() {
   local cell=sigint scope=pid gate=$OUT/sigint.gate
   rm -f -- "$gate" sigint.json sigint.wl sigint.stderr sigint.stdout sigint.receipt.json
   local output; output=$(product_output sigint.json)
-  [ "$LOCAL_OUTPUT" = "$OUT" ] || rm -f -- "$output"
+  rm -f -- "$output"
   local before after gen='' readygen='' wl='' pp='' ready=0 capturing=0 released=0 observer_rc=125 workload_rc=125
   before=$(pin) || { result "$cell" 0 'provider pin failed' failed; return 1; }
   asuser "$GATED" "$MODULE" "$ITERS" 200 "$gate" > sigint.wl 2>&1 & wl=$!; register "$wl" && gen=${CHILDREN[$wl]}

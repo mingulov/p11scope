@@ -182,12 +182,14 @@ def run_oracle(report, *, modfs="overlayfs", pin=None):
     with tempfile.TemporaryDirectory() as raw:
         tmp = Path(raw)
         stamp(tmp, "inventory-cgroup")
-        (tmp / "r.json").write_text(json.dumps(report))
+        # The product report: only from the run's private output directory.
+        (tmp / ("run-" + RUN_ID)).mkdir()
+        (tmp / ("run-" + RUN_ID) / "r.json").write_text(json.dumps(report))
         (tmp / "in.wl").write_text(inside_wl)
         (tmp / "out.wl").write_text(outside_wl)
         proc = subprocess.run(
             ["python3", "-I", str(RECORDS), "cgroup-inventory", "--stamp", "inventory-cgroup.stamp",
-             "--run-id", RUN_ID, "--cell", "inventory-cgroup", "--report", "r.json",
+             "--run-id", RUN_ID, "--cell", "inventory-cgroup", "--report", "run-%s/r.json" % RUN_ID,
              "--inside-wl", "in.wl", "--outside-wl", "out.wl", "--pin", json.dumps(pin),
              "--inside-iters", "250", "--outside-iters", "500", "--module", MODPATH,
              "--module-fs", modfs, "--inside-pid", "100", "--inside-gen", str(GENERATIONS[100]),
@@ -530,7 +532,7 @@ class GenerationHandoffTests(unittest.TestCase):
     def run_invocation(self, gen, childgen, report=None, optimize=False):
         body = (
             "cell=inventory-cgroup; ext=json; module_fs=overlayfs\n"
-            "RECORDS=%s; RUN_ID=%s\n"
+            "RECORDS=%s; RUN_ID=%s; output=run-$RUN_ID/$cell.$ext\n"
             "inside=100; child_owned=101; outside=102\n"
             "%sMODULE=%s\nbefore='%s'\ngen=%s; childgen=%s\n"
             "inside_iters=250; outside_iters=500\n%s"
@@ -541,7 +543,8 @@ class GenerationHandoffTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             tmp = Path(raw)
             stamp(tmp, "inventory-cgroup")
-            (tmp / "inventory-cgroup.json").write_text(
+            (tmp / ("run-" + RUN_ID)).mkdir()
+            (tmp / ("run-" + RUN_ID) / "inventory-cgroup.json").write_text(
                 json.dumps(report or overlay_published_report()))
             (tmp / "inventory-cgroup-inside.wl").write_text(
                 "READY pid=100\nCHILD pid=101\n%s\n" % INSIDE_LEDGER)
@@ -1186,8 +1189,11 @@ class WholePrearmBlockTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_name:
             tmp = Path(tmp_name)
             stamp(tmp, "run-prearm")
+            # Product reports: only from the run's private output directory.
+            private = tmp / ("run-" + RUN_ID)
+            private.mkdir()
             for name, (text, ledger) in twins.items():
-                (tmp / ("run-prearm-%s.txt" % name)).write_text("\n".join(text) + "\n")
+                (private / ("run-prearm-%s.txt" % name)).write_text("\n".join(text) + "\n")
                 (tmp / ("run-prearm-%s.wl" % name)).write_text("\n".join(ledger) + "\n")
             env = None
             if extra_env is not None:
@@ -1197,9 +1203,9 @@ class WholePrearmBlockTests(unittest.TestCase):
                 env.update(extra_env)
             proc = subprocess.run(argv + [str(RECORDS), "run-prearm", "--stamp", "run-prearm.stamp",
                                           "--run-id", RUN_ID, "--kernel-release", release,
-                                          "--held-report", "run-prearm-held.txt",
+                                          "--held-report", str(private / "run-prearm-held.txt"),
                                           "--held-ledger", "run-prearm-held.wl",
-                                          "--passive-report", "run-prearm-passive.txt",
+                                          "--passive-report", str(private / "run-prearm-passive.txt"),
                                           "--passive-ledger", "run-prearm-passive.wl"],
                                   cwd=tmp, capture_output=True, text=True,
                                   timeout=30, env=env)

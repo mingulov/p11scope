@@ -1713,6 +1713,34 @@ class SignalCustodyTests(unittest.TestCase):
         self.control('wrong-parent',1)
 
 
+def private_dir(base):
+    """The invocation's one private producer-output directory under base
+    (scripts/qualify-public-cli.sh setup_local_output)."""
+    found = [path for path in base.iterdir() if path.name.startswith("run-")]
+    if len(found) != 1 or not found[0].is_dir() or found[0].is_symlink():
+        raise AssertionError("expected one private run-* directory in %s, found %r" % (base, found))
+    return found[0]
+
+
+# The typed records a failed control leaves behind (controller r11: a
+# once-seen load failure must keep its evidence for diagnosis).
+FAILURE_RECORDS = ("results.jsonl", "summary.txt", "selected-output.json", "readiness-before-release.json")
+FAILURE_SUFFIXES = (".verdict.json", ".receipt.json", ".stderr", ".wl", ".stamp")
+
+
+def save_failure_records(test, out):
+    dest = Path(os.environ.get("TMPDIR") or tempfile.gettempdir()) / (
+        "oracle-fail-%s-%d" % (test.id().rsplit(".", 1)[-1], os.getpid()))
+    dest.mkdir(parents=True, exist_ok=True)
+    for path in sorted(out.rglob("*")):
+        if path.is_file() and not path.is_symlink() and (
+                path.name in FAILURE_RECORDS or path.name.endswith(FAILURE_SUFFIXES)):
+            target = dest / path.relative_to(out)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, target)
+    return dest
+
+
 class ShellControls(unittest.TestCase):
     def control(self, mode, want, cell="profile-pid", *, unrelated=False, local_output=False):
         with tempfile.TemporaryDirectory() as raw:
@@ -1740,49 +1768,13 @@ class ShellControls(unittest.TestCase):
                 proc = subprocess.run(["bash", str(SHELL), "--control-gated", str(observer),
                                        str(out), str(fixture), cell], env=env, text=True,
                                       capture_output=True, timeout=8)
-                self.assertEqual(proc.returncode, want, proc.stdout + proc.stderr)
-                rows = [json.loads(s) for s in (out / "results.jsonl").read_text().splitlines()]
-                self.assertEqual(len(rows), 1, rows)
-                self.assertEqual(rows[0]["cell"], cell)
-                self.assertEqual(rows[0]["pass"], want == 0)
-                if sentinel is not None:
-                    self.assertIsNone(sentinel.poll(), "runner cleanup killed an unrelated process")
-                if mode in ("never-ready", "exits-before-ready", "stale-output", "wrong-ready-pid"):
-                    self.assertFalse((out / "released").exists())
-                if cell == "system" and (out / "observer-argv.json").exists():
-                    argv = json.loads((out / "observer-argv.json").read_text())
-                    self.assertNotIn("--pid", argv)
-                    self.assertEqual(argv, ["profile", "--system", "--module", str(module),
-                                            "--duration", "25", "-o", str(out / "system.json")])
-                if want == 0 or mode in ("missing-ledger", "unproven-drain"):
-                    self.assertTrue((out / "released").exists())
-                    self.assertIs(json.loads((out / "readiness-before-release.json").read_text()), True)
-                if want == 0:
-                    if cell == "system":
-                        ledger = [json.loads(line[7:]) for line in (out / "system.wl").read_text().splitlines()
-                                  if line.startswith("LEDGER ")]
-                        self.assertEqual(len(ledger), 1)
-                        self.assertIs(ledger[0]["complete"], True)
-                        self.assertEqual([(row["name"], row["attempts"], row["successful"])
-                                          for row in ledger[0]["functions"]], [(name, 500, 500) for name in NAMES])
-                        receipt = json.loads((out / "system.receipt.json").read_text())
-                        self.assertEqual((receipt["observer_exit"], receipt["workload_exit"]), (0, 0))
-                        self.assertTrue(receipt["workload_ready"] and receipt["capture_ready"] and receipt["gate_released"])
-                        self.assertIs(json.loads((out / "system.json").read_text())["evidence"]["drain_proven"], True)
-                    if not local_output:
-                        selected = Path(json.loads((out / "selected-output.json").read_text()))
-                        self.assertEqual(selected, out / (cell + ".json"))
-                        self.assertEqual(list(local.iterdir()), [])
-                if local_output:
-                    selected = Path(json.loads((out / "selected-output.json").read_text()))
-                    self.assertTrue(selected.is_relative_to(local), "product output did not use the local disk root")
-                    self.assertFalse(selected.is_relative_to(out))
-                    self.assertEqual(json.loads((out / (cell + ".json")).read_text())["schema"], "p11scope/observed-profile/v3")
-                for name in ("fixture.pid", "observer.pid"):
-                    path = out / name
-                    if path.exists():
-                        with self.assertRaises(ProcessLookupError):
-                            os.kill(int(path.read_text()), 0)
+                try:
+                    self.check_control(proc, mode, want, cell, out, local, module, sentinel, local_output)
+                except AssertionError as error:
+                    dest = save_failure_records(self, out)
+                    if local_output:
+                        save_failure_records(self, local)
+                    raise AssertionError("%s\nfailure records: %s" % (error, dest)) from error
             finally:
                 if sentinel is not None:
                     sentinel.terminate(); sentinel.wait(timeout=2)
@@ -1792,6 +1784,68 @@ class ShellControls(unittest.TestCase):
                     if path.exists():
                         try: os.kill(int(path.read_text()), 9)
                         except ProcessLookupError: pass
+
+    def check_control(self, proc, mode, want, cell, out, local, module, sentinel, local_output):
+        self.assertEqual(proc.returncode, want, proc.stdout + proc.stderr)
+        rows = [json.loads(s) for s in (out / "results.jsonl").read_text().splitlines()]
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual(rows[0]["cell"], cell)
+        self.assertEqual(rows[0]["pass"], want == 0)
+        if sentinel is not None:
+            self.assertIsNone(sentinel.poll(), "runner cleanup killed an unrelated process")
+        if mode in ("never-ready", "exits-before-ready", "stale-output", "wrong-ready-pid"):
+            self.assertFalse((out / "released").exists())
+        if cell == "system" and (out / "observer-argv.json").exists():
+            argv = json.loads((out / "observer-argv.json").read_text())
+            self.assertNotIn("--pid", argv)
+            self.assertEqual(argv, ["profile", "--system", "--module", str(module),
+                                    "--duration", "25", "-o", str(private_dir(out) / "system.json")])
+        if want == 0 or mode in ("missing-ledger", "unproven-drain"):
+            self.assertTrue((out / "released").exists())
+            self.assertIs(json.loads((out / "readiness-before-release.json").read_text()), True)
+        if want == 0:
+            if cell == "system":
+                ledger = [json.loads(line[7:]) for line in (out / "system.wl").read_text().splitlines()
+                          if line.startswith("LEDGER ")]
+                self.assertEqual(len(ledger), 1)
+                self.assertIs(ledger[0]["complete"], True)
+                self.assertEqual([(row["name"], row["attempts"], row["successful"])
+                                  for row in ledger[0]["functions"]], [(name, 500, 500) for name in NAMES])
+                receipt = json.loads((out / "system.receipt.json").read_text())
+                self.assertEqual((receipt["observer_exit"], receipt["workload_exit"]), (0, 0))
+                self.assertTrue(receipt["workload_ready"] and receipt["capture_ready"] and receipt["gate_released"])
+                self.assertIs(json.loads((out / "system.json").read_text())["evidence"]["drain_proven"], True)
+            if not local_output:
+                selected = Path(json.loads((out / "selected-output.json").read_text()))
+                self.assertEqual(selected, private_dir(out) / (cell + ".json"))
+                self.assertEqual(list(local.iterdir()), [])
+        if local_output:
+            selected = Path(json.loads((out / "selected-output.json").read_text()))
+            self.assertTrue(selected.is_relative_to(local), "product output did not use the local disk root")
+            self.assertEqual(selected, private_dir(local) / (cell + ".json"))
+            self.assertFalse(selected.is_relative_to(out))
+            self.assertEqual(json.loads((out / (cell + ".json")).read_text())["schema"], "p11scope/observed-profile/v3")
+        for name in ("fixture.pid", "observer.pid"):
+            path = out / name
+            if path.exists():
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(int(path.read_text()), 0)
+
+    def test_a_failed_control_saves_its_typed_records(self):
+        # A wrong expectation stands in for a load failure: the message
+        # names the folder holding this control's records.
+        with self.assertRaises(AssertionError) as raised:
+            self.control("healthy", 1, local_output=True)
+        message = str(raised.exception)
+        self.assertIn("failure records: ", message)
+        dest = Path(message.rsplit("failure records: ", 1)[1].strip())
+        try:
+            rows = [json.loads(line) for line in (dest / "results.jsonl").read_text().splitlines()]
+            self.assertEqual([(row["cell"], row["pass"]) for row in rows], [("profile-pid", True)])
+            self.assertTrue((dest / "profile-pid.receipt.json").is_file())
+            self.assertTrue((dest / "selected-output.json").is_file())
+        finally:
+            shutil.rmtree(dest, ignore_errors=True)
 
     def test_ready_completed_ledger_control(self):
         self.control("healthy", 0)
@@ -1937,7 +1991,10 @@ class ShellControls(unittest.TestCase):
             self.assertEqual([(row['cell'],row['pass']) for row in rows],[('fifo-refused',passed)])
             self.assertTrue(stat.S_ISFIFO((out/'fifo').stat().st_mode))
             self.assertEqual(json.loads((out/'selected-output.json').read_text()),str(out/'fifo'))
-            self.assertEqual(list(local.iterdir()),[])
+            # The refused capture published nothing: the local root holds
+            # only this invocation's empty private directory.
+            self.assertEqual(list(local.iterdir()),[private_dir(local)])
+            self.assertEqual(list(private_dir(local).iterdir()),[])
 
     def test_never_ready_fails_without_release(self):
         self.control("never-ready", 1)

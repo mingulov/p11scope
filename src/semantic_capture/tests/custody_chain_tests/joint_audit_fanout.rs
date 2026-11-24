@@ -28910,6 +28910,12 @@ fn seal_pending_across_stop(inject_resource_failure: bool) {
     use crate::semantics_objects::journal::joint_audit::{
         CAPTURE_ENDED_SUBJECT, capture_ended_reason,
     };
+    assert_eq!(
+        capture_ended_reason(BirthObservationRefusal::Stopped, 1),
+        "the capture ended before the seal could take its birth evidence \
+         (Stopped); fell back with counted loss (1 calls)",
+        "control: the reason renders the refusal and the count"
+    );
     let registry = fixture.scene.real.scene.coordinator.registry();
     let mut ended = registry
         .gaps()
@@ -28926,7 +28932,10 @@ fn seal_pending_across_stop(inject_resource_failure: bool) {
             module: None,
             pid: None,
             subject: CAPTURE_ENDED_SUBJECT.to_string(),
-            reason: capture_ended_reason(BirthObservationRefusal::Stopped, 1),
+            // Pinned as text: the count must reach the rendered reason.
+            reason: "the capture ended before the seal could take its birth \
+                     evidence (Stopped); fell back with counted loss (1 calls)"
+                .to_string(),
             budget: None,
         })
         .collect::<Vec<_>>();

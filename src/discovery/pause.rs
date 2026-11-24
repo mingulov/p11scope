@@ -393,6 +393,10 @@ pub(crate) trait PauseIo {
 
     /// A cycle did not confirm: its stop protects nothing.
     fn note_unconfirmed_cycle(&mut self) {}
+
+    /// The pause arm failed before the first epoch and the run
+    /// continues without pause protection: file the named gap.
+    fn note_arm_failed(&mut self) {}
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -534,6 +538,15 @@ pub(crate) struct PauseCoordinator {
     successors_left: u8,
     cleaning: bool,
     cleaned: bool,
+    /// An arm-failure disarm is still unproven: the kernel may hold a
+    /// key nobody services, so every disabled pass retries the removal
+    /// and releases any stop that landed on it.
+    disarm_owed: bool,
+    /// A pause key was issued to the kernel at least once (an `arm`
+    /// write succeeded, even if its readback failed). Before the first
+    /// issuance the session's map holds no key by construction, so a
+    /// failed first arm owes no disarm read; after it, doubt reads.
+    key_issued: bool,
 }
 
 enum TimedDequeueError {
@@ -700,6 +713,8 @@ impl PauseCoordinator {
             successors_left: MAX_SUCCESSORS_PER_ARM,
             cleaning: false,
             cleaned: false,
+            disarm_owed: false,
+            key_issued: false,
         }
     }
 
@@ -728,6 +743,7 @@ impl PauseCoordinator {
 
     pub(crate) fn arm(&mut self, io: &mut impl PauseIo) -> Result<ArmResult, PauseError> {
         if self.policy == PausePolicy::Never || !self.rearming_enabled {
+            self.service_disarm_backlog(io);
             return Ok(ArmResult::Disabled);
         }
         if self.armed {
@@ -758,6 +774,7 @@ impl PauseCoordinator {
         if let Err(error) = io.arm() {
             return self.arm_cleanup_failed(io, error, false);
         }
+        self.key_issued = true;
         match io.authorization() {
             Ok(Some(PAUSE_ARMED)) => {
                 self.armed = true;
@@ -826,8 +843,33 @@ impl PauseCoordinator {
         self.begin_attempt();
         self.set_diagnostic(PauseDiagnostic::ArmFailedBeforeEpoch);
         self.rearming_enabled = false;
+        io.note_unconfirmed_cycle();
+        io.note_arm_failed();
         match self.policy {
             PausePolicy::Auto => {
+                // Never-stop: a failed re-arm must not leave the child
+                // stopped or the kernel armed with nobody servicing it
+                // (a stale key from an earlier arm, or a stop that
+                // landed on one). Before the first issuance the map
+                // holds no key by construction, so a failed first arm
+                // owes no disarm read. After it, an absent key owes
+                // nothing; any other read — a live key or an unreadable
+                // map — removes the key and releases the child, best
+                // effort, and owes a disarm retry while the removal is
+                // unproven. Removal runs before the resume: a stop that
+                // landed just before the removal is released by the
+                // resume, and none can land after it (the key is gone
+                // and nothing re-arms).
+                if self.key_issued {
+                    match io.authorization() {
+                        Ok(None) => {}
+                        _ => {
+                            let removed = io.remove_authorization().is_ok();
+                            let _ = io.resume();
+                            self.disarm_owed = !removed;
+                        }
+                    }
+                }
                 self.counters.partial = self.counters.partial.saturating_add(1);
                 let _ = self.emit_partial_diagnostic();
                 self.attempt_open = false;
@@ -838,6 +880,21 @@ impl PauseCoordinator {
                 .map(|()| ArmResult::Disabled),
             PausePolicy::Never => Ok(ArmResult::Disabled),
         }
+    }
+
+    /// Retries an arm-failure disarm the earlier pass could not prove:
+    /// the kernel may still hold the key, and a stop may have landed on
+    /// it since. Removal first (nothing can stop after an acknowledged
+    /// delete: only an arm creates the key, and re-arming is disabled),
+    /// then the release for any stop that landed before it. Doubt keeps
+    /// the debt: a failed removal retries on the next pass.
+    fn service_disarm_backlog(&mut self, io: &mut impl PauseIo) {
+        if !self.disarm_owed {
+            return;
+        }
+        let removed = io.remove_authorization().is_ok();
+        let _ = io.resume();
+        self.disarm_owed = !removed;
     }
 
     fn arm_cleanup_failed(
@@ -1352,6 +1409,7 @@ impl PauseCoordinator {
             if let Err(error) = io.arm() {
                 return self.fail_cycle(io, error, true);
             }
+            self.key_issued = true;
             let authorization = match io.authorization() {
                 Ok(state) => state,
                 Err(error) => return self.fail_cycle(io, error, true),
@@ -2955,6 +3013,11 @@ impl PauseIo for SessionPauseIo<'_> {
     fn note_unconfirmed_cycle(&mut self) {
         self.engine.note_unprotected_owned(self.child.pid());
     }
+
+    fn note_arm_failed(&mut self) {
+        self.engine
+            .note_owned_pause_gap(crate::render::PAUSE_ARM_FAILED_REASON);
+    }
 }
 
 /// Whether the coordinator's own generation is still exactly the one behind
@@ -3633,6 +3696,8 @@ mod tests {
         terminal_authority_pending: bool,
         publication_pending: bool,
         unpaused_publications: u64,
+        arm_failed_notes: u64,
+        unconfirmed_notes: u64,
     }
 
     impl Default for FakeIo {
@@ -3695,6 +3760,8 @@ mod tests {
                 terminal_authority_pending: false,
                 publication_pending: false,
                 unpaused_publications: 0,
+                arm_failed_notes: 0,
+                unconfirmed_notes: 0,
             }
         }
     }
@@ -3988,6 +4055,14 @@ mod tests {
 
         fn note_unpaused_publication(&mut self) {
             self.unpaused_publications += 1;
+        }
+
+        fn note_unconfirmed_cycle(&mut self) {
+            self.unconfirmed_notes += 1;
+        }
+
+        fn note_arm_failed(&mut self) {
+            self.arm_failed_notes += 1;
         }
     }
 
@@ -8764,6 +8839,171 @@ mod tests {
         assert!(!coordinator.rearming_enabled());
         assert!(!coordinator.is_armed());
         assert_eq!(coordinator.pending_diagnostic, None);
+    }
+
+    #[test]
+    fn auto_arm_failure_with_stale_armed_key_removes_resumes_and_gaps() {
+        let mut io = FakeIo {
+            same_generation: false,
+            authorization: Some(PAUSE_ARMED),
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.key_issued = true;
+
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Disabled);
+
+        // Removal before resume: nothing can stop after the acknowledged
+        // delete, and the resume releases any stop that landed before it.
+        assert_eq!(io.events, ["read", "remove", "resume"]);
+        assert_eq!(io.authorization, None);
+        assert!(io.resumed);
+        assert!(!coordinator.disarm_owed);
+        assert_eq!(io.arm_failed_notes, 1);
+        assert_eq!(io.unconfirmed_notes, 1);
+        assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+        // A proven disarm owes no backlog: the next pass is silent.
+        io.events.clear();
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Disabled);
+        assert!(io.events.is_empty());
+    }
+
+    #[test]
+    fn auto_arm_failure_with_landed_stop_releases_it_at_once() {
+        let mut io = FakeIo {
+            same_generation: false,
+            authorization: Some(PAUSE_REQUESTED),
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.key_issued = true;
+
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Disabled);
+
+        assert_eq!(io.events, ["read", "remove", "resume"]);
+        assert_eq!(io.authorization, None);
+        assert!(io.resumed);
+        assert!(!coordinator.disarm_owed);
+        assert_eq!(io.arm_failed_notes, 1);
+        assert_eq!(io.unconfirmed_notes, 1);
+    }
+
+    #[test]
+    fn auto_arm_failure_before_first_issuance_owes_no_disarm_io() {
+        let mut io = FakeIo {
+            same_generation: false,
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Disabled);
+
+        // The session map holds no key before the first issuance, so a
+        // failed first arm files only the named gap: no read, no
+        // removal, no signal.
+        assert!(io.events.is_empty());
+        assert!(!io.resumed);
+        assert!(!coordinator.disarm_owed);
+        assert_eq!(io.arm_failed_notes, 1);
+        assert_eq!(io.unconfirmed_notes, 1);
+        assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+    }
+
+    #[test]
+    fn always_arm_failure_files_the_named_gap_through_its_terminal_route() {
+        let mut io = FakeIo {
+            same_generation: false,
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Always, 41, 9, stopped());
+        coordinator.arm(&mut io).unwrap_err();
+        assert_eq!(io.arm_failed_notes, 1);
+        assert_eq!(io.unconfirmed_notes, 1);
+    }
+
+    #[test]
+    fn successful_arm_records_key_issuance_for_later_disarm_doubt() {
+        let mut io = FakeIo::default();
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        assert!(!coordinator.key_issued);
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Armed);
+        assert!(coordinator.key_issued);
+    }
+
+    #[test]
+    fn auto_rearm_failure_with_clean_kernel_reads_but_owes_no_resume() {
+        let mut io = FakeIo {
+            same_generation: false,
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.key_issued = true;
+
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Disabled);
+
+        // After an issuance doubt reads, but an absent key owes no
+        // removal and no signal: only the read and the named gap.
+        assert_eq!(io.events, ["read"]);
+        assert!(!io.resumed);
+        assert!(!coordinator.disarm_owed);
+        assert_eq!(io.arm_failed_notes, 1);
+        assert_eq!(io.unconfirmed_notes, 1);
+    }
+
+    #[test]
+    fn auto_arm_failure_with_unproven_disarm_retries_until_proven() {
+        let mut io = FakeIo {
+            same_generation: false,
+            authorization: Some(PAUSE_ARMED),
+            fail_remove: true,
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.key_issued = true;
+
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Disabled);
+
+        // Doubt resumes even though the removal failed, and the debt stays.
+        assert!(io.events.contains(&"remove"));
+        assert!(io.events.contains(&"resume"));
+        assert!(io.resumed);
+        assert!(coordinator.disarm_owed);
+        assert_eq!(io.arm_failed_notes, 1);
+        // The next disabled pass retries the removal and releases any
+        // stop that landed meanwhile, then clears the debt.
+        io.fail_remove = false;
+        io.events.clear();
+        io.resumed = false;
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Disabled);
+        assert_eq!(io.events, ["remove", "resume"]);
+        assert!(io.resumed);
+        assert!(!coordinator.disarm_owed);
+        // Proven: further passes are silent.
+        io.events.clear();
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Disabled);
+        assert!(io.events.is_empty());
+    }
+
+    #[test]
+    fn auto_arm_failure_with_unreadable_map_resumes_and_owes_disarm() {
+        let mut io = FakeIo {
+            same_generation: false,
+            fail_read: true,
+            fail_remove: true,
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.key_issued = true;
+
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Disabled);
+
+        // An unreadable map is doubt: remove attempted, child released,
+        // debt kept until a removal proves the kernel clean.
+        assert!(io.events.contains(&"remove"));
+        assert!(io.events.contains(&"resume"));
+        assert!(io.resumed);
+        assert!(coordinator.disarm_owed);
+        assert_eq!(io.arm_failed_notes, 1);
     }
 
     #[test]

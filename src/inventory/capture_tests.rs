@@ -4455,6 +4455,165 @@ fn a_stop_with_an_owed_exit_decision_past_its_deadline_finishes_exact() {
     );
 }
 
+/// A phased stop with an owed exit decision past its deadline
+/// finishes exact: like the blocking driver, the deadline re-entry
+/// consults the last staged sweep through the shared step instead of
+/// misreporting a refresh loss after exact sweeps.
+#[test]
+fn a_phased_stop_with_an_owed_exit_decision_past_its_deadline_finishes_exact() {
+    let log = Log::default();
+    let mut host = ContinuationHost::new(&log, Vec::new());
+    host.owed_always = true;
+    let mut lane = ScriptedLane::new(&log);
+    lane.read_delay = Duration::from_millis(10);
+    let bounded = LaneWindows {
+        terminal_sweep_budget: Duration::from_millis(50),
+        ..windows()
+    };
+    let mut started = NativeLane::start(lane, &mut host, bounded, None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    started.after_pass(&mut host);
+    let mut stop = started
+        .into_finite_stop(NativeStopDisposition::Completed, None)
+        .ok()
+        .expect("a completed pass admits the phased stop");
+    let clock = LoopClock {
+        deadline: None,
+        stop: &|| false,
+        now: &Instant::now,
+        interval: Duration::ZERO,
+        tick: Duration::from_millis(1),
+        collection_tick: Duration::ZERO,
+    };
+    let mut yielded = false;
+    loop {
+        let now = Instant::now();
+        match stop.step(&mut host, now, now + Duration::from_secs(60), &clock) {
+            NativeStopProgress::Pending(next) => {
+                stop = next;
+                // Yield to the clock after the first terminal-refresh
+                // staging (past begin_stop: pass-time and terminal
+                // stages do not count): the cooperative driver then
+                // observes the expired deadline on its next step,
+                // like a real retained run that yields between steps.
+                if !yielded {
+                    let logged = entries(&log);
+                    if let Some(stopped_at) =
+                        logged.iter().position(|entry| entry == "begin_stop")
+                    {
+                        let refresh_stages = logged[stopped_at..]
+                            .iter()
+                            .filter(|entry| *entry == "stage:witness")
+                            .count();
+                        if refresh_stages >= 1 {
+                            std::thread::sleep(Duration::from_millis(100));
+                            yielded = true;
+                        }
+                    }
+                }
+            }
+            NativeStopProgress::Stopped(_) => break,
+        }
+    }
+    assert!(yielded, "the run staged its terminal refresh");
+    let log = entries(&log);
+    let stopped_at = log.iter().position(|entry| entry == "begin_stop").unwrap();
+    let reads = log[stopped_at..]
+        .iter()
+        .filter(|entry| *entry == "read")
+        .count();
+    assert_eq!(
+        reads, 1,
+        "one exact refresh stages, then the deadline re-entry decides: {reads}"
+    );
+    assert_eq!(host.finishes, 1, "the deadline finishes the domain");
+    assert!(
+        host.refresh_losses.is_empty(),
+        "an exact refresh never reports a loss: {:?}",
+        host.refresh_losses
+    );
+}
+
+/// A phased stop past its deadline still reports the loss when no
+/// refresh sweep completed gap-free: the deadline re-entry finishes
+/// only on a genuinely exact last sweep.
+#[test]
+fn a_phased_stop_with_no_exact_refresh_past_its_deadline_reports_the_loss() {
+    let log = Log::default();
+    let mut host = ContinuationHost::new(&log, Vec::new());
+    host.owed_always = true;
+    let mut lane = ScriptedLane::new(&log);
+    lane.read_delay = Duration::from_millis(10);
+    lane.partial_refresh_reads.extend(1..=300);
+    let bounded = LaneWindows {
+        terminal_sweep_budget: Duration::from_millis(50),
+        ..windows()
+    };
+    let mut started = NativeLane::start(lane, &mut host, bounded, None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    started.after_pass(&mut host);
+    let mut stop = started
+        .into_finite_stop(NativeStopDisposition::Completed, None)
+        .ok()
+        .expect("a completed pass admits the phased stop");
+    let clock = LoopClock {
+        deadline: None,
+        stop: &|| false,
+        now: &Instant::now,
+        interval: Duration::ZERO,
+        tick: Duration::from_millis(1),
+        collection_tick: Duration::ZERO,
+    };
+    let mut yielded = false;
+    loop {
+        let now = Instant::now();
+        match stop.step(&mut host, now, now + Duration::from_secs(60), &clock) {
+            NativeStopProgress::Pending(next) => {
+                stop = next;
+                // Yield to the clock after the first terminal-refresh
+                // staging, like the exact twin: the loss below is the
+                // deadline re-entry's, not a read-straddling race.
+                if !yielded {
+                    let logged = entries(&log);
+                    if let Some(stopped_at) =
+                        logged.iter().position(|entry| entry == "begin_stop")
+                    {
+                        let refresh_stages = logged[stopped_at..]
+                            .iter()
+                            .filter(|entry| *entry == "stage:witness")
+                            .count();
+                        if refresh_stages >= 1 {
+                            std::thread::sleep(Duration::from_millis(100));
+                            yielded = true;
+                        }
+                    }
+                }
+            }
+            NativeStopProgress::Stopped(_) => break,
+        }
+    }
+    assert!(yielded, "the run staged its terminal refresh");
+    let log = entries(&log);
+    let stopped_at = log.iter().position(|entry| entry == "begin_stop").unwrap();
+    let reads = log[stopped_at..]
+        .iter()
+        .filter(|entry| *entry == "read")
+        .count();
+    assert_eq!(
+        reads, 1,
+        "one inexact refresh stages, then the deadline re-entry decides: {reads}"
+    );
+    assert_eq!(host.finishes, 1, "the deadline finishes the domain");
+    assert_eq!(
+        host.refresh_losses.len(),
+        1,
+        "an inexact refresh reports its loss exactly once: {:?}",
+        host.refresh_losses
+    );
+}
+
 /// The terminal sweep is bounded: a sweep that never completes stops
 /// reading at the budget and the stop goes on (its reads are not clean).
 #[test]

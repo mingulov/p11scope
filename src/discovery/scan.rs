@@ -24193,119 +24193,42 @@ int main(int argc, char **argv) {
         );
     }
 
-    /// A replaced-file join never consults: after a rename over the
-    /// preloaded copy the maps render it deleted, the group joins via
-    /// `map_files`, and the call-site gate keeps it off the consult
-    /// even though a matching seeded entry exists. The other groups
-    /// hit, so the third-scan total is exactly `2H - 1`. Removing the
-    /// deleted clause hits the seed and misattributes the replaced
-    /// file as examined.
+    /// A replaced-file join never consults: the maps render the
+    /// group deleted, the join opens the VMA's own file through
+    /// `map_files`, and the call-site gate keeps the joined group off
+    /// the consult even though a matching seeded entry exists.
+    /// Scripted join (a live join needs privileges the test host
+    /// lacks); the `map_files` log line plus the examined key prove
+    /// the group reached the call site. Removing the deleted clause
+    /// hits the seed instead of skipping.
     #[test]
     fn preopen_call_site_deleted_join_skips_consult() {
+        use crate::discovery::identity::FileIdentity;
         use std::os::unix::fs::MetadataExt as _;
         let _force = ForcePreopenConsultGuard::forced();
-        let dir = tempfile::tempdir().expect("preload dir");
-        let libc = ["usr/lib/x86_64-linux-gnu/libc.so.6", "usr/lib64/libc.so.6"]
-            .into_iter()
-            .map(|relative| std::path::PathBuf::from("/").join(relative))
-            .find(|candidate| candidate.is_file())
-            .expect("a system libc to copy");
-        let loader = [
-            "usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
-            "usr/lib64/ld-linux-x86-64.so.2",
-        ]
-        .into_iter()
-        .map(|relative| std::path::PathBuf::from("/").join(relative))
-        .find(|candidate| candidate.is_file())
-        .expect("a system loader to rename with");
-        let copy = dir.path().join("preload-libc.so.6");
-        std::fs::copy(&libc, &copy).expect("copy libc for preloading");
-        let mut command = std::process::Command::new("sh");
-        command
-            .args(["-c", "LD_PRELOAD= sleep 30"])
-            .env("LD_PRELOAD", &copy);
-        crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild::harden_spawn(
-            &mut command,
-        );
-        let mut sleeper = command.spawn().expect("spawn preloaded shell");
-        let mut preloaded = false;
-        for _ in 0..100 {
-            let maps = std::fs::read_to_string(format!("/proc/{}/maps", sleeper.id()))
-                .expect("read sleeper maps");
-            if maps.lines().any(|line| line.contains("preload-libc.so.6")) {
-                preloaded = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        assert!(
-            preloaded,
-            "the sleeper maps the preloaded copy (non-vacuous preload)"
-        );
-        let observer_ns = std::fs::read_link("/proc/self/ns/mnt").expect("read observer mount ns");
-        let member_ns = std::fs::read_link(format!("/proc/{}/ns/mnt", sleeper.id()))
-            .expect("read member mount ns");
-        assert_eq!(
-            observer_ns, member_ns,
-            "the member shares the observer mount namespace (same-ns consult)"
-        );
-        let pid = sleeper.id();
-        let hooks = HookRegistry::builtin();
-        let mut budget = CaptureWorkBudget::default();
-        preopen_call_site_scan(pid, &[], &hooks, &mut budget);
-        assert_eq!(
-            budget.preopen_hits_for_test(),
-            0,
-            "the cold first scan misses every group"
-        );
-        preopen_call_site_scan(pid, &[], &hooks, &mut budget);
-        let hits = budget.preopen_hits_for_test();
-        assert!(
-            hits > 0,
-            "the plain repeat hits (entries stored and hittable): {hits}"
-        );
-        let replacement = dir.path().join("replacement.so.6");
-        std::fs::copy(&loader, &replacement).expect("stage the replacement file");
-        std::fs::rename(&replacement, &copy).expect("rename over the preloaded copy");
-        let maps =
-            std::fs::read_to_string(format!("/proc/{pid}/maps")).expect("read replaced maps");
-        let line = maps
-            .lines()
-            .find(|line| line.contains("preload-libc.so.6"))
-            .expect("the replaced mapping is still rendered")
-            .to_string();
-        assert!(
-            line.contains("(deleted)"),
-            "the replaced mapping renders deleted (join precondition): {line}"
-        );
-        let mut parts = line.split_whitespace();
-        let _range = parts.next().expect("maps range");
-        let _perms = parts.next().expect("maps perms");
-        let _offset = parts.next().expect("maps offset");
-        let dev = parts.next().expect("maps device");
-        let inode: u64 = parts
-            .next()
-            .expect("maps inode")
-            .parse()
-            .expect("inode parses");
-        let mut dev_parts = dev.split(':');
-        let major =
-            u64::from_str_radix(dev_parts.next().expect("major"), 16).expect("major parses");
-        let minor =
-            u64::from_str_radix(dev_parts.next().expect("minor"), 16).expect("minor parses");
-        // The joined consult key: the observer namespace, the stale
-        // maps identity, and the replacement file's pin.
-        let target = std::fs::metadata(&copy).expect("stat the replacement file");
+        let mut fixture = MapFilesFallbackFixture::new();
+        // Suffix shape with the file still on disk: the scan branches
+        // on the marker, and the consult under test needs a statable
+        // usable path.
+        fixture.set_deleted_suffix();
+        let identity = FileIdentity { dev: 37, ino: 9 };
+        fixture.map_files = MapFilesScript::Serve(File::open(fixture.path.clone()).unwrap());
+        fixture.mapped = Some((MapFilesFallbackFixture::scripted_held(identity), identity));
+        // The joined consult key: the observer namespace (the fixture
+        // view is the observer itself), the scripted maps identity,
+        // and the replaced path's live pin.
         let ns_meta = std::fs::metadata("/proc/self/ns/mnt").expect("stat observer mount ns");
+        let target = std::fs::metadata(&fixture.path).expect("stat the replaced path");
         let seed_key = PreopenFileKey::for_target(
             crate::process::MountNamespaceId {
                 device: ns_meta.dev(),
                 inode: ns_meta.ino(),
             },
-            p11scope_manifest::maps::Device { major, minor },
-            inode,
+            fixture.key.device,
+            fixture.key.inode,
             &target,
         );
+        let mut budget = CaptureWorkBudget::default();
         let now_ns = crate::attach::monotonic_ns().expect("monotonic clock reads");
         assert!(
             budget.note_preopen_facts(
@@ -24325,16 +24248,28 @@ int main(int argc, char **argv) {
         );
         assert!(
             budget.preopen_facts_for(&seed_key, now_ns).is_some(),
-            "the seed is hittable before the third scan"
+            "the seed is hittable before the scan"
         );
-        preopen_call_site_scan(pid, &[], &hooks, &mut budget);
+        let (outcome, examined, _, _) = fixture.run(&mut budget).unwrap();
+        assert!(
+            fixture
+                .log
+                .borrow()
+                .iter()
+                .any(|line| line.starts_with("map_files 1000-2000")),
+            "the join opens the group's VMA range, got {:?}",
+            fixture.log.borrow()
+        );
+        assert!(
+            examined.iter().any(|object| object.key == fixture.key),
+            "the joined group takes the full path, got examined={examined:?} skipped={:?}",
+            outcome.skipped()
+        );
         assert_eq!(
             budget.preopen_hits_for_test(),
-            2 * hits - 1,
-            "the joined group never consults while the rest hit: second={hits}"
+            0,
+            "the joined group never consults (its seed never hits)"
         );
-        sleeper.kill().expect("kill sleeper");
-        sleeper.wait().expect("reap sleeper");
     }
 
     /// The same-root comparison behind the consult gate: the same

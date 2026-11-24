@@ -271,7 +271,7 @@ later mapper. Its `first_loaded_by.exe` is the same `/proc/<pid>/exe`
 link, read for the proving member through its retained pidfd (the
 scan view's, or a stopped member's own while it is stopped) at scan
 time and bracketed the same way; staging never re-resolves a bare
-pid. With the pause chain armed (the default) a run member
+pid. Whatever the pause policy, a run member
 is also stopped the first time it maps an executable file the
 capture has not seen yet: the observer proves the file, attaches a
 provider's probes, and resumes the member before it runs any of that
@@ -327,12 +327,13 @@ CPU burners: ten sequential python workers loading SoftHSM observe
 60 of 60 calls in 5 of 5 runs (0 of 60 before), five workers with a
 2 s hold 30 of 30 in 5 of 5 (29 of 30 before), and the pkcs11-check
 smoke suite under plain `run` reaches default call recall 1.0 (42 of
-42 oracle calls; 0.81 before). Without the stop (`--pause never`, or
-the stop object refused by the kernel) the first mapper's own calls
+42 oracle calls; 0.81 before). Without the stop (the stop object
+refused by the kernel) the first mapper's own calls
 may still be missed and the learned provider lists its missed first
 use as an unobserved window; the capture stays `PARTIAL` with the
 same fixed learned-file gap row plus descendant gaps for members
-that retired before admission. Members too short-lived to scan at all
+that retired before admission. `--pause never` keeps the stop: it
+only leaves the direct child unpaused. Members too short-lived to scan at all
 (a few milliseconds) stay counted in `pid_descendant_gaps` like the
 other never-admitted members. A job-control shell in the run tree
 can see its child briefly stopped (`CLD_STOPPED`). The stop and its
@@ -1031,8 +1032,9 @@ names the source SHA behind each check the release rounds re-measured.
   release, so fork/exec children, `sh -c` and `env` wrappers and
   double forks are born in the cgroup. The pause chain holds the
   direct child; descendants stop only briefly at their first map of
-  each new executable file (see the run first-map stop above), and
-  never with `--pause never`. Killing the observer with SIGKILL while
+  each new executable file (see the run first-map stop above),
+  whatever the pause policy (`--pause never` only leaves the direct
+  child unpaused). Killing the observer with SIGKILL while
   the child is held stopped writes no final report (no handler can
   run); the child resumes when the observer dies, through its SIGCONT
   parent-death signal, and stopped descendants through the run's

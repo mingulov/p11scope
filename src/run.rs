@@ -4174,10 +4174,12 @@ struct Owned {
     /// Never read: the `Drop` removal is the whole point.
     #[allow(dead_code)]
     run_cgroup_retired: Option<crate::scope::RunCgroup>,
-    /// Run-tree first-map stop (`None` unless the pause chain armed on
-    /// the run's own cgroup): members stop at their first map of an
-    /// uncleared executable file until its provider probes attach.
-    /// Dropping it resumes every member it still holds.
+    /// Run-tree first-map stop (`None` unless the run holds its own
+    /// cgroup scope): members stop at their first map of an uncleared
+    /// executable file until its provider probes attach. Independent of
+    /// the pause policy: the pause chain holds the owned child, this
+    /// holds its descendants. Dropping it resumes every member it
+    /// still holds.
     member_stops: Option<crate::attach::member_stop::MemberStopHooks>,
 }
 
@@ -6792,8 +6794,11 @@ fn run_owned_inner_with_host(
     // a short-lived member's provider attaches before its first call.
     // Started before the barrier release, so no member predates it. A
     // load refusal keeps the run (learning still covers later mappers).
-    if owned.coordinator.is_armed()
-        && let Some(group) = owned.run_cgroup.as_ref()
+    // Independent of the pause policy: `--pause never` leaves the owned
+    // child unpaused, but descendants still stop at first map — without
+    // this a never-pause tree reaches its provider calls before the
+    // probes attach.
+    if let Some(group) = owned.run_cgroup.as_ref()
         && let Scope::Cgroup { dir, .. } = &scope
     {
         let tree = crate::attach::member_stop::RunTree::of(group);

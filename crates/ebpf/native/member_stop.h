@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
-/* Run-tree first-map stop. Standalone object loaded only by an owned,
- * pause-armed `run` on its cgroup scope. The hook reads kernel VMA/file
- * metadata only (VM_EXEC, the mapping's range, the file's inode number
- * and superblock device):
+/* Run-tree first-map stop. Standalone object loaded only by an owned
+ * `run` on its cgroup scope, whatever the pause policy. The hook reads
+ * kernel VMA/file metadata only (VM_EXEC, the mapping's range, the
+ * file's inode number and superblock device):
  * no syscall argument, user address, path, payload or memory content is
  * read or emitted. Shared by the BPF build and the userspace mirror in
  * `src/attach/member_stop.rs`, which pins every layout below. */

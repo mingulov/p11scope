@@ -3907,6 +3907,106 @@ fn carried_fix5_backlog_skip_pops_pace_one_stride_per_apply() {
     member.wait().expect("the member reaps");
 }
 
+#[test]
+fn carried_fix5_staged_pops_pace_one_stride_per_apply() {
+    // sr-sr F1 charging, staged arm: the already-staged skip arm
+    // consumes one stride unit per pop like the other arms. A
+    // staged-only backlog past the stride (65 table-less entries,
+    // whose harvest is empty) drains 64 on the first apply and the
+    // last on the second; uncharged pops would drain it at once.
+    // (The mixed backlog above cannot pin this arm: staged entries
+    // queue last, so a dropped staged charge hides behind the
+    // charged arms ahead of it.)
+    const STAGED: usize = super::GRAPH_STRIDE + 1;
+    let me = std::process::id();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 42,
+        path: "/".into(),
+        dir: Arc::new(File::open("/").expect("open root dir")),
+    };
+    engine.owned_run_pid = Some(me);
+    engine.next_view_id = 100;
+    let mut member = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("a descendant member");
+    let descendant = member.id();
+    let other_id = engine.allocate_view_id_for_newcomer(descendant).unwrap();
+    let other_view = ProcessView::open(other_id, descendant).expect("the descendant view opens");
+    for index in 0..STAGED {
+        let key = overlay_key(6600 + index as u64);
+        let mut module = super::owned_proof_module_without_tables(key);
+        module.view = other_id;
+        let source = overlay_view_pin(&module, 6700 + index as u64, OVERLAY_SHA, 1, false);
+        let object = source
+            .id_for_scanned(&module, module.key, &module.path)
+            .expect("the fixture pin resolves");
+        engine.defer_owned_learn_proof(
+            &OwnedLearnProof {
+                view: other_id,
+                path: OVERLAY_PATH.into(),
+                object,
+                loader_exe: None,
+                loader_unknown_reason: None,
+                module,
+            },
+            &other_view,
+            &source,
+        );
+        let back = engine.owned_learn_deferred.back().expect("just queued");
+        let staged_key = super::owned_learn_key(&back.scan_pins, &back.proof)
+            .expect("the hashed fixture proofs key");
+        engine.owned_learned_staged.insert(staged_key);
+    }
+    assert_eq!(
+        engine.owned_learn_deferred.len(),
+        STAGED,
+        "every staged entry queues"
+    );
+    let weaks: Vec<std::sync::Weak<std::fs::File>> = engine
+        .owned_learn_deferred
+        .iter()
+        .map(|entry| {
+            entry
+                .scan_pins
+                .weak_file_for_test(entry.proof.object)
+                .expect("every stashed file shares")
+        })
+        .collect();
+    let mut scratch = PinnedObjects::empty();
+    engine.learn_owned_proofs_with_views(&mut scratch, &[], &[], None);
+    assert_eq!(
+        engine.owned_learn_deferred.len(),
+        1,
+        "one apply pops exactly one stride of staged entries"
+    );
+    assert_eq!(
+        engine.owned_learn_stage_attempts_for_test, 0,
+        "staged pops attempt nothing"
+    );
+    assert_eq!(
+        weaks.iter().filter(|weak| weak.upgrade().is_none()).count(),
+        super::GRAPH_STRIDE,
+        "one stride of popped files loses its last share"
+    );
+    engine.learn_owned_proofs_with_views(&mut scratch, &[], &[], None);
+    assert!(
+        engine.owned_learn_deferred.is_empty(),
+        "the second apply settles the last staged entry"
+    );
+    assert!(
+        weaks.iter().all(|weak| weak.upgrade().is_none()),
+        "every popped file loses its last share"
+    );
+    assert!(
+        engine.pending_learned.is_empty(),
+        "staged entries stage nothing"
+    );
+    member.kill().expect("the member exits");
+    member.wait().expect("the member reaps");
+}
+
 /// Seeds 65 distinct-file carriers and exits their view, so all ride
 /// as carriers (T11 shape). Returns the engine and the carried
 /// objects; the caller applies its own row-loss arm.

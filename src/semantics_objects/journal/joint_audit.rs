@@ -618,6 +618,15 @@ pub(super) struct FailureReplayCursor {
     disposed: usize,
 }
 
+impl FailureReplayCursor {
+    /// Every head this delivery degraded across all its slices,
+    /// replayed or disposed: the count both close disclosures name
+    /// (the fallback fence and the parked consumer).
+    fn counted_units(&self) -> usize {
+        self.replayed.saturating_add(self.disposed)
+    }
+}
+
 /// The real frame's two original negatives and bounded per-consumer cursor.
 /// No public constructor, merged failure, cloned effects or reusable token.
 pub(crate) struct FailureBatchDelivery<'q> {
@@ -718,6 +727,10 @@ impl<'q> FailureBatchDelivery<'q> {
     /// Heads disposed across all this delivery's slices.
     pub(crate) fn delivered_disposed(&self) -> usize {
         self.cursor.disposed
+    }
+    /// Heads replayed or disposed across all this delivery's slices.
+    pub(crate) fn delivered_units(&self) -> usize {
+        self.cursor.counted_units()
     }
 }
 
@@ -2760,9 +2773,7 @@ impl IngestedJointQuantum {
                     && let Some(decision) =
                         adapter.fence_destroyed_proof(&target.bootstrap().proof(), self.frontier.0)
                 {
-                    let units = batch
-                        .delivered_replayed()
-                        .saturating_add(batch.delivered_disposed());
+                    let units = batch.delivered_units();
                     registry.record_gap(crate::discovery::caller_registry::RegistryGap {
                         caller: Some(target.caller()),
                         module: None,
@@ -2778,9 +2789,7 @@ impl IngestedJointQuantum {
                 // Every head degraded across all delivery slices counts,
                 // replayed or disposed — not just the terminal slice's.
                 if forced.is_some() {
-                    let units = batch
-                        .delivered_replayed()
-                        .saturating_add(batch.delivered_disposed());
+                    let units = batch.delivered_units();
                     registry.record_gap(crate::discovery::caller_registry::RegistryGap {
                         caller: Some(target.caller()),
                         module: None,
@@ -3216,6 +3225,25 @@ pub(crate) mod tests {
     /// the expected set is the exact non-resumable list, so dropping
     /// either conjunct (the loss-close guard or the resumability
     /// guard) or widening the outcome flips a row.
+    #[test]
+    fn close_disclosures_count_replayed_and_disposed_heads() {
+        use super::FailureReplayCursor;
+        for (replayed, disposed, units) in [
+            (0, 0, 0),
+            (2, 0, 2),
+            (0, 3, 3),
+            (2, 3, 5),
+            (usize::MAX, 1, usize::MAX),
+        ] {
+            let cursor = FailureReplayCursor {
+                replayed,
+                disposed,
+                ..FailureReplayCursor::default()
+            };
+            assert_eq!(cursor.counted_units(), units, "{replayed}+{disposed}");
+        }
+    }
+
     #[test]
     fn fallback_close_destroys_proof_only_on_nonresumable_fallback() {
         use JournalGap::*;

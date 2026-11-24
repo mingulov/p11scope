@@ -1408,12 +1408,13 @@ fn has_pqc_content(observations: &ObjectObservations) -> bool {
 /// 12/48 value length, or a new curve name in any row or block —
 /// or, keymeta §6/K5, any established field with a non-`query`
 /// source (a view carrying `creation_success` emits v6, never v7) —
-/// or, controller KEYMETA-T1 rulings 2026-11-16 ruling 2, any view
-/// created from a truncated template (so its truncation reasons are
-/// never silently dropped below v6) — or any unsupported-value,
+/// or, controller KEYMETA-T1 rulings 2026-11-16 ruling 2, a rendered
+/// truncation reason on a truncated view (so its truncation reasons
+/// are never silently dropped below v6) — or any unsupported-value,
 /// unusable-curve (fix round 3) or partly-read (fix round 4) reason
 /// (so those reasons are never silently dropped on complete or
-/// partly-read templates).
+/// partly-read templates). The version follows visible content: the
+/// bare truncation flag alone never selects v6.
 fn has_newsite_content(observations: &ObjectObservations) -> bool {
     if observations
         .key_operations
@@ -1424,7 +1425,7 @@ fn has_newsite_content(observations: &ObjectObservations) -> bool {
     }
     observations.objects.iter().any(|row| {
         row.label.is_some_and(is_newsite_metadata_label)
-            || row.creation_truncated
+            || row_truncation_is_visible(row)
             || [row.requested, row.established].iter().any(|block| {
                 block.key_type.scalar.is_some_and(|scalar| scalar == 0x42)
                     || block
@@ -1435,6 +1436,37 @@ fn has_newsite_content(observations: &ObjectObservations) -> bool {
                     || block_has_named_reason(block)
             })
             || block_has_creation_source(&row.established)
+    })
+}
+
+/// Whether a truncated row renders its truncation: the truncation
+/// flag selects v6 only while a truncation reason is actually
+/// rendered in the row. A truncated creation whose every field kept
+/// a state (valued, conflicting or invalidated) renders no reason
+/// anywhere and selects no v6 from the hidden flag alone.
+fn row_truncation_is_visible(row: &ObjectRow) -> bool {
+    row.creation_truncated
+        && (block_has_truncation_reason(&row.requested)
+            || block_has_truncation_reason(&row.established))
+}
+
+/// Whether any field of one block carries the truncation reason:
+/// the visible v6 content a truncated template leaves behind.
+fn block_has_truncation_reason(block: &MetadataBlock) -> bool {
+    [
+        block.class,
+        block.key_type,
+        block.token,
+        block.value_len,
+        block.modulus_bits,
+        block.ec_params,
+        block.parameter_set,
+    ]
+    .iter()
+    .any(|field| {
+        field
+            .reason
+            .is_some_and(|reason| reason == TRUNCATED_TEMPLATE_REASON)
     })
 }
 

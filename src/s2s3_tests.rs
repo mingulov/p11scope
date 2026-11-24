@@ -6300,3 +6300,91 @@ fn newsite_truncated_invalidated_row_is_not_contentless_v6() {
         rendered["version"],
     );
 }
+
+// The version follows visible content: a truncated creation whose
+// established facts are all invalidated renders old-vocabulary
+// requested values, sourceless reasonless invalidated fields and no
+// label — nothing v6 — so the committed section selects no v6 from
+// the hidden truncation flag alone, and the row downstream never
+// faces the v6 visible-content gate with nothing in it.
+#[test]
+fn newsite_truncated_invalidated_row_selects_version_by_visible_content() {
+    use crate::key_operation_projection::producer::commit;
+    use crate::key_operation_projection::{
+        OBSERVATIONS_VERSION_V6, is_newsite_curve_name, is_newsite_metadata_label,
+        object_observations_json, observations_version,
+    };
+    use crate::semantics_key_use::{JointStaging, KeyUseReducer};
+    let mut h = Hist::qualified();
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    let template = attrs(&[
+        scalar(CKA_CLASS, 4),
+        scalar(CKA_KEY_TYPE, 0x1f),
+        scalar(CKA_VALUE_LEN, 32),
+        scalar(CKA_TOKEN, 1),
+        scalar(CKA_MODULUS_BITS, 2048),
+        AttrObservation::curve(CKA_EC_PARAMS, &SECP256R1, LinuxLayout::Lp64),
+        scalar(CKA_PARAMETER_SET, 1),
+        scalar(CKA_ID, 7),
+        scalar(CKA_VALUE_LEN, 48),
+    ]);
+    let x = h.run(3, create(SA).request(0, template), 4, ok().result(0, H1));
+    h.run(5, call("C_SetAttributeValue").on(SA).input(0, H1), 6, ok());
+    let e = h.settle(6);
+    let id = created(&e, x, 0).unwrap();
+    let projection = h.project();
+    let v = view(&projection, id);
+    assert!(
+        v.creation_truncated,
+        "the nine-slot template records its truncation"
+    );
+    assert_eq!(v.label, None, "no established fact survives to label");
+    let staging = JointStaging::select_s1_only();
+    let keyuse = KeyUseReducer::new();
+    let committed = commit(1, &[&staging], &projection, &keyuse);
+    assert_ne!(
+        observations_version(&committed),
+        OBSERVATIONS_VERSION_V6,
+        "a row with no visible v6 content selects no v6"
+    );
+    let rendered = object_observations_json(&committed);
+    assert_ne!(
+        rendered["version"], OBSERVATIONS_VERSION_V6,
+        "the rendered section carries the content-selected version"
+    );
+    let row = &rendered["objects"][0];
+    let visible = row["label"].as_str().is_some_and(is_newsite_metadata_label)
+        || ["requested", "established"].iter().any(|block| {
+            let block = &row[block];
+            block["key_type"]["value"] == 66
+                || block["value_len"]["value"] == 12
+                || block["value_len"]["value"] == 48
+                || block["ec_params"]["value"]
+                    .as_str()
+                    .is_some_and(is_newsite_curve_name)
+                || [
+                    "class",
+                    "key_type",
+                    "token",
+                    "value_len",
+                    "modulus_bits",
+                    "ec_params",
+                    "parameter_set",
+                ]
+                .iter()
+                .any(|name| {
+                    block[name]
+                        .get("source")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("creation_success")
+                        || block[name]
+                            .get("reason")
+                            .is_some_and(|reason| !reason.is_null())
+                })
+        });
+    assert!(
+        !visible,
+        "the row carries no visible v6 content: version={} row={row}",
+        rendered["version"],
+    );
+}

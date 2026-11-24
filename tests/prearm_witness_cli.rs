@@ -2797,6 +2797,80 @@ fn private_mount_loader_naming_rejects_the_same_basename_elsewhere() {
     ));
 }
 
+/// Whether the exact module record names the second-round tool as its
+/// first loader: the reported executable must equal the tool's own
+/// canonical path (`expected_exe`), or the finite unknown when the
+/// round-1 loader already exited (its exe link unreadable at drain).
+/// A same-named program elsewhere is foreign evidence.
+fn second_round_loader_named(
+    first_loaded_by: &serde_json::Value,
+    _expected_exe: &str,
+) -> bool {
+    // RED: suffix check mirrors the privileged cell's current verdict;
+    // the twin below must fail until the exact binding lands.
+    first_loaded_by
+        .get("exe")
+        .and_then(|exe| exe.as_str())
+        .is_some_and(|exe| exe.ends_with("pkcs11-tool"))
+        || first_loaded_by
+            .get("exe_unknown_reason")
+            .and_then(|reason| reason.as_str())
+            == Some("loader exe link unreadable")
+}
+
+/// Healthy control and negative controls for the second-round loader
+/// naming: the tool's exact executable or the finite unknown.
+#[test]
+fn second_round_loader_naming_requires_the_tool_exe_or_finite_unknown() {
+    let expected = "/usr/bin/pkcs11-tool";
+    assert!(second_round_loader_named(
+        &serde_json::json!({
+            "exe": "/usr/bin/pkcs11-tool",
+        }),
+        expected
+    ));
+    // The round-1 loader usually already exited at drain: the finite
+    // unknown is accepted here (unlike the always-alive holder).
+    assert!(second_round_loader_named(
+        &serde_json::json!({
+            "exe_unknown_reason": "loader exe link unreadable",
+        }),
+        expected
+    ));
+    // Another program's executable is foreign evidence.
+    assert!(!second_round_loader_named(
+        &serde_json::json!({
+            "exe": "/usr/bin/other-tool",
+        }),
+        expected
+    ));
+    // A missing loader record names nothing.
+    assert!(!second_round_loader_named(
+        &serde_json::json!({}),
+        expected
+    ));
+}
+
+/// The tool's basename in another directory is foreign evidence:
+/// only the tool's own canonical spelling counts, not a same-named
+/// program elsewhere.
+#[test]
+fn second_round_loader_naming_rejects_the_same_basename_elsewhere() {
+    let expected = "/usr/bin/pkcs11-tool";
+    assert!(!second_round_loader_named(
+        &serde_json::json!({
+            "exe": "/tmp/other/pkcs11-tool",
+        }),
+        expected
+    ));
+    assert!(!second_round_loader_named(
+        &serde_json::json!({
+            "exe": "/other/usr/bin/pkcs11-tool",
+        }),
+        expected
+    ));
+}
+
 /// Exact counts in both directions against a validated ledger: every
 /// ledger function observed exactly its count, and the total outside
 /// the ledger. Silence passes this comparison — that is why the cell

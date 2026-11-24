@@ -180,6 +180,7 @@ RUN = [
     ("test_release_recipient.py", []),
     ("test_residual_gates.py", []),
     ("test_return_probe_admission.py", []),
+    ("test_run_outer_layers.py", []),
     ("test_runtime_observer_download.py", []),
     ("test_s1_throughput_compare.py", []),
     ("test_scan_only_layout_oracle.py", []),

@@ -441,21 +441,23 @@ def check_mechanisms_present(report: dict[str, Any]) -> list[str]:
     return []
 
 
-def _linkage_cells(row: dict[str, Any], label: str) -> tuple[dict[str, dict[str, int]], list[str]]:
-    """Strict typed read of one mechanism row's ``by_function`` linkage.
+def _linkage_cells(holder: dict[str, Any], label: str, mechanism: int,
+                   scope: str) -> tuple[dict[str, dict[str, int]], list[str]]:
+    """Strict typed read of one ``by_function`` linkage breakdown.
 
     Returns (cells, failures): ``cells`` maps function name to its
-    ``{"calls", "errors"}`` counts. The row must carry ``by_function``
-    (a missing field is the no-linkage failure, never a skip), a list
+    ``{"calls", "errors"}`` counts. The holder (a mechanism row or
+    one provider's ``by_module`` cell) must carry ``by_function`` (a
+    missing field is the no-linkage failure, never a skip), a list
     of ``{"function", "calls", "errors"}`` objects with unique string
     names and u64 counters. Malformed input fails closed.
     """
     failures: list[str] = []
     cells: dict[str, dict[str, int]] = {}
-    linkage = row.get("by_function")
+    linkage = holder.get("by_function")
     if linkage is None:
         return cells, [f"{label}: no function x mechanism linkage "
-                       f"(by_function missing on the 0x{row.get('mechanism', 0):x} row)"]
+                       f"(by_function missing on the 0x{mechanism:x} {scope})"]
     if not isinstance(linkage, list):
         return cells, [f"{label}: by_function is not a list"]
     for entry in linkage:
@@ -478,6 +480,66 @@ def _linkage_cells(row: dict[str, Any], label: str) -> tuple[dict[str, dict[str,
     return cells, failures
 
 
+def _check_linkage_tables(cells: dict[str, dict[str, int]],
+                          totals: dict[str, Any], mechanism: int,
+                          exact: dict[str, int], floors: dict[str, int],
+                          label: str, unlisted: str, scope: str) -> list[str]:
+    """Compare one linkage breakdown against its expected tables.
+
+    Shared core behind the row and module checks: ``exact`` functions
+    compare exactly, ``floors`` need only reach their minimum,
+    unlisted cells follow ``unlisted`` (``"forbid"`` fails all,
+    ``"allow_verify"`` permits ``C_Verify*``), errors pin at zero,
+    and the cells must sum to the holder's own ``calls``/``errors``
+    totals. ``scope`` nouns the holder in messages (``"row"`` or
+    ``"module cell"``).
+    """
+    failures = []
+    for name, want in exact.items():
+        observed = cells.get(name, {}).get("calls", 0)
+        if observed != want:
+            failures.append(f"{label}: ({name} x 0x{mechanism:x}): observed "
+                            f"{observed}, want exactly {want}")
+    for name, floor in floors.items():
+        observed = cells.get(name, {}).get("calls", 0)
+        if observed < floor:
+            failures.append(f"{label}: ({name} x 0x{mechanism:x}): observed "
+                            f"{observed}, want >= {floor}")
+    for name in cells:
+        if name in exact or name in floors:
+            continue
+        if unlisted == "allow_verify" and name.startswith(_VERIFY_FAMILY_PREFIX):
+            continue
+        failures.append(f"{label}: ({name} x 0x{mechanism:x}): observed "
+                        f"{cells[name]['calls']}, want exactly 0 "
+                        f"(linkage outside the expected table)")
+    if not _u64(totals.get("calls")) or not _u64(totals.get("errors")):
+        failures.append(f"{label}: {scope} totals are not u64 counters")
+        return failures
+    if sum(cell["calls"] for cell in cells.values()) != totals["calls"]:
+        failures.append(f"{label}: linkage cells sum to "
+                        f"{sum(cell['calls'] for cell in cells.values())}, "
+                        f"{scope} calls={totals['calls']} "
+                        f"(linkage accounting drift?)")
+    if sum(cell["errors"] for cell in cells.values()) != totals["errors"]:
+        failures.append(f"{label}: linkage errors sum to "
+                        f"{sum(cell['errors'] for cell in cells.values())}, "
+                        f"{scope} errors={totals['errors']}")
+    for name in list(exact) + list(floors):
+        if name in cells and cells[name]["errors"] != 0:
+            failures.append(f"{label}: ({name} x 0x{mechanism:x}): errors "
+                            f"{cells[name]['errors']}, want 0")
+    return failures
+
+
+def _mechanism_row(report: dict[str, Any], mechanism: int) -> dict[str, Any] | None:
+    """The mechanisms[] row for ``mechanism``, or None when missing."""
+    for entry in report.get("mechanisms", []) or []:
+        if isinstance(entry, dict) and entry.get("mechanism") == mechanism:
+            return entry
+    return None
+
+
 def check_linkage_exact(report: dict[str, Any], mechanism: int,
                         exact: dict[str, int], label: str) -> list[str]:
     """The mechanism's function linkage equals ``exact`` (strict typed read).
@@ -490,43 +552,14 @@ def check_linkage_exact(report: dict[str, Any], mechanism: int,
     Missing row, missing linkage, malformed entries, and count
     mismatches all fail.
     """
-    failures = []
-    row = None
-    for entry in report.get("mechanisms", []) or []:
-        if isinstance(entry, dict) and entry.get("mechanism") == mechanism:
-            row = entry
-            break
+    row = _mechanism_row(report, mechanism)
     if row is None:
         return [f"{label}: no mechanism row for 0x{mechanism:x}"]
-    cells, failures = _linkage_cells(row, label)
+    cells, failures = _linkage_cells(row, label, mechanism, "row")
     if failures:
         return failures
-    for name, want in exact.items():
-        observed = cells.get(name, {}).get("calls", 0)
-        if observed != want:
-            failures.append(f"{label}: ({name} x 0x{mechanism:x}): observed "
-                            f"{observed}, want exactly {want}")
-    for name in cells:
-        if name not in exact:
-            failures.append(f"{label}: ({name} x 0x{mechanism:x}): observed "
-                            f"{cells[name]['calls']}, want exactly 0 "
-                            f"(linkage outside the expected table)")
-    if not _u64(row.get("calls")) or not _u64(row.get("errors")):
-        failures.append(f"{label}: row totals are not u64 counters")
-        return failures
-    if sum(cell["calls"] for cell in cells.values()) != row["calls"]:
-        failures.append(f"{label}: linkage cells sum to "
-                        f"{sum(cell['calls'] for cell in cells.values())}, "
-                        f"row calls={row['calls']} (linkage accounting drift?)")
-    if sum(cell["errors"] for cell in cells.values()) != row["errors"]:
-        failures.append(f"{label}: linkage errors sum to "
-                        f"{sum(cell['errors'] for cell in cells.values())}, "
-                        f"row errors={row['errors']}")
-    for name in exact:
-        if name in cells and cells[name]["errors"] != 0:
-            failures.append(f"{label}: ({name} x 0x{mechanism:x}): errors "
-                            f"{cells[name]['errors']}, want 0")
-    return failures
+    return _check_linkage_tables(cells, row, mechanism, exact, {}, label,
+                                 "forbid", "row")
 
 
 #: Function-name prefix allowed past the expected table under the
@@ -555,51 +588,51 @@ def check_linkage_floored(report: dict[str, Any], mechanism: int,
     """
     if unlisted not in ("forbid", "allow_verify"):
         raise ValueError(f"{label}: unlisted={unlisted!r}, want forbid|allow_verify")
-    failures = []
-    row = None
-    for entry in report.get("mechanisms", []) or []:
-        if isinstance(entry, dict) and entry.get("mechanism") == mechanism:
-            row = entry
-            break
+    row = _mechanism_row(report, mechanism)
     if row is None:
         return [f"{label}: no mechanism row for 0x{mechanism:x}"]
-    cells, failures = _linkage_cells(row, label)
+    cells, failures = _linkage_cells(row, label, mechanism, "row")
     if failures:
         return failures
-    for name, want in exact.items():
-        observed = cells.get(name, {}).get("calls", 0)
-        if observed != want:
-            failures.append(f"{label}: ({name} x 0x{mechanism:x}): observed "
-                            f"{observed}, want exactly {want}")
-    for name, floor in floors.items():
-        observed = cells.get(name, {}).get("calls", 0)
-        if observed < floor:
-            failures.append(f"{label}: ({name} x 0x{mechanism:x}): observed "
-                            f"{observed}, want >= {floor}")
-    for name in cells:
-        if name in exact or name in floors:
-            continue
-        if unlisted == "allow_verify" and name.startswith(_VERIFY_FAMILY_PREFIX):
-            continue
-        failures.append(f"{label}: ({name} x 0x{mechanism:x}): observed "
-                        f"{cells[name]['calls']}, want exactly 0 "
-                        f"(linkage outside the expected table)")
-    if not _u64(row.get("calls")) or not _u64(row.get("errors")):
-        failures.append(f"{label}: row totals are not u64 counters")
+    return _check_linkage_tables(cells, row, mechanism, exact, floors,
+                                 label, unlisted, "row")
+
+
+def check_module_linkage(report: dict[str, Any], mechanism: int,
+                         module_sha: str, exact: dict[str, int],
+                         floors: dict[str, int], label: str,
+                         unlisted: str = "forbid") -> list[str]:
+    """One provider's legs on a shared mechanism row equal the tables.
+
+    Rows are shared (one mechanism id serves several providers), so
+    row-level linkage cannot isolate one provider's legs; this check
+    scopes to the ``by_module`` cell for ``module_sha`` and compares
+    its inner ``by_function`` breakdown with the exact/floors/unlisted
+    rules above. The inner cells must sum to the cell's own totals
+    (exact by construction). A missing row, a missing module cell, a
+    missing inner breakdown, and count mismatches all fail.
+    """
+    if unlisted not in ("forbid", "allow_verify"):
+        raise ValueError(f"{label}: unlisted={unlisted!r}, want forbid|allow_verify")
+    row = _mechanism_row(report, mechanism)
+    if row is None:
+        return [f"{label}: no mechanism row for 0x{mechanism:x}"]
+    cell = None
+    for candidate in row.get("by_module", []) or []:
+        if not isinstance(candidate, dict):
+            return [f"{label}: by_module carries a malformed entry"]
+        module = candidate.get("module") or {}
+        if module.get("sha256") == module_sha:
+            cell = candidate
+            break
+    if cell is None:
+        return [f"{label}: no by_module cell for the expected module "
+                f"on the 0x{mechanism:x} row"]
+    cells, failures = _linkage_cells(cell, label, mechanism, "module cell")
+    if failures:
         return failures
-    if sum(cell["calls"] for cell in cells.values()) != row["calls"]:
-        failures.append(f"{label}: linkage cells sum to "
-                        f"{sum(cell['calls'] for cell in cells.values())}, "
-                        f"row calls={row['calls']} (linkage accounting drift?)")
-    if sum(cell["errors"] for cell in cells.values()) != row["errors"]:
-        failures.append(f"{label}: linkage errors sum to "
-                        f"{sum(cell['errors'] for cell in cells.values())}, "
-                        f"row errors={row['errors']}")
-    for name in list(exact) + list(floors):
-        if name in cells and cells[name]["errors"] != 0:
-            failures.append(f"{label}: ({name} x 0x{mechanism:x}): errors "
-                            f"{cells[name]['errors']}, want 0")
-    return failures
+    return _check_linkage_tables(cells, cell, mechanism, exact, floors,
+                                 label, unlisted, "module cell")
 
 
 def check_module_covers_row(report: dict[str, Any], mechanism: int,

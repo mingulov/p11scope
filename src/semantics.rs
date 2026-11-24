@@ -81,6 +81,17 @@ pub struct MechStat {
     /// keys are the closed function vocabulary plus `"unknown"`.
     /// Living inside the row like `by_module`, dropped with it.
     pub by_function: BTreeMap<String, MechFunctionStat>,
+    /// Per-module function linkage: sole-owner module id -> the
+    /// `by_function` partition of that module's `by_module` cell.
+    /// Rows are shared (one mechanism id serves several providers),
+    /// so row-level linkage cannot isolate one provider's legs; the
+    /// inner map can. Recorded beside every `by_module` cell count
+    /// with the row's own error rule, so each inner map sums exactly
+    /// to its cell totals. Like `by_function`, uncharged (closed
+    /// vocabulary). A separate nested map rather than a
+    /// [`MechCallStat`] field: that struct is `Copy`, and the
+    /// per-cgroup rows sharing it carry no function breakdown.
+    pub by_module_function: BTreeMap<crate::plan::ModuleId, BTreeMap<String, MechFunctionStat>>,
     /// At least one observation arrived through a standard-layout-only
     /// slot (scan layout evidence, no manifest). JSON renders the
     /// attribution basis from this and `attributed_confirmed`.
@@ -617,6 +628,73 @@ mod corrective_tests {
             },
             "function cell takes no key: {row:?}"
         );
+    }
+
+    #[test]
+    fn module_function_linkage_splits_each_providers_legs() {
+        // Shared row, split legs: two providers drive the same
+        // mechanism id (module 0 runs two single-part ops, the second
+        // failing; module 1 runs one). Each provider's
+        // `by_module_function` inner map partitions its own cell
+        // (sums equal the cell totals), while the row-level
+        // `by_function` unions both.
+        let p = two_module_plan();
+        let mut state = State::new(&p);
+        state.observe(&mechanism_at(&p, "C_SignInit", 0, 7, 0x1087, 0));
+        state.observe(&op_at(&p, "C_Sign", 2, 7, 0));
+        state.observe(&mechanism_at(&p, "C_SignInit", 0, 7, 0x1087, 0));
+        state.observe(&op_at(&p, "C_Sign", 2, 7, CkRv::GENERAL_ERROR.0));
+        state.observe(&mechanism_at(&p, "C_SignInit", 1, 7, 0x1087, 0));
+        state.observe(&op_at(&p, "C_Sign", 3, 7, 0));
+
+        let row = &state.mechanisms()[&0x1087];
+        assert_eq!((row.calls, row.errors), (6, 1));
+        let inner0 = &row.by_module_function[&crate::plan::ModuleId(0)];
+        assert_eq!(inner0.len(), 2);
+        assert_eq!(
+            inner0["C_SignInit"],
+            MechFunctionStat {
+                calls: 2,
+                errors: 0
+            }
+        );
+        assert_eq!(
+            inner0["C_Sign"],
+            MechFunctionStat {
+                calls: 2,
+                errors: 1
+            }
+        );
+        let inner1 = &row.by_module_function[&crate::plan::ModuleId(1)];
+        assert_eq!(inner1.len(), 2);
+        assert_eq!(
+            inner1["C_SignInit"],
+            MechFunctionStat {
+                calls: 1,
+                errors: 0
+            }
+        );
+        assert_eq!(
+            inner1["C_Sign"],
+            MechFunctionStat {
+                calls: 1,
+                errors: 0
+            }
+        );
+        // Each inner map sums exactly to its own cell totals.
+        for (id, cell) in &row.by_module {
+            let inner = &row.by_module_function[id];
+            assert_eq!(
+                inner.values().map(|link| link.calls).sum::<u64>(),
+                cell.calls,
+                "module {id:?} linkage sums to its cell"
+            );
+            assert_eq!(
+                inner.values().map(|link| link.errors).sum::<u64>(),
+                cell.errors,
+                "module {id:?} linkage errors sum to its cell"
+            );
+        }
     }
 
     #[test]
@@ -3875,7 +3953,7 @@ impl State {
         );
         self.record_module_mechanism(
             mechanism,
-            meta.module,
+            meta,
             ev.rv,
             ev.capture & capture::MECHANISM_UNREGISTERED != 0,
             meta.standard_layout,
@@ -4002,7 +4080,7 @@ impl State {
             );
             self.record_module_mechanism(
                 mechanism,
-                meta.module,
+                meta,
                 ev.rv,
                 unregistered,
                 from_standard_layout,
@@ -4634,32 +4712,46 @@ impl State {
     fn record_module_mechanism(
         &mut self,
         mechanism: u64,
-        module: ModuleId,
+        meta: &SlotMeta,
         rv: u64,
         unregistered: bool,
         from_standard_layout: bool,
         from_confirmed: bool,
     ) {
-        if module == MODULE_UNRESOLVED {
+        if meta.module == MODULE_UNRESOLVED {
             return;
         }
         // The capture-wide row always exists at our call sites; without
         // a rendered row there is no breakdown to record into.
         let is_new = match self.mechanisms.get(&mechanism) {
             None => return,
-            Some(stat) => !stat.by_module.contains_key(&module),
+            Some(stat) => !stat.by_module.contains_key(&meta.module),
         };
         if is_new && !self.admit(1) {
             return;
         }
+        let name = linkage_function_name(&meta.names);
         if let Some(stat) = self.mechanisms.get_mut(&mechanism) {
-            let cell = stat.by_module.entry(module).or_default();
+            let cell = stat.by_module.entry(meta.module).or_default();
             cell.unregistered |= unregistered;
             cell.attributed_standard_layout |= from_standard_layout;
             cell.attributed_confirmed |= from_confirmed;
             cell.calls += 1;
             if rv != 0 {
                 cell.errors += 1;
+            }
+            // The per-module function linkage rides beside the cell
+            // count with the same error rule, so the inner map sums
+            // exactly to its cell totals. Uncharged like `by_function`.
+            let inner = stat
+                .by_module_function
+                .entry(meta.module)
+                .or_default()
+                .entry(name.to_owned())
+                .or_default();
+            inner.calls += 1;
+            if rv != 0 {
+                inner.errors += 1;
             }
         }
     }

@@ -6002,11 +6002,15 @@ struct MechanismOut {
 /// subset of the row — observations on slots with no sole owner, or
 /// whose owner the discovery list does not name, count in the row
 /// totals but in no entry — so entry sums never exceed the row.
+/// `by_function` partitions the entry: rows are shared, so row-level
+/// linkage cannot isolate one provider's legs; the inner entries sum
+/// exactly to this entry's totals.
 #[derive(Serialize)]
 struct ByModuleOut {
     module: ModuleRef,
     calls: u64,
     errors: u64,
+    by_function: Vec<ByFunctionOut>,
 }
 
 /// One function name's share of a mechanism row: the function x
@@ -6601,6 +6605,20 @@ fn profile_mechanisms_out(
                             },
                             calls: cell.calls,
                             errors: cell.errors,
+                            by_function: m
+                                .by_module_function
+                                .get(id)
+                                .map(|inner| {
+                                    inner
+                                        .iter()
+                                        .map(|(function, linkage)| ByFunctionOut {
+                                            function: function.clone(),
+                                            calls: linkage.calls,
+                                            errors: linkage.errors,
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
                         })
                 })
                 .collect();
@@ -18293,6 +18311,8 @@ pub(crate) mod tests {
     /// one `by_module` entry per sole-owner module, each with the same
     /// `{dev, ino, sha256}` reference `functions[].module` uses. The
     /// entries partition the row: their sums equal the row totals.
+    /// Each entry carries its own `by_function` linkage partitioning
+    /// the entry the row-level breakdown partitions the row.
     #[test]
     fn profile_json_mechanism_rows_split_calls_and_errors_by_module() {
         let mut state = crate::semantics::State::with_policy(
@@ -18339,11 +18359,19 @@ pub(crate) mod tests {
                     "module": {"dev": [8, 1], "ino": 11, "sha256": "11".repeat(32)},
                     "calls": 4,
                     "errors": 1,
+                    "by_function": [
+                        {"function": "C_Sign", "calls": 2, "errors": 1},
+                        {"function": "C_SignInit", "calls": 2, "errors": 0},
+                    ],
                 },
                 {
                     "module": {"dev": [8, 2], "ino": 22, "sha256": "22".repeat(32)},
                     "calls": 6,
                     "errors": 0,
+                    "by_function": [
+                        {"function": "C_Sign", "calls": 3, "errors": 0},
+                        {"function": "C_SignInit", "calls": 3, "errors": 0},
+                    ],
                 },
             ]),
             "per-provider partition of the row: {row}"

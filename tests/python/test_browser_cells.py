@@ -581,13 +581,10 @@ class BrowserCells(unittest.TestCase):
         failures += oracle.check_module_covers_row(
             report, oracle.CKM_SHA256_RSA_PKCS_PSS,
             oracle.sha256_of(Path(bundled)), "FF-CC-SIGN pss-sign")
-        failures += oracle.check_linkage_floored(
-            report, oracle.CKM_SHA256_HMAC,
-            {"C_SignInit": 1, "C_SignFinal": 1}, {"C_SignUpdate": 1},
-            "FF-CC-SIGN seeding-hmac")
-        failures += oracle.check_module_covers_row(
+        failures += oracle.check_module_linkage(
             report, oracle.CKM_SHA256_HMAC,
             oracle.system_softokn_sha(report, bundled),
+            {"C_SignInit": 1, "C_SignFinal": 1}, {"C_SignUpdate": 1},
             "FF-CC-SIGN seeding-hmac")
         failures += oracle.check_bundled_coverage_or_named_gap(
             report, oracle.sha256_of(Path(bundled)), bundled,
@@ -620,13 +617,10 @@ class BrowserCells(unittest.TestCase):
         failures += oracle.check_linkage_floored(
             report, oracle.CKM_SHA256_RSA_PKCS_PSS, {}, {},
             "FF-CC-PLAIN pss-sign", unlisted="allow_verify")
-        failures += oracle.check_linkage_floored(
-            report, oracle.CKM_SHA256_HMAC,
-            {"C_SignInit": 1, "C_SignFinal": 1}, {"C_SignUpdate": 1},
-            "FF-CC-PLAIN seeding-hmac")
-        failures += oracle.check_module_covers_row(
+        failures += oracle.check_module_linkage(
             report, oracle.CKM_SHA256_HMAC,
             oracle.system_softokn_sha(report, bundled),
+            {"C_SignInit": 1, "C_SignFinal": 1}, {"C_SignUpdate": 1},
             "FF-CC-PLAIN seeding-hmac")
         failures += oracle.check_bundled_coverage_or_named_gap(
             report, oracle.sha256_of(Path(bundled)), bundled,
@@ -2306,23 +2300,23 @@ def sign_cells_missing_coverage(source):
 #: pairs for the attributed mechanisms plus presence legs. Dropping
 #: any leg weakens the cell silently (fewer failures, same green),
 #: including dropping one of two same-family legs, so the meta-test
-#: pins mechanism pairing, not just call presence. The plain control
-#: pins the HMAC seeding legs too (seeding is handshake-independent)
-#: but not PSS sole-module (unobserved there).
+#: pins mechanism pairing, not just call presence. The shared HMAC
+#: row is pinned per-module (module linkage); the sole-user PSS row
+#: per-row (linkage plus sole-module cover). The plain control pins
+#: the HMAC seeding legs too (seeding is handshake-independent) but
+#: not PSS sole-module (unobserved there).
 _FF_CC_REQUIRED_LEGS = {
     "test_ff_cc_sign_attributed_under_run_default": {
         ("check_linkage_floored", "CKM_SHA256_RSA_PKCS_PSS"),
-        ("check_linkage_floored", "CKM_SHA256_HMAC"),
+        ("check_module_linkage", "CKM_SHA256_HMAC"),
         ("check_module_covers_row", "CKM_SHA256_RSA_PKCS_PSS"),
-        ("check_module_covers_row", "CKM_SHA256_HMAC"),
         ("check_bundled_coverage_or_named_gap", None),
         ("check_no_state_drops", None),
         ("check_cc_ground_truth", None),
     },
     "test_ff_cc_plain_has_no_pss_sign": {
         ("check_linkage_floored", "CKM_SHA256_RSA_PKCS_PSS"),
-        ("check_linkage_floored", "CKM_SHA256_HMAC"),
-        ("check_module_covers_row", "CKM_SHA256_HMAC"),
+        ("check_module_linkage", "CKM_SHA256_HMAC"),
         ("check_bundled_coverage_or_named_gap", None),
         ("check_no_state_drops", None),
         ("check_plain_ground_truth", None),
@@ -2375,7 +2369,8 @@ def sign_cells_missing_required_legs(source):
                     continue
                 name = call.func.attr
                 if name in ("check_linkage_floored",
-                            "check_module_covers_row"):
+                            "check_module_covers_row",
+                            "check_module_linkage"):
                     mech = None
                     if len(call.args) >= 2 and isinstance(
                             call.args[1], ast.Attribute):
@@ -3269,6 +3264,109 @@ class BrowserFirefoxCC(unittest.TestCase):
             self.assertNotEqual(failures, [])
             self.assertIn("another user", failures[0])
 
+    def test_module_linkage_healthy_accepted(self):
+        """Twin: shared row, one provider's legs pinned in its cell."""
+        sha_sys, sha_bun = "s" * 64, "b" * 64
+        sys_entries = [self.linkage_entry("C_SignInit", 1),
+                       self.linkage_entry("C_SignUpdate", 3),
+                       self.linkage_entry("C_SignFinal", 1)]
+        bun_entries = [self.linkage_entry("C_SignInit", 3),
+                       self.linkage_entry("C_SignUpdate", 3),
+                       self.linkage_entry("C_SignFinal", 3)]
+        sys_cell = {"module": {"sha256": sha_sys}, "calls": 5, "errors": 0,
+                    "by_function": [dict(e) for e in sys_entries]}
+        bun_cell = {"module": {"sha256": sha_bun}, "calls": 9, "errors": 0,
+                    "by_function": [dict(e) for e in bun_entries]}
+        row_entries = ([self.linkage_entry("C_SignInit", 4),
+                        self.linkage_entry("C_SignUpdate", 6),
+                        self.linkage_entry("C_SignFinal", 4)])
+        row = self.linkage_row(0x251, row_entries,
+                               by_module=[sys_cell, bun_cell])
+        doc = {"mechanisms": [row]}
+        self.assertEqual(
+            oracle.check_module_linkage(
+                doc, 0x251, sha_sys,
+                {"C_SignInit": 1, "C_SignFinal": 1}, {"C_SignUpdate": 1},
+                "TWIN"), [])
+
+    def test_module_linkage_rejected(self):
+        sha_sys = "s" * 64
+        sys_entries = [self.linkage_entry("C_SignInit", 1),
+                       self.linkage_entry("C_SignUpdate", 3),
+                       self.linkage_entry("C_SignFinal", 1)]
+
+        def run(row, sha=None, **kwargs):
+            doc = {"mechanisms": [row] if row is not None else []}
+            return oracle.check_module_linkage(
+                doc, 0x251, sha or sha_sys,
+                {"C_SignInit": 1, "C_SignFinal": 1}, {"C_SignUpdate": 1},
+                "TWIN", **kwargs)
+
+        def cell(entries, calls=5, errors=0, sha=None, extra=None):
+            entry = {"module": {"sha256": sha or sha_sys},
+                     "calls": calls, "errors": errors,
+                     "by_function": entries}
+            if extra:
+                entry.update(extra)
+            return entry
+
+        with self.subTest("missing row"):
+            self.assertNotEqual(run(None), [])
+        with self.subTest("missing module cell"):
+            row = self.linkage_row(
+                0x251, sys_entries,
+                by_module=[cell(sys_entries, sha="o" * 64)])
+            failures = run(row)
+            self.assertNotEqual(failures, [])
+            self.assertIn("no by_module cell", failures[0])
+        with self.subTest("malformed by_module"):
+            row = self.linkage_row(0x251, sys_entries)
+            row["by_module"] = ["x"]
+            failures = run(row)
+            self.assertNotEqual(failures, [])
+            self.assertIn("malformed entry", failures[0])
+        with self.subTest("missing inner breakdown"):
+            inner = cell(sys_entries)
+            del inner["by_function"]
+            row = self.linkage_row(0x251, sys_entries,
+                                   by_module=[inner])
+            failures = run(row)
+            self.assertNotEqual(failures, [])
+            self.assertIn("no function x mechanism linkage", failures[0])
+        with self.subTest("off by one"):
+            entries = [self.linkage_entry("C_SignInit", 2),
+                       self.linkage_entry("C_SignUpdate", 3),
+                       self.linkage_entry("C_SignFinal", 1)]
+            row = self.linkage_row(0x251, entries,
+                                   by_module=[cell(entries, calls=6)])
+            failures = run(row)
+            self.assertNotEqual(failures, [])
+            self.assertIn("want exactly 1", failures[0])
+        with self.subTest("floor missed"):
+            entries = [self.linkage_entry("C_SignInit", 1),
+                       self.linkage_entry("C_SignFinal", 1)]
+            row = self.linkage_row(0x251, entries,
+                                   by_module=[cell(entries, calls=2)])
+            self.assertNotEqual(run(row), [])
+        with self.subTest("extra function"):
+            entries = sys_entries + [self.linkage_entry("C_Sign", 1)]
+            row = self.linkage_row(0x251, entries,
+                                   by_module=[cell(entries, calls=6)])
+            failures = run(row)
+            self.assertNotEqual(failures, [])
+            self.assertIn("outside the expected table", failures[0])
+        with self.subTest("inner sums must match the cell"):
+            row = self.linkage_row(0x251, sys_entries,
+                                   by_module=[cell(sys_entries, calls=99)])
+            failures = run(row)
+            self.assertNotEqual(failures, [])
+            self.assertIn("module cell calls=99", failures[0])
+        with self.subTest("bad policy raises"):
+            row = self.linkage_row(0x251, sys_entries,
+                                   by_module=[cell(sys_entries)])
+            with self.assertRaises(ValueError):
+                run(row, unlisted="allow_all")
+
     def test_no_state_drops_healthy_accepted(self):
         doc = {"evidence": {"semantic_state_drops": 0,
                             "semantic_history_drops": 0}}
@@ -3674,8 +3772,7 @@ class BrowserFirefoxCC(unittest.TestCase):
         self.assertEqual(
             missing,
             {"test_ff_cc_sign_attributed_under_run_default": [
-                ("check_linkage_floored", "CKM_SHA256_HMAC"),
-                ("check_module_covers_row", "CKM_SHA256_HMAC"),
+                ("check_module_linkage", "CKM_SHA256_HMAC"),
             ]})
 
     def test_sign_cells_flag_missing_coverage_call(self):

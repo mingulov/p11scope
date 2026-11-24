@@ -289,8 +289,12 @@ cell, recorded beside the row count. The row's `ops` names the
 operation families; `by_function` names which calls drove them.
 `cgroups[].mechanisms[]` rows carry no `by_function` (they carry no
 `ops` either); use the row plus `by_module` for the provider split.
-Like `registered` and `name`, this is a v3-additive disclosure with no
-new schema revision.
+Each `by_module` entry carries its own `by_function` breakdown with
+the same shape and rules: rows are shared (one id serves several
+providers), so row-level linkage cannot isolate one provider's legs,
+while the inner entries sum exactly to their entry's totals. Like
+`registered` and `name`, these are v3-additive disclosures with no new
+schema revision.
 
 The observer and `p11scope inspect` make zero PKCS #11 calls. Only the explicit
 offline `p11scope-discover` helper loads a provider and makes exactly ten

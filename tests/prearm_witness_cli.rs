@@ -646,10 +646,7 @@ fn read_ledger_file(ledger: &Path) -> BTreeMap<String, u64> {
     let deadline = Instant::now() + TIMEOUT;
     loop {
         if let Ok(text) = std::fs::read_to_string(ledger) {
-            let records: Vec<&str> = text
-                .lines()
-                .filter(|line| !line.is_empty())
-                .collect();
+            let records: Vec<&str> = text.lines().filter(|line| !line.is_empty()).collect();
             if !records.is_empty() && text.ends_with('\n') {
                 assert_eq!(
                     records.len(),
@@ -3100,8 +3097,7 @@ fn privileged_profile_system_learned_provider_private_mount_is_learned_and_count
     let (counts_exact, spurious) = ledger_counts_match(&observed, &ledger_counts);
     // The provider is listed with the program that first loaded it.
     let first = record.get("first_loaded_by");
-    let loader_named =
-        first.is_some_and(|first| private_mount_loader_named(first, &holder_exe));
+    let loader_named = first.is_some_and(|first| private_mount_loader_named(first, &holder_exe));
     let pre_attach_loads = first
         .and_then(|first| first.get("pre_attach_loads"))
         .and_then(|loads| loads.as_u64());

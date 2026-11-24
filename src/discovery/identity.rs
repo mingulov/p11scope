@@ -17507,16 +17507,8 @@ mod tests {
             })
             .expect("the twin match must resolve")
             .expect("the twin row is found");
-            assert_eq!(
-                row,
-                table.trim_end_matches('\n'),
-                "total: {total_want}"
-            );
-            assert_eq!(
-                budget.work_units_count(),
-                units_want,
-                "total: {total_want}"
-            );
+            assert_eq!(row, table.trim_end_matches('\n'), "total: {total_want}");
+            assert_eq!(budget.work_units_count(), units_want, "total: {total_want}");
             assert_eq!(polls, polls_want, "total: {total_want}");
             assert_eq!(
                 exact_bytes_scanned_for_test(),

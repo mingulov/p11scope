@@ -690,7 +690,9 @@ fn read_mountinfo_pass<R: Read>(
                 return Err(reason.into());
             }
             if !progress.encoding.complete() {
-                return Err("mount table is not valid UTF-8: incomplete sequence at end of table".into());
+                return Err(
+                    "mount table is not valid UTF-8: incomplete sequence at end of table".into(),
+                );
             }
             // SAFETY: every byte in `progress.table` passed through
             // `progress.encoding` in the chunk loop of this or an
@@ -21772,10 +21774,8 @@ int main(int argc, char **argv) {
     fn mountinfo_reader_valid_multibyte_utf8_resolves() {
         reset_reader_scan_counters_for_test();
         let line = "1 1 8:1 / /münt rw - ext4 /dev/root rw\n";
-        let mut reader = RecordingReader::new([
-            ReaderStep::Bytes(line.as_bytes().to_vec()),
-            ReaderStep::Eof,
-        ]);
+        let mut reader =
+            RecordingReader::new([ReaderStep::Bytes(line.as_bytes().to_vec()), ReaderStep::Eof]);
         let mut budget = CaptureWorkBudget::default();
         let table = read_mountinfo_with(&mut reader, &mut budget, 1024 * 1024, |_| None)
             .expect("valid multi-byte UTF-8 must read");

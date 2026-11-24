@@ -40,14 +40,13 @@ use crate::discovery::loader::{LoaderContextId, LoaderContextSpec, LoaderRegistr
 use crate::discovery::noise::DiscoveryNoiseAggregator;
 use crate::discovery::scan::{
     CaptureWorkBudget, LoaderElfFacts, LoaderFactsKey, MapsReadBuffers, MapsReadLimits,
-    ObjectExports, PER_OBJECT_ALLOWANCE_REASON, ScanOutcome, ScanRequest, ScannedEntry,
-    ScannedInterface, ScannedModule, ScannedTable, Skipped, decode_exact_table,
-    decode_observed_words, decoded_table_addresses, exact_legacy_prefix_bytes,
-    exact_table_addresses_n, exact_table_bytes, export_agreement, index_maps_or_refuse,
-    is_provider_mapping, published_walk, read_elf_snapshot, read_maps_or_refuse,
-    read_maps_or_refuse_with_buffers, scan_process_view, scan_process_view_examined,
-    scan_process_view_without_memory, scan_skip_truncates, table_evidence_score,
-    table_has_only_opaque_interfaces, table_linkage, target_layout,
+    ObjectExports, ScanOutcome, ScanRequest, ScannedEntry, ScannedInterface, ScannedModule,
+    ScannedTable, Skipped, decode_exact_table, decode_observed_words, decoded_table_addresses,
+    exact_legacy_prefix_bytes, exact_table_addresses_n, exact_table_bytes, export_agreement,
+    index_maps_or_refuse, is_provider_mapping, published_walk, read_elf_snapshot,
+    read_maps_or_refuse, read_maps_or_refuse_with_buffers, scan_process_view,
+    scan_process_view_examined, scan_process_view_without_memory, scan_skip_truncates,
+    table_evidence_score, table_has_only_opaque_interfaces, table_linkage, target_layout,
 };
 use crate::discovery::scheduler::{
     DiscoveryScheduler, InventoryCadence, MAX_NEWCOMER_ADMISSIONS_PER_TICK, MAX_PENDING_REFRESH,
@@ -27313,11 +27312,19 @@ impl Engine {
                 let len = (end - addr).min(chunk.len() as u64) as usize;
                 let used = op_bytes.get(&object).copied().unwrap_or(0);
                 if self.budget.allowed_io(used, len) < len {
-                    if self.budget.io_shortfall_reason(used) == PER_OBJECT_ALLOWANCE_REASON {
-                        // This object's allowance is spent: retire its
-                        // remaining ranges and continue with other
-                        // objects while window budget remains. Only a
-                        // spent window stops the pass.
+                    // A per-object shortfall — exact or partial — retires
+                    // this object's remaining ranges and continues with
+                    // other objects while the window still admits the
+                    // chunk; only a spent window (or a terminal
+                    // collection/scan stop) ends the pass. The legs are
+                    // read directly: `io_shortfall_reason` names only a
+                    // zero allowance, while a nonzero remainder below
+                    // `len` still leaves the chunk unfittable for this
+                    // object. Both reads are charge-free, so the
+                    // checkpoint inside `allowed_io` above runs once.
+                    let op_left = self.budget.limits().per_object_bytes.saturating_sub(used);
+                    let win_left = self.budget.remaining_window_io().unwrap_or(0);
+                    if Self::prefault_retire_on_shortfall(op_left, win_left, len) {
                         exhausted.insert(object);
                         cursor.ranges[index].next_addr = end;
                         break;
@@ -27639,6 +27646,17 @@ impl Engine {
             .map_err(std::io::Error::other)?
             .pop()
             .unwrap_or_else(|| Err(std::io::Error::other("empty re-proof batch")))
+    }
+
+    /// Whether a warmup chunk shortfall retires its object instead of
+    /// stopping the pass: true exactly when the object cannot fit the
+    /// chunk while the window still admits it. Pure over the two
+    /// allowance legs (no budget charge or stop), so exact and partial
+    /// per-object shortfalls retire alike; a fitting object, a window
+    /// below the chunk, or a terminal stop behind admitting legs all
+    /// stop the pass instead.
+    fn prefault_retire_on_shortfall(op_left: u64, win_left: u64, len: usize) -> bool {
+        op_left < len as u64 && (len as u64) <= win_left
     }
 
     /// Files one finite named warmup-loss gap (deduped exact

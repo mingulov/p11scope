@@ -41206,6 +41206,43 @@ fn prefault_manifest_getter_data_retires_an_exhausted_tail_across_a_resume_witho
     );
 }
 
+/// The warmup shortfall decision retires exactly when the object cannot
+/// fit the chunk while the window still admits it: every quadrant and
+/// boundary of the two legs (unit: the decision is pure, so the table
+/// pins it without a maps snapshot; the twins above pin the wired legs
+/// at the seam).
+#[test]
+fn prefault_shortfall_retires_only_a_fittable_window_with_an_unfittable_object() {
+    let cases: &[(u64, u64, usize, bool)] = &[
+        // Exact exhaustion with window room retires.
+        (0, 65536, 65536, true),
+        (0, 8 << 20, 16384, true),
+        // Partial remainders with window room retire.
+        (32768, 8 << 20, 65536, true),
+        (65535, 8 << 20, 65536, true),
+        (1, 8 << 20, 65536, true),
+        // A fitting object never retires (the branch is unreachable).
+        (65536, 8 << 20, 65536, false),
+        (8 << 20, 8 << 20, 65536, false),
+        // A window below the chunk stops the pass even with a spent
+        // object.
+        (0, 0, 65536, false),
+        (0, 1000, 65536, false),
+        (32768, 1000, 65536, false),
+        // Boundary: the window admits exactly the chunk.
+        (0, 65536, 65536, true),
+        (32768, 65536, 65536, true),
+        (65536, 65535, 65536, false),
+    ];
+    for (op_left, win_left, len, expected) in cases {
+        assert_eq!(
+            Engine::prefault_retire_on_shortfall(*op_left, *win_left, *len),
+            *expected,
+            "op_left={op_left} win_left={win_left} len={len}"
+        );
+    }
+}
+
 /// Failed proofs count as attempted operations too: a missing held proof
 /// spends its lookup, and unreadable batch stats spend theirs (twin:
 /// counting only successes would under-report the native work).

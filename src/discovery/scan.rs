@@ -24007,7 +24007,9 @@ int main(int argc, char **argv) {
     /// early skip) and still take the full path. The narrowed clause
     /// alone is redundant (a narrowed group is always a hinted run,
     /// so the hints clause co-blocks), but the end-to-end property
-    /// must hold and any fail-open wiring serves hits here.
+    /// must hold: only a fail-open of the whole guard conjunction
+    /// (narrowed+hints+excludes) serves hits here; the narrowed
+    /// single flip is equivalent.
     #[test]
     fn preopen_call_site_narrowed_group_skips_consult() {
         use crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild;
@@ -24200,7 +24202,10 @@ int main(int argc, char **argv) {
     /// Scripted join (a live join needs privileges the test host
     /// lacks); the `map_files` log line plus the examined key prove
     /// the group reached the call site. Removing the deleted clause
-    /// hits the seed instead of skipping.
+    /// together with the single-path gate (the deleted+single double)
+    /// hits the seed instead of skipping; the single flip is
+    /// co-blocked by the single-path gate for this all-deleted
+    /// rendering (the mixed-rendering twin pins the single kill).
     #[test]
     fn preopen_call_site_deleted_join_skips_consult() {
         use crate::discovery::identity::FileIdentity;
@@ -24269,6 +24274,105 @@ int main(int argc, char **argv) {
             budget.preopen_hits_for_test(),
             0,
             "the joined group never consults (its seed never hits)"
+        );
+    }
+
+    /// A mixed deleted+usable same-key group never consults: the first
+    /// range renders `<path> (deleted)` so the join still runs (`usable`
+    /// derives from the first entry only), while the second range
+    /// renders a usable hardlink alias of the same key (one link
+    /// unlinked while another still maps the inode). The group IS
+    /// single-path, so the deleted clause is the only barrier before
+    /// the consult. Removing the deleted clause hits the seed instead
+    /// of skipping.
+    #[test]
+    fn preopen_call_site_mixed_deleted_usable_group_skips_consult() {
+        use crate::discovery::identity::FileIdentity;
+        use std::os::unix::fs::MetadataExt as _;
+        let _force = ForcePreopenConsultGuard::forced();
+        let mut fixture = MapFilesFallbackFixture::new();
+        // A real hardlink alias: the same inode under a second path,
+        // so both maps lines render the fixture key while only the
+        // first carries the deleted marker.
+        let alias = fixture.path.with_file_name("libfixture-alias.so");
+        std::fs::hard_link(&fixture.path, &alias).unwrap();
+        fixture.render_mixed_deleted_usable_maps(&alias.display().to_string());
+        // Premise on the production parser, grouper and predicate: the
+        // fixture text must stay one two-entry group that IS
+        // single-path, else this twin would pass without pinning the
+        // deleted clause.
+        let parsed = parse_maps(fixture.maps.as_bytes()).expect("the mixed maps parse");
+        let parsed_index = MapIndex::new(&parsed).expect("the mixed entries index");
+        let groups = candidate_groups(&parsed);
+        assert_eq!(
+            groups.len(),
+            1,
+            "the mixed renderings share one key: {groups:?}"
+        );
+        let group = groups.values().next().expect("one mixed group");
+        assert_eq!(group.len(), 2, "the mixed group keeps both renderings");
+        assert!(
+            preopen_group_single_path(group, &parsed_index),
+            "premise: the mixed deleted+usable group is single-path"
+        );
+        let identity = FileIdentity { dev: 37, ino: 9 };
+        fixture.map_files = MapFilesScript::Serve(File::open(fixture.path.clone()).unwrap());
+        fixture.mapped = Some((MapFilesFallbackFixture::scripted_held(identity), identity));
+        // The joined consult key: the observer namespace (the fixture
+        // view is the observer itself), the scripted maps identity,
+        // and the replaced path's live pin.
+        let ns_meta = std::fs::metadata("/proc/self/ns/mnt").expect("stat observer mount ns");
+        let target = std::fs::metadata(&fixture.path).expect("stat the replaced path");
+        let seed_key = PreopenFileKey::for_target(
+            crate::process::MountNamespaceId {
+                device: ns_meta.dev(),
+                inode: ns_meta.ino(),
+            },
+            fixture.key.device,
+            fixture.key.inode,
+            &target,
+        );
+        let mut budget = CaptureWorkBudget::default();
+        let now_ns = crate::attach::monotonic_ns().expect("monotonic clock reads");
+        assert!(
+            budget.note_preopen_facts(
+                seed_key,
+                PreopenEntry {
+                    facts: ElfExportFacts {
+                        abi: p11scope_manifest::elf::ElfAbi::Lp64,
+                        exports: Vec::new(),
+                        getter_present: false,
+                        witness_fault: false,
+                        excluded_anchor_ranges: Vec::new(),
+                    },
+                    stored_ns: now_ns,
+                },
+            ),
+            "the mixed-join seed stores"
+        );
+        assert!(
+            budget.preopen_facts_for(&seed_key, now_ns).is_some(),
+            "the seed is hittable before the scan"
+        );
+        let (outcome, examined, _, _) = fixture.run(&mut budget).unwrap();
+        assert!(
+            fixture
+                .log
+                .borrow()
+                .iter()
+                .any(|line| line.starts_with("map_files 1000-2000")),
+            "the mixed join opens the group's VMA range, got {:?}",
+            fixture.log.borrow()
+        );
+        assert!(
+            examined.iter().any(|object| object.key == fixture.key),
+            "the mixed joined group takes the full path, got examined={examined:?} skipped={:?}",
+            outcome.skipped()
+        );
+        assert_eq!(
+            budget.preopen_hits_for_test(),
+            0,
+            "the mixed joined group never consults (its seed never hits)"
         );
     }
 
@@ -31319,6 +31423,25 @@ int main(int argc, char **argv) {
         /// branches on the suffix, not on the unlink.
         fn set_deleted_suffix(&mut self) {
             self.render_deleted_maps();
+        }
+
+        /// The mixed-rendering shape: the first range keeps the
+        /// `<path> (deleted)` marker (so the join still runs — `usable`
+        /// derives from the first entry only) while the second range
+        /// renders `alias` usable under the same key (one hardlink
+        /// unlinked while another still maps the inode). The group IS
+        /// single-path, so the deleted clause is the only barrier
+        /// before the consult.
+        fn render_mixed_deleted_usable_maps(&mut self, alias: &str) {
+            let key = format!(
+                "{:x}:{:x} {}",
+                self.key.device.major, self.key.device.minor, self.key.inode
+            );
+            self.maps = format!(
+                "1000-2000 r-xp 00000000 {key} {} (deleted)\n\
+                 7000-8000 r--p 00004000 {key} {alias}\n",
+                self.path.display(),
+            );
         }
 
         /// The faithful replaced-on-disk shape: the path is unlinked

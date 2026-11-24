@@ -23109,13 +23109,15 @@ fn owned_tree_watch_repeat_in_foreign_mount_ns_skips_consult() {
 }
 
 /// Replacing a mapped file by rename never consults: the maps render
-/// the mapping deleted, the group joins via `map_files`, and the
-/// call-site gate keeps the joined group off the consult entirely, so
-/// no key Miss occurs (unlike overwrite, which Misses on its pin
-/// change). The joined group then takes the full path and the identity
-/// guard refuses the renamed path without re-reading, so the twin
-/// asserts the exact `2H - 1` hit delta (all but the renamed group
-/// hit). It kills a disabled consult via `H > 0`, not a key mutant.
+/// the mapping deleted; the group joins via `map_files` where
+/// privileges allow (else it takes the replaced-file gap before the
+/// call site), and either way it never consults, so no key Miss occurs
+/// (unlike overwrite, which Misses on its pin change). On the join path
+/// the joined group then takes the full path and the identity guard
+/// refuses the renamed path without re-reading; on the gap path the
+/// group is skipped as replaced-file loss. Either way the twin asserts
+/// the exact `2H - 1` hit delta (all but the renamed group hit). It
+/// kills a disabled consult via `H > 0`, not a key mutant.
 #[test]
 fn owned_tree_watch_repeat_after_file_replace_by_rename_misses() {
     let dir = tempfile::tempdir().expect("watch cgroup dir");

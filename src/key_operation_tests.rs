@@ -30064,6 +30064,243 @@ fn keymeta_secret_first_clears_unknown_reason() {
     assert_eq!(family.reason, None, "secret-first clears the reason");
 }
 
+/// The EC size class renders in JSON: a 64-byte ECDSA signature
+/// infers `ec_class` (never a curve name), and the class value
+/// validates in the v7 schema's `inferred_size` slot.
+#[test]
+fn keymeta_ec_size_class_renders_in_json() {
+    use crate::key_operation_projection::inferred_size_json;
+    let ids = KeymetaCtx::object_ids(1);
+    let mut ctx = KeymetaCtx::new();
+    let receipt = KeymetaCtx::receipt(ids[0], "C_SignInit", 0, KeyRole::OperationKey, None);
+    ctx.start("C_SignInit", 7, Some(0x1041), &[receipt], 100);
+    ctx.end(
+        "C_Sign",
+        7,
+        CkRv::OK.0,
+        op_capture(),
+        200,
+        Some(LengthOutcome::Value(64)),
+        None,
+    );
+    let inferred = ctx
+        .inference(ids[0].as_u64(), "sign", "key", "unknown")
+        .expect("the sign row infers");
+    assert_eq!(inferred.size.status, InferredStatus::Inferred);
+    let rendered = inferred_size_json(&inferred.size);
+    assert_eq!(rendered["detail"]["kind"], "ec_class");
+    assert!(rendered["detail"].get("curve").is_none());
+    assert_eq!(rendered["detail"]["octets"], 64);
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let schema_file: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            root.join("docs/schema/inventory-v1-object-observations-v7.schema.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let mut slot_schema = serde_json::json!({"$ref": "#/$defs/inferred_size"});
+    slot_schema["$defs"] = schema_file["$defs"].clone();
+    let validator = jsonschema::options()
+        .build(&slot_schema)
+        .expect("v7 inferred-size schema builds");
+    assert!(
+        validator.is_valid(&rendered),
+        "the size-class detail validates"
+    );
+}
+
+/// Forward-filled wrapped material never conflicts with typed size
+/// evidence: wrapped material measures the encoded key, never the
+/// modulus or field, so an AES-KW unwrap followed by an RSA sign
+/// leaves the row inferred with the RSA detail — and a typed row
+/// touched after a park keeps its typed detail, still inferred.
+#[test]
+fn keymeta_forward_filled_wrapped_yields_to_typed_detail() {
+    let rsa_2048 = SizeDetail::Rsa {
+        size_class: Some(2048),
+        modulus_bytes: 256,
+    };
+    // Unwrap parks first; the RSA sign then types the row.
+    let ids = KeymetaCtx::object_ids(2);
+    let mut ctx = KeymetaCtx::new();
+    let unwrapping = KeymetaCtx::receipt(ids[0], "C_UnwrapKey", 0, KeyRole::UnwrappingKey, None);
+    ctx.direct(
+        "C_UnwrapKey",
+        7,
+        Some(0x2109),
+        &[unwrapping],
+        100,
+        Some(LengthOutcome::Value(32)),
+        Some(ids[1].as_u64()),
+    )
+    .expect("unwrap completes");
+    let receipt = KeymetaCtx::receipt(ids[1], "C_SignInit", 0, KeyRole::OperationKey, None);
+    ctx.start("C_SignInit", 7, Some(0x0001), &[receipt], 200);
+    ctx.end(
+        "C_Sign",
+        7,
+        CkRv::OK.0,
+        op_capture(),
+        300,
+        Some(LengthOutcome::Value(256)),
+        None,
+    );
+    let inferred = ctx
+        .inference(ids[1].as_u64(), "sign", "key", "unknown")
+        .expect("the sign row infers");
+    assert_eq!(inferred.family.value, Some(KeyFamily::Rsa));
+    assert_eq!(inferred.size.status, InferredStatus::Inferred);
+    assert_eq!(
+        inferred.size.detail.as_ref().map(|(detail, _)| detail),
+        Some(&rsa_2048)
+    );
+    // Typed first; the later park touches a typed row.
+    let ids = KeymetaCtx::object_ids(2);
+    let mut ctx = KeymetaCtx::new();
+    let receipt = KeymetaCtx::receipt(ids[1], "C_SignInit", 0, KeyRole::OperationKey, None);
+    ctx.start("C_SignInit", 7, Some(0x0001), &[receipt], 100);
+    ctx.end(
+        "C_Sign",
+        7,
+        CkRv::OK.0,
+        op_capture(),
+        200,
+        Some(LengthOutcome::Value(256)),
+        None,
+    );
+    let unwrapping = KeymetaCtx::receipt(ids[0], "C_UnwrapKey", 0, KeyRole::UnwrappingKey, None);
+    ctx.direct(
+        "C_UnwrapKey",
+        7,
+        Some(0x2109),
+        &[unwrapping],
+        250,
+        Some(LengthOutcome::Value(32)),
+        Some(ids[1].as_u64()),
+    )
+    .expect("unwrap completes");
+    let receipt = KeymetaCtx::receipt(ids[1], "C_SignInit", 0, KeyRole::OperationKey, None);
+    ctx.start("C_SignInit", 7, Some(0x0001), &[receipt], 300);
+    ctx.end("C_Sign", 7, CkRv::OK.0, op_capture(), 400, None, None);
+    let inferred = ctx
+        .inference(ids[1].as_u64(), "sign", "key", "unknown")
+        .expect("the sign row infers");
+    assert_eq!(inferred.size.status, InferredStatus::Inferred);
+    assert_eq!(
+        inferred.size.detail.as_ref().map(|(detail, _)| detail),
+        Some(&rsa_2048)
+    );
+}
+
+/// A NULL-buffer OK on an output-bearing direct is a length query,
+/// like a retained multipart query: observed (calls, mechanism
+/// claim) but no operation counted and no terminal emitted, so one
+/// real wrap after its query completes exactly once.
+#[test]
+fn key_operation_direct_query_counts_no_operation() {
+    for name in ["C_WrapKey", "C_EncapsulateKey", "C_WrapKeyAuthenticated"] {
+        let mut edge = EdgeSemantics::default();
+        let mut sink = Vec::new();
+        let mut query = call(name, 7, CkRv::OK.0, 100);
+        query.mechanism = 0x0001;
+        query.capture = capture::MECHANISM_VALUE | capture::OUTPUT_NULL;
+        let origin = EffectOrigin::from(&query);
+        edge.observe_joint_with_resources(
+            &query,
+            &origin,
+            &[],
+            &CompletionEvidence {
+                length: Some(LengthOutcome::Value(256)),
+                fresh_view: Some(999),
+            },
+            false,
+            &mut sink,
+        )
+        .expect("replay");
+        assert!(sink.is_empty(), "{name}: a length query emits no terminal");
+        assert_eq!(
+            (edge.started(), edge.completed()),
+            (0, 0),
+            "{name}: a length query counts no operation"
+        );
+        assert_eq!(
+            edge.calls(),
+            1,
+            "{name}: the query is still an observed call"
+        );
+        let mut real = call(name, 7, CkRv::OK.0, 200);
+        real.mechanism = 0x0001;
+        real.capture = capture::MECHANISM_VALUE | capture::OUTPUT_NON_NULL;
+        let origin = EffectOrigin::from(&real);
+        edge.observe_joint_with_resources(
+            &real,
+            &origin,
+            &[],
+            &CompletionEvidence::NONE,
+            false,
+            &mut sink,
+        )
+        .expect("replay");
+        assert_eq!(sink.len(), 1, "{name}: the real call completes once");
+        assert_eq!(
+            (edge.started(), edge.completed()),
+            (1, 1),
+            "{name}: query plus real call counts one operation"
+        );
+    }
+}
+
+/// `unsupported` never blocks a later classified detail: a wrap row
+/// whose first AES-KW output is above the admission bound reports
+/// unsupported, then a valid wrap output replaces the detail-less
+/// unsupported with its classified size.
+#[test]
+fn keymeta_unsupported_yields_to_later_classified_detail() {
+    let ids = KeymetaCtx::object_ids(2);
+    let mut ctx = KeymetaCtx::new();
+    let wrapping = KeymetaCtx::receipt(ids[0], "C_WrapKey", 0, KeyRole::WrappingKey, None);
+    let wrapped = KeymetaCtx::receipt(ids[1], "C_WrapKey", 1, KeyRole::WrappedKey, None);
+    ctx.direct(
+        "C_WrapKey",
+        7,
+        Some(0x2109),
+        &[wrapping, wrapped],
+        100,
+        Some(LengthOutcome::Value(8200)),
+        None,
+    )
+    .expect("wrap completes");
+    let inferred = ctx
+        .inference(ids[1].as_u64(), "wrap", "wrapped_object", "unknown")
+        .expect("the wrapped row infers");
+    assert_eq!(inferred.size.status, InferredStatus::Unsupported);
+    assert_eq!(inferred.size.detail, None);
+    let wrapping = KeymetaCtx::receipt(ids[0], "C_WrapKey", 0, KeyRole::WrappingKey, None);
+    let wrapped = KeymetaCtx::receipt(ids[1], "C_WrapKey", 1, KeyRole::WrappedKey, None);
+    ctx.direct(
+        "C_WrapKey",
+        7,
+        Some(0x2109),
+        &[wrapping, wrapped],
+        200,
+        Some(LengthOutcome::Value(32)),
+        None,
+    )
+    .expect("wrap completes");
+    let inferred = ctx
+        .inference(ids[1].as_u64(), "wrap", "wrapped_object", "unknown")
+        .expect("the wrapped row infers");
+    assert_eq!(inferred.size.status, InferredStatus::Inferred);
+    assert_eq!(
+        inferred.size.detail.as_ref().map(|(detail, _)| detail),
+        Some(&SizeDetail::WrappedMaterial {
+            material_octets: 24,
+            octets: 32,
+        })
+    );
+}
+
 /// Established/inferred compatibility at the reducer seam: an
 /// incompatible pair flips the inferred side while the established
 /// label stands; compatible pairs show both sides quietly.

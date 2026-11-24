@@ -1061,6 +1061,181 @@ fn cbom_limit_only_mechanism_mints_algorithm_component() {
     );
 }
 
+/// A limit-only component names provider-reported support
+/// truthfully: the registered mechanism name (so classification
+/// works), a description that says no use was observed, and the
+/// `p11scope:limit_only` marker — while a mechanism with observed
+/// use keeps the observed-operations description.
+#[test]
+fn cbom_limit_only_mechanism_names_support_truthfully() {
+    let bytes = inventory_document_with_info(
+        vec![caller("c0", Some("/bin/driver"))],
+        vec![module("m0", "/lib/p.so", Some(&"a".repeat(64)))],
+        vec![edge(
+            "c0",
+            "m0",
+            Some(vec![mechanism_row(
+                1082,
+                Some("CKM_SHA256_RSA_PKCS"),
+                &["sign"],
+                4,
+            )]),
+        )],
+        vec![],
+        vec![
+            mechanism_limit_row("c0", 0, 4231),
+            mechanism_limit_row("c0", 0, 1082),
+        ],
+    );
+    let projection = parse_input(&bytes).unwrap();
+    let limit_only = projection
+        .mechanisms
+        .iter()
+        .find(|mechanism| mechanism.id == 4231)
+        .expect("the limit-only mechanism");
+    assert!(limit_only.limit_only);
+    assert_eq!(limit_only.name.as_deref(), Some("CKM_AES_GCM"));
+    let document = super::render::render_json(&projection);
+    let algorithm = library_component(&document, "p11scope:mechanism:0x1087");
+    assert_eq!(algorithm["name"], "CKM_AES_GCM");
+    assert_eq!(
+        algorithm["description"],
+        "Mechanism reported by the provider (C_GetMechanismInfo); no use observed"
+    );
+    assert_eq!(
+        algorithm["cryptoProperties"]["algorithmProperties"]["primitive"],
+        "ae"
+    );
+    let properties = algorithm["properties"].as_array().expect("properties");
+    assert!(
+        properties.iter().any(|property| property["name"] == "p11scope:limit_only"
+            && property["value"] == "true"),
+        "the limit-only marker, got: {properties:?}"
+    );
+    let used = library_component(&document, "p11scope:mechanism:0x43a");
+    assert_eq!(
+        used["description"],
+        "Mechanism observed initializing operations; carries no key size, curve or parameters; provider key-size limits in properties."
+    );
+    let properties = used["properties"].as_array().expect("properties");
+    assert!(
+        properties
+            .iter()
+            .all(|property| property["name"] != "p11scope:limit_only"),
+        "a used mechanism carries no limit-only marker, got: {properties:?}"
+    );
+}
+
+/// The PQC key types keep their established names in CBOM output:
+/// 73/74/75 read `ml_kem`/`ml_dsa`/`slh_dsa`, never `unknown`.
+#[test]
+fn cbom_pqc_key_types_keep_established_names() {
+    let key_object = |object: u64, key_type: u64| {
+        json!({
+            "object": object, "session": 0, "origin": "created",
+            "creation": "generate", "birth": {"start_ns": 1, "end_ns": 2},
+            "lifetime": "live", "lifetime_reason": null,
+            "attribution": "valid", "attribution_reason": null,
+            "requested": metadata_block(Some(3), Some(key_type), None),
+            "established": metadata_block(Some(3), Some(key_type), None),
+            "queries": {"class": "established", "key_type": "established",
+                        "token": "established", "value_len": "not_queried",
+                        "modulus_bits": "not_queried", "ec_params": "not_queried"},
+            "label": null,
+            "successful_references": 1, "successful_key_references": 1,
+            "accessing_sessions": 1
+        })
+    };
+    let mut document: Value = serde_json::from_slice(&inventory_document(
+        vec![caller("c0", Some("/bin/driver"))],
+        vec![module("m0", "/lib/p.so", Some(&"c".repeat(64)))],
+        vec![edge("c0", "m0", None)],
+    ))
+    .unwrap();
+    document["instances"] = json!([
+        {"id": "i0", "caller": "c0", "module": "m0", "state": "observed",
+         "reason": null, "first_seen_ns": 110, "last_seen_ns": 190}
+    ]);
+    document["object_observations"] = json!({
+        "version": 1, "revision": 1, "status": "populated", "reason": "none",
+        "sessions": [{"session": 0, "origin": "opened", "status": "live"}],
+        "objects": [key_object(0, 73), key_object(1, 74), key_object(2, 75)],
+        "key_operations": [
+            {"instance": "i0", "object": 0, "category": "encapsulate", "role": "encapsulation_key",
+             "metadata_at_use": "unknown", "unit": "operations",
+             "started": 1, "completed": 1, "failed": 0, "cancelled": 0,
+             "unknown": 0, "active": 0, "key_join_lost": 0}
+        ],
+        "unknown_key_operations": [],
+        "gaps": {"rows": [], "suppressed": 0},
+        "budgets": {
+            "key_rows": {"limit": 65536, "occupied": 1, "refused": 0},
+            "object_rows": {"limit": 65536, "occupied": 3, "refused": 0},
+            "unknown_rows": {"occupied": 0},
+            "encoded_bytes": 100, "allocation_refused": false, "refusal_reason": "none"
+        }
+    });
+    let projection = parse_input(&serde_json::to_vec(&document).unwrap()).unwrap();
+    assert_eq!(projection.keys.len(), 3);
+    let document = super::render::render_json(&projection);
+    for (object, name) in [(0, "ml_kem"), (1, "ml_dsa"), (2, "slh_dsa")] {
+        let key = library_component(&document, &format!("p11scope:key:{object}"));
+        let properties = key["properties"].as_array().expect("properties");
+        let key_type = properties
+            .iter()
+            .find(|property| property["name"] == "p11scope:key_type")
+            .expect("key_type property");
+        assert_eq!(
+            key_type["value"],
+            format!("{} ({name})", 73 + object),
+            "object {object}"
+        );
+    }
+}
+
+/// Token devices dedup across volatile PIN-state flag bits: one
+/// wrong PIN (`CKF_USER_PIN_COUNT_LOW`) or a lock bit on a second
+/// caller's row still projects one device, while a real identity
+/// difference (model) keeps its own device.
+#[test]
+fn cbom_token_devices_ignore_pin_state_flags() {
+    let mut count_low = token_row("c1", 0);
+    count_low["flags"] = json!(6 | 0x10000);
+    let mut locked = token_row("c2", 0);
+    locked["flags"] = json!(6 | 0x40000 | 0x100000);
+    let mut conflict = token_row("c3", 0);
+    conflict["model"] = json!("Model-Y");
+    let bytes = inventory_document_with_info(
+        vec![
+            caller("c0", Some("/bin/driver")),
+            caller("c1", Some("/bin/other")),
+            caller("c2", Some("/bin/third")),
+            caller("c3", Some("/bin/fourth")),
+        ],
+        vec![module_with_info("m0", "/lib/p.so", Some(&"a".repeat(64)))],
+        vec![
+            edge("c0", "m0", None),
+            edge("c1", "m0", None),
+            edge("c2", "m0", None),
+            edge("c3", "m0", None),
+        ],
+        vec![token_row("c0", 0), count_low, locked, conflict],
+        vec![],
+    );
+    let projection = parse_input(&bytes).unwrap();
+    assert_eq!(projection.tokens.len(), 2);
+    let mut names: Vec<(&str, u64)> = projection
+        .tokens
+        .iter()
+        .map(|token| (token.name.as_str(), token.slot))
+        .collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        vec![("TokenMfr Model-X", 0), ("TokenMfr Model-Y", 0),]
+    );
+}
+
 #[test]
 fn cbom_text_names_tokens_verbose_only() {
     let bytes = inventory_document_with_info(

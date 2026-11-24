@@ -3159,6 +3159,32 @@ fn provider_token_only_module_lists_rows_in_verbose_only() {
     );
 }
 
+/// Provider-block mechanism limit lines name the mechanism when
+/// the id is known; an unregistered id keeps its bare hex, never a
+/// guessed name.
+#[test]
+fn provider_mechanism_limit_lines_name_known_mechanisms() {
+    let presentation = provider_presentation();
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    assert!(
+        verbose.lines().any(|line| line
+            == "  mechanism 0x43a (CKM_SHA256_RSA_PKCS) slot 0: limits 1024-4096, flags 0x1"),
+        "known id carries its name, got:\n{verbose}"
+    );
+    let mut presentation = provider_presentation();
+    let observations = presentation
+        .provider_observations
+        .as_mut()
+        .expect("provider observations");
+    observations.mechanisms[0].mechanism = 0x1234;
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    assert!(
+        verbose.lines().any(|line| line
+            == "  mechanism 0x1234 slot 0: limits 1024-4096, flags 0x1"),
+        "unknown id keeps bare hex, got:\n{verbose}"
+    );
+}
+
 #[test]
 fn provider_verbose_adds_token_and_mechanism_lines() {
     let presentation = provider_presentation();
@@ -3951,6 +3977,65 @@ fn key_ops_verbose_size_conflict_established_mismatch() {
     assert!(
         !line.contains("more conflicting size"),
         "no phantom second side:\n{snapshot}"
+    );
+}
+
+/// An established-vs-inferred size mismatch says `conflicting` in
+/// `-v`: a key established as `rsa_3072` that produced a 256-byte
+/// signature renders the inferred value against the established
+/// label, never the bare value alone.
+#[test]
+fn key_ops_verbose_size_conflict_names_established_mismatch() {
+    let mut observations = populated(9);
+    observations.key_operations.push(key_row_inferred(
+        11,
+        "sign",
+        "key",
+        10,
+        "rsa_3072",
+        RowInference {
+            family: FamilyState {
+                status: InferredStatus::Inferred,
+                value: Some(KeyFamily::Rsa),
+                completions: 10,
+                value_completions: 10,
+                conflict_value: None,
+                conflict_completions: 0,
+                further: 0,
+                reason: None,
+                further_seen: 0,
+            },
+            size: SizeState {
+                status: InferredStatus::Conflicting,
+                detail: Some((
+                    SizeDetail::Rsa {
+                        size_class: Some(2048),
+                        modulus_bytes: 256,
+                    },
+                    EvidenceTag::SignOutput,
+                )),
+                completions: 10,
+                conflict_detail: None,
+                further: 0,
+                reason: None,
+                further_seen: Vec::new(),
+                rsa_further_seen: [0; 32],
+                wrapped_further_seen: None,
+            },
+        },
+    ));
+    let mut presentation = key_ops_presentation(observations);
+    presentation.key_sizes_requested = true;
+    let snapshot =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    let block = key_ops_block(&snapshot);
+    let line = block
+        .iter()
+        .find(|line| line.contains("key row"))
+        .expect("one row line");
+    assert!(
+        line.contains("size conflicting (RSA 2048 (from signature length) vs established rsa_3072)"),
+        "the mismatch names both sides:\n{snapshot}"
     );
 }
 

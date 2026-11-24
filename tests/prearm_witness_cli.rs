@@ -2116,6 +2116,53 @@ fn fresh_staging_line_rejects_malformed_staging_lines() {
     ));
 }
 
+/// A fresh-staging record for the same basename in a different
+/// directory is foreign evidence: only the held copy's own staging
+/// may release the workload.
+#[test]
+fn fresh_staging_line_rejects_the_same_basename_elsewhere() {
+    let file_name = "libprivatemnt-123-p28.so";
+    assert!(!is_fresh_staging_line_for(
+        "p11scope: learned provider /tmp/other/mnt/libprivatemnt-123-p28.so (first loaded by /tmp/cell/p28-mnt-holder): 1 earlier loads missed; attached for later runs\n",
+        file_name,
+    ));
+    assert!(!is_fresh_staging_line_for(
+        "p11scope: learned provider /tmp/cell/other/libprivatemnt-123-p28.so (first loaded by /tmp/cell/p28-mnt-holder): 1 earlier loads missed; attached for later runs\n",
+        file_name,
+    ));
+}
+
+/// A staging record with a non-numeric or zero load count is
+/// malformed evidence: the count must be the expected positive
+/// number, never free text or zero.
+#[test]
+fn fresh_staging_line_rejects_malformed_load_counts() {
+    let file_name = "libprivatemnt-123-p28.so";
+    assert!(!is_fresh_staging_line_for(
+        "p11scope: learned provider /tmp/cell/mnt/libprivatemnt-123-p28.so (first loaded by /tmp/cell/p28-mnt-holder): many earlier loads missed; attached for later runs\n",
+        file_name,
+    ));
+    assert!(!is_fresh_staging_line_for(
+        "p11scope: learned provider /tmp/cell/mnt/libprivatemnt-123-p28.so (first loaded by /tmp/cell/p28-mnt-holder): 0 earlier loads missed; attached for later runs\n",
+        file_name,
+    ));
+    assert!(!is_fresh_staging_line_for(
+        "p11scope: learned provider /tmp/cell/mnt/libprivatemnt-123-p28.so (first loaded by /tmp/cell/p28-mnt-holder): 1x earlier loads missed; attached for later runs\n",
+        file_name,
+    ));
+}
+
+/// The healthy staging record for the exact held copy still matches:
+/// full display path, expected loader, and one earlier load missed.
+#[test]
+fn fresh_staging_line_accepts_the_healthy_record() {
+    let file_name = "libprivatemnt-123-p28.so";
+    assert!(is_fresh_staging_line_for(
+        "p11scope: learned provider /tmp/cell/mnt/libprivatemnt-123-p28.so (first loaded by /tmp/cell/p28-mnt-holder): 1 earlier loads missed; attached for later runs\n",
+        file_name,
+    ));
+}
+
 /// Whether the profile carries the learned first-use gap as a
 /// structured skip row for the exact subject and reason: only an
 /// `evidence.skipped[]` entry with render's `SkippedOut` name/reason
@@ -2613,6 +2660,19 @@ fn private_mount_loader_naming_requires_the_holder_exe() {
     })));
     // A missing loader record names nothing.
     assert!(!private_mount_loader_named(&serde_json::json!({})));
+}
+
+/// The holder's basename in another directory is foreign evidence:
+/// only the holder's own executable spelling counts, not a
+/// same-named program elsewhere.
+#[test]
+fn private_mount_loader_naming_rejects_the_same_basename_elsewhere() {
+    assert!(!private_mount_loader_named(&serde_json::json!({
+        "exe": "/tmp/other/p28-mnt-holder",
+    })));
+    assert!(!private_mount_loader_named(&serde_json::json!({
+        "exe": "/other/cell/p28-mnt-holder",
+    })));
 }
 
 /// Exact counts in both directions against a validated ledger: every

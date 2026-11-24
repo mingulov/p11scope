@@ -512,6 +512,87 @@ fn read_ledger_file(ledger: &Path) -> BTreeMap<String, u64> {
     }
 }
 
+/// Waits for a non-hold workload and asserts its clean exit: the
+/// ledger proves the fixture reached its write, the exit proves it
+/// passed its own drift check. Hold workloads are killed by design
+/// and never pass through here.
+fn wait_workload_success(workload: &mut GuardedChild) {
+    let status = workload.wait_expect("workload exit");
+    assert!(status.success(), "workload exits clean");
+}
+
+/// The ledger producer validates shape: an impossible ledger file
+/// (zero slot-list attempts, which the fixture cannot emit) never
+/// yields counts — every exact cell inherits the guard.
+#[test]
+fn ledger_file_reader_rejects_an_impossible_ledger() {
+    let dir = tempfile::tempdir().expect("cell dir");
+    let ledger = dir.path().join("ledger.txt");
+    std::fs::write(
+        &ledger,
+        format!(
+            "LEDGER C_Initialize=1 C_Finalize=1 C_GetInfo={} C_GetSlotList=0 \
+             C_GetSlotInfo=0 C_GetTokenInfo=0 C_GetMechanismList=0 C_GetMechanismInfo=0\n",
+            u64::from(ITERS)
+        ),
+    )
+    .expect("write impossible ledger");
+    let rejected =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read_ledger_file(&ledger)));
+    assert!(
+        rejected.is_err(),
+        "an impossible ledger must not yield counts"
+    );
+}
+
+/// A healthy ledger file still yields its counts through the same
+/// validating producer.
+#[test]
+fn ledger_file_reader_accepts_a_healthy_ledger() {
+    let dir = tempfile::tempdir().expect("cell dir");
+    let ledger = dir.path().join("ledger.txt");
+    let iters = u64::from(ITERS);
+    std::fs::write(
+        &ledger,
+        format!(
+            "LEDGER C_Initialize=1 C_Finalize=1 C_GetInfo={iters} C_GetSlotList={} \
+             C_GetSlotInfo={iters} C_GetTokenInfo={iters} C_GetMechanismList={} \
+             C_GetMechanismInfo={iters}\n",
+            2 * iters,
+            2 * iters,
+        ),
+    )
+    .expect("write healthy ledger");
+    let counts = read_ledger_file(&ledger);
+    assert_eq!(counts.len(), 8);
+    assert!(validate_workload_ledger(&counts));
+}
+
+/// The workload-exit gate fails loudly on a nonzero exit and passes
+/// on a clean one (negative control for the gate every exact cell
+/// applies to its non-hold workload).
+#[test]
+fn workload_exit_gate_fails_a_nonzero_exit() {
+    fn guarded(argv0: &str) -> GuardedChild {
+        let mut child = Command::new(argv0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn gate control");
+        let stdout = child.stdout.take().expect("control stdout");
+        GuardedChild::new(child, stdout)
+    }
+    wait_workload_success(&mut guarded("true"));
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        wait_workload_success(&mut guarded("false"))
+    }));
+    assert!(
+        failed.is_err(),
+        "a nonzero workload exit must fail the gate"
+    );
+}
+
 /// Finds the module record for `module` in a profile/metrics JSON
 /// document: the full `DiscoveredModule` lives at `evidence.discovery[]`
 /// (`capture.modules[]` is an identity-only projection).

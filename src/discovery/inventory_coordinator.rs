@@ -45150,17 +45150,14 @@ int main(void) {
 
     // ---- Held-head resume on changed inputs (r7b) ----
 
-    /// The typed terminal settlement total (excluded calls over every
-    /// cause), read from the registry's authoritative map.
-    fn typed_terminal_total(native: &NativeScene) -> u64 {
+    /// The registry's authoritative terminal settlement map: cause ->
+    /// (excluded calls, settlements).
+    fn terminal_totals(native: &NativeScene) -> BTreeMap<String, (u64, u64)> {
         native
             .scene
             .coordinator
             .registry
             .terminal_retry_totals_for_test()
-            .values()
-            .map(|(calls, _)| *calls)
-            .sum()
     }
 
     #[test]
@@ -45189,7 +45186,7 @@ int main(void) {
             native.scene.coordinator.commit_batch(false).unwrap();
             let held = !native.scene.coordinator.held_stage.is_empty();
             if held {
-                held_totals.push(typed_terminal_total(&native));
+                held_totals.push(terminal_totals(&native));
             }
             if !receipt.settlement_owed {
                 break;
@@ -45200,10 +45197,14 @@ int main(void) {
             "the fixture holds a row (setup pin)"
         );
         assert!(
-            held_totals.iter().all(|total| *total == 0),
+            held_totals.iter().all(BTreeMap::is_empty),
             "nothing settles while staging is held: {held_totals:?}"
         );
-        assert_eq!(typed_terminal_total(&native), 40, "settled exactly once");
+        assert_eq!(
+            terminal_totals(&native),
+            BTreeMap::from([("domain finish".to_string(), (40, 1))]),
+            "settled exactly once, under its cause"
+        );
         assert!(native.scene.coordinator.retry_owed.is_empty());
     }
 
@@ -45265,8 +45266,8 @@ int main(void) {
                 held_with_verdict += 1;
             }
             assert_eq!(
-                typed_terminal_total(&native),
-                0,
+                terminal_totals(&native),
+                BTreeMap::new(),
                 "nothing settles while the head is held ({cold} cold paths)"
             );
         }
@@ -45510,17 +45511,37 @@ int main(void) {
         // Control: untrusted live reads cost nothing after the shared
         // learn, so B always resolves in A's action and no commit can
         // fall between them; A still never publishes.
-        let waited = superseded_backfill_cells(false);
+        let waited =
+            crate::pidns::test_seam::with_numbering(crate::pidns::PidNumbering::agreeing(), || {
+                superseded_backfill_cells(false)
+            });
         assert_eq!(waited, 0, "untrusted reads leave no window: {waited}");
     }
 
     #[test]
     fn a_held_backfill_never_attaches_a_superseded_exec_trusted_reads() {
-        let waited = superseded_backfill_cells(true);
+        // Every trust input pinned, PID numbering included: the cell
+        // never depends on the host's namespace.
+        let waited =
+            crate::pidns::test_seam::with_numbering(crate::pidns::PidNumbering::agreeing(), || {
+                superseded_backfill_cells(true)
+            });
         assert!(
             waited >= 1,
             "some pass commits with only B waiting (setup pin): {waited}"
         );
+    }
+
+    #[test]
+    fn a_held_backfill_never_attaches_a_superseded_exec_nested_numbering() {
+        // Control for the third trust input: clocks agree but the PID
+        // numbering is nested, so live reads are untrusted and free,
+        // B resolves in A's action, and A still never publishes.
+        let waited =
+            crate::pidns::test_seam::with_numbering(crate::pidns::test_seam::nested(), || {
+                superseded_backfill_cells(true)
+            });
+        assert_eq!(waited, 0, "nested numbering leaves no window: {waited}");
     }
 
     #[test]

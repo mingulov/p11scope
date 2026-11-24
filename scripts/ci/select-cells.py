@@ -544,15 +544,15 @@ def select_privileged(tier, bpf_extra, event, pkcs11_full,
     else:
         jobs["pkcs11-check-full"] = (
             "not-selected",
-            "FULL suites run on schedule, dispatch with the flag, "
-            "or the integration tier")
+            "FULL suites run on the integration tier or dispatch "
+            "with the flag")
     if tier == "integration" or pkcs11_full or "providers-full" in cells:
         jobs["pkcs11-check-providers-full"] = ("selected", None)
     else:
         jobs["pkcs11-check-providers-full"] = (
             "not-selected",
-            "FULL suites run on schedule, dispatch with the flag, "
-            "or the integration tier")
+            "FULL suites run on the integration tier or dispatch "
+            "with the flag")
     return jobs
 
 

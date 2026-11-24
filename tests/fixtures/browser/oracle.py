@@ -287,6 +287,25 @@ def check_skipped_structural(report: dict[str, Any]) -> list[str]:
     return failures
 
 
+def check_skipped_run_exact(report: dict[str, Any], allowed) -> list[str]:
+    """Every skipped record is an allowed (name, reason) pair, nothing else.
+
+    Run-default cells honestly disclose spawn-window timing skips
+    (short-lived discovery subjects that exit mid-flight); the pairs
+    are a closed world calibrated per cell, so a new skip reason fails
+    loud instead of widening the allowance silently.
+    """
+    failures = []
+    allowed_set = set(allowed)
+    for record in evidence(report).get("skipped") or []:
+        pair = ((record or {}).get("name"), (record or {}).get("reason"))
+        if pair not in allowed_set:
+            failures.append(
+                f"skipped record {pair[0]!r} reason {pair[1]!r}: outside "
+                f"the calibrated run set")
+    return failures
+
+
 def check_verdict(report: dict[str, Any], allowed: tuple[str, ...]) -> list[str]:
     """The verdict detail is one the cell earned during calibration."""
     failures = []
@@ -396,6 +415,375 @@ def check_s1_logins_absent(report: dict[str, Any]) -> list[str]:
     if logins:
         return [f"logins observed {logins}, want none (boundary crossed?)"]
     return []
+
+
+#: RSA-PSS with SHA-256 (the TLS 1.3 CertificateVerify mechanism NSS
+#: uses for a 2048-bit RSA client credential).
+CKM_SHA256_RSA_PKCS_PSS = 0x43
+#: HMAC with SHA-256 (the in-tree NSS seeding operation's mechanism).
+CKM_SHA256_HMAC = 0x251
+
+
+def check_mechanisms_present(report: dict[str, Any]) -> list[str]:
+    """A mechanism-attributed call happened (the sign-cell S1 positive half).
+
+    Sign cells assert mechanism presence with function linkage (see
+    check_linkage_exact), so the mechanisms section must exist and be a
+    non-empty list; a missing section fails closed, like the absent leg.
+    """
+    if "mechanisms" not in report:
+        return ["mechanisms section missing: cannot verify S1 mechanism use"]
+    mechanisms = report["mechanisms"]
+    if not isinstance(mechanisms, list):
+        return ["mechanisms section is not a list"]
+    if not mechanisms:
+        return ["mechanisms section empty: no mechanism-attributed call observed"]
+    return []
+
+
+def _linkage_cells(row: dict[str, Any], label: str) -> tuple[dict[str, dict[str, int]], list[str]]:
+    """Strict typed read of one mechanism row's ``by_function`` linkage.
+
+    Returns (cells, failures): ``cells`` maps function name to its
+    ``{"calls", "errors"}`` counts. The row must carry ``by_function``
+    (a missing field is the no-linkage failure, never a skip), a list
+    of ``{"function", "calls", "errors"}`` objects with unique string
+    names and u64 counters. Malformed input fails closed.
+    """
+    failures: list[str] = []
+    cells: dict[str, dict[str, int]] = {}
+    linkage = row.get("by_function")
+    if linkage is None:
+        return cells, [f"{label}: no function x mechanism linkage "
+                       f"(by_function missing on the 0x{row.get('mechanism', 0):x} row)"]
+    if not isinstance(linkage, list):
+        return cells, [f"{label}: by_function is not a list"]
+    for entry in linkage:
+        if not isinstance(entry, dict):
+            failures.append(f"{label}: by_function carries a malformed entry")
+            continue
+        name = entry.get("function")
+        calls = entry.get("calls")
+        errors = entry.get("errors")
+        if not isinstance(name, str) or not name:
+            failures.append(f"{label}: by_function entry without a function name")
+            continue
+        if name in cells:
+            failures.append(f"{label}: by_function names {name!r} twice")
+            continue
+        if not _u64(calls) or not _u64(errors):
+            failures.append(f"{label}: by_function[{name}] counters are not u64")
+            continue
+        cells[name] = {"calls": calls, "errors": errors}
+    return cells, failures
+
+
+def check_linkage_exact(report: dict[str, Any], mechanism: int,
+                        exact: dict[str, int], label: str) -> list[str]:
+    """The mechanism's function linkage equals ``exact`` (strict typed read).
+
+    Every ``exact`` function must show exactly its count (returned
+    calls; errors pinned at zero beside them), no other function may
+    appear (an ``"unknown"`` cell hides linkage and fails), and the
+    cells must sum to the row's own ``calls``/``errors`` totals, so a
+    shed or partial linkage cannot pass as exact. Missing row, missing
+    linkage, malformed entries, and count mismatches all fail.
+    """
+    failures = []
+    row = None
+    for entry in report.get("mechanisms", []) or []:
+        if isinstance(entry, dict) and entry.get("mechanism") == mechanism:
+            row = entry
+            break
+    if row is None:
+        return [f"{label}: no mechanism row for 0x{mechanism:x}"]
+    cells, failures = _linkage_cells(row, label)
+    if failures:
+        return failures
+    for name, want in exact.items():
+        observed = cells.get(name, {}).get("calls", 0)
+        if observed != want:
+            failures.append(f"{label}: ({name} x 0x{mechanism:x}): observed "
+                            f"{observed}, want exactly {want}")
+    for name in cells:
+        if name not in exact:
+            failures.append(f"{label}: ({name} x 0x{mechanism:x}): observed "
+                            f"{cells[name]['calls']}, want exactly 0 "
+                            f"(linkage outside the expected table)")
+    if not _u64(row.get("calls")) or not _u64(row.get("errors")):
+        failures.append(f"{label}: row totals are not u64 counters")
+        return failures
+    if sum(cell["calls"] for cell in cells.values()) != row["calls"]:
+        failures.append(f"{label}: linkage cells sum to "
+                        f"{sum(cell['calls'] for cell in cells.values())}, "
+                        f"row calls={row['calls']} (shed or partial linkage?)")
+    if sum(cell["errors"] for cell in cells.values()) != row["errors"]:
+        failures.append(f"{label}: linkage errors sum to "
+                        f"{sum(cell['errors'] for cell in cells.values())}, "
+                        f"row errors={row['errors']}")
+    for name in exact:
+        if name in cells and cells[name]["errors"] != 0:
+            failures.append(f"{label}: ({name} x 0x{mechanism:x}): errors "
+                            f"{cells[name]['errors']}, want 0")
+    return failures
+
+
+#: Function-name prefix allowed past the expected table under the
+#: ``allow_verify`` unlisted policy: server-driven verification legs
+#: share the row with the asserted sign legs, and no sign-family call
+#: can hide behind a ``C_Verify*`` name.
+_VERIFY_FAMILY_PREFIX = "C_Verify"
+
+
+def check_linkage_floored(report: dict[str, Any], mechanism: int,
+                          exact: dict[str, int], floors: dict[str, int],
+                          label: str, unlisted: str = "forbid") -> list[str]:
+    """Like check_linkage_exact with racy-chunked legs floored, not pinned.
+
+    ``exact`` functions compare exactly and every other named function
+    must be absent, as above; ``floors`` functions need only reach
+    their minimum (multipart update legs, whose per-run count follows
+    transcript chunking). ``unlisted`` selects the rule for cells
+    outside both tables: ``"forbid"`` fails them all (a single-family
+    row), ``"allow_verify"`` additionally permits ``C_Verify*`` cells
+    (server-driven verification sharing the row with the asserted
+    sign legs — the sign family stays fully pinned, and ``"unknown"``
+    still fails since it could hide sign legs). Anything else raises.
+    The cell-sum and error-shape rules still apply, so the floors
+    cannot hide shed linkage: with drops at zero the cells still sum
+    to the row totals.
+    """
+    if unlisted not in ("forbid", "allow_verify"):
+        raise ValueError(f"{label}: unlisted={unlisted!r}, want forbid|allow_verify")
+    failures = []
+    row = None
+    for entry in report.get("mechanisms", []) or []:
+        if isinstance(entry, dict) and entry.get("mechanism") == mechanism:
+            row = entry
+            break
+    if row is None:
+        return [f"{label}: no mechanism row for 0x{mechanism:x}"]
+    cells, failures = _linkage_cells(row, label)
+    if failures:
+        return failures
+    for name, want in exact.items():
+        observed = cells.get(name, {}).get("calls", 0)
+        if observed != want:
+            failures.append(f"{label}: ({name} x 0x{mechanism:x}): observed "
+                            f"{observed}, want exactly {want}")
+    for name, floor in floors.items():
+        observed = cells.get(name, {}).get("calls", 0)
+        if observed < floor:
+            failures.append(f"{label}: ({name} x 0x{mechanism:x}): observed "
+                            f"{observed}, want >= {floor}")
+    for name in cells:
+        if name in exact or name in floors:
+            continue
+        if unlisted == "allow_verify" and name.startswith(_VERIFY_FAMILY_PREFIX):
+            continue
+        failures.append(f"{label}: ({name} x 0x{mechanism:x}): observed "
+                        f"{cells[name]['calls']}, want exactly 0 "
+                        f"(linkage outside the expected table)")
+    if not _u64(row.get("calls")) or not _u64(row.get("errors")):
+        failures.append(f"{label}: row totals are not u64 counters")
+        return failures
+    if sum(cell["calls"] for cell in cells.values()) != row["calls"]:
+        failures.append(f"{label}: linkage cells sum to "
+                        f"{sum(cell['calls'] for cell in cells.values())}, "
+                        f"row calls={row['calls']} (shed or partial linkage?)")
+    if sum(cell["errors"] for cell in cells.values()) != row["errors"]:
+        failures.append(f"{label}: linkage errors sum to "
+                        f"{sum(cell['errors'] for cell in cells.values())}, "
+                        f"row errors={row['errors']}")
+    for name in list(exact) + list(floors):
+        if name in cells and cells[name]["errors"] != 0:
+            failures.append(f"{label}: ({name} x 0x{mechanism:x}): errors "
+                            f"{cells[name]['errors']}, want 0")
+    return failures
+
+
+def check_module_covers_row(report: dict[str, Any], mechanism: int,
+                            module_sha: str, label: str) -> list[str]:
+    """The row's every call is attributed to ``module_sha`` (sole user).
+
+    The row must carry a ``by_module`` cell for the module whose calls
+    equal the row totals: with a single in-tree user of the mechanism,
+    any unattributed or foreign-module share fails. A missing row or
+    a missing cell fails closed.
+    """
+    for entry in report.get("mechanisms", []) or []:
+        if isinstance(entry, dict) and entry.get("mechanism") == mechanism:
+            row = entry
+            break
+    else:
+        return [f"{label}: no mechanism row for 0x{mechanism:x}"]
+    cells = {}
+    for cell in row.get("by_module", []) or []:
+        if not isinstance(cell, dict):
+            return [f"{label}: by_module carries a malformed entry"]
+        module = cell.get("module") or {}
+        if module.get("sha256") == module_sha:
+            cells = cell
+            break
+    else:
+        return [f"{label}: no by_module cell for the expected module "
+                f"on the 0x{mechanism:x} row"]
+    if not _u64(cells.get("calls")) or not _u64(row.get("calls")):
+        return [f"{label}: module/row call counters are not u64"]
+    if cells["calls"] != row["calls"]:
+        return [f"{label}: module cell calls={cells['calls']} != row "
+                f"calls={row['calls']} (another user shares 0x{mechanism:x}?)"]
+    return []
+
+
+def system_softokn_sha(report: dict[str, Any], bundled_path: str) -> str:
+    """The system softokn module's sha, anchored to the real file.
+
+    The report's capture modules must name exactly one ``libsoftokn3.so``
+    besides the bundled one; its bytes on disk must hash to the
+    reported sha (an unanchored report value is not an identity).
+    Raises :class:`OracleError` when the capture names zero or two,
+    the file is unreadable, or the hash disagrees.
+    """
+    candidates = [module for module in
+                  (report.get("capture") or {}).get("modules", []) or []
+                  if isinstance(module, dict)
+                  and (module.get("path") or "").endswith("/libsoftokn3.so")
+                  and module.get("path") != bundled_path]
+    if len(candidates) != 1:
+        raise OracleError(f"want exactly one system libsoftokn3.so besides "
+                          f"{bundled_path}, capture names {len(candidates)}")
+    module = candidates[0]
+    try:
+        actual = sha256_of(Path(module["path"]))
+    except (OSError, KeyError) as exc:
+        raise OracleError(f"cannot hash system softokn "
+                          f"{module.get('path')!r}: {exc}") from exc
+    if actual != module.get("sha256"):
+        raise OracleError(f"system softokn hash {actual[:16]}... != report "
+                          f"{str(module.get('sha256'))[:16]}...")
+    return actual
+
+
+def check_no_state_drops(report: dict[str, Any]) -> list[str]:
+    """No semantic state admission drop voided the strict linkage sums.
+
+    A dropped linkage cell sheds silently from ``by_function`` while
+    the row totals still count it, so the cell-sum equality above
+    would fail without this leg naming the cause. Healthy captures
+    keep both counters at zero.
+    """
+    failures = []
+    for key in ("semantic_state_drops", "semantic_history_drops"):
+        value = evidence(report).get(key, 0) or 0
+        if value != 0:
+            failures.append(f"{key}={value}, want 0 (strict sums unverifiable)")
+    return failures
+
+
+def check_cc_ground_truth(server: dict[str, Any], flow: dict[str, Any],
+                          label: str) -> list[str]:
+    """Exactly one full client-cert handshake + served request happened.
+
+    The observer-independent ground truth: the TLS server saw one
+    completed handshake presenting one client certificate and served
+    one request, with no empty certs, stalls, refusals, abandonments,
+    failures, or error text; the browser flow loaded the page with
+    HTTP 200. Strict equality on every counter; mistyped facts fail.
+    """
+    failures = []
+
+    def want(key, expected):
+        value = server.get(key)
+        if type(value) is not int or value != expected:
+            failures.append(f"{label}: server {key}={value!r}, want {expected}")
+
+    for key in ("handshakes_ok", "client_certs_presented", "requests_served"):
+        want(key, 1)
+    for key in ("empty_certs", "selection_stalls", "cert_refusals",
+                "abandoned", "handshake_failures"):
+        want(key, 0)
+    errors = server.get("handshake_errors")
+    if errors != []:
+        failures.append(f"{label}: handshake_errors={errors!r}, want []")
+    if flow.get("loaded") is not True:
+        failures.append(f"{label}: flow loaded={flow.get('loaded')!r}, want True "
+                        f"(error: {flow.get('error')!r})")
+    if flow.get("http_status") != 200:
+        failures.append(f"{label}: http_status={flow.get('http_status')!r}, want 200")
+    return failures
+
+
+def check_plain_ground_truth(server: dict[str, Any], flow: dict[str, Any],
+                             label: str) -> list[str]:
+    """Exactly one full handshake with no client cert + served request.
+
+    The no-sign control twin: same strict shape as the cc ground
+    truth except no certificate is presented (the server never asks),
+    so no CertificateVerify sign may exist anywhere in the capture.
+    """
+    failures = []
+
+    def want(key, expected):
+        value = server.get(key)
+        if type(value) is not int or value != expected:
+            failures.append(f"{label}: server {key}={value!r}, want {expected}")
+
+    want("handshakes_ok", 1)
+    want("client_certs_presented", 0)
+    want("requests_served", 1)
+    for key in ("empty_certs", "selection_stalls", "cert_refusals",
+                "abandoned", "handshake_failures"):
+        want(key, 0)
+    errors = server.get("handshake_errors")
+    if errors != []:
+        failures.append(f"{label}: handshake_errors={errors!r}, want []")
+    if flow.get("loaded") is not True:
+        failures.append(f"{label}: flow loaded={flow.get('loaded')!r}, want True "
+                        f"(error: {flow.get('error')!r})")
+    if flow.get("http_status") != 200:
+        failures.append(f"{label}: http_status={flow.get('http_status')!r}, want 200")
+    return failures
+
+
+def check_bundled_coverage_or_named_gap(report: dict[str, Any], module_sha: str,
+                                        module_path: str, gap_cause: str,
+                                        label: str) -> list[str]:
+    """The bundled provider is covered, or its miss is a named gap.
+
+    Passes when the discovery entry for ``module_path`` shows an
+    attached scan (tables observed) and the module's function rows
+    counted calls. Otherwise the miss must be disclosed, not silent:
+    a ``gap_cause`` observation cause must name the window and the
+    discovery entry must carry its observed-load count. A prearmed
+    but never attached file with no window and no cause fails.
+    """
+    failures = []
+    entry = None
+    for candidate in evidence(report).get("discovery", []) or []:
+        if isinstance(candidate, dict) and candidate.get("path") == module_path:
+            entry = candidate
+            break
+    calls = 0
+    for row in report.get("functions", []) or []:
+        target = (row.get("target") or {}).get("object") or {}
+        if target.get("sha256") == module_sha:
+            calls += row.get("calls") or 0
+    tables = len((entry or {}).get("tables", []) or [])
+    attached = (entry or {}).get("attached_at_ns") is not None
+    if entry is not None and attached and tables > 0 and calls > 0:
+        return []
+    causes = ((evidence(report).get("gap_classes") or {}).get("observation") or {})
+    if gap_cause not in (causes.get("causes") or []):
+        failures.append(f"{label}: {module_path} has tables={tables} calls={calls} "
+                        f"attached={attached} with no {gap_cause!r} gap cause "
+                        f"(silent provider miss)")
+        return failures
+    loads = ((entry or {}).get("first_loaded_by") or {}).get("pre_attach_loads")
+    if type(loads) is not int or loads < 1:
+        failures.append(f"{label}: {gap_cause!r} names the miss but the discovery "
+                        f"entry carries pre_attach_loads={loads!r} (gap has no counts)")
+    return failures
 
 
 def check_s1_sessions(report: dict[str, Any], opened_min: int = 0,

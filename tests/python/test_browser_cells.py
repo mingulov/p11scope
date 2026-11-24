@@ -40,6 +40,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tests" / "fixtures" / "browser"))
 
 import cells
+import ff_cc
 import flows
 import oracle
 import softhsm
@@ -124,6 +125,36 @@ _VERDICTS_NEVER_MAPPED = ("concrete_gap",)
 #: Private-token operations no PINBOUND flow may ever reach: login plus
 #: signing setup and signing (init and one-shot share the boundary).
 _PINBOUND_ABSENT = ("C_Login", "C_SignInit", "C_Sign")
+
+#: Gap cause naming a learned-but-never-scanned provider file with
+#: observed loads (the bundled-NSS miss window, disclosed with its
+#: pre-attach load count instead of read as silence).
+FF_CC_MISS_CAUSE = "learned_never_scanned"
+#: FF-CC-SIGN observation gaps: a default discovery-all run over the
+#: Firefox tree honestly discloses the slot fight (modules_skipped),
+#: spawn-window timing (skipped, loader_discovery, pid_descendant_gaps,
+#: surfaces), the one unconfirmed pause member (pause_partial), and —
+#: only when the bundled provider really missed — its named window.
+_FF_CC_RUN_GAPS = frozenset({
+    "modules_skipped", "skipped", "surfaces", "pause_partial",
+    "loader_discovery", "pid_descendant_gaps",
+    FF_CC_MISS_CAUSE,
+})
+#: FF-CC verdict: default discovery-all runs always carry concrete
+#: window caveats (late discovery, spawn windows), never clean_proven.
+_FF_CC_VERDICTS = ("concrete_gap",)
+#: FF-CC-SIGN skipped records: the closed-world run set. Short-lived
+#: discovery subjects exit mid-flight; learned provider files disclose
+#: first-use loss (the linkage exactness guards the asserted property:
+#: a lost cc Init fails the Init==1 leg, never passes silently).
+_FF_CC_SKIPPED = frozenset({
+    ("discovery subject", "process exited mid-flight"),
+    ("discovery subject", "discovery unavailable"),
+    ("discovery subject", "no unique attached loader context"),
+    ("learned provider file",
+     "a provider file was learned after its first use; "
+     "its earlier calls were not observed"),
+})
 
 
 def _stall_outcomes(server) -> str:
@@ -219,7 +250,8 @@ class BrowserCells(unittest.TestCase):
 
     def check_report(self, result, store, floors=None, zero=False, attached=None,
                      allowed_gaps=(), allowed_verdicts=_VERDICTS_ATTACHED, absent=None,
-                     s1=None, qualify_nomod_link_loss=False):
+                     s1=None, qualify_nomod_link_loss=False,
+                     expect_mechanisms=False, skipped_allowed=None):
         """Common oracle: schema, identity, counts, loss, gaps, earned verdict.
 
         ``attached`` pins the probe state: True (hooked the mapped module),
@@ -241,7 +273,18 @@ class BrowserCells(unittest.TestCase):
         sessions at startup, strictly before capture, so floored calls
         legitimately ride cached sessions. None (the twin default)
         skips the S1 checks.
+        ``expect_mechanisms`` selects the sign-cell S1 positive half:
+        the mechanisms section must exist and be non-empty (presence,
+        not absence); the cell then pins the attributed use itself
+        through the linkage oracles (a meta-test fails a sign cell
+        with no linkage call). It requires ``s1`` (fail closed).
+        ``skipped_allowed`` replaces the structural skipped check with
+        the closed-world run set: every skipped record must be an
+        allowed (name, reason) pair. None keeps the structural check.
         """
+        if expect_mechanisms and s1 is None:
+            raise ValueError("expect_mechanisms=True requires s1= "
+                             "(sign cells prove S1 presence, never skip it)")
         report = oracle.load_report(result.report_path)
         module_sha = oracle.sha256_of(store.lib)
         counts = oracle.module_counts(report, module_sha)
@@ -253,10 +296,16 @@ class BrowserCells(unittest.TestCase):
             failures += oracle.check_observation_gaps_nomod_qualified(report, allowed_gaps)
         else:
             failures += oracle.check_observation_gaps(report, allowed_gaps)
-        failures += oracle.check_skipped_structural(report)
+        if skipped_allowed is None:
+            failures += oracle.check_skipped_structural(report)
+        else:
+            failures += oracle.check_skipped_run_exact(report, skipped_allowed)
         if s1 is not None:
             failures += oracle.check_no_joint_content(report)
-            failures += oracle.check_s1_mechanisms_absent(report)
+            if expect_mechanisms:
+                failures += oracle.check_mechanisms_present(report)
+            else:
+                failures += oracle.check_s1_mechanisms_absent(report)
             failures += oracle.check_s1_logins_absent(report)
             failures += oracle.check_s1_sessions(
                 report, opened_min=s1.get("sessions_opened_min", 0),
@@ -490,6 +539,81 @@ class BrowserCells(unittest.TestCase):
                           allowed_gaps=_GAPS_ATTACHED_ABSENT, absent=_PINBOUND_ABSENT,
                           allowed_verdicts=_VERDICTS_ATTACHED_VERIFIED,
                           s1={})
+
+    @gate("firefox")
+    def test_ff_cc_sign_attributed_under_run_default(self):
+        """FF-CC-SIGN: default run attributes the Firefox RSA-PSS cc sign."""
+        from profiles import firefox_binary
+        store, cred = self.seed()
+        key, cert = tls_server.make_server_credential(self.work / "srv")
+        with tls_server.FlowServer(cert=cert, key=key, require_client_cert=True,
+                                   client_ca=cred.cert_pem) as flow:
+            result = ff_cc.run_firefox_cc(
+                "FF-CC-SIGN", self.work / "cell", flow, cred)
+            server_facts = dict(result.server)
+        self.assertEqual(result.flow.get("observer_exit"), 0,
+                         f"observer failed: {result.observer_stderr_tail}")
+        self.assertEqual(
+            oracle.check_cc_ground_truth(server_facts, result.flow, "FF-CC-SIGN"), [])
+        bundled = str(firefox_binary().parent / "libsoftokn3.so")
+        report = self.check_report(
+            result, store,
+            attached=True, allowed_gaps=_FF_CC_RUN_GAPS,
+            allowed_verdicts=_FF_CC_VERDICTS,
+            skipped_allowed=_FF_CC_SKIPPED, s1={},
+            expect_mechanisms=True)
+        failures = []
+        failures += oracle.check_no_state_drops(report)
+        failures += oracle.check_linkage_floored(
+            report, oracle.CKM_SHA256_RSA_PKCS_PSS,
+            {"C_SignInit": 1, "C_SignFinal": 1}, {"C_SignUpdate": 1},
+            "FF-CC-SIGN pss-sign", unlisted="allow_verify")
+        failures += oracle.check_module_covers_row(
+            report, oracle.CKM_SHA256_RSA_PKCS_PSS,
+            oracle.sha256_of(Path(bundled)), "FF-CC-SIGN pss-sign")
+        failures += oracle.check_linkage_floored(
+            report, oracle.CKM_SHA256_HMAC,
+            {"C_SignInit": 1, "C_SignFinal": 1}, {"C_SignUpdate": 1},
+            "FF-CC-SIGN seeding-hmac")
+        failures += oracle.check_module_covers_row(
+            report, oracle.CKM_SHA256_HMAC,
+            oracle.system_softokn_sha(report, bundled),
+            "FF-CC-SIGN seeding-hmac")
+        failures += oracle.check_bundled_coverage_or_named_gap(
+            report, oracle.sha256_of(Path(bundled)), bundled,
+            FF_CC_MISS_CAUSE, "FF-CC-SIGN bundled")
+        self.assertEqual(failures, [])
+
+    @gate("firefox")
+    def test_ff_cc_plain_has_no_pss_sign(self):
+        """FF-CC-PLAIN: no-sign control; the plain run shows no PSS sign leg."""
+        from profiles import firefox_binary
+        store, cred = self.seed()
+        key, cert = tls_server.make_server_credential(self.work / "srv")
+        with tls_server.FlowServer(cert=cert, key=key) as flow:
+            result = ff_cc.run_firefox_cc(
+                "FF-CC-PLAIN", self.work / "cell", flow, cred)
+            server_facts = dict(result.server)
+        self.assertEqual(result.flow.get("observer_exit"), 0,
+                         f"observer failed: {result.observer_stderr_tail}")
+        self.assertEqual(
+            oracle.check_plain_ground_truth(server_facts, result.flow, "FF-CC-PLAIN"), [])
+        bundled = str(firefox_binary().parent / "libsoftokn3.so")
+        report = self.check_report(
+            result, store,
+            attached=True, allowed_gaps=_FF_CC_RUN_GAPS,
+            allowed_verdicts=_FF_CC_VERDICTS,
+            skipped_allowed=_FF_CC_SKIPPED, s1={},
+            expect_mechanisms=True)
+        failures = []
+        failures += oracle.check_no_state_drops(report)
+        failures += oracle.check_linkage_floored(
+            report, oracle.CKM_SHA256_RSA_PKCS_PSS, {}, {},
+            "FF-CC-PLAIN pss-sign", unlisted="allow_verify")
+        failures += oracle.check_bundled_coverage_or_named_gap(
+            report, oracle.sha256_of(Path(bundled)), bundled,
+            FF_CC_MISS_CAUSE, "FF-CC-PLAIN bundled")
+        self.assertEqual(failures, [])
 
     @gate_system("firefox")
     def test_ff_first_with_background_provider_covers_browser(self):
@@ -2063,6 +2187,55 @@ def live_cells_missing_s1(source):
     return found, missing
 
 
+def sign_cells_missing_linkage(source):
+    """``@gate`` sign cells with no linkage-oracle call in their body.
+
+    Parses ``source`` (this suite file) like ``live_cells_missing_s1``.
+    A cell that passes ``expect_mechanisms=True`` asserts mechanism
+    presence through ``check_report``; presence alone is vacuous
+    without the attributed-use legs, so the body must also call a
+    linkage oracle (``check_linkage_exact`` or
+    ``check_linkage_floored``). Returns (found, missing): all sign
+    cells, and those without the call.
+    """
+    found, missing = [], []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.ClassDef) or node.name != "BrowserCells":
+            continue
+        for item in node.body:
+            if not isinstance(item, ast.FunctionDef):
+                continue
+            gated = any(
+                (isinstance(expr, ast.Call)
+                 and isinstance(expr.func, ast.Name)
+                 and expr.func.id == "gate")
+                or (isinstance(expr, ast.Name) and expr.id == "gate")
+                for expr in item.decorator_list)
+            if not gated:
+                continue
+            calls = [call for call in ast.walk(item)
+                     if isinstance(call, ast.Call)]
+            sign = any(
+                isinstance(call.func, ast.Attribute)
+                and call.func.attr == "check_report"
+                and any(keyword.arg == "expect_mechanisms"
+                        and isinstance(keyword.value, ast.Constant)
+                        and keyword.value.value is True
+                        for keyword in call.keywords)
+                for call in calls)
+            if not sign:
+                continue
+            found.append(item.name)
+            linked = any(
+                isinstance(call.func, ast.Attribute)
+                and call.func.attr in ("check_linkage_exact",
+                                       "check_linkage_floored")
+                for call in calls)
+            if not linked:
+                missing.append(item.name)
+    return found, missing
+
+
 def system_first_cells_missing_oracle(source):
     """Observer-first system cells and those lacking the rows oracle.
 
@@ -2529,7 +2702,7 @@ class BrowserS1Oracle(unittest.TestCase):
         require_s1_wiring(self)
         found, missing = live_cells_missing_s1(
             Path(__file__).read_text())
-        self.assertEqual(len(found), 5)
+        self.assertEqual(len(found), 7)
         self.assertEqual(missing, [])
 
     def test_system_first_cells_wire_browser_rows_oracle(self):
@@ -2670,6 +2843,517 @@ def _wait_tree_dead(pid, timeout):
         if time.monotonic() >= deadline:
             return False
         time.sleep(0.05)
+
+
+class BrowserFirefoxCC(unittest.TestCase):
+    """FF-CC-SIGN/PLAIN oracle twins: unprivileged, run everywhere.
+
+    Every leg of the two Firefox run-default sign cells over synthetic
+    reports, so a softened check fails here instead of silently
+    widening the live cells. Each twin kills one clause; the live RED
+    run proves the legs fail on today's product shape (no
+    ``by_function`` linkage, no seeding HMAC row, silent bundled miss).
+    """
+
+    maxDiff = 4096
+
+    def setUp(self):
+        self.work = Path(tempfile.mkdtemp(prefix="g33-browser-ffcc-"))
+        self.addCleanup(shutil.rmtree, self.work, True)
+
+    def ffcc_result(self, name, rows, evidence, mechanisms, sessions,
+                    logins, extra=None):
+        """Write a twin v3 document with S1 sections; wrap it in a result."""
+        doc = {"schema": oracle.SCHEMA, "functions": rows,
+               "evidence": evidence, "mechanisms": mechanisms,
+               "sessions": sessions, "logins": logins,
+               "cgroups": []}
+        if extra:
+            doc.update(extra)
+        path = self.work / f"{name}-report.json"
+        path.write_text(json.dumps(doc))
+        return doc, cells.CellResult(name, path)
+
+    @staticmethod
+    def linkage_row(mechanism, entries, calls=None, errors=0,
+                    by_module=None, ops=("sign",)):
+        """One mechanisms[] row with ``by_function`` linkage."""
+        total = sum(entry.get("calls", 0) for entry in entries
+                    if isinstance(entry, dict))
+        return {
+            "mechanism": mechanism,
+            "mechanism_hex": f"0x{mechanism:x}",
+            "ops": list(ops),
+            "calls": total if calls is None else calls,
+            "errors": errors,
+            "by_function": list(entries),
+            "by_module": list(by_module or []),
+        }
+
+    @staticmethod
+    def linkage_entry(function, calls, errors=0):
+        return {"function": function, "calls": calls, "errors": errors}
+
+    @staticmethod
+    def cc_serverFacts(**overrides):
+        facts = {
+            "handshakes_ok": 1, "client_certs_presented": 1,
+            "requests_served": 1, "empty_certs": 0,
+            "selection_stalls": 0, "cert_refusals": 0,
+            "abandoned": 0, "handshake_failures": 0,
+            "handshake_errors": [],
+        }
+        facts.update(overrides)
+        return facts
+
+    @staticmethod
+    def cc_flowFacts(**overrides):
+        facts = {"flow": "client_cert_visit", "loaded": True,
+                 "http_status": 200}
+        facts.update(overrides)
+        return facts
+
+    def test_presence_healthy_accepted(self):
+        doc = {"mechanisms": [{"mechanism": 0x43}]}
+        self.assertEqual(oracle.check_mechanisms_present(doc), [])
+
+    def test_presence_rejected(self):
+        self.assertNotEqual(oracle.check_mechanisms_present({}), [])
+        self.assertNotEqual(
+            oracle.check_mechanisms_present({"mechanisms": {}}), [])
+        self.assertNotEqual(
+            oracle.check_mechanisms_present({"mechanisms": []}), [])
+
+    def test_linkage_exact_healthy_accepted(self):
+        entries = [self.linkage_entry("C_SignInit", 1),
+                   self.linkage_entry("C_SignFinal", 1)]
+        doc = {"mechanisms": [self.linkage_row(0x43, entries)]}
+        self.assertEqual(
+            oracle.check_linkage_exact(
+                doc, 0x43, {"C_SignInit": 1, "C_SignFinal": 1}, "TWIN"), [])
+
+    def test_linkage_exact_rejected(self):
+        healthy = [self.linkage_entry("C_SignInit", 1),
+                   self.linkage_entry("C_SignFinal", 1)]
+
+        def run(mechanisms, exact=None):
+            doc = {"mechanisms": mechanisms}
+            return oracle.check_linkage_exact(
+                doc, 0x43,
+                {"C_SignInit": 1, "C_SignFinal": 1} if exact is None else exact,
+                "TWIN")
+
+        with self.subTest("missing row"):
+            self.assertNotEqual(run([]), [])
+        with self.subTest("missing by_function"):
+            row = self.linkage_row(0x43, healthy)
+            del row["by_function"]
+            failures = run([row])
+            self.assertNotEqual(failures, [])
+            self.assertIn("no function x mechanism linkage", failures[0])
+        with self.subTest("by_function not a list"):
+            row = self.linkage_row(0x43, healthy, calls=2)
+            row["by_function"] = {}
+            self.assertNotEqual(run([row]), [])
+        with self.subTest("malformed entry"):
+            row = self.linkage_row(0x43, ["x"], calls=2)
+            self.assertNotEqual(run([row]), [])
+        with self.subTest("nameless entry"):
+            row = self.linkage_row(
+                0x43, [{"calls": 1, "errors": 0}], calls=2)
+            self.assertNotEqual(run([row]), [])
+        with self.subTest("duplicate name"):
+            row = self.linkage_row(
+                0x43, [self.linkage_entry("C_SignInit", 1),
+                       self.linkage_entry("C_SignInit", 1)], calls=2)
+            self.assertNotEqual(run([row]), [])
+        with self.subTest("non-u64 counters"):
+            row = self.linkage_row(
+                0x43, [{"function": "C_SignInit", "calls": True,
+                        "errors": 0}], calls=2)
+            self.assertNotEqual(run([row]), [])
+        with self.subTest("off by one"):
+            entries = [self.linkage_entry("C_SignInit", 2),
+                       self.linkage_entry("C_SignFinal", 1)]
+            self.assertNotEqual(
+                run([self.linkage_row(0x43, entries)]), [])
+        with self.subTest("extra function"):
+            entries = healthy + [self.linkage_entry("C_Sign", 1)]
+            self.assertNotEqual(
+                run([self.linkage_row(0x43, entries)]), [])
+        with self.subTest("unknown hides legs"):
+            entries = healthy + [self.linkage_entry("unknown", 3)]
+            failures = run([self.linkage_row(0x43, entries)])
+            self.assertNotEqual(failures, [])
+            self.assertIn("unknown", failures[0])
+        with self.subTest("cells do not sum to the row"):
+            row = self.linkage_row(0x43, healthy, calls=99)
+            self.assertNotEqual(run([row]), [])
+        with self.subTest("errors pinned at zero"):
+            entries = [self.linkage_entry("C_SignInit", 1),
+                       self.linkage_entry("C_SignFinal", 1, errors=1)]
+            row = self.linkage_row(0x43, entries, errors=0)
+            self.assertNotEqual(run([row]), [])
+
+    def test_linkage_floored_healthy_accepted(self):
+        entries = [self.linkage_entry("C_SignInit", 1),
+                   self.linkage_entry("C_SignUpdate", 3),
+                   self.linkage_entry("C_SignFinal", 1)]
+        doc = {"mechanisms": [self.linkage_row(0x43, entries)]}
+        self.assertEqual(
+            oracle.check_linkage_floored(
+                doc, 0x43, {"C_SignInit": 1, "C_SignFinal": 1},
+                {"C_SignUpdate": 1}, "TWIN"), [])
+
+    def test_linkage_floored_rejected(self):
+        def run(entries, exact=None, floors=None, **kwargs):
+            doc = {"mechanisms": [self.linkage_row(0x43, entries)]}
+            return oracle.check_linkage_floored(
+                doc, 0x43,
+                {"C_SignInit": 1, "C_SignFinal": 1} if exact is None else exact,
+                {"C_SignUpdate": 1} if floors is None else floors,
+                "TWIN", **kwargs)
+
+        with self.subTest("floor missed"):
+            entries = [self.linkage_entry("C_SignInit", 1),
+                       self.linkage_entry("C_SignFinal", 1)]
+            row = self.linkage_row(0x43, entries)
+            doc = {"mechanisms": [row]}
+            failures = oracle.check_linkage_floored(
+                doc, 0x43, {"C_SignInit": 1, "C_SignFinal": 1},
+                {"C_SignUpdate": 1}, "TWIN")
+            self.assertNotEqual(failures, [])
+        with self.subTest("bad policy raises"):
+            entries = [self.linkage_entry("C_SignInit", 1)]
+            with self.assertRaises(ValueError):
+                run(entries, unlisted="allow_all")
+        with self.subTest("allow_verify passes verify legs"):
+            entries = [self.linkage_entry("C_SignInit", 1),
+                       self.linkage_entry("C_SignUpdate", 1),
+                       self.linkage_entry("C_SignFinal", 1),
+                       self.linkage_entry("C_VerifyInit", 3),
+                       self.linkage_entry("C_VerifyFinal", 3)]
+            self.assertEqual(
+                run(entries, unlisted="allow_verify"), [])
+        with self.subTest("allow_verify still forbids sign extras"):
+            entries = [self.linkage_entry("C_SignInit", 1),
+                       self.linkage_entry("C_SignUpdate", 1),
+                       self.linkage_entry("C_SignFinal", 1),
+                       self.linkage_entry("C_Sign", 1)]
+            self.assertNotEqual(
+                run(entries, unlisted="allow_verify"), [])
+        with self.subTest("allow_verify still forbids unknown"):
+            entries = [self.linkage_entry("C_SignInit", 1),
+                       self.linkage_entry("C_SignUpdate", 1),
+                       self.linkage_entry("C_SignFinal", 1),
+                       self.linkage_entry("unknown", 2)]
+            failures = run(entries, unlisted="allow_verify")
+            self.assertNotEqual(failures, [])
+            self.assertIn("unknown", failures[0])
+        with self.subTest("forbid rejects verify legs"):
+            entries = [self.linkage_entry("C_SignInit", 1),
+                       self.linkage_entry("C_SignUpdate", 1),
+                       self.linkage_entry("C_SignFinal", 1),
+                       self.linkage_entry("C_VerifyInit", 1)]
+            self.assertNotEqual(run(entries), [])
+
+    def test_module_covers_row_healthy_accepted(self):
+        sha = "b" * 64
+        cell = {"module": {"sha256": sha}, "calls": 5, "errors": 0}
+        entries = [self.linkage_entry("C_SignInit", 5)]
+        row = self.linkage_row(0x43, entries, by_module=[cell])
+        doc = {"mechanisms": [row]}
+        self.assertEqual(
+            oracle.check_module_covers_row(doc, 0x43, sha, "TWIN"), [])
+
+    def test_module_covers_row_rejected(self):
+        sha = "b" * 64
+        other = "c" * 64
+        entries = [self.linkage_entry("C_SignInit", 5)]
+
+        def run(row):
+            return oracle.check_module_covers_row(
+                {"mechanisms": [row] if row is not None else []},
+                0x43, sha, "TWIN")
+
+        with self.subTest("missing row"):
+            self.assertNotEqual(run(None), [])
+        with self.subTest("malformed by_module"):
+            row = self.linkage_row(0x43, entries)
+            row["by_module"] = ["x"]
+            self.assertNotEqual(run(row), [])
+        with self.subTest("no cell for the module"):
+            cell = {"module": {"sha256": other}, "calls": 5, "errors": 0}
+            self.assertNotEqual(
+                run(self.linkage_row(0x43, entries, by_module=[cell])), [])
+        with self.subTest("foreign share"):
+            cell = {"module": {"sha256": sha}, "calls": 4, "errors": 0}
+            failures = run(self.linkage_row(0x43, entries, by_module=[cell]))
+            self.assertNotEqual(failures, [])
+            self.assertIn("another user", failures[0])
+
+    def test_no_state_drops_healthy_accepted(self):
+        doc = {"evidence": {"semantic_state_drops": 0,
+                            "semantic_history_drops": 0}}
+        self.assertEqual(oracle.check_no_state_drops(doc), [])
+        self.assertEqual(oracle.check_no_state_drops({"evidence": {}}), [])
+
+    def test_no_state_drops_rejected(self):
+        doc = {"evidence": {"semantic_state_drops": 1,
+                            "semantic_history_drops": 0}}
+        self.assertNotEqual(oracle.check_no_state_drops(doc), [])
+        doc = {"evidence": {"semantic_state_drops": 0,
+                            "semantic_history_drops": 2}}
+        self.assertNotEqual(oracle.check_no_state_drops(doc), [])
+
+    def test_cc_ground_truth_healthy_accepted(self):
+        self.assertEqual(
+            oracle.check_cc_ground_truth(
+                self.cc_serverFacts(), self.cc_flowFacts(), "TWIN"), [])
+
+    def test_cc_ground_truth_rejected(self):
+        healthy_server = self.cc_serverFacts()
+        healthy_flow = self.cc_flowFacts()
+
+        def run(server=None, flow=None):
+            return oracle.check_cc_ground_truth(
+                healthy_server if server is None else server,
+                healthy_flow if flow is None else flow, "TWIN")
+
+        for key in ("handshakes_ok", "client_certs_presented",
+                    "requests_served"):
+            with self.subTest(key=key):
+                self.assertNotEqual(
+                    run(server=self.cc_serverFacts(**{key: 0})), [])
+        for key in ("empty_certs", "selection_stalls", "cert_refusals",
+                    "abandoned", "handshake_failures"):
+            with self.subTest(key=key):
+                self.assertNotEqual(
+                    run(server=self.cc_serverFacts(**{key: 1})), [])
+        with self.subTest("error text"):
+            self.assertNotEqual(
+                run(server=self.cc_serverFacts(handshake_errors=["x"])), [])
+        with self.subTest("not loaded"):
+            self.assertNotEqual(
+                run(flow=self.cc_flowFacts(loaded=False)), [])
+        with self.subTest("bad status"):
+            self.assertNotEqual(
+                run(flow=self.cc_flowFacts(http_status=404)), [])
+        with self.subTest("mistyped counter"):
+            self.assertNotEqual(
+                run(server=self.cc_serverFacts(handshakes_ok=True)), [])
+
+    def test_plain_ground_truth_healthy_accepted(self):
+        self.assertEqual(
+            oracle.check_plain_ground_truth(
+                self.cc_serverFacts(client_certs_presented=0),
+                self.cc_flowFacts(), "TWIN"), [])
+
+    def test_plain_ground_truth_rejected(self):
+        self.assertNotEqual(
+            oracle.check_plain_ground_truth(
+                self.cc_serverFacts(), self.cc_flowFacts(), "TWIN"), [])
+        self.assertNotEqual(
+            oracle.check_plain_ground_truth(
+                self.cc_serverFacts(client_certs_presented=0),
+                self.cc_flowFacts(loaded=False), "TWIN"), [])
+
+    def test_system_softokn_sha_healthy_accepted(self):
+        bundled = self.work / "firefox" / "libsoftokn3.so"
+        bundled.parent.mkdir(parents=True)
+        bundled.write_bytes(b"bundled-softokn")
+        system = self.work / "system" / "libsoftokn3.so"
+        system.parent.mkdir(parents=True)
+        system.write_bytes(b"system-softokn")
+        doc = {"capture": {"modules": [
+            {"path": str(bundled),
+             "sha256": oracle.sha256_of(bundled)},
+            {"path": str(system),
+             "sha256": oracle.sha256_of(system)},
+        ]}}
+        self.assertEqual(
+            oracle.system_softokn_sha(doc, str(bundled)),
+            oracle.sha256_of(system))
+
+    def test_system_softokn_sha_rejected(self):
+        bundled = self.work / "firefox" / "libsoftokn3.so"
+        bundled.parent.mkdir(parents=True)
+        bundled.write_bytes(b"bundled-softokn")
+        system = self.work / "system" / "libsoftokn3.so"
+        system.parent.mkdir(parents=True)
+        system.write_bytes(b"system-softokn")
+
+        def doc_for(modules):
+            return {"capture": {"modules": modules}}
+
+        with self.subTest("none besides bundled"):
+            doc = doc_for([{"path": str(bundled),
+                            "sha256": oracle.sha256_of(bundled)}])
+            with self.assertRaises(oracle.OracleError):
+                oracle.system_softokn_sha(doc, str(bundled))
+        with self.subTest("two besides bundled"):
+            other = self.work / "other" / "libsoftokn3.so"
+            other.parent.mkdir(parents=True)
+            other.write_bytes(b"other-softokn")
+            doc = doc_for([
+                {"path": str(bundled),
+                 "sha256": oracle.sha256_of(bundled)},
+                {"path": str(system),
+                 "sha256": oracle.sha256_of(system)},
+                {"path": str(other),
+                 "sha256": oracle.sha256_of(other)},
+            ])
+            with self.assertRaises(oracle.OracleError):
+                oracle.system_softokn_sha(doc, str(bundled))
+        with self.subTest("hash mismatch"):
+            doc = doc_for([
+                {"path": str(bundled),
+                 "sha256": oracle.sha256_of(bundled)},
+                {"path": str(system), "sha256": "0" * 64},
+            ])
+            with self.assertRaises(oracle.OracleError):
+                oracle.system_softokn_sha(doc, str(bundled))
+        with self.subTest("unreadable file"):
+            doc = doc_for([
+                {"path": str(bundled),
+                 "sha256": oracle.sha256_of(bundled)},
+                {"path": str(self.work / "missing.so"),
+                 "sha256": "0" * 64},
+            ])
+            with self.assertRaises(oracle.OracleError):
+                oracle.system_softokn_sha(doc, str(bundled))
+
+    def _coverage_doc(self, tables, calls, loads, causes, sha="b" * 64,
+                      path="/ff/libsoftokn3.so"):
+        """Twin report with one bundled discovery entry + function rows."""
+        entry = {
+            "path": path,
+            "attached_at_ns": 100 if tables else None,
+            "tables": [{"entries": 68}] * tables,
+            "first_loaded_by": {"pre_attach_loads": loads},
+        }
+        rows = [BrowserCells._twin_row(["C_SignInit"], calls, sha)]
+        return {
+            "schema": oracle.SCHEMA,
+            "functions": rows,
+            "evidence": {
+                "discovery": [entry],
+                "gap_classes": {"observation": {"causes": list(causes)}},
+            },
+        }
+
+    def test_coverage_or_gap_covered_accepted(self):
+        doc = self._coverage_doc(
+            tables=6, calls=1772, loads=1, causes=["pause_partial"])
+        self.assertEqual(
+            oracle.check_bundled_coverage_or_named_gap(
+                doc, "b" * 64, "/ff/libsoftokn3.so",
+                FF_CC_MISS_CAUSE, "TWIN"), [])
+
+    def test_coverage_or_gap_missed_without_cause_rejected(self):
+        doc = self._coverage_doc(
+            tables=0, calls=0, loads=1, causes=["pause_partial"])
+        failures = oracle.check_bundled_coverage_or_named_gap(
+            doc, "b" * 64, "/ff/libsoftokn3.so", FF_CC_MISS_CAUSE, "TWIN")
+        self.assertNotEqual(failures, [])
+        self.assertIn("silent provider miss", failures[0])
+
+    def test_coverage_or_gap_named_gap_accepted(self):
+        doc = self._coverage_doc(
+            tables=0, calls=0, loads=3, causes=[FF_CC_MISS_CAUSE])
+        self.assertEqual(
+            oracle.check_bundled_coverage_or_named_gap(
+                doc, "b" * 64, "/ff/libsoftokn3.so",
+                FF_CC_MISS_CAUSE, "TWIN"), [])
+
+    def test_coverage_or_gap_gap_without_counts_rejected(self):
+        doc = self._coverage_doc(
+            tables=0, calls=0, loads=0, causes=[FF_CC_MISS_CAUSE])
+        failures = oracle.check_bundled_coverage_or_named_gap(
+            doc, "b" * 64, "/ff/libsoftokn3.so", FF_CC_MISS_CAUSE, "TWIN")
+        self.assertNotEqual(failures, [])
+        self.assertIn("no counts", failures[0])
+
+    def test_skipped_run_exact_healthy_accepted(self):
+        doc = {"evidence": {"skipped": [
+            {"name": "discovery subject",
+             "reason": "process exited mid-flight"},
+        ]}}
+        self.assertEqual(
+            oracle.check_skipped_run_exact(doc, _FF_CC_SKIPPED), [])
+        self.assertEqual(
+            oracle.check_skipped_run_exact({"evidence": {}}, _FF_CC_SKIPPED),
+            [])
+
+    def test_skipped_run_exact_rejected(self):
+        doc = {"evidence": {"skipped": [
+            {"name": "discovery subject", "reason": "something new"},
+        ]}}
+        failures = oracle.check_skipped_run_exact(doc, _FF_CC_SKIPPED)
+        self.assertNotEqual(failures, [])
+        self.assertIn("outside", failures[0])
+
+    def test_check_report_sign_mode_wiring(self):
+        sha = "0" * 64
+        store = SimpleNamespace(lib=Path("/not-opened/provider.so"))
+        rows = [BrowserCells._twin_row(["C_FindObjects"], 3, sha)]
+        mechanisms = [{"mechanism": 0x43, "mechanism_hex": "0x43",
+                       "ops": ["sign"], "calls": 3, "errors": 0}]
+        _, result = self.ffcc_result(
+            "SIGN-WIRED", rows, BrowserCells._twin_evidence(),
+            mechanisms, healthy_sessions(), {})
+        case = BrowserCells("test_oracle_builder_healthy_accepted")
+        case.work = self.work
+        with patch.object(oracle, "sha256_of", return_value=sha):
+            with self.assertRaises(ValueError):
+                case.check_report(result, store, s1=None,
+                                  expect_mechanisms=True)
+            case.check_report(result, store, s1={},
+                              expect_mechanisms=True)
+        _, empty = self.ffcc_result(
+            "SIGN-EMPTY", rows, BrowserCells._twin_evidence(), [],
+            healthy_sessions(), {})
+        with patch.object(oracle, "sha256_of", return_value=sha):
+            with self.assertRaises(AssertionError):
+                case.check_report(empty, store, s1={},
+                                  expect_mechanisms=True)
+
+    def test_sign_cells_wire_linkage_oracle(self):
+        found, missing = sign_cells_missing_linkage(
+            Path(__file__).read_text())
+        self.assertEqual(len(found), 2)
+        self.assertEqual(missing, [])
+
+    def test_sign_cells_flag_missing_linkage_call(self):
+        template = (
+            "import unittest\n"
+            "\n"
+            "class BrowserCells(unittest.TestCase):\n"
+            '    @gate("firefox")\n'
+            "    def test_probe_cell(self):\n"
+            "        self.check_report(result, store, s1={}, "
+            "expect_mechanisms=True)\n"
+            "%s\n"
+        )
+        found, missing = sign_cells_missing_linkage(template % "")
+        self.assertEqual(found, ["test_probe_cell"])
+        self.assertEqual(missing, ["test_probe_cell"])
+        linked = template % ("        oracle.check_linkage_floored("
+                             "report, 0x43, {}, {}, 'TWIN')\n")
+        found, missing = sign_cells_missing_linkage(linked)
+        self.assertEqual(found, ["test_probe_cell"])
+        self.assertEqual(missing, [])
+        plain = (
+            "import unittest\n"
+            "\n"
+            "class BrowserCells(unittest.TestCase):\n"
+            '    @gate("firefox")\n'
+            "    def test_probe_cell(self):\n"
+            "        self.check_report(result, store, s1={})\n"
+        )
+        found, missing = sign_cells_missing_linkage(plain)
+        self.assertEqual(found, [])
+        self.assertEqual(missing, [])
 
 
 class BrowserReapTree(unittest.TestCase):

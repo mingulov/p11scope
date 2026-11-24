@@ -87,17 +87,21 @@ def run_judge(stream, full_report):
         with (tmpdir / "event-stdout.jsonl").open("w", encoding="utf-8") as handle:
             for entry in stream:
                 handle.write(json.dumps(entry) + "\n")
-        (tmpdir / "event-stdout.json").write_text(
+        # Product reports: only from the run's private output directory.
+        private = tmpdir / ("run-" + RUN_ID)
+        private.mkdir()
+        (private / "event-stdout.json").write_text(
             json.dumps(full_report), encoding="utf-8"
         )
-        (tmpdir / "event-epipe.json").write_text(
+        (private / "event-epipe.json").write_text(
             json.dumps(report(1, TRUNCATED)), encoding="utf-8"
         )
         (tmpdir / "event-epipe.head").write_bytes(b"{" + b"x" * 199)
         result = subprocess.run(
             [sys.executable, "-I", str(RECORDS), "event-stdout", "--stamp", "inventory-event-stdout.stamp",
              "--run-id", RUN_ID, "--verdict", "verdict.json", "--jsonl", "event-stdout.jsonl",
-             "--full-report", "event-stdout.json", "--epipe-report", "event-epipe.json",
+             "--full-report", str(private / "event-stdout.json"),
+             "--epipe-report", str(private / "event-epipe.json"),
              "--epipe-head", "event-epipe.head", "--rc1", "0", "--rc2", "1"],
             cwd=tmp,
             capture_output=True,

@@ -470,15 +470,10 @@ class MatrixContract(unittest.TestCase):
                 self.seal(); self.reject()
 
     def clone_source(self):
+        # The clone holds exactly the staged source list (codex r10 #1:
+        # a hand-kept copy hid the missing loader).
         repo = self.base / "source-clone"
-        for name in ("scripts/release-matrix-contract.py", "scripts/qualify-release-matrix.sh",
-                     "scripts/run-privileged-lib-tests.sh", "scripts/qualify-public-cli.sh",
-                     "scripts/mapped-provider-pin.py", "scripts/public-cli-oracle.py", "scripts/system-scope-measure.py",
-                     "scripts/check-capture-evidence.py",
-                     "scripts/qualify-inventory-native.sh", "scripts/inventory-native-oracle.py",
-                     "tests/fixtures/public-cli/gated.c", "tests/fixtures/public-cli/mt.c",
-                     "tests/fixtures/public-cli/inventory-ledger.c", "scripts/fixtures/exec_churn.c",
-                     "tests/fixtures/public-cli/prearm-first-use.c"):
+        for name in sorted(set(CHECKER_MOD["SOURCE_FILES"]) | set(CHECKER_MOD["RUNTIME_SOURCES"])):
             path = repo / name; path.parent.mkdir(parents=True, exist_ok=True); shutil.copy2(ROOT / name, path)
         stage = self.base / "clone-stage"
         receipt = candidate_receipt(self.bins, self.base / "clone-build.json", repo)
@@ -510,6 +505,13 @@ class MatrixContract(unittest.TestCase):
             shell_control.control("healthy", 0, local_output=True)
         finally:
             os.chdir(previous)
+        # Loader-backed controls (codex r10 #1): the FIFO refusal and the
+        # event cell stamp and judge through the staged typed loader.
+        shell_control.fifo_refusal(shell_control.FIFO_REFUSAL, True)
+        events = runpy.run_path(str(ROOT / "tests/python/test_qualify_records.py"))
+        binding = events["ShellBindingTests"]()
+        binding.event_cell.__func__.__globals__["QUAL"] = staged / "qualify-public-cli.sh"
+        binding.expect("healthy", True, True)
         native = subprocess.run([sys.executable, "-I", str(staged / "inventory-native-oracle.py"), "probe-help"],
                                 cwd=unrelated, input="Usage: p11scope inventory --capture --manifest\n",
                                 text=True, capture_output=True, timeout=5)
@@ -522,7 +524,7 @@ class MatrixContract(unittest.TestCase):
         repo, stage = self.clone_source()
         contract_path = stage / "contract.json"
         original = json.loads(contract_path.read_text())
-        for name in ("public-cli-oracle.py", "check-capture-evidence.py"):
+        for name in ("public-cli-oracle.py", "check-capture-evidence.py", "qualify_records.py"):
             relative = "artifacts/source/scripts/" + name
             source, staged = repo / "scripts" / name, stage / relative
             self.assertIn(relative, original["bindings"])
@@ -541,6 +543,42 @@ class MatrixContract(unittest.TestCase):
                     self.assertFalse((stage / "inner.sh").exists())
                     staged.write_bytes(content); source.write_bytes(content)
         contract_path.write_text(json.dumps(original))
+
+    def test_public_cli_shell_siblings_are_all_staged(self):
+        # Every helper and fixture source the staged public CLI shell
+        # resolves next to itself is in the staged source list, and the
+        # shell's startup guard names exactly its helpers.
+        text = (ROOT / "scripts/qualify-public-cli.sh").read_text()
+        helpers = set(re.findall(r'\$HERE/([A-Za-z0-9_.-]+\.(?:py|sh))', text))
+        fixtures = set(re.findall(r'\$SRC/([A-Za-z0-9_.-]+\.c)', text))
+        self.assertIn("qualify_records.py", helpers)
+        self.assertGreaterEqual(len(fixtures), 7)
+        staged = set(CHECKER_MOD["SOURCE_FILES"])
+        self.assertEqual(sorted("scripts/" + h for h in helpers if "scripts/" + h not in staged), [])
+        self.assertEqual(sorted("tests/fixtures/public-cli/" + f for f in fixtures
+                                if "tests/fixtures/public-cli/" + f not in staged), [])
+        guard = re.search(r'for _helper in ([^;]+); do', text)
+        self.assertIsNotNone(guard)
+        self.assertEqual(set(guard.group(1).replace("\\\n", " ").split()), helpers)
+
+    def test_staged_shell_without_a_helper_refuses_before_any_cell(self):
+        repo, stage = self.clone_source()
+        staged = stage / "artifacts/source/scripts"
+        repo.rename(self.base / "unavailable original checkout")
+        for name in ("qualify_records.py", "inventory-mt-gate.py"):
+            with self.subTest(helper=name):
+                content = (staged / name).read_bytes()
+                (staged / name).unlink()
+                try:
+                    out = self.base / ("refused-" + name)
+                    result = subprocess.run(["bash", str(staged / "qualify-public-cli.sh"), "--control-fifo",
+                                             "/bin/false", str(out), "/bin/true"],
+                                            text=True, capture_output=True, timeout=10)
+                    self.assertEqual(result.returncode, 64, result.stdout + result.stderr)
+                    self.assertIn("required helper missing: %s" % (staged / name), result.stderr)
+                    self.assertFalse(out.exists())
+                finally:
+                    (staged / name).write_bytes(content)
 
     def test_runtime_ledger_drift_is_rejected_before_inner_generation(self):
         repo, stage = self.clone_source()
@@ -2258,10 +2296,10 @@ class MatrixContract(unittest.TestCase):
                 body = "mkdir -p \"$2\"\nprintf 'controlled lib output' > \"$2/results.txt\"\n"
             path.write_text(text.replace("exit 0\n", body + "exit 0\n"))
             path.chmod(0o755)
-        for name in ("scripts/inventory-native-oracle.py", "scripts/mapped-provider-pin.py",
-                     "tests/fixtures/public-cli/gated.c", "tests/fixtures/public-cli/mt.c",
-                     "tests/fixtures/public-cli/inventory-ledger.c", "scripts/fixtures/exec_churn.c",
-                     "tests/fixtures/public-cli/prearm-first-use.c"):
+        # Every other staged source (the full SOURCE_FILES list) is a
+        # controlled stand-in.
+        for name in sorted((set(CHECKER_MOD["SOURCE_FILES"]) | set(CHECKER_MOD["RUNTIME_SOURCES"]))
+                           - {"scripts/" + p.name for p in repo.joinpath("scripts").iterdir()}):
             path = repo / name; path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("controlled external fixture\n")
         for name in ("p11scope", "p11scope-bpfmulti"):

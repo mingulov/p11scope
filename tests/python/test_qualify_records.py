@@ -152,7 +152,9 @@ def member_case():
 
 
 def prearm_evidence(windows, attached=50):
-    return {"discovery": [{"sources": ["scan"], "unobserved_windows": [], "attached_at_ns": 7},
+    # The unrelated row is the producer's unattached sibling
+    # (src/render.rs ModuleSummary): a null attach stamp, no windows key.
+    return {"discovery": [{"sources": ["scan"], "attached_at_ns": None},
                           {"sources": ["prearm", "scan"], "unobserved_windows": windows,
                            "attached_at_ns": attached}]}
 
@@ -207,6 +209,27 @@ CELLS = {"cgroup-inventory": "inventory-cgroup", "event-stdout": "inventory-even
 
 # -- in-process runner ------------------------------------------------------------
 
+# Product reports are read from this run's private output directory
+# (codex r10 #2); every other input is a shell-owned file.
+PRIVATE = "run-" + RUN_ID
+PRODUCT = {"report.json", "full.json", "epipe.json", "sigint2.json", "run-prearm-held.txt",
+           "run-prearm-passive.txt", "chain.json"}
+
+
+def place(tmp, name, case):
+    if name in PRODUCT and name not in case.get("outside_private", ()):
+        return tmp / case.get("private_dir", PRIVATE) / name
+    return tmp / name
+
+
+def make_private(tmp, case):
+    if case.get("private_symlink"):
+        (tmp / "elsewhere").mkdir()
+        os.symlink("elsewhere", tmp / PRIVATE)
+    else:
+        (tmp / case.get("private_dir", PRIVATE)).mkdir(exist_ok=True)
+
+
 def dumps(value):
     return json.dumps(value)
 
@@ -219,7 +242,7 @@ def write_inputs(case, tmp):
 
     def put(name, text, option):
         files[name] = raw.get(name, text)
-        argv.extend(["--" + option, str(tmp / name)])
+        argv.extend(["--" + option, str(place(tmp, name, case))])
 
     if judge == "cgroup-inventory":
         put("report.json", dumps(case["report"]), "report")
@@ -297,24 +320,30 @@ def run_case(case, *, stamp=True, before=None):
                 Q.write_stamp(str(stamp_path), case.get("stamp_run_id", RUN_ID),
                               case.get("stamp_cell", CELLS[judge]))
             argv += ["--stamp", str(stamp_path), "--run-id", case.get("run_id", RUN_ID)]
+        make_private(tmp, case)
         files, named = write_inputs(case, tmp)
         for name, text in files.items():
-            path = tmp / name
+            path = place(tmp, name, case)
             if isinstance(text, bytes):
                 path.write_bytes(text)
             else:
                 path.write_text(text)
         for name, delta in case.get("age", {}).items():
             info = os.stat(tmp / "cell.stamp")
-            os.utime(tmp / name, ns=(info.st_atime_ns, info.st_mtime_ns - delta))
+            os.utime(place(tmp, name, case), ns=(info.st_atime_ns, info.st_mtime_ns - delta))
         for name in case.get("remove", ()):
-            os.unlink(tmp / name)
+            os.unlink(place(tmp, name, case))
         for name in case.get("symlink", ()):
             # The same bytes behind a symlink: an input is never followed.
-            os.rename(tmp / name, tmp / (name + ".real"))
-            os.symlink(name + ".real", tmp / name)
+            path = place(tmp, name, case)
+            os.rename(path, path.with_name(name + ".real"))
+            os.symlink(name + ".real", path)
         for name, size in case.get("sparse", {}).items():
-            os.truncate(tmp / name, size)
+            os.truncate(place(tmp, name, case), size)
+        for name in case.get("as_fifo", ()):
+            # A FIFO input is refused without blocking the judge.
+            os.unlink(place(tmp, name, case))
+            os.mkfifo(place(tmp, name, case))
         if before:
             before(tmp)
         with Trace() as trace, contextlib.redirect_stdout(io.StringIO()):
@@ -483,6 +512,18 @@ def prearm_module(name, **fields):
     return go
 
 
+def unset_module(name, key):
+    def go(case):
+        del case[name + "_evidence"][0]["discovery"][1][key]
+    return go
+
+
+def unrelated(name, **fields):
+    def go(case):
+        case[name + "_evidence"][0]["discovery"][0].update(fields)
+    return go
+
+
 def direct(function):
     """A rule decided by a loader function outside the judges' paths."""
     return {"judge": "direct", "function": function}
@@ -504,12 +545,36 @@ NEGATIVE = [
     ("fresh.file", "run-prearm", lambda c: c.update(age={"run-prearm-held.txt": 1})),
     ("fresh.file", "second-sigint", raw("sigint2.json", b"\xff\xfe")),
     ("record.stamp", "event-stdout", lambda c: c.update(raw_stamp=True)),
+    # codex r10 #2: every product report read is bound to this run's
+    # private output directory (one row per read site)
+    ("fresh.private", "event-stdout", lambda c: c.update(private_dir="run-another-run")),
+    ("fresh.private", "event-stdout", lambda c: c.update(outside_private=["full.json"])),
+    ("fresh.private", "event-stdout", lambda c: c.update(outside_private=["epipe.json"])),
+    ("fresh.private", "second-sigint", lambda c: c.update(outside_private=["sigint2.json"])),
+    ("fresh.private", "cgroup-inventory", lambda c: c.update(outside_private=["report.json"])),
+    ("fresh.private", "run-prearm", lambda c: c.update(outside_private=["run-prearm-held.txt"])),
+    ("fresh.private", "run-prearm", lambda c: c.update(outside_private=["run-prearm-passive.txt"])),
+    ("fresh.private", "run-prearm", lambda c: c.update(private_symlink=True)),
+    ("fresh.private", "parent-chain", lambda c: c.update(outside_private=["chain.json"])),
+    ("fresh.file", "event-stdout", lambda c: c.update(as_fifo=["events.jsonl"])),
+    ("fresh.file", "second-sigint", lambda c: c.update(as_fifo=["sigint2.json"])),
     ("arg.integer", "second-sigint", arg("rc", "130.0")),
     ("arg.integer", "cgroup-inventory", arg("inside-pid", "4194305")),
     # second SIGINT
     ("record.observed-profile", "second-sigint", at(("report", "schema"), "p11scope/observed-profile/v2")),
     ("record.profile-evidence", "second-sigint", at(("report", "evidence", "drain_proven"), 1)),
     ("record.stop-quiescence", "second-sigint", at(("report", "evidence", "stop_quiescence", "state"), None)),
+    # codex r10 #3: the producer's three states and two plain flags, on
+    # an unproven stop where drain_proven false would otherwise agree
+    ("record.stop-quiescence", "second-sigint", chain(
+        at(("report", "evidence", "stop_quiescence", "state"), "made-up"),
+        at(("report", "evidence", "drain_proven"), False))),
+    ("record.stop-quiescence", "second-sigint", chain(
+        at(("report", "evidence", "stop_quiescence", "post_q_events"), None),
+        at(("report", "evidence", "drain_proven"), False))),
+    ("record.stop-quiescence", "second-sigint", chain(
+        at(("report", "evidence", "stop_quiescence", "post_q_discovery"), None),
+        at(("report", "evidence", "drain_proven"), False))),
     ("sigint.exit", "second-sigint", arg("rc", "0")),
     ("sigint.custody", "second-sigint", arg("custody", "0")),
     ("sigint.custody", "second-sigint", arg("cleanup", "0")),
@@ -654,6 +719,9 @@ NEGATIVE = [
         *[ledger_fn("inside", n, "attempts", 501) for n in range(6)],
         *[ledger_fn("inside", n, "successful", 501) for n in range(6)])),
     ("ledger.inside-attempts", "cgroup-inventory", arg("inside-iters", "249")),
+    # codex r10 #4: odd attempts with mismatched successes refuse at the
+    # parity guard, before the success check
+    ("ledger.inside-attempts", "cgroup-inventory", all_attempts("inside", 501, 500)),
     ("ledger.outside-attempts", "cgroup-inventory", arg("outside-iters", "400")),
     ("ledger.outside-attempts", "cgroup-inventory", chain(
         ledger_fn("outside", 1, "attempts", -1), ledger_fn("outside", 1, "successful", -1))),
@@ -714,6 +782,16 @@ NEGATIVE = [
     ("prearm.evidence-once", "run-prearm", lambda c: c.update(passive_evidence=[])),
     ("record.prearm-evidence", "run-prearm", evidence("held", {"discovery": {}})),
     ("record.prearm-module", "run-prearm", prearm_module("held", attached_at_ns=50.0)),
+    # codex r10 #3: the selected module needs its attach stamp key and
+    # window list on each twin; unrelated rows keep the producer's types
+    ("record.prearm-module", "run-prearm", unset_module("held", "unobserved_windows")),
+    ("record.prearm-module", "run-prearm", unset_module("passive", "unobserved_windows")),
+    ("record.prearm-module", "run-prearm", unset_module("held", "attached_at_ns")),
+    ("record.prearm-module", "run-prearm", unset_module("passive", "attached_at_ns")),
+    ("record.prearm-discovery-row", "run-prearm", unrelated("held", attached_at_ns=7.5)),
+    ("record.prearm-discovery-row", "run-prearm", unrelated("passive", unobserved_windows={})),
+    ("record.prearm-discovery-row", "run-prearm", unrelated("held", sources="scan")),
+    ("prearm.attached", "run-prearm", prearm_module("passive", attached_at_ns=None)),
     ("record.unobserved-window", "run-prearm", prearm_module(
         "passive", unobserved_windows=[{"start_ns": 10, "end_ns": 50, "reason": "pre_attach", "x": 1}])),
     ("record.prearm-pair", "run-prearm", lambda c: c["held_ledger"][0].update(pair=True)),
@@ -865,6 +943,24 @@ POSITIVE = [
      for r in Q.CHAIN_GAP_REASONS] + [
     ("chain.ancestor", "parent-chain", ancestor(1, exe=None, label="bash", folded=2, exe_gap="hidden")),
     ("cgroup.procs-once", "cgroup-member", lambda c: c.update(procs="100")),
+    # codex r10 #3: a valid unproven (and a never-reached) stop passes
+    ("sigint.drain-proof", "second-sigint", chain(
+        at(("report", "evidence", "stop_quiescence", "state"), "unproven"),
+        at(("report", "evidence", "drain_proven"), False))),
+    ("sigint.drain-proof", "second-sigint", chain(
+        at(("report", "evidence", "stop_quiescence", "state"), "not_reached"),
+        at(("report", "evidence", "drain_proven"), False))),
+    ("sigint.drain-proof", "second-sigint", chain(
+        at(("report", "evidence", "stop_quiescence", "post_q_events"), True),
+        at(("report", "evidence", "drain_proven"), False))),
+    # producer-valid unrelated discovery rows on both twins: attached
+    # with its windows, or only its sources (before assembly)
+    ("record.prearm-discovery-row", "run-prearm", chain(
+        unrelated("held", attached_at_ns=7, unobserved_windows=[]),
+        unrelated("passive", attached_at_ns=7, unobserved_windows=PRE_ATTACH))),
+    ("record.prearm-discovery-row", "run-prearm", chain(
+        lambda c: c["held_evidence"][0]["discovery"][0].pop("attached_at_ns"),
+        lambda c: c["passive_evidence"][0]["discovery"][0].pop("attached_at_ns"))),
     ("sigint.cleanup-line", "second-sigint", at(("stderr",), "a\np11scope: cleanup incomplete")),
     ("event-output.consistent", "event-stdout", at(("epipe", "event_output", "lines_lost"), 1)),
     ("fresh.file", "event-stdout", lambda c: c.update(age={"events.jsonl": 0, "full.json": 0})),
@@ -1024,7 +1120,7 @@ ALLOWED = {
     ("event-stdout", ("report", "modules", "*", "*")): "only the modules count is consumed",
     ("event-stdout", ("report", "edges", "*", "*")): "only the edges count is consumed",
     # Another discovery module's nullable attach stamp and free text.
-    ("run-prearm", ("*", 0, "discovery", 0, "attached_at_ns")): "nullable by schema",
+    ("run-prearm", ("*", 0, "discovery", 0, "attached_at_ns")): "an unrelated attach stamp is nullable",
     ("run-prearm", ("*", 0, "discovery", 0, "sources", "*")): "free source name of another module",
     # A further ancestor's exe, its optional fields and the chain gap.
     ("parent-chain", ("report", "callers", 1, "launched_by", "*", "exe")): "a further ancestor's exe is nullable",
@@ -1034,7 +1130,8 @@ ALLOWED = {
 
 # Optional keys: deleting one passes; a wrong type there is still refused.
 OPTIONAL = {
-    ("parent-chain", ("report", "callers", 1, "launched_by", "*", key)) for key in ("label", "folded", "exe_gap")}
+    ("parent-chain", ("report", "callers", 1, "launched_by", "*", key)) for key in ("label", "folded", "exe_gap")} | {
+    ("run-prearm", ("*", 0, "discovery", 0, key)) for key in ("attached_at_ns", "unobserved_windows")}
 
 
 def allowed(judge, path):
@@ -1051,8 +1148,6 @@ def optional(judge, path):
 VALUE_DECIDED = {
     ("cgroup-inventory", ("report", "modules", 0, "identity", "sha256"), None),
     ("cgroup-inventory", ("report", "edges", "*", "entries", "coverage", "lossy"), None),
-    ("second-sigint", ("report", "evidence", "stop_quiescence", "post_q_events"), None),
-    ("second-sigint", ("report", "evidence", "stop_quiescence", "post_q_discovery"), None),
     ("run-prearm", ("*", 0, "discovery", 1, "attached_at_ns"), None),
     ("parent-chain", ("report", "callers", 1, "launched_by", 0, "exe"), None),
     ("parent-chain", ("report", "callers", 1, "launched_by_unit"), "x"),
@@ -1073,7 +1168,7 @@ CLOSED = {
     ("event-stdout", ("stream", "*", "event", "totals")),
     ("event-stdout", ("stream", "*", "event", "stdout_lost")),
     ("event-stdout", ("*", "event_output")),
-    ("run-prearm", ("*", 0, "discovery", 1, "unobserved_windows", "*")),
+    ("run-prearm", ("*", 0, "discovery", "*", "unobserved_windows", "*")),
     ("run-prearm", ("held_ledger", "*")),
     ("run-prearm", ("passive_ledger", "*")),
 }
@@ -1214,6 +1309,8 @@ class LoaderKernelTests(unittest.TestCase):
         # follow a dropped reason instead of refusing it.
         self.assertEqual(Q.MAX_INPUT_BYTES, 64 * 1024 * 1024)
         self.assertEqual(Q.PID_MAX, 4194304)
+        self.assertEqual(Q.PRIVATE_PREFIX, "run-")
+        self.assertEqual(Q.STOP_STATES, ("not_reached", "proven", "unproven"))
         self.assertEqual(Q.SHED_REASONS, ("broken_pipe", "slow_reader", "write_error", "zero_write",
                                           "invalid_descriptor"))
         self.assertEqual(Q.CHAIN_GAP_REASONS, (
@@ -1259,43 +1356,119 @@ def shell_function(name):
     return text[start:end]
 
 
+EVENT_FIXTURE = (
+    "#!/usr/bin/python3\nimport os,signal,time\nprint('READY pid=%d' % os.getpid(), flush=True)\n"
+    "signal.signal(signal.SIGTERM, lambda a, b: exit(0))\nwhile True: time.sleep(.02)\n")
+# The product stand-in: writes (or withholds) its -o report, streams the
+# event JSONL and exits like the product. `interleave` first runs a whole
+# second invocation B (its own OUT, the same local root), then writes
+# nothing itself: A must never qualify on B's reports.
+EVENT_OBSERVER = r"""#!/usr/bin/python3
+import json, os, pathlib, subprocess, sys
+mode = os.environ["EVENT_MODE"]
+argv = sys.argv[1:]
+out = pathlib.Path(argv[argv.index("-o") + 1])
+full = "--event-interval" in argv
+case = json.loads(os.environ["EVENT_CASE"])
+with open(pathlib.Path(os.environ["CONTROL_OUT"], "observer-outputs.jsonl"), "a") as log:
+    log.write(json.dumps(str(out)) + "\n")
+if mode == "interleave" and full:
+    env = dict(os.environ, EVENT_MODE="healthy", CONTROL_OUT=os.environ["EVENT_B_OUT"])
+    b = subprocess.run(["bash", os.environ["EVENT_SHELL"], "--control-event-stdout", sys.argv[0],
+                        os.environ["EVENT_B_OUT"], os.environ["EVENT_FIXTURE"]], env=env, timeout=60,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    pathlib.Path(os.environ["EVENT_B_OUT"], "b.rc").write_text(str(b.returncode))
+if mode in ("healthy", "tie") or (mode == "missing-epipe" and full) or (mode == "missing-full" and not full):
+    out.write_text(json.dumps(case["report" if full else "epipe"]))
+    if mode == "tie":
+        stamp = os.stat(pathlib.Path(os.environ["CONTROL_OUT"], "inventory-event-stdout.stamp"))
+        os.utime(out, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+try:
+    for row in case["stream"]:
+        sys.stdout.write(json.dumps(row) + "\n")
+    sys.stdout.flush()
+except BrokenPipeError:
+    os.dup2(os.open(os.devnull, os.O_WRONLY), 1)
+sys.exit(0 if full else 1)
+"""
+
+
 class ShellBindingTests(unittest.TestCase):
-    """stamp_leg removes every destination and stamps; a seeded old
-    report then never reaches a judge, in both output layouts."""
+    """The real event cell (`--control-event-stdout`: the actual
+    setup_local_output, stamp_leg, product_output, publish_output and
+    judge call) in both output layouts. Codex r10 #2: a report qualifies
+    only from this invocation's private output directory."""
 
-    def run_leg(self, local_same):
+    def event_cell(self, mode, split, seed=False):
         with tempfile.TemporaryDirectory() as raw:
-            out = Path(raw) / "out"
-            local = out if local_same else Path(raw) / "local"
-            out.mkdir()
-            local.mkdir(exist_ok=True)
-            for where in {out, local}:
-                (where / "event-epipe.json").write_text(json.dumps(event_case()["epipe"]))
-            body = ("set -u\nRECORDS=%s\nRUN_ID=%s\nOUT=%s\nLOCAL_OUTPUT=%s\n%s\n%s\n"
-                    "cd \"$OUT\"\n"
-                    "stamp_leg inventory-event-stdout \"$(product_output event-epipe.json)\" "
-                    "\"$OUT/event-epipe.json\" || exit 9\n"
-                    "ls -A \"$OUT\" \"$LOCAL_OUTPUT\"\n"
-                    % (RECORDS, RUN_ID, out, local, shell_function("product_output"),
-                       shell_function("stamp_leg")))
-            proc = subprocess.run(["bash", "-c", body], capture_output=True, text=True, timeout=30)
-            self.assertEqual(proc.returncode, 0, proc.stderr)
-            self.assertFalse((out / "event-epipe.json").exists())
-            self.assertFalse((local / "event-epipe.json").exists())
-            self.assertTrue((out / "inventory-event-stdout.stamp").is_file())
-            # The product wrote no report this run: the judge refuses.
-            stamp = json.loads((out / "inventory-event-stdout.stamp").read_text())
-            self.assertEqual((stamp["run_id"], stamp["cell"]), (RUN_ID, "inventory-event-stdout"))
-            run = Q.Run(str(out / "inventory-event-stdout.stamp"), RUN_ID, "inventory-event-stdout")
-            with self.assertRaises(Q.Refusal) as raised:
-                run.read(str(local / "event-epipe.json"), "early-close report")
-            self.assertEqual(raised.exception.rule, "fresh.file")
+            tmp = Path(raw)
+            out, out_b, root = tmp / "out", tmp / "out-b", tmp / "local disk"
+            out.mkdir(); out_b.mkdir(); root.mkdir(mode=0o700)
+            fixture, observer = tmp / "fixture", tmp / "observer"
+            fixture.write_text(EVENT_FIXTURE); observer.write_text(EVENT_OBSERVER)
+            fixture.chmod(0o755); observer.chmod(0o755)
+            case = event_case()
+            if seed:
+                # An older run's reports at every published or local name.
+                for where in (out, root):
+                    (where / "event-stdout.json").write_text(json.dumps(case["report"]))
+                    (where / "event-epipe.json").write_text(json.dumps(case["epipe"]))
+            env = dict(os.environ, EVENT_MODE=mode, CONTROL_OUT=str(out), EVENT_B_OUT=str(out_b),
+                       EVENT_SHELL=str(QUAL), EVENT_FIXTURE=str(fixture),
+                       EVENT_CASE=json.dumps({k: case[k] for k in ("stream", "report", "epipe")}))
+            env.pop("P11SCOPE_LOCAL_OUTPUT_ROOT", None)
+            if split:
+                env["P11SCOPE_LOCAL_OUTPUT_ROOT"] = str(root)
+            proc = subprocess.run(["bash", str(QUAL), "--control-event-stdout", str(observer), str(out),
+                                   str(fixture)], env=env, text=True, capture_output=True, timeout=120)
+            rows = [json.loads(line) for line in (out / "results.jsonl").read_text().splitlines()]
+            verdict = out / "inventory-event-stdout.verdict.json"
+            run_id = json.loads((out / "inventory-event-stdout.stamp").read_text())["run_id"]
+            private = (root if split else out) / ("run-" + run_id)
+            selected = [Path(json.loads(line)) for line in
+                        (out / "observer-outputs.jsonl").read_text().splitlines()]
+            got = {"rc": proc.returncode, "rows": [(r["cell"], r["pass"]) for r in rows],
+                   "verdict": json.loads(verdict.read_text())["verdict"] if verdict.exists() else None,
+                   "selected": [p.parent == private for p in selected],
+                   "b_rc": (out_b / "b.rc").read_text() if (out_b / "b.rc").exists() else None}
+            if got["verdict"] == "pass":
+                for name in ("event-stdout.json", "event-epipe.json"):
+                    self.assertEqual((out / name).read_bytes(), (private / name).read_bytes(), name)
+            return got, proc.stdout + proc.stderr
 
-    def test_seeded_old_report_is_removed_in_the_shared_layout(self):
-        self.run_leg(True)
+    def expect(self, mode, split, passed, **kwargs):
+        got, log = self.event_cell(mode, split, **kwargs)
+        want = {"rc": 0 if passed else 1, "rows": [("inventory-event-stdout", passed)],
+                "verdict": "pass" if passed else None, "selected": [True, True],
+                "b_rc": "0" if mode == "interleave" else None}
+        self.assertEqual(got, want, log)
 
-    def test_seeded_old_report_is_removed_in_the_split_layout(self):
-        self.run_leg(False)
+    def test_event_cell_qualifies_only_its_own_reports_in_both_layouts(self):
+        for split in (False, True):
+            for mode, passed in (("healthy", True), ("tie", True), ("missing-full", False),
+                                 ("missing-epipe", False)):
+                with self.subTest(split=split, mode=mode):
+                    self.expect(mode, split, passed)
+
+    def test_seeded_old_reports_never_qualify_in_both_layouts(self):
+        for split in (False, True):
+            with self.subTest(split=split):
+                self.expect("missing-full", split, False, seed=True)
+
+    def test_a_second_invocation_on_the_same_local_root_never_qualifies_this_one(self):
+        # B stamps and writes both reports between A's stamp and judge.
+        self.expect("interleave", True, False)
+
+    def test_setup_refuses_an_existing_private_directory(self):
+        body = ("set -u\nOUT=%s\nRUN_ID=fixed\nHERE=/nonexistent\n%s"
+                "setup_local_output && echo first\nsetup_local_output || echo refused\n"
+                % ("{out}", shell_function("setup_local_output")))
+        with tempfile.TemporaryDirectory() as raw:
+            proc = subprocess.run(["bash", "-c", body.replace("{out}", raw)], capture_output=True, text=True,
+                                  timeout=30, env={k: v for k, v in os.environ.items()
+                                                   if k != "P11SCOPE_LOCAL_OUTPUT_ROOT"})
+            self.assertEqual(proc.stdout.split(), ["first", "refused"], proc.stderr)
+            self.assertTrue((Path(raw) / "run-fixed").is_dir())
 
     def test_stamp_refuses_to_reuse_an_existing_stamp(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -1344,7 +1517,8 @@ class ShellBindingTests(unittest.TestCase):
 
 
 # Rows whose setup is done by run_case (not by write_inputs alone).
-SETUP_HOOKS = {"age", "remove", "symlink", "sparse", "stamp_dir", "stamp_text", "run_id"}
+SETUP_HOOKS = {"age", "remove", "symlink", "sparse", "stamp_dir", "stamp_text", "run_id", "as_fifo",
+               "private_dir", "private_symlink", "outside_private"}
 
 
 class OptimizedInterpreterTests(unittest.TestCase):
@@ -1364,9 +1538,10 @@ class OptimizedInterpreterTests(unittest.TestCase):
                         Q.write_stamp(str(tmp / "cell.stamp"), case.get("stamp_run_id", RUN_ID),
                                       case.get("stamp_cell", CELLS[case["judge"]]))
                         argv += ["--stamp", str(tmp / "cell.stamp"), "--run-id", RUN_ID]
+                    make_private(tmp, case)
                     files, named = write_inputs(case, tmp)
                     for name, text in files.items():
-                        (tmp / name).write_bytes(text if isinstance(text, bytes) else text.encode())
+                        place(tmp, name, case).write_bytes(text if isinstance(text, bytes) else text.encode())
                     env = {k: v for k, v in os.environ.items() if not k.startswith("PYTHON")}
                     env.update(extra or {})
                     proc = subprocess.run(interp + [str(RECORDS)] + argv + named, env=env,

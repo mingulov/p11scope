@@ -272,6 +272,10 @@ BOOL = Exact(bool)
 
 FRESH_RUN = declare("fresh.run", "the run stamp names this run id and cell")
 FRESH_FILE = declare("fresh.file", "every input is a regular file written at or after this run's stamp")
+FRESH_PRIVATE = declare("fresh.private", "every product report is read from this run's private output directory")
+# The shell gives each invocation a private producer-output directory named
+# by its random run id (scripts/qualify-public-cli.sh setup_local_output).
+PRIVATE_PREFIX = "run-"
 
 STAMP = Record("stamp", {"schema": (OneOf(STAMP_SCHEMA), "stamp schema"),
                          "run_id": (STR, "stamp run_id"),
@@ -285,30 +289,63 @@ def write_stamp(path, run_id, cell):
         handle.write(data)
 
 
+def open_regular(path, rule, what):
+    """One open descriptor: its metadata and its bytes are the same file
+    (no symlink is followed and a FIFO never blocks)."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except FileNotFoundError:
+        raise Refusal(rule, "%s %s missing" % (what, path)) from None
+    except OSError as error:
+        raise Refusal(rule, "%s %s is not a regular file (%s)" % (what, path, error.strerror)) from None
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode):
+        os.close(fd)
+        raise Refusal(rule, "%s %s is not a regular file" % (what, path))
+    return fd, info
+
+
+def read_fd(fd, limit):
+    with os.fdopen(fd, "rb") as handle:
+        return handle.read(limit + 1)
+
+
 class Run:
     """The current run: its stamp time bounds every input below."""
 
     def __init__(self, stamp_path, run_id, cell):
-        info = os.lstat(stamp_path) if os.path.lexists(stamp_path) else None
-        require(info is not None and stat.S_ISREG(info.st_mode), FRESH_RUN,
-                "run stamp %s missing" % stamp_path)
-        with open(stamp_path, encoding="utf-8") as handle:
-            stamp = STAMP.check(strict_json(handle.read(), "run stamp"))
+        fd, info = open_regular(stamp_path, FRESH_RUN, "run stamp")
+        stamp = STAMP.check(strict_json(read_fd(fd, MAX_INPUT_BYTES).decode("utf-8", "replace"), "run stamp"))
         require(stamp["run_id"] == run_id and run_id != "", FRESH_RUN,
                 "run stamp run id %r is not this run %r" % (stamp["run_id"], run_id))
         require(stamp["cell"] == cell, FRESH_RUN,
                 "run stamp cell %r is not %r" % (stamp["cell"], cell))
         self.stamp_ns = info.st_mtime_ns
+        self.run_id = run_id
+
+    def read_product(self, path, what, binary=False):
+        """A product report: only from this run's private output
+        directory (a real directory named by the run id), so another
+        invocation's report never qualifies this run."""
+        parent = os.path.dirname(os.path.abspath(path))
+        require(os.path.basename(parent) == PRIVATE_PREFIX + self.run_id, FRESH_PRIVATE,
+                "%s %s is outside this run's private output directory" % (what, path))
+        info = os.lstat(parent)
+        require(stat.S_ISDIR(info.st_mode), FRESH_PRIVATE,
+                "%s %s: the private output directory is not a real directory" % (what, path))
+        return self.read(path, what, binary)
 
     def read(self, path, what, binary=False):
-        info = os.lstat(path) if os.path.lexists(path) else None
-        require(info is not None, FRESH_FILE, "%s %s missing" % (what, path))
-        require(stat.S_ISREG(info.st_mode), FRESH_FILE, "%s %s is not a regular file" % (what, path))
-        require(info.st_mtime_ns >= self.stamp_ns, FRESH_FILE,
-                "%s %s predates this run's stamp (stale)" % (what, path))
-        require(info.st_size <= MAX_INPUT_BYTES, FRESH_FILE, "%s %s exceeds the size limit" % (what, path))
-        with open(path, "rb") as handle:
-            data = handle.read()
+        fd, info = open_regular(path, FRESH_FILE, what)
+        try:
+            require(info.st_mtime_ns >= self.stamp_ns, FRESH_FILE,
+                    "%s %s predates this run's stamp (stale)" % (what, path))
+            require(info.st_size <= MAX_INPUT_BYTES, FRESH_FILE, "%s %s exceeds the size limit" % (what, path))
+        except Refusal:
+            os.close(fd)
+            raise
+        data = read_fd(fd, MAX_INPUT_BYTES)
+        require(len(data) <= MAX_INPUT_BYTES, FRESH_FILE, "%s %s exceeds the size limit" % (what, path))
         if binary:
             return data
         try:
@@ -372,6 +409,8 @@ def check_event_output_consistent(outcome, what):
 
 # -- second SIGINT --------------------------------------------------------
 
+# The producer's QuiescenceState (src/render.rs, serde snake_case).
+STOP_STATES = ("not_reached", "proven", "unproven")
 SIGINT_EXIT = declare("sigint.exit", "the observer exits 130 after the second SIGINT")
 SIGINT_CUSTODY = declare("sigint.custody", "the owned child was in custody and every owned process was collected")
 SIGINT_PARTIAL = declare("sigint.partial", "an abandoned teardown never seals COMPLETE")
@@ -385,9 +424,9 @@ PROFILE = Record("observed-profile", {
     "evidence": (Record("profile-evidence", {
         "completeness": (STR, "evidence completeness"),
         "stop_quiescence": (Record("stop-quiescence", {
-            "state": (STR, "stop_quiescence state"),
-            "post_q_events": (Nullable(BOOL), "stop_quiescence post_q_events"),
-            "post_q_discovery": (Nullable(BOOL), "stop_quiescence post_q_discovery")}, closed=False),
+            "state": (OneOf(*STOP_STATES), "stop_quiescence state"),
+            "post_q_events": (BOOL, "stop_quiescence post_q_events"),
+            "post_q_discovery": (BOOL, "stop_quiescence post_q_discovery")}, closed=False),
             "evidence stop_quiescence"),
         "drain_proven": (BOOL, "evidence drain_proven"),
         "scheduling": (Decided(Record("profile-scheduling", {
@@ -407,7 +446,7 @@ def judge_second_sigint(args):
     rc = arg_int(args.rc, "rc", 0, 255)
     custody = arg_int(args.custody, "custody", 0, 1)
     cleanup = arg_int(args.cleanup, "cleanup", 0, 1)
-    report = PROFILE.check(strict_json(run.read(args.report, "profile report"), "profile report"))
+    report = PROFILE.check(strict_json(run.read_product(args.report, "profile report"), "profile report"))
     stderr = run.read(args.stderr, "observer stderr")
     require(rc == 130, SIGINT_EXIT, "observer rc=%d, expected 130" % rc)
     require(custody == 1 and cleanup == 1, SIGINT_CUSTODY,
@@ -541,7 +580,7 @@ def judge_event_stdout(args):
         elif row["kind"] == "totals":
             TOTALS_EVENT.check(row["event"], "totals event")
     ended = ENDED_EVENT.check(stream[-1]["event"], "ended event")
-    report = INVENTORY_DOC.check(strict_json(run.read(args.full_report, "full report"), "full report"))
+    report = INVENTORY_DOC.check(strict_json(run.read_product(args.full_report, "full report"), "full report"))
     require(report["observation"]["passes"] == ended["passes"], EVENT_PASSES,
             "passes agree: report %d, ended %d" % (report["observation"]["passes"], ended["passes"]))
     markers = [row["event"] for row in stream if row["kind"] == "pass_committed"]
@@ -574,7 +613,7 @@ def judge_event_stdout(args):
     require(rc2 == 1, EVENT_EARLY_EXIT, "early-close rc=%d" % rc2)
     head = run.read(args.epipe_head, "early-close head", binary=True)
     require(head[:1] == b"{", EVENT_EARLY_HEAD, "the head holds event bytes")
-    epipe = EPIPE_DOC.check(strict_json(run.read(args.epipe_report, "early-close report"),
+    epipe = EPIPE_DOC.check(strict_json(run.read_product(args.epipe_report, "early-close report"),
                                         "early-close report"))
     lost = event_output(epipe, "early-close")
     require(lost["status"] == "truncated" and lost["reason"] == "broken_pipe", EVENT_EARLY_OUTPUT,
@@ -759,7 +798,7 @@ def judge_cgroup_inventory(args):
     launched_inside = arg_int(args.inside_pid, "inside pid", 1, PID_MAX)
     launched_outside = arg_int(args.outside_pid, "outside pid", 1, PID_MAX)
     modpath, modfs = args.module, args.module_fs
-    report = CGROUP_REPORT.check(strict_json(run.read(args.report, "inventory report"), "inventory report"))
+    report = CGROUP_REPORT.check(strict_json(run.read_product(args.report, "inventory report"), "inventory report"))
     inside = run.read(args.inside_wl, "inside workload log")
     outside = run.read(args.outside_wl, "outside workload log")
     pin = PIN.check(strict_json(args.pin, "provider pin"))
@@ -963,11 +1002,23 @@ def judge_cgroup_inventory(args):
 
 WINDOW = Record("unobserved-window", {"start_ns": (U64, "window start_ns"), "end_ns": (U64, "window end_ns"),
                                       "reason": (STR, "window reason")})
+# Every discovery row has the producer's types (src/render.rs
+# ModuleSummary): `attached_at_ns` is absent before assembly and null when
+# nothing attached; `unobserved_windows` is absent when undisclosed.
+DISCOVERY_ROW = Record("prearm-discovery-row", {"sources": (ListOf(STR), "module sources")},
+                       optional={"attached_at_ns": (Nullable(U64), "module attached_at_ns"),
+                                 "unobserved_windows": (ListOf(WINDOW), "module unobserved_windows")},
+                       closed=False)
+# Selection reads only a row's sources; the optional keys are typed after.
+ROW_SOURCES = Record("prearm-row-sources", {"sources": (ListOf(STR), "module sources")}, closed=False,
+                     rule=DISCOVERY_ROW.rule)
+# The selected pre-armed module carries both keys: an exact window claim
+# is relative to its attach stamp.
 PREARM_MODULE = Record("prearm-module", {
     "sources": (ListOf(STR), "module sources"),
     "unobserved_windows": (ListOf(WINDOW), "module unobserved_windows"),
     "attached_at_ns": (Nullable(U64), "module attached_at_ns")}, closed=False)
-PREARM_EVIDENCE = Record("prearm-evidence", {"discovery": (ListOf(PREARM_MODULE), "evidence discovery")},
+PREARM_EVIDENCE = Record("prearm-evidence", {"discovery": (ListOf(ROW_SOURCES), "evidence discovery")},
                          closed=False)
 PREARM_PAIR = Record("prearm-pair", {"pair": (U64, "ledger pair"), "init_ns": (U64, "ledger init_ns"),
                                      "init_returned_ns": (U64, "ledger init_returned_ns"),
@@ -1012,7 +1063,7 @@ def assert_handoff_pair(module):
 def assert_pre68_held(module):
     # Pre-6.8 held twin: merged into the kept pre-arm object ([]) or the
     # exact handoff pair; the reasons dispatch, nothing else passes.
-    reasons = [w["reason"] for w in (module.get("unobserved_windows") or [])]
+    reasons = [w["reason"] for w in module["unobserved_windows"]]
     if reasons == ["late_discovery", "mapped_unattached"]:
         assert_handoff_pair(module)
         return "handoff pair"
@@ -1029,7 +1080,7 @@ def assert_single_pre_attach(module):
 def assert_pre68_passive(module):
     # Pre-6.8 passive twin: the same dispatch, the merged arm the exact
     # single pre_attach window of the >= 6.8 branch.
-    reasons = [w["reason"] for w in (module.get("unobserved_windows") or [])]
+    reasons = [w["reason"] for w in module["unobserved_windows"]]
     if reasons == ["late_discovery", "mapped_unattached"]:
         assert_handoff_pair(module)
         return "handoff pair"
@@ -1067,18 +1118,23 @@ def prearm_ledger(text, name):
 
 
 def prearmed_module(evidence):
-    mods = [m for m in evidence["discovery"] if "prearm" in m["sources"]]
+    rows = evidence["discovery"]
+    mods = [m for m in rows if "prearm" in m["sources"]]
     require(len(mods) == 1, PREARM_ONE, "one pre-armed module, got %d" % len(mods))
-    return mods[0]
+    selected = PREARM_MODULE.check(mods[0])
+    for row in rows:
+        if row is not mods[0]:
+            DISCOVERY_ROW.check(row)
+    return selected
 
 
 def judge_run_prearm(args):
     run = Run(args.stamp, args.run_id, "run-prearm")
     pre_68 = kernel_is_pre_68(args.kernel_release)
-    held_text = run.read(args.held_report, "held report")
+    held_text = run.read_product(args.held_report, "held report")
     held = prearmed_module(prearm_evidence(held_text, "held"))
     prearm_ledger(run.read(args.held_ledger, "held ledger"), "held")
-    passive = prearmed_module(prearm_evidence(run.read(args.passive_report, "passive report"), "passive"))
+    passive = prearmed_module(prearm_evidence(run.read_product(args.passive_report, "passive report"), "passive"))
     prearm_ledger(run.read(args.passive_ledger, "passive ledger"), "passive")
     require("scan" in held["sources"], PREARM_SCAN, repr(held["sources"]))
     require("scan" in passive["sources"], PREARM_SCAN, repr(passive["sources"]))
@@ -1133,7 +1189,7 @@ def judge_parent_chain(args):
     wl_gen = arg_int(args.workload_gen, "workload generation")
     parent = arg_int(args.parent_pid, "parent pid", 1, PID_MAX)
     parent_gen = arg_int(args.parent_gen, "parent generation")
-    report = CHAIN_REPORT.check(strict_json(run.read(args.report, "chain report"), "chain report"))
+    report = CHAIN_REPORT.check(strict_json(run.read_product(args.report, "chain report"), "chain report"))
     callers = [c for c in report["callers"] if c["pid"] == wl]
     require(len(callers) == 1, CHAIN_ONCE, "one incarnation for the workload")
     c = CHAIN_CALLER.check(callers[0], "workload caller")

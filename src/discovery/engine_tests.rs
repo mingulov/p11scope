@@ -39941,6 +39941,10 @@ fn prefault_manifest_getter_data_keeps_progress_when_the_frame_expires_mid_read(
         cursor.ranges[1].next_addr, ranges[1].0,
         "the pending range keeps its offset"
     );
+    assert_eq!(
+        cursor.op_bytes, 65536,
+        "the yield carries the warmed chunk's bytes"
+    );
     let attempts = engine.prefault_attempts_for_test();
     assert_eq!(
         attempts,
@@ -39948,6 +39952,101 @@ fn prefault_manifest_getter_data_keeps_progress_when_the_frame_expires_mid_read(
         "exactly the proven chunk reads: {attempts:?}"
     );
     engine.frame_deadline_ns = Some(u64::MAX);
+    let outcome = engine.prefault_manifest_getter_data(id, &sites);
+    // SAFETY: the successful mapping above, released once.
+    assert_eq!(unsafe { libc::munmap(low, 131072) }, 0);
+    assert_eq!(outcome, GetterPrefaultOutcome::Complete);
+    let attempts = engine.prefault_attempts_for_test();
+    assert_eq!(
+        attempts,
+        vec![
+            (low as u64, 65536, true),
+            (low as u64 + 65536, 65536, true),
+            (ranges[1].0, (ranges[1].1 - ranges[1].0) as usize, true),
+        ],
+        "resumes mid-range, never re-reads: {attempts:?}"
+    );
+}
+
+/// A proof-credit deferral at a chunk's re-proof check carries the
+/// pass's read bytes: with one slow 2-chunk range warmed one chunk, the
+/// pass defers with the first chunk's bytes, and the fresh pass resumes
+/// at the second chunk (twin: dropping the total would under-count the
+/// per-object allowance on the next pass).
+#[test]
+fn prefault_manifest_getter_data_carries_read_bytes_across_a_reproof_yield() {
+    use crate::discovery::identity::{FileIdentity, MappedFile};
+    let fixture = ScanManifestFixture::new();
+    pad_fixture_file_to_len(&fixture, 131072);
+    let (view, modules, pins, input) = same_object_scan_and_manifest(&fixture, 0x40);
+    let id = view.id();
+    let mut engine = discovered_from_inputs(vec![view], modules, pins, vec![input]);
+    let object = engine.modules[0].object;
+    let sites = vec![(object, 0x80, "C_GetFunctionList".to_string())];
+    // SAFETY: a private read-only mapping of the held fixture file at a
+    // free low address, unmapped below before the fixture drops.
+    let low = map_fixture_low(&fixture.file, 131072);
+    // A tmpfs identity no maps key renders: every range takes the slow
+    // path and proves per range.
+    let identity = FileIdentity { dev: 7, ino: 7 };
+    let ranges = prefault_candidate_ranges(&engine, object);
+    assert_eq!(ranges.len(), 2, "premise: exactly two ranges");
+    assert_eq!(
+        ranges[0],
+        (low as u64, low as u64 + 131072),
+        "premise: the low range sorts first with two chunks"
+    );
+    let scripted: Vec<((u64, u64), Option<FileIdentity>)> = ranges
+        .iter()
+        .map(|range| (*range, Some(identity)))
+        .collect();
+    engine.set_prefault_proof_for_test(
+        object,
+        MappedFile {
+            identity,
+            fs_magic: Some(0x0102_1994),
+        },
+        scripted,
+    );
+    // Three proof credits: the first range's held lookup, batch stat and
+    // first re-proof spend them all, so the second chunk's re-proof check
+    // defers.
+    engine.set_prefault_caps_for_test(None, Some(3));
+    let outcome = engine.prefault_manifest_getter_data(id, &sites);
+    assert_eq!(
+        outcome,
+        GetterPrefaultOutcome::Deferred { frame_spent: false },
+        "pass 1 defers at the second chunk's re-proof check"
+    );
+    let cursor = engine
+        .getter_prefault_cursors
+        .get(&id)
+        .expect("a deferred pass saves its cursor")
+        .clone();
+    assert_eq!(
+        cursor.ranges[0].next_addr,
+        low as u64 + 65536,
+        "the partial range keeps its mid-range offset"
+    );
+    assert_eq!(
+        cursor.ranges[1].next_addr, ranges[1].0,
+        "the pending range keeps its offset"
+    );
+    assert_eq!(
+        cursor.op_bytes, 65536,
+        "the yield carries the warmed chunk's bytes"
+    );
+    assert_eq!(
+        engine.prefault_attempts_for_test(),
+        vec![(low as u64, 65536, true)],
+        "exactly the proven chunk reads"
+    );
+    assert_eq!(
+        engine.prefault_proof_attempts_for_test(),
+        3,
+        "pass 1 attempts held, batch and one re-proof"
+    );
+    engine.set_prefault_caps_for_test(None, None);
     let outcome = engine.prefault_manifest_getter_data(id, &sites);
     // SAFETY: the successful mapping above, released once.
     assert_eq!(unsafe { libc::munmap(low, 131072) }, 0);

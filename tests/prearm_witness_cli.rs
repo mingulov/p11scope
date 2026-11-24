@@ -2835,10 +2835,7 @@ fn second_round_loader_naming_requires_the_tool_exe_or_finite_unknown() {
         expected
     ));
     // A missing loader record names nothing.
-    assert!(!second_round_loader_named(
-        &serde_json::json!({}),
-        expected
-    ));
+    assert!(!second_round_loader_named(&serde_json::json!({}), expected));
 }
 
 /// The tool's basename in another directory is foreign evidence:

@@ -1428,6 +1428,12 @@
       "cell": "privileged"
     },
     {
+      "file": "src/inventory/manifest_e2e_tests.rs",
+      "path": "inventory::manifest_e2e_tests::privileged_inventory_pid_key_sizes_canary_no_payload_leak",
+      "reason": "privileged: live key-sizes canary proves no sentinel payload byte reaches output or logs",
+      "cell": "privileged"
+    },
+    {
       "file": "src/inventory/privileged_tests.rs",
       "path": "inventory::privileged_tests::privileged_native_lane_dashboard_slow_pty_lp64",
       "reason": "root-owned live BPF lane; native lane under the dashboard on a stalled pty",

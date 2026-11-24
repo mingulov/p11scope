@@ -205,6 +205,7 @@
     "inventory::manifest_e2e_tests::privileged_inventory_pid_key_operations_mt_sign_rows_exact",
     "inventory::manifest_e2e_tests::privileged_inventory_pid_key_sizes_live_sign_reports_size",
     "inventory::manifest_e2e_tests::privileged_inventory_pid_key_sizes_off_live_sign_reports_no_size",
+    "inventory::manifest_e2e_tests::privileged_inventory_pid_key_sizes_canary_no_payload_leak",
     "inventory_present::reload_disclosure_privileged_tests::privileged_inventory_reload_disclosure_lists_churned_identity",
     "inventory_present::reload_disclosure_privileged_tests::privileged_inventory_reload_disclosure_omits_key_without_churn",
     "metrics::counter_reader::tests::counter_reader_native_maps_match_all_modes",
@@ -326,7 +327,8 @@
       "attach::tests::sealed_session_drain_linkage_is_behavioral",
       "inventory::manifest_e2e_tests::privileged_inventory_pid_key_operations_mt_sign_rows_exact",
       "inventory::manifest_e2e_tests::privileged_inventory_pid_key_sizes_live_sign_reports_size",
-      "inventory::manifest_e2e_tests::privileged_inventory_pid_key_sizes_off_live_sign_reports_no_size"
+      "inventory::manifest_e2e_tests::privileged_inventory_pid_key_sizes_off_live_sign_reports_no_size",
+      "inventory::manifest_e2e_tests::privileged_inventory_pid_key_sizes_canary_no_payload_leak"
     ]
   },
   "counter_flavor": {

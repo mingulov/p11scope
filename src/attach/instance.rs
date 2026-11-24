@@ -1471,6 +1471,30 @@ pub(crate) enum BirthObservationRefusal {
     /// witness, not a contended attempt: delivery falls back
     /// promptly instead of retrying through the watchdog delay.
     RetainedWitnessMismatch,
+    /// The capture stopped (Finish detached the native probes): no
+    /// later take can ever succeed, so this is final, never the
+    /// contention retry. A seal pending at stop falls back at once
+    /// with a named stop-loss gap instead of retrying until the
+    /// finish watchdog trips.
+    Stopped,
+    /// The capture spent its authority (positions exhausted): the
+    /// latch never clears, so this is final like [`Self::Stopped`].
+    AuthorityExhausted,
+    /// The capture's image coverage failed permanently: the latch
+    /// never clears, so this is final like [`Self::Stopped`].
+    CoverageFailed,
+}
+
+impl BirthObservationRefusal {
+    /// A refusal naming a capture that ended for good (stop, spent
+    /// authority, failed coverage): no retry can recover, so delivery
+    /// closes it with a counted capture-end loss.
+    pub(crate) fn capture_ended(self) -> bool {
+        matches!(
+            self,
+            Self::Stopped | Self::AuthorityExhausted | Self::CoverageFailed
+        )
+    }
 }
 
 /// Only a genuine H3 admission can construct this retained association.

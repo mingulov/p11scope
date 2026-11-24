@@ -3501,6 +3501,94 @@ fn joint_birth_witness_deadline_refuses_current_partition() {
     );
 }
 
+/// Round 13 ruling 1: the capture's three never-clearing latches
+/// (stopped, spent authority, failed coverage) are final take
+/// refusals, each with its own variant, so delivery falls back at
+/// once instead of retrying them as contention. Stop outranks the
+/// others; a clean capture still takes (control).
+#[test]
+fn joint_birth_witness_capture_latches_refuse_finally() {
+    use crate::attach::BirthObservationRefusal as Refusal;
+    use crate::semantics_objects::journal::tests::{NativeBirthRows, NativePublisher};
+    let mut harness = JointBirthHarness::new();
+    harness.push_create(1);
+    let mut raw = harness.collect();
+    let (report, admitted) = harness.route(&mut raw);
+    let (_, proof) = harness.ingest(raw, &admitted);
+    let publisher = NativePublisher::build();
+    let closure = harness.fixture.attachment().generation();
+    let (row, control, _) = publisher.publish_stamped(&["0", "0"], closure);
+    let mut rows = NativeBirthRows { row, control };
+    let witness = harness.birth(report, &admitted, &proof, None, &mut rows);
+    let mut outcomes = Vec::new();
+    for (stopped, exhausted, image_failed) in [
+        (false, false, false),
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
+        (true, true, true),
+        (false, true, true),
+    ] {
+        harness.capture.stopped = stopped;
+        harness.capture.exhausted = exhausted;
+        harness.capture.image_failed = image_failed;
+        let taken = witness
+            .fresh_evidence_with(
+                &mut harness.io,
+                &mut rows,
+                &harness.capture,
+                harness.fixture.attachment(),
+                harness.fixture.binding(),
+            )
+            .map(|_| ());
+        let gate = harness.capture.absence_acquire_gate();
+        outcomes.push(((stopped, exhausted, image_failed), taken, gate));
+    }
+    harness.capture.stopped = false;
+    harness.capture.exhausted = false;
+    harness.capture.image_failed = false;
+    assert_eq!(
+        outcomes,
+        vec![
+            ((false, false, false), Ok(()), Ok(())),
+            (
+                (true, false, false),
+                Err(Refusal::Stopped),
+                Err(Refusal::Stopped)
+            ),
+            (
+                (false, true, false),
+                Err(Refusal::AuthorityExhausted),
+                Ok(())
+            ),
+            ((false, false, true), Err(Refusal::CoverageFailed), Ok(())),
+            (
+                (true, true, true),
+                Err(Refusal::Stopped),
+                Err(Refusal::Stopped)
+            ),
+            (
+                (false, true, true),
+                Err(Refusal::AuthorityExhausted),
+                Ok(())
+            ),
+        ],
+        "each latch names its own final refusal; stop outranks the rest"
+    );
+    for refusal in [
+        Refusal::Stopped,
+        Refusal::AuthorityExhausted,
+        Refusal::CoverageFailed,
+    ] {
+        assert!(refusal.capture_ended(), "{refusal:?} is a capture end");
+    }
+    assert!(
+        !Refusal::CurrentPartition.capture_ended(),
+        "contention is never a capture end"
+    );
+    assert!(!Refusal::RetainedWitnessMismatch.capture_ended());
+}
+
 #[test]
 fn joint_birth_recheck_measures_the_window_on_the_test_clock() {
     use crate::semantics_objects::journal::tests::{NativeBirthRows, NativePublisher};

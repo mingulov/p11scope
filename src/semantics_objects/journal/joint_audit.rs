@@ -345,6 +345,24 @@ fn fallback_close_destroys_proof(applied: &FailureApplyOutcome, gap: JournalGap)
         && !crate::semantics_key_use::segment_resumable_after(gap)
 }
 
+/// Gap subject for a seal whose birth-evidence take was refused
+/// because the capture ended for good (stopped at Finish, spent
+/// authority, failed coverage): the consumer fell back at once with
+/// counted loss instead of retrying against a capture that can never
+/// answer (round 13 ruling 1, the stop-time seal stall).
+pub(crate) const CAPTURE_ENDED_SUBJECT: &str = "joint seal capture ended";
+
+/// Reason text of one capture-ended gap: the final refusal and the
+/// exact count of calls the fallback replayed or disposed.
+pub(crate) fn capture_ended_reason(
+    refusal: crate::attach::BirthObservationRefusal,
+    units: usize,
+) -> String {
+    format!(
+        "the capture ended before the seal could take its birth evidence ({refusal:?}); fell back with counted loss ({units} calls)"
+    )
+}
+
 /// Gap subject for a parked stuck consumer's forced-fallback
 /// degrade: the watchdog parked the consumer past its retry stall
 /// with counted loss instead of tripping the lane.
@@ -2745,6 +2763,11 @@ impl IngestedJointQuantum {
         // The delivered failure's gap, copied out before the outcome
         // match (the batch borrows frame state the arms mutate).
         let stuck_gap = batch.audited().failure().gap;
+        let ended_take = batch
+            .audited()
+            .failure()
+            .take_failed
+            .filter(|refusal| refusal.capture_ended());
         let forced = batch.forced_disposition();
         match outcome {
             FailureBatchProgress::NegativeDelivered(completed) => {
@@ -2768,8 +2791,12 @@ impl IngestedJointQuantum {
                 // successor there (ruling R10), instead of dooming every
                 // later same-domain birth until some later void fences
                 // the dead key. The adapter decides; the close names the
-                // decision and the calls it disposed in one gap.
-                if fallback_close_destroys_proof(&applied, stuck_gap)
+                // decision and the calls it disposed in one gap. A
+                // capture-ended close names its calls in its own gap
+                // below instead: no successor can follow an ended
+                // capture, and one loss is never named twice.
+                if ended_take.is_none()
+                    && fallback_close_destroys_proof(&applied, stuck_gap)
                     && let Some(decision) =
                         adapter.fence_destroyed_proof(&target.bootstrap().proof(), self.frontier.0)
                 {
@@ -2780,6 +2807,21 @@ impl IngestedJointQuantum {
                         pid: None,
                         subject: FALLBACK_FENCED_SUBJECT.to_string(),
                         reason: decision.gap_reason(units as u64),
+                        budget: None,
+                    });
+                }
+                // A take refused because the capture ended (stop at
+                // Finish, spent authority, failed coverage) is final:
+                // the consumer fell back at once, and its calls land in
+                // one named capture-ended gap with their exact count.
+                if let Some(refusal) = ended_take {
+                    let units = batch.delivered_units();
+                    registry.record_gap(crate::discovery::caller_registry::RegistryGap {
+                        caller: Some(target.caller()),
+                        module: None,
+                        pid: None,
+                        subject: CAPTURE_ENDED_SUBJECT.to_string(),
+                        reason: capture_ended_reason(refusal, units),
                         budget: None,
                     });
                 }

@@ -216,6 +216,13 @@ impl ReplayBounds {
         })
     }
 
+    /// Test-only exact counts: the sized calls and steps, so the
+    /// formula twin pins every term against a worked example.
+    #[cfg(test)]
+    pub(crate) fn counts_for_test(self) -> (usize, usize) {
+        (self.calls, self.steps)
+    }
+
     /// The original table is already included in the existing result bound.
     pub(super) fn retained_bytes(self) -> Option<usize> {
         allocation_bytes::<SealReplayStep>(self.steps)

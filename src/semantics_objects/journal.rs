@@ -25073,6 +25073,51 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn object_journal_replay_bounds_sample_counts_exact_populations() {
+        // `sample` reads the maintained counters verbatim: a mixed
+        // open table (3 unconverted begins, 1 staged end, 1 staged
+        // abandonment, nothing refused or pending) sizes exactly
+        // begins + terminals + abandoned plus the fixed terms.
+        // Dropping, scaling or reweighting any term changes the
+        // reservation and breaks this worked example.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+        let mut scene = Scene::new(image_default());
+        let open = function_id("C_OpenSession");
+        let begin1 = begin_bytes(1, 1, open, 0);
+        assert_eq!(scene.ingest(&begin1), JournalDisposition::BeginAdmitted);
+        assert_eq!(
+            scene.ingest(&end_bytes_absent(&begin1, 0, ENTRY_NS + 50)),
+            JournalDisposition::EndStaged
+        );
+        let begin2 = begin_bytes(1, 2, open, 0);
+        assert_eq!(scene.ingest(&begin2), JournalDisposition::BeginAdmitted);
+        let abandon2 =
+            abandon_bytes(1, 2, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
+        assert_eq!(
+            scene.ingest(&abandon2),
+            JournalDisposition::AbandonStaged
+        );
+        let begin3 = begin_bytes(1, 3, open, 0);
+        assert_eq!(scene.ingest(&begin3), JournalDisposition::BeginAdmitted);
+        assert_eq!(
+            scene.adapter.replay_counters_for_test(),
+            (3, 1, 1),
+            "the mixed table counts three begins, one terminal, one abandonment"
+        );
+        assert!(scene.adapter.refused.is_empty());
+        assert_eq!(
+            scene.model.replay_pending_count(),
+            0,
+            "a fresh model holds no pending replay"
+        );
+        let bounds = super::seal_replay::ReplayBounds::sample(&scene.adapter, &scene.model)
+            .expect("replay bounds");
+        // refused 0 + no-refused-shelf + begins 3 + terminals 1 +
+        // abandoned 1 + (pending 0 + begins 3) * 2 + trailing 2.
+        assert_eq!(bounds.counts_for_test(), (3, 13));
+    }
+
+    #[test]
     fn joint_keepup_seal_validation_census_is_linear_in_retained() {
         // The live-feed seal attributes every converting call: with a
         // full open table the attribution census must visit each

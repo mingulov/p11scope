@@ -1102,13 +1102,19 @@ struct HeadWork {
     /// The pre-admission prerequisites are met (space proven, or a
     /// whole prune cycle completed over the full stash).
     preadmission_ready: bool,
+    /// How many stash keys `preadmission_ready` was proven for: the
+    /// head's keys are re-derived every action (its endpoint may gain
+    /// a module while it is held), and a different count re-proves.
+    prepared_key_len: Option<usize>,
     /// A prune cycle over the full stash: the pid snapshot at its
     /// start and the next index to check.
     prune_cycle: Option<(Vec<u32>, usize)>,
     /// The executable resolution in progress.
     resolve: Option<ResolveJob>,
-    /// The completed executable verdict, kept until the head stages.
-    resolved: Option<UnboundExe>,
+    /// The completed executable verdict and the stashed EXEC it was
+    /// resolved for, kept until the head stages; a re-stash or removal
+    /// of the head's EXEC while it is held discards it.
+    resolved: Option<(StashedExec, UnboundExe)>,
 }
 
 /// Scan-learned exe-probe cache: one entry per distinct caller path
@@ -1129,6 +1135,15 @@ struct StashedExec {
     /// When the pid was first observed gone: the departed-stash grace
     /// starts at the exit observation, not at this (possibly old) EXEC.
     gone_since: Option<u64>,
+}
+
+impl StashedExec {
+    /// The same EXEC image (what resolution verifies against); the
+    /// exit observation is bookkeeping, not identity.
+    fn same_image(&self, other: &Self) -> bool {
+        (self.pid_host, self.dev, self.ino, self.hook_ts_ns)
+            == (other.pid_host, other.dev, other.ino, other.hook_ts_ns)
+    }
 }
 
 /// Scan-learned exe identities per build: the primary
@@ -2021,6 +2036,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         keys: &[Option<ModuleKey>],
         credit: &mut StageCredit,
     ) -> bool {
+        if self.head_work.prepared_key_len != Some(keys.len()) {
+            self.head_work.prepared_key_len = Some(keys.len());
+            self.head_work.preadmission_ready = false;
+            self.head_work.prune_cycle = None;
+        }
         if self.head_work.preadmission_ready {
             return true;
         }
@@ -2083,12 +2103,26 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         if !self.prepare_preadmission(&keys, credit) {
             return None;
         }
-        if modules.is_ok()
-            && self.head_work.resolved.is_none()
-            && let Some(stashed) = self.exec_exe.get(&row.cookie()).copied()
+        let stashed = if modules.is_ok() {
+            self.exec_exe.get(&row.cookie()).copied()
+        } else {
+            None
+        };
+        // A verdict resolved for an EXEC the stash no longer holds
+        // (re-stashed or removed while the head waited) never stages.
+        if self
+            .head_work
+            .resolved
+            .as_ref()
+            .is_some_and(|(exec, _)| stashed.is_none_or(|now| !now.same_image(exec)))
+        {
+            self.head_work.resolved = None;
+        }
+        if self.head_work.resolved.is_none()
+            && let Some(stashed) = stashed
         {
             let exe = self.prepare_exe(stashed, credit)?;
-            self.head_work.resolved = Some(exe);
+            self.head_work.resolved = Some((stashed, exe));
         }
         // The row's own stash reads at staging: its entry's staleness
         // check (two reads) and a possible re-insert, else one
@@ -2106,7 +2140,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         if !credit.take(stash_reads) {
             return None;
         }
-        Some(self.head_work.resolved.take())
+        Some(self.head_work.resolved.take().map(|(_, exe)| exe))
     }
 
     /// Live-process reads are trusted only under agreeing pidns
@@ -11710,8 +11744,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 // The stash's resolution was prepared, under the
                 // staging credit, before this row staged.
                 debug_assert_eq!(
-                    prepared_exe.is_some(),
-                    self.exec_exe.contains_key(&cookie),
+                    prepared_exe.as_ref().map(|exe| (exe.dev, exe.ino)),
+                    self.exec_exe.get(&cookie).map(|exec| (exec.dev, exec.ino)),
                     "a stashed EXEC stages exactly its prepared verdict"
                 );
                 let exe = match prepared_exe {
@@ -31402,7 +31436,7 @@ exit 0
     fn finish_runs_no_tombstone_expiry_sweep() {
         // Expiry work belongs to sweeps, never to the finish credit:
         // witness sweeps run the tombstone expiry (positive control),
-        // while two Finish credits that flush 65 rows and settle a
+        // while the Finish credits that flush 65 rows and settle a
         // queue run none.
         let mut native = retained_with_growth();
         let sweeps = native.scene.coordinator.expire_sweep_calls_for_test();
@@ -45086,13 +45120,71 @@ int main(void) {
                 break;
             }
         }
-        assert!(!held_totals.is_empty(), "the fixture holds a row (setup pin)");
+        assert!(
+            !held_totals.is_empty(),
+            "the fixture holds a row (setup pin)"
+        );
         assert!(
             held_totals.iter().all(|total| *total == 0),
             "nothing settles while staging is held: {held_totals:?}"
         );
         assert_eq!(terminal_retry_total(&native), 40, "settled exactly once");
         assert!(native.scene.coordinator.retry_owed.is_empty());
+    }
+
+    #[test]
+    fn a_held_verdict_is_discarded_when_its_exec_is_restashed() {
+        // The head's executable verdict completes in one Finish, but
+        // the row's own stash read no longer fits that credit, so the
+        // row waits with its verdict. A re-stash of the row's EXEC
+        // (same cookie, new image) lands before it stages: the staged
+        // verdict names the current EXEC, never the discarded one.
+        // The cold-path count that spends the Finish credit exactly up
+        // to the row's stash read depends on the resolver's own charge,
+        // so the fixture searches it (deterministic per tree).
+        let domain_of = |native: &NativeScene| native.domain;
+        let mut found = None;
+        for cold in (40..=63u64).rev() {
+            // A capture stash, so the row's own stash read is charged.
+            let (mut native, _) = watched_native();
+            native.scene.coordinator.set_exe_index_dirs(Vec::new());
+            let base = cold_exe_paths(&native);
+            if base > cold {
+                continue;
+            }
+            admit_cold_exe_callers(&mut native, (cold - base) as u32);
+            native.execs(vec![exec_record(41, 9, 100, 8, 99)]);
+            let staged = native.read(vec![native.row(41, 1, 9, 210, 0)]);
+            assert_eq!(staged.decided, 0);
+            let domain = domain_of(&native);
+            native.stage(NativeBatch::Finish { domain });
+            let waits_with_verdict = native.scene.coordinator.held_stage.len() == 1
+                && native
+                    .scene
+                    .coordinator
+                    .head_work
+                    .resolved
+                    .as_ref()
+                    .is_some_and(|(_, exe)| (exe.dev, exe.ino) == (8, 99));
+            if waits_with_verdict {
+                found = Some(native);
+                break;
+            }
+        }
+        let mut native = found.expect("a completed verdict waits for its row (setup pin)");
+        let domain = native.domain;
+        native.execs(vec![exec_record(41, 9, 150, 8, 77)]);
+        for _ in 0..4 {
+            if native.scene.coordinator.held_stage.is_empty() {
+                break;
+            }
+            native.stage(NativeBatch::Finish { domain });
+        }
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(native.scene.coordinator.held_stage.is_empty());
+        let exes = scene_unbound_exe(&native);
+        assert_eq!(exes.len(), 1);
+        assert_eq!((exes[0].dev, exes[0].ino), (8, 77), "{exes:?}");
     }
 
     #[test]
@@ -45162,7 +45254,11 @@ int main(void) {
         );
         let before = stash_stale_checks();
         assert!(coordinator.prepare_preadmission(&[None, None], &mut credit));
-        assert_eq!(stash_stale_checks() - before, 0, "the same keys stay proven");
+        assert_eq!(
+            stash_stale_checks() - before,
+            0,
+            "the same keys stay proven"
+        );
     }
 
     // ---- Bounded staging slow work (r7, F1 class) ----

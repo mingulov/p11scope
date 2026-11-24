@@ -3047,7 +3047,7 @@ fn stopping_with_sixty_five_pending_rows_finishes_in_two_credits() {
 /// through `NativeStop::step`, then retirement and the stop summary
 /// run. RED: the base stages one Finish for all 65.
 #[test]
-fn phased_stop_with_sixty_five_pending_rows_finishes_in_two_credits() {
+fn phased_stop_with_sixty_five_pending_rows_finishes_in_three_credits() {
     let log = Log::default();
     let mut scene = Scene::new(&log);
     let lane = ScriptedLane::new(&log);

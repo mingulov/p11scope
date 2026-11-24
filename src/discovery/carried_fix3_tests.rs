@@ -4435,6 +4435,66 @@ fn carried_fix5_clone_failure_refuses_deferred_file() {
 }
 
 #[test]
+fn carried_fix5_fresh_failure_retries_silently() {
+    // hg-5 caller contract: a fresh proof's duplicate/stat failure
+    // is a silent retry, never loss — committed-row proofs rebuild
+    // every apply, so the next apply re-attempts. No loss is
+    // counted, no gap is filed, and no staged key is recorded.
+    let me = std::process::id();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 43,
+        path: "/".into(),
+        dir: Arc::new(File::open("/").expect("open root dir")),
+    };
+    engine.owned_run_pid = Some(424242);
+    let key = overlay_key(9999);
+    let mut module = super::owned_proof_module_without_tables(key);
+    module.view = ProcessViewId(67);
+    let mut pins = overlay_view_pin(&module, 8408, OVERLAY_SHA, 1, false);
+    let object = pins
+        .id_for_scanned(&module, module.key, &module.path)
+        .expect("the fixture pin resolves");
+    let proof = OwnedLearnProof {
+        view: ProcessViewId(67),
+        path: OVERLAY_PATH.into(),
+        object,
+        loader_exe: None,
+        loader_unknown_reason: Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
+        module,
+    };
+    engine.fail_learned_stage_clone_for_test = true;
+    engine.learn_owned_proofs_with_views(&mut pins, std::slice::from_ref(&proof), &[], None);
+    assert_eq!(
+        engine.owned_learn_stage_attempts_for_test, 1,
+        "the fresh proof attempts"
+    );
+    assert_eq!(
+        engine.learned_event_loss_for_test(),
+        0,
+        "a fresh failure counts no loss"
+    );
+    assert!(
+        engine.pending_learned.is_empty(),
+        "no file stages without its duplicate"
+    );
+    assert!(
+        engine.owned_learned_staged.is_empty(),
+        "no staged key is recorded, so the next apply re-attempts"
+    );
+    engine.learn_owned_proofs_with_views(&mut pins, std::slice::from_ref(&proof), &[], None);
+    assert_eq!(
+        engine.owned_learn_stage_attempts_for_test, 2,
+        "the next apply re-attempts the fresh proof"
+    );
+    assert_eq!(
+        engine.learned_event_loss_for_test(),
+        0,
+        "still no loss after the retry"
+    );
+}
+
+#[test]
 fn carried_fix5_stat_failure_refuses_deferred_file() {
     // hg-5 loss accounting, stat arm: a deferred proof whose held
     // file cannot be statted refuses loudly with counted loss and a

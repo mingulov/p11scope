@@ -42,6 +42,7 @@ sys.path.insert(0, str(ROOT / "tests" / "fixtures" / "browser"))
 import cells
 import flows
 import oracle
+import reap_tree
 import softhsm
 import tls_server
 
@@ -611,6 +612,14 @@ class BrowserCells(unittest.TestCase):
                     "system softokn provider not found")
             self.skipTest("browser gate prerequisite missing: "
                           "system softokn provider not found")
+        missing = cells.missing_nss_seed_tools()
+        if missing:
+            if STRICT:
+                raise AssertionError(
+                    "strict installed mode requires this cell: "
+                    f"NSS seed tools missing: {', '.join(missing)}")
+            self.skipTest("browser gate prerequisite missing: "
+                          f"NSS seed tools missing: {', '.join(missing)}")
         cred = softhsm.generate_client_credential(self.work / "cred")
         key, cert = tls_server.make_server_credential(self.work / "srv")
         with tls_server.FlowServer(cert=cert, key=key, require_client_cert=True,
@@ -671,6 +680,14 @@ class BrowserCells(unittest.TestCase):
         pre-existing SoftHSM caller; the late browser's key rows populate
         (the scan seal settles over the newcomer instead of seating over
         the background provider alone)."""
+        missing = cells.missing_nss_seed_tools()
+        if missing:
+            if STRICT:
+                raise AssertionError(
+                    "strict installed mode requires this cell: "
+                    f"NSS seed tools missing: {', '.join(missing)}")
+            self.skipTest("browser gate prerequisite missing: "
+                          f"NSS seed tools missing: {', '.join(missing)}")
         store, cred = self.seed()
         bg = cells.start_soft_call(store.lib, self.work / "bg", env=store.env)
         self.addCleanup(bg.stop)
@@ -1079,9 +1096,27 @@ class BrowserCells(unittest.TestCase):
         self.assertIsNone(cells.find_softokn(
             ldconfig_text=f"libsoftokn3.so.1 (libc6,x86-64) => {suffixed}\n",
             candidates=[]))
+        # Order pin: with an existing hit AND an existing candidate,
+        # the ldconfig hit wins (a candidates-first mutant resolves
+        # the candidate here).
+        cand = self.work / "ord" / "libsoftokn3.so"
+        cand.parent.mkdir(parents=True)
+        cand.write_bytes(b"probe-candidate")
+        self.assertEqual(
+            cells.find_softokn(ldconfig_text=table,
+                               candidates=[str(cand)]),
+            hit)
 
     def test_attached_run_gaps_exact(self):
         """Twin: the run-floor gap set passes calibrated causes only."""
+        # Membership pin: the behavioral legs below build their passing
+        # doc from the set itself, so a widening mutant (an 8th cause)
+        # would stay green without this literal.
+        self.assertEqual(_GAPS_ATTACHED_RUN, frozenset({
+            "loader_discovery", "unprotected_live_windows",
+            "pid_descendant_gaps", "task_uprobe_link_losses",
+            "discovery_truncated", "skipped", "interface_selection",
+        }))
         doc = {"evidence": {"gap_classes": {"observation": {
             "status": "lossy", "causes": sorted(_GAPS_ATTACHED_RUN)}}}}
         self.assertEqual(
@@ -1106,6 +1141,45 @@ class BrowserCells(unittest.TestCase):
             ldconfig_text=table, candidates=[str(missing)]))
         self.assertIsNone(
             cells.find_softokn(ldconfig_text="", candidates=[]))
+
+    def test_find_softokn_survives_ldconfig_failure(self):
+        """Twin: an ldconfig failure/timeout falls back to candidates."""
+        cand = self.work / "fb" / "libsoftokn3.so"
+        cand.parent.mkdir(parents=True)
+        cand.write_bytes(b"probe-softokn")
+        for failure in (OSError("no ldconfig"),
+                        subprocess.TimeoutExpired("ldconfig", 30)):
+            with self.subTest(failure=type(failure).__name__):
+                with patch.object(cells.subprocess, "run",
+                                  side_effect=failure):
+                    self.assertEqual(
+                        cells.find_softokn(
+                            ldconfig_text=None,
+                            candidates=[str(cand)]),
+                        cand)
+        # A nonzero ldconfig exit reads as an empty table (same fallback).
+        with patch.object(cells.subprocess, "run",
+                          return_value=SimpleNamespace(
+                              returncode=1, stdout="")):
+            self.assertEqual(
+                cells.find_softokn(ldconfig_text=None,
+                                   candidates=[str(cand)]),
+                cand)
+
+    def test_missing_nss_seed_tools_names_absent_tools(self):
+        """Twin: the NSS-seed gate names exactly the tools absent from PATH."""
+        with patch.object(cells.shutil, "which",
+                          return_value="/usr/bin/x"):
+            self.assertEqual(cells.missing_nss_seed_tools(), [])
+        with patch.object(cells.shutil, "which", return_value=None):
+            self.assertEqual(cells.missing_nss_seed_tools(),
+                             ["certutil", "pk12util"])
+
+        def which(tool):
+            return None if tool == "pk12util" else f"/usr/bin/{tool}"
+
+        with patch.object(cells.shutil, "which", side_effect=which):
+            self.assertEqual(cells.missing_nss_seed_tools(), ["pk12util"])
 
     def test_launch_without_registered_module_scrubs_store_env(self):
         """Twin: an unregistered launch must not leak SOFTHSM2_CONF.
@@ -1642,6 +1716,25 @@ class BrowserCells(unittest.TestCase):
         with patch.object(oracle, "sha256_of", return_value=sha):
             with self.assertRaises(AssertionError):
                 self.check_report(result, store, zero=True, attached=True)
+
+    def test_multi_sha_open_entries_aggregate_for_absences(self):
+        """Twin: in-flight entries sum across the pair for absence legs.
+
+        C_Login enters-but-never-returns once on each sha of a
+        copy-up pair; the absence leg must see the summed 2 and fail.
+        Dropping the opened aggregation loop (``opened`` stays {})
+        would pass blind.
+        """
+        sha = "ab" * 32
+        sha2 = "cd" * 32
+        rows = [self._twin_row(["C_Login"], 0, sha, in_flight=1),
+                self._twin_row(["C_Login"], 0, sha2, in_flight=1)]
+        result = self._twin_result("TWIN-MULTISHA-OPEN", rows,
+                                   self._twin_evidence())
+        with self.assertRaises(AssertionError):
+            self.check_report(result, None, attached=True,
+                              module_sha={sha, sha2},
+                              absent=("C_Login",))
 
     def test_oracle_rejects_attach_failures(self):
         """P2-3 twin: failed attachments fail even when some probes hooked."""
@@ -2338,6 +2431,26 @@ class ReapTreeDelay(unittest.TestCase):
                 self.assertNotEqual(proc.returncode, 0)
                 self.assertIn("usage", proc.stderr)
 
+    def test_valueless_delay_flag_fails_usage(self):
+        """Twin: a present-but-valueless --initial-delay is a usage failure.
+
+        RED before the fix: the flag fell through and was exec'd as the
+        child command (``reap_tree: the browser failed to start``).
+        """
+        proc = self._run("--initial-delay")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("usage", proc.stderr)
+
+    def test_valueless_flow_done_flag_fails_usage(self):
+        """Twin: a present-but-valueless --flow-done is a usage failure.
+
+        Same class as the delay flag (present-but-valueless option
+        escaping usage failure); this site predates the lane.
+        """
+        proc = self._run("--flow-done")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("usage", proc.stderr)
+
     def test_orphaned_delay_exits_promptly(self):
         """Twin: a supervisor whose parent died exits, never lingers."""
         shim = self.work / "shim.py"
@@ -2368,6 +2481,19 @@ class ReapTreeDelay(unittest.TestCase):
                           "(parent-death watch dead?)")
         finally:
             _kill_quietly(pid)
+
+    def test_delay_wait_rechecks_parent_after_deadline(self):
+        """Twin: the parent-death watch rechecks after the deadline.
+
+        A parent that dies during the final poll interval must still
+        abort the spawn (no browser launch into an ownerless run).
+        RED before the fix: the wait returned True without a final
+        check.
+        """
+        with patch("os.getppid", return_value=os.getpid()):
+            self.assertTrue(reap_tree._wait_initial_delay(0.0, os.getpid()))
+        with patch("os.getppid", return_value=99999999):
+            self.assertFalse(reap_tree._wait_initial_delay(0.0, os.getpid()))
 
 
 def require_s1(test):
@@ -3045,6 +3171,35 @@ class BrowserS1Oracle(unittest.TestCase):
                         s1={"sessions_opened_min": 1,
                             "sign_mechanisms": spec})
 
+    def test_check_report_multi_sha_floors_sum_across_pair(self):
+        """Twin: check_report floors sum across a discovery copy-up pair.
+
+        C_Sign rides both shas (1+1) under a floor of 2 while
+        C_SignInit rides one sha under a floor of 1; the summed
+        floors pass. An overwrite mutant (``counts[name] = calls``)
+        leaves C_Sign at 1 and fails deterministically regardless of
+        set order. A disjoint split (C_SignInit on one sha, C_Sign on
+        the other) would NOT kill it — each name is set once, so
+        overwrite equals sum — hence the shared-name summed floor.
+        """
+        require_sign_wiring(self)
+        sha = "ab" * 32
+        sha2 = "cd" * 32
+        rows = [BrowserCells._twin_row(["C_SignInit"], 1, sha),
+                BrowserCells._twin_row(["C_Sign"], 1, sha),
+                BrowserCells._twin_row(["C_Sign"], 1, sha2)]
+        mechanisms = [self._sign_mechanism_entry(0x40, sha, 1),
+                      self._sign_mechanism_entry(0x43, sha2, 1)]
+        _, result = self.s1_result(
+            "S1-MULTISHA", rows, BrowserCells._twin_evidence(),
+            mechanisms, healthy_sessions(), {})
+        case = BrowserCells("test_oracle_builder_healthy_accepted")
+        case.work = self.work
+        s1 = {"sign_mechanisms": {"family_ids": sorted(_RSA_FAMILY_IDS),
+                                  "min_calls": 2}}
+        case.check_report(result, None, {"C_SignInit": 1, "C_Sign": 2},
+                          attached=True, module_sha={sha, sha2}, s1=s1)
+
     def test_rsa_family_mirror_matches_product_table(self):
         """Twin: the RSA mirror stays the 32-id keymeta.rs table.
 
@@ -3070,7 +3225,9 @@ class BrowserS1Oracle(unittest.TestCase):
         self.assertEqual(oracle.check_skipped_run_floor(healthy), [])
         self.assertEqual(
             oracle.check_skipped_run_floor({"evidence": {}}), [])
-        # Every other learned-file reason stays refused (unbounded loss).
+        # Every other learned-file reason stays refused (unbounded loss):
+        # all nine non-first-use LEARNED_*_REASON literals from
+        # src/render.rs, verbatim.
         refused = [
             ("learned provider file",
              "file learning reached its 32-file per-capture cap; "
@@ -3081,6 +3238,28 @@ class BrowserS1Oracle(unittest.TestCase):
             ("learned provider file",
              "a learned provider's tables lost their pinned identity; "
              "its calls were not observed"),
+            ("learned provider file",
+             "table learning reached its 32-module per-capture cap; "
+             "further provider tables were not learned"),
+            ("learned provider file",
+             "file learning was unavailable; short-lived first loads "
+             "of new provider files were not learned"),
+            ("learned provider file",
+             "a provider file was replaced or deleted before staging; "
+             "it was not learned"),
+            ("learned provider file",
+             "file learning was disabled by the operator; "
+             "short-lived first loads of new provider files were not "
+             "learned"),
+            ("learned provider file",
+             "file learning cannot see filesystems outside the "
+             "observer's mount namespace; provider files opened only "
+             "there were not learned"),
+            ("learned provider file",
+             "some filesystems were not marked for file learning, or "
+             "a re-mark pass was still pending or could not start; "
+             "short-lived first loads of new provider files opened "
+             "only there were not learned"),
             # Retire/detach windows could hide the asserted signs.
             ("C_Sign",
              "counting probes were retired mid-capture; calls in the "

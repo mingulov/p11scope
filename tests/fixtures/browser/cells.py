@@ -95,6 +95,22 @@ SOFTOKN_CANDIDATES = (
 #: version-suffixed ``libsoftokn3.so.1`` is a different file).
 SOFTOKN_SONAME = "libsoftokn3.so"
 
+#: Host tools the NSS client-credential seed needs beyond preflight's
+#: shared set (``profiles.seed_nss_client_credential`` raises
+#: ProfileError naming the missing tool; openssl is already gated by
+#: preflight).
+NSS_SEED_TOOLS = ("certutil", "pk12util")
+
+
+def missing_nss_seed_tools() -> list[str]:
+    """Names of NSS-seed tools absent from PATH (empty when seedable).
+
+    NSS-seeding live cells (CR-RUN-SIGN, FF-FIRST-BG) call this before
+    any privileged work so a missing tool skips (or strict-fails) at
+    the gate instead of erroring mid-cell from the seed step.
+    """
+    return [tool for tool in NSS_SEED_TOOLS if shutil.which(tool) is None]
+
 
 def find_softokn(*, ldconfig_text: str | None = None,
                  candidates=None) -> Path | None:
@@ -225,9 +241,12 @@ def run_direct(name: str, browser: str, workdir: Path, flow_url: str,
     provider for absence twins); ``None`` omits ``--module`` so discovery
     scans every PKCS#11-looking object the owned tree maps (the browser's
     own NSS provider included). ``register_module`` is the module
-    registered in the fresh profile; ``None`` with an ``observe_module``
-    builds the no-module failure twin (the browser never maps the
-    provider, so the cell expects zero rows for it). ``prearm_modules``
+    registered in the fresh profile; ``None`` leaves the fresh profile
+    without a registration: with a controlled-SoftHSM ``observe_module``
+    that builds the no-module failure twin (the browser never maps the
+    provider, so the cell expects zero rows for it), while run-sign
+    cells observe the browser's own NSS provider instead and expect
+    signs. ``prearm_modules``
     pins provider files before any mapping (one ``--prearm-module``
     each), so a fast browser flow cannot use them before attach.
     ``initial_delay_seconds`` holds the browser spawn past observer

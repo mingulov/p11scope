@@ -339,12 +339,15 @@ MAX_INITIAL_DELAY_SECONDS = 300.0
 def _parse_initial_delay(rest):
     """Split a leading ``--initial-delay SECONDS``; (delay, rest).
 
-    Returns (0.0, rest) when absent. A present-but-unparseable value
-    (non-numeric, negative, NaN/inf, or past the upper bound) returns
-    (None, rest): the caller fails loud with usage.
+    Returns (0.0, rest) when absent. A present-but-valueless flag or
+    a present-but-unparseable value (non-numeric, negative, NaN/inf,
+    or past the upper bound) returns (None, rest): the caller fails
+    loud with usage.
     """
-    if len(rest) < 2 or rest[0] != "--initial-delay":
+    if not rest or rest[0] != "--initial-delay":
         return 0.0, rest
+    if len(rest) < 2:
+        return None, rest
     try:
         delay = float(rest[1])
     except ValueError:
@@ -367,6 +370,10 @@ def _wait_initial_delay(delay, parent):
         if os.getppid() != parent:
             return False
         time.sleep(min(_FLOW_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
+    # Final recheck: a parent that died during the last poll interval
+    # must still abort the spawn, never launch into an ownerless run.
+    if os.getppid() != parent:
+        return False
     return True
 
 
@@ -381,7 +388,10 @@ def main(argv):
     if delay is None:
         return _fail("usage: reap_tree.py [--initial-delay SECONDS] "
                       "[--flow-done shot.png] <command> [args ...]")
-    if len(rest) >= 2 and rest[0] == "--flow-done":
+    if rest and rest[0] == "--flow-done":
+        if len(rest) < 2:
+            return _fail("usage: reap_tree.py [--initial-delay SECONDS] "
+                          "[--flow-done shot.png] <command> [args ...]")
         shot = rest[1]
         rest = rest[2:]
     if not rest:

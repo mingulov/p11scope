@@ -847,6 +847,13 @@ struct JournalDeathMarks {
     /// The proof-destroying fallback close that fenced this key, if
     /// any (see [`JournalAdapter::fence_destroyed_proof`]).
     fallback: Option<FallbackFence>,
+    /// The begin ordinal of a call that began at or below the
+    /// predecessor's fallback fence and had not returned by it, and
+    /// so refused this successor's birth (`BootstrapMismatch`): a
+    /// straddler of that close, never attributed. This key's own
+    /// fallback close counts it as its own field (see
+    /// [`FallbackFenceDecision::straddlers`]).
+    straddler: Option<u64>,
 }
 
 /// One proof-destroying fallback close's fence on a dead key: the
@@ -855,10 +862,10 @@ struct JournalDeathMarks {
 /// successor chain it ends, and the passes left before a successor
 /// may mint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FallbackFence {
-    fence: u64,
-    chain: u32,
-    wait: u32,
+pub(crate) struct FallbackFence {
+    pub(crate) fence: u64,
+    pub(crate) chain: u32,
+    pub(crate) wait: u32,
 }
 
 /// What one proof-destroying fallback close decided (see
@@ -869,22 +876,33 @@ pub(crate) struct FallbackFenceDecision {
     /// The close's frontier: the closed key's fence and the floor
     /// every successor birth must cut at or above.
     pub(crate) fence: u64,
-    /// Consecutive successors that died without a validated birth
-    /// (zero: this key made progress, or was not such a successor).
+    /// Consecutive successors that died without ever sealing (not
+    /// even an empty seal; zero: this key sealed, or was not such a
+    /// successor).
     pub(crate) chain: u32,
     /// Passes before a successor may mint (zero: at once).
     pub(crate) backoff_passes: u32,
     /// Whether the death rule may mint past this key once it is dead:
     /// false when a refusal already grounds in a capable frame, which
     /// never mints (the binding then waits for quarantine-end proof).
+    /// It names key-level death-rule eligibility only: an image taint
+    /// still governs every later bind (`ImageTainted`, named there).
     pub(crate) successor_allowed: bool,
+    /// Calls that began at or below the predecessor's fallback fence,
+    /// returned after it and refused this key's birth: straddlers of
+    /// the earlier close, never attributed. Named here beside the
+    /// close's replayed or disposed `calls` (which may include it), so
+    /// the loss names its cause instead of folding silently into this
+    /// close's count. A seal stops at its first birth mismatch, so at
+    /// most one per key.
+    pub(crate) straddlers: u32,
 }
 
 impl FallbackFenceDecision {
     /// The gap reason for this close, with the calls it disposed.
     pub(crate) fn gap_reason(&self, calls: u64) -> String {
         format!(
-            "install_segment_fallback_fenced calls={calls} fence={} chain={} backoff_passes={} successor={}",
+            "install_segment_fallback_fenced calls={calls} fence={} chain={} backoff_passes={} successor={} straddlers={}",
             self.fence,
             self.chain,
             self.backoff_passes,
@@ -892,7 +910,8 @@ impl FallbackFenceDecision {
                 "minted"
             } else {
                 "capable_frame"
-            }
+            },
+            self.straddlers
         )
     }
 }
@@ -2329,6 +2348,10 @@ enum ClaimValidation {
 #[derive(Clone, Copy, Debug)]
 struct SealScanFacts {
     birth_mismatch: bool,
+    /// The deciding birth mismatch is a straddler of the predecessor's
+    /// fallback fence: its begin ordinal (see
+    /// [`JournalDeathMarks::straddler`]).
+    straddler_begin: Option<u64>,
     barrier: bool,
     /// Some barrier row is settled history this frame already holds:
     /// an unbound open BEGIN with its terminal at or below the
@@ -2361,6 +2384,7 @@ impl Default for SealScanFacts {
     fn default() -> Self {
         Self {
             birth_mismatch: false,
+            straddler_begin: None,
             barrier: false,
             barrier_settled: false,
             barrier_in_flight_min: None,
@@ -7909,8 +7933,16 @@ impl JournalAdapter {
     /// ([`Self::fence_destroyed_proof`]); quarantine-end mints on new
     /// post-fence object proof. A key whose fallback close still serves
     /// its successor backoff mints under neither rule until the backoff
-    /// ends ([`Self::tick_fallback_backoff`]). Resolution, the fallback
-    /// close and the birth probe all decide through this function.
+    /// ends ([`Self::tick_fallback_backoff`]). Every mint in
+    /// [`Self::resolve_binding_key`] decides through this function. The
+    /// other callers consult parts of it: the fallback close only sets
+    /// the fence and backoff the rule reads
+    /// ([`Self::fence_destroyed_proof`]); the birth probe reads the
+    /// backoff clause alone ([`Self::successor_backoff_for`]); and
+    /// [`Self::probe_admitted_key`]'s taint bypass reads quarantine-end
+    /// eligibility without the backoff gate, so during a backoff it may
+    /// bind the dead key (whose proof then refuses at birth and seal;
+    /// nothing mints or lifts there).
     fn successor_mint_rule(
         &self,
         admitted: &AdmittedInstanceCall,
@@ -7953,16 +7985,21 @@ impl JournalAdapter {
     /// successor birth certifies history at or below the close.
     fn key_resume_fence(&self, key: JournalDomainKey) -> u64 {
         let own = self.keys.get(&key).map_or(0, |state| state.void_fence);
-        let inherited = key
-            .incarnation
+        let inherited = self.inherited_fallback_fence(key).unwrap_or(0);
+        own.max(*self.voided_through).max(inherited)
+    }
+
+    /// The predecessor's fallback fence when `key` is a successor
+    /// minted past a proof-destroying fallback close.
+    fn inherited_fallback_fence(&self, key: JournalDomainKey) -> Option<u64> {
+        key.incarnation
             .checked_sub(1)
             .and_then(|incarnation| {
                 self.death_marks
                     .get(&JournalDomainKey { incarnation, ..key })
             })
             .and_then(|marks| marks.fallback)
-            .map_or(0, |fence| fence.fence);
-        own.max(*self.voided_through).max(inherited)
+            .map(|fence| fence.fence)
     }
 
     /// Fence a key whose segment a fallback close just ended with its
@@ -7980,8 +8017,15 @@ impl JournalAdapter {
     /// cycle: when this key was itself such a successor and never
     /// sealed (no validated birth), the next successor waits an
     /// exponential backoff in
-    /// [`crate::semantics_key_use::RESEED_COOLDOWN_PASSES`] units. Once
-    /// per key (`None` on a repeat or an unknown key).
+    /// [`crate::semantics_key_use::RESEED_COOLDOWN_PASSES`] units. Any
+    /// seal counts as progress, an empty one included (`sealed_through`
+    /// moves on every successful seal): the chain grows only for a
+    /// successor that never sealed at all. The wait counts passes only
+    /// ([`Self::tick_fallback_backoff`]); a later void neither clears
+    /// nor shortens it, so a void during a backoff pacing an
+    /// unproductive chain still waits it out (bounded by the cap in
+    /// [`fallback_backoff_passes`]). Once per key (`None` on a repeat or
+    /// an unknown key).
     pub(crate) fn fence_destroyed_proof(
         &mut self,
         proof: &JournalDomainProof,
@@ -8028,10 +8072,49 @@ impl JournalAdapter {
                 .death_marks
                 .get(&key)
                 .is_some_and(|marks| marks.refused_capable == Some(true)),
+            straddlers: u32::from(
+                self.death_marks
+                    .get(&key)
+                    .is_some_and(|marks| marks.straddler.is_some()),
+            ),
         })
     }
 
-    /// Tick one pass off every fallback successor backoff.
+    /// The fallback fence recorded on `key`, if any.
+    #[cfg(test)]
+    pub(crate) fn fallback_fence_for_test(
+        &self,
+        proof: &JournalDomainProof,
+    ) -> Option<FallbackFence> {
+        self.death_marks
+            .get(&proof.key)
+            .and_then(|marks| marks.fallback)
+    }
+
+    /// Keys carrying a fallback fence (frame cells: a close that must
+    /// not fence leaves this unchanged).
+    #[cfg(test)]
+    pub(crate) fn fallback_fence_count_for_test(&self) -> usize {
+        self.death_marks
+            .values()
+            .filter(|marks| marks.fallback.is_some())
+            .count()
+    }
+
+    /// Pose a fallback fence on `key` (machine/probe cells that need a
+    /// standing backoff without driving an unproductive chain).
+    #[cfg(test)]
+    pub(crate) fn pose_fallback_fence_for_test(
+        &mut self,
+        proof: &JournalDomainProof,
+        fence: FallbackFence,
+    ) {
+        self.death_marks.entry(proof.key).or_default().fallback = Some(fence);
+    }
+
+    /// Tick one pass off every fallback successor backoff. The only
+    /// writer that drains a wait; its sole production caller is the
+    /// machine's Births arm, beside the reseed cooldown tick.
     pub(crate) fn tick_fallback_backoff(&mut self) {
         for marks in self.death_marks.values_mut() {
             if let Some(fence) = marks.fallback.as_mut() {
@@ -10045,6 +10128,19 @@ impl JournalAdapter {
                 // Diagnostic-only (bootstrap arms): count the refusing arm.
                 // The refusal below is unchanged.
                 self.note_bootstrap_arm(SealBootstrapArm::Covers);
+                // A straddler of the predecessor's fallback fence is kept
+                // for this key's own close to count (once per key).
+                if let Some(begin) = barrier
+                    .scan
+                    .as_ref()
+                    .and_then(|scan| scan.facts.straddler_begin)
+                {
+                    self.death_marks
+                        .entry(key)
+                        .or_default()
+                        .straddler
+                        .get_or_insert(begin);
+                }
                 return SealAttempt::Decided(Err(self.failure(JournalGap::BootstrapMismatch)));
             }
             BarrierCheck::Yielded => return SealAttempt::Yielded,
@@ -10849,6 +10945,18 @@ impl JournalAdapter {
         let ours = converts || entry.converted_for == Some(key);
         if stamp.mode == SealScanMode::Seal && entry.begin_ordinal <= birth_cut && ours {
             facts.birth_mismatch = true;
+            // A call that began at or below the predecessor's fallback
+            // fence and had not returned by it straddles that close:
+            // named apart from a plain mismatch, still never attributed.
+            if let Some(fence) = self.inherited_fallback_fence(key)
+                && entry.begin_ordinal <= fence
+                && !entry.end.is_some_and(|end| end.ordinal <= fence)
+                && !entry
+                    .abandon
+                    .is_some_and(|abandon| abandon.ordinal <= fence)
+            {
+                facts.straddler_begin = Some(entry.begin_ordinal);
+            }
             return;
         }
         if unconverted && within {
@@ -29682,12 +29790,13 @@ pub(crate) mod tests {
                 chain: 0,
                 backoff_passes: 0,
                 successor_allowed: true,
+                straddlers: 0,
             }
         );
         assert_eq!(
             decision.gap_reason(3),
             format!(
-                "install_segment_fallback_fenced calls=3 fence={fence} chain=0 backoff_passes=0 successor=minted"
+                "install_segment_fallback_fenced calls=3 fence={fence} chain=0 backoff_passes=0 successor=minted straddlers=0"
             )
         );
         assert_eq!(
@@ -29736,16 +29845,53 @@ pub(crate) mod tests {
         assert_eq!(stale.gap, JournalGap::DomainTainted);
     }
 
-    #[test]
-    fn object_journal_fallback_fence_straddler_is_never_attributed() {
+    /// How the call that refuses the successor's birth sits against
+    /// the predecessor's fallback fence.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum StraddleShape {
+        /// BEGIN is the last ordinal at the fence, END after it.
+        BeginAtFence,
+        /// BEGIN strictly below the fence (later rows follow it), END
+        /// after the fence.
+        BeginBelowFence,
+        /// BEGIN and END both at or below the fence: not a straddler.
+        EndedBeforeFence,
+        /// BEGIN above the fence, at or below the successor's birth
+        /// cut: a plain birth mismatch, not a straddler.
+        BeginAboveFence,
+    }
+
+    /// Run one straddle shape: returns the seal's gap, the successor's
+    /// recorded straddler mark, its sealed frontier and the successor
+    /// close's decision.
+    fn fallback_fence_straddle(
+        shape: StraddleShape,
+    ) -> (
+        Option<JournalGap>,
+        Option<u64>,
+        u64,
+        FallbackFenceDecision,
+        u64,
+    ) {
         use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
 
         let (mut scene, proof, _) = fallback_fence_doomed_scene();
-        // A call in flight across the close: BEGIN at or below the
-        // fence, END after the successor minted and claimed it.
         let create = function_id("C_CreateObject");
-        let straddler = begin_bytes(1, 3, create, 0);
-        scene.ingest(&straddler);
+        let call = begin_bytes(1, 3, create, 0);
+        let begin_at = scene.adapter.consumed_through + 1;
+        if shape != StraddleShape::BeginAboveFence {
+            scene.ingest(&call);
+            assert_eq!(scene.adapter.consumed_through, begin_at);
+        }
+        if shape == StraddleShape::EndedBeforeFence {
+            scene.ingest(&end_bytes(&call, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 70));
+        }
+        if shape == StraddleShape::BeginBelowFence {
+            // Unrelated rows land after the BEGIN, before the close.
+            let other = begin_bytes(2, 9, function_id("C_GetAttributeValue"), 0);
+            scene.ingest(&other);
+            assert!(scene.adapter.consumed_through > begin_at);
+        }
         let fence = scene.adapter.consumed_through;
         scene
             .adapter
@@ -29753,26 +29899,75 @@ pub(crate) mod tests {
             .expect("the close fences the doomed key");
         let reborn = scene.attest_function("C_CreateObject");
         assert_eq!(reborn.key.incarnation, proof.key.incarnation + 1);
-        scene.ingest(&end_bytes(
-            &straddler,
-            OBJECT_ACTION_CREATE,
-            0,
-            ENTRY_NS + 70,
-        ));
+        let mut birth_cut = fence;
+        if shape == StraddleShape::BeginAboveFence {
+            scene.ingest(&call);
+            birth_cut = scene.adapter.consumed_through;
+        }
+        if shape != StraddleShape::EndedBeforeFence {
+            scene.ingest(&end_bytes(&call, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 70));
+        }
         let grant = SessionBirthGrant::scripted(
             reborn,
             BirthKind::AbsenceAppearance,
-            fence,
+            birth_cut,
             scene.closure_generation(),
         );
         let rebirth = BootstrapReceipt::attest(&scene.adapter, &grant).expect("at-fence birth");
-        let refused = scene
-            .seal(&rebirth)
-            .expect_err("a straddler below the fence is never attributed");
-        assert_eq!(refused.gap, JournalGap::BootstrapMismatch);
+        let gap = scene.seal(&rebirth).err().map(|failure| failure.gap);
+        let straddler = scene
+            .adapter
+            .death_marks
+            .get(&reborn.key)
+            .and_then(|marks| marks.straddler);
+        let sealed = scene.adapter.keys[&reborn.key].sealed_through;
+        let close_at = scene.adapter.consumed_through;
+        let decision = scene
+            .adapter
+            .fence_destroyed_proof(&reborn, close_at)
+            .expect("the successor's own close fences it");
+        (gap, straddler, sealed, decision, begin_at)
+    }
+
+    /// A call that begins at or below the fallback fence and returns
+    /// after it refuses the successor's birth (`BootstrapMismatch`),
+    /// converts nothing, and is counted as a straddler in the
+    /// successor's own close decision, apart from its replayed calls.
+    /// A call ended before the fence, or begun above it, is a plain
+    /// mismatch with no straddler count.
+    #[test]
+    fn object_journal_fallback_fence_straddler_is_never_attributed() {
+        let rows = [
+            StraddleShape::BeginAtFence,
+            StraddleShape::BeginBelowFence,
+            StraddleShape::EndedBeforeFence,
+            StraddleShape::BeginAboveFence,
+        ]
+        .map(|shape| {
+            let (gap, straddler, sealed, decision, begin_at) = fallback_fence_straddle(shape);
+            (
+                shape,
+                gap,
+                straddler.map(|begin| begin == begin_at),
+                sealed,
+                decision.straddlers,
+                decision.chain,
+                decision
+                    .gap_reason(1)
+                    .ends_with(&format!(" straddlers={}", decision.straddlers)),
+            )
+        });
+        use StraddleShape::*;
+        let mismatch = Some(JournalGap::BootstrapMismatch);
         assert_eq!(
-            scene.adapter.keys[&reborn.key].sealed_through, 0,
-            "nothing converted under the successor"
+            rows,
+            [
+                (BeginAtFence, mismatch, Some(true), 0, 1, 1, true),
+                (BeginBelowFence, mismatch, Some(true), 0, 1, 1, true),
+                (EndedBeforeFence, mismatch, None, 0, 0, 1, true),
+                (BeginAboveFence, mismatch, None, 0, 0, 1, true),
+            ],
+            "straddlers refuse, convert nothing and are counted only when they cross the fence"
         );
     }
 
@@ -29849,6 +30044,7 @@ pub(crate) mod tests {
                 chain: 1,
                 backoff_passes: RESEED_COOLDOWN_PASSES,
                 successor_allowed: true,
+                straddlers: 0,
             },
             "no progress: the next successor waits one cooldown unit"
         );

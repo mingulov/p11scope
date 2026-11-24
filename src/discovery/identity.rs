@@ -29086,4 +29086,64 @@ mod tests {
         );
         assert!(!aliased.contains(&lone_id), "the lone id stays reclaimable");
     }
+
+    #[test]
+    fn proving_pins_conflict_checks_own_and_entry_digests() {
+        // Target-identity check: any shared raw observation (the
+        // module's own file or a table-entry dependency) with both
+        // digests present and unequal conflicts, so the harvest
+        // refuses instead of aliasing against a different file.
+        // Identical digests, missing entries and missing digests
+        // never conflict (a missing digest proves no change).
+        let key = overlay(893);
+        let dep = overlay(894);
+        let mut main = module(key);
+        main.tables[0].entries.push(ScannedEntry {
+            name: "C_Dependency",
+            object: dep,
+            object_path: PATH.into(),
+            file_offset: 0x2200,
+        });
+        let mut dep_module = module(dep);
+        dep_module.mount_namespace = main.mount_namespace;
+        let store_for = |own_sha: &str, dep_sha: &str| {
+            let mut store = PinnedObjects::empty();
+            assert!(
+                store
+                    .absorb(view_pin(&main, 8930, own_sha, 1, false))
+                    .is_empty()
+            );
+            assert!(
+                store
+                    .absorb(view_pin(&dep_module, 8931, dep_sha, 1, false))
+                    .is_empty()
+            );
+            store
+        };
+        let own_a = "a1".repeat(32);
+        let own_b = "b2".repeat(32);
+        let dep_a = "c3".repeat(32);
+        let dep_b = "d4".repeat(32);
+        let source = store_for(&own_a, &dep_a);
+        assert!(
+            store_for(&own_b, &dep_a).proving_pins_conflict(&source, &main),
+            "a different own-file digest conflicts"
+        );
+        assert!(
+            store_for(&own_a, &dep_b).proving_pins_conflict(&source, &main),
+            "a different entry-dep digest conflicts"
+        );
+        assert!(
+            !store_for(&own_a, &dep_a).proving_pins_conflict(&source, &main),
+            "identical digests never conflict"
+        );
+        assert!(
+            !PinnedObjects::empty().proving_pins_conflict(&source, &main),
+            "missing target entries never conflict"
+        );
+        assert!(
+            !store_for("", "").proving_pins_conflict(&source, &main),
+            "missing digests never conflict"
+        );
+    }
 }

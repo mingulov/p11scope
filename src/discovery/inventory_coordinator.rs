@@ -46007,6 +46007,303 @@ int main(void) {
     }
 
     #[test]
+    fn a_system_scope_proven_interval_labels_the_post_proof_image() {
+        // An exec between the admission's executable sample and its
+        // leader-alive proof must not leave the proven interval labeled
+        // with the pre-exec image: the label is re-sampled after the
+        // proof, so the successor image's rows edge the record carrying
+        // the successor image.
+        agreeing(|| {
+            let (mut native, caller) = proven_system_native_shaped(Some(200), |source| {
+                source.exec(7, 200, "/bin/successor");
+            });
+            let record = native.scene.coordinator.adapter.record(caller).unwrap();
+            assert_eq!(
+                record.exe.as_ref().and_then(|exe| exe.path.as_deref()),
+                Some("/bin/successor"),
+                "the proven label postdates the proof: {:?}",
+                record.exe
+            );
+            assert_eq!(
+                native.scene.coordinator.adapter.leader_alive_ns(caller),
+                Some(200),
+                "the liveness proof still stands"
+            );
+            retire_then_exits(&mut native, &[450]);
+            let row = native.row(41, 1, 7, 300, 0);
+            native.witness(vec![row]);
+            assert_eq!(bound_census(&native), (1, 1, 0));
+            assert_only_holder_edged(&native, caller);
+            let edged = native.scene.coordinator.adapter.record(caller).unwrap();
+            assert_eq!(
+                edged.exe.as_ref().and_then(|exe| exe.path.as_deref()),
+                Some("/bin/successor"),
+                "the edged record carries the successor image: {:?}",
+                edged.exe
+            );
+        });
+    }
+
+    #[test]
+    fn a_system_scope_unreadable_post_proof_image_withholds_the_lifetime() {
+        // If the executable is unreadable right after the leader-alive
+        // proof, the image is unprovable: no proven interval is minted,
+        // so the later row stays unbound instead of binding a possibly
+        // pre-exec label.
+        agreeing(|| {
+            let (mut native, caller) = proven_system_native_shaped(Some(200), |source| {
+                source.hide_ancestor_exe(7);
+            });
+            assert_eq!(
+                native.scene.coordinator.adapter.leader_alive_ns(caller),
+                None,
+                "an unprovable image mints no lifetime"
+            );
+            retire_then_exits(&mut native, &[450]);
+            let row = native.row(41, 1, 7, 300, 0);
+            native.witness(vec![row]);
+            assert_eq!(bound_census(&native), (1, 0, 0));
+            assert_eq!(no_live_caller(&native), Some(1));
+        });
+    }
+
+    #[test]
+    fn a_system_scope_row_binds_its_exit_interval_before_the_live_successor_query() {
+        // A live successor already answers the pid at first read, but
+        // the row predates it: the predecessor's healthy witnessed exit
+        // interval owns the row, so the read consults that interval
+        // before spending a live cookie query.
+        agreeing(|| {
+            let (mut native, caller) = proven_system_native(false);
+            retire_then_exits(&mut native, &[450]);
+            native.scene.source.spawn(7, 1600);
+            native.scene.coordinator.adapter.reconcile_detected(
+                &[7].into_iter().collect(),
+                &mut |_| ImageAuthority::ScanPinned,
+                300_000,
+                &mut || Some(400_000),
+            );
+            assert!(native.scene.coordinator.adapter.live_id(7).is_some());
+            native.scene.project(7, 400_010);
+            native.scene.coordinator.commit_batch(false).unwrap();
+            native.answer(7, 1600, 5059);
+            let row = native.row(41, 1, 7, 300, 0);
+            native.witness(vec![row]);
+            assert_eq!(
+                native.cookies.queries, 0,
+                "the exit interval answers before any live query"
+            );
+            assert_eq!(bound_census(&native), (1, 1, 0));
+            assert_only_holder_edged(&native, caller);
+        });
+    }
+
+    #[test]
+    fn a_system_scope_resight_consults_the_stamped_exit_before_the_new_successor() {
+        // The row is read before its leader exit drains (owed, Absent,
+        // no deferral); the exit then stamps cleanly and a live
+        // successor arrives before the re-sight. The re-sight still
+        // consults the stamped interval before querying the successor.
+        agreeing(|| {
+            let (mut native, caller) = proven_system_native(false);
+            retire_then_exits(&mut native, &[]);
+            let row = native.row(41, 1, 7, 300, 0);
+            let read = native.stamps.read(native.domain, vec![row]);
+            native.stage(read);
+            let at = native.stamps.tick();
+            native.stage(NativeBatch::Lifecycle(leader_exit_drain(
+                native.domain,
+                at,
+                450,
+            )));
+            native.scene.source.spawn(7, 1600);
+            native.scene.coordinator.adapter.reconcile_detected(
+                &[7].into_iter().collect(),
+                &mut |_| ImageAuthority::ScanPinned,
+                300_000,
+                &mut || Some(400_000),
+            );
+            assert!(native.scene.coordinator.adapter.live_id(7).is_some());
+            native.scene.project(7, 400_010);
+            native.scene.coordinator.commit_batch(false).unwrap();
+            native.answer(7, 1600, 5059);
+            native.witness(Vec::new());
+            assert_eq!(
+                native.cookies.queries, 0,
+                "the stamped exit answers before any live query"
+            );
+            assert_eq!(bound_census(&native), (1, 1, 0));
+            assert_only_holder_edged(&native, caller);
+        });
+    }
+
+    #[test]
+    fn a_system_scope_successor_row_still_queries_and_binds_live() {
+        // The exit-first reorder must not slow the live path: a row the
+        // live successor fired after its own admission binds through the
+        // usual live query, with no exit scan in front of it.
+        agreeing(|| {
+            let (mut native, _) = proven_system_native(false);
+            retire_then_exits(&mut native, &[450]);
+            native.scene.source.spawn(7, 1600);
+            native.scene.coordinator.adapter.reconcile_detected(
+                &[7].into_iter().collect(),
+                &mut |_| ImageAuthority::ScanPinned,
+                300_000,
+                &mut || Some(400_000),
+            );
+            let successor = native
+                .scene
+                .coordinator
+                .adapter
+                .live_id(7)
+                .expect("successor admitted");
+            native.scene.project(7, 400_010);
+            native.scene.coordinator.commit_batch(false).unwrap();
+            native.answer(7, 1600, 5059);
+            let row = native.row(5059, 3, 7, 500_000, 0);
+            native.witness(vec![row]);
+            assert_eq!(
+                native.cookies.queries, 1,
+                "the live row spends its live query"
+            );
+            assert_eq!(bound_census(&native), (1, 1, 0));
+            assert_only_holder_edged(&native, successor);
+        });
+    }
+
+    #[test]
+    fn a_system_scope_hot_predecessors_bind_before_the_live_successor_query() {
+        // Scale shape of the exit-first reorder: 59 stamped hot
+        // predecessors plus a live successor. Every predecessor row
+        // binds its own holder with no live query, and the successor's
+        // own row still binds live in the same staging.
+        agreeing(|| {
+            let (mut native, holders) = hot_pid_system_native(1100);
+            stamp_hot_exits(&mut native, 7, 59);
+            native.scene.source.spawn(7, 1600);
+            native.scene.coordinator.adapter.reconcile_detected(
+                &[7].into_iter().collect(),
+                &mut |_| ImageAuthority::ScanPinned,
+                300_000,
+                &mut || Some(400_000),
+            );
+            let successor = native
+                .scene
+                .coordinator
+                .adapter
+                .live_id(7)
+                .expect("successor admitted");
+            native.scene.project(7, 400_010);
+            native.scene.coordinator.commit_batch(false).unwrap();
+            native.answer(7, 1600, 5059);
+            let mut rows = hot_rows(&native, 0, 59);
+            rows.push(native.row(5059, 7, 7, 500_000, 0));
+            native.witness(rows);
+            assert_eq!(native.cookies.queries, 1, "only the successor row queries");
+            assert_eq!(bound_census(&native), (60, 60, 0));
+            let mut expected = holders[..59].to_vec();
+            expected.push(successor);
+            assert_holders_edged(&native, &expected);
+        });
+    }
+
+    #[test]
+    fn a_system_scope_unhealthy_read_queries_the_live_successor_first() {
+        // The exit-first reorder applies to healthy reads only: a row
+        // read while unhealthy still queries its live successor first —
+        // today's CookieMismatch with exactly one query — since
+        // incomplete exit evidence must not select the retained path.
+        agreeing(|| {
+            let (mut native, _) = proven_system_native(false);
+            retire_then_exits(&mut native, &[450]);
+            native.scene.source.spawn(7, 1600);
+            native.scene.coordinator.adapter.reconcile_detected(
+                &[7].into_iter().collect(),
+                &mut |_| ImageAuthority::ScanPinned,
+                300_000,
+                &mut || Some(400_000),
+            );
+            assert!(native.scene.coordinator.adapter.live_id(7).is_some());
+            native.scene.project(7, 400_010);
+            native.scene.coordinator.commit_batch(false).unwrap();
+            native.answer(7, 1600, 5059);
+            let row = native.row(41, 1, 7, 300, 0);
+            let NativeBatch::Witness(mut batch) = native.stamps.read(native.domain, vec![row])
+            else {
+                unreachable!("the scripted read constructs a witness batch");
+            };
+            batch.health.failures = vec!["scripted transport failure".into()];
+            native.stage(NativeBatch::Witness(batch));
+            native.witness(Vec::new());
+            assert_eq!(
+                native.cookies.queries, 1,
+                "the unhealthy read spends its live query"
+            );
+            assert_eq!(bound_census(&native), (1, 0, 0));
+            assert_eq!(
+                native
+                    .scene
+                    .coordinator
+                    .registry
+                    .witness_census()
+                    .unbound
+                    .get(&UnboundReason::CookieMismatch)
+                    .copied(),
+                Some(1),
+                "the unhealthy read keeps today's live mismatch"
+            );
+        });
+    }
+
+    #[test]
+    fn a_system_scope_pool_exhaustion_aggregates_distinct_attempted_totals() {
+        // Per-staging attempted totals vary, but the exhaustion
+        // condition is one: distinct totals aggregate into a single
+        // published gap reporting the largest attempted total, with
+        // the deferred-scan count, instead of one gap row per total.
+        let mut scene = CaptureScene::new(2);
+        let coordinator = &mut scene.coordinator;
+        coordinator.holder_pool.reset();
+        assert!(coordinator.holder_pool.try_charge(60_000));
+        assert!(!coordinator.holder_pool.try_charge(6_000));
+        coordinator.record_holder_pool_exhaustion();
+        coordinator.holder_pool.reset();
+        assert!(coordinator.holder_pool.try_charge(60_000));
+        assert!(!coordinator.holder_pool.try_charge(7_000));
+        coordinator.record_holder_pool_exhaustion();
+        coordinator.holder_pool.reset();
+        assert!(coordinator.holder_pool.try_charge(60_000));
+        assert!(!coordinator.holder_pool.try_charge(7_000));
+        coordinator.record_holder_pool_exhaustion();
+        coordinator.registry.publish();
+        let gaps = coordinator.registry.gaps();
+        let exhausted: Vec<&RegistryGap> = gaps
+            .iter()
+            .filter(|gap| gap.subject == "holder scan pool exhausted")
+            .collect();
+        assert_eq!(
+            exhausted.len(),
+            1,
+            "distinct totals aggregate into one gap: {gaps:?}"
+        );
+        assert_eq!(
+            exhausted[0].budget,
+            Some(crate::discovery::caller_registry::BudgetRefusal {
+                resource: "holder_scan_units",
+                limit: 65_536,
+                requested: 67_000,
+            }),
+            "the aggregate reports the largest attempted total: {gaps:?}"
+        );
+        assert!(
+            exhausted[0].reason.contains("3 scans deferred"),
+            "the aggregate counts every deferred scan: {}",
+            exhausted[0].reason
+        );
+    }
+
+    #[test]
     fn a_system_scope_absent_exit_retry_does_not_rescan_on_its_miss() {
         // A deferred exit retry that answers Absent keeps that answer
         // for its visit: when the live lookup then misses, the pass
@@ -46033,22 +46330,20 @@ int main(void) {
                 1,
                 "only the Deferred row waits for its retry"
             );
-            let staged_before = native
-                .scene
-                .coordinator
-                .registry
-                .staged_gaps_for_test()
-                .len();
+            // Publish earlier stagings so the measured read's filings
+            // stand alone at publish level, where the exhaustion
+            // aggregate lands.
+            native.scene.coordinator.commit_batch(false).unwrap();
+            let gaps_before = native.scene.coordinator.registry.gaps().len();
             native.read(hot_rows(&native, 60, 58));
-            let staged = native.scene.coordinator.registry.staged_gaps_for_test();
+            native.scene.coordinator.commit_batch(false).unwrap();
             assert!(
-                !staged[staged_before..]
+                !native.scene.coordinator.registry.gaps()[gaps_before..]
                     .iter()
                     .any(|gap| gap.subject == "holder scan pool exhausted"),
                 "one scan per staging per row leaves the pool exact: {:?}",
-                &staged[staged_before..]
+                native.scene.coordinator.registry.gaps()
             );
-            native.scene.coordinator.commit_batch(false).unwrap();
             assert_eq!(no_live_caller(&native), Some(60));
         });
     }
@@ -46473,18 +46768,12 @@ int main(void) {
     #[test]
     fn a_system_scope_pool_charge_failure_keeps_its_budget_payload() {
         // A staging that actually spends past the holder-scan pool
-        // files the pool-exhausted gap with its structured budget,
-        // beside any queue-only wait. The payload reports the actual
-        // attempted total: 59 hot scans spend 64,900 units, so the
-        // 60th scan's attempt reaches 66,000 past the 65,536 pool.
+        // files the pool-exhausted aggregate with its structured
+        // budget, beside any queue-only wait. The payload reports the
+        // actual attempted total: 59 hot scans spend 64,900 units, so
+        // the 60th scan's attempt reaches 66,000 past the 65,536 pool.
         agreeing(|| {
             let (mut native, _) = hot_pid_system_native(1100);
-            let staged_before = native
-                .scene
-                .coordinator
-                .registry
-                .staged_gaps_for_test()
-                .len();
             let storm: Vec<u64> = (0..70).map(|i| 200_000 + i).collect();
             let at = native.stamps.tick();
             native.stage(NativeBatch::Lifecycle(leader_exit_drain_many(
@@ -46493,19 +46782,25 @@ int main(void) {
                 7,
                 &storm,
             )));
-            let staged = native.scene.coordinator.registry.staged_gaps_for_test();
-            let fresh = &staged[staged_before..];
-            assert!(
-                fresh
-                    .iter()
-                    .any(|gap| gap.subject == "holder scan pool exhausted"
-                        && gap.budget
-                            == Some(crate::discovery::caller_registry::BudgetRefusal {
-                                resource: "holder_scan_units",
-                                limit: 65_536,
-                                requested: 66_000,
-                            })),
-                "a charge failure files the budgeted gap: {fresh:?}"
+            native.scene.coordinator.commit_batch(false).unwrap();
+            let gaps = native.scene.coordinator.registry.gaps();
+            let exhausted: Vec<&RegistryGap> = gaps
+                .iter()
+                .filter(|gap| gap.subject == "holder scan pool exhausted")
+                .collect();
+            assert_eq!(
+                exhausted.len(),
+                1,
+                "a charge failure files exactly one aggregate gap: {gaps:?}"
+            );
+            assert_eq!(
+                exhausted[0].budget,
+                Some(crate::discovery::caller_registry::BudgetRefusal {
+                    resource: "holder_scan_units",
+                    limit: 65_536,
+                    requested: 66_000,
+                }),
+                "the aggregate reports the actual attempted total: {gaps:?}"
             );
         });
     }

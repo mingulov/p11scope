@@ -1466,48 +1466,82 @@ impl NativeBinder {
                 .or_default();
             seen.last_t0_ns = seen.last_t0_ns.max(row.recorded_at_ns);
             seen.last_tgid = row.host_tgid;
-            let sighting = lookup.live_caller(row.host_tgid).map(|caller| Sighting {
-                caller: caller.id,
-                first_seen_ns: caller.first_seen_ns,
-                query: identity.query_cookie(row.domain, caller.pin),
-                // A read-time sighting is decided against the row's
-                // read; only a late sighting carries its own query
-                // completion threshold.
-                late: false,
-                sighted_ns: None,
-            });
+            let live = lookup.live_caller(row.host_tgid);
+            // Exit-first: a row predating the live incarnation may
+            // belong to a prior incarnation's witnessed exit interval,
+            // so consult it before spending a live cookie query that a
+            // successor's ticket would only mismatch. Healthy reads
+            // only: incomplete exit evidence must not select the
+            // retained path. A deferral owes the exit-first retry; any
+            // other answer falls through to the live query below.
+            let mut exit_hit: Option<RetainedCaller> = None;
+            let mut exit_deferred = false;
+            if read_healthy
+                && live
+                    .as_ref()
+                    .is_some_and(|caller| caller.first_seen_ns > row.recorded_at_ns)
+            {
+                match lookup.try_exit_witnessed_caller(row.host_tgid, row.recorded_at_ns) {
+                    HolderScan::Found(witnessed)
+                        if retained_candidate(&witnessed, row.recorded_at_ns) =>
+                    {
+                        exit_hit = Some(witnessed);
+                    }
+                    HolderScan::Deferred => exit_deferred = true,
+                    HolderScan::Found(_) | HolderScan::Absent => {}
+                }
+            }
+            let sighting = if exit_hit.is_some() || exit_deferred {
+                None
+            } else {
+                live.map(|caller| Sighting {
+                    caller: caller.id,
+                    first_seen_ns: caller.first_seen_ns,
+                    query: identity.query_cookie(row.domain, caller.pin),
+                    // A read-time sighting is decided against the row's
+                    // read; only a late sighting carries its own query
+                    // completion threshold.
+                    late: false,
+                    sighted_ns: None,
+                })
+            };
             // A row with no live answer may still bind through the one
             // unambiguous retained incarnation; anything else keeps its
             // live-miss gap at decision time.
             let needs_retained = sighting
                 .as_ref()
                 .is_none_or(|sighting| matches!(sighting.query, CookieQuery::Exited));
-            let mut exit_deferred = false;
-            let retained = needs_retained
-                .then(|| lookup.retained_callers(row.host_tgid))
-                .and_then(|held| {
-                    let [only] = held.as_slice() else {
-                        return None;
-                    };
-                    retained_candidate(only, row.recorded_at_ns).then_some((*only, false))
-                })
-                .or_else(|| {
-                    if !(needs_retained && read_healthy) {
-                        return None;
-                    }
-                    match lookup.try_exit_witnessed_caller(row.host_tgid, row.recorded_at_ns) {
-                        HolderScan::Found(witnessed)
-                            if retained_candidate(&witnessed, row.recorded_at_ns) =>
-                        {
-                            Some((witnessed, true))
+            let retained = if let Some(witnessed) = exit_hit {
+                Some((witnessed, true))
+            } else if exit_deferred {
+                None
+            } else {
+                needs_retained
+                    .then(|| lookup.retained_callers(row.host_tgid))
+                    .and_then(|held| {
+                        let [only] = held.as_slice() else {
+                            return None;
+                        };
+                        retained_candidate(only, row.recorded_at_ns).then_some((*only, false))
+                    })
+                    .or_else(|| {
+                        if !(needs_retained && read_healthy) {
+                            return None;
                         }
-                        HolderScan::Deferred => {
-                            exit_deferred = true;
-                            None
+                        match lookup.try_exit_witnessed_caller(row.host_tgid, row.recorded_at_ns) {
+                            HolderScan::Found(witnessed)
+                                if retained_candidate(&witnessed, row.recorded_at_ns) =>
+                            {
+                                Some((witnessed, true))
+                            }
+                            HolderScan::Deferred => {
+                                exit_deferred = true;
+                                None
+                            }
+                            HolderScan::Found(_) | HolderScan::Absent => None,
                         }
-                        HolderScan::Found(_) | HolderScan::Absent => None,
-                    }
-                });
+                    })
+            };
             let (retained, retained_is_exit) = retained
                 .map_or((None, false), |(snapshot, is_exit)| {
                     (Some(snapshot), is_exit)
@@ -1549,7 +1583,9 @@ impl NativeBinder {
     /// stamps its attempt; a hit past an allowance goes back to the
     /// queue. A row with an exit retry owed runs its exit scan before
     /// any live lookup (sighted rows keep their sighting); the scan
-    /// spends no query. The pass reports [`ResightOutcome::Incomplete`]
+    /// spends no query. An unflagged row predating its live hit runs
+    /// the same exit scan first, like a first read. The pass reports
+    /// [`ResightOutcome::Incomplete`]
     /// while owed rows remain and the next batch resumes with them; it
     /// never scans the pending rows.
     fn resight_pass<Pin>(
@@ -1647,6 +1683,47 @@ impl NativeBinder {
                 exit_absent_this_visit = true;
             }
             let hit = lookup.live_caller(row_tgid);
+            // Exit-first for rows predating the live incarnation (the
+            // read path's gate): a prior incarnation's witnessed
+            // interval may own the row, so consult it before spending
+            // a live query. Runs ahead of the query allowance: a scan
+            // spends no query and can resolve the row while queries
+            // are exhausted. A retry that just answered Absent keeps
+            // that answer instead of re-running its scan.
+            if !exit_absent_this_visit
+                && let Some(caller) = hit.as_ref()
+                && self.domains[index].pending.get(rel).is_some_and(|pending| {
+                    pending.read_healthy && caller.first_seen_ns > pending.row.recorded_at_ns
+                })
+            {
+                let event_ns = self.domains[index]
+                    .pending
+                    .get(rel)
+                    .map(|pending| pending.row.recorded_at_ns)
+                    .expect("the row was just filtered present");
+                match lookup.try_exit_witnessed_caller(row_tgid, event_ns) {
+                    HolderScan::Found(only) if retained_candidate(&only, event_ns) => {
+                        let state = &mut self.domains[index];
+                        let Some(pending) = state.pending.get_mut(rel) else {
+                            continue;
+                        };
+                        pending.retained = Some(only);
+                        pending.retained_is_exit = true;
+                        pending.resight_due = false;
+                        pending.last_attempt = Some(current);
+                        continue;
+                    }
+                    HolderScan::Deferred => {
+                        let state = &mut self.domains[index];
+                        if let Some(pending) = state.pending.get_mut(rel) {
+                            pending.exit_retry_owed = true;
+                        }
+                        self.domains[index].owed.push_back(pos);
+                        continue;
+                    }
+                    HolderScan::Found(_) | HolderScan::Absent => {}
+                }
+            }
             if hit.is_some() && queries >= RESIGHT_QUERIES_PER_PASS {
                 // A hit past the query allowance stays owed for the
                 // next pass while later rows are still visited.

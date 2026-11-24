@@ -42,6 +42,8 @@ use crate::discovery::scan::{
 thread_local! {
     static EXACT_ROWS_VISITED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static METERED_FDINFO_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static EXACT_BYTES_SCANNED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static EXACT_NEWLINES_SCANNED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Mount-table rows the exact-id scan actually visited (test seam).
@@ -56,11 +58,25 @@ pub(crate) fn metered_fdinfo_calls_for_test() -> u64 {
     METERED_FDINFO_CALLS.with(std::cell::Cell::get)
 }
 
+/// Table bytes the exact-id scan actually examined (test seam).
+#[cfg(test)]
+pub(crate) fn exact_bytes_scanned_for_test() -> u64 {
+    EXACT_BYTES_SCANNED.with(std::cell::Cell::get)
+}
+
+/// Row terminators the exact-id scan actually examined (test seam).
+#[cfg(test)]
+pub(crate) fn exact_newlines_scanned_for_test() -> u64 {
+    EXACT_NEWLINES_SCANNED.with(std::cell::Cell::get)
+}
+
 /// Reset the exact-scan counters (test seam).
 #[cfg(test)]
 pub(crate) fn reset_exact_scan_counters_for_test() {
     EXACT_ROWS_VISITED.with(|counter| counter.set(0));
     METERED_FDINFO_CALLS.with(|counter| counter.set(0));
+    EXACT_BYTES_SCANNED.with(|counter| counter.set(0));
+    EXACT_NEWLINES_SCANNED.with(|counter| counter.set(0));
 }
 use crate::manifest_input::{MAX_OBJECTS, MAX_TOTAL_OBJECT_BYTES, validate_structure};
 use crate::process::{
@@ -9090,6 +9106,12 @@ fn scan_mount_table_for_row_with<'table>(
             let Some(row) = rows.next() else {
                 break;
             };
+            // Test seam: yielding the row scanned its bytes plus the
+            // terminator. Counted before the spend, where the work is.
+            #[cfg(test)]
+            EXACT_BYTES_SCANNED.with(|counter| counter.set(counter.get() + row.len() as u64 + 1));
+            #[cfg(test)]
+            EXACT_NEWLINES_SCANNED.with(|counter| counter.set(counter.get() + 1));
             budget.spend(1).map_err(str::to_string)?;
             stride_rows += 1;
             #[cfg(test)]
@@ -17161,6 +17183,85 @@ mod tests {
             "only the finished stride is visited: {}",
             exact_rows_visited_for_test()
         );
+    }
+
+    /// INV-2 lookahead bound: an exhausted allowance refuses before
+    /// scanning any row byte, not just before counting the visit. A
+    /// 100 KiB first row with zero remaining units must scan zero
+    /// bytes and zero terminators — the iterator lookahead that finds
+    /// the row end is itself scan work.
+    #[test]
+    fn exact_mount_scan_zero_allowance_scans_no_row_bytes() {
+        reset_exact_scan_counters_for_test();
+        let file = open_regular(Path::new("/bin/sh")).unwrap();
+        let mount_id = fd_mount_id(&file).unwrap();
+        let long_row = format!(
+            "9000001 1 8:1 / /{} rw - ext4 /dev/decoy rw\n",
+            "x".repeat(100_000)
+        );
+        let table = format!("{long_row}{}", mount_table_with_match_last(&mount_id, 2));
+        let mut budget = CaptureWorkBudget::default();
+        assert!(budget.charge(budget.work_ceiling()));
+        assert!(budget.stopped_reason().is_none());
+        let error =
+            scan_mount_table_for_row_with(&table, &mount_id, &mut budget, |_| None).unwrap_err();
+        assert_eq!(error, crate::discovery::scan::WORK_CEILING_REASON);
+        assert_eq!(
+            exact_rows_visited_for_test(),
+            0,
+            "no row visited without allowance: {}",
+            exact_rows_visited_for_test()
+        );
+        assert_eq!(
+            exact_bytes_scanned_for_test(),
+            0,
+            "no row byte scanned without allowance: {}",
+            exact_bytes_scanned_for_test()
+        );
+        assert_eq!(
+            exact_newlines_scanned_for_test(),
+            0,
+            "no terminator scanned without allowance: {}",
+            exact_newlines_scanned_for_test()
+        );
+    }
+
+    /// The scan seam counts every examined byte and terminator: two
+    /// decoys plus the last-row match pin exact literals for rows,
+    /// bytes, newlines, and charged units.
+    #[test]
+    fn exact_mount_scan_counts_scanned_bytes_and_terminators() {
+        reset_exact_scan_counters_for_test();
+        let file = open_regular(Path::new("/bin/sh")).unwrap();
+        let mount_id = fd_mount_id(&file).unwrap();
+        let table = mount_table_with_match_last(&mount_id, 2);
+        let mut budget = CaptureWorkBudget::default();
+        let row = scan_mount_table_for_row_with(&table, &mount_id, &mut budget, |_| None)
+            .expect("the last-row match must resolve")
+            .expect("the match row is found");
+        assert_eq!(
+            row,
+            format!("{mount_id} 1 9:9 / /target rw - ext4 /dev/target rw")
+        );
+        assert_eq!(
+            exact_rows_visited_for_test(),
+            3,
+            "two decoys plus the match: {}",
+            exact_rows_visited_for_test()
+        );
+        assert_eq!(
+            exact_bytes_scanned_for_test(),
+            table.len() as u64,
+            "every table byte examined once: {}",
+            exact_bytes_scanned_for_test()
+        );
+        assert_eq!(
+            exact_newlines_scanned_for_test(),
+            3,
+            "every row terminator examined: {}",
+            exact_newlines_scanned_for_test()
+        );
+        assert_eq!(budget.work_units_count(), 3);
     }
 
     /// Exhaustion through the threaded resolution path (not just the

@@ -4046,6 +4046,51 @@ class StrictSelfTest(unittest.TestCase):
                 rc, text = self.strict(root, env={"TMPDIR": raw})
                 self.assertEqual(rc, 0, text)
 
+    def test_shell_punctuation_never_hides_a_file_alias(self):
+        # codex r11j F1: a symlink straight to an undeclared checkout file,
+        # spelled with attached shell operators, in the environment and in
+        # a shell command the suite runs.
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as raw:
+            root = self.make_root(raw, "")
+            for name in ("alias file", "alias-file", "alias;semi(x)"):
+                (Path(raw) / name).symlink_to(root / "data/secret.txt")
+            spaced, plain, punct = (str(Path(raw) / n) for n in ("alias file", "alias-file", "alias;semi(x)"))
+            q = shlex.quote
+            table = {";": "cat %s;" % q(spaced), "&&": "cat %s&&true" % q(spaced), "||": "cat %s||true" % q(spaced),
+                     "|": "cat %s|cat" % q(spaced), "&": "cat %s&" % q(spaced), "<": "cat <%s" % q(spaced),
+                     ">": "cat %s>/dev/null" % q(spaced), "2>": "cat %s 2>/dev/null" % q(spaced),
+                     "( )": "(cat %s)" % q(spaced), "$( )": "echo $(cat %s)" % q(spaced),
+                     "backquotes": "echo `cat %s`" % q(spaced), "{ ; }": "{ cat %s; }" % q(spaced),
+                     "double quotes": 'cat "%s";' % spaced, "unquoted ;": "cat %s;" % plain,
+                     "unbalanced quote": "'%s" % plain, "! ": "! cat %s" % q(spaced),
+                     # A quoted name that really holds punctuation stays whole.
+                     "quoted name with ; and ( )": "cat %s;" % q(punct)}
+            (root / "suite.py").write_text(self.HEADER + "class T(unittest.TestCase):\n    def test_a(self):\n"
+                                           "        assert 'REPO_ALIAS' not in os.environ\n"
+                                           "        assert os.environ['UNRELATED'] == \"cat '/nowhere;x(y)';\"\n")
+            for row, value in table.items():
+                with self.subTest(env=row):
+                    rc, text = self.strict(root, env={"REPO_ALIAS": value, "UNRELATED": "cat '/nowhere;x(y)';"})
+                    self.assertEqual(rc, 0, text)
+                    self.assertEqual(text.split("inherited variables removed: ", 1)[1].split()[0], "REPO_ALIAS", text)
+            for row, value in table.items():
+                if row == "unbalanced quote":
+                    continue  # not a command a shell runs
+                with self.subTest(event=row):
+                    (root / "suite.py").write_text(self.HEADER + "class T(unittest.TestCase):\n"
+                                                   "    def test_a(self):\n        subprocess.run(%r, shell=True)\n"
+                                                   % value)
+                    rc, text = self.strict(root)
+                    self.assertEqual(rc, 1, text)
+                    self.assertIn("reached the checkout outside its declared copy (", text)
+                    self.assertIn("subprocess.Popen)", text)
+            with self.subTest(event="unrelated punctuated path (healthy twin)"):
+                (root / "suite.py").write_text(self.HEADER + "class T(unittest.TestCase):\n    def test_a(self):\n"
+                                               "        subprocess.run(\"cat '/nowhere;x(y)'; true\", shell=True,"
+                                               " check=True, stderr=subprocess.DEVNULL)\n")
+                rc, text = self.strict(root)
+                self.assertEqual(rc, 0, text)
+
     def test_setup_refusals_are_named(self):
         with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as raw:
             root = self.make_root(raw, "class T(unittest.TestCase):\n    def test_a(self):\n        pass\n")

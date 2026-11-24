@@ -871,6 +871,18 @@ impl ProcessSource for ScriptedSource {
             .get(&pid)
             .is_some_and(|process| process.alive)
     }
+
+    fn leader_proven_live(&self, pid: u32, pin: &Self::Pin) -> bool {
+        // Scenario truth: alive, readable (an affirmative live read),
+        // and the pin names its start time. This harness models no
+        // zombies and no refused pidfds.
+        self.state
+            .borrow()
+            .get(&pid)
+            .is_some_and(|process| {
+                process.alive && process.readable && process.start_time == pin.1
+            })
+    }
 }
 
 /// One churn workload: `pids` pids turning over `generations` times

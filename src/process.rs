@@ -1900,6 +1900,13 @@ impl PidPin {
         self.pid
     }
 
+    /// Whether this pin holds the original pidfd: generation-strong
+    /// custody. A fallback pin (the pidfd open was refused) compares
+    /// start-time ticks only, which cannot prove a generation.
+    pub(crate) fn has_pidfd(&self) -> bool {
+        self.pidfd.is_some()
+    }
+
     /// The `/proc` start time retained at `open` (clock ticks since boot),
     /// the same basis caller incarnations carry; `None` when unreadable.
     pub(crate) fn start_time(&self) -> Option<u64> {
@@ -2414,6 +2421,38 @@ pub(crate) fn process_is_kthread(pid: u32) -> bool {
 /// task never carries these words, so the verdict is reuse-safe.
 pub(crate) fn stat_state_is_dead(state: &str) -> bool {
     state == "Z" || state == "X" || state == "x"
+}
+
+/// True when a `/proc/<pid>/stat` read affirmatively shows a live
+/// leader: the read succeeds, the line frames past `comm`, and the
+/// state word is a single letter that is not a dead word. A denied or
+/// malformed read answers false: an inconclusive read proves nothing,
+/// so the leader-alive proof withholds it while ordinary observation
+/// continues. This is the affirmative dual of [`generation_dead`]:
+/// unknown is neither dead nor live.
+pub(crate) fn leader_stat_live(pid: u32) -> bool {
+    let Ok(stat) = read_proc_stat(pid) else {
+        return false;
+    };
+    stat_state_live_word(&stat)
+}
+
+/// Whether a stat line's state word shows a live task: framed past the
+/// LAST `)` with a single ASCII-letter state that is not dead. Split
+/// from the read so malformed framings are unit-testable without
+/// `/proc`. A garbage word (multi-letter, digits, symbols) is unknown,
+/// never live; an unfamiliar single letter reads live (a scheduled
+/// entity), while the dead words stay refused.
+fn stat_state_live_word(stat: &str) -> bool {
+    let Some(end) = stat.rfind(')') else {
+        return false;
+    };
+    let Some(state) = stat[end + 1..].split_whitespace().next() else {
+        return false;
+    };
+    state.len() == 1
+        && state.bytes().all(|byte| byte.is_ascii_alphabetic())
+        && !stat_state_is_dead(state)
 }
 
 /// True when `pid` is provably dead: reaped (`/proc/<pid>/stat` is gone),
@@ -3554,6 +3593,60 @@ int main(int argc, char **argv) {
         assert!(generation_dead(pid), "a zombie reads live");
         child.wait().unwrap();
         assert!(generation_dead(pid), "a reaped child reads live");
+    }
+
+    #[test]
+    fn leader_stat_live_reports_live_but_not_zombie_reaped_or_absent_pids() {
+        assert!(leader_stat_live(std::process::id()));
+        assert!(!leader_stat_live(u32::MAX));
+        assert!(!leader_stat_live(0));
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .die_with_parent()
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        assert!(leader_stat_live(pid), "a live child reads not-live");
+        child.kill().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !process_is_zombie(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(process_is_zombie(pid), "the killed child is unreaped");
+        assert!(!leader_stat_live(pid), "a zombie reads live");
+        child.wait().unwrap();
+        assert!(!leader_stat_live(pid), "a reaped child reads live");
+    }
+
+    #[test]
+    fn leader_stat_live_word_accepts_only_a_framed_live_letter() {
+        for live in ["R", "S", "D", "T", "t", "K", "W", "P", "Q"] {
+            let stat = format!("7 (worker) {live} 1 0 0 0");
+            assert!(stat_state_live_word(&stat), "{live} reads not-live");
+        }
+        for dead in ["Z", "X", "x"] {
+            let stat = format!("7 (worker) {dead} 1 0 0 0");
+            assert!(!stat_state_live_word(&stat), "{dead} reads live");
+        }
+        for malformed in [
+            "",
+            "garbage without a comm close",
+            "7 (worker)",
+            "7 (worker) ",
+            "7 (worker) ?? 1",
+            "7 (worker) RS 1",
+            "7 (worker) 3 1",
+            "7 (worker) ! 1",
+        ] {
+            assert!(
+                !stat_state_live_word(malformed),
+                "{malformed:?} reads live"
+            );
+        }
+        assert!(
+            stat_state_live_word("7 (we)ird) S 1 0 0 0"),
+            "a paren in comm still frames the live word"
+        );
     }
 
     /// The shared whole-group exit proof: a reaped pid proves the end

@@ -18181,6 +18181,9 @@ pub(crate) mod tests {
         fn proven_exited(&self, pid: u32) -> bool {
             OsProcessSource.proven_exited(pid)
         }
+        fn leader_proven_live(&self, pid: u32, pin: &Self::Pin) -> bool {
+            OsProcessSource.leader_proven_live(pid, pin)
+        }
         fn shared_semantic_custody(
             &self,
             _pin: &Arc<Self::Pin>,
@@ -26216,6 +26219,9 @@ exit 0
         }
         fn proven_exited(&self, pid: u32) -> bool {
             OsProcessSource.proven_exited(pid)
+        }
+        fn leader_proven_live(&self, pid: u32, pin: &Self::Pin) -> bool {
+            OsProcessSource.leader_proven_live(pid, pin)
         }
     }
 
@@ -41766,6 +41772,9 @@ exit 0
         }
         fn proven_exited(&self, pid: u32) -> bool {
             self.inner.proven_exited(pid)
+        }
+        fn leader_proven_live(&self, pid: u32, pin: &Self::Pin) -> bool {
+            self.inner.leader_proven_live(pid, pin)
         }
     }
 

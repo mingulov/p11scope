@@ -34,8 +34,8 @@ use crate::discovery::scan::CaptureWorkBudget;
 use crate::discovery::sweep_attribution::{ReservationOwner, SegmentPolicy};
 use crate::process::CustodyCharge;
 use crate::process::{
-    PidPin, generation_dead, process_is_kthread, process_is_zombie, process_proven_exited,
-    process_start_time, process_stat_pair,
+    PidPin, generation_dead, leader_stat_live, process_is_kthread, process_is_zombie,
+    process_proven_exited, process_start_time, process_stat_pair,
 };
 pub(crate) mod metadata;
 
@@ -358,6 +358,16 @@ pub(crate) trait ProcessSource {
     /// false — they still answer the signal — so this decides only
     /// stat-failure gaps, where a zombie's parseable stat never lands.
     fn proven_exited(&self, pid: u32) -> bool;
+    /// Whether `pin`'s generation is affirmatively led-live right now:
+    /// the pin is generation-strong (a held pidfd, never a tick-only
+    /// fallback) and a fresh leader-state read shows the leader live.
+    /// The leader-alive proof's only liveness input: an inconclusive
+    /// read (denied, malformed, or tick-only) withholds the proof while
+    /// ordinary observation continues. The default withholds: scripted
+    /// sources override with their scenario truth.
+    fn leader_proven_live(&self, _pid: u32, _pin: &Self::Pin) -> bool {
+        false
+    }
     /// A leader-exit hook plus a held process pin is not proof of a live
     /// worker. Sources without fresh original-custody task evidence defer.
     fn leader_exit_observation(
@@ -765,6 +775,19 @@ impl ProcessSource for OsProcessSource {
 
     fn proven_exited(&self, pid: u32) -> bool {
         process_proven_exited(pid)
+    }
+
+    fn leader_proven_live(&self, pid: u32, pin: &PidPin) -> bool {
+        // Affirmative only, in the legacy order (a state read, then
+        // the pin): a live stat for the numeric pid plus a held pidfd
+        // for the pinned generation. The held pidfd rules out reuse
+        // between the pin's open and this read (the tgid cannot name
+        // another process while its group lives), so the live state is
+        // the pinned leader's. A fallback pin never proves: equal
+        // ticks cannot distinguish two generations. The same two reads
+        // as the legacy composition (one stat, one pidfd poll), never
+        // a native query.
+        leader_stat_live(pid) && pin.has_pidfd() && pin.still_the_same()
     }
 
     fn leader_exit_observation(
@@ -1930,20 +1953,20 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
             }
         };
         // Leader-alive proof: the stamp was sampled after the pin
-        // opened; the leader thread is then read live (not a zombie or
-        // dead, which also refuses cold zombie-leader admissions) and the
-        // pin still holds the same generation after that read. So the
-        // leader lived at a later instant than the stamp and the pin
-        // existed before it: it lived at the stamp, and its tgid could
-        // name no other process then. An exit during admission fails the
-        // proof instead of discarding the genuine exit.
+        // opened; the pinned generation is then affirmatively led-live
+        // (a held pidfd plus a fresh live leader-state read, which also
+        // refuses cold zombie-leader admissions). So the leader lived at
+        // a later instant than the stamp and the pin existed before it:
+        // it lived at the stamp, and its tgid could name no other
+        // process then. An exit during admission, an inconclusive state
+        // read, or a tick-only pin fails the proof instead of
+        // discarding the genuine exit or minting a false interval.
         let proven = admitted_ns != 0
-            && !self.source.gone(pid)
             && self
                 .callers
                 .get(&id)
                 .and_then(|tracked| tracked.pin.as_ref())
-                .is_some_and(|pin| self.source.still_the_same(pin));
+                .is_some_and(|pin| self.source.leader_proven_live(pid, pin));
         let tracked = self
             .callers
             .get_mut(&id)
@@ -9778,6 +9801,25 @@ pub(crate) mod tests {
                 .is_some_and(|process| process.alive)
         }
 
+        fn leader_proven_live(&self, pid: u32, pin: &Self::Pin) -> bool {
+            // Scenario truth: the process is alive, its leader is not
+            // a zombie, its stat is readable (an affirmative live read),
+            // the pin names its start time, and the pin is
+            // proof-strong (no refused pidfd behind it).
+            !self.pin_is_weak(pin)
+                && self
+                    .state
+                    .borrow()
+                    .processes
+                    .get(&pid)
+                    .is_some_and(|process| {
+                        process.alive
+                            && !process.zombie
+                            && process.readable
+                            && process.start_time == pin.1
+                    })
+        }
+
         fn leader_exit_observation(
             &self,
             pin: &Self::Pin,
@@ -11243,6 +11285,48 @@ pub(crate) mod tests {
         );
         assert!(adapter.live_id(pid).is_none());
         child.wait().unwrap();
+    }
+
+    #[test]
+    fn affirmative_leader_proof_needs_a_pidfd_a_live_pin_and_a_live_stat() {
+        // The production proof's three arms, each isolated: a held
+        // pidfd for a live process proves; a tick-only fallback pin
+        // never proves even with a live stat; a dead stat refuses even
+        // with a held pin; and a lapsed pin refuses even with a live
+        // stat. Cross-pid pairs keep each arm deterministic.
+        let source = OsProcessSource;
+        let live = std::process::id();
+        let pin = OsProcessSource.open(live).unwrap();
+        assert!(pin.has_pidfd(), "the test host grants pidfds");
+        assert!(
+            source.leader_proven_live(live, &pin),
+            "a held pidfd plus a live stat proves"
+        );
+        let fallback = PidPin::test_pidfd_fallback(live, pin.start_time());
+        assert!(
+            !source.leader_proven_live(live, &fallback),
+            "a tick-only pin never proves, even with a live stat"
+        );
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead = child.id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !process_is_zombie(dead) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "spawned `true` never became observable as exited"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let dead_pin = OsProcessSource.open(dead).unwrap();
+        assert!(
+            !source.leader_proven_live(dead, &pin),
+            "a dead stat refuses, even with a held pin"
+        );
+        child.wait().unwrap();
+        assert!(
+            !source.leader_proven_live(live, &dead_pin),
+            "a lapsed pin refuses, even with a live stat"
+        );
     }
 
     #[test]

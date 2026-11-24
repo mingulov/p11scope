@@ -984,6 +984,15 @@ class BrowserCells(unittest.TestCase):
         at = argv.index("--module")
         self.assertEqual(argv[at + 1], str(module))
 
+    def test_run_direct_prearm_modules_pin_each_file(self):
+        """Twin: every prearm entry becomes one --prearm-module."""
+        mods = (Path("/probe-test/a.so"), Path("/probe-test/b.so"))
+        argv = self._capture_run_direct_argv(prearm_modules=mods)
+        self.assertNotIn("--module", argv)
+        for mod in mods:
+            self.assertIn(str(mod), argv)
+        self.assertEqual(argv.count("--prearm-module"), 2)
+
     def test_launch_without_registered_module_scrubs_store_env(self):
         """Twin: an unregistered launch must not leak SOFTHSM2_CONF.
 

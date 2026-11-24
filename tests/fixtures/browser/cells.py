@@ -166,7 +166,8 @@ def run_direct(name: str, browser: str, workdir: Path, flow_url: str,
                duration_seconds: int = 120,
                nss_credential=None,
                nss_nickname: str = "g33-nss-client",
-               auto_select_cert: bool = True) -> CellResult:
+               auto_select_cert: bool = True,
+               prearm_modules: tuple[Path, ...] = ()) -> CellResult:
     """Run one ``p11scope run`` cell with the tree supervisor as the owned child.
 
     ``observe_module`` is the ``--module`` target (the controlled SoftHSM
@@ -175,7 +176,9 @@ def run_direct(name: str, browser: str, workdir: Path, flow_url: str,
     own NSS provider included). ``register_module`` is the module
     registered in the fresh profile; ``None`` with an ``observe_module``
     builds the no-module failure twin (the browser never maps the
-    provider, so the cell expects zero rows for it).
+    provider, so the cell expects zero rows for it). ``prearm_modules``
+    pins provider files before any mapping (one ``--prearm-module``
+    each), so a fast browser flow cannot use them before attach.
     ``nss_credential`` (a ``softhsm.ClientCredential``) seeds the
     browser's own empty-password NSS database with a usable client key
     before launch (DEMO-4), so a CERT_REQUIRED flow signs with its own
@@ -252,6 +255,8 @@ def run_direct(name: str, browser: str, workdir: Path, flow_url: str,
     argv += [str(binary), "run"]
     if observe_module is not None:
         argv += ["--module", str(observe_module)]
+    for prearm in prearm_modules:
+        argv += ["--prearm-module", str(prearm)]
     argv += [
         "-o", str(report), "--pause", PAUSE_POLICY[browser],
         "--duration", str(duration_seconds), "--kill-on-timeout",

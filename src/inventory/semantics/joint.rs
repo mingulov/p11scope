@@ -65,6 +65,14 @@ impl RetainedJointBirth {
 pub(crate) struct RetainedJointBirths {
     witnesses: Vec<RetainedJointBirth>,
     capacity_storage: Option<ResourceLease>,
+    /// Test-only count of witness rows the pending-absence search
+    /// visited (seal work bound). Production pays nothing.
+    #[cfg(test)]
+    witness_search_visits: std::cell::Cell<usize>,
+    /// Test-only count of witness rows the native-read ordering
+    /// visited (seal work bound). Production pays nothing.
+    #[cfg(test)]
+    witness_order_visits: std::cell::Cell<usize>,
 }
 pub(crate) struct RetainedBirthSlot<'a> {
     owner: &'a mut RetainedJointBirths,
@@ -116,6 +124,9 @@ impl RetainedJointBirths {
         arms: &mut crate::discovery::engine::inventory_coordinator::semantics::BirthReserveArms,
     ) -> Result<RetainedBirthSlot<'_>, ()> {
         let pending = self.witnesses.iter().position(|entry| {
+            #[cfg(test)]
+            self.witness_search_visits
+                .set(self.witness_search_visits.get().saturating_add(1));
             matches!(&entry.birth, RetainedBirth::PendingAbsence(negative)
                 if negative.matches_current(current))
         });
@@ -204,12 +215,34 @@ impl RetainedJointBirths {
     }
 
     pub(crate) fn order_for_native_reads(&mut self) {
+        #[cfg(test)]
+        self.witness_order_visits.set(
+            self.witness_order_visits
+                .get()
+                .saturating_add(self.witnesses.len()),
+        );
         self.witnesses.sort_unstable_by_key(|entry| {
             (
                 entry.ready().is_none(),
                 entry.ready().map(|witness| witness.receipt().domain()),
             )
         });
+    }
+
+    /// Test-only witness visit counts (seal work bound).
+    #[cfg(test)]
+    pub(crate) fn witness_visits_for_test(&self) -> (usize, usize) {
+        (
+            self.witness_search_visits.get(),
+            self.witness_order_visits.get(),
+        )
+    }
+
+    /// Test-only: reset every witness visit counter.
+    #[cfg(test)]
+    pub(crate) fn reset_witness_visits_for_test(&self) {
+        self.witness_search_visits.set(0);
+        self.witness_order_visits.set(0);
     }
 
     /// Borrow only an exact completed original. Pending has no receipt or

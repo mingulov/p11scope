@@ -1067,6 +1067,24 @@ pub(crate) struct PreparedSemanticBatch {
     /// path against the feed-less skip on identical sequences.
     #[cfg(test)]
     test_legacy_claims: bool,
+    /// Test-only per-step visit counters (seal work bound): preamble
+    /// entries, counted receipts, built associations, linked entries,
+    /// processed births, disclosed links and native consumes.
+    /// Production pays nothing.
+    #[cfg(test)]
+    births_preamble_visits: std::cell::Cell<usize>,
+    #[cfg(test)]
+    births_count_visits: std::cell::Cell<usize>,
+    #[cfg(test)]
+    births_build_visits: std::cell::Cell<usize>,
+    #[cfg(test)]
+    births_link_visits: std::cell::Cell<usize>,
+    #[cfg(test)]
+    births_process_visits: std::cell::Cell<usize>,
+    #[cfg(test)]
+    births_disclose_visits: std::cell::Cell<usize>,
+    #[cfg(test)]
+    births_native_consumes: std::cell::Cell<usize>,
 }
 
 fn allocation_bytes<T>(capacity: usize) -> Option<usize> {
@@ -1100,7 +1118,37 @@ impl PreparedSemanticBatch {
             storage: None,
             #[cfg(test)]
             test_legacy_claims: false,
+            #[cfg(test)]
+            births_preamble_visits: std::cell::Cell::new(0),
+            #[cfg(test)]
+            births_count_visits: std::cell::Cell::new(0),
+            #[cfg(test)]
+            births_build_visits: std::cell::Cell::new(0),
+            #[cfg(test)]
+            births_link_visits: std::cell::Cell::new(0),
+            #[cfg(test)]
+            births_process_visits: std::cell::Cell::new(0),
+            #[cfg(test)]
+            births_disclose_visits: std::cell::Cell::new(0),
+            #[cfg(test)]
+            births_native_consumes: std::cell::Cell::new(0),
         }
+    }
+
+    /// Test-only Births visit counts (seal work bound).
+    #[cfg(test)]
+    pub(crate) fn births_visits_for_test(
+        &self,
+    ) -> (usize, usize, usize, usize, usize, usize, usize) {
+        (
+            self.births_preamble_visits.get(),
+            self.births_count_visits.get(),
+            self.births_build_visits.get(),
+            self.births_link_visits.get(),
+            self.births_process_visits.get(),
+            self.births_disclose_visits.get(),
+            self.births_native_consumes.get(),
+        )
     }
 
     fn reserve_retention(&mut self, registry: &CallerRegistry) -> bool {
@@ -1543,6 +1591,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
         let mut preamble_failed = false;
         for entry in &batch.entries {
+            #[cfg(test)]
+            batch
+                .births_preamble_visits
+                .set(batch.births_preamble_visits.get().saturating_add(1));
             // An admission retained as plain S1 is not claimed as
             // Joint evidence: it stages no birth and names no original.
             if let Some(Ok(input)) = &entry.input
@@ -1577,13 +1629,29 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             }
             return Ok(disposition);
         }
-        let count = match batch
+        #[cfg(test)]
+        let mut count_visited = 0usize;
+        let folded = batch
             .current
             .iter()
-            .filter(|receipt| receipt.birth_quantum().is_some())
+            .filter(|receipt| {
+                #[cfg(test)]
+                {
+                    count_visited += 1;
+                }
+                receipt.birth_quantum().is_some()
+            })
             .try_fold(0usize, |count, receipt| {
                 count.checked_add(receipt.instances().len())
-            }) {
+            });
+        #[cfg(test)]
+        batch.births_count_visits.set(
+            batch
+                .births_count_visits
+                .get()
+                .saturating_add(count_visited),
+        );
+        let count = match folded {
             Some(count) => count,
             None => {
                 note_prepare_birth_drop(batch, &mut self.joint_birth_funnel.prepare_capacity_count);
@@ -1628,6 +1696,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             association.capacity() <= count,
             "original association index was precharged"
         );
+        #[cfg(test)]
+        let mut build_visited = 0usize;
         for (current, receipt) in batch
             .current
             .iter()
@@ -1636,6 +1706,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         {
             let image = receipt.image();
             for router in receipt.instances() {
+                #[cfg(test)]
+                {
+                    build_visited += 1;
+                }
                 association.push(BirthAssociation {
                     image: (image.task_cookie, image.exec_id),
                     router: router.get(),
@@ -1646,6 +1720,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 });
             }
         }
+        #[cfg(test)]
+        batch.births_build_visits.set(
+            batch
+                .births_build_visits
+                .get()
+                .saturating_add(build_visited),
+        );
         association.sort_unstable_by_key(|link| (link.image, link.router));
         if association
             .windows(2)
@@ -1656,7 +1737,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
         // One increasing admission walk and binary lookup; never scan the
         // whole retained suffix per key or re-attest a discarded Result arm.
+        #[cfg(test)]
+        let mut link_visited = 0usize;
         for (at, entry) in batch.entries.iter().enumerate() {
+            #[cfg(test)]
+            {
+                link_visited += 1;
+            }
             let Some(Ok(input)) = &entry.input else {
                 continue;
             };
@@ -1685,6 +1772,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 }
             }
         }
+        #[cfg(test)]
+        batch
+            .births_link_visits
+            .set(batch.births_link_visits.get().saturating_add(link_visited));
         // Descending original positions allow moving each Current once with
         // swap_remove; earlier indices remain valid without another table.
         association.sort_unstable_by_key(|link| {
@@ -1717,6 +1808,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let mut installed = 0;
         let mut cursor = 0;
         while cursor < association.len() {
+            #[cfg(test)]
+            batch
+                .births_process_visits
+                .set(batch.births_process_visits.get().saturating_add(1));
             // A refusal may not stage a gap while the registration plan
             // retains its original positions: the next sibling still
             // needs that same unchanged index.
@@ -1892,6 +1987,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 unreachable!("only an early-refused birth skips its reservations");
             };
             let absence = slot.take_absence();
+            #[cfg(test)]
+            batch
+                .births_native_consumes
+                .set(batch.births_native_consumes.get().saturating_add(1));
             let witness = match consume(candidate, absence, input, binding, &proof, adapter) {
                 Ok(witness) => witness,
                 Err(reason) => {
@@ -1918,6 +2017,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         drop(registrations);
         let mut reoffers = Vec::new();
         for link in &association {
+            #[cfg(test)]
+            batch
+                .births_disclose_visits
+                .set(batch.births_disclose_visits.get().saturating_add(1));
             if let Some((caller, refusal)) = link.refusal {
                 match link.deferred {
                     Some((image, file)) => {

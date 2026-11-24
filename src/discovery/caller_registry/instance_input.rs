@@ -1709,6 +1709,15 @@ pub(super) struct InstanceState {
     /// First birth-registration `Capacity` arm plus the table sizes
     /// then (diagnostics only; set once, never authority).
     first_birth_capacity: Option<BirthCapacityLatch>,
+    /// Test-only per-walk visit counters (seal work bound): reseed
+    /// queue scans, cooldown ticks and image-router checks.
+    /// Production pays nothing.
+    #[cfg(test)]
+    reseed_queue_visits: std::cell::Cell<usize>,
+    #[cfg(test)]
+    cooldown_tick_visits: std::cell::Cell<usize>,
+    #[cfg(test)]
+    image_router_check_visits: std::cell::Cell<usize>,
 }
 
 impl Default for InstanceState {
@@ -1740,6 +1749,12 @@ impl Default for InstanceState {
             folded_instance_calls_refused: 0,
             registration_refused_callers: BTreeSet::new(),
             first_birth_capacity: None,
+            #[cfg(test)]
+            reseed_queue_visits: std::cell::Cell::new(0),
+            #[cfg(test)]
+            cooldown_tick_visits: std::cell::Cell::new(0),
+            #[cfg(test)]
+            image_router_check_visits: std::cell::Cell::new(0),
         }
     }
 }
@@ -2584,10 +2599,23 @@ impl CallerRegistry {
         // (fresh proof of health; no void needed), so the reseed queue
         // scan right after this tick can offer the fresh birth.
         let healthy = self.reseed_session_healthy();
+        #[cfg(test)]
+        let mut visited = 0usize;
         for record in self.instance_state.semantics.values_mut() {
+            #[cfg(test)]
+            {
+                visited += 1;
+            }
             record.feed.tick_reseed_cooldown();
             record.feed.lift_settled_stuck_bar(healthy);
         }
+        #[cfg(test)]
+        self.instance_state.cooldown_tick_visits.set(
+            self.instance_state
+                .cooldown_tick_visits
+                .get()
+                .saturating_add(visited),
+        );
     }
 
     fn queue_reseed_where(
@@ -2595,13 +2623,28 @@ impl CallerRegistry {
         mut eligible: impl FnMut(&InstanceSemanticRecord) -> bool,
     ) -> usize {
         let mut queued = 0usize;
+        #[cfg(test)]
+        let mut visited = 0usize;
         let ids: Vec<RegistryInstanceId> = self
             .instance_state
             .semantics
             .iter()
-            .filter(|(_, record)| eligible(record))
+            .filter(|(_, record)| {
+                #[cfg(test)]
+                {
+                    visited += 1;
+                }
+                eligible(record)
+            })
             .map(|(id, _)| *id)
             .collect();
+        #[cfg(test)]
+        self.instance_state.reseed_queue_visits.set(
+            self.instance_state
+                .reseed_queue_visits
+                .get()
+                .saturating_add(visited),
+        );
         for id in ids {
             let Some(record) = self.instance_state.records.get(&id) else {
                 continue;
@@ -2788,10 +2831,35 @@ impl CallerRegistry {
         routers: &[crate::discovery::instances::InstanceId],
     ) -> bool {
         self.instance_state.by_key.keys().any(|key| {
+            #[cfg(test)]
+            self.instance_state.image_router_check_visits.set(
+                self.instance_state
+                    .image_router_check_visits
+                    .get()
+                    .saturating_add(1),
+            );
             key.image.task_cookie == image.task_cookie
                 && key.image.exec_id == image.exec_id
                 && routers.contains(&key.router)
         })
+    }
+
+    /// Test-only reseed visit counts (seal work bound).
+    #[cfg(test)]
+    pub(crate) fn reseed_visits_for_test(&self) -> (usize, usize, usize) {
+        (
+            self.instance_state.reseed_queue_visits.get(),
+            self.instance_state.cooldown_tick_visits.get(),
+            self.instance_state.image_router_check_visits.get(),
+        )
+    }
+
+    /// Test-only: reset every reseed visit counter.
+    #[cfg(test)]
+    pub(crate) fn reset_reseed_visits_for_test(&self) {
+        self.instance_state.reseed_queue_visits.set(0);
+        self.instance_state.cooldown_tick_visits.set(0);
+        self.instance_state.image_router_check_visits.set(0);
     }
 
     /// Whether the drain would refuse a reseed onto this key's feed

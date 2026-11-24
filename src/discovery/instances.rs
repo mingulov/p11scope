@@ -866,6 +866,10 @@ pub(crate) struct InstanceRouter {
     /// coverage failure, proven absence or retirement drops it.
     era_carry: BTreeMap<(ImageKey, u32), Observed>,
     carry_ranges: usize,
+    /// Test-only count of observed keys the reseed re-arm scan
+    /// visited (seal work bound). Production pays nothing.
+    #[cfg(test)]
+    rearm_scan_visits: std::cell::Cell<usize>,
 }
 
 pub(crate) struct ObservationLoss {
@@ -950,6 +954,8 @@ impl InstanceRouter {
             miss_era_pending: false,
             era_carry: BTreeMap::new(),
             carry_ranges: 0,
+            #[cfg(test)]
+            rearm_scan_visits: std::cell::Cell::new(0),
         }
     }
 
@@ -1088,11 +1094,22 @@ impl InstanceRouter {
         if self.image_retired(key) {
             return 0;
         }
+        #[cfg(test)]
+        let mut visited = 0usize;
         let files: Vec<u32> = self
             .observed
             .keys()
-            .filter_map(|(owner, file)| (*owner == key).then_some(*file))
+            .filter_map(|(owner, file)| {
+                #[cfg(test)]
+                {
+                    visited += 1;
+                }
+                (*owner == key).then_some(*file)
+            })
             .collect();
+        #[cfg(test)]
+        self.rearm_scan_visits
+            .set(self.rearm_scan_visits.get().saturating_add(visited));
         let mut rearmed = 0;
         for file in files {
             self.arm_birth_retry((key, file));
@@ -1101,6 +1118,18 @@ impl InstanceRouter {
             }
         }
         rearmed
+    }
+
+    /// Test-only re-arm scan visits (seal work bound).
+    #[cfg(test)]
+    pub(crate) fn rearm_scan_visits_for_test(&self) -> usize {
+        self.rearm_scan_visits.get()
+    }
+
+    /// Test-only: reset the re-arm scan counter.
+    #[cfg(test)]
+    pub(crate) fn reset_rearm_scan_visits_for_test(&self) {
+        self.rearm_scan_visits.set(0);
     }
 
     /// Arm the birth retry for a key just sighted `New`. A mint is

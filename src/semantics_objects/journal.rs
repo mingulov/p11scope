@@ -2830,6 +2830,20 @@ pub(crate) struct JournalAdapter {
     /// per-bind work bound.
     #[cfg(test)]
     binding_resolutions: std::cell::Cell<usize>,
+    /// Test-only per-walk visit counters (seal work bound): each counts
+    /// retained rows the named walk reads. Production pays nothing.
+    #[cfg(test)]
+    sibling_probe_visits: std::cell::Cell<usize>,
+    #[cfg(test)]
+    fenced_sibling_visits: std::cell::Cell<usize>,
+    #[cfg(test)]
+    post_fence_visits: std::cell::Cell<usize>,
+    #[cfg(test)]
+    reseed_reset_visits: std::cell::Cell<usize>,
+    #[cfg(test)]
+    quarantine_candidate_visits: std::cell::Cell<usize>,
+    #[cfg(test)]
+    binding_list_visits: std::cell::Cell<usize>,
     /// Test-only one-shot: the next failure delivery replays as if a
     /// head's reducer reservation had already failed (the production
     /// `resource_failed` cursor state), so its heads dispose.
@@ -3061,6 +3075,18 @@ impl JournalAdapter {
             binding_latest: BTreeMap::new(),
             #[cfg(test)]
             binding_resolutions: std::cell::Cell::new(0),
+            #[cfg(test)]
+            sibling_probe_visits: std::cell::Cell::new(0),
+            #[cfg(test)]
+            fenced_sibling_visits: std::cell::Cell::new(0),
+            #[cfg(test)]
+            post_fence_visits: std::cell::Cell::new(0),
+            #[cfg(test)]
+            reseed_reset_visits: std::cell::Cell::new(0),
+            #[cfg(test)]
+            quarantine_candidate_visits: std::cell::Cell::new(0),
+            #[cfg(test)]
+            binding_list_visits: std::cell::Cell::new(0),
             #[cfg(test)]
             replay_resource_failure_once: false,
             tainted_images: Tracked::new(BTreeSet::new()),
@@ -3446,6 +3472,30 @@ impl JournalAdapter {
     #[cfg(test)]
     pub(crate) fn seal_apply_visits_for_test(&self) -> usize {
         self.seal_apply_visits.get()
+    }
+
+    /// Test-only per-walk visit counts (seal work bound).
+    #[cfg(test)]
+    pub(crate) fn seal_walk_visits_for_test(&self) -> (usize, usize, usize, usize, usize, usize) {
+        (
+            self.sibling_probe_visits.get(),
+            self.fenced_sibling_visits.get(),
+            self.post_fence_visits.get(),
+            self.reseed_reset_visits.get(),
+            self.quarantine_candidate_visits.get(),
+            self.binding_list_visits.get(),
+        )
+    }
+
+    /// Test-only: reset every per-walk visit counter.
+    #[cfg(test)]
+    pub(crate) fn reset_seal_walk_visits_for_test(&self) {
+        self.sibling_probe_visits.set(0);
+        self.fenced_sibling_visits.set(0);
+        self.post_fence_visits.set(0);
+        self.reseed_reset_visits.set(0);
+        self.quarantine_candidate_visits.set(0);
+        self.binding_list_visits.set(0);
     }
 
     /// Test-only: stage `rows` synthetic unconverted open entries cloned
@@ -7691,9 +7741,12 @@ impl JournalAdapter {
         }
         if fresh
             && let Some(siblings) = self.image_keys.get(&(key.cookie, key.exec))
-            && siblings
-                .iter()
-                .any(|sibling| sibling != &key && self.sibling_holds_unfenced_history(*sibling))
+            && siblings.iter().any(|sibling| {
+                #[cfg(test)]
+                self.sibling_probe_visits
+                    .set(self.sibling_probe_visits.get().saturating_add(1));
+                sibling != &key && self.sibling_holds_unfenced_history(*sibling)
+            })
         {
             return Err(AttestationRefusal::ImageSealed);
         }
@@ -7736,7 +7789,14 @@ impl JournalAdapter {
         #[cfg(test)]
         debug_assert_eq!(
             (live, latest),
-            self.binding_incarnations_by_scan(base),
+            {
+                // Oracle visits never count toward the production work
+                // bound: only a restored production scan may move it.
+                let saved = self.binding_list_visits.get();
+                let scanned = self.binding_incarnations_by_scan(base);
+                self.binding_list_visits.set(saved);
+                scanned
+            },
             "the binding index matches the image key list"
         );
         (live, latest)
@@ -7752,6 +7812,9 @@ impl JournalAdapter {
         let mut latest = None;
         if let Some(siblings) = self.image_keys.get(&(base.cookie, base.exec)) {
             for sibling in siblings {
+                #[cfg(test)]
+                self.binding_list_visits
+                    .set(self.binding_list_visits.get().saturating_add(1));
                 if !sibling.same_binding(&base) {
                     continue;
                 }
@@ -8108,6 +8171,9 @@ impl JournalAdapter {
         }
         self.image_keys.get(&image).is_some_and(|siblings| {
             siblings.iter().any(|key| {
+                #[cfg(test)]
+                self.quarantine_candidate_visits
+                    .set(self.quarantine_candidate_visits.get().saturating_add(1));
                 self.keys.get(key).is_some_and(|state| {
                     (state.refused || state.tainted || state.era_ended)
                         && self.quarantine_death_recorded(*key)
@@ -8188,6 +8254,9 @@ impl JournalAdapter {
             rv: admitted.s1_facts().rv,
         };
         self.open.values().any(|entry| {
+            #[cfg(test)]
+            self.post_fence_visits
+                .set(self.post_fence_visits.get().saturating_add(1));
             entry.begin_ordinal > *self.voided_through
                 && entry.end.is_some()
                 && entry.abandon.is_none()
@@ -8346,6 +8415,9 @@ impl JournalAdapter {
                 .get(&(key.cookie, key.exec))
                 .is_some_and(|siblings| {
                     siblings.iter().any(|sibling| {
+                        #[cfg(test)]
+                        self.fenced_sibling_visits
+                            .set(self.fenced_sibling_visits.get().saturating_add(1));
                         *sibling != key
                             && self.key_is_live(*sibling)
                             && self.keys.get(sibling).is_some_and(|state| {
@@ -11069,6 +11141,9 @@ impl JournalAdapter {
     pub(crate) fn clear_bootstraps_for_reseed(&mut self, cookie: u64, exec: u64) {
         if let Some(keys) = self.image_keys.get(&(cookie, exec)).cloned() {
             for key in keys {
+                #[cfg(test)]
+                self.reseed_reset_visits
+                    .set(self.reseed_reset_visits.get().saturating_add(1));
                 if let Some(state) = self.keys.edit().get_mut(&key) {
                     state.bootstraps.clear();
                 }
@@ -28461,6 +28536,252 @@ pub(crate) mod tests {
             ],
             "only the episode that refused reports its straddlers"
         );
+    }
+
+    /// Insert `n` dead sibling keys on the default image with distinct
+    /// routers (never the fixture binding's router), for seal work-bound
+    /// tests. Every sibling is refused, so no sibling predicate matches
+    /// and every walk visits all of them.
+    fn insert_dead_siblings(scene: &mut Scene, n: usize) {
+        let image = (COOKIE, EXEC);
+        for index in 0..n {
+            let key = JournalDomainKey {
+                domain_tag: 0,
+                caller: 0,
+                cookie: COOKIE,
+                exec: EXEC,
+                router: 1_000 + index as u64,
+                incarnation: 0,
+            };
+            let mut state = JournalDomainState::default();
+            state.refused = true;
+            scene.adapter.keys.edit().insert(key, state);
+            scene
+                .adapter
+                .image_keys
+                .edit()
+                .entry(image)
+                .or_default()
+                .push(key);
+        }
+    }
+
+    /// Fresh-bind sibling probe visits at most one 64-unit credit: 63
+    /// and 64 dead siblings pass, 65 fails until the probe is indexed.
+    #[test]
+    fn seal_walk_sibling_probe_visits_at_most_64() {
+        for siblings in [63usize, 64, 65] {
+            let mut scene = Scene::new(image_default());
+            insert_dead_siblings(&mut scene, siblings);
+            scene.adapter.reset_seal_walk_visits_for_test();
+            let admitted = scene.fixture.admit_function("C_CreateObject");
+            let _ = scene.adapter.probe_admitted_key(&admitted);
+            let (probe, _, _, _, _, _) = scene.adapter.seal_walk_visits_for_test();
+            assert!(
+                probe <= SCOPED_RECOVERY_SLICE,
+                "{siblings} dead siblings: probe visited {probe}, bound is {}",
+                SCOPED_RECOVERY_SLICE,
+            );
+        }
+    }
+
+    /// Fresh-bind fenced-sibling diagnostic visits at most one credit.
+    #[test]
+    fn seal_walk_fenced_sibling_visits_at_most_64() {
+        for siblings in [63usize, 64, 65] {
+            let mut scene = Scene::new(image_default());
+            insert_dead_siblings(&mut scene, siblings);
+            scene.adapter.reset_seal_walk_visits_for_test();
+            let admitted = scene.fixture.admit_function("C_CreateObject");
+            let _ = scene.adapter.bind_admitted_key(&admitted);
+            let (_, fenced, _, _, _, _) = scene.adapter.seal_walk_visits_for_test();
+            assert!(
+                fenced <= SCOPED_RECOVERY_SLICE,
+                "{siblings} dead siblings: fenced diagnostic visited {fenced}, bound is {}",
+                SCOPED_RECOVERY_SLICE,
+            );
+        }
+    }
+
+    /// Post-fence proof scan visits at most one credit: 65 staged
+    /// non-matching rows fail until the scan is indexed by identity.
+    #[test]
+    fn seal_walk_post_fence_proof_visits_at_most_64() {
+        use crate::kinds::function_id;
+        use p11scope_ebpf_common::object_journal::{JournalRecord, decode_journal_record};
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+        for rows in [63usize, 64, 65] {
+            let mut scene = Scene::new(image_default());
+            let create = function_id("C_CreateObject").expect("known function");
+            for sequence in 1..=rows as u64 {
+                let begin = begin_bytes(1, sequence, create, 0);
+                assert_eq!(
+                    scene.ingest(&begin),
+                    JournalDisposition::BeginAdmitted,
+                    "row {sequence} of {rows} ingests"
+                );
+            }
+            // An admitted return (END event) carries the fingerprint and
+            // return time the proof scan matches on: without them the
+            // scan exits early and the test would be vacuous.
+            let probe_begin = begin_bytes(9, 1, create, 0);
+            let probe_end = end_bytes(&probe_begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 100);
+            let JournalRecord::End(end) =
+                decode_journal_record(&probe_end, &scene.descriptors).expect("END")
+            else {
+                panic!("END decodes");
+            };
+            let admitted = scene
+                .fixture
+                .admit_original_event("C_CreateObject", end.payload_base().event);
+            assert!(
+                admitted.journal_call_fingerprint().is_some()
+                    && admitted.journal_return_ns().is_some(),
+                "the probe admission names return evidence"
+            );
+            scene.adapter.reset_seal_walk_visits_for_test();
+            let _ = scene.adapter.post_fence_claimable_proof(&admitted);
+            let (_, _, proof, _, _, _) = scene.adapter.seal_walk_visits_for_test();
+            assert!(
+                proof <= SCOPED_RECOVERY_SLICE,
+                "{rows} staged rows: proof scan visited {proof}, bound is {}",
+                SCOPED_RECOVERY_SLICE,
+            );
+        }
+    }
+
+    /// Per-image reseed reset visits at most one credit: 65 retained
+    /// keys fail until the reset is a generation bump.
+    #[test]
+    fn seal_walk_reseed_reset_visits_at_most_64() {
+        for keys in [63usize, 64, 65] {
+            let mut adapter = JournalAdapter::new(JournalLimits::policy());
+            let image = (COOKIE, EXEC);
+            for index in 0..keys {
+                let key = JournalDomainKey {
+                    domain_tag: 0,
+                    caller: 0,
+                    cookie: COOKIE,
+                    exec: EXEC,
+                    router: index as u64,
+                    incarnation: 0,
+                };
+                adapter
+                    .keys
+                    .edit()
+                    .insert(key, JournalDomainState::default());
+                adapter
+                    .image_keys
+                    .edit()
+                    .entry(image)
+                    .or_default()
+                    .push(key);
+            }
+            adapter.reset_seal_walk_visits_for_test();
+            adapter.clear_bootstraps_for_reseed(COOKIE, EXEC);
+            let (_, _, _, reset, _, _) = adapter.seal_walk_visits_for_test();
+            assert!(
+                reset <= SCOPED_RECOVERY_SLICE,
+                "{keys} retained keys: reseed reset visited {reset}, bound is {}",
+                SCOPED_RECOVERY_SLICE,
+            );
+        }
+    }
+
+    /// Quarantine recovery scan visits at most one credit.
+    #[test]
+    fn seal_walk_quarantine_candidate_visits_at_most_64() {
+        for keys in [63usize, 64, 65] {
+            let mut adapter = JournalAdapter::new(JournalLimits::policy());
+            let image = (COOKIE, EXEC);
+            adapter.tainted_images.edit().insert(image);
+            *adapter.voided_through.edit() = 1;
+            for index in 0..keys {
+                let key = JournalDomainKey {
+                    domain_tag: 0,
+                    caller: 0,
+                    cookie: COOKIE,
+                    exec: EXEC,
+                    router: index as u64,
+                    incarnation: 0,
+                };
+                let mut state = JournalDomainState::default();
+                state.refused = true;
+                adapter.keys.edit().insert(key, state);
+                adapter
+                    .image_keys
+                    .edit()
+                    .entry(image)
+                    .or_default()
+                    .push(key);
+            }
+            adapter.reset_seal_walk_visits_for_test();
+            let _ = adapter.quarantine_recovery_candidate(image);
+            let (_, _, _, _, candidate, _) = adapter.seal_walk_visits_for_test();
+            assert!(
+                candidate <= SCOPED_RECOVERY_SLICE,
+                "{keys} retained keys: quarantine scan visited {candidate}, bound is {}",
+                SCOPED_RECOVERY_SLICE,
+            );
+        }
+    }
+
+    /// Binding resolution never walks the image key list (F5): with 65
+    /// retained incarnations the indexed path visits zero list rows.
+    /// A restored production scan moves the counter and fails this.
+    #[test]
+    fn seal_walk_binding_resolution_visits_no_list_rows() {
+        let mut adapter = JournalAdapter::new(JournalLimits::policy());
+        let image = (COOKIE, EXEC);
+        let base = JournalDomainKey {
+            domain_tag: 7,
+            caller: 9,
+            cookie: COOKIE,
+            exec: EXEC,
+            router: 3,
+            incarnation: 0,
+        };
+        for incarnation in 0..65u32 {
+            let key = JournalDomainKey {
+                incarnation,
+                ..base
+            };
+            let mut state = JournalDomainState::default();
+            // All dead except the latest, which stays live.
+            state.refused = incarnation < 64;
+            adapter.keys.edit().insert(key, state);
+            adapter
+                .image_keys
+                .edit()
+                .entry(image)
+                .or_default()
+                .push(key);
+        }
+        let latest = JournalDomainKey {
+            incarnation: 64,
+            ..base
+        };
+        adapter.binding_latest.insert(base, latest);
+        adapter.reset_seal_walk_visits_for_test();
+        let (live, found) = adapter.binding_incarnations(base);
+        assert_eq!((live, found), (Some(latest), Some(latest)));
+        let (_, _, _, _, _, list) = adapter.seal_walk_visits_for_test();
+        assert_eq!(
+            list, 0,
+            "65 retained incarnations: indexed resolution must visit no list rows"
+        );
+        // The all-dead twin resolves to the latest with no live key.
+        adapter
+            .keys
+            .edit()
+            .get_mut(&latest)
+            .expect("latest")
+            .refused = true;
+        adapter.reset_seal_walk_visits_for_test();
+        let (live, found) = adapter.binding_incarnations(base);
+        assert_eq!((live, found), (None, Some(latest)));
+        let (_, _, _, _, _, list) = adapter.seal_walk_visits_for_test();
+        assert_eq!(list, 0, "all-dead twin visits no list rows either");
     }
 
     /// Doom a minted successor on its first seal (no validated birth):

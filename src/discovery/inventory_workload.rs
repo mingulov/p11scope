@@ -879,9 +879,7 @@ impl ProcessSource for ScriptedSource {
         self.state
             .borrow()
             .get(&pid)
-            .is_some_and(|process| {
-                process.alive && process.readable && process.start_time == pin.1
-            })
+            .is_some_and(|process| process.alive && process.readable && process.start_time == pin.1)
     }
 }
 

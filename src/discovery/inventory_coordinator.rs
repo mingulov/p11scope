@@ -46292,8 +46292,9 @@ int main(void) {
             native.read(Vec::new());
             let staged = native.scene.coordinator.registry.staged_gaps_for_test();
             assert!(
-                !staged[staged_before..].iter().any(|gap| gap.subject
-                    == "exit resolution waiting on queued hooks"),
+                !staged[staged_before..]
+                    .iter()
+                    .any(|gap| gap.subject == "exit resolution waiting on queued hooks"),
                 "no stale wait leaks past the drain: {:?}",
                 &staged[staged_before..]
             );
@@ -46336,13 +46337,15 @@ int main(void) {
             let staged = native.scene.coordinator.registry.staged_gaps_for_test();
             let fresh = &staged[staged_before..];
             assert!(
-                fresh.iter().any(|gap| gap.subject == "holder scan pool exhausted"
-                    && gap.budget
-                        == Some(crate::discovery::caller_registry::BudgetRefusal {
-                            resource: "holder_scan_units",
-                            limit: 65_536,
-                            requested: 65_537,
-                        })),
+                fresh
+                    .iter()
+                    .any(|gap| gap.subject == "holder scan pool exhausted"
+                        && gap.budget
+                            == Some(crate::discovery::caller_registry::BudgetRefusal {
+                                resource: "holder_scan_units",
+                                limit: 65_536,
+                                requested: 65_537,
+                            })),
                 "a charge failure files the budgeted gap: {fresh:?}"
             );
         });
@@ -46387,10 +46390,7 @@ int main(void) {
                         .contains_key(id)
                 })
                 .count();
-            assert_eq!(
-                stamped, 58,
-                "the blind drain's visits cost one fresh stamp"
-            );
+            assert_eq!(stamped, 58, "the blind drain's visits cost one fresh stamp");
         });
     }
 
@@ -46467,8 +46467,7 @@ int main(void) {
             let (mut native, _) = hot_pid_system_native(1100);
             let mut queued = Vec::new();
             for batch in 0..7 {
-                let hooks: Vec<u64> =
-                    (0..70).map(|i| 200_000 + batch * 1_000 + i).collect();
+                let hooks: Vec<u64> = (0..70).map(|i| 200_000 + batch * 1_000 + i).collect();
                 let at = native.stamps.tick();
                 native.stage(NativeBatch::Lifecycle(leader_exit_drain_many(
                     native.domain,
@@ -46512,8 +46511,7 @@ int main(void) {
             );
             native.scene.coordinator.commit_batch(false).unwrap();
             for batch in 0..8 {
-                let storm: Vec<u64> =
-                    (0..256).map(|i| 200_000 + batch * 1_000 + i).collect();
+                let storm: Vec<u64> = (0..256).map(|i| 200_000 + batch * 1_000 + i).collect();
                 let at = native.stamps.tick();
                 native.stage(NativeBatch::Lifecycle(leader_exit_drain_many(
                     native.domain,

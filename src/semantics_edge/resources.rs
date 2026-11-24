@@ -186,6 +186,10 @@ impl SemanticResourceReserver {
     /// the held charge is credited therefore never needs both at once.
     /// A refusal hands the held lease back unchanged; a lease from
     /// another pool is kept apart and refunds only after success.
+    /// Test-only: the bounded void seam resizes aborted takeovers;
+    /// production start/poll reserve directly (a recovery never
+    /// stands at start — Voiding always completes first).
+    #[cfg(test)]
     pub(crate) fn resize(
         &self,
         held: Option<ResourceLease>,

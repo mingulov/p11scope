@@ -423,7 +423,11 @@ impl JointCaptureOwner {
         // A stream break aborts any scoped recovery in progress (its
         // lease refunds on drop; the stream void below subsumes the
         // partial fence/wipe/preserve work) and, after the same
-        // preflight, subsumes any pending scoped break.
+        // preflight, subsumes any pending scoped break. The machine
+        // never reaches here with a recovery standing (Voiding
+        // always completes first), so the abort only defends
+        // non-machine callers; the bounded test seam carries the
+        // lane's lease-resizing takeover instead.
         if self.adapter.stream_broken {
             self.adapter.scoped_recovery = None;
             let bytes =

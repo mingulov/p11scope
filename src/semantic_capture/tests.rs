@@ -5952,9 +5952,13 @@ fn joint_birth_witness_capture_latches_refuse_finally() {
             (
                 (false, true, false),
                 Err(Refusal::AuthorityExhausted),
-                Ok(())
+                Err(Refusal::AuthorityExhausted)
             ),
-            ((false, false, true), Err(Refusal::CoverageFailed), Ok(())),
+            (
+                (false, false, true),
+                Err(Refusal::CoverageFailed),
+                Err(Refusal::CoverageFailed)
+            ),
             (
                 (true, true, true),
                 Err(Refusal::Stopped),
@@ -5963,7 +5967,7 @@ fn joint_birth_witness_capture_latches_refuse_finally() {
             (
                 (false, true, true),
                 Err(Refusal::AuthorityExhausted),
-                Ok(())
+                Err(Refusal::AuthorityExhausted)
             ),
         ],
         "each latch names its own final refusal; stop outranks the rest"

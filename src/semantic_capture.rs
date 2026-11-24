@@ -3126,9 +3126,9 @@ impl SemanticCapture {
     /// the contention retry.
     fn absence_acquire_gate(&self) -> Result<(), crate::attach::BirthObservationRefusal> {
         use crate::attach::BirthObservationRefusal as Refusal;
-        if self.stopped {
-            return Err(Refusal::Stopped);
-        }
+        // The final latches decide before any proof I/O, so a later
+        // I/O failure can never mask them as retryable contention.
+        self.capture_ended_refusal()?;
         if !self.awaiting.is_empty() || !self.jobs.is_empty() {
             return Err(Refusal::CurrentPartition);
         }
@@ -3213,14 +3213,12 @@ impl SemanticCapture {
         })
     }
 
-    fn birth_health_with(
-        &self,
-        io: &mut impl CaptureIo,
-    ) -> Result<(), crate::attach::BirthObservationRefusal> {
+    /// The three latches never clear, so each is a final refusal with
+    /// its own slot (checked in this order); only a domain or health
+    /// mismatch, which a later tick can catch up, stays the contention
+    /// retry. One owner for every birth gate.
+    fn capture_ended_refusal(&self) -> Result<(), crate::attach::BirthObservationRefusal> {
         use crate::attach::BirthObservationRefusal as Refusal;
-        // The three latches never clear, so each is a final refusal
-        // with its own slot; only a domain or health mismatch (which a
-        // later tick can catch up) stays the contention retry.
         if self.stopped {
             return Err(Refusal::Stopped);
         }
@@ -3230,6 +3228,15 @@ impl SemanticCapture {
         if self.image_failed {
             return Err(Refusal::CoverageFailed);
         }
+        Ok(())
+    }
+
+    fn birth_health_with(
+        &self,
+        io: &mut impl CaptureIo,
+    ) -> Result<(), crate::attach::BirthObservationRefusal> {
+        use crate::attach::BirthObservationRefusal as Refusal;
+        self.capture_ended_refusal()?;
         if io.domain() != Some(self.router.domain()) {
             return Err(Refusal::CurrentPartition);
         }

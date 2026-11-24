@@ -10971,7 +10971,9 @@ impl JournalAdapter {
                         index += 1;
                         self.visit_seal_refused(scan, image, &refused);
                         if scan.facts.birth_mismatch {
-                            scan.facts.straddlers_unscanned =
+                            // Kept when the deciding row itself left
+                            // the count unknown.
+                            scan.facts.straddlers_unscanned |=
                                 self.inherited_fallback_fence(key).is_some()
                                     && index < self.refused.len();
                             break;
@@ -11218,6 +11220,22 @@ impl JournalAdapter {
         let converts = attribution == CallAttribution::Mine;
         if stamp.mode == SealScanMode::Seal && refused.cut <= birth_cut && converts {
             facts.birth_mismatch = true;
+            // A paid refused BEGIN at or below the predecessor's
+            // fallback fence is classified like an open row, with its
+            // only retained terminal evidence (a corroborated ordinary
+            // return; a refused row keeps no END or ABANDON): a return
+            // after the fence straddles exactly, a return at or below
+            // it does not, and no return leaves it unknown, so the
+            // count becomes a lower bound instead of an exact zero.
+            if let Some(fence) = self.inherited_fallback_fence(key)
+                && refused.cut <= fence
+            {
+                match refused.corroborated_return {
+                    Some(at) if at > fence => facts.straddler_begin = Some(refused.cut),
+                    Some(_) => {}
+                    None => facts.straddlers_unscanned = true,
+                }
+            }
             return;
         }
         if within {
@@ -30042,6 +30060,15 @@ pub(crate) mod tests {
         /// refused scan decides on the first with the second
         /// unvisited (no open straddler counted, a lower bound).
         TwoRefused,
+        /// One capacity-refused BEGIN before the fence, its
+        /// corroborated return after it: an exact straddler.
+        RefusedReturnedAfter,
+        /// One capacity-refused BEGIN and its corroborated return both
+        /// before the fence: exactly no straddler.
+        RefusedReturnedBefore,
+        /// One capacity-refused BEGIN before the fence with no return
+        /// seen: unknown, so zero is only a lower bound.
+        RefusedUnreturned,
     }
 
     /// Run one straddle shape: returns the seal's gap, the successor's
@@ -30067,7 +30094,13 @@ pub(crate) mod tests {
         let create = function_id("C_CreateObject");
         let call = begin_bytes(1, 3, create, 0);
         let begin_at = scene.adapter.consumed_through + 1;
-        if shape == StraddleShape::TwoRefused {
+        let refused_single = matches!(
+            shape,
+            StraddleShape::RefusedReturnedAfter
+                | StraddleShape::RefusedReturnedBefore
+                | StraddleShape::RefusedUnreturned
+        );
+        if shape == StraddleShape::TwoRefused || refused_single {
             scene.adapter.limits.open_calls = scene.adapter.open.len();
         }
         if shape != StraddleShape::BeginAbove {
@@ -30100,6 +30133,20 @@ pub(crate) mod tests {
         if shape == StraddleShape::EndedBefore {
             scene.ingest(&end_bytes(&call, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 70));
         }
+        if refused_single {
+            assert_eq!(
+                scene.adapter.refused.len(),
+                1,
+                "{shape:?}: control: refused"
+            );
+        }
+        if shape == StraddleShape::RefusedReturnedBefore {
+            scene.ingest_ordinary(ordinary_for(&call, FAILED));
+            assert!(
+                scene.adapter.refused[0].corroborated_return.is_some(),
+                "control: the refused row's return is corroborated"
+            );
+        }
         if shape == StraddleShape::ReturnedBefore {
             assert_eq!(
                 scene.ingest_ordinary(ordinary_for(&call, FAILED)),
@@ -30129,6 +30176,15 @@ pub(crate) mod tests {
         let reborn = scene.attest_function("C_CreateObject");
         assert_eq!(reborn.key.incarnation, proof.key.incarnation + 1);
         let mut birth_cut = fence;
+        if shape == StraddleShape::RefusedReturnedAfter {
+            scene.ingest_ordinary(ordinary_for(&call, FAILED));
+            assert!(
+                scene.adapter.refused[0]
+                    .corroborated_return
+                    .is_some_and(|at| at > fence),
+                "control: the refused row's return lands after the fence"
+            );
+        }
         if shape == StraddleShape::ReturnedAfter {
             assert_eq!(
                 scene.ingest_ordinary(ordinary_for(&call, FAILED)),
@@ -30149,6 +30205,9 @@ pub(crate) mod tests {
                 | StraddleShape::ReturnedBefore
                 | StraddleShape::ReturnedAfter
                 | StraddleShape::TwoRefused
+                | StraddleShape::RefusedReturnedAfter
+                | StraddleShape::RefusedReturnedBefore
+                | StraddleShape::RefusedUnreturned
         ) {
             scene.ingest(&end_bytes(&call, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 70));
         }
@@ -30280,7 +30339,14 @@ pub(crate) mod tests {
     /// deciding refused one).
     #[test]
     fn object_journal_refused_rows_past_the_decision_bound_the_count() {
-        let rows = [StraddleShape::OpenThenRefused, StraddleShape::TwoRefused].map(|shape| {
+        let rows = [
+            StraddleShape::OpenThenRefused,
+            StraddleShape::TwoRefused,
+            StraddleShape::RefusedReturnedAfter,
+            StraddleShape::RefusedReturnedBefore,
+            StraddleShape::RefusedUnreturned,
+        ]
+        .map(|shape| {
             let (gap, straddler, _, decision, begin_at) = fallback_fence_straddle(shape, false);
             (
                 shape,
@@ -30296,6 +30362,9 @@ pub(crate) mod tests {
             [
                 (OpenThenRefused, mismatch, Some(true), (1, true)),
                 (TwoRefused, mismatch, None, (0, true)),
+                (RefusedReturnedAfter, mismatch, Some(true), (1, false)),
+                (RefusedReturnedBefore, mismatch, None, (0, false)),
+                (RefusedUnreturned, mismatch, None, (0, true)),
             ],
             "an unvisited refused row past the decision is a possible straddler"
         );

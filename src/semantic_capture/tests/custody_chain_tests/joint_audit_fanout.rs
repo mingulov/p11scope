@@ -10957,6 +10957,33 @@ fn joint_nonresumable_void_records_no_below_fence_deferral() {
         0,
         "the FaultChanged void ended every Joint feed"
     );
+    // A loss close never fences through the fallback hook: no
+    // fallback fence and no fallback-fence gap.
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .fallback_fence_count_for_test(),
+        0,
+        "the FaultChanged loss close records no fallback fence"
+    );
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .staged_gaps_for_test()
+            .iter()
+            .all(|gap| gap.subject
+                != crate::semantics_objects::journal::joint_audit::FALLBACK_FENCED_SUBJECT),
+        "a loss close names no fallback fence"
+    );
     // Second round: clean-point calls refuse below the fence on a
     // segment that can never resume. A third round flushes anything
     // the second round's commit staged into the published set, so
@@ -21897,6 +21924,14 @@ fn joint_machine_rearm_fences_spanned_key_tracking_for_rebirth() {
         Err(BirthRefusal::BelowVoidFence),
         "a birth inside the lost window refuses"
     );
+    // The resumable fallback close went through the delivery arm's
+    // R10 hook and fenced no key there: only the void's fence holds.
+    assert_eq!(
+        adapter.fallback_fence_count_for_test(),
+        0,
+        "a resumable fallback close records no fallback fence"
+    );
+    assert_eq!(adapter.fallback_fence_for_test(&proof), None);
     assert_ne!(
         BootstrapReceipt::attest(
             adapter,
@@ -41218,9 +41253,38 @@ fn joint_reoffer_evicts_unregistered_key() {
 /// witnesses no staging can ever consume.
 #[test]
 fn joint_birth_refuses_doomed_segment_before_install() {
+    assert_eq!(
+        doomed_segment_birth_refusals(None),
+        vec!["joint_birth_install_segment_unresumable".to_string()],
+        "the doomed birth names its install-time refusal exactly once"
+    );
+}
+
+/// The same doomed birth while the adapter's successor decision holds
+/// a fallback backoff on the proof's key: the probe names the backoff
+/// (`successor_backoff`) instead of the plain doom, and once the wait
+/// is served the same birth names the plain doom again.
+#[test]
+fn joint_birth_names_successor_backoff_before_install() {
+    assert_eq!(
+        doomed_segment_birth_refusals(Some(5)),
+        vec!["joint_birth_install_successor_backoff".to_string()],
+        "a standing backoff names the wait, exactly once"
+    );
+    assert_eq!(
+        doomed_segment_birth_refusals(Some(0)),
+        vec!["joint_birth_install_segment_unresumable".to_string()],
+        "a served backoff names the plain doom"
+    );
+}
+
+/// Drive one doomed same-proof birth through `prepare_joint_births`,
+/// optionally with a fallback fence of `backoff` passes posed on the
+/// doomed proof's key; returns the birth-unavailable gap reasons.
+fn doomed_segment_birth_refusals(backoff: Option<u32>) -> Vec<String> {
     use crate::inventory_present::JOINT_BIRTH_UNAVAILABLE_SUBJECT;
     use crate::inventory_semantics::RetainedJointBirths;
-    use crate::semantics_objects::journal::{BirthKind, BootstrapReceipt};
+    use crate::semantics_objects::journal::{BirthKind, BootstrapReceipt, FallbackFence};
 
     let image = ImageIdentity {
         task_cookie: 71,
@@ -41274,6 +41338,22 @@ fn joint_birth_refuses_doomed_segment_before_install() {
         .coordinator
         .registry_mut()
         .pose_fallback_segment_for_test(&key, false, doomed);
+    if let Some(wait) = backoff {
+        scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture_mut()
+            .adapter_mut()
+            .pose_fallback_fence_for_test(
+                &proof,
+                FallbackFence {
+                    fence: 7,
+                    chain: 1,
+                    wait,
+                },
+            );
+    }
     let installed_before: usize = scene.real.scene.coordinator.joint_births_installed() as usize;
     let mut births = RetainedJointBirths::new();
     let h0 = scene.real.h0.clone();
@@ -41320,22 +41400,112 @@ fn joint_birth_refuses_doomed_segment_before_install() {
         0,
         "no witness retains for the doomed birth"
     );
-    let doomed_gaps: Vec<_> = scene
+    scene
         .real
         .scene
         .coordinator
         .registry()
         .staged_gaps_for_test()
         .into_iter()
-        .filter(|gap| {
-            gap.subject == JOINT_BIRTH_UNAVAILABLE_SUBJECT
-                && gap.reason == "joint_birth_install_segment_unresumable"
-        })
-        .collect();
+        .filter(|gap| gap.subject == JOINT_BIRTH_UNAVAILABLE_SUBJECT)
+        .map(|gap| gap.reason)
+        .collect()
+}
+
+/// The machine's Births arm is the only pass unit that drains a
+/// fallback successor backoff (`machine.rs`, the
+/// `tick_fallback_backoff` call beside `tick_reseed_cooldowns`): each
+/// completed Births pass takes exactly one pass off a posed wait, no
+/// other phase does, and the wait ends at zero (the backoff then no
+/// longer withholds a successor). Without the tick the wait never
+/// drains and the binding never mints.
+#[test]
+fn joint_machine_births_pass_drains_fallback_backoff() {
+    use crate::semantics_objects::journal::FallbackFence;
+    const WAIT: u32 = 3;
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    let pid = std::process::id();
+    fixture.scene.push(pid, 0, "C_SignInit", 2);
+    fixture.reach_phase("Births");
+    fixture.reach_phase("Audited");
+    let (_, proofs) = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .invocation_claims_for_test();
+    let proof = proofs.first().expect("a live claim names a proof").1;
+    let posed = FallbackFence {
+        fence: 1,
+        chain: 1,
+        wait: WAIT,
+    };
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture_mut()
+        .adapter_mut()
+        .pose_fallback_fence_for_test(&proof, posed);
+    let read = |fixture: &MachineScene| {
+        let adapter = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter();
+        (
+            adapter.fallback_fence_for_test(&proof),
+            adapter.successor_backoff_for(&proof),
+        )
+    };
+    let mut births_passes = 0u32;
+    let mut trace = Vec::new();
+    for round in 0..(WAIT + 2) {
+        fixture
+            .scene
+            .push(pid, 0, "C_SignInit", 10 + u64::from(round));
+        let mut published = false;
+        for _ in 0..512 {
+            let before = fixture.machine.diagnostic_snapshot_for_test().0;
+            let progress = fixture.service(1).expect("the healthy pass never refuses");
+            let after = fixture.machine.diagnostic_snapshot_for_test().0;
+            if before == "Births" && after != "Births" {
+                births_passes += 1;
+            }
+            let left = WAIT.saturating_sub(births_passes);
+            assert_eq!(
+                read(&fixture),
+                (
+                    Some(FallbackFence {
+                        wait: left,
+                        ..posed
+                    }),
+                    (left > 0).then_some(left)
+                ),
+                "exactly one pass per completed Births arm ({before} -> {after})"
+            );
+            if progress == crate::inventory_semantics::JointServiceProgress::Published {
+                published = true;
+                break;
+            }
+        }
+        assert!(published, "round {round} publishes");
+        trace.push(births_passes);
+    }
+    assert!(
+        births_passes > WAIT,
+        "the rounds ran more Births passes than the wait: {trace:?}"
+    );
     assert_eq!(
-        doomed_gaps.len(),
-        1,
-        "the doomed birth names its install-time refusal exactly once"
+        read(&fixture),
+        (Some(FallbackFence { wait: 0, ..posed }), None),
+        "the served backoff no longer withholds a successor"
     );
 }
 

@@ -335,6 +335,16 @@ enum ConsumerState {
 /// key and created the successor at the close's frontier.
 pub(crate) const FALLBACK_FENCED_SUBJECT: &str = "joint fallback fence";
 
+/// Whether one completed failure delivery is a proof-destroying
+/// fallback close (ruling R10): a fallback (never a loss close, whose
+/// void already fences its key and records no backoff) that ended a
+/// segment which can never resume. A resumable fallback keeps the key
+/// unfenced, so its rebirth at the fence resumes past the loss.
+fn fallback_close_destroys_proof(applied: &FailureApplyOutcome, gap: JournalGap) -> bool {
+    matches!(applied, FailureApplyOutcome::FellBack { .. })
+        && !crate::semantics_key_use::segment_resumable_after(gap)
+}
+
 /// Gap subject for a parked stuck consumer's forced-fallback
 /// degrade: the watchdog parked the consumer past its retry stall
 /// with counted loss instead of tripping the lane.
@@ -2746,8 +2756,7 @@ impl IngestedJointQuantum {
                 // later same-domain birth until some later void fences
                 // the dead key. The adapter decides; the close names the
                 // decision and the calls it disposed in one gap.
-                if matches!(applied, FailureApplyOutcome::FellBack { .. })
-                    && !crate::semantics_key_use::segment_resumable_after(stuck_gap)
+                if fallback_close_destroys_proof(&applied, stuck_gap)
                     && let Some(decision) =
                         adapter.fence_destroyed_proof(&target.bootstrap().proof(), self.frontier.0)
                 {
@@ -3055,6 +3064,7 @@ impl IngestedJointQuantum {
 pub(crate) mod tests {
     use super::super::{JournalGap, ObjectEffects, SealFailure, SealFailureScope};
     use super::failure_rank;
+    use super::{FailureApplyOutcome, fallback_close_destroys_proof};
 
     /// Failure selection ranks a transient unknown take below real
     /// endings: a transient take failure never masks a fallback or
@@ -3199,5 +3209,88 @@ pub(crate) mod tests {
             "zero budget with no spend stays stuck"
         );
         assert!(!failure_yielded_is_progress(10, 10), "no spend stays stuck");
+    }
+
+    /// The R10 hook fires on exactly one completed shape: a fallback
+    /// on a gap that can never resume. Every gap meets both outcomes;
+    /// the expected set is the exact non-resumable list, so dropping
+    /// either conjunct (the loss-close guard or the resumability
+    /// guard) or widening the outcome flips a row.
+    #[test]
+    fn fallback_close_destroys_proof_only_on_nonresumable_fallback() {
+        use JournalGap::*;
+        let gaps = [
+            FaultChanged,
+            FaultUnreadable,
+            FaultSaturated,
+            Malformed,
+            CounterUnprovable,
+            ResourceUnavailable,
+            H3Pending,
+            H3Loss,
+            AdapterInvalidated,
+            DomainTainted,
+            ImageTainted,
+            FrontierRegression,
+            BootstrapMismatch,
+            BoundNotReady,
+            ModelRefused,
+            DomainEnded,
+            ClosureStale,
+            Stopped,
+            DrainMismatch,
+            H3Exhausted,
+            Discarded,
+            CutExhausted,
+            ClaimUnmatched,
+            IngestBreakLoss,
+            PregrantNonAdmission,
+            PregrantRawLoss,
+        ];
+        // Exhaustive: a new gap variant must join the table.
+        for gap in gaps {
+            match gap {
+                FaultChanged | FaultUnreadable | FaultSaturated | Malformed | CounterUnprovable
+                | ResourceUnavailable | H3Pending | H3Loss | AdapterInvalidated | DomainTainted
+                | ImageTainted | FrontierRegression | BootstrapMismatch | BoundNotReady
+                | ModelRefused | DomainEnded | ClosureStale | Stopped | DrainMismatch
+                | H3Exhausted | Discarded | CutExhausted | ClaimUnmatched | IngestBreakLoss
+                | PregrantNonAdmission | PregrantRawLoss => {}
+            }
+        }
+        let fires = |applied: FailureApplyOutcome| {
+            gaps.iter()
+                .copied()
+                .filter(|gap| fallback_close_destroys_proof(&applied, *gap))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            fires(FailureApplyOutcome::FellBack { replayed: 3 }),
+            vec![
+                FaultChanged,
+                FaultUnreadable,
+                FaultSaturated,
+                AdapterInvalidated,
+                DomainTainted,
+                ImageTainted,
+                BootstrapMismatch,
+                DomainEnded,
+                Stopped,
+            ],
+            "a fallback fences exactly on the non-resumable gaps"
+        );
+        assert_eq!(
+            fires(FailureApplyOutcome::Degraded { disposed: 3 }),
+            Vec::<JournalGap>::new(),
+            "a loss close never fences through the fallback hook"
+        );
+        assert_eq!(
+            fires(FailureApplyOutcome::Retried),
+            Vec::<JournalGap>::new()
+        );
+        assert_eq!(
+            fires(FailureApplyOutcome::HeldForCompleteness),
+            Vec::<JournalGap>::new()
+        );
     }
 }

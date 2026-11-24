@@ -1408,7 +1408,7 @@ impl SealBootstrapCounts {
     /// variant. A new variant extends this count, the name table and
     /// the index match together (the index match is exhaustive, so a
     /// new variant fails to compile until it is placed).
-    pub(crate) const TAKE_ARMS: usize = 22;
+    pub(crate) const TAKE_ARMS: usize = 25;
     /// Re-verify-failure slots: one per `BirthRefusal` variant,
     /// with the same extend-together rule.
     pub(crate) const REVERIFY_ARMS: usize = 8;
@@ -1436,6 +1436,9 @@ impl SealBootstrapCounts {
         "WitnessStale",
         "TakeDeadline",
         "SessionBorrowed",
+        "Stopped",
+        "AuthorityExhausted",
+        "CoverageFailed",
     ];
     /// Re-verify-failure slot names in index order.
     const REVERIFY_ARM_NAMES: [&'static str; Self::REVERIFY_ARMS] = [
@@ -1476,6 +1479,9 @@ impl SealBootstrapCounts {
             WitnessStale => 19,
             TakeDeadline => 20,
             SessionBorrowed => 21,
+            Stopped => 22,
+            AuthorityExhausted => 23,
+            CoverageFailed => 24,
         }
     }
 
@@ -35538,6 +35544,9 @@ pub(crate) mod tests {
             Take::WitnessStale,
             Take::TakeDeadline,
             Take::SessionBorrowed,
+            Take::Stopped,
+            Take::AuthorityExhausted,
+            Take::CoverageFailed,
         ];
         assert_eq!(takes.len(), SealBootstrapCounts::TAKE_ARMS);
         let mut seen = [false; SealBootstrapCounts::TAKE_ARMS];
@@ -35589,6 +35598,11 @@ pub(crate) mod tests {
                 Take::SessionBorrowed => {
                     assert_eq!((index, name), (21, Some("SessionBorrowed")))
                 }
+                Take::Stopped => assert_eq!((index, name), (22, Some("Stopped"))),
+                Take::AuthorityExhausted => {
+                    assert_eq!((index, name), (23, Some("AuthorityExhausted")))
+                }
+                Take::CoverageFailed => assert_eq!((index, name), (24, Some("CoverageFailed"))),
             }
         }
         assert!(
@@ -36850,6 +36864,9 @@ pub(crate) mod tests {
             Refusal::RowUnreadable,
             Refusal::MarkerNotReady,
             Refusal::CustodyLost,
+            Refusal::Stopped,
+            Refusal::AuthorityExhausted,
+            Refusal::CoverageFailed,
         ] {
             assert_eq!(
                 failure(JournalGap::BootstrapMismatch, Some(refusal)).delivery_disposition(),

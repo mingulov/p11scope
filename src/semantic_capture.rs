@@ -3068,9 +3068,7 @@ impl SemanticCapture {
         adapter: &mut JournalAdapter,
     ) -> Result<CommittedAbsenceBirth, crate::attach::BirthObservationRefusal> {
         use crate::attach::BirthObservationRefusal as Refusal;
-        if !self.awaiting.is_empty() || !self.jobs.is_empty() || self.stopped {
-            return Err(Refusal::CurrentPartition);
-        }
+        self.absence_acquire_gate()?;
         let producers = session.drain_producers().ok_or(Refusal::StreamCut)?;
         let before = session
             .event_drain()
@@ -3121,6 +3119,20 @@ impl SemanticCapture {
             self.router.end_birth_retry(binding.image(), slot);
         }
         committed
+    }
+
+    /// The idle gate of an absence acquisition: a stopped capture is
+    /// final (no later acquisition can succeed); a busy H0 owner is
+    /// the contention retry.
+    fn absence_acquire_gate(&self) -> Result<(), crate::attach::BirthObservationRefusal> {
+        use crate::attach::BirthObservationRefusal as Refusal;
+        if self.stopped {
+            return Err(Refusal::Stopped);
+        }
+        if !self.awaiting.is_empty() || !self.jobs.is_empty() {
+            return Err(Refusal::CurrentPartition);
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3206,11 +3218,19 @@ impl SemanticCapture {
         io: &mut impl CaptureIo,
     ) -> Result<(), crate::attach::BirthObservationRefusal> {
         use crate::attach::BirthObservationRefusal as Refusal;
-        if self.stopped
-            || self.exhausted
-            || self.image_failed
-            || io.domain() != Some(self.router.domain())
-        {
+        // The three latches never clear, so each is a final refusal
+        // with its own slot; only a domain or health mismatch (which a
+        // later tick can catch up) stays the contention retry.
+        if self.stopped {
+            return Err(Refusal::Stopped);
+        }
+        if self.exhausted {
+            return Err(Refusal::AuthorityExhausted);
+        }
+        if self.image_failed {
+            return Err(Refusal::CoverageFailed);
+        }
+        if io.domain() != Some(self.router.domain()) {
             return Err(Refusal::CurrentPartition);
         }
         let health = io.health().map_err(|_| Refusal::CurrentPartition)?;

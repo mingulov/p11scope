@@ -30205,6 +30205,124 @@ fn joint_parked_retry_keeps_genuine_fault_loss() {
     assert_eq!(sibling.1, "LossDelivered");
 }
 
+/// Round 13 ruling 1 (stop-time seal stall): a seal still pending when
+/// the capture stops can never take its birth evidence again, so the
+/// refusal is final. Both consumers fall back at once (no retry), the
+/// frame completes, and each feed's calls land in one named stop-loss
+/// gap with its exact count. Before the fix the stopped capture's take
+/// read as partition contention and every delivery retried forever
+/// (the live s12b/s12c finish stall).
+#[test]
+fn joint_seal_pending_across_stop_falls_back_with_named_stop_loss() {
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    fixture.push_two("C_SignInit", 2);
+    let fault = FrameFault::clean();
+    let mut frame = fixture.audited(2, 2, &fault);
+    let h0 = fixture.scene.real.h0.clone();
+    let _ = h0.0.borrow_mut().capture.stop();
+    assert!(
+        h0.0.borrow().capture.stopped,
+        "control: the capture is stopped"
+    );
+    let mut takes = NativeFrameBirths {
+        h0: &h0,
+        attached: &fixture.attached,
+        retained: &mut fixture.births,
+        seen: Vec::new(),
+        unreadable: false,
+    };
+    let mut steps = Vec::new();
+    let mut first_take = None;
+    {
+        let mut ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        frame.bind_targets(&ports).unwrap();
+        for _ in 0..16 {
+            let sealed = frame.seal_next(&mut ports, &mut takes, &fault);
+            if first_take.is_none() {
+                first_take = Some(frame.failure_for_test().map(|failure| failure.take_failed));
+            }
+            let delivered = frame.deliver_next(&mut ports);
+            let done = delivered == Ok(QuantumSealProgress::Complete);
+            steps.push((sealed, delivered));
+            if done {
+                break;
+            }
+        }
+    }
+    drop(takes);
+    assert_eq!(
+        steps,
+        vec![
+            (
+                Ok(QuantumSealProgress::DeliveryReady),
+                Ok(QuantumSealProgress::LocalPending)
+            ),
+            (
+                Ok(QuantumSealProgress::DeliveryReady),
+                Ok(QuantumSealProgress::Complete)
+            ),
+        ],
+        "each consumer falls back on its first visit; nothing retries"
+    );
+    let feeds = fixture.feeds();
+    assert_eq!(feeds.len(), 2);
+    assert!(
+        feeds
+            .iter()
+            .all(|feed| feed.staged == 0 && feed.fallback && !feed.degraded),
+        "both staged calls replay as fallback rows"
+    );
+    assert_eq!(
+        first_take,
+        Some(Some(Some(BirthObservationRefusal::Stopped))),
+        "the stopped capture refuses the take with its own final variant"
+    );
+    use crate::semantics_objects::journal::joint_audit::{
+        CAPTURE_ENDED_SUBJECT, capture_ended_reason,
+    };
+    let registry = fixture.scene.real.scene.coordinator.registry();
+    let mut ended = registry
+        .gaps()
+        .iter()
+        .cloned()
+        .chain(registry.staged_gaps_for_test())
+        .filter(|gap| gap.subject == CAPTURE_ENDED_SUBJECT)
+        .collect::<Vec<_>>();
+    ended.sort_by_key(|gap| gap.caller);
+    let mut expected = feeds
+        .iter()
+        .map(|feed| crate::discovery::caller_registry::RegistryGap {
+            caller: Some(feed.caller),
+            module: None,
+            pid: None,
+            subject: CAPTURE_ENDED_SUBJECT.to_string(),
+            reason: capture_ended_reason(BirthObservationRefusal::Stopped, 1),
+            budget: None,
+        })
+        .collect::<Vec<_>>();
+    expected.sort_by_key(|gap| gap.caller);
+    assert_eq!(
+        ended, expected,
+        "one capture-ended gap per feed, each with its exact call count"
+    );
+    assert!(
+        registry
+            .gaps()
+            .iter()
+            .cloned()
+            .chain(registry.staged_gaps_for_test())
+            .all(|gap| gap.subject
+                != crate::semantics_objects::journal::joint_audit::FALLBACK_FENCED_SUBJECT),
+        "a capture-ended close never names its calls twice"
+    );
+}
+
 #[test]
 fn joint_future_end_disposes_frame_without_disposing_call() {
     let mut previous_generation = None;

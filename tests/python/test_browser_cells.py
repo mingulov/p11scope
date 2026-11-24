@@ -685,6 +685,87 @@ class BrowserCells(unittest.TestCase):
                                     "min_calls": 1}})
 
     @gate_system("firefox")
+
+    def test_cr_run_nodelay_observes_client_cert_signs(self):
+        """CR-RUN-NODELAY: run-owned Chromium signs are observed with no spawn delay.
+
+        ``p11scope run`` owns the browser from exec, so the browser must
+        never reach its provider calls before the probes attach: the
+        run-tree first-map stop holds it at its first map of the
+        provider until the probes attach, with no readiness margin.
+        A CERT_REQUIRED screenshot flow against the browser's own
+        seeded NSS token (empty-password, so no PIN can stall it, and
+        no login is required) must show completed C_SignInit/C_Sign
+        calls plus an attributed RSA-family sign mechanism on the
+        softokn provider the report's own discovery list resolves.
+        Run reports carry no per-key rows (inventory-only); the sign
+        calls plus the attributed family mechanism are the run-visible
+        proof the handshake's private-key use was seen. The scan is
+        narrowed to the probed system softokn (a discovery-all run
+        drowns it in p11-kit slot demand on Fedora) and the spawn runs
+        with no delay, so a map-to-attach window fails this cell
+        instead of hiding behind a margin.
+        """
+        softokn = cells.find_softokn()
+        if softokn is None:
+            if STRICT:
+                raise AssertionError(
+                    "strict installed mode requires this cell: "
+                    "system softokn provider not found")
+            self.skipTest("browser gate prerequisite missing: "
+                          "system softokn provider not found")
+        cred = softhsm.generate_client_credential(self.work / "cred")
+        key, cert = tls_server.make_server_credential(self.work / "srv")
+        with tls_server.FlowServer(cert=cert, key=key, require_client_cert=True,
+                                   client_ca=cred.cert_pem) as flow:
+            result = cells.run_direct(
+                "CR-RUN-NODELAY", "chromium", self.work / "cell", flow.url,
+                observe_module=softokn, register_module=None,
+                browser_env=None,
+                extra_browser_args=CHROMIUM_STABLE_ARGS,
+                duration_seconds=RUN_DURATION,
+                nss_credential=cred, auto_select_cert=True)
+            self.assertGreaterEqual(
+                flow.client_certs_presented, 1,
+                "client cert never presented (no TLS sign happened)")
+            self.assertGreaterEqual(
+                flow.handshakes_ok, 1,
+                "client-cert flow never handshook (no TLS sign happened)")
+        self.assertEqual(result.flow.get("observer_exit"), 0,
+                         f"observer failed: {result.observer_stderr_tail}")
+        self.assertTrue(result.flow.get("nss_seeded"),
+                        "NSS credential was not seeded?!")
+        self.assertTrue(result.flow.get("auto_select_policy"),
+                        "auto-select policy was not installed?!")
+        self.assertGreater(result.screenshot_bytes, 0, "no screenshot bytes")
+        report = oracle.load_report(result.report_path)
+        shas, failures = oracle.discovery_module_shas(
+            report, _SOFTOKN_BASENAME)
+        if failures:
+            self.fail("CR-RUN-NODELAY failed:\n"
+                      f"{json.dumps({'failures': failures}, indent=1)}")
+        self.assertGreater(
+            len(shas), 0,
+            "softokn never discovered (browser never mapped it, or "
+            "discovery missed it)")
+        # PARTIAL/concrete_gap is earned: the run-tree teardown and
+        # the map-to-attach window are structural to run mode (see
+        # _GAPS_ATTACHED_RUN); the floors, the family leg, and the TLS
+        # ground truth above carry the proof, and any new gap cause
+        # still fails. No sessions floor: the sign's session may
+        # legitimately have opened in the tolerated pre-attach window.
+        self.check_report(
+            result, None, {"C_SignInit": 1, "C_Sign": 1}, attached=True,
+            allowed_gaps=_GAPS_ATTACHED_RUN,
+            allowed_verdicts=("concrete_gap",),
+            module_sha=shas,
+            qualify_run_floor_skipped=True,
+            s1={"sign_mechanisms": {"family_ids": sorted(_RSA_FAMILY_IDS),
+                                    "min_calls": 1}})
+
+    @gate_system("firefox")
+
+    @gate_system("firefox")
     def test_ff_first_with_background_provider_covers_browser(self):
         """FF-FIRST-BG (v0.6.0 F1): observer-first key operations beside a
         pre-existing SoftHSM caller; the late browser's key rows populate

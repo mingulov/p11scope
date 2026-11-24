@@ -4440,7 +4440,6 @@ fn carried_fix5_fresh_failure_retries_silently() {
     // is a silent retry, never loss — committed-row proofs rebuild
     // every apply, so the next apply re-attempts. No loss is
     // counted, no gap is filed, and no staged key is recorded.
-    let me = std::process::id();
     let mut engine = Engine::empty();
     engine.scope = Scope::Cgroup {
         id: 43,

@@ -24203,6 +24203,35 @@ fn engine_note_run_tree_gap_publishes_under_the_run_tree_subject() {
     assert_eq!(engine.counters.object_skips.len(), 2);
 }
 
+#[test]
+fn engine_note_member_stop_unavailable_files_the_named_row_once() {
+    let mut engine = Engine::empty();
+    engine.note_member_stop_unavailable();
+    assert_eq!(engine.counters.object_skips.len(), 1);
+    let skipped = &engine.counters.object_skips[0];
+    assert_eq!(skipped.subject, crate::render::MEMBER_STOP_SKIP_SUBJECT);
+    assert_eq!(
+        skipped.reason,
+        crate::render::MEMBER_STOP_UNAVAILABLE_REASON
+    );
+    engine.note_member_stop_unavailable();
+    assert_eq!(
+        engine.counters.object_skips.len(),
+        1,
+        "repeat filings dedupe to the one row"
+    );
+}
+
+#[test]
+fn engine_note_owned_pause_gap_files_the_arm_failure_row() {
+    let mut engine = Engine::empty();
+    engine.note_owned_pause_gap(crate::render::PAUSE_ARM_FAILED_REASON);
+    assert_eq!(engine.counters.object_skips.len(), 1);
+    let skipped = &engine.counters.object_skips[0];
+    assert_eq!(skipped.subject, crate::render::PAUSE_SKIP_SUBJECT);
+    assert_eq!(skipped.reason, crate::render::PAUSE_ARM_FAILED_REASON);
+}
+
 /// A run cgroup scope missing the held child refuses the prearm by
 /// name, never arming blind.
 #[test]
@@ -94118,6 +94147,112 @@ fn member_stop_holds_a_provider_mapper_until_its_staging_attaches() {
     );
     assert_eq!(engine.member_stop_stats_for_test().attached_resumes, 1);
     assert_eq!(engine.member_stop_stats_for_test().timed_out, 0);
+    // End state: the stop-staged suppression held through the resume
+    // and the withdraw — a held-then-attached first mapper owes no
+    // first-use row at any point.
+    assert!(
+        !files_the_first_use_row(&engine),
+        "no first-use row after an attached hold: {:?}",
+        engine.counters.object_skips
+    );
+}
+
+/// Twin: a second mapper of a stop-staged-but-unattached provider is
+/// held too, never resumed unprotected. The staging is shared (one
+/// pending file), the hold is per member, and no first-use row is owed
+/// while either is held; both resume attached once the staging lands.
+#[test]
+fn member_stop_holds_a_second_mapper_of_a_stop_staged_provider() {
+    let (mut fixture, _view, _module, _pins) = loaded_seed_provider();
+    let pid = fixture.child.id();
+    let peer = fixture.spawn_peer();
+    let library = fixture._dir.path().join("seed-provider.so");
+    stop_member_for_test(pid);
+    stop_member_for_test(peer);
+    let key = member_exec_key_for_test(pid, &library);
+    assert_eq!(
+        member_exec_key_for_test(peer, &library),
+        key,
+        "both members map the same provider file"
+    );
+    let mut io = ScriptedMemberStops::default();
+    io.rows.insert(pid, member_stop_row(pid, &library, key));
+    io.rows.insert(peer, member_stop_row(peer, &library, key));
+    let mut engine = member_stop_engine();
+    engine.pause_owned_batch = true;
+    let mut session = attaching_session();
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        1,
+        "one shared staging for both mappers"
+    );
+    assert_eq!(
+        engine.member_stop_stats_for_test().provider_holds,
+        2,
+        "both mappers held: {:?}",
+        engine.member_stop_stats_for_test()
+    );
+    assert!(
+        !files_the_first_use_row(&engine),
+        "no row while either mapper is held"
+    );
+    // The batch ends: the staging applies once and both resume attached.
+    engine.pause_owned_batch = false;
+    engine.service_member_stops(&mut io, &mut session, Some(20));
+    assert!(!engine.learned_unapplied, "the staging applied");
+    assert!(!engine.member_stops_held());
+    assert_eq!(engine.member_stop_stats_for_test().attached_resumes, 2);
+    assert_eq!(engine.member_stop_stats_for_test().timed_out, 0);
+    assert!(member_resumed_for_test(pid));
+    assert!(member_resumed_for_test(peer));
+    assert!(
+        !files_the_first_use_row(&engine),
+        "no first-use row after attached holds: {:?}",
+        engine.counters.object_skips
+    );
+}
+
+/// Twin: one service pass takes the 64 oldest stops (the production
+/// intake cap) and leaves the rest stopped with their rows for the
+/// next pass, oldest first. Departed tgids stand in for stopped
+/// members here: no signals, no maps reads, only the intake bound.
+#[test]
+fn member_stop_intake_takes_64_oldest_per_pass() {
+    let mut io = ScriptedMemberStops::default();
+    for n in 0..65u32 {
+        let tgid = 4_200_000_000 + n;
+        io.rows.insert(
+            tgid,
+            p11scope_ebpf_common::MemberStop {
+                file: p11scope_ebpf_common::MemberFileKey { dev: 1, ino: 1 },
+                hook_ts_ns: u64::from(n + 1),
+                vm_start: 0x1000,
+                vm_end: 0x2000,
+            },
+        );
+    }
+    let mut engine = member_stop_engine();
+    assert!(
+        engine.member_stops.intake_cap.is_none(),
+        "the twin pins the production intake cap, not an override"
+    );
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(1_000));
+    assert_eq!(io.withdrawn.len(), 64);
+    assert_eq!(io.rows.len(), 1);
+    assert!(
+        io.rows.contains_key(&4_200_000_064),
+        "the newest stop waits for the next pass: {:?}",
+        io.rows.keys()
+    );
+    assert_eq!(engine.member_stop_stats_for_test().stopped, 64);
+    assert_eq!(engine.member_stop_stats_for_test().departed, 64);
+    engine.service_member_stops(&mut io, &mut session, Some(2_000));
+    assert!(io.rows.is_empty());
+    assert_eq!(io.withdrawn.len(), 65);
+    assert_eq!(engine.member_stop_stats_for_test().stopped, 65);
+    assert_eq!(engine.member_stop_stats_for_test().departed, 65);
 }
 
 /// Twin: an apply whose target preflight refused attached nothing, so

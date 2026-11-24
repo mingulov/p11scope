@@ -8006,10 +8006,14 @@ def capacity_self_test():
 
     namespace = runpy.run_path(str(Path(__file__).resolve().parents[1] / "tests/python/test_inventory_capacity_oracle.py"))
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(namespace["CapacityOracleTests"])
-    result = unittest.TextTestRunner(stream=sys.stdout).run(suite)
-    # Strict: a skip, an expected failure or an unexpected success is never a pass.
-    return (result.testsRun > 0 and result.wasSuccessful() and not result.skipped
-            and not result.expectedFailures and not result.unexpectedSuccesses)
+    return strict_result(unittest.TextTestRunner(stream=sys.stdout).run(suite))
+
+
+def strict_result(result):
+    """A unittest result passes only when tests ran and every one passed: a
+    skip, an expected failure or an unexpected success is never a pass."""
+    return bool(result.testsRun > 0 and result.wasSuccessful() and not result.skipped
+                and not result.expectedFailures and not result.unexpectedSuccesses)
 
 
 def main(argv):

@@ -3759,7 +3759,8 @@ class StrictSelfTest(unittest.TestCase):
     def strict(self, root, *names, env=None):
         result = subprocess.run([sys.executable, "-I", str(self.STRICT), str(root), "r.sh", "self-test",
                                  str(root / "suite.py"), *names], capture_output=True, text=True, timeout=60,
-                                cwd=root, env=dict(os.environ, **(env or {})))
+                                cwd=root, env=dict({k: v for k, v in os.environ.items() if not k.startswith("GIT_")},
+                                                   **(env or {})))
         return result.returncode, result.stdout + result.stderr
 
     def run_suite(self, body, *names, env=None):
@@ -3772,7 +3773,9 @@ class StrictSelfTest(unittest.TestCase):
         rc, text = self.run_suite(
             "import helper_ok\nclass T(unittest.TestCase):\n    def test_a(self):\n"
             "        (ROOT / 'data/ok.txt').read_text()\n        open(ROOT / 'written', 'w').write('x')\n"
-            "        assert os.environ['STRICT_PROBE_DIR'] == '/nowhere'\n",
+            "        assert os.environ['STRICT_PROBE_DIR'] == '/nowhere'\n"
+            "        subprocess.run(['cat', str(ROOT / 'data/ok.txt')], check=True, capture_output=True)\n"
+            "        assert not [p for p in sys.path if 'site-packages' in p or 'dist-packages' in p], sys.path\n",
             env={"STRICT_PROBE_DIR": "/nowhere"})
         self.assertEqual(rc, 0, text)
         self.assertIn("strict self-test passed: 1 tests, 0 skipped, run in a copy of its 5 declared inputs", text)
@@ -3781,9 +3784,9 @@ class StrictSelfTest(unittest.TestCase):
                                        "        assert not any(CHECKOUT in v for v in os.environ.values())\n")
             rc, text = self.strict(root, env={"STRICT_PROBE_DIR": str(root / "data")})
             self.assertEqual(rc, 0, text)
-            self.assertIn("checkout variables removed: ", text)
+            self.assertIn("inherited variables removed: ", text)
             self.assertIn("STRICT_PROBE_DIR", text)
-        self.assertNotIn("checkout variables removed", self.run_suite(
+        self.assertNotIn("inherited variables removed", self.run_suite(
             "class T(unittest.TestCase):\n    def test_a(self):\n        pass\n")[1])
 
     def test_every_non_pass_fails(self):
@@ -3813,6 +3816,7 @@ class StrictSelfTest(unittest.TestCase):
                               " % str(ROOT / 'data/secret.txt')], check=True)\n", "1 errors"),
             "import found only beside the runner": ("    def test_a(self):\n        import helper_scripts_only\n",
                                                      "helper_scripts_only"),
+            "ambient module of the same name": ("    def test_a(self):\n        import pip\n", "pip"),
             "undeclared import": ("import helper_secret\nclass U(unittest.TestCase):\n    def test_b(self):\n"
                                   "        pass\n", "helper_secret"),
             "checkout by its own path": ("    def test_a(self):\n        open(CHECKOUT + '/data/secret.txt').read()\n",
@@ -3828,6 +3832,9 @@ class StrictSelfTest(unittest.TestCase):
                 self.assertIn(message, text)
                 if name.startswith(("checkout", "child given")):
                     self.assertIn("reached the checkout outside its declared copy", text)
+                elif name.startswith("child "):  # the child itself found the file absent
+                    self.assertIn("secret.txt", text)
+                    self.assertIn("No such file", text)
                 self.assertNotIn("strict self-test passed", text)
 
     def test_a_warm_bytecode_cache_never_hides_an_import(self):
@@ -3854,6 +3861,57 @@ class StrictSelfTest(unittest.TestCase):
             "        assert sorted(git('ls-files').split()) == ['data/ok.txt', 'helper_ok.py', 'r.sh',"
             " 'scripts/runner_inputs.py', 'suite.py']\n")
         self.assertEqual(rc, 0, text)
+
+    def test_inherited_git_routing_never_reaches_the_checkout(self):
+        # codex r11h F1, hungerg r11h B2: hostile git variables cannot make
+        # setup touch the source repository or run its hooks.
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as raw:
+            root = self.make_root(raw, "class T(unittest.TestCase):\n    def test_a(self):\n"
+                                       "        out = subprocess.run(['git', '-C', str(ROOT), 'rev-list', '--count',"
+                                       " 'HEAD'], capture_output=True, text=True, check=True).stdout\n"
+                                       "        assert out.strip() == '1', out\n"
+                                       "        assert not [k for k in os.environ if k.startswith('GIT_')]\n")
+            git = lambda *a: subprocess.run(["git", "-C", str(root), *a], capture_output=True, text=True,
+                                            check=True, env=dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull,
+                                                                 GIT_CONFIG_NOSYSTEM="1")).stdout
+            git("init", "-q"); git("add", "-A")
+            git("-c", "user.name=t", "-c", "user.email=t@invalid", "commit", "-q", "--no-gpg-sign", "-m", "source")
+            (root / "data/ok.txt").write_text("dirty\n"); (root / "untracked.txt").write_text("untracked\n")
+            hooks = Path(raw) / "hooks"; hooks.mkdir()
+            marker = Path(raw) / "hook-ran"
+            for hook in ("pre-commit", "post-commit"):
+                (hooks / hook).write_text("#!/bin/sh\ntouch %s\n" % marker); (hooks / hook).chmod(0o755)
+            template = Path(raw) / "template"; (template / "hooks").mkdir(parents=True)
+            shutil.copy2(hooks / "pre-commit", template / "hooks/pre-commit")
+            before = (git("rev-parse", "HEAD"), git("status", "--porcelain"), (root / ".git/index").read_bytes())
+            hostile = {"GIT_DIR": str(root / ".git"), "GIT_WORK_TREE": str(root),
+                       "GIT_INDEX_FILE": str(root / ".git/index"), "GIT_OBJECT_DIRECTORY": str(root / ".git/objects"),
+                       "GIT_TEMPLATE_DIR": str(template), "GIT_CONFIG_COUNT": "1",
+                       "GIT_CONFIG_KEY_0": "core.hooksPath", "GIT_CONFIG_VALUE_0": str(hooks)}
+            rc, text = self.strict(root, env=hostile)
+            self.assertEqual(rc, 0, text)
+            for key in hostile:
+                self.assertIn(key, text.split("inherited variables removed: ", 1)[1])
+            self.assertEqual((git("rev-parse", "HEAD"), git("status", "--porcelain"),
+                              (root / ".git/index").read_bytes()), before)
+            self.assertEqual(git("rev-list", "--count", "HEAD").strip(), "1")
+            self.assertFalse(marker.exists())
+
+    def test_an_alias_of_the_checkout_is_the_checkout(self):
+        # hungerg r11h B2: a symlink alias in the environment or an event.
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as raw:
+            alias = Path(raw) / "alias"
+            root = self.make_root(raw, "class T(unittest.TestCase):\n    def test_a(self):\n"
+                                       "        assert 'REPO_ALIAS' not in os.environ\n")
+            alias.symlink_to(root)
+            rc, text = self.strict(root, env={"REPO_ALIAS": str(alias), "OTHER": "x:%s/data" % alias})
+            self.assertEqual(rc, 0, text)
+            self.assertIn("inherited variables removed: OTHER, REPO_ALIAS", text)
+            (root / "suite.py").write_text(self.HEADER + "class T(unittest.TestCase):\n    def test_a(self):\n"
+                                           "        open(%r).read()\n" % str(alias / "data/secret.txt"))
+            rc, text = self.strict(root)
+            self.assertEqual(rc, 1, text)
+            self.assertIn("reached the checkout outside its declared copy (open", text)
 
     def test_setup_refusals_are_named(self):
         with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as raw:
@@ -3901,23 +3959,44 @@ class StrictSelfTest(unittest.TestCase):
         self.assertIn('timeout 300 python3 -I "$REPO/scripts/strict-selftest.py" "$REPO" '
                       'scripts/qualify-inventory-native.sh self-test \\\n'
                       '        "$REPO/tests/python/test_inventory_capacity_oracle.py" || die', native)
-        # The oracle's own CapacityOracleTests self-test is strict too.
+        # The oracle's own CapacityOracleTests self-test is strict too
+        # (hungerg r11h N2: by executed outcome, not by text).
         oracle = (ROOT / "scripts/inventory-native-oracle.py").read_text()
-        body = oracle.split("def capacity_self_test():", 1)[1].split("\ndef ", 1)[0]
-        for clause in ("result.testsRun > 0", "result.wasSuccessful()", "not result.skipped",
-                       "not result.expectedFailures", "not result.unexpectedSuccesses"):
-            self.assertIn(clause, body)
+        self.assertIn("return strict_result(unittest.TextTestRunner(", oracle.split("def capacity_self_test():", 1)[1]
+                      .split("\ndef ", 1)[0])
+        strict_result = runpy.run_path(str(ROOT / "scripts/inventory-native-oracle.py"))["strict_result"]
+        def outcome(body):
+            namespace = {"unittest": unittest}
+            exec("class T(unittest.TestCase):\n" + body, namespace)
+            suite = unittest.TestLoader().loadTestsFromTestCase(namespace["T"])  # never the caller's -k
+            return strict_result(unittest.TextTestRunner(stream=io.StringIO()).run(suite))
+        self.assertIs(outcome("    def test_a(self):\n        pass\n"), True)
+        for name, body in (("empty", "    pass\n"), ("failure", "    def test_a(self):\n        self.fail()\n"),
+                           ("error", "    def test_a(self):\n        raise OSError()\n"),
+                           ("skip", "    def test_a(self):\n        self.skipTest('x')\n"),
+                           ("expected failure", "    @unittest.expectedFailure\n    def test_a(self):\n"
+                                                "        self.fail()\n"),
+                           ("unexpected success", "    @unittest.expectedFailure\n    def test_a(self):\n"
+                                                  "        pass\n"),
+                           ("pass and skip", "    def test_a(self):\n        pass\n"
+                                             "    def test_b(self):\n        self.skipTest('x')\n")):
+            with self.subTest(case=name):
+                self.assertIs(outcome(body), False)
 
     def test_self_test_takes_no_other_option(self):
         # hungerg r11g #6: an earlier dispatch can never divert --self-test.
-        for argv in (["--self-test", "--dry-run"], ["--dry-run", "--self-test"],
-                     ["--self-test", "--kernels", "host"]):
-            with self.subTest(argv=argv):
-                result = subprocess.run(["bash", str(ROOT / "scripts/qualify-release-matrix.sh"), *argv],
+        for runner, argv in (("qualify-release-matrix.sh", ["--self-test", "--dry-run"]),
+                             ("qualify-release-matrix.sh", ["--dry-run", "--self-test"]),
+                             ("qualify-release-matrix.sh", ["--self-test", "--kernels", "host"]),
+                             ("qualify-inventory-native.sh", ["--self-test", "--capacity", "boundary"]),
+                             ("qualify-inventory-native.sh", ["--self-test", "/bin/true"])):
+            with self.subTest(runner=runner, argv=argv):
+                result = subprocess.run(["bash", str(ROOT / "scripts" / runner), *argv],
                                         capture_output=True, text=True, timeout=60)
                 self.assertEqual(result.returncode, 2, result.stderr)
-                self.assertIn("--self-test takes no other option", result.stderr)
+                self.assertIn("%s: --self-test takes no other option" % runner, result.stderr)
                 self.assertNotIn("dry-run:", result.stdout)
+                self.assertNotIn("self-test passed", result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

@@ -2137,6 +2137,15 @@ pub(crate) struct JournalAdapter {
     /// write it mirrors), so proof queries cost one indexed range probe
     /// per candidate rather than one full scan.
     drain_ordinals: BTreeSet<((u64, u64), u64)>,
+    /// Drain-proof candidate keys: open entries holding a reason-9
+    /// abandonment with a corroborated tail-free return that needs an
+    /// order proof and has not converted yet. Maintained incrementally
+    /// at every staging mutation that can flip membership (abandon
+    /// staging, return corroboration, drain conversion, removal,
+    /// function replacement), so derivation walks this index instead
+    /// of scanning the open table per seal. Frontier gating happens
+    /// at walk time; membership itself is frontier-independent.
+    drain_proof_candidates: BTreeSet<JournalNativeKey>,
     /// Derived drain window dispositions for one frontier (candidate ->
     /// whether its causal window holds no same-image ordinal): derived
     /// once per frontier in budgeted slices and reused through fencing,
@@ -2145,11 +2154,11 @@ pub(crate) struct JournalAdapter {
     /// Frontier the proof cache was derived for (`None` before the first
     /// derivation): a new frontier clears the cache and restarts.
     drain_proof_cache_frontier: Option<u64>,
-    /// Resume cursor for the budgeted derivation: the last classified
-    /// open key (`None` starts before the first). The walk charges one
-    /// unit per visited entry, candidate or not, and persists the
-    /// cursor past every visit, so resumption after a yield never
-    /// re-classifies and never discards the derived prefix.
+    /// Resume cursor for the budgeted derivation: the last visited
+    /// candidate key (`None` starts before the first). The walk charges
+    /// one unit per visited member and persists the cursor past every
+    /// visit, so resumption after a yield never re-derives and never
+    /// discards the derived prefix.
     drain_proof_cursor: Option<JournalNativeKey>,
     floors: BTreeMap<u64, u64>,
     /// One ordered Session EVENTS/boot-clock namespace. Non-evicted
@@ -2258,9 +2267,9 @@ pub(crate) struct JournalAdapter {
     /// scanned while attributing staged calls.
     #[cfg(test)]
     test_seal_census_visits: usize,
-    /// Test-only drain order-proof visits: open entries classified
-    /// while deriving lifecycle window dispositions, one charged unit
-    /// each. Interior mutability so the shared `&self` predicate counts
+    /// Test-only drain order-proof visits: candidate members derived
+    /// while proving lifecycle windows, one charged unit each.
+    /// Interior mutability so the shared `&self` predicate counts
     /// without a signature change.
     #[cfg(test)]
     test_drain_proof_visits: std::cell::Cell<usize>,
@@ -2370,6 +2379,7 @@ impl JournalAdapter {
             seal_bootstrap: SealBootstrapCounts::default(),
             open: BTreeMap::new(),
             drain_ordinals: BTreeSet::new(),
+            drain_proof_candidates: BTreeSet::new(),
             drain_proof_cache: BTreeMap::new(),
             drain_proof_cache_frontier: None,
             drain_proof_cursor: None,
@@ -2657,7 +2667,9 @@ impl JournalAdapter {
     /// one template identity (fine for doom and recovery paths that never
     /// validate invocation claims), each row decodes fresh BEGIN words on
     /// its own thread, so claim validation sees singletons, never a
-    /// `ClaimAmbiguity` taint.
+    /// `ClaimAmbiguity` taint. Rows clone the template's abandonment and
+    /// corroboration (above every cut), so they join the drain-proof
+    /// candidate index exactly like staged members.
     #[cfg(test)]
     pub(crate) fn populate_unique_foreign_open_rows_for_test(&mut self, rows: usize) {
         use p11scope_ebpf_common::object_journal::{JournalRecord, decode_journal_record};
@@ -2680,12 +2692,16 @@ impl JournalAdapter {
             entry.image = (template.image.0 ^ 0x5eed_0000, template.image.1);
             entry.begin_ordinal = u64::MAX / 2 + index;
             entry.end = None;
-            entry.abandon = None;
+            entry.abandon = template.abandon.map(|mut staged| {
+                staged.ordinal = u64::MAX / 2 + index;
+                staged
+            });
             entry.converted_ticket = None;
             entry.converted_for = None;
             entry.end_converted = false;
             entry.drained_converted = false;
-            entry.corroborated_return = None;
+            entry.corroborated_return = template.corroborated_return.map(|_| u64::MAX / 2 + index);
+            entry.corroborated_returned = template.corroborated_returned;
             entry.raw_resource = None;
             entry.collected_origin = None;
             entry.s1only_subject = None;
@@ -2699,6 +2715,10 @@ impl JournalAdapter {
             assert!(self.open.insert(native, entry).is_none());
             self.drain_ordinals
                 .insert((entry.image, entry.begin_ordinal));
+            if let Some(staged) = entry.abandon {
+                self.drain_ordinals.insert((entry.image, staged.ordinal));
+            }
+            self.drain_candidate_sync(native);
         }
     }
 
@@ -2791,6 +2811,7 @@ impl JournalAdapter {
             return false;
         };
         entry.function = function;
+        self.drain_candidate_sync(native);
         true
     }
 
@@ -2983,6 +3004,19 @@ impl JournalAdapter {
             }
         }
         mirror
+    }
+
+    /// Test-only exact mirror of the drain-proof candidate index,
+    /// rebuilt from the open table through the membership predicate.
+    /// Twins asserting candidate maintenance compare the live index
+    /// against this reconstruction.
+    #[cfg(test)]
+    pub(crate) fn drain_candidate_mirror_for_test(&self) -> BTreeSet<JournalNativeKey> {
+        self.open
+            .iter()
+            .filter(|(_, entry)| Self::drain_candidate_member(entry))
+            .map(|(native, _)| *native)
+            .collect()
     }
 
     pub(crate) fn consumed_frontier(&self) -> ConsumptionOrdinal {
@@ -3296,6 +3330,7 @@ impl JournalAdapter {
             if old.converted_ticket.is_none() {
                 self.retained_member_dec(identity_of_begin(&old.begin), RetainedMember::Open(key));
             }
+            self.drain_proof_candidates.remove(&key);
         }
         self.drain_ordinals.insert((image, ordinal));
         self.retained_member_inc(inserted, RetainedMember::Open(key));
@@ -3503,6 +3538,7 @@ impl JournalAdapter {
         self.open.get_mut(&key).expect("open entry").abandon =
             Some(StagedAbandon { ordinal, abandon });
         self.drain_ordinals.insert((image, ordinal));
+        self.drain_candidate_sync(key);
         JournalDisposition::AbandonStaged
     }
 
@@ -3577,12 +3613,14 @@ impl JournalAdapter {
             return JournalDisposition::Contradiction(JournalContradiction::AmbiguousReturn);
         }
         if let Some((key, _, _)) = matches.first() {
-            let entry = self.open.get_mut(key).expect("matched open entry");
+            let key = *key;
+            let entry = self.open.get_mut(&key).expect("matched open entry");
             entry.corroborated_return = Some(ordinal);
             entry.corroborated_ts_ns = event.ts_ns;
             entry.corroborated_returned = ReturnedWords::of_event(event);
             entry.negative_return |=
                 !super::state::return_leaves_no_lifecycle_effect(entry.function, event.rv);
+            self.drain_candidate_sync(key);
             return JournalDisposition::ReturnObserved;
         }
         if let Some(index) = refused_matches.first() {
@@ -4136,6 +4174,37 @@ impl JournalAdapter {
         !self.s1only_open.is_empty()
     }
 
+    /// Whether one open entry is a drain-proof candidate: a reason-9
+    /// abandonment with a corroborated tail-free return that needs an
+    /// order proof and has not converted yet. Frontier-independent:
+    /// the derivation walk and every consumer gate ordinals on the
+    /// sealing frontier themselves.
+    fn drain_candidate_member(entry: &OpenEntry) -> bool {
+        entry
+            .abandon
+            .is_some_and(|staged| staged.abandon.reason() == JOURNAL_REASON_SYNC_RETURN_RESULT_LOST)
+            && entry.corroborated_return.is_some()
+            && return_drains_without_tail(entry.function)
+            && !entry.drained_converted
+            && entry.corroborated_return.is_some_and(|_| {
+                drained_needs_order_proof(entry.function, entry.corroborated_returned.rv)
+            })
+    }
+
+    /// Re-evaluate one open entry's drain-proof candidacy after a
+    /// staging mutation: insert or remove exactly.
+    fn drain_candidate_sync(&mut self, native: JournalNativeKey) {
+        let member = self
+            .open
+            .get(&native)
+            .is_some_and(Self::drain_candidate_member);
+        if member {
+            self.drain_proof_candidates.insert(native);
+        } else {
+            self.drain_proof_candidates.remove(&native);
+        }
+    }
+
     /// Remove one open entry, keeping the S1-only subject index exact.
     fn take_open(&mut self, native: JournalNativeKey) -> Option<OpenEntry> {
         let removed = self.open.remove(&native)?;
@@ -4150,6 +4219,7 @@ impl JournalAdapter {
         if let Some(staged) = removed.abandon {
             self.drain_ordinals.remove(&(removed.image, staged.ordinal));
         }
+        self.drain_proof_candidates.remove(&native);
         Some(removed)
     }
 
@@ -4158,6 +4228,7 @@ impl JournalAdapter {
         self.open.clear();
         self.s1only_open.clear();
         self.drain_ordinals.clear();
+        self.drain_proof_candidates.clear();
     }
 
     /// Whether every queued claim on this identity reports a return that
@@ -9686,10 +9757,16 @@ impl JournalAdapter {
     /// table scan). Conservative: any same-image BEGIN, END or
     /// abandonment in the window blocks, including entries that would
     /// not convert here; lone drains carry consecutive cuts with no
-    /// integer between them, so they always pass. Refused begins live
-    /// outside the open table and stay out of the window, as do
-    /// ordinary CALL ordinals (observations, not Begin/End events).
+    /// integer between them, so they always pass. A return observed
+    /// at or after its abandonment has nothing between them by
+    /// construction, so the window is vacuously empty (and the range
+    /// below never inverts). Refused begins live outside the open
+    /// table and stay out of the window, as do ordinary CALL ordinals
+    /// (observations, not Begin/End events).
     fn drain_window_empty(&self, image: (u64, u64), returned: u64, abandoned: u64) -> bool {
+        if returned >= abandoned {
+            return true;
+        }
         use std::ops::Bound::Excluded;
         self.drain_ordinals
             .range((Excluded((image, returned)), Excluded((image, abandoned))))
@@ -9698,19 +9775,21 @@ impl JournalAdapter {
     }
 
     /// Derive drain window dispositions for one frontier in budgeted
-    /// slices of at most one credit ([`SCOPED_RECOVERY_SLICE`] units):
-    /// each open entry costs one unit to classify, and each
-    /// candidate's window emptiness is computed once from the
-    /// per-image index and cached for every seal of this frontier to
-    /// reuse. The walk never materializes the candidate set: it
-    /// resumes from the persisted scan cursor through an indexed
-    /// range, one entry per step. A slice that exhausts its budget
-    /// yields [`SealWait::DrainProofPending`] with the derived prefix
-    /// cached and the cursor past the last classified entry, so the
-    /// next seal resumes after it and never discards progress. A new
-    /// frontier clears the cache and restarts. Converted drains and
-    /// effect-free neutral drains need no proof and cost nothing
-    /// beyond their classification.
+    /// slices of at most one credit ([`SCOPED_RECOVERY_SLICE`] units,
+    /// one per candidate): each member's window emptiness is computed
+    /// once from the per-image index and cached for every seal of this
+    /// frontier to reuse. The walk covers only the maintained
+    /// candidate index ([`Self::drain_proof_candidates`]), never the
+    /// open table: entries outside the index cost nothing here, so a
+    /// seal over unrelated history pays no derivation. The walk
+    /// resumes from the persisted cursor through an indexed range,
+    /// one member per step. A slice that exhausts its budget yields
+    /// [`SealWait::DrainProofPending`] with the derived prefix cached
+    /// and the cursor past the last visited member, so the next seal
+    /// resumes after it and never discards progress. A new frontier
+    /// clears the cache and restarts. Members above the frontier
+    /// derive like the rest; every consumer gates ordinals on the
+    /// sealing frontier before reading a disposition.
     fn ensure_drain_proofs(&mut self, frontier: u64) -> Result<(), SealFailure> {
         if self.drain_proof_cache_frontier != Some(frontier) {
             self.drain_proof_cache.clear();
@@ -9720,39 +9799,11 @@ impl JournalAdapter {
         let mut credit = self.inline_credit.min(SCOPED_RECOVERY_SLICE);
         let allowance = credit;
         loop {
-            // One indexed step past the cursor, copying the
-            // classification words before the borrow ends: no table
-            // scan, no candidate vector, no borrow held across the
-            // cached derivation below.
-            let next = match self.drain_proof_cursor {
-                None => self.open.iter().next(),
-                Some(cursor) => {
-                    use std::ops::Bound::Excluded;
-                    self.open
-                        .range((Excluded(cursor), std::ops::Bound::Unbounded))
-                        .next()
-                }
-            }
-            .map(|(native, entry)| {
-                (
-                    *native,
-                    entry.image,
-                    entry.function,
-                    entry.abandon,
-                    entry.corroborated_return,
-                    entry.drained_converted,
-                    entry.corroborated_returned.rv,
-                )
-            });
-            let Some((
-                native,
-                image,
-                function,
-                abandon,
-                corroborated_return,
-                drained_converted,
-                rv,
-            )) = next
+            // One indexed step past the cursor over the candidate
+            // index: no table scan, no candidate vector, no borrow
+            // held across the cached derivation below.
+            let Some(native) =
+                next_member_after(&self.drain_proof_candidates, self.drain_proof_cursor)
             else {
                 break;
             };
@@ -9766,30 +9817,22 @@ impl JournalAdapter {
                 self.test_drain_proof_visits
                     .set(self.test_drain_proof_visits.get() + 1);
             }
-            // The cursor advances past every visited entry, candidate
-            // or not: a run of non-candidates longer than the credit
-            // still makes progress across slices instead of re-yielding
-            // over the same entries forever.
+            // The cursor advances past every visited member, derived
+            // or skipped, so resumption always makes progress.
             self.drain_proof_cursor = Some(native);
-            let Some(staged) = abandon.filter(|staged| {
-                staged.ordinal <= frontier
-                    && staged.abandon.reason() == JOURNAL_REASON_SYNC_RETURN_RESULT_LOST
-            }) else {
-                continue;
+            // A member whose entry is gone, or whose staged words no
+            // longer carry a corroborated abandonment, derives nothing:
+            // unreachable while every removal and mutation keeps the
+            // index exact, fail-closed if it ever happens — the drain
+            // keeps its loss like any cache miss.
+            let (returned, abandoned, image) = match self.open.get(&native) {
+                Some(entry) => match (entry.corroborated_return, entry.abandon) {
+                    (Some(returned), Some(staged)) => (returned, staged.ordinal, entry.image),
+                    _ => continue,
+                },
+                None => continue,
             };
-            if !return_drains_without_tail(function) {
-                continue;
-            }
-            let Some(returned) = corroborated_return.filter(|at| *at <= frontier) else {
-                continue;
-            };
-            if drained_converted {
-                continue;
-            }
-            if !drained_needs_order_proof(function, rv) {
-                continue;
-            }
-            let empty = self.drain_window_empty(image, returned, staged.ordinal);
+            let empty = self.drain_window_empty(image, returned, abandoned);
             self.drain_proof_cache.insert(native, empty);
         }
         self.inline_spent = self.inline_spent.saturating_add(allowance - credit);
@@ -10373,6 +10416,7 @@ impl JournalAdapter {
                         }
                         let staged_entry = self.open.get_mut(&native).expect("staged terminal");
                         staged_entry.drained_converted = true;
+                        self.drain_candidate_sync(native);
                     }
                     // A drained return is a completion, not a loss: no
                     // bounded upper is retained for it.
@@ -23156,6 +23200,16 @@ pub(crate) mod tests {
             .adapter
             .attest_key(&admitted)
             .expect("the paired return attests");
+        assert_eq!(
+            scene.adapter.drain_proof_candidates,
+            scene.adapter.drain_candidate_mirror_for_test(),
+            "staging keeps the candidate index an exact mirror"
+        );
+        assert_eq!(
+            scene.adapter.drain_proof_candidates,
+            BTreeSet::from([(1, 1)]),
+            "only the abandoned corroborated opener is a candidate"
+        );
         let bootstrap = scene.bootstrap(proof, 0);
         let first = scene.seal(&bootstrap).expect("first seal passes");
         assert_eq!(first.prefix.settled().len(), 2);
@@ -23176,8 +23230,17 @@ pub(crate) mod tests {
         );
         assert_eq!(
             scene.adapter.test_drain_proof_visits_for_test(),
-            2,
-            "the conversion seal classifies both open entries, holder and opener"
+            1,
+            "the conversion seal derives the one open drain"
+        );
+        assert_eq!(
+            scene.adapter.drain_proof_candidates,
+            scene.adapter.drain_candidate_mirror_for_test(),
+            "conversion keeps the candidate index an exact mirror"
+        );
+        assert!(
+            scene.adapter.drain_proof_candidates.is_empty(),
+            "the converted drain leaves the candidate index at conversion"
         );
         assert!(
             scene.adapter.open.contains_key(&(1, 1)),
@@ -23250,8 +23313,8 @@ pub(crate) mod tests {
         );
         assert_eq!(
             scene.adapter.test_drain_proof_visits_for_test(),
-            4,
-            "the moved frontier re-classifies both staged entries, deriving nothing new"
+            1,
+            "a converted drain costs no re-derivation on later seals"
         );
         assert!(
             scene.adapter.drain_proof_cache.is_empty(),
@@ -23740,15 +23803,14 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn object_journal_drain_proof_scan_charges_every_open_entry() {
-        // The budgeted derivation charges every open entry it
-        // classifies, not just drain candidates: 70 lifecycle drains
-        // plus 100 ordinary settled calls visit 170 entries in slices
-        // of one credit (64 units), each slice charging exactly its
-        // visits, resuming without discarding, with every drain
-        // completing. A scan that classified outside the credit would
-        // visit more than 64 per slice; a cursor that advanced only
-        // on candidates would re-yield forever past the drains.
+    fn object_journal_drain_proof_walk_covers_only_candidates() {
+        // The budgeted derivation walks only the candidate index: 70
+        // lifecycle drains plus 100 ordinary settled calls derive 70
+        // dispositions in slices of one credit (64 units), with the
+        // ordinary calls costing nothing. A walk that visited the
+        // whole open table would yield three slices and charge 170;
+        // the indexed walk yields once and charges 70, resuming
+        // without discarding, with every drain completing.
         use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
         const DRAINS: u64 = 70;
         const ORDINARY: u64 = 100;
@@ -23784,7 +23846,17 @@ pub(crate) mod tests {
         assert_eq!(
             scene.adapter.open.len(),
             (DRAINS + ORDINARY) as usize,
-            "drains plus ordinary calls fill the scanned table"
+            "drains plus ordinary calls fill the open table"
+        );
+        assert_eq!(
+            scene.adapter.drain_proof_candidates,
+            scene.adapter.drain_candidate_mirror_for_test(),
+            "staging keeps the candidate index an exact mirror"
+        );
+        assert_eq!(
+            scene.adapter.drain_proof_candidates.len(),
+            DRAINS as usize,
+            "only the drains join the candidate index"
         );
         let bootstrap = scene.bootstrap(proof, 0);
         scene.adapter.test_drain_proof_visits.set(0);
@@ -23800,27 +23872,13 @@ pub(crate) mod tests {
         assert_eq!(
             scene.adapter.test_drain_proof_visits.get(),
             64,
-            "one slice classifies one credit, no more"
-        );
-        let second = scene
-            .seal(&bootstrap)
-            .expect_err("the second slice yields at the budget boundary");
-        assert_eq!(second.gap, JournalGap::BoundNotReady);
-        assert_eq!(
-            scene.adapter.last_seal_wait(),
-            SealWait::DrainProofPending,
-            "the yield names its resume cause"
-        );
-        assert_eq!(
-            scene.adapter.test_drain_proof_visits.get(),
-            128,
-            "resumption classifies the next credit, never discards"
+            "one slice derives one credit, no more"
         );
         let success = scene.seal(&bootstrap).expect("resumption completes");
         assert_eq!(
             scene.adapter.test_drain_proof_visits.get(),
-            (DRAINS + ORDINARY) as usize,
-            "the last slice classifies only the remainder"
+            DRAINS as usize,
+            "resumption derives only the remainder, never discards"
         );
         assert_eq!(
             success.prefix.settled().len(),
@@ -23851,23 +23909,18 @@ pub(crate) mod tests {
 
     #[test]
     fn object_journal_drain_proofs_rederive_after_the_frontier_moves() {
-        // A new frontier clears the proof cache and the scan cursor.
-        // A holder keeps two converted drains staged past their seal
-        // (3 visits); a third drain stages under the moved frontier,
-        // and the next seal re-classifies every entry (7 cumulative).
-        // With the reset dropped, the seal resumes after the stale
-        // cursor and visits only the newcomer. The earlier drains
-        // keep their loss under the covered-return bar; the fresh
-        // drain still completes.
+        // A new frontier clears the proof cache and the cursor. Two
+        // drains yield after one visit under a one-unit bound, so both
+        // stay staged and stay candidates; a third drain stages under
+        // the moved frontier, and the next seal re-derives every
+        // member (1 visit, then 4 cumulative). With the reset dropped,
+        // the seal resumes after the stale cursor and visits only the
+        // two members past it. All three drains complete.
         use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
         let mut scene = Scene::new(image_default());
         let open = function_id("C_OpenSession");
-        let sign = function_id("C_Sign");
-        scene.attest_function("C_Sign");
         scene.attest_function_n("C_OpenSession", 3);
         let proof = scene.attest_function("C_OpenSession");
-        let holder = begin_bytes(2, 1, sign, 0);
-        assert_eq!(scene.ingest(&holder), JournalDisposition::BeginAdmitted);
         for sequence in 1..=2 {
             let begin = begin_bytes(1, sequence, open, 0);
             assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
@@ -23883,19 +23936,37 @@ pub(crate) mod tests {
             );
             assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
         }
-        let bootstrap = scene.bootstrap(proof, 0);
-        scene.adapter.test_drain_proof_visits.set(0);
-        let first = scene.seal(&bootstrap).expect("two drains seal at once");
-        assert_eq!(first.prefix.settled().len(), 3);
         assert_eq!(
-            scene.adapter.test_drain_proof_visits.get(),
-            3,
-            "the first frontier classifies its three entries"
+            scene.adapter.drain_proof_candidates,
+            scene.adapter.drain_candidate_mirror_for_test(),
+            "staging keeps the candidate index an exact mirror"
         );
         assert_eq!(
-            scene.adapter.open.len(),
-            3,
-            "the holder keeps both converted drains staged"
+            scene.adapter.drain_proof_candidates,
+            BTreeSet::from([(1, 1), (1, 2)]),
+            "both drains join the candidate index"
+        );
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.adapter.test_drain_proof_visits.set(0);
+        scene.adapter.bound_inline_credit_for_test(1);
+        let first = scene
+            .seal(&bootstrap)
+            .expect_err("the one-unit slice yields");
+        assert_eq!(first.gap, JournalGap::BoundNotReady);
+        assert_eq!(
+            scene.adapter.last_seal_wait(),
+            SealWait::DrainProofPending,
+            "the yield names its resume cause"
+        );
+        assert_eq!(
+            scene.adapter.test_drain_proof_visits.get(),
+            1,
+            "the first slice derives one member"
+        );
+        assert_eq!(
+            scene.adapter.drain_proof_candidates,
+            BTreeSet::from([(1, 1), (1, 2)]),
+            "a yielded slice converts nothing, so both stay candidates"
         );
         let begin = begin_bytes(1, 3, open, 0);
         assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
@@ -23905,37 +23976,41 @@ pub(crate) mod tests {
         );
         let abandon = abandon_bytes(1, 3, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
         assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        scene.adapter.bound_inline_credit_for_test(64);
         let second = scene.seal(&bootstrap).expect("the moved frontier seals");
         assert_eq!(
             scene.adapter.test_drain_proof_visits.get(),
-            7,
-            "the new frontier re-derives every candidate, never resumes stale"
+            4,
+            "the new frontier re-derives every member, never resumes stale"
         );
-        let fresh = *second
-            .prefix
-            .settled()
-            .iter()
-            .find(|call| call.begin_cut == 8)
-            .expect("the fresh drain settles in the second seal");
+        assert_eq!(second.prefix.settled().len(), 3);
         assert!(
-            !fresh.abandoned && fresh.end_cut == Some(10),
-            "the fresh drain completes at its abandonment: {fresh:?}"
+            second.prefix.settled().iter().all(|call| !call.abandoned),
+            "every empty-window drain completes: {:?}",
+            second.prefix.settled()
+        );
+        assert_eq!(
+            scene.adapter.drain_proof_candidates,
+            scene.adapter.drain_candidate_mirror_for_test(),
+            "the second seal keeps the candidate mirror exact"
         );
     }
 
     #[test]
     fn object_journal_pruned_ordinal_leaves_no_window_blocker() {
-        // Removal keeps the order-proof index exact: the opener
-        // returns early, a sibling stages its BEGIN and END inside
-        // the future drain window, the sibling leaves through the
-        // production prune-removal path, and the abandonment
-        // certifies last. The pruned ordinals must block nothing:
-        // with the index removal dropped, the stale BEGIN and END
-        // keep the loss. (A seal-driven prune cannot stage this
-        // shape: any open drain holds the single-key prune watermark
-        // at its own begin, so removal under an open drain goes
-        // through the prune removal itself, exactly as
-        // `prune_settled` calls it once the watermark allows.)
+        // Removal keeps both drain indexes exact: the opener returns
+        // early, a sibling drain stages its BEGIN, return and
+        // abandonment inside the future drain window, the sibling
+        // leaves through the production prune-removal path, and the
+        // opener's abandonment certifies last. The pruned ordinals
+        // must block nothing: with the order-index removal dropped,
+        // the stale BEGIN and ABANDON keep the loss. The removed
+        // member leaves the candidate index with its entry. (A
+        // seal-driven prune cannot stage this shape: any open drain
+        // holds the single-key prune watermark at its own begin, so
+        // removal under an open drain goes through the prune removal
+        // itself, exactly as `prune_settled` calls it once the
+        // watermark allows.)
         use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
         let mut scene = Scene::new(image_default());
         let open = function_id("C_OpenSession");
@@ -23951,8 +24026,24 @@ pub(crate) mod tests {
         let sibling = begin_bytes(1, 2, close, 0);
         assert_eq!(scene.ingest(&sibling), JournalDisposition::BeginAdmitted);
         assert_eq!(
-            scene.ingest(&end_bytes_absent(&sibling, 0, ENTRY_NS + 80)),
-            JournalDisposition::EndStaged
+            scene.ingest_ordinary(ordinary_for(&sibling, 0)),
+            JournalDisposition::ReturnObserved
+        );
+        let sibling_abandon =
+            abandon_bytes(1, 2, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
+        assert_eq!(
+            scene.ingest(&sibling_abandon),
+            JournalDisposition::AbandonStaged
+        );
+        assert_eq!(
+            scene.adapter.drain_proof_candidates,
+            scene.adapter.drain_candidate_mirror_for_test(),
+            "staging keeps the candidate index an exact mirror"
+        );
+        assert_eq!(
+            scene.adapter.drain_proof_candidates,
+            BTreeSet::from([(1, 2)]),
+            "the staged sibling drain joins the candidate index"
         );
         scene
             .adapter
@@ -23965,6 +24056,15 @@ pub(crate) mod tests {
             scene.adapter.drain_ordinals,
             scene.adapter.drain_index_mirror_for_test(),
             "removal keeps the order index an exact mirror of open"
+        );
+        assert_eq!(
+            scene.adapter.drain_proof_candidates,
+            scene.adapter.drain_candidate_mirror_for_test(),
+            "removal keeps the candidate index an exact mirror of open"
+        );
+        assert!(
+            scene.adapter.drain_proof_candidates.is_empty(),
+            "the removed member leaves the candidate index"
         );
         let abandon = abandon_bytes(1, 1, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
         assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
@@ -23985,7 +24085,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             drained.end_cut,
-            Some(5),
+            Some(6),
             "the completion cut is the abandonment ordinal"
         );
         assert_eq!(
@@ -23993,14 +24093,19 @@ pub(crate) mod tests {
             scene.adapter.drain_index_mirror_for_test(),
             "the seal's own prune keeps the mirror exact"
         );
+        assert_eq!(
+            scene.adapter.drain_proof_candidates,
+            scene.adapter.drain_candidate_mirror_for_test(),
+            "the seal keeps the candidate mirror exact"
+        );
     }
 
     #[test]
     fn object_journal_wipe_clears_the_order_index_before_restart() {
-        // A void/wipe clears the order-proof index with the open
-        // table: staged history wipes, the mirror must be empty
-        // (with the clear dropped, every wiped ordinal lingers and
-        // the index grows with each restart), then fresh post-void
+        // A void/wipe clears both drain indexes with the open table:
+        // staged history wipes, both mirrors must be empty (with a
+        // clear dropped, wiped ordinals or members linger and the
+        // index grows with each restart), then fresh post-void
         // history seals and a fresh drain completes above the wiped
         // ordinals.
         use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
@@ -24013,12 +24118,28 @@ pub(crate) mod tests {
             scene.ingest_ordinary(ordinary_for(&doomed, 0)),
             JournalDisposition::ReturnObserved
         );
+        let doomed_abandon =
+            abandon_bytes(1, 1, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
+        assert_eq!(
+            scene.ingest(&doomed_abandon),
+            JournalDisposition::AbandonStaged
+        );
         let sibling = begin_bytes(1, 2, open, 0);
         assert_eq!(scene.ingest(&sibling), JournalDisposition::BeginAdmitted);
         assert_eq!(
             scene.adapter.drain_index_mirror_for_test().len(),
-            2,
-            "two staged BEGINs populate the mirror"
+            3,
+            "two staged BEGINs and one abandonment populate the mirror"
+        );
+        assert_eq!(
+            scene.adapter.drain_proof_candidates,
+            scene.adapter.drain_candidate_mirror_for_test(),
+            "staging keeps the candidate index an exact mirror"
+        );
+        assert_eq!(
+            scene.adapter.drain_proof_candidates,
+            BTreeSet::from([(1, 1)]),
+            "the doomed drain joins the candidate index before the wipe"
         );
         scene.adapter.void_staged();
         assert!(
@@ -24033,6 +24154,15 @@ pub(crate) mod tests {
         assert!(
             scene.adapter.drain_ordinals.is_empty(),
             "no wiped ordinal survives the restart"
+        );
+        assert_eq!(
+            scene.adapter.drain_proof_candidates,
+            scene.adapter.drain_candidate_mirror_for_test(),
+            "the wipe clears the candidate index, never lingers"
+        );
+        assert!(
+            scene.adapter.drain_proof_candidates.is_empty(),
+            "no wiped member survives the restart"
         );
         let proof = scene.attest_function("C_OpenSession");
         let begin = begin_bytes(1, 3, open, 0);
@@ -24052,7 +24182,7 @@ pub(crate) mod tests {
             .prefix
             .settled()
             .iter()
-            .find(|call| call.begin_cut == 4)
+            .find(|call| call.begin_cut == 5)
             .expect("the fresh drain settles");
         assert!(
             !drained.abandoned,
@@ -24062,6 +24192,11 @@ pub(crate) mod tests {
             scene.adapter.drain_ordinals,
             scene.adapter.drain_index_mirror_for_test(),
             "the restart seal keeps the mirror exact"
+        );
+        assert_eq!(
+            scene.adapter.drain_proof_candidates,
+            scene.adapter.drain_candidate_mirror_for_test(),
+            "the restart seal keeps the candidate mirror exact"
         );
     }
 
@@ -24087,6 +24222,116 @@ pub(crate) mod tests {
             scene.adapter.drain_ordinals,
             scene.adapter.drain_index_mirror_for_test(),
             "the helper keeps the order index an exact mirror of open"
+        );
+    }
+
+    #[test]
+    fn object_journal_abandon_first_drain_completes_after_late_return() {
+        // Corroboration after abandonment still joins the candidate
+        // index: the opener abandons before its ordinary return
+        // lands, the late return corroborates and stages the member,
+        // and the drain completes (its window is empty: nothing sits
+        // between a return observed after its abandonment). Without
+        // the corroboration insert, the drain keeps its loss.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+        let mut scene = Scene::new(image_default());
+        let open = function_id("C_OpenSession");
+        let proof = scene.attest_function("C_OpenSession");
+        let begin = begin_bytes(1, 1, open, 0);
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        assert!(
+            scene.adapter.drain_proof_candidates.is_empty(),
+            "no corroboration yet, no candidate"
+        );
+        assert_eq!(
+            scene.ingest_ordinary(ordinary_for(&begin, 0)),
+            JournalDisposition::ReturnObserved
+        );
+        assert_eq!(
+            scene.adapter.drain_proof_candidates,
+            scene.adapter.drain_candidate_mirror_for_test(),
+            "corroboration keeps the candidate index an exact mirror"
+        );
+        assert_eq!(
+            scene.adapter.drain_proof_candidates,
+            BTreeSet::from([(1, 1)]),
+            "the late return stages the candidate"
+        );
+        let mut pad = ordinary_for(&begin, 0);
+        pad.slot = 99;
+        scene.ingest_ordinary(pad);
+        let bootstrap = scene.bootstrap(proof, 0);
+        let success = scene.seal(&bootstrap).expect("the drain seals");
+        let drained = *success
+            .prefix
+            .settled()
+            .iter()
+            .find(|call| call.begin_cut == 1)
+            .expect("the drained call settles");
+        assert!(
+            !drained.abandoned,
+            "the abandon-first drain completes: {drained:?}"
+        );
+        assert_eq!(
+            drained.end_cut,
+            Some(2),
+            "the completion cut is the abandonment ordinal"
+        );
+        assert_eq!(
+            scene.adapter.drain_proof_candidates,
+            scene.adapter.drain_candidate_mirror_for_test(),
+            "the seal keeps the candidate mirror exact"
+        );
+    }
+
+    #[test]
+    fn object_journal_function_swap_keeps_the_candidate_index_exact() {
+        // The test-only function replacement re-evaluates candidacy:
+        // a staged member swapped to a tail-needing function leaves
+        // the index, and swapping back rejoins. Without the re-sync,
+        // the stale member lingers (or the restored member stays
+        // missing).
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+        let mut scene = Scene::new(image_default());
+        let open = function_id("C_OpenSession");
+        let create = function_id("C_CreateObject");
+        scene.attest_function("C_OpenSession");
+        let begin = begin_bytes(1, 1, open, 0);
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        assert_eq!(
+            scene.ingest_ordinary(ordinary_for(&begin, 0)),
+            JournalDisposition::ReturnObserved
+        );
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        assert_eq!(
+            scene.adapter.drain_proof_candidates,
+            BTreeSet::from([(1, 1)]),
+            "the staged drain joins the candidate index"
+        );
+        assert!(
+            scene.adapter.replace_open_function_for_test((1, 1), create),
+            "the function swaps"
+        );
+        assert_eq!(
+            scene.adapter.drain_proof_candidates,
+            scene.adapter.drain_candidate_mirror_for_test(),
+            "the swap keeps the candidate index an exact mirror"
+        );
+        assert!(
+            scene.adapter.drain_proof_candidates.is_empty(),
+            "a tail-needing function is no candidate"
+        );
+        assert!(
+            scene.adapter.replace_open_function_for_test((1, 1), open),
+            "the function swaps back"
+        );
+        assert_eq!(
+            scene.adapter.drain_proof_candidates,
+            BTreeSet::from([(1, 1)]),
+            "the restored drain rejoins the candidate index"
         );
     }
 

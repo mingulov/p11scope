@@ -33562,9 +33562,9 @@ fn joint_drain_proof_slice_yields_and_resumes_through_bounded_seal() {
 fn joint_drain_proof_retry_samples_its_preflight_once() {
     // A bounded seal that retries across proof slices samples its
     // replay preflight once, not once per retry: two proof-needing
-    // drains plus 63 retained rows (65 classified entries) under a
+    // drains plus 63 synthetic candidate rows (65 members) under a
     // 65-unit budget visit 64, yield once in-loop, retry the last
-    // entry, and seal, with one preflight sample and every unit
+    // member, and seal, with one preflight sample and every unit
     // spent. Sampling per retry would report two samples.
     use crate::semantics_objects::journal::tests::abandon_bytes;
     use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
@@ -33649,7 +33649,7 @@ fn joint_drain_proof_retry_samples_its_preflight_once() {
     assert_eq!(
         ports.read().1.adapter().test_drain_proof_visits_for_test(),
         65,
-        "the retry classifies only the remainder, never discards"
+        "the retry derives only the remainder, never discards"
     );
     assert_eq!(
         ports

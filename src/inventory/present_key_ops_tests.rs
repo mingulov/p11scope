@@ -69,6 +69,7 @@ fn key_row(
         active,
         key_join_lost: 0,
         inferred: None,
+        type_established: false,
     }
 }
 
@@ -4094,6 +4095,13 @@ fn key_ops_verbose_size_conflict_names_key_type_mismatch() {
             },
         },
     ));
+    // The type-only setup this twin pins: frozen key-type evidence
+    // with no combined label (assertions below unchanged).
+    observations
+        .key_operations
+        .last_mut()
+        .expect("one row")
+        .type_established = true;
     let mut presentation = key_ops_presentation(observations);
     presentation.key_sizes_requested = true;
     let snapshot =
@@ -4214,9 +4222,7 @@ fn key_ops_line_splits_type_only_from_typeless_counts() {
     let mut typed = key_row("sign", "key", 2, 0, 0, "operations");
     typed.object = 11;
     typed.metadata_at_use = "unknown";
-    // The implementation commit marks this row's frozen key-type
-    // evidence (no such field exists yet); the assertions below
-    // already demand the split count.
+    typed.type_established = true;
     observations.key_operations.push(typed);
     let mut typeless = key_row("sign", "key", 3, 0, 0, "operations");
     typeless.object = 12;

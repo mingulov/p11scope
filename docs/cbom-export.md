@@ -88,7 +88,9 @@ projection re-projects it; profile inputs never carry it.
   `p11scope:limit_only: true` property; it stays out of the
   unknown-primitive count.
 - Text: the head counts tokens only when devices exist; `-v` adds a
-  tokens block. Section gaps (`info_*`, `mechanism_info_refused`)
+  tokens block and per-algorithm rows, where a limit-only mechanism
+  carries `(provider-reported support; no use observed)` beside its
+  zero counts. Section gaps (`info_*`, `mechanism_info_refused`)
   have no CBOM mapping and are not projected.
 
 ## Algorithm properties (name-determined only)

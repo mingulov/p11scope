@@ -2028,7 +2028,7 @@ fn key_provider_groups(
         // Inferred facts surface only where they add information:
         // unknown-metadata rows (established rows already name
         // their key).
-        if row.metadata_at_use == "unknown" {
+        if !has_established_combined(row) {
             partition_inferred(notes.entry(row.category).or_default(), row);
         }
     }
@@ -2187,6 +2187,21 @@ fn render_parenthetical(partition: &InferredPartition) -> Option<String> {
     Some(format!(" ({})", segments.join("; ")))
 }
 
+/// Whether a proved row's combined label was established at use (H9
+/// §72): any label other than `unknown`. The one source of truth for
+/// the established split, shared by the inference partition, the
+/// per-row detail and the footer counts.
+fn has_established_combined(row: &crate::key_operation_projection::KeyAggRow) -> bool {
+    row.metadata_at_use != crate::key_operation_projection::METADATA_UNKNOWN
+}
+
+/// Whether a proved row's key type was established at use: an
+/// established combined label implies its type, else the bucket's
+/// frozen type-at-use evidence (never later object metadata).
+fn has_established_type(row: &crate::key_operation_projection::KeyAggRow) -> bool {
+    has_established_combined(row) || row.type_established
+}
+
 /// One `-v` per-row inference line, or nothing for fully blank rows.
 /// Fragments follow §10.3 exactly; a blank half omits its fragment.
 fn inferred_row_detail(row: &crate::key_operation_projection::KeyAggRow) -> Option<String> {
@@ -2223,25 +2238,34 @@ fn inferred_row_detail(row: &crate::key_operation_projection::KeyAggRow) -> Opti
             if let Some((detail, tag)) = inferred.size.detail.as_ref() {
                 // An established mismatch pins no second side: the
                 // conflict still says so, naming the inferred value
-                // against the established label on the row. An
-                // `unknown` row carries no combined label, so its
+                // against the established label on the row. A
+                // type-only row carries no combined label, so its
                 // established conflict went through the key-type
                 // gate: the fragment names the type conflict instead
-                // of an `unknown` label.
+                // of an `unknown` label. A genuinely typeless row
+                // names no established side at all.
                 let rest =
                     u64::from(inferred.size.conflict_detail.is_some()) + inferred.size.further;
                 if rest == 0 {
-                    if row.metadata_at_use == crate::key_operation_projection::METADATA_UNKNOWN {
-                        fragments.push(format!(
-                            "size conflicting ({} vs established key type)",
-                            size_verbose(detail, *tag)
-                        ));
-                    } else {
+                    if has_established_combined(row) {
                         fragments.push(format!(
                             "size conflicting ({} vs established {})",
                             size_verbose(detail, *tag),
                             row.metadata_at_use
                         ));
+                    } else if has_established_type(row) {
+                        fragments.push(format!(
+                            "size conflicting ({} vs established key type)",
+                            size_verbose(detail, *tag)
+                        ));
+                    } else {
+                        // Genuinely typeless with no second inferred
+                        // side: unreachable through the reducer (with
+                        // no established side the size would infer,
+                        // not conflict), so the conflict names no
+                        // established side rather than a false one.
+                        fragments
+                            .push(format!("size conflicting ({})", size_verbose(detail, *tag)));
                     }
                 } else {
                     fragments.push(format!(
@@ -5065,19 +5089,33 @@ fn render_snapshot_inner(
             // First-observed keys with unestablished type keep their
             // rows under the `unknown` metadata label (DEMO-4): say
             // so beside the tallies, counts only, never a guessed
-            // label.
+            // label. Rows whose frozen evidence established a key
+            // type without a combined label count separately as
+            // size-unestablished: the same established-type truth the
+            // per-row detail uses, never a merged never-established
+            // count.
             let unknown_type_rows = observations
                 .key_operations
                 .iter()
-                .filter(|row| {
-                    row.metadata_at_use == crate::key_operation_projection::METADATA_UNKNOWN
-                })
+                .filter(|row| !has_established_type(row))
                 .count();
             if unknown_type_rows > 0 {
                 let _ = writeln!(
                     out,
                     "  type unknown (not established while observed) ({unknown_type_rows} key row{})",
                     if unknown_type_rows == 1 { "" } else { "s" }
+                );
+            }
+            let type_only_rows = observations
+                .key_operations
+                .iter()
+                .filter(|row| !has_established_combined(row) && has_established_type(row))
+                .count();
+            if type_only_rows > 0 {
+                let _ = writeln!(
+                    out,
+                    "  size unknown (key type established while observed) ({type_only_rows} key row{})",
+                    if type_only_rows == 1 { "" } else { "s" }
                 );
             }
             // Controller KEYMETA-T1 rulings 2026-11-16, ruling 2:

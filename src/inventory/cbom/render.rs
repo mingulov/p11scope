@@ -913,14 +913,23 @@ pub(super) fn render_verbose(projection: &Projection, out: &mut Vec<u8>) -> std:
         if !classified.functions.is_empty() {
             let _ = write!(detail, ", {}", classified.functions.join("+"));
         }
+        // Limit-only rows carry the provider-reported support
+        // distinction JSON draws with its description and marker: a
+        // zero call count alone never says why the row exists.
+        let support = if mechanism.limit_only {
+            " (provider-reported support; no use observed)"
+        } else {
+            ""
+        };
         let _ = writeln!(
             text,
-            "  {} (0x{:x}): {}, {}, {}",
+            "  {} (0x{:x}): {}, {}, {}{}",
             escape_controls(&name),
             mechanism.id,
             detail,
             counted(mechanism.calls as usize, "call", "calls"),
             counted(mechanism.errors as usize, "error", "errors"),
+            support,
         );
     }
     let _ = writeln!(

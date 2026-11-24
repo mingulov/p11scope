@@ -33320,6 +33320,7 @@ fn keymeta_softhsm_sign_lengths_flow_from_wire_to_v7() {
         active: counters.active,
         key_join_lost: counters.key_join_lost,
         inferred: Some(keys.clone()),
+        type_established: false,
     };
     let mut observations = ObjectObservations::unavailable(1, "none");
     observations.status = ObsStatus::Populated;
@@ -33751,6 +33752,7 @@ fn key_row_json_v7_renders_inferred_keys() {
                 wrapped_further_seen: None,
             },
         }),
+        type_established: false,
     };
     let rendered = key_row_json(&row);
     assert_eq!(
@@ -33895,6 +33897,7 @@ fn key_row_json_revision_changes_bytes() {
                 wrapped_further_seen: None,
             },
         }),
+        type_established: false,
     };
     let before = serde_json::to_string(&key_row_json(&row(Some(2048)))).unwrap();
     let after = serde_json::to_string(&key_row_json(&row(Some(3072)))).unwrap();
@@ -33925,6 +33928,7 @@ fn observations_version_v7_triggers_on_inferred_content() {
         active: 0,
         key_join_lost: 0,
         inferred,
+        type_established: false,
     };
     let version_of = |rows: Vec<KeyAggRow>| {
         let mut observations = ObjectObservations::unavailable(1, "none");
@@ -34191,6 +34195,7 @@ fn observations_version_no_evidence_stays_below_v7() {
                 wrapped_further_seen: None,
             },
         }),
+        type_established: false,
     }];
     assert_eq!(observations_version(&observations), 1);
 }

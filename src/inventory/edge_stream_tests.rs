@@ -1250,6 +1250,7 @@ fn final_sweep_under_tiny_retention_discloses_unretained_key_rows() {
             active: 0,
             key_join_lost: 0,
             inferred: None,
+            type_established: false,
         })
         .collect();
     let observations = ObjectObservations {
@@ -1357,6 +1358,7 @@ fn key_rows_lost_to_pressure_are_repaired_by_the_dump_when_it_fits() {
                     active: 0,
                     key_join_lost: 0,
                     inferred: None,
+                    type_established: false,
                 })
                 .collect(),
             unknown_key_operations: Vec::new(),

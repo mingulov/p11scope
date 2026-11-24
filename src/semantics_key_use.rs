@@ -33,7 +33,7 @@ use crate::semantics_objects::journal::{
     BootstrapReceipt, H3DispositionEvidence, JournalGap, SealFailure, SealSuccess, SealedCall,
 };
 use crate::semantics_objects::{ObjectEffect, ObjectId, ObjectSemantics, SessionIncarnation};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::mem::size_of;
 
 /// At most 1,024 unsettled staged payloads per feed: one bound, two
@@ -3079,6 +3079,11 @@ struct OpenAssoc {
     /// receipts). Snapshotted at admission: a later query never
     /// re-opens the comparison.
     established_type: Option<crate::keymeta::EstablishedKind>,
+    /// The receipt's frozen established key-type code snapshot (the
+    /// text split's evidence): `Some` exactly when the key type was
+    /// established non-conflicting at use, including codes the §4.5
+    /// kind table does not list. Snapshotted at admission.
+    key_type: Option<u16>,
 }
 
 /// One receipt resolved to its bucket at admission, before any
@@ -3174,6 +3179,15 @@ pub(crate) struct KeyUseReducer {
     /// and size (flag-on lengths only). Entries exist only beside
     /// proved buckets, so the map never exceeds the aggregate bound.
     inferred: BTreeMap<AggKey, RowInference>,
+    /// Proved buckets whose frozen join-time evidence established a
+    /// key type (keymeta §4.5 left side): any contributing receipt
+    /// carried a `key_type` snapshot, even without a combined label.
+    /// Entries exist only beside proved buckets, so the set never
+    /// exceeds the aggregate bound; frozen at admission, never
+    /// rewritten by later queries. Feeds the text split between
+    /// typeless and type-only `unknown` rows — never JSON, never
+    /// inference.
+    type_established: BTreeSet<AggKey>,
     /// Wrapped-material parks by viewed object id (keymeta §5.4
     /// U1): evidence about keys with no sealed row yet. Bounded by
     /// the aggregate capacity; invalidation drops the view's park.
@@ -3232,6 +3246,7 @@ impl KeyUseReducer {
             evidence: KeyUseEvidence::default(),
             pending_shared_releases: Vec::new(),
             inferred: BTreeMap::new(),
+            type_established: BTreeSet::new(),
             parked: BTreeMap::new(),
             key_sizes: true,
             key_sizes_unavailable: false,
@@ -3303,6 +3318,12 @@ impl KeyUseReducer {
     /// Retained per-bucket inferred keys, for the projection.
     pub(crate) fn inferred_map(&self) -> &BTreeMap<AggKey, RowInference> {
         &self.inferred
+    }
+
+    /// Whether a proved bucket's frozen evidence established a key
+    /// type at use, for the projection.
+    pub(crate) fn type_established_at_use(&self, bucket: &AggKey) -> bool {
+        self.type_established.contains(bucket)
     }
 
     /// Retained key-use evidence counters, for gap publication.
@@ -3559,6 +3580,7 @@ impl KeyUseReducer {
                             primary: slot.primary,
                             established,
                             established_type,
+                            key_type: receipt.key_type,
                         }
                     })
                     .collect();
@@ -3568,10 +3590,15 @@ impl KeyUseReducer {
                     let slot = unknown_index(category, unknown_reason_for(category, *internal));
                     self.unknown_activate(slot);
                 }
-                // Touched proved buckets forward-fill their parks.
+                // Touched proved buckets forward-fill their parks
+                // and freeze any key-type evidence their receipt
+                // carried.
                 for assoc in associations.iter() {
                     if let AssocBucket::Proved(bucket) = assoc.bucket {
                         self.forward_fill(bucket, assoc.established);
+                        if assoc.key_type.is_some() {
+                            self.type_established.insert(bucket);
+                        }
                     }
                 }
                 self.open.insert(
@@ -4026,6 +4053,11 @@ impl KeyUseReducer {
             match slot.bucket {
                 AssocBucket::Proved(bucket) => {
                     self.forward_fill(bucket, established);
+                    // Freeze any key-type evidence this receipt
+                    // carried (the text split's evidence).
+                    if receipt.key_type.is_some() {
+                        self.type_established.insert(bucket);
+                    }
                     // Family by role: the mechanism types the
                     // operation key; the wrapped key gains nothing
                     // from it; unclassifiable roles stay blank.

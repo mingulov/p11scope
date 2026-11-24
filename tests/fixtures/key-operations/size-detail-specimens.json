@@ -74,6 +74,36 @@
       "curve": "p256",
       "octets": 132,
       "evidence": "sign_output"
+    },
+    "crossed curve width 256/96": {
+      "kind": "ec",
+      "curve": "p256",
+      "octets": 96,
+      "evidence": "sign_output"
+    },
+    "crossed curve width 384/64": {
+      "kind": "ec",
+      "curve": "p384",
+      "octets": 64,
+      "evidence": "sign_output"
+    },
+    "crossed curve width 384/132": {
+      "kind": "ec",
+      "curve": "p384",
+      "octets": 132,
+      "evidence": "sign_output"
+    },
+    "crossed curve width 521/64": {
+      "kind": "ec",
+      "curve": "p521",
+      "octets": 64,
+      "evidence": "sign_output"
+    },
+    "crossed curve width 521/96": {
+      "kind": "ec",
+      "curve": "p521",
+      "octets": 96,
+      "evidence": "sign_output"
     }
   }
 }

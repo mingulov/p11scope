@@ -823,6 +823,13 @@ pub(crate) struct KeyAggRow {
     /// section (blank states render unknown), `None` below v7, so
     /// v1–v6 rows keep the frozen 13 keys byte-stable.
     pub inferred: Option<crate::semantics_key_use::RowInference>,
+    /// Frozen key-type evidence at use (keymeta §4.5 left side):
+    /// `true` when any contributing receipt's join-time snapshot
+    /// established a key type, even without a combined label (an
+    /// established combined label implies its type). Internal only:
+    /// feeds the text split between typeless and type-only
+    /// `unknown` rows; JSON carries no such key.
+    pub type_established: bool,
 }
 
 /// One capture-wide unknown-key summary row: terminals partitioned
@@ -2003,6 +2010,7 @@ pub(crate) mod producer {
                         .cloned()
                         .unwrap_or_default(),
                 ),
+                type_established: keyuse.type_established_at_use(bucket),
             });
         }
         key_rows.sort_by(|a, b| {

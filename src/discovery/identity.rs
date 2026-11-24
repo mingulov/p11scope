@@ -44,6 +44,7 @@ thread_local! {
     static METERED_FDINFO_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static EXACT_BYTES_SCANNED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static EXACT_NEWLINES_SCANNED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static DELEGATE_ROW_LEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Mount-table rows the exact-id scan actually visited (test seam).
@@ -77,6 +78,13 @@ pub(crate) fn reset_exact_scan_counters_for_test() {
     METERED_FDINFO_CALLS.with(|counter| counter.set(0));
     EXACT_BYTES_SCANNED.with(|counter| counter.set(0));
     EXACT_NEWLINES_SCANNED.with(|counter| counter.set(0));
+    DELEGATE_ROW_LEN.with(|counter| counter.set(0));
+}
+
+/// Length of the matched row handed to the shared parser (test seam).
+#[cfg(test)]
+pub(crate) fn delegate_row_len_for_test() -> u64 {
+    DELEGATE_ROW_LEN.with(std::cell::Cell::get)
 }
 use crate::manifest_input::{MAX_OBJECTS, MAX_TOTAL_OBJECT_BYTES, validate_structure};
 use crate::process::{
@@ -9170,6 +9178,10 @@ fn mapping_file_key_in_mountinfo_metered_with(
     let mount_id = fd_mount_id(file)?;
     let row = scan_mount_table_for_row_with(mountinfo, &mount_id, budget, stop)?;
     budget.spend(1).map_err(str::to_string)?;
+    #[cfg(test)]
+    DELEGATE_ROW_LEN.with(|counter| {
+        counter.set(row.map(|matched| matched.len() as u64).unwrap_or(0));
+    });
     // An unmatched id resolves against the empty table, which the
     // shared parser refuses with its exact missing-mount error — no
     // error string is duplicated here.
@@ -17342,6 +17354,168 @@ mod tests {
         assert_eq!(exact_bytes_scanned_for_test(), 0);
         assert_eq!(exact_newlines_scanned_for_test(), 0);
         assert_eq!(budget.work_units_count(), 0);
+    }
+
+    /// INV-2 byte bound: one row credit must not cover a 100 KiB first
+    /// row. A single matching row of 100 KiB with one unit left refuses
+    /// after its first 8 KiB byte stride instead of scanning the whole
+    /// row for one credit.
+    #[test]
+    fn exact_mount_scan_one_credit_refuses_a_100kib_first_row() {
+        reset_exact_scan_counters_for_test();
+        let file = open_regular(Path::new("/bin/sh")).unwrap();
+        let mount_id = fd_mount_id(&file).unwrap();
+        let table = format!(
+            "{mount_id} 1 9:9 / /{} rw - ext4 /dev/target rw\n",
+            "x".repeat(100_000)
+        );
+        assert!(
+            table.len() > 100_000,
+            "the first row must exceed one byte stride by far: {}",
+            table.len()
+        );
+        let mut budget = CaptureWorkBudget::default();
+        assert!(budget.charge(budget.work_ceiling() - 1));
+        let error =
+            scan_mount_table_for_row_with(&table, &mount_id, &mut budget, |_| None).unwrap_err();
+        assert_eq!(error, crate::discovery::scan::WORK_CEILING_REASON);
+        assert_eq!(
+            exact_rows_visited_for_test(),
+            1,
+            "the row credit is spent before its byte stride refuses: {}",
+            exact_rows_visited_for_test()
+        );
+        assert_eq!(
+            exact_bytes_scanned_for_test(),
+            8 * 1024,
+            "only the first byte stride is scanned on one credit: {}",
+            exact_bytes_scanned_for_test()
+        );
+        assert_eq!(
+            exact_newlines_scanned_for_test(),
+            0,
+            "the terminator past the stride is never reached: {}",
+            exact_newlines_scanned_for_test()
+        );
+    }
+
+    /// INV-2 stop bound inside a row: a stop landing during a long
+    /// first row refuses instead of scanning the whole row between
+    /// inter-stride polls. Tripping on the first poll must refuse a
+    /// 100 KiB first-row match after at most one byte stride.
+    #[test]
+    fn exact_mount_scan_stop_during_long_first_row_refuses() {
+        reset_exact_scan_counters_for_test();
+        let file = open_regular(Path::new("/bin/sh")).unwrap();
+        let mount_id = fd_mount_id(&file).unwrap();
+        let table = format!(
+            "{mount_id} 1 9:9 / /{} rw - ext4 /dev/target rw\n",
+            "x".repeat(100_000)
+        );
+        let mut budget = CaptureWorkBudget::default();
+        let mut polls = 0;
+        let error = scan_mount_table_for_row_with(&table, &mount_id, &mut budget, |_| {
+            polls += 1;
+            (polls == 1).then_some(crate::discovery::scan::SCAN_DEADLINE_REASON)
+        })
+        .unwrap_err();
+        assert_eq!(error, crate::discovery::scan::SCAN_DEADLINE_REASON);
+        assert_eq!(polls, 1, "the byte stride polls the stop: {polls}");
+        assert_eq!(
+            exact_bytes_scanned_for_test(),
+            8 * 1024,
+            "only the first byte stride is scanned before the stop: {}",
+            exact_bytes_scanned_for_test()
+        );
+        assert_eq!(
+            exact_newlines_scanned_for_test(),
+            0,
+            "the terminator past the stop is never reached: {}",
+            exact_newlines_scanned_for_test()
+        );
+    }
+
+    /// INV-2 byte-stride twins: a row totalling exactly 8 KiB scanned
+    /// bytes charges its row credit only, while one byte more charges
+    /// an additional byte credit with one stop poll. Sizes and totals
+    /// are literals.
+    #[test]
+    fn exact_mount_scan_8kib_twins_charge_byte_strides() {
+        let file = open_regular(Path::new("/bin/sh")).unwrap();
+        let mount_id = fd_mount_id(&file).unwrap();
+        let prefix = format!("{mount_id} 1 9:9 / /");
+        let suffix = " rw - ext4 /dev/target rw\n";
+        for (total_want, units_want, polls_want) in [(8 * 1024, 1, 0), (8 * 1024 + 1, 2, 1)] {
+            reset_exact_scan_counters_for_test();
+            let fill = total_want - prefix.len() - suffix.len();
+            let table = format!("{prefix}{}{suffix}", "x".repeat(fill));
+            assert_eq!(table.len(), total_want, "total: {total_want}");
+            let mut budget = CaptureWorkBudget::default();
+            let mut polls = 0;
+            let row = scan_mount_table_for_row_with(&table, &mount_id, &mut budget, |_| {
+                polls += 1;
+                None
+            })
+            .expect("the twin match must resolve")
+            .expect("the twin row is found");
+            assert_eq!(
+                row,
+                table.trim_end_matches('\n'),
+                "total: {total_want}"
+            );
+            assert_eq!(
+                budget.work_units_count(),
+                units_want,
+                "total: {total_want}"
+            );
+            assert_eq!(polls, polls_want, "total: {total_want}");
+            assert_eq!(
+                exact_bytes_scanned_for_test(),
+                total_want as u64,
+                "total: {total_want}"
+            );
+            assert_eq!(exact_newlines_scanned_for_test(), 1, "total: {total_want}");
+        }
+    }
+
+    /// The shared parser receives a bounded row: a 100 KiB match still
+    /// resolves to its device, but the delegate input is truncated to
+    /// one byte stride so its whole-row re-read stays within its one
+    /// credit.
+    #[test]
+    fn exact_mount_scan_delegate_receives_a_bounded_row() {
+        reset_exact_scan_counters_for_test();
+        let file = open_regular(Path::new("/bin/sh")).unwrap();
+        let mount_id = fd_mount_id(&file).unwrap();
+        let table = format!(
+            "{mount_id} 1 9:9 / /{} rw - ext4 /dev/target rw\n",
+            "x".repeat(100_000)
+        );
+        let mut budget = CaptureWorkBudget::default();
+        let key = mapping_file_key_in_mountinfo_metered_with(&file, &table, &mut budget, |_| None)
+            .expect("the long match must resolve with ample budget");
+        assert_eq!((key.device_major, key.device_minor), (9, 9));
+        assert!(
+            delegate_row_len_for_test() <= 8 * 1024,
+            "the delegate input stays within one byte stride: {}",
+            delegate_row_len_for_test()
+        );
+    }
+
+    /// Healthy parity: the metered resolver agrees with the shared
+    /// parser on an ordinary short-row table.
+    #[test]
+    fn exact_mount_scan_metered_matches_unmetered_on_healthy_table() {
+        let file = open_regular(Path::new("/bin/sh")).unwrap();
+        let mount_id = fd_mount_id(&file).unwrap();
+        let table = mount_table_with_match_last(&mount_id, 5);
+        let mut budget = CaptureWorkBudget::default();
+        let metered =
+            mapping_file_key_in_mountinfo_metered_with(&file, &table, &mut budget, |_| None)
+                .expect("the metered healthy table must resolve");
+        let unmetered = mapping_file_key_in_mountinfo(&file, &table)
+            .expect("the shared healthy table must resolve");
+        assert_eq!(metered, unmetered);
     }
 
     /// Exhaustion through the threaded resolution path (not just the

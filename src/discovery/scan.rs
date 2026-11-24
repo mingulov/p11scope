@@ -21670,6 +21670,62 @@ int main(int argc, char **argv) {
         assert_eq!(MOUNTINFO_BYTE_STRIDE, 8 * 1024);
     }
 
+    /// INV-2 encoding bound: an invalid byte fails fast instead of
+    /// reading the whole table and validating it after the last poll.
+    /// A 1 MiB chunk with an invalid lead byte refuses after its first
+    /// read instead of charging a full scan.
+    #[test]
+    fn mountinfo_reader_invalid_utf8_fails_fast() {
+        reset_reader_scan_counters_for_test();
+        let mut bytes = vec![b'x'; 1024 * 1024];
+        bytes[0] = 0xFF;
+        let mut reader = RecordingReader::new([ReaderStep::Bytes(bytes), ReaderStep::Eof]);
+        let mut budget = CaptureWorkBudget::default();
+        let error =
+            read_mountinfo_with(&mut reader, &mut budget, 1024 * 1024, |_| None).unwrap_err();
+        assert!(
+            error.starts_with("mount table is not valid UTF-8"),
+            "invalid bytes refuse as an encoding error: {error}"
+        );
+        assert!(
+            budget.work_units < 10,
+            "the encoding refusal precedes the full scan: {}",
+            budget.work_units
+        );
+    }
+
+    /// Valid multi-byte UTF-8 still reads: the incremental encoding
+    /// check accepts a mountpoint carrying a two-byte character.
+    #[test]
+    fn mountinfo_reader_valid_multibyte_utf8_resolves() {
+        reset_reader_scan_counters_for_test();
+        let line = "1 1 8:1 / /münt rw - ext4 /dev/root rw\n";
+        let mut reader = RecordingReader::new([
+            ReaderStep::Bytes(line.as_bytes().to_vec()),
+            ReaderStep::Eof,
+        ]);
+        let mut budget = CaptureWorkBudget::default();
+        let table = read_mountinfo_with(&mut reader, &mut budget, 1024 * 1024, |_| None)
+            .expect("valid multi-byte UTF-8 must read");
+        assert_eq!(table, line);
+    }
+
+    /// A truncated multi-byte sequence at EOF refuses as an encoding
+    /// error instead of resolving.
+    #[test]
+    fn mountinfo_reader_truncated_utf8_at_eof_refuses() {
+        reset_reader_scan_counters_for_test();
+        let bytes = b"1 1 8:1 / /mnt rw - ext4 /dev/root rw\nabc\xC3".to_vec();
+        let mut reader = RecordingReader::new([ReaderStep::Bytes(bytes), ReaderStep::Eof]);
+        let mut budget = CaptureWorkBudget::default();
+        let error =
+            read_mountinfo_with(&mut reader, &mut budget, 1024 * 1024, |_| None).unwrap_err();
+        assert!(
+            error.starts_with("mount table is not valid UTF-8"),
+            "a truncated sequence refuses as an encoding error: {error}"
+        );
+    }
+
     /// The in-loop entry-ceiling precheck stops the actual newline
     /// scan, not just the charging: 640 lines past the ceiling refuse
     /// after exactly ceiling-plus-one-stride terminators instead of

@@ -102,6 +102,18 @@ fn arenas_supported() -> bool {
     cfg!(all(target_os = "linux", target_env = "gnu"))
 }
 
+/// Maps the `mallopt` outcome to its tuning verdict: a refused call
+/// reports [`AllocatorTuning::Failed`] and the capture continues.
+/// Separated from the `mallopt` call so unit tests pin the fail-open
+/// mapping without forcing a real allocator failure.
+fn map_set_result(ok: bool, arenas: i32) -> AllocatorTuning {
+    if ok {
+        AllocatorTuning::Applied { arenas }
+    } else {
+        AllocatorTuning::Failed
+    }
+}
+
 /// Applies the arena cap for an injected environment value. Production
 /// calls [`apply_allocator_tuning`], which reads the real environment.
 pub fn apply_allocator_tuning_for_env(env: Option<&OsStr>) -> AllocatorTuning {
@@ -111,11 +123,7 @@ pub fn apply_allocator_tuning_for_env(env: Option<&OsStr>) -> AllocatorTuning {
     if !arenas_supported() {
         return AllocatorTuning::Unsupported;
     }
-    if set_arena_max(arenas) {
-        AllocatorTuning::Applied { arenas }
-    } else {
-        AllocatorTuning::Failed
-    }
+    map_set_result(set_arena_max(arenas), arenas)
 }
 
 /// Reads `MALLOC_ARENA_MAX` and applies the product arena cap unless the
@@ -153,6 +161,15 @@ mod tests {
             apply_allocator_tuning_for_env(Some(OsStr::new("8"))),
             AllocatorTuning::SkippedEnvVar
         );
+    }
+
+    #[test]
+    fn map_set_result_reports_failed_fail_open() {
+        assert_eq!(
+            map_set_result(true, 2),
+            AllocatorTuning::Applied { arenas: 2 }
+        );
+        assert_eq!(map_set_result(false, 2), AllocatorTuning::Failed);
     }
 
     /// Serializes the tests that call `mallopt` or mutate the process

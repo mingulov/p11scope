@@ -141,7 +141,7 @@ pub mod vendor_mechanisms;
 
 /// The run member-stop watchdog's entry: `Some(exit code)` when this
 /// process was started as the watchdog (a hidden first argument), else
-/// `None`. `main` calls it before anything else.
+/// `None`. `main` calls it second, right after the allocator cap.
 pub fn member_stop_watchdog_entry() -> Option<i32> {
     attach::member_stop::watchdog::entry(std::env::args_os())
 }

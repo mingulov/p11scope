@@ -210,6 +210,6 @@ def run_firefox_cc(name: str, workdir: Path, server, credential) -> FirefoxCCRes
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 7 or sys.argv[1] != "--inner":
+    if len(sys.argv) != 6 or sys.argv[1] != "--inner":
         raise SystemExit(f"usage: {sys.argv[0]} --inner WORKDIR URL KEY CERT")
     sys.exit(inner(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]))

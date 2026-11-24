@@ -3324,6 +3324,20 @@ class BrowserFirefoxCC(unittest.TestCase):
         self.assertEqual(len(found), 2)
         self.assertEqual(missing, [])
 
+    def test_inner_argv_shape(self):
+        """Twin: the owned driver takes exactly --inner WORKDIR URL KEY CERT."""
+        driver = ROOT / "tests" / "fixtures" / "browser" / "ff_cc.py"
+        bare = subprocess.run(
+            [sys.executable, "-I", str(driver)],
+            capture_output=True, text=True, check=False, timeout=60)
+        self.assertNotEqual(bare.returncode, 0)
+        self.assertIn("--inner WORKDIR URL KEY CERT", bare.stderr)
+        short = subprocess.run(
+            [sys.executable, "-I", str(driver), "--inner", "only"],
+            capture_output=True, text=True, check=False, timeout=60)
+        self.assertNotEqual(short.returncode, 0)
+        self.assertIn("--inner WORKDIR URL KEY CERT", short.stderr)
+
     def test_sign_cells_flag_missing_linkage_call(self):
         template = (
             "import unittest\n"

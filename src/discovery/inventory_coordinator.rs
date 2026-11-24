@@ -45112,6 +45112,19 @@ int main(void) {
 
     // ---- Held-head resume on changed inputs (r7b) ----
 
+    /// The typed terminal settlement total (excluded calls over every
+    /// cause), read from the registry's authoritative map.
+    fn typed_terminal_total(native: &NativeScene) -> u64 {
+        native
+            .scene
+            .coordinator
+            .registry
+            .terminal_retry_totals_for_test()
+            .values()
+            .map(|(calls, _)| *calls)
+            .sum()
+    }
+
     #[test]
     fn no_retry_mark_settles_while_staging_is_held() {
         // Settlement waits behind held staging: a retained 3 -> 43
@@ -45138,7 +45151,7 @@ int main(void) {
             native.scene.coordinator.commit_batch(false).unwrap();
             let held = !native.scene.coordinator.held_stage.is_empty();
             if held {
-                held_totals.push(terminal_retry_total(&native));
+                held_totals.push(typed_terminal_total(&native));
             }
             if !receipt.settlement_owed {
                 break;
@@ -45152,7 +45165,7 @@ int main(void) {
             held_totals.iter().all(|total| *total == 0),
             "nothing settles while staging is held: {held_totals:?}"
         );
-        assert_eq!(terminal_retry_total(&native), 40, "settled exactly once");
+        assert_eq!(typed_terminal_total(&native), 40, "settled exactly once");
         assert!(native.scene.coordinator.retry_owed.is_empty());
     }
 
@@ -45214,7 +45227,7 @@ int main(void) {
                 held_with_verdict += 1;
             }
             assert_eq!(
-                terminal_retry_total(&native),
+                typed_terminal_total(&native),
                 0,
                 "nothing settles while the head is held ({cold} cold paths)"
             );
@@ -45393,6 +45406,91 @@ int main(void) {
         let exes = scene_unbound_exe(&native);
         assert_eq!(exes.len(), 1);
         assert_eq!((exes[0].dev, exes[0].ino), (8, 77), "{exes:?}");
+    }
+
+    #[test]
+    fn a_held_backfill_never_attaches_a_superseded_exec() {
+        // EXEC A for an unjoined image waits in the held queue on its
+        // cold learn; EXEC B for the same cookie replaces it in the
+        // stash and queues behind. Where the credit that completes A's
+        // learn leaves too little for B, the pass commits with B still
+        // waiting: A's superseded pair is never attached, and B's lands
+        // once it resolves (the latest EXEC wins). The cold-path count
+        // placing that boundary is searched (deterministic per tree).
+        let mut b_waited = 0;
+        for cold in 64..=127u32 {
+            let (mut native, _) = NativeScene::new();
+            native.scene.coordinator.set_exe_index_dirs(Vec::new());
+            native.witness(vec![native.row(41, 1, 9, 210, 0)]);
+            assert_eq!(
+                scene_unbound_exe(&native).len(),
+                1,
+                "unjoined image (setup pin)"
+            );
+            admit_cold_exe_callers(&mut native, cold);
+            native.execs(vec![exec_record(41, 9, 100, 8, 99)]);
+            native.scene.coordinator.commit_batch(false).unwrap();
+            if native.scene.coordinator.held_stage.len() != 1 {
+                continue;
+            }
+            native.execs(vec![exec_record(41, 9, 150, 8, 77)]);
+            native.scene.coordinator.commit_batch(false).unwrap();
+            let exes = scene_unbound_exe(&native);
+            assert_eq!(exes.len(), 1);
+            assert_ne!(
+                (exes[0].dev, exes[0].ino),
+                (8, 99),
+                "the superseded EXEC never publishes ({cold} cold paths)"
+            );
+            if !native.scene.coordinator.held_stage.is_empty() {
+                b_waited += 1;
+            }
+            for _ in 0..8 {
+                if native.scene.coordinator.held_stage.is_empty() {
+                    break;
+                }
+                native.read(Vec::new());
+                native.scene.coordinator.commit_batch(false).unwrap();
+            }
+            assert!(native.scene.coordinator.held_stage.is_empty());
+            let exes = scene_unbound_exe(&native);
+            assert_eq!((exes[0].dev, exes[0].ino), (8, 77), "{cold}: {exes:?}");
+        }
+        assert!(
+            b_waited >= 1,
+            "some pass commits with B still waiting (setup pin)"
+        );
+    }
+
+    #[test]
+    fn a_partial_prune_cycle_resumes_across_key_count_changes() {
+        // A full stash of live entries needs a whole prune cycle; the
+        // cycle is charged one staleness check per credit here. The
+        // head's key count alternating between one and two re-proves
+        // the space check but keeps the cycle's cursor: progress is
+        // monotonic and the cycle completes after exactly one check
+        // per entry.
+        let (mut native, _) = watched_native();
+        stash_limit(&mut native, 3);
+        stash_rows(&mut native, 6_000..6_003);
+        assert_eq!(native.preadmission().held, 3);
+        let coordinator = &mut native.scene.coordinator;
+        let before = stash_stale_checks();
+        let mut ready = Vec::new();
+        for keys in [
+            &[None][..],
+            &[None, None][..],
+            &[None][..],
+            &[None, None][..],
+        ] {
+            let mut credit = StageCredit::new(super::STASH_STALE_CHECK_UNITS);
+            ready.push(coordinator.prepare_preadmission(keys, &mut credit));
+            if ready.last() == Some(&true) {
+                break;
+            }
+        }
+        assert_eq!(ready, [false, false, true], "one check per credit, resumed");
+        assert_eq!(stash_stale_checks() - before, 3, "each entry checked once");
     }
 
     #[test]

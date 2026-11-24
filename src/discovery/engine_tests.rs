@@ -40154,6 +40154,520 @@ fn prefault_manifest_getter_data_meters_every_reproof_under_the_proof_cap() {
     );
 }
 
+/// Two distinct-file provider copies pinned as their own objects in one
+/// view: the per-object warmup twins' shared fixture. The copies guard
+/// their mappings; the engine holds no fixture borrow.
+struct TwoObjectWarmup {
+    _fixture: ScanManifestFixture,
+    copies: GetterLivenessCopies,
+    engine: Engine,
+    id: ProcessViewId,
+    objects: Vec<PinnedObjectId>,
+    padded: usize,
+}
+
+/// Builds the two-copy warmup fixture with `file_len`-byte copies
+/// (`None` page-aligns the fixture file, like the single-object twins).
+/// The budget keeps its default allowances; each twin sets its own tight
+/// per-object cap from `padded`.
+fn two_object_warmup_with_len(file_len: Option<usize>) -> TwoObjectWarmup {
+    let fixture = ScanManifestFixture::new();
+    let padded = match file_len {
+        Some(len) => {
+            pad_fixture_file_to_len(&fixture, len);
+            len
+        }
+        None => page_align_fixture_file(&fixture),
+    };
+    let (copies, mut inputs) = pin_liveness_copies(&fixture, padded, 2);
+    let (view, modules, pins, input) = same_object_scan_and_manifest(&fixture, 0x40);
+    let id = view.id();
+    inputs.insert(0, input);
+    let engine = discovered_from_inputs(vec![view], modules, pins, inputs);
+    let mut objects = Vec::with_capacity(2);
+    for path in &copies.paths {
+        let summary = engine
+            .pinned
+            .pinned()
+            .find(|summary| summary.path == path.to_str().unwrap())
+            .expect("every copy pins its own object");
+        objects.push(summary.id);
+    }
+    assert_ne!(objects[0], objects[1], "premise: two distinct objects");
+    TwoObjectWarmup {
+        _fixture: fixture,
+        copies,
+        engine,
+        id,
+        objects,
+        padded,
+    }
+}
+
+/// The two-copy warmup fixture with page-aligned (single-chunk) copies.
+fn two_object_warmup() -> TwoObjectWarmup {
+    two_object_warmup_with_len(None)
+}
+
+/// Slow proof for both copies: a tmpfs identity no maps key renders, so
+/// every range proves through its scripted batch verdict (mirrors the
+/// held-yield twin's proof).
+fn install_two_object_slow_proof(warmup: &mut TwoObjectWarmup) {
+    use crate::discovery::identity::{FileIdentity, MappedFile};
+    const TMPFS: u64 = 0x0102_1994;
+    let objects = warmup.objects.clone();
+    for (index, object) in objects.iter().enumerate() {
+        let identity = FileIdentity {
+            dev: 7000 + index as u64,
+            ino: 8000 + index as u64,
+        };
+        let base = warmup.copies.readable[index] as u64;
+        let len = warmup.padded as u64;
+        warmup.engine.set_prefault_proof_for_test(
+            *object,
+            MappedFile {
+                identity,
+                fs_magic: Some(TMPFS),
+            },
+            vec![((base, base + len), Some(identity))],
+        );
+    }
+}
+
+/// Warmup sites for `objects` (one getter site each, like the
+/// single-object twins).
+fn warmup_sites_for(objects: &[PinnedObjectId]) -> Vec<(PinnedObjectId, u64, String)> {
+    objects
+        .iter()
+        .map(|object| (*object, 0x80, "C_GetFunctionList".to_string()))
+        .collect()
+}
+
+/// A lone object past its allowance retires its tail without stopping the
+/// pass: with one 2-chunk range and a 1-chunk allowance, the first chunk
+/// reads and the second never attempts (guard: the per-object check still
+/// bills; nothing here suppresses a second object).
+#[test]
+fn prefault_manifest_getter_data_retires_only_the_exhausted_objects_tail() {
+    let fixture = ScanManifestFixture::new();
+    pad_fixture_file_to_len(&fixture, 131072);
+    let (view, modules, pins, input) = same_object_scan_and_manifest(&fixture, 0x40);
+    let id = view.id();
+    let mut engine = discovered_from_inputs(vec![view], modules, pins, vec![input]);
+    engine.budget = CaptureWorkBudget::new(ScanLimits {
+        per_object_bytes: 65536,
+        total_bytes: 8 << 20,
+    });
+    let object = engine.modules[0].object;
+    let sites = vec![(object, 0x80, "C_GetFunctionList".to_string())];
+    // SAFETY: a private read-only mapping of the held fixture file at a
+    // free low address, unmapped below before the fixture drops.
+    let low = map_fixture_low(&fixture.file, 131072);
+    let ranges = install_prefault_fast_proof(&mut engine, object);
+    assert_eq!(ranges.len(), 2, "premise: exactly two ranges");
+    assert_eq!(
+        ranges[0],
+        (low as u64, low as u64 + 131072),
+        "premise: the low range sorts first with two chunks"
+    );
+    let skips = engine.counters.object_skips.len();
+    let outcome = engine.prefault_manifest_getter_data(id, &sites);
+    // SAFETY: the successful mapping above, released once.
+    assert_eq!(unsafe { libc::munmap(low, 131072) }, 0);
+    assert_eq!(outcome, GetterPrefaultOutcome::Complete);
+    assert_eq!(
+        engine.prefault_attempts_for_test(),
+        vec![(low as u64, 65536, true)],
+        "only the first chunk reads: {:?}",
+        engine.prefault_attempts_for_test()
+    );
+    assert_eq!(
+        engine.counters.object_skips.len(),
+        skips,
+        "an exhausted allowance files no gap"
+    );
+}
+
+/// The per-object allowance applies per object, not per view: with two
+/// distinct providers each owed exactly one allowance-sized range, one
+/// pass warms both (twin: a view-wide total suppresses the second object
+/// once the first consumes the allowance).
+#[test]
+fn prefault_manifest_getter_data_applies_the_allowance_per_object() {
+    let mut warmup = two_object_warmup();
+    warmup.engine.budget = CaptureWorkBudget::new(ScanLimits {
+        per_object_bytes: warmup.padded as u64,
+        total_bytes: 8 << 20,
+    });
+    install_two_object_slow_proof(&mut warmup);
+    for (object, base) in warmup.objects.iter().zip(warmup.copies.readable.iter()) {
+        let base = *base as u64;
+        assert_eq!(
+            prefault_candidate_ranges(&warmup.engine, *object),
+            vec![(base, base + warmup.padded as u64)],
+            "premise: one candidate per copy"
+        );
+    }
+    let sites = warmup_sites_for(&warmup.objects);
+    let skips = warmup.engine.counters.object_skips.len();
+    let outcome = warmup
+        .engine
+        .prefault_manifest_getter_data(warmup.id, &sites);
+    assert_eq!(outcome, GetterPrefaultOutcome::Complete);
+    let attempts = warmup.engine.prefault_attempts_for_test();
+    let mut addrs: Vec<u64> = attempts.iter().map(|attempt| attempt.0).collect();
+    addrs.sort_unstable();
+    let mut expected: Vec<u64> = warmup
+        .copies
+        .readable
+        .iter()
+        .map(|base| *base as u64)
+        .collect();
+    expected.sort_unstable();
+    assert_eq!(
+        addrs, expected,
+        "both objects read exactly once: {attempts:?}"
+    );
+    for attempt in &attempts {
+        assert_eq!(attempt.1, warmup.padded, "each read spans its range");
+        assert!(attempt.2, "each read succeeds");
+    }
+    assert_eq!(
+        warmup.engine.counters.object_skips.len(),
+        skips,
+        "a fully warmed view files no gap"
+    );
+}
+
+/// A rescan that replaces the object set drops the removed object's
+/// bytes: with A warmed one chunk under a 1-chunk allowance and deferred
+/// on its read credit, the next pass over B alone warms B under B's own
+/// full allowance (twin: carrying A's debit into B's set suppresses B).
+#[test]
+fn prefault_manifest_getter_data_drops_a_removed_objects_bytes_on_rescan() {
+    let mut warmup = two_object_warmup_with_len(Some(131072));
+    warmup.engine.budget = CaptureWorkBudget::new(ScanLimits {
+        per_object_bytes: 65536,
+        total_bytes: 8 << 20,
+    });
+    install_two_object_slow_proof(&mut warmup);
+    for (object, base) in warmup.objects.iter().zip(warmup.copies.readable.iter()) {
+        let base = *base as u64;
+        assert_eq!(
+            prefault_candidate_ranges(&warmup.engine, *object),
+            vec![(base, base + 131072)],
+            "premise: one 2-chunk candidate per copy"
+        );
+    }
+    warmup.engine.set_prefault_caps_for_test(Some(1), None);
+    let sites_a = warmup_sites_for(&warmup.objects[..1]);
+    let outcome = warmup
+        .engine
+        .prefault_manifest_getter_data(warmup.id, &sites_a);
+    assert_eq!(
+        outcome,
+        GetterPrefaultOutcome::Deferred { frame_spent: false },
+        "pass 1 warms A's first chunk and defers on its read credit"
+    );
+    assert_eq!(
+        warmup.engine.prefault_attempts_for_test().len(),
+        1,
+        "pass 1 attempts exactly A's first chunk"
+    );
+    warmup.engine.set_prefault_caps_for_test(None, None);
+    let sites_b = warmup_sites_for(&warmup.objects[1..]);
+    let outcome = warmup
+        .engine
+        .prefault_manifest_getter_data(warmup.id, &sites_b);
+    assert_eq!(outcome, GetterPrefaultOutcome::Complete);
+    let attempts = warmup.engine.prefault_attempts_for_test();
+    let base_b = warmup.copies.readable[1] as u64;
+    assert!(
+        attempts
+            .iter()
+            .any(|attempt| attempt.0 == base_b && attempt.1 == 65536 && attempt.2),
+        "B warms under its own allowance, never A's debit: {attempts:?}"
+    );
+    assert_eq!(
+        attempts.len(),
+        2,
+        "exactly A's and B's first chunks: {attempts:?}"
+    );
+}
+
+/// Per-object totals resume across passes: with two allowance-sized
+/// ranges and one read per pass, the first pass warms the first object
+/// and defers, and the fresh pass warms the second under its own
+/// allowance (twin: a carried view-wide total suppresses the second
+/// pass's object).
+#[test]
+fn prefault_manifest_getter_data_keeps_per_object_totals_across_a_resume() {
+    let mut warmup = two_object_warmup();
+    warmup.engine.budget = CaptureWorkBudget::new(ScanLimits {
+        per_object_bytes: warmup.padded as u64,
+        total_bytes: 8 << 20,
+    });
+    install_two_object_slow_proof(&mut warmup);
+    let sites = warmup_sites_for(&warmup.objects);
+    warmup.engine.set_prefault_caps_for_test(Some(1), None);
+    let outcome = warmup
+        .engine
+        .prefault_manifest_getter_data(warmup.id, &sites);
+    assert_eq!(
+        outcome,
+        GetterPrefaultOutcome::Deferred { frame_spent: false },
+        "pass 1 warms one range and defers on its read credit"
+    );
+    assert_eq!(
+        warmup.engine.prefault_attempts_for_test().len(),
+        1,
+        "pass 1 attempts exactly one range"
+    );
+    warmup.engine.set_prefault_caps_for_test(None, None);
+    let outcome = warmup
+        .engine
+        .prefault_manifest_getter_data(warmup.id, &sites);
+    assert_eq!(outcome, GetterPrefaultOutcome::Complete);
+    let attempts = warmup.engine.prefault_attempts_for_test();
+    let mut addrs: Vec<u64> = attempts.iter().map(|attempt| attempt.0).collect();
+    addrs.sort_unstable();
+    let mut expected: Vec<u64> = warmup
+        .copies
+        .readable
+        .iter()
+        .map(|base| *base as u64)
+        .collect();
+    expected.sort_unstable();
+    assert_eq!(
+        addrs, expected,
+        "both objects read exactly once across the resume: {attempts:?}"
+    );
+}
+
+/// An exhausted object retires mid-pass without stopping it: with two
+/// 2-chunk ranges and a 1-chunk allowance, one pass reads each object's
+/// first chunk and retires both tails (twin: a view-wide stop abandons
+/// the second object with the first's tail).
+#[test]
+fn prefault_manifest_getter_data_continues_past_an_exhausted_object() {
+    let mut warmup = two_object_warmup_with_len(Some(131072));
+    warmup.engine.budget = CaptureWorkBudget::new(ScanLimits {
+        per_object_bytes: 65536,
+        total_bytes: 8 << 20,
+    });
+    install_two_object_slow_proof(&mut warmup);
+    let sites = warmup_sites_for(&warmup.objects);
+    let skips = warmup.engine.counters.object_skips.len();
+    let outcome = warmup
+        .engine
+        .prefault_manifest_getter_data(warmup.id, &sites);
+    assert_eq!(outcome, GetterPrefaultOutcome::Complete);
+    let attempts = warmup.engine.prefault_attempts_for_test();
+    let mut bases: Vec<u64> = warmup
+        .copies
+        .readable
+        .iter()
+        .map(|base| *base as u64)
+        .collect();
+    bases.sort_unstable();
+    assert_eq!(
+        attempts,
+        vec![(bases[0], 65536, true), (bases[1], 65536, true)],
+        "each object's first chunk reads in maps order: {attempts:?}"
+    );
+    assert_eq!(
+        warmup.engine.counters.object_skips.len(),
+        skips,
+        "retired tails file no gap"
+    );
+}
+
+/// Interleaved objects keep their own totals within one pass: with A's
+/// file mapped low and high around B's, and a 1-range allowance, the pass
+/// reads A's low range and B's, then retires A's high tail (twin: a
+/// view-wide total suppresses B between A's ranges).
+#[test]
+fn prefault_manifest_getter_data_interleaves_objects_within_one_pass() {
+    use crate::discovery::identity::{FileIdentity, MappedFile};
+    const TMPFS: u64 = 0x0102_1994;
+    let mut warmup = two_object_warmup();
+    // SAFETY: a private read-only mapping of A's copy at a free low
+    // address, unmapped below before the guard drops.
+    let file_a = std::fs::File::open(&warmup.copies.paths[0]).unwrap();
+    let low = map_fixture_low(&file_a, warmup.padded);
+    warmup.engine.budget = CaptureWorkBudget::new(ScanLimits {
+        per_object_bytes: warmup.padded as u64,
+        total_bytes: 8 << 20,
+    });
+    let object_a = warmup.objects[0];
+    let object_b = warmup.objects[1];
+    let high_a = warmup.copies.readable[0] as u64;
+    let base_b = warmup.copies.readable[1] as u64;
+    let len = warmup.padded as u64;
+    let identity_a = FileIdentity {
+        dev: 7000,
+        ino: 8000,
+    };
+    let identity_b = FileIdentity {
+        dev: 7001,
+        ino: 8001,
+    };
+    warmup.engine.set_prefault_proof_for_test(
+        object_a,
+        MappedFile {
+            identity: identity_a,
+            fs_magic: Some(TMPFS),
+        },
+        vec![
+            ((low as u64, low as u64 + len), Some(identity_a)),
+            ((high_a, high_a + len), Some(identity_a)),
+        ],
+    );
+    warmup.engine.set_prefault_proof_for_test(
+        object_b,
+        MappedFile {
+            identity: identity_b,
+            fs_magic: Some(TMPFS),
+        },
+        vec![((base_b, base_b + len), Some(identity_b))],
+    );
+    assert_eq!(
+        prefault_candidate_ranges(&warmup.engine, object_a),
+        vec![(low as u64, low as u64 + len), (high_a, high_a + len),],
+        "premise: A owns the low and high ranges"
+    );
+    assert_eq!(
+        prefault_candidate_ranges(&warmup.engine, object_b),
+        vec![(base_b, base_b + len)],
+        "premise: B owns one range"
+    );
+    assert!(
+        (low as u64) < base_b && base_b < high_a,
+        "premise: B sorts between A's ranges"
+    );
+    let sites = warmup_sites_for(&warmup.objects);
+    let outcome = warmup
+        .engine
+        .prefault_manifest_getter_data(warmup.id, &sites);
+    // SAFETY: the successful mapping above, released once.
+    assert_eq!(unsafe { libc::munmap(low, warmup.padded) }, 0);
+    assert_eq!(outcome, GetterPrefaultOutcome::Complete);
+    assert_eq!(
+        warmup.engine.prefault_attempts_for_test(),
+        vec![
+            (low as u64, warmup.padded, true),
+            (base_b, warmup.padded, true),
+        ],
+        "A's low range and B read; A's high tail retires: {:?}",
+        warmup.engine.prefault_attempts_for_test()
+    );
+}
+
+/// A frame yield across an expanded object set keeps only present
+/// objects' bytes: with A warmed one chunk and deferred, a spent frame
+/// over both objects carries A's total alone, and the fresh frame warms
+/// B under B's own allowance (twin: a carried view-wide debit suppresses
+/// B after the yield).
+#[test]
+fn prefault_manifest_getter_data_keeps_only_present_objects_bytes_across_a_frame_yield() {
+    let mut warmup = two_object_warmup_with_len(Some(131072));
+    warmup.engine.budget = CaptureWorkBudget::new(ScanLimits {
+        per_object_bytes: 65536,
+        total_bytes: 8 << 20,
+    });
+    install_two_object_slow_proof(&mut warmup);
+    warmup.engine.set_prefault_caps_for_test(Some(1), None);
+    let sites_a = warmup_sites_for(&warmup.objects[..1]);
+    let outcome = warmup
+        .engine
+        .prefault_manifest_getter_data(warmup.id, &sites_a);
+    assert_eq!(
+        outcome,
+        GetterPrefaultOutcome::Deferred { frame_spent: false },
+        "pass 1 warms A's first chunk and defers on its read credit"
+    );
+    warmup.engine.frame_deadline_ns = Some(0);
+    let sites_both = warmup_sites_for(&warmup.objects);
+    let outcome = warmup
+        .engine
+        .prefault_manifest_getter_data(warmup.id, &sites_both);
+    assert_eq!(
+        outcome,
+        GetterPrefaultOutcome::Deferred { frame_spent: true },
+        "pass 2 yields before enumerating under the spent frame"
+    );
+    assert_eq!(
+        warmup.engine.prefault_attempts_for_test().len(),
+        1,
+        "the frame yield attempts nothing"
+    );
+    warmup.engine.frame_deadline_ns = Some(u64::MAX);
+    warmup.engine.set_prefault_caps_for_test(None, None);
+    let outcome = warmup
+        .engine
+        .prefault_manifest_getter_data(warmup.id, &sites_both);
+    assert_eq!(outcome, GetterPrefaultOutcome::Complete);
+    let attempts = warmup.engine.prefault_attempts_for_test();
+    let base_b = warmup.copies.readable[1] as u64;
+    assert!(
+        attempts
+            .iter()
+            .any(|attempt| attempt.0 == base_b && attempt.2),
+        "B warms under its own allowance after the yield: {attempts:?}"
+    );
+    assert_eq!(
+        attempts.len(),
+        2,
+        "exactly A's and B's first chunks: {attempts:?}"
+    );
+}
+
+/// Retiring a stale cursor drops the removed object's bytes: with A
+/// warmed one chunk and deferred, retiring its cursor against B alone
+/// leaves B a full allowance (twin: carrying A's debit into B's cursor
+/// suppresses B).
+#[test]
+fn prefault_manifest_getter_data_drops_a_removed_objects_bytes_when_its_cursor_retires() {
+    let mut warmup = two_object_warmup_with_len(Some(131072));
+    warmup.engine.budget = CaptureWorkBudget::new(ScanLimits {
+        per_object_bytes: 65536,
+        total_bytes: 8 << 20,
+    });
+    install_two_object_slow_proof(&mut warmup);
+    warmup.engine.set_prefault_caps_for_test(Some(1), None);
+    let sites_a = warmup_sites_for(&warmup.objects[..1]);
+    let outcome = warmup
+        .engine
+        .prefault_manifest_getter_data(warmup.id, &sites_a);
+    assert_eq!(
+        outcome,
+        GetterPrefaultOutcome::Deferred { frame_spent: false },
+        "pass 1 warms A's first chunk and defers on its read credit"
+    );
+    let sites_b = warmup_sites_for(&warmup.objects[1..]);
+    warmup
+        .engine
+        .retire_stale_prefault_cursor(warmup.id, &sites_b);
+    warmup.engine.set_prefault_caps_for_test(None, None);
+    let outcome = warmup
+        .engine
+        .prefault_manifest_getter_data(warmup.id, &sites_b);
+    assert_eq!(outcome, GetterPrefaultOutcome::Complete);
+    let attempts = warmup.engine.prefault_attempts_for_test();
+    let base_b = warmup.copies.readable[1] as u64;
+    assert!(
+        attempts
+            .iter()
+            .any(|attempt| attempt.0 == base_b && attempt.2),
+        "B warms under its own allowance after the retire: {attempts:?}"
+    );
+    assert_eq!(
+        attempts.len(),
+        2,
+        "exactly A's and B's first chunks: {attempts:?}"
+    );
+}
+
 /// Failed proofs count as attempted operations too: a missing held proof
 /// spends its lookup, and unreadable batch stats spend theirs (twin:
 /// counting only successes would under-report the native work).

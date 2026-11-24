@@ -26907,7 +26907,10 @@ impl Engine {
     /// per-object allowance spans passes through the cursor's per-object
     /// totals; an object past its allowance retires its remaining ranges
     /// without stopping other objects, and only a spent window stops the
-    /// pass. Under an Inventory policy with no active scan the allowance
+    /// pass. Retired ranges file no gap: the spent allowance is the
+    /// pre-fault's own refusal, and a still-cold page reports honestly
+    /// on its later BPF miss. Under an Inventory policy with no active
+    /// scan the allowance
     /// is zero, so this faults nothing; and a page can be reclaimed again
     /// before the getter returns. A same-generation remap between one chunk's
     /// re-proof stat and its first byte remains a residual microsecond

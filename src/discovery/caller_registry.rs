@@ -3934,6 +3934,17 @@ enum Mutation {
         /// `terminal_phase` captured at stage time (see `RecordGap`).
         terminal: bool,
     },
+    RecordAggregatedExhaustion {
+        /// One staging's holder-scan pool refusals: the deferred-scan
+        /// count and that staging's largest attempted total, merged
+        /// into the one lane-wide exhaustion row at apply time, never
+        /// one row per attempted total.
+        deferrals: u64,
+        max_attempted: u64,
+        limit: u64,
+        /// `terminal_phase` captured at stage time (see `RecordGap`).
+        terminal: bool,
+    },
 }
 
 /// A publication is applied but its original frame has not finished. This
@@ -4067,6 +4078,22 @@ struct UnroutedAggregate {
     gap_index: Option<usize>,
 }
 
+/// The one lane-wide holder-scan pool exhaustion aggregate: the
+/// deferred-scan count with the retained row's index once it lands.
+/// Per-staging attempted totals vary, but the condition is one, so
+/// stagings sum into this row instead of one row per total. Bounded
+/// by construction (a single condition).
+struct ExhaustionAggregate {
+    deferrals: u64,
+    max_attempted: u64,
+    limit: u64,
+    gap_index: Option<usize>,
+}
+
+/// The exhaustion aggregate's subject: the only gap row this
+/// condition ever retains.
+const HOLDER_SCAN_POOL_EXHAUSTED_SUBJECT: &str = "holder scan pool exhausted";
+
 /// One aggregated per-module demoted-placement marker: the placement
 /// count with the retained row's index once it lands. Keyed by
 /// (module, subject) so a late-bind storm folds into one counted gap
@@ -4094,6 +4121,15 @@ fn demoted_placed_reason(placements: u64) -> String {
 /// (BTreeMap order), matching the drain formatter. Unknown
 /// subjects fall back to the `with {N} bindings` template; only
 /// the two unrouted subjects aggregate.
+/// The exhaustion aggregate's reason: the deferred-scan count with
+/// the largest attempted total, so the one retained row still names
+/// the true maximum the per-staging payloads carried.
+fn aggregated_exhaustion_reason(deferrals: u64, max_attempted: u64) -> String {
+    format!(
+        "{deferrals} scans deferred past the staging's holder-scan pool (largest attempted total {max_attempted}); the owed rows, held decisions and unstamped exits retry on a later batch"
+    )
+}
+
 fn aggregated_unrouted_reason(
     subject: &str,
     total: u64,
@@ -4196,6 +4232,12 @@ pub(crate) struct CallerRegistry {
     /// Aggregated subjects already counted as suppressed: a
     /// suppressed aggregate counts once, not once per merged drain.
     suppressed_aggregates: HashSet<(String, usize)>,
+    /// The one lane-wide exhaustion aggregate, if any staging filed
+    /// it yet.
+    exhaustion_aggregate: Option<ExhaustionAggregate>,
+    /// The exhaustion aggregate already counted as suppressed: a
+    /// suppressed aggregate counts once, not once per merged staging.
+    suppressed_exhaustion: bool,
     /// Aggregated demoted-placement markers by (module, subject):
     /// repeated placements sum into one counted row instead of one
     /// row per caller. Bounded by distinct (module, subject) pairs
@@ -4525,6 +4567,8 @@ impl CallerRegistry {
             gaps_suppressed: 0,
             unrouted_aggregates: HashMap::new(),
             suppressed_aggregates: HashSet::new(),
+            exhaustion_aggregate: None,
+            suppressed_exhaustion: false,
             demoted_placed_aggregates: BTreeMap::new(),
             suppressed_demoted_placed: BTreeSet::new(),
             terminal_phase: false,
@@ -5970,6 +6014,28 @@ impl CallerRegistry {
         });
     }
 
+    /// Stage one staging's holder-scan pool refusals for the
+    /// lane-wide exhaustion aggregate: stagings sharing the condition
+    /// merge into one counted row at apply time, never one row per
+    /// attempted total. The row keeps repeats 1 (consumers multiply
+    /// count by repeats, so a summed row must not count stagings
+    /// there); the deferred-scan count and the largest attempted
+    /// total ride the reason and the budget payload.
+    pub(crate) fn record_aggregated_exhaustion(
+        &mut self,
+        deferrals: u64,
+        max_attempted: u64,
+        limit: u64,
+    ) {
+        let terminal = self.terminal_phase;
+        self.staged.push(Mutation::RecordAggregatedExhaustion {
+            deferrals,
+            max_attempted,
+            limit,
+            terminal,
+        });
+    }
+
     /// Enter the terminal/stop-time phase: gaps staged from now on
     /// carry the terminal flag and may use the [`TERMINAL_GAP_RESERVE`]
     /// headroom above the bound. Idempotent; the lane enters it when
@@ -6529,6 +6595,98 @@ impl CallerRegistry {
         }
     }
 
+    /// Merge one staging's pool refusals into the lane-wide
+    /// exhaustion row: sums deferred scans and keeps the largest
+    /// attempted total, then retains or rewrites the one row in
+    /// place. The row keeps `repeats` 1 (consumers multiply count by
+    /// repeats, so a summed row must not count stagings there). A
+    /// suppressed aggregate counts once, never once per merged
+    /// staging.
+    fn push_aggregated_exhaustion(
+        &mut self,
+        deferrals: u64,
+        max_attempted: u64,
+        limit: u64,
+        terminal: bool,
+    ) {
+        let subject = String::from(HOLDER_SCAN_POOL_EXHAUSTED_SUBJECT);
+        let (reason, budget, retained_index) = {
+            let aggregate = self
+                .exhaustion_aggregate
+                .get_or_insert_with(|| ExhaustionAggregate {
+                    deferrals: 0,
+                    max_attempted: 0,
+                    limit: 0,
+                    gap_index: None,
+                });
+            aggregate.deferrals = aggregate.deferrals.saturating_add(deferrals);
+            aggregate.max_attempted = aggregate.max_attempted.max(max_attempted);
+            aggregate.limit = aggregate.limit.max(limit);
+            let reason = aggregated_exhaustion_reason(aggregate.deferrals, aggregate.max_attempted);
+            let budget = Some(BudgetRefusal {
+                resource: "holder_scan_units",
+                limit: aggregate.limit as usize,
+                requested: aggregate.max_attempted as usize,
+            });
+            (reason, budget, aggregate.gap_index)
+        };
+        // A retained row rewrites in place (the dedupe key follows
+        // the new reason and budget); repeats stays 1.
+        if let Some(index) = retained_index
+            && let Some(retained) = self.gaps.get_mut(index)
+            && retained.subject == subject
+        {
+            let old = std::mem::replace(&mut retained.reason, reason.clone());
+            let old_budget = std::mem::replace(&mut retained.budget, budget.clone());
+            self.gap_index.remove(&RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: subject.clone(),
+                reason: old,
+                budget: old_budget,
+            });
+            self.gap_index.insert(
+                RegistryGap {
+                    caller: None,
+                    module: None,
+                    pid: None,
+                    subject,
+                    reason,
+                    budget,
+                },
+                index,
+            );
+            return;
+        }
+        // First landing (or a lost index): retain one row through
+        // the budgeted path. An aggregate suppressed once stays
+        // suppressed without recounting per merged staging.
+        if self.suppressed_exhaustion {
+            return;
+        }
+        let gap = RegistryGap {
+            caller: None,
+            module: None,
+            pid: None,
+            subject,
+            reason,
+            budget,
+        };
+        let before = self.gaps.len();
+        self.push_gap_as(gap.clone(), terminal);
+        if let Some(&index) = self.gap_index.get(&gap) {
+            if let Some(aggregate) = self.exhaustion_aggregate.as_mut() {
+                aggregate.gap_index = Some(index);
+            }
+            debug_assert!(self.gaps.len() == before + 1 || self.gap_repeats[index] > 1);
+        } else {
+            // `push_gap` counted this distinct suppression; later
+            // merges of the same aggregate return early above.
+            self.suppressed_exhaustion = true;
+        }
+    }
+
     fn apply(
         &mut self,
         mutation: Mutation,
@@ -6902,6 +7060,12 @@ impl CallerRegistry {
                 bindings,
                 terminal,
             } => self.push_aggregated_unrouted(subject, total, labels, bindings, terminal),
+            Mutation::RecordAggregatedExhaustion {
+                deferrals,
+                max_attempted,
+                limit,
+                terminal,
+            } => self.push_aggregated_exhaustion(deferrals, max_attempted, limit, terminal),
             Mutation::RecordKeyedGap {
                 key,
                 caller,
@@ -10984,6 +11148,86 @@ pub(crate) mod tests {
         // repeats 1, never drains.
         assert_eq!(registry.gap_repeats(), &[1]);
         assert_eq!(registry.gaps_suppressed(), 0);
+    }
+
+    #[test]
+    fn pool_exhaustion_filings_aggregate_into_one_max_row() {
+        // Distinct per-staging attempted totals merge into the one
+        // lane-wide exhaustion row: the deferred scans sum, the
+        // budget keeps the largest attempted total, and repeats stays
+        // 1 (consumers multiply count by repeats).
+        let mut registry = registry();
+        registry.record_aggregated_exhaustion(2, 66_000, 65_536);
+        registry.publish();
+        registry.record_aggregated_exhaustion(1, 66_560, 65_536);
+        registry.publish();
+        registry.record_aggregated_exhaustion(4, 66_000, 65_536);
+        registry.publish();
+        assert_eq!(registry.gaps().len(), 1, "{:?}", registry.gaps());
+        let gap = &registry.gaps()[0];
+        assert_eq!(gap.subject, "holder scan pool exhausted");
+        assert_eq!(
+            gap.budget,
+            Some(BudgetRefusal {
+                resource: "holder_scan_units",
+                limit: 65_536,
+                requested: 66_560,
+            }),
+            "the aggregate reports the largest attempted total: {gap:?}"
+        );
+        assert!(
+            gap.reason.contains("7 scans deferred"),
+            "summed deferred scans: {}",
+            gap.reason
+        );
+        assert!(
+            gap.reason.contains("largest attempted total 66560"),
+            "the reason names the true maximum: {}",
+            gap.reason
+        );
+        assert_eq!(registry.gap_repeats(), &[1]);
+        assert_eq!(registry.gaps_suppressed(), 0);
+    }
+
+    #[test]
+    fn pool_exhaustion_aggregate_holds_one_capped_slot() {
+        // Under a one-entry gap cap, repeated exhaustion filings —
+        // distinct totals and exact repeats — still retain exactly
+        // one row without suppressing the condition itself; an
+        // unrelated gap past the cap suppresses exactly once.
+        let mut registry =
+            CallerRegistry::new(RegistryLimits::new(64, 64, 64, 1, 1 << 20, 64).unwrap());
+        registry.record_aggregated_exhaustion(1, 66_000, 65_536);
+        registry.publish();
+        registry.record_aggregated_exhaustion(1, 66_560, 65_536);
+        registry.publish();
+        registry.record_aggregated_exhaustion(1, 66_560, 65_536);
+        registry.publish();
+        assert_eq!(registry.gaps().len(), 1, "{:?}", registry.gaps());
+        let gap = &registry.gaps()[0];
+        assert_eq!(gap.subject, "holder scan pool exhausted");
+        assert_eq!(
+            gap.budget.map(|budget| budget.requested),
+            Some(66_560),
+            "the capped row reports the true maximum: {gap:?}"
+        );
+        assert!(
+            gap.reason.contains("3 scans deferred"),
+            "repeats increment the aggregate: {}",
+            gap.reason
+        );
+        assert_eq!(registry.gaps_suppressed(), 0);
+        registry.record_gap(RegistryGap {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: "unrelated".into(),
+            reason: "an unrelated gap past the cap".into(),
+            budget: None,
+        });
+        registry.publish();
+        assert_eq!(registry.gaps().len(), 1, "{:?}", registry.gaps());
+        assert_eq!(registry.gaps_suppressed(), 1);
     }
 
     #[test]

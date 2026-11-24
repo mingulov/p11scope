@@ -265,10 +265,10 @@ preflight() {
 # or host path is needed, so hosted CI runs it.
 self_test() {
   # The real shell plan and judge are exercised through bounded controlled files.
-  # P11SCOPE_MATRIX_SELF_TEST_K narrows the suite (unittest -k) for the
-  # contract's own healthy-twin run of this mode.
-  python3 -I "$REPO/tests/python/test_release_matrix_contract.py" -v \
-    ${P11SCOPE_MATRIX_SELF_TEST_K:+-k "$P11SCOPE_MATRIX_SELF_TEST_K"}
+  # The whole suite, always (no selection, no environment): a skip, an
+  # empty run or a read of an undeclared input fails.
+  python3 -I "$REPO/scripts/strict-selftest.py" "$REPO" scripts/qualify-release-matrix.sh self-test \
+    "$REPO/tests/python/test_release_matrix_contract.py"
 }
 
 if [ "$SELF_TEST" -eq 1 ]; then
@@ -315,11 +315,14 @@ PYARGS
     cat <<'INNER'
 P=$STAGE/artifacts/p11scope
 BM=$STAGE/artifacts/p11scope-bpfmulti
-# Bootstrap: the judge and the input declaration it loads; every other
-# staged input is bound by --verify-inputs below, before any runner.
+# Bootstrap: the judge and the input declaration it loads; the declared
+# check and --verify-inputs below cover every other staged input, before any runner.
 for _input in scripts/release-matrix-contract.py scripts/runner_inputs.py; do
   [ -f "$R/$_input" ] && [ -r "$R/$_input" ] || { echo "matrix inner: required input missing: $R/$_input" >&2; exit 64; }
 done
+# Every staged input present, readable and (a launched shell) executable;
+# --verify-inputs below binds their bytes.
+python3 -I "$R/scripts/runner_inputs.py" check "$R" scripts/qualify-release-matrix.sh stage || exit 64
 python3 -I "$R/scripts/release-matrix-contract.py" --verify-launch-policy || exit 1
 [ "$(id -u)" = 0 ] || { echo 'matrix inner requires root' >&2; exit 1; }
 python3 -I "$R/scripts/release-matrix-contract.py" --verify-inputs "$STAGE" --contract "$STAGE/contract.json" || exit 1

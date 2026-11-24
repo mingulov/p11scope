@@ -532,6 +532,10 @@ pub struct Engine {
     /// retired (no view owns them) and never rescanned; bounded by
     /// the learned-file cap, with loud refusal past it.
     run_learned_modules: Vec<ScannedModule>,
+    /// Reserved-owner aliases refused past the 32-entry alias budget.
+    /// Test-only: the harvest path names refusals on the diagnostics
+    /// channel in product.
+    run_learned_alias_refused: u64,
     /// Provider files the fanotify drain staged for attachment.
     learned_staged_files: u64,
     /// Learning loss: queue overflows, lost tails, drain deaths.
@@ -14987,6 +14991,7 @@ impl Engine {
             learned_finalize: false,
             pending_learned: Vec::new(),
             run_learned_modules: Vec::new(),
+            run_learned_alias_refused: 0,
             learned_staged_files: 0,
             learned_event_loss: 0,
             learned_cap_skipped: 0,
@@ -16605,6 +16610,14 @@ impl Engine {
                 );
             }
         }
+    }
+
+    /// Reserved-owner aliases refused past the 32-entry alias budget.
+    /// Test-only: the harvest path names refusals on the diagnostics
+    /// channel in product.
+    #[cfg(test)]
+    pub(crate) fn run_learned_alias_refused(&self) -> u64 {
+        self.run_learned_alias_refused
     }
 
     /// Consume the learned-staging (or owned incomplete-rescan)
@@ -19600,14 +19613,13 @@ impl Engine {
         // too (it is authorized below, so the scrub spares it).
         let ridden: BTreeSet<ProcessViewId> =
             raw_modules.iter().map(|module| module.view).collect();
-        raw_modules.retain(|module| {
-            !pinned.rejects(module.key)
-                && !module
-                    .tables
-                    .iter()
-                    .flat_map(|table| &table.entries)
-                    .any(|entry| pinned.rejects(entry.object))
-        });
+        // Entry-dependency rejections never drop the whole module here:
+        // the strict binder below keeps the module's valid entries and
+        // files a per-entry skip for each unusable one (a rejected key's
+        // raws no longer resolve, so those entries cannot bind). Only a
+        // rejected module key — the module's own identity — discards
+        // the module before the bind.
+        raw_modules.retain(|module| !pinned.rejects(module.key));
         if crate::run::capture_diagnostics_on() && raw_with_learned > raw_before_learned {
             eprintln!(
                 "p11scope: candidate scan inputs: {} frame + {} run-learned, {} survive rejects",
@@ -25401,6 +25413,35 @@ impl Engine {
         }
     }
 
+    /// Whether absorbing `incoming` could still serve `module`'s
+    /// harvest: some module raw (its own file or an entry dependency)
+    /// the incoming pins resolve but the committed set lacks, or a
+    /// rejection the committed set has not recorded yet. An identical
+    /// re-proof brings neither (its missing raw resolves nowhere and
+    /// its rejections already merged), so the harvest skips the
+    /// whole-store absorb then; a later fuller proof still absorbs.
+    fn harvest_absorb_would_serve(
+        committed: &PinnedObjects,
+        incoming: &PinnedObjects,
+        module: &ScannedModule,
+    ) -> bool {
+        if !incoming.newly_rejected_keys(committed).is_empty() {
+            return true;
+        }
+        std::iter::once((module.key, module.path.as_str()))
+            .chain(
+                module
+                    .tables
+                    .iter()
+                    .flat_map(|table| &table.entries)
+                    .map(|entry| (entry.object, entry.object_path.as_str())),
+            )
+            .any(|(key, path)| {
+                incoming.id_for_scanned(module, key, path).is_some()
+                    && committed.id_for_scanned(module, key, path).is_none()
+            })
+    }
+
     /// Persists one proof's decoded tables and interfaces as
     /// run-persistent scan inputs ([`Self::run_learned_modules`]).
     /// Without this, a transient prover teaches the run its file
@@ -25424,7 +25465,12 @@ impl Engine {
     /// re-absorbing. A proof from a new generation of the file
     /// (same union key, new digest) refuses loudly with the finite
     /// replaced-file row instead of unioning: an older generation's
-    /// tables are never reused for a new generation. Bounded by the
+    /// tables are never reused for a new generation. Tables without
+    /// a file offset never persist: generation-local addresses are
+    /// no cross-process identity, so only file-anchored tables join
+    /// the store (dangling interfaces unlink); a proof left with
+    /// neither tables nor interfaces refuses loudly through the
+    /// finite unbound row. Bounded by the
     /// learned-file cap as a second 32-entry budget beside the file
     /// store: past it the tables refuse loudly through their own
     /// finite cap row, counted in the same `learned_cap_skipped` as
@@ -25458,6 +25504,21 @@ impl Engine {
         if proof.module.tables.is_empty() && proof.module.interfaces.is_empty() {
             return None;
         }
+        // Charge the harvest below (filter, absorb, union and compare
+        // ride on the proof's decoded size): one unit per table, entry
+        // and interface plus one for the call, so run learning debits
+        // the capture work budget instead of absorbing proofs
+        // uncharged. Advisory: the verdicts below never change on a
+        // trip.
+        let units = proof
+            .module
+            .tables
+            .iter()
+            .map(|table| table.entries.len() as u64)
+            .fold(1u64, |total, entries| total.saturating_add(entries))
+            .saturating_add(proof.module.tables.len() as u64)
+            .saturating_add(proof.module.interfaces.len() as u64);
+        self.budget.charge(units);
         // File-generation check: the union below keys on
         // (mount namespace, key, path) with no digest, so a proof
         // from a NEW generation of the file (same key after an
@@ -25527,6 +25588,53 @@ impl Engine {
         }
         let mut module = proof.module.clone();
         module.view = Self::RUN_LEARNED_VIEW_ID;
+        // Stable-identity filter: a table without a file offset is
+        // generation-local (heap-resident with no object-relative
+        // location), so persisting its ordinal mapping as
+        // run-persistent cross-process authority would misattribute
+        // later processes' calls — and distinct runtime tables would
+        // collapse once their addresses normalize to zero below.
+        // Only file-anchored tables persist; interfaces left
+        // dangling unlink, like a cap-dropped table in
+        // `truncate_module_tables_to_cap`. A proof left with neither
+        // tables nor interfaces refuses loudly through the finite
+        // unbound row: its tables' calls go unobserved while the
+        // file's own staging is unaffected.
+        let mut kept_tables = Vec::with_capacity(module.tables.len());
+        let mut index_map: Vec<Option<usize>> = Vec::with_capacity(module.tables.len());
+        let mut heap_dropped = 0u64;
+        for table in module.tables.drain(..) {
+            if table.file_offset.is_some() {
+                index_map.push(Some(kept_tables.len()));
+                kept_tables.push(table);
+            } else {
+                index_map.push(None);
+                heap_dropped = heap_dropped.saturating_add(1);
+            }
+        }
+        module.tables = kept_tables;
+        for interface in &mut module.interfaces {
+            interface.table = interface
+                .table
+                .and_then(|index| index_map.get(index).copied().flatten());
+        }
+        if heap_dropped > 0 {
+            self.mark_partial(
+                crate::render::LEARNED_SKIP_SUBJECT,
+                crate::render::LEARNED_TABLE_UNBOUND_REASON,
+            );
+            if crate::run::capture_diagnostics_on() {
+                eprintln!(
+                    "p11scope: run-learned tables for {}: {} heap-resident table{} without a stable identity refused (file staging unaffected)",
+                    proof.path,
+                    heap_dropped,
+                    if heap_dropped == 1 { "" } else { "s" },
+                );
+            }
+        }
+        if module.tables.is_empty() && module.interfaces.is_empty() {
+            return;
+        }
         // Generation-local addresses never identify a persistent
         // table: consecutive provers map the same tables at
         // different addresses (ASLR), so the raw address would
@@ -25574,8 +25682,15 @@ impl Engine {
         // the candidate bind below resolves module and entry objects
         // through the committed set, and the reserved aliases keep
         // them bindable after the proving view retires or its id is
-        // reused. A second 32-entry budget bounds the aliases; the
-        // absorb merges by identity and the alias call is
+        // reused. The absorb runs only while the incoming pins still
+        // serve this harvest (see `harvest_absorb_would_serve`): an
+        // identical re-proof of an unaliasable module skips the
+        // whole-store absorb instead of re-running it per proof. A
+        // second 32-entry budget beside the file store bounds the
+        // reserved aliases; past it the tail refuses, counted in
+        // `run_learned_alias_refused` and diagnosed, while the tables
+        // still persist and bind through the committed identities.
+        // The absorb merges by identity and both alias calls are
         // idempotent, so a later fuller proof still contributes its
         // dependencies without stacking claims.
         if !self
@@ -26418,6 +26533,15 @@ impl Engine {
             let now_ns = crate::attach::monotonic_ns();
             let pids: Vec<u32> = self.views.iter().map(ProcessView::pid).collect();
             for pid in &pids {
+                // Stop-when-full: past a provably full queue no further
+                // prompt request can succeed, so each excess attempt
+                // would only pay the refusal path (a queued-entry scan
+                // plus /proc probes) and file an owed intent. The
+                // ordinary refresh path still covers every view; the
+                // prompt round is best-effort expedition only.
+                if self.refresh_requested.len() >= MAX_PENDING_REFRESH {
+                    break;
+                }
                 self.request_refresh(*pid, now_ns);
             }
             if crate::run::capture_diagnostics_on() {

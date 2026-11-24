@@ -105362,6 +105362,150 @@ fn run_learned_harvest_refuses_heap_live_tables() {
     );
 }
 
+/// A mixed proof persists its file-anchored tables only: the
+/// heap-resident table drops with the loud finite unbound row while
+/// the file-anchored table unions into the store, and interfaces
+/// remap onto the surviving tables (dangling links unlink rather
+/// than landing on the wrong table).
+#[test]
+fn run_learned_harvest_keeps_file_tables_past_heap_tables() {
+    use crate::discovery::identity::test_fixture::module as fixture_module;
+    let key = overlay_key(97);
+    let mut module = fixture_module(key);
+    module.view = ProcessViewId(9);
+    module.path = "/usr/lib/mixedprov.so".into();
+    let entry = |name: &'static str| ScannedEntry {
+        name,
+        object: key,
+        object_path: module.path.clone(),
+        file_offset: 0x1000,
+    };
+    module.tables = vec![
+        ScannedTable {
+            version: (3, 0),
+            walk: "full",
+            entries: vec![entry("C_HeapCall")],
+            null_entries: vec![],
+            unpinned: vec![],
+            address: 0x7f00_1234_5000,
+            file_offset: None,
+            live_return: true,
+            manifest_supported: false,
+            extension_impossible: false,
+        },
+        ScannedTable {
+            version: (3, 0),
+            walk: "full",
+            entries: vec![entry("C_FileCall")],
+            null_entries: vec![],
+            unpinned: vec![],
+            address: 0x7f00_1234_6000,
+            file_offset: Some(0x3000),
+            live_return: true,
+            manifest_supported: false,
+            extension_impossible: false,
+        },
+    ];
+    let interface = |index: usize, table: Option<usize>| ScannedInterface {
+        index,
+        name_class: "exact_standard",
+        name_lossy: None,
+        name_private: None,
+        flags: 0,
+        table,
+    };
+    module.interfaces = vec![interface(0, Some(0)), interface(1, Some(1))];
+    let proof = OwnedLearnProof {
+        view: ProcessViewId(9),
+        path: module.path.clone(),
+        object: PinnedObjectId(4242),
+        loader_exe: None,
+        loader_unknown_reason: None,
+        module,
+    };
+    let mut engine = Engine::empty();
+    let mut pins = PinnedObjects::empty();
+    engine.harvest_run_learned_tables(&mut pins, &proof);
+    assert_eq!(
+        engine.run_learned_modules.len(),
+        1,
+        "the file-anchored table still persists"
+    );
+    let stored = &engine.run_learned_modules[0];
+    assert_eq!(
+        stored
+            .tables
+            .iter()
+            .flat_map(|table| &table.entries)
+            .map(|entry| entry.name)
+            .collect::<Vec<_>>(),
+        vec!["C_FileCall"],
+        "only the file-anchored table's entries persist"
+    );
+    assert_eq!(
+        stored
+            .interfaces
+            .iter()
+            .map(|link| link.table)
+            .collect::<Vec<_>>(),
+        vec![None, Some(0)],
+        "the heap table's link unlinks while the file table's link remaps"
+    );
+    let row = crate::discovery::scan::Skipped {
+        subject: "learned provider file".into(),
+        reason:
+            "a learned provider's tables lost their pinned identity; its calls were not observed"
+                .into(),
+    };
+    assert!(
+        engine.counters.object_skips.contains(&row),
+        "the dropped heap table refuses loudly: {:?}",
+        engine.counters.object_skips,
+    );
+}
+
+/// An interfaces-only proof still persists: the stable-identity
+/// filter refuses the harvest only when neither tables nor interfaces
+/// survive it.
+#[test]
+fn run_learned_harvest_persists_interfaces_only_proof() {
+    use crate::discovery::identity::test_fixture::module as fixture_module;
+    let key = overlay_key(97);
+    let mut module = fixture_module(key);
+    module.view = ProcessViewId(9);
+    module.path = "/usr/lib/ifaceprov.so".into();
+    module.tables = vec![];
+    module.interfaces = vec![ScannedInterface {
+        index: 0,
+        name_class: "exact_standard",
+        name_lossy: None,
+        name_private: None,
+        flags: 0,
+        table: None,
+    }];
+    let proof = OwnedLearnProof {
+        view: ProcessViewId(9),
+        path: module.path.clone(),
+        object: PinnedObjectId(4242),
+        loader_exe: None,
+        loader_unknown_reason: None,
+        module,
+    };
+    let mut engine = Engine::empty();
+    let mut pins = PinnedObjects::empty();
+    engine.harvest_run_learned_tables(&mut pins, &proof);
+    assert_eq!(
+        engine.run_learned_modules.len(),
+        1,
+        "an interfaces-only proof persists its module"
+    );
+    assert_eq!(
+        engine.run_learned_modules[0].interfaces.len(),
+        1,
+        "the interface survives the harvest"
+    );
+}
+
 /// Re-harvesting an identical proof whose dependency has no committed
 /// identity absorbs idempotently: the module can never alias complete
 /// (the unresolvable raw is skipped every time), so every harvest
@@ -105423,6 +105567,246 @@ fn run_learned_repeated_unaliasable_proof_does_not_duplicate_pins() {
     );
     sleeper.kill().expect("kill sleeper");
     sleeper.wait().expect("reap sleeper");
+}
+
+/// Re-harvesting an identical proof skips the whole-store absorb: the
+/// incoming pins resolve nothing the committed set lacks and carry no
+/// new rejection, so the harvest only re-runs the idempotent alias.
+/// Without the skip, the re-absorb re-marks the carried rejection as
+/// a repeat and files a fresh ambiguity row per proof.
+#[test]
+fn run_learned_repeated_proof_skips_its_absorb() {
+    use crate::discovery::identity::test_fixture::real_scan_pin;
+    let (_dir, mut sleeper, mut engine, key, path) = learned_tables_engine_with(None);
+    let badkey = overlay_key(99);
+    assert_ne!(key, badkey, "the rejected key names another file");
+    let mut pins = real_scan_pin(std::path::Path::new(&path), None, 400, &"ef".repeat(32));
+    record_scan_ownership(&mut pins, ProcessViewId(9), key, &path);
+    pins.reapply_rejected_keys(&BTreeSet::from([badkey]));
+    let object = pins.pinned().next().expect("one pin").id;
+    let module = engine.run_learned_modules[0].clone();
+    let proof = || OwnedLearnProof {
+        view: ProcessViewId(9),
+        path: path.clone(),
+        object,
+        loader_exe: None,
+        loader_unknown_reason: Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
+        module: module.clone(),
+    };
+    // The module already aliases complete from the fixture harvest,
+    // so break the alias with an unresolvable dependency: the guard
+    // re-enters every proof, and only the absorb-skip keeps the
+    // re-absorb out.
+    let mut unaliasable = module.clone();
+    unaliasable.tables[0].entries.push(ScannedEntry {
+        name: "C_Login",
+        object: badkey,
+        object_path: "/usr/lib/otherprov.so".into(),
+        file_offset: 0x2000,
+    });
+    let unaliasable_proof = || OwnedLearnProof {
+        view: ProcessViewId(9),
+        path: path.clone(),
+        object,
+        loader_exe: None,
+        loader_unknown_reason: Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
+        module: unaliasable.clone(),
+    };
+    engine.learn_owned_proofs(&mut pins.clone(), &[proof()]);
+    let skips_after_first = engine.counters.object_skips.len();
+    engine.learn_owned_proofs(&mut pins.clone(), &[unaliasable_proof()]);
+    assert!(
+        engine.pinned.rejects(badkey),
+        "the unaliasable proof still absorbs its carried rejection"
+    );
+    let skips_after_second = engine.counters.object_skips.len();
+    engine.learn_owned_proofs(&mut pins.clone(), &[unaliasable_proof()]);
+    assert_eq!(
+        engine.counters.object_skips.len(),
+        skips_after_second,
+        "an identical re-proof files no fresh ambiguity row"
+    );
+    assert!(
+        skips_after_second >= skips_after_first,
+        "the comparison spans the re-absorb (first {skips_after_first}, second {skips_after_second})"
+    );
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
+/// Reserved-owner aliases stop at the second 32-entry budget: a proof
+/// naming 33 distinct dependency files aliases 32 raws, refuses the
+/// tail loudly through the counted diagnostic, and still persists
+/// and binds its tables through the committed identities. A re-proof
+/// grows the reserved set no further.
+#[test]
+fn run_learned_reserved_aliases_stop_at_thirty_two() {
+    use crate::discovery::identity::test_fixture::{module as fixture_module, real_scan_pin};
+    const DEPS: usize = 33;
+    let dir = tempfile::tempdir().expect("alias backing dir");
+    let mut incoming = PinnedObjects::empty();
+    let mut keys = Vec::with_capacity(DEPS);
+    let mut paths = Vec::with_capacity(DEPS);
+    for index in 0..DEPS {
+        let backing = dir.path().join(format!("libdep{index}.so"));
+        std::fs::write(&backing, format!("p11scope-fixture:alias-dep-{index}"))
+            .expect("write backing");
+        let digest = format!("{:064x}", index + 1);
+        let set = real_scan_pin(&backing, None, 400, &digest);
+        let pin = set.pinned().next().expect("one pin");
+        keys.push(pin.key);
+        paths.push(backing.to_string_lossy().into_owned());
+        let skipped = incoming.absorb(set);
+        assert!(
+            skipped.is_empty(),
+            "distinct files absorb cleanly: {skipped:?}"
+        );
+    }
+    let mut module = fixture_module(keys[0]);
+    module.view = ProcessViewId(9);
+    module.path = paths[0].clone();
+    module.tables = vec![ScannedTable {
+        version: (2, 40),
+        walk: "full",
+        entries: keys
+            .iter()
+            .zip(&paths)
+            .enumerate()
+            .map(|(index, (key, path))| ScannedEntry {
+                name: Box::leak(format!("C_AliasDep{index}").into_boxed_str()),
+                object: *key,
+                object_path: path.clone(),
+                file_offset: 0x1000 + index as u64 * 0x10,
+            })
+            .collect(),
+        null_entries: vec![],
+        unpinned: vec![],
+        address: 0x7000,
+        file_offset: Some(0),
+        live_return: false,
+        manifest_supported: false,
+        extension_impossible: false,
+    }];
+    module.interfaces = vec![];
+    incoming.prove_scanned_entries_for_test(std::slice::from_ref(&module));
+    let object = incoming
+        .id_for_scanned(&module, keys[0], &paths[0])
+        .expect("the own file resolves in the incoming pins");
+    let proof = || OwnedLearnProof {
+        view: ProcessViewId(9),
+        path: paths[0].clone(),
+        object,
+        loader_exe: None,
+        loader_unknown_reason: Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
+        module: module.clone(),
+    };
+    let me = std::process::id();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 7,
+        path: "/".into(),
+        dir: Arc::new(File::open("/").expect("open root dir")),
+    };
+    engine.owned_run_pid = Some(me);
+    engine.next_view_id = 8;
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(0), me).expect("own view opens"));
+    engine.learn_owned_proofs(&mut incoming.clone(), &[proof()]);
+    assert_eq!(
+        engine.run_learned_modules.len(),
+        1,
+        "the module persists despite the alias refusal"
+    );
+    assert_eq!(
+        engine
+            .pinned
+            .owned_raw_count_under(Engine::RUN_LEARNED_VIEW_ID),
+        crate::fanotify::LEARNED_FILES_PER_CAPTURE_CAP,
+        "reserved aliases stop at the 32-entry budget"
+    );
+    assert_eq!(
+        engine.run_learned_alias_refused(),
+        1,
+        "the over-budget tail refuses loudly"
+    );
+    assert_eq!(
+        learned_candidate_module_count(&mut engine),
+        1,
+        "the tables still bind through the committed identities"
+    );
+    engine.learn_owned_proofs(&mut incoming.clone(), &[proof()]);
+    assert_eq!(
+        engine
+            .pinned
+            .owned_raw_count_under(Engine::RUN_LEARNED_VIEW_ID),
+        crate::fanotify::LEARNED_FILES_PER_CAPTURE_CAP,
+        "a re-proof grows the reserved set no further"
+    );
+}
+
+/// Harvesting a proof debits the capture work budget: with one unit
+/// of room left, a harvest trips the ceiling, while the same room
+/// without a harvest still admits one unit.
+#[test]
+fn run_learned_harvest_charges_the_work_budget() {
+    use crate::discovery::identity::test_fixture::module as fixture_module;
+    const WORK_CEILING: u64 = 16 * 1024 * 1024;
+    let key = overlay_key(97);
+    let mut module = fixture_module(key);
+    module.view = ProcessViewId(9);
+    module.path = "/usr/lib/chargedprov.so".into();
+    module.tables = vec![ScannedTable {
+        version: (3, 0),
+        walk: "full",
+        entries: vec![ScannedEntry {
+            name: "C_Initialize",
+            object: key,
+            object_path: module.path.clone(),
+            file_offset: 0x1000,
+        }],
+        null_entries: vec![],
+        unpinned: vec![],
+        address: 0x7000,
+        file_offset: Some(0),
+        live_return: false,
+        manifest_supported: false,
+        extension_impossible: false,
+    }];
+    module.interfaces = vec![];
+    let proof = OwnedLearnProof {
+        view: ProcessViewId(9),
+        path: module.path.clone(),
+        object: PinnedObjectId(4242),
+        loader_exe: None,
+        loader_unknown_reason: None,
+        module,
+    };
+    let mut engine = Engine::empty();
+    let mut pins = PinnedObjects::empty();
+    assert!(engine.budget_charge_for_test(WORK_CEILING - 1));
+    engine.harvest_run_learned_tables(&mut pins, &proof);
+    assert!(
+        !engine.budget_charge_for_test(1),
+        "the harvest debited the capture work budget"
+    );
+    let row = crate::discovery::scan::Skipped {
+        subject: "learned provider file".into(),
+        reason:
+            "a learned provider's tables lost their pinned identity; its calls were not observed"
+                .into(),
+    };
+    assert!(
+        !engine.counters.object_skips.contains(&row),
+        "a clean harvest files no unbound row: {:?}",
+        engine.counters.object_skips,
+    );
+    let mut control = Engine::empty();
+    assert!(control.budget_charge_for_test(WORK_CEILING - 1));
+    assert!(
+        control.budget_charge_for_test(1),
+        "one unit of room admits one unit without a harvest"
+    );
 }
 
 /// A rejected forwarded dependency must not discard its whole learned
@@ -105551,4 +105935,33 @@ fn learned_staging_stops_requesting_refreshes_once_the_queue_is_full() {
         sleeper.kill().expect("kill sleeper");
         sleeper.wait().expect("reap sleeper");
     }
+}
+
+/// A refresh refusal past a full queue debits the capture work budget
+/// for its relief scan: with one unit of room left, one refusal trips
+/// the ceiling.
+#[test]
+fn refresh_refusal_past_a_full_queue_charges_the_work_budget() {
+    const WORK_CEILING: u64 = 16 * 1024 * 1024;
+    let mut engine = Engine::empty();
+    for offset in 0..MAX_PENDING_REFRESH as u32 {
+        assert!(
+            engine.request_refresh_consumed_for_view(
+                FAKE_PID_FLOOR + offset,
+                None,
+                ProcessViewId(0),
+            ),
+            "the queue fills without refusal"
+        );
+    }
+    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    assert!(engine.budget_charge_for_test(WORK_CEILING - 1));
+    assert!(
+        !engine.request_refresh_consumed_for_view(FAKE_PID_FLOOR + 1000, None, ProcessViewId(0)),
+        "past a full queue the request refuses"
+    );
+    assert!(
+        !engine.budget_charge_for_test(1),
+        "the refusal scan debited the capture work budget"
+    );
 }

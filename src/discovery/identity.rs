@@ -2447,26 +2447,51 @@ impl PinnedObjects {
                 .filter(|key| other.proven_collision_keys.contains(key)),
         );
         for (view, claims) in other.ownership {
-            let ours = self.ownership.entry(view).or_default();
-            ours.tables.extend(
-                claims
-                    .tables
-                    .into_iter()
-                    .filter_map(|id| id_map.get(&id).copied())
-                    .filter(|id| self.by_id.contains_key(id)),
-            );
-            ours.targets
-                .extend(claims.targets.into_iter().filter_map(|(id, offset)| {
+            let tables: Vec<_> = claims
+                .tables
+                .into_iter()
+                .filter_map(|id| id_map.get(&id).copied())
+                .filter(|id| self.by_id.contains_key(id))
+                .collect();
+            let targets: Vec<_> = claims
+                .targets
+                .into_iter()
+                .filter_map(|(id, offset)| {
                     let id = id_map.get(&id).copied()?;
                     self.by_id.contains_key(&id).then_some((id, offset))
-                }));
-            ours.pins.extend(
-                claims
-                    .pins
-                    .into_iter()
-                    .filter_map(|id| id_map.get(&id).copied())
-                    .filter(|id| self.by_id.contains_key(id)),
-            );
+                })
+                .collect();
+            let pins: Vec<_> = claims
+                .pins
+                .into_iter()
+                .filter_map(|id| id_map.get(&id).copied())
+                .filter(|id| self.by_id.contains_key(id))
+                .collect();
+            // Idempotent claim merge: claims this set already files
+            // gain no further copies — re-absorbing one proof's pins
+            // (an identical re-proof, a per-tick apply harvest) stacks
+            // nothing. The incoming batch itself still applies as filed
+            // (the binder's per-table rows keep their shape); only
+            // re-absorption dedups, against the pre-absorb rows.
+            let ours = self.ownership.entry(view).or_default();
+            let have_tables = ours.tables.clone();
+            for id in tables {
+                if !have_tables.contains(&id) {
+                    ours.tables.push(id);
+                }
+            }
+            let have_targets = ours.targets.clone();
+            for target in targets {
+                if !have_targets.contains(&target) {
+                    ours.targets.push(target);
+                }
+            }
+            let have_pins = ours.pins.clone();
+            for id in pins {
+                if !have_pins.contains(&id) {
+                    ours.pins.push(id);
+                }
+            }
         }
         // Custody merges under its generation tag: incoming carry rows stay
         // carry (never promoted by a fresh set of the same numeric ID).
@@ -3946,6 +3971,12 @@ impl PinnedObjects {
             .all(|raw| aliased(&raw))
     }
 
+    /// Ownership rows filed under `view`: the committed size a capped
+    /// alias caller measures its fresh-row allowance against.
+    pub(crate) fn owned_raw_count_under(&self, view: ProcessViewId) -> usize {
+        self.raw_ownership.get(&view).map_or(0, BTreeSet::len)
+    }
+
     /// Files scan-owned raw aliases for `module` — its own file plus
     /// every table-entry dependency already in `raw_to_id` — under
     /// `view`, with pin claims keeping the entries' custody.
@@ -3954,12 +3985,19 @@ impl PinnedObjects {
     /// later retirement or refresh then prunes only its own rows,
     /// never the learned module's. Raws with no committed identity
     /// (an absorb rejection) are skipped, so their bind still fails
-    /// loudly per entry. Idempotent: repeated calls add nothing.
-    pub(crate) fn alias_scanned_module_under(
+    /// loudly per entry. At most `max_new` fresh ownership rows file
+    /// (own file first, then entry dependencies in order); the rest
+    /// refuse and count in the returned tail. Already-owned raws
+    /// still gain a missing pin claim without spending the budget.
+    /// Idempotent within the allowance: repeated calls add nothing.
+    /// The caller mirrors one computed allowance into every pin set
+    /// it files, so the commit installs exactly the allowed subset.
+    pub(crate) fn alias_scanned_module_under_capped(
         &mut self,
         module: &ScannedModule,
         view: ProcessViewId,
-    ) {
+        max_new: usize,
+    ) -> usize {
         self.bump_revision();
         let mut raws = Vec::new();
         if let Some(own) = RawObjectInstance::scanned(module, module.key, &module.path) {
@@ -3972,6 +4010,8 @@ impl PinnedObjects {
                 raws.push(target);
             }
         }
+        let mut fresh_allowed = max_new;
+        let mut refused = 0usize;
         for raw in raws {
             let Some(id) = self.raw_to_id.get(&raw).copied() else {
                 continue;
@@ -3979,12 +4019,29 @@ impl PinnedObjects {
             if !self.by_id.contains_key(&id) {
                 continue;
             }
+            if self
+                .raw_ownership
+                .get(&view)
+                .is_some_and(|owned| owned.contains(&raw))
+            {
+                let claims = self.ownership.entry(view).or_default();
+                if !claims.pins.contains(&id) {
+                    claims.pins.push(id);
+                }
+                continue;
+            }
+            if fresh_allowed == 0 {
+                refused = refused.saturating_add(1);
+                continue;
+            }
+            fresh_allowed -= 1;
             self.raw_ownership.entry(view).or_default().file_fresh(raw);
             let claims = self.ownership.entry(view).or_default();
             if !claims.pins.contains(&id) {
                 claims.pins.push(id);
             }
         }
+        refused
     }
 
     /// Whether `source`'s pins for `module` contradict this store: any
@@ -22525,6 +22582,43 @@ mod tests {
                 .pins,
             vec![incoming_id, incoming_id],
             "ownership kept the incoming set's pre-absorb ID"
+        );
+    }
+
+    #[test]
+    fn absorbing_one_view_claims_twice_stacks_no_further_copies() {
+        let real = |minor| ObjectKey {
+            device: Device { major: 8, minor },
+            inode: INODE + minor,
+        };
+        let first_module = module(real(1));
+        let mut first = image_pins(&[(real(1), "aaaaaaaa", 1)]);
+        reconcile_scanned_modules(std::slice::from_ref(&first_module), &mut first);
+
+        let incoming_module = module(real(17));
+        let mut incoming = image_pins(&[(real(17), "bbbbbbbb", 2)]);
+        reconcile_scanned_modules(std::slice::from_ref(&incoming_module), &mut incoming);
+        first.absorb(incoming.clone());
+        let snapshot = |set: &PinnedObjects| {
+            let claims = set
+                .view_claims(ProcessViewId(17))
+                .expect("incoming view claims survive");
+            (
+                claims.tables.clone(),
+                claims.targets.clone(),
+                claims.pins.clone(),
+            )
+        };
+        let after_first = snapshot(&first);
+        assert!(
+            !after_first.0.is_empty() && !after_first.1.is_empty() && !after_first.2.is_empty(),
+            "the first absorb files table, target and pin claims to compare against"
+        );
+        first.absorb(incoming);
+        assert_eq!(
+            snapshot(&first),
+            after_first,
+            "re-absorbing one pin set files no further claim copies"
         );
     }
 

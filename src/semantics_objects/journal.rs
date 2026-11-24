@@ -9848,6 +9848,14 @@ impl JournalAdapter {
     /// clears the cache and restarts. Members above the frontier
     /// derive like the rest; every consumer gates ordinals on the
     /// sealing frontier before reading a disposition.
+    ///
+    /// Cursor reads are control work outside the charged leaf unit:
+    /// each slice performs one look-ahead past its charged visits
+    /// (the fetch that finds the budget exhausted, or the terminal
+    /// `None`), so reads never exceed visits plus slices. Every other
+    /// budgeted cursor in the crate pays before it reads through the
+    /// [`Paid`](super::credit::Paid) token; this is the one look-ahead,
+    /// pinned by the cursor-reads twin.
     fn ensure_drain_proofs(&mut self, frontier: u64) -> Result<usize, SealFailure> {
         if self.drain_proof_cache_frontier != Some(frontier) {
             self.drain_proof_cache.clear();

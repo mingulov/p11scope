@@ -55,7 +55,7 @@ impl ScopedCollectionOutcome {
                 "cgroup member generation could not be pinned or read"
             }
             Self::Incomplete(ScopedCollectionGap::GenerationChanged) => {
-                "cgroup member generation or image changed during its transaction"
+                "cgroup member generation or image could not be revalidated during its transaction"
             }
             Self::Incomplete(ScopedCollectionGap::ScanIncomplete) => {
                 "cgroup member scan was incomplete"

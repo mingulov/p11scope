@@ -10713,10 +10713,8 @@ const STALE_EXPORT_LOWERING_BEFORE: &str =
     "process generation could not be revalidated before export lowering";
 const STALE_EXPORT_LOWERING_DURING: &str =
     "process generation could not be revalidated during export lowering";
-const UNSTABLE_TABLE_VALIDATION_REASON: &str =
-    "a published table moved or the process generation could not be revalidated during validation";
-const BROAD_UNSTABLE_TABLE_REASON: &str =
-    "the mappings moved or the generation could not be revalidated during validation";
+const UNSTABLE_TABLE_VALIDATION_REASON: &str = "published table stability validation failed";
+const BROAD_UNSTABLE_TABLE_REASON: &str = "pool table stability validation failed";
 const LOADER_ATTACH_INVARIANT_AROUND_RECHECK: &str =
     "dynamic loader attachment invariant failed around a failed generation recheck";
 /// The loss mark a loader-attachment generation check files for a live
@@ -12203,8 +12201,8 @@ enum ExactReadRefusal {
     Unreadable,
     /// The bytes at the address are not a function table.
     Undecodable,
-    /// The mappings moved, or the generation could not be revalidated,
-    /// under the read.
+    /// A table, mapping, memory, or generation stability check failed under
+    /// the read; the cause need not be a move or generation change.
     Unstable,
     /// A decode budget ceiling stopped the validation.
     Budget,
@@ -27494,7 +27492,9 @@ impl Engine {
         let outcome = self.apply_candidate(session, candidate, additions_allowed, false, &[])?;
         self.queue_apply_outcome(&outcome, pending_views);
         if !outcome.stale_views.is_empty() {
-            bail!("the owned child generation changed before pre-exec loader attachment");
+            bail!(
+                "the owned child generation could not be revalidated before pre-exec loader attachment"
+            );
         }
         if !outcome.accepted() || !*additions_allowed {
             self.mark_partial(

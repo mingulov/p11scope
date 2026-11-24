@@ -45,7 +45,7 @@ pub(crate) const MAX_SUCCESSORS_PER_ARM: u8 = 16;
 const MAX_CONSECUTIVE_ENGINE_INCOMPLETE: u32 = 3;
 const MSG_UNPAUSED_PUBLICATION: &str = "the owned pause chain ended while a provider's function table was still unpublished; calls before its probes attach may be unobserved";
 const MAX_FAILURE_ITEMS: usize = 128;
-const MSG_ARM_FAILED: &str = "owned child generation changed before pause arm";
+const MSG_ARM_FAILED: &str = "owned child generation could not be revalidated before pause arm";
 const MSG_POST_RELEASE_REVALIDATION_INCOMPLETE: &str =
     "post-release loader revalidation did not close required discovery";
 const MSG_PAUSE_HELPER_REJECTED: &str = "pause helper rejected SIGSTOP";
@@ -620,7 +620,7 @@ impl PauseCoordinator {
         if expected_tasks.is_empty() || !child.pin().still_the_same() {
             return Err(Self::policy_error(
                 policy,
-                "owned child generation changed during pause preflight",
+                "owned child generation could not be revalidated during pause preflight",
                 true,
             ));
         }
@@ -1633,7 +1633,9 @@ impl PauseCoordinator {
         }
         match io.same_generation(self.pid, self.generation) {
             Ok(true) => {}
-            Ok(false) => lifecycle_errors.push("owned child generation changed".into()),
+            Ok(false) => {
+                lifecycle_errors.push("owned child generation could not be revalidated".into())
+            }
             Err(error) => lifecycle_errors.push(error),
         }
         self.may_be_stopped = false;
@@ -1775,7 +1777,7 @@ impl PauseCoordinator {
     ) -> Result<(), String> {
         loop {
             if !io.same_generation(self.pid, self.generation)? {
-                return Err("owned child generation changed after resume".into());
+                return Err("owned child generation could not be revalidated after resume".into());
             }
             let authorization = io.authorization()?;
             if install_successor && authorization == Some(PAUSE_REQUESTED) {
@@ -1843,7 +1845,8 @@ impl PauseCoordinator {
                 Ok(false) => {
                     self.unvalidated_records = self.unvalidated_records.saturating_add(1);
                     return Err(TimedDequeueError::Failure(
-                        "owned child generation changed after discovery decode".into(),
+                        "owned child generation could not be revalidated after discovery decode"
+                            .into(),
                     ));
                 }
                 Err(error) => {
@@ -3093,7 +3096,7 @@ fn collect_timed_retirement_with(
                         malformed,
                         unvalidated_records,
                         anyhow::anyhow!(
-                            "owned child generation changed after nested discovery decode"
+                            "owned child generation could not be revalidated after nested discovery decode"
                         ),
                     )
                     .into());

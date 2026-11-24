@@ -84,6 +84,7 @@ pub fn classify_discovery_noise(subject: &str, reason: &str) -> DiscoveryNoiseCl
         || reason.contains("could not be scanned")
         || reason.contains("could not be pinned")
         || reason.contains("could not be revalidated")
+        || reason.contains("table stability validation failed")
         || reason.contains("process-view capacity")
     {
         DiscoveryNoiseClass::ProcessView

@@ -25,11 +25,12 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 
 const DOC_ID: &str = "p11scope/inspect/v1";
-pub(crate) const INSPECT_GENERATION_BEFORE: &str = "process generation changed before inspect";
+pub(crate) const INSPECT_GENERATION_BEFORE: &str =
+    "process generation could not be revalidated before inspect";
 pub(crate) const INSPECT_GENERATION_SCANNING: &str =
-    "process generation changed while inspect was scanning";
+    "process generation could not be revalidated while inspect was scanning";
 pub(crate) const INSPECT_GENERATION_PINNING: &str =
-    "process generation changed while inspect was pinning";
+    "process generation could not be revalidated while inspect was pinning";
 
 /// Writes `lines`, naming each run of consecutive identical lines once with
 /// its count (`  (×N identical)`). A proxy such as p11-kit carries dozens of

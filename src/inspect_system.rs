@@ -2242,7 +2242,7 @@ fn prepare_count_manifests(
                         && generation.exe.is_some()
                         && view.start_time() == generation.start_time
                         && read_exe_identity(pid) == generation.exe,
-                    "manifest locator generation changed"
+                    "manifest locator generation could not be revalidated"
                 );
                 views.push(view);
             }
@@ -2294,7 +2294,7 @@ fn prepare_count_manifests(
                     .unwrap();
                 ensure!(
                     view.still_the_same() && read_exe_identity(view.pid()) == generation.exe,
-                    "manifest locator generation changed during validation"
+                    "manifest locator generation could not be revalidated during validation"
                 );
             }
             let own = pinning

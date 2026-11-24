@@ -1827,7 +1827,7 @@ pub(crate) fn prepare_confirmation<Io: ConfirmIo>(
 }
 
 pub(crate) const CONFIRMATION_GENERATION_UNPROVEN_DETAIL: &str =
-    "the process generation changed during the confirmation read";
+    "the process generation could not be revalidated during the confirmation read";
 
 /// Live final checks consume the original pin only after all segment proofs.
 pub(crate) fn finish_confirmation<Io: ConfirmIo>(

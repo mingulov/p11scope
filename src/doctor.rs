@@ -1532,7 +1532,7 @@ pub fn target_readability_proven<E>(
     operations.into_iter().all(|result| result.is_ok())
 }
 
-const TARGET_GENERATION_UNPROVEN: &str = "generation changed";
+const TARGET_GENERATION_UNPROVEN: &str = "generation could not be revalidated";
 
 fn assess_target_readability(pid: u32) -> Result<usize, &'static str> {
     use p11scope_manifest::maps::{MapIndex, MappedPath, ObjectKey, Resolved};

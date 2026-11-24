@@ -1499,7 +1499,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
             || generation != *preparation.generation()
         {
             return Err(failed(
-                "cgroup caller source generation or image changed before final sampling",
+                "cgroup caller source generation or image could not be revalidated before final sampling",
             ));
         }
         if let Some(id) = existing {

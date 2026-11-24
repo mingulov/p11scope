@@ -6455,6 +6455,44 @@ fn settle_pause_preflight(
     }
 }
 
+/// Starts the run-tree first-map stop hooks on the run's cgroup scope.
+/// A load refusal keeps the run (learning still covers later mappers)
+/// and files the named backstop-unavailable gap: descendants ran
+/// without first-map protection, with no call count claimed.
+fn start_run_member_stops(
+    engine: &mut Engine,
+    dir: &File,
+    tree: crate::attach::member_stop::RunTree,
+    owned_tgid: u32,
+) -> Option<crate::attach::member_stop::MemberStopHooks> {
+    start_run_member_stops_with(engine, || {
+        crate::attach::member_stop::MemberStopHooks::start(
+            dir,
+            tree,
+            owned_tgid,
+            &crate::attach::member_stop::WatchdogLauncher::SelfExe,
+        )
+    })
+}
+
+fn start_run_member_stops_with(
+    engine: &mut Engine,
+    start: impl FnOnce() -> anyhow::Result<crate::attach::member_stop::MemberStopHooks>,
+) -> Option<crate::attach::member_stop::MemberStopHooks> {
+    match start() {
+        Ok(hooks) => Some(hooks),
+        Err(error) => {
+            if capture_diagnostics_on() {
+                emit_capture_diagnostic(&format!(
+                    "p11scope: run member first-map stop unavailable: {error:#}"
+                ));
+            }
+            engine.note_member_stop_unavailable();
+            None
+        }
+    }
+}
+
 fn run_owned_inner_with_host(
     args: &RunArgs,
     stop: Arc<SignalState>,
@@ -6802,21 +6840,7 @@ fn run_owned_inner_with_host(
         && let Scope::Cgroup { dir, .. } = &scope
     {
         let tree = crate::attach::member_stop::RunTree::of(group);
-        match crate::attach::member_stop::MemberStopHooks::start(
-            dir,
-            tree,
-            pid,
-            &crate::attach::member_stop::WatchdogLauncher::SelfExe,
-        ) {
-            Ok(hooks) => owned.member_stops = Some(hooks),
-            Err(error) => {
-                if capture_diagnostics_on() {
-                    emit_capture_diagnostic(&format!(
-                        "p11scope: run member first-map stop unavailable: {error:#}"
-                    ));
-                }
-            }
-        }
+        owned.member_stops = start_run_member_stops(&mut engine, dir, tree, pid);
     }
 
     let release = owned
@@ -22463,6 +22487,27 @@ int main(int argc, char **argv) {
             },
             "the coordinator passes through untouched"
         );
+    }
+
+    #[test]
+    fn member_stop_start_refusal_files_the_named_gap_without_counts() {
+        let mut engine = crate::discovery::engine::Engine::empty_for_test();
+        let out = start_run_member_stops_with(&mut engine, || {
+            Err(anyhow::anyhow!("loading the member-stop object failed"))
+        });
+        assert!(out.is_none());
+        let skips = engine.object_skips_for_test();
+        assert_eq!(skips.len(), 1);
+        assert_eq!(skips[0].subject, crate::render::MEMBER_STOP_SKIP_SUBJECT);
+        assert_eq!(
+            skips[0].reason,
+            crate::render::MEMBER_STOP_UNAVAILABLE_REASON
+        );
+        // Repeat filings dedupe to the one row.
+        let out =
+            start_run_member_stops_with(&mut engine, || Err(anyhow::anyhow!("still unavailable")));
+        assert!(out.is_none());
+        assert_eq!(engine.object_skips_for_test().len(), 1);
     }
 
     /// U-19: the live discovery-noise summary is flushed on every

@@ -69,13 +69,17 @@ SHELL_OPERATORS = ";&|()<>`'\"{}!"
 
 def shell_words(text):
     """Shell words of a value: shlex with the operator characters split off
-    (quoted names keep them), each word also with operator characters
-    stripped from both ends (for unbalanced or odd spellings)."""
+    (quoted names keep them; no comment handling), each word also with
+    operator characters stripped from both ends (for unbalanced or odd
+    spellings). Both readings are candidates, so a quoted name and its
+    stripped twin are both checked: if either resolves into the checkout,
+    the value is refused (fail closed)."""
     words = []
     if len(text) <= 65536:
         try:
             lexer = shlex.shlex(text, posix=True, punctuation_chars=True)
             lexer.whitespace_split = True
+            lexer.commenters = ""  # `#` inside a word is part of a name
             words = list(lexer)
         except ValueError:
             words = []

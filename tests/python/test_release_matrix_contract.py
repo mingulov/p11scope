@@ -4052,9 +4052,11 @@ class StrictSelfTest(unittest.TestCase):
         # a shell command the suite runs.
         with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as raw:
             root = self.make_root(raw, "")
-            for name in ("alias file", "alias-file", "alias;semi(x)"):
+            for name in ("alias file", "alias-file", "alias;semi(x)", "alias#hash", "actual"):
                 (Path(raw) / name).symlink_to(root / "data/secret.txt")
-            spaced, plain, punct = (str(Path(raw) / n) for n in ("alias file", "alias-file", "alias;semi(x)"))
+            (Path(raw) / "actual!").write_text("unrelated\n")
+            spaced, plain, punct, hashed, actual = (str(Path(raw) / n) for n in (
+                "alias file", "alias-file", "alias;semi(x)", "alias#hash", "actual!"))
             q = shlex.quote
             table = {";": "cat %s;" % q(spaced), "&&": "cat %s&&true" % q(spaced), "||": "cat %s||true" % q(spaced),
                      "|": "cat %s|cat" % q(spaced), "&": "cat %s&" % q(spaced), "<": "cat <%s" % q(spaced),
@@ -4064,7 +4066,13 @@ class StrictSelfTest(unittest.TestCase):
                      "double quotes": 'cat "%s";' % spaced, "unquoted ;": "cat %s;" % plain,
                      "unbalanced quote": "'%s" % plain, "! ": "! cat %s" % q(spaced),
                      # A quoted name that really holds punctuation stays whole.
-                     "quoted name with ; and ( )": "cat %s;" % q(punct)}
+                     "quoted name with ; and ( )": "cat %s;" % q(punct),
+                     # codex r11k #1: `#` inside a word is no comment.
+                     "#, separated ;": "cat %s ;" % hashed, "#, attached ;": "cat %s;" % hashed,
+                     # codex r11k #2: both readings are checked; the stripped
+                     # one (actual -> checkout) refuses although the quoted
+                     # name (actual!) is an unrelated file (fail closed).
+                     "quoted name and its stripped twin": "cat %s" % q(actual)}
             (root / "suite.py").write_text(self.HEADER + "class T(unittest.TestCase):\n    def test_a(self):\n"
                                            "        assert 'REPO_ALIAS' not in os.environ\n"
                                            "        assert os.environ['UNRELATED'] == \"cat '/nowhere;x(y)';\"\n")

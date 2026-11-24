@@ -13347,7 +13347,7 @@ fn rendered_retry_breakdown_satisfies_the_discovery_retry_consumer() {
     );
     noise.note_skip(
         "process view",
-        "accepted process generation changed during attach preparation",
+        "accepted process generation could not be revalidated during attach preparation",
     );
     noise.note_skip(
         "capture discovery",

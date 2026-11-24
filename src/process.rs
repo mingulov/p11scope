@@ -2288,6 +2288,30 @@ mod tests {
         }));
     }
 
+    /// Fix7 (target-access guards A12/A13): a failed bracket check
+    /// refuses proof-neutral — it never claims the generation changed.
+    /// The check is a bool: a poll error on a live, unchanged process
+    /// fails it exactly like an exit does.
+    #[test]
+    fn run_while_same_refusals_are_proof_neutral() {
+        assert_eq!(
+            run_while_same_with(|| false, || {}).unwrap_err(),
+            "process generation could not be revalidated before target access"
+        );
+        let checks = Cell::new(0);
+        assert_eq!(
+            run_while_same_with(
+                || {
+                    checks.set(checks.get() + 1);
+                    checks.get() == 1
+                },
+                || {}
+            )
+            .unwrap_err(),
+            "process generation could not be revalidated during target access"
+        );
+    }
+
     #[test]
     fn root_fence_owned_poll_error_is_not_a_timeout() {
         // Own both pipe ends: dropping the reader makes poll report POLLERR.

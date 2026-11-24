@@ -8403,9 +8403,7 @@ fn broad_pool_table(
     )
     .map_err(|refusal| match refusal {
         ExactReadRefusal::Budget => "a decode budget ceiling stopped the validation".to_string(),
-        ExactReadRefusal::Unstable => {
-            "the mappings moved or the generation changed during validation".to_string()
-        }
+        ExactReadRefusal::Unstable => BROAD_UNSTABLE_TABLE_REASON.to_string(),
         ExactReadRefusal::Unreadable => {
             "the pool address was unreadable when validated".to_string()
         }
@@ -10706,6 +10704,25 @@ fn bind_pending_corroboration(
 
 const STALE_VIEW_REASON: &str = "accepted process generation changed during attach preparation; its discovery claims were removed";
 
+/// Operator-facing texts for a failed process-generation revalidation.
+/// A failed revalidation proves neither exit nor change — the pin may
+/// have erred on a live, unchanged process — so these texts must never
+/// claim the generation changed. Each is pinned by its behavioral or
+/// const-value test; the sweep restores the old claim per site.
+const STALE_EXPORT_LOWERING_BEFORE: &str = "process generation changed before export lowering";
+const STALE_EXPORT_LOWERING_DURING: &str = "process generation changed during export lowering";
+const UNSTABLE_TABLE_VALIDATION_REASON: &str =
+    "a published table moved or the process generation changed during validation";
+const BROAD_UNSTABLE_TABLE_REASON: &str =
+    "the mappings moved or the generation changed during validation";
+const LOADER_ATTACH_INVARIANT_AROUND_RECHECK: &str =
+    "dynamic loader attachment invariant failed around generation change";
+/// The loss mark a loader-attachment generation check files for a live
+/// generation it could not revalidate (proof-neutral; the mark helper
+/// stays silent for an exited or ending group).
+const LOADER_ATTACH_STALE_REASON: &str =
+    "loader generation, mapping, or pinned identity changed during attach";
+
 /// The record a failed post-detach terminal drain publishes. It announces a
 /// *retry*, so it is only true while the journal that owes it is still
 /// pending; `settle_terminal_drain` judges it at capture end.
@@ -12372,7 +12389,7 @@ fn lower_heap_publication_record(
         return Err("export record kind disagrees with its private hook ABI".into());
     }
     if !view.still_the_same() {
-        return Err("process generation changed before export lowering".into());
+        return Err(STALE_EXPORT_LOWERING_BEFORE.into());
     }
     if let Some(reason) = budget.stopped_now() {
         return Err(reason.into());
@@ -12398,9 +12415,7 @@ fn lower_heap_publication_record(
                 ExactReadRefusal::Budget => {
                     "a published table validation stopped at a decode budget ceiling"
                 }
-                ExactReadRefusal::Unstable => {
-                    "a published table moved or the process generation changed during validation"
-                }
+                ExactReadRefusal::Unstable => UNSTABLE_TABLE_VALIDATION_REASON,
                 ExactReadRefusal::Unreadable => {
                     "a published table address was unreadable when validated"
                 }
@@ -12475,7 +12490,7 @@ fn lower_heap_publication_record(
 
     let module = publication_module(view, record, hook_name, key, path, table);
     if !view.still_the_same() {
-        return Err("process generation changed during export lowering".into());
+        return Err(STALE_EXPORT_LOWERING_DURING.into());
     }
     Ok(HeapLowerOutcome::Admitted(module, header_available))
 }
@@ -27310,7 +27325,7 @@ impl Engine {
                     true
                 } else {
                     return Err(LoaderArmFailure::invariant(anyhow!(
-                        "dynamic loader attachment invariant failed around generation change: {error}"
+                        "{LOADER_ATTACH_INVARIANT_AROUND_RECHECK}: {error}"
                     )));
                 }
             }
@@ -27321,11 +27336,7 @@ impl Engine {
                 return Err(LoaderArmFailure::ordinary(error));
             }
             self.queue_stale_views(&[view_id].into_iter().collect(), pending_views);
-            self.mark_generation_change(
-                view_id,
-                "live loader arming",
-                "loader generation, mapping, or pinned identity changed during attach",
-            );
+            self.mark_generation_change(view_id, "live loader arming", LOADER_ATTACH_STALE_REASON);
             // A named target that provably exited mid-arm is the target
             // ending: its retirement is queued as an expected removal and the
             // capture ends the ordinary way. Only a proven exit or change

@@ -2513,7 +2513,7 @@ fn async_global_precheck_failed_replacement_discloses_the_stranded_endpoint() {
         engine.counters.object_skips.iter().any(|skip| {
             skip.subject == "live discovery replacement"
                 && skip.reason
-                    == "a process generation changed before downgraded exact targets were replaced; they were deactivated"
+                    == "a process generation could not be revalidated before downgraded exact targets were replaced; they were deactivated"
         }),
         "premise: the precheck skipped the replacement: {:?}",
         engine.counters.object_skips

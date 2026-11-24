@@ -20570,7 +20570,7 @@ pub(crate) mod tests {
             format!("memory scan refused: initial mapping validation unavailable: {CEILING}"),
             format!("memory scan refused: final mapping validation unavailable: {CEILING}"),
             format!(
-                "memory scan refused: process generation changed during acquisition: {CEILING}"
+                "memory scan refused: process generation could not be revalidated during acquisition: {CEILING}"
             ),
         ];
         let mut internals: Vec<(String, String)> = Vec::new();
@@ -20738,11 +20738,11 @@ pub(crate) mod tests {
             ),
             (
                 "live export hook",
-                "the process generation changed around a dynamic export attachment",
+                "the process generation could not be revalidated around a dynamic export attachment",
             ),
             (
                 "live discovery generation",
-                "a process generation changed after link mutation; its targets were retired before context cleanup",
+                "a process generation could not be revalidated after link mutation; its targets were retired before context cleanup",
             ),
             (
                 "live discovery generation",
@@ -20785,6 +20785,75 @@ pub(crate) mod tests {
         ev.verdict();
         let text = scope_summary("pid", &reports_fixture(), &ev);
         assert!(text.contains("19 discovery steps unavailable"), "{text}");
+    }
+
+    /// Fix7 (public rows unchanged): every reworded unproven-loss
+    /// diagnostic still folds to the generic discovery row — the
+    /// rewording changes diagnostics only, never the published JSON.
+    #[test]
+    fn reworded_unproven_diagnostics_fold_to_generic() {
+        use crate::discovery::scan::Skipped;
+        let internals = [
+            (
+                "process view",
+                "accepted process generation could not be revalidated during attach preparation; its discovery claims were removed",
+            ),
+            (
+                "live loader arming",
+                "the process generation could not be revalidated before the loader-arm postcheck",
+            ),
+            (
+                "live loader arming",
+                "loader generation, mapping, or pinned identity could not be revalidated during attach",
+            ),
+            (
+                "live export hook",
+                "the process generation could not be revalidated around a dynamic export attachment",
+            ),
+            (
+                "live discovery replacement",
+                "a process generation could not be revalidated before downgraded exact targets were replaced; they were deactivated",
+            ),
+            (
+                "live discovery generation",
+                "a process generation could not be revalidated after link mutation; its targets were retired before context cleanup",
+            ),
+            (
+                "live discovery attach",
+                "a process generation could not be revalidated before new exact targets were attached; they were deactivated for a later attempt",
+            ),
+            (
+                "live export discovery",
+                "a published table moved or the process generation could not be revalidated during validation",
+            ),
+            (
+                "live interface selection",
+                "a published table moved or the process generation could not be revalidated during validation",
+            ),
+            (
+                "capture discovery",
+                "memory scan refused: process generation could not be revalidated during acquisition: gone",
+            ),
+            (
+                "capture discovery",
+                "memory scan refused: final mapping validation unavailable: process generation could not be revalidated before target access",
+            ),
+            (
+                "/usr/lib/libpool.so",
+                "broad fixed-family: pool table 0 refused (the mappings moved or the generation could not be revalidated during validation); the pool layout is unverified, so no fixed-family tables were added",
+            ),
+        ];
+        for (subject, reason) in &internals {
+            let projected = capture_skipped_out(&Skipped {
+                subject: (*subject).into(),
+                reason: (*reason).into(),
+            });
+            assert_eq!(projected.name, "discovery subject", "{subject} {reason}");
+            assert_eq!(
+                projected.reason, "discovery unavailable",
+                "{subject} {reason}"
+            );
+        }
     }
 
     /// View-collapse fix1 (RED): the deep-scan selection cap projects to

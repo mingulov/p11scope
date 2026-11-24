@@ -16144,11 +16144,15 @@ fn inventory_preflight_all_four_causes_file_five_rows_at_both_sites() {
 /// kept duplicates would file two gap rows here).
 #[test]
 fn inventory_preflight_same_cause_newcomers_share_one_gap_row() {
-    let pids = [
-        spawn_execed_sleep().id(),
-        spawn_execed_sleep().id(),
-        spawn_execed_sleep().id(),
-    ];
+    // The three fixture children stay owned: dropping a `Child` neither
+    // kills nor reaps, so the guard reaps them at scope end, including
+    // on an assertion failure below.
+    let children = ExitMappingChildrenGuard(vec![
+        spawn_execed_sleep(),
+        spawn_execed_sleep(),
+        spawn_execed_sleep(),
+    ]);
+    let pids = [children.0[0].id(), children.0[1].id(), children.0[2].id()];
     let mut engine = Engine::empty();
     engine
         .views
@@ -24605,7 +24609,9 @@ fn absorb_watch_scan_counters_counts_refusals_without_marking_gaps() {
     let mut counters = DiscoveryCounters::default();
     let skipped = Skipped {
         subject: "capture discovery".into(),
-        reason: "memory scan refused: process generation changed during acquisition".into(),
+        reason:
+            "memory scan refused: process generation could not be revalidated during acquisition"
+                .into(),
     };
     // The scan notes every skip it returns (scan_and_pin_with_proof).
     counters.noise.note_skip(&skipped.subject, &skipped.reason);
@@ -24619,7 +24625,7 @@ fn absorb_watch_scan_counters_counts_refusals_without_marking_gaps() {
         engine
             .counters
             .noise
-            .count(DiscoveryNoiseClass::ProcessEnded),
+            .count(DiscoveryNoiseClass::ProcessView),
         1,
         "the refusal cause still counts exactly once"
     );
@@ -44861,7 +44867,7 @@ fn a_generation_lost_before_attach_leaves_a_refreshed_views_new_targets_retryabl
     assert!(
         engine.counters.object_skips.contains(&u07_partial(
             "live discovery attach",
-            "a process generation changed before new exact targets were attached; they were deactivated for a later attempt",
+            "a process generation could not be revalidated before new exact targets were attached; they were deactivated for a later attempt",
         )),
         "the unattached targets are an explicit failure: {:?}",
         engine.counters.object_skips
@@ -45431,7 +45437,7 @@ fn a_generation_skipped_replacement_recovers_the_surviving_owner() {
     assert!(
         engine.counters.object_skips.contains(&u07_partial(
             "live discovery replacement",
-            "a process generation changed before downgraded exact targets were replaced; they were deactivated",
+            "a process generation could not be revalidated before downgraded exact targets were replaced; they were deactivated",
         )),
         "tick 2 skips the replacement in the precheck None arm: {:?}",
         engine.counters.object_skips
@@ -45542,7 +45548,7 @@ fn a_replacement_skipped_by_an_attach_phase_loss_recovers_the_surviving_owner() 
     assert!(
         !engine.counters.object_skips.contains(&u07_partial(
             "live discovery replacement",
-            "a process generation changed before downgraded exact targets were replaced; they were deactivated",
+            "a process generation could not be revalidated before downgraded exact targets were replaced; they were deactivated",
         )),
         "tick 2 skips the replacement in the else branch, not the precheck None arm: {:?}",
         engine.counters.object_skips
@@ -45812,7 +45818,7 @@ fn a_generation_lost_before_replacement_leaves_the_detached_targets_inactive() {
     assert!(
         engine.counters.object_skips.contains(&u07_partial(
             "live discovery replacement",
-            "a process generation changed before downgraded exact targets were replaced; they were deactivated",
+            "a process generation could not be revalidated before downgraded exact targets were replaced; they were deactivated",
         )),
         "the unreplaced target is an explicit failure: {:?}",
         engine.counters.object_skips
@@ -45889,7 +45895,7 @@ fn a_retired_conservative_replay_closes_the_tick() {
     assert!(
         engine.counters.object_skips.contains(&u07_partial(
             "live discovery generation",
-            "a process generation changed after link mutation; its targets were retired before context cleanup",
+            "a process generation could not be revalidated after link mutation; its targets were retired before context cleanup",
         )),
         "{:?}",
         engine.counters.object_skips
@@ -94001,6 +94007,249 @@ fn named_proven_reuse_race_keeps_changed_bail_during_loader_attachment() {
     drop(child);
 }
 
+/// Fix7 (stale-view diagnostic A1): removing an accepted view that the
+/// caller reports stale files a proof-neutral diagnostic — never a
+/// "changed" claim. The removed view here is the live test process
+/// itself, so no exit or reuse proof exists; the stale-member refusal
+/// (removal + counts + stale-view class) stays exactly as before.
+#[test]
+fn stale_view_removal_files_a_proof_neutral_diagnostic() {
+    use crate::discovery::noise::DiscoveryNoiseClass;
+    let view = ProcessView::open(ProcessViewId(37), std::process::id()).unwrap();
+    let mut engine = lifecycle_discovered(vec![view]);
+    let removed = remove_stale_views(&mut engine, &[ProcessViewId(37)]).unwrap();
+    assert_eq!(removed, 1, "the stale member is still refused");
+    assert!(engine.views.is_empty());
+    let filed: Vec<_> = engine
+        .base_counters
+        .object_skips
+        .iter()
+        .filter(|skip| skip.subject == "process view")
+        .collect();
+    assert_eq!(filed.len(), 1, "{:?}", engine.base_counters.object_skips);
+    assert_eq!(
+        filed[0].reason,
+        "accepted process generation could not be revalidated during attach preparation; its discovery claims were removed",
+        "the stale-view diagnostic never claims a change without proof"
+    );
+    assert_eq!(
+        engine.noise_totals.count(DiscoveryNoiseClass::StaleView),
+        1,
+        "the stale-view class keeps its count"
+    );
+    let lines = engine.noise_totals.lines();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].contains("stale-view")
+            && lines[0].contains(&filed[0].reason)
+            && !lines[0].contains("changed"),
+        "the verbose sample carries the neutral wording: {lines:?}"
+    );
+}
+
+/// Fix7 (loader-arm postcheck mark A2): the same forced loss as the
+/// contradicted S1 twin, but asserting the filed loss mark rather than
+/// the bail: on a pin that reads `Current` the mark must be
+/// proof-neutral, never "changed". The bail twin pins the refusal.
+#[test]
+fn loader_arm_postcheck_mark_is_proof_neutral_on_a_contradicted_pin() {
+    let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+    engine.lose_generation_after_arm_for_test = true;
+    engine.pin_probe_script.borrow_mut().extend([
+        PinProbeAnswer::Exited(Ok(false)),
+        PinProbeAnswer::Exited(Ok(false)),
+        PinProbeAnswer::State(Some(Ok(crate::process::OriginalGenerationState::Current))),
+        PinProbeAnswer::Exited(Ok(false)),
+        PinProbeAnswer::Exited(Ok(false)),
+        PinProbeAnswer::State(Some(Ok(crate::process::OriginalGenerationState::Current))),
+    ]);
+    let error = engine
+        .arm_loader_or_partial(
+            0,
+            &mut ScriptedSession::default(),
+            &mut true,
+            &mut PendingViewRetirements::new(),
+        )
+        .expect_err("a contradicted named generation refuses the capture");
+    assert!(
+        format!("{error:#}").contains("was unverified during loader arming"),
+        "premise: the unproven path still refuses: {error:#}"
+    );
+    let mark = engine.counters.object_skips.iter().find(|skip| {
+        skip.subject == "live loader arming"
+            && skip.reason
+                == "the process generation could not be revalidated before the loader-arm postcheck"
+    });
+    assert!(
+        mark.is_some(),
+        "the postcheck loss mark is proof-neutral: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        !engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.reason
+                == "the process generation changed before the loader-arm postcheck"),
+        "no mark claims a change without proof: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        engine.pin_probe_script.borrow().is_empty(),
+        "the exit probes and the state recheck consumed their answers: {:?}",
+        engine.pin_probe_script.borrow()
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+/// Fix7 (loader-attachment marks A3): the same lost attach as the
+/// unprovable C4 twin. The scripted kill really reaps the child, so
+/// the mark helper stays silent for the exited group and files
+/// neither the inner attachment mark nor the outer postcheck mark;
+/// the bail twin pins the refusal, and the const pin below pins the
+/// attachment mark's proof-neutral wording (no deterministic fixture
+/// drives the inner bracket with a live child).
+#[test]
+fn loader_attachment_marks_are_proof_neutral_on_an_unprovable_pin() {
+    let (child, mut engine, _modules) = engine_with_one_accepted_provider();
+    let pid = child.id();
+    engine.pin_probe_script.borrow_mut().extend([
+        PinProbeAnswer::Exited(Ok(false)),
+        PinProbeAnswer::State(Some(Err("simulated pin poll failure".to_string()))),
+        PinProbeAnswer::Exited(Ok(false)),
+        PinProbeAnswer::Exited(Ok(false)),
+        PinProbeAnswer::State(Some(Err("simulated pin poll failure".to_string()))),
+        PinProbeAnswer::Exited(Ok(false)),
+        PinProbeAnswer::Exited(Ok(false)),
+        PinProbeAnswer::State(Some(Err("simulated pin poll failure".to_string()))),
+        PinProbeAnswer::Exited(Ok(false)),
+        PinProbeAnswer::Exited(Ok(false)),
+    ]);
+    let mut session = ScriptedSession::default();
+    session.lose_generation_at_dynamic_loader_attach(pid);
+    let error = engine
+        .arm_loader_or_partial(
+            0,
+            &mut session,
+            &mut true,
+            &mut PendingViewRetirements::new(),
+        )
+        .expect_err("an unproven named generation refuses the capture");
+    assert!(
+        format!("{error:#}").contains("was unverified during loader attachment"),
+        "premise: the unproven path still refuses: {error:#}"
+    );
+    assert!(
+        !engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live loader arming"
+                && (skip.reason.contains("during attach") || skip.reason.contains("postcheck"))
+        }),
+        "an exited group files no loader-attachment loss mark: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        engine.pin_probe_script.borrow().is_empty(),
+        "every probe consumed its answer: {:?}",
+        engine.pin_probe_script.borrow()
+    );
+    // The scripted attach killed and reaped the child above; its
+    // handle drops here without waiting.
+    drop(child);
+}
+
+/// Fix7 (export-lowering precheck A8): lowering against a view that no
+/// longer revalidates refuses with the proof-neutral text, never a
+/// "changed" claim. The killed child is reaped before the call, so the
+/// precheck deterministically fails closed.
+#[test]
+fn export_lowering_before_a_stale_view_refuses_proof_neutral() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let view = ProcessView::open(ProcessViewId(4246), child.id()).unwrap();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(
+        !view.still_the_same(),
+        "premise: the reaped view fails revalidation"
+    );
+    let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+    let map_index = MapIndex::new(&maps).unwrap();
+    let hooks = HookRegistry::builtin();
+    let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+    record.kind = DISCOVERY_KIND_FUNCTION_LIST_RETURN;
+    record.symbol_id = hooks.id("C_GetFunctionList").unwrap();
+    // structurally valid (never dereferenced: the precheck fires first)
+    record.table_ptr = 1;
+    assert!(valid_discovery_record(&record));
+    let Err(error) = lower_heap_publication_record(
+        &view,
+        &map_index,
+        &hooks,
+        &record,
+        &[],
+        &mut CaptureWorkBudget::default(),
+        None,
+    ) else {
+        panic!("a stale view refuses lowering before any read");
+    };
+    assert_eq!(
+        error, "process generation could not be revalidated before export lowering",
+        "the lowering refusal never claims a change without proof"
+    );
+}
+
+/// Fix7 (revalidation vocabulary consts): the operator-facing texts for
+/// a failed generation revalidation never claim the generation
+/// changed. Behavioral tests pin the lowering precheck; these pins
+/// cover the post-validation check, the unstable-table refusal, the
+/// broad-pool refusal, the invariant context and the inner
+/// loader-attachment mark, which no deterministic fixture drives.
+#[test]
+fn revalidation_vocabulary_never_claims_a_change() {
+    for text in [
+        STALE_EXPORT_LOWERING_BEFORE,
+        STALE_EXPORT_LOWERING_DURING,
+        UNSTABLE_TABLE_VALIDATION_REASON,
+        BROAD_UNSTABLE_TABLE_REASON,
+        LOADER_ATTACH_INVARIANT_AROUND_RECHECK,
+        LOADER_ATTACH_STALE_REASON,
+    ] {
+        assert!(
+            !text.contains("changed") && !text.contains("change"),
+            "a failed revalidation proves neither exit nor change: {text:?}"
+        );
+    }
+    assert_eq!(
+        STALE_EXPORT_LOWERING_BEFORE,
+        "process generation could not be revalidated before export lowering"
+    );
+    assert_eq!(
+        STALE_EXPORT_LOWERING_DURING,
+        "process generation could not be revalidated during export lowering"
+    );
+    assert_eq!(
+        UNSTABLE_TABLE_VALIDATION_REASON,
+        "a published table moved or the process generation could not be revalidated during validation"
+    );
+    assert_eq!(
+        BROAD_UNSTABLE_TABLE_REASON,
+        "the mappings moved or the generation could not be revalidated during validation"
+    );
+    assert_eq!(
+        LOADER_ATTACH_INVARIANT_AROUND_RECHECK,
+        "dynamic loader attachment invariant failed around a failed generation recheck"
+    );
+    assert_eq!(
+        LOADER_ATTACH_STALE_REASON,
+        "loader generation, mapping, or pinned identity could not be revalidated during attach"
+    );
+}
+
 /// The export-hook generation-change mark: silent for an ending group,
 /// a named gap for a live one.
 #[test]
@@ -94017,7 +94266,7 @@ fn export_generation_change_is_silent_only_for_an_ending_group() {
         let filed = engine.counters.object_skips.iter().any(|skip| {
             skip.subject == "live export hook"
                 && skip.reason
-                    == "the process generation changed around a dynamic export attachment"
+                    == "the process generation could not be revalidated around a dynamic export attachment"
         });
         assert_eq!(filed, !ending);
     }
@@ -94328,21 +94577,21 @@ fn scan_view_with_outcome_skips(
 /// through the mount-namespace path).
 fn mid_scan_exit_race_reasons() -> Vec<String> {
     vec![
-        "memory scan refused: final mapping validation unavailable: process generation changed before target access"
+        "memory scan refused: final mapping validation unavailable: process generation could not be revalidated before target access"
             .into(),
-        "memory scan refused: final mapping validation unavailable: process generation changed during target access"
+        "memory scan refused: final mapping validation unavailable: process generation could not be revalidated during target access"
             .into(),
-        "memory scan refused: process generation changed during acquisition: original process exited before proc acquisition"
+        "memory scan refused: process generation could not be revalidated during acquisition: original process exited before proc acquisition"
             .into(),
-        "memory scan refused: initial mapping validation unavailable: process generation changed before target access"
+        "memory scan refused: initial mapping validation unavailable: process generation could not be revalidated before target access"
             .into(),
-        "memory scan refused: initial mapping validation unavailable: process generation changed during target access"
+        "memory scan refused: initial mapping validation unavailable: process generation could not be revalidated during target access"
             .into(),
-        "memory scan refused: initial mapping validation unavailable: memory scan refused: process generation changed during acquisition: process generation changed during target access"
+        "memory scan refused: initial mapping validation unavailable: memory scan refused: process generation could not be revalidated during acquisition: process generation could not be revalidated during target access"
             .into(),
-        "memory scan refused: process generation changed during acquisition: original process exited during proc acquisition"
+        "memory scan refused: process generation could not be revalidated during acquisition: original process exited during proc acquisition"
             .into(),
-        "memory scan refused: process generation changed during acquisition: original process exited while proc identity was read"
+        "memory scan refused: process generation could not be revalidated during acquisition: original process exited while proc identity was read"
             .into(),
         "memory scan refused: initial mapping validation unavailable: original process exited while its filesystem was identified"
             .into(),
@@ -94530,7 +94779,7 @@ fn mid_scan_proven_exit_keeps_non_exit_refusals_loud() {
     let pid = child.id();
     let view = ProcessView::open(ProcessViewId(717), pid).unwrap();
     let reasons = vec![
-        "memory scan refused: process generation changed during acquisition: proc acquisition crossed a process generation change"
+        "memory scan refused: process generation could not be revalidated during acquisition: proc acquisition crossed a process generation change"
             .to_string(),
         crate::discovery::scan::MAPPING_CHANGED_REASON.to_string(),
         format!(

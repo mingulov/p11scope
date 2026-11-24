@@ -578,7 +578,7 @@ mod tests {
         assert_eq!(
             classify_discovery_noise(
                 "process view",
-                "accepted process generation changed during attach preparation; its discovery claims were removed"
+                "accepted process generation could not be revalidated during attach preparation; its discovery claims were removed"
             ),
             DiscoveryNoiseClass::StaleView
         );
@@ -601,6 +601,61 @@ mod tests {
             assert!(
                 !label.contains("4242") && !label.contains("0x"),
                 "labels are categorical, never data: {label:?}"
+            );
+        }
+    }
+
+    /// Fix7 (noise classes): proof-neutral revalidation failures
+    /// classify as unproven loss (`process-view`), never as ended;
+    /// proven exit details and the proven reuse crossing keep the
+    /// `process-ended` class, and the stale-view diagnostic keeps its
+    /// own class, truncated or whole.
+    #[test]
+    fn classification_routes_proof_neutral_revalidation_to_process_view() {
+        for (subject, reason) in [
+            (
+                "capture discovery",
+                "memory scan refused: process generation could not be revalidated during acquisition: gone",
+            ),
+            (
+                "capture discovery",
+                "memory scan refused: process generation could not be revalidated during acquisition: process generation could not be revalidated during target access",
+            ),
+            (
+                "/usr/lib/libpool.so",
+                "broad fixed-family: pool table 0 refused (the mappings moved or the generation could not be revalidated during validation); the pool layout is unverified, so no fixed-family tables were added",
+            ),
+        ] {
+            assert_eq!(
+                classify_discovery_noise(subject, reason),
+                DiscoveryNoiseClass::ProcessView,
+                "{subject} {reason}"
+            );
+        }
+        for (subject, reason) in [
+            (
+                "capture discovery",
+                "memory scan refused: process generation could not be revalidated during acquisition: original process exited before proc acquisition",
+            ),
+            (
+                "capture discovery",
+                "memory scan refused: process generation could not be revalidated during acquisition: proc acquisition crossed a process generation change",
+            ),
+        ] {
+            assert_eq!(
+                classify_discovery_noise(subject, reason),
+                DiscoveryNoiseClass::ProcessEnded,
+                "{subject} {reason}"
+            );
+        }
+        for reason in [
+            "accepted process generation could not be revalidated during attach preparation; its discovery claims were removed",
+            "accepted process generation could not be revalidated during attach preparation",
+        ] {
+            assert_eq!(
+                classify_discovery_noise("process view", reason),
+                DiscoveryNoiseClass::StaleView,
+                "{reason}"
             );
         }
     }

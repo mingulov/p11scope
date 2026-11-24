@@ -9864,7 +9864,7 @@ mod tests {
         f.fail_generation = true;
         f.assert_refused(
             &mut CaptureWorkBudget::default(),
-            "memory scan refused: process generation changed during acquisition",
+            "memory scan refused: process generation could not be revalidated during acquisition",
         );
     }
 
@@ -10181,7 +10181,7 @@ mod tests {
         assert!(
             outcome.skipped().iter().any(|skip| skip
                 .reason
-                .contains("process generation changed during acquisition")),
+                .contains("process generation could not be revalidated during acquisition")),
             "the loss stays named: {:?}",
             outcome.skipped()
         );
@@ -10235,7 +10235,7 @@ mod tests {
         assert!(
             outcome.skipped().iter().any(|skip| skip
                 .reason
-                .contains("process generation changed during acquisition")),
+                .contains("process generation could not be revalidated during acquisition")),
             "the loss stays named: {:?}",
             outcome.skipped()
         );
@@ -10297,7 +10297,7 @@ mod tests {
         assert!(
             outcome.skipped().iter().any(|skip| skip
                 .reason
-                .contains("process generation changed during acquisition")),
+                .contains("process generation could not be revalidated during acquisition")),
             "the starved proof stays named: {:?}",
             outcome.skipped()
         );
@@ -10705,7 +10705,7 @@ mod tests {
             assert!(
                 outcome.skipped().iter().any(|skip| skip
                     .reason
-                    .contains("process generation changed during acquisition")),
+                    .contains("process generation could not be revalidated during acquisition")),
                 "the starved generation proof stays named: {:?}",
                 outcome.skipped()
             );
@@ -19313,7 +19313,7 @@ int main(int argc, char **argv) {
             MAPPING_CHANGED_REASON,
             "memory scan refused: final mapping validation unavailable: gone",
             "memory scan refused: initial mapping validation unavailable: gone",
-            "memory scan refused: process generation changed during acquisition: gone",
+            "memory scan refused: process generation could not be revalidated during acquisition: gone",
             "file changed while it was being scanned - retry",
             "partial snapshot of one data mapping: read 3 of 9 bytes: the read failed: gone",
             // Owner rule 2026-11-09 (data-always): a deleted mapping may

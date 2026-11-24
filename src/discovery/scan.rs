@@ -24006,10 +24006,10 @@ int main(int argc, char **argv) {
     /// exclude present the narrowed groups reach the call site (no
     /// early skip) and still take the full path. The narrowed clause
     /// alone is redundant (a narrowed group is always a hinted run,
-    /// so the hints clause co-blocks), but the end-to-end property
-    /// must hold: only a fail-open of the whole guard conjunction
-    /// (narrowed+hints+excludes) serves hits here; the narrowed
-    /// single flip is equivalent.
+    /// so the hints clause co-blocks); only a fail-open of the whole
+    /// narrowed barrier (narrowed+hints+exclude-paths) serves a
+    /// narrowed-group hit, and the narrowed single flip stays
+    /// equivalent (hints+exclude-paths alone serves the hinted group).
     #[test]
     fn preopen_call_site_narrowed_group_skips_consult() {
         use crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild;
@@ -24041,7 +24041,7 @@ int main(int argc, char **argv) {
             metadata_reads_during(|| preopen_call_site_scan(pid, &hints, &hooks, &mut budget));
         assert!(
             reads > 0,
-            "the narrowed groups re-open instead of hitting: {reads}"
+            "scan 3 re-opens (hinted group) instead of hitting: {reads}"
         );
         assert_eq!(
             budget.preopen_hits_for_test(),
@@ -24216,6 +24216,24 @@ int main(int argc, char **argv) {
         // on the marker, and the consult under test needs a statable
         // usable path.
         fixture.set_deleted_suffix();
+        // Premise on the production parser, grouper and predicate: the
+        // fixture text must stay one two-entry group that is NOT
+        // single-path, else the co-block claim below would rot silently
+        // (the mixed twin pins the single-path shape).
+        let parsed = parse_maps(fixture.maps.as_bytes()).expect("the deleted maps parse");
+        let parsed_index = MapIndex::new(&parsed).expect("the deleted entries index");
+        let groups = candidate_groups(&parsed);
+        assert_eq!(
+            groups.len(),
+            1,
+            "the deleted renderings share one key: {groups:?}"
+        );
+        let group = groups.values().next().expect("one deleted group");
+        assert_eq!(group.len(), 2, "the deleted group keeps both renderings");
+        assert!(
+            !preopen_group_single_path(group, &parsed_index),
+            "premise: the all-deleted group is not single-path"
+        );
         let identity = FileIdentity { dev: 37, ino: 9 };
         fixture.map_files = MapFilesScript::Serve(File::open(fixture.path.clone()).unwrap());
         fixture.mapped = Some((MapFilesFallbackFixture::scripted_held(identity), identity));
@@ -24280,11 +24298,11 @@ int main(int argc, char **argv) {
     /// A mixed deleted+usable same-key group never consults: the first
     /// range renders `<path> (deleted)` so the join still runs (`usable`
     /// derives from the first entry only), while the second range
-    /// renders a usable hardlink alias of the same key (one link
-    /// unlinked while another still maps the inode). The group IS
-    /// single-path, so the deleted clause is the only barrier before
-    /// the consult. Removing the deleted clause hits the seed instead
-    /// of skipping.
+    /// renders a usable hardlink alias of the same key (suffix shape:
+    /// the file stays on disk; the scan branches on the marker). The
+    /// group IS single-path, so the deleted clause is the only barrier
+    /// before the consult. Removing the deleted clause hits the seed
+    /// instead of skipping.
     #[test]
     fn preopen_call_site_mixed_deleted_usable_group_skips_consult() {
         use crate::discovery::identity::FileIdentity;
@@ -31428,10 +31446,10 @@ int main(int argc, char **argv) {
         /// The mixed-rendering shape: the first range keeps the
         /// `<path> (deleted)` marker (so the join still runs — `usable`
         /// derives from the first entry only) while the second range
-        /// renders `alias` usable under the same key (one hardlink
-        /// unlinked while another still maps the inode). The group IS
-        /// single-path, so the deleted clause is the only barrier
-        /// before the consult.
+        /// renders `alias` usable under the same key (suffix shape:
+        /// the file stays on disk; the scan branches on the marker).
+        /// The group IS single-path, so the deleted clause is the
+        /// only barrier before the consult.
         fn render_mixed_deleted_usable_maps(&mut self, alias: &str) {
             let key = format!(
                 "{:x}:{:x} {}",

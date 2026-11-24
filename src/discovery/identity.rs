@@ -9083,7 +9083,13 @@ fn scan_mount_table_for_row_with<'table>(
     budget: &mut CaptureWorkBudget,
     mut stop: impl FnMut(&mut CaptureWorkBudget) -> Option<&'static str>,
 ) -> Result<Option<&'table str>, String> {
-    let mut rows = table.lines();
+    // Byte-offset cursor with `str::lines` row shapes (split at
+    // `\n`, one trailing `\r` stripped, a final partial yielded
+    // once): emptiness is O(1), so each row credit is spent before
+    // its bytes are scanned. An iterator lookahead would scan the
+    // row to its terminator before the spend.
+    let bytes = table.as_bytes();
+    let mut offset = 0usize;
     let mut first_stride = true;
     loop {
         if !first_stride {
@@ -9095,27 +9101,39 @@ fn scan_mount_table_for_row_with<'table>(
             }
         }
         first_stride = false;
-        // INV-2: each row is spent before it is visited, so an
-        // exhausted allowance refuses without visiting any row. Totals
-        // match the old post-stride spend exactly, including the full
-        // first stride after an early match (no later stride is read,
-        // charged, or stop-polled).
+        // INV-2: each row is spent before it is scanned, so an
+        // exhausted allowance refuses without examining any row byte.
+        // Totals match the old post-stride spend exactly, including
+        // the full first stride after an early match (no later stride
+        // is read, charged, or stop-polled).
         let mut stride_rows = 0usize;
         let mut found = None;
         for _ in 0..MOUNTINFO_STRIDE {
-            let Some(row) = rows.next() else {
+            if offset >= bytes.len() {
                 break;
-            };
-            // Test seam: yielding the row scanned its bytes plus the
-            // terminator. Counted before the spend, where the work is.
-            #[cfg(test)]
-            EXACT_BYTES_SCANNED.with(|counter| counter.set(counter.get() + row.len() as u64 + 1));
-            #[cfg(test)]
-            EXACT_NEWLINES_SCANNED.with(|counter| counter.set(counter.get() + 1));
+            }
             budget.spend(1).map_err(str::to_string)?;
             stride_rows += 1;
             #[cfg(test)]
             EXACT_ROWS_VISITED.with(|counter| counter.set(counter.get() + 1));
+            let start = offset;
+            while offset < bytes.len() && bytes[offset] != b'\n' {
+                #[cfg(test)]
+                EXACT_BYTES_SCANNED.with(|counter| counter.set(counter.get() + 1));
+                offset += 1;
+            }
+            let end = offset;
+            if offset < bytes.len() {
+                #[cfg(test)]
+                EXACT_BYTES_SCANNED.with(|counter| counter.set(counter.get() + 1));
+                #[cfg(test)]
+                EXACT_NEWLINES_SCANNED.with(|counter| counter.set(counter.get() + 1));
+                offset += 1;
+            }
+            let mut row = &table[start..end];
+            if let Some(stripped) = row.strip_suffix('\r') {
+                row = stripped;
+            }
             if found.is_none() {
                 let mut fields = row.split_ascii_whitespace();
                 if fields.next() == Some(mount_id) {
@@ -17262,6 +17280,74 @@ mod tests {
             exact_newlines_scanned_for_test()
         );
         assert_eq!(budget.work_units_count(), 3);
+    }
+
+    /// Row shapes match `str::lines`: a CRLF terminator is consumed
+    /// and stripped, so the returned match carries no carriage return
+    /// and every consumed byte is counted exactly once.
+    #[test]
+    fn exact_mount_scan_strips_a_crlf_terminator() {
+        reset_exact_scan_counters_for_test();
+        let file = open_regular(Path::new("/bin/sh")).unwrap();
+        let mount_id = fd_mount_id(&file).unwrap();
+        assert_ne!(
+            "9000001", mount_id,
+            "decoys must not match the fd mount"
+        );
+        let table = format!(
+            "9000001 1 8:1 / /decoy rw - ext4 /dev/decoy rw\r\n{mount_id} 1 9:9 / /target rw - ext4 /dev/target rw\r\n"
+        );
+        let mut budget = CaptureWorkBudget::default();
+        let row = scan_mount_table_for_row_with(&table, &mount_id, &mut budget, |_| None)
+            .expect("the CRLF match must resolve")
+            .expect("the match row is found");
+        assert_eq!(
+            row,
+            format!("{mount_id} 1 9:9 / /target rw - ext4 /dev/target rw")
+        );
+        assert_eq!(exact_rows_visited_for_test(), 2);
+        assert_eq!(exact_bytes_scanned_for_test(), table.len() as u64);
+        assert_eq!(exact_newlines_scanned_for_test(), 2);
+        assert_eq!(budget.work_units_count(), 2);
+    }
+
+    /// A final partial row without a terminator still resolves, and an
+    /// empty table resolves nothing with no scan at all.
+    #[test]
+    fn exact_mount_scan_resolves_an_unterminated_final_row() {
+        reset_exact_scan_counters_for_test();
+        let file = open_regular(Path::new("/bin/sh")).unwrap();
+        let mount_id = fd_mount_id(&file).unwrap();
+        assert_ne!(
+            "9000001", mount_id,
+            "decoys must not match the fd mount"
+        );
+        let table = format!(
+            "9000001 1 8:1 / /decoy rw - ext4 /dev/decoy rw\n{mount_id} 1 9:9 / /target rw - ext4 /dev/target rw"
+        );
+        let mut budget = CaptureWorkBudget::default();
+        let row = scan_mount_table_for_row_with(&table, &mount_id, &mut budget, |_| None)
+            .expect("the unterminated match must resolve")
+            .expect("the match row is found");
+        assert_eq!(
+            row,
+            format!("{mount_id} 1 9:9 / /target rw - ext4 /dev/target rw")
+        );
+        assert_eq!(exact_rows_visited_for_test(), 2);
+        assert_eq!(exact_bytes_scanned_for_test(), table.len() as u64);
+        assert_eq!(exact_newlines_scanned_for_test(), 1);
+        assert_eq!(budget.work_units_count(), 2);
+
+        reset_exact_scan_counters_for_test();
+        let mut budget = CaptureWorkBudget::default();
+        assert_eq!(
+            scan_mount_table_for_row_with("", &mount_id, &mut budget, |_| None).unwrap(),
+            None
+        );
+        assert_eq!(exact_rows_visited_for_test(), 0);
+        assert_eq!(exact_bytes_scanned_for_test(), 0);
+        assert_eq!(exact_newlines_scanned_for_test(), 0);
+        assert_eq!(budget.work_units_count(), 0);
     }
 
     /// Exhaustion through the threaded resolution path (not just the

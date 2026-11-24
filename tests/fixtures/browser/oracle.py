@@ -287,6 +287,50 @@ def check_skipped_structural(report: dict[str, Any]) -> list[str]:
     return failures
 
 
+#: The one learned-file reason a run-floor cell tolerates: the
+#: provider was first used before the pre-attach scan learned it
+#: (src/render.rs LEARNED_FIRST_RUN_REASON, verbatim). Every other
+#: learned-file reason (overflow, caps, unbound tables, unavailable
+#: learning, replaced files) stays refused: each hides unbounded loss.
+LEARNED_FIRST_USE_REASON = (
+    "a provider file was learned after its first use; "
+    "its earlier calls were not observed")
+
+#: Short-lived run-tree children that exited while discovery still
+#: walked them (src/render.rs MID_FLIGHT_REASON, verbatim).
+MID_FLIGHT_REASON = "process exited mid-flight"
+
+
+def check_skipped_run_floor(report: dict[str, Any]) -> list[str]:
+    """Skipped records a run-mode floor cell provably survives.
+
+    Beside the structural reasons (shared with the base check), two
+    run-tree timing classes pass: subjects that exited mid-flight
+    (owned short-lived descendants retiring between admission passes)
+    and the single learned-first-use record (the pre-attach window the
+    run-sign cells close with a spawn delay; the sign floors below it
+    are lower bounds, so window loss can only undercount, never invent
+    a sign). Any other record — a retire window, a detach gap, another
+    learned-file reason — fails: it could hide the asserted signs.
+    """
+    failures = []
+    for record in evidence(report).get("skipped") or []:
+        record = record or {}
+        name = record.get("name")
+        reason = record.get("reason")
+        if reason in STRUCTURAL_SKIPPED_REASONS:
+            continue
+        if name == "discovery subject" and reason == MID_FLIGHT_REASON:
+            continue
+        if (name == "learned provider file"
+                and reason == LEARNED_FIRST_USE_REASON):
+            continue
+        failures.append(
+            f"skipped record {name!r} reason {reason!r}: "
+            f"possible coverage gap, want run-floor timing only")
+    return failures
+
+
 def check_verdict(report: dict[str, Any], allowed: tuple[str, ...]) -> list[str]:
     """The verdict detail is one the cell earned during calibration."""
     failures = []

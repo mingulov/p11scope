@@ -83,6 +83,56 @@ def preflight(browser: str | None = None) -> Path:
     return binary
 
 
+#: System NSS softokn locations by distro, probed in order after
+#: ldconfig (Fedora/RHEL, Debian/Ubuntu, generic prefix).
+SOFTOKN_CANDIDATES = (
+    "/usr/lib64/libsoftokn3.so",
+    "/usr/lib/x86_64-linux-gnu/libsoftokn3.so",
+    "/usr/lib/libsoftokn3.so",
+)
+
+#: Soname the ldconfig table must carry verbatim (exact match: a
+#: version-suffixed ``libsoftokn3.so.1`` is a different file).
+SOFTOKN_SONAME = "libsoftokn3.so"
+
+
+def find_softokn(*, ldconfig_text: str | None = None,
+                 candidates=None) -> Path | None:
+    """Resolve the system NSS softokn provider (probed, never hard-coded).
+
+    Reads the ``ldconfig -p`` table first (first existing hit wins),
+    then ``candidates`` (default ``SOFTOKN_CANDIDATES``) in order;
+    returns None when no probed file exists. ``ldconfig_text`` injects
+    the table for tests (None runs ``ldconfig -p`` best-effort).
+    """
+    if ldconfig_text is None:
+        try:
+            proc = subprocess.run(
+                ["ldconfig", "-p"], capture_output=True, text=True,
+                check=False, timeout=30)
+            ldconfig_text = proc.stdout if proc.returncode == 0 else ""
+        except (OSError, subprocess.SubprocessError):
+            ldconfig_text = ""
+    hits: list[Path] = []
+    for line in ldconfig_text.splitlines():
+        _left, sep, right = line.partition("=>")
+        if not sep:
+            continue
+        name = _left.strip().split(" ", 1)[0] if _left.strip() else ""
+        if name != SOFTOKN_SONAME:
+            continue
+        hits.append(Path(right.strip()))
+    for path in hits + [Path(entry) for entry in
+                        (SOFTOKN_CANDIDATES if candidates is None
+                         else candidates)]:
+        try:
+            if path.is_file():
+                return path
+        except OSError:
+            continue
+    return None
+
+
 @dataclass
 class CellResult:
     """Everything one cell produced, for the oracle and the log."""
@@ -167,7 +217,8 @@ def run_direct(name: str, browser: str, workdir: Path, flow_url: str,
                nss_credential=None,
                nss_nickname: str = "g33-nss-client",
                auto_select_cert: bool = True,
-               prearm_modules: tuple[Path, ...] = ()) -> CellResult:
+               prearm_modules: tuple[Path, ...] = (),
+               initial_delay_seconds: float = 0) -> CellResult:
     """Run one ``p11scope run`` cell with the tree supervisor as the owned child.
 
     ``observe_module`` is the ``--module`` target (the controlled SoftHSM
@@ -179,6 +230,10 @@ def run_direct(name: str, browser: str, workdir: Path, flow_url: str,
     provider, so the cell expects zero rows for it). ``prearm_modules``
     pins provider files before any mapping (one ``--prearm-module``
     each), so a fast browser flow cannot use them before attach.
+    ``initial_delay_seconds`` holds the browser spawn past observer
+    startup (the supervisor's ``--initial-delay``): BPF load and the
+    first scans complete while nothing runs yet, so the flow's signs
+    land in-window deterministically instead of racing attach.
     ``nss_credential`` (a ``softhsm.ClientCredential``) seeds the
     browser's own empty-password NSS database with a usable client key
     before launch (DEMO-4), so a CERT_REQUIRED flow signs with its own
@@ -249,6 +304,9 @@ def run_direct(name: str, browser: str, workdir: Path, flow_url: str,
     # (see the module docstring); the browser inherits env through it.
     tmpdir = child_tmpdir(browser, workdir)
     supervisor = Path(__file__).resolve().parent / "reap_tree.py"
+    supervisor_prefix: list[str] = []
+    if initial_delay_seconds > 0:
+        supervisor_prefix = ["--initial-delay", str(initial_delay_seconds)]
     argv = ["sudo", "-n"]
     for key, value in (browser_env or {}).items():
         argv.append(f"{key}={value}")
@@ -263,6 +321,7 @@ def run_direct(name: str, browser: str, workdir: Path, flow_url: str,
         "--", "/usr/bin/env",
         f"HOME={child_env['HOME']}", f"TMPDIR={tmpdir}",
         sys.executable, str(supervisor),
+        *supervisor_prefix,
         # Assumption: the run's remaining work past its screenshot is
         # pure teardown, so ending the run at flow completion truncates
         # nothing a cell needs. A future registered-module run_direct

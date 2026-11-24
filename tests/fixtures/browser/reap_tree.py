@@ -331,20 +331,74 @@ def _claim_subreaper():
         return False
 
 
+#: Upper bound for --initial-delay: a spawn delay past this is a
+#: caller bug, not a readiness margin (fail loud, never sleep it off).
+MAX_INITIAL_DELAY_SECONDS = 300.0
+
+
+def _parse_initial_delay(rest):
+    """Split a leading ``--initial-delay SECONDS``; (delay, rest).
+
+    Returns (0.0, rest) when absent. A present-but-unparseable value
+    (non-numeric, negative, NaN/inf, or past the upper bound) returns
+    (None, rest): the caller fails loud with usage.
+    """
+    if len(rest) < 2 or rest[0] != "--initial-delay":
+        return 0.0, rest
+    try:
+        delay = float(rest[1])
+    except ValueError:
+        return None, rest
+    # NaN and inf both fail the range comparison (fail loud).
+    if not (0.0 <= delay <= MAX_INITIAL_DELAY_SECONDS):
+        return None, rest
+    return delay, rest[2:]
+
+
+def _wait_initial_delay(delay, parent):
+    """Sleep ``delay`` seconds; False when the parent died first.
+
+    The observer is our parent: when it is gone (our ppid changed) the
+    run is over and lingering the full delay would strand a sleeper
+    with no run to join, so exit promptly instead.
+    """
+    deadline = time.monotonic() + delay
+    while time.monotonic() < deadline:
+        if os.getppid() != parent:
+            return False
+        time.sleep(min(_FLOW_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
+    return True
+
+
 def main(argv):
+    # The observer's pid, read before anything slow: the parent-death
+    # watch below compares against it, and a parent that dies during
+    # our own startup is already gone by the time we could ask.
+    parent = os.getppid()
     rest = argv[1:]
     shot = None
+    delay, rest = _parse_initial_delay(rest)
+    if delay is None:
+        return _fail("usage: reap_tree.py [--initial-delay SECONDS] "
+                      "[--flow-done shot.png] <command> [args ...]")
     if len(rest) >= 2 and rest[0] == "--flow-done":
         shot = rest[1]
         rest = rest[2:]
     if not rest:
-        return _fail("usage: reap_tree.py [--flow-done shot.png] <command> [args ...]")
+        return _fail("usage: reap_tree.py [--initial-delay SECONDS] "
+                      "[--flow-done shot.png] <command> [args ...]")
     if sys.platform != "linux":
         return _fail("the owned-child supervisor is Linux-only")
     if not _claim_subreaper():
         return _fail("the child-subreaper bit is unavailable")
     state = {"pgid": None, "killer": None}
     _install_termination_handler(state)
+    if delay > 0:
+        # Readiness margin: the observer's BPF load and first scans run
+        # while the browser is not spawned yet, so a fast flow cannot
+        # use its provider before attach (the run-sign attach race).
+        if not _wait_initial_delay(delay, parent):
+            return _fail("the observer is gone")
     try:
         # The browser founds its own session: the killpg helper and the
         # reaper act on exactly that group, never ours.

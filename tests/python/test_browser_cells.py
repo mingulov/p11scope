@@ -125,13 +125,23 @@ _VERDICTS_NEVER_MAPPED = ("concrete_gap",)
 #: signing setup and signing (init and one-shot share the boundary).
 _PINBOUND_ABSENT = ("C_Login", "C_SignInit", "C_Sign")
 
-#: Run-mode attached cells (CR-RUN-SIGN): the S1 floor causes plus the
-#: run-tree spawn-window caveats (the owned browser's short-lived
-#: descendants retire between admission passes; the pause gate may
-#: cover part of a spawn). A link loss or any other cause still fails:
-#: it could hide exactly the asserted signs.
-_GAPS_ATTACHED_RUN = _GAPS_ATTACHED_FLOOR | frozenset({
-    "pause_partial", "pid_descendant_gaps",
+#: Run-mode attached floor cells (CR-RUN-SIGN), calibrated on sm1
+#: (narrowed softokn scan, spawn delayed past observer startup): the
+#: loader/discovery window causes, the owned tree's short-lived
+#: descendants retiring between admission passes
+#: (``pid_descendant_gaps``), the SIGKILL-teardown link losses
+#: (``task_uprobe_link_losses``: the supervisor SIGKILLs the whole
+#: browser group at flow completion, so teardown links race), the
+#: bounded-queue discovery drops under that churn
+#: (``discovery_truncated``), and the ``skipped`` cause whose records
+#: the run-floor skipped qualification judges one by one. Floors are
+#: lower bounds, so each cause can only undercount, never invent the
+#: asserted signs — and the sign floors below still fail a capture
+#: that lost them. Any other cause fails.
+_GAPS_ATTACHED_RUN = frozenset({
+    "loader_discovery", "unprotected_live_windows",
+    "pid_descendant_gaps", "task_uprobe_link_losses",
+    "discovery_truncated", "skipped",
 })
 
 #: RSA mechanism family ids (numeric, exact): the verbatim RSA_IDS table
@@ -251,7 +261,8 @@ class BrowserCells(unittest.TestCase):
 
     def check_report(self, result, store, floors=None, zero=False, attached=None,
                      allowed_gaps=(), allowed_verdicts=_VERDICTS_ATTACHED, absent=None,
-                     s1=None, qualify_nomod_link_loss=False, module_sha=None):
+                     s1=None, qualify_nomod_link_loss=False, module_sha=None,
+                     qualify_run_floor_skipped=False):
         """Common oracle: schema, identity, counts, loss, gaps, earned verdict.
 
         ``attached`` pins the probe state: True (hooked the mapped module),
@@ -261,7 +272,11 @@ class BrowserCells(unittest.TestCase):
         every other cause fails. ``qualify_nomod_link_loss`` routes the
         gap check through the FF-NOMOD qualification (sole named link
         loss with zero probes and zero rows); only the FF-NOMOD cell
-        sets it. ``allowed_verdicts`` pins the verdict
+        sets it. ``qualify_run_floor_skipped`` routes the skipped
+        check through the run-floor qualification (structural records
+        plus run-tree timing: mid-flight subjects and the single
+        learned-first-use record); only run-mode floor cells set it,
+        never beside ``qualify_nomod_link_loss``. ``allowed_verdicts`` pins the verdict
         details the cell earned. ``absent`` names functions that must never
         have been called (returns, open entries, and unattributed rows).
         ``module_sha`` overrides the module identity: a sha string or a
@@ -304,7 +319,14 @@ class BrowserCells(unittest.TestCase):
             failures += oracle.check_observation_gaps_nomod_qualified(report, allowed_gaps)
         else:
             failures += oracle.check_observation_gaps(report, allowed_gaps)
-        failures += oracle.check_skipped_structural(report)
+        if qualify_nomod_link_loss and qualify_run_floor_skipped:
+            failures.append(
+                "conflicting skipped qualifications (test bug): "
+                "nomod and run-floor are mutually exclusive")
+        elif qualify_run_floor_skipped:
+            failures += oracle.check_skipped_run_floor(report)
+        else:
+            failures += oracle.check_skipped_structural(report)
         if s1 is not None:
             failures += oracle.check_no_joint_content(report)
             sign_mechanisms = s1.get("sign_mechanisms")
@@ -569,19 +591,36 @@ class BrowserCells(unittest.TestCase):
         softokn provider the report's own discovery list resolves.
         Run reports carry no per-key rows (inventory-only); the sign
         calls plus the attributed family mechanism are the run-visible
-        proof the handshake's private-key use was seen.
+        proof the handshake's private-key use was seen. The scan is
+        narrowed to the probed system softokn (a discovery-all run
+        drowns it in p11-kit slot demand on Fedora) and the spawn is
+        delayed past observer startup, so the signs land in-window
+        deterministically instead of racing BPF load.
         """
+        softokn = cells.find_softokn()
+        if softokn is None:
+            if STRICT:
+                raise AssertionError(
+                    "strict installed mode requires this cell: "
+                    "system softokn provider not found")
+            self.skipTest("browser gate prerequisite missing: "
+                          "system softokn provider not found")
         cred = softhsm.generate_client_credential(self.work / "cred")
         key, cert = tls_server.make_server_credential(self.work / "srv")
         with tls_server.FlowServer(cert=cert, key=key, require_client_cert=True,
                                    client_ca=cred.cert_pem) as flow:
             result = cells.run_direct(
                 "CR-RUN-SIGN", "chromium", self.work / "cell", flow.url,
-                observe_module=None, register_module=None,
+                observe_module=softokn, register_module=None,
                 browser_env=None,
                 extra_browser_args=CHROMIUM_STABLE_ARGS,
                 duration_seconds=RUN_DURATION,
-                nss_credential=cred, auto_select_cert=True)
+                nss_credential=cred, auto_select_cert=True,
+                # Matches the ruled BPF-load bound behind
+                # cells.ATTACH_GRACE_SECONDS, kept as its own literal:
+                # tightening hang detection must not tighten this
+                # spawn margin.
+                initial_delay_seconds=15)
             self.assertGreaterEqual(
                 flow.client_certs_presented, 1,
                 "client cert never presented (no TLS sign happened)")
@@ -605,13 +644,19 @@ class BrowserCells(unittest.TestCase):
             len(shas), 0,
             "softokn never discovered (browser never mapped it, or "
             "discovery missed it)")
+        # PARTIAL/concrete_gap is earned: the run-tree teardown and
+        # the map-to-attach window are structural to run mode (see
+        # _GAPS_ATTACHED_RUN); the floors, the family leg, and the TLS
+        # ground truth above carry the proof, and any new gap cause
+        # still fails. No sessions floor: the sign's session may
+        # legitimately have opened in the tolerated pre-attach window.
         self.check_report(
             result, None, {"C_SignInit": 1, "C_Sign": 1}, attached=True,
             allowed_gaps=_GAPS_ATTACHED_RUN,
-            allowed_verdicts=_VERDICTS_ATTACHED_VERIFIED,
+            allowed_verdicts=("concrete_gap",),
             module_sha=shas,
-            s1={"sessions_opened_min": 1,
-                "sign_mechanisms": {"family_ids": sorted(_RSA_FAMILY_IDS),
+            qualify_run_floor_skipped=True,
+            s1={"sign_mechanisms": {"family_ids": sorted(_RSA_FAMILY_IDS),
                                     "min_calls": 1}})
 
     @gate_system("firefox")
@@ -992,6 +1037,58 @@ class BrowserCells(unittest.TestCase):
         for mod in mods:
             self.assertIn(str(mod), argv)
         self.assertEqual(argv.count("--prearm-module"), 2)
+
+    def test_run_direct_initial_delay_prefix(self):
+        """Twin: a spawn delay prefixes the supervisor argv; zero omits it."""
+        argv = self._capture_run_direct_argv(initial_delay_seconds=15)
+        at = next(i for i, arg in enumerate(argv)
+                  if arg.endswith("reap_tree.py"))
+        self.assertEqual(argv[at + 1:at + 3], ["--initial-delay", "15"])
+        self.assertIn("--flow-done", argv[at + 3:])
+        argv = self._capture_run_direct_argv()
+        self.assertNotIn("--initial-delay", argv)
+
+    def test_find_softokn_prefers_ldconfig_hits(self):
+        """Twin: the resolver reads ldconfig first, then candidates."""
+        hit = self.work / "lib" / "libsoftokn3.so"
+        hit.parent.mkdir(parents=True)
+        hit.write_bytes(b"probe-softokn")
+        table = (
+            "libc.so.6 (libc6,x86-64) => /usr/lib/libc.so.6\n"
+            "libsoftokn3.so.1 (libc6,x86-64) => /usr/lib/libsoftokn3.so.1\n"
+            f"libsoftokn3.so (libc6,x86-64) => {hit}\n"
+            "malformed line without arrow\n"
+        )
+        self.assertEqual(
+            cells.find_softokn(ldconfig_text=table, candidates=[]), hit)
+        # A version-suffixed soname is a different file: no match.
+        self.assertIsNone(cells.find_softokn(
+            ldconfig_text="libsoftokn3.so.1 (libc6,x86-64) => /usr/lib/x\n",
+            candidates=[]))
+        # ...even when the suffixed file exists (a substring match
+        # would resolve the wrong provider here).
+        suffixed = self.work / "sfx" / "libsoftokn3.so.1"
+        suffixed.parent.mkdir(parents=True)
+        suffixed.write_bytes(b"probe-suffixed")
+        self.assertIsNone(cells.find_softokn(
+            ldconfig_text=f"libsoftokn3.so.1 (libc6,x86-64) => {suffixed}\n",
+            candidates=[]))
+
+    def test_find_softokn_falls_back_to_candidates(self):
+        """Twin: missing hits fall through to candidates, then None."""
+        cand = self.work / "cand" / "libsoftokn3.so"
+        cand.parent.mkdir(parents=True)
+        cand.write_bytes(b"probe-softokn")
+        missing = self.work / "nope" / "libsoftokn3.so"
+        table = f"libsoftokn3.so (libc6,x86-64) => {missing}\n"
+        self.assertEqual(
+            cells.find_softokn(ldconfig_text=table,
+                               candidates=[str(missing), str(cand)]),
+            cand)
+        self.assertIsNone(cells.find_softokn(
+            ldconfig_text=table, candidates=[str(missing)]))
+        self.assertIsNone(
+            cells.find_softokn(ldconfig_text="", candidates=[]))
 
     def test_launch_without_registered_module_scrubs_store_env(self):
         """Twin: an unregistered launch must not leak SOFTHSM2_CONF.
@@ -2178,6 +2275,84 @@ class BrowserCells(unittest.TestCase):
                          f"strict nonempty selection must pass: {picked.stderr[-500:]}")
 
 
+class ReapTreeDelay(unittest.TestCase):
+    """Supervisor --initial-delay twins: unprivileged, run everywhere.
+
+    The run-sign cells hold the browser spawn past observer startup so
+    the flow's signs land in-window deterministically; these twins pin
+    the delay, its validation, and the orphan fast-exit over the real
+    supervisor subprocess.
+    """
+
+    def setUp(self):
+        self.work = Path(tempfile.mkdtemp(prefix="g33-reap-delay-"))
+        self.addCleanup(shutil.rmtree, self.work, True)
+        self.supervisor = (ROOT / "tests" / "fixtures" / "browser"
+                           / "reap_tree.py")
+
+    def _run(self, *args, timeout=30):
+        return subprocess.run(
+            [sys.executable, "-I", str(self.supervisor), *args],
+            capture_output=True, text=True, check=False, timeout=timeout)
+
+    def test_initial_delay_holds_the_spawn(self):
+        """Twin: the spawn waits out the delay, then runs the child."""
+        start = time.monotonic()
+        proc = self._run("--initial-delay", "0.6", sys.executable,
+                         "-c", "pass")
+        elapsed = time.monotonic() - start
+        self.assertEqual(proc.returncode, 0, proc.stderr[-300:])
+        self.assertGreaterEqual(elapsed, 0.6)
+
+    def test_absent_delay_spawns_at_once(self):
+        """Twin: no flag means no wait (existing behavior unchanged)."""
+        start = time.monotonic()
+        proc = self._run(sys.executable, "-c", "pass")
+        elapsed = time.monotonic() - start
+        self.assertEqual(proc.returncode, 0, proc.stderr[-300:])
+        self.assertLess(elapsed, 10.0)
+
+    def test_invalid_delay_fails_loud(self):
+        """Twin: an unparseable delay fails instead of sleeping it off."""
+        for value in ("nope", "-1", "nan", "inf", "301", ""):
+            with self.subTest(value=value):
+                proc = self._run("--initial-delay", value, sys.executable,
+                                 "-c", "pass")
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn("usage", proc.stderr)
+
+    def test_orphaned_delay_exits_promptly(self):
+        """Twin: a supervisor whose parent died exits, never lingers."""
+        shim = self.work / "shim.py"
+        shim.write_text(
+            "import subprocess, sys, time\n"
+            "proc = subprocess.Popen(\n"
+            "    [sys.executable, '-I', sys.argv[1], '--initial-delay',\n"
+            "     '30', sys.executable, '-c', 'pass'],\n"
+            "    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,\n"
+            "    start_new_session=True)\n"
+            "print(proc.pid, flush=True)\n"
+            # Let the supervisor reach its delay wait (reading us as
+            # its parent) before we die mid-delay, the production
+            # shape: an observer that outlives supervisor startup.
+            "time.sleep(2.0)\n")
+        proc = subprocess.run(
+            [sys.executable, "-I", str(shim), str(self.supervisor)],
+            capture_output=True, text=True, check=False, timeout=30)
+        pid = int(proc.stdout.strip())
+        try:
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline:
+                if _is_zombie(pid):
+                    break
+                time.sleep(0.1)
+            else:
+                self.fail("orphaned supervisor lingered past 10s "
+                          "(parent-death watch dead?)")
+        finally:
+            _kill_quietly(pid)
+
+
 def require_s1(test):
     """Fail naming the missing S1 oracle (RED) once per check."""
     for name in ("check_no_joint_content", "check_s1_mechanisms_absent",
@@ -2865,6 +3040,76 @@ class BrowserS1Oracle(unittest.TestCase):
                        0x00000060, 0x00000067, 0x00001054, 0x00004002):
             self.assertIn(anchor, _RSA_FAMILY_IDS)
         self.assertNotIn(_SHA256_MECHANISM_ID, _RSA_FAMILY_IDS)
+
+    def test_skipped_run_floor_exact(self):
+        """Twin: the run-floor qualification judges records one by one."""
+        healthy = {"evidence": {"skipped": [
+            {"name": "discovery subject", "reason": "discovery unavailable"},
+            {"name": "discovery subject",
+             "reason": "process exited mid-flight"},
+            {"name": "learned provider file",
+             "reason": oracle.LEARNED_FIRST_USE_REASON},
+        ]}}
+        self.assertEqual(oracle.check_skipped_run_floor(healthy), [])
+        self.assertEqual(
+            oracle.check_skipped_run_floor({"evidence": {}}), [])
+        # Every other learned-file reason stays refused (unbounded loss).
+        refused = [
+            ("learned provider file",
+             "file learning reached its 32-file per-capture cap; "
+             "further provider files were not learned"),
+            ("learned provider file",
+             "file-learning events were lost; "
+             "some provider files may not have been learned"),
+            ("learned provider file",
+             "a learned provider's tables lost their pinned identity; "
+             "its calls were not observed"),
+            # Retire/detach windows could hide the asserted signs.
+            ("C_Sign",
+             "counting probes were retired mid-capture; calls in the "
+             "retire window were not observed"),
+            # Near-miss records never qualify (exact pairs only).
+            # (Structural reasons stay reason-only like the base check,
+            # so a structural reason under any name still passes.)
+            ("discovery subject", "process exited mid-flight!"),
+            ("learned provider file", None),
+            ("learned provider file", ""),
+            (None, None),
+        ]
+        for name, reason in refused:
+            with self.subTest(name=name, reason=reason):
+                doc = {"evidence": {"skipped": [
+                    {"name": name, "reason": reason}]}}
+                self.assertNotEqual(
+                    oracle.check_skipped_run_floor(doc), [])
+
+    def test_skipped_run_floor_check_report_wiring(self):
+        """Twin: the qualification routes through check_report, exclusively."""
+        sha = "ab" * 32
+        rows = [BrowserCells._twin_row(["C_Sign"], 1, sha)]
+        window = [{"name": "discovery subject",
+                   "reason": "process exited mid-flight"}]
+        _, result = self.s1_result(
+            "S1-RUNFLOOR", rows,
+            BrowserCells._twin_evidence(skipped=window),
+            [], healthy_sessions(), {})
+        case = BrowserCells("test_oracle_builder_healthy_accepted")
+        case.work = self.work
+        # The base check refuses the window record...
+        with patch.object(oracle, "sha256_of", return_value=sha):
+            with self.assertRaises(AssertionError):
+                case.check_report(result, None, {"C_Sign": 1},
+                                  attached=True, module_sha={sha})
+            # ...the run-floor route qualifies it...
+            case.check_report(result, None, {"C_Sign": 1},
+                              attached=True, module_sha={sha},
+                              qualify_run_floor_skipped=True)
+            # ...and the two qualifications conflict loud (test bug).
+            with self.assertRaises(AssertionError):
+                case.check_report(
+                    result, None, {"C_Sign": 1}, attached=True,
+                    module_sha={sha}, qualify_nomod_link_loss=True,
+                    qualify_run_floor_skipped=True)
 
     def test_live_cells_all_wire_s1_proof(self):
         require_s1_wiring(self)

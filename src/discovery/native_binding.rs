@@ -707,6 +707,14 @@ struct Pending {
     /// batch re-queues there, so a caller admitted later is still
     /// sighted without ever scanning the queue.
     resight_due: bool,
+    /// A read-time exit scan deferred past the holder pool for this
+    /// row: a metadata-only exit retry is still owed. The re-sight
+    /// pass runs the exit scan before any late live query (a sighted
+    /// row keeps its sighting; only the retained fallback is added),
+    /// and the front holds while the retry is owed, so a deferred
+    /// scan is never lost and never costs a native query. Implies
+    /// `resight_due`; set only on healthy reads.
+    exit_retry_owed: bool,
     /// The domain batch that last attempted this row (`None`: never).
     /// A row decides sightingless only on a miss from its own batch;
     /// an earlier miss is stale once later evidence may have arrived.
@@ -1804,6 +1812,7 @@ impl NativeBinder {
                 retained_is_exit,
                 read_healthy,
                 resight_due: due,
+                exit_retry_owed: exit_deferred,
                 last_attempt: None,
             });
             state.next_pos += 1;
@@ -1819,8 +1828,10 @@ impl NativeBinder {
     /// [`RESIGHT_QUERIES_PER_PASS`] live hits are queried, then the
     /// pass completion stamp for every row this pass sighted. A miss
     /// stamps its attempt; a hit past an allowance goes back to the
-    /// queue. The pass reports [`ResightOutcome::Incomplete`] while
-    /// owed rows remain and the next batch resumes with them; it
+    /// queue. A row with an exit retry owed runs its exit scan before
+    /// any live lookup (sighted rows keep their sighting); the scan
+    /// spends no query. The pass reports [`ResightOutcome::Incomplete`]
+    /// while owed rows remain and the next batch resumes with them; it
     /// never scans the pending rows.
     fn resight_pass<Pin>(
         &mut self,
@@ -1842,7 +1853,9 @@ impl NativeBinder {
                 .pending
                 .get(rel)
                 .filter(|pending| {
-                    pending.resight_due && pending.sighting.is_none() && pending.retained.is_none()
+                    pending.resight_due
+                        && (pending.exit_retry_owed
+                            || (pending.sighting.is_none() && pending.retained.is_none()))
                 })
                 .map(|pending| pending.row.host_tgid)
             else {
@@ -1853,6 +1866,67 @@ impl NativeBinder {
                 }
                 continue;
             };
+            // A deferred exit scan retries before any late live query:
+            // the row's event predates the live successor, and the scan
+            // spends no native query. A sighted row keeps its sighting;
+            // the retry only adds the retained fallback (or clears when
+            // Absent, falling through to the live lookup below).
+            let mut exit_absent_this_visit = false;
+            if self.domains[index]
+                .pending
+                .get(rel)
+                .is_some_and(|pending| pending.exit_retry_owed)
+            {
+                let event_ns = self.domains[index]
+                    .pending
+                    .get(rel)
+                    .map(|pending| pending.row.recorded_at_ns)
+                    .expect("the row was just filtered present");
+                // The flag implies a healthy read (the read path sets it
+                // only there); an unhealthy exit snapshot refuses at
+                // decide time regardless.
+                debug_assert!(
+                    self.domains[index]
+                        .pending
+                        .get(rel)
+                        .is_some_and(|pending| pending.read_healthy)
+                );
+                let verdict = lookup.try_exit_witnessed_caller(row_tgid, event_ns);
+                if matches!(verdict, HolderScan::Deferred) {
+                    // The exit scan deferred past the holder pool
+                    // again: the row keeps its owed attempt for the
+                    // next pass (the visit is spent, like a hit past
+                    // the query allowance).
+                    self.domains[index].owed.push_back(pos);
+                    continue;
+                }
+                let state = &mut self.domains[index];
+                let Some(pending) = state.pending.get_mut(rel) else {
+                    continue;
+                };
+                pending.exit_retry_owed = false;
+                if let HolderScan::Found(only) = verdict
+                    && retained_candidate(&only, event_ns)
+                {
+                    pending.retained = Some(only);
+                    pending.retained_is_exit = true;
+                    pending.resight_due = false;
+                    pending.last_attempt = Some(current);
+                    continue;
+                }
+                if pending.sighting.is_some() {
+                    // The read-time sighting decides the row (with no
+                    // retained fallback past an Absent scan); no live
+                    // re-query is owed for it.
+                    pending.resight_due = false;
+                    pending.last_attempt = Some(current);
+                    continue;
+                }
+                // Absent with no sighting: fall through to the live
+                // lookup, which must not re-run the scan it just
+                // answered (one scan per staging per row).
+                exit_absent_this_visit = true;
+            }
             let hit = lookup.live_caller(row_tgid);
             if hit.is_some() && queries >= RESIGHT_QUERIES_PER_PASS {
                 // A hit past the query allowance stays owed for the
@@ -1877,9 +1951,13 @@ impl NativeBinder {
                     // general fallback's custody gate belongs to the
                     // row's own read. A row read while unhealthy
                     // carries that health and never resolves here,
-                    // even on a healthy pass.
+                    // even on a healthy pass. A row whose exit retry
+                    // just answered Absent above keeps that answer
+                    // instead of re-running the scan in this visit.
                     let event_ns = pending.row.recorded_at_ns;
-                    let verdict = if pending.read_healthy {
+                    let verdict = if exit_absent_this_visit {
+                        HolderScan::Absent
+                    } else if pending.read_healthy {
                         lookup.try_exit_witnessed_caller(row_tgid, event_ns)
                     } else {
                         HolderScan::Absent
@@ -2220,9 +2298,10 @@ impl NativeBinder {
     fn decide_ready(&mut self, index: usize, exit_validator: Option<&dyn ExitWitnessValidator>) {
         loop {
             // The front row's gate: uncovered or revalidation-waiting
-            // rows hold; an unsighted row without a retained fallback
-            // holds while owed; only a miss from the row's own batch
-            // decides sightingless.
+            // rows hold, as do rows with an exit retry still owed; an
+            // unsighted row without a retained fallback holds while
+            // owed; only a miss from the row's own batch decides
+            // sightingless.
             let current = self.domains[index].batch_seq;
             let gate = {
                 let state = &self.domains[index];
@@ -2230,6 +2309,11 @@ impl NativeBinder {
                     return;
                 };
                 if !state.horizons_cover(pending) || state.awaits_revalidation(pending) {
+                    false
+                } else if pending.exit_retry_owed {
+                    // A deferred exit scan is still owed for this row:
+                    // the decision waits for the retry instead of
+                    // settling on the sighting alone.
                     false
                 } else if pending.sighting.is_some() || pending.retained.is_some() {
                     true

@@ -45742,6 +45742,193 @@ int main(void) {
     }
 
     #[test]
+    fn a_system_scope_absent_exit_retry_does_not_rescan_on_its_miss() {
+        // A deferred exit retry that answers Absent keeps that answer
+        // for its visit: when the live lookup then misses, the pass
+        // must not re-run the scan it just answered (one scan per
+        // staging per row). The staging after the retry spends exactly
+        // one scan, so its 58 fresh rows resolve without filing the
+        // pool-exhausted gap a second scan would force.
+        agreeing(|| {
+            let (mut native, _) = hot_pid_system_native(1100);
+            // No exits stamped and no successor: every retry answers
+            // Absent and every live lookup misses.
+            native.read(hot_rows(&native, 0, 60));
+            assert_eq!(
+                native.scene.coordinator.binder.owed_len_for_test(),
+                60,
+                "59 Absent rows plus the Deferred row wait"
+            );
+            native.drain();
+            // One empty witness read decides the 59 Absent rows and
+            // leaves only the Deferred row owed for the measured read.
+            native.read(Vec::new());
+            assert_eq!(
+                native.scene.coordinator.binder.owed_len_for_test(),
+                1,
+                "only the Deferred row waits for its retry"
+            );
+            let staged_before = native
+                .scene
+                .coordinator
+                .registry
+                .staged_gaps_for_test()
+                .len();
+            native.read(hot_rows(&native, 60, 58));
+            let staged = native.scene.coordinator.registry.staged_gaps_for_test();
+            assert!(
+                !staged[staged_before..]
+                    .iter()
+                    .any(|gap| gap.subject == "holder scan pool exhausted"),
+                "one scan per staging per row leaves the pool exact: {:?}",
+                &staged[staged_before..]
+            );
+            native.scene.coordinator.commit_batch(false).unwrap();
+            assert_eq!(no_live_caller(&native), Some(60));
+        });
+    }
+
+    #[test]
+    fn a_system_scope_sighted_absent_exit_retry_spends_no_live_query() {
+        // A sighted row whose exit retry answers Absent keeps its
+        // read-time sighting: no live re-query is owed for it, so the
+        // row settles on its sighting with exactly the read-time
+        // queries spent.
+        agreeing(|| {
+            let (mut native, _) = hot_pid_system_native(1100);
+            // No exits stamped: every exit scan answers Absent.
+            native.scene.source.spawn(7, 1600);
+            native.scene.coordinator.adapter.reconcile_detected(
+                &[7].into_iter().collect(),
+                &mut |_| ImageAuthority::ScanPinned,
+                50,
+                &mut || Some(400_000),
+            );
+            assert!(native.scene.coordinator.adapter.live_id(7).is_some());
+            native.query_answer(7, 1600, CookieQuery::Exited);
+            native.read(hot_rows(&native, 0, 60));
+            assert_eq!(
+                native.scene.coordinator.binder.owed_len_for_test(),
+                1,
+                "the read defers exactly the row past the pool"
+            );
+            native.drain();
+            native.witness(Vec::new());
+            native.witness(Vec::new());
+            assert_eq!(bound_census(&native), (60, 0, 0));
+            assert_eq!(
+                native
+                    .scene
+                    .coordinator
+                    .registry
+                    .witness_census()
+                    .unbound
+                    .get(&UnboundReason::CallerExited)
+                    .copied(),
+                Some(60)
+            );
+            assert_eq!(
+                native.cookies.queries, 60,
+                "the Absent retry spends no live query"
+            );
+        });
+    }
+
+    #[test]
+    fn a_system_scope_exit_retry_deferred_again_keeps_its_attempt() {
+        // An exit retry that defers past the pool a second time keeps
+        // its owed attempt (never cleared, never decided): 120 hot
+        // rows defer 61 retries, the next pass answers 59 and requeues
+        // 2, and later passes finish every row on its own holder.
+        agreeing(|| {
+            let (mut native, holders) = hot_pid_system_native(1100);
+            stamp_hot_exits(&mut native, 7, 120);
+            native.read(hot_rows(&native, 0, 120));
+            assert_eq!(
+                native.scene.coordinator.binder.owed_len_for_test(),
+                61,
+                "the read defers exactly the rows past the pool"
+            );
+            native.drain();
+            native.witness(Vec::new());
+            native.witness(Vec::new());
+            native.witness(Vec::new());
+            native.witness(Vec::new());
+            assert_eq!(bound_census(&native), (120, 120, 0));
+            assert_holders_edged(&native, &holders[..120]);
+        });
+    }
+
+    #[test]
+    fn a_system_scope_sighted_retry_owed_row_holds_past_covering_decisions() {
+        // A sighted row whose exit retry re-defers on queued hooks
+        // holds while covered: the decision waits for the retry
+        // instead of settling on the Exited sighting, and binds its
+        // true holder once the hooks drain. The storm queues 71 hooks
+        // so 12 still gate the pid past the covering drain.
+        agreeing(|| {
+            let (mut native, holders) = hot_pid_system_native(1100);
+            stamp_hot_exits(&mut native, 7, 60);
+            native.scene.source.spawn(7, 1600);
+            native.scene.coordinator.adapter.reconcile_detected(
+                &[7].into_iter().collect(),
+                &mut |_| ImageAuthority::ScanPinned,
+                50,
+                &mut || Some(400_000),
+            );
+            assert!(native.scene.coordinator.adapter.live_id(7).is_some());
+            native.query_answer(7, 1600, CookieQuery::Exited);
+            let storm: Vec<u64> = (0..130).map(|i| 200_000 + i).collect();
+            let at = native.stamps.tick();
+            native.stage(NativeBatch::Lifecycle(leader_exit_drain_many(
+                native.domain,
+                at,
+                7,
+                &storm,
+            )));
+            assert_eq!(
+                native.scene.coordinator.deferred_hooks.queue_len_for_test(),
+                71,
+                "the storm queues 71 hooks past the pool"
+            );
+            let row = hot_rows(&native, 59, 1).pop().unwrap();
+            native.read(vec![row]);
+            assert_eq!(
+                native.scene.coordinator.binder.owed_len_for_test(),
+                1,
+                "the gated row waits for its exit retry"
+            );
+            // The covering drain stamps 59 hooks and stops with 12
+            // still queued; the row stays undecided without horizons.
+            native.drain();
+            assert_eq!(
+                native.scene.coordinator.deferred_hooks.queue_len_for_test(),
+                12,
+                "the drain stops intact with 12 hooks still queued"
+            );
+            // Horizons cover the row but its retry re-defers on the
+            // queued hooks: it holds, never settling on its sighting.
+            native.read(Vec::new());
+            native.scene.coordinator.commit_batch(false).unwrap();
+            assert_eq!(
+                bound_census(&native),
+                (1, 0, 1),
+                "the covered row holds for its exit retry"
+            );
+            // The next drain completes the hooks; the retry runs and
+            // the row binds its true holder.
+            native.drain();
+            native.witness(Vec::new());
+            assert_eq!(bound_census(&native), (1, 1, 0));
+            assert_only_holder_edged(&native, holders[59]);
+            assert_eq!(
+                native.cookies.queries, 1,
+                "one read-time query, none for the retries"
+            );
+        });
+    }
+
+    #[test]
     fn a_system_scope_queued_hook_hold_files_no_budget_payload() {
         // A row held only by its pid's queued hooks waits on evidence,
         // not on a failed charge: its staging files the waiting gap

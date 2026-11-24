@@ -41,6 +41,10 @@ _NATIVE = ("scripts/inventory-native-oracle.py", "scripts/qualify-cgroup-trace.p
            "crates/discover/tests/fixture/version_matrix.c")
 _MATRIX_RUNNERS = ("scripts/qualify-public-cli.sh", "scripts/qualify-inventory-native.sh",
                    "scripts/run-privileged-lib-tests.sh")
+_MATRIX_STAGE = tuple(dict.fromkeys(_MATRIX_RUNNERS + _PUBLIC + _NATIVE + _LIB))
+# The compiler pin, the candidate build and its fixture, and the self-test.
+_MATRIX_HOST = (".release-rust-version", "scripts/cargo.sh", "scripts/prepare-dependencies.py",
+                "scripts/fixtures/exec_churn.c", "tests/python/test_release_matrix_contract.py")
 
 # runner -> mode -> (where the mode runs, its inputs). A `stage` mode runs
 # from the checkout-free release stage; a `checkout` mode only from a
@@ -56,13 +60,14 @@ RUNNERS = {
     "scripts/ci/build-counter-fixtures.sh": {"run": (STAGE, _COUNTER)},
     "scripts/ci/build-wrap-fixtures.sh": {"run": (STAGE, _WRAP)},
     "scripts/ci/prepare-btrfs-tmpdir.sh": {"run": (STAGE, ())},
-    # stage: the guest's inner script; its preflight is --verify-inputs,
-    # which binds every staged source. checkout: the host driver (build,
-    # self-test and stage writing), refused here before any of them.
+    # stage: the guest's inner script; its bootstrap check names the judge
+    # and this file, then --verify-inputs binds every staged source.
+    # checkout: the host driver. Every host mode (dry run, plan, build,
+    # stage writing, self-test) reads the whole guest stage from the
+    # checkout plus the host-only files, refused before the first read.
     "scripts/qualify-release-matrix.sh": {
-        "stage": (STAGE, tuple(dict.fromkeys(_MATRIX_RUNNERS + _PUBLIC + _NATIVE + _LIB))),
-        "checkout": (CHECKOUT, ("scripts/cargo.sh", "scripts/prepare-dependencies.py", "scripts/fixtures/exec_churn.c",
-                                "tests/python/test_release_matrix_contract.py"))},
+        "stage": (STAGE, _MATRIX_STAGE),
+        "checkout": (CHECKOUT, _MATRIX_STAGE + _MATRIX_HOST)},
 }
 
 

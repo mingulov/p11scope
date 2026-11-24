@@ -1115,6 +1115,48 @@ class BoundedReadTests(unittest.TestCase):
                     finally:
                         os.close(dup)
 
+    def test_every_read_closes_its_descriptor(self):
+        # hungerg r11d: success, oversize, stale and a failing read each
+        # close the one descriptor they opened.
+        opened = []
+        original_open, original_read = Q.open_regular, os.read
+
+        def spy(path, rule, what):
+            fd, info = original_open(path, rule, what)
+            opened.append(fd)
+            return fd, info
+
+        def closed(fd):
+            try:
+                os.fstat(fd)
+            except OSError:
+                return True
+            return False
+
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "input"
+            path.write_bytes(b"x" * 100)
+            future = path.stat().st_mtime_ns + 10**9
+            rows = (("success", 4096, None, None), ("oversize", 10, None, Q.Refusal),
+                    ("stale", 4096, future, Q.Refusal), ("read error", 4096, None, OSError))
+            for name, limit, newer, error in rows:
+                with self.subTest(case=name):
+                    Q.open_regular = spy
+                    if name == "read error":
+                        def failing(fd, n):
+                            raise OSError(5, "controlled read failure")
+                        Q.os.read = failing
+                    try:
+                        if error is None:
+                            Q.read_bounded(str(path), "fresh.run", "input", limit, newer)
+                        else:
+                            with self.assertRaises(error):
+                                Q.read_bounded(str(path), "fresh.run", "input", limit, newer)
+                    finally:
+                        Q.open_regular = original_open
+                        Q.os.read = original_read
+                    self.assertTrue(closed(opened.pop()), name)
+
     def test_cgroup_procs(self):
         limit = 65  # the healthy 7 bytes plus whole "7\n" rows
         healthy = member_case()["procs"].encode()

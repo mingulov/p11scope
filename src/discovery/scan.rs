@@ -7569,8 +7569,8 @@ thread_local! {
 /// hence the observer-side key; the lower file's facts cache under
 /// this key since the cache pin carries no device. Failure keeps the
 /// named gap, so the file stays learnable through ordinary scans.
-/// (device, inode) of the file the last `lower_proven_key` call was
-/// asked to bind (test seam).
+// (device, inode) of the file the last `lower_proven_key` call was
+// asked to bind (test seam).
 #[cfg(test)]
 thread_local! {
     static LOWER_PROVEN_RESOLVED: std::cell::Cell<Option<(u64, u64)>> =

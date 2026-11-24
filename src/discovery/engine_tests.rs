@@ -41825,6 +41825,12 @@ fn merge_scanned_module_keeps_live_tables_past_the_merge_cap() {
         entered[0].tables.iter().filter(|t| t.live_return).count(),
         1
     );
+    assert!(
+        entered[0].tables[1..]
+            .windows(2)
+            .all(|pair| pair[0].address < pair[1].address),
+        "the partition is stable: surviving heuristics keep scan order"
+    );
     assert_eq!(entered[0].interfaces.len(), 1);
     assert_eq!(
         entered[0].interfaces[0].table,

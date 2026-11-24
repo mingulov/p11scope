@@ -122,9 +122,9 @@ echo "run-matrix: delivered, binary sha ok"
 # Throwaway PINs (600 file, sourced on the host, never shown).
 $SSH "umask 077 && printf 'P11TEST_PIN=1234\nP11TEST_SO_PIN=5678\n' >'$TASKDIR/pins.env' && chmod 600 '$TASKDIR/pins.env'" || exit 2
 # Pinned pkcs11-check venv on the host.
-$SSH "python3 -m venv '$TASKDIR/venv' && '$TASKDIR/venv/bin/pip' install --quiet --require-hashes -r '$TASKDIR/repo/scripts/ci/pkcs11-check-requirements.txt' && test \"\$('$TASKDIR/venv/bin/pkcs11-check' version)\" = 'pkcs11-check 0.2.3'" \
+$SSH "python3 -m venv '$TASKDIR/venv' && '$TASKDIR/venv/bin/pip' install --quiet --require-hashes -r '$TASKDIR/repo/scripts/ci/pkcs11-check-requirements.txt' && test \"\$('$TASKDIR/venv/bin/pkcs11-check' version)\" = 'pkcs11-check 0.3.1'" \
   || { echo "run-matrix: host venv setup failed" >&2; exit 2; }
-echo "run-matrix: host venv ready (pkcs11-check 0.2.3)"
+echo "run-matrix: host venv ready (pkcs11-check 0.3.1)"
 # One lane hold per cell; a failing cell never aborts the matrix.
 mkdir -p "$COLLECT" || exit 2
 OVERALL=0

@@ -97,7 +97,7 @@ if [ "$PROVIDER_SUITE" = yes ]; then
   [ -z "${P11TEST_PIN:-}" ] && { echo "provider-matrix-cell: P11TEST_PIN env must be set (throwaway token PIN, never echoed)" >&2; exit 2; }
   [ -z "${P11TEST_SO_PIN:-}" ] && { echo "provider-matrix-cell: P11TEST_SO_PIN env must be set (throwaway SO PIN, never echoed)" >&2; exit 2; }
   HAVE_VER=$("$P11CHECK_BIN" version 2>/dev/null) || { echo "provider-matrix-cell: cannot run $P11CHECK_BIN version" >&2; exit 77; }
-  [ "$HAVE_VER" = "pkcs11-check 0.2.3" ] || { echo "provider-matrix-cell: want pkcs11-check 0.2.3, have '$HAVE_VER'" >&2; exit 1; }
+  [ "$HAVE_VER" = "pkcs11-check 0.3.1" ] || { echo "provider-matrix-cell: want pkcs11-check 0.3.1, have '$HAVE_VER'" >&2; exit 1; }
 else
   command -v "$PKCS11_TOOL" >/dev/null 2>&1 || { echo "provider-matrix-cell: missing prerequisite: $PKCS11_TOOL" >&2; exit 77; }
 fi

@@ -2020,7 +2020,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
   # pkcs11-check SMOKE under p11scope: the owner's public suite (PyPI,
-  # pinned 0.2.3, DEFAULT crash isolation, never --isolation none) against
+  # pinned 0.3.1, DEFAULT crash isolation, never --isolation none) against
   # SoftHSM in three legs (alone, under run, under run --manifest) with
   # identical-result, observer-clean, oracle-subset and default-coverage
   # checks (scripts/ci/pkcs11-check-cell.sh). Exact selector --marker
@@ -2042,11 +2042,11 @@ jobs:
         run: |
           set -euo pipefail
           python3 -m venv "$RUNNER_TEMP/p11check"
-          # Pinned pkcs11-check==0.2.3 plus its exact dependency closure, by
+          # Pinned pkcs11-check==0.3.1 plus its exact dependency closure, by
           # artifact hash (tests/privileged-campaign.json pkcs11_check pins).
           "$RUNNER_TEMP/p11check/bin/pip" install --quiet --require-hashes \
             -r scripts/ci/pkcs11-check-requirements.txt
-          test "$("$RUNNER_TEMP/p11check/bin/pkcs11-check" version)" = 'pkcs11-check 0.2.3'
+          test "$("$RUNNER_TEMP/p11check/bin/pkcs11-check" version)" = 'pkcs11-check 0.3.1'
       - name: Download the release observer
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -2099,11 +2099,11 @@ jobs:
         run: |
           set -euo pipefail
           python3 -m venv "$RUNNER_TEMP/p11check"
-          # Pinned pkcs11-check==0.2.3 plus its exact dependency closure, by
+          # Pinned pkcs11-check==0.3.1 plus its exact dependency closure, by
           # artifact hash (tests/privileged-campaign.json pkcs11_check pins).
           "$RUNNER_TEMP/p11check/bin/pip" install --quiet --require-hashes \
             -r scripts/ci/pkcs11-check-requirements.txt
-          test "$("$RUNNER_TEMP/p11check/bin/pkcs11-check" version)" = 'pkcs11-check 0.2.3'
+          test "$("$RUNNER_TEMP/p11check/bin/pkcs11-check" version)" = 'pkcs11-check 0.3.1'
       - name: Download the release observer
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -2176,11 +2176,11 @@ jobs:
         run: |
           set -euo pipefail
           python3 -m venv "$RUNNER_TEMP/p11check"
-          # Pinned pkcs11-check==0.2.3 plus its exact dependency closure, by
+          # Pinned pkcs11-check==0.3.1 plus its exact dependency closure, by
           # artifact hash (tests/privileged-campaign.json pkcs11_check pins).
           "$RUNNER_TEMP/p11check/bin/pip" install --quiet --require-hashes \
             -r scripts/ci/pkcs11-check-requirements.txt
-          test "$("$RUNNER_TEMP/p11check/bin/pkcs11-check" version)" = 'pkcs11-check 0.2.3'
+          test "$("$RUNNER_TEMP/p11check/bin/pkcs11-check" version)" = 'pkcs11-check 0.3.1'
       - name: Fetch the pinned provider
         shell: bash
         run: |
@@ -2261,11 +2261,11 @@ jobs:
         run: |
           set -euo pipefail
           python3 -m venv "$RUNNER_TEMP/p11check"
-          # Pinned pkcs11-check==0.2.3 plus its exact dependency closure, by
+          # Pinned pkcs11-check==0.3.1 plus its exact dependency closure, by
           # artifact hash (tests/privileged-campaign.json pkcs11_check pins).
           "$RUNNER_TEMP/p11check/bin/pip" install --quiet --require-hashes \
             -r scripts/ci/pkcs11-check-requirements.txt
-          test "$("$RUNNER_TEMP/p11check/bin/pkcs11-check" version)" = 'pkcs11-check 0.2.3'
+          test "$("$RUNNER_TEMP/p11check/bin/pkcs11-check" version)" = 'pkcs11-check 0.3.1'
       - name: Fetch the pinned provider
         shell: bash
         run: |

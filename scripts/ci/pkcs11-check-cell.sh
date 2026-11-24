@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # pkcs11-check-cell.sh P11SCOPE OUTDIR: pkcs11-check suite under p11scope.
-# Runs the owner's public pkcs11-check suite (PyPI, pinned 0.2.3, DEFAULT
+# Runs the owner's public pkcs11-check suite (PyPI, pinned 0.3.1, DEFAULT
 # crash isolation) against SoftHSM (probed path) in three legs: (a) alone,
 # (b) under `p11scope run` (default, no manifest), (c) under `p11scope run
 # --manifest` (manifest from p11scope-discover, the verify-oracle shape).
@@ -59,7 +59,7 @@ MODULE=${MODULE:-$(probe_module || true)}
 [ -f "$MODULE" ] || { echo "pkcs11-check-cell: MODULE not found: $MODULE" >&2; exit 77; }
 # Pinned suite version: the binary must report exactly it.
 HAVE_VER=$("$P11CHECK_BIN" version 2>/dev/null) || { echo "pkcs11-check-cell: cannot run $P11CHECK_BIN version" >&2; exit 77; }
-[ "$HAVE_VER" = "pkcs11-check 0.2.3" ] || { echo "pkcs11-check-cell: want pkcs11-check 0.2.3, have '$HAVE_VER'" >&2; exit 1; }
+[ "$HAVE_VER" = "pkcs11-check 0.3.1" ] || { echo "pkcs11-check-cell: want pkcs11-check 0.3.1, have '$HAVE_VER'" >&2; exit 1; }
 mkdir -p "$OUT" || exit 2
 OUT=$(cd "$OUT" && pwd) || exit 2
 COMPARE=$HERE/pkcs11_check_cell_compare.py

@@ -902,7 +902,7 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
         # them: exact version, exact smoke marker, four cells and floor.
         campaign = json.loads(CAMPAIGN.read_text(encoding="utf-8"))
         check = campaign["pkcs11_check"]
-        self.assertEqual(check["version"], "0.2.3")
+        self.assertEqual(check["version"], "0.3.1")
         self.assertEqual(check["smoke_marker"], "smoke")
         self.assertEqual(check["cells"], [
             "pkcs11-check-identical-results",
@@ -913,7 +913,7 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
         self.assertEqual(check["default_coverage_floor"], 1.0)
         self.assertNotIn("default_coverage_expected_failure", check)
         script = (ROOT / "scripts" / "ci" / "pkcs11-check-cell.sh").read_text(encoding="utf-8")
-        self.assertIn("pkcs11-check==0.2.3", self.yml)
+        self.assertIn("pkcs11-check==0.3.1", self.yml)
         self.assertIn("--marker smoke", script)
         # DEFAULT crash isolation: the suite invocations never pass
         # --isolation (comments and state-file names may mention it).
@@ -924,7 +924,7 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
             self.assertNotIn("--isolation", line)
         self.assertIn("FLOOR=1.0", script)
         helper = (ROOT / "scripts" / "ci" / "pkcs11_check_cell_compare.py").read_text(encoding="utf-8")
-        self.assertIn('PINNED_VERSION = "0.2.3"', helper)
+        self.assertIn('PINNED_VERSION = "0.3.1"', helper)
 
     def test_pkcs11_check_jobs_use_the_template_with_exact_cells(self):
         for job_name, mode, timeout in (("pkcs11-check-smoke", "smoke", "30"),
@@ -934,7 +934,7 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
                 self.assertIn("needs: release-build", job)
                 self.assertIn("runs-on: ubuntu-26.04", job)
                 self.assertIn(f"timeout-minutes: {timeout}", job)
-                self.assertIn("pkcs11-check==0.2.3", job)
+                self.assertIn("pkcs11-check==0.3.1", job)
                 self.assertIn(f"P11CHECK_MODE={mode}", job)
                 self.assertIn("scripts/ci/run-cell-script.sh pkcs11-check-cell", job)
                 for cell in ("pkcs11-check-identical-results",

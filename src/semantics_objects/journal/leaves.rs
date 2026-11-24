@@ -506,11 +506,13 @@ impl<'a> JournalLeaves<'a> {
     /// grounds it, for incarnation fencing.
     fn refuse_key(&mut self, key: JournalDomainKey, capable: bool) -> Option<DomainRetirement> {
         let lived = self.adapter.key_is_live(key);
+        let old = self.adapter.sibling_flags(key);
         let (era, registered) = {
             let state = self.adapter.keys.edit().get_mut(&key).expect("refused key");
             state.refused = true;
             (state.era, state.model_registered)
         };
+        self.adapter.refresh_sibling_counts(key, old);
         self.adapter.note_refused_mark(key, capable);
         self.adapter.claims_prune_dirty |= lived;
         registered.then(|| {
@@ -616,15 +618,17 @@ impl<'a> JournalLeaves<'a> {
         _paid: Paid,
     ) -> Option<DomainRetirement> {
         self.visit();
-        let state = self.adapter.keys.edit().get_mut(&key)?;
-        state.void_fence = state.void_fence.max(upper);
-        if !state.model_registered {
+        let old = self.adapter.sibling_flags(key);
+        let (registered, era) = {
+            let state = self.adapter.keys.edit().get_mut(&key)?;
+            state.void_fence = state.void_fence.max(upper);
+            (state.model_registered, state.era)
+        };
+        self.adapter.refresh_sibling_counts(key, old);
+        if !registered {
             return None;
         }
-        let domain = ObjectDomain::sealed(&JournalDomainProof {
-            key,
-            era: state.era,
-        });
+        let domain = ObjectDomain::sealed(&JournalDomainProof { key, era });
         Some(DomainRetirement::void(
             domain,
             RefCut::sealed(ConsumptionOrdinal(upper)),
@@ -646,21 +650,28 @@ impl<'a> JournalLeaves<'a> {
         self.visit();
         if mode == RecoveryMode::RefuseAll {
             let lived = self.adapter.key_is_live(key);
-            let state = self.adapter.keys.edit().get_mut(&key).expect("refused key");
-            state.bootstraps.clear();
-            let scope = JournalDomainProof {
-                key,
-                era: state.era,
-            }
-            .domain();
-            let mut retire = None;
-            if !state.refused {
-                state.refused = true;
-                if state.model_registered {
-                    retire = Some(DomainRetirement::abandon(scope));
+            let old = self.adapter.sibling_flags(key);
+            let (scope, retire, newly_refused) = {
+                let state = self.adapter.keys.edit().get_mut(&key).expect("refused key");
+                state.bootstraps.clear();
+                let scope = JournalDomainProof {
+                    key,
+                    era: state.era,
                 }
-                self.adapter.claims_prune_dirty |= lived;
-            }
+                .domain();
+                let mut retire = None;
+                let mut newly_refused = false;
+                if !state.refused {
+                    state.refused = true;
+                    newly_refused = true;
+                    if state.model_registered {
+                        retire = Some(DomainRetirement::abandon(scope));
+                    }
+                }
+                (scope, retire, newly_refused)
+            };
+            self.adapter.refresh_sibling_counts(key, old);
+            self.adapter.claims_prune_dirty |= lived && newly_refused;
             // Unlocalized disposal evidences stream corruption:
             // unknown effects from live frames never mint past it.
             self.adapter.note_refused_mark(key, true);
@@ -671,18 +682,23 @@ impl<'a> JournalLeaves<'a> {
                 count_unregistered: false,
             });
         }
-        let state = self.adapter.keys.edit().get_mut(&key).expect("fenced key");
-        state.void_fence = state.void_fence.max(upper);
-        let pending_unregistered = state.bootstraps.is_empty() && !state.model_registered;
-        state.bootstraps.clear();
-        let scope = JournalDomainProof {
-            key,
-            era: state.era,
-        }
-        .domain();
-        let retire = state
-            .model_registered
-            .then(|| DomainRetirement::void(scope, RefCut::sealed(ConsumptionOrdinal(upper))));
+        let old = self.adapter.sibling_flags(key);
+        let (pending_unregistered, scope, retire) = {
+            let state = self.adapter.keys.edit().get_mut(&key).expect("fenced key");
+            state.void_fence = state.void_fence.max(upper);
+            let pending_unregistered = state.bootstraps.is_empty() && !state.model_registered;
+            state.bootstraps.clear();
+            let scope = JournalDomainProof {
+                key,
+                era: state.era,
+            }
+            .domain();
+            let retire = state
+                .model_registered
+                .then(|| DomainRetirement::void(scope, RefCut::sealed(ConsumptionOrdinal(upper))));
+            (pending_unregistered, scope, retire)
+        };
+        self.adapter.refresh_sibling_counts(key, old);
         Some(FenceAllVisit {
             key,
             scope,

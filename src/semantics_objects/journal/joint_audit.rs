@@ -1573,7 +1573,7 @@ impl IngestedJointQuantum {
         image: super::JournalDomainProof,
         healthy: super::JournalDomainProof,
     ) {
-        assert_eq!(size_of::<super::JournalDomainState>(), 72);
+        assert_eq!(size_of::<super::JournalDomainState>(), 80);
         assert_eq!(std::mem::align_of::<super::JournalDomainState>(), 8);
         assert_ne!(exact.key, image.key);
         assert_ne!(exact.key, healthy.key);

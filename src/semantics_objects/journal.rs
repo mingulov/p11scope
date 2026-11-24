@@ -855,6 +855,10 @@ struct JournalDeathMarks {
     /// the close names its count as a lower bound
     /// ([`FallbackFenceDecision::straddlers_at_least`]).
     straddlers_unscanned: bool,
+    /// Reseed generation of the straddler tally: a tally from an
+    /// older generation belongs to a prior episode and reads as
+    /// none (see [`JournalAdapter::image_reseed_gen`]).
+    straddler_gen: u64,
 }
 
 /// One proof-destroying fallback close's fence on a dead key: the
@@ -980,9 +984,23 @@ fn admission_disposed_unclaimed(entry: &OpenEntry, audit: &JournalAuditReceipt) 
 /// registration, the bootstrap cuts and bounded-loss uppers that gate
 /// later seals, and the void fence (history at or below it is explicitly
 /// lost, so later proof resumes at or above it).
+/// One key's per-image sibling-count memberships ignoring image
+/// taint (see [`JournalAdapter::sibling_flags`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SiblingFlags {
+    live_flags: bool,
+    unfenced: bool,
+    fenced: bool,
+    dead_recorded: bool,
+}
+
 #[derive(Debug, Default)]
 struct JournalDomainState {
     era: u64,
+    /// Reseed generation of the pinned bootstrap cuts: cuts from an
+    /// older generation belong to a prior episode and read as absent
+    /// (see [`JournalAdapter::image_reseed_gen`]).
+    bootstrap_gen: u64,
     refused: bool,
     /// A genuinely marked S1Only original was disposed for this retained
     /// exact key. This negative provenance survives image-independent voids;
@@ -2826,6 +2844,23 @@ pub(crate) struct JournalAdapter {
     /// quarantine-end mint retires its blocked latest first. Updated
     /// beside the one `image_keys` append.
     binding_latest: BTreeMap<JournalDomainKey, JournalDomainKey>,
+    /// Per-image sibling counts ignoring image taint (INV-2): the
+    /// fresh-bind probe, fenced-sibling diagnostic and quarantine
+    /// scan read these instead of walking the image key list. Taint
+    /// is image-global, so probes check it once (O(1)) and use the
+    /// counts only when siblings can be live. Maintained eagerly at
+    /// every key/mark mutation; a debug oracle checks them against
+    /// a full scan on every read.
+    image_unfenced_siblings: BTreeMap<(u64, u64), usize>,
+    image_fenced_siblings: BTreeMap<(u64, u64), usize>,
+    image_dead_recorded: BTreeMap<(u64, u64), usize>,
+    image_live_flags: BTreeMap<(u64, u64), usize>,
+    /// Per-image reseed generation (INV-2): `clear_bootstraps_for_reseed`
+    /// bumps this instead of walking the image key list. A key's
+    /// pinned bootstraps and straddler tally read as absent unless
+    /// their generations match; the next write clears stale entries
+    /// and adopts the current generation.
+    image_reseed_gen: BTreeMap<(u64, u64), u64>,
     /// Test-only count of binding-incarnation resolutions, for the
     /// per-bind work bound.
     #[cfg(test)]
@@ -3073,6 +3108,11 @@ impl JournalAdapter {
             fallback_pass: 0,
             image_keys: Tracked::new(BTreeMap::new()),
             binding_latest: BTreeMap::new(),
+            image_unfenced_siblings: BTreeMap::new(),
+            image_fenced_siblings: BTreeMap::new(),
+            image_dead_recorded: BTreeMap::new(),
+            image_live_flags: BTreeMap::new(),
+            image_reseed_gen: BTreeMap::new(),
             #[cfg(test)]
             binding_resolutions: std::cell::Cell::new(0),
             #[cfg(test)]
@@ -4802,7 +4842,7 @@ impl JournalAdapter {
             if state.tainted || self.is_tainted((key.cookie, key.exec)) {
                 tainted = tainted.saturating_add(1);
             }
-            if state.bootstraps.is_empty() {
+            if self.bootstraps_empty(*key) {
                 pending = pending.saturating_add(1);
             }
         }
@@ -5436,8 +5476,12 @@ impl JournalAdapter {
                 return;
             };
             let lived = self.key_is_live(key);
+            let old = self.sibling_flags(key);
             if let Some(state) = self.keys.edit().get_mut(&key) {
                 state.tainted = true;
+            }
+            self.refresh_sibling_counts(key, old);
+            if self.keys.contains_key(&key) {
                 self.note_tainted_mark(key);
             }
             self.claims_prune_dirty |= lived;
@@ -7739,16 +7783,26 @@ impl JournalAdapter {
         {
             return Err(AttestationRefusal::ImageTainted);
         }
-        if fresh
-            && let Some(siblings) = self.image_keys.get(&(key.cookie, key.exec))
-            && siblings.iter().any(|sibling| {
-                #[cfg(test)]
-                self.sibling_probe_visits
-                    .set(self.sibling_probe_visits.get().saturating_add(1));
-                sibling != &key && self.sibling_holds_unfenced_history(*sibling)
-            })
-        {
-            return Err(AttestationRefusal::ImageSealed);
+        // Fresh-bind sibling probe (INV-2): the per-image unfenced
+        // count replaces the key-list walk. Siblings share the
+        // image's taint verdict at the global fence, so a blocked
+        // image holds no live sibling without consulting the count.
+        // The fresh key is not yet inserted, so the count excludes
+        // it exactly like the `sibling != &key` guard did.
+        if fresh {
+            let image = (key.cookie, key.exec);
+            #[cfg(test)]
+            self.check_sibling_counts(image);
+            if !self.image_taint_blocks(image, *self.voided_through)
+                && self
+                    .image_unfenced_siblings
+                    .get(&image)
+                    .copied()
+                    .unwrap_or(0)
+                    > 0
+            {
+                return Err(AttestationRefusal::ImageSealed);
+            }
         }
         if fresh && self.keys.len() >= self.limits.domain_keys {
             return Err(AttestationRefusal::KeysExhausted);
@@ -8041,20 +8095,26 @@ impl JournalAdapter {
         };
         let wait = fallback_backoff_passes(chain);
         {
-            let state = self.keys.edit().get_mut(&key).expect("closed key");
-            state.void_fence = state.void_fence.max(frontier);
+            let old = self.sibling_flags(key);
+            {
+                let state = self.keys.edit().get_mut(&key).expect("closed key");
+                state.void_fence = state.void_fence.max(frontier);
+            }
+            self.refresh_sibling_counts(key, old);
         }
         let expires_at = self.fallback_pass.saturating_add(u64::from(wait));
-        let marks = self.death_marks.entry(key).or_default();
-        marks.fallback = Some(FallbackFenceMark {
-            fence: frontier,
-            chain,
-            expires_at,
-        });
-        // The close consumes this key's straddler tally: it names them
-        // once, and a later close never re-reports them.
-        let straddler = marks.straddler.take();
-        let straddlers_at_least = std::mem::take(&mut marks.straddlers_unscanned);
+        {
+            let marks = self.death_marks.entry(key).or_default();
+            marks.fallback = Some(FallbackFenceMark {
+                fence: frontier,
+                chain,
+                expires_at,
+            });
+        }
+        // The close consumes this key's live straddler tally: it names
+        // them once, and a later close never re-reports them. A stale
+        // episode's tally reads as none.
+        let (straddler, straddlers_at_least) = self.straddler_take(key);
         Some(FallbackFenceDecision {
             fence: frontier,
             chain,
@@ -8169,21 +8229,17 @@ impl JournalAdapter {
         if *self.voided_through == 0 {
             return false;
         }
-        self.image_keys.get(&image).is_some_and(|siblings| {
-            siblings.iter().any(|key| {
-                #[cfg(test)]
-                self.quarantine_candidate_visits
-                    .set(self.quarantine_candidate_visits.get().saturating_add(1));
-                self.keys.get(key).is_some_and(|state| {
-                    (state.refused || state.tainted || state.era_ended)
-                        && self.quarantine_death_recorded(*key)
-                        || (!state.refused
-                            && !state.tainted
-                            && !state.era_ended
-                            && self.image_taint_blocks(image, *self.voided_through))
-                })
-            })
-        })
+        // Quarantine scan (INV-2): per-image counts replace the
+        // key-list walk. A dead recorded key qualifies on its own;
+        // a live-flags key qualifies only while the shared taint
+        // verdict blocks the image.
+        #[cfg(test)]
+        self.check_sibling_counts(image);
+        if self.image_dead_recorded.get(&image).copied().unwrap_or(0) > 0 {
+            return true;
+        }
+        self.image_taint_blocks(image, *self.voided_through)
+            && self.image_live_flags.get(&image).copied().unwrap_or(0) > 0
     }
 
     /// Whether one admission ends its binding's quarantine: some
@@ -8247,24 +8303,43 @@ impl JournalAdapter {
         let Some(return_ns) = admitted.journal_return_ns() else {
             return false;
         };
+        // A drifted census is untrusted: fail closed without scanning
+        // (the next claim rebuilds it; refusing a quarantine-end mint
+        // strands nothing that a later proof cannot re-establish).
+        if self.retained_census_drift {
+            return false;
+        }
         let claim = AdmittedJournalClaim {
             admission: admitted.h0_ordinal(),
             return_ns,
             returned: fingerprint,
             rv: admitted.s1_facts().rv,
         };
-        self.open.values().any(|entry| {
+        // INV-2: the retained census replaces the open-table walk. A
+        // claim names entries only under its own entry-invariant
+        // identity, so only that identity's members are examined
+        // (typically one; capped at a credit for pathological
+        // collisions, failing closed past the cap).
+        let Some(members) = self.retained_counts.get(&fingerprint.identity()) else {
+            return false;
+        };
+        members.iter().take(SCOPED_RECOVERY_SLICE).any(|member| {
             #[cfg(test)]
             self.post_fence_visits
                 .set(self.post_fence_visits.get().saturating_add(1));
-            entry.begin_ordinal > *self.voided_through
-                && entry.end.is_some()
-                && entry.abandon.is_none()
-                && entry.converted_ticket.is_none()
-                && entry.converted_for.is_none()
-                && !entry.end_converted
-                && entry.call_key.is_none()
-                && claim_names_shape(&shape_of_entry(entry), &claim)
+            let RetainedMember::Open(native) = member else {
+                return false;
+            };
+            self.open.get(native).is_some_and(|entry| {
+                entry.begin_ordinal > *self.voided_through
+                    && entry.end.is_some()
+                    && entry.abandon.is_none()
+                    && entry.converted_ticket.is_none()
+                    && entry.converted_for.is_none()
+                    && !entry.end_converted
+                    && entry.call_key.is_none()
+                    && claim_names_shape(&shape_of_entry(entry), &claim)
+            })
         })
     }
 
@@ -8340,6 +8415,166 @@ impl JournalAdapter {
             })
     }
 
+    /// One key's sibling-count contributions ignoring image taint
+    /// (taint is image-global and checked once at read time).
+    fn sibling_flags(&self, key: JournalDomainKey) -> SiblingFlags {
+        let Some(state) = self.keys.get(&key) else {
+            return SiblingFlags::default();
+        };
+        let live_flags = !state.refused && !state.tainted && !state.era_ended;
+        let fenced = state.void_fence > 0 && state.void_fence >= state.sealed_through;
+        SiblingFlags {
+            live_flags,
+            unfenced: live_flags && state.model_registered && !fenced,
+            fenced: live_flags && state.model_registered && fenced,
+            dead_recorded: !live_flags && self.quarantine_death_recorded(key),
+        }
+    }
+
+    /// Adjust the image sibling counts after one key's state changed
+    /// from `old` to its current state. Call after every key or
+    /// death-mark mutation (O(1)).
+    fn refresh_sibling_counts(&mut self, key: JournalDomainKey, old: SiblingFlags) {
+        let new = self.sibling_flags(key);
+        if old == new {
+            return;
+        }
+        let image = (key.cookie, key.exec);
+        Self::adjust_count(
+            &mut self.image_live_flags,
+            image,
+            old.live_flags,
+            new.live_flags,
+        );
+        Self::adjust_count(
+            &mut self.image_unfenced_siblings,
+            image,
+            old.unfenced,
+            new.unfenced,
+        );
+        Self::adjust_count(
+            &mut self.image_fenced_siblings,
+            image,
+            old.fenced,
+            new.fenced,
+        );
+        Self::adjust_count(
+            &mut self.image_dead_recorded,
+            image,
+            old.dead_recorded,
+            new.dead_recorded,
+        );
+    }
+
+    /// Move one image count by a single key's changed membership.
+    fn adjust_count(
+        counts: &mut BTreeMap<(u64, u64), usize>,
+        image: (u64, u64),
+        was: bool,
+        is: bool,
+    ) {
+        match (was, is) {
+            (true, false) => {
+                if let Some(count) = counts.get_mut(&image) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        counts.remove(&image);
+                    }
+                }
+            }
+            (false, true) => {
+                *counts.entry(image).or_default() =
+                    counts.get(&image).copied().unwrap_or(0).saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+
+    /// Debug oracle: the sibling counts for `image` match a full scan
+    /// of its key list. Production reads assert this; tests rebuild
+    /// counts after direct state surgery via
+    /// [`Self::sync_sibling_counts_for_test`].
+    #[cfg(test)]
+    fn check_sibling_counts(&self, image: (u64, u64)) {
+        let mut live_flags = 0usize;
+        let mut unfenced = 0usize;
+        let mut fenced = 0usize;
+        let mut dead_recorded = 0usize;
+        if let Some(siblings) = self.image_keys.get(&image) {
+            for sibling in siblings {
+                let flags = self.sibling_flags(*sibling);
+                live_flags += usize::from(flags.live_flags);
+                unfenced += usize::from(flags.unfenced);
+                fenced += usize::from(flags.fenced);
+                dead_recorded += usize::from(flags.dead_recorded);
+                // The counter predicate matches the original walk
+                // predicate whenever the shared taint verdict allows
+                // siblings to be live.
+                if !self.image_taint_blocks(image, *self.voided_through) {
+                    debug_assert_eq!(
+                        flags.unfenced,
+                        self.sibling_holds_unfenced_history(*sibling),
+                        "unfenced counter matches the walk predicate"
+                    );
+                }
+            }
+        }
+        debug_assert_eq!(
+            self.image_live_flags.get(&image).copied().unwrap_or(0),
+            live_flags,
+            "live-flags count matches the image key list"
+        );
+        debug_assert_eq!(
+            self.image_unfenced_siblings
+                .get(&image)
+                .copied()
+                .unwrap_or(0),
+            unfenced,
+            "unfenced-sibling count matches the image key list"
+        );
+        debug_assert_eq!(
+            self.image_fenced_siblings.get(&image).copied().unwrap_or(0),
+            fenced,
+            "fenced-sibling count matches the image key list"
+        );
+        debug_assert_eq!(
+            self.image_dead_recorded.get(&image).copied().unwrap_or(0),
+            dead_recorded,
+            "dead-recorded count matches the image key list"
+        );
+    }
+
+    /// Test-only: rebuild every sibling count from the key lists, after
+    /// direct state surgery that bypassed [`Self::refresh_sibling_counts`].
+    #[cfg(test)]
+    pub(crate) fn sync_sibling_counts_for_test(&mut self) {
+        self.image_live_flags.clear();
+        self.image_unfenced_siblings.clear();
+        self.image_fenced_siblings.clear();
+        self.image_dead_recorded.clear();
+        let images: Vec<(u64, u64)> = self.image_keys.keys().copied().collect();
+        for image in images {
+            let Some(siblings) = self.image_keys.get(&image).cloned() else {
+                continue;
+            };
+            for sibling in siblings {
+                let flags = self.sibling_flags(sibling);
+                if flags.live_flags {
+                    *self.image_live_flags.entry(image).or_default() += 1;
+                }
+                if flags.unfenced {
+                    *self.image_unfenced_siblings.entry(image).or_default() += 1;
+                }
+                if flags.fenced {
+                    *self.image_fenced_siblings.entry(image).or_default() += 1;
+                }
+                if flags.dead_recorded {
+                    *self.image_dead_recorded.entry(image).or_default() += 1;
+                }
+            }
+        }
+    }
+
     /// Bind one H3-admitted call's incarnation to a journal key without
     /// claiming the invocation before its original START is ingested: the
     /// binding's live incarnation, or a fresh incarnation when every
@@ -8392,11 +8627,13 @@ impl JournalAdapter {
                 .get(&last)
                 .is_some_and(|state| !state.refused && !state.tainted && !state.era_ended)
         {
+            let old = self.sibling_flags(last);
             self.keys
                 .edit()
                 .get_mut(&last)
                 .expect("quarantined key")
                 .era_ended = true;
+            self.refresh_sibling_counts(last, old);
             self.note_ended_mark(last);
         }
         if quarantine_mint {
@@ -8408,25 +8645,17 @@ impl JournalAdapter {
         // ones).
         let fresh = !self.keys.contains_key(&key);
         let minted_incarnation = fresh && key.incarnation > 0;
-        let fenced_siblings = fresh
-            && !minted_incarnation
-            && self
-                .image_keys
-                .get(&(key.cookie, key.exec))
-                .is_some_and(|siblings| {
-                    siblings.iter().any(|sibling| {
-                        #[cfg(test)]
-                        self.fenced_sibling_visits
-                            .set(self.fenced_sibling_visits.get().saturating_add(1));
-                        *sibling != key
-                            && self.key_is_live(*sibling)
-                            && self.keys.get(sibling).is_some_and(|state| {
-                                state.model_registered
-                                    && state.void_fence > 0
-                                    && state.void_fence >= state.sealed_through
-                            })
-                    })
-                });
+        // Fenced-sibling diagnostic (INV-2): the per-image fenced
+        // count replaces the key-list walk, under the same shared
+        // taint verdict as the probe. The fresh key is not yet
+        // inserted, so the count excludes it exactly.
+        let fenced_siblings = fresh && !minted_incarnation && {
+            let image = (key.cookie, key.exec);
+            #[cfg(test)]
+            self.check_sibling_counts(image);
+            !self.image_taint_blocks(image, *self.voided_through)
+                && self.image_fenced_siblings.get(&image).copied().unwrap_or(0) > 0
+        };
         if let std::collections::btree_map::Entry::Vacant(vacant) = self.keys.edit().entry(key) {
             if minted_incarnation {
                 self.reentry_incarnations = self.reentry_incarnations.saturating_add(1);
@@ -8457,6 +8686,9 @@ impl JournalAdapter {
             if key.incarnation >= latest.incarnation {
                 *latest = key;
             }
+            // A newborn key was absent (no contributions); its default
+            // state joins the live-flags count.
+            self.refresh_sibling_counts(key, SiblingFlags::default());
         }
         let era = self.keys[&key].era;
         Ok(JournalDomainProof { key, era })
@@ -9970,8 +10202,8 @@ impl JournalAdapter {
         // The birth cut pins per key-era at first seal: a later seal for
         // the same era must carry the same cut. Rebirth above kept staged
         // history is refused — void first.
-        if let Some(pinned) = state.bootstraps.get(&bootstrap.proof().era)
-            && *pinned != bootstrap.birth_cut()
+        if let Some(pinned) = self.bootstrap_cut(key, bootstrap.proof().era)
+            && pinned != bootstrap.birth_cut()
         {
             // Diagnostic-only (bootstrap arms): count the refusing arm. The
             // refusal below is unchanged.
@@ -10038,18 +10270,10 @@ impl JournalAdapter {
                 // A straddler of the predecessor's fallback fence is kept
                 // for this key's own close to count (once per key).
                 let facts = barrier.scan.as_ref().map(|scan| scan.facts);
-                if let Some(begin) = facts.and_then(|facts| facts.straddler_begin) {
-                    self.death_marks
-                        .entry(key)
-                        .or_default()
-                        .straddler
-                        .get_or_insert(begin);
-                }
-                if facts.is_some_and(|facts| facts.straddlers_unscanned) {
-                    self.death_marks
-                        .entry(key)
-                        .or_default()
-                        .straddlers_unscanned = true;
+                let begin = facts.and_then(|facts| facts.straddler_begin);
+                let unscanned = facts.is_some_and(|facts| facts.straddlers_unscanned);
+                if begin.is_some() || unscanned {
+                    self.straddler_record(key, begin, unscanned);
                 }
                 return SealAttempt::Decided(Err(self.failure(JournalGap::BootstrapMismatch)));
             }
@@ -10061,10 +10285,10 @@ impl JournalAdapter {
         let decision = Self::seal_decision(
             &facts,
             state,
-            bootstrap.proof().era,
             bootstrap.birth_cut(),
             frontier,
             completed,
+            self.bootstrap_has(key, bootstrap.proof().era),
         );
         // The decided outcome's own table work (a taint drain, the doom's
         // live set, conversion and pruning) is paid row by row first,
@@ -10104,10 +10328,10 @@ impl JournalAdapter {
     fn seal_decision(
         facts: &SealScanFacts,
         state: &JournalDomainState,
-        era: u64,
         birth_cut: u64,
         frontier: u64,
         completed: bool,
+        has_bootstrap: bool,
     ) -> SealDecision {
         // With sibling keys, every staged entry for this image needs
         // its attribution: this key's entries convert, a sibling's
@@ -10134,7 +10358,7 @@ impl JournalAdapter {
         // an advanced frontier but no convertible begin above the cut
         // certifies nothing, so the seal waits instead of succeeding
         // vacantly.
-        if !state.bootstraps.contains_key(&era) && !facts.staged_history {
+        if !has_bootstrap && !facts.staged_history {
             return SealDecision::Wait(
                 SealStageGate::FreshBirthNoHistory,
                 SealWait::FreshBirthNoHistory,
@@ -10325,8 +10549,12 @@ impl JournalAdapter {
             prefix.replay_steps = steps;
             prefix.replay_index = Some(index);
         }
-        let state = self.keys.edit().get_mut(&key).expect("sealed key");
-        state.sealed_through = frontier;
+        let old = self.sibling_flags(key);
+        {
+            let state = self.keys.edit().get_mut(&key).expect("sealed key");
+            state.sealed_through = frontier;
+        }
+        self.refresh_sibling_counts(key, old);
         self.note_seal_stage(SealStageGate::Success);
         Ok(SealSuccess {
             prefix,
@@ -10441,7 +10669,9 @@ impl JournalAdapter {
                 effects.effects.extend(refused.effects);
             }
             let lived = self.key_is_live(key);
+            let old = self.sibling_flags(key);
             self.keys.edit().get_mut(&key).expect("doomed key").refused = true;
+            self.refresh_sibling_counts(key, old);
             self.note_refused_mark(key, capable);
             self.claims_prune_dirty |= lived;
         }
@@ -10461,8 +10691,12 @@ impl JournalAdapter {
             .map(|(key, state)| (*key, state.era, state.model_registered))
             .collect();
         for (key, era, registered) in live {
-            let state = self.keys.edit().get_mut(&key).expect("fenced key");
-            state.void_fence = state.void_fence.max(upper);
+            let old = self.sibling_flags(key);
+            {
+                let state = self.keys.edit().get_mut(&key).expect("fenced key");
+                state.void_fence = state.void_fence.max(upper);
+            }
+            self.refresh_sibling_counts(key, old);
             if !registered {
                 continue;
             }
@@ -11139,22 +11373,98 @@ impl JournalAdapter {
     /// already cleared (no-op there); scoped voids keep pins for the
     /// audit, so the reseed clears them here instead.
     pub(crate) fn clear_bootstraps_for_reseed(&mut self, cookie: u64, exec: u64) {
-        if let Some(keys) = self.image_keys.get(&(cookie, exec)).cloned() {
-            for key in keys {
-                #[cfg(test)]
-                self.reseed_reset_visits
-                    .set(self.reseed_reset_visits.get().saturating_add(1));
-                if let Some(state) = self.keys.edit().get_mut(&key) {
-                    state.bootstraps.clear();
-                }
-                // A reseed starts a new episode: a straddler tallied
-                // by the refused earlier birth belongs to that episode
-                // and never reaches a later close.
-                if let Some(marks) = self.death_marks.get_mut(&key) {
-                    marks.straddler = None;
-                    marks.straddlers_unscanned = false;
-                }
+        // A reseed starts a new episode (INV-2): bump the image
+        // generation instead of walking its key list. Stale pinned
+        // bootstraps and straddler tallies read as absent; the next
+        // write clears them and adopts the generation. O(1).
+        let generation = self.image_reseed_gen.entry((cookie, exec)).or_default();
+        *generation = generation.saturating_add(1);
+    }
+
+    /// The current reseed generation of one image (0 when never reseeded).
+    fn reseed_gen(&self, image: (u64, u64)) -> u64 {
+        self.image_reseed_gen.get(&image).copied().unwrap_or(0)
+    }
+
+    /// Whether one key's pinned bootstraps belong to the live episode.
+    fn bootstraps_live(&self, key: JournalDomainKey) -> bool {
+        self.keys
+            .get(&key)
+            .is_some_and(|state| state.bootstrap_gen == self.reseed_gen((key.cookie, key.exec)))
+    }
+
+    /// The live pinned bootstrap cut for one key and era, if any.
+    fn bootstrap_cut(&self, key: JournalDomainKey, era: u64) -> Option<u64> {
+        if !self.bootstraps_live(key) {
+            return None;
+        }
+        self.keys
+            .get(&key)
+            .and_then(|state| state.bootstraps.get(&era).copied())
+    }
+
+    /// Whether one key holds a live pinned bootstrap cut for an era.
+    fn bootstrap_has(&self, key: JournalDomainKey, era: u64) -> bool {
+        self.bootstrap_cut(key, era).is_some()
+    }
+
+    /// Whether one key holds any live pinned bootstrap cut.
+    fn bootstraps_empty(&self, key: JournalDomainKey) -> bool {
+        if !self.bootstraps_live(key) {
+            return true;
+        }
+        self.keys
+            .get(&key)
+            .is_none_or(|state| state.bootstraps.is_empty())
+    }
+
+    /// Pin one bootstrap cut, clearing a stale episode's cuts first.
+    fn bootstrap_insert(&mut self, key: JournalDomainKey, era: u64, cut: u64) {
+        let generation = self.reseed_gen((key.cookie, key.exec));
+        if let Some(state) = self.keys.edit().get_mut(&key) {
+            if state.bootstrap_gen != generation {
+                state.bootstraps.clear();
+                state.bootstrap_gen = generation;
             }
+            state.bootstraps.insert(era, cut);
+        }
+    }
+
+    /// Take one key's live straddler tally, discarding a stale episode's.
+    /// Returns the tally and whether more straddlers went unscanned.
+    fn straddler_take(&mut self, key: JournalDomainKey) -> (Option<u64>, bool) {
+        let generation = self.reseed_gen((key.cookie, key.exec));
+        let Some(marks) = self.death_marks.get_mut(&key) else {
+            return (None, false);
+        };
+        if marks.straddler_gen != generation {
+            marks.straddler = None;
+            marks.straddlers_unscanned = false;
+            marks.straddler_gen = generation;
+            return (None, false);
+        }
+        (
+            marks.straddler.take(),
+            std::mem::take(&mut marks.straddlers_unscanned),
+        )
+    }
+
+    /// Record one key's straddler tally under the live generation,
+    /// discarding a stale episode's first. A live recorded straddler
+    /// keeps the first deciding mismatch's begin (get_or_insert).
+    fn straddler_record(&mut self, key: JournalDomainKey, begin: Option<u64>, unscanned: bool) {
+        let generation = self.reseed_gen((key.cookie, key.exec));
+        let marks = self.death_marks.entry(key).or_default();
+        if marks.straddler_gen != generation {
+            marks.straddler = None;
+            marks.straddlers_unscanned = false;
+            marks.straddler_gen = generation;
+        }
+        if let Some(begin) = begin {
+            marks.straddler.get_or_insert(begin);
+        }
+        if unscanned {
+            marks.straddlers_unscanned = true;
         }
     }
 
@@ -11970,7 +12280,9 @@ impl JournalAdapter {
         let ticket =
             self.issue_doom_rejection(key, live, super::state::DomainRetirement::abandon(domain));
         let lived = self.key_is_live(key);
+        let old = self.sibling_flags(key);
         self.keys.edit().get_mut(&key).expect("sealed key").refused = true;
+        self.refresh_sibling_counts(key, old);
         self.note_refused_mark(key, capable);
         self.claims_prune_dirty |= lived;
         let mut failure = SealFailure {
@@ -12033,7 +12345,9 @@ impl JournalAdapter {
     /// point, recording the death ordinal for incarnation fencing.
     fn surprise_taint_key(&mut self, key: JournalDomainKey) {
         let lived = self.key_is_live(key);
+        let old = self.sibling_flags(key);
         self.keys.edit().get_mut(&key).expect("sealed key").tainted = true;
+        self.refresh_sibling_counts(key, old);
         self.note_tainted_mark(key);
         self.claims_prune_dirty |= lived;
     }
@@ -12041,18 +12355,24 @@ impl JournalAdapter {
     /// Record one key's refusal grounding (capable frame or dead
     /// frame) for incarnation fencing.
     fn note_refused_mark(&mut self, key: JournalDomainKey, capable: bool) {
+        let old = self.sibling_flags(key);
         let marks = self.death_marks.entry(key).or_default();
         marks.refused_capable = Some(marks.refused_capable.map_or(capable, |was| was || capable));
+        self.refresh_sibling_counts(key, old);
     }
 
     /// Record one key's taint for incarnation fencing.
     fn note_tainted_mark(&mut self, key: JournalDomainKey) {
+        let old = self.sibling_flags(key);
         self.death_marks.entry(key).or_default().tainted = true;
+        self.refresh_sibling_counts(key, old);
     }
 
     /// Record one key's clean close for incarnation fencing.
     fn note_ended_mark(&mut self, key: JournalDomainKey) {
+        let old = self.sibling_flags(key);
         self.death_marks.entry(key).or_default().ended = true;
+        self.refresh_sibling_counts(key, old);
     }
 
     /// Register, convert (refused, begins, terminals, abandonments),
@@ -12084,11 +12404,13 @@ impl JournalAdapter {
                 scope: SealFailureScope::Unqualified,
             });
         }
+        let old = self.sibling_flags(key);
         self.keys
             .edit()
             .get_mut(&key)
             .expect("sealed key")
             .model_registered = true;
+        self.refresh_sibling_counts(key, old);
         // This key's refused begins first: the model records each cut
         // exactly like its own capacity refusal, then a single
         // lost-outcome bound clears them once every refused begin is
@@ -12567,11 +12889,13 @@ impl JournalAdapter {
         });
         if ended {
             let lived = self.key_is_live(key);
+            let old = self.sibling_flags(key);
             self.keys
                 .edit()
                 .get_mut(&key)
                 .expect("sealed key")
                 .era_ended = true;
+            self.refresh_sibling_counts(key, old);
             self.note_ended_mark(key);
             self.claims_prune_dirty |= lived;
             return Err(SealFailure {
@@ -12604,11 +12928,13 @@ impl JournalAdapter {
             prefix.replay_index = Some(index);
         }
         debug_assert!(prefix.settled_len <= prefix.settled.len());
+        let old = self.sibling_flags(key);
         self.keys
             .edit()
             .get_mut(&key)
             .expect("sealed key")
             .sealed_through = frontier;
+        self.refresh_sibling_counts(key, old);
         if model.domain_completed(domain) {
             self.keys
                 .edit()
@@ -12616,12 +12942,7 @@ impl JournalAdapter {
                 .expect("sealed key")
                 .era_completed = true;
         }
-        self.keys
-            .edit()
-            .get_mut(&key)
-            .expect("sealed key")
-            .bootstraps
-            .insert(bootstrap.proof().era, bootstrap.birth_cut());
+        self.bootstrap_insert(key, bootstrap.proof().era, bootstrap.birth_cut());
         self.prune_settled(key, frontier);
         Ok(SealSuccess { prefix, effects })
     }
@@ -18360,7 +18681,7 @@ pub(crate) mod tests {
         scene.adapter.clear_bootstraps_for_reseed(COOKIE, EXEC);
         let state = scene.adapter.keys.get(&proof.key).expect("sealed key");
         assert!(
-            state.bootstraps.is_empty() && state.model_registered,
+            scene.adapter.bootstraps_empty(proof.key) && state.model_registered,
             "the key reads pending and registered after the reseed clear"
         );
         let frontier = scene.adapter.consumed_frontier();
@@ -28553,8 +28874,10 @@ pub(crate) mod tests {
                 router: 1_000 + index as u64,
                 incarnation: 0,
             };
-            let mut state = JournalDomainState::default();
-            state.refused = true;
+            let state = JournalDomainState {
+                refused: true,
+                ..Default::default()
+            };
             scene.adapter.keys.edit().insert(key, state);
             scene
                 .adapter
@@ -28705,8 +29028,10 @@ pub(crate) mod tests {
                     router: index as u64,
                     incarnation: 0,
                 };
-                let mut state = JournalDomainState::default();
-                state.refused = true;
+                let state = JournalDomainState {
+                    refused: true,
+                    ..Default::default()
+                };
                 adapter.keys.edit().insert(key, state);
                 adapter
                     .image_keys
@@ -28723,6 +29048,59 @@ pub(crate) mod tests {
                 "{keys} retained keys: quarantine scan visited {candidate}, bound is {}",
                 SCOPED_RECOVERY_SLICE,
             );
+        }
+    }
+
+    /// Sibling counters decide binds without walking: one live
+    /// registered unfenced sibling refuses a fresh bind, one live
+    /// fenced sibling counts the re-entry diagnostic, each with zero
+    /// visits. Direct state surgery syncs counts first.
+    #[test]
+    fn seal_walk_sibling_counts_decide_without_visits() {
+        for (fenced, expect_refuse, expect_diagnostic) in
+            [(false, true, false), (true, false, true)]
+        {
+            let mut scene = Scene::new(image_default());
+            let key = JournalDomainKey {
+                domain_tag: 0,
+                caller: 0,
+                cookie: COOKIE,
+                exec: EXEC,
+                router: 1_000,
+                incarnation: 0,
+            };
+            let state = JournalDomainState {
+                model_registered: true,
+                void_fence: u64::from(fenced) * 5,
+                sealed_through: u64::from(fenced) * 3,
+                ..Default::default()
+            };
+            scene.adapter.keys.edit().insert(key, state);
+            scene
+                .adapter
+                .image_keys
+                .edit()
+                .entry((COOKIE, EXEC))
+                .or_default()
+                .push(key);
+            scene.adapter.sync_sibling_counts_for_test();
+            scene.adapter.reset_seal_walk_visits_for_test();
+            let admitted = scene.fixture.admit_function("C_CreateObject");
+            let probe = scene.adapter.probe_admitted_key(&admitted);
+            assert_eq!(
+                probe.is_err(),
+                expect_refuse,
+                "fenced={fenced}: probe refuses iff an unfenced sibling lives"
+            );
+            let before = scene.adapter.reentry_sibling_binds;
+            let _ = scene.adapter.bind_admitted_key(&admitted);
+            assert_eq!(
+                scene.adapter.reentry_sibling_binds > before,
+                expect_diagnostic,
+                "fenced={fenced}: diagnostic counts iff a fenced sibling lives"
+            );
+            let (visits, _, _, _, _, _) = scene.adapter.seal_walk_visits_for_test();
+            assert_eq!(visits, 0, "counters decide with zero visits");
         }
     }
 
@@ -28746,9 +29124,11 @@ pub(crate) mod tests {
                 incarnation,
                 ..base
             };
-            let mut state = JournalDomainState::default();
             // All dead except the latest, which stays live.
-            state.refused = incarnation < 64;
+            let state = JournalDomainState {
+                refused: incarnation < 64,
+                ..Default::default()
+            };
             adapter.keys.edit().insert(key, state);
             adapter
                 .image_keys

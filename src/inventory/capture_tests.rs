@@ -3312,6 +3312,234 @@ fn a_stop_with_owed_resight_work_reads_past_the_first_exact_refresh() {
     );
 }
 
+/// A host serving canned native receipts: post-stop witness receipts
+/// report `decision_owed` from the scripted queue (exhausted, or
+/// pre-stop: clear), so the stop-gate twins drive the continuation
+/// without a hot scene. (The binder's genuine reporting is pinned at
+/// the coordinator level; these twins pin that each driver honors the
+/// receipt.)
+struct ContinuationHost {
+    log: Log,
+    set: InventoryAttachSet,
+    delta: TargetDelta,
+    stopped: bool,
+    owed: VecDeque<bool>,
+    owed_always: bool,
+    finishes: usize,
+    refresh_losses: Vec<String>,
+}
+
+impl ContinuationHost {
+    fn new(log: &Log, owed: Vec<bool>) -> Self {
+        Self {
+            log: Rc::clone(log),
+            set: InventoryAttachSet::new(InventoryBudget::new(32768, 32768 * 8).unwrap()),
+            delta: fabricated_delta(0),
+            stopped: false,
+            owed: owed.into(),
+            owed_always: false,
+            finishes: 0,
+            refresh_losses: Vec::new(),
+        }
+    }
+
+    fn note(&self, entry: impl Into<String>) {
+        self.log.borrow_mut().push(entry.into());
+    }
+}
+
+impl LaneHost<Pin> for ContinuationHost {
+    fn begin_capture_coverage(&mut self, _scope: CaptureScopeCoverage) {}
+    fn abandon_capture_coverage(&mut self) {}
+    fn note_extend_receipt(&mut self, _receipt: &ExtendReceipt) {}
+    fn note_capture_custody(&mut self, _custody: &ScopeCustody) {}
+    fn take_target_delta(&mut self) -> TargetDelta {
+        std::mem::take(&mut self.delta)
+    }
+    fn capture_targets(&self) -> &dyn CaptureTargets {
+        &self.set
+    }
+    fn stage_native(
+        &mut self,
+        batch: NativeBatch,
+        _identity: &mut dyn NativeIdentity<Pin>,
+        _now_ns: u64,
+    ) -> NativeReceipt {
+        self.note(match &batch {
+            NativeBatch::Witness(_) => "stage:witness",
+            NativeBatch::Lifecycle(_) => "stage:lifecycle",
+            NativeBatch::Finish { .. } => "stage:finish",
+            NativeBatch::Semantic(_) => "stage:semantic",
+        });
+        if matches!(batch, NativeBatch::Finish { .. }) {
+            self.finishes += 1;
+        }
+        let decision_owed = if matches!(batch, NativeBatch::Witness(_)) && self.stopped {
+            self.owed_always || self.owed.pop_front().unwrap_or(false)
+        } else {
+            false
+        };
+        NativeReceipt {
+            decision_owed,
+            ..NativeReceipt::default()
+        }
+    }
+    fn end_capture_coverage(&mut self, _at_ns: u64) {
+        self.stopped = true;
+    }
+    fn note_native_lane(&mut self) {}
+    fn note_scope_gap(&mut self, _subject: String, _reason: String) {}
+    fn note_refresh_loss(&mut self, reason: String) {
+        self.note("refresh-loss");
+        self.refresh_losses.push(reason);
+    }
+}
+
+/// The shared terminal-refresh decision: the full truth table over
+/// exactness, owed continuation and deadline expiry.
+#[test]
+fn the_shared_terminal_refresh_step_finishes_only_past_continuation() {
+    use TerminalRefreshStep::{FinishExact, ReadOn, RefreshLoss};
+    for (exact, owed, expired, expected) in [
+        (true, false, false, FinishExact),
+        (true, false, true, FinishExact),
+        (true, true, false, ReadOn),
+        (true, true, true, FinishExact),
+        (false, false, false, ReadOn),
+        (false, false, true, RefreshLoss),
+        (false, true, false, ReadOn),
+        (false, true, true, RefreshLoss),
+    ] {
+        assert_eq!(
+            terminal_refresh_step(exact, owed, expired),
+            expected,
+            "exact={exact} owed={owed} expired={expired}"
+        );
+    }
+}
+
+/// The blocking stop reads past an exact refresh while a covered exit
+/// decision is owed: the first exact post-stop read reports its held
+/// decision, so the stop reads on for the budgeted retry instead of
+/// finishing at once.
+#[test]
+fn a_stop_with_an_owed_exit_decision_reads_past_the_first_exact_refresh() {
+    let log = Log::default();
+    let mut host = ContinuationHost::new(&log, vec![true]);
+    let lane = ScriptedLane::new(&log);
+    let mut started = NativeLane::start(lane, &mut host, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    started.after_pass(&mut host);
+    let _ = started.stop(&mut host);
+    let log = entries(&log);
+    let stopped_at = log.iter().position(|entry| entry == "begin_stop").unwrap();
+    let after: Vec<&str> = log[stopped_at..]
+        .iter()
+        .map(String::as_str)
+        .filter(|entry| *entry == "read" || *entry == "stage:witness")
+        .collect();
+    assert_eq!(
+        after,
+        ["read", "stage:witness", "read", "stage:witness"],
+        "the exact read reports the held decision and the retry runs: {after:?}"
+    );
+    assert_eq!(host.finishes, 1, "the retry finishes the domain");
+    assert!(
+        host.refresh_losses.is_empty(),
+        "an exact refresh never reports a loss: {:?}",
+        host.refresh_losses
+    );
+}
+
+/// The phased stop honors the same continuation: its terminal refresh
+/// reads past the first exact sweep while a covered exit decision is
+/// owed, through the shared step function.
+#[test]
+fn a_phased_stop_with_an_owed_exit_decision_reads_past_the_first_exact_refresh() {
+    let log = Log::default();
+    let mut host = ContinuationHost::new(&log, vec![true]);
+    let lane = ScriptedLane::new(&log);
+    let mut started = NativeLane::start(lane, &mut host, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    started.after_pass(&mut host);
+    let mut stop = started
+        .into_finite_stop(NativeStopDisposition::Completed, None)
+        .ok()
+        .expect("a completed pass admits the phased stop");
+    let clock = LoopClock {
+        deadline: None,
+        stop: &|| false,
+        now: &Instant::now,
+        interval: Duration::ZERO,
+        tick: Duration::from_millis(1),
+        collection_tick: Duration::ZERO,
+    };
+    loop {
+        let now = Instant::now();
+        match stop.step(&mut host, now, now + Duration::from_secs(60), &clock) {
+            NativeStopProgress::Pending(next) => stop = next,
+            NativeStopProgress::Stopped(_) => break,
+        }
+    }
+    let log = entries(&log);
+    let stopped_at = log.iter().position(|entry| entry == "begin_stop").unwrap();
+    let after: Vec<&str> = log[stopped_at..]
+        .iter()
+        .map(String::as_str)
+        .filter(|entry| *entry == "read" || *entry == "stage:witness")
+        .collect();
+    assert_eq!(
+        after,
+        ["read", "stage:witness", "read", "stage:witness"],
+        "the exact read reports the held decision and the retry runs: {after:?}"
+    );
+    assert_eq!(host.finishes, 1, "the retry finishes the domain");
+    assert!(
+        host.refresh_losses.is_empty(),
+        "an exact refresh never reports a loss: {:?}",
+        host.refresh_losses
+    );
+}
+
+/// An owed exit decision past its deadline finishes exact: the stop
+/// reads on past the first exact refresh within its budget, then
+/// finishes without a refresh-loss misreport.
+#[test]
+fn a_stop_with_an_owed_exit_decision_past_its_deadline_finishes_exact() {
+    let log = Log::default();
+    let mut host = ContinuationHost::new(&log, Vec::new());
+    host.owed_always = true;
+    let mut lane = ScriptedLane::new(&log);
+    lane.read_delay = Duration::from_millis(10);
+    let bounded = LaneWindows {
+        terminal_sweep_budget: Duration::from_millis(50),
+        ..windows()
+    };
+    let mut started = NativeLane::start(lane, &mut host, bounded, None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    started.after_pass(&mut host);
+    let _ = started.stop(&mut host);
+    let log = entries(&log);
+    let stopped_at = log.iter().position(|entry| entry == "begin_stop").unwrap();
+    let reads = log[stopped_at..]
+        .iter()
+        .filter(|entry| *entry == "read")
+        .count();
+    assert!(
+        reads >= 2,
+        "the stop reads on past the first exact refresh: {reads}"
+    );
+    assert_eq!(host.finishes, 1, "the deadline finishes the domain");
+    assert!(
+        host.refresh_losses.is_empty(),
+        "an exact refresh never reports a loss: {:?}",
+        host.refresh_losses
+    );
+}
+
 /// The terminal sweep is bounded: a sweep that never completes stops
 /// reading at the budget and the stop goes on (its reads are not clean).
 #[test]

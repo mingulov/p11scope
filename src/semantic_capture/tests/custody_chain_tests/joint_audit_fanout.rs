@@ -42146,4 +42146,19 @@ fn seal_walk_router_check_visits_at_most_64() {
         checks <= 64,
         "65 registry keys: router check visited {checks}, bound is 64"
     );
+    // Fail-safe cap: past 64 routers the guard reports protected
+    // without further lookups (over-protection only delays a futile
+    // eviction).
+    use crate::discovery::instances::InstanceId;
+    let many = (0..65u64).map(InstanceId::from_raw).collect::<Vec<_>>();
+    coordinator.registry().reset_reseed_visits_for_test();
+    assert!(
+        coordinator.registry().joint_image_router_registered(foreign, &many),
+        "65 routers report fail-safe protected"
+    );
+    let (_, _, capped) = coordinator.registry().reseed_visits_for_test();
+    assert!(
+        capped <= 64,
+        "65 routers: capped check visited {capped}, bound is 64"
+    );
 }

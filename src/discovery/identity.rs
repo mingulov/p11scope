@@ -37,6 +37,31 @@ use crate::discovery::scan::{
     Skipped, TABLE_WINDOW_CEILING_REASON, WORK_CEILING_REASON, read_maps_or_refuse, read_mountinfo,
     standard_function_names,
 };
+
+#[cfg(test)]
+thread_local! {
+    static EXACT_ROWS_VISITED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static METERED_FDINFO_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Mount-table rows the exact-id scan actually visited (test seam).
+#[cfg(test)]
+pub(crate) fn exact_rows_visited_for_test() -> u64 {
+    EXACT_ROWS_VISITED.with(std::cell::Cell::get)
+}
+
+/// fdinfo reads the metered resolve actually issued (test seam).
+#[cfg(test)]
+pub(crate) fn metered_fdinfo_calls_for_test() -> u64 {
+    METERED_FDINFO_CALLS.with(std::cell::Cell::get)
+}
+
+/// Reset the exact-scan counters (test seam).
+#[cfg(test)]
+pub(crate) fn reset_exact_scan_counters_for_test() {
+    EXACT_ROWS_VISITED.with(|counter| counter.set(0));
+    METERED_FDINFO_CALLS.with(|counter| counter.set(0));
+}
 use crate::manifest_input::{MAX_OBJECTS, MAX_TOTAL_OBJECT_BYTES, validate_structure};
 use crate::process::{
     LoaderPid, LoaderPidMismatch, MappedOpenError, MountNamespaceId, MountTableCache, ProcessView,
@@ -9057,6 +9082,8 @@ fn scan_mount_table_for_row_with<'table>(
         let mut found = None;
         for row in rows.by_ref().take(MOUNTINFO_STRIDE) {
             stride_rows += 1;
+            #[cfg(test)]
+            EXACT_ROWS_VISITED.with(|counter| counter.set(counter.get() + 1));
             if found.is_none() {
                 let mut fields = row.split_ascii_whitespace();
                 if fields.next() == Some(mount_id) {
@@ -9088,6 +9115,8 @@ fn mapping_file_key_in_mountinfo_metered_with(
     budget: &mut CaptureWorkBudget,
     stop: impl FnMut(&mut CaptureWorkBudget) -> Option<&'static str>,
 ) -> Result<MappingFileKey, String> {
+    #[cfg(test)]
+    METERED_FDINFO_CALLS.with(|counter| counter.set(counter.get() + 1));
     let mount_id = fd_mount_id(file)?;
     budget.spend(1).map_err(str::to_string)?;
     let row = scan_mount_table_for_row_with(mountinfo, &mount_id, budget, stop)?;
@@ -17008,6 +17037,120 @@ mod tests {
             1 + 64 + 1,
             "fdinfo row, one stride, delegate re-read: {}",
             budget.work_units_count()
+        );
+    }
+
+    /// INV-2 visit bound: an exhausted allowance refuses before visiting
+    /// any row or reading fdinfo. Zero remaining units must visit zero
+    /// rows and issue zero fdinfo reads.
+    #[test]
+    fn exact_mount_scan_zero_allowance_visits_nothing() {
+        reset_exact_scan_counters_for_test();
+        let file = open_regular(Path::new("/bin/sh")).unwrap();
+        let mount_id = fd_mount_id(&file).unwrap();
+        let table = mount_table_with_match_last(&mount_id, 130);
+        let mut budget = CaptureWorkBudget::default();
+        assert!(budget.charge(budget.work_ceiling()));
+        let error =
+            mapping_file_key_in_mountinfo_metered_with(&file, &table, &mut budget, |_| None)
+                .unwrap_err();
+        assert_eq!(error, crate::discovery::scan::WORK_CEILING_REASON);
+        assert_eq!(
+            exact_rows_visited_for_test(),
+            0,
+            "no row visited without allowance: {}",
+            exact_rows_visited_for_test()
+        );
+        assert_eq!(
+            metered_fdinfo_calls_for_test(),
+            0,
+            "no fdinfo read without allowance: {}",
+            metered_fdinfo_calls_for_test()
+        );
+    }
+
+    /// INV-2 seam bound: the exact-id scan itself refuses before
+    /// visiting any row when the allowance is exactly exhausted (no
+    /// sticky stop yet). Driving the seam directly with zero remaining
+    /// units must visit zero rows.
+    #[test]
+    fn exact_mount_scan_seam_refuses_before_visiting_any_row() {
+        reset_exact_scan_counters_for_test();
+        let file = open_regular(Path::new("/bin/sh")).unwrap();
+        let mount_id = fd_mount_id(&file).unwrap();
+        let table = mount_table_with_match_last(&mount_id, 130);
+        let mut budget = CaptureWorkBudget::default();
+        assert!(budget.charge(budget.work_ceiling()));
+        assert!(budget.stopped_reason().is_none());
+        let error =
+            scan_mount_table_for_row_with(&table, &mount_id, &mut budget, |_| None).unwrap_err();
+        assert_eq!(error, crate::discovery::scan::WORK_CEILING_REASON);
+        assert_eq!(
+            exact_rows_visited_for_test(),
+            0,
+            "no row visited without allowance: {}",
+            exact_rows_visited_for_test()
+        );
+    }
+
+    /// INV-2 twins: 64 rows visit 64 with no inter-stride poll; the 65th
+    /// row visits 65 with one poll between. Visit counts equal charged
+    /// rows exactly.
+    #[test]
+    fn exact_mount_scan_64_65_row_twins_visit_rows_per_credit() {
+        let file = open_regular(Path::new("/bin/sh")).unwrap();
+        let mount_id = fd_mount_id(&file).unwrap();
+        for (decoys, polls_want, units_want, rows_want) in
+            [(63, 0, 1 + 64 + 1, 64), (64, 1, 1 + 64 + 1 + 1, 65)]
+        {
+            reset_exact_scan_counters_for_test();
+            let table = mount_table_with_match_last(&mount_id, decoys);
+            let mut budget = CaptureWorkBudget::default();
+            let mut polls = 0;
+            mapping_file_key_in_mountinfo_metered_with(&file, &table, &mut budget, |_| {
+                polls += 1;
+                None
+            })
+            .expect("the twin match must resolve");
+            assert_eq!(polls, polls_want, "decoys: {decoys}");
+            assert_eq!(budget.work_units_count(), units_want, "decoys: {decoys}");
+            assert_eq!(exact_rows_visited_for_test(), rows_want, "decoys: {decoys}");
+            assert_eq!(
+                metered_fdinfo_calls_for_test(),
+                1,
+                "one fdinfo read per resolution: decoys {decoys}"
+            );
+        }
+    }
+
+    /// INV-2 stop bound: tripping on the first inter-stride poll visits
+    /// only the finished stride. 131 rows stopping at poll 1 visit 64
+    /// rows, charge fdinfo plus 64, and never reach the later match.
+    #[test]
+    fn exact_mount_scan_stop_between_strides_visits_only_finished_stride() {
+        reset_exact_scan_counters_for_test();
+        let file = open_regular(Path::new("/bin/sh")).unwrap();
+        let mount_id = fd_mount_id(&file).unwrap();
+        let table = mount_table_with_match_last(&mount_id, 130);
+        let mut budget = CaptureWorkBudget::default();
+        let mut polls = 0;
+        let error = mapping_file_key_in_mountinfo_metered_with(&file, &table, &mut budget, |_| {
+            polls += 1;
+            (polls == 1).then_some(crate::discovery::scan::SCAN_DEADLINE_REASON)
+        })
+        .unwrap_err();
+        assert_eq!(error, crate::discovery::scan::SCAN_DEADLINE_REASON);
+        assert_eq!(
+            budget.work_units_count(),
+            1 + 64,
+            "fdinfo row plus the first 64-row stride: {}",
+            budget.work_units_count()
+        );
+        assert_eq!(
+            exact_rows_visited_for_test(),
+            64,
+            "only the finished stride is visited: {}",
+            exact_rows_visited_for_test()
         );
     }
 

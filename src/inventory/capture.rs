@@ -1599,14 +1599,19 @@ impl<L> NativeLane<L> {
                 now_ns(),
             );
             events.extend(receipt.events);
-            // Owed re-sight work keeps the terminal refresh reading
-            // within its deadline even once a sweep lands exact: the
-            // finish files only work the continuations actually
-            // attempted. Past the deadline an exact sweep still
-            // finishes (never a refresh-loss misreport); the
-            // remaining rows file incomplete, as accounted.
-            if (exact && !receipt.resight_owed) || Instant::now() >= refresh_deadline {
-                break exact;
+            // Owed continuation (re-sight attempts or held exit
+            // decisions) keeps the terminal refresh reading within its
+            // deadline even once a sweep lands exact: the finish files
+            // only work the continuations actually attempted. Past the
+            // deadline an exact sweep still finishes (never a
+            // refresh-loss misreport); the remaining rows file
+            // incomplete, as accounted.
+            let owed = receipt.resight_owed || receipt.decision_owed;
+            match terminal_refresh_step(exact, owed, Instant::now() >= refresh_deadline) {
+                TerminalRefreshStep::ReadOn => {}
+                TerminalRefreshStep::FinishExact | TerminalRefreshStep::RefreshLoss => {
+                    break exact;
+                }
             }
         };
         if !exact {
@@ -1924,7 +1929,8 @@ impl<L> NativeStop<L> {
                         }
                     }
                     NativeAfterStage::PostWitness { exact } => {
-                        // Owed re-sight work keeps the terminal refresh
+                        // Owed continuation (re-sight attempts or held
+                        // exit decisions) keeps the terminal refresh
                         // reading within its deadline even once a sweep
                         // lands exact: the finish files only work the
                         // continuations actually attempted. Past the
@@ -1932,17 +1938,12 @@ impl<L> NativeStop<L> {
                         // refresh was exact — never a refresh-loss
                         // misreport); the remaining rows file
                         // incomplete, as accounted.
-                        let owed = self.staged_resight_owed;
-                        self.phase = if exact && !owed {
-                            NativeStopPhase::Finish
-                        } else if now >= self.refresh_deadline.unwrap() {
-                            if exact {
-                                NativeStopPhase::Finish
-                            } else {
-                                NativeStopPhase::RefreshLoss
-                            }
-                        } else {
-                            NativeStopPhase::PostWitness
+                        let owed = self.staged_resight_owed || self.staged_decision_owed;
+                        let expired = now >= self.refresh_deadline.unwrap();
+                        self.phase = match terminal_refresh_step(exact, owed, expired) {
+                            TerminalRefreshStep::ReadOn => NativeStopPhase::PostWitness,
+                            TerminalRefreshStep::FinishExact => NativeStopPhase::Finish,
+                            TerminalRefreshStep::RefreshLoss => NativeStopPhase::RefreshLoss,
                         };
                     }
                     NativeAfterStage::Finish => self.phase = NativeStopPhase::RetirementGap,

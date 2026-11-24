@@ -28894,8 +28894,10 @@ fn seal_pending_across_stop(inject_resource_failure: bool) {
     let feeds = fixture.feeds();
     assert_eq!(feeds.len(), 2);
     assert!(
-        feeds.iter().all(|feed| feed.staged == 0 && feed.fallback),
-        "both feeds fall back with nothing left staged"
+        feeds.iter().all(|feed| feed.staged == 0
+            && feed.fallback
+            && (inject_resource_failure || !feed.degraded)),
+        "both feeds fall back with nothing left staged (a clean stop never degrades)"
     );
     assert_eq!(
         feeds.iter().map(|feed| feed.disposed).sum::<u64>(),
@@ -41435,7 +41437,8 @@ fn joint_birth_names_successor_backoff_before_install() {
 /// optionally with a fallback fence of `backoff` passes posed on the
 /// doomed proof's key; returns the birth-unavailable gap reasons.
 fn doomed_segment_birth_refusals(backoff: Option<u32>) -> Vec<String> {
-    let (reasons, _, reoffers) = doomed_segment_birth_refusals_with(backoff, None);
+    let (reasons, _, reoffers) =
+        doomed_segment_birth_refusals_with(EarlyBirthGate::Doom(backoff), None);
     assert_eq!(reoffers, 0, "a doomed birth is final, never re-offered");
     reasons
 }
@@ -41451,25 +41454,31 @@ fn doomed_segment_birth_refusals(backoff: Option<u32>) -> Vec<String> {
 #[test]
 fn joint_birth_backoff_refusal_precedes_witness_reservation() {
     const RESOURCE: &str = "joint_birth_deferred_resource_capacity";
-    for (backoff, reason) in [
-        (Some(5), "joint_birth_install_successor_backoff"),
-        (None, "joint_birth_install_segment_unresumable"),
+    for (gate, reason) in [
+        (
+            EarlyBirthGate::Doom(Some(5)),
+            "joint_birth_install_successor_backoff",
+        ),
+        (
+            EarlyBirthGate::Doom(None),
+            "joint_birth_install_segment_unresumable",
+        ),
+        (
+            EarlyBirthGate::Unhealthy,
+            "joint_birth_reseed_session_unhealthy",
+        ),
     ] {
         // A batch-wide deferral (association or plan storage) names
         // no caller; a per-key resource deferral names the birth's.
         let plan_deferred = |room: usize| {
-            let (unavailable, deferred, _) =
-                doomed_segment_birth_refusals_with(backoff, Some(room));
+            let (unavailable, deferred, _) = doomed_segment_birth_refusals_with(gate, Some(room));
             unavailable.is_empty()
                 && !deferred.is_empty()
                 && deferred.iter().all(|(caller, _)| caller.is_none())
         };
         let (mut low, mut high) = (0usize, 1usize << 22);
-        assert!(plan_deferred(low), "{backoff:?}: no room defers the plan");
-        assert!(
-            !plan_deferred(high),
-            "{backoff:?}: ample room admits the plan"
-        );
+        assert!(plan_deferred(low), "{gate:?}: no room defers the plan");
+        assert!(!plan_deferred(high), "{gate:?}: ample room admits the plan");
         while high - low > 1 {
             let mid = low + (high - low) / 2;
             if plan_deferred(mid) {
@@ -41479,15 +41488,15 @@ fn joint_birth_backoff_refusal_precedes_witness_reservation() {
             }
         }
         let (unavailable, deferred, reoffers) =
-            doomed_segment_birth_refusals_with(backoff, Some(high));
+            doomed_segment_birth_refusals_with(gate, Some(high));
         assert!(
             deferred.iter().all(|(_, deferred)| deferred != RESOURCE),
-            "{backoff:?}: no per-key resource deferral at room {high}"
+            "{gate:?}: no per-key resource deferral at room {high}"
         );
         assert_eq!(
             (unavailable, deferred, reoffers),
             (vec![reason.to_string()], Vec::new(), 0),
-            "{backoff:?}: at the least plan room ({high}) the early refusal wins"
+            "{gate:?}: at the least plan room ({high}) the early refusal wins"
         );
     }
 }
@@ -41500,8 +41509,18 @@ type DeferredBirthGap = (Option<CallerId>, String);
 /// optionally clamped first; returns the birth-unavailable reasons, the
 /// birth-deferred reasons and the re-offer count. Without a clamp the
 /// helper also pins the no-install, no-consume, no-witness controls.
+/// Which early birth gate a pressure cell poses: segment doom (with
+/// an optional successor backoff), or an unhealthy session over a
+/// resumable fallback segment. (The stuck bar needs a superseding
+/// incarnation's proof, which this two-quantum fixture never mints.)
+#[derive(Clone, Copy, Debug)]
+enum EarlyBirthGate {
+    Doom(Option<u32>),
+    Unhealthy,
+}
+
 fn doomed_segment_birth_refusals_with(
-    backoff: Option<u32>,
+    gate: EarlyBirthGate,
     clamp_room: Option<usize>,
 ) -> (Vec<String>, Vec<DeferredBirthGap>, usize) {
     use crate::inventory_present::JOINT_BIRTH_UNAVAILABLE_SUBJECT;
@@ -41553,13 +41572,28 @@ fn doomed_segment_birth_refusals_with(
         .expect("Q2 admitted")
         .instance_key_for_test()
         .clone();
+    let backoff = match gate {
+        EarlyBirthGate::Doom(backoff) => backoff,
+        EarlyBirthGate::Unhealthy => None,
+    };
     let doomed = BootstrapReceipt::scripted(proof, BirthKind::AttachObserved, 7, 0);
+    // An unhealthy session gates a resumable segment: the health gate
+    // alone refuses it.
+    let resumable = matches!(gate, EarlyBirthGate::Unhealthy);
     scene
         .real
         .scene
         .coordinator
         .registry_mut()
-        .pose_fallback_segment_for_test(&key, false, doomed);
+        .pose_fallback_segment_for_test(&key, resumable, doomed);
+    if resumable {
+        scene
+            .real
+            .scene
+            .coordinator
+            .registry_mut()
+            .pose_session_unhealthy_for_test();
+    }
     if let Some(wait) = backoff {
         scene
             .real
@@ -41614,11 +41648,11 @@ fn doomed_segment_birth_refusals_with(
         .unwrap();
     assert_eq!(
         disposition.installed, 0,
-        "the doomed birth installs nothing"
+        "{gate:?}: the doomed birth installs nothing"
     );
     assert!(
         !consumed.get(),
-        "the doomed birth never reaches native consume"
+        "{gate:?}: the doomed birth never reaches native consume"
     );
     assert_eq!(
         scene.real.scene.coordinator.joint_births_installed() as usize,

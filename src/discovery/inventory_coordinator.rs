@@ -46411,6 +46411,24 @@ int main(void) {
     }
 
     #[test]
+    fn a_system_scope_clean_staging_files_no_exhaustion_aggregate() {
+        // A staging with no deferral files nothing: the aggregate
+        // only exists once a scan actually deferred past the pool, so
+        // a clean run never carries an empty exhaustion row.
+        let mut scene = CaptureScene::new(2);
+        let coordinator = &mut scene.coordinator;
+        coordinator.holder_pool.reset();
+        assert!(coordinator.holder_pool.try_charge(1_000));
+        coordinator.record_holder_pool_exhaustion();
+        coordinator.registry.publish();
+        assert!(
+            coordinator.registry.gaps().is_empty(),
+            "a clean staging files no exhaustion row: {:?}",
+            coordinator.registry.gaps()
+        );
+    }
+
+    #[test]
     fn a_system_scope_pool_exhaustion_aggregates_distinct_attempted_totals() {
         // Per-staging attempted totals vary, but the exhaustion
         // condition is one: distinct totals aggregate into a single

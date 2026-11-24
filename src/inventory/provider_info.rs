@@ -845,6 +845,9 @@ impl InfoJoin {
         }
     }
 
+    /// Test-only terminal projection: the join's finished view.
+    /// Production renders streaming views from [`InfoJoin::snapshot`].
+    #[cfg(test)]
     pub(crate) fn finish(self) -> (BTreeMap<ModuleId, ProviderInfo>, ProviderObservations) {
         self.snapshot()
     }

@@ -1330,6 +1330,20 @@ fn carried_fix4_table_coverage_requires_stable_offset() {
         super::carrier_covered_by_live(&carrier_none, &[&live_none]),
         "two unattributable identical tables cover"
     );
+    // Superset: a live table preserving everything plus more still
+    // covers (and pins argument order: swapping the compared tables
+    // flips this verdict).
+    let mut live_super = fix3_two_table_module(key, Some(0));
+    live_super.tables[0].entries.push(ScannedEntry {
+        name: "C_Extra",
+        object: key,
+        object_path: OVERLAY_PATH.into(),
+        file_offset: 0x1200,
+    });
+    assert!(
+        super::carrier_covered_by_live(&carrier, &[&live_super]),
+        "a live table preserving a superset still covers"
+    );
 }
 
 #[test]

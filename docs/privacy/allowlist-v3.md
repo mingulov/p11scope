@@ -89,8 +89,8 @@ section is APPROVED and its length capture is IMPLEMENTED behind
 ours, owner sign-off at 0.9.x; Task 2 reviews `rv-v080-keymeta-t2`
 + `rv-v080-keymeta-t2-sr` + `hy4-rv-v080-keymeta-t2` with 8 fix
 rounds including the codex B1 fetch-mask over-read fix; Task 3
-join/publication landed; the Task 4 `--key-sizes` canary is an
-explicit outstanding item). The
+join/publication landed; the Task 4 `--key-sizes` canary passed on
+2026-11-24, recorded in the keymeta section). The
 [Provider, token and mechanism info (v0.8.0 keymeta Task 7)](#provider-token-and-mechanism-info-v080-keymeta-task-7)
 section is APPROVED and its info capture is IMPLEMENTED behind
 `--provider-info` (owner direction 2026-11-19 via the Task 7 fix8
@@ -2393,10 +2393,14 @@ versions 1–5 stay frozen and byte-stable.
 sign-off at 0.9.x; Task 2 reviews `rv-v080-keymeta-t2` +
 `rv-v080-keymeta-t2-sr` + `hy4-rv-v080-keymeta-t2` with 8 fix
 rounds including the codex B1 fetch-mask over-read fix; Task 3
-join/publication landed). The Task 4 `--key-sizes` canary
-(length-cell sentinels on every shape, lane v080-keymeta-t4b,
-blocked on the joint-seal view-void) and the Task 5 live matrix
-remain explicit outstanding items.**
+join/publication landed). The Task 4 `--key-sizes` canary passed on
+2026-11-24 (live sentinel run, lane v080-keysizes-canary, rev
+e86bc2bd5 on Fedora kernel 7.2.9, 5/5 passes: S/V protocols on LP64,
+the marker absent from the JSON report, the event log, the observer
+log and every owned BPF map including `EVIDENCE_START`, with
+positive controls and published RSA-2048 sizes; the committed cell
+is `privileged_inventory_pid_key_sizes_canary_no_payload_leak`).
+The Task 5 live matrix remains an explicit outstanding item.**
 This section scopes section version 7 of
 `inventory-v1-object-observations-v7.schema.json`: the
 `inferred_family`/`inferred_size` row keys and the finite

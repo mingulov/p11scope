@@ -703,7 +703,7 @@ last 2 minutes. The broad inventory keeps running to the end of the
 window with exact call counts, and detailed-tracking probes stay
 attached until exit.
 
-### Operation-length key sizes need a FULL build, and the Task 4 canary is outstanding
+### Operation-length key sizes need a FULL build; the Task 4 canary passed
 
 `--key-sizes` (with `--key-operations`) infers key sizes from
 operation lengths. Length capture loads only on FULL builds (P0
@@ -711,10 +711,21 @@ omits the length programs); when the sizes start fails — for
 example a length program the verifier refuses — the journal retries
 without sizes behind a `key sizes unavailable` gap and key rows
 continue without operation-length sizes. The Task 4 privacy canary
-for `--key-sizes` (length-cell sentinels on every shape proving no
-payload byte reaches output, maps or logs) has not run yet; it is
-an explicit outstanding item, blocked behind the joint-seal
-view-void work.
+for `--key-sizes` ran on 2026-11-24 (rev e86bc2bd5, Fedora kernel
+7.2.9, 5/5 passes) and passed: a live `inventory --pid --capture
+native --key-operations --key-sizes` capture over a sentinel-guarded
+sign+verify workload (64-byte `K3YS1Z3CANARY!` guards with an
+embedded 256-valued collision word beside the S length cell and the
+V buffers) found the marker in none of the JSON report, the event
+log, the observer log or any BPF map owned by the observer
+(including `EVIDENCE_START`), while both RSA-2048 sizes published
+from `sign_output`/`verify_input` evidence. The scanner's positive
+control (an injected marker copy it must find) and the size verdict
+keep the cell non-vacuous; the committed cell is
+`privileged_inventory_pid_key_sizes_canary_no_payload_leak`.
+Live coverage is the S and V protocols on LP64; the remaining nine
+endpoints ride the same adapters with exact read-set twins at the
+host seam, and ia32 live lanes stay future work.
 
 ### ECDSA signature lengths publish the size class, never the curve
 

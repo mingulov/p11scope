@@ -21711,6 +21711,23 @@ fn joint_machine_rearm_fences_spanned_key_tracking_for_rebirth() {
         baseline_reduced + 1,
         "only the fresh probe reduces, as transitional fallback loss"
     );
+    // The fenced quantum's publish may still be in flight (its loss
+    // polls resume on budgeted visits): drain it to Idle so the
+    // rebirth below starts from a clean lane and prepares anew
+    // instead of publishing the retained audit.
+    for _ in 0..64 {
+        if fixture.machine.diagnostic_snapshot_for_test().0 == "Idle" {
+            break;
+        }
+        fixture
+            .service(1)
+            .expect("the publish tail never refuses");
+    }
+    assert_eq!(
+        fixture.machine.diagnostic_snapshot_for_test().0,
+        "Idle",
+        "the fenced publish completes before the rebirth"
+    );
     // Post-fence rebirth tracks cleanly: publish new work past the
     // fence. The seal meets the fenced history and retains S1: the
     // probe reduces direct while Joint certifies none of the lost

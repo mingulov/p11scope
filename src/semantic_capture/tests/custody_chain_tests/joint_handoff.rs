@@ -669,6 +669,16 @@ impl JointScene {
         &mut self,
         fault: &impl crate::semantics_objects::journal::FaultEpoch,
     ) -> RawJointQuantum {
+        self.collect_with_fault_capped(fault, 64)
+    }
+
+    /// Test-only collect with an explicit record cap, for scale cells
+    /// that need more than one 64-record quantum in a single batch.
+    fn collect_with_fault_capped(
+        &mut self,
+        fault: &impl crate::semantics_objects::journal::FaultEpoch,
+        cap: usize,
+    ) -> RawJointQuantum {
         let reserve = self
             .real
             .scene
@@ -678,7 +688,7 @@ impl JointScene {
         RawJointQuantum::collect_bounded_with_adapter(
             &mut self.drain,
             &publish_object_descriptors(),
-            64,
+            cap,
             None,
             fault,
             &self.producers,

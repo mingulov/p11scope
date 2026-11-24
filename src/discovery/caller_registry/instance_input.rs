@@ -2680,6 +2680,34 @@ impl CallerRegistry {
         self.instance_state.journal_linked = linked;
     }
 
+    /// Test-only: insert `n` dummy semantic records (S1Only feeds) for
+    /// seal work-bound cells. Registry ids continue from the live
+    /// allocator; callers and modules are distinct dummies.
+    #[cfg(test)]
+    pub(crate) fn pose_many_feeds_for_test(&mut self, n: usize) {
+        use crate::semantics_key_use::JointStaging;
+        for _ in 0..n {
+            let id = RegistryInstanceId(self.instance_state.next_id);
+            self.instance_state.next_id = self.instance_state.next_id.saturating_add(1);
+            let record = InstanceSemanticRecord {
+                id,
+                caller: crate::discovery::caller_registry::CallerId(id.0),
+                module: crate::discovery::caller_registry::ModuleId(id.0),
+                api_returns: None,
+                saturated: false,
+                historical_only_returns: 0,
+                boundary: None,
+                last_reduced: None,
+                reasons: std::collections::BTreeSet::new(),
+                lossy: false,
+                semantics: None,
+                authority_exhausted: false,
+                feed: JointStaging::select_s1_only(),
+            };
+            self.instance_state.semantics.insert(id, record);
+        }
+    }
+
     /// Whether a journal producer is linked for this lane.
     pub(crate) fn journal_linked(&self) -> bool {
         self.instance_state.journal_linked

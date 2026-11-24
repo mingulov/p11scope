@@ -40558,6 +40558,7 @@ fn joint_birth_funnel_accounts_every_offer() {
             .borrow_mut()
             .capture
             .rearm_image_for_reseed(image)
+            .0
             > 0,
         "Q2 re-arms its keys"
     );
@@ -40574,6 +40575,7 @@ fn joint_birth_funnel_accounts_every_offer() {
             .borrow_mut()
             .capture
             .rearm_image_for_reseed(image)
+            .0
             > 0,
         "Q3 re-arms its keys"
     );
@@ -41557,6 +41559,7 @@ fn doomed_segment_birth_refusals_with(
             .borrow_mut()
             .capture
             .rearm_image_for_reseed(image)
+            .0
             > 0,
         "Q2 re-arms its key so the doomed birth forms"
     );
@@ -41940,5 +41943,174 @@ fn joint_disposed_terminal_check_is_metered() {
         polls,
         rows + scan.identities + 1,
         "one delivery per paid unit, then the advance"
+    );
+}
+
+/// 65-provider birth originals in one batch for seal work-bound
+/// cells: admit before tick (tick filters to admitted providers)
+/// and collect past the 64-record helper cap.
+fn seal_walk_65_birth_originals() -> (
+    JointScene,
+    IngestedRaw,
+    crate::attach::AttachedSemanticSet,
+    SessionDrainGrant,
+) {
+    use p11scope_ebpf_common::ImageIdentity;
+    let (held, attached) = HeldProviders::with_attachment(65, &["C_CreateObject", "C_SignInit"]);
+    let mut scene = JointScene::from_held(held, Some(attached));
+    scene.real.h0.0.borrow_mut().io.script.local = 1;
+    let pid = std::process::id();
+    let caller = scene.real.bind(
+        pid,
+        ImageIdentity {
+            task_cookie: 71,
+            exec_id: 0,
+        },
+        0,
+    );
+    let files = (0..65u32).collect::<Vec<_>>();
+    for file in &files {
+        scene.push(pid, *file, "C_CreateObject", u64::from(*file) + 1);
+    }
+    scene.admit_providers(pid, caller, &files);
+    let raw = scene.collect_with_fault_capped(&BirthFault, 256);
+    scene.real.h0.0.borrow_mut().collected = Some(raw);
+    let batch = scene.real.tick();
+    scene.prepare_batch(batch, 65);
+    let raw = scene.real.h0.0.borrow_mut().collected.take().unwrap();
+    let (ingested, _, grant) = scene.ingest_with_grant(raw);
+    let mut count = 0;
+    while scene
+        .real
+        .scene
+        .coordinator
+        .claim_next_prepared_admission(&scene.producers, &ingested)
+        .unwrap()
+        .is_some()
+    {
+        count += 1;
+    }
+    assert_eq!(count, 65, "all 65 admissions claim");
+    let attached = attachment(&mut scene);
+    assert!(
+        scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture_mut()
+            .adapter_mut()
+            .install_closure_grant(&SessionClosureGrant::observe(&attached))
+    );
+    (scene, ingested, attached, grant)
+}
+
+/// Seal work bound: one Births credit visits at most 64 units per
+/// step and performs at most one native consume. With 65 providers
+/// every step exceeds its bound until Births is resumable.
+#[test]
+fn seal_walk_births_phases_visit_at_most_64() {
+    let (mut scene, ingested, _attached, _grant) = seal_walk_65_birth_originals();
+    let mut births = crate::inventory_semantics::RetainedJointBirths::new();
+    let _ = scene.real.scene.coordinator.prepare_joint_births(
+        &ingested,
+        &scene.producers,
+        &mut births,
+        |_candidate, _absence, _input, _binding, _proof, _adapter| {
+            Err(crate::attach::BirthObservationRefusal::BindingMismatch)
+        },
+    );
+    let batch = scene
+        .real
+        .scene
+        .coordinator
+        .prepared_semantic_batch()
+        .expect("the batch persists for its visit counts");
+    let (preamble, count, build, link, process, disclose, natives) = batch.births_visits_for_test();
+    for (step, visits) in [
+        ("preamble", preamble),
+        ("count", count),
+        ("build", build),
+        ("link", link),
+        ("process", process),
+        ("disclose", disclose),
+    ] {
+        assert!(
+            visits <= 64,
+            "65 providers: Births {step} visited {visits}, bound is 64"
+        );
+    }
+    assert!(
+        natives <= 1,
+        "65 providers: one Births credit attempted {natives} natives, bound is 1"
+    );
+}
+
+/// Seal work bound: reseed queue and cooldown scans visit at most 64
+/// rows per credit. With 65 retained feeds both scans exceed their
+/// bound until they carry cursors.
+#[test]
+fn seal_walk_reseed_scans_visit_at_most_64() {
+    for feeds in [63usize, 64, 65] {
+        let (held, attached) = HeldProviders::with_attachment(1, &["C_CreateObject"]);
+        let mut scene = JointScene::from_held(held, Some(attached));
+        let coordinator = &mut scene.real.scene.coordinator;
+        coordinator
+            .registry_mut()
+            .pose_many_feeds_for_test(feeds);
+        coordinator.registry().reset_reseed_visits_for_test();
+        coordinator.queue_reseed_for_awaiting_feeds();
+        coordinator.tick_reseed_cooldowns();
+        let (queue, tick, _) = coordinator.registry().reseed_visits_for_test();
+        assert!(
+            queue <= 64,
+            "{feeds} feeds: reseed queue scan visited {queue}, bound is 64"
+        );
+        assert!(
+            tick <= 64,
+            "{feeds} feeds: cooldown tick visited {tick}, bound is 64"
+        );
+    }
+}
+
+/// Seal work bound: a reseed re-arm visits at most 64 observed keys
+/// per credit. With 65 observed keys it exceeds its bound until sliced.
+#[test]
+fn seal_walk_rearm_visits_at_most_64() {
+    use p11scope_ebpf_common::ImageIdentity;
+    let (mut scene, _ingested, _attached, _grant) = seal_walk_65_birth_originals();
+    let image = ImageIdentity {
+        task_cookie: 71,
+        exec_id: 0,
+    };
+    let mut owned = scene.real.h0.0.borrow_mut();
+    let HeldH0 { capture, .. } = &mut *owned;
+    capture.reset_rearm_scan_visits_for_test();
+    let _ = capture.rearm_image_for_reseed(image);
+    assert!(
+        capture.rearm_scan_visits_for_test() <= 64,
+        "65 observed keys: re-arm visited {}, bound is 64",
+        capture.rearm_scan_visits_for_test(),
+    );
+}
+
+/// Seal work bound: an image-router check visits at most 64 registry
+/// keys. With 65 retained keys it exceeds its bound until indexed.
+#[test]
+fn seal_walk_router_check_visits_at_most_64() {
+    use p11scope_ebpf_common::ImageIdentity;
+    let (mut scene, _ingested, _attached, _grant) = seal_walk_65_birth_originals();
+    let coordinator = &mut scene.real.scene.coordinator;
+    coordinator.registry().reset_reseed_visits_for_test();
+    let foreign = ImageIdentity {
+        task_cookie: 0xdead,
+        exec_id: 0xbeef,
+    };
+    let _ = coordinator
+        .registry()
+        .joint_image_router_registered(foreign, &[]);
+    let (_, _, checks) = coordinator.registry().reseed_visits_for_test();
+    assert!(
+        checks <= 64,
+        "65 registry keys: router check visited {checks}, bound is 64"
     );
 }

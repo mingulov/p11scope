@@ -340,10 +340,11 @@ class Run:
         try:
             require(info.st_mtime_ns >= self.stamp_ns, FRESH_FILE,
                     "%s %s predates this run's stamp (stale)" % (what, path))
-            require(info.st_size <= MAX_INPUT_BYTES, FRESH_FILE, "%s %s exceeds the size limit" % (what, path))
         except Refusal:
             os.close(fd)
             raise
+        # The bytes read from this descriptor decide the size, not a
+        # metadata size that could change after fstat.
         data = read_fd(fd, MAX_INPUT_BYTES)
         require(len(data) <= MAX_INPUT_BYTES, FRESH_FILE, "%s %s exceeds the size limit" % (what, path))
         if binary:
@@ -972,11 +973,12 @@ WINDOW = Record("unobserved-window", {"start_ns": (U64, "window start_ns"), "end
 # Every discovery row has the producer's types (src/render.rs
 # ModuleSummary): `attached_at_ns` is absent before assembly and null when
 # nothing attached; `unobserved_windows` is absent when undisclosed.
-DISCOVERY_ROW = Record("prearm-discovery-row", {"sources": (ListOf(STR), "module sources")},
+DISCOVERY_ROW = Record("prearm-discovery-row", {},
                        optional={"attached_at_ns": (Nullable(U64), "module attached_at_ns"),
                                  "unobserved_windows": (ListOf(WINDOW), "module unobserved_windows")},
                        closed=False)
-# Selection reads only a row's sources; the optional keys are typed after.
+# Selection reads only a row's sources (the same rule); the optional keys
+# are typed after the selected module's strict check.
 ROW_SOURCES = Record("prearm-row-sources", {"sources": (ListOf(STR), "module sources")}, closed=False,
                      rule=DISCOVERY_ROW.rule)
 # The selected pre-armed module carries both keys: an exact window claim
@@ -1090,8 +1092,7 @@ def prearmed_module(evidence):
     require(len(mods) == 1, PREARM_ONE, "one pre-armed module, got %d" % len(mods))
     selected = PREARM_MODULE.check(mods[0])
     for row in rows:
-        if row is not mods[0]:
-            DISCOVERY_ROW.check(row)
+        DISCOVERY_ROW.check(row)
     return selected
 
 

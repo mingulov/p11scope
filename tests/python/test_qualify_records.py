@@ -31,6 +31,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -1458,6 +1459,32 @@ class ShellBindingTests(unittest.TestCase):
                                                    if k != "P11SCOPE_LOCAL_OUTPUT_ROOT"})
             self.assertEqual(proc.stdout.split(), ["first", "refused"], proc.stderr)
             self.assertTrue((Path(raw) / "run-fixed").is_dir())
+
+    def test_every_judged_product_report_is_the_private_path(self):
+        # Codex r10 #2, per judge call: each product-report option names
+        # the cell's private product path, never the published copy.
+        text = QUAL.read_text()
+        private = {'"$output"', '"$full_out"', '"$epipe_out"', '"$(product_output run-prearm-held.txt)"',
+                   '"$(product_output run-prearm-passive.txt)"'}
+        options = ("--report", "--full-report", "--epipe-report", "--held-report", "--passive-report")
+        seen = {}
+        for line in text.splitlines():
+            if 'python3 -I "$RECORDS" ' not in line:
+                continue
+            judge = line.split('"$RECORDS" ', 1)[1].split()[0]
+            for option in options:
+                found = re.search(" %s (\"\\$\\(product_output [^)]+\\)\"|\\S+)" % option, line)
+                if found:
+                    seen[(judge, option)] = found.group(1)
+        self.assertEqual(sorted(seen), sorted([
+            ("cgroup-inventory", "--report"), ("event-stdout", "--epipe-report"),
+            ("event-stdout", "--full-report"), ("parent-chain", "--report"),
+            ("run-prearm", "--held-report"), ("run-prearm", "--passive-report"),
+            ("second-sigint", "--report")]))
+        self.assertEqual({key: value for key, value in seen.items() if value not in private}, {})
+        for cell in ("second_sigint", "parent_chain_cell", "cgroup_capture"):
+            body = shell_function(cell)
+            self.assertIn("output=$(product_output ", body.replace("output_v=$(product_output", ""), cell)
 
     def test_stamp_refuses_to_reuse_an_existing_stamp(self):
         with tempfile.TemporaryDirectory() as raw:

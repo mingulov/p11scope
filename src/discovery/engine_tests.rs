@@ -14911,6 +14911,100 @@ fn a_dead_stale_view_beside_a_live_newcomer_target_stays_loud() {
     );
 }
 
+/// Twin (fix) of the dead-view-loud guard above: a view that died
+/// BEFORE the candidate built is carried, not currency-checked. Its
+/// module rides for its file facts, its id stays out of the candidate
+/// views, and the live newcomer's attach applies instead of aborting —
+/// one exited member cannot wedge every apply under churn.
+#[test]
+fn a_view_dead_before_build_rides_carried_and_the_live_apply_proceeds() {
+    let (_fixture, live_view, module, pins) = loaded_seed_provider();
+    let live_id = live_view.id();
+    let mut dead = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let dead_view = ProcessView::open(ProcessViewId(4401), dead.id()).unwrap();
+    let dead_id = dead_view.id();
+    // Dead BEFORE the build (vs the guard above, which kills after).
+    dead.kill().unwrap();
+    dead.wait().unwrap();
+    let mut engine = Engine::empty();
+    engine.views.push(live_view);
+    engine.views.push(dead_view);
+    let mut dead_module = module.clone();
+    dead_module.view = dead_id;
+    let mut candidate = engine
+        .live_candidate(pins, vec![module.clone(), dead_module], Vec::new())
+        .expect("a seed candidate builds");
+    assert!(
+        !candidate.views.contains(&dead_id),
+        "exited views stay out of currency: {:?}",
+        candidate.views
+    );
+    assert!(
+        candidate.views.contains(&live_id),
+        "live views stay in: {:?}",
+        candidate.views
+    );
+    assert!(
+        candidate
+            .modules
+            .iter()
+            .any(|module| module.scanned.view == dead_id),
+        "the dead view's module rides for its file facts"
+    );
+    // Stage the live newcomer's attach target exactly like the guard.
+    let object = candidate
+        .pinned
+        .id_for_scanned(&module, module.key, &module.path)
+        .unwrap();
+    let owner = candidate
+        .plan
+        .modules
+        .iter()
+        .find(|summary| summary.object == object)
+        .unwrap()
+        .id;
+    let file_offset = ElfSnapshot::read(candidate.pinned.file_for(object).unwrap())
+        .unwrap()
+        .defined_symbol("C_GetFunctionList")
+        .unwrap()
+        .unwrap()
+        .file_offset;
+    let slot = candidate
+        .plan
+        .add_provisional_get_function_list(plan::ProvisionalGetFunctionList {
+            module: owner,
+            object,
+            object_path: module.path.clone(),
+            file_offset,
+        })
+        .unwrap()
+        .unwrap();
+    candidate.delta.new.push(slot);
+    let mut session = ScriptedSession::default();
+    let mut additions_allowed = true;
+    let outcome = engine
+        .apply_candidate(&mut session, candidate, &mut additions_allowed, false, &[])
+        .expect("the live apply proceeds");
+    assert!(
+        outcome.stale_views.is_empty(),
+        "no stale abort for a carried view: {:?}",
+        outcome.stale_views
+    );
+    assert!(
+        engine.counters.object_skips.iter().all(|skip| {
+            skip.reason
+                != "candidate generation changed before mutation; canonical identity, plan, and links were unchanged"
+        }),
+        "no generation mark when nothing deferred: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(additions_allowed, "the live attach was not refused");
+}
+
 /// The H2 silence gate, case by case: all-dead reads silent; anything
 /// live, mixed, or unknown reads loud (fail-closed). Direct unit cover
 /// for the predicate the candidate test above wires through the apply.
@@ -20922,6 +21016,7 @@ fn evidence_verdict(
         learned_staged_files: 0,
         learned_event_loss: 0,
         learned_cap_skipped: 0,
+        learned_never_scanned: 0,
         gap_exe_hints: None,
         target_exec_hints: None,
         instance_reload_not_excluded: None,
@@ -46926,6 +47021,7 @@ fn an_unpinned_entry_skip_is_bounded_in_every_capture_output() {
         learned_staged_files: 0,
         learned_event_loss: 0,
         learned_cap_skipped: 0,
+        learned_never_scanned: 0,
         gap_exe_hints: None,
         target_exec_hints: None,
         instance_reload_not_excluded: None,
@@ -88179,6 +88275,163 @@ fn learned_terminal_record_publishes_unserviced_file() {
     );
     assert_eq!(record.sources, vec!["prearm"]);
     assert!(!record.corroborated);
+}
+
+/// A terminally learned file names its miss window with counts: with a
+/// scope start the record carries one `learned_never_scanned` window
+/// over `[scope_start_ns, now_ns]` beside its load count, and the
+/// capture counts the file once.
+#[test]
+fn learned_terminal_record_names_its_miss_window_with_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = dir.path().join("terminal.c");
+    let so = dir.path().join("libterminal2.so");
+    std::fs::write(
+        &c,
+        "unsigned long C_GetFunctionList(void **out){ (void)out; return 5; }\n",
+    )
+    .unwrap();
+    assert!(
+        std::process::Command::new("gcc")
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&so)
+            .arg(&c)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let file = std::fs::File::open(&so).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    tx.send(crate::fanotify::LearnMsg::Candidate(
+        crate::fanotify::LearnedCandidate {
+            file,
+            dev,
+            ino,
+            display_path: so.to_string_lossy().into_owned(),
+            loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+            loader_unknown_reason: None,
+            run_learned: false,
+            proving_retained: false,
+        },
+    ))
+    .unwrap();
+    drop(tx);
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.set_learned_rx_for_test(rx);
+    engine.set_scope_start_ns(Some(50));
+    // No tick service at all: finish alone must stage and publish.
+    let session = ScriptedSession::default();
+    engine.finish_prearm_capture(
+        &session,
+        crate::render::PrearmWatchEnd::ScopeEnd,
+        &BTreeSet::new(),
+        &[],
+        Some(100),
+        &crate::metrics::KernelEvidence::default(),
+        0,
+        None,
+        false,
+        None,
+    );
+    assert_eq!(engine.learned_never_scanned_for_test(), 1);
+    let facts = engine.capture_facts();
+    let record = facts
+        .discovery
+        .modules
+        .iter()
+        .find(|module| module.path.ends_with("libterminal2.so"))
+        .expect("the terminally learned file is listed");
+    let first = record
+        .first_loaded_by
+        .as_ref()
+        .expect("the terminal record names its first loader");
+    assert!(first.pre_attach_loads >= 1);
+    assert_eq!(
+        record.unobserved_windows,
+        Some(vec![crate::render::UnobservedWindow {
+            start_ns: 50,
+            end_ns: 100,
+            reason: crate::render::UnobservedReason::LearnedNeverScanned,
+        }]),
+        "one named window over the conservative outer bounds"
+    );
+}
+
+/// Without a scope start the terminal record keeps today's windowless
+/// shape, but the file still counts: the fact (loads seen, never
+/// scanned) does not depend on the clock.
+#[test]
+fn learned_terminal_record_without_scope_start_counts_but_carries_no_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = dir.path().join("terminal.c");
+    let so = dir.path().join("libterminal3.so");
+    std::fs::write(
+        &c,
+        "unsigned long C_GetFunctionList(void **out){ (void)out; return 5; }\n",
+    )
+    .unwrap();
+    assert!(
+        std::process::Command::new("gcc")
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&so)
+            .arg(&c)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let file = std::fs::File::open(&so).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    tx.send(crate::fanotify::LearnMsg::Candidate(
+        crate::fanotify::LearnedCandidate {
+            file,
+            dev,
+            ino,
+            display_path: so.to_string_lossy().into_owned(),
+            loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+            loader_unknown_reason: None,
+            run_learned: false,
+            proving_retained: false,
+        },
+    ))
+    .unwrap();
+    drop(tx);
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.set_learned_rx_for_test(rx);
+    // No scope start: windowless, but counted.
+    let session = ScriptedSession::default();
+    engine.finish_prearm_capture(
+        &session,
+        crate::render::PrearmWatchEnd::ScopeEnd,
+        &BTreeSet::new(),
+        &[],
+        Some(100),
+        &crate::metrics::KernelEvidence::default(),
+        0,
+        None,
+        false,
+        None,
+    );
+    assert_eq!(engine.learned_never_scanned_for_test(), 1);
+    let facts = engine.capture_facts();
+    let record = facts
+        .discovery
+        .modules
+        .iter()
+        .find(|module| module.path.ends_with("libterminal3.so"))
+        .expect("the terminally learned file is listed");
+    assert_eq!(record.unobserved_windows, None);
+    assert!(
+        record
+            .first_loaded_by
+            .as_ref()
+            .expect("loads ride the record")
+            .pre_attach_loads
+            >= 1
+    );
 }
 
 /// A candidate the pin worker refuses after the drain proved it

@@ -49,7 +49,7 @@ PROFILE_FIELDS = ("interface_selection", "attach_mechanisms",
                   "pid_descendant_gaps_admitted",
                   "member_stop_attached", "member_stop_unattached",
                   "learned_staged_files", "learned_event_loss",
-                  "learned_cap_skipped")
+                  "learned_cap_skipped", "learned_never_scanned")
 
 
 def provider_pin():
@@ -160,7 +160,8 @@ def inputs(*, metrics=False, scope="pid", calls=None, cell="profile-pid"):
         pid_descendant_gaps_admitted=0,
         member_stop_attached=0, member_stop_unattached=0,
         learned_staged_files=0, learned_event_loss=0,
-        learned_cap_skipped=0)
+        learned_cap_skipped=0,
+        learned_never_scanned=0)
     if metrics:
         report["schema"] = "p11scope/observed-profile/v3-metrics"
         report["lane"] = report["capture"]["mode"] = "metrics"
@@ -297,7 +298,8 @@ def inputs_mt(*, metrics=False, scope="pid", calls=24, errors=0, cell):
         pid_descendant_gaps_admitted=0,
         member_stop_attached=0, member_stop_unattached=0,
         learned_staged_files=0, learned_event_loss=0,
-        learned_cap_skipped=0)
+        learned_cap_skipped=0,
+        learned_never_scanned=0)
     if metrics:
         report["schema"] = "p11scope/observed-profile/v3-metrics"
         report["lane"] = report["capture"]["mode"] = "metrics"

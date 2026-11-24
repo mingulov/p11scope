@@ -1005,7 +1005,10 @@ registered registry count only, never publish). Calls made before the tables
 attach stay missing inside the module's disclosed
 `late_discovery`/`mapped_unattached` window. The learned-table store
 holds 32 modules beside the 32 learned files; past either cap the
-refusal is named and counted (`learned_cap_skipped`).
+refusal is named and counted (`learned_cap_skipped`). A staged file
+whose tables never complete still lists as a terminal discovery
+record with its load count and a `learned_never_scanned` window
+(`evidence.learned_never_scanned`), so the miss is a named gap.
 Pass `--prearm-module` for the provider when the very first mapper's
 calls must land then too. (`sudo`/`setuid` inside the command cannot elevate under the
 child's `no_new_privs` hardening, so privilege hops are not a

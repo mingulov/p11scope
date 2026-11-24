@@ -840,6 +840,7 @@
         "learned_staged_files": {"type": "integer", "minimum": 0},
         "learned_event_loss": {"type": "integer", "minimum": 0},
         "learned_cap_skipped": {"type": "integer", "minimum": 0},
+        "learned_never_scanned": {"type": "integer", "minimum": 0},
         "selected_detail": {
           "description": "Optional additive 6.15 endpoint-selection envelope (--select-endpoint beside counter captures). Closed nested shape; the release oracle is the enforcement behind this file. Never carries process identity.",
           "type": "object",
@@ -1184,7 +1185,7 @@
         "properties": {
           "schema": {"const": "p11scope/observed-profile/v3"},
           "evidence": {
-            "required": ["interface_selection", "attach_mechanisms", "pid_descendant_gaps", "multi_rebuild_gaps", "pid_descendant_gaps_admitted", "member_stop_attached", "member_stop_unattached", "learned_staged_files", "learned_event_loss", "learned_cap_skipped"]
+            "required": ["interface_selection", "attach_mechanisms", "pid_descendant_gaps", "multi_rebuild_gaps", "pid_descendant_gaps_admitted", "member_stop_attached", "member_stop_unattached", "learned_staged_files", "learned_event_loss", "learned_cap_skipped", "learned_never_scanned"]
           }
         },
         "required": ["mechanisms", "sessions", "logins", "templates", "cgroups"]
@@ -1208,6 +1209,7 @@
                 {"required": ["learned_staged_files"]},
                 {"required": ["learned_event_loss"]},
                 {"required": ["learned_cap_skipped"]},
+                {"required": ["learned_never_scanned"]},
                 {"required": ["gap_exit_mappings"]}
               ]
             }

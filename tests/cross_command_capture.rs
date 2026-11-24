@@ -95,6 +95,7 @@ fn evidence() -> Evidence {
         learned_staged_files: 0,
         learned_event_loss: 0,
         learned_cap_skipped: 0,
+        learned_never_scanned: 0,
         gap_exe_hints: None,
         target_exec_hints: None,
         instance_reload_not_excluded: None,

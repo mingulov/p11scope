@@ -54,7 +54,7 @@ PROFILE_FIELDS = ("interface_selection", "attach_mechanisms",
                   "pid_descendant_gaps_admitted",
                   "member_stop_attached", "member_stop_unattached",
                   "learned_staged_files", "learned_event_loss",
-                  "learned_cap_skipped")
+                  "learned_cap_skipped", "learned_never_scanned")
 
 
 def provider_pin():
@@ -131,7 +131,8 @@ def inputs(*, metrics=False, system=False):
         pid_descendant_gaps_admitted=0,
         member_stop_attached=0, member_stop_unattached=0,
         learned_staged_files=0, learned_event_loss=0,
-        learned_cap_skipped=0)
+        learned_cap_skipped=0,
+        learned_never_scanned=0)
     if metrics:
         report["schema"] = "p11scope/observed-profile/v3-metrics"
         report["lane"] = report["capture"]["mode"] = "metrics"
@@ -219,7 +220,8 @@ def inputs_mt_system(*, calls=40):
         pid_descendant_gaps_admitted=0,
         member_stop_attached=0, member_stop_unattached=0,
         learned_staged_files=0, learned_event_loss=0,
-        learned_cap_skipped=0)
+        learned_cap_skipped=0,
+        learned_never_scanned=0)
     ledger = ["TARGET " + json.dumps(row) for row in targets]
     ledger += ["CHILD pid=%d" % pid for pid in MT_SYSTEM_CHILDREN]
     ledger += ["READY pid=123", "LEDGER " + json.dumps({

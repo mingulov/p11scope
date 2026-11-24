@@ -14525,6 +14525,7 @@ pub(crate) fn evidence_for(
         learned_staged_files: engine.learned_staged_files(),
         learned_event_loss: engine.learned_event_loss(),
         learned_cap_skipped: engine.learned_cap_skipped(),
+        learned_never_scanned: engine.learned_never_scanned(),
         // 6.14 Option B: `None` unless extensive mode armed; the JSON
         // key is then omitted, never null.
         gap_exe_hints: engine.gap_exe_hints().copied(),

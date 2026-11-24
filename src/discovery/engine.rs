@@ -502,6 +502,11 @@ pub struct Engine {
     learned_event_loss: u64,
     /// Learned candidates refused by the per-capture file cap.
     learned_cap_skipped: u64,
+    /// Staged learned files the plan never adopted (no table proof
+    /// by capture end): each gets a terminal record with its load
+    /// count and, with a scope start, a `learned_never_scanned`
+    /// window. Staging observed at least one load per file.
+    learned_never_scanned: u64,
     /// Fresh tables the per-module merge cap dropped (counted overflow,
     /// never silent). Drops are only possible past 64 distinct tables
     /// for one module, far above any legitimate provider surface.
@@ -13983,15 +13988,30 @@ fn stale_views_all_dead(
     views: &[ProcessView],
     extra_views: &[&ProcessView],
 ) -> bool {
-    stale.iter().all(|id| {
-        views
-            .iter()
-            .chain(extra_views.iter().copied())
-            .find(|view| view.id() == *id)
-            .is_some_and(|view| {
-                view.original_exited() == Ok(true) && process::generation_dead(view.pid())
-            })
-    })
+    stale
+        .iter()
+        .all(|id| process_view_provably_dead(views, extra_views, *id))
+}
+
+/// True when one view names an original generation that is provably
+/// gone two ways: the retained pin answers exited (no live generation,
+/// no poll error) and the pid has no live generation right now. An
+/// exec'd view reads live (its pid runs a new program); an unreadable
+/// pid, an unanswerable pin, or an unknown view reads unproven. Single
+/// source of truth for the dead checks in `stale_views_all_dead` and
+/// the candidate-build exclusion below.
+fn process_view_provably_dead(
+    views: &[ProcessView],
+    extra_views: &[&ProcessView],
+    id: ProcessViewId,
+) -> bool {
+    views
+        .iter()
+        .chain(extra_views.iter().copied())
+        .find(|view| view.id() == id)
+        .is_some_and(|view| {
+            view.original_exited() == Ok(true) && process::generation_dead(view.pid())
+        })
 }
 
 /// True when no stale view owns a module with a pending attach target
@@ -14157,6 +14177,7 @@ impl Engine {
             learned_staged_files: 0,
             learned_event_loss: 0,
             learned_cap_skipped: 0,
+            learned_never_scanned: 0,
             merge_tables_dropped: 0,
             learned_frame_owed: false,
             owned_watch_unproven: BTreeMap::new(),
@@ -15689,6 +15710,11 @@ impl Engine {
     /// Learned candidates refused by the per-capture file cap.
     pub(crate) fn learned_cap_skipped(&self) -> u64 {
         self.learned_cap_skipped
+    }
+
+    /// Learned files with observed loads the plan never adopted.
+    pub(crate) fn learned_never_scanned(&self) -> u64 {
+        self.learned_never_scanned
     }
 
     /// Fresh tables the per-module merge cap dropped. Test-only: the
@@ -18980,10 +19006,33 @@ impl Engine {
         // generation: it must never enter generation-currency
         // checks (admission staleness, attach pre/post-checks), or
         // every candidate carrying learned tables aborts as stale.
+        // Carried views are exited: their modules ride for the
+        // still-attached objects, but the views themselves must not
+        // enter currency, stale or admission checks (the inventory
+        // and conservative-carry precedent). Without this, one
+        // exited member aborts every apply under churn — the
+        // owned-run all-or-nothing attach miss. Exec'd views read
+        // live and still trip the apply-time check, as do views
+        // dying during this build.
+        let carried: BTreeSet<ProcessViewId> = modules
+            .iter()
+            .map(|module| module.scanned.view)
+            .filter(|view| {
+                *view != Self::RUN_LEARNED_VIEW_ID
+                    && process_view_provably_dead(&self.views, &[], *view)
+            })
+            .collect();
+        if crate::run::capture_diagnostics_on() && !carried.is_empty() {
+            eprintln!(
+                "p11scope: candidate build carries {} exited views past currency checks",
+                carried.len(),
+            );
+        }
         let views = modules
             .iter()
             .map(|module| module.scanned.view)
             .filter(|view| *view != Self::RUN_LEARNED_VIEW_ID)
+            .filter(|view| !carried.contains(view))
             .collect();
         self.stage_timings.span(
             crate::timing::StageKind::Merge,
@@ -23343,14 +23392,22 @@ impl Engine {
     /// Lists every staged learned file the plan never adopted (first
     /// serviced at capture end, so no apply ran): a bounded terminal
     /// record per file with its path and first loader, explicitly
-    /// unattached (no objects, no watch, no windows), so the file is
-    /// named in the evidence instead of only counted. Files the plan
-    /// adopted already list through ordinary projection and are
-    /// skipped here.
-    fn publish_terminal_learned_records(&mut self) {
+    /// unattached (no objects, no watch), so the file is named in the
+    /// evidence instead of only counted. Files the plan adopted
+    /// already list through ordinary projection and are skipped here.
+    /// Every record carries a `learned_never_scanned` unobserved window
+    /// over the conservative `[scope_start_ns, now_ns]` outer bounds
+    /// and counts in `learned_never_scanned`: staging observed loads
+    /// (at least one per note) but no table proof ever completed, so
+    /// the miss is a named gap with counts, never silence. No window
+    /// unless both bounds are known (the counter still fires); bounds
+    /// clamp non-decreasing.
+    fn publish_terminal_learned_records(&mut self, now_ns: Option<u64>) {
         if self.learned_notes.is_empty() {
             return;
         }
+        let scope_start_ns = self.prearm.scope_start_ns();
+        let end_ns = now_ns.or_else(crate::attach::monotonic_ns);
         let planned: BTreeSet<ObjectKey> = self
             .plan
             .modules
@@ -23387,6 +23444,15 @@ impl Engine {
             );
             let id = plan::ModuleId(next_id);
             next_id = next_id.saturating_add(1);
+            self.learned_never_scanned = self.learned_never_scanned.saturating_add(1);
+            let unobserved_windows = match (scope_start_ns, end_ns) {
+                (Some(start_ns), Some(end_ns)) => Some(vec![render::UnobservedWindow {
+                    start_ns,
+                    end_ns: end_ns.max(start_ns),
+                    reason: render::UnobservedReason::LearnedNeverScanned,
+                }]),
+                _ => None,
+            };
             self.discovery.modules.push(render::DiscoveredModule {
                 id,
                 admission_class: None,
@@ -23405,7 +23471,7 @@ impl Engine {
                 skipped: Vec::new(),
                 watch: None,
                 attached_at_ns: Some(None),
-                unobserved_windows: None,
+                unobserved_windows,
                 first_attached_at_ns: None,
                 first_attach_points: None,
                 first_loaded_by: Some(note.clone()),
@@ -40887,7 +40953,7 @@ impl Engine {
             &first_stamps,
             &proofs,
         );
-        self.publish_terminal_learned_records();
+        self.publish_terminal_learned_records(now);
         if !self.prearm.is_empty() {
             // Retire after assembly: deactivation unresolves declared keys,
             // and the stamps are historical facts the assembly must still read.
@@ -43234,6 +43300,10 @@ impl Engine {
 
     pub(crate) fn learned_cap_skipped_for_test(&self) -> u64 {
         self.learned_cap_skipped
+    }
+
+    pub(crate) fn learned_never_scanned_for_test(&self) -> u64 {
+        self.learned_never_scanned
     }
 
     pub(crate) fn learned_frame_owed_for_test(&self) -> bool {

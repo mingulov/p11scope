@@ -285,6 +285,7 @@ PROFILE_V3_FIELDS = {
     "pid_descendant_gaps_admitted",
     "member_stop_attached", "member_stop_unattached",
     "learned_staged_files", "learned_event_loss", "learned_cap_skipped",
+    "learned_never_scanned",
 }
 ATTACH_BACKEND_KEYS = {"selection", "fallback", "scope_filter"}
 OBJECT_CAPTURE_KEYS = {"available", "reason"}
@@ -1166,6 +1167,7 @@ def exact_profile_v3_selection(document, *, terminal=False, run=False):
     require(not missing, f"missing profile-v3 evidence: {sorted(missing)}")
     for field in (
         "learned_staged_files", "learned_event_loss", "learned_cap_skipped",
+        "learned_never_scanned",
     ):
         uint(evidence[field], U64_MAX, field)
     selection = evidence["interface_selection"]
@@ -5093,6 +5095,7 @@ def document_fixture(evidence, *, schema=PROFILE_SCHEMA, mode="profile", privacy
         evidence.setdefault("learned_staged_files", 0)
         evidence.setdefault("learned_event_loss", 0)
         evidence.setdefault("learned_cap_skipped", 0)
+        evidence.setdefault("learned_never_scanned", 0)
     elif schema in (METRICS_SCHEMA, HISTORICAL_METRICS_SCHEMA):
         for field in PROFILE_V3_FIELDS:
             evidence.pop(field, None)

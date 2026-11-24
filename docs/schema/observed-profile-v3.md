@@ -310,8 +310,8 @@ capture, and a consumer must dispatch on the top-level `lane` field
   `attach_mechanisms`, `pid_descendant_gaps`, `multi_rebuild_gaps`,
   `pid_descendant_gaps_admitted`, `member_stop_attached`,
   `member_stop_unattached`, and the learned-file counts
-  `learned_staged_files`, `learned_event_loss`, and
-  `learned_cap_skipped`. Its
+  `learned_staged_files`, `learned_event_loss`,
+  `learned_cap_skipped`, and `learned_never_scanned`. Its
   verdict is selection-aware: a descendant gap, a rebuild gap, or any
   selection loss forces `PARTIAL`.
 - The **metrics** lane (`render::json`, verdict
@@ -481,6 +481,16 @@ vocabulary below), and every learned row forces `PARTIAL` through the
 `skipped` observation cause. Unavailable learning (no fanotify marks)
 files its own row once and the capture continues with ordinary
 discovery only.
+
+`learned_never_scanned` is a saturating u64 count beside them, always
+present on the profile lane: staged learned files the plan never
+adopted (no table proof by capture end). Each counted file carries a
+terminal discovery record with its `first_loaded_by.pre_attach_loads`
+count (at least one load per staged file) and, with a scope start, a
+`learned_never_scanned` unobserved window over the conservative
+`[scope_start_ns, capture_end_ns]` outer bounds. A nonzero count
+raises the same-named `learned_never_scanned` observation cause and
+forces `PARTIAL`; the windows never estimate missed calls.
 
 `deep_scan_selection` is present if and only if the initial discovery
 pass ran over the deep-scan cap (`--max-scan-pids`, default 1024);

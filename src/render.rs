@@ -1135,6 +1135,14 @@ pub enum UnobservedReason {
     /// `coverage_retired_slots` count names how many live slots went
     /// down; the window itself never estimates missed calls.
     CoverageRetired,
+    /// A learned provider file with observed loads was never scanned:
+    /// `[scope_start_ns, capture_end_ns]` outer bounds. Loads were
+    /// seen (the record's `first_loaded_by.pre_attach_loads`), but no
+    /// table proof ever completed, so calls through it were not
+    /// observed. The paired `learned_never_scanned` count names how
+    /// many files ended this way; the window itself never estimates
+    /// missed calls.
+    LearnedNeverScanned,
 }
 
 /// One explicitly unobserved interval on a discovery module record. Key
@@ -1609,6 +1617,12 @@ pub struct Evidence {
     /// Learned candidates refused by the per-capture file cap.
     #[serde(skip)]
     pub learned_cap_skipped: u64,
+    /// Staged learned files the plan never adopted (no table proof
+    /// by capture end): each gets a terminal record with its load
+    /// count and, with a scope start, a `learned_never_scanned`
+    /// window. Staging observed at least one load per file.
+    #[serde(skip)]
+    pub learned_never_scanned: u64,
     /// 6.14 Option B extensive-mode split of the novel unmatched-exit
     /// subpopulation, `None` unless armed. Manually serialized beside
     /// the gap counts; never part of shares or verdicts.
@@ -2765,6 +2779,7 @@ impl Evidence {
         cause(o, "pause_partial", self.pause_partial > 0);
         cause(o, "pause_unavailable", self.pause_unavailable > 0);
         cause(o, "loader_discovery", !self.loader_discovery.complete());
+        cause(o, "learned_never_scanned", self.learned_never_scanned > 0);
         cause(
             o,
             "scheduling.terminal_drain_truncated",
@@ -5871,6 +5886,10 @@ pub(crate) fn versioned_evidence(ev: &Evidence) -> serde_json::Value {
     );
     object.insert("learned_event_loss".into(), ev.learned_event_loss.into());
     object.insert("learned_cap_skipped".into(), ev.learned_cap_skipped.into());
+    object.insert(
+        "learned_never_scanned".into(),
+        ev.learned_never_scanned.into(),
+    );
     // 6.14 Option B: present if and only if extensive mode armed. The
     // label and scope ride every publication (Row C); the counts never
     // feed shares, verdicts, or completeness.
@@ -7510,6 +7529,7 @@ pub(crate) mod tests {
             learned_staged_files: 0,
             learned_event_loss: 0,
             learned_cap_skipped: 0,
+            learned_never_scanned: 0,
             gap_exe_hints: None,
             target_exec_hints: None,
             instance_reload_not_excluded: None,
@@ -9286,6 +9306,44 @@ pub(crate) mod tests {
         ev.verdict();
         assert_eq!(ev.gap_classes.semantics.status, "not_applicable");
         assert_eq!(ev.verdict_detail, VERDICT_ATTRIBUTION_ONLY);
+    }
+
+    /// The new window reason serializes under its schema name.
+    #[test]
+    fn learned_never_scanned_reason_serializes_snake_case() {
+        assert_eq!(
+            serde_json::to_value(UnobservedReason::LearnedNeverScanned).unwrap(),
+            serde_json::json!("learned_never_scanned")
+        );
+    }
+
+    /// A nonzero `learned_never_scanned` count raises its observation
+    /// cause and forces PARTIAL: staged files with observed loads but
+    /// no table proof are a named window gap, never silence.
+    #[test]
+    fn learned_never_scanned_count_raises_its_gap_cause() {
+        let mut ev = evidence();
+        ev.learned_never_scanned = 2;
+        ev.verdict();
+        assert_eq!(ev.completeness, "PARTIAL");
+        assert!(
+            ev.gap_classes
+                .observation
+                .causes
+                .contains(&"learned_never_scanned"),
+            "causes: {:?}",
+            ev.gap_classes.observation.causes
+        );
+        let mut clean = evidence();
+        clean.verdict();
+        assert!(
+            !clean
+                .gap_classes
+                .observation
+                .causes
+                .contains(&"learned_never_scanned"),
+            "zero count raises no cause"
+        );
     }
 
     /// DR-K8S-1/2: an observer outside the initial PID namespace cannot

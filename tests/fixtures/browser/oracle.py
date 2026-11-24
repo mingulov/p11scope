@@ -755,9 +755,11 @@ def check_bundled_coverage_or_named_gap(report: dict[str, Any], module_sha: str,
     Passes when the discovery entry for ``module_path`` shows an
     attached scan (tables observed) and the module's function rows
     counted calls. Otherwise the miss must be disclosed, not silent:
-    a ``gap_cause`` observation cause must name the window and the
-    discovery entry must carry its observed-load count. A prearmed
-    but never attached file with no window and no cause fails.
+    a ``gap_cause`` observation cause must name the window, the
+    discovery entry must carry its observed-load count, and the entry
+    must carry the ``gap_cause`` unobserved window itself (a valid
+    ``[start_ns, end_ns)`` interval). A prearmed but never attached
+    file with no window and no cause fails.
     """
     failures = []
     entry = None
@@ -784,6 +786,17 @@ def check_bundled_coverage_or_named_gap(report: dict[str, Any], module_sha: str,
     if type(loads) is not int or loads < 1:
         failures.append(f"{label}: {gap_cause!r} names the miss but the discovery "
                         f"entry carries pre_attach_loads={loads!r} (gap has no counts)")
+    windows = (entry or {}).get("unobserved_windows") or []
+    shaped = [window for window in windows
+              if isinstance(window, dict)
+              and window.get("reason") == gap_cause
+              and type(window.get("start_ns")) is int
+              and type(window.get("end_ns")) is int
+              and window["start_ns"] < window["end_ns"]]
+    if not shaped:
+        failures.append(f"{label}: {gap_cause!r} names the miss but the discovery "
+                        f"entry carries no {gap_cause!r} window "
+                        f"(unobserved_windows={windows!r})")
     return failures
 
 

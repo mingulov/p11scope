@@ -1386,6 +1386,8 @@ class SchemaOracleAgreement(unittest.TestCase):
             | set(CHECKER["RUN_TREE_REASONS"])
             | set(CHECKER["LEARNED_SKIP_REASONS"])
             | set(CHECKER["COVERAGE_RETIRED_REASONS"])
+            | set(CHECKER["PAUSE_ARM_FAILED_REASONS"])
+            | set(CHECKER["MEMBER_STOP_UNAVAILABLE_REASONS"])
             | set(CHECKER["HANDOFF_REASONS"]),
         )
 
@@ -1403,6 +1405,89 @@ class SchemaOracleAgreement(unittest.TestCase):
         CHECKER["settle_fixture_verdict"](document)
         CHECKER["discovery_skips"](evidence)
         CHECKER["exact_profile_v3_selection"](document)
+
+    def test_pause_and_member_stop_vocabulary_matches_producer(self):
+        """The oracle's pause/member-stop vocabulary is exactly what
+        `src/render.rs` emits: transcription drift between the producer
+        consts and this checker fails closed here."""
+        render_rs = (ROOT / "src" / "render.rs").read_text(encoding="utf-8")
+        consts = {}
+        for name in (
+            "PAUSE_SKIP_SUBJECT",
+            "PAUSE_ARM_FAILED_REASON",
+            "MEMBER_STOP_SKIP_SUBJECT",
+            "MEMBER_STOP_UNAVAILABLE_REASON",
+        ):
+            match = re.search(
+                r"pub\(crate\) const " + name + r': &str =((?:\s*"[^"]*")+);',
+                render_rs,
+                re.DOTALL,
+            )
+            self.assertIsNotNone(match, f"{name} not found in src/render.rs")
+            consts[name] = "".join(re.findall(r'"([^"]*)"', match.group(1)))
+        self.assertEqual(consts["PAUSE_SKIP_SUBJECT"], CHECKER["PAUSE_SKIP_SUBJECT"])
+        self.assertEqual(
+            consts["MEMBER_STOP_SKIP_SUBJECT"], CHECKER["MEMBER_STOP_SKIP_SUBJECT"]
+        )
+        self.assertEqual(
+            consts["PAUSE_ARM_FAILED_REASON"], CHECKER["PAUSE_ARM_FAILED_REASON"]
+        )
+        self.assertEqual(
+            consts["MEMBER_STOP_UNAVAILABLE_REASON"],
+            CHECKER["MEMBER_STOP_UNAVAILABLE_REASON"],
+        )
+
+    def test_pause_and_member_stop_skips_validate_by_subject(self):
+        """The new gap rows validate under their own subjects only."""
+        evidence = {
+            "skipped": [
+                {
+                    "name": CHECKER["PAUSE_SKIP_SUBJECT"],
+                    "reason": CHECKER["PAUSE_ARM_FAILED_REASON"],
+                },
+                {
+                    "name": CHECKER["MEMBER_STOP_SKIP_SUBJECT"],
+                    "reason": CHECKER["MEMBER_STOP_UNAVAILABLE_REASON"],
+                },
+            ]
+        }
+        CHECKER["discovery_skips"](evidence)
+        CHECKER["rejected"](
+            lambda: CHECKER["discovery_skips"](
+                {
+                    "skipped": [
+                        {
+                            "name": CHECKER["PAUSE_SKIP_SUBJECT"],
+                            "reason": CHECKER["MEMBER_STOP_UNAVAILABLE_REASON"],
+                        }
+                    ]
+                }
+            )
+        )
+        CHECKER["rejected"](
+            lambda: CHECKER["discovery_skips"](
+                {
+                    "skipped": [
+                        {
+                            "name": CHECKER["MEMBER_STOP_SKIP_SUBJECT"],
+                            "reason": CHECKER["PAUSE_ARM_FAILED_REASON"],
+                        }
+                    ]
+                }
+            )
+        )
+        CHECKER["rejected"](
+            lambda: CHECKER["discovery_skips"](
+                {
+                    "skipped": [
+                        {
+                            "name": CHECKER["PAUSE_SKIP_SUBJECT"],
+                            "reason": "the pause arm failed: bpf map error",
+                        }
+                    ]
+                }
+            )
+        )
 
     def test_handoff_vocabulary_matches_producer(self):
         """The oracle's handoff vocabulary is exactly what `src/run.rs`

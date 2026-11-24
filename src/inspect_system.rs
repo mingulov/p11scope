@@ -1084,7 +1084,7 @@ fn scan_pinned_member_inner(
         return member_not_scanned(
             pid,
             view,
-            "the process generation changed before inspect",
+            "the process generation could not be revalidated before inspect",
             noise,
             gaps,
         );
@@ -1116,7 +1116,7 @@ fn scan_pinned_member_inner(
         return member_not_scanned(
             pid,
             view,
-            "the process generation changed while inspect was scanning",
+            "the process generation could not be revalidated while inspect was scanning",
             noise,
             gaps,
         );
@@ -1149,7 +1149,7 @@ fn scan_pinned_member_inner(
         return member_not_scanned(
             pid,
             view,
-            "the process generation changed while inspect was pinning",
+            "the process generation could not be revalidated while inspect was pinning",
             noise,
             gaps,
         );
@@ -9479,6 +9479,10 @@ int main(int argc, char **argv) {
         #[test]
         fn member_scan_generation_wording_never_claims_a_change() {
             let source = include_str!("inspect_system.rs");
+            let source = source
+                .split_once("mod tests {")
+                .map(|(production, _)| production)
+                .unwrap();
             for current in [
                 "the process generation could not be revalidated before inspect",
                 "the process generation could not be revalidated while inspect was scanning",

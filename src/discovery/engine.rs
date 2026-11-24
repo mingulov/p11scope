@@ -10714,9 +10714,9 @@ const STALE_EXPORT_LOWERING_BEFORE: &str =
 const STALE_EXPORT_LOWERING_DURING: &str =
     "process generation could not be revalidated during export lowering";
 const UNSTABLE_TABLE_VALIDATION_REASON: &str =
-    "a published table moved or the process generation could not be revalidated during validation";
+    "a published table's stability could not be revalidated during validation";
 const BROAD_UNSTABLE_TABLE_REASON: &str =
-    "the mappings moved or the generation could not be revalidated during validation";
+    "pool table stability could not be revalidated during validation";
 const LOADER_ATTACH_INVARIANT_AROUND_RECHECK: &str =
     "dynamic loader attachment invariant failed around a failed generation recheck";
 /// The loss mark a loader-attachment generation check files for a live
@@ -12218,8 +12218,9 @@ enum ExactReadRefusal {
     Unreadable,
     /// The bytes at the address are not a function table.
     Undecodable,
-    /// The mappings moved, or the generation could not be revalidated,
-    /// under the read.
+    /// Table stability could not be revalidated under the read: the
+    /// mappings moved, the generation stopped matching, or a maps or
+    /// memory read the bracket needed failed.
     Unstable,
     /// A decode budget ceiling stopped the validation.
     Budget,

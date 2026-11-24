@@ -615,15 +615,17 @@ fn scan_and_pin_retained_with<C, S, P>(
     pin: impl FnOnce(&mut C, &S) -> Result<P, String>,
 ) -> Result<(S, P), String> {
     if !still_the_same(context) {
-        return Err("process generation changed before inspect".into());
+        return Err("process generation could not be revalidated before inspect".into());
     }
     let scanned = scan(context)?;
     if !still_the_same(context) {
-        return Err("process generation changed while inspect was scanning".into());
+        return Err(
+            "process generation could not be revalidated while inspect was scanning".into(),
+        );
     }
     let pinned = pin(context, &scanned)?;
     if !still_the_same(context) {
-        return Err("process generation changed while inspect was pinning".into());
+        return Err("process generation could not be revalidated while inspect was pinning".into());
     }
     Ok((scanned, pinned))
 }
@@ -1248,6 +1250,10 @@ mod tests {
     #[test]
     fn retained_bracket_wording_never_claims_a_change() {
         let source = include_str!("inspect.rs");
+        let source = source
+            .split_once("mod tests {")
+            .map(|(production, _)| production)
+            .unwrap();
         for current in [
             "process generation could not be revalidated before inspect",
             "process generation could not be revalidated while inspect was scanning",

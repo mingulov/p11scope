@@ -1861,7 +1861,7 @@ pub(crate) fn finish_confirmation<Io: ConfirmIo>(
             io,
             pid,
             AttributionLoss::GenerationChanged,
-            "the process generation changed during the confirmation read".into(),
+            "the process generation could not be revalidated during the confirmation read".into(),
         );
     }
     match after {

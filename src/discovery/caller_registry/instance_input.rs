@@ -2542,27 +2542,6 @@ impl CallerRegistry {
         std::mem::take(&mut self.joint_reseed_queue)
     }
 
-    /// Pop one queued reseed image (O(1)).
-    pub(crate) fn pop_joint_reseed_queue(&mut self) -> Option<p11scope_ebpf_common::ImageIdentity> {
-        let popped = self.joint_reseed_queue.pop();
-        if let Some(image) = &popped {
-            Self::reseed_queued_dec(
-                &mut self.joint_reseed_queued,
-                (image.task_cookie, image.exec_id),
-            );
-        }
-        popped
-    }
-
-    /// Push one unfinished reseed image back (O(1)).
-    pub(crate) fn push_joint_reseed_queue(&mut self, image: p11scope_ebpf_common::ImageIdentity) {
-        Self::reseed_queued_inc(
-            &mut self.joint_reseed_queued,
-            (image.task_cookie, image.exec_id),
-        );
-        self.joint_reseed_queue.push(image);
-    }
-
     /// Count one queued reseed image.
     fn reseed_queued_inc(
         index: &mut std::collections::HashMap<(u64, u64), usize>,
@@ -2582,11 +2561,6 @@ impl CallerRegistry {
                 index.remove(&slot);
             }
         }
-    }
-
-    /// Whether reseed images remain queued.
-    pub(crate) fn joint_reseed_queue_is_empty(&self) -> bool {
-        self.joint_reseed_queue.is_empty()
     }
 
     /// Queue reseed images for live Joint feeds. The machine calls

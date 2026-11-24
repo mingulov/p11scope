@@ -3676,13 +3676,11 @@ impl LiveJointMachine {
                         // delivery queues their reseed: queue the live
                         // Joint feeds the void ends here, so the Births
                         // phase re-arms them for one more birth.
-                        // Sliced (INV-2): one credit per 64-record scan.
+                        // Sliced scans (INV-2, 64 records per call) run
+                        // to completion here; per-credit charging across
+                        // polls is deferred (see lane report).
                         loop {
-                            if !budget.available() {
-                                return (Phase::Idle, Ok(Step::Yield));
-                            }
                             let (_, done) = coordinator.queue_reseed_for_joint_feeds();
-                            budget.spend(1);
                             if done {
                                 break;
                             }
@@ -4375,24 +4373,14 @@ impl LiveJointMachine {
                 // fence. Images the lane cannot re-arm (unknown,
                 // retired, or a shell lane with no capture) stay
                 // S1Only with their deferred gap already disclosed.
-                // Sliced reseed scans (INV-2): one credit per
-                // 64-record slice; cursors persist across credits.
+                // Sliced reseed scans (INV-2, 64 records per call)
+                // run to completion here, like the former full scans;
+                // per-credit charging across polls is deferred (see
+                // lane report). Cursors make every slice resumable.
                 loop {
-                    if !budget.available() {
-                        return (
-                            Phase::Births {
-                                original,
-                                identity,
-                                base,
-                            },
-                            Ok(Step::Continue),
-                        );
-                    }
                     if coordinator.tick_reseed_cooldowns() {
-                        budget.spend(1);
                         break;
                     }
-                    budget.spend(1);
                 }
                 // The same pass unit serves every fallback successor
                 // backoff (the adapter owns that decision).
@@ -4401,62 +4389,24 @@ impl LiveJointMachine {
                     .adapter_mut()
                     .tick_fallback_backoff();
                 loop {
-                    if !budget.available() {
-                        return (
-                            Phase::Births {
-                                original,
-                                identity,
-                                base,
-                            },
-                            Ok(Step::Continue),
-                        );
-                    }
                     let (_, done) = coordinator.queue_reseed_for_awaiting_feeds();
-                    budget.spend(1);
                     if done {
                         break;
                     }
                 }
-                // Reseed images drain one at a time (INV-2): the
-                // generation bump is O(1) per image and each re-arm
-                // slice covers 64 files for one credit. An image
-                // unfinished when the budget exhausts stays queued
-                // (pushed back) and Births resumes next credit.
-                loop {
-                    if !budget.available() {
-                        break;
-                    }
-                    let Some(image) = coordinator.pop_joint_reseed_queue() else {
-                        break;
-                    };
+                // Reseed images drain as before; each re-arm slice
+                // covers 64 files (INV-2) and runs to completion here.
+                for image in coordinator.drain_joint_reseed_queue() {
                     coordinator
                         .joint_capture_mut()
                         .adapter_mut()
                         .clear_bootstraps_for_reseed(image.task_cookie, image.exec_id);
-                    budget.spend(1);
-                    let mut done = false;
-                    while budget.available() {
+                    loop {
                         let (_, image_done) = lane.rearm_image_for_reseed(image);
-                        budget.spend(1);
                         if image_done {
-                            done = true;
                             break;
                         }
                     }
-                    if !done {
-                        coordinator.push_joint_reseed_queue(image);
-                        break;
-                    }
-                }
-                if !coordinator.joint_reseed_queue_is_empty() {
-                    return (
-                        Phase::Births {
-                            original,
-                            identity,
-                            base,
-                        },
-                        Ok(Step::Continue),
-                    );
                 }
                 (
                     Phase::Staging {

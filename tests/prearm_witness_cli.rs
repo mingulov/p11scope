@@ -1718,6 +1718,48 @@ fn fresh_staging_line_names_the_exact_file_and_shape() {
     ));
 }
 
+/// The requested basename inside the free-text loader field is foreign
+/// evidence: only the display field names the staged file. A line
+/// staging `/tmp/other.so` whose loader text carries the requested
+/// basename must never release the workload.
+#[test]
+fn fresh_staging_line_rejects_loader_field_injection() {
+    let file_name = "libprivatemnt-123-p28.so";
+    assert!(!is_fresh_staging_line_for(
+        "p11scope: learned provider /tmp/other.so (first loaded by /tmp/cell/libprivatemnt-123-p28.so (first loaded by /tmp/x): 1 earlier loads missed; attached for later runs\n",
+        file_name,
+    ));
+}
+
+/// Only the exact staging shape for the exact display basename gates
+/// the workload: leading space, trailing junk, a loader segment
+/// without its "<loader>): <loads>" shape, or the basename without
+/// its slash boundary never match.
+#[test]
+fn fresh_staging_line_rejects_malformed_staging_lines() {
+    let file_name = "libprivatemnt-123-p28.so";
+    // Leading space before the diagnostics tag.
+    assert!(!is_fresh_staging_line_for(
+        "  p11scope: learned provider /tmp/cell/mnt/libprivatemnt-123-p28.so (first loaded by /tmp/cell/p28-mnt-holder): 1 earlier loads missed; attached for later runs\n",
+        file_name,
+    ));
+    // Trailing junk past the exact shape.
+    assert!(!is_fresh_staging_line_for(
+        "p11scope: learned provider /tmp/cell/mnt/libprivatemnt-123-p28.so (first loaded by /tmp/cell/p28-mnt-holder): 1 earlier loads missed; attached for later runs; retried\n",
+        file_name,
+    ));
+    // Loader segment without the "<loader>): <loads>" shape.
+    assert!(!is_fresh_staging_line_for(
+        "p11scope: learned provider /tmp/cell/mnt/libprivatemnt-123-p28.so (first loaded by 1 earlier loads missed; attached for later runs\n",
+        file_name,
+    ));
+    // Basename as a suffix without its slash boundary.
+    assert!(!is_fresh_staging_line_for(
+        "p11scope: learned provider /tmp/cell/mnt/prefixlibprivatemnt-123-p28.so (first loaded by /tmp/cell/p28-mnt-holder): 1 earlier loads missed; attached for later runs\n",
+        file_name,
+    ));
+}
+
 /// Whether the profile carries the learned first-use gap as a
 /// structured skip row for the exact subject and reason: only an
 /// `evidence.skipped[]` entry with render's `SkippedOut` name/reason
@@ -1828,6 +1870,143 @@ fn workload_ledger_validator_requires_the_known_shape() {
     let mut extra = good.clone();
     extra.insert("C_Extra".to_string(), 1);
     assert!(!validate_workload_ledger(&extra));
+}
+
+/// The C fixture attempts one `C_GetSlotList` per iteration
+/// unconditionally, plus one more per iteration that lists a
+/// non-empty slot set — so the count is always within
+/// `ITERS..=2 * ITERS`. Zero slot-list attempts on a successful run
+/// are impossible and never validate.
+#[test]
+fn workload_ledger_validator_rejects_impossible_slot_list_counts() {
+    fn ledger(pairs: &[(&str, u64)]) -> BTreeMap<String, u64> {
+        pairs
+            .iter()
+            .map(|(name, count)| ((*name).to_string(), *count))
+            .collect()
+    }
+    let good = ledger(&[
+        ("C_Initialize", 1),
+        ("C_Finalize", 1),
+        ("C_GetInfo", u64::from(ITERS)),
+        ("C_GetSlotList", 2 * u64::from(ITERS)),
+        ("C_GetSlotInfo", u64::from(ITERS)),
+        ("C_GetTokenInfo", u64::from(ITERS)),
+        ("C_GetMechanismList", 2 * u64::from(ITERS)),
+        ("C_GetMechanismInfo", u64::from(ITERS)),
+    ]);
+    assert!(validate_workload_ledger(&good));
+    // Zero slot-list attempts are impossible on a successful run.
+    let mut silent_slots = good.clone();
+    silent_slots.insert("C_GetSlotList".to_string(), 0);
+    silent_slots.insert("C_GetSlotInfo".to_string(), 0);
+    silent_slots.insert("C_GetTokenInfo".to_string(), 0);
+    silent_slots.insert("C_GetMechanismList".to_string(), 0);
+    silent_slots.insert("C_GetMechanismInfo".to_string(), 0);
+    assert!(
+        !validate_workload_ledger(&silent_slots),
+        "zero slot-list attempts cannot come from this fixture"
+    );
+    // Below the unconditional floor, and above the two-per-iteration cap.
+    for bad in [u64::from(ITERS) - 1, 2 * u64::from(ITERS) + 1] {
+        let mut out_of_range = good.clone();
+        out_of_range.insert("C_GetSlotList".to_string(), bad);
+        assert!(
+            !validate_workload_ledger(&out_of_range),
+            "C_GetSlotList = {bad} is outside ITERS..=2*ITERS"
+        );
+    }
+}
+
+/// The C loop dictates the slot/mechanism relationships: slot info and
+/// token info run once per listed slot, the mechanism list runs once
+/// per slot plus once per slot with mechanisms, and mechanism info
+/// runs at most once per slot. Ledgers breaking these shapes never
+/// validate.
+#[test]
+fn workload_ledger_validator_requires_slot_mechanism_relationships() {
+    fn ledger(pairs: &[(&str, u64)]) -> BTreeMap<String, u64> {
+        pairs
+            .iter()
+            .map(|(name, count)| ((*name).to_string(), *count))
+            .collect()
+    }
+    let good = ledger(&[
+        ("C_Initialize", 1),
+        ("C_Finalize", 1),
+        ("C_GetInfo", u64::from(ITERS)),
+        ("C_GetSlotList", 2 * u64::from(ITERS)),
+        ("C_GetSlotInfo", u64::from(ITERS)),
+        ("C_GetTokenInfo", u64::from(ITERS)),
+        ("C_GetMechanismList", 2 * u64::from(ITERS)),
+        ("C_GetMechanismInfo", u64::from(ITERS)),
+    ]);
+    assert!(validate_workload_ledger(&good));
+    // Slot info and token info share one loop over the listed slots.
+    let mut split_slots = good.clone();
+    split_slots.insert("C_GetTokenInfo".to_string(), u64::from(ITERS) - 1);
+    assert!(!validate_workload_ledger(&split_slots));
+    // The mechanism list is one per slot plus one per slot with mechanisms.
+    let mut drifted_mech_list = good.clone();
+    drifted_mech_list.insert("C_GetMechanismList".to_string(), 2 * u64::from(ITERS) + 1);
+    assert!(!validate_workload_ledger(&drifted_mech_list));
+    // Mechanism info runs at most once per listed slot.
+    let mut extra_mech_info = good.clone();
+    extra_mech_info.insert("C_GetMechanismInfo".to_string(), u64::from(ITERS) + 1);
+    assert!(!validate_workload_ledger(&extra_mech_info));
+    // Listed slots without the second slot-list query are impossible:
+    // every iteration that lists slots issues both queries.
+    let mut slots_without_query = good.clone();
+    slots_without_query.insert("C_GetSlotList".to_string(), u64::from(ITERS));
+    assert!(!validate_workload_ledger(&slots_without_query));
+    // Fewer listed slots than iterations with slots: every such
+    // iteration lists at least one slot.
+    let mut thin_slots = good.clone();
+    thin_slots.insert("C_GetSlotInfo".to_string(), u64::from(ITERS) - 1);
+    thin_slots.insert("C_GetTokenInfo".to_string(), u64::from(ITERS) - 1);
+    thin_slots.insert("C_GetMechanismList".to_string(), 2 * (u64::from(ITERS) - 1));
+    thin_slots.insert("C_GetMechanismInfo".to_string(), u64::from(ITERS) - 1);
+    assert!(!validate_workload_ledger(&thin_slots));
+    // More listed slots than the per-iteration 64-slot cap allows.
+    let mut over_cap_slots = good.clone();
+    over_cap_slots.insert("C_GetSlotList".to_string(), u64::from(ITERS) + 1);
+    over_cap_slots.insert("C_GetSlotInfo".to_string(), 65);
+    over_cap_slots.insert("C_GetTokenInfo".to_string(), 65);
+    over_cap_slots.insert("C_GetMechanismList".to_string(), 65);
+    over_cap_slots.insert("C_GetMechanismInfo".to_string(), 0);
+    assert!(!validate_workload_ledger(&over_cap_slots));
+    // Mechanism info for more slots than were listed, with a
+    // consistent mechanism-list total: info still runs at most once
+    // per listed slot.
+    let mut over_mech_info = good.clone();
+    over_mech_info.insert("C_GetMechanismInfo".to_string(), u64::from(ITERS) + 1);
+    over_mech_info.insert("C_GetMechanismList".to_string(), 2 * u64::from(ITERS) + 1);
+    assert!(!validate_workload_ledger(&over_mech_info));
+}
+
+/// A cold Finalize (the workload never finished) never validates.
+#[test]
+fn workload_ledger_validator_requires_hot_finalize() {
+    fn ledger(pairs: &[(&str, u64)]) -> BTreeMap<String, u64> {
+        pairs
+            .iter()
+            .map(|(name, count)| ((*name).to_string(), *count))
+            .collect()
+    }
+    let good = ledger(&[
+        ("C_Initialize", 1),
+        ("C_Finalize", 1),
+        ("C_GetInfo", u64::from(ITERS)),
+        ("C_GetSlotList", 2 * u64::from(ITERS)),
+        ("C_GetSlotInfo", u64::from(ITERS)),
+        ("C_GetTokenInfo", u64::from(ITERS)),
+        ("C_GetMechanismList", 2 * u64::from(ITERS)),
+        ("C_GetMechanismInfo", u64::from(ITERS)),
+    ]);
+    assert!(validate_workload_ledger(&good));
+    let mut cold = good.clone();
+    cold.insert("C_Finalize".to_string(), 0);
+    assert!(!validate_workload_ledger(&cold));
 }
 
 /// Whether the exact module record names the private-mount holder as

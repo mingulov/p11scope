@@ -465,9 +465,8 @@ impl JointCaptureOwner {
         if !self.adapter.scoped_break_pending() {
             return Ok(false);
         }
-        let bytes =
-            super::joint_audit::raw_disposition_storage_bound(&self.adapter, &self.model)
-                .ok_or(RawQuantumRefusal::Capacity)?;
+        let bytes = super::joint_audit::raw_disposition_storage_bound(&self.adapter, &self.model)
+            .ok_or(RawQuantumRefusal::Capacity)?;
         let lease = self
             .adapter
             .ledger

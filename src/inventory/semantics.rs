@@ -2004,6 +2004,8 @@ pub(crate) fn joint_decoder_line(raw_malformed: Option<u64>) -> String {
              raw_malformed_unprovable=1"
             .to_string(),
     }
+}
+
 /// One stderr line for the diagnostic seal-bootstrap summary:
 /// which bootstrap check refused a seal, by arm, plus retained
 /// takes that succeeded across same-instance drift and

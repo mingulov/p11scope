@@ -4201,9 +4201,7 @@ fn key_ops_verbose_size_conflict_without_type_names_no_established_side() {
         .find(|line| line.contains("key row"))
         .expect("one row line");
     assert!(
-        line.contains(
-            "size conflicting (EC P-256 (from signature length))"
-        ),
+        line.contains("size conflicting (EC P-256 (from signature length))"),
         "the typeless conflict names no established side:\n{snapshot}"
     );
     assert!(

@@ -3651,9 +3651,7 @@ impl LiveJointMachine {
                 // twin and the long-bucket twin.
                 let scoped = matches!(
                     coordinator.joint_capture_mut().take_last_void_scope(),
-                    Some(
-                        crate::semantics_objects::journal::joint_driver::JointVoidScope::Scoped
-                    )
+                    Some(crate::semantics_objects::journal::joint_driver::JointVoidScope::Scoped)
                 );
                 if scoped {
                     coordinator.note_scope_gap(

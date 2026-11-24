@@ -170,6 +170,115 @@ def check_absent(counts: dict[str, int], names: tuple[str, ...],
     return failures
 
 
+def check_function_rows_typed(report: dict[str, Any]) -> list[str]:
+    """Every functions[] row carries typed counts and name lists.
+
+    The counters read ``calls``/``in_flight`` with ``or 0``: a JSON
+    boolean or float would silently count (``True`` is ``1``), and a
+    string ``names`` would bucket per character. Each row must be an
+    object whose ``calls``/``in_flight`` are missing, null, or u64
+    (booleans are not counters), whose ``names`` is missing, null, or
+    a list of strings (missing or empty still buckets under
+    ``"unknown"``), and whose ``target``/``object`` navigation is
+    missing, null, or an object. A malformed row fails: floors over
+    untyped rows could pass on a boolean.
+    """
+    failures = []
+    functions = report.get("functions")
+    if functions is None:
+        return []
+    if not isinstance(functions, list):
+        return ["functions section is not a list"]
+    for index, row in enumerate(functions):
+        if not isinstance(row, dict):
+            failures.append(f"functions[{index}] is not an object")
+            continue
+        target = row.get("target")
+        if target is not None and not isinstance(target, dict):
+            failures.append(f"functions[{index}].target is not an object")
+            continue
+        obj = (target or {}).get("object")
+        if obj is not None and not isinstance(obj, dict):
+            failures.append(f"functions[{index}].target.object is not an object")
+            continue
+        for key in ("calls", "in_flight"):
+            value = row.get(key)
+            if value is not None and not _u64(value):
+                failures.append(
+                    f"functions[{index}].{key}={value!r}: want a u64 counter")
+        names = row.get("names")
+        if names is not None and (
+                not isinstance(names, list)
+                or not all(isinstance(name, str) for name in names)):
+            failures.append(
+                f"functions[{index}].names={names!r}: want a list of strings")
+    return failures
+
+
+def check_exact_counts(counts: dict[str, int],
+                       expected: dict[str, int]) -> list[str]:
+    """Named functions were observed exactly their expected counts.
+
+    Floors allow silent overcounts (duplicate records); exactness ties
+    each completed count to independent ground truth (one sign pair per
+    TLS handshake). Missing names read as zero.
+    """
+    failures = []
+    for name, want in expected.items():
+        observed = counts.get(name, 0)
+        if observed != want:
+            failures.append(f"{name}: observed {observed}, want exactly {want}")
+    return failures
+
+
+def check_zero_open_entries(opened: dict[str, int],
+                            names: tuple[str, ...]) -> list[str]:
+    """Named functions have no entered-but-unreturned calls at end.
+
+    Completed counts alone cannot see a surplus call still in flight;
+    the pair (completed exact, in-flight zero) closes it.
+    """
+    failures = []
+    for name in names:
+        entered = opened.get(name, 0)
+        if entered != 0:
+            failures.append(
+                f"{name}: {entered} entered but unreturned "
+                f"(in-flight at end)")
+    return failures
+
+
+def check_no_cross_function_alias(report: dict[str, Any], module_shas,
+                                  pairs: tuple[tuple[str, str], ...]) -> list[str]:
+    """No single row claims both names of an asserted pair.
+
+    The counters add a row's calls to every name it lists, so one
+    aliased row could satisfy two floors with a single call. Distinct
+    PKCS#11 functions never share a slot address in a real report, so
+    a row naming both halves of a pair is malformed: the pair must
+    come from distinct rows. Only rows attributed to ``module_shas``
+    are judged.
+    """
+    failures = []
+    shas = set(module_shas)
+    for row in report.get("functions") or []:
+        if not isinstance(row, dict):
+            continue
+        target = row.get("target") or {}
+        obj = target.get("object") or {} if isinstance(target, dict) else {}
+        if not isinstance(obj, dict) or obj.get("sha256") not in shas:
+            continue
+        names = row.get("names") or []
+        if not isinstance(names, list):
+            continue
+        for first, second in pairs:
+            if first in names and second in names:
+                failures.append(
+                    f"row names both {first} and {second}: one aliased row "
+                    f"cannot prove two functions")
+    return failures
+
+
 def check_observation_gaps(report: dict[str, Any], allowed) -> list[str]:
     """Every observation gap cause is explicitly allowed for this cell.
 
@@ -308,10 +417,11 @@ def check_skipped_run_floor(report: dict[str, Any]) -> list[str]:
     run-tree timing classes pass: subjects that exited mid-flight
     (owned short-lived descendants retiring between admission passes)
     and the single learned-first-use record (the pre-attach window the
-    run-sign cells close with a spawn delay; the sign floors below it
-    are lower bounds, so window loss can only undercount, never invent
-    a sign). Any other record — a retire window, a detach gap, another
-    learned-file reason — fails: it could hide the asserted signs.
+    run-sign cells close with a spawn delay and CR-RUN-NODELAY holds
+    with the first-map stop; window loss can only undercount, never
+    invent a sign). Any other record — a retire window, a detach gap,
+    another learned-file reason — fails: it could hide the asserted
+    signs.
     """
     failures = []
     for record in evidence(report).get("skipped") or []:
@@ -427,8 +537,14 @@ def check_s1_mechanisms_absent(report: dict[str, Any]) -> list[str]:
     return failures
 
 
+#: Operation categories the product attributes to a mechanism row
+#: (src/semantics.rs OPERATIONS): the family-sign leg requires "sign".
+SIGN_OPS = frozenset({"sign"})
+
+
 def check_s1_sign_mechanisms(report: dict[str, Any], module_shas,
-                             family_ids, min_calls: int) -> list[str]:
+                             family_ids, min_calls: int,
+                             exact_calls: int | None = None) -> list[str]:
     """Family sign mechanisms attributed to the module reach the floor.
 
     ``module_shas`` is the discovery-resolved identity set of the signing
@@ -439,6 +555,16 @@ def check_s1_sign_mechanisms(report: dict[str, Any], module_shas,
     are unprovable and fail closed, as do a missing section, a non-list
     section, and any malformed entry (the v3 schema always renders
     ``mechanism``/``calls``/``errors`` u64s plus a ``by_module`` list).
+    A family entry that contributes attributed calls must also show
+    signing use in its row-wide ``ops`` (a list containing ``"sign"``):
+    ``ops`` is row-wide while ``by_module`` partitions counts, so this
+    leg is sound only on the narrowed single-provider scan, where the
+    row's operations are the module's. A contributing entry with
+    missing, non-list, or sign-free ``ops`` (an encrypt-only RSA row)
+    fails: the family id alone never proves a sign happened.
+    ``exact_calls`` (None for a floor-only leg) pins the attributed
+    total exactly: duplicate mechanism records then fail instead of
+    passing a floor.
     """
     if "mechanisms" not in report:
         return ["mechanisms section missing: cannot verify sign mechanisms"]
@@ -458,6 +584,7 @@ def check_s1_sign_mechanisms(report: dict[str, Any], module_shas,
             return ["mechanisms section carries a malformed entry"]
         if entry["mechanism"] not in ids:
             continue
+        attributed = 0
         for part in by_module:
             if not isinstance(part, dict):
                 return ["mechanisms section carries a malformed entry"]
@@ -467,7 +594,21 @@ def check_s1_sign_mechanisms(report: dict[str, Any], module_shas,
             if not _u64(part.get("calls")) or not _u64(part.get("errors")):
                 return ["mechanisms section carries a malformed entry"]
             if module.get("sha256") in shas:
-                total += part["calls"]
+                attributed += part["calls"]
+        if attributed > 0:
+            ops = entry.get("ops")
+            if (not isinstance(ops, list)
+                    or not all(isinstance(op, str) for op in ops)
+                    or SIGN_OPS.isdisjoint(ops)):
+                return [f"mechanism 0x{entry['mechanism']:x} attributes "
+                        f"{attributed} family calls without signing use "
+                        f"(ops={ops!r}): cannot verify a sign happened"]
+        total += attributed
+    if exact_calls is not None:
+        if total != exact_calls:
+            return [f"family sign mechanisms attributed to the module: "
+                    f"observed {total}, want exactly {exact_calls}"]
+        return []
     if total < min_calls:
         return [f"family sign mechanisms attributed to the module: "
                 f"observed {total}, want >= {min_calls}"]
@@ -505,6 +646,34 @@ def discovery_module_shas(report: dict[str, Any],
                            f"sha256: cannot attribute its calls"]
         shas.add(digest)
     return shas, []
+
+
+def check_discovery_shas_anchored(shas, known_shas, required_sha,
+                                  basename: str) -> list[str]:
+    """Discovery-resolved shas are files the cell hashed independently.
+
+    ``shas`` is the report's discovery resolution for ``basename``
+    (``discovery_module_shas``); ``known_shas`` the content hashes of
+    the provider files the cell itself located on disk, and
+    ``required_sha`` the observed module's hash among them. A coherent
+    substitution — another digest under a same-basename path, with
+    functions and S1 rows rewritten to match — would otherwise
+    attribute counts to a file the run never mapped. Any resolved sha
+    outside the known set fails, as does a missing observed module;
+    a known file the run never mapped is fine (subset, not equality).
+    """
+    failures = []
+    resolved, known = set(shas), set(known_shas)
+    unknown = resolved - known
+    if unknown:
+        failures.append(
+            f"discovery resolved {basename} shas the cell never hashed "
+            f"on disk: {sorted(unknown)}")
+    if required_sha not in resolved:
+        failures.append(
+            f"observed {basename} module (sha256 {required_sha}) never "
+            f"discovered: cannot attribute its calls")
+    return failures
 
 
 def check_s1_logins_absent(report: dict[str, Any]) -> list[str]:

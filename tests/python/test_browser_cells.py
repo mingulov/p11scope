@@ -125,10 +125,11 @@ _VERDICTS_NEVER_MAPPED = ("concrete_gap",)
 #: signing setup and signing (init and one-shot share the boundary).
 _PINBOUND_ABSENT = ("C_Login", "C_SignInit", "C_Sign")
 
-#: Run-mode attached floor cells (CR-RUN-SIGN), calibrated on sm1
-#: (narrowed softokn scan, spawn delayed past observer startup): the
-#: loader/discovery window causes, the owned tree's short-lived
-#: descendants retiring between admission passes
+#: Run-mode attached floor cells (CR-RUN-SIGN and CR-RUN-NODELAY),
+#: calibrated on sm1 (narrowed softokn scan; spawn delayed past
+#: observer startup in CR-RUN-SIGN, no delay with the first-map stop
+#: in CR-RUN-NODELAY): the loader/discovery window causes, the owned
+#: tree's short-lived descendants retiring between admission passes
 #: (``pid_descendant_gaps``), the SIGKILL-teardown link losses
 #: (``task_uprobe_link_losses``: the supervisor SIGKILLs the whole
 #: browser group at flow completion, so teardown links race), the
@@ -136,14 +137,14 @@ _PINBOUND_ABSENT = ("C_Login", "C_SignInit", "C_Sign")
 #: (``discovery_truncated``), the ``skipped`` cause whose records
 #: the run-floor skipped qualification judges one by one, and the
 #: interface-selection cause (``interface_selection``): a selection
-#: pass runs before the delayed browser maps its provider and
+#: pass runs before the browser maps its provider and
 #: intermittently records it ``absent_uncovered`` (no truncation, no
 #: unmatched tuples — the observed shape twice). Selection decides
 #: which table, never whether calls count: the events lane counts
 #: C_Sign independently, so the cause cannot hide a sign, and the
-#: sign floors below still fail a capture that lost one. Floors are
-#: lower bounds throughout: each cause can only undercount, never
-#: invent the asserted signs. Any other cause fails.
+#: exact counts below still fail a capture that lost one. Each cause
+#: can only undercount, never invent the asserted signs. Any other
+#: cause fails.
 _GAPS_ATTACHED_RUN = frozenset({
     "loader_discovery", "unprotected_live_windows",
     "pid_descendant_gaps", "task_uprobe_link_losses",
@@ -268,7 +269,8 @@ class BrowserCells(unittest.TestCase):
     def check_report(self, result, store, floors=None, zero=False, attached=None,
                      allowed_gaps=(), allowed_verdicts=_VERDICTS_ATTACHED, absent=None,
                      s1=None, qualify_nomod_link_loss=False, module_sha=None,
-                     qualify_run_floor_skipped=False):
+                     qualify_run_floor_skipped=False, exact=None,
+                     exact_opened_zero=(), no_cross_alias=()):
         """Common oracle: schema, identity, counts, loss, gaps, earned verdict.
 
         ``attached`` pins the probe state: True (hooked the mapped module),
@@ -301,8 +303,15 @@ class BrowserCells(unittest.TestCase):
         branch instead: the Joint negative and the session floor stay,
         but the enumeration absence legs give way to the attributed
         family-sign floor (mechanism use is the asserted property
-        here, not a violation). None (the twin default)
-        skips the S1 checks.
+        here, not a violation; an optional ``exact_calls`` pins the
+        attributed family total exactly instead of flooring it).
+        None (the twin default)
+        skips the S1 checks. ``exact`` pins completed counts exactly
+        (``{name: count}`` against independent ground truth, missing
+        names read as zero) beside the floors; ``exact_opened_zero``
+        names functions with no entered-but-unreturned calls at end;
+        ``no_cross_alias`` lists ``(first, second)`` pairs no single
+        row may claim together.
         """
         report = oracle.load_report(result.report_path)
         if module_sha is None:
@@ -311,6 +320,8 @@ class BrowserCells(unittest.TestCase):
             module_sha = {module_sha}
         else:
             module_sha = set(module_sha)
+        failures = []
+        failures += oracle.check_function_rows_typed(report)
         counts: dict = {}
         opened: dict = {}
         for sha in module_sha:
@@ -318,7 +329,6 @@ class BrowserCells(unittest.TestCase):
                 counts[name] = counts.get(name, 0) + calls
             for name, entries in oracle.module_open_entries(report, sha).items():
                 opened[name] = opened.get(name, 0) + entries
-        failures = []
         failures += oracle.check_no_event_loss(report)
         failures += oracle.check_capture_intact(report)
         if qualify_nomod_link_loss:
@@ -342,16 +352,22 @@ class BrowserCells(unittest.TestCase):
             else:
                 family_ids = sign_mechanisms.get("family_ids")
                 min_calls = sign_mechanisms.get("min_calls")
+                exact_calls = sign_mechanisms.get("exact_calls")
                 if (not isinstance(family_ids, (list, tuple, set, frozenset))
                         or not family_ids
                         or not all(type(mid) is int for mid in family_ids)
-                        or type(min_calls) is not int or min_calls < 1):
+                        or type(min_calls) is not int or min_calls < 1
+                        or (exact_calls is not None
+                            and (type(exact_calls) is not int
+                                 or exact_calls < 1))):
                     failures.append(
                         "s1 sign_mechanisms malformed: need "
-                        "{family_ids: non-empty ints, min_calls: >= 1}")
+                        "{family_ids: non-empty ints, min_calls: >= 1, "
+                        "exact_calls: >= 1 or absent}")
                 else:
                     failures += oracle.check_s1_sign_mechanisms(
-                        report, module_sha, family_ids, min_calls)
+                        report, module_sha, family_ids, min_calls,
+                        exact_calls=exact_calls)
             failures += oracle.check_s1_sessions(
                 report, opened_min=s1.get("sessions_opened_min", 0),
                 zero=s1.get("sessions_zero", False))
@@ -359,6 +375,14 @@ class BrowserCells(unittest.TestCase):
             failures += oracle.check_zero_counts(counts, opened)
         else:
             failures += oracle.check_min_counts(counts, floors or {})
+        if exact is not None:
+            failures += oracle.check_exact_counts(counts, exact)
+        if exact_opened_zero:
+            failures += oracle.check_zero_open_entries(
+                opened, tuple(exact_opened_zero))
+        if no_cross_alias:
+            failures += oracle.check_no_cross_function_alias(
+                report, module_sha, tuple(no_cross_alias))
         if attached is True:
             failures += oracle.check_attached(report)
         elif attached is False:
@@ -631,6 +655,7 @@ class BrowserCells(unittest.TestCase):
             self.assertGreaterEqual(
                 flow.handshakes_ok, 1,
                 "client-cert flow never handshook (no TLS sign happened)")
+            handshakes = flow.handshakes_ok
         self.assertEqual(result.flow.get("observer_exit"), 0,
                          f"observer failed: {result.observer_stderr_tail}")
         self.assertTrue(result.flow.get("nss_seeded"),
@@ -648,20 +673,40 @@ class BrowserCells(unittest.TestCase):
             len(shas), 0,
             "softokn never discovered (browser never mapped it, or "
             "discovery missed it)")
+        # Anchor: every resolved sha must be the observed system
+        # softokn file hashed on this host — Chromium links system
+        # NSS, so a coherent substitution (another digest under a
+        # same-basename path, with functions and S1 rewritten to
+        # match) fails here instead of attributing to phantom rows.
+        observed_sha = oracle.sha256_of(softokn)
+        anchor_failures = oracle.check_discovery_shas_anchored(
+            shas, {observed_sha}, observed_sha, _SOFTOKN_BASENAME)
+        if anchor_failures:
+            self.fail("CR-RUN-NODELAY failed:\n"
+                      f"{json.dumps({'failures': anchor_failures}, indent=1)}")
         # PARTIAL/concrete_gap is earned: the run-tree teardown and
         # the map-to-attach window are structural to run mode (see
-        # _GAPS_ATTACHED_RUN); the floors, the family leg, and the TLS
-        # ground truth above carry the proof, and any new gap cause
-        # still fails. No sessions floor: the sign's session may
+        # _GAPS_ATTACHED_RUN); the exact counts, the family leg, and
+        # the TLS ground truth above carry the proof, and any new gap
+        # cause still fails. No sessions floor: the sign's session may
         # legitimately have opened in the tolerated pre-attach window.
+        # Exactness is per-handshake: one client-cert handshake signs
+        # once (one C_SignInit + one C_Sign, two attributed family
+        # mechanism uses for the init and sign legs), nothing in flight
+        # at end, and the pair comes from distinct rows (no single
+        # aliased row may satisfy both).
         self.check_report(
-            result, None, {"C_SignInit": 1, "C_Sign": 1}, attached=True,
+            result, None, None, attached=True,
             allowed_gaps=_GAPS_ATTACHED_RUN,
             allowed_verdicts=("concrete_gap",),
             module_sha=shas,
             qualify_run_floor_skipped=True,
+            exact={"C_SignInit": handshakes, "C_Sign": handshakes},
+            exact_opened_zero=("C_SignInit", "C_Sign"),
+            no_cross_alias=(("C_SignInit", "C_Sign"),),
             s1={"sign_mechanisms": {"family_ids": sorted(_RSA_FAMILY_IDS),
-                                    "min_calls": 1}})
+                                    "min_calls": 1,
+                                    "exact_calls": 2 * handshakes}})
 
     @gate_system("firefox")
     def test_ff_first_with_background_provider_covers_browser(self):
@@ -2858,6 +2903,279 @@ class BrowserS1Oracle(unittest.TestCase):
                         attached=True, module_sha={sha},
                         s1={"sessions_opened_min": 1,
                             "sign_mechanisms": spec})
+
+    def test_nodelay_exact_counts_reject_overcount_and_undercount(self):
+        """Twin: the sign pair is exact per handshake, never a floor."""
+        self.assertEqual(
+            oracle.check_exact_counts(
+                {"C_SignInit": 1, "C_Sign": 1},
+                {"C_SignInit": 1, "C_Sign": 1}),
+            [])
+        for counts in ({"C_SignInit": 2, "C_Sign": 2},
+                       {"C_SignInit": 1, "C_Sign": 2},
+                       {"C_SignInit": 2, "C_Sign": 1},
+                       {"C_SignInit": 1, "C_Sign": 0},
+                       {"C_SignInit": 0, "C_Sign": 0},
+                       {}):
+            with self.subTest(counts=counts):
+                self.assertNotEqual(
+                    oracle.check_exact_counts(
+                        counts, {"C_SignInit": 1, "C_Sign": 1}),
+                    [])
+
+    def test_nodelay_zero_open_entries_rejects_surplus_inflight(self):
+        """Twin: no entered-but-unreturned sign may hide beside exact counts."""
+        self.assertEqual(
+            oracle.check_zero_open_entries(
+                {"C_SignInit": 0, "C_Sign": 0},
+                ("C_SignInit", "C_Sign")),
+            [])
+        self.assertEqual(
+            oracle.check_zero_open_entries(
+                {}, ("C_SignInit", "C_Sign")),
+            [])
+        for opened in ({"C_SignInit": 1, "C_Sign": 0},
+                       {"C_SignInit": 0, "C_Sign": 1},
+                       {"C_SignInit": 1, "C_Sign": 1}):
+            with self.subTest(opened=opened):
+                self.assertNotEqual(
+                    oracle.check_zero_open_entries(
+                        opened, ("C_SignInit", "C_Sign")),
+                    [])
+
+    def test_nodelay_cross_alias_rejected_distinct_rows_accepted(self):
+        """Twin: one aliased row cannot prove the two sign functions."""
+        sha = "ab" * 32
+        report = {"functions": [
+            BrowserCells._twin_row(["C_SignInit", "C_Sign"], 1, sha)]}
+        self.assertNotEqual(
+            oracle.check_no_cross_function_alias(
+                report, {sha}, (("C_SignInit", "C_Sign"),)),
+            [])
+        report = {"functions": [
+            BrowserCells._twin_row(["C_SignInit"], 1, sha),
+            BrowserCells._twin_row(["C_Sign"], 1, sha)]}
+        self.assertEqual(
+            oracle.check_no_cross_function_alias(
+                report, {sha}, (("C_SignInit", "C_Sign"),)),
+            [])
+        # An aliased row on another module is not this cell's evidence.
+        report = {"functions": [
+            BrowserCells._twin_row(["C_SignInit", "C_Sign"], 1, "cd" * 32)]}
+        self.assertEqual(
+            oracle.check_no_cross_function_alias(
+                report, {sha}, (("C_SignInit", "C_Sign"),)),
+            [])
+
+    def test_function_rows_typed_rejects_bools_and_bad_shapes(self):
+        """Twin: untyped counts and names fail before any floor reads them."""
+        sha = "ab" * 32
+        healthy = {"functions": [
+            BrowserCells._twin_row(["C_Sign"], 1, sha),
+            {"names": ["C_Login"], "calls": 0,
+             "target": {"object": {"sha256": sha}}},
+            {"target": {"object": {"sha256": "cd" * 32}}},
+            {"names": [], "calls": None, "in_flight": None,
+             "target": None},
+        ]}
+        self.assertEqual(oracle.check_function_rows_typed(healthy), [])
+        self.assertEqual(oracle.check_function_rows_typed({}), [])
+        self.assertEqual(
+            oracle.check_function_rows_typed({"functions": []}), [])
+        hostile_rows = [
+            {"names": ["C_Sign"], "calls": True,
+             "target": {"object": {"sha256": sha}}},
+            {"names": ["C_Sign"], "calls": 1.5,
+             "target": {"object": {"sha256": sha}}},
+            {"names": ["C_Sign"], "calls": "1",
+             "target": {"object": {"sha256": sha}}},
+            {"names": ["C_Sign"], "calls": 1, "in_flight": True,
+             "target": {"object": {"sha256": sha}}},
+            {"names": "C_Sign", "calls": 1,
+             "target": {"object": {"sha256": sha}}},
+            {"names": ["C_Sign", 42], "calls": 1,
+             "target": {"object": {"sha256": sha}}},
+            {"names": ["C_Sign"], "calls": -1,
+             "target": {"object": {"sha256": sha}}},
+            {"names": ["C_Sign"], "calls": 1, "target": "x"},
+            {"names": ["C_Sign"], "calls": 1,
+             "target": {"object": "x"}},
+            "not-a-row",
+        ]
+        for row in hostile_rows:
+            with self.subTest(row=row):
+                self.assertNotEqual(
+                    oracle.check_function_rows_typed(
+                        {"functions": [row]}),
+                    [])
+        self.assertNotEqual(
+            oracle.check_function_rows_typed({"functions": {}}), [])
+
+    def test_sign_mechanisms_rejects_nonsign_ops(self):
+        """Twin: a contributing family entry must show signing use."""
+        require_sign_wiring(self)
+        sha = "ab" * 32
+        entry = self._sign_mechanism_entry(0x40, sha, 3)
+        self.assertEqual(
+            oracle.check_s1_sign_mechanisms(
+                {"mechanisms": [entry]}, {sha}, _RSA_FAMILY_IDS, 1),
+            [])
+        # Signing among other operations still proves a sign.
+        entry["ops"] = ["encrypt", "sign"]
+        self.assertEqual(
+            oracle.check_s1_sign_mechanisms(
+                {"mechanisms": [entry]}, {sha}, _RSA_FAMILY_IDS, 1),
+            [])
+        for ops in (["encrypt"], [], None, "sign", [42]):
+            with self.subTest(ops=ops):
+                bad = self._sign_mechanism_entry(0x40, sha, 3)
+                if ops is None:
+                    del bad["ops"]
+                else:
+                    bad["ops"] = ops
+                failures = oracle.check_s1_sign_mechanisms(
+                    {"mechanisms": [bad]}, {sha}, _RSA_FAMILY_IDS, 1)
+                self.assertNotEqual(failures, [])
+                self.assertIn("signing use", failures[0])
+        # A non-contributing entry's ops stay unchecked: the floor
+        # below still fails it for the missing attribution instead.
+        bad = self._sign_mechanism_entry(0x40, "cd" * 32, 3)
+        del bad["ops"]
+        failures = oracle.check_s1_sign_mechanisms(
+            {"mechanisms": [bad]}, {sha}, _RSA_FAMILY_IDS, 1)
+        self.assertNotEqual(failures, [])
+        self.assertIn("want >=", failures[0])
+
+    def test_sign_mechanisms_exact_calls_rejects_duplicates(self):
+        """Twin: exact family totals fail duplicate mechanism records."""
+        require_sign_wiring(self)
+        sha = "ab" * 32
+        doc = {"mechanisms": [self._sign_mechanism_entry(0x40, sha, 2)]}
+        self.assertEqual(
+            oracle.check_s1_sign_mechanisms(
+                doc, {sha}, _RSA_FAMILY_IDS, 1, exact_calls=2),
+            [])
+        for wrong in (1, 3):
+            with self.subTest(exact_calls=wrong):
+                failures = oracle.check_s1_sign_mechanisms(
+                    doc, {sha}, _RSA_FAMILY_IDS, 1, exact_calls=wrong)
+                self.assertNotEqual(failures, [])
+                self.assertIn("exactly", failures[0])
+        # A duplicated record (the same entry twice) reads 4, not 2.
+        doubled = {"mechanisms": [self._sign_mechanism_entry(0x40, sha, 2),
+                                  self._sign_mechanism_entry(0x40, sha, 2)]}
+        failures = oracle.check_s1_sign_mechanisms(
+            doubled, {sha}, _RSA_FAMILY_IDS, 1, exact_calls=2)
+        self.assertNotEqual(failures, [])
+
+    def test_nodelay_exact_wiring_healthy_accepted_hostile_rejected(self):
+        """Twin: the exact nodelay wiring passes healthy, fails hostile."""
+        require_sign_wiring(self)
+        sha = "ab" * 32
+        rows = [BrowserCells._twin_row(["C_SignInit"], 1, sha),
+                BrowserCells._twin_row(["C_Sign"], 1, sha)]
+        mechanisms = [self._sign_mechanism_entry(0x40, sha, 2)]
+        _, result = self.s1_result(
+            "S1-NODELAY", rows, BrowserCells._twin_evidence(),
+            mechanisms, healthy_sessions(), {})
+        case = BrowserCells("test_oracle_builder_healthy_accepted")
+        case.work = self.work
+        exact = {"C_SignInit": 1, "C_Sign": 1}
+        s1 = {"sessions_opened_min": 1,
+              "sign_mechanisms": {"family_ids": sorted(_RSA_FAMILY_IDS),
+                                  "min_calls": 1, "exact_calls": 2}}
+        case.check_report(
+            result, None, None, attached=True, module_sha={sha}, s1=s1,
+            exact=exact, exact_opened_zero=("C_SignInit", "C_Sign"),
+            no_cross_alias=(("C_SignInit", "C_Sign"),))
+        hostiles = {
+            # Duplicate completed records: the floor would still pass.
+            "overcount": [BrowserCells._twin_row(["C_SignInit"], 2, sha),
+                          BrowserCells._twin_row(["C_Sign"], 2, sha)],
+            # A boolean count is malformed, never one.
+            "bool-calls": [dict(BrowserCells._twin_row(["C_SignInit"], 1, sha),
+                                calls=True),
+                           BrowserCells._twin_row(["C_Sign"], 1, sha)],
+            # A surplus call still in flight beside exact completed.
+            "in-flight": [BrowserCells._twin_row(["C_SignInit"], 1, sha, 1),
+                          BrowserCells._twin_row(["C_Sign"], 1, sha)],
+            # One aliased row for both functions.
+            "cross-alias": [BrowserCells._twin_row(
+                ["C_SignInit", "C_Sign"], 1, sha)],
+            # Unresolved names hide the pair in the unknown bucket.
+            "unresolved": [dict(BrowserCells._twin_row(["C_SignInit"], 1, sha),
+                                names=None),
+                           dict(BrowserCells._twin_row(["C_Sign"], 1, sha),
+                                names=None)],
+        }
+        for name, hostile_rows in hostiles.items():
+            with self.subTest(hostile=name):
+                _, bad = self.s1_result(
+                    f"S1-NODELAY-{name}", hostile_rows,
+                    BrowserCells._twin_evidence(), mechanisms,
+                    healthy_sessions(), {})
+                with self.assertRaises(AssertionError):
+                    case.check_report(
+                        bad, None, None, attached=True, module_sha={sha},
+                        s1=s1, exact=exact,
+                        exact_opened_zero=("C_SignInit", "C_Sign"),
+                        no_cross_alias=(("C_SignInit", "C_Sign"),))
+        # A duplicated mechanism record reads 4 family uses, not 2.
+        doubled = [self._sign_mechanism_entry(0x40, sha, 2),
+                   self._sign_mechanism_entry(0x40, sha, 2)]
+        _, bad = self.s1_result(
+            "S1-NODELAY-MECH", rows, BrowserCells._twin_evidence(),
+            doubled, healthy_sessions(), {})
+        with self.assertRaises(AssertionError):
+            case.check_report(
+                bad, None, None, attached=True, module_sha={sha},
+                s1=s1, exact=exact,
+                exact_opened_zero=("C_SignInit", "C_Sign"),
+                no_cross_alias=(("C_SignInit", "C_Sign"),))
+        # An encrypt-only RSA row proves no sign.
+        encrypt = [dict(self._sign_mechanism_entry(0x40, sha, 2),
+                        ops=["encrypt"])]
+        _, bad = self.s1_result(
+            "S1-NODELAY-OPS", rows, BrowserCells._twin_evidence(),
+            encrypt, healthy_sessions(), {})
+        with self.assertRaises(AssertionError):
+            case.check_report(
+                bad, None, None, attached=True, module_sha={sha},
+                s1=s1, exact=exact,
+                exact_opened_zero=("C_SignInit", "C_Sign"),
+                no_cross_alias=(("C_SignInit", "C_Sign"),))
+
+    def test_discovery_anchor_rejects_coherent_substitution(self):
+        """Twin: discovery shas must be files the cell hashed itself."""
+        system = "ab" * 32
+        bundled = "cd" * 32
+        fake = "ef" * 32
+        # Both known files discovered: healthy.
+        self.assertEqual(
+            oracle.check_discovery_shas_anchored(
+                {system, bundled}, {system, bundled}, system,
+                _SOFTOKN_BASENAME),
+            [])
+        # Only the observed module discovered: healthy (subset).
+        self.assertEqual(
+            oracle.check_discovery_shas_anchored(
+                {system}, {system, bundled}, system, _SOFTOKN_BASENAME),
+            [])
+        # A coherent substitution (another digest, same basename,
+        # functions and S1 rewritten to match) fails on the unknown sha.
+        failures = oracle.check_discovery_shas_anchored(
+            {fake}, {system, bundled}, system, _SOFTOKN_BASENAME)
+        self.assertEqual(len(failures), 2)
+        self.assertIn("never hashed", failures[0])
+        # The observed module missing from discovery fails too.
+        failures = oracle.check_discovery_shas_anchored(
+            {bundled}, {system, bundled}, system, _SOFTOKN_BASENAME)
+        self.assertEqual(len(failures), 1)
+        self.assertIn("never discovered", failures[0])
+        # Nothing discovered at all fails on the missing module.
+        failures = oracle.check_discovery_shas_anchored(
+            set(), {system, bundled}, system, _SOFTOKN_BASENAME)
+        self.assertEqual(len(failures), 1)
 
     def test_rsa_family_mirror_matches_product_table(self):
         """Twin: the RSA mirror stays the 32-id keymeta.rs table.

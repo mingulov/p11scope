@@ -1175,17 +1175,21 @@ class BrowserCells(unittest.TestCase):
         # provider, so a mutant that trusts stdout on failure
         # resolves the decoy and this leg fails = killed (empty
         # stdout would agree with the mutant and prove nothing).
+        # Two nonzero codes pin `returncode == 0`, not `!= 1`.
         decoy = self.work / "decoy" / "libsoftokn3.so"
         decoy.parent.mkdir(parents=True)
         decoy.write_bytes(b"probe-decoy")
         decoy_table = f"libsoftokn3.so (libc6,x86-64) => {decoy}\n"
-        with patch.object(cells.subprocess, "run",
-                          return_value=SimpleNamespace(
-                              returncode=1, stdout=decoy_table)):
-            self.assertEqual(
-                cells.find_softokn(ldconfig_text=None,
-                                   candidates=[str(cand)]),
-                cand)
+        for code in (1, 2):
+            with self.subTest(returncode=code):
+                with patch.object(cells.subprocess, "run",
+                                  return_value=SimpleNamespace(
+                                      returncode=code,
+                                      stdout=decoy_table)):
+                    self.assertEqual(
+                        cells.find_softokn(ldconfig_text=None,
+                                           candidates=[str(cand)]),
+                        cand)
 
     def test_missing_nss_seed_tools_names_absent_tools(self):
         """Twin: the NSS-seed gate names exactly the tools absent from PATH."""
@@ -1815,6 +1819,36 @@ class BrowserCells(unittest.TestCase):
         self.assertEqual(counts, {"C_Login": 2})
         self.assertEqual(opened, {"C_Login": 2})
 
+    def test_module_counts_sums_exactly_within_sha(self):
+        """Twin: same-sha completed rows sum exactly (== 2).
+
+        Two rows with one completed C_Sign each under one sha
+        return exactly ``{"C_Sign": 2}``. Overwrite, first-wins,
+        last-wins, and max mutants each leave 1 and fail; a dropped
+        row leaves 1 the same way. Row order cannot matter (1+1).
+        """
+        sha = "ab" * 32
+        doc = {"functions": [
+            self._twin_row(["C_Sign"], 1, sha),
+            self._twin_row(["C_Sign"], 1, sha)]}
+        self.assertEqual(oracle.module_counts(doc, sha), {"C_Sign": 2})
+
+    def test_module_open_entries_sums_exactly_within_sha(self):
+        """Twin: same-sha open entries sum exactly (== 2).
+
+        Two rows with one in-flight C_Login each under one sha
+        return exactly ``{"C_Login": 2}``. The ordered-absence twin
+        pins overwrite ([1, 0] leaves a trailing 0) but cannot tell
+        sum from max or first-wins on that pair; this exact twin
+        kills every non-summing reducer ([1, 1] leaves 1 under each).
+        """
+        sha = "ab" * 32
+        doc = {"functions": [
+            self._twin_row(["C_Login"], 0, sha, in_flight=1),
+            self._twin_row(["C_Login"], 0, sha, in_flight=1)]}
+        self.assertEqual(
+            oracle.module_open_entries(doc, sha), {"C_Login": 2})
+
     def test_oracle_rejects_attach_failures(self):
         """P2-3 twin: failed attachments fail even when some probes hooked."""
         sha = "0" * 64
@@ -1994,6 +2028,163 @@ class BrowserCells(unittest.TestCase):
         self._pinbound_rig(
             self._pinbound_stats(empty_certs=1, abandoned=0, client_hello_complete=1),
             self._pinbound_facts())
+
+    def _crrunsign_rig(self, rows, mechanisms, presented, handshakes,
+                       extra=None):
+        """Run the real CR-RUN-SIGN cell against synthetic report+server.
+
+        Mocks the gate, the credential/server factories, and the
+        browser drive (following _pinbound_rig); the cell body, its
+        TLS ground-truth asserts, and its check_report composition
+        run for real. Returns (drive_mock, softokn, cred) so twins
+        pin the drive arguments too. ``extra`` adds top-level
+        report sections (the no-sign twin needs ``logins: {}`` so
+        the absence legs of a gutted cell would pass).
+        """
+        sha = "ab" * 32
+        evidence = self._twin_evidence(
+            verdict_detail="concrete_gap",
+            gap_classes={"observation": {
+                "status": "lossy",
+                "causes": sorted(_GAPS_ATTACHED_RUN)}},
+            discovery=[{"path": "/usr/lib64/libsoftokn3.so",
+                        "sha256": sha, "dev": [0, 40], "ino": 11}],
+            skipped=[])
+        result = self._twin_result("CR-RUN-SIGN", rows, evidence)
+        doc = json.loads(result.report_path.read_text())
+        doc.update({"mechanisms": mechanisms,
+                    "sessions": healthy_sessions()})
+        if extra:
+            doc.update(extra)
+        result.report_path.write_text(json.dumps(doc))
+        softokn = Path("/fake-nss/libsoftokn3.so")
+        cred = SimpleNamespace(cert_pem=Path("/fake-nss/client.pem"))
+        server = SimpleNamespace(
+            url="https://127.0.0.1:1/",
+            client_certs_presented=presented, handshakes_ok=handshakes)
+        entered = MagicMock()
+        entered.__enter__.return_value = server
+        fake = cells.CellResult(
+            "CR-RUN-SIGN", result.report_path, screenshot_bytes=7,
+            flow={"observer_exit": 0, "nss_seeded": True,
+                  "auto_select_policy": True},
+            observer_stderr_tail="")
+        case = BrowserCells("test_cr_run_sign_observes_client_cert_signs")
+        case.work = self.work
+        with patch.object(cells, "preflight", return_value=None), \
+                patch.object(cells, "find_softokn",
+                             return_value=softokn), \
+                patch.object(cells, "missing_nss_seed_tools",
+                             return_value=[]), \
+                patch.object(softhsm, "generate_client_credential",
+                             return_value=cred), \
+                patch.object(tls_server, "make_server_credential",
+                             return_value=(Path("/fake/key"),
+                                           Path("/fake/cert"))), \
+                patch.object(tls_server, "FlowServer",
+                             return_value=entered), \
+                patch.object(cells, "run_direct",
+                             return_value=fake) as drive:
+            case.test_cr_run_sign_observes_client_cert_signs()
+        return drive, softokn, cred
+
+    @staticmethod
+    def _crrunsign_mechanism(sha, calls=1):
+        """One RSA-family mechanisms[] row attributed to ``sha``."""
+        return {"mechanism": 0x40, "mechanism_hex": "0x40",
+                "ops": ["sign"], "calls": calls, "errors": 0,
+                "by_module": [{"module": {"dev": [1, 2], "ino": 3,
+                                          "sha256": sha},
+                               "calls": calls, "errors": 0}]}
+
+    def test_crrunsign_rig_healthy_sign_passes(self):
+        """Twin: the real CR cell passes a healthy sign report + server.
+
+        Both proof legs hold (completed C_SignInit/C_Sign rows plus
+        an attributed RSA-family mechanism) beside TLS ground truth,
+        so the cell passes; the captured drive call pins the
+        targeting, timing, and policy composition (softokn module,
+        15 s spawn delay, chromium policy, wired credential).
+        Deleting the s1 sign branch (s1={}) fires the absence legs
+        on the healthy mechanisms and fails here = killed, as does
+        any dropped or retuned drive argument below.
+        """
+        sha = "ab" * 32
+        rows = [self._twin_row(["C_SignInit"], 1, sha),
+                self._twin_row(["C_Sign"], 1, sha)]
+        drive, softokn, cred = self._crrunsign_rig(
+            rows, [self._crrunsign_mechanism(sha)], 1, 1)
+        self.assertEqual(drive.call_count, 1)
+        args, kwargs = drive.call_args
+        self.assertEqual(args[0], "CR-RUN-SIGN")
+        self.assertEqual(args[1], "chromium")
+        self.assertEqual(kwargs["observe_module"], softokn)
+        self.assertIsNone(kwargs["register_module"])
+        self.assertIsNone(kwargs["browser_env"])
+        self.assertEqual(kwargs["extra_browser_args"],
+                         CHROMIUM_STABLE_ARGS)
+        self.assertEqual(kwargs["duration_seconds"], RUN_DURATION)
+        self.assertIs(kwargs["nss_credential"], cred)
+        self.assertTrue(kwargs["auto_select_cert"])
+        self.assertEqual(kwargs["initial_delay_seconds"], 15)
+
+    def test_crrunsign_rig_no_sign_fails(self):
+        """Twin: the real CR cell fails a sign-less report (both legs).
+
+        Discovery still resolves the provider and TLS still saw a
+        handshake, but no sign rows and no attributed mechanisms
+        exist: the floors and the family leg fail together. A cell
+        gutted of both (floors {} plus s1={}) passes this doc —
+        the empty mechanisms/logins sections satisfy the absence
+        legs — so the assertRaises fails = killed.
+        """
+        sha = "ab" * 32
+        rows = [self._twin_row(["C_FindObjects"], 3, sha)]
+        with self.assertRaises(AssertionError):
+            self._crrunsign_rig(rows, [], 1, 1, extra={"logins": {}})
+
+    def test_crrunsign_rig_no_tls_ground_truth_fails(self):
+        """Twin: the real CR cell fails without TLS ground truth.
+
+        The report holds full sign proof, but the server saw no
+        presented cert and no handshake: the ground-truth asserts
+        fail first. Deleting them lets this doc pass = killed.
+        """
+        sha = "ab" * 32
+        rows = [self._twin_row(["C_SignInit"], 1, sha),
+                self._twin_row(["C_Sign"], 1, sha)]
+        with self.assertRaises(AssertionError):
+            self._crrunsign_rig(
+                rows, [self._crrunsign_mechanism(sha)], 0, 0)
+
+    def test_crrunsign_rig_unattributed_mechanism_fails(self):
+        """Twin: sign rows with an elsewhere-attributed mechanism fail.
+
+        The family leg counts only by_module calls on the resolved
+        provider shas; a mechanism attributed to another module
+        fails it. Dropping the whole s1 proof (s1=None) skips that
+        leg and this doc passes on floors alone = killed.
+        """
+        sha = "ab" * 32
+        rows = [self._twin_row(["C_SignInit"], 1, sha),
+                self._twin_row(["C_Sign"], 1, sha)]
+        with self.assertRaises(AssertionError):
+            self._crrunsign_rig(
+                rows, [self._crrunsign_mechanism("cd" * 32)], 1, 1)
+
+    def test_crrunsign_rig_mechanism_without_rows_fails(self):
+        """Twin: an attributed mechanism without sign rows fails the cell.
+
+        The doc is deliberately inconsistent (mechanisms claim
+        attributed signs, functions carry none) to isolate the
+        floors leg: only it fails here. Deleting the floors lets
+        this doc pass on the family leg alone = killed.
+        """
+        sha = "ab" * 32
+        rows = [self._twin_row(["C_FindObjects"], 3, sha)]
+        with self.assertRaises(AssertionError):
+            self._crrunsign_rig(
+                rows, [self._crrunsign_mechanism(sha)], 1, 1)
 
     def test_handshake_classifier_buckets(self):
         """Unit: every wrap failure lands in its documented outcome bucket."""
@@ -2746,17 +2937,143 @@ _SEEDING_DRIVERS = ("run_direct", "observe_first_system",
                     "launch_browser_context")
 
 
+def _const_truth(node):
+    """Constant-test truth: True/False for a literal, else None (unknown).
+
+    Only ``ast.Constant`` tests decide; anything dynamic (names,
+    calls, ``not``-forms) is unknown and its branches stay live.
+    """
+    if isinstance(node, ast.Constant):
+        return bool(node.value)
+    return None
+
+
+def _dead_statements(item):
+    """Ids of top statements in ``item`` that never execute.
+
+    A statement is dead under a constant-false ``if``/``while``
+    guard (the ``if True:`` else-branch symmetrically) or after a
+    terminator (return/raise/break/continue) in the same block.
+    Only tops are marked; descendants inherit through the parent
+    map. Dynamic guards (``if flag:``) and ``assert`` exits stay
+    live: the probe cannot decide them statically.
+    """
+    dead = set()
+
+    def block(stmts):
+        terminated = False
+        for stmt in stmts:
+            if terminated:
+                dead.add(id(stmt))
+            else:
+                if isinstance(stmt, (ast.Return, ast.Raise,
+                                     ast.Continue, ast.Break)):
+                    terminated = True
+                visit(stmt)
+
+    def visit(node):
+        if isinstance(node, ast.If):
+            truth = _const_truth(node.test)
+            if truth is False:
+                for stmt in node.body:
+                    dead.add(id(stmt))
+            elif truth is True:
+                for stmt in node.orelse:
+                    dead.add(id(stmt))
+            block(node.body)
+            block(node.orelse)
+        elif isinstance(node, ast.While):
+            if _const_truth(node.test) is False:
+                for stmt in node.body:
+                    dead.add(id(stmt))
+            block(node.body)
+            block(node.orelse)
+        else:
+            for _name, value in ast.iter_fields(node):
+                if (isinstance(value, list) and value
+                        and all(isinstance(part, ast.stmt)
+                                for part in value)):
+                    block(value)
+                elif isinstance(value, ast.stmt):
+                    visit(value)
+
+    block(item.body)
+    return dead
+
+
+def _positional_credential_index(driver):
+    """Positional index of ``nss_credential`` for ``driver``, if any.
+
+    Follows the real driver signature: only a positional-capable
+    parameter has an index (keyword-only drivers stay None, so a
+    future keyword-only ``run_direct`` disables positional
+    detection structurally instead of rotting here).
+    """
+    func = getattr(cells, driver, None)
+    if func is None:
+        return None
+    try:
+        params = inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        return None
+    param = params.get("nss_credential")
+    if param is None or param.kind not in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD):
+        return None
+    return list(params).index("nss_credential")
+
+
+def _call_seeds_nss(call):
+    """True when a seeding-driver ``call`` may seed an NSS credential.
+
+    A non-None ``nss_credential`` keyword seeds, as does a
+    non-None positional in the driver's credential slot; ``*args``
+    and ``**kwargs`` unpackings fail closed (their content is
+    unprovable, so the call counts as seeding). ``None`` in every
+    spelling means no seed runs.
+    """
+    func = call.func
+    if not (isinstance(func, ast.Attribute)
+            and func.attr in _SEEDING_DRIVERS):
+        return False
+    for keyword in call.keywords:
+        if keyword.arg is None:
+            return True
+        if keyword.arg == "nss_credential" and not (
+                isinstance(keyword.value, ast.Constant)
+                and keyword.value.value is None):
+            return True
+    if any(isinstance(arg, ast.Starred) for arg in call.args):
+        return True
+    index = _positional_credential_index(func.attr)
+    if (index is not None and len(call.args) > index
+            and not (isinstance(call.args[index], ast.Constant)
+                      and call.args[index].value is None)):
+        return True
+    return False
+
+
 def seeding_cells_missing_nss_gate(source):
-    """NSS-seeding live cells and those lacking the seed-tools gate.
+    """NSS-seeding live cells and those lacking an effective gate.
 
     Parses ``source`` (this suite file), finds every
     @gate/@gate_system-decorated method of BrowserCells that drives
     a browser with a non-None ``nss_credential`` (an NSS
     client-credential seed runs before launch), and returns (found,
-    missing): all seeding cells, and those whose body never calls
-    ``missing_nss_seed_tools``. A future seeding cell that forgets
-    the gate — skipping (or strict-failing) at the gate instead of
-    erroring mid-cell from the seed step — lands in ``missing``.
+    missing): all seeding cells, and those with a seeding drive
+    the gate does not effectively precede. Effective means a live
+    ``missing_nss_seed_tools`` call whose result feeds a live
+    ``if`` branch (an assigned name the test reads, or the call
+    directly in the test), with the gate and the branch lexically
+    before the drive: order is lexical over live statements, not a
+    full CFG dominance proof. Dead code (constant-false guards,
+    post-terminator lines) never counts as gating, while dead or
+    unprovably-shaped seeding calls (``*args``/``**kwargs``,
+    positional credentials) count as seeding: both fail closed. A
+    future seeding cell that forgets the gate — skipping (or
+    strict-failing) at the gate instead of erroring mid-cell from
+    the seed step — lands in ``missing``.
     """
     found, missing = [], []
     for node in ast.walk(ast.parse(source)):
@@ -2774,26 +3091,62 @@ def seeding_cells_missing_nss_gate(source):
                 for expr in item.decorator_list)
             if not gated:
                 continue
+            parents = {}
+            for parent in ast.walk(item):
+                for child in ast.iter_child_nodes(parent):
+                    parents[child] = parent
+            dead = _dead_statements(item)
+
+            def live(node):
+                current = node
+                while current is not None:
+                    if id(current) in dead:
+                        return False
+                    current = parents.get(current)
+                return True
+
             calls = [call for call in ast.walk(item)
                      if isinstance(call, ast.Call)]
-            seeds = any(
-                isinstance(call.func, ast.Attribute)
-                and call.func.attr in _SEEDING_DRIVERS
-                and any(keyword.arg == "nss_credential"
-                        and not (isinstance(keyword.value, ast.Constant)
-                                 and keyword.value.value is None)
-                        for keyword in call.keywords)
-                for call in calls)
+            seeds = [call for call in calls if _call_seeds_nss(call)]
             if not seeds:
                 continue
             found.append(item.name)
-            gated_call = any(
-                isinstance(call.func, ast.Attribute)
-                and call.func.attr == "missing_nss_seed_tools"
-                for call in calls)
-            if not gated_call:
+            gate_calls = [call for call in calls
+                          if live(call)
+                          and isinstance(call.func, ast.Attribute)
+                          and call.func.attr == "missing_nss_seed_tools"]
+            bound = set()
+            for call in gate_calls:
+                parent = parents.get(call)
+                if isinstance(parent, ast.Assign):
+                    bound.update(target.id for target in parent.targets
+                                 if isinstance(target, ast.Name))
+                elif (isinstance(parent, ast.AnnAssign)
+                      and isinstance(parent.target, ast.Name)):
+                    bound.add(parent.target.id)
+            branches = [node for node in ast.walk(item)
+                        if live(node) and isinstance(node, ast.If)
+                        and (any(isinstance(name, ast.Name)
+                                 and name.id in bound
+                                 for name in ast.walk(node.test))
+                             or any(node is ancestor
+                                    for call in gate_calls
+                                    for ancestor in _ancestors(
+                                        call, parents)))]
+            if any(not any(gate.lineno <= branch.lineno < seed.lineno
+                           for gate in gate_calls
+                           for branch in branches)
+                   for seed in seeds):
                 missing.append(item.name)
     return found, missing
+
+
+def _ancestors(node, parents):
+    """Yield ``node`` and its ancestors up to the method root."""
+    current = node
+    while current is not None:
+        yield current
+        current = parents.get(current)
 
 
 def healthy_sessions(opened=2, inherited=0, closed=1, async_opened=0,
@@ -3471,11 +3824,12 @@ class BrowserS1Oracle(unittest.TestCase):
     def test_nss_gate_probe_flags_ungated_seeders_only(self):
         """Twin: the gate probe flags exactly the ungated seeders.
 
-        An ungated seeder lands in missing; a gated seeder and a
-        None-credential drive (no seed runs) pass. Deleting either
-        live gate block moves that cell into missing (see the
-        sweep); renaming the probe's driver set or the gate call
-        breaks the live-file twin above.
+        An ungated seeder lands in missing; a gated seeder (the
+        real skip/strict-fail branch shape) and a None-credential
+        drive (no seed runs) pass. Deleting either live gate block
+        moves that cell into missing (see the sweep); renaming the
+        probe's driver set or the gate call breaks the live-file
+        twin above.
         """
         template = (
             "import unittest\n"
@@ -3488,6 +3842,10 @@ class BrowserS1Oracle(unittest.TestCase):
             '    @gate("firefox")\n'
             "    def test_probe_gated(self):\n"
             "        missing = cells.missing_nss_seed_tools()\n"
+            "        if missing:\n"
+            "            if STRICT:\n"
+            "                raise AssertionError(\"NSS seed tools missing\")\n"
+            "            self.skipTest(\"NSS seed tools missing\")\n"
             "        cells.run_direct(\"P\", \"firefox\", work, url,\n"
             "                         nss_credential=cred)\n"
             '    @gate("firefox")\n'
@@ -3499,6 +3857,90 @@ class BrowserS1Oracle(unittest.TestCase):
         self.assertEqual(sorted(found),
                          ["test_probe_gated", "test_probe_ungated"])
         self.assertEqual(missing, ["test_probe_ungated"])
+
+    def test_nss_gate_probe_enforces_order_branch_and_spelling(self):
+        """Twin: the gate probe pins order, branch use, and spelling.
+
+        Each hostile shape lands in missing (or in found when it
+        seeds): a gate after the drive, a gate in dead code (``if
+        False:`` or past a return), a gate call whose result feeds
+        no branch, a branch on the wrong name or after the drive,
+        and positional/``*``/``**`` credentials an ungated cell
+        could hide behind. Accepted controls (a keyword-gated
+        seeder, a positional seeder with the gate first, a gate
+        call directly in the ``if`` test, a None credential, a
+        non-seeding driver) prove the probe is exact, not
+        flag-happy: every case asserts the full (found, missing)
+        pair.
+        """
+        gate = ("        missing = cells.missing_nss_seed_tools()\n"
+                "        if missing:\n"
+                "            self.skipTest(\"NSS seed tools missing\")\n")
+        drive = ("        cells.run_direct(\"P\", \"chromium\", work, url,\n"
+                 "                         nss_credential=cred)\n")
+        positional = ("        cells.run_direct(\"P\", \"chromium\", work, url,\n"
+                      "                         None, None, None, (), 120, cred)\n")
+        cases = {
+            # want_found, want_missing.
+            "control_gated": (gate + drive, True, False),
+            "control_in_test": (
+                "        if cells.missing_nss_seed_tools():\n"
+                "            self.skipTest(\"NSS seed tools missing\")\n"
+                + drive, True, False),
+            "control_gated_positional": (gate + positional, True, False),
+            "control_none_credential": (
+                "        cells.run_direct(\"P\", \"chromium\", work, url,\n"
+                "                         None, None, None, (), 120, None)\n",
+                False, False),
+            "control_non_seeding_driver": (
+                "        cells.attach_drive(\"P\", \"firefox\", work, url,"
+                " flow, lib)\n",
+                False, False),
+            "late_gate": (drive + gate, True, True),
+            "dead_gate_if_false": (
+                "        if False:\n"
+                "            missing = cells.missing_nss_seed_tools()\n"
+                "        if missing:\n"
+                "            self.skipTest(\"NSS seed tools missing\")\n"
+                + drive, True, True),
+            "dead_gate_post_return": (
+                "        return\n" + gate + drive, True, True),
+            "call_without_branch": (
+                "        cells.missing_nss_seed_tools()\n" + drive,
+                True, True),
+            "branch_on_wrong_name": (
+                "        missing = cells.missing_nss_seed_tools()\n"
+                "        if other:\n"
+                "            self.skipTest(\"NSS seed tools missing\")\n"
+                + drive, True, True),
+            "branch_after_drive": (
+                drive
+                + "        missing = cells.missing_nss_seed_tools()\n"
+                "        if missing:\n"
+                "            self.skipTest(\"NSS seed tools missing\")\n",
+                True, True),
+            "positional_credential": (positional, True, True),
+            "star_args": (
+                "        cells.run_direct(*args)\n", True, True),
+            "kwargs_spread": (
+                "        cells.run_direct(\"P\", \"chromium\", work, url,\n"
+                "                         **{\"nss_credential\": cred})\n",
+                True, True),
+            "first_drive_ungated": (
+                drive + gate + drive, True, True),
+        }
+        shell = ("import unittest\n"
+                 "\n"
+                 "class BrowserCells(unittest.TestCase):\n"
+                 '    @gate("chromium")\n'
+                 "    def test_m(self):\n%s")
+        for name, (body, want_found, want_missing) in cases.items():
+            with self.subTest(shape=name):
+                found, missing = seeding_cells_missing_nss_gate(
+                    shell % body)
+                self.assertEqual(found, ["test_m"] if want_found else [])
+                self.assertEqual(
+                    missing, ["test_m"] if want_missing else [])
 
     def test_system_first_cells_wire_browser_rows_oracle(self):
         found, missing = system_first_cells_missing_oracle(

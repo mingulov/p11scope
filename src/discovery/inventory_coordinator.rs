@@ -2051,9 +2051,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         credit: &mut StageCredit,
     ) -> bool {
         if self.head_work.prepared_key_len != Some(keys.len()) {
+            // Re-prove space for the new count; a prune cycle already
+            // started (or completed) in this hold keeps its cursor, so
+            // key churn never restarts charged work.
             self.head_work.prepared_key_len = Some(keys.len());
             self.head_work.preadmission_ready = false;
-            self.head_work.prune_cycle = None;
         }
         if self.head_work.preadmission_ready {
             return true;
@@ -9150,8 +9152,20 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         unresolved.push(reason);
                     }
                 }
-                HeldStage::Backfill { exec, .. } => {
+                HeldStage::Backfill { cookie, exec } => {
                     let exec = *exec;
+                    // A backfill whose EXEC a later one replaced in the
+                    // stash never attaches: the replacement queued its
+                    // own backfill behind this one (the latest wins).
+                    if self
+                        .exec_exe
+                        .get(cookie)
+                        .is_some_and(|now| !now.same_image(&exec))
+                    {
+                        self.held_stage.pop_front();
+                        self.head_work = HeadWork::default();
+                        continue;
+                    }
                     let Some(exe) = self.prepare_exe(exec, credit) else {
                         break;
                     };

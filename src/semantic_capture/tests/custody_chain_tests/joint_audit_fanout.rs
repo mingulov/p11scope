@@ -21719,9 +21719,7 @@ fn joint_machine_rearm_fences_spanned_key_tracking_for_rebirth() {
         if fixture.machine.diagnostic_snapshot_for_test().0 == "Idle" {
             break;
         }
-        fixture
-            .service(1)
-            .expect("the publish tail never refuses");
+        fixture.service(1).expect("the publish tail never refuses");
     }
     assert_eq!(
         fixture.machine.diagnostic_snapshot_for_test().0,

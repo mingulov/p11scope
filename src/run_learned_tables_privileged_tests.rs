@@ -1174,4 +1174,43 @@ mod exact_accounting_tests {
             "the failure names the missing authorized slot: {error:#}"
         );
     }
+
+    #[test]
+    fn exact_accounting_rejects_a_post_attach_miss_inside_a_module_wide_window() {
+        // Per-endpoint attach order: C_Initialize attaches at t=100,
+        // C_Finalize at t=1000. Worker 0 bursts [140,160] on
+        // C_Initialize — after its own endpoint attached — and is
+        // missed; worker 1 bursts [170,190] on C_Finalize, honestly
+        // pre-attach; worker 2 is fully observed. Observed [0,0,10]
+        // satisfies the prefix rule and both misses sit inside the
+        // module-wide [10,1000] window, but worker 0's miss is a
+        // post-attach loss its own endpoint's first attach discloses.
+        let mut report = report([Some(0), Some(0), Some(10)]);
+        report["evidence"]["discovery"][0]["unobserved_windows"] = serde_json::json!([
+            {"start_ns": 10, "end_ns": 1000, "reason": "mapped_unattached"},
+        ]);
+        report["evidence"]["discovery"][0]["first_attach_points"] = serde_json::json!([
+            {"file_offset": 0x1000, "began_ns": 100, "attached_ns": 110},
+            {"file_offset": 0x1010, "began_ns": 990, "attached_ns": 1000},
+        ]);
+        report["functions"][0]["target"] = serde_json::json!({
+            "object": {"dev": [DEV.0, DEV.1], "ino": INO, "sha256": SHA},
+            "file_offset": 0x1000,
+        });
+        report["functions"][1]["target"] = serde_json::json!({
+            "object": {"dev": [DEV.0, DEV.1], "ino": INO, "sha256": SHA},
+            "file_offset": 0x1010,
+        });
+        let workers = vec![
+            worker(0, 140, 160),
+            worker(1, 170, 190),
+            worker(2, 1100, 1200),
+        ];
+        let error = check_exact_accounting(&report, PROVIDER, &workers)
+            .expect_err("a post-attach miss inside a module-wide window must fail");
+        assert!(
+            format!("{error:#}").contains("mid-capture"),
+            "the failure names the mid-capture loss: {error:#}"
+        );
+    }
 }

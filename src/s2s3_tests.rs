@@ -6189,3 +6189,114 @@ fn newsite_created_data_object_stays_unlabeled() {
         assert_eq!(v.label, None, "{case}: a data object never labels");
     }
 }
+
+// A truncated creation whose established facts are all invalidated
+// selects v6 from hidden state alone: the row carries only
+// old-vocabulary requested values, invalidated established fields
+// (no sources, no reasons) and no label — nothing the qualifier's
+// visible-content rule accepts. The version must follow visible
+// content: v6 with nothing v6 in it is rejected downstream.
+#[test]
+fn newsite_truncated_invalidated_row_is_not_contentless_v6() {
+    use crate::key_operation_projection::producer::commit;
+    use crate::key_operation_projection::{
+        OBSERVATIONS_VERSION_V6, is_newsite_curve_name, is_newsite_metadata_label,
+        object_observations_json, observations_version,
+    };
+    use crate::semantics_key_use::{JointStaging, KeyUseReducer};
+    let mut h = Hist::qualified();
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    // All seven safe kinds in the first eight cells (old vocabulary
+    // throughout), with a conflicting ninth cell past the window.
+    let template = attrs(&[
+        scalar(CKA_CLASS, 4),
+        scalar(CKA_KEY_TYPE, 0x1f),
+        scalar(CKA_VALUE_LEN, 32),
+        scalar(CKA_TOKEN, 1),
+        scalar(CKA_MODULUS_BITS, 2048),
+        AttrObservation::curve(CKA_EC_PARAMS, &SECP256R1, LinuxLayout::Lp64),
+        scalar(CKA_PARAMETER_SET, 1),
+        scalar(CKA_ID, 7),
+        scalar(CKA_VALUE_LEN, 48),
+    ]);
+    let x = h.run(3, create(SA).request(0, template), 4, ok().result(0, H1));
+    h.run(5, call("C_SetAttributeValue").on(SA).input(0, H1), 6, ok());
+    let e = h.settle(6);
+    let id = created(&e, x, 0).unwrap();
+    let projection = h.project();
+    let v = view(&projection, id);
+    assert!(
+        v.creation_truncated,
+        "the nine-slot template records its truncation"
+    );
+    for kind in [
+        SafeAttributeKind::Class,
+        SafeAttributeKind::KeyType,
+        SafeAttributeKind::ValueLen,
+        SafeAttributeKind::ModulusBits,
+        SafeAttributeKind::EcParams,
+        SafeAttributeKind::ParameterSet,
+    ] {
+        assert!(
+            matches!(v.established.field(kind), FieldState::Invalidated(_)),
+            "{kind:?}: the mutation invalidates the promoted fact"
+        );
+        assert_eq!(
+            v.established.source(kind),
+            None,
+            "{kind:?}: an invalidated field carries no source"
+        );
+    }
+    assert_eq!(v.label, None, "no established fact survives to label");
+    // The committed section carries v6 from the hidden truncation flag
+    // with no visible v6 content: the producer/qualifier mismatch.
+    let staging = JointStaging::select_s1_only();
+    let keyuse = KeyUseReducer::new();
+    let committed = commit(1, &[&staging], &projection, &keyuse);
+    assert_eq!(
+        observations_version(&committed),
+        OBSERVATIONS_VERSION_V6,
+        "the hidden truncation flag selects v6"
+    );
+    let rendered = object_observations_json(&committed);
+    assert_eq!(
+        rendered["objects"].as_array().map(Vec::len),
+        Some(1),
+        "the created object renders one row"
+    );
+    let row = &rendered["objects"][0];
+    let visible = row["label"].as_str().is_some_and(is_newsite_metadata_label)
+        || ["requested", "established"].iter().any(|block| {
+            let block = &row[block];
+            block["key_type"]["value"] == 66
+                || block["value_len"]["value"] == 12
+                || block["value_len"]["value"] == 48
+                || block["ec_params"]["value"]
+                    .as_str()
+                    .is_some_and(is_newsite_curve_name)
+                || [
+                    "class",
+                    "key_type",
+                    "token",
+                    "value_len",
+                    "modulus_bits",
+                    "ec_params",
+                    "parameter_set",
+                ]
+                .iter()
+                .any(|name| {
+                    block[name]
+                        .get("source")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("creation_success")
+                        || block[name]
+                            .get("reason")
+                            .is_some_and(|reason| !reason.is_null())
+                })
+        });
+    assert!(
+        visible,
+        "a v6 row carries visible v6 content: version={} row={row}",
+        rendered["version"],
+    );
+}

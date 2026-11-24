@@ -105312,3 +105312,243 @@ fn carried_fix2_unresolvable_carrier_keeps_unless_absence_proven() {
         }
     }
 }
+
+/// Run-learned harvest refuses heap-resident live tables: a
+/// `file_offset=None` table's addresses are generation-local with no
+/// stable identity, so persisting its ordinal mapping as
+/// run-persistent cross-process authority misattributes later
+/// processes' calls (and collapses distinct runtime tables in the
+/// union once addresses normalize to zero).
+#[test]
+fn run_learned_harvest_refuses_heap_live_tables() {
+    use crate::discovery::identity::test_fixture::module as fixture_module;
+    let key = overlay_key(97);
+    let mut module = fixture_module(key);
+    module.view = ProcessViewId(9);
+    module.path = "/usr/lib/heapprov.so".into();
+    module.tables = vec![ScannedTable {
+        version: (3, 0),
+        walk: "full",
+        entries: vec![ScannedEntry {
+            name: "C_Initialize",
+            object: key,
+            object_path: module.path.clone(),
+            file_offset: 0x1000,
+        }],
+        null_entries: vec![],
+        unpinned: vec![],
+        address: 0x7f00_1234_5000,
+        file_offset: None,
+        live_return: true,
+        manifest_supported: false,
+        extension_impossible: false,
+    }];
+    module.interfaces = vec![];
+    let proof = OwnedLearnProof {
+        view: ProcessViewId(9),
+        path: module.path.clone(),
+        object: PinnedObjectId(4242),
+        loader_exe: None,
+        loader_unknown_reason: None,
+        module,
+    };
+    let mut engine = Engine::empty();
+    let mut pins = PinnedObjects::empty();
+    engine.harvest_run_learned_tables(&mut pins, &proof);
+    assert!(
+        engine.run_learned_modules.is_empty(),
+        "a heap live table must not persist as run authority: {} stored modules",
+        engine.run_learned_modules.len(),
+    );
+}
+
+/// Re-harvesting an identical proof whose dependency has no committed
+/// identity absorbs idempotently: the module can never alias complete
+/// (the unresolvable raw is skipped every time), so every harvest
+/// re-absorbs — and each absorb must not stack another copy of the
+/// proving scan's pin claims onto the committed set.
+#[test]
+fn run_learned_repeated_unaliasable_proof_does_not_duplicate_pins() {
+    use crate::discovery::identity::test_fixture::real_scan_pin;
+    let (_dir, mut sleeper, mut engine, key, path) = learned_tables_engine_with(None);
+    let badkey = overlay_key(99);
+    assert_ne!(key, badkey, "the forwarded dependency names another file");
+    let mut module = engine.run_learned_modules[0].clone();
+    module.view = ProcessViewId(9);
+    module.tables[0].entries.push(ScannedEntry {
+        name: "C_Login",
+        object: badkey,
+        object_path: "/usr/lib/otherprov.so".into(),
+        file_offset: 0x2000,
+    });
+    let mut pins = real_scan_pin(std::path::Path::new(&path), None, 400, &"ef".repeat(32));
+    record_scan_ownership(&mut pins, ProcessViewId(9), key, &path);
+    let object = pins.pinned().next().expect("one pin").id;
+    let proof = || OwnedLearnProof {
+        view: ProcessViewId(9),
+        path: path.clone(),
+        object,
+        loader_exe: None,
+        loader_unknown_reason: Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
+        module: module.clone(),
+    };
+    let pins_before_second = pins.clone();
+    engine.learn_owned_proofs(&mut pins, &[proof()]);
+    let stored = engine
+        .run_learned_modules
+        .iter()
+        .find(|known| known.key == key)
+        .expect("the re-proof unions into the stored module");
+    assert!(
+        !engine
+            .pinned
+            .module_aliased_under(stored, Engine::RUN_LEARNED_VIEW_ID),
+        "the unresolvable dependency keeps the module unaliased"
+    );
+    let claims_after_first = engine
+        .pinned
+        .view_claims(ProcessViewId(9))
+        .map(|claims| claims.pins.len())
+        .unwrap_or(0);
+    let mut pins2 = pins_before_second;
+    engine.learn_owned_proofs(&mut pins2, &[proof()]);
+    let claims_after_second = engine
+        .pinned
+        .view_claims(ProcessViewId(9))
+        .map(|claims| claims.pins.len())
+        .unwrap_or(0);
+    assert_eq!(
+        claims_after_second, claims_after_first,
+        "an identical re-proof stacks no further pin claims"
+    );
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
+/// A rejected forwarded dependency must not discard its whole learned
+/// module: the binder keeps valid entries and files a per-entry skip
+/// for the unusable one, so the pre-bind whole-module filter must not
+/// drop every valid endpoint before the binder sees them.
+#[test]
+fn run_learned_rejected_dependency_keeps_valid_entries() {
+    let (_dir, mut sleeper, mut engine, key, _path) = learned_tables_engine_with(None);
+    assert_eq!(
+        learned_candidate_module_count(&mut engine),
+        1,
+        "baseline: the learned module binds"
+    );
+    let badkey = overlay_key(99);
+    assert_ne!(key, badkey, "the forwarded dependency names another file");
+    engine.run_learned_modules[0].tables[0]
+        .entries
+        .push(ScannedEntry {
+            name: "C_Login",
+            object: badkey,
+            object_path: "/usr/lib/otherprov.so".into(),
+            file_offset: 0x2000,
+        });
+    assert_eq!(
+        learned_candidate_module_count(&mut engine),
+        1,
+        "the binder keeps valid entries past an unresolvable dependency"
+    );
+    engine
+        .pinned
+        .reapply_rejected_keys(&BTreeSet::from([badkey]));
+    assert_eq!(
+        learned_candidate_module_count(&mut engine),
+        1,
+        "a rejected dependency keeps the module's valid entries"
+    );
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
+/// One learned staging requests no refresh past a full queue: every
+/// retained view is attempted even when the bounded pending queue
+/// provably cannot accept another request, so each excess attempt
+/// pays the refusal path (a view-list scan plus /proc probes per
+/// queued entry) with no work-budget charge.
+#[test]
+fn learned_staging_stops_requesting_refreshes_once_the_queue_is_full() {
+    let dir = tempfile::tempdir().expect("learned backing dir");
+    let c = dir.path().join("prompt.c");
+    let so = dir.path().join("libprompt.so");
+    std::fs::write(
+        &c,
+        "unsigned long C_GetFunctionList(void **out){ (void)out; return 5; }\n",
+    )
+    .expect("write prompt source");
+    assert!(
+        std::process::Command::new("gcc")
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&so)
+            .arg(&c)
+            .status()
+            .expect("run gcc")
+            .success(),
+        "the prompt fixture must compile"
+    );
+    let me = std::process::id();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 7,
+        path: "/".into(),
+        dir: Arc::new(File::open("/").expect("open root dir")),
+    };
+    engine.owned_run_pid = Some(me);
+    engine.next_view_id = 8;
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(0), me).expect("own view opens"));
+    // The queue is full of owned requests, so no fair-queue victim can
+    // relieve it: every further request refuses.
+    for offset in 0..MAX_PENDING_REFRESH as u32 {
+        assert!(
+            engine.request_refresh_consumed_for_view(
+                FAKE_PID_FLOOR + offset,
+                None,
+                ProcessViewId(0),
+            ),
+            "the queue fills without refusal"
+        );
+    }
+    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    let mut sleepers = Vec::new();
+    for id in 0..10u32 {
+        let sleeper = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleeper");
+        engine.views.push(
+            ProcessView::open(ProcessViewId(100 + id), sleeper.id()).expect("retained view opens"),
+        );
+        sleepers.push(sleeper);
+    }
+    let file = std::fs::File::open(&so).expect("open prompt fixture");
+    let (dev, ino) = crate::fanotify::file_identity(&file).expect("fixture identity");
+    engine.stage_learned_candidate(crate::fanotify::LearnedCandidate {
+        file,
+        dev,
+        ino,
+        display_path: so.to_string_lossy().into_owned(),
+        loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+        loader_unknown_reason: None,
+        run_learned: true,
+        proving_retained: false,
+    });
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        1,
+        "the candidate staged (the prompt path runs)"
+    );
+    assert!(
+        engine.retirement_intents.is_empty(),
+        "no refresh is attempted past a full queue: {} owed intents",
+        engine.retirement_intents.len(),
+    );
+    for mut sleeper in sleepers {
+        sleeper.kill().expect("kill sleeper");
+        sleeper.wait().expect("reap sleeper");
+    }
+}

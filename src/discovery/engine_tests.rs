@@ -11,6 +11,8 @@ use crate::discovery::test_subject::{OwnedMapper, poll_fd as system_scope_poll_f
 
 #[path = "engine_cancellation_tests.rs"]
 mod cancellation;
+#[path = "carried_fix3_tests.rs"]
+mod carried_fix3;
 #[path = "inventory_claims_tests.rs"]
 mod inventory_claims;
 #[path = "tabled_readiness_tests.rs"]
@@ -32203,6 +32205,7 @@ fn seed_loop_candidate(plan: plan::AttachPlan, pinned: PinnedObjects) -> LiveCan
         exec_preservations: Vec::new(),
         exec_completions: Vec::new(),
         built_by_full_rebuild: false,
+        modules_unchanged: false,
     }
 }
 
@@ -34210,6 +34213,7 @@ fn tick_refuses_a_whole_new_module_at_capacity_without_aborting() {
         exec_preservations: Vec::new(),
         exec_completions: Vec::new(),
         built_by_full_rebuild: true,
+        modules_unchanged: false,
     };
     let mut additions_allowed = true;
     let outcome = engine
@@ -38377,6 +38381,7 @@ fn an_ended_pid_retirement_keeping_a_grouped_slot_deactivates_it() {
         exec_preservations: Vec::new(),
         exec_completions: Vec::new(),
         built_by_full_rebuild: false,
+        modules_unchanged: false,
     };
     let outcome = engine
         .apply_candidate_with_ended(&mut session, candidate, &mut true, true, &[], Some(&ended))
@@ -38473,6 +38478,7 @@ fn an_ended_pid_retirement_closes_over_the_disturbed_group_only() {
         exec_preservations: Vec::new(),
         exec_completions: Vec::new(),
         built_by_full_rebuild: false,
+        modules_unchanged: false,
     };
     let outcome = engine
         .apply_candidate_with_ended(&mut session, candidate, &mut true, true, &[], Some(&ended))
@@ -38553,6 +38559,7 @@ fn an_ended_pid_retirement_retiring_nothing_keeps_every_grouped_slot() {
         exec_preservations: Vec::new(),
         exec_completions: Vec::new(),
         built_by_full_rebuild: false,
+        modules_unchanged: false,
     };
     let outcome = engine
         .apply_candidate_with_ended(&mut session, candidate, &mut true, true, &[], Some(&ended))
@@ -41138,6 +41145,7 @@ fn post_attach_generation_loss_detaches_and_cannot_commit_stale_candidate() {
         exec_preservations: Vec::new(),
         exec_completions: Vec::new(),
         built_by_full_rebuild: false,
+        modules_unchanged: false,
     };
     commit_cleaned_candidate_identity(
         &mut candidate,
@@ -73353,6 +73361,7 @@ fn midfinal_res3_tableless_provider_peer_does_not_authorize_retry() {
         exec_preservations: Vec::new(),
         exec_completions: Vec::new(),
         built_by_full_rebuild: false,
+        modules_unchanged: false,
     };
     let declined: BTreeSet<ProcessViewId> = [view_a].into_iter().collect();
     engine.withhold_declined_retry_targets(&mut candidate, &declined);
@@ -73471,6 +73480,7 @@ fn midfinal_res3_exact_target_contribution_from_healthy_peer_attaches() {
         exec_preservations: Vec::new(),
         exec_completions: Vec::new(),
         built_by_full_rebuild: false,
+        modules_unchanged: false,
     };
     let declined: BTreeSet<ProcessViewId> = [view_a].into_iter().collect();
     engine.withhold_declined_retry_targets(&mut candidate, &declined);
@@ -99341,11 +99351,18 @@ fn merge_ownership_e1_reused_view_id_releases_while_carried_row_rides() {
 
 #[test]
 fn carried_view_ids_system_sequential_views_recycle_ids_and_bound_modules() {
-    // C1: Scope::System admitting and exiting 1100 sequential views mapping
-    // one object. Allocation must keep succeeding (an exited view's ID
-    // recycles once its carried row no longer names it) and committed
-    // modules must stay bounded (carried rows merge under one reserved
-    // owner and drop once a live row covers the object).
+    // Detailed view-ID churn: Scope::System admitting and exiting 1100
+    // sequential views mapping one object (a Detailed process-view
+    // allocator exercise, not an Inventory endpoint-sizing result).
+    // Allocation must keep succeeding (an exited view's ID recycles
+    // once its carried row no longer names it), committed modules must
+    // stay bounded (carried rows merge under one reserved owner and
+    // drop once a live row covers the object), no held ID may leak
+    // (partial leakage fails here, not just exhaustion), and minted
+    // IDs stay at a small stable maximum. Every iteration drives the
+    // commit seam (`refresh_held_view_ids`, as the commit does) and
+    // the release seam (`release_view_id`), so the maintained
+    // named/held sets — not just the free list — prove exact.
     let key = overlay_key(777);
     let me = std::process::id();
     let mut engine = Engine::empty();
@@ -99377,6 +99394,9 @@ fn carried_view_ids_system_sequential_views_recycle_ids_and_bound_modules() {
         engine.plan = candidate.plan;
         engine.pinned = candidate.pinned;
         engine.modules = candidate.modules;
+        // The commit seam: rebuild the maintained sets beside the
+        // assignment, exactly as committing this candidate would.
+        engine.refresh_held_view_ids();
         if let Some(p) = prev {
             engine.views.retain(|view| view.id() != p);
             engine.release_view_id(p);
@@ -99413,6 +99433,26 @@ fn carried_view_ids_system_sequential_views_recycle_ids_and_bound_modules() {
         engine.modules.len() <= 4,
         "committed modules stay bounded, got {}",
         engine.modules.len()
+    );
+    assert!(
+        engine.held_view_ids.is_empty(),
+        "no held ID leaks across the churn, got {:?}",
+        engine.held_view_ids
+    );
+    assert!(
+        engine.next_view_id <= 4,
+        "minted IDs stay at a small stable maximum, got {}",
+        engine.next_view_id
+    );
+    // The named set is exact: every committed row's view and no other.
+    let named_rows: BTreeSet<u32> = engine
+        .modules
+        .iter()
+        .map(|module| module.scanned.view.0)
+        .collect();
+    assert_eq!(
+        engine.named_view_ids, named_rows,
+        "the maintained named set matches the committed rows"
     );
 }
 

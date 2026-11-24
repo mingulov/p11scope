@@ -3584,8 +3584,7 @@ fn a_phased_stop_with_an_owed_exit_decision_past_its_deadline_finishes_exact() {
                 // like a real retained run that yields between steps.
                 if !yielded {
                     let logged = entries(&log);
-                    if let Some(stopped_at) =
-                        logged.iter().position(|entry| entry == "begin_stop")
+                    if let Some(stopped_at) = logged.iter().position(|entry| entry == "begin_stop")
                     {
                         let refresh_stages = logged[stopped_at..]
                             .iter()
@@ -3662,8 +3661,7 @@ fn a_phased_stop_with_no_exact_refresh_past_its_deadline_reports_the_loss() {
                 // deadline re-entry's, not a read-straddling race.
                 if !yielded {
                     let logged = entries(&log);
-                    if let Some(stopped_at) =
-                        logged.iter().position(|entry| entry == "begin_stop")
+                    if let Some(stopped_at) = logged.iter().position(|entry| entry == "begin_stop")
                     {
                         let refresh_stages = logged[stopped_at..]
                             .iter()

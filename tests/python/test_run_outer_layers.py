@@ -404,8 +404,13 @@ def check_spy_prefix_gap(report, ledger, spyview, failures, notes):
     return "exact"
 
 
-def judge_proxy_outer(report, ledger, tool_rc, priv_objects, pub_objects):
-    """Strict-exact verdict for RPO-PROXY (no miss-tolerant branch)."""
+def judge_proxy_common_legs(report, ledger, tool_rc, priv_objects, pub_objects):
+    """Tool, backend, and interface legs shared by both proxy judges.
+
+    Returns (failures, notes, backend, spyview, backend_indexes,
+    unattributed, unknown). The spy layer itself is judged separately
+    (strict-exact vs prefix-gap); everything else is identical.
+    """
     failures, notes = [], []
     if tool_rc != 0 or priv_objects != 2 or pub_objects != 2:
         failures.append(
@@ -434,6 +439,23 @@ def judge_proxy_outer(report, ledger, tool_rc, priv_objects, pub_objects):
             failures.append(
                 f"backend {fn}: obs calls={got} errs={goterr}, spy calls={want} errs={wanterr}")
     check_gfl_gi(report, ledger, backend, spyview, backend_indexes, failures, notes)
+    return failures, notes, backend, spyview, backend_indexes, unattributed, unknown
+
+
+def judge_proxy_tail(report, failures, notes):
+    """Proxy closure skip (shared tail leg). Returns nothing."""
+    skips = report.get("evidence", {}).get("modules_skipped") or []
+    if not any("libp11-kit" in (s.get("name") or "") and "not counted" in (s.get("reason") or "")
+               for s in skips):
+        failures.append(f"proxy closure skip missing: {[(s.get('name'), (s.get('reason') or '')[:60]) for s in skips]!r}")
+    else:
+        notes.append("proxy: closure skip named")
+
+
+def judge_proxy_outer(report, ledger, tool_rc, priv_objects, pub_objects):
+    """Strict-exact verdict for RPO-PROXY (no miss-tolerant branch)."""
+    failures, notes, _, spyview, _, unattributed, unknown = judge_proxy_common_legs(
+        report, ledger, tool_rc, priv_objects, pub_objects)
     for fn in sorted(set(ledger.counts) | set(spyview.calls)):
         if fn in ("C_GetFunctionList", "C_GetInterface"):
             continue
@@ -446,12 +468,7 @@ def judge_proxy_outer(report, ledger, tool_rc, priv_objects, pub_objects):
                 f"spy {fn}: obs calls={got} errs={goterr}, spy calls={want} errs={wanterr}")
     if not failures:
         notes.append(f"spy: exact {sum(spyview.calls.values())}/{ledger.total - ledger.counts.get('C_GetInterface', 0) - ledger.counts.get('C_GetFunctionList', 0)}")
-    skips = report.get("evidence", {}).get("modules_skipped") or []
-    if not any("libp11-kit" in (s.get("name") or "") and "not counted" in (s.get("reason") or "")
-               for s in skips):
-        failures.append(f"proxy closure skip missing: {[(s.get('name'), (s.get('reason') or '')[:60]) for s in skips]!r}")
-    else:
-        notes.append("proxy: closure skip named")
+    judge_proxy_tail(report, failures, notes)
     check_hygiene(report, unattributed, unknown, failures, notes)
     detail = "; ".join(notes + (["FAIL: " + " | ".join(failures)] if failures else []))
     return Verdict(not failures, "exact", detail)
@@ -466,40 +483,10 @@ def judge_proxy_outer_prefix_gap(report, ledger, tool_rc, priv_objects, pub_obje
     its full typed disclosure (books balanced, window, PARTIAL, zero
     in-flight, zero loss, no surplus).
     """
-    failures, notes = [], []
-    if tool_rc != 0 or priv_objects != 2 or pub_objects != 2:
-        failures.append(
-            f"tool effect: rc={tool_rc} priv={priv_objects} pub={pub_objects}, want rc=0 priv=2 pub=2")
-    else:
-        notes.append("tool: rc=0 objects=2+2")
-    _, _, backend, spyview, unattributed, unknown = split_layers(report, "libsofthsm2.so")
-    modules = report.get("capture", {}).get("modules", [])
-    backend_indexes = {i for i, m in enumerate(modules) if "libsofthsm2.so" in (m.get("path") or "")}
-    for fn in sorted(set(ledger.counts) | set(backend.calls)):
-        if fn in ("C_GetFunctionList", "C_GetInterface"):
-            continue
-        want, got = ledger.counts.get(fn, 0), backend.calls.get(fn, 0)
-        wanterr, goterr = ledger.errors.get(fn, 0), backend.errors.get(fn, 0)
-        if fn == "C_GetSlotList":
-            # The proxy enumerates slots for itself on top of the
-            # forwarded calls (measured +4 on both hosts): a surplus
-            # here is proxy-internal traffic, recorded never pinned,
-            # while a deficit or an error mismatch still fails.
-            if got < want or goterr != wanterr:
-                failures.append(f"backend {fn}: obs={got}/{goterr} spy={want}/{wanterr}")
-            else:
-                notes.append(f"backend {fn}: obs={got} spy={want} (surplus={got - want})")
-        elif want != got or wanterr != goterr:
-            failures.append(
-                f"backend {fn}: obs calls={got} errs={goterr}, spy calls={want} errs={wanterr}")
-    check_gfl_gi(report, ledger, backend, spyview, backend_indexes, failures, notes)
+    failures, notes, _, spyview, _, unattributed, unknown = judge_proxy_common_legs(
+        report, ledger, tool_rc, priv_objects, pub_objects)
     branch = check_spy_prefix_gap(report, ledger, spyview, failures, notes)
-    skips = report.get("evidence", {}).get("modules_skipped") or []
-    if not any("libp11-kit" in (s.get("name") or "") and "not counted" in (s.get("reason") or "")
-               for s in skips):
-        failures.append(f"proxy closure skip missing: {[(s.get('name'), (s.get('reason') or '')[:60]) for s in skips]!r}")
-    else:
-        notes.append("proxy: closure skip named")
+    judge_proxy_tail(report, failures, notes)
     check_hygiene(report, unattributed, unknown, failures, notes)
     detail = "; ".join(notes + (["FAIL: " + " | ".join(failures)] if failures else []))
     if failures:
@@ -1151,6 +1138,16 @@ class OpenscJudgeTwins(unittest.TestCase):
         self.assertFalse(verdict, verdict.detail)
         self.assertIn("prefix", verdict.detail)
 
+    def test_gap_rejects_order_drift(self):
+        # Ledger puts SlotList before Initialize (tool drift): the
+        # prefix rule keys on ledger order, so drift fails loudly
+        # instead of silently redefining the prefix.
+        ledger = parse_spy_log(spy_text([("C_GetInterface", 0), ("C_GetSlotList", 0),
+                                         ("C_Initialize", 0), ("C_Finalize", 0)]))
+        _, report = opensc_fixture()
+        verdict = judge_opensc_outer(report, ledger, 1, "Available slots:\n")
+        self.assertFalse(verdict, verdict.detail)
+
     def test_gap_without_window_fails(self):
         def drop_both(report, _ledger):
             report["functions"] = [r for r in report["functions"]
@@ -1242,7 +1239,12 @@ class OpenscJudgeTwins(unittest.TestCase):
         self.assertFalse(verdict, verdict.detail)
 
     def test_ledger_drift_fails(self):
-        ledger = parse_spy_log(spy_text([("C_GetInterface", 0), ("C_Initialize", 0)]))
+        # A late second Initialize: counts drift while the leading
+        # order stays intact, so only the ledger-shape pin can fail
+        # this (isolates it from the order pin and the prefix rule).
+        ledger = parse_spy_log(spy_text([("C_GetInterface", 0), ("C_Initialize", 0),
+                                         ("C_GetSlotList", 0), ("C_Finalize", 0),
+                                         ("C_Initialize", 0)]))
         _, report = opensc_fixture()
         verdict = judge_opensc_outer(report, ledger, 1, "Available slots:\n")
         self.assertFalse(verdict, verdict.detail)

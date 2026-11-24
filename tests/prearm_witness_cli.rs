@@ -2062,6 +2062,43 @@ fn workload_ledger_validator_requires_the_known_shape() {
     assert!(!validate_workload_ledger(&extra));
 }
 
+/// Key presence is load-bearing: a zero `C_GetMechanismInfo` is valid
+/// (slots without mechanisms), so only the name check — not the
+/// length or value checks — refuses a ledger that swaps the
+/// mechanism-info counter for an unknown key.
+#[test]
+fn workload_ledger_validator_requires_every_counter_by_name() {
+    fn ledger(pairs: &[(&str, u64)]) -> BTreeMap<String, u64> {
+        pairs
+            .iter()
+            .map(|(name, count)| ((*name).to_string(), *count))
+            .collect()
+    }
+    // Valid zero-mechanism ledger: every listed slot answered its
+    // mechanism list with an empty set, so no mechanism info ran.
+    let good = ledger(&[
+        ("C_Initialize", 1),
+        ("C_Finalize", 1),
+        ("C_GetInfo", u64::from(ITERS)),
+        ("C_GetSlotList", 2 * u64::from(ITERS)),
+        ("C_GetSlotInfo", u64::from(ITERS)),
+        ("C_GetTokenInfo", u64::from(ITERS)),
+        ("C_GetMechanismList", u64::from(ITERS)),
+        ("C_GetMechanismInfo", 0),
+    ]);
+    assert!(validate_workload_ledger(&good));
+    // The same counts with the zero mechanism-info counter swapped
+    // for an unknown key: length and relationships still hold, but
+    // the required name is gone.
+    let mut swapped = good.clone();
+    swapped.remove("C_GetMechanismInfo");
+    swapped.insert("C_Extra".to_string(), 1);
+    assert!(
+        !validate_workload_ledger(&swapped),
+        "a swapped-out counter name never validates"
+    );
+}
+
 /// The C fixture attempts one `C_GetSlotList` per iteration
 /// unconditionally, plus one more per iteration that lists a
 /// non-empty slot set — so the count is always within

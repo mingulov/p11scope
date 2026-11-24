@@ -2517,7 +2517,9 @@ fn decide_retained(
             HolderScan::Deferred => return DecideOutcome::Hold,
         }
     }
-    DecideOutcome::Decided(decide_retained_inner(state, pending, retained, miss, reuse_ns))
+    DecideOutcome::Decided(decide_retained_inner(
+        state, pending, retained, miss, reuse_ns,
+    ))
 }
 
 /// [`decide_retained`] past the exit revalidation: the reuse veto and

@@ -42,9 +42,24 @@ _NATIVE = ("scripts/inventory-native-oracle.py", "scripts/qualify-cgroup-trace.p
 _MATRIX_RUNNERS = ("scripts/qualify-public-cli.sh", "scripts/qualify-inventory-native.sh",
                    "scripts/run-privileged-lib-tests.sh")
 _MATRIX_STAGE = tuple(dict.fromkeys(_MATRIX_RUNNERS + _PUBLIC + _NATIVE + _LIB))
-# The compiler pin, the candidate build and its fixture, and the self-test.
+# The compiler pin, the candidate build and its fixture.
 _MATRIX_HOST = (".release-rust-version", "scripts/cargo.sh", "scripts/prepare-dependencies.py",
-                "scripts/fixtures/exec_churn.c", "tests/python/test_release_matrix_contract.py")
+                "scripts/fixtures/exec_churn.c")
+# --self-test runs the contract suite: it and every file it loads or runs.
+_MATRIX_SELF_TEST = (
+    "tests/python/test_release_matrix_contract.py", "tests/python/test_canary_evidence.py",
+    "tests/python/test_canary_object.py", "tests/python/test_canary_workload.py",
+    "tests/python/test_inventory_capacity_oracle.py", "tests/python/test_public_cli_oracle.py",
+    "tests/python/test_qualify_records.py", "tests/python/test_task_storage_canary.py",
+    "scripts/build-task-storage-canary.sh", "scripts/build-task-storage-reader.sh",
+    "scripts/capture-stopped-canary.py", "scripts/check-bpf-map-defs.py", "scripts/check-canary-evidence.py",
+    "scripts/check-ignored-tests.py", "scripts/ci/stop-races.sh", "scripts/cleanup-traps.sh",
+    "scripts/dump-owned-bpf-maps.py", "scripts/fixtures/canary_workload.c",
+    "scripts/fixtures/privacy-stack-workload.c", "scripts/lane-lib-oracle-1.py", "scripts/lane-lib-oracle-2.py",
+    "scripts/lane-lib-oracle-3.py", "scripts/lane-lib-oracle-4.py", "scripts/lane-lib-oracle-5.py",
+    "scripts/lane-lib-oracle-6.py", "scripts/lib.sh", "scripts/native/dump-task-storage.bpf.c",
+    "scripts/native/dump-task-storage.c", "scripts/product-build.sh", "scripts/qualify-stop-races.sh",
+    "scripts/qualify-task-storage-canary.py", "scripts/recorded-process-exec.py", "scripts/verify-canaries.sh")
 
 # runner -> mode -> (where the mode runs, its inputs). A `stage` mode runs
 # from the checkout-free release stage; a `checkout` mode only from a
@@ -63,11 +78,12 @@ RUNNERS = {
     # stage: the guest's inner script; its bootstrap check names the judge
     # and this file, then --verify-inputs binds every staged source.
     # checkout: the host driver. Every host mode (dry run, plan, build,
-    # stage writing, self-test) reads the whole guest stage from the
-    # checkout plus the host-only files, refused before the first read.
+    # stage writing) reads the whole guest stage from the checkout plus the
+    # host-only files, refused before the first read; self-test also the suite.
     "scripts/qualify-release-matrix.sh": {
         "stage": (STAGE, _MATRIX_STAGE),
-        "checkout": (CHECKOUT, _MATRIX_STAGE + _MATRIX_HOST)},
+        "checkout": (CHECKOUT, _MATRIX_STAGE + _MATRIX_HOST),
+        "self-test": (CHECKOUT, _MATRIX_STAGE + _MATRIX_HOST + _MATRIX_SELF_TEST)},
 }
 
 
@@ -87,11 +103,14 @@ def staged_sources():
 
 
 def missing(root, runner, mode):
+    """Every input that is absent, unreadable, or (a runner it executes)
+    not executable. Other shell inputs are sourced or read, never run."""
     out = []
     for name in required(runner, mode):
         path = os.path.normpath(os.path.join(root, name))
-        executable = name.endswith(".sh")
-        if not os.path.isfile(path) or (executable and not os.access(path, os.X_OK)):
+        executable = name in RUNNERS
+        if (not os.path.isfile(path) or not os.access(path, os.R_OK)
+                or (executable and not os.access(path, os.X_OK))):
             out.append(path)
     return out
 
@@ -106,7 +125,8 @@ def main(argv):
         return 2
     gone = missing(root, runner, mode)
     for path in gone:
-        print("%s: required input missing: %s" % (os.path.basename(runner), path), file=sys.stderr)
+        state = "missing" if not os.path.isfile(path) else "unreadable"
+        print("%s: required input %s: %s" % (os.path.basename(runner), state, path), file=sys.stderr)
     return 64 if gone else 0
 
 

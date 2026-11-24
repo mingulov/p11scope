@@ -1681,7 +1681,7 @@ main() {
     # is declared once in runner_inputs.py, the declaration the release
     # stage is built from: refuse by name before any setup. The --list
     # modes run no helper (runner_inputs.py declares them input-free).
-    [ -f "$REPO_ROOT/scripts/runner_inputs.py" ] || {
+    [ -f "$REPO_ROOT/scripts/runner_inputs.py" ] && [ -r "$REPO_ROOT/scripts/runner_inputs.py" ] || {
         echo "$PROG: required input missing: $REPO_ROOT/scripts/runner_inputs.py" >&2; return 64; }
     python3 -I "$REPO_ROOT/scripts/runner_inputs.py" check "$REPO_ROOT" scripts/run-privileged-lib-tests.sh run \
         || return 64

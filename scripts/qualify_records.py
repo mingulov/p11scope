@@ -301,10 +301,13 @@ def open_regular(path, rule, what):
         raise Refusal(rule, "%s %s missing" % (what, path)) from None
     except OSError as error:
         raise Refusal(rule, "%s %s is not a regular file (%s)" % (what, path, error.strerror)) from None
-    info = os.fstat(fd)
-    if not stat.S_ISREG(info.st_mode):
-        os.close(fd)
-        raise Refusal(rule, "%s %s is not a regular file" % (what, path))
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise Refusal(rule, "%s %s is not a regular file" % (what, path))
+    except BaseException:
+        os.close(fd)  # every refusal and failure after the open closes it (hungerg r11e #3)
+        raise
     return fd, info
 
 

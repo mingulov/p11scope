@@ -34,10 +34,14 @@ REPO=$(cd "$(dirname "$0")/.." && pwd -P)
 # Every host input (the guest stage's sources, the compiler pin, the build
 # and self-test files) is declared once in runner_inputs.py; a missing one
 # refuses here, before the first read. The guest checks its own copy.
-[ -f "$REPO/scripts/runner_inputs.py" ] || {
+[ -f "$REPO/scripts/runner_inputs.py" ] && [ -r "$REPO/scripts/runner_inputs.py" ] || {
   echo "qualify-release-matrix.sh: required input missing: $REPO/scripts/runner_inputs.py" >&2; exit 64; }
-python3 -I "$REPO/scripts/runner_inputs.py" check "$REPO" scripts/qualify-release-matrix.sh checkout || exit 64
-RUST=$(cat "$REPO/.release-rust-version")
+# --self-test anywhere selects the self-test mode (a superset of checkout).
+_MODE=checkout
+for _arg in "$@"; do [ "$_arg" != "--self-test" ] || _MODE=self-test; done
+python3 -I "$REPO/scripts/runner_inputs.py" check "$REPO" scripts/qualify-release-matrix.sh "$_MODE" || exit 64
+RUST=$(cat "$REPO/.release-rust-version") && [ -n "$RUST" ] || {
+  echo "qualify-release-matrix.sh: compiler pin unreadable or empty: $REPO/.release-rust-version" >&2; exit 64; }
 LOCK=/var/tmp/p11scope-ws-tmp/privileged.lock
 QUIET=/var/tmp/p11scope-ws-tmp/QUIET-WINDOW
 OUT_BASE=/var/tmp/p11scope-ws-tmp/rc-qualify
@@ -261,7 +265,10 @@ preflight() {
 # or host path is needed, so hosted CI runs it.
 self_test() {
   # The real shell plan and judge are exercised through bounded controlled files.
-  python3 -I "$REPO/tests/python/test_release_matrix_contract.py" -v
+  # P11SCOPE_MATRIX_SELF_TEST_K narrows the suite (unittest -k) for the
+  # contract's own healthy-twin run of this mode.
+  python3 -I "$REPO/tests/python/test_release_matrix_contract.py" -v \
+    ${P11SCOPE_MATRIX_SELF_TEST_K:+-k "$P11SCOPE_MATRIX_SELF_TEST_K"}
 }
 
 if [ "$SELF_TEST" -eq 1 ]; then
@@ -311,7 +318,7 @@ BM=$STAGE/artifacts/p11scope-bpfmulti
 # Bootstrap: the judge and the input declaration it loads; every other
 # staged input is bound by --verify-inputs below, before any runner.
 for _input in scripts/release-matrix-contract.py scripts/runner_inputs.py; do
-  [ -f "$R/$_input" ] || { echo "matrix inner: required input missing: $R/$_input" >&2; exit 64; }
+  [ -f "$R/$_input" ] && [ -r "$R/$_input" ] || { echo "matrix inner: required input missing: $R/$_input" >&2; exit 64; }
 done
 python3 -I "$R/scripts/release-matrix-contract.py" --verify-launch-policy || exit 1
 [ "$(id -u)" = 0 ] || { echo 'matrix inner requires root' >&2; exit 1; }

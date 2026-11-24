@@ -24,7 +24,7 @@ set -uo pipefail
 PROG=${0##*/}
 REPO_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 # Inputs are declared once in runner_inputs.py (also the release stage list).
-[ -f "$REPO_ROOT/scripts/runner_inputs.py" ] || {
+[ -f "$REPO_ROOT/scripts/runner_inputs.py" ] && [ -r "$REPO_ROOT/scripts/runner_inputs.py" ] || {
     echo "$PROG: required input missing: $REPO_ROOT/scripts/runner_inputs.py" >&2; exit 64; }
 python3 -I "$REPO_ROOT/scripts/runner_inputs.py" check "$REPO_ROOT" scripts/ci/build-counter-fixtures.sh run || exit 64
 

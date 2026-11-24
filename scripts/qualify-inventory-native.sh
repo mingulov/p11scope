@@ -72,7 +72,7 @@ ROTATE_BYTES=1024M  # far above any run: the oracle fails a rotated stream
 # built from; a missing one refuses here, before any build or capture.
 _MODE=run
 [ "${1:-}" != "--self-test" ] || _MODE=self-test
-[ -f "$REPO/scripts/runner_inputs.py" ] || {
+[ -f "$REPO/scripts/runner_inputs.py" ] && [ -r "$REPO/scripts/runner_inputs.py" ] || {
     echo "qualify-inventory-native.sh: required input missing: $REPO/scripts/runner_inputs.py" >&2; exit 64; }
 python3 -I "$REPO/scripts/runner_inputs.py" check "$REPO" scripts/qualify-inventory-native.sh "$_MODE" || exit 64
 

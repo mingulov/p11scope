@@ -637,25 +637,39 @@ class MatrixContract(unittest.TestCase):
         "scripts/fixtures/exec_churn.c": "build_bins hashes it in the checkout; staged as artifacts/lib-source",
     }
     # Modes that read no repository input.
-    INPUT_FREE = {("scripts/run-privileged-lib-tests.sh", "list"): "--list modes print the curation, run no helper"}
+    INPUT_FREE = {("scripts/run-privileged-lib-tests.sh", "list"): "--list modes print the curation, run no helper",
+                  ("scripts/ci/prepare-btrfs-tmpdir.sh", "run"): "loop-mounts a btrfs image; reads no repository file"}
+    # Every runner's modes, enumerated independently of the declaration.
+    MODES = {
+        "scripts/qualify-public-cli.sh": {"run"},
+        "scripts/qualify-inventory-native.sh": {"run", "self-test"},
+        "scripts/run-privileged-lib-tests.sh": {"run", "list"},
+        "scripts/ci/build-counter-fixtures.sh": {"run"},
+        "scripts/ci/build-wrap-fixtures.sh": {"run"},
+        "scripts/ci/prepare-btrfs-tmpdir.sh": {"run"},
+        "scripts/qualify-release-matrix.sh": {"stage", "checkout", "self-test"},
+    }
     # Text that names a file without reading it (an unscheduled cell's reason).
     PROSE = {("scripts/run-privileged-lib-tests.sh", "scripts/ci/stop-races.sh")}
 
-    def closure(self, owner):
+    def closure(self, owner, self_test=False):
         """Every repository file `owner` reads, file by file through the
-        scripts it runs. Self-test-only files count as direct references
-        only; the contract (the declaration under test) is read, not walked."""
+        scripts it runs; the contract (the declaration under test) is read,
+        not walked. Without `self_test`, self-test-only files count as
+        direct references only; with it, the self-test's files are walked
+        too (hungerg r11e #2: the self-test mode reads their closure)."""
         seen, todo = set(), [owner]
         while todo:
             current = todo.pop()
             for name in self.references(current):
                 if name in (owner, INPUTS["SELF"]) or (current, name) in self.PROSE:
                     continue
-                if name in self.SELF_TEST_ONLY and current != owner:
+                if name in self.SELF_TEST_ONLY and current != owner and not self_test:
                     continue
                 if name not in seen:
                     seen.add(name)
-                    if name.endswith((".py", ".sh")) and name != self.DECLARATION and name not in self.SELF_TEST_ONLY:
+                    walk = self_test or name not in self.SELF_TEST_ONLY
+                    if name.endswith((".py", ".sh")) and name != self.DECLARATION and walk:
                         todo.append(name)
         return seen
 
@@ -668,6 +682,11 @@ class MatrixContract(unittest.TestCase):
         runners = INPUTS["RUNNERS"]
         staged = set(CHECKER_MOD["SOURCE_FILES"])
         self.assertEqual(staged, set(INPUTS["staged_sources"]()))
+        # hungerg/spark r11e: no mode (input-free ones included) can drop out
+        # of the declaration, and no exemption outlives its mode.
+        self.assertEqual({r: set(modes) for r, modes in runners.items()}, self.MODES)
+        self.assertEqual({(r, m) for r, modes in runners.items() for m, (_, inputs) in modes.items() if not inputs},
+                         set(self.INPUT_FREE))
         self.assertIn(INPUTS["SELF"], staged)
         for runner, modes in runners.items():
             with self.subTest(runner=runner):
@@ -675,13 +694,16 @@ class MatrixContract(unittest.TestCase):
                 for mode, (where, inputs) in modes.items():
                     self.assertIn(where, (INPUTS["STAGE"], INPUTS["CHECKOUT"]))
                     self.assertEqual(len(inputs), len(set(inputs)), (runner, mode))
-                    # Per mode, never a union: a checkout mode reads the
-                    # runner's whole closure; a stage mode all of it but the
-                    # self-test and host-only files; a named mode nothing.
+                    # Per mode, never a union: a self-test mode reads the
+                    # closure walked through the self-test's own files; another
+                    # checkout mode the closure but the self-test files; a stage
+                    # mode also not the host-only files; a named mode nothing.
                     if (runner, mode) in self.INPUT_FREE:
                         expected = set()
+                    elif mode == "self-test":
+                        expected = self.closure(runner, self_test=True)
                     elif where == INPUTS["CHECKOUT"]:
-                        expected = closure
+                        expected = closure - self.SELF_TEST_ONLY
                     else:
                         expected = closure - self.SELF_TEST_ONLY - set(self.HOST_ONLY)
                     self.assertEqual(set(inputs), expected, (runner, mode))
@@ -714,6 +736,22 @@ class MatrixContract(unittest.TestCase):
         helper = root / "scripts/ci/prepare-btrfs-tmpdir.sh"
         helper.chmod(0o644)
         self.assertEqual(INPUTS["missing"](str(root), "scripts/run-privileged-lib-tests.sh", "run"), [str(helper)])
+        helper.chmod(0o755)
+        # hungerg r11e #1: present but unreadable is refused too (root reads any bits).
+        source = root / "tests/fixtures/counter-banks.c"
+        source.chmod(0)
+        try:
+            gone = INPUTS["missing"](str(root), "scripts/run-privileged-lib-tests.sh", "run")
+        finally:
+            source.chmod(0o644)
+        self.assertEqual(gone, [] if os.geteuid() == 0 else [str(source)])
+        # A sourced shell input needs no execute bit; a runner does.
+        library = root / "scripts/lib.sh"
+        library.parent.mkdir(parents=True, exist_ok=True); shutil.copy2(ROOT / "scripts/lib.sh", library)
+        library.chmod(0o644)
+        names = INPUTS["required"]("scripts/qualify-release-matrix.sh", "self-test")
+        self.assertIn("scripts/lib.sh", names)
+        self.assertNotIn(str(library), INPUTS["missing"](str(root), "scripts/qualify-release-matrix.sh", "self-test"))
 
     def test_every_runner_with_inputs_runs_the_declared_preflight(self):
         for runner, modes in INPUTS["RUNNERS"].items():
@@ -730,9 +768,8 @@ class MatrixContract(unittest.TestCase):
 
     def run_tool(self, argv, env=None, ignore_hup=False):
         merged = dict(os.environ, **(env or {}))
-        def preexec():
-            if ignore_hup:
-                signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        def preexec():  # never the invoking session's disposition (spark r11e F2)
+            signal.signal(signal.SIGHUP, signal.SIG_IGN if ignore_hup else signal.SIG_DFL)
         return subprocess.run(argv, text=True, capture_output=True, timeout=120, env=merged,
                               cwd=self.base, preexec_fn=preexec)
 
@@ -745,6 +782,7 @@ class MatrixContract(unittest.TestCase):
         staged = stage / "artifacts/source"
         binary = self.base / "not-a-libtest"
         binary.write_text("#!/bin/sh\nexit 0\n"); binary.chmod(0o755)
+        bins = self.base / "no-integration-tests"; bins.mkdir()
         contract = stage / "contract.json"
         def cases(root):
             sh = lambda name: ["bash", str(root / name)]
@@ -761,6 +799,14 @@ class MatrixContract(unittest.TestCase):
                      (70, "must run as root"))],
                 ("scripts/qualify-inventory-native.sh", "self-test"): [
                     (lambda out: native + ["--self-test"], {}, True, (70, "positive control failed"))],
+                ("scripts/run-privileged-lib-tests.sh", "list"): [
+                    (lambda out: sh("scripts/run-privileged-lib-tests.sh") + ["--list", str(binary)], {}, False,
+                     (1, "default (")),
+                    (lambda out: sh("scripts/run-privileged-lib-tests.sh") + ["--list-integration", str(bins)], {},
+                     False, (1, "integration ("))],
+                ("scripts/ci/prepare-btrfs-tmpdir.sh", "run"): [
+                    (lambda out: sh("scripts/ci/prepare-btrfs-tmpdir.sh") + [str(out) + ".img", str(out)], {}, False,
+                     (77, "must run as root"))],
                 ("scripts/run-privileged-lib-tests.sh", "run"): [
                     (lambda out: sh("scripts/run-privileged-lib-tests.sh") + [str(binary), str(out)], {}, False,
                      (64, "must be run as root"))],
@@ -774,33 +820,47 @@ class MatrixContract(unittest.TestCase):
                      {}, False, (0, "")),
                     (lambda out: sh("scripts/qualify-release-matrix.sh") + ["--dry-run", "--kernels", "host"],
                      {}, False, (0, "dry-run: no build, no guests started"))],
+                ("scripts/qualify-release-matrix.sh", "self-test"): [
+                    (lambda out: sh("scripts/qualify-release-matrix.sh") + ["--self-test"],
+                     {"P11SCOPE_MATRIX_SELF_TEST_K": "test_closure_scan_finds_each_reference_form"}, False,
+                     (0, "Ran 1 test"))],
                 ("scripts/qualify-release-matrix.sh", "stage"): [
                     (lambda out: sh("scripts/qualify-release-matrix.sh") + ["--write-inner-stage", str(stage),
                                                                             "--contract", str(contract)],
                      {}, False, (0, ""))],
             }
-        declared = {(r, m) for r, modes in INPUTS["RUNNERS"].items() for m, (_, inputs) in modes.items() if inputs}
+        declared = {(r, m) for r, modes in INPUTS["RUNNERS"].items() for m in modes}
         self.assertEqual(set(cases(repo)), declared)
+        unreadable = os.geteuid() != 0  # root reads any mode bits
         inner = stage / "inner.sh"
         def check(runner, mode, root, remove_root):
             where = INPUTS["RUNNERS"][runner][mode][0]
             names = list(INPUTS["required"](runner, mode))
-            if mode != "stage":
+            if mode != "stage" and (runner, mode) not in self.INPUT_FREE:
                 names.append(INPUTS["SELF"])
+            # Each input removed, and (hungerg r11e #1) each present but unreadable.
+            variants = [(None, None)] + [(n, "unlink") for n in names]
+            if mode != "stage" and unreadable:
+                variants += [(n, "chmod") for n in names]
             for number, (argv, env, hup, (rc, marker)) in enumerate(cases(root)[(runner, mode)]):
-                for name in [None] + names:
-                    with self.subTest(runner=runner, mode=mode, invocation=number, missing=name):
-                        label = "out-%s-%s-%d-%s" % (Path(runner).name, mode, number, name or "healthy")
+                for name, how in variants:
+                    with self.subTest(runner=runner, mode=mode, invocation=number, missing=name, how=how):
+                        label = "out-%s-%s-%d-%s-%s" % (Path(runner).name, mode, number, name or "healthy", how)
                         out = self.base / label.replace("/", "_")
                         path = remove_root / name if name else None
                         if path is not None:
                             content, mode_bits = path.read_bytes(), path.stat().st_mode
-                            path.unlink()
+                            if how == "unlink":
+                                path.unlink()
+                            else:
+                                path.chmod(0)
                         try:
                             result = self.run_tool(argv(out), env, hup)
                         finally:
                             if path is not None:
-                                path.write_bytes(content); path.chmod(mode_bits)
+                                if how == "unlink":
+                                    path.write_bytes(content)
+                                path.chmod(mode_bits)
                         text = result.stdout + result.stderr
                         if name is None:
                             self.assertEqual(result.returncode, rc, text)
@@ -813,7 +873,10 @@ class MatrixContract(unittest.TestCase):
                             self.assertFalse(inner.exists())
                         else:
                             self.assertEqual(result.returncode, 64, text)
-                            self.assertIn("required input missing: %s" % path, text)
+                            # The bootstrap check of the declaration says "missing" for both.
+                            state = "unreadable" if how == "chmod" and name != INPUTS["SELF"] else "missing"
+                            self.assertIn("required input %s: %s" % (state, path), text)
+                            self.assertNotIn("Permission denied", text)
                             self.assertFalse(out.exists())
                             if marker:  # refused at preflight, never at the later check
                                 self.assertNotIn(marker, text)
@@ -824,12 +887,13 @@ class MatrixContract(unittest.TestCase):
                             shutil.rmtree(out)
         moved = self.base / "unavailable original checkout"
         repo.rename(moved)
-        for runner, mode in sorted(declared):
+        for runner, mode in sorted(declared):  # input-free modes run checkout-free too
             if INPUTS["RUNNERS"][runner][mode][0] == INPUTS["STAGE"] and runner != "scripts/qualify-release-matrix.sh":
                 check(runner, mode, staged, staged)
         moved.rename(repo)
         check("scripts/qualify-inventory-native.sh", "self-test", repo, repo)
         check("scripts/qualify-release-matrix.sh", "checkout", repo, repo)
+        check("scripts/qualify-release-matrix.sh", "self-test", repo, repo)
         check("scripts/qualify-release-matrix.sh", "stage", repo, staged)
 
     def staged_native(self):
@@ -2659,6 +2723,9 @@ class MatrixContract(unittest.TestCase):
             with self.subTest(missing=name):
                 for marker in self.base.glob("*.args"):
                     marker.unlink()
+                work = stage / "guest-work.json"  # the next guest step's output
+                if work.exists():
+                    work.unlink()
                 path = source / name
                 content, bits = path.read_bytes(), path.stat().st_mode
                 path.unlink()
@@ -2675,7 +2742,40 @@ class MatrixContract(unittest.TestCase):
                     self.assertEqual(result.returncode, 1, text)
                     self.assertIn(name, text)
                     self.assertNotIn("required input missing", text)
+                # Refused at the preflight itself, never by a later step's recheck.
+                self.assertFalse(work.exists(), name)
                 self.assertEqual(sorted(p.name for p in self.base.glob("*.args")), [])
+        if os.geteuid() == 0:
+            return  # root reads any mode bits
+        # hungerg r11e #1: a present but unreadable bootstrap input is the same refusal.
+        for name in ("scripts/release-matrix-contract.py", "scripts/runner_inputs.py"):
+            with self.subTest(unreadable=name):
+                path = source / name
+                bits = path.stat().st_mode
+                path.chmod(0)
+                try:
+                    result = subprocess.run(["bash", str(stage / "inner.sh")], cwd=ROOT, capture_output=True,
+                                            text=True, env=env, timeout=30)
+                finally:
+                    path.chmod(bits)
+                text = result.stdout + result.stderr
+                self.assertEqual(result.returncode, 64, text)
+                self.assertIn("matrix inner: required input missing: %s" % path, text)
+                self.assertNotIn("Permission denied", text)
+                self.assertEqual(sorted(p.name for p in self.base.glob("*.args")), [])
+
+    def test_empty_compiler_pin_refuses_the_dry_run(self):
+        # hungerg r11e #1: the pin read itself is checked; a present, readable
+        # but empty pin never becomes an empty toolchain selector.
+        repo, _ = self.clone_source()
+        (repo / ".release-rust-version").write_text("")
+        result = subprocess.run(["bash", str(repo / "scripts/qualify-release-matrix.sh"), "--dry-run", "--kernels",
+                                 "host"], cwd=self.base, capture_output=True, text=True, timeout=60)
+        text = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 64, text)
+        self.assertIn("compiler pin unreadable or empty: %s" % (repo / ".release-rust-version"), text)
+        self.assertNotIn("dry-run:", text)
+        self.assertNotIn("rust=+", text)
 
     def test_generated_guest_executes_mt12_exact_selectors_and_fails_bad_evidence(self):
         self.generated_guest()

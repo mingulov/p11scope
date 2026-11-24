@@ -1429,7 +1429,10 @@ never imply S1 loss.
   once the row's instance has folded; `unit` is `operations`, or
   `message_contexts` for `message_*` categories.
   Row equation: `started = completed + failed + cancelled + unknown
-  + active + key_join_lost` (before counter saturation). Role rows
+  + active + key_join_lost` (before counter saturation). A NULL-buffer
+  length query on an output-bearing direct (the two-call
+  wrap/encapsulate convention) counts no operation and opens no row:
+  only the real call completes. Role rows
   count associations and cannot be summed across roles into a global
   operation denominator. At version 7 each row also carries
   `inferred_family` (the mechanism family observed at use: `rsa`,
@@ -1481,7 +1484,8 @@ never imply S1 loss.
   unknown); existing inferred or conflicting size evidence
   remains, as does any stronger unknown, and under `-v` the row
   reads `size unsupported (outside admission bound)` only when
-  that reason is set. On a rowless wrap or fresh-view unwrap
+  that reason is set. A later classified size replaces a
+  detail-less `unsupported` with its value. On a rowless wrap or fresh-view unwrap
   the above-bound observation
   leaves no park and contributes no wrapped-size evidence to the
   subsequent row.

@@ -12431,8 +12431,9 @@ fn key_operation_kem_no_deferred_positive() {
 /// Item 10: the encapsulation query corner. A null or unavailable
 /// entry ciphertext-pointer decision refuses input-use inference
 /// and new object authority even for CKR_OK with a readable nonzero
-/// sentinel; the healthy non-null owned call is the twin; S1
-/// accounting matches its existing control.
+/// sentinel; the healthy non-null owned call is the twin. The NULL
+/// corner is a length query (no S1 operation, no terminal, no row);
+/// the other corners still complete in S1 with a partitioned row.
 #[test]
 fn key_operation_kem_query_corner_refuses_use_and_output() {
     // Null and unreadable OUTPUT decisions (plus a missing marker)
@@ -12486,24 +12487,37 @@ fn key_operation_kem_query_corner_refuses_use_and_output() {
             "capture {capture:#x}: the refused protocol names its gap"
         );
         // The completed S1 terminal still partitions role_unavailable:
-        // observed but unbound, never a key use.
+        // observed but unbound, never a key use — except the NULL
+        // corner, a length query with no terminal at all.
         let unknown: Vec<_> = committed
             .unknown_key_operations
             .iter()
             .map(|row| (row.category, row.reason, row.completed))
             .collect();
-        assert_eq!(
-            unknown,
-            vec![("encapsulate", "role_unavailable", 1)],
-            "capture {capture:#x}"
-        );
-        // S1 still completes the observed successful call: S1
-        // accounting is unchanged by the object refusal.
-        assert_eq!(
-            (joint.started(), joint.completed()),
-            (s1_before.0 + 1, s1_before.1 + 1),
-            "capture {capture:#x}: S1 completes the refused query"
-        );
+        if capture == kem_query_capture() {
+            assert!(
+                unknown.is_empty(),
+                "capture {capture:#x}: a query partitions no row"
+            );
+            assert_eq!(
+                (joint.started(), joint.completed()),
+                s1_before,
+                "capture {capture:#x}: S1 counts no query"
+            );
+        } else {
+            assert_eq!(
+                unknown,
+                vec![("encapsulate", "role_unavailable", 1)],
+                "capture {capture:#x}"
+            );
+            // S1 still completes the observed successful call: S1
+            // accounting is unchanged by the object refusal.
+            assert_eq!(
+                (joint.started(), joint.completed()),
+                (s1_before.0 + 1, s1_before.1 + 1),
+                "capture {capture:#x}: S1 completes the refused call"
+            );
+        }
     }
     // Healthy twin: the non-null owned call uses and creates.
     let mut scene = JointScene::new();
@@ -13313,7 +13327,7 @@ fn key_operation_kem_created_output_later_use_m2_twins() {
 fn key_operation_kem_wire_to_commit_link() {
     // Mixed scene: two qualified uses, one query, one failure.
     // References and receipts agree exactly; every terminal lands
-    // in its own summary.
+    // in its own summary while the query lands nowhere.
     let mut scene = JointScene::new();
     let bootstrap = scene.bootstrap();
     let mut staging = JointStaging::select_joint(Some(&bootstrap));
@@ -13372,7 +13386,10 @@ fn key_operation_kem_wire_to_commit_link() {
         .map(|row| (row.category, row.reason, row.completed))
         .collect();
     unknown.sort();
-    assert_eq!(unknown, vec![("encapsulate", "role_unavailable", 1)]);
+    assert!(
+        unknown.is_empty(),
+        "the query is no terminal and partitions no row: {unknown:?}"
+    );
     let creations: Vec<_> = committed
         .objects
         .iter()
@@ -14491,8 +14508,9 @@ fn key_operation_kem_adapter_reads_reach_original_wire_and_commit() {
         assert_eq!((joint.started(), joint.completed()), (1, 1), "leg {leg}");
     }
     // Encapsulation query shapes retain no result: no creation,
-    // unknown input, and the END slot is irrelevant (the adapter
-    // (0, UNREADABLE) commits exactly as the default END).
+    // unknown input, no S1 operation, and the END slot is irrelevant
+    // (the adapter (0, UNREADABLE) commits exactly as the default
+    // END).
     for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
         let input_word = if matches!(layout, LinuxLayout::Ilp32) {
             0x7172
@@ -14539,7 +14557,11 @@ fn key_operation_kem_adapter_reads_reach_original_wire_and_commit() {
         );
         let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
         assert!(committed.key_operations.is_empty(), "query proves nothing");
-        assert_eq!((joint.started(), joint.completed()), (1, 1));
+        assert_eq!(
+            (joint.started(), joint.completed()),
+            (0, 0),
+            "a query counts no S1 operation"
+        );
         let (scene, staging, joint, keyuse, _) = drive_shaped(
             &ShapedS1::shaped("C_EncapsulateKey", CkRv::OK.0, 0x17, kem_query_capture()),
             None,
@@ -14549,7 +14571,11 @@ fn key_operation_kem_adapter_reads_reach_original_wire_and_commit() {
             crate::key_operation_projection::object_observations_json(&committed),
             crate::key_operation_projection::object_observations_json(&control),
         );
-        assert_eq!((joint.started(), joint.completed()), (1, 1));
+        assert_eq!(
+            (joint.started(), joint.completed()),
+            (0, 0),
+            "a query counts no S1 operation"
+        );
     }
     // P0 legs carry the refusal verdicts: unreadable input, no
     // creation, zero adapter reads, S1 preserved.
@@ -30885,13 +30911,17 @@ fn keymeta_unsupported_never_flips() {
     );
 }
 
-/// `unsupported` never flips to `inferred`: a later valued terminal
-/// leaves an unsupported row unsupported with its first reason and no
-/// detail. The zero vehicle is the S-path zero word (an OK trailer
-/// with a zero value classifies outside the admission bound); the
-/// subset vehicle is an unmapped legacy cipher ahead of an RSA value.
+/// A later valued terminal flips `unsupported` to `inferred` with
+/// the new value. The zero vehicle is the S-path zero word (an OK
+/// trailer with a zero value classifies outside the admission
+/// bound); the subset vehicle is an unmapped legacy cipher ahead of
+/// an RSA value.
 #[test]
-fn keymeta_unsupported_never_flips_to_inferred() {
+fn keymeta_unsupported_flips_to_inferred_on_valued_terminal() {
+    let rsa_2048 = SizeDetail::Rsa {
+        size_class: Some(2048),
+        modulus_bytes: 256,
+    };
     // S-path zero word first, then a standard RSA value.
     let ids = KeymetaCtx::object_ids(1);
     let mut ctx = KeymetaCtx::new();
@@ -30920,12 +30950,12 @@ fn keymeta_unsupported_never_flips_to_inferred() {
     let inferred = ctx
         .inference(ids[0].as_u64(), "sign", "key", "unknown")
         .expect("the sign row infers");
-    assert_eq!(inferred.size.status, InferredStatus::Unsupported);
+    assert_eq!(inferred.size.status, InferredStatus::Inferred);
+    assert_eq!(inferred.size.reason, None);
     assert_eq!(
-        inferred.size.reason,
-        Some(crate::keymeta::REASON_OUTSIDE_ADMISSION_BOUND)
+        inferred.size.detail.as_ref().map(|(detail, _)| detail),
+        Some(&rsa_2048)
     );
-    assert_eq!(inferred.size.detail, None);
     assert_eq!(inferred.size.completions, 2);
     // Unmapped subset first, then a standard RSA value.
     let ids = KeymetaCtx::object_ids(1);
@@ -30955,12 +30985,12 @@ fn keymeta_unsupported_never_flips_to_inferred() {
     let inferred = ctx
         .inference(ids[0].as_u64(), "sign", "key", "unknown")
         .expect("the sign row infers");
-    assert_eq!(inferred.size.status, InferredStatus::Unsupported);
+    assert_eq!(inferred.size.status, InferredStatus::Inferred);
+    assert_eq!(inferred.size.reason, None);
     assert_eq!(
-        inferred.size.reason,
-        Some(crate::keymeta::REASON_NO_LENGTH_MAP)
+        inferred.size.detail.as_ref().map(|(detail, _)| detail),
+        Some(&rsa_2048)
     );
-    assert_eq!(inferred.size.detail, None);
     assert_eq!(inferred.size.completions, 2);
 }
 
@@ -32953,13 +32983,12 @@ fn keymeta_edge_direct_carries_completion() {
     assert_eq!(sink.len(), before, "a too-small direct emits nothing");
 }
 
-/// Direct length queries drop their value at the edge (§5.4): a
-/// NULL-output OK wrap/encapsulate still completes (the call ran),
-/// but the over-estimate query length never rides the effect — only
-/// a terminal non-NULL length classifies. The seal's fresh view
-/// rides through unchanged.
+/// Direct length queries emit nothing at the edge (§5.4): a
+/// NULL-output OK wrap/encapsulate is a length query, not a
+/// completion — the over-estimate query length and the seal's fresh
+/// view both drop with the query, so no terminal and no operation.
 #[test]
-fn keymeta_edge_direct_query_drops_length() {
+fn keymeta_edge_direct_query_emits_nothing() {
     for name in ["C_WrapKey", "C_EncapsulateKey", "C_WrapKeyAuthenticated"] {
         let mut edge = EdgeSemantics::default();
         let mut sink = Vec::new();
@@ -32979,27 +33008,24 @@ fn keymeta_edge_direct_query_drops_length() {
             &mut sink,
         )
         .expect("replay");
-        match sink.last().unwrap_or_else(|| panic!("{name} query emits")) {
-            OperationEffect::DirectCompleted {
-                length, fresh_view, ..
-            } => {
-                assert_eq!(*length, None, "{name}: the query value drops");
-                assert_eq!(
-                    *fresh_view,
-                    Some(999),
-                    "{name}: the fresh view rides through"
-                );
-            }
-            other => panic!("expected DirectCompleted, got {other:?}"),
-        }
+        assert!(
+            sink.is_empty(),
+            "{name}: the query emits no terminal (fresh view rides nowhere)"
+        );
+        assert_eq!(
+            (edge.started(), edge.completed()),
+            (0, 0),
+            "{name}: the query counts no operation"
+        );
     }
 }
 
-/// A direct wrap query never sizes at the reducer seam: through the
-/// real edge the query value drops, so the wrapping row infers its
-/// family (the mechanism is real) with no size completion behind it.
+/// A direct wrap query opens no row at the reducer seam: through the
+/// real edge the query emits nothing, so the wrapping key gains no
+/// row at all (neither family nor size), like a retained multipart
+/// query.
 #[test]
-fn keymeta_direct_query_never_sizes() {
+fn keymeta_direct_query_opens_no_row() {
     let ids = KeymetaCtx::object_ids(2);
     let mut ctx = KeymetaCtx::new();
     let wrapping = KeymetaCtx::receipt(ids[0], "C_WrapKey", 0, KeyRole::WrappingKey, None);
@@ -33022,20 +33048,17 @@ fn keymeta_direct_query_never_sizes() {
             &mut ctx.sink,
         )
         .expect("replay");
-    assert_eq!(ctx.sink.len(), before + 1, "the query completes");
-    let effect = ctx.sink.last().cloned().expect("effect");
-    ctx.keyuse
-        .observe_effect(ctx.instance, &effect, Some(&mut ctx.ledger), None);
-    let inferred = ctx
-        .inference(ids[0].as_u64(), "wrap", "wrapping_key", "unknown")
-        .expect("the wrapping row infers");
-    assert_eq!(inferred.family.value, Some(KeyFamily::Rsa));
-    assert_eq!(inferred.size.status, InferredStatus::Unknown);
-    assert_eq!(
-        inferred.size.reason,
-        Some(crate::keymeta::REASON_NO_LENGTH_EVIDENCE)
+    assert_eq!(ctx.sink.len(), before, "the query emits nothing");
+    assert!(
+        ctx.inference(ids[0].as_u64(), "wrap", "wrapping_key", "unknown")
+            .is_none(),
+        "the query opens no wrapping row"
     );
-    assert_eq!(inferred.size.completions, 0);
+    assert!(
+        ctx.inference(ids[1].as_u64(), "wrap", "wrapped_object", "unknown")
+            .is_none(),
+        "the query opens no wrapped row"
+    );
 }
 
 /// Without a length trailer the seal carries no length into the
@@ -34022,11 +34045,11 @@ fn keymeta_weaker_evidence_never_disturbs_valued() {
     assert_eq!(size.completions, 2);
 }
 
-/// `unsupported` pins against later valued and unknown evidence
-/// (never flips to `inferred`); unknown evidence never downgrades
-/// unsupported ones.
+/// A later classified size replaces a detail-less `unsupported`
+/// (flips to `inferred` with the new value); unknown evidence never
+/// disturbs an unsupported one.
 #[test]
-fn keymeta_unsupported_pins_against_valued_and_unknown() {
+fn keymeta_unsupported_yields_to_valued_pins_against_unknown() {
     use crate::semantics_key_use::{FamilyState, SizeInput, SizeState};
     let mut size = SizeState::default();
     size.accumulate_size(
@@ -34044,9 +34067,15 @@ fn keymeta_unsupported_pins_against_valued_and_unknown() {
         Some(EvidenceTag::SignOutput),
         SizeInput::Value(256),
     );
-    assert_eq!(size.status, InferredStatus::Unsupported);
-    assert_eq!(size.reason, Some(crate::keymeta::REASON_NO_LENGTH_MAP));
-    assert_eq!(size.detail, None);
+    assert_eq!(size.status, InferredStatus::Inferred);
+    assert_eq!(size.reason, None);
+    assert_eq!(
+        size.detail.as_ref().map(|(detail, _)| detail),
+        Some(&SizeDetail::Rsa {
+            size_class: Some(2048),
+            modulus_bytes: 256,
+        })
+    );
     assert_eq!(size.completions, 2);
     let mut size = SizeState::default();
     size.accumulate_size(

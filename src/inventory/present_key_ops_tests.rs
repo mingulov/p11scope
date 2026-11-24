@@ -3164,11 +3164,17 @@ fn provider_token_only_module_lists_rows_in_verbose_only() {
 /// guessed name.
 #[test]
 fn provider_mechanism_limit_lines_name_known_mechanisms() {
-    let presentation = provider_presentation();
+    let mut presentation = provider_presentation();
+    presentation
+        .provider_observations
+        .as_mut()
+        .expect("provider observations")
+        .mechanisms[0]
+        .mechanism = 0x40;
     let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
     assert!(
         verbose.lines().any(|line| line
-            == "  mechanism 0x43a (CKM_SHA256_RSA_PKCS) slot 0: limits 1024-4096, flags 0x1"),
+            == "  mechanism 0x40 (CKM_SHA256_RSA_PKCS) slot 0: limits 1024-4096, flags 0x1"),
         "known id carries its name, got:\n{verbose}"
     );
     let mut presentation = provider_presentation();
@@ -3179,8 +3185,9 @@ fn provider_mechanism_limit_lines_name_known_mechanisms() {
     observations.mechanisms[0].mechanism = 0x1234;
     let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
     assert!(
-        verbose.lines().any(|line| line
-            == "  mechanism 0x1234 slot 0: limits 1024-4096, flags 0x1"),
+        verbose
+            .lines()
+            .any(|line| line == "  mechanism 0x1234 slot 0: limits 1024-4096, flags 0x1"),
         "unknown id keeps bare hex, got:\n{verbose}"
     );
 }
@@ -3917,10 +3924,10 @@ fn key_ops_verbose_outside_bound_only_when_set() {
     );
 }
 
-/// An established-vs-inferred size mismatch names the single inferred
-/// value with no phantom second side: `conflict_detail` is absent
-/// and `further` is 0, so `-v` renders the bare value (the
-/// established label stands on the row).
+/// An established-vs-inferred size mismatch says `conflicting` with
+/// no phantom second side: `conflict_detail` is absent and `further`
+/// is 0, so `-v` names the single inferred value against the
+/// established label on the row.
 #[test]
 fn key_ops_verbose_size_conflict_established_mismatch() {
     let mut observations = populated(9);
@@ -3971,8 +3978,10 @@ fn key_ops_verbose_size_conflict_established_mismatch() {
         .find(|line| line.contains("key row"))
         .expect("one row line");
     assert!(
-        line.contains("RSA 2048 (from signature length)"),
-        "the inferred value renders:\n{snapshot}"
+        line.contains(
+            "size conflicting (RSA 2048 (from signature length) vs established rsa_1024)"
+        ),
+        "the mismatch names both sides:\n{snapshot}"
     );
     assert!(
         !line.contains("more conflicting size"),
@@ -4034,7 +4043,9 @@ fn key_ops_verbose_size_conflict_names_established_mismatch() {
         .find(|line| line.contains("key row"))
         .expect("one row line");
     assert!(
-        line.contains("size conflicting (RSA 2048 (from signature length) vs established rsa_3072)"),
+        line.contains(
+            "size conflicting (RSA 2048 (from signature length) vs established rsa_3072)"
+        ),
         "the mismatch names both sides:\n{snapshot}"
     );
 }

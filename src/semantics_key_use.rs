@@ -2834,8 +2834,9 @@ impl FamilyState {
 impl SizeState {
     /// Accumulate one completion's size input (§5.4): valued evidence
     /// upgrades unknowns, same sizes keep the first tag, distinct
-    /// sizes conflict with extras counted once each, and
-    /// `unsupported` never overwrites `inferred` nor flips.
+    /// sizes conflict with extras counted once each, `unsupported`
+    /// never overwrites `inferred`, and a later classified size
+    /// replaces a detail-less `unsupported`.
     /// `established` is the combined size/curve label (exact params);
     /// `established_type` is the key type alone (§4.5 family gate when
     /// no combined label exists).
@@ -2924,7 +2925,12 @@ impl SizeState {
     /// the established-size check), same sizes keep the first tag, a
     /// second distinct size rides the conflict pair, and further
     /// distinct sizes count once each (exact: RSA and wrapped
-    /// bitmaps, finite kinds in the capped set).
+    /// bitmaps, finite kinds in the capped set). Wrapped material is
+    /// compatible with any typed detail in either order (it measures
+    /// the encoded key, never the modulus or field): the typed
+    /// detail stands. A terminal classified size replaces an
+    /// `unsupported` that carries no detail; forward-filled parks
+    /// still pin (gated at the fill site).
     fn accumulate_detail(
         &mut self,
         established: Option<crate::keymeta::EstablishedKind>,
@@ -2933,12 +2939,14 @@ impl SizeState {
         tag: crate::keymeta::EvidenceTag,
         detail: crate::keymeta::SizeDetail,
     ) {
+        use crate::keymeta::SizeDetail;
         use crate::keymeta::{families_compatible, same_size, size_compatible, size_family};
-        // `unsupported` pins: a later classified size never flips the
-        // row (nor its reason) to inferred or conflicting.
-        if self.status == InferredStatus::Unsupported {
+        // `unsupported` with a detail pins; a detail-less
+        // unsupported yields to terminal classified evidence.
+        if self.status == InferredStatus::Unsupported && self.detail.is_some() {
             return;
         }
+        let incoming_wrapped = matches!(detail, SizeDetail::WrappedMaterial { .. });
         match self.detail.as_ref() {
             None => {
                 // A length-only EC class publishes its established
@@ -2965,6 +2973,33 @@ impl SizeState {
             }
             Some((current, _)) if same_size(current, &detail) => {
                 // Same size: the first tag stands.
+            }
+            Some((SizeDetail::WrappedMaterial { .. }, _)) if !incoming_wrapped => {
+                // Wrapped current, typed incoming: compatible (the
+                // size_compatible rule); the typed detail becomes the
+                // value with the first-value established checks. Only
+                // flips to conflicting, never back.
+                let conflicting = if let (Some(kind), Some(mechanism)) = (established, mechanism) {
+                    !size_compatible(&detail, mechanism, kind)
+                } else if established.is_none()
+                    && let (Some(type_kind), Some(mechanism)) = (established_type, mechanism)
+                    && let Some(family) = size_family(&detail)
+                {
+                    !families_compatible(family, mechanism, type_kind)
+                } else {
+                    false
+                };
+                self.detail = Some((detail, tag));
+                self.reason = None;
+                if conflicting {
+                    self.status = InferredStatus::Conflicting;
+                }
+            }
+            Some((current, _))
+                if incoming_wrapped && !matches!(current, SizeDetail::WrappedMaterial { .. }) =>
+            {
+                // Typed current, wrapped incoming: compatible (the
+                // same rule); the typed value stands, status untouched.
             }
             Some(_) => match self.conflict_detail.as_ref() {
                 None => {
@@ -4157,11 +4192,15 @@ impl KeyUseReducer {
         // The parked completion carried admitted length evidence, so
         // it counts; the detail then competes through the shared
         // path (wrapped shapes imply no mechanism qualifier and no
-        // family, so the type gate is vacuous).
+        // family, so the type gate is vacuous) — except onto
+        // `unsupported`, which pins against parks (only terminal
+        // classified evidence replaces a detail-less unsupported).
         state.size.completions = state.size.completions.saturating_add(1);
-        state
-            .size
-            .accumulate_detail(established, None, None, parked.tag, parked.detail);
+        if state.size.status != InferredStatus::Unsupported {
+            state
+                .size
+                .accumulate_detail(established, None, None, parked.tag, parked.detail);
+        }
     }
 
     /// Whether every new proved bucket in one resolution fits the

@@ -1052,7 +1052,7 @@ fn cbom_limit_only_mechanism_mints_algorithm_component() {
     assert_eq!(projection.unknowns.mechanisms_unknown_primitive, 0);
     let document = super::render::render_json(&projection);
     let algorithm = library_component(&document, "p11scope:mechanism:0x1087");
-    assert_eq!(algorithm["name"], "PKCS#11 mechanism 0x1087");
+    assert_eq!(algorithm["name"], "CKM_AES_GCM");
     let properties = algorithm["properties"].as_array().expect("properties");
     assert!(
         properties
@@ -1100,7 +1100,7 @@ fn cbom_limit_only_mechanism_names_support_truthfully() {
     assert_eq!(algorithm["name"], "CKM_AES_GCM");
     assert_eq!(
         algorithm["description"],
-        "Mechanism reported by the provider (C_GetMechanismInfo); no use observed"
+        "Mechanism reported by the provider (C_GetMechanismInfo); no use observed."
     );
     assert_eq!(
         algorithm["cryptoProperties"]["algorithmProperties"]["primitive"],
@@ -1108,8 +1108,9 @@ fn cbom_limit_only_mechanism_names_support_truthfully() {
     );
     let properties = algorithm["properties"].as_array().expect("properties");
     assert!(
-        properties.iter().any(|property| property["name"] == "p11scope:limit_only"
-            && property["value"] == "true"),
+        properties.iter().any(
+            |property| property["name"] == "p11scope:limit_only" && property["value"] == "true"
+        ),
         "the limit-only marker, got: {properties:?}"
     );
     let used = library_component(&document, "p11scope:mechanism:0x43a");

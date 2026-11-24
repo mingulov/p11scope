@@ -59,7 +59,8 @@ projection re-projects it; profile inputs never carry it.
   manufacturer omits the supplier; malformed provider detail
   degrades to no supplier/version while the component renders.
 - Tokens dedup to one `type: device` component per (module,
-  slot, token identity) named `<manufacturerID> <model>`
+  slot, token identity; volatile PIN-state flag bits excluded)
+  named `<manufacturerID> <model>`
   (available parts only; `token slot <N>` when both strings were
   refused) with hardware/firmware versions, flags and PIN lengths
   in `properties[]`, linked to its library via `dependencies[]`.
@@ -81,7 +82,11 @@ projection re-projects it; profile inputs never carry it.
   gains `; provider key-size limits in properties`. A mechanism id
   with limits but no observed operation row mints an algorithm
   component from the limits alone (zero calls, no observed
-  operations); it stays out of the unknown-primitive count.
+  operations): it carries the registered mechanism name when the id
+  is known, the description `Mechanism reported by the provider
+  (C_GetMechanismInfo); no use observed.`, and the
+  `p11scope:limit_only: true` property; it stays out of the
+  unknown-primitive count.
 - Text: the head counts tokens only when devices exist; `-v` adds a
   tokens block. Section gaps (`info_*`, `mechanism_info_refused`)
   have no CBOM mapping and are not projected.
@@ -122,7 +127,8 @@ are not in the input (see the object-observations privacy rule) and
 this projection invents no identifier for them. The capture-local
 object id rides a `p11scope:object` property for traceability, with
 the label, key-type code, creation family and reference counts beside
-it. The key-type code 66 renders `key_type_name: hkdf`; other
+it. The key-type code 66 renders `key_type_name: hkdf` and codes
+73–75 render `ml_kem`/`ml_dsa`/`slh_dsa`; other
 codes keep their established names. K4 qualification: a slot whose
 `status` is `value` qualifies however it was established — a query
 answer and a creation-success promotion read identically; the

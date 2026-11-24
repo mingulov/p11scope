@@ -2222,12 +2222,16 @@ fn inferred_row_detail(row: &crate::key_operation_projection::KeyAggRow) -> Opti
         InferredStatus::Conflicting => {
             if let Some((detail, tag)) = inferred.size.detail.as_ref() {
                 // An established mismatch pins no second side: the
-                // bare value renders (the established label stands on
-                // the row), like the family side.
+                // conflict still says so, naming the inferred value
+                // against the established label on the row.
                 let rest =
                     u64::from(inferred.size.conflict_detail.is_some()) + inferred.size.further;
                 if rest == 0 {
-                    fragments.push(size_verbose(detail, *tag));
+                    fragments.push(format!(
+                        "size conflicting ({} vs established {})",
+                        size_verbose(detail, *tag),
+                        row.metadata_at_use
+                    ));
                 } else {
                     fragments.push(format!(
                         "{}, +{rest} more conflicting size",
@@ -4586,9 +4590,12 @@ fn render_provider_info_rows(
         } else {
             String::new()
         };
+        let name = crate::mechanism_names::mechanism_name(row.mechanism)
+            .map(|name| format!(" ({name})"))
+            .unwrap_or_default();
         let _ = writeln!(
             out,
-            "  mechanism 0x{:x} slot {}: limits {}-{}, flags 0x{:x}{caller}",
+            "  mechanism 0x{:x}{name} slot {}: limits {}-{}, flags 0x{:x}{caller}",
             row.mechanism, row.slot, row.min_key_size, row.max_key_size, row.flags,
         );
     }

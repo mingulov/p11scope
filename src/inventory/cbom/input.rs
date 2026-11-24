@@ -17,6 +17,7 @@ use std::path::Path;
 #[cfg(test)]
 use crate::inventory_diff::input::parse_bounded_value;
 use crate::inventory_diff::input::{InputLimits, read_bounded_value};
+use crate::mechanism_names::mechanism_name;
 
 pub(super) const SCHEMA_INVENTORY_V1: &str = "p11scope/inventory/v1";
 pub(super) const SCHEMA_PROFILE_V3: &str = "p11scope/observed-profile/v3";
@@ -113,6 +114,13 @@ pub(super) struct Provider {
     pub library_version: Option<String>,
     pub bom_ref: String,
 }
+
+/// Volatile PIN-state bits in `CK_TOKEN_INFO.flags`: one wrong PIN
+/// flips `CKF_USER_PIN_COUNT_LOW`, a lock flips its lock bit. Masked
+/// out of the device dedup key only — the full flags still publish
+/// on the component — so the same physical token never projects two
+/// devices across PIN attempts.
+const TOKEN_PIN_STATE_MASK: u64 = 0x00ff_0000;
 
 /// Dedup key for Task 7 token devices: one device per (module,
 /// slot, token identity).
@@ -939,7 +947,7 @@ fn convert_inventory(value: &Value) -> Result<Projection> {
                 model.clone(),
                 hardware.clone(),
                 firmware.clone(),
-                flags,
+                flags & !TOKEN_PIN_STATE_MASK,
                 pin_min,
                 pin_max,
             )) {
@@ -1008,9 +1016,13 @@ fn convert_inventory(value: &Value) -> Result<Projection> {
             if let Some(mechanism) = out.mechanisms.iter_mut().find(|row| row.id == *id) {
                 mechanism.limits.clone_from(reporters);
             } else {
+                // Limit-only: provider-reported support, never
+                // observed use. The registered name still fills (so
+                // classification works); unregistered ids stay
+                // nameless, never guessed.
                 out.mechanisms.push(Mechanism {
                     id: *id,
-                    name: None,
+                    name: mechanism_name(*id).map(str::to_string),
                     calls: 0,
                     errors: 0,
                     operations: Vec::new(),

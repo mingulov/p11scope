@@ -2162,9 +2162,11 @@ impl EdgeSemantics {
 
     /// Direct call (`C_GenerateKey`, `C_WrapKey`, ...): no machine — a
     /// successful call starts and finishes its operation in this one
-    /// call. (The mechanism claim, if any, was already recorded.) One
-    /// atomic [`OperationEffect::DirectCompleted`]; a failed direct
-    /// call emits nothing. The identity draws from the same checked
+    /// call, except a NULL-output OK on an output-bearing direct,
+    /// which is a length query (no operation, no terminal). (The
+    /// mechanism claim, if any, was already recorded.) One atomic
+    /// [`OperationEffect::DirectCompleted`]; a failed direct call
+    /// emits nothing. The identity draws from the same checked
     /// source as machines: on exhaustion the definite in-call
     /// completion still counts, but no effect is emitted.
     #[allow(clippy::too_many_arguments)] // Direct-call context: call/descriptor/origin/keys/completion/internal plus sink.
@@ -2181,6 +2183,15 @@ impl EdgeSemantics {
         if call.rv != CkRv::OK.0 {
             return;
         }
+        // Keymeta §5.4: a NULL-output OK on an output-bearing direct
+        // is a length query (the two-call wrap/encapsulate
+        // convention), not a completion — like a retained multipart
+        // query it counts no operation and emits no terminal. (The
+        // mechanism claim and `calls` already recorded above; only
+        // output-bearing directs ever read OUTPUT_NULL.)
+        if call.capture & capture::OUTPUT_MASK == capture::OUTPUT_NULL {
+            return;
+        }
         self.started = self.started.saturating_add(1);
         self.completed = self.completed.saturating_add(1);
         let Some(generation) = self.alloc_generation() else {
@@ -2194,17 +2205,10 @@ impl EdgeSemantics {
             );
             let mechanism =
                 (call.mechanism_capture() == capture::MECHANISM_VALUE).then_some(call.mechanism);
-            // Keymeta §5.4: a NULL-output OK direct is a length
-            // query (wrap/encapsulate shapes): the call completes
-            // but the over-estimate value drops on arrival — never
-            // stored, classified or counted. Only output-bearing
-            // directs ever read OUTPUT_NULL; V-directs always read
-            // OUTPUT_NONE.
-            let length = if call.capture & capture::OUTPUT_MASK == capture::OUTPUT_NULL {
-                None
-            } else {
-                completion.length
-            };
+            // Queries return above, so every length here is terminal
+            // (queries drop on arrival — never stored, classified or
+            // counted).
+            let length = completion.length;
             sink.emit(OperationEffect::DirectCompleted {
                 id: OperationId(generation),
                 category: crate::semantics::direct_name(descriptor.direct).unwrap_or("direct"),

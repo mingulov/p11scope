@@ -1241,8 +1241,8 @@ class ObservedRsaTests(unittest.TestCase):
 
     def test_h9_v7_size_detail_closed_variants(self):
         # Closed per-kind variants (§10.2): the shared specimen table
-        # runs through both detail slots — valid RSA and wrapped
-        # details qualify; a foreign field, a missing required field,
+        # runs through both detail slots — valid RSA, wrapped and EC
+        # size-class details qualify; a foreign field, a missing required field,
         # an inappropriate evidence tag, an arbitrary class, an
         # unconstrained curve and a cross-kind curve (which belongs to
         # the outer vocabulary, so it tests the discriminator) do

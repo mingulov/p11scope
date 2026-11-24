@@ -6,21 +6,14 @@
 //! (`modules[].provider_info` plus the top-level
 //! `provider_observations` section).
 //!
-//! TODO(Task 7 BPF half, attach + session): the `INFO_START` / `INFO` /
-//! `INFO_KIND` / `INFO_EVIDENCE` maps, the inventory program list
-//! 12→15, the per-group info returns with EMFILE deferral, and the
-//! INFO drain in the inventory session land after the Task 2 merge.
-//! The drain feeds [`decode_info_record`] + [`InfoJoin::ingest`]
-//! (resolving endpoint → module and the header identity → caller
-//! incarnation itself) and calls [`InfoJoin::note_aliased_endpoint`] /
+//! The INFO drain in the inventory session feeds
+//! [`decode_info_record`] + [`InfoJoin::ingest`] (resolving endpoint
+//! → module and the header identity → caller incarnation itself)
+//! and calls [`InfoJoin::note_aliased_endpoint`] /
 //! [`InfoJoin::note_return_deferred`] for the attach-side gaps. The
 //! shared adapters, read lists and wire codes live in
 //! `p11scope_ebpf_common::inventory_info` / `object_flow`; the
-//! root-crate LP64 cross-check pins them against cryptoki-sys. Until
-//! the drain lands, this module's decode/join surface is test-driven
-//! only.
-
-#![allow(dead_code)] // TODO(Task 7 BPF half): remove once the INFO drain feeds the join.
+//! root-crate LP64 cross-check pins them against cryptoki-sys.
 
 use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
 use crate::discovery::caller_registry::{CallerId, ModuleId};

@@ -396,7 +396,12 @@ fn render_components(projection: &Projection) -> Vec<Value> {
             prop("p11scope:rows", mechanism.rows.to_string()),
         ];
         properties.extend(limit_properties(&mechanism.limits));
-        let description = if mechanism.limits.is_empty() {
+        if mechanism.limit_only {
+            properties.push(prop("p11scope:limit_only", "true".to_string()));
+        }
+        let description = if mechanism.limit_only {
+            "Mechanism reported by the provider (C_GetMechanismInfo); no use observed.".to_string()
+        } else if mechanism.limits.is_empty() {
             "Mechanism observed initializing operations; carries no key size, curve or parameters."
                 .to_string()
         } else {
@@ -538,6 +543,9 @@ fn key_type_name(code: u64) -> &'static str {
         64 => "ec_edwards",
         65 => "ec_montgomery",
         66 => "hkdf",
+        73 => "ml_kem",
+        74 => "ml_dsa",
+        75 => "slh_dsa",
         _ => "unknown",
     }
 }

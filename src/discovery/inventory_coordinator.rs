@@ -1239,6 +1239,7 @@ fn collapse_hint_misses(
 struct HolderScanBudget {
     spent: Cell<u64>,
     deferrals: Cell<u64>,
+    queued_holds: Cell<u64>,
 }
 
 impl HolderScanBudget {
@@ -1246,6 +1247,7 @@ impl HolderScanBudget {
         Self {
             spent: Cell::new(0),
             deferrals: Cell::new(0),
+            queued_holds: Cell::new(0),
         }
     }
 
@@ -1256,6 +1258,7 @@ impl HolderScanBudget {
     fn reset(&self) {
         self.spent.set(0);
         self.deferrals.set(0);
+        self.queued_holds.set(0);
     }
 
     /// Charge `units` holder inspections, or defer: false past the
@@ -1271,14 +1274,26 @@ impl HolderScanBudget {
         true
     }
 
-    /// One scan deferred without charging (its pid's stamps are
-    /// incomplete): counts for the same named gap.
+    /// One scan that actually spent past the pool: counts for the
+    /// budgeted exhaustion gap.
     fn note_deferral(&self) {
         self.deferrals.set(self.deferrals.get().saturating_add(1));
     }
 
     fn deferrals(&self) -> u64 {
         self.deferrals.get()
+    }
+
+    /// One scan held without charging (its pid's stamps are
+    /// incomplete while hooks queue): counts for the unbudgeted
+    /// waiting gap, never the exhaustion payload.
+    fn note_queued_hold(&self) {
+        self.queued_holds
+            .set(self.queued_holds.get().saturating_add(1));
+    }
+
+    fn queued_holds(&self) -> u64 {
+        self.queued_holds.get()
     }
 }
 
@@ -1526,7 +1541,7 @@ impl<'a, Source: ProcessSource> CallerLookup<Source::Pin> for RetainedGate<'a, S
             // out-of-order hook could shrink them, so the row holds
             // for the drain that stamps them.
             ExitHookState::Deferred => {
-                self.pool.note_deferral();
+                self.pool.note_queued_hold();
                 return HolderScan::Deferred;
             }
             ExitHookState::Ready => {}
@@ -1577,7 +1592,7 @@ impl<Source: ProcessSource> ExitWitnessValidator for RetainedGate<'_, Source> {
         match self.hooks.hook_state(pid) {
             ExitHookState::Blinded => return HolderScan::Absent,
             ExitHookState::Deferred => {
-                self.pool.note_deferral();
+                self.pool.note_queued_hold();
                 return HolderScan::Deferred;
             }
             ExitHookState::Ready => {}
@@ -8761,28 +8776,42 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
     }
 
-    /// Files the named exhaustion gap when this staging deferred any
-    /// holder scan: the owed rows, held decisions and unstamped exits
-    /// retry on a later batch. Stable text, so repeats aggregate.
+    /// Files the named exhaustion gap when this staging spent past
+    /// the holder-scan pool: the owed rows, held decisions and
+    /// unstamped exits retry on a later batch. Stable text, so repeats
+    /// aggregate. Rows held only by their pid's queued hooks file the
+    /// separate unbudgeted waiting gap instead: a queue-only hold is
+    /// waiting evidence, never a failed charge.
     fn record_holder_pool_exhaustion(&mut self) {
-        if self.holder_pool.deferrals() == 0 {
-            return;
+        if self.holder_pool.deferrals() > 0 {
+            self.registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: "holder scan pool exhausted".into(),
+                reason: "a per-PID holder scan deferred past the staging's holder-scan pool \
+                     (1,024 visit credits of 64 units); the owed rows, held decisions and \
+                     unstamped exits retry on a later batch"
+                    .into(),
+                budget: Some(BudgetRefusal {
+                    resource: "holder_scan_units",
+                    limit: HolderScanBudget::limit() as usize,
+                    requested: HolderScanBudget::limit() as usize + 1,
+                }),
+            });
         }
-        self.registry.record_gap(RegistryGap {
-            caller: None,
-            module: None,
-            pid: None,
-            subject: "holder scan pool exhausted".into(),
-            reason: "a per-PID holder scan deferred past the staging's holder-scan pool \
-                 (1,024 visit credits of 64 units); the owed rows, held decisions and \
-                 unstamped exits retry on a later batch"
-                .into(),
-            budget: Some(BudgetRefusal {
-                resource: "holder_scan_units",
-                limit: HolderScanBudget::limit() as usize,
-                requested: HolderScanBudget::limit() as usize + 1,
-            }),
-        });
+        if self.holder_pool.queued_holds() > 0 {
+            self.registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: "exit resolution waiting on queued hooks".into(),
+                reason: "a per-PID holder scan held for its pid's queued leader-exit hooks; \
+                     the owed rows and held decisions retry after the queued hooks drain"
+                    .into(),
+                budget: None,
+            });
+        }
     }
 
     /// Whether this witness batch may resolve rows through a witnessed
@@ -38512,6 +38541,113 @@ int main(void) {
             assert_eq!(
                 fresh[0].budget, None,
                 "a queue-only hold carries no budget-overrun payload: {fresh:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_system_scope_validator_hold_on_queued_hooks_files_no_budget_payload() {
+        // The decide-time validator holds on queued hooks exactly like
+        // the resolve path: its staging files the waiting gap with no
+        // budget-overrun payload and no pool-exhausted gap, and the
+        // hold clears with the hooks (no stale wait leaks into the
+        // next staging). The row then correctly stays unbound past
+        // the true exit its hook completes.
+        agreeing(|| {
+            let mut scene = CaptureScene::new(2);
+            scene
+                .coordinator
+                .begin_capture_coverage(CaptureScopeCoverage::System);
+            let mut native = NativeScene::over(scene, 0);
+            native.scene.attach_all(100, ScopeCustody::System);
+            let _storm = admit_hot_pid(&mut native.scene, 7, 1100);
+            let gated = admit_hot_pid(&mut native.scene, 9, 1100);
+            native.scene.coordinator.commit_batch(false).unwrap();
+            native.scene.coordinator.engine.scope = Scope::System;
+            native.scene.coordinator.exit_clocks_comparable = true;
+            // The gated pid's wide exit stamps while its stamps are
+            // complete; the row snapshots the oldest holder.
+            let at = native.stamps.tick();
+            native.stage(NativeBatch::Lifecycle(leader_exit_drain_many(
+                native.domain,
+                at,
+                9,
+                &[100_000],
+            )));
+            let row = native.row(41, 1, 9, 1050, 0);
+            native.read(vec![row]);
+            assert_eq!(
+                native.scene.coordinator.binder.owed_len_for_test(),
+                0,
+                "the row snapshots against complete stamps"
+            );
+            // A storm for the hot pid defers its tail, and the gated
+            // pid's small hook past the spent pool.
+            let storm_hooks: Vec<u64> = (0..60).map(|i| 200_000 + i).collect();
+            let at = native.stamps.tick();
+            let mut storm = leader_exit_drain_many(native.domain, at, 7, &storm_hooks);
+            let small = leader_exit_drain_many(native.domain, at, 9, &[1001]);
+            storm.records.extend(small.records);
+            native.stage(NativeBatch::Lifecycle(storm));
+            // The next witness read covers the row while its hook
+            // still queues: the validator holds with no charge spent.
+            let staged_before = native
+                .scene
+                .coordinator
+                .registry
+                .staged_gaps_for_test()
+                .len();
+            native.read(Vec::new());
+            assert_eq!(
+                native.scene.coordinator.binder.pending_rows().count(),
+                1,
+                "the covered row holds for its queued hook"
+            );
+            let staged = native.scene.coordinator.registry.staged_gaps_for_test();
+            let fresh = &staged[staged_before..];
+            assert_eq!(
+                fresh.len(),
+                1,
+                "the holding staging files exactly one gap: {fresh:?}"
+            );
+            assert_eq!(
+                fresh[0].subject, "exit resolution waiting on queued hooks",
+                "a validator hold names the wait: {fresh:?}"
+            );
+            assert_eq!(
+                fresh[0].budget, None,
+                "a validator hold carries no budget-overrun payload: {fresh:?}"
+            );
+            // The drain completes the small hook; the row lies past
+            // the true exit and stays unbound, and no stale wait
+            // leaks into the deciding staging (the delta is read
+            // before the commit clears it).
+            let staged_before = native
+                .scene
+                .coordinator
+                .registry
+                .staged_gaps_for_test()
+                .len();
+            native.drain();
+            native.read(Vec::new());
+            let staged = native.scene.coordinator.registry.staged_gaps_for_test();
+            assert!(
+                !staged[staged_before..].iter().any(|gap| gap.subject
+                    == "exit resolution waiting on queued hooks"),
+                "no stale wait leaks past the drain: {:?}",
+                &staged[staged_before..]
+            );
+            native.scene.coordinator.commit_batch(false).unwrap();
+            assert_eq!(bound_census(&native), (1, 0, 0));
+            assert_eq!(no_live_caller(&native), Some(1));
+            assert!(
+                native
+                    .scene
+                    .coordinator
+                    .registry
+                    .edges()
+                    .all(|edge| edge.caller != gated[0] || edge.entry_count == 0),
+                "the gated row edged nothing"
             );
         });
     }

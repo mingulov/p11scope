@@ -1532,6 +1532,8 @@ pub fn target_readability_proven<E>(
     operations.into_iter().all(|result| result.is_ok())
 }
 
+const TARGET_GENERATION_UNPROVEN: &str = "generation changed";
+
 fn assess_target_readability(pid: u32) -> Result<usize, &'static str> {
     use p11scope_manifest::maps::{MapIndex, MappedPath, ObjectKey, Resolved};
 
@@ -1540,19 +1542,19 @@ fn assess_target_readability(pid: u32) -> Result<usize, &'static str> {
     let root = format!("/proc/{pid}/root");
     let maps_opened = view
         .run_while_same(|| std::fs::read(format!("/proc/{pid}/maps")))
-        .map_err(|_| "generation changed")
+        .map_err(|_| TARGET_GENERATION_UNPROVEN)
         .and_then(|result| result.map_err(|_| "maps unavailable"));
     let maps = maps_opened.as_ref().map_err(|reason| *reason)?;
     let entries = p11scope_manifest::maps::parse_maps(maps).map_err(|_| "maps invalid")?;
     let index = MapIndex::new(&entries).map_err(|_| "maps invalid")?;
     let mem_opened = view
         .run_while_same(|| std::fs::File::open(format!("/proc/{pid}/mem")))
-        .map_err(|_| "generation changed")
+        .map_err(|_| TARGET_GENERATION_UNPROVEN)
         .and_then(|result| result.map_err(|_| "mem unavailable"));
     let _mem = mem_opened.as_ref().map_err(|reason| *reason)?;
     let root_opened = view
         .run_while_same(|| std::fs::File::open(&root))
-        .map_err(|_| "generation changed")
+        .map_err(|_| TARGET_GENERATION_UNPROVEN)
         .and_then(|result| result.map_err(|_| "root unavailable"));
     let _root = root_opened.as_ref().map_err(|reason| *reason)?;
 
@@ -1620,7 +1622,7 @@ fn assess_target_readability(pid: u32) -> Result<usize, &'static str> {
     let generation_stable = view
         .still_the_same()
         .then_some(())
-        .ok_or("generation changed");
+        .ok_or(TARGET_GENERATION_UNPROVEN);
     if !target_readability_proven([
         generation_stable.as_ref().map(|_| ()).map_err(|_| ()),
         maps_opened.as_ref().map(|_| ()).map_err(|_| ()),
@@ -1631,7 +1633,7 @@ fn assess_target_readability(pid: u32) -> Result<usize, &'static str> {
             .map(|_| ())
             .map_err(|_| ()),
     ]) {
-        return Err("generation changed");
+        return Err(TARGET_GENERATION_UNPROVEN);
     }
     Ok(providers)
 }
@@ -2224,7 +2226,7 @@ fn next_step_for(check: &Check, privileged: bool, caps_lacking: bool) -> String 
         if detail == "generation unavailable" {
             return "verify the target is live and readable, then rerun p11scope doctor --pid <PID>".into();
         }
-        if ["generation changed", "ESRCH", "ENOENT"]
+        if [TARGET_GENERATION_UNPROVEN, "ESRCH", "ENOENT"]
             .iter()
             .any(|cause| detail.contains(cause))
         {
@@ -4074,6 +4076,20 @@ mod tests {
                 "{name} was not requested and must not Fail"
             );
         }
+    }
+
+    #[test]
+    fn target_generation_revalidation_failure_is_proof_neutral() {
+        assert_eq!(
+            TARGET_GENERATION_UNPROVEN,
+            "generation could not be revalidated"
+        );
+        let check = Check {
+            name: "target readability".into(),
+            status: Status::Fail(TARGET_GENERATION_UNPROVEN.into()),
+        };
+        let next = next_step_for(&check, false, false);
+        assert!(!next.contains("changed"), "{next}");
     }
 
     #[test]

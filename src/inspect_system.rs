@@ -54,6 +54,9 @@ use crate::discovery::sweep_attribution::{
 };
 use crate::discovery::sweep_attribution::{MemberProbe, OsMemberProbe, attribute_unselected};
 use crate::discovery::sweep_shards::{shard_count, shard_threads};
+use crate::inspect::{
+    INSPECT_GENERATION_BEFORE, INSPECT_GENERATION_PINNING, INSPECT_GENERATION_SCANNING,
+};
 use crate::inspect_identity::{
     InspectApplicationResult, InspectIdentityUnknown, InspectImageReader, ProcessViewImageReader,
     application_detail, application_from_confirmed_member, application_json, application_label,
@@ -1081,13 +1084,7 @@ fn scan_pinned_member_inner(
     // pid-inspect: a member that changes mid-scan is re-read as whatever
     // it is now (usually gone), never half of each generation.
     if !view_handle.still_the_same() {
-        return member_not_scanned(
-            pid,
-            view,
-            "the process generation changed before inspect",
-            noise,
-            gaps,
-        );
+        return member_not_scanned(pid, view, INSPECT_GENERATION_BEFORE, noise, gaps);
     }
     let request = ScanRequest { pid, hints, hooks };
     let scanned = match custody {
@@ -1113,13 +1110,7 @@ fn scan_pinned_member_inner(
         }
     };
     if !view_handle.still_the_same() {
-        return member_not_scanned(
-            pid,
-            view,
-            "the process generation changed while inspect was scanning",
-            noise,
-            gaps,
-        );
+        return member_not_scanned(pid, view, INSPECT_GENERATION_SCANNING, noise, gaps);
     }
     // The run's table bounds this member's pins like every other
     // member's: a full table stops the pin with the shared
@@ -1146,13 +1137,7 @@ fn scan_pinned_member_inner(
         }
     };
     if !view_handle.still_the_same() {
-        return member_not_scanned(
-            pid,
-            view,
-            "the process generation changed while inspect was pinning",
-            noise,
-            gaps,
-        );
+        return member_not_scanned(pid, view, INSPECT_GENERATION_PINNING, noise, gaps);
     }
     let generation_current = generation.start_time.is_some()
         && generation.exe.is_some()
@@ -9064,6 +9049,48 @@ int main(int argc, char **argv) {
                 crate::inspect_identity::application_json(&row.application)["application"]
                     .is_null()
             );
+        }
+
+        #[test]
+        fn unproven_generation_detail_is_neutral_in_json_and_verbose_text() {
+            let detail =
+                crate::discovery::sweep_attribution::CONFIRMATION_GENERATION_UNPROVEN_DETAIL;
+            let catalog = catalog_of(
+                over_cap(&[]),
+                HashMap::from([(
+                    10_001,
+                    Confirmation::Lost(AttributionLoss::GenerationChanged, detail.into()),
+                )]),
+                false,
+            );
+            let process = catalog
+                .processes
+                .iter()
+                .find(|process| process.pid == 10_001)
+                .unwrap();
+            let expected = format!("generation_changed: {detail}");
+            assert_eq!(process.status.reason(), Some(expected.as_str()));
+            assert_eq!(
+                catalog
+                    .attribution_losses
+                    .get(&AttributionLoss::GenerationChanged),
+                Some(&1)
+            );
+            let document = render_json(&catalog);
+            let row = document["processes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["pid"] == 10_001)
+                .unwrap();
+            assert_eq!(row["reason"], expected);
+            assert_eq!(
+                document["scan"]["attribution_losses"]["generation_changed"],
+                1
+            );
+            let text = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
+            assert!(text.contains(&expected), "{text}");
+            assert!(!detail.contains("changed"), "{detail}");
         }
 
         /// Review fix (Important 2): "examined" comes from the deep scan's

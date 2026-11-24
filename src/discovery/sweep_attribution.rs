@@ -1826,6 +1826,9 @@ pub(crate) fn prepare_confirmation<Io: ConfirmIo>(
     })
 }
 
+pub(crate) const CONFIRMATION_GENERATION_UNPROVEN_DETAIL: &str =
+    "the process generation changed during the confirmation read";
+
 /// Live final checks consume the original pin only after all segment proofs.
 pub(crate) fn finish_confirmation<Io: ConfirmIo>(
     io: &Io,
@@ -1861,7 +1864,7 @@ pub(crate) fn finish_confirmation<Io: ConfirmIo>(
             io,
             pid,
             AttributionLoss::GenerationChanged,
-            "the process generation changed during the confirmation read".into(),
+            CONFIRMATION_GENERATION_UNPROVEN_DETAIL.into(),
         );
     }
     match after {

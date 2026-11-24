@@ -34124,6 +34124,44 @@ fn pin_test_modules(view: &ProcessView, modules: &[ScannedModule]) -> PinnedObje
     pins
 }
 
+struct ProviderChildGuard(std::process::Child);
+
+impl std::ops::Deref for ProviderChildGuard {
+    type Target = std::process::Child;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ProviderChildGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for ProviderChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn provider_child_guard_reaps_on_drop() {
+    let pid = {
+        let child = ProviderChildGuard(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .die_with_parent()
+                .spawn()
+                .unwrap(),
+        );
+        child.id()
+    };
+    assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+}
+
 /// A live child, an Engine that retains one process view on it, and one
 /// accepted provider already attached in slot 0. The returned modules are
 /// `[accepted, peer]`; the peer is what a later candidate allocates.
@@ -34133,6 +34171,25 @@ fn engine_with_one_accepted_provider() -> (std::process::Child, Engine, Vec<Scan
         .die_with_parent()
         .spawn()
         .unwrap();
+    let (engine, modules) = engine_with_accepted_provider_child(&child);
+    (child, engine, modules)
+}
+
+fn engine_with_one_accepted_provider_guarded() -> (ProviderChildGuard, Engine, Vec<ScannedModule>) {
+    let mut child = ProviderChildGuard(
+        std::process::Command::new("sleep")
+            .arg("30")
+            .die_with_parent()
+            .spawn()
+            .unwrap(),
+    );
+    let (engine, modules) = engine_with_accepted_provider_child(&mut child);
+    (child, engine, modules)
+}
+
+fn engine_with_accepted_provider_child(
+    child: &std::process::Child,
+) -> (Engine, Vec<ScannedModule>) {
     let view = ProcessView::open(ProcessViewId(3), child.id()).unwrap();
     let modules = child_provider_modules(&view);
     let mut engine = Engine::empty();
@@ -34152,7 +34209,7 @@ fn engine_with_one_accepted_provider() -> (std::process::Child, Engine, Vec<Scan
     assert!(outcome.accepted(), "the first candidate is accepted whole");
     assert_eq!(engine.plan.slots.len(), 1);
     assert!(engine.plan.module_of_slot(0).is_some());
-    (child, engine, modules)
+    (engine, modules)
 }
 
 /// The candidate that allocates one more cell for the peer provider.
@@ -82124,6 +82181,34 @@ impl Drop for LegacyPrefixBoundaryFixture {
     }
 }
 
+struct ScratchMapping {
+    base: *mut libc::c_void,
+    len: usize,
+}
+
+impl ScratchMapping {
+    fn new(len: usize) -> Self {
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(base, libc::MAP_FAILED);
+        Self { base, len }
+    }
+}
+
+impl Drop for ScratchMapping {
+    fn drop(&mut self) {
+        assert_eq!(unsafe { libc::munmap(self.base, self.len) }, 0);
+    }
+}
+
 #[test]
 fn exact_read_recovers_legacy_prefix_at_readable_mapping_boundary() {
     const TEST: &str =
@@ -94053,7 +94138,7 @@ fn stale_view_removal_files_a_proof_neutral_diagnostic() {
 /// proof-neutral, never "changed". The bail twin pins the refusal.
 #[test]
 fn loader_arm_postcheck_mark_is_proof_neutral_on_a_contradicted_pin() {
-    let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+    let (mut child, mut engine, _modules) = engine_with_one_accepted_provider_guarded();
     engine.lose_generation_after_arm_for_test = true;
     engine.pin_probe_script.borrow_mut().extend([
         PinProbeAnswer::Exited(Ok(false)),
@@ -94113,7 +94198,7 @@ fn loader_arm_postcheck_mark_is_proof_neutral_on_a_contradicted_pin() {
 /// drives the inner bracket with a live child).
 #[test]
 fn loader_attachment_marks_are_proof_neutral_on_an_unprovable_pin() {
-    let (child, mut engine, _modules) = engine_with_one_accepted_provider();
+    let (child, mut engine, _modules) = engine_with_one_accepted_provider_guarded();
     let pid = child.id();
     engine.pin_probe_script.borrow_mut().extend([
         PinProbeAnswer::Exited(Ok(false)),
@@ -94165,11 +94250,13 @@ fn loader_attachment_marks_are_proof_neutral_on_an_unprovable_pin() {
 /// precheck deterministically fails closed.
 #[test]
 fn export_lowering_before_a_stale_view_refuses_proof_neutral() {
-    let mut child = std::process::Command::new("sleep")
-        .arg("30")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
+    let mut child = ProviderChildGuard(
+        std::process::Command::new("sleep")
+            .arg("30")
+            .die_with_parent()
+            .spawn()
+            .unwrap(),
+    );
     let view = ProcessView::open(ProcessViewId(4246), child.id()).unwrap();
     child.kill().unwrap();
     child.wait().unwrap();
@@ -94234,11 +94321,11 @@ fn revalidation_vocabulary_never_claims_a_change() {
     );
     assert_eq!(
         UNSTABLE_TABLE_VALIDATION_REASON,
-        "a published table moved or the process generation could not be revalidated during validation"
+        "published table stability validation failed"
     );
     assert_eq!(
         BROAD_UNSTABLE_TABLE_REASON,
-        "the mappings moved or the generation could not be revalidated during validation"
+        "pool table stability validation failed"
     );
     assert_eq!(
         LOADER_ATTACH_INVARIANT_AROUND_RECHECK,
@@ -94248,6 +94335,165 @@ fn revalidation_vocabulary_never_claims_a_change() {
         LOADER_ATTACH_STALE_REASON,
         "loader generation, mapping, or pinned identity could not be revalidated during attach"
     );
+}
+
+#[test]
+fn publication_read_refusal_is_a_stability_failure_not_a_change() {
+    let mapping = ScratchMapping::new(4096);
+    let address = mapping.base as u64;
+    unsafe { *(address as *mut u64) = 0x0203 };
+    let view = ProcessView::open(ProcessViewId(4250), std::process::id()).unwrap();
+    let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+    let index = MapIndex::new(&maps).unwrap();
+    assert!(view.still_the_same());
+    drop(mapping);
+    let hooks = HookRegistry::builtin();
+    let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+    record.kind = DISCOVERY_KIND_FUNCTION_LIST_RETURN;
+    record.symbol_id = hooks.id("C_GetFunctionList").unwrap();
+    record.pid_tgid = u64::from(std::process::id()) << 32;
+    record.table_ptr = address;
+    record.version_major = 3;
+    record.version_minor = 2;
+    assert!(valid_discovery_record(&record));
+    let outcome = lower_heap_publication_record(
+        &view,
+        &index,
+        &hooks,
+        &record,
+        &[],
+        &mut CaptureWorkBudget::default(),
+        None,
+    )
+    .unwrap();
+    let HeapLowerOutcome::Refused(reason) = outcome else {
+        panic!("a stale maps bracket must refuse publication");
+    };
+    assert_eq!(reason, "published table stability validation failed");
+    assert!(view.still_the_same());
+}
+
+#[test]
+fn broad_pool_read_refusal_is_a_stability_failure_not_a_change() {
+    let mapping = ScratchMapping::new(4096);
+    let address = mapping.base as u64;
+    unsafe { *(address as *mut u64) = 0x0203 };
+    let view = ProcessView::open(ProcessViewId(4251), std::process::id()).unwrap();
+    let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+    let index = MapIndex::new(&maps).unwrap();
+    assert!(view.still_the_same());
+    drop(mapping);
+    let mut module = overlay_module(overlay_key(1));
+    let mut tallies = BroadTallies::default();
+    let reason = broad_pool_table(
+        &view,
+        &mut module,
+        &index,
+        &mut CaptureWorkBudget::default(),
+        address,
+        LinuxLayout::Lp64,
+        &mut tallies,
+    )
+    .expect_err("a stale maps bracket must refuse the pool table");
+    assert_eq!(reason, "pool table stability validation failed");
+    assert!(view.still_the_same());
+}
+
+#[test]
+fn operator_generation_diagnostics_never_restore_retired_claims() {
+    let engine = include_str!("engine.rs");
+    for (name, uses) in [
+        ("STALE_VIEW_REASON", 3),
+        ("STALE_EXPORT_LOWERING_BEFORE", 2),
+        ("STALE_EXPORT_LOWERING_DURING", 2),
+        ("UNSTABLE_TABLE_VALIDATION_REASON", 2),
+        ("BROAD_UNSTABLE_TABLE_REASON", 2),
+        ("LOADER_ATTACH_INVARIANT_AROUND_RECHECK", 2),
+        ("LOADER_ATTACH_STALE_REASON", 2),
+    ] {
+        assert_eq!(engine.matches(name).count(), uses, "{name}");
+    }
+    for retired in [
+        "accepted process generation changed during attach preparation",
+        "the process generation changed before the loader-arm postcheck",
+        "loader generation, mapping, or pinned identity changed during attach",
+        "the process generation changed around a dynamic export attachment",
+        "a process generation changed before downgraded exact targets were replaced",
+        "a process generation changed after link mutation",
+        "a process generation changed before new exact targets were attached",
+        "process generation changed before export lowering",
+        "process generation changed during export lowering",
+        "a published table moved or the process generation changed during validation",
+        "the mappings moved or the generation changed during validation",
+        "dynamic loader attachment invariant failed around generation change",
+        "the owned child generation changed before pre-exec loader attachment",
+    ] {
+        assert!(
+            !engine.contains(retired),
+            "retired claim returned: {retired}"
+        );
+    }
+    for (source, retired, neutral) in [
+        (
+            include_str!("../process.rs"),
+            "process generation changed before target access",
+            "process generation could not be revalidated before target access",
+        ),
+        (
+            include_str!("scan.rs"),
+            "memory scan refused: process generation changed during acquisition",
+            "memory scan refused: process generation could not be revalidated during acquisition",
+        ),
+        (
+            include_str!("../inspect.rs"),
+            "process generation changed before inspect",
+            "process generation could not be revalidated before inspect",
+        ),
+        (
+            include_str!("../inspect.rs"),
+            "process generation changed while inspect was scanning",
+            "process generation could not be revalidated while inspect was scanning",
+        ),
+        (
+            include_str!("../inspect.rs"),
+            "process generation changed while inspect was pinning",
+            "process generation could not be revalidated while inspect was pinning",
+        ),
+        (
+            include_str!("../doctor.rs"),
+            "generation changed",
+            "generation could not be revalidated",
+        ),
+        (
+            include_str!("pause.rs"),
+            "owned child generation changed",
+            "owned child generation could not be revalidated",
+        ),
+        (
+            include_str!("caller_registry.rs"),
+            "cgroup caller source generation or image changed before final sampling",
+            "cgroup caller source generation or image could not be revalidated before final sampling",
+        ),
+        (
+            include_str!("../inspect_system/inventory_cgroup.rs"),
+            "cgroup member generation or image changed during its transaction",
+            "cgroup member generation or image could not be revalidated during its transaction",
+        ),
+        (
+            include_str!("../inspect_system.rs"),
+            "manifest locator generation changed",
+            "manifest locator generation could not be revalidated",
+        ),
+    ] {
+        assert!(
+            !source.contains(retired),
+            "retired claim returned: {retired}"
+        );
+        assert!(
+            source.contains(neutral),
+            "neutral wording missing: {neutral}"
+        );
+    }
 }
 
 /// The export-hook generation-change mark: silent for an ending group,

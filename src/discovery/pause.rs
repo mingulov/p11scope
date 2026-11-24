@@ -4626,6 +4626,12 @@ mod tests {
         let error = coordinator.service(&mut io).unwrap_err();
 
         assert!(error.lifecycle());
+        assert!(
+            error
+                .to_string()
+                .contains("generation could not be revalidated after resume")
+        );
+        assert!(!error.to_string().contains("generation changed"));
         assert_eq!(
             coordinator.counters(),
             PauseCounters {
@@ -7044,6 +7050,10 @@ mod tests {
             Ok(_) => panic!("generation change must reject the removed record"),
         };
         assert!(matches!(error, TimedDequeueError::Failure(_)));
+        assert_eq!(
+            error.message(),
+            "owned child generation could not be revalidated after discovery decode"
+        );
         assert_eq!(coordinator.pending_records.len(), 1);
         assert_eq!(coordinator.unvalidated_records, 1);
     }
@@ -7064,7 +7074,9 @@ mod tests {
         };
 
         assert!(matches!(&error, TimedDequeueError::Failure(_)));
-        assert!(error.message().contains("generation changed"));
+        let message = error.message();
+        assert!(message.contains("generation could not be revalidated"));
+        assert!(!message.contains("generation changed"));
         assert!(coordinator.pending_records.is_empty());
         assert_eq!(coordinator.unvalidated_records, 1);
     }
@@ -7310,6 +7322,12 @@ mod tests {
         let error = coordinator.service(&mut io).unwrap_err();
 
         assert!(error.lifecycle());
+        assert!(
+            error
+                .to_string()
+                .contains("owned child generation could not be revalidated")
+        );
+        assert!(!error.to_string().contains("generation changed"));
         assert_eq!(io.applied.len(), 2);
         assert_eq!(io.applied[0].hook_ts_ns, 10);
         assert_eq!(io.applied[1].hook_ts_ns, 20);
@@ -8722,7 +8740,12 @@ mod tests {
             Ok(_) => panic!("generation loss must fail the nested drain"),
         };
 
-        assert!(error.to_string().contains("generation changed"));
+        assert!(
+            error
+                .to_string()
+                .contains("generation could not be revalidated")
+        );
+        assert!(!error.to_string().contains("generation changed"));
         assert!(error.records.is_empty());
         assert_eq!(error.unvalidated_records, 1);
     }
@@ -8738,11 +8761,10 @@ mod tests {
         let error = coordinator.arm(&mut io).unwrap_err();
 
         assert!(error.required());
-        assert!(
-            error
-                .to_string()
-                .contains("[pause_diag=arm_failed_before_epoch]")
-        );
+        assert!(error.to_string().contains(
+            "owned child generation could not be revalidated before pause arm [pause_diag=arm_failed_before_epoch]"
+        ));
+        assert!(!error.to_string().contains("generation changed"));
         assert_eq!(
             io.events,
             ["dequeue", "account", "read", "remove", "detach"]
@@ -8976,7 +8998,12 @@ mod tests {
 
         assert!(error.required());
         assert!(error.lifecycle());
-        assert!(error.to_string().contains("generation changed"));
+        assert!(
+            error
+                .to_string()
+                .contains("generation could not be revalidated")
+        );
+        assert!(!error.to_string().contains("generation changed"));
         assert!(error.to_string().contains("detach"));
         assert!(io.events.contains(&"account"));
         assert!(io.events.contains(&"remove"));

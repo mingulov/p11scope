@@ -25,6 +25,11 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 
 const DOC_ID: &str = "p11scope/inspect/v1";
+pub(crate) const INSPECT_GENERATION_BEFORE: &str = "process generation changed before inspect";
+pub(crate) const INSPECT_GENERATION_SCANNING: &str =
+    "process generation changed while inspect was scanning";
+pub(crate) const INSPECT_GENERATION_PINNING: &str =
+    "process generation changed while inspect was pinning";
 
 /// Writes `lines`, naming each run of consecutive identical lines once with
 /// its count (`  (×N identical)`). A proxy such as p11-kit carries dozens of
@@ -615,15 +620,15 @@ fn scan_and_pin_retained_with<C, S, P>(
     pin: impl FnOnce(&mut C, &S) -> Result<P, String>,
 ) -> Result<(S, P), String> {
     if !still_the_same(context) {
-        return Err("process generation changed before inspect".into());
+        return Err(INSPECT_GENERATION_BEFORE.into());
     }
     let scanned = scan(context)?;
     if !still_the_same(context) {
-        return Err("process generation changed while inspect was scanning".into());
+        return Err(INSPECT_GENERATION_SCANNING.into());
     }
     let pinned = pin(context, &scanned)?;
     if !still_the_same(context) {
-        return Err("process generation changed while inspect was pinning".into());
+        return Err(INSPECT_GENERATION_PINNING.into());
     }
     Ok((scanned, pinned))
 }
@@ -1035,6 +1040,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn inspect_generation_brackets_are_proof_neutral() {
+        use std::cell::Cell;
+
+        for (fail_at, expected) in [
+            (
+                1,
+                "process generation could not be revalidated before inspect",
+            ),
+            (
+                2,
+                "process generation could not be revalidated while inspect was scanning",
+            ),
+            (
+                3,
+                "process generation could not be revalidated while inspect was pinning",
+            ),
+        ] {
+            let checks = Cell::new(0usize);
+            let error = scan_and_pin_retained_with(
+                &mut (),
+                |_| {
+                    checks.set(checks.get() + 1);
+                    checks.get() != fail_at
+                },
+                |_| Ok::<(), String>(()),
+                |_, _| Ok::<(), String>(()),
+            )
+            .unwrap_err();
+            assert_eq!(error, expected);
+            assert!(!error.contains("changed"), "{error}");
+        }
+    }
+
     /// F-20: a soft diagnosis failure (the target changed mid-scan or
     /// mid-pin) with `--json` prints a machine-readable failure document
     /// on stdout and exits 1 — never a text line that breaks `| jq`.
@@ -1045,7 +1084,7 @@ mod tests {
             4242,
             true,
             &mut stdout,
-            Err("process generation changed while inspect was scanning".into()),
+            Err("process generation could not be revalidated while inspect was scanning".into()),
         )
         .unwrap();
         assert_eq!(code, 1);
@@ -1055,7 +1094,7 @@ mod tests {
         assert_eq!(document["scan"]["status"], "failed");
         assert_eq!(
             document["scan"]["reason"],
-            "process generation changed while inspect was scanning"
+            "process generation could not be revalidated while inspect was scanning"
         );
         assert_eq!(document["modules"], serde_json::json!([]));
         assert_eq!(document["skipped"], serde_json::json!([]));
@@ -1184,14 +1223,14 @@ mod tests {
             4242,
             false,
             &mut stdout,
-            Err("process generation changed while inspect was pinning".into()),
+            Err("process generation could not be revalidated while inspect was pinning".into()),
         )
         .unwrap();
         assert_eq!(code, 1);
         assert_eq!(
             String::from_utf8(stdout).unwrap(),
-            "p11scope: cannot inspect pid 4242: process generation changed while inspect was \
-             pinning\n"
+            "p11scope: cannot inspect pid 4242: process generation could not be revalidated while \
+             inspect was pinning\n"
         );
     }
 

@@ -1793,6 +1793,14 @@ mod tests {
     }
 
     #[test]
+    fn generation_gap_reason_is_proof_neutral() {
+        assert_eq!(
+            ScopedCollectionOutcome::Incomplete(ScopedCollectionGap::GenerationChanged).reason(),
+            "cgroup member generation or image could not be revalidated during its transaction"
+        );
+    }
+
+    #[test]
     fn an_exec_changes_image_under_the_same_original_process_pin() {
         let child = crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild::with_command(
             "kill -STOP $$; exec /bin/sleep 30",

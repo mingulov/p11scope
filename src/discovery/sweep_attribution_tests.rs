@@ -778,10 +778,13 @@ fn confirmation_requires_the_pin_to_hold_and_the_exe_to_stay() {
         same: false,
         ..Io::healthy()
     };
-    assert!(matches!(
+    assert_eq!(
         confirm(turned),
-        Confirmation::Lost(AttributionLoss::GenerationChanged, _)
-    ));
+        Confirmation::Lost(
+            AttributionLoss::GenerationChanged,
+            "the process generation could not be revalidated during the confirmation read".into(),
+        )
+    );
     // An exec between the two exe reads.
     let mut other = exe();
     other.ino = 101;

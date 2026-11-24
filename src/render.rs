@@ -20824,11 +20824,11 @@ pub(crate) mod tests {
             ),
             (
                 "live export discovery",
-                "a published table moved or the process generation could not be revalidated during validation",
+                "published table stability validation failed",
             ),
             (
                 "live interface selection",
-                "a published table moved or the process generation could not be revalidated during validation",
+                "published table stability validation failed",
             ),
             (
                 "capture discovery",
@@ -20840,7 +20840,7 @@ pub(crate) mod tests {
             ),
             (
                 "/usr/lib/libpool.so",
-                "broad fixed-family: pool table 0 refused (the mappings moved or the generation could not be revalidated during validation); the pool layout is unverified, so no fixed-family tables were added",
+                "broad fixed-family: pool table 0 refused (pool table stability validation failed); the pool layout is unverified, so no fixed-family tables were added",
             ),
         ];
         for (subject, reason) in &internals {

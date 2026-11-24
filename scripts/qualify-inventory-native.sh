@@ -67,6 +67,12 @@ ORACLE=$REPO/scripts/inventory-native-oracle.py
 MODULE=${MODULE:-/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so}
 ITERS=${ITERS:-4}
 ROTATE_BYTES=1024M  # far above any run: the oracle fails a rotated stream
+# Every repository input this driver and its C8 gate load at run time; a
+# checkout-free stage without one refuses here, before any build or capture.
+for _input in scripts/inventory-native-oracle.py scripts/qualify-cgroup-trace.py scripts/mapped-provider-pin.py \
+    tests/fixtures/public-cli/inventory-ledger.c; do
+    [ -f "$REPO/$_input" ] || { echo "qualify-inventory-native: required input missing: $REPO/$_input" >&2; exit 64; }
+done
 
 die() { echo "qualify-inventory-native: $*" >&2; exit 70; }
 

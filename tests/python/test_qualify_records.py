@@ -317,6 +317,8 @@ def run_case(case, *, stamp=True, before=None):
                 stamp_path.mkdir()
             elif "stamp_text" in case:
                 stamp_path.write_text(case["stamp_text"])
+            elif "stamp_bytes" in case:
+                stamp_path.write_bytes(case["stamp_bytes"])
             elif stamp:
                 Q.write_stamp(str(stamp_path), case.get("stamp_run_id", RUN_ID),
                               case.get("stamp_cell", CELLS[judge]))
@@ -604,6 +606,14 @@ NEGATIVE = [
     ("cgroup.procs-once", "cgroup-member", lambda c: c.update(procs="1000\n10\n")),
     ("cgroup.procs-once", "cgroup-member", lambda c: c.update(procs="100\n100\n")),
     ("cgroup.procs-once", "cgroup-member", lambda c: c.update(procs="")),
+    ("cgroup.procs-read", "cgroup-member", lambda c: c.update(remove=["cgroup.procs"])),
+    ("cgroup.procs-read", "cgroup-member", lambda c: c.update(as_fifo=["cgroup.procs"])),
+    # codex r11 #2: a stamp is read whole within its limit, never as a prefix
+    ("fresh.run", "fifo-refusal", lambda c: c.update(
+        stamp_bytes=stamp_bytes("fifo-refusal").ljust(Q.MAX_STAMP_BYTES + 1) + b"NO")),
+    ("fresh.run", "fifo-refusal", lambda c: c.update(
+        stamp_bytes=stamp_bytes("fifo-refusal").ljust(Q.MAX_STAMP_BYTES + 1))),
+    ("fresh.run", "fifo-refusal", lambda c: c.update(stamp_bytes=stamp_bytes("fifo-refusal") + b"\xff")),
     # event stdout (codex r9 #3)
     ("record.event-row", "event-stdout", chain(stream_row(1, seq=True))),
     ("record.event-row", "event-stdout", stream_row(1, at_ns=2**64)),
@@ -1006,6 +1016,80 @@ def stamp_record_case(case):
         path.write_text(json.dumps(text))
         os.utime(path, ns=(info.st_atime_ns, info.st_mtime_ns))
     return before
+
+
+def stamp_bytes(judge, run_id=RUN_ID):
+    return json.dumps({"schema": Q.STAMP_SCHEMA, "run_id": run_id, "cell": CELLS[judge]}).encode()
+
+
+class BoundedReadTests(unittest.TestCase):
+    """codex r11 #2: every file read refuses an input with more bytes than
+    its limit and never decides from the prefix it read. One row per read
+    site: the run stamp, a product report (read_product), a plain run input
+    (Run.read) and cgroup.procs. Each has an exact-boundary pass, a valid
+    prefix with an unread tail, and an invalid encoding. Limits are lowered
+    for the 64 MiB sites so the boundary files stay small."""
+
+    def outcome(self, case, limit=None):
+        if limit is None:
+            record, _ = run_case(case)
+        else:
+            saved = Q.MAX_INPUT_BYTES
+            Q.MAX_INPUT_BYTES = limit
+            try:
+                record, _ = run_case(case)
+            finally:
+                Q.MAX_INPUT_BYTES = saved
+        self.assertEqual(record["schema"], "p11scope/qualify-verdict/v1")
+        return (record["verdict"], record.get("rule") if record["verdict"] == "fail" else None), record
+
+    def check(self, name, case, limit, want):
+        with self.subTest(site=name):
+            got, record = self.outcome(case, limit)
+            self.assertEqual(got, want, record)
+
+    def test_run_stamp(self):
+        healthy = stamp_bytes("fifo-refusal")
+        rows = (("healthy", healthy, ("pass", None)),
+                ("exact limit", healthy.ljust(Q.MAX_STAMP_BYTES), ("pass", None)),
+                ("prefix and unread tail", healthy.ljust(Q.MAX_STAMP_BYTES + 1) + b"NO", ("fail", "fresh.run")),
+                ("only whitespace past the limit", healthy.ljust(Q.MAX_STAMP_BYTES + 1), ("fail", "fresh.run")),
+                ("invalid UTF-8", healthy + b"\xff", ("fail", "fresh.run")))
+        for name, data, want in rows:
+            self.check("stamp " + name, dict(base("fifo-refusal"), stamp_bytes=data), None, want)
+
+    def sigint_sizes(self):
+        case = base("second-sigint")
+        report, stderr = dumps(case["report"]).encode(), case["stderr"].encode()
+        return case, report, stderr, max(len(report), len(stderr)) + 16
+
+    def test_product_report(self):
+        case, report, _, limit = self.sigint_sizes()
+        rows = (("exact limit", report.ljust(limit), ("pass", None)),
+                ("prefix and unread tail", report.ljust(limit + 1) + b"NO", ("fail", "fresh.file")),
+                ("invalid UTF-8", report + b" \xff", ("fail", "fresh.file")))
+        for name, data, want in rows:
+            self.check("product " + name, dict(copy.deepcopy(case), raw={"sigint2.json": data}), limit, want)
+
+    def test_run_input(self):
+        case, _, stderr, limit = self.sigint_sizes()
+        rows = (("exact limit", stderr.ljust(limit, b"\n"), ("pass", None)),
+                ("prefix and unread tail", stderr.ljust(limit + 1, b"\n") + b"p11scope: cleanup incomplete\n",
+                 ("fail", "fresh.file")),
+                ("invalid UTF-8", stderr + b"\xff\n", ("fail", "fresh.file")))
+        for name, data, want in rows:
+            self.check("input " + name, dict(copy.deepcopy(case), raw={"sig2.stderr": data}), limit, want)
+
+    def test_cgroup_procs(self):
+        limit = 65  # the healthy 7 bytes plus whole "7\n" rows
+        healthy = member_case()["procs"].encode()
+        filled = healthy + b"7\n" * ((limit - len(healthy)) // 2)
+        self.assertEqual(len(filled), limit)
+        rows = (("exact limit", filled, ("pass", None)),
+                ("prefix and unread tail", filled + b"100\n", ("fail", "cgroup.procs-read")),
+                ("non-ASCII", healthy + b"1\xff\n", ("fail", "cgroup.procs-lines")))
+        for name, data, want in rows:
+            self.check("procs " + name, dict(base("cgroup-member"), procs=data), limit, want)
 
 
 class RuleTableTests(unittest.TestCase):
@@ -1551,8 +1635,11 @@ class OptimizedInterpreterTests(unittest.TestCase):
                     tmp = Path(raw)
                     argv = [case["judge"], "--verdict", str(tmp / "v.json")]
                     if case["judge"] != "cgroup-member":
-                        Q.write_stamp(str(tmp / "cell.stamp"), case.get("stamp_run_id", RUN_ID),
-                                      case.get("stamp_cell", CELLS[case["judge"]]))
+                        if "stamp_bytes" in case:
+                            (tmp / "cell.stamp").write_bytes(case["stamp_bytes"])
+                        else:
+                            Q.write_stamp(str(tmp / "cell.stamp"), case.get("stamp_run_id", RUN_ID),
+                                          case.get("stamp_cell", CELLS[case["judge"]]))
                         argv += ["--stamp", str(tmp / "cell.stamp"), "--run-id", RUN_ID]
                     make_private(tmp, case)
                     files, named = write_inputs(case, tmp)

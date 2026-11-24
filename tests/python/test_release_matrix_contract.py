@@ -524,7 +524,8 @@ class MatrixContract(unittest.TestCase):
         repo, stage = self.clone_source()
         contract_path = stage / "contract.json"
         original = json.loads(contract_path.read_text())
-        for name in ("public-cli-oracle.py", "check-capture-evidence.py", "qualify_records.py"):
+        for name in ("public-cli-oracle.py", "check-capture-evidence.py", "qualify_records.py",
+                     "qualify-cgroup-trace.py", "cgroup-trace-oracle.py"):
             relative = "artifacts/source/scripts/" + name
             source, staged = repo / "scripts" / name, stage / relative
             self.assertIn(relative, original["bindings"])
@@ -561,9 +562,11 @@ class MatrixContract(unittest.TestCase):
         self.assertIsNotNone(guard)
         self.assertEqual(set(guard.group(1).replace("\\\n", " ").split()), helpers)
 
-    # Every staged runner's references to repository files, by the variable
-    # each resolves them through, with the transitive files its helpers read.
-    # Self-test-only references run from a checkout, never from a stage.
+    # Every staged script's references to repository files (codex r11 #1:
+    # the whole checkout-free closure, Python helpers included): through a
+    # runner variable, a repository-relative literal (runpy/ROOT paths and
+    # heredoc Python inside shells) or a sibling of the script itself.
+    # Comment lines name files for readers; they load nothing.
     RUNNER_REFERENCES = {
         "scripts/qualify-public-cli.sh": (("HERE", "scripts/"), ("SRC", "tests/fixtures/public-cli/")),
         "scripts/run-privileged-lib-tests.sh": (("REPO_ROOT", ""),),
@@ -572,40 +575,142 @@ class MatrixContract(unittest.TestCase):
         "scripts/ci/build-counter-fixtures.sh": (("REPO_ROOT", ""),),
         "scripts/ci/build-wrap-fixtures.sh": (("REPO_ROOT", ""),),
     }
+    LITERAL = re.compile(r'''['"/ ]((?:scripts|tests|crates|src)/[A-Za-z0-9_./-]+\.(?:py|sh|c))\b''')
+    SIBLING = re.compile(r'''(?:with_name\(\s*|parent\s*/\s*)['"]([A-Za-z0-9_.-]+\.(?:py|sh|c))['"]''')
     SELF_TEST_ONLY = {"tests/python/test_inventory_capacity_oracle.py", "tests/python/test_release_matrix_contract.py"}
+    # (staged owner, file): why that owner never loads the file from a stage
+    OUTSIDE_STAGE = {
+        ("scripts/qualify-release-matrix.sh", "scripts/cargo.sh"): "build_bins builds in the checkout before staging",
+        ("scripts/qualify-release-matrix.sh", "scripts/fixtures/exec_churn.c"):
+            "build_bins hashes it in the checkout; the stage carries it as artifacts/lib-source",
+        ("scripts/run-privileged-lib-tests.sh", "scripts/ci/stop-races.sh"):
+            "prose in an unscheduled cell's reason text; this runner never runs it",
+    }
+    # The contract's own literals are the staging declarations under test.
+    DECLARATION = "scripts/release-matrix-contract.py"
     TRANSITIVE = {
         # build-counter-fixtures.sh builds "$REPO_ROOT/tests/fixtures/$src" for these sources
         "scripts/ci/build-counter-fixtures.sh": {"tests/fixtures/counter-banks.c",
                                                  "tests/fixtures/counter-bank-growth.c"},
-        # prepare-diagnostics-wrap.py reads its ledger, the included base and the pin helper
-        "tests/fixtures/operator-output/prepare-diagnostics-wrap.py": {
-            "tests/fixtures/operator-output/diagnostics-wrap-ledger.c",
-            "tests/fixtures/public-cli/demotion-ledger.c", "scripts/mapped-provider-pin.py"},
     }
 
-    def test_every_staged_runner_reference_is_staged(self):
+    @classmethod
+    def references(cls, owner):
+        text = "\n".join(line for line in (ROOT / owner).read_text().splitlines()
+                         if not line.lstrip().startswith("#"))
+        found = set()
+        for var, prefix in cls.RUNNER_REFERENCES.get(owner, ()):
+            for name in re.findall(r'\$\{?%s\}?/([A-Za-z0-9_./-]+\.(?:py|sh|c))\b' % var, text):
+                found.add(prefix + name)
+        found.update(cls.LITERAL.findall(text))
+        here = str(Path(owner).parent)
+        found.update(here + "/" + name for name in cls.SIBLING.findall(text))
+        return found | cls.TRANSITIVE.get(owner, set())
+
+    def test_every_staged_script_reference_is_staged(self):
         staged = set(CHECKER_MOD["SOURCE_FILES"])
-        missing = {}
-        for runner, roots in self.RUNNER_REFERENCES.items():
-            self.assertIn(runner, staged)
-            text = (ROOT / runner).read_text()
-            found = set()
-            for var, prefix in roots:
-                for name in re.findall(r'\$\{?%s\}?/([A-Za-z0-9_./-]+\.(?:py|sh|c))\b' % var, text):
-                    found.add(prefix + name)
-            # A runner that names its files only through a variable has them in TRANSITIVE.
-            self.assertTrue(found or runner in self.TRANSITIVE, runner)
-            for name in sorted(found - self.SELF_TEST_ONLY):
-                self.assertTrue((ROOT / name).is_file(), (runner, name))
+        missing, used = {}, set()
+        for owner in sorted(staged):
+            if not owner.endswith((".py", ".sh")) or owner == self.DECLARATION:
+                continue
+            for name in sorted(self.references(owner) - self.SELF_TEST_ONLY):
+                if (owner, name) in self.OUTSIDE_STAGE:
+                    used.add((owner, name))
+                    continue
+                self.assertTrue((ROOT / name).is_file(), (owner, name))
                 if name not in staged:
-                    missing.setdefault(runner, []).append(name)
-        for owner, names in self.TRANSITIVE.items():
-            self.assertIn(owner, staged)
-            missing.update({owner: sorted(names - staged)} if names - staged else {})
+                    missing.setdefault(owner, []).append(name)
+        self.assertEqual(missing, {})
+        self.assertEqual(used, set(self.OUTSIDE_STAGE), "stale outside-stage rows")
+        for runner in self.RUNNER_REFERENCES:
+            self.assertIn(runner, staged)
         counter = (ROOT / "scripts/ci/build-counter-fixtures.sh").read_text()
         self.assertEqual({"tests/fixtures/" + s for s in re.findall(r'^build ([A-Za-z0-9_-]+\.c) ', counter, re.M)},
                          self.TRANSITIVE["scripts/ci/build-counter-fixtures.sh"])
-        self.assertEqual(missing, {})
+
+    def test_closure_scan_finds_each_reference_form(self):
+        # Positive controls for the scan itself: one known reference of each form.
+        self.assertIn("scripts/qualify-cgroup-trace.py", self.references("scripts/qualify-inventory-native.sh"))
+        self.assertIn("scripts/cgroup-trace-oracle.py", self.references("scripts/qualify-cgroup-trace.py"))
+        self.assertIn("scripts/check-capture-evidence.py", self.references("scripts/system-scope-measure.py"))
+        self.assertIn("tests/fixtures/operator-output/diagnostics-wrap-ledger.c",
+                      self.references("tests/fixtures/operator-output/prepare-diagnostics-wrap.py"))
+        self.assertIn("scripts/qualify_records.py", self.references("scripts/qualify-public-cli.sh"))
+        self.assertIn("tests/fixtures/catalog-driver.c", self.references("scripts/inventory-native-oracle.py"))
+        # A commented mention is not a reference.
+        self.assertNotIn("scripts/check-ignored-tests.py", self.references("scripts/run-privileged-lib-tests.sh"))
+
+    def test_native_driver_guard_names_its_runtime_inputs(self):
+        text = (ROOT / "scripts/qualify-inventory-native.sh").read_text()
+        guard = re.search(r'for _input in ([^;]+); do', text)
+        self.assertIsNotNone(guard)
+        self.assertEqual(set(guard.group(1).replace("\\\n", " ").split()),
+                         self.references("scripts/qualify-inventory-native.sh") - self.SELF_TEST_ONLY)
+
+    def staged_native(self):
+        repo, stage = self.clone_source()
+        staged = stage / "artifacts/source"
+        repo.rename(self.base / "unavailable original checkout")
+        return staged
+
+    def test_staged_native_driver_without_an_input_refuses_before_any_work(self):
+        staged = self.staged_native()
+        driver = staged / "scripts/qualify-inventory-native.sh"
+        def run():
+            return subprocess.run(["bash", str(driver), "/bin/true", "--lane", "unknown"],
+                                  text=True, capture_output=True, timeout=30)
+        healthy = run()
+        self.assertEqual(healthy.returncode, 64, healthy.stdout + healthy.stderr)
+        self.assertIn("--lane must be scan or native", healthy.stderr)
+        self.assertNotIn("required input missing", healthy.stderr)
+        for name in ("scripts/inventory-native-oracle.py", "scripts/qualify-cgroup-trace.py",
+                     "scripts/mapped-provider-pin.py", "tests/fixtures/public-cli/inventory-ledger.c"):
+            with self.subTest(input=name):
+                path = staged / name
+                content = path.read_bytes(); path.unlink()
+                try:
+                    result = run()
+                    self.assertEqual(result.returncode, 64, result.stdout + result.stderr)
+                    self.assertIn("required input missing: %s" % path, result.stderr)
+                    self.assertNotIn("--lane must be", result.stderr)
+                finally:
+                    path.write_bytes(content)
+
+    def test_staged_native_c8_calibration_runs_checkout_free(self):
+        # The staged driver's actual C8 prepare seam with four parent-held
+        # ordinary descriptors writes the typed receipt; without its trace
+        # helper it refuses and writes none.
+        staged = self.staged_native()
+        text = (staged / "scripts/qualify-inventory-native.sh").read_text()
+        function = text.split("c8_gate() {", 1)[1].split("\n}\n\nmono_ns", 1)[0]
+        files = []
+        for role in ("L", "L2", "A", "B"):
+            path = self.base / ("held-" + role)
+            path.write_bytes(b"held " + role.encode() + b"\n")
+            files.append(str(path))
+        script = ('REPO=$1\nc8_gate() {' + function + '\n}\n'
+                  'exec {one}<"$2"\nexec {two}<"$3"\nexec {three}<"$4"\nexec {four}<"$5"\n'
+                  'c8_gate prepare "$6" "$one" "$two" "$three" "$four"\n')
+        def prepare(name):
+            receipt = self.base / name
+            result = subprocess.run(["bash", "-u", "-c", script, "c8", str(staged), *files, str(receipt)],
+                                    cwd=self.base, capture_output=True, text=True, timeout=30)
+            return result, receipt
+        result, receipt = prepare("pins-healthy.json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        pins = json.loads(receipt.read_text())["pins"]
+        self.assertEqual(set(pins), {"L", "L2", "A", "B"})
+        self.assertEqual({role: pins[role]["path"] for role in pins},
+                         dict(zip(("L", "L2", "A", "B"), files)))
+        helper = staged / "scripts/qualify-cgroup-trace.py"
+        content = helper.read_bytes(); helper.unlink()
+        try:
+            result, receipt = prepare("pins-refused.json")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("qualify-cgroup-trace.py", result.stderr)
+            self.assertFalse(receipt.exists())
+        finally:
+            helper.write_bytes(content)
 
     def test_staged_lib_runner_without_a_helper_refuses_before_any_setup(self):
         repo, stage = self.clone_source()

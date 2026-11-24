@@ -182,6 +182,9 @@ SOURCE_FILES = ("scripts/release-matrix-contract.py", "scripts/qualify-release-m
                 "scripts/check-capture-evidence.py", "scripts/qualify_records.py",
                 "scripts/inventory-mt-oracle.py", "scripts/system-cell-census.py", "scripts/inventory-mt-gate.py",
                 "scripts/qualify-inventory-native.sh", "scripts/inventory-native-oracle.py",
+                # qualify-inventory-native.sh's C8 gate and the native oracle's capacity run
+                "scripts/qualify-cgroup-trace.py", "scripts/cgroup-trace-oracle.py",
+                "tests/fixtures/catalog-driver.c", "crates/discover/tests/fixture/version_matrix.c",
                 "tests/fixtures/public-cli/gated.c", "tests/fixtures/public-cli/mt.c",
                 "tests/fixtures/public-cli/inventory-ledger.c", "tests/fixtures/public-cli/prearm-first-use.c",
                 "tests/fixtures/public-cli/cgroup-fork.c", "tests/fixtures/public-cli/chain-parent.c",

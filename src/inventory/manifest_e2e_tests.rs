@@ -4067,12 +4067,24 @@ fn keysize_canary_map_identity(shown: &[u8], id: u32) -> Result<(String, String)
 }
 
 /// The owned-map scan result: dumped (and scanned) maps, ringbufs the
-/// kernel cannot dump, and the scanned dump bytes. Only names and
-/// counts ever print; dump contents stay in 0600 scratch files.
+/// kernel cannot dump, identity task storage the kernel cannot dump,
+/// and the scanned dump bytes. Only names and counts ever print; dump
+/// contents stay in 0600 scratch files.
 struct KeysizeCanaryMapScan {
     dumped: Vec<String>,
     rings: Vec<String>,
+    task_storage: Vec<String>,
     bytes: u64,
+}
+
+/// The one undumpable non-ring map: `THREAD_OWNER` task storage is
+/// keyed by live task, so `bpftool map dump` refuses it. Its value
+/// type (`struct thread_owner` in `crates/ebpf/native/task_owner.h`)
+/// holds identity/lease/counter words only — no length cell, no
+/// payload buffer — and userspace never reads it (`K::Unsupported` in
+/// `src/attach/inventory.rs`). Anything else undumpable fails closed.
+fn keysize_canary_is_identity_task_storage(name: &str, kind: &str) -> bool {
+    name == "THREAD_OWNER" && kind == "task_storage"
 }
 
 /// The length stash must be among the dumped maps: without
@@ -4088,9 +4100,10 @@ fn keysize_canary_dumped_covers_evidence_start(dumped: &[String]) -> bool {
 /// each dump raw+hex for the canary marker. Ringbufs
 /// (`EVENTS`/`DISCOVERY`/`INFO`) are not bpftool-dumpable; the
 /// observer drains them into the scanned report, event log and
-/// observer log, so they are listed, not dumped. Any other refusal, a
-/// missing `EVIDENCE_START`, or a failed positive control fails the
-/// cell: an unscanned map is a hole, not a pass.
+/// observer log, so they are listed, not dumped. The identity task
+/// storage is likewise undumpable and listed, never read. Any other
+/// refusal, a missing `EVIDENCE_START`, or a failed positive control
+/// fails the cell: an unscanned map is a hole, not a pass.
 fn keysize_canary_scan_owned_maps(pid: u32, dump_dir: &Path) -> Result<KeysizeCanaryMapScan> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -4104,6 +4117,7 @@ fn keysize_canary_scan_owned_maps(pid: u32, dump_dir: &Path) -> Result<KeysizeCa
     std::fs::create_dir_all(dump_dir)?;
     let mut dumped = Vec::new();
     let mut rings = Vec::new();
+    let mut task_storage = Vec::new();
     let mut bytes = 0u64;
     let mut combined = Vec::new();
     for id in ids {
@@ -4124,13 +4138,17 @@ fn keysize_canary_scan_owned_maps(pid: u32, dump_dir: &Path) -> Result<KeysizeCa
             rings.push(format!("{name} ({id})"));
             continue;
         }
+        if keysize_canary_is_identity_task_storage(&name, &kind) {
+            task_storage.push(format!("{name} ({id})"));
+            continue;
+        }
         let dump = Command::new("bpftool")
             .args(["map", "dump", "id", &id.to_string()])
             .output()
             .context("KEYCANARY: spawning bpftool map dump")?;
         ensure!(
             dump.status.success(),
-            "{TAG}: bpftool map dump id {id} ({name}) refused: {}",
+            "{TAG}: bpftool map dump id {id} ({name}/{kind}) refused: {}",
             String::from_utf8_lossy(&dump.stderr)
                 .chars()
                 .take(200)
@@ -4145,7 +4163,7 @@ fn keysize_canary_scan_owned_maps(pid: u32, dump_dir: &Path) -> Result<KeysizeCa
         bytes += dump.stdout.len() as u64;
         ensure!(
             !keysize_canary_scan_map_dump(&dump.stdout),
-            "{TAG}: canary marker leaked into BPF map {name} ({id})"
+            "{TAG}: canary marker leaked into BPF map {name} ({id}/{kind})"
         );
         combined.extend_from_slice(&dump.stdout);
         dumped.push(format!("{name} ({id})"));
@@ -4162,6 +4180,7 @@ fn keysize_canary_scan_owned_maps(pid: u32, dump_dir: &Path) -> Result<KeysizeCa
     Ok(KeysizeCanaryMapScan {
         dumped,
         rings,
+        task_storage,
         bytes,
     })
 }
@@ -4209,13 +4228,33 @@ fn keysize_canary_evidence_start_cover_requires_the_stash() {
     assert!(!keysize_canary_dumped_covers_evidence_start(&impostor));
 }
 
+#[test]
+fn keysize_canary_identity_task_storage_matches_one_map() {
+    assert!(keysize_canary_is_identity_task_storage(
+        "THREAD_OWNER",
+        "task_storage"
+    ));
+    assert!(!keysize_canary_is_identity_task_storage(
+        "THREAD_OWNER",
+        "hash"
+    ));
+    assert!(!keysize_canary_is_identity_task_storage(
+        "EVIDENCE_START",
+        "task_storage"
+    ));
+    assert!(!keysize_canary_is_identity_task_storage(
+        "EVENTS", "ringbuf"
+    ));
+}
+
 /// Task 4 privacy canary, live: `inventory --pid --capture native
 /// --key-operations --key-sizes --manifest --verbose` over the
 /// sentinel-guarded sign+verify workload. The S length cell and the V
 /// buffers sit between pure repeated `K3YS1Z3CANARY!` guards; the cell
 /// asserts the marker appears in none of the JSON report, the event
 /// log, the verbose observer log or any dumpable owned BPF map (rings
-/// drain into the scanned outputs), while both RSA-2048 sizes publish.
+/// drain into the scanned outputs; the identity task storage is
+/// undumpable and never read), while both RSA-2048 sizes publish.
 /// Needs an observer binary via `P11SCOPE_E2E_OBSERVER` or a `p11scope`
 /// sibling of this test binary, plus `bpftool` for the map dumps.
 /// Prints KEYCANARY lines. Root BPF lane, serial, about a minute.
@@ -4352,11 +4391,13 @@ fn keysize_canary_inner(workload: &E2eWorkload, module: &str, observer: &Path) -
     // are listed, not dumped: they drain into the scanned outputs.
     let map_scan = keysize_canary_scan_owned_maps(child.id(), &workload.path("mapdumps"))?;
     println!(
-        "{TAG} maps dumped={} rings={} bytes={} rings=[{}]",
+        "{TAG} maps dumped={} rings={} taskstorage={} bytes={} rings=[{}] taskstorage=[{}]",
         map_scan.dumped.len(),
         map_scan.rings.len(),
+        map_scan.task_storage.len(),
         map_scan.bytes,
-        map_scan.rings.join(", ")
+        map_scan.rings.join(", "),
+        map_scan.task_storage.join(", ")
     );
     target.ensure_alive("after the owned-map scan before the observer stopped")?;
     let stop_deadline = Instant::now() + Duration::from_secs(120);
@@ -4411,12 +4452,13 @@ fn keysize_canary_inner(workload: &E2eWorkload, module: &str, observer: &Path) -
         .context("object_observations")?;
     let verdict = judge_keysize_canary_observations(observations, ledger_signs, ledger_verifies)?;
     println!(
-        "{TAG} {verdict} ledger={ledger_signs}/{ledger_verifies} scanned={}/{}/{} maps={}/{}",
+        "{TAG} {verdict} ledger={ledger_signs}/{ledger_verifies} scanned={}/{}/{} maps={}/{}/{}",
         report_bytes.len(),
         event_bytes.len(),
         observer_bytes.len(),
         map_scan.dumped.len(),
         map_scan.rings.len(),
+        map_scan.task_storage.len(),
     );
     Ok(())
 }

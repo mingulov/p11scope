@@ -5335,6 +5335,9 @@ type OwnedLearnedKey = (String, crate::process::MountNamespaceId, ObjectKey, Str
 /// (staged, refused past the cap, or settled through another path —
 /// the key is noted either way) or failed duplicating/statting the
 /// held file (nothing noted, so a later proof re-attempts).
+/// Deferred callers refuse a failure loudly (the popped proof cannot
+/// regenerate); fresh proofs regenerate next apply, so their caller
+/// ignores it.
 enum LearnedStageOutcome {
     Terminal,
     CloneFailed,
@@ -25132,14 +25135,35 @@ impl Engine {
             self.owned_learn_file_probes_for_test =
                 self.owned_learn_file_probes_for_test.saturating_add(1);
         }
-        let _ = self.stage_learned_file(
+        // A popped proof cannot regenerate: a duplicate/stat
+        // failure refuses loudly with counted loss and a named gap
+        // instead of vanishing silently. The prepared tables still
+        // commit below (file and tables are independent outcomes, as
+        // on the refused-generation path).
+        match self.stage_learned_file(
             file,
             &entry.proof.path,
             loader_exe,
             loader_unknown_reason,
             key,
             entry.proving_retained,
-        );
+        ) {
+            LearnedStageOutcome::Terminal => {}
+            LearnedStageOutcome::CloneFailed => {
+                self.learned_event_loss = self.learned_event_loss.saturating_add(1);
+                self.mark_partial(
+                    crate::render::LEARNED_SKIP_SUBJECT,
+                    "a deferred owned-learn proof's file could not be duplicated; it was refused",
+                );
+            }
+            LearnedStageOutcome::StatFailed => {
+                self.learned_event_loss = self.learned_event_loss.saturating_add(1);
+                self.mark_partial(
+                    crate::render::LEARNED_SKIP_SUBJECT,
+                    "a deferred owned-learn proof's file metadata could not be read; it was refused",
+                );
+            }
+        }
         if let Some(module) = prepared {
             self.harvest_commit(target, module, Some(&entry.scan_pins));
         }

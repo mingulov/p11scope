@@ -1427,14 +1427,8 @@ mod holder_scan_state_tests {
     fn deferred_hooks_gate_until_the_drain() {
         let mut hooks = DeferredExitHooks::new();
         assert_eq!(hooks.hook_state(7), ExitHookState::Ready);
-        assert!(matches!(
-            hooks.push_deferred(7, 100),
-            DeferredPush::Queued
-        ));
-        assert!(matches!(
-            hooks.push_deferred(7, 200),
-            DeferredPush::Queued
-        ));
+        assert!(matches!(hooks.push_deferred(7, 100), DeferredPush::Queued));
+        assert!(matches!(hooks.push_deferred(7, 200), DeferredPush::Queued));
         assert_eq!(hooks.hook_state(7), ExitHookState::Deferred);
         assert_eq!(hooks.hook_state(9), ExitHookState::Ready);
         assert_eq!(hooks.peek_for_drain(), Some((7, 100)));
@@ -1452,10 +1446,7 @@ mod holder_scan_state_tests {
         assert_eq!(MAX_DEFERRED_EXIT_HOOKS, 1_024);
         let mut hooks = DeferredExitHooks::new();
         for i in 0..1_024 {
-            assert!(matches!(
-                hooks.push_deferred(7, i),
-                DeferredPush::Queued
-            ));
+            assert!(matches!(hooks.push_deferred(7, i), DeferredPush::Queued));
         }
         assert_eq!(hooks.queue_len_for_test(), 1_024);
         assert!(matches!(
@@ -36854,8 +36845,7 @@ int main(void) {
             );
             assert!(scene.coordinator.adapter.live_id(pid).is_none());
         }
-        let proven: Vec<(CallerId, u64)> =
-            scene.coordinator.adapter.leader_proven(pid).collect();
+        let proven: Vec<(CallerId, u64)> = scene.coordinator.adapter.leader_proven(pid).collect();
         assert_eq!(proven.len(), generations, "every generation proven");
         assert_eq!(
             proven.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
@@ -36900,8 +36890,7 @@ int main(void) {
             // SAFETY: DiscoveryRecord contains only integer fields;
             // this is the same fixed, zero-reserved lifecycle wire
             // shape the real producer emits.
-            let mut record: p11scope_ebpf_common::DiscoveryRecord =
-                unsafe { std::mem::zeroed() };
+            let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
             record.hook_ts_ns = hook_ts_ns;
             record.pid_tgid = ((pid as u64) << 32) | pid as u64;
             record.kind = p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT;
@@ -37635,9 +37624,13 @@ int main(void) {
             assert_eq!(bound_census(&native), (70, 70, 0));
             assert_holders_edged(&native, &holders[..70]);
             assert!(
-                native.scene.coordinator.registry.gaps().iter().any(|gap| gap
-                    .subject
-                    == "holder scan pool exhausted"),
+                native
+                    .scene
+                    .coordinator
+                    .registry
+                    .gaps()
+                    .iter()
+                    .any(|gap| gap.subject == "holder scan pool exhausted"),
                 "the pool exhaustion files the named gap"
             );
         });
@@ -37672,9 +37665,13 @@ int main(void) {
             assert_eq!(bound_census(&native), (177, 177, 0));
             assert_holders_edged(&native, &holders[..177]);
             assert!(
-                native.scene.coordinator.registry.gaps().iter().any(|gap| gap
-                    .subject
-                    == "holder scan pool exhausted"),
+                native
+                    .scene
+                    .coordinator
+                    .registry
+                    .gaps()
+                    .iter()
+                    .any(|gap| gap.subject == "holder scan pool exhausted"),
                 "the pool exhaustion files the named gap"
             );
         });
@@ -37711,9 +37708,13 @@ int main(void) {
             assert_eq!(bound_census(&native), (60, 60, 0));
             assert_holders_edged(&native, &holders[..60]);
             assert!(
-                native.scene.coordinator.registry.gaps().iter().any(|gap| gap
-                    .subject
-                    == "holder scan pool exhausted"),
+                native
+                    .scene
+                    .coordinator
+                    .registry
+                    .gaps()
+                    .iter()
+                    .any(|gap| gap.subject == "holder scan pool exhausted"),
                 "the pool exhaustion files the named gap"
             );
         });
@@ -37752,9 +37753,13 @@ int main(void) {
             assert_eq!(bound_census(&native), (1, 1, 0));
             assert_only_holder_edged(&native, holders[0]);
             assert!(
-                native.scene.coordinator.registry.gaps().iter().any(|gap| gap
-                    .subject
-                    == "holder scan pool exhausted"),
+                native
+                    .scene
+                    .coordinator
+                    .registry
+                    .gaps()
+                    .iter()
+                    .any(|gap| gap.subject == "holder scan pool exhausted"),
                 "the pool exhaustion files the named gap"
             );
         });
@@ -37789,7 +37794,8 @@ int main(void) {
                 &[100_000],
             )));
             let endpoint = native.scene.delta.endpoints[0];
-            let row = WitnessRow::scripted(native.domain, 41, 1, endpoint.object, endpoint.id, 9, 1050);
+            let row =
+                WitnessRow::scripted(native.domain, 41, 1, endpoint.object, endpoint.id, 9, 1050);
             native.read(vec![row]);
             // A 60-hook storm for the hot pid defers its last hook.
             let storm_hooks: Vec<u64> = (0..60).map(|i| 200_000 + i).collect();
@@ -37838,9 +37844,13 @@ int main(void) {
                 "the gated row edged nothing"
             );
             assert!(
-                native.scene.coordinator.registry.gaps().iter().any(|gap| gap
-                    .subject
-                    == "holder scan pool exhausted"),
+                native
+                    .scene
+                    .coordinator
+                    .registry
+                    .gaps()
+                    .iter()
+                    .any(|gap| gap.subject == "holder scan pool exhausted"),
                 "the pool exhaustion files the named gap"
             );
         });
@@ -37891,8 +37901,10 @@ int main(void) {
                 &[450],
             )));
             let endpoint = native.scene.delta.endpoints[0];
-            let blinded = WitnessRow::scripted(native.domain, 41, 1, endpoint.object, endpoint.id, 7, 1025);
-            let held = WitnessRow::scripted(native.domain, 42, 1, endpoint.object, endpoint.id, 8, 300);
+            let blinded =
+                WitnessRow::scripted(native.domain, 41, 1, endpoint.object, endpoint.id, 7, 1025);
+            let held =
+                WitnessRow::scripted(native.domain, 42, 1, endpoint.object, endpoint.id, 8, 300);
             native.witness(vec![blinded, held]);
             assert_eq!(bound_census(&native), (2, 1, 0));
             assert_eq!(no_live_caller(&native), Some(1));

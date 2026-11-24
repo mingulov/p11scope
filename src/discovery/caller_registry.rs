@@ -6360,16 +6360,41 @@ impl CallerRegistry {
         self.staged
             .iter()
             .filter(|staged| {
-                matches!(
-                    staged,
+                // Exhaustive: every `Mutation` arm names its verdict, so
+                // a new variant fails to compile here until the twin's
+                // conservative set is re-examined.
+                match staged {
                     Mutation::NoteInstance(_)
-                        | Mutation::ObserveInstanceSemantic(_)
-                        | Mutation::InstanceSemanticLoss(_)
-                        | Mutation::RetireInstance(_)
-                        | Mutation::RetireCaller { .. }
-                        | Mutation::NoteModuleAbsent { .. }
-                        | Mutation::NoteMemberUnscanned { .. }
-                )
+                    | Mutation::ObserveInstanceSemantic(_)
+                    | Mutation::InstanceSemanticLoss(_)
+                    | Mutation::RetireInstance(_)
+                    | Mutation::RetireCaller { .. }
+                    | Mutation::NoteModuleAbsent { .. }
+                    | Mutation::NoteMemberUnscanned { .. } => true,
+                    Mutation::NoteMapping { .. }
+                    | Mutation::ObserveEntries { .. }
+                    | Mutation::SetInFlight { .. }
+                    | Mutation::ObserveSemantic { .. }
+                    | Mutation::NoteSemanticLoss { .. }
+                    | Mutation::NoteRefreshLoss { .. }
+                    | Mutation::NoteCountedLoss
+                    | Mutation::NoteCountedPidExit
+                    | Mutation::NoteWitness { .. }
+                    | Mutation::NoteBoundWitness { .. }
+                    | Mutation::NoteUnboundWitness { .. }
+                    | Mutation::NoteUnresolvedWitness
+                    | Mutation::NoteUseBeforeAdmission { .. }
+                    | Mutation::NoteWitnessCensus { .. }
+                    | Mutation::NoteCoverage { .. }
+                    | Mutation::NoteCountedUse { .. }
+                    | Mutation::NotePendingCount { .. }
+                    | Mutation::NotePairsUncounted { .. }
+                    | Mutation::NoteHealthRegression { .. }
+                    | Mutation::EndWatches { .. }
+                    | Mutation::RecordGap { .. }
+                    | Mutation::RecordKeyedGap { .. }
+                    | Mutation::RecordAggregatedUnrouted { .. } => false,
+                }
             })
             .count()
     }
@@ -10918,6 +10943,25 @@ pub(crate) mod tests {
 
     fn registry() -> CallerRegistry {
         CallerRegistry::new(RegistryLimits::default_limits())
+    }
+
+    #[test]
+    fn staged_instance_invalidations_counts_one_retire_caller() {
+        // Positive control for the void-entry proof twins' zero pin:
+        // one staged caller retirement counts exactly one, and an
+        // empty staging counts zero.
+        let mut registry = registry();
+        assert_eq!(
+            registry.staged_instance_invalidations_for_test(),
+            0,
+            "premise: empty staging counts zero"
+        );
+        registry.retire_caller(CallerId(1), "test retirement".to_string(), 0);
+        assert_eq!(
+            registry.staged_instance_invalidations_for_test(),
+            1,
+            "one staged caller retirement counts one"
+        );
     }
 
     #[test]

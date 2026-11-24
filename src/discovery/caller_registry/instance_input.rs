@@ -3452,6 +3452,76 @@ impl CallerRegistry {
         self.staged_disposal.is_some()
     }
 
+    /// Test-only pose of a pending staged disposal: one Joint
+    /// instance with two staged heads over `ledger`, disposal
+    /// started. The exit-hold twins pose through the coordinator
+    /// wrapper, which passes the joint ledger the hold's drain
+    /// polls with. Returns the posed instance for fold assertions.
+    #[cfg(test)]
+    pub(crate) fn pose_joint_staged_disposal_for_test(
+        &mut self,
+        ledger: &mut crate::semantics_objects::journal::StagingLedger,
+    ) -> RegistryInstanceId {
+        let domain = NativeDomainId::try_mint().expect("fresh domain");
+        let caller = CallerId(7);
+        let module_key = ModuleKey::Physical {
+            dev_major: 1,
+            dev_minor: 2,
+            ino: 3,
+            sha256: None,
+        };
+        let _module = self.scripted_module_edge(module_key.clone(), caller);
+        let key = InstanceKey::scripted(
+            domain,
+            ImageIdentity {
+                task_cookie: 100,
+                exec_id: 1,
+            },
+            InstanceId::from_raw(0),
+            module_key,
+        );
+        self.note_instance(AdmittedInstance::scripted(key, caller));
+        self.publish();
+        let id = self
+            .instances()
+            .next()
+            .expect("the posed registration retains its instance")
+            .id;
+        let record = self
+            .instance_state
+            .semantics
+            .get_mut(&id)
+            .expect("retained semantics");
+        record.feed = JointStaging::select_joint_for_test();
+        for position in 1..=2u64 {
+            let session = 6000 + position;
+            let facts = SemanticCall {
+                function: "C_SignInit".into(),
+                session,
+                mechanism: 0x000d,
+                capture: p11scope_ebpf_common::capture::MECHANISM_VALUE
+                    | p11scope_ebpf_common::capture::OUTPUT_NON_NULL,
+                ts_ns: 100 * position,
+                ..SemanticCall::default()
+            };
+            let origin = EffectOrigin {
+                function: "C_SignInit".into(),
+                session,
+                ts_ns: 100 * position,
+            };
+            record
+                .feed
+                .stage(facts, origin, position, ledger)
+                .expect("the posed heads stage");
+        }
+        self.start_staged_disposal();
+        assert!(
+            self.staged_disposal_pending(),
+            "the pose leaves a disposal pending"
+        );
+        id
+    }
+
     /// Test-only read of the disposal feed-visit counter.
     #[cfg(test)]
     pub(crate) fn test_disposal_reads_for_test(&self) -> usize {
@@ -8442,5 +8512,89 @@ mod staged_disposal_gate_tests {
         registry.start_staged_disposal();
         assert!(registry.staged_disposal_pending());
         registry.invalidate_instance(id, None, InstanceReason::TaskRetired, true, None);
+    }
+
+    /// A synchronous association mint under a pending staged disposal
+    /// fails fast in debug builds: the disposal's budgeted cursors own
+    /// the fallback table, and a sync insert would splice chains under
+    /// them. Every sync fallback-mint site funnels through
+    /// `charge_role_with_credit`. Release builds omit the check.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "no sync charge while a staged disposal owns the table")]
+    fn staged_disposal_sync_charge_while_pending_panics_in_debug() {
+        let mut registry = CallerRegistry::new(RegistryLimits::default_limits());
+        let id = RegistryInstanceId::from_raw(23);
+        registry
+            .instance_state
+            .semantics
+            .insert(id, empty_record(id));
+        registry.start_staged_disposal();
+        assert!(registry.staged_disposal_pending());
+        let _ = registry.assoc_fallback.mint_keyassoc(16);
+    }
+
+    /// A synchronous association release under a pending staged
+    /// disposal fails fast in debug builds, like the mint arm above.
+    /// The ticket mints before the disposal starts (allowed); only
+    /// the release under the disposal trips.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "no sync release while a staged disposal owns the table")]
+    fn staged_disposal_sync_release_while_pending_panics_in_debug() {
+        let mut registry = CallerRegistry::new(RegistryLimits::default_limits());
+        registry.assoc_fallback.prepare_capacity().unwrap();
+        let ticket = registry.assoc_fallback.mint_keyassoc(16).unwrap();
+        let id = RegistryInstanceId::from_raw(24);
+        registry
+            .instance_state
+            .semantics
+            .insert(id, empty_record(id));
+        registry.start_staged_disposal();
+        assert!(registry.staged_disposal_pending());
+        registry.assoc_fallback.release_keyassoc(ticket);
+    }
+
+    /// A synchronous bulk H8 release under a pending staged disposal
+    /// fails fast in debug builds, like the single-release arm above.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "no sync release while a staged disposal owns the table")]
+    fn staged_disposal_sync_release_all_while_pending_panics_in_debug() {
+        let mut registry = CallerRegistry::new(RegistryLimits::default_limits());
+        let id = RegistryInstanceId::from_raw(25);
+        registry
+            .instance_state
+            .semantics
+            .insert(id, empty_record(id));
+        registry.start_staged_disposal();
+        assert!(registry.staged_disposal_pending());
+        registry.assoc_fallback.release_all_h8open();
+    }
+
+    /// Draining the disposal clears the table ownership: a mint and
+    /// its release after completion succeed (no false trip past the
+    /// disposal).
+    #[test]
+    fn staged_disposal_drain_clears_sync_ownership() {
+        let mut registry = CallerRegistry::new(RegistryLimits::default_limits());
+        let pool = SemanticResourcePool::default();
+        let mut ledger = StagingLedger::with_resources(pool.reserver());
+        ledger.prepare_capacity().unwrap();
+        let id = RegistryInstanceId::from_raw(26);
+        registry
+            .instance_state
+            .semantics
+            .insert(id, empty_record(id));
+        registry.start_staged_disposal();
+        let (done, spent) = registry.poll_staged_disposal(&mut ledger, 64);
+        assert!(done, "the empty feed disposes in one credit");
+        assert_eq!((spent, registry.test_disposal_reads_for_test()), (2, 2));
+        assert!(!registry.staged_disposal_pending());
+        let ticket = registry
+            .assoc_fallback
+            .mint_keyassoc(16)
+            .expect("a mint past a drained disposal succeeds");
+        registry.assoc_fallback.release_keyassoc(ticket);
     }
 }

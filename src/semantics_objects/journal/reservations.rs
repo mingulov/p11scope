@@ -2725,24 +2725,33 @@ mod tests {
     fn resource_reservations_unindexed_budgeted_pop_restores_from_its_own_index() {
         // The restore protocol: after a pop advances past its slot,
         // the caller resets the scan to the restored slot and the
-        // retry re-takes it (the mint's link-grant yield). Striding
-        // past would strand the restored vacancy behind the scan.
+        // retry re-takes it (the mint's link-grant yield). Three-way
+        // distinguishing setup: slot 0 stays occupied, so the first
+        // pop takes slot 1; the retry must re-take slot 1 (no reset
+        // would stride to slot 2) in exactly one leaf (a reset to
+        // zero would re-scan the occupied slot 0 first).
         let mut table = ReservationTable::<()>::try_new(MAX_INDEXED + 1).unwrap();
         assert!(!table.indexed());
+        table.init_fresh_operation(0);
         let mut gate = LeafBudget::new(64);
         let mut resume = 0;
         assert_eq!(
             table.budgeted_free_pop(&mut resume, &mut gate),
-            FreePopOutcome::Slot(0)
+            FreePopOutcome::Slot(1)
         );
-        assert_eq!(resume, 1, "a taken vacancy advances the scan past it");
-        table.free_restore(0);
-        resume = 0;
+        assert_eq!(resume, 2, "a taken vacancy advances the scan past it");
+        table.free_restore(1);
+        resume = 1;
         let mut gate = LeafBudget::new(64);
         assert_eq!(
             table.budgeted_free_pop(&mut resume, &mut gate),
-            FreePopOutcome::Slot(0),
+            FreePopOutcome::Slot(1),
             "the restored slot re-scans from its own index"
+        );
+        assert_eq!(
+            gate.spent(),
+            1,
+            "the own-index retry visits only the restored slot"
         );
     }
 

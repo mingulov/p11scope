@@ -14036,6 +14036,23 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .break_scoped_after_running_abandon(&members);
     }
 
+    /// Test-only pose of a pending staged disposal over one Joint
+    /// instance with two staged heads: the exit-hold twins' wedge
+    /// stand-in. Prepares the joint ledger, then poses against it so
+    /// the hold's drain polls the ledger the heads staged with.
+    /// Returns the posed instance for fold assertions.
+    #[cfg(test)]
+    pub(crate) fn pose_staged_disposal_for_test(
+        &mut self,
+    ) -> crate::discovery::caller_registry::instance_input::RegistryInstanceId {
+        self.joint_capture
+            .ledger_mut()
+            .prepare_capacity()
+            .expect("the joint ledger prepares for the posed heads");
+        let ledger = self.joint_capture.ledger_mut();
+        self.registry.pose_joint_staged_disposal_for_test(ledger)
+    }
+
     /// Pose a coordinator-half pending Joint publication (no registry
     /// phase): the hold twin's wedge stand-in. Real registry-pending
     /// shapes are driven by the joint fixtures instead.

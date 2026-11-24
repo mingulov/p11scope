@@ -1509,6 +1509,11 @@ mod tests {
                     matches!(outcome, MintStepOutcome::Yield),
                     "the one credit pops but cannot grant both link heads"
                 );
+                assert_eq!(
+                    gate.spent(),
+                    1,
+                    "the single credit pops; both link heads wait for fresh credit"
+                );
                 committed = true;
                 break;
             }

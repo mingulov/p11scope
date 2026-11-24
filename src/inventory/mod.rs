@@ -23966,6 +23966,119 @@ mod tests {
     }
 
     #[test]
+    fn hold_joint_lane_for_exit_drains_a_pending_staged_disposal() {
+        // The exit hold settles a pending staged disposal before its
+        // terminal commits: the drain disposes the staged heads, the
+        // void's history loss discloses exactly like a machine
+        // completion, no abandon gap stages, no instance is lost, and
+        // the departed fold proceeds past the hold (no permanent
+        // deferral). Gap strings are pinned by literal, like the
+        // fold-deferral twin.
+        let mut coordinator = coordinator();
+        let id = coordinator.pose_staged_disposal_for_test();
+        assert!(
+            coordinator.registry().staged_disposal_pending(),
+            "premise: the pose leaves a disposal pending"
+        );
+        let lane = joint_lane(WindDownIo::completing(), false);
+        let mut display = None;
+        let mut warn = WarnSink {
+            display: &mut display,
+        };
+        let _ = ClassicDriver::hold_joint_lane_for_exit(
+            lane,
+            &mut coordinator,
+            "test exit",
+            "joint work abandoned for exit",
+            &mut warn,
+            None,
+        );
+        assert!(
+            !coordinator.registry().staged_disposal_pending(),
+            "the hold drains the pending disposal"
+        );
+        let mut gaps = coordinator.registry().staged_scope_gaps_for_test();
+        gaps.extend(
+            coordinator
+                .registry()
+                .gaps()
+                .iter()
+                .map(|gap| (gap.subject.clone(), gap.reason.clone())),
+        );
+        assert_eq!(
+            gaps.iter()
+                .filter(|(subject, reason)| subject
+                    == "Joint key operations unavailable; retained S1"
+                    && reason == "joint_void_ingest_break_loss_history_loss")
+                .count(),
+            1,
+            "the drained void discloses its history loss exactly once: {gaps:?}"
+        );
+        assert!(
+            gaps.iter()
+                .all(|(subject, _)| subject != "staged disposal abandoned for exit"),
+            "a drained disposal stages no abandon gap: {gaps:?}"
+        );
+        assert!(
+            gaps.iter().all(|(subject, _)| subject
+                != "staged disposal instance retired mid-disposal"),
+            "no instance is lost across the exit drain: {gaps:?}"
+        );
+        assert!(
+            coordinator
+                .registry_mut()
+                .take_instance_for_fold(id)
+                .is_some(),
+            "the departed fold proceeds past the settled disposal"
+        );
+    }
+
+    #[test]
+    fn complete_final_joint_lane_settles_a_pending_staged_disposal() {
+        // Defense in depth beside the hold twin above: the wound-down
+        // release settles a pending staged disposal before releasing
+        // the lane shell. Unreachable through the machine, which
+        // publishes only past a drained disposal; the settle is a
+        // no-op then. The posed disposal proves the release drains
+        // rather than orphaning it.
+        let mut coordinator = coordinator();
+        let id = coordinator.pose_staged_disposal_for_test();
+        assert!(
+            coordinator.registry().staged_disposal_pending(),
+            "premise: the pose leaves a disposal pending"
+        );
+        let mut lane = joint_lane(WindDownIo::completing(), true);
+        lane.set_test_joint_frame(false);
+        assert!(
+            matches!(
+                lane.poll_wound_down(&mut coordinator, &mut std::io::sink()),
+                Ok(true)
+            ),
+            "the completing detach joins"
+        );
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.semantic = Some(lane);
+        driver.complete_final_joint_lane();
+        assert!(
+            driver.semantic.is_none(),
+            "the handoff releases the lane shell"
+        );
+        assert!(
+            !driver.coordinator.registry().staged_disposal_pending(),
+            "the release drains the pending disposal"
+        );
+        assert!(
+            driver
+                .coordinator
+                .registry_mut()
+                .take_instance_for_fold(id)
+                .is_some(),
+            "the departed fold proceeds past the settled disposal"
+        );
+    }
+
+    #[test]
     fn scripted_decoder_total_answers_without_a_live_drain() {
         // The posed retained-decoder total stands in for a live
         // drain's terminal total, so the release snapshot and tail

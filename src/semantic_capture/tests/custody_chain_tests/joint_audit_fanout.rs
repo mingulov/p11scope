@@ -14314,10 +14314,11 @@ fn drive_held_break_to_first_voiding_staged() -> (MachineScene, bool) {
     panic!("the broken stream must reach VoidingStaged");
 }
 
-/// The idle void entry starts its staged disposal with no
-/// instance-invalidating mutation staged: collection runs only after
-/// the disposal drains, so no commit can apply prestaged
-/// invalidations under the disposal's budgeted cursors.
+/// The direct void entry — an idle break with no sweep work —
+/// starts its staged disposal with no instance-invalidating mutation
+/// staged: the machine holds `VoidingStaged` until the disposal
+/// drains, so no commit can apply prestaged invalidations under the
+/// disposal's budgeted cursors.
 #[test]
 fn joint_machine_idle_void_entry_stages_no_instance_invalidations() {
     let (mut fixture, saw_voiding) = drive_clean_break_to_first_voiding_staged();
@@ -14346,7 +14347,7 @@ fn joint_machine_idle_void_entry_stages_no_instance_invalidations() {
 }
 
 /// The post-sweep void entry starts its staged disposal with no
-/// instance-invalidating mutation staged, like the idle entry: the
+/// instance-invalidating mutation staged, like the direct entry: the
 /// sweep completion stages nothing, so the disposal still runs
 /// before any collection.
 #[test]

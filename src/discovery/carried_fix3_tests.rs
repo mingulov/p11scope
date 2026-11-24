@@ -1,12 +1,14 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
-//! v072 carried-view-ids fix3/fix4: killing tests for the blocking review
-//! classes (absence-proof walk arm, table-specific interface coverage,
-//! INV-2 charging, watch continuation, pin reclaim) and the fix4
+//! v072 carried-view-ids fix3/fix4/fix5: killing tests for the blocking
+//! review classes (absence-proof walk arm, table-specific interface
+//! coverage, INV-2 charging, watch continuation, pin reclaim), the fix4
 //! follow-ups (stable cross-store custody, table identity, paced
-//! retirement, post-filter reclaim, clause-level co-owners). Each test
-//! fails when its guard is removed; see the lane reports' site tables
-//! and sweeps.
+//! retirement, post-filter reclaim, clause-level co-owners) and the fix5
+//! follow-ups (committing-target remap, newcomer direct-child staging,
+//! skip-pop charging, reject/bind pacing, stage-failure loss, unhashed
+//! staged keys, version/walk conjuncts). Each test fails when its guard
+//! is removed; see the lane reports' site tables and sweeps.
 
 use super::*;
 
@@ -3368,5 +3370,875 @@ fn carried_fix4_watch_shells_name_under_credit() {
     assert_eq!(
         engine.owned_learn_stage_attempts_for_test, 3,
         "every shell attempts exactly once"
+    );
+}
+
+#[test]
+fn carried_fix5_commit_keeps_deferred_harvest_aliases() {
+    // hg-1 remap: a deferred proof's harvest aliases must land in the
+    // committing target (which the commit installs), not just in the
+    // committed set. Drain proof 65 into an empty target, install the
+    // target the way a commit does, and the harvested tables must keep
+    // their bindable pins; otherwise the commit wipes the absorb while
+    // `run_learned_modules` retains unbindable tables.
+    const PROOFS: usize = super::GRAPH_STRIDE + 1;
+    let me = std::process::id();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 34,
+        path: "/".into(),
+        dir: Arc::new(File::open("/").expect("open root dir")),
+    };
+    engine.owned_run_pid = Some(me);
+    engine.next_view_id = 100;
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("a watch member");
+    let member = child.id();
+    let watch_id = engine.allocate_view_id().unwrap();
+    let watch_view = ProcessView::open(watch_id, member).expect("the member view opens");
+    let mut pins = PinnedObjects::empty();
+    let mut proofs = Vec::with_capacity(PROOFS);
+    for index in 0..PROOFS {
+        let key = overlay_key(9860 + index as u64);
+        let mut module = overlay_module(key);
+        module.view = watch_id;
+        let mpins = overlay_view_pin(&module, 8300 + index as u64, OVERLAY_SHA, 1, false);
+        let skips = pins.absorb(mpins);
+        assert!(skips.is_empty(), "{skips:?}");
+        let object = pins
+            .id_for_scanned(&module, module.key, &module.path)
+            .expect("the scan resolves its own module");
+        if index + 1 < PROOFS {
+            module.tables.clear();
+            module.interfaces.clear();
+            module.exports.clear();
+        }
+        proofs.push(OwnedLearnProof {
+            view: watch_id,
+            path: module.path.clone(),
+            object,
+            loader_exe: None,
+            loader_unknown_reason: None,
+            module,
+        });
+    }
+    engine.learn_owned_proofs_with_views(&mut pins, &proofs, &[], Some(&watch_view));
+    assert_eq!(
+        engine.owned_learn_deferred.len(),
+        1,
+        "the paced-out proof queues with its pin"
+    );
+    child.kill().expect("the member exits");
+    child.wait().expect("the member reaps");
+    engine.pending_learned.clear();
+    let mut scratch = PinnedObjects::empty();
+    engine.learn_owned_proofs_with_views(&mut scratch, &[], &[], None);
+    assert!(
+        engine.owned_learn_deferred.is_empty(),
+        "the drain settles the backlog"
+    );
+    let harvested = &proofs[PROOFS - 1].module;
+    assert!(
+        engine
+            .pinned
+            .module_aliased_under(harvested, Engine::RUN_LEARNED_VIEW_ID),
+        "control: the harvest aliases land in the committed set"
+    );
+    // The commit installs the draining target wholesale: the absorbed
+    // proving pins must survive that install, not just the drain.
+    engine.pinned = scratch;
+    assert_eq!(
+        engine.run_learned_modules.len(),
+        1,
+        "proof 65's tables union exactly once"
+    );
+    assert!(
+        engine
+            .pinned
+            .module_aliased_under(harvested, Engine::RUN_LEARNED_VIEW_ID),
+        "the installed target keeps the harvested tables' bindable pins"
+    );
+}
+
+#[test]
+fn carried_fix5_conflicting_target_refuses_harvest_tables() {
+    // hg-1 conflict: when the draining target already maps the proof's
+    // raw observation to a different physical file (same maps key and
+    // path, different digest), the harvest must not alias the old
+    // proof's tables against the target's different file. The tables
+    // refuse loudly with a named gap (the file itself still stages, as
+    // on the replaced-generation path), and nothing unions.
+    let me = std::process::id();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 35,
+        path: "/".into(),
+        dir: Arc::new(File::open("/").expect("open root dir")),
+    };
+    engine.owned_run_pid = Some(424242);
+    engine.next_view_id = 100;
+    let view_id = ProcessViewId(64);
+    let view = ProcessView::open(view_id, me).expect("own view opens");
+    let key = overlay_key(9993);
+    let mut module = overlay_module(key);
+    module.view = view_id;
+    assert!(
+        !module.tables.is_empty(),
+        "the proof carries tables to harvest"
+    );
+    let sha_old = "aa".repeat(32);
+    let sha_new = "bb".repeat(32);
+    let source = overlay_view_pin(&module, 8403, &sha_old, 1, false);
+    let object = source
+        .id_for_scanned(&module, module.key, &module.path)
+        .expect("the fixture pin resolves");
+    let proof = OwnedLearnProof {
+        view: view_id,
+        path: OVERLAY_PATH.into(),
+        object,
+        loader_exe: None,
+        loader_unknown_reason: None,
+        module: module.clone(),
+    };
+    engine.defer_owned_learn_proof(&proof, &view, &source);
+    assert_eq!(
+        engine.owned_learn_deferred.len(),
+        1,
+        "the proof queues with its custody"
+    );
+    // The draining target maps the same raw observation to a different
+    // generation's bytes: aliasing there would bind old tables to a
+    // new file.
+    let mut target = overlay_view_pin(&module, 8404, &sha_new, 1, false);
+    let target_object = target
+        .id_for_scanned(&module, module.key, &module.path)
+        .expect("the target resolves the same raw");
+    assert_eq!(
+        target.summary(target_object).expect("target digest").sha256,
+        sha_new,
+        "control: the target really holds different bytes at the same raw"
+    );
+    assert_eq!(
+        source.summary(object).expect("source digest").sha256,
+        sha_old,
+        "control: the stash really holds the old bytes"
+    );
+    let mut scratch_target = target;
+    engine.learn_owned_proofs_with_views(&mut scratch_target, &[], &[], None);
+    assert!(
+        engine.owned_learn_deferred.is_empty(),
+        "the drain pops the conflicting entry"
+    );
+    assert!(
+        !scratch_target.module_aliased_under(&module, Engine::RUN_LEARNED_VIEW_ID),
+        "no alias files against the target's different file"
+    );
+    assert!(
+        engine.run_learned_modules.is_empty(),
+        "conflicting tables never union"
+    );
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.reason.contains("conflict")),
+        "the refusal names the identity conflict: {:?}",
+        engine.counters.object_skips,
+    );
+    assert_eq!(
+        engine.pending_learned.len(),
+        1,
+        "the proving file itself still stages (tables-only refusal)"
+    );
+    assert_eq!(
+        engine.learned_event_loss_for_test(),
+        0,
+        "a tables-only refusal files a gap, not event loss (replaced-generation precedent)"
+    );
+}
+
+#[test]
+fn carried_fix5_newcomer_direct_child_stages_on_drain() {
+    // hg-2 skip gate: the drain skips a deferred direct-child proof
+    // only when the defer-time snapshot proves the prover retained
+    // (its scan-owned slots persist, so its files need no learning).
+    // A newcomer owned-child proof — paced out before its rows commit
+    // — must stage under credit instead of vanishing silently when
+    // its rows never commit.
+    let me = std::process::id();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 36,
+        path: "/".into(),
+        dir: Arc::new(File::open("/").expect("open root dir")),
+    };
+    engine.owned_run_pid = Some(me);
+    engine.next_view_id = 100;
+    let child_id = engine.allocate_view_id_for_newcomer(me).unwrap();
+    // Unlike the retained-child twin, the newcomer view never
+    // commits: its rows may never exist.
+    let child_view = ProcessView::open(child_id, me).expect("the proving view opens");
+    let key = overlay_key(9995);
+    let mut module = super::owned_proof_module_without_tables(key);
+    module.view = child_id;
+    let pins = overlay_view_pin(&module, 8405, OVERLAY_SHA, 1, false);
+    let object = pins
+        .id_for_scanned(&module, module.key, &module.path)
+        .expect("the fixture pin resolves");
+    let proof = OwnedLearnProof {
+        view: child_id,
+        path: OVERLAY_PATH.into(),
+        object,
+        loader_exe: None,
+        loader_unknown_reason: None,
+        module,
+    };
+    engine.defer_owned_learn_proof(&proof, &child_view, &pins);
+    assert_eq!(
+        engine.owned_learn_deferred.len(),
+        1,
+        "the newcomer proof queues"
+    );
+    assert!(
+        engine.owned_learn_deferred[0].is_direct_child,
+        "control: the pid snapshot marks the owned child"
+    );
+    assert!(
+        !engine.owned_learn_deferred[0].proving_retained,
+        "control: the retention snapshot marks the newcomer uncommitted"
+    );
+    let mut scratch = PinnedObjects::empty();
+    engine.learn_owned_proofs_with_views(&mut scratch, &[], &[], None);
+    assert!(
+        engine.owned_learn_deferred.is_empty(),
+        "the drain pops the newcomer proof"
+    );
+    assert_eq!(
+        engine.owned_learn_stage_attempts_for_test, 1,
+        "the uncommitted direct-child proof attempts under credit (never silently skipped)"
+    );
+    assert_eq!(
+        engine.pending_learned.len(),
+        1,
+        "the uncommitted direct-child proof stages its file"
+    );
+}
+
+#[test]
+fn carried_fix5_newcomer_direct_child_stages_at_shutdown() {
+    // hg-2 terminal: the capture-end drain stages a newcomer
+    // owned-child proof too. Same shape as the shutdown twin (a real
+    // provider .so through the end-of-capture flush), but the paced-out
+    // prover is the owned child itself before its first commit.
+    use crate::discovery::identity::test_fixture::real_scan_pin;
+    const PROOFS: usize = super::GRAPH_STRIDE + 1;
+    let dir = tempfile::tempdir().expect("learned backing dir");
+    let c = dir.path().join("prompt.c");
+    let so = dir.path().join(format!("libprov{}.so", PROOFS - 1));
+    std::fs::write(
+        &c,
+        "unsigned long C_GetFunctionList(void **out){ (void)out; return 5; }\n",
+    )
+    .expect("write prompt source");
+    assert!(
+        std::process::Command::new("gcc")
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&so)
+            .arg(&c)
+            .status()
+            .expect("run gcc")
+            .success(),
+        "the prompt fixture must compile"
+    );
+    let mut pins = PinnedObjects::empty();
+    for index in 0..PROOFS {
+        let backing = dir.path().join(format!("libprov{index}.so"));
+        if index + 1 < PROOFS {
+            std::fs::write(&backing, format!("p11scope-fixture:provider-bytes-{index}"))
+                .expect("write backing");
+        }
+        let sha = format!("{:064x}", 0xd80000u64 + index as u64);
+        let skips = pins.absorb(real_scan_pin(&backing, None, 400, &sha));
+        assert!(skips.is_empty(), "{skips:?}");
+    }
+    let objects: Vec<PinnedObjectId> = pins.pinned().map(|pin| pin.id).collect();
+    assert_eq!(objects.len(), PROOFS, "every backing file pins distinctly");
+    let me = std::process::id();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 37,
+        path: "/".into(),
+        dir: Arc::new(File::open("/").expect("open root dir")),
+    };
+    engine.owned_run_pid = Some(me);
+    engine.next_view_id = 100;
+    // The owned child itself, scanned before its first commit: a
+    // newcomer view the fresh loop does not skip (it is not retained).
+    let watch_id = engine.allocate_view_id().unwrap();
+    let watch_view = ProcessView::open(watch_id, me).expect("the owned-child view opens");
+    let mut proofs = Vec::with_capacity(PROOFS);
+    for (index, object) in objects.iter().enumerate() {
+        let key = overlay_key(9980 + index as u64);
+        let mut module = super::owned_proof_module_without_tables(key);
+        module.view = watch_id;
+        proofs.push(OwnedLearnProof {
+            view: watch_id,
+            path: dir
+                .path()
+                .join(format!("libprov{index}.so"))
+                .to_string_lossy()
+                .into_owned(),
+            object: *object,
+            loader_exe: None,
+            loader_unknown_reason: None,
+            module,
+        });
+    }
+    engine.learn_owned_proofs_with_views(&mut pins, &proofs, &[], Some(&watch_view));
+    assert_eq!(
+        engine.owned_learn_deferred.len(),
+        1,
+        "the paced-out proof queues with its pin"
+    );
+    assert!(
+        engine.owned_learn_deferred[0].is_direct_child,
+        "control: the queued proof snapshots the owned child"
+    );
+    engine.pending_learned.clear();
+    engine.shutdown_file_learning();
+    assert!(
+        engine.owned_learn_deferred.is_empty(),
+        "capture end settles the newcomer backlog"
+    );
+    assert_eq!(
+        engine.owned_learn_stage_attempts_for_test,
+        (super::GRAPH_STRIDE + 1) as u64,
+        "proof 65 attempts exactly once, at capture end"
+    );
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        1,
+        "proof 65's provider stages at capture end"
+    );
+}
+
+#[test]
+fn carried_fix5_backlog_skip_pops_pace_one_stride_per_apply() {
+    // sr-sr F1 charging: every backlog pop consumes one stride unit —
+    // the terminal skip arms (direct-child, unresolvable,
+    // already-staged) included. Popping an entry drops its proving pin
+    // and stashed files, so uncharged pops close fds outside INV-2.
+    // A full 128-entry backlog of terminal entries (all three arms)
+    // drains 64 per apply over two applies, attempts nothing, and the
+    // popped files lose their last share exactly as popped.
+    const CHILD: usize = 44;
+    const UNRESOLVABLE: usize = 42;
+    const STAGED: usize = 42;
+    const TOTAL: usize = CHILD + UNRESOLVABLE + STAGED;
+    assert_eq!(TOTAL, super::OWNED_LEARN_DEFERRED_CAP);
+    let me = std::process::id();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 38,
+        path: "/".into(),
+        dir: Arc::new(File::open("/").expect("open root dir")),
+    };
+    engine.owned_run_pid = Some(me);
+    engine.next_view_id = 100;
+    let child_id = engine.allocate_view_id_for_newcomer(me).unwrap();
+    engine
+        .views
+        .push(ProcessView::open(child_id, me).expect("the owned child view opens"));
+    let child_view = ProcessView::open(child_id, me).expect("the proving view opens");
+    let mut member = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("a descendant member");
+    let descendant = member.id();
+    let other_id = engine.allocate_view_id_for_newcomer(descendant).unwrap();
+    let other_view = ProcessView::open(other_id, descendant).expect("the descendant view opens");
+    // Retained direct-child entries: skipped AND charged.
+    for index in 0..CHILD {
+        let key = overlay_key(6000 + index as u64);
+        let mut module = super::owned_proof_module_without_tables(key);
+        module.view = child_id;
+        let source = overlay_view_pin(&module, 6100 + index as u64, OVERLAY_SHA, 1, false);
+        let object = source
+            .id_for_scanned(&module, module.key, &module.path)
+            .expect("the fixture pin resolves");
+        engine.defer_owned_learn_proof(
+            &OwnedLearnProof {
+                view: child_id,
+                path: OVERLAY_PATH.into(),
+                object,
+                loader_exe: None,
+                loader_unknown_reason: None,
+                module,
+            },
+            &child_view,
+            &source,
+        );
+    }
+    // Unresolvable entries: the stash holds a file, but the proof
+    // names a dangling id (hand-built, like the wiped-stash twin), so
+    // the drain refuses each with counted loss — and still charges.
+    for index in 0..UNRESOLVABLE {
+        let key = overlay_key(6200 + index as u64);
+        let mut module = super::owned_proof_module_without_tables(key);
+        module.view = other_id;
+        let source = overlay_view_pin(&module, 6300 + index as u64, OVERLAY_SHA, 1, false);
+        let object = source
+            .id_for_scanned(&module, module.key, &module.path)
+            .expect("the fixture pin resolves");
+        engine.defer_owned_learn_proof(
+            &OwnedLearnProof {
+                view: other_id,
+                path: OVERLAY_PATH.into(),
+                object,
+                loader_exe: None,
+                loader_unknown_reason: None,
+                module,
+            },
+            &other_view,
+            &source,
+        );
+        engine
+            .owned_learn_deferred
+            .back_mut()
+            .expect("just queued")
+            .proof
+            .object = PinnedObjectId(990000 + index as u32);
+    }
+    // Already-staged entries: terminal keys, table-less modules (no
+    // harvest), still charged per pop.
+    for index in 0..STAGED {
+        let key = overlay_key(6400 + index as u64);
+        let mut module = super::owned_proof_module_without_tables(key);
+        module.view = other_id;
+        let source = overlay_view_pin(&module, 6500 + index as u64, OVERLAY_SHA, 1, false);
+        let object = source
+            .id_for_scanned(&module, module.key, &module.path)
+            .expect("the fixture pin resolves");
+        engine.defer_owned_learn_proof(
+            &OwnedLearnProof {
+                view: other_id,
+                path: OVERLAY_PATH.into(),
+                object,
+                loader_exe: None,
+                loader_unknown_reason: None,
+                module,
+            },
+            &other_view,
+            &source,
+        );
+        let back = engine.owned_learn_deferred.back().expect("just queued");
+        let staged_key = super::owned_learn_key(&back.scan_pins, &back.proof);
+        engine.owned_learned_staged.insert(staged_key);
+    }
+    assert_eq!(
+        engine.owned_learn_deferred.len(),
+        TOTAL,
+        "all three terminal arms queue to the cap"
+    );
+    // Weak shares of every stashed file (sources dropped above, so
+    // each stash is the last share): pops must pace the closes.
+    let weaks: Vec<std::sync::Weak<std::fs::File>> = engine
+        .owned_learn_deferred
+        .iter()
+        .map(|entry| {
+            // Unresolvable entries name a dangling id; their stash
+            // file is the queue's only other object.
+            let id = entry
+                .scan_pins
+                .file_for(entry.proof.object)
+                .map(|_| entry.proof.object)
+                .or_else(|| entry.scan_pins.pinned().next().map(|pin| pin.id))
+                .expect("every stash holds its file");
+            entry
+                .scan_pins
+                .weak_file_for_test(id)
+                .expect("every stashed file shares")
+        })
+        .collect();
+    assert_eq!(weaks.len(), TOTAL, "every entry stashes a distinct file");
+    let mut scratch = PinnedObjects::empty();
+    engine.learn_owned_proofs_with_views(&mut scratch, &[], &[], None);
+    assert_eq!(
+        engine.owned_learn_deferred.len(),
+        TOTAL - super::GRAPH_STRIDE,
+        "one apply pops exactly one stride of terminal entries"
+    );
+    assert_eq!(
+        engine.owned_learn_stage_attempts_for_test, 0,
+        "terminal pops attempt nothing"
+    );
+    assert_eq!(
+        weaks.iter().filter(|weak| weak.upgrade().is_none()).count(),
+        super::GRAPH_STRIDE,
+        "one stride of popped files loses its last share"
+    );
+    engine.learn_owned_proofs_with_views(&mut scratch, &[], &[], None);
+    assert!(
+        engine.owned_learn_deferred.is_empty(),
+        "the second apply settles the remainder"
+    );
+    assert_eq!(
+        engine.owned_learn_stage_attempts_for_test, 0,
+        "still no stage attempt after the full drain"
+    );
+    assert!(
+        weaks.iter().all(|weak| weak.upgrade().is_none()),
+        "every popped file loses its last share"
+    );
+    assert_eq!(
+        engine.learned_event_loss_for_test(),
+        UNRESOLVABLE as u64,
+        "each unresolvable pop refuses loudly with counted loss"
+    );
+    assert!(
+        engine.pending_learned.is_empty(),
+        "terminal entries stage nothing"
+    );
+    member.kill().expect("the member exits");
+    member.wait().expect("the member reaps");
+}
+
+/// Seeds 65 distinct-file carriers and exits their view, so all ride
+/// as carriers (T11 shape). Returns the engine and the carried
+/// objects; the caller applies its own row-loss arm.
+fn fix5_seed_sixty_five_carriers() -> (Engine, BTreeSet<PinnedObjectId>) {
+    const CARRIERS: usize = super::GRAPH_STRIDE + 1;
+    let me = std::process::id();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    let empty: BTreeSet<ProcessViewId> = BTreeSet::new();
+    let id_v = engine.allocate_view_id_for_newcomer(me).unwrap();
+    let view_v = ProcessView::open(id_v, me).unwrap();
+    let mut modules = Vec::with_capacity(CARRIERS);
+    let mut pins = PinnedObjects::empty();
+    for index in 0..CARRIERS {
+        let key = overlay_key(9130 + index as u64);
+        let mut module = overlay_module(key);
+        module.view = id_v;
+        let mpins = overlay_view_pin(&module, 8100 + index as u64, OVERLAY_SHA, 1, false);
+        let skips = pins.absorb(mpins);
+        assert!(skips.is_empty(), "{skips:?}");
+        record_scan_ownership(&mut pins, id_v, key, &module.path);
+        pins.prove_scanned_entries_for_test(std::slice::from_ref(&module));
+        modules.push(module);
+    }
+    let seed = engine
+        .inventory_candidate(&empty, &[], &[(view_v, modules, pins)], Vec::new(), &empty)
+        .unwrap();
+    engine.plan = seed.plan;
+    engine.pinned = seed.pinned;
+    engine.modules = seed.modules;
+    engine.views.push(ProcessView::open(id_v, me).unwrap());
+    assert_eq!(engine.modules.len(), CARRIERS, "all carriers seed");
+    let exited = engine
+        .inventory_candidate(&BTreeSet::from([id_v]), &[], &[], Vec::new(), &empty)
+        .unwrap();
+    engine.plan = exited.plan;
+    engine.pinned = exited.pinned;
+    engine.modules = exited.modules;
+    engine.views.retain(|view| view.id() != id_v);
+    engine.release_view_id(id_v);
+    assert_eq!(
+        engine
+            .modules
+            .iter()
+            .filter(|module| module.scanned.view == Engine::CARRIED_VIEW_ID)
+            .count(),
+        CARRIERS,
+        "all carriers ride their exit tick"
+    );
+    let objects: BTreeSet<PinnedObjectId> =
+        engine.modules.iter().map(|module| module.object).collect();
+    assert_eq!(objects.len(), CARRIERS, "distinct files pin distinctly");
+    (engine, objects)
+}
+
+#[test]
+fn carried_fix5_rejected_carriers_pace_sixty_four_per_rebuild() {
+    // hg-4/spark-F1 pacing: the rejection filter can drop every
+    // carrier row in one rebuild, but pin reclaim still paces at one
+    // stride per rebuild across all row-loss arms (not just
+    // normalize). 65 rejected carriers reclaim 64 on the first
+    // rebuild and the last on the next quiet rebuild — which must run
+    // the full path (pending reclaim defeats the quiet fast path).
+    const CARRIERS: usize = super::GRAPH_STRIDE + 1;
+    let (mut engine, objects) = fix5_seed_sixty_five_carriers();
+    // Distinct rejected entry keys per carrier (shared keys could
+    // merge carriers before the filter runs).
+    let mut targets = BTreeSet::new();
+    for (index, module) in engine.modules.iter_mut().enumerate() {
+        if module.scanned.view == Engine::CARRIED_VIEW_ID {
+            let target = overlay_key(9700 + index as u64);
+            module.scanned.tables[0].entries[0].object = target;
+            targets.insert(target);
+        }
+    }
+    assert_eq!(
+        targets.len(),
+        CARRIERS,
+        "every carrier names its own reject"
+    );
+    engine.pinned.reapply_rejected_keys(&targets);
+    // Absence stays unproven so normalization keeps every row and
+    // only the rejection filter drops them.
+    engine.newcomer_first_seen.insert(424310, None);
+    engine.set_disable_empty_tick_fast_path_for_test(true);
+    let weaks: Vec<std::sync::Weak<std::fs::File>> = objects
+        .iter()
+        .map(|id| {
+            engine
+                .pinned
+                .weak_file_for_test(*id)
+                .expect("every carrier file shares")
+        })
+        .collect();
+    let empty: BTreeSet<ProcessViewId> = BTreeSet::new();
+    engine.plan_rebuild_stable = true;
+    let tick1 = engine
+        .inventory_candidate(&empty, &[], &[], Vec::new(), &empty)
+        .unwrap();
+    engine.plan = tick1.plan;
+    engine.pinned = tick1.pinned;
+    engine.modules = tick1.modules;
+    assert!(
+        engine
+            .modules
+            .iter()
+            .all(|module| !objects.contains(&module.object)),
+        "the rejection filter drops every carrier row at once"
+    );
+    assert_eq!(
+        engine.carrier_pins_reclaimed_for_test,
+        super::GRAPH_STRIDE as u64,
+        "one rebuild reclaims one stride of rejected pins"
+    );
+    assert_eq!(
+        weaks.iter().filter(|weak| weak.upgrade().is_none()).count(),
+        super::GRAPH_STRIDE,
+        "one stride of rejected files loses its last share"
+    );
+    assert_eq!(
+        objects
+            .iter()
+            .filter(|id| engine.pinned.summary(**id).is_some())
+            .count(),
+        1,
+        "one rejected pin rolls over to the next rebuild"
+    );
+    // The next quiet rebuild drains the rollover through the
+    // ordinary fast-path gate (re-enabled here): pending reclaim
+    // must defeat it, or the pin stalls forever.
+    engine.set_disable_empty_tick_fast_path_for_test(false);
+    engine.plan_rebuild_stable = true;
+    let tick2 = engine
+        .inventory_candidate(&empty, &[], &[], Vec::new(), &empty)
+        .unwrap();
+    engine.plan = tick2.plan;
+    engine.pinned = tick2.pinned;
+    engine.modules = tick2.modules;
+    assert_eq!(
+        engine.carrier_pins_reclaimed_for_test, CARRIERS as u64,
+        "eventual full reclaim of rejected pins"
+    );
+    assert!(
+        objects
+            .iter()
+            .all(|id| engine.pinned.summary(*id).is_none()),
+        "no rejected pin stalls past its rollover rebuild"
+    );
+    assert!(
+        weaks.iter().all(|weak| weak.upgrade().is_none()),
+        "every rejected file loses its last share"
+    );
+}
+
+#[test]
+fn carried_fix5_bind_dropped_carriers_pace_sixty_four_per_rebuild() {
+    // hg-4/spark-F1 pacing, binding arm: carriers that survive
+    // normalization but fail strict binding reclaim at the same
+    // one-stride-per-rebuild pace with rollover.
+    const CARRIERS: usize = super::GRAPH_STRIDE + 1;
+    let (mut engine, objects) = fix5_seed_sixty_five_carriers();
+    for module in engine.modules.iter_mut() {
+        if module.scanned.view == Engine::CARRIED_VIEW_ID {
+            module.scanned.decoder_abi = Some(p11scope_manifest::elf::ElfAbi::Ilp32);
+        }
+    }
+    engine.newcomer_first_seen.insert(424312, None);
+    engine.set_disable_empty_tick_fast_path_for_test(true);
+    let weaks: Vec<std::sync::Weak<std::fs::File>> = objects
+        .iter()
+        .map(|id| {
+            engine
+                .pinned
+                .weak_file_for_test(*id)
+                .expect("every carrier file shares")
+        })
+        .collect();
+    let empty: BTreeSet<ProcessViewId> = BTreeSet::new();
+    engine.plan_rebuild_stable = true;
+    let tick1 = engine
+        .inventory_candidate(&empty, &[], &[], Vec::new(), &empty)
+        .unwrap();
+    engine.plan = tick1.plan;
+    engine.pinned = tick1.pinned;
+    engine.modules = tick1.modules;
+    assert!(
+        engine
+            .modules
+            .iter()
+            .all(|module| !objects.contains(&module.object)),
+        "strict binding drops every carrier row at once"
+    );
+    assert_eq!(
+        engine.carrier_pins_reclaimed_for_test,
+        super::GRAPH_STRIDE as u64,
+        "one rebuild reclaims one stride of bind-dropped pins"
+    );
+    assert_eq!(
+        weaks.iter().filter(|weak| weak.upgrade().is_none()).count(),
+        super::GRAPH_STRIDE,
+        "one stride of bind-dropped files loses its last share"
+    );
+    engine.set_disable_empty_tick_fast_path_for_test(false);
+    engine.plan_rebuild_stable = true;
+    let tick2 = engine
+        .inventory_candidate(&empty, &[], &[], Vec::new(), &empty)
+        .unwrap();
+    engine.plan = tick2.plan;
+    engine.pinned = tick2.pinned;
+    engine.modules = tick2.modules;
+    assert_eq!(
+        engine.carrier_pins_reclaimed_for_test, CARRIERS as u64,
+        "eventual full reclaim of bind-dropped pins"
+    );
+    assert!(
+        objects
+            .iter()
+            .all(|id| engine.pinned.summary(*id).is_none()),
+        "no bind-dropped pin stalls past its rollover rebuild"
+    );
+    assert!(
+        weaks.iter().all(|weak| weak.upgrade().is_none()),
+        "every bind-dropped file loses its last share"
+    );
+}
+
+#[test]
+fn carried_fix5_unhashed_generations_never_skip_staging() {
+    // spark-F2/sr-sr-F3 fail-closed: the already-staged set keys on
+    // the proving digest, so an empty digest must bypass the set
+    // (consult and record), never share one "" key. Two unhashed
+    // generations at one locus (same mount namespace, maps key and
+    // path after inode reuse) each attempt their file work; the
+    // second never false-skips on the first's key.
+    use crate::discovery::identity::test_fixture::real_scan_pin;
+    let dir = tempfile::tempdir().expect("learned backing dir");
+    let gen1 = dir.path().join("libgen.so.1");
+    let gen2 = dir.path().join("libgen.so.2");
+    std::fs::write(&gen1, "p11scope-fixture:generation-one-bytes").expect("write gen1");
+    std::fs::write(&gen2, "p11scope-fixture:generation-two-bytes").expect("write gen2");
+    // Same staged locus (mount namespace, maps key, path), different
+    // files, both unhashed: the inode-reuse shape with no digest to
+    // tell generations apart. The pins keep their own per-file maps
+    // keys (the staged key reads the module's locus, not the pin's).
+    let locus = overlay_key(9996);
+    let mut store = real_scan_pin(&gen1, None, 400, "");
+    let skips = store.absorb(real_scan_pin(&gen2, None, 400, ""));
+    assert!(skips.is_empty(), "{skips:?}");
+    let ids: Vec<PinnedObjectId> = store.pinned().map(|pin| pin.id).collect();
+    assert_eq!(ids.len(), 2, "both generations pin distinctly");
+    let me = std::process::id();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 39,
+        path: "/".into(),
+        dir: Arc::new(File::open("/").expect("open root dir")),
+    };
+    engine.owned_run_pid = Some(me);
+    let make_proof = |object: PinnedObjectId| {
+        let mut module = super::owned_proof_module_without_tables(locus);
+        module.view = ProcessViewId(0);
+        module.path = "/locus/libgen.so".into();
+        OwnedLearnProof {
+            view: ProcessViewId(0),
+            path: "/locus/libgen.so".into(),
+            object,
+            loader_exe: None,
+            loader_unknown_reason: Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
+            module,
+        }
+    };
+    let proofs = vec![make_proof(ids[0]), make_proof(ids[1])];
+    engine.learn_owned_proofs_with_views(&mut store, &proofs, &[], None);
+    assert_eq!(
+        engine.owned_learn_stage_attempts_for_test, 2,
+        "both unhashed generations attempt (no false skip)"
+    );
+    assert_eq!(
+        engine.owned_learn_file_probes_for_test, 2,
+        "both unhashed generations reach their file"
+    );
+    assert_eq!(
+        engine.pending_learned.len(),
+        2,
+        "both unhashed generations stage (distinct identities)"
+    );
+    assert!(
+        engine
+            .owned_learned_staged
+            .iter()
+            .all(|key| !key.0.is_empty()),
+        "no empty-digest key is ever recorded"
+    );
+}
+
+#[test]
+fn carried_fix5_table_coverage_requires_version_and_walk() {
+    // hg-6 conjuncts: table cover requires the same version and the
+    // same walk, exactly like the offset arm. A version or walk
+    // mismatch in either direction keeps the carrier; only an exact
+    // match covers.
+    let key = overlay_key(968);
+    let carrier = fix3_two_table_module(key, Some(0));
+    // Version mismatch either way: never covers.
+    let mut live_newer = fix3_two_table_module(key, Some(0));
+    live_newer.tables[0].version = (2, 41);
+    assert!(
+        !super::carrier_covered_by_live(&carrier, &[&live_newer]),
+        "a live table at a different version never covers"
+    );
+    let mut carrier_newer = fix3_two_table_module(key, Some(0));
+    carrier_newer.tables[0].version = (2, 41);
+    let live_stock = fix3_two_table_module(key, Some(0));
+    assert!(
+        !super::carrier_covered_by_live(&carrier_newer, &[&live_stock]),
+        "a carrier version the live table lacks never covers"
+    );
+    // Walk mismatch either way: never covers.
+    let mut live_rescan = fix3_two_table_module(key, Some(0));
+    live_rescan.tables[0].walk = "exports-only";
+    assert!(
+        !super::carrier_covered_by_live(&carrier, &[&live_rescan]),
+        "a live table from a different walk never covers"
+    );
+    let mut carrier_rescan = fix3_two_table_module(key, Some(0));
+    carrier_rescan.tables[0].walk = "exports-only";
+    assert!(
+        !super::carrier_covered_by_live(&carrier_rescan, &[&live_stock]),
+        "a carrier walk the live table lacks never covers"
+    );
+    // Control: the exact table still covers.
+    assert!(
+        super::carrier_covered_by_live(&carrier, &[&live_stock]),
+        "an identical table covers"
     );
 }

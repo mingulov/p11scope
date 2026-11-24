@@ -190,20 +190,25 @@ impl ReplayBounds {
         adapter
             .test_replay_bound_samples
             .set(adapter.test_replay_bound_samples.get() + 1);
-        // No table walk: every counted category (begins still
-        // unconverted, terminals awaiting conversion, staged
-        // abandonments) holds at most one step per open entry, so the
-        // maintained table populations bound the reservation in O(1).
-        // A per-entry preflight would spend uncharged work outside the
-        // service allowance on every seal; the one-unit joint twin
-        // pins the visit counter at zero.
+        // No table walk: the adapter maintains the exact counted
+        // populations (begins still unconverted, terminals awaiting
+        // conversion, staged abandonments) at every open-table
+        // mutation, so the reservation sizes in O(1). A per-entry
+        // preflight would spend uncharged work outside the service
+        // allowance on every seal; the one-unit joint twin pins the
+        // visit counter at zero.
         let retained = adapter.open.len();
         let refused = adapter.refused.len();
+        let begins = adapter.replay_begins_unconverted;
+        let terminals = adapter.replay_terminals_pending;
+        let abandoned = adapter.replay_abandoned;
         let pending = model.replay_pending_count();
         let steps = refused
             .checked_add(usize::from(refused != 0))?
-            .checked_add(retained.checked_mul(3)?)?
-            .checked_add(pending.checked_add(retained)?.checked_mul(2)?)?
+            .checked_add(begins)?
+            .checked_add(terminals)?
+            .checked_add(abandoned)?
+            .checked_add(pending.checked_add(begins)?.checked_mul(2)?)?
             .checked_add(2)?;
         Some(Self {
             calls: retained,

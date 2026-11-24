@@ -2673,6 +2673,7 @@ impl JournalAdapter {
                 identity_of_begin(&entry.begin),
                 RetainedMember::Open(native),
             );
+            self.replay_count_add(&entry);
             assert!(self.open.insert(native, entry).is_none());
             self.drain_ordinals
                 .insert((entry.image, entry.begin_ordinal));
@@ -2732,6 +2733,7 @@ impl JournalAdapter {
                 identity_of_begin(&entry.begin),
                 RetainedMember::Open(native),
             );
+            self.replay_count_add(&entry);
             assert!(self.open.insert(native, entry).is_none());
             self.drain_ordinals
                 .insert((entry.image, entry.begin_ordinal));
@@ -2845,7 +2847,11 @@ impl JournalAdapter {
             return false;
         };
         let image = entry.image;
+        let counted = entry.end.is_some() && !entry.end_converted;
         let staged = entry.end.take();
+        if counted {
+            self.replay_terminals_pending -= 1;
+        }
         if let Some(staged) = staged {
             self.drain_ordinals.remove(&(image, staged.ordinal));
         }
@@ -3399,7 +3405,11 @@ impl JournalAdapter {
                 self.retained_member_dec(identity_of_begin(&old.begin), RetainedMember::Open(key));
             }
             self.drain_proof_candidates.remove(&key);
+            self.replay_count_sub(&old);
         }
+        // The replacing entry is always an unconverted begin with no
+        // terminal staged yet.
+        self.replay_begins_unconverted += 1;
         self.drain_ordinals.insert((image, ordinal));
         self.retained_member_inc(inserted, RetainedMember::Open(key));
         JournalDisposition::BeginAdmitted
@@ -3553,7 +3563,14 @@ impl JournalAdapter {
             return JournalDisposition::Contradiction(JournalContradiction::EndBeginMismatch);
         }
         let image = entry.image;
+        // Duplicate terminals refused above, so no end was staged; the
+        // new terminal counts unless an earlier conversion already
+        // consumed this entry's terminal slot.
+        let counted = !entry.end_converted;
         self.open.get_mut(&key).expect("open entry").end = Some(StagedEnd { ordinal, end });
+        if counted {
+            self.replay_terminals_pending += 1;
+        }
         self.drain_ordinals.insert((image, ordinal));
         JournalDisposition::EndStaged
     }
@@ -3605,6 +3622,8 @@ impl JournalAdapter {
         let image = entry.image;
         self.open.get_mut(&key).expect("open entry").abandon =
             Some(StagedAbandon { ordinal, abandon });
+        // Duplicate terminals refused above, so no abandonment was staged.
+        self.replay_abandoned += 1;
         self.drain_ordinals.insert((image, ordinal));
         self.drain_candidate_sync(key);
         JournalDisposition::AbandonStaged
@@ -4277,8 +4296,7 @@ impl JournalAdapter {
     /// begin, a terminal awaiting conversion, a staged abandonment.
     fn replay_count_add(&mut self, entry: &OpenEntry) {
         self.replay_begins_unconverted += usize::from(entry.converted_ticket.is_none());
-        self.replay_terminals_pending +=
-            usize::from(entry.end.is_some() && !entry.end_converted);
+        self.replay_terminals_pending += usize::from(entry.end.is_some() && !entry.end_converted);
         self.replay_abandoned += usize::from(entry.abandon.is_some());
     }
 
@@ -4286,14 +4304,14 @@ impl JournalAdapter {
     /// `-=`): any drift panics in test builds instead of hiding.
     fn replay_count_sub(&mut self, entry: &OpenEntry) {
         self.replay_begins_unconverted -= usize::from(entry.converted_ticket.is_none());
-        self.replay_terminals_pending -=
-            usize::from(entry.end.is_some() && !entry.end_converted);
+        self.replay_terminals_pending -= usize::from(entry.end.is_some() && !entry.end_converted);
         self.replay_abandoned -= usize::from(entry.abandon.is_some());
     }
 
     /// Remove one open entry, keeping the S1-only subject index exact.
     fn take_open(&mut self, native: JournalNativeKey) -> Option<OpenEntry> {
         let removed = self.open.remove(&native)?;
+        self.replay_count_sub(&removed);
         if removed.s1only_subject.is_some() {
             self.s1only_open.remove(&native);
         }
@@ -4315,6 +4333,9 @@ impl JournalAdapter {
         self.s1only_open.clear();
         self.drain_ordinals.clear();
         self.drain_proof_candidates.clear();
+        self.replay_begins_unconverted = 0;
+        self.replay_terminals_pending = 0;
+        self.replay_abandoned = 0;
     }
 
     /// Whether every queued claim on this identity reports a return that
@@ -10324,6 +10345,10 @@ impl JournalAdapter {
                     debug_assert_eq!(popped, Some(claim));
                     let (session, mechanism) = sealed_fingerprint(&entry.begin);
                     self.retained_member_dec(identity, RetainedMember::Open(native));
+                    // Conversion visits each begin once (`converts_here`
+                    // requires an unconverted ticket), so this is the
+                    // one decrement for the staged begin.
+                    self.replay_begins_unconverted -= 1;
                     let entry = self.open.get_mut(&native).expect("staged begin");
                     // The claim leaves the store here: a negative return
                     // it carried stays with the original as disposal
@@ -10509,6 +10534,9 @@ impl JournalAdapter {
                     .get_mut(&native)
                     .expect("staged terminal")
                     .end_converted = true;
+                // The guard above admits only staged, unconverted ends,
+                // exactly the counted terminals.
+                self.replay_terminals_pending -= 1;
             }
             if let Some(staged) = entry.abandon
                 && staged.ordinal <= frontier
@@ -24631,12 +24659,8 @@ pub(crate) mod tests {
             JournalDisposition::ReturnObserved
         );
         check(&scene, (2, 1, 0), "corroboration changes no counter");
-        let abandon2 =
-            abandon_bytes(1, 2, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
-        assert_eq!(
-            scene.ingest(&abandon2),
-            JournalDisposition::AbandonStaged
-        );
+        let abandon2 = abandon_bytes(1, 2, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon2), JournalDisposition::AbandonStaged);
         check(&scene, (2, 1, 1), "second abandon");
         let mut pad = ordinary_for(&begin1, 0);
         pad.slot = 99;
@@ -24651,7 +24675,9 @@ pub(crate) mod tests {
         scene.adapter.clear_open();
         check(&scene, (0, 0, 0), "bulk wipe zeroes every counter");
         // Synthetic bulk inserts keep the counters exact too, including
-        // abandon-carrying rows cloned from an abandoned template.
+        // abandon-carrying rows cloned from an abandoned template. The
+        // two helpers share one synthetic native-key space, so each
+        // gets its own scene.
         let mut bulk = Scene::new(image_default());
         check(&bulk, (0, 0, 0), "fresh bulk scene");
         let template_begin = begin_bytes(1, 1, open, 0);
@@ -24668,8 +24694,20 @@ pub(crate) mod tests {
         check(&bulk, (1, 0, 1), "abandoned template");
         bulk.adapter.populate_foreign_open_rows_for_test(2);
         check(&bulk, (3, 0, 1), "normalized synthetic rows");
-        bulk.adapter.populate_unique_foreign_open_rows_for_test(2);
-        check(&bulk, (5, 0, 3), "abandon-carrying synthetic rows");
+        let mut unique = Scene::new(image_default());
+        let template_begin = begin_bytes(1, 1, open, 0);
+        assert_eq!(
+            unique.ingest(&template_begin),
+            JournalDisposition::BeginAdmitted
+        );
+        let template_abandon =
+            abandon_bytes(1, 1, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
+        assert_eq!(
+            unique.ingest(&template_abandon),
+            JournalDisposition::AbandonStaged
+        );
+        unique.adapter.populate_unique_foreign_open_rows_for_test(2);
+        check(&unique, (3, 0, 3), "abandon-carrying synthetic rows");
     }
 
     #[test]

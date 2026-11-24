@@ -3390,10 +3390,7 @@ int main(int argc, char **argv) {
             "7 (worker) 3 1",
             "7 (worker) ! 1",
         ] {
-            assert!(
-                !stat_state_live_word(malformed),
-                "{malformed:?} reads live"
-            );
+            assert!(!stat_state_live_word(malformed), "{malformed:?} reads live");
         }
         assert!(
             stat_state_live_word("7 (we)ird) S 1 0 0 0"),

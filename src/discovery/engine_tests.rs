@@ -94481,6 +94481,21 @@ fn operator_generation_diagnostics_never_restore_retired_claims() {
         ),
         (
             include_str!("../inspect_system.rs"),
+            "process generation changed before inspect",
+            "process generation could not be revalidated before inspect",
+        ),
+        (
+            include_str!("../inspect_system.rs"),
+            "process generation changed while inspect was scanning",
+            "process generation could not be revalidated while inspect was scanning",
+        ),
+        (
+            include_str!("../inspect_system.rs"),
+            "process generation changed while inspect was pinning",
+            "process generation could not be revalidated while inspect was pinning",
+        ),
+        (
+            include_str!("../inspect_system.rs"),
             "manifest locator generation changed",
             "manifest locator generation could not be revalidated",
         ),

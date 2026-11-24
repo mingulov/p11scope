@@ -2358,15 +2358,27 @@ fn mixed_image_and_exact_refusal_pending(scenario: MixedRefusalControl) {
         "C sealed before its close: no unproductive chain"
     );
     let registry = coordinator.registry();
+    // Applied gaps carry their repeat count (an identical second write
+    // bumps it instead of adding a row); staged ones count once each.
     let disclosed = registry
         .gaps()
         .iter()
         .cloned()
-        .chain(registry.staged_gaps_for_test())
-        .filter(|gap| {
+        .zip(registry.gap_repeats().iter().copied())
+        .chain(
+            registry
+                .staged_gaps_for_test()
+                .into_iter()
+                .map(|gap| (gap, 1)),
+        )
+        .filter(|(gap, _)| {
             gap.subject == crate::semantics_objects::journal::joint_audit::FALLBACK_FENCED_SUBJECT
         })
-        .map(|gap| (gap.caller, gap.module, gap.pid, gap.reason, gap.budget))
+        .map(|(gap, repeats)| {
+            (
+                gap.caller, gap.module, gap.pid, gap.reason, gap.budget, repeats,
+            )
+        })
         .collect::<Vec<_>>();
     assert_eq!(
         disclosed,
@@ -2375,9 +2387,10 @@ fn mixed_image_and_exact_refusal_pending(scenario: MixedRefusalControl) {
             None,
             None,
             decision.gap_reason(FALLBACK_CLOSE_UNITS),
-            None
+            None,
+            1
         )],
-        "one fallback-fence gap, exactly the typed decision"
+        "one fallback-fence gap, written once, exactly the typed decision"
     );
     let work =
         failures[0].effects.effects.len() + coordinator.registry().joint_history_targets().count();

@@ -30172,9 +30172,19 @@ pub(crate) mod tests {
             (doubled.chain, doubled.backoff_passes),
             (2, 2 * RESEED_COOLDOWN_PASSES)
         );
-        for _ in 0..doubled.backoff_passes {
+        // The wait counts from this close, not from the pass clock's
+        // origin: a close after 20 served passes still waits its full
+        // 40, and stands until the last of them.
+        assert_eq!(
+            scene.adapter.successor_backoff_for(&second),
+            Some(2 * RESEED_COOLDOWN_PASSES)
+        );
+        for _ in 1..doubled.backoff_passes {
             scene.adapter.tick_fallback_backoff();
         }
+        assert_eq!(scene.adapter.successor_backoff_for(&second), Some(1));
+        scene.adapter.tick_fallback_backoff();
+        assert_eq!(scene.adapter.successor_backoff_for(&second), None);
         let third = scene.attest_function("C_CreateObject");
         assert_eq!(third.key.incarnation, second.key.incarnation + 1);
         // Progress resets the chain: the third successor validates a

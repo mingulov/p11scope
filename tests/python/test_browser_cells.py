@@ -144,13 +144,15 @@ _FF_CC_RUN_GAPS = frozenset({
 #: window caveats (late discovery, spawn windows), never clean_proven.
 _FF_CC_VERDICTS = ("concrete_gap",)
 #: FF-CC-SIGN skipped records: the closed-world run set. Short-lived
-#: discovery subjects exit mid-flight; learned provider files disclose
+#: discovery subjects exit mid-flight, lose their loader context, or
+#: shed a scan under budget pressure; learned provider files disclose
 #: first-use loss (the linkage exactness guards the asserted property:
 #: a lost cc Init fails the Init==1 leg, never passes silently).
 _FF_CC_SKIPPED = frozenset({
     ("discovery subject", "process exited mid-flight"),
     ("discovery subject", "discovery unavailable"),
     ("discovery subject", "no unique attached loader context"),
+    ("discovery subject", "scan budget exhausted"),
     ("learned provider file",
      "a provider file was learned after its first use; "
      "its earlier calls were not observed"),

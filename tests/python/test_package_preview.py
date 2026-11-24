@@ -121,8 +121,13 @@ if sys.argv[1:3] == ["run", "download"]:
     fixture = api / ("gate-" + value("--name") + ".json")
     if not fixture.is_file():
         sys.exit(3)
-    target = pathlib.Path(value("--dir")) / value("--name")
-    target.mkdir(parents=True)
+    # A single-artifact download extracts directly into the directory
+    # (observed against real runs, not assumed); FAKE_NESTED emulates
+    # gh versions that nest one level deeper instead.
+    target = pathlib.Path(value("--dir"))
+    if os.environ.get("FAKE_NESTED"):
+        target = target / value("--name")
+        target.mkdir(parents=True)
     shutil.copyfile(fixture, target / "gate.json")
     sys.exit(0)
 assert sys.argv[1] == "api"
@@ -364,6 +369,14 @@ sys.stdout.write((api / name).read_text())
                      "gate-bpf-kernels-gate.json"):
             with self.subTest(name=name):
                 self.assert_refused(self.validate(drop=(name,)))
+
+    def test_nested_gate_layout_validates(self):
+        self.env["FAKE_NESTED"] = "1"
+        try:
+            output = self.outputs(self.validate())
+        finally:
+            del self.env["FAKE_NESTED"]
+        self.assertEqual(output["sha"], self.sha)
 
     def test_privileged_and_bpf_run_identity_refuse(self):
         for attribute, run_id in (("priv_run", PRIV_RUN_ID),

@@ -215,17 +215,29 @@ def check_full_job(repository, run_id, attempt, sha):
 
 def download_gate_record(repository, run_id, workflow_path, directory):
     artifact = GATE_ARTIFACT[workflow_path]
+    # One subdirectory per download: a single-artifact download extracts
+    # directly into its directory, so sharing one would collide.
+    target = os.path.join(directory, artifact)
+    os.makedirs(target, exist_ok=True)
     result = subprocess.run(["gh", "run", "download", str(run_id),
                              "--name", artifact, "--repo", repository,
-                             "--dir", directory],
+                             "--dir", target],
                             text=True, capture_output=True, timeout=120)
     require(result.returncode == 0,
             f"gate record {artifact} is missing from run {run_id}")
-    path = os.path.join(directory, artifact, "gate.json")
-    try:
-        with open(path, encoding="utf-8") as handle:
-            text = handle.read()
-    except OSError:
+    # Observed layout first, then the per-artifact subdirectory some gh
+    # versions nest inside the target.
+    candidates = (os.path.join(target, "gate.json"),
+                  os.path.join(target, artifact, "gate.json"))
+    text = None
+    for path in candidates:
+        try:
+            with open(path, encoding="utf-8") as handle:
+                text = handle.read()
+            break
+        except OSError:
+            continue
+    if text is None:
         raise ValueError(f"gate record {artifact} has no gate.json")
     record = json.loads(text, object_pairs_hook=unique_object,
                         parse_constant=lambda _: require(False, "invalid gate JSON constant"))

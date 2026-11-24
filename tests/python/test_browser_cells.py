@@ -252,6 +252,25 @@ def needs_chromium(test):
     return wrapper
 
 
+def aggregate_module_counts(report, module_sha):
+    """Sum per-name completed calls and open entries over ``module_sha``.
+
+    One ``(counts, opened)`` pair over the whole identity set: a
+    discovery copy-up pair contributes one row per sha, so floors and
+    absence legs see the summed totals, never one sha's slice. Pure
+    over the parsed report (exact dicts, no thresholds), so twins pin
+    the sums with exact equality.
+    """
+    counts: dict = {}
+    opened: dict = {}
+    for sha in module_sha:
+        for name, calls in oracle.module_counts(report, sha).items():
+            counts[name] = counts.get(name, 0) + calls
+        for name, entries in oracle.module_open_entries(report, sha).items():
+            opened[name] = opened.get(name, 0) + entries
+    return counts, opened
+
+
 class BrowserCells(unittest.TestCase):
     maxDiff = 4096
 
@@ -312,13 +331,7 @@ class BrowserCells(unittest.TestCase):
             module_sha = {module_sha}
         else:
             module_sha = set(module_sha)
-        counts: dict = {}
-        opened: dict = {}
-        for sha in module_sha:
-            for name, calls in oracle.module_counts(report, sha).items():
-                counts[name] = counts.get(name, 0) + calls
-            for name, entries in oracle.module_open_entries(report, sha).items():
-                opened[name] = opened.get(name, 0) + entries
+        counts, opened = aggregate_module_counts(report, module_sha)
         failures = []
         failures += oracle.check_no_event_loss(report)
         failures += oracle.check_capture_intact(report)
@@ -1157,10 +1170,18 @@ class BrowserCells(unittest.TestCase):
                             ldconfig_text=None,
                             candidates=[str(cand)]),
                         cand)
-        # A nonzero ldconfig exit reads as an empty table (same fallback).
+        # A nonzero ldconfig exit reads as an empty table (same
+        # fallback): the decoy stdout names a *different* existing
+        # provider, so a mutant that trusts stdout on failure
+        # resolves the decoy and this leg fails = killed (empty
+        # stdout would agree with the mutant and prove nothing).
+        decoy = self.work / "decoy" / "libsoftokn3.so"
+        decoy.parent.mkdir(parents=True)
+        decoy.write_bytes(b"probe-decoy")
+        decoy_table = f"libsoftokn3.so (libc6,x86-64) => {decoy}\n"
         with patch.object(cells.subprocess, "run",
                           return_value=SimpleNamespace(
-                              returncode=1, stdout="")):
+                              returncode=1, stdout=decoy_table)):
             self.assertEqual(
                 cells.find_softokn(ldconfig_text=None,
                                    candidates=[str(cand)]),
@@ -1735,6 +1756,64 @@ class BrowserCells(unittest.TestCase):
             self.check_report(result, None, attached=True,
                               module_sha={sha, sha2},
                               absent=("C_Login",))
+
+    def test_check_report_duplicate_rows_sum_within_sha(self):
+        """Twin: duplicate same-sha rows sum under one floor.
+
+        C_Sign completes once in each of two rows attached to the
+        same sha (a retired-and-reattached target contributes one
+        row per cell); the floor of 2 passes. An overwrite mutant
+        in the per-sha counts loop leaves 1 and fails
+        deterministically (row order cannot matter: 1+1 leaves 1
+        either way).
+        """
+        sha = "ab" * 32
+        rows = [self._twin_row(["C_Sign"], 1, sha),
+                self._twin_row(["C_Sign"], 1, sha)]
+        result = self._twin_result("TWIN-DUPROWS", rows,
+                                   self._twin_evidence())
+        self.check_report(result, None, {"C_Sign": 2}, attached=True,
+                          module_sha={sha})
+
+    def test_check_report_duplicate_open_entries_ordered_absence(self):
+        """Twin: ordered duplicate open entries fail the absence leg.
+
+        Two same-sha C_Login rows ordered [in_flight=1,
+        in_flight=0]; the summed 1 enters the absence leg, which
+        fails. An overwrite mutant in the per-sha opened loop
+        leaves the trailing 0, the absence passes, and the
+        assertRaises fails = killed. Row order is list order
+        (deterministic), not set order.
+        """
+        sha = "ab" * 32
+        rows = [self._twin_row(["C_Login"], 0, sha, in_flight=1),
+                self._twin_row(["C_Login"], 0, sha, in_flight=0)]
+        result = self._twin_result("TWIN-DUPOPEN", rows,
+                                   self._twin_evidence())
+        with self.assertRaises(AssertionError):
+            self.check_report(result, None, attached=True,
+                              module_sha={sha},
+                              absent=("C_Login",))
+
+    def test_aggregate_module_counts_sums_exactly_across_pair(self):
+        """Twin: cross-sha counts and opened sum exactly (== 2, == 2).
+
+        C_Login completes once and enters-but-never-returns once on
+        each sha of a copy-up pair; the helper returns exactly
+        ``({"C_Login": 2}, {"C_Login": 2})``. An overwrite mutant on
+        either loop leaves 1, a dropped loop leaves {} — each
+        fails deterministically regardless of set order (no
+        absent-leg twin can pin the opened sum: zero-vs-nonzero is
+        all the absence leg distinguishes).
+        """
+        sha = "ab" * 32
+        sha2 = "cd" * 32
+        doc = {"functions": [
+            self._twin_row(["C_Login"], 1, sha, in_flight=1),
+            self._twin_row(["C_Login"], 1, sha2, in_flight=1)]}
+        counts, opened = aggregate_module_counts(doc, {sha, sha2})
+        self.assertEqual(counts, {"C_Login": 2})
+        self.assertEqual(opened, {"C_Login": 2})
 
     def test_oracle_rejects_attach_failures(self):
         """P2-3 twin: failed attachments fail even when some probes hooked."""
@@ -2659,6 +2738,64 @@ def attach_cells_with_opened_floor(source):
     return violations
 
 
+#: Drive entries that seed an NSS client credential before launch when
+#: called with a non-None ``nss_credential`` (run_direct and
+#: launch_browser_context default it to None; observe_first_system
+#: requires it; attach_drive has no such parameter and never seeds).
+_SEEDING_DRIVERS = ("run_direct", "observe_first_system",
+                    "launch_browser_context")
+
+
+def seeding_cells_missing_nss_gate(source):
+    """NSS-seeding live cells and those lacking the seed-tools gate.
+
+    Parses ``source`` (this suite file), finds every
+    @gate/@gate_system-decorated method of BrowserCells that drives
+    a browser with a non-None ``nss_credential`` (an NSS
+    client-credential seed runs before launch), and returns (found,
+    missing): all seeding cells, and those whose body never calls
+    ``missing_nss_seed_tools``. A future seeding cell that forgets
+    the gate — skipping (or strict-failing) at the gate instead of
+    erroring mid-cell from the seed step — lands in ``missing``.
+    """
+    found, missing = [], []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.ClassDef) or node.name != "BrowserCells":
+            continue
+        for item in node.body:
+            if not isinstance(item, ast.FunctionDef):
+                continue
+            gated = any(
+                (isinstance(expr, ast.Call)
+                 and isinstance(expr.func, ast.Name)
+                 and expr.func.id in ("gate", "gate_system"))
+                or (isinstance(expr, ast.Name)
+                    and expr.id in ("gate", "gate_system"))
+                for expr in item.decorator_list)
+            if not gated:
+                continue
+            calls = [call for call in ast.walk(item)
+                     if isinstance(call, ast.Call)]
+            seeds = any(
+                isinstance(call.func, ast.Attribute)
+                and call.func.attr in _SEEDING_DRIVERS
+                and any(keyword.arg == "nss_credential"
+                        and not (isinstance(keyword.value, ast.Constant)
+                                 and keyword.value.value is None)
+                        for keyword in call.keywords)
+                for call in calls)
+            if not seeds:
+                continue
+            found.append(item.name)
+            gated_call = any(
+                isinstance(call.func, ast.Attribute)
+                and call.func.attr == "missing_nss_seed_tools"
+                for call in calls)
+            if not gated_call:
+                missing.append(item.name)
+    return found, missing
+
+
 def healthy_sessions(opened=2, inherited=0, closed=1, async_opened=0,
                      peak=2):
     """Balanced S1 session accounting (balance follows the counters)."""
@@ -3313,6 +3450,55 @@ class BrowserS1Oracle(unittest.TestCase):
             Path(__file__).read_text())
         self.assertEqual(len(found), 6)
         self.assertEqual(missing, [])
+
+    def test_nss_seeding_cells_call_the_seed_gate(self):
+        """Twin: every NSS-seeding live cell gates the seed tools first.
+
+        CR-RUN-SIGN and FF-FIRST-BG seed an NSS client credential
+        before launch; both must call missing_nss_seed_tools at the
+        gate (skip, or strict-fail, naming the absent tools) instead
+        of erroring mid-cell from the seed step. The seeding set is
+        pinned exactly: a future seeder fails here until gated.
+        """
+        found, missing = seeding_cells_missing_nss_gate(
+            Path(__file__).read_text())
+        self.assertEqual(sorted(found), [
+            "test_cr_run_sign_observes_client_cert_signs",
+            "test_ff_first_with_background_provider_covers_browser",
+        ])
+        self.assertEqual(missing, [])
+
+    def test_nss_gate_probe_flags_ungated_seeders_only(self):
+        """Twin: the gate probe flags exactly the ungated seeders.
+
+        An ungated seeder lands in missing; a gated seeder and a
+        None-credential drive (no seed runs) pass. Deleting either
+        live gate block moves that cell into missing (see the
+        sweep); renaming the probe's driver set or the gate call
+        breaks the live-file twin above.
+        """
+        template = (
+            "import unittest\n"
+            "\n"
+            "class BrowserCells(unittest.TestCase):\n"
+            '    @gate("chromium")\n'
+            "    def test_probe_ungated(self):\n"
+            "        cells.run_direct(\"P\", \"chromium\", work, url,\n"
+            "                         nss_credential=cred)\n"
+            '    @gate("firefox")\n'
+            "    def test_probe_gated(self):\n"
+            "        missing = cells.missing_nss_seed_tools()\n"
+            "        cells.run_direct(\"P\", \"firefox\", work, url,\n"
+            "                         nss_credential=cred)\n"
+            '    @gate("firefox")\n'
+            "    def test_probe_unseeded(self):\n"
+            "        cells.run_direct(\"P\", \"firefox\", work, url,\n"
+            "                         nss_credential=None)\n"
+        )
+        found, missing = seeding_cells_missing_nss_gate(template)
+        self.assertEqual(sorted(found),
+                         ["test_probe_gated", "test_probe_ungated"])
+        self.assertEqual(missing, ["test_probe_ungated"])
 
     def test_system_first_cells_wire_browser_rows_oracle(self):
         found, missing = system_first_cells_missing_oracle(

@@ -704,7 +704,7 @@ print(json.dumps({"name":n,"cells":cells.split(","),"json":j or None,"jsonl":jl 
 self_test() {
     need_tools
     timeout 300 python3 -I "$ORACLE" --self-test || die "oracle self-test failed"
-    timeout 300 python3 -I "$REPO/scripts/strict-selftest.py" "$REPO" scripts/qualify-inventory-native.sh self-test \
+    timeout 300 python3 -I -S "$REPO/scripts/strict-selftest.py" "$REPO" scripts/qualify-inventory-native.sh self-test \
         "$REPO/tests/python/test_inventory_capacity_oracle.py" || die "native fixture self-test failed"
     SELFTEST_TMP=$(mktemp -d "${TMPDIR:-/tmp}/c8-selftest.XXXXXX") || die "mktemp"
     SELFTEST_HELD=""

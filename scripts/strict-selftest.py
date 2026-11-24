@@ -14,18 +14,28 @@ any read of it fails, whether this process makes it or a child does; by
 `dir_fd`, a shell string or an environment-passed path. The declaration is
 complete exactly when the suite passes in the copy.
 
-The copy must not be bypassed. Before anything runs, every inherited GIT_*
-variable and every variable naming the checkout (literally, or through a
-symlink or `..` alias that resolves into it) leaves the environment; git
-then runs with a built environment, explicit repository and work tree, an
-empty template and no hooks. During the run, sys.path holds the copy and
-the standard library only (no checkout directory, no site packages, so an
-installed module cannot stand in for an undeclared one), and an audit hook
-fails the run on any event (open, listdir, exec, spawn, chdir and so on)
-whose arguments name the checkout, aliases included. Limits: the hook sees
-this process only, so a child that rebuilds the checkout path by itself, or
-a child interpreter's own site packages, is outside it; nothing the two
-strict suites run does either.
+The copy must not be bypassed.
+- The runner runs as `python3 -I -S` (it re-executes itself so if started
+  otherwise): no site startup, no .pth file, no sitecustomize, nothing
+  preloaded. sys.path is then the suite's directory in the copy followed by
+  the interpreter's standard library entries, nothing else.
+- Before anything runs, every inherited GIT_* and PYTHON* variable and
+  every variable whose value resolves into the checkout leaves the
+  environment. A value resolves into it when the whole value, any
+  os.pathsep or shell word of it, or the part after `=` of such a word,
+  resolves (symlinks, `..`, `~`; a relative one, to an existing path, from
+  the invocation directory or the copy) to the checkout or below it. Spaces and colons in a name are
+  kept whole, so they never split an alias.
+- git runs with a built environment, explicit repository and work tree, an
+  empty template and no hooks, and the copy must then be one clean commit
+  of exactly the declared inputs.
+- An audit hook fails the run on any event (open, listdir, exec, spawn,
+  chdir and so on) whose arguments resolve into the checkout by the same
+  rule, relative to the current directory.
+Limits: the hook sees this process only. A child that rebuilds the checkout
+path with nothing naming it, or a child interpreter's own site packages
+(children get no PYTHON* variable), is outside it; nothing the two strict
+suites run does either.
 
 The result is strict: a skip, an expected failure, an unexpected success,
 an empty selection, a failure or an error fails. The selection is fixed by
@@ -37,9 +47,8 @@ self-tests stay exit-code based.
 """
 import importlib.util
 import os
-import re
 import runpy
-import site
+import shlex
 import shutil
 import subprocess
 import sys
@@ -50,33 +59,61 @@ RECEIPT = "strict self-test passed"
 SOURCE_EVENTS = {"compile", "exec", "code.__new__", "marshal.loads", "marshal.load", "marshal.dumps"}
 
 
-def path_words(text):
-    """Absolute-path words in a value (shell strings, PATH lists, --opt=/path)."""
-    return re.findall(r"/[^\s:=;,'\"]*", text)
+def candidates(text):
+    """Every reading of a value as a path: the whole value, its os.pathsep
+    parts, its shell words (quotes kept) and their `--opt=` values."""
+    out = {text}
+    out.update(text.split(os.pathsep))
+    try:
+        words = shlex.split(text) if len(text) <= 65536 else text.split()
+    except ValueError:
+        words = text.split()
+    out.update(words)
+    out.update(word.split("=", 1)[1] for word in words if "=" in word)
+    return {c for c in out if c and "\0" not in c}
 
 
-def names_checkout(value, checkout):
-    """Whether a value names the checkout, literally or through an alias
-    (a symlink or `..` path that resolves into it)."""
+def resolves_into(text, checkout, bases):
+    for candidate in candidates(text):
+        if candidate.startswith("~"):
+            candidate = os.path.expanduser(candidate)
+        if candidate.startswith(os.sep):
+            paths, relative = [candidate], False
+        elif os.sep in candidate or candidate in (os.curdir, os.pardir):
+            # Relative: as each context would resolve it. Only a path that
+            # exists there counts, or every relative word would be an alias
+            # when a context lies in the checkout.
+            paths, relative = [os.path.join(base, candidate) for base in bases], True
+        else:
+            continue
+        for path in paths:
+            try:
+                real = os.path.realpath(path)
+                if (real == checkout or real.startswith(checkout + os.sep)) and (
+                        not relative or os.path.lexists(real)):
+                    return True
+            except (OSError, ValueError):
+                continue
+    return False
+
+
+def names_checkout(value, checkout, bases=None):
+    """Whether a value names the checkout, literally or through any alias
+    that resolves into it."""
+    if bases is None:
+        bases = (os.getcwd(),)
     if isinstance(value, bytes):
         value = os.fsdecode(value)
     if isinstance(value, str):
-        if value == checkout or (checkout + os.sep) in value or value.startswith(checkout + os.sep):
-            return True
-        for word in path_words(value):
-            try:
-                real = os.path.realpath(word)
-            except (OSError, ValueError):
-                continue
-            if real == checkout or real.startswith(checkout + os.sep):
-                return True
-        return False
+        return (value == checkout or (checkout + os.sep) in value
+                or resolves_into(value, checkout, bases))
     if isinstance(value, os.PathLike):
-        return names_checkout(os.fspath(value), checkout)
+        return names_checkout(os.fspath(value), checkout, bases)
     if isinstance(value, dict):
-        return any(names_checkout(k, checkout) or names_checkout(v, checkout) for k, v in value.items())
+        return any(names_checkout(k, checkout, bases) or names_checkout(v, checkout, bases)
+                   for k, v in value.items())
     if isinstance(value, (list, tuple)):
-        return any(names_checkout(item, checkout) for item in value)
+        return any(names_checkout(item, checkout, bases) for item in value)
     return False
 
 
@@ -99,10 +136,21 @@ def main(argv):
         return 2
     root, runner, mode, suite, names = argv[0], argv[1], argv[2], argv[3], argv[4:]
     checkout = os.path.realpath(root)
-    # Before anything runs (git included): no inherited git routing or
-    # configuration, and no variable naming the checkout, reaches the copy.
+    invoked_in = os.getcwd()
+    base = os.path.realpath(tempfile.mkdtemp(prefix="strict-selftest-"))
+    try:
+        return prepare_and_run(checkout, invoked_in, base, runner, mode, suite, names)
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def prepare_and_run(checkout, invoked_in, base, runner, mode, suite, names):
+    copy = os.path.join(base, "source")
+    # Before anything runs (git included): no inherited git or Python
+    # routing, and no variable resolving into the checkout from the
+    # invocation directory or the copy, reaches the copy.
     removed = sorted(key for key, value in os.environ.items()
-                     if key.startswith("GIT_") or names_checkout(value, checkout))
+                     if key.startswith(("GIT_", "PYTHON")) or names_checkout(value, checkout, (invoked_in, copy)))
     for key in removed:
         del os.environ[key]
     declared = runpy.run_path(os.path.join(checkout, "scripts/runner_inputs.py"))
@@ -112,26 +160,21 @@ def main(argv):
         print("strict self-test failed: the suite %s is not a declared input of %s %s"
               % (suite_name, runner, mode), file=sys.stderr)
         return 1
-    base = os.path.realpath(tempfile.mkdtemp(prefix="strict-selftest-"))
-    try:
-        if names_checkout(base, checkout):
-            print("strict self-test failed: the copy %s lies inside the checkout" % base, file=sys.stderr)
+    if base == checkout or base.startswith(checkout + os.sep):
+        print("strict self-test failed: the copy %s lies inside the checkout" % base, file=sys.stderr)
+        return 1
+    for name in inputs:
+        source, target = os.path.join(checkout, name), os.path.join(copy, name)
+        if not os.path.isfile(source):
+            print("strict self-test failed: declared input missing: %s" % source, file=sys.stderr)
             return 1
-        copy = os.path.join(base, "source")
-        for name in inputs:
-            source, target = os.path.join(checkout, name), os.path.join(copy, name)
-            if not os.path.isfile(source):
-                print("strict self-test failed: declared input missing: %s" % source, file=sys.stderr)
-                return 1
-            os.makedirs(os.path.dirname(target), exist_ok=True)
-            shutil.copy2(source, target)
-        refused = commit_copy(copy, inputs)
-        if refused:
-            print("strict self-test failed: " + refused, file=sys.stderr)
-            return 1
-        return run_in_copy(checkout, copy, suite_name, names, len(inputs), removed)
-    finally:
-        shutil.rmtree(base, ignore_errors=True)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        shutil.copy2(source, target)
+    refused = commit_copy(copy, inputs)
+    if refused:
+        print("strict self-test failed: " + refused, file=sys.stderr)
+        return 1
+    return run_in_copy(checkout, copy, suite_name, names, len(inputs), removed)
 
 
 def commit_copy(copy, inputs):
@@ -156,20 +199,22 @@ def commit_copy(copy, inputs):
         if result.returncode != 0:
             return "git %s failed in the copy: %s" % (argv[1] if argv[1] == "init" else argv[5], result.stderr.strip())
         out.append(result.stdout)
-    if out[3].strip() != "1" or out[4] != "" or sorted(out[5].split()) != sorted(inputs):
-        return "the copy is not one clean commit of its declared inputs"
+    if out[3].strip() != "1":
+        return "the copy is not one commit (rev-list says %r)" % out[3].strip()
+    if out[4] != "":
+        return "the copy is not clean after its commit: %r" % out[4].strip()
+    if sorted(out[5].split("\n")[:-1] if out[5] else []) != sorted(inputs):
+        return "the copy's commit is not exactly its declared inputs"
     return None
 
 
 def run_in_copy(checkout, copy, suite_name, names, copied, scrubbed):
     os.chdir(copy)
     os.environ["PWD"] = copy
-    # Imports resolve in the copy or the standard library only: no checkout
-    # path and no installed (site) package can stand in for an undeclared module.
-    ambient = set(site.getsitepackages()) | {site.getusersitepackages()}
-    sys.path[:] = [p for p in sys.path if not names_checkout(os.path.realpath(p or "."), checkout)
-                   and p not in ambient and os.path.basename(p) not in ("site-packages", "dist-packages")]
-    sys.path.insert(0, os.path.dirname(os.path.join(copy, suite_name)))  # as when run as a script
+    # Imports resolve in the copy or the standard library only: under -I -S
+    # sys.path is the standard library alone (-I adds no script directory,
+    # -S no site directory), and the suite's directory goes first.
+    sys.path.insert(0, os.path.dirname(os.path.join(copy, suite_name)))
     sys.dont_write_bytecode = True
     hits = guard(checkout)
     spec = importlib.util.spec_from_file_location("strict_selftest_suite", os.path.join(copy, suite_name))
@@ -204,4 +249,7 @@ def run_in_copy(checkout, copy, suite_name, names, copied, scrubbed):
 
 
 if __name__ == "__main__":
+    if not (sys.flags.isolated and sys.flags.no_site):
+        # Always -I -S: no site startup may add paths or preload modules.
+        os.execv(sys.executable, [sys.executable, "-I", "-S", os.path.abspath(__file__)] + sys.argv[1:])
     sys.exit(main(sys.argv[1:]))

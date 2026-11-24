@@ -5748,7 +5748,7 @@ fn operator_diagnostics_three_round_probe_checks_fence_and_physical_pair() -> Re
 
 /// Twin helper: refresh the probe footer counters after adding or removing a
 /// body row, so a negative fails on its shape clause rather than the footer.
-fn rebuild_probe_footer(rows: &mut Vec<serde_json::Value>) {
+fn rebuild_probe_footer(rows: &mut [serde_json::Value]) {
     let names = [
         "count_observation",
         "ownership_transition",

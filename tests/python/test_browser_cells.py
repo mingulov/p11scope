@@ -133,15 +133,21 @@ _PINBOUND_ABSENT = ("C_Login", "C_SignInit", "C_Sign")
 #: (``task_uprobe_link_losses``: the supervisor SIGKILLs the whole
 #: browser group at flow completion, so teardown links race), the
 #: bounded-queue discovery drops under that churn
-#: (``discovery_truncated``), and the ``skipped`` cause whose records
-#: the run-floor skipped qualification judges one by one. Floors are
-#: lower bounds, so each cause can only undercount, never invent the
-#: asserted signs — and the sign floors below still fail a capture
-#: that lost them. Any other cause fails.
+#: (``discovery_truncated``), the ``skipped`` cause whose records
+#: the run-floor skipped qualification judges one by one, and the
+#: interface-selection cause (``interface_selection``): a selection
+#: pass runs before the delayed browser maps its provider and
+#: intermittently records it ``absent_uncovered`` (no truncation, no
+#: unmatched tuples — the observed shape twice). Selection decides
+#: which table, never whether calls count: the events lane counts
+#: C_Sign independently, so the cause cannot hide a sign, and the
+#: sign floors below still fail a capture that lost one. Floors are
+#: lower bounds throughout: each cause can only undercount, never
+#: invent the asserted signs. Any other cause fails.
 _GAPS_ATTACHED_RUN = frozenset({
     "loader_discovery", "unprotected_live_windows",
     "pid_descendant_gaps", "task_uprobe_link_losses",
-    "discovery_truncated", "skipped",
+    "discovery_truncated", "skipped", "interface_selection",
 })
 
 #: RSA mechanism family ids (numeric, exact): the verbatim RSA_IDS table
@@ -1073,6 +1079,17 @@ class BrowserCells(unittest.TestCase):
         self.assertIsNone(cells.find_softokn(
             ldconfig_text=f"libsoftokn3.so.1 (libc6,x86-64) => {suffixed}\n",
             candidates=[]))
+
+    def test_attached_run_gaps_exact(self):
+        """Twin: the run-floor gap set passes calibrated causes only."""
+        doc = {"evidence": {"gap_classes": {"observation": {
+            "status": "lossy", "causes": sorted(_GAPS_ATTACHED_RUN)}}}}
+        self.assertEqual(
+            oracle.check_observation_gaps(doc, _GAPS_ATTACHED_RUN), [])
+        doc["evidence"]["gap_classes"]["observation"]["causes"].append(
+            "capture_halted")
+        self.assertNotEqual(
+            oracle.check_observation_gaps(doc, _GAPS_ATTACHED_RUN), [])
 
     def test_find_softokn_falls_back_to_candidates(self):
         """Twin: missing hits fall through to candidates, then None."""

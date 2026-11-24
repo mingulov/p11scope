@@ -29098,6 +29098,10 @@ mod tests {
         let key = overlay(893);
         let dep = overlay(894);
         let mut main = module(key);
+        // Only the pushed dependency names a table entry: the
+        // fixture's own-keyed entry would re-cover the own raw
+        // through the entry loop and mask the own-leg mutant.
+        main.tables[0].entries.clear();
         main.tables[0].entries.push(ScannedEntry {
             name: "C_Dependency",
             object: dep,

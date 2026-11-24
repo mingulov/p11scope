@@ -2783,6 +2783,20 @@ impl CallerRegistry {
                     .next()
                     .is_some()
             });
+        // Debug oracle: the queued-image refcounts match the queue.
+        #[cfg(test)]
+        {
+            let mut expected = std::collections::HashMap::new();
+            for image in &self.joint_reseed_queue {
+                *expected
+                    .entry((image.task_cookie, image.exec_id))
+                    .or_insert(0usize) += 1;
+            }
+            debug_assert_eq!(
+                self.joint_reseed_queued, expected,
+                "the queued-image index matches the queue"
+            );
+        }
         if more {
             self.instance_state.reseed_queue_after = last;
             (queued, false)

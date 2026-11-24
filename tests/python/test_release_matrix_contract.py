@@ -565,7 +565,19 @@ class MatrixContract(unittest.TestCase):
     }
     LITERAL = re.compile(r'''['"/ ]((?:scripts|tests|crates|src)/[A-Za-z0-9_./-]+\.(?:py|sh|c))\b''')
     SIBLING = re.compile(r'''(?:with_name\(\s*|parent\s*/\s*)['"]([A-Za-z0-9_.-]+\.(?:py|sh|c))['"]''')
-    SELF_TEST_ONLY = {"tests/python/test_inventory_capacity_oracle.py", "tests/python/test_release_matrix_contract.py"}
+    SELF_TEST_ONLY = {"tests/python/test_inventory_capacity_oracle.py", "tests/python/test_release_matrix_contract.py",
+                      "scripts/strict-selftest.py"}
+    # (runner, file): self-test inputs the text scan cannot see, found by
+    # strict-selftest.py's audit of the real suite run (which refuses any
+    # undeclared read, so a new one fails the self-test itself).
+    SELF_TEST_OBSERVED = {
+        ("scripts/qualify-release-matrix.sh", "build.rs"): "the canary producer receipt hashes it",
+        ("scripts/qualify-release-matrix.sh", "src/lib.rs"): "the canary producer receipt hashes it",
+        ("scripts/qualify-release-matrix.sh", "scripts/_loader.py"): "imported by module name",
+        ("scripts/qualify-release-matrix.sh", "scripts/canary_process_custody.py"): "imported by module name",
+        ("scripts/qualify-release-matrix.sh", "tests/python/json_signal_lifetime_probe.py"):
+            "a probe path the suite builds at run time",
+    }
     # (staged owner, file): why that owner never loads the file from a stage
     OUTSIDE_STAGE = {
         ("scripts/qualify-release-matrix.sh", "scripts/cargo.sh"): "build_bins builds in the checkout before staging",
@@ -687,6 +699,9 @@ class MatrixContract(unittest.TestCase):
         self.assertEqual({r: set(modes) for r, modes in runners.items()}, self.MODES)
         self.assertEqual({(r, m) for r, modes in runners.items() for m, (_, inputs) in modes.items() if not inputs},
                          set(self.INPUT_FREE))
+        for runner, name in self.SELF_TEST_OBSERVED:  # never stale
+            self.assertTrue((ROOT / name).is_file(), name)
+            self.assertIn("self-test", runners[runner], name)
         self.assertIn(INPUTS["SELF"], staged)
         for runner, modes in runners.items():
             with self.subTest(runner=runner):
@@ -701,7 +716,8 @@ class MatrixContract(unittest.TestCase):
                     if (runner, mode) in self.INPUT_FREE:
                         expected = set()
                     elif mode == "self-test":
-                        expected = self.closure(runner, self_test=True)
+                        expected = self.closure(runner, self_test=True) | {
+                            name for (owner, name) in self.SELF_TEST_OBSERVED if owner == runner}
                     elif where == INPUTS["CHECKOUT"]:
                         expected = closure - self.SELF_TEST_ONLY
                     else:
@@ -744,14 +760,31 @@ class MatrixContract(unittest.TestCase):
             gone = INPUTS["missing"](str(root), "scripts/run-privileged-lib-tests.sh", "run")
         finally:
             source.chmod(0o644)
-        self.assertEqual(gone, [] if os.geteuid() == 0 else [str(source)])
-        # A sourced shell input needs no execute bit; a runner does.
+        root_user = os.geteuid() == 0
+        self.assertEqual(gone, [] if root_user else [str(source)])
+        # codex r11f #3: a directly launched shell that is not a runner key
+        # (the host's cargo.sh) is refused without its execute bit.
+        cargo = root / "scripts/cargo.sh"
+        cargo.parent.mkdir(parents=True, exist_ok=True); shutil.copy2(ROOT / "scripts/cargo.sh", cargo)
+        cargo.chmod(0o644)
+        self.assertIn((str(cargo), "not executable"),
+                      INPUTS["problems"](str(root), "scripts/qualify-release-matrix.sh", "checkout"))
+        cargo.chmod(0o755)
+        self.assertNotIn(str(cargo), INPUTS["missing"](str(root), "scripts/qualify-release-matrix.sh", "checkout"))
+        # The sourced exemptions are exactly the declared shells the checkout
+        # ships without an execute bit.
+        shells = {n for modes in INPUTS["RUNNERS"].values() for _, inputs in modes.values() for n in inputs
+                  if n.endswith(".sh")}
+        self.assertEqual(set(INPUTS["SOURCED"]), {n for n in shells if not os.access(ROOT / n, os.X_OK)})
+        # A sourced shell input needs no execute bit; a launched one does.
         library = root / "scripts/lib.sh"
         library.parent.mkdir(parents=True, exist_ok=True); shutil.copy2(ROOT / "scripts/lib.sh", library)
         library.chmod(0o644)
         names = INPUTS["required"]("scripts/qualify-release-matrix.sh", "self-test")
         self.assertIn("scripts/lib.sh", names)
         self.assertNotIn(str(library), INPUTS["missing"](str(root), "scripts/qualify-release-matrix.sh", "self-test"))
+        if root_user:  # visible, and never a strict self-test pass
+            self.skipTest("the unreadable twin needs a non-root user")
 
     def test_every_runner_with_inputs_runs_the_declared_preflight(self):
         for runner, modes in INPUTS["RUNNERS"].items():
@@ -783,6 +816,13 @@ class MatrixContract(unittest.TestCase):
         binary = self.base / "not-a-libtest"
         binary.write_text("#!/bin/sh\nexit 0\n"); binary.chmod(0o755)
         bins = self.base / "no-integration-tests"; bins.mkdir()
+        shim = self.base / "python-shim"; shim.mkdir()
+        (shim / "python3").write_text(
+            "#!%s\nimport json, os, sys\n"
+            "if len(sys.argv) > 2 and sys.argv[2].endswith('/scripts/strict-selftest.py'):\n"
+            "    print('strict argv: ' + json.dumps(sys.argv[1:])); sys.exit(0)\n"
+            "os.execv(%r, [%r] + sys.argv[1:])\n" % (sys.executable, sys.executable, sys.executable))
+        (shim / "python3").chmod(0o755)
         contract = stage / "contract.json"
         def cases(root):
             sh = lambda name: ["bash", str(root / name)]
@@ -821,9 +861,16 @@ class MatrixContract(unittest.TestCase):
                     (lambda out: sh("scripts/qualify-release-matrix.sh") + ["--dry-run", "--kernels", "host"],
                      {}, False, (0, "dry-run: no build, no guests started"))],
                 ("scripts/qualify-release-matrix.sh", "self-test"): [
+                    # The real entry with python3 shimmed only for the strict
+                    # runner: it must get the whole suite whatever the
+                    # environment says (codex r11f #1).
                     (lambda out: sh("scripts/qualify-release-matrix.sh") + ["--self-test"],
-                     {"P11SCOPE_MATRIX_SELF_TEST_K": "test_closure_scan_finds_each_reference_form"}, False,
-                     (0, "Ran 1 test"))],
+                     {"PATH": "%s:%s" % (shim, os.environ.get("PATH", "")),
+                      "P11SCOPE_MATRIX_SELF_TEST_K": "test_closure_scan_finds_each_reference_form"}, False,
+                     (0, "strict argv: " + json.dumps(
+                         ["-I", str(root / "scripts/strict-selftest.py"), str(root),
+                          "scripts/qualify-release-matrix.sh", "self-test",
+                          str(root / "tests/python/test_release_matrix_contract.py")])))],
                 ("scripts/qualify-release-matrix.sh", "stage"): [
                     (lambda out: sh("scripts/qualify-release-matrix.sh") + ["--write-inner-stage", str(stage),
                                                                             "--contract", str(contract)],
@@ -838,10 +885,13 @@ class MatrixContract(unittest.TestCase):
             names = list(INPUTS["required"](runner, mode))
             if mode != "stage" and (runner, mode) not in self.INPUT_FREE:
                 names.append(INPUTS["SELF"])
-            # Each input removed, and (hungerg r11e #1) each present but unreadable.
+            # Each input removed; (hungerg r11e #1) each present but unreadable;
+            # (codex r11f #3) each launched shell without its execute bit.
             variants = [(None, None)] + [(n, "unlink") for n in names]
             if mode != "stage" and unreadable:
                 variants += [(n, "chmod") for n in names]
+            if mode != "stage":
+                variants += [(n, "noexec") for n in names if INPUTS["executable"](n)]
             for number, (argv, env, hup, (rc, marker)) in enumerate(cases(root)[(runner, mode)]):
                 for name, how in variants:
                     with self.subTest(runner=runner, mode=mode, invocation=number, missing=name, how=how):
@@ -853,7 +903,7 @@ class MatrixContract(unittest.TestCase):
                             if how == "unlink":
                                 path.unlink()
                             else:
-                                path.chmod(0)
+                                path.chmod(0 if how == "chmod" else 0o644)
                         try:
                             result = self.run_tool(argv(out), env, hup)
                         finally:
@@ -874,7 +924,9 @@ class MatrixContract(unittest.TestCase):
                         else:
                             self.assertEqual(result.returncode, 64, text)
                             # The bootstrap check of the declaration says "missing" for both.
-                            state = "unreadable" if how == "chmod" and name != INPUTS["SELF"] else "missing"
+                            state = {"chmod": "unreadable", "noexec": "not executable"}.get(how, "missing")
+                            if name == INPUTS["SELF"]:
+                                state = "missing"
                             self.assertIn("required input %s: %s" % (state, path), text)
                             self.assertNotIn("Permission denied", text)
                             self.assertFalse(out.exists())
@@ -894,6 +946,8 @@ class MatrixContract(unittest.TestCase):
         check("scripts/qualify-inventory-native.sh", "self-test", repo, repo)
         check("scripts/qualify-release-matrix.sh", "checkout", repo, repo)
         check("scripts/qualify-release-matrix.sh", "self-test", repo, repo)
+        if not unreadable:  # visible, and never a strict self-test pass
+            self.skipTest("the unreadable twins need a non-root user")
         check("scripts/qualify-release-matrix.sh", "stage", repo, staged)
 
     def staged_native(self):
@@ -2719,6 +2773,7 @@ class MatrixContract(unittest.TestCase):
         stage, boot, run, env = self.generated_guest()
         self.assertTrue((self.base / "qualify-public-cli.sh.args").is_file(), run.stdout + run.stderr)
         source = stage / "artifacts/source"
+        checked = set(INPUTS["required"]("scripts/qualify-release-matrix.sh", "stage"))
         for name in sorted(CHECKER_MOD["SOURCE_FILES"]):
             with self.subTest(missing=name):
                 for marker in self.base.glob("*.args"):
@@ -2738,6 +2793,9 @@ class MatrixContract(unittest.TestCase):
                 if name in ("scripts/release-matrix-contract.py", "scripts/runner_inputs.py"):
                     self.assertEqual(result.returncode, 64, text)
                     self.assertIn("matrix inner: required input missing: %s" % path, text)
+                elif name in checked:
+                    self.assertEqual(result.returncode, 64, text)
+                    self.assertIn("qualify-release-matrix.sh: required input missing: %s" % path, text)
                 else:
                     self.assertEqual(result.returncode, 1, text)
                     self.assertIn(name, text)
@@ -2745,14 +2803,25 @@ class MatrixContract(unittest.TestCase):
                 # Refused at the preflight itself, never by a later step's recheck.
                 self.assertFalse(work.exists(), name)
                 self.assertEqual(sorted(p.name for p in self.base.glob("*.args")), [])
-        if os.geteuid() == 0:
-            return  # root reads any mode bits
-        # hungerg r11e #1: a present but unreadable bootstrap input is the same refusal.
-        for name in ("scripts/release-matrix-contract.py", "scripts/runner_inputs.py"):
-            with self.subTest(unreadable=name):
+        # hungerg r11e #1, codex r11f #3: every checked staged input present
+        # but unreadable, and every launched staged shell without its execute
+        # bit (bytes unchanged, so --verify-inputs alone would pass), refuses
+        # before any setup.
+        bootstrap = ("scripts/release-matrix-contract.py", "scripts/runner_inputs.py")
+        cases = [(n, "noexec") for n in sorted(checked) if INPUTS["executable"](n)]
+        if os.geteuid() != 0:  # root reads any mode bits; the noexec twins still run
+            cases = [(n, "unreadable") for n in sorted(checked | set(bootstrap))] + cases
+        self.assertTrue(any(how == "noexec" for _, how in cases))
+        for name, how in cases:
+            with self.subTest(name=name, how=how):
+                for marker in self.base.glob("*.args"):
+                    marker.unlink()
+                work = stage / "guest-work.json"
+                if work.exists():
+                    work.unlink()
                 path = source / name
                 bits = path.stat().st_mode
-                path.chmod(0)
+                path.chmod(0 if how == "unreadable" else 0o644)
                 try:
                     result = subprocess.run(["bash", str(stage / "inner.sh")], cwd=ROOT, capture_output=True,
                                             text=True, env=env, timeout=30)
@@ -2760,9 +2829,16 @@ class MatrixContract(unittest.TestCase):
                     path.chmod(bits)
                 text = result.stdout + result.stderr
                 self.assertEqual(result.returncode, 64, text)
-                self.assertIn("matrix inner: required input missing: %s" % path, text)
+                if name in bootstrap:
+                    self.assertIn("matrix inner: required input missing: %s" % path, text)
+                else:
+                    self.assertIn("qualify-release-matrix.sh: required input %s: %s" % (
+                        "not executable" if how == "noexec" else "unreadable", path), text)
                 self.assertNotIn("Permission denied", text)
+                self.assertFalse(work.exists(), name)
                 self.assertEqual(sorted(p.name for p in self.base.glob("*.args")), [])
+        if os.geteuid() == 0:  # visible, and never a strict self-test pass
+            self.skipTest("the unreadable twins need a non-root user")
 
     def test_empty_compiler_pin_refuses_the_dry_run(self):
         # hungerg r11e #1: the pin read itself is checked; a present, readable
@@ -3625,6 +3701,78 @@ def check_d4_ready_pair(pair, cells, lanes, lanes_all, runnable):
     assert lane in lanes[obligation], f"ready lane {lane} is not in D4_LANES[{obligation}]"
     for selector in cells[obligation]:
         assert selector in runnable, f"ready selector {selector} is not curated runnable"
+
+
+class StrictSelfTest(unittest.TestCase):
+    """codex r11f #1/#2: the strict self-test runner, on small owned suites."""
+    STRICT = ROOT / "scripts" / "strict-selftest.py"
+    DECLARATION = (
+        'SELF = "scripts/runner_inputs.py"\n'
+        'RUNNERS = {"r.sh": {"self-test": ("checkout", ("data/ok.txt", "suite.py"))}}\n'
+        'def required(runner, mode):\n    return RUNNERS[runner][mode][1]\n')
+
+    def run_suite(self, body, *names):
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as raw:
+            root = Path(raw)
+            (root / "scripts").mkdir(); (root / "data").mkdir()
+            (root / "scripts/runner_inputs.py").write_text(self.DECLARATION)
+            (root / "data/ok.txt").write_text("ok\n"); (root / "data/secret.txt").write_text("secret\n")
+            (root / "suite.py").write_text(
+                "import subprocess, unittest\nfrom pathlib import Path\nROOT = Path(%r)\n" % str(root) + body)
+            result = subprocess.run([sys.executable, "-I", str(self.STRICT), str(root), "r.sh", "self-test",
+                                     str(root / "suite.py"), *names], capture_output=True, text=True, timeout=60,
+                                    cwd=self.STRICT.parent)
+            return result.returncode, result.stdout + result.stderr
+
+    def test_pass_reads_only_declared_inputs(self):
+        rc, text = self.run_suite("class T(unittest.TestCase):\n"
+                                  "    def test_a(self):\n        (ROOT / 'data/ok.txt').read_text()\n")
+        self.assertEqual(rc, 0, text)
+        self.assertIn("strict self-test passed: 1 tests, 0 skipped", text)
+
+    def test_every_non_pass_fails(self):
+        rows = {
+            "skip": ("    def test_a(self):\n        self.skipTest('x')\n", "1 skipped (a skip is never a pass)"),
+            "skip in subtest": ("    def test_a(self):\n        with self.subTest(i=1):\n"
+                                "            self.skipTest('x')\n", "1 skipped (a skip is never a pass)"),
+            "expected failure": ("    @unittest.expectedFailure\n    def test_a(self):\n        self.fail()\n",
+                                 "1 expected failures"),
+            "failure": ("    def test_a(self):\n        self.fail('x')\n", "1 failed, 0 errors"),
+            "empty": ("    pass\n", "no test ran"),
+            "undeclared read": ("    def test_a(self):\n        (ROOT / 'data/secret.txt').read_text()\n",
+                                "read undeclared input(s) of r.sh self-test: data/secret.txt"),
+            "undeclared launch": ("    def test_a(self):\n"
+                                  "        subprocess.run(['/bin/true', str(ROOT / 'data/secret.txt')])\n",
+                                  "read undeclared input(s) of r.sh self-test: data/secret.txt"),
+        }
+        for name, (body, message) in rows.items():
+            with self.subTest(case=name):
+                rc, text = self.run_suite("class T(unittest.TestCase):\n" + body)
+                self.assertEqual(rc, 1, text)
+                self.assertIn("strict self-test failed: " , text)
+                self.assertIn(message, text)
+                self.assertNotIn("strict self-test passed", text)
+
+    def test_selection_is_argv_only(self):
+        body = ("class T(unittest.TestCase):\n    def test_a(self):\n        pass\n"
+                "    def test_b(self):\n        self.fail('b')\n")
+        rc, text = self.run_suite(body, "T.test_a")
+        self.assertEqual(rc, 0, text)
+        self.assertIn("1 tests, 0 skipped", text)
+        rc, text = self.run_suite(body)
+        self.assertEqual(rc, 1, text)
+
+    def test_runners_call_it_with_a_fixed_selection(self):
+        matrix = (ROOT / "scripts/qualify-release-matrix.sh").read_text()
+        body = matrix.split("self_test() {", 1)[1].split("\n}\n", 1)[0]
+        self.assertEqual([l.strip() for l in body.splitlines() if l.strip() and not l.strip().startswith("#")], [
+            'python3 -I "$REPO/scripts/strict-selftest.py" "$REPO" scripts/qualify-release-matrix.sh self-test \\',
+            '"$REPO/tests/python/test_release_matrix_contract.py"'])
+        native = (ROOT / "scripts/qualify-inventory-native.sh").read_text()
+        self.assertIn('timeout 60 python3 -I "$REPO/scripts/strict-selftest.py" "$REPO" '
+                      'scripts/qualify-inventory-native.sh self-test \\\n'
+                      '        "$REPO/tests/python/test_inventory_capacity_oracle.py" \\\n'
+                      '        CapacityFixtureTests C8GatePredicateTests C8GateFixtureTests || die', native)
 
 
 if __name__ == "__main__":

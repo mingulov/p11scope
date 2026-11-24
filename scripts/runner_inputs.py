@@ -17,6 +17,12 @@ import sys
 
 STAGE, CHECKOUT = "stage", "checkout"
 SELF = "scripts/runner_inputs.py"
+# Every declared .sh input is launched directly and must be executable,
+# except these, which are only sourced (`. scripts/lib.sh`) or read.
+SOURCED = ("scripts/cleanup-traps.sh", "scripts/lib.sh", "scripts/product-build.sh")
+# Runs a mode's self-test suite strictly (no skip passes; every repository
+# file the suite reads must be declared for that mode).
+_STRICT = "scripts/strict-selftest.py"
 
 _PIN = "scripts/mapped-provider-pin.py"
 _COUNTER = ("tests/fixtures/counter-banks.c", "tests/fixtures/counter-bank-growth.c")
@@ -45,8 +51,11 @@ _MATRIX_STAGE = tuple(dict.fromkeys(_MATRIX_RUNNERS + _PUBLIC + _NATIVE + _LIB))
 # The compiler pin, the candidate build and its fixture.
 _MATRIX_HOST = (".release-rust-version", "scripts/cargo.sh", "scripts/prepare-dependencies.py",
                 "scripts/fixtures/exec_churn.c")
-# --self-test runs the contract suite: it and every file it loads or runs.
+# --self-test runs the contract suite strictly: it and every file it loads,
+# reads or runs (strict-selftest.py refuses a read of any other repository file).
 _MATRIX_SELF_TEST = (
+    _STRICT, "build.rs", "src/lib.rs", "scripts/_loader.py", "scripts/canary_process_custody.py",
+    "tests/python/json_signal_lifetime_probe.py",
     "tests/python/test_release_matrix_contract.py", "tests/python/test_canary_evidence.py",
     "tests/python/test_canary_object.py", "tests/python/test_canary_workload.py",
     "tests/python/test_inventory_capacity_oracle.py", "tests/python/test_public_cli_oracle.py",
@@ -68,7 +77,7 @@ RUNNERS = {
     "scripts/qualify-public-cli.sh": {"run": (STAGE, _PUBLIC)},
     "scripts/qualify-inventory-native.sh": {
         "run": (STAGE, _NATIVE),
-        "self-test": (CHECKOUT, _NATIVE + ("tests/python/test_inventory_capacity_oracle.py",))},
+        "self-test": (CHECKOUT, _NATIVE + ("tests/python/test_inventory_capacity_oracle.py", _STRICT))},
     # run: the campaign; list: --list/--list-integration print the curation
     # and run no helper.
     "scripts/run-privileged-lib-tests.sh": {"run": (STAGE, _LIB), "list": (STAGE, ())},
@@ -102,17 +111,27 @@ def staged_sources():
     return tuple(sorted(names))
 
 
-def missing(root, runner, mode):
-    """Every input that is absent, unreadable, or (a runner it executes)
-    not executable. Other shell inputs are sourced or read, never run."""
+def executable(name):
+    return name.endswith(".sh") and name not in SOURCED
+
+
+def problems(root, runner, mode):
+    """(path, state) for every input that is missing, unreadable or (a
+    directly launched shell) not executable."""
     out = []
     for name in required(runner, mode):
         path = os.path.normpath(os.path.join(root, name))
-        executable = name in RUNNERS
-        if (not os.path.isfile(path) or not os.access(path, os.R_OK)
-                or (executable and not os.access(path, os.X_OK))):
-            out.append(path)
+        if not os.path.isfile(path):
+            out.append((path, "missing"))
+        elif not os.access(path, os.R_OK):
+            out.append((path, "unreadable"))
+        elif executable(name) and not os.access(path, os.X_OK):
+            out.append((path, "not executable"))
     return out
+
+
+def missing(root, runner, mode):
+    return [path for path, _ in problems(root, runner, mode)]
 
 
 def main(argv):
@@ -123,9 +142,8 @@ def main(argv):
     if mode not in RUNNERS.get(runner, {}):
         print("runner_inputs.py: undeclared runner mode: %s %s" % (runner, mode), file=sys.stderr)
         return 2
-    gone = missing(root, runner, mode)
-    for path in gone:
-        state = "missing" if not os.path.isfile(path) else "unreadable"
+    gone = problems(root, runner, mode)
+    for path, state in gone:
         print("%s: required input %s: %s" % (os.path.basename(runner), state, path), file=sys.stderr)
     return 64 if gone else 0
 

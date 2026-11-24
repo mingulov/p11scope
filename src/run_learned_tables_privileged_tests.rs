@@ -1227,6 +1227,68 @@ mod exact_accounting_tests {
     }
 
     #[test]
+    fn exact_accounting_accepts_a_full_miss_inside_a_later_window() {
+        // A re-attach gap after the endpoint's first attach: worker 0
+        // bursts [140,160] fully past its own endpoint's attach
+        // (began=100) but inside the later [130,170] window, while
+        // the pre-attach [10,90] window cannot disclose it. The
+        // later window honestly discloses the post-attach miss.
+        let mut report = report([Some(0), Some(10), Some(10)]);
+        report["evidence"]["discovery"][0]["unobserved_windows"] = serde_json::json!([
+            {"start_ns": 10, "end_ns": 90, "reason": "mapped_unattached"},
+            {"start_ns": 130, "end_ns": 170, "reason": "mapped_unattached"},
+        ]);
+        report["evidence"]["discovery"][0]["first_attach_points"] = serde_json::json!([
+            {"file_offset": 0x1000, "began_ns": 100, "attached_ns": 110},
+        ]);
+        report["functions"][0]["target"] = serde_json::json!({
+            "object": {"dev": [DEV.0, DEV.1], "ino": INO, "sha256": SHA},
+            "file_offset": 0x1000,
+        });
+        let workers = vec![
+            worker(0, 140, 160),
+            worker(1, 1300, 1400),
+            worker(2, 1500, 1600),
+        ];
+        check_exact_accounting(&report, PROVIDER, &workers)
+            .expect("a full miss inside a later window passes");
+    }
+
+    #[test]
+    fn exact_accounting_accepts_a_partial_starting_inside_a_later_window() {
+        // Worker 0 missed honestly pre-attach ([50,60] ends before
+        // began=100); worker 1 is partially observed with its burst
+        // [140,200] starting inside the later [130,170] re-attach
+        // window, fully past its own endpoint's first attach
+        // (began=100); worker 2 is fully observed. The later window
+        // honestly discloses the partial's unobserved head.
+        let mut report = report([Some(0), Some(4), Some(10)]);
+        report["evidence"]["discovery"][0]["unobserved_windows"] = serde_json::json!([
+            {"start_ns": 10, "end_ns": 90, "reason": "mapped_unattached"},
+            {"start_ns": 130, "end_ns": 170, "reason": "mapped_unattached"},
+        ]);
+        report["evidence"]["discovery"][0]["first_attach_points"] = serde_json::json!([
+            {"file_offset": 0x1000, "began_ns": 100, "attached_ns": 110},
+            {"file_offset": 0x1010, "began_ns": 100, "attached_ns": 110},
+        ]);
+        report["functions"][0]["target"] = serde_json::json!({
+            "object": {"dev": [DEV.0, DEV.1], "ino": INO, "sha256": SHA},
+            "file_offset": 0x1000,
+        });
+        report["functions"][1]["target"] = serde_json::json!({
+            "object": {"dev": [DEV.0, DEV.1], "ino": INO, "sha256": SHA},
+            "file_offset": 0x1010,
+        });
+        let workers = vec![
+            worker(0, 50, 60),
+            worker(1, 140, 200),
+            worker(2, 1100, 1200),
+        ];
+        check_exact_accounting(&report, PROVIDER, &workers)
+            .expect("a partial starting inside a later window passes");
+    }
+
+    #[test]
     fn exact_accounting_rejects_a_post_attach_partial_inside_a_module_wide_window() {
         // Worker 0 missed honestly pre-attach ([50,60] ends before
         // began=100); worker 1 is partially observed with its burst

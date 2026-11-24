@@ -14022,7 +14022,7 @@ pub(crate) mod test_fixture {
 mod tests {
     use super::test_fixture::{
         FakeSelfMappingProbe, INODE, PATH, SHA, backing_file, mark_pre_copy_up, module, overlay,
-        own_all_raws, own_all_raws_under, pin_set, pins, reback, view_pin,
+        own_all_raws, own_all_raws_under, pin_set, pins, reback, repath_single_pin, view_pin,
     };
     use super::*;
     use crate::discovery::scan::ScannedEntry;
@@ -15820,6 +15820,246 @@ mod tests {
             "the surviving key's proof stays: {:?}",
             pins.proven_targets
         );
+    }
+
+    /// An overlay copy-up key the capture rejected, with the
+    /// witness-proven lower file kept: the pre pins first under the
+    /// lower path, an identical plain observation merges its raw
+    /// onto the pre's id, and a divergent same-key observation under
+    /// another path fails the key closed. The merged plain raw stays
+    /// routable to the kept lower file. Returns the pins, the
+    /// rejected key, the lower path and the lower digest.
+    fn rejected_copyup_pins() -> (PinnedObjects, ObjectKey, &'static str, &'static str) {
+        const LOWER_SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const OTHER_SHA: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        const LOWER_PATH: &str = "/usr/lib/softhsm/lower/libsofthsm2.so";
+        let key = overlay(81);
+        let mut pins = image_pins(&[(key, LOWER_SHA, 1)]);
+        repath_single_pin(&mut pins, LOWER_PATH);
+        mark_pre_copy_up(&mut pins);
+        let mut plain = image_pins(&[(key, LOWER_SHA, 1)]);
+        repath_single_pin(&mut plain, LOWER_PATH);
+        let skipped = pins.absorb(plain);
+        assert!(
+            skipped.is_empty(),
+            "the identical plain merges onto the kept pre: {skipped:?}"
+        );
+        assert_eq!(pins.pinned().count(), 1, "the merge mints no second object");
+        let divergent = image_pins(&[(key, OTHER_SHA, 1)]);
+        let skipped = pins.absorb(divergent);
+        assert!(
+            skipped.is_empty(),
+            "the divergent locus fails the key silently: {skipped:?}"
+        );
+        assert!(
+            pins.rejects(key),
+            "the divergent locus fails the key closed"
+        );
+        assert_eq!(
+            pins.raw_to_id.len(),
+            2,
+            "the pre raw and the merged plain raw stay routable"
+        );
+        (pins, key, LOWER_PATH, LOWER_SHA)
+    }
+
+    #[test]
+    fn rejected_dependency_key_refuses_its_entries_but_keeps_valid_ones() {
+        // Overlay copy-up with a witness-kept lower file: the
+        // dependency key is rejected, yet its merged plain raw still
+        // resolves to the kept lower pin. A wrapper module's entry
+        // into that key must refuse with the reconciled row — binding
+        // it would credit calls at the upper file's offsets under the
+        // lower file's name — while the wrapper's valid entry binds
+        // and owns the only claim. Both the default and the strict
+        // bind refuse: the check lives in the shared inner binder.
+        let (mut pins, dependency, lower_path, lower_sha) = rejected_copyup_pins();
+        let provider = overlay(80);
+        let mut wrapper = module(provider);
+        wrapper.mount_namespace = module(dependency).mount_namespace;
+        wrapper.tables[0].live_return = true;
+        wrapper.tables[0].entries.push(ScannedEntry {
+            name: "C_Login",
+            object: dependency,
+            object_path: lower_path.into(),
+            file_offset: 0x2000,
+        });
+        let probe = pins
+            .id_for_scanned(&wrapper, dependency, lower_path)
+            .expect("the rejected key still resolves (the bug shape)");
+        assert_eq!(
+            pins.summary(probe).map(|pin| pin.sha256),
+            Some(lower_sha),
+            "the rejected key resolves to the witness-kept lower file"
+        );
+        let skipped = pins.absorb(view_pin(&wrapper, 3, SHA, 9, false));
+        assert!(skipped.is_empty(), "the wrapper pins cleanly: {skipped:?}");
+        for (name, (bound, skipped)) in [
+            (
+                "default",
+                bind_scanned_modules(&[wrapper.clone()], &mut pins.clone()),
+            ),
+            (
+                "strict",
+                bind_scanned_modules_strict(&[wrapper.clone()], &mut pins.clone()),
+            ),
+        ] {
+            assert_eq!(bound.len(), 1, "{name}: the wrapper module binds");
+            let entries = &bound[0].scanned.tables[0].entries;
+            assert_eq!(
+                entries.len(),
+                1,
+                "{name}: only the valid entry binds: {entries:?}"
+            );
+            assert_eq!(entries[0].name, "C_Initialize");
+            assert_eq!(
+                bound[0].entry_objects[0].len(),
+                1,
+                "{name}: only the valid entry owns a target"
+            );
+            assert_eq!(skipped.len(), 1, "{name}: one entry refuses: {skipped:?}");
+            assert_eq!(skipped[0].subject, "C_Login");
+            assert!(
+                skipped[0]
+                    .reason
+                    .contains("could not be reconciled to a comparable pinned object"),
+                "{name}: the rejected dependency keeps the reconciled row: {}",
+                skipped[0].reason
+            );
+        }
+    }
+
+    #[test]
+    fn rejected_module_key_refuses_the_module_at_the_bind_choke() {
+        // The bind choke refuses a rejected module key itself, not
+        // just its entries: rebuild and snapshot binds carry no
+        // engine pre-filter, so a module whose own key failed closed
+        // must drop here with the identity row even though its plain
+        // raw still resolves to the witness-kept lower file.
+        let (mut pins, dependency, lower_path, _) = rejected_copyup_pins();
+        let mut module = module(dependency);
+        module.path = lower_path.into();
+        assert!(
+            pins.id_for_scanned(&module, dependency, lower_path)
+                .is_some(),
+            "the rejected module key still resolves (the bug shape)"
+        );
+        let (bound, skipped) = bind_scanned_modules(&[module], &mut pins);
+        assert!(bound.is_empty(), "the rejected module never binds");
+        assert_eq!(skipped.len(), 1, "one module refuses: {skipped:?}");
+        assert!(
+            skipped[0]
+                .reason
+                .contains("module has no comparable pinned identity"),
+            "the rejected module keeps the identity row: {}",
+            skipped[0].reason
+        );
+    }
+
+    #[test]
+    fn learned_view_entry_refusals_file_the_learned_row() {
+        // Every per-entry refusal arm names the finite learned-tables
+        // row for a run-persistent learned module: a path-carrying
+        // row would collapse to the generic discovery row and hide
+        // which capture input lost its tables (the module-level arms
+        // already do this). The table keeps the per-entry detail for
+        // its local consumers; the lost stream names the learned
+        // input once per refused entry. One entry per arm refuses
+        // while the proven same-file entry binds.
+        const VERIFIED_OFFSET: u64 = 0xebe0;
+        const MISDIRECTED_OFFSET: u64 = 0x20;
+        const DANGLING_OFFSET: u64 = 0x30;
+        let provider = overlay(70);
+        let dependency = ObjectKey {
+            inode: provider.inode + 1,
+            ..provider
+        };
+        let unpinned = overlay(71);
+        let mut scanned = module(provider);
+        scanned.view = crate::discovery::engine::Engine::RUN_LEARNED_VIEW_ID;
+        scanned.tables[0].entries.push(ScannedEntry {
+            name: "C_GetInterfaceList",
+            object: dependency,
+            object_path: PATH.into(),
+            file_offset: MISDIRECTED_OFFSET,
+        });
+        scanned.tables[0].entries.push(ScannedEntry {
+            name: "C_Sign",
+            object: dependency,
+            object_path: PATH.into(),
+            file_offset: DANGLING_OFFSET,
+        });
+        scanned.tables[0].entries.push(ScannedEntry {
+            name: "C_Verify",
+            object: unpinned,
+            object_path: PATH.into(),
+            file_offset: 0x3000,
+        });
+        let mut pinned = view_pin(&scanned, 1, SHA, 1, false);
+        let mut dependency_module = scanned.clone();
+        dependency_module.key = dependency;
+        let dependency_pins = view_pin(&dependency_module, 2, SHA, 1, false);
+        assert!(pinned.absorb(dependency_pins).is_empty());
+        let provider_id = pinned
+            .id_for_scanned(&scanned, provider, &scanned.path)
+            .expect("the provider is pinned");
+        pinned.by_id.get_mut(&provider_id).unwrap().exports =
+            Arc::from(vec![("C_Initialize".to_string(), 0x1000)]);
+        let target = pinned
+            .id_for_scanned(&dependency_module, dependency, &dependency_module.path)
+            .expect("the dependency is pinned");
+        pinned.by_id.get_mut(&target).unwrap().exports =
+            Arc::from(vec![("C_GetInterface".to_string(), VERIFIED_OFFSET)]);
+        let (bound, skipped) = bind_scanned_modules_strict(&[scanned], &mut pinned);
+        assert_eq!(bound.len(), 1, "the learned module binds");
+        let entries = &bound[0].scanned.tables[0].entries;
+        assert_eq!(
+            entries.len(),
+            1,
+            "only the proven same-file entry binds: {entries:?}"
+        );
+        assert_eq!(entries[0].name, "C_Initialize");
+        let unpinned_rows = &bound[0].scanned.tables[0].unpinned;
+        assert_eq!(
+            unpinned_rows.len(),
+            3,
+            "the table keeps one row per refused entry: {unpinned_rows:?}"
+        );
+        assert_eq!(unpinned_rows[0].subject, "C_GetInterfaceList");
+        assert!(
+            unpinned_rows[0].reason.contains("forwarded offset"),
+            "the forward arm keeps its detail: {}",
+            unpinned_rows[0].reason
+        );
+        assert_eq!(unpinned_rows[1].subject, "C_Sign");
+        assert!(
+            unpinned_rows[1]
+                .reason
+                .contains("not a proven function entry"),
+            "the strict arm keeps its detail: {}",
+            unpinned_rows[1].reason
+        );
+        assert_eq!(unpinned_rows[2].subject, "C_Verify");
+        assert!(
+            unpinned_rows[2]
+                .reason
+                .contains("could not be reconciled to a comparable pinned object"),
+            "the unreconciled arm keeps its detail: {}",
+            unpinned_rows[2].reason
+        );
+        assert_eq!(
+            skipped.len(),
+            3,
+            "one lost row per refused entry: {skipped:?}"
+        );
+        for skip in &skipped {
+            assert_eq!(skip.subject, crate::render::LEARNED_SKIP_SUBJECT);
+            assert_eq!(
+                skip.reason,
+                crate::render::LEARNED_TABLE_UNBOUND_REASON,
+                "every arm names the learned input: {skipped:?}"
+            );
+        }
     }
 
     #[test]

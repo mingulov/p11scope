@@ -6190,6 +6190,75 @@ fn newsite_created_data_object_stays_unlabeled() {
     }
 }
 
+/// A rendered observations section must qualify downstream: feed
+/// it through `scripts/qualify-key-operations.py`'s `check_section`
+/// (strict shape plus the version/content gates) and require
+/// acceptance. The script path resolves from the crate root, so the
+/// check runs wherever the test binary runs.
+fn assert_section_qualifies(rendered: &serde_json::Value) {
+    run_qualifier_check(rendered, true);
+}
+
+/// The bridge is non-vacuous: the same section with its version
+/// bumped to v6 (no visible v6 content) must refuse.
+fn assert_bumped_v6_section_refuses(rendered: &serde_json::Value) {
+    let mut bumped = rendered.clone();
+    bumped["version"] = serde_json::json!(6);
+    run_qualifier_check(&bumped, false);
+}
+
+fn run_qualifier_check(rendered: &serde_json::Value, expect_pass: bool) {
+    const DRIVER: &str = r#"
+import importlib.util
+import json
+import sys
+spec = importlib.util.spec_from_file_location("r3_qualifier", sys.argv[2])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+with open(sys.argv[1], encoding="utf-8") as stream:
+    section = json.load(stream)
+try:
+    module.check_section(section)
+except Exception as error:
+    print(f"REFUSED: {error}", file=sys.stderr)
+    sys.exit(1)
+print("QUALIFIED")
+"#;
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let script = root.join("scripts/qualify-key-operations.py");
+    assert!(
+        script.is_file(),
+        "the qualifier script ships with the crate: {}",
+        script.display()
+    );
+    let dir = tempfile::tempdir().expect("qualifier scratch dir");
+    let section_path = dir.path().join("section.json");
+    std::fs::write(
+        &section_path,
+        serde_json::to_string(rendered).expect("the section serializes"),
+    )
+    .expect("write the section");
+    let output = std::process::Command::new("python3")
+        .args(["-I", "-c", DRIVER])
+        .arg(&section_path)
+        .arg(&script)
+        .output()
+        .expect("run the qualifier");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if expect_pass {
+        assert!(
+            output.status.success(),
+            "the committed section qualifies: {stderr}"
+        );
+    } else {
+        assert!(
+            !output.status.success() && stderr.contains("REFUSED"),
+            "a contentless v6 section refuses: status={} stderr={stderr}",
+            output.status
+        );
+    }
+}
+
 // A truncated creation whose established facts are all invalidated
 // selects v6 from hidden state alone: the row carries only
 // old-vocabulary requested values, invalidated established fields
@@ -6200,7 +6269,7 @@ fn newsite_created_data_object_stays_unlabeled() {
 fn newsite_truncated_invalidated_row_is_not_contentless_v6() {
     use crate::key_operation_projection::producer::commit;
     use crate::key_operation_projection::{
-        OBSERVATIONS_VERSION_V6, is_newsite_curve_name, is_newsite_metadata_label,
+        OBSERVATIONS_VERSION_V5, is_newsite_curve_name, is_newsite_metadata_label,
         object_observations_json, observations_version,
     };
     use crate::semantics_key_use::{JointStaging, KeyUseReducer};
@@ -6249,14 +6318,15 @@ fn newsite_truncated_invalidated_row_is_not_contentless_v6() {
     }
     assert_eq!(v.label, None, "no established fact survives to label");
     // The committed section selects no v6 from the hidden truncation
-    // flag alone: the version follows visible content.
+    // flag alone: the version follows visible content, and this row's
+    // only newer content is the parameter set, so exactly v5.
     let staging = JointStaging::select_s1_only();
     let keyuse = KeyUseReducer::new();
     let committed = commit(1, &[&staging], &projection, &keyuse);
-    assert_ne!(
+    assert_eq!(
         observations_version(&committed),
-        OBSERVATIONS_VERSION_V6,
-        "a row with no visible v6 content selects no v6"
+        OBSERVATIONS_VERSION_V5,
+        "a row with only pqc-visible content selects exactly v5"
     );
     let rendered = object_observations_json(&committed);
     assert_eq!(
@@ -6299,6 +6369,8 @@ fn newsite_truncated_invalidated_row_is_not_contentless_v6() {
         "the row carries no visible v6 content: version={} row={row}",
         rendered["version"],
     );
+    assert_section_qualifies(&rendered);
+    assert_bumped_v6_section_refuses(&rendered);
 }
 
 // The version follows visible content: a truncated creation whose
@@ -6311,7 +6383,7 @@ fn newsite_truncated_invalidated_row_is_not_contentless_v6() {
 fn newsite_truncated_invalidated_row_selects_version_by_visible_content() {
     use crate::key_operation_projection::producer::commit;
     use crate::key_operation_projection::{
-        OBSERVATIONS_VERSION_V6, is_newsite_curve_name, is_newsite_metadata_label,
+        OBSERVATIONS_VERSION_V5, is_newsite_curve_name, is_newsite_metadata_label,
         object_observations_json, observations_version,
     };
     use crate::semantics_key_use::{JointStaging, KeyUseReducer};
@@ -6342,14 +6414,14 @@ fn newsite_truncated_invalidated_row_selects_version_by_visible_content() {
     let staging = JointStaging::select_s1_only();
     let keyuse = KeyUseReducer::new();
     let committed = commit(1, &[&staging], &projection, &keyuse);
-    assert_ne!(
+    assert_eq!(
         observations_version(&committed),
-        OBSERVATIONS_VERSION_V6,
-        "a row with no visible v6 content selects no v6"
+        OBSERVATIONS_VERSION_V5,
+        "a row with only pqc-visible content selects exactly v5"
     );
     let rendered = object_observations_json(&committed);
-    assert_ne!(
-        rendered["version"], OBSERVATIONS_VERSION_V6,
+    assert_eq!(
+        rendered["version"], OBSERVATIONS_VERSION_V5,
         "the rendered section carries the content-selected version"
     );
     let row = &rendered["objects"][0];
@@ -6387,4 +6459,6 @@ fn newsite_truncated_invalidated_row_selects_version_by_visible_content() {
         "the row carries no visible v6 content: version={} row={row}",
         rendered["version"],
     );
+    assert_section_qualifies(&rendered);
+    assert_bumped_v6_section_refuses(&rendered);
 }

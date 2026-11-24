@@ -105743,6 +105743,84 @@ fn run_learned_reserved_aliases_stop_at_thirty_two() {
         crate::fanotify::LEARNED_FILES_PER_CAPTURE_CAP,
         "a re-proof grows the reserved set no further"
     );
+    // The cap refusal is load-bearing only past retirement: while the
+    // proving view's pins stay, the refused tail still resolves
+    // through them. Phase separation first: earlier binds filed
+    // their own rows, so the retire step below must file its own.
+    engine.counters.object_skips.clear();
+    let learned = engine.run_learned_modules.clone();
+    engine.pinned.prove_scanned_entries_for_test(&learned);
+    let baseline = engine
+        .live_candidate_with_pending(
+            engine.pinned.clone(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )
+        .expect("a live candidate builds before retirement");
+    assert_eq!(
+        baseline.modules[0].scanned.tables[0].entries.len(),
+        DEPS,
+        "baseline: every entry binds before retirement"
+    );
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .all(|skip| skip.reason != crate::render::LEARNED_TABLE_UNBOUND_REASON),
+        "baseline: no unbound row before retirement: {:?}",
+        engine.counters.object_skips,
+    );
+    for (key, path) in keys.iter().zip(&paths) {
+        record_scan_ownership(&mut engine.pinned, ProcessViewId(9), *key, path);
+    }
+    assert!(
+        engine.pinned.remove_view(ProcessViewId(9)).is_some(),
+        "the proving view owned pins to retire"
+    );
+    let candidate = engine
+        .live_candidate_with_pending(
+            engine.pinned.clone(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )
+        .expect("a live candidate builds after retirement");
+    assert_eq!(
+        candidate.modules.len(),
+        1,
+        "the module re-binds through its reserved aliases"
+    );
+    assert_eq!(
+        candidate.modules[0].scanned.tables[0].entries.len(),
+        DEPS - 1,
+        "exactly the refused tail unbinds"
+    );
+    assert!(
+        candidate.modules[0].scanned.tables[0]
+            .unpinned
+            .iter()
+            .any(|skip| skip.subject == "C_AliasDep32"),
+        "the table keeps the refused entry's detail: {:?}",
+        candidate.modules[0].scanned.tables[0].unpinned,
+    );
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.subject == crate::render::LEARNED_SKIP_SUBJECT
+                && skip.reason == crate::render::LEARNED_TABLE_UNBOUND_REASON),
+        "the retired tail names the learned input: {:?}",
+        engine.counters.object_skips,
+    );
 }
 
 /// Harvesting a proof debits the capture work budget: with one unit
@@ -105807,6 +105885,295 @@ fn run_learned_harvest_charges_the_work_budget() {
         control.budget_charge_for_test(1),
         "one unit of room admits one unit without a harvest"
     );
+}
+
+/// A proceeding harvest debits exactly its decoded size: one unit
+/// per table, entry and interface plus one for the call. Both sides
+/// of the boundary pin the formula, so a flat charge(1) — or any
+/// miscount of the components — fails.
+#[test]
+fn run_learned_harvest_charges_exactly_its_decoded_size() {
+    use crate::discovery::identity::test_fixture::module as fixture_module;
+    const WORK_CEILING: u64 = 16 * 1024 * 1024;
+    // Two tables (three entries plus one), two interfaces: one for
+    // the call plus four entries plus two tables plus two interfaces.
+    const UNITS: u64 = 1 + 4 + 2 + 2;
+    let key = overlay_key(97);
+    let mut module = fixture_module(key);
+    module.view = ProcessViewId(9);
+    module.path = "/usr/lib/sizedprov.so".into();
+    let table = |names: &[&'static str]| ScannedTable {
+        version: (3, 0),
+        walk: "full",
+        entries: names
+            .iter()
+            .enumerate()
+            .map(|(index, &name)| ScannedEntry {
+                name,
+                object: key,
+                object_path: module.path.clone(),
+                file_offset: 0x1000 + index as u64 * 0x10,
+            })
+            .collect(),
+        null_entries: vec![],
+        unpinned: vec![],
+        address: 0x7000,
+        file_offset: Some(0),
+        live_return: false,
+        manifest_supported: false,
+        extension_impossible: false,
+    };
+    module.tables = vec![
+        table(&["C_Initialize", "C_GetSlotList", "C_OpenSession"]),
+        table(&["C_Login"]),
+    ];
+    module.interfaces = vec![
+        ScannedInterface {
+            index: 0,
+            name_class: "exact_standard",
+            name_lossy: None,
+            name_private: None,
+            flags: 0,
+            table: Some(0),
+        },
+        ScannedInterface {
+            index: 1,
+            name_class: "exact_standard",
+            name_lossy: None,
+            name_private: None,
+            flags: 0,
+            table: Some(1),
+        },
+    ];
+    let proof = OwnedLearnProof {
+        view: ProcessViewId(9),
+        path: module.path.clone(),
+        object: PinnedObjectId(4242),
+        loader_exe: None,
+        loader_unknown_reason: None,
+        module,
+    };
+    let mut engine = Engine::empty();
+    let mut pins = PinnedObjects::empty();
+    assert!(engine.budget_charge_for_test(WORK_CEILING - UNITS - 1));
+    engine.harvest_run_learned_tables(&mut pins, &proof);
+    assert!(
+        engine.budget_charge_for_test(1),
+        "the harvest debited at most its decoded size of {UNITS}"
+    );
+    assert!(
+        !engine.budget_charge_for_test(1),
+        "the harvest debited at least its decoded size of {UNITS}"
+    );
+}
+
+/// A harvest that refuses loudly burns no capture work budget: only
+/// a harvest that reaches the absorb and union pays for them. Each
+/// no-op exit below — a replaced file generation, heap-only tables,
+/// the table cap, and an empty proof — debits nothing.
+#[test]
+fn run_learned_refused_harvests_burn_no_work_budget() {
+    use crate::discovery::identity::test_fixture::{module as fixture_module, real_scan_pin};
+    const WORK_CEILING: u64 = 16 * 1024 * 1024;
+    // A replaced file generation: the incoming proof's digest
+    // disagrees with the committed pin, so the tables refuse loudly.
+    {
+        let dir = tempfile::tempdir().expect("replaced backing dir");
+        let committed_path = dir.path().join("libcommitted.so");
+        std::fs::write(
+            &committed_path,
+            "p11scope-fixture:committed-generation-bytes",
+        )
+        .expect("write committed");
+        let mut committed = real_scan_pin(&committed_path, None, 400, &"ef".repeat(32));
+        let pin = committed.pinned().next().expect("one pin");
+        let (key, path) = (pin.key, pin.path.to_string());
+        record_scan_ownership(&mut committed, ProcessViewId(9), key, &path);
+        let mut engine = Engine::empty();
+        let skipped = engine.pinned.absorb(committed);
+        assert!(skipped.is_empty(), "the committed pin absorbs: {skipped:?}");
+        let incoming_path = dir.path().join("libincoming.so");
+        std::fs::write(&incoming_path, "p11scope-fixture:incoming-generation-bytes")
+            .expect("write incoming");
+        let mut incoming = real_scan_pin(&incoming_path, None, 400, &"cd".repeat(32));
+        let object = incoming.pinned().next().expect("one pin").id;
+        let mut module = fixture_module(key);
+        module.view = ProcessViewId(9);
+        module.path = path.clone();
+        module.tables = vec![ScannedTable {
+            version: (2, 40),
+            walk: "full",
+            entries: vec![ScannedEntry {
+                name: "C_Initialize",
+                object: key,
+                object_path: path.clone(),
+                file_offset: 0x1000,
+            }],
+            null_entries: vec![],
+            unpinned: vec![],
+            address: 0x7000,
+            file_offset: Some(0),
+            live_return: false,
+            manifest_supported: false,
+            extension_impossible: false,
+        }];
+        module.interfaces = vec![];
+        let proof = OwnedLearnProof {
+            view: ProcessViewId(9),
+            path: path.clone(),
+            object,
+            loader_exe: None,
+            loader_unknown_reason: None,
+            module,
+        };
+        assert!(engine.budget_charge_for_test(WORK_CEILING - 1));
+        engine.harvest_run_learned_tables(&mut incoming, &proof);
+        assert!(
+            engine.budget_charge_for_test(1),
+            "a generation-refused harvest burned no budget"
+        );
+        assert!(
+            engine
+                .counters
+                .object_skips
+                .iter()
+                .any(|skip| skip.reason == crate::render::LEARNED_REPLACED_DELETED_REASON),
+            "the generation refusal files its row: {:?}",
+            engine.counters.object_skips,
+        );
+    }
+    // Heap-only tables: no file offset, so nothing persists and the
+    // proof refuses through the finite unbound row.
+    {
+        let key = overlay_key(97);
+        let mut module = fixture_module(key);
+        module.view = ProcessViewId(9);
+        module.path = "/usr/lib/heaponly.so".into();
+        module.tables = vec![ScannedTable {
+            version: (2, 40),
+            walk: "full",
+            entries: vec![ScannedEntry {
+                name: "C_Initialize",
+                object: key,
+                object_path: module.path.clone(),
+                file_offset: 0x1000,
+            }],
+            null_entries: vec![],
+            unpinned: vec![],
+            address: 0x7000,
+            file_offset: None,
+            live_return: false,
+            manifest_supported: false,
+            extension_impossible: false,
+        }];
+        module.interfaces = vec![];
+        let proof = OwnedLearnProof {
+            view: ProcessViewId(9),
+            path: module.path.clone(),
+            object: PinnedObjectId(4242),
+            loader_exe: None,
+            loader_unknown_reason: None,
+            module,
+        };
+        let mut engine = Engine::empty();
+        let mut pins = PinnedObjects::empty();
+        assert!(engine.budget_charge_for_test(WORK_CEILING - 1));
+        engine.harvest_run_learned_tables(&mut pins, &proof);
+        assert!(
+            engine.budget_charge_for_test(1),
+            "a heap-refused harvest burned no budget"
+        );
+        assert!(
+            engine
+                .counters
+                .object_skips
+                .iter()
+                .any(|skip| skip.reason == crate::render::LEARNED_TABLE_UNBOUND_REASON),
+            "the heap refusal files its row: {:?}",
+            engine.counters.object_skips,
+        );
+    }
+    // Past the table cap: the store already holds 32 modules, so a
+    // new file's tables refuse loudly.
+    {
+        let key = overlay_key(97);
+        let mut module = fixture_module(key);
+        module.view = ProcessViewId(9);
+        module.path = "/usr/lib/overcap.so".into();
+        module.tables = vec![ScannedTable {
+            version: (2, 40),
+            walk: "full",
+            entries: vec![ScannedEntry {
+                name: "C_Initialize",
+                object: key,
+                object_path: module.path.clone(),
+                file_offset: 0x1000,
+            }],
+            null_entries: vec![],
+            unpinned: vec![],
+            address: 0x7000,
+            file_offset: Some(0),
+            live_return: false,
+            manifest_supported: false,
+            extension_impossible: false,
+        }];
+        module.interfaces = vec![];
+        let proof = OwnedLearnProof {
+            view: ProcessViewId(9),
+            path: module.path.clone(),
+            object: PinnedObjectId(4242),
+            loader_exe: None,
+            loader_unknown_reason: None,
+            module: module.clone(),
+        };
+        let mut engine = Engine::empty();
+        for index in 0..crate::fanotify::LEARNED_FILES_PER_CAPTURE_CAP {
+            let mut stored = module.clone();
+            stored.key = overlay_key(100 + index as u64);
+            engine.run_learned_modules.push(stored);
+        }
+        let mut pins = PinnedObjects::empty();
+        assert!(engine.budget_charge_for_test(WORK_CEILING - 1));
+        engine.harvest_run_learned_tables(&mut pins, &proof);
+        assert!(
+            engine.budget_charge_for_test(1),
+            "a cap-refused harvest burned no budget"
+        );
+        assert!(
+            engine
+                .counters
+                .object_skips
+                .iter()
+                .any(|skip| skip.reason == crate::render::LEARNED_TABLE_CAP_REASON),
+            "the cap refusal files its row: {:?}",
+            engine.counters.object_skips,
+        );
+    }
+    // An empty proof harvests nothing and debits nothing.
+    {
+        let key = overlay_key(97);
+        let mut module = fixture_module(key);
+        module.view = ProcessViewId(9);
+        module.path = "/usr/lib/emptyproof.so".into();
+        module.tables = vec![];
+        module.interfaces = vec![];
+        let proof = OwnedLearnProof {
+            view: ProcessViewId(9),
+            path: module.path.clone(),
+            object: PinnedObjectId(4242),
+            loader_exe: None,
+            loader_unknown_reason: None,
+            module,
+        };
+        let mut engine = Engine::empty();
+        let mut pins = PinnedObjects::empty();
+        assert!(engine.budget_charge_for_test(WORK_CEILING - 1));
+        engine.harvest_run_learned_tables(&mut pins, &proof);
+        assert!(
+            engine.budget_charge_for_test(1),
+            "an empty harvest burned no budget"
+        );
+    }
 }
 
 /// A rejected forwarded dependency must not discard its whole learned
@@ -105937,12 +106304,16 @@ fn learned_staging_stops_requesting_refreshes_once_the_queue_is_full() {
     }
 }
 
-/// A refresh refusal past a full queue debits the capture work budget
-/// for its relief scan: with one unit of room left, one refusal trips
-/// the ceiling.
+/// Refresh refusals past a full queue burn no capture work budget:
+/// one hundred thousand refusals (past the 65k trip point of a
+/// len+1 charge) leave one unit of room untouched, so a busy host's
+/// churn never trips the capture into a permanent discovery stop.
+/// Refusals are scheduler bookkeeping, not scan work; the bounded
+/// queue itself is the structural bound on the relief scan.
 #[test]
-fn refresh_refusal_past_a_full_queue_charges_the_work_budget() {
+fn refresh_refusals_past_a_full_queue_burn_no_work_budget() {
     const WORK_CEILING: u64 = 16 * 1024 * 1024;
+    const REFUSALS: u32 = 100_000;
     let mut engine = Engine::empty();
     for offset in 0..MAX_PENDING_REFRESH as u32 {
         assert!(
@@ -105956,12 +106327,23 @@ fn refresh_refusal_past_a_full_queue_charges_the_work_budget() {
     }
     assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
     assert!(engine.budget_charge_for_test(WORK_CEILING - 1));
-    assert!(
-        !engine.request_refresh_consumed_for_view(FAKE_PID_FLOOR + 1000, None, ProcessViewId(0)),
-        "past a full queue the request refuses"
+    for index in 0..REFUSALS {
+        assert!(
+            !engine.request_refresh_consumed_for_view(
+                FAKE_PID_FLOOR + 1_000_000 + index,
+                None,
+                ProcessViewId(0),
+            ),
+            "refusal {index} past a full queue refuses"
+        );
+    }
+    assert_eq!(
+        engine.refresh_requested.len(),
+        MAX_PENDING_REFRESH,
+        "the overload refuses without growing the queue"
     );
     assert!(
-        !engine.budget_charge_for_test(1),
-        "the refusal scan debited the capture work budget"
+        engine.budget_charge_for_test(1),
+        "one hundred thousand refusals burned no budget: discovery still admits work"
     );
 }

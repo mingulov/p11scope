@@ -30276,7 +30276,14 @@ pub(crate) mod tests {
         scene.ingest(&begin_bytes(2, 9, function_id("C_GetAttributeValue"), 0));
         // Every call stays open at the seal.
         assert_eq!(scene.adapter.open.len(), 3, "control: three open rows");
-        let birth = scene.bootstrap(proof, birth_cut);
+        // An attach-observed birth decides through the seal scan (an
+        // exec-marker birth refuses before it).
+        let birth = BootstrapReceipt::scripted(
+            proof,
+            BirthKind::AttachObserved,
+            birth_cut,
+            scene.closure_generation(),
+        );
         let gap = scene.seal(&birth).err().map(|failure| failure.gap);
         let marks = scene
             .adapter

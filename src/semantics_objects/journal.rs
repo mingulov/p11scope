@@ -846,7 +846,7 @@ struct JournalDeathMarks {
     ended: bool,
     /// The proof-destroying fallback close that fenced this key, if
     /// any (see [`JournalAdapter::fence_destroyed_proof`]).
-    fallback: Option<FallbackFence>,
+    fallback: Option<FallbackFenceMark>,
     /// The begin ordinal of a call that began at or below the
     /// predecessor's fallback fence and had not returned by it, and
     /// so refused this successor's birth (`BootstrapMismatch`): a
@@ -866,6 +866,18 @@ pub(crate) struct FallbackFence {
     pub(crate) fence: u64,
     pub(crate) chain: u32,
     pub(crate) wait: u32,
+}
+
+/// The stored form of a [`FallbackFence`]: the wait is kept as the
+/// adapter Births-pass count at which it ends
+/// ([`JournalAdapter::fallback_pass`]), so serving a pass is one
+/// counter step and never visits the retained marks (INV-2: a pass
+/// pays one unit however many fences are retained).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FallbackFenceMark {
+    fence: u64,
+    chain: u32,
+    expires_at: u64,
 }
 
 /// What one proof-destroying fallback close decided (see
@@ -2808,6 +2820,9 @@ pub(crate) struct JournalAdapter {
     /// any refusal grounds in a capable frame. Lives outside the
     /// size-pinned per-key state; incarnation minting reads it.
     death_marks: BTreeMap<JournalDomainKey, JournalDeathMarks>,
+    /// Births passes served so far: the clock every fallback backoff
+    /// counts against ([`JournalAdapter::tick_fallback_backoff`]).
+    fallback_pass: u64,
     image_keys: Tracked<BTreeMap<(u64, u64), Vec<JournalDomainKey>>>,
     /// Individually retained taints, capped at the sighting bound (the
     /// same image population). Past the cap, `taint_overflow` latches
@@ -3033,6 +3048,7 @@ impl JournalAdapter {
             refused: Tracked::new(Vec::new()),
             keys: Tracked::new(BTreeMap::new()),
             death_marks: BTreeMap::new(),
+            fallback_pass: 0,
             image_keys: Tracked::new(BTreeMap::new()),
             tainted_images: Tracked::new(BTreeSet::new()),
             taint_evidence: Tracked::new(BTreeMap::new()),
@@ -7967,8 +7983,13 @@ impl JournalAdapter {
         self.death_marks
             .get(&key)
             .and_then(|marks| marks.fallback)
-            .map(|fence| fence.wait)
+            .map(|mark| self.fallback_wait(mark))
             .filter(|wait| *wait > 0)
+    }
+
+    /// Passes left on one stored fallback fence at the current clock.
+    fn fallback_wait(&self, mark: FallbackFenceMark) -> u32 {
+        u32::try_from(mark.expires_at.saturating_sub(self.fallback_pass)).unwrap_or(u32::MAX)
     }
 
     /// The birth probe's view of [`Self::successor_mint_rule`]: passes
@@ -8059,10 +8080,11 @@ impl JournalAdapter {
             let state = self.keys.edit().get_mut(&key).expect("closed key");
             state.void_fence = state.void_fence.max(frontier);
         }
-        self.death_marks.entry(key).or_default().fallback = Some(FallbackFence {
+        let expires_at = self.fallback_pass.saturating_add(u64::from(wait));
+        self.death_marks.entry(key).or_default().fallback = Some(FallbackFenceMark {
             fence: frontier,
             chain,
-            wait,
+            expires_at,
         });
         Some(FallbackFenceDecision {
             fence: frontier,
@@ -8089,6 +8111,11 @@ impl JournalAdapter {
         self.death_marks
             .get(&proof.key)
             .and_then(|marks| marks.fallback)
+            .map(|mark| FallbackFence {
+                fence: mark.fence,
+                chain: mark.chain,
+                wait: self.fallback_wait(mark),
+            })
     }
 
     /// Keys carrying a fallback fence (frame cells: a close that must
@@ -8109,18 +8136,22 @@ impl JournalAdapter {
         proof: &JournalDomainProof,
         fence: FallbackFence,
     ) {
-        self.death_marks.entry(proof.key).or_default().fallback = Some(fence);
+        let expires_at = self.fallback_pass.saturating_add(u64::from(fence.wait));
+        self.death_marks.entry(proof.key).or_default().fallback = Some(FallbackFenceMark {
+            fence: fence.fence,
+            chain: fence.chain,
+            expires_at,
+        });
     }
 
-    /// Tick one pass off every fallback successor backoff. The only
-    /// writer that drains a wait; its sole production caller is the
-    /// machine's Births arm, beside the reseed cooldown tick.
+    /// Serve one pass of every fallback successor backoff: one step of
+    /// the Births-pass clock each wait counts against, so the pass
+    /// costs one unit whatever the number of retained fences (no mark
+    /// is visited or rewritten). The only writer that drains a wait;
+    /// its sole production caller is the machine's Births arm, beside
+    /// the reseed cooldown tick.
     pub(crate) fn tick_fallback_backoff(&mut self) {
-        for marks in self.death_marks.values_mut() {
-            if let Some(fence) = marks.fallback.as_mut() {
-                fence.wait = fence.wait.saturating_sub(1);
-            }
-        }
+        self.fallback_pass = self.fallback_pass.saturating_add(1);
     }
 
     /// Whether a dead key's deaths are all recorded (capable
@@ -10946,7 +10977,9 @@ impl JournalAdapter {
         if stamp.mode == SealScanMode::Seal && entry.begin_ordinal <= birth_cut && ours {
             facts.birth_mismatch = true;
             // A call that began at or below the predecessor's fallback
-            // fence and had not returned by it straddles that close:
+            // fence and had not returned by it (no END, ABANDON or
+            // corroborated ordinary return at or below it) straddles
+            // that close:
             // named apart from a plain mismatch, still never attributed.
             if let Some(fence) = self.inherited_fallback_fence(key)
                 && entry.begin_ordinal <= fence
@@ -10954,6 +10987,7 @@ impl JournalAdapter {
                 && !entry
                     .abandon
                     .is_some_and(|abandon| abandon.ordinal <= fence)
+                && !entry.corroborated_return.is_some_and(|at| at <= fence)
             {
                 facts.straddler_begin = Some(entry.begin_ordinal);
             }
@@ -29860,6 +29894,12 @@ pub(crate) mod tests {
         /// BEGIN and an ABANDON both at or below the fence: the call
         /// ended there without a return, so it is not a straddler.
         AbandonedBefore,
+        /// BEGIN and a corroborated ordinary return both at or below
+        /// the fence (no END): proven returned, not a straddler.
+        ReturnedBefore,
+        /// BEGIN at the fence, its corroborated ordinary return after
+        /// it (no END): a straddler.
+        ReturnedAfter,
         /// BEGIN above the fence, at or below the successor's birth
         /// cut: a plain birth mismatch, not a straddler.
         BeginAbove,
@@ -29879,6 +29919,10 @@ pub(crate) mod tests {
     ) {
         use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
 
+        // A failed create: its ordinary return corroborates the call
+        // without any object effect (an affecting return on the dead
+        // key's image would taint it instead).
+        const FAILED: u64 = pkcs11_types::CkRv::ARGUMENTS_BAD.0;
         let (mut scene, proof, _) = fallback_fence_doomed_scene();
         let create = function_id("C_CreateObject");
         let call = begin_bytes(1, 3, create, 0);
@@ -29889,6 +29933,12 @@ pub(crate) mod tests {
         }
         if shape == StraddleShape::EndedBefore {
             scene.ingest(&end_bytes(&call, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 70));
+        }
+        if shape == StraddleShape::ReturnedBefore {
+            assert_eq!(
+                scene.ingest_ordinary(ordinary_for(&call, FAILED)),
+                JournalDisposition::ReturnObserved
+            );
         }
         if shape == StraddleShape::AbandonedBefore {
             use p11scope_ebpf_common::object_journal::JOURNAL_REASON_EXEC_EXIT;
@@ -29913,13 +29963,25 @@ pub(crate) mod tests {
         let reborn = scene.attest_function("C_CreateObject");
         assert_eq!(reborn.key.incarnation, proof.key.incarnation + 1);
         let mut birth_cut = fence;
+        if shape == StraddleShape::ReturnedAfter {
+            assert_eq!(
+                scene.ingest_ordinary(ordinary_for(&call, FAILED)),
+                JournalDisposition::ReturnObserved
+            );
+            assert!(scene.adapter.consumed_through > fence);
+        }
         if shape == StraddleShape::BeginAbove {
             scene.ingest(&call);
             birth_cut = scene.adapter.consumed_through;
         }
+        // The returned shapes carry no END: the corroborated ordinary
+        // return is their only terminal evidence.
         if !matches!(
             shape,
-            StraddleShape::EndedBefore | StraddleShape::AbandonedBefore
+            StraddleShape::EndedBefore
+                | StraddleShape::AbandonedBefore
+                | StraddleShape::ReturnedBefore
+                | StraddleShape::ReturnedAfter
         ) {
             scene.ingest(&end_bytes(&call, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 70));
         }
@@ -29929,7 +29991,8 @@ pub(crate) mod tests {
             birth_cut,
             scene.closure_generation(),
         );
-        let rebirth = BootstrapReceipt::attest(&scene.adapter, &grant).expect("at-fence birth");
+        let rebirth = BootstrapReceipt::attest(&scene.adapter, &grant)
+            .unwrap_or_else(|refusal| panic!("{shape:?}: at-fence birth {refusal:?}"));
         let gap = scene.seal(&rebirth).err().map(|failure| failure.gap);
         let straddler = scene
             .adapter
@@ -29958,6 +30021,8 @@ pub(crate) mod tests {
             StraddleShape::BeginBelow,
             StraddleShape::EndedBefore,
             StraddleShape::AbandonedBefore,
+            StraddleShape::ReturnedBefore,
+            StraddleShape::ReturnedAfter,
             StraddleShape::BeginAbove,
         ]
         .map(|shape| {
@@ -29983,6 +30048,8 @@ pub(crate) mod tests {
                 (BeginBelow, mismatch, Some(true), 0, 1, 1, true),
                 (EndedBefore, mismatch, None, 0, 0, 1, true),
                 (AbandonedBefore, mismatch, None, 0, 0, 1, true),
+                (ReturnedBefore, mismatch, None, 0, 0, 1, true),
+                (ReturnedAfter, mismatch, Some(true), 0, 1, 1, true),
                 (BeginAbove, mismatch, None, 0, 0, 1, true),
             ],
             "straddlers refuse, convert nothing and are counted only when they cross the fence"
@@ -30137,6 +30204,52 @@ pub(crate) mod tests {
         );
         let fourth = scene.attest_function("C_CreateObject");
         assert_eq!(fourth.key.incarnation, third.key.incarnation + 1);
+    }
+
+    /// Serving a Births pass is one clock step however many fallback
+    /// fences are retained (INV-2: one Births credit pays one unit,
+    /// never a walk of the marks). 100 retained fences, past the
+    /// 64-unit slice, with waits 0 to 6 (some served at once, several
+    /// standing at the same time): each pass rewrites no mark, moves
+    /// the clock by exactly one, and every wait reads exactly its
+    /// remainder; served waits withhold nothing.
+    #[test]
+    fn fallback_backoff_pass_is_one_step_over_many_retained_fences() {
+        let (mut scene, proof, _) = fallback_fence_doomed_scene();
+        const FENCES: u32 = 100;
+        assert!(FENCES as usize > SCOPED_RECOVERY_SLICE);
+        let wait_of = |index: u32| index % 7;
+        let keys = (0..FENCES)
+            .map(|index| JournalDomainKey {
+                incarnation: proof.key.incarnation + 10 + index,
+                ..proof.key
+            })
+            .collect::<Vec<_>>();
+        for (index, key) in (0..FENCES).zip(&keys) {
+            scene.adapter.death_marks.entry(*key).or_default().fallback = Some(FallbackFenceMark {
+                fence: 1,
+                chain: 1,
+                expires_at: u64::from(wait_of(index)),
+            });
+        }
+        let marks = format!("{:?}", scene.adapter.death_marks);
+        for pass in 0..8u32 {
+            let expected = (0..FENCES)
+                .map(|index| Some(wait_of(index).saturating_sub(pass)).filter(|left| *left > 0))
+                .collect::<Vec<_>>();
+            let seen = keys
+                .iter()
+                .map(|key| scene.adapter.successor_backoff(*key))
+                .collect::<Vec<_>>();
+            assert_eq!(seen, expected, "pass {pass}: exact remainders");
+            scene.adapter.tick_fallback_backoff();
+            assert_eq!(scene.adapter.fallback_pass, u64::from(pass) + 1);
+            assert_eq!(
+                format!("{:?}", scene.adapter.death_marks),
+                marks,
+                "a pass visits and rewrites no retained mark"
+            );
+        }
     }
 
     #[test]

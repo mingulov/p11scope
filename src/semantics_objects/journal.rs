@@ -4129,7 +4129,7 @@ impl JournalAdapter {
                 h3_voided: None,
                 fence: None,
             };
-            if !self.settle_inline(model, ticket, &mut failure) {
+            if !self.settle_inline(model, ticket, &mut failure, 0) {
                 self.raw_rejection = Some(ticket);
             }
             return failure;
@@ -4150,7 +4150,7 @@ impl JournalAdapter {
             h3_voided: None,
             fence: None,
         };
-        if !self.settle_inline(model, ticket, &mut failure) {
+        if !self.settle_inline(model, ticket, &mut failure, 0) {
             self.raw_rejection = Some(ticket);
         }
         failure
@@ -4472,7 +4472,7 @@ impl JournalAdapter {
             h3_voided: None,
             fence: None,
         };
-        let pending = (!self.settle_inline(model, ticket, &mut failure)).then_some(ticket);
+        let pending = (!self.settle_inline(model, ticket, &mut failure, 0)).then_some(ticket);
         Some((failure, pending))
     }
 }
@@ -8149,7 +8149,7 @@ impl JournalAdapter {
         };
         if deferred {
             let ticket = self.issue_rejection(mode, true, None);
-            self.settle_inline(model, ticket, &mut failure);
+            self.settle_inline(model, ticket, &mut failure, 0);
         }
         Err(failure)
     }
@@ -8250,8 +8250,11 @@ impl JournalAdapter {
         let key = bootstrap.proof().key;
         // Drain window dispositions derive here, once per frontier in
         // budgeted slices, before any site reads them: a yielded slice
-        // waits with its prefix cached and resumes next seal.
-        self.ensure_drain_proofs(frontier)?;
+        // waits with its prefix cached and resumes next seal. The
+        // spent units travel with the seal so a later inline phase of
+        // this same attempt (a seal-time doom) shares the one
+        // allowance instead of taking it again.
+        let proof_spent = self.ensure_drain_proofs(frontier)?;
         let Some(state) = self.keys.get(&key) else {
             // Diagnostic-only (bootstrap arms): count the refusing arm. The
             // refusal below is unchanged.
@@ -8517,7 +8520,16 @@ impl JournalAdapter {
         if completed && !self.has_history_through(key, &live, frontier) {
             return self.seal_completed_era(key, bootstrap, frontier, replay);
         }
-        self.seal_validated(model, key, bootstrap, frontier, fence, audit, replay)
+        self.seal_validated(
+            model,
+            key,
+            bootstrap,
+            frontier,
+            fence,
+            audit,
+            replay,
+            proof_spent,
+        )
     }
 
     /// Whether any staged wire truth for one key sits at or below a
@@ -9259,14 +9271,22 @@ impl JournalAdapter {
     /// into its failure when that finishes it: a small rejection settles
     /// where it was decided, a large one leaves its remainder to the
     /// holder's budget. The deciding call never does more than this one
-    /// credit of per-row work.
+    /// credit of per-row work: `prior_spent` carries the units an
+    /// earlier phase of the same call already spent from this same
+    /// allowance (drain-proof derivation ahead of a seal-time doom),
+    /// so the two phases share one allowance instead of each taking
+    /// it whole. Calls with no earlier phase pass zero.
     fn settle_inline(
         &mut self,
         model: &mut ObjectSemantics,
         ticket: u64,
         failure: &mut SealFailure,
+        prior_spent: usize,
     ) -> bool {
-        let mut credit = self.inline_credit.min(SCOPED_RECOVERY_SLICE);
+        let mut credit = self
+            .inline_credit
+            .saturating_sub(prior_spent)
+            .min(SCOPED_RECOVERY_SLICE);
         let allowance = credit;
         self.drive_rejections(model, &mut credit);
         self.inline_spent = self.inline_spent.saturating_add(allowance - credit);
@@ -9674,6 +9694,7 @@ impl JournalAdapter {
         key: JournalDomainKey,
         bootstrap: &BootstrapReceipt,
         live: &[JournalDomainKey],
+        proof_spent: usize,
     ) -> SealFailure {
         let domain = ObjectDomain::sealed(&bootstrap.proof());
         // The key refusal publishes here; its image's staged rows and the
@@ -9693,7 +9714,7 @@ impl JournalAdapter {
             fence: None,
             scope: SealFailureScope::Unqualified,
         };
-        self.settle_inline(model, ticket, &mut failure);
+        self.settle_inline(model, ticket, &mut failure, proof_spent);
         failure
     }
 
@@ -9827,7 +9848,7 @@ impl JournalAdapter {
     /// clears the cache and restarts. Members above the frontier
     /// derive like the rest; every consumer gates ordinals on the
     /// sealing frontier before reading a disposition.
-    fn ensure_drain_proofs(&mut self, frontier: u64) -> Result<(), SealFailure> {
+    fn ensure_drain_proofs(&mut self, frontier: u64) -> Result<usize, SealFailure> {
         if self.drain_proof_cache_frontier != Some(frontier) {
             self.drain_proof_cache.clear();
             self.drain_proof_cursor = None;
@@ -9867,8 +9888,9 @@ impl JournalAdapter {
             let empty = self.drain_window_empty(image, returned, abandoned);
             self.drain_proof_cache.insert(native, empty);
         }
-        self.inline_spent = self.inline_spent.saturating_add(allowance - credit);
-        Ok(())
+        let spent = allowance - credit;
+        self.inline_spent = self.inline_spent.saturating_add(spent);
+        Ok(spent)
     }
 
     /// Conversion and settlement after every structural rule passed. The
@@ -9883,6 +9905,7 @@ impl JournalAdapter {
         model_fence: Option<u64>,
         audit: &JournalAuditReceipt,
         replay: Option<ReplayPreparation>,
+        proof_spent: usize,
     ) -> Result<SealSuccess, SealFailure> {
         let image = (key.cookie, key.exec);
         let live = self.live_keys_for_image(image);
@@ -9924,7 +9947,7 @@ impl JournalAdapter {
             }
         }
         if dooming {
-            return Err(self.doom_key_for_abandonment(model, key, bootstrap, &live));
+            return Err(self.doom_key_for_abandonment(model, key, bootstrap, &live, proof_spent));
         }
         // This key's bounded abandonments need their corroborating
         // returns within the frontier; otherwise the bound is not ready

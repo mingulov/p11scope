@@ -2254,10 +2254,17 @@ impl IngestedJointQuantum {
             let mark = adapter.rejection_mark();
             // A refusal decided by this seal runs its inline rejection work
             // from this same service budget, never past it.
-            adapter.bound_inline_credit(*remaining);
+            let budget = *remaining;
+            adapter.bound_inline_credit(budget);
             let outcome = adapter.seal_in_audit(model, input, &mut selected, fault, replay);
             let spent = adapter.take_inline_spent();
-            *remaining = remaining.saturating_sub(spent);
+            assert!(
+                spent <= budget,
+                "one seal attempt never spends past its service allowance"
+            );
+            *remaining = budget
+                .checked_sub(spent)
+                .expect("a bounded seal attempt debits its spent units");
             assert!(
                 outcome_storage(&outcome).is_some_and(|actual| actual <= bytes),
                 "retained seal result exceeds its checked preflight bound"

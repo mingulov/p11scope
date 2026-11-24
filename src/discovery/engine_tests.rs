@@ -41270,6 +41270,10 @@ fn prefault_manifest_getter_data_completes_on_a_spent_window_without_retiring() 
         (low as u64) < base_b && (low as u64) < high_a,
         "premise: the low range sorts first"
     );
+    assert!(
+        base_b < high_a,
+        "premise: B's range sorts second, so the ceiling range pays held and batch"
+    );
     warmup.engine.set_prefault_window_trip_for_test(2, 1000);
     let sites = warmup_sites_for(&warmup.objects);
     let skips = warmup.engine.counters.object_skips.len();

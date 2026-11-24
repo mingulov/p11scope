@@ -2014,6 +2014,16 @@ fn joint_machine_resource_flag_with_pending_h3_keeps_originals_local() {
     mixed_image_and_exact_refusal_pending(MixedRefusalControl::ResourcePending);
 }
 
+/// Round 13 ruling 3 (N11): C's proof-destroying fallback close
+/// replays its heads after a reducer resource failure, so both heads
+/// dispose instead of replaying. The fallback-fence gap still names
+/// every head the close degraded (`calls=2`), never only the
+/// replayed ones.
+#[test]
+fn joint_machine_fallback_close_counts_heads_disposed_by_resource_failure() {
+    mixed_image_and_exact_refusal_pending(MixedRefusalControl::ReplayResource);
+}
+
 #[test]
 fn joint_machine_negative_only_image_taint_preserves_unrelated_joint() {
     mixed_image_and_exact_refusal_pending(MixedRefusalControl::ImageOnly);
@@ -2025,6 +2035,7 @@ enum MixedRefusalControl {
     Provenance,
     ResourcePending,
     ImageOnly,
+    ReplayResource,
 }
 
 /// Calls C's proof-destroying close replayed or disposed (its two
@@ -2158,7 +2169,50 @@ fn mixed_image_and_exact_refusal_pending(scenario: MixedRefusalControl) {
             .insert(c.bootstrap().domain(), NativeBirthRows { row, control })
             .is_some()
     );
+    let replay_resource = scenario == MixedRefusalControl::ReplayResource;
+    let disposed_before = scene
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .instance_semantic_edges()
+        .find(|record| record.id == c.id())
+        .unwrap()
+        .feed
+        .history_disposed();
+    if replay_resource {
+        scene
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture_mut()
+            .adapter_mut()
+            .inject_replay_resource_failure_for_test();
+    }
     scene.published_labeled("mixed-scope-native-c-refusal", None);
+    let disposed_by_close = scene
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .instance_semantic_edges()
+        .find(|record| record.id == c.id())
+        .unwrap()
+        .feed
+        .history_disposed()
+        - disposed_before;
+    assert_eq!(
+        disposed_by_close,
+        if replay_resource {
+            FALLBACK_CLOSE_UNITS
+        } else {
+            0
+        },
+        "the resource failure disposes both of C's heads (control: none otherwise)"
+    );
     assert!(matches!(
         scene.poll_commit(0).unwrap(),
         JointCommitProgress::Published(_)
@@ -2351,6 +2405,7 @@ fn mixed_image_and_exact_refusal_pending(scenario: MixedRefusalControl) {
         backoff_passes: 0,
         successor_allowed: true,
         straddlers: 0,
+        straddlers_at_least: false,
     };
     assert_eq!(
         (fenced.chain, fenced.wait),

@@ -2731,6 +2731,13 @@ impl IngestedJointQuantum {
             && audited.disposition() == SealFailureDisposition::Retry)
             .then_some(SealFailureDisposition::Fallback);
         let park_streak = self.consumers[index].stuck_streak;
+        #[cfg(test)]
+        {
+            let (_, owner, _, _, _) = ports.split();
+            if owner.parts().0.take_replay_resource_failure_for_test() {
+                self.consumers[index].failure.resource_failed = true;
+            }
+        }
         let mut batch = FailureBatchDelivery {
             audited,
             cursor: &mut self.consumers[index].failure,

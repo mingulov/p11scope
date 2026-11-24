@@ -1781,40 +1781,54 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 ));
                 continue;
             }
-            let Ok(mut slot) = births.reserve_for_current(
-                &reserve,
-                receipt,
-                &mut self.joint_birth_funnel.resource,
-            ) else {
-                association[first].refusal = Some((caller, BirthRefusal::Resource));
-                association[first].deferred = Some(reoffer_key);
-                continue;
-            };
-            // Computed before the reservation borrows the plan: no
-            // feed mutation happens between here and the consume
-            // gate below, so the verdict cannot go stale.
+            // The deterministic early gates (B3, round 13) are read
+            // before any fallible reservation: a birth they refuse is
+            // final whatever the resource room, so a full witness table
+            // must never turn it into a deferred resource refusal (and
+            // a re-offer) or charge witness capacity for it. No feed
+            // mutation happens between here and the gates below, so
+            // the verdicts cannot go stale.
             let segment_doomed = registrations.joint_reselect_segment_doomed(input, &proof);
             let stuck_barred = registrations.joint_reselect_stuck_barred(input, &proof);
             let unhealthy = registrations.joint_reselect_unhealthy(input);
-            let reservation = match registrations.reserve(input, &batch.registrations) {
-                Ok(reservation) => reservation,
-                Err(refusal) => {
-                    // AlreadySelected on an S1Only feed means the
-                    // registration drained before this first birth:
-                    // the same transient skew as a capacity wall,
-                    // recoverable by the same bounded re-offer. An
-                    // AlreadySelected Joint feed is a healthy
-                    // duplicate offer and stays final.
-                    let selected_s1only = refusal
+            let early_refused = unhealthy || segment_doomed || stuck_barred;
+            let reserved = if early_refused {
+                None
+            } else {
+                let Ok(slot) = births.reserve_for_current(
+                    &reserve,
+                    receipt,
+                    &mut self.joint_birth_funnel.resource,
+                ) else {
+                    association[first].refusal = Some((caller, BirthRefusal::Resource));
+                    association[first].deferred = Some(reoffer_key);
+                    continue;
+                };
+                Some(slot)
+            };
+            let reservation = if early_refused {
+                None
+            } else {
+                Some(match registrations.reserve(input, &batch.registrations) {
+                    Ok(reservation) => reservation,
+                    Err(refusal) => {
+                        // AlreadySelected on an S1Only feed means the
+                        // registration drained before this first birth:
+                        // the same transient skew as a capacity wall,
+                        // recoverable by the same bounded re-offer. An
+                        // AlreadySelected Joint feed is a healthy
+                        // duplicate offer and stays final.
+                        let selected_s1only = refusal
                         == crate::discovery::caller_registry::instance_input::JointReceiptInstallRefusal::AlreadySelected
                         && registrations.admitted_feed_is_s1only(input);
-                    let refusal = BirthRefusal::Registration(refusal);
-                    if refusal.transient() || selected_s1only {
-                        association[first].deferred = Some(reoffer_key);
+                        let refusal = BirthRefusal::Registration(refusal);
+                        if refusal.transient() || selected_s1only {
+                            association[first].deferred = Some(reoffer_key);
+                        }
+                        association[first].refusal = Some((caller, refusal));
+                        continue;
                     }
-                    association[first].refusal = Some((caller, refusal));
-                    continue;
-                }
+                })
             };
             let receipt = batch.current.swap_remove(current);
             let candidate = match receipt.into_birth_candidate() {
@@ -1842,7 +1856,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             // Worst case a probe misses and the arm refuses as before.
             if unhealthy {
                 drop(reservation);
-                drop(slot);
+                drop(reserved);
                 association[first].refusal = Some((caller, BirthRefusal::SessionUnhealthy));
                 continue;
             }
@@ -1855,7 +1869,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             // misses and the drain refuses as before.
             if segment_doomed {
                 drop(reservation);
-                drop(slot);
+                drop(reserved);
                 // The adapter's successor decision names the wait: a
                 // backoff after an unproductive successor, or the plain
                 // doom (no successor may mint for this proof yet).
@@ -1869,10 +1883,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             }
             if stuck_barred {
                 drop(reservation);
-                drop(slot);
+                drop(reserved);
                 association[first].refusal = Some((caller, BirthRefusal::StuckBarred));
                 continue;
             }
+            // Every early gate refused above, so both reservations exist.
+            let (Some(mut slot), Some(reservation)) = (reserved, reservation) else {
+                unreachable!("only an early-refused birth skips its reservations");
+            };
             let absence = slot.take_absence();
             let witness = match consume(candidate, absence, input, binding, &proof, adapter) {
                 Ok(witness) => witness,

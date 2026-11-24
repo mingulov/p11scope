@@ -7559,6 +7559,29 @@ thread_local! {
         const { std::cell::Cell::new(false) };
 }
 
+/// The examined-mode lower-file mapping key: the observer-side key for
+/// the proven lower fd, re-derived through the shared metered resolve
+/// on the caller's budget — never a fresh allowance, never the
+/// unmetered primitive. The lower fd opens in the observer namespace,
+/// hence the observer-side key; the lower file's facts cache under
+/// this key since the cache pin carries no device. Failure keeps the
+/// named gap, so the file stays learnable through ordinary scans.
+pub(crate) fn lower_proven_key(
+    file: &File,
+    budget: &mut CaptureWorkBudget,
+) -> Result<ObjectKey, String> {
+    match identity_of(file, budget) {
+        Ok(lower_mapping) => Ok(ObjectKey {
+            device: Device {
+                major: lower_mapping.device_major,
+                minor: lower_mapping.device_minor,
+            },
+            inode: lower_mapping.inode,
+        }),
+        Err(reason) => Err(format!("lower mapping identity unavailable: {reason}")),
+    }
+}
+
 /// Read (or reuse the cached) ELF export facts for one opened file
 /// under its pin bracket. `key` is the group's maps identity. A repeat
 /// scan of the unchanged file reuses the cached facts — or the cached
@@ -10193,24 +10216,13 @@ fn scan_view_examined_mode(
                     // process runs the lower bytes, so everything
                     // file-derived is re-derived from the proven lower
                     // file — upper offsets are never reused.
-                    // The lower file's facts cache under the lower
-                    // file's own mapping key: the cache pin carries no
-                    // device, so the upper's maps key would collide
-                    // across lower files. The lower fd opens in the
-                    // observer namespace, hence the observer-side key.
-                    let lower_key = match identity_of(&proof.file, budget) {
-                        Ok(lower_mapping) => ObjectKey {
-                            device: Device {
-                                major: lower_mapping.device_major,
-                                minor: lower_mapping.device_minor,
-                            },
-                            inode: lower_mapping.inode,
-                        },
+                    // The stale shape with a proven lower file re-derives
+                    // everything file-derived from that file through the
+                    // shared metered resolve on this scan's budget.
+                    let lower_key = match lower_proven_key(&proof.file, budget) {
+                        Ok(lower_key) => lower_key,
                         Err(reason) => {
-                            skipped.push(Skipped {
-                                subject,
-                                reason: format!("lower mapping identity unavailable: {reason}"),
-                            });
+                            skipped.push(Skipped { subject, reason });
                             continue;
                         }
                     };
@@ -21633,6 +21645,291 @@ int main(int argc, char **argv) {
             budget.work_ceiling(),
             "the chunk spend lands, the line-stride spend refuses: {}",
             budget.work_units_count()
+        );
+    }
+
+    /// The examined-mode lower-file decision threads the caller's budget
+    /// through the metered resolve: a live budget binds the same file as
+    /// the unmetered primitive and charges the caller, while a spent
+    /// allowance refuses loudly with the named gap. A fresh allowance or
+    /// the unmetered primitive inside the decision succeeds on a spent
+    /// caller budget instead of refusing.
+    #[test]
+    fn lower_proven_key_threads_the_caller_budget() {
+        let file = std::fs::File::open("/bin/sh").unwrap();
+        let mut budget = CaptureWorkBudget::default();
+        let key = lower_proven_key(&file, &mut budget).expect("a live budget binds the lower file");
+        let unmetered = p11scope_manifest::identity::mapping_file_key(&file).unwrap();
+        assert_eq!(
+            (key.device.major, key.device.minor, key.inode),
+            (
+                unmetered.device_major,
+                unmetered.device_minor,
+                unmetered.inode
+            ),
+            "the metered lower key binds the same file"
+        );
+        // fdinfo row, exact-id rows, delegate re-read, table chunk and
+        // line reads: a live resolve always charges its caller.
+        assert!(
+            budget.work_units_count() >= 6,
+            "the caller pays for the resolve: {}",
+            budget.work_units_count()
+        );
+
+        let mut spent = CaptureWorkBudget::default();
+        assert!(spent.charge(spent.work_ceiling()));
+        let error = lower_proven_key(&file, &mut spent).unwrap_err();
+        assert_eq!(
+            error,
+            format!("lower mapping identity unavailable: {WORK_CEILING_REASON}"),
+            "a spent allowance keeps the named gap"
+        );
+        assert_eq!(spent.work_units_count(), spent.work_ceiling());
+    }
+
+    /// Full-scan fixture for the LowerProven arm: scripted maps over a
+    /// small real ELF, zeroed memory, an overlayfs held identity matching
+    /// the maps key, a scripted witness-verdict sequence (held query
+    /// first, then one per lower candidate), and scripted lower
+    /// candidates served from real held files.
+    struct LowerProvenScanFixture {
+        maps: Vec<u8>,
+        held: MappedFile,
+        outcomes: std::collections::VecDeque<WitnessOutcome>,
+        candidates: Vec<PathBuf>,
+        served: HashMap<PathBuf, File>,
+        prove_calls: usize,
+    }
+
+    struct LowerProvenScanMemory;
+
+    impl ScanMemory for LowerProvenScanMemory {
+        fn read_memory_at(&self, bytes: &mut [u8], _offset: u64) -> std::io::Result<usize> {
+            bytes.fill(0);
+            Ok(bytes.len())
+        }
+    }
+
+    impl ScanIo for LowerProvenScanFixture {
+        type Memory = LowerProvenScanMemory;
+
+        fn open_maps(
+            &mut self,
+            _: &ProcessView,
+            _: &mut CaptureWorkBudget,
+        ) -> std::io::Result<Box<dyn Read>> {
+            Ok(Box::new(std::io::Cursor::new(self.maps.clone())))
+        }
+
+        fn open_mem(
+            &mut self,
+            _: &ProcessView,
+            _: &mut CaptureWorkBudget,
+        ) -> std::io::Result<LowerProvenScanMemory> {
+            Ok(LowerProvenScanMemory)
+        }
+
+        fn final_generation(
+            &mut self,
+            view: &ProcessView,
+            _: &mut CaptureWorkBudget,
+        ) -> Result<(), String> {
+            view.run_while_same(|| ())
+        }
+
+        fn held_identity(&mut self, _file: &File) -> Option<MappedFile> {
+            Some(self.held)
+        }
+
+        fn range_identity(
+            &mut self,
+            _: &ProcessView,
+            _: u64,
+            _: u64,
+            _: &mut CaptureWorkBudget,
+        ) -> Result<std::io::Result<crate::discovery::identity::FileIdentity>, String> {
+            Ok(Ok(self.held.identity))
+        }
+
+        fn prove_original_file_diagnosed(
+            &mut self,
+            _: &ProcessView,
+            _: &File,
+            _: &MappedFile,
+            _: ObjectKey,
+            _: (u64, u64),
+            _: &mut CaptureWorkBudget,
+        ) -> WitnessOutcome {
+            self.prove_calls += 1;
+            self.outcomes
+                .pop_front()
+                .expect("one scripted verdict per witness query")
+        }
+
+        fn lower_candidates(
+            &mut self,
+            _: &ProcessView,
+            _: &Path,
+            _: &mut CaptureWorkBudget,
+        ) -> Vec<PathBuf> {
+            self.candidates.clone()
+        }
+
+        fn open_lower_candidate(
+            &mut self,
+            _: &ProcessView,
+            candidate: &Path,
+            _: &mut CaptureWorkBudget,
+        ) -> Result<File, String> {
+            self.served
+                .get(candidate)
+                .and_then(|file| file.try_clone().ok())
+                .ok_or_else(|| format!("unscripted lower candidate {}", candidate.display()))
+        }
+    }
+
+    /// Drive one full deep scan over the LowerProven fixture and return
+    /// the outcome, the maps key, the witness query count, and the
+    /// caller-budget work delta. The provider file at
+    /// `dir/libprov.so` must already exist (one write per test keeps
+    /// pins stable across the compared scans).
+    fn scan_lower_proven_provider(
+        dir: &tempfile::TempDir,
+        outcomes: Vec<WitnessOutcome>,
+        candidates: Vec<PathBuf>,
+        served: HashMap<PathBuf, File>,
+    ) -> (ScanOutcome, ObjectKey, usize, u64) {
+        use std::os::unix::fs::MetadataExt as _;
+        let so_path = dir.path().join("libprov.so");
+        let view = ProcessView::open(ProcessViewId(702), std::process::id())
+            .expect("the test process opens");
+        let key_file = std::fs::File::open(&so_path).expect("the fixture provider opens");
+        let mut mounts = MountTableCache::default();
+        let mut key_budget = CaptureWorkBudget::default();
+        let key = crate::discovery::identity::retained_object_key_cached(
+            &view,
+            &key_file,
+            &mut mounts,
+            &mut key_budget,
+        )
+        .expect("the fixture key resolves");
+        let (major, minor, ino) = (key.device.major, key.device.minor, key.inode);
+        let maps = format!(
+            "7f1000000000-7f1000001000 r-xp 00000000 {major:02x}:{minor:02x} {ino} {}\n\
+             7f1000001000-7f1000002000 r--p 00001000 {major:02x}:{minor:02x} {ino} {}\n\
+             7f1000002000-7f1000003000 rw-p 00002000 {major:02x}:{minor:02x} {ino} {}\n",
+            so_path.display(),
+            so_path.display(),
+            so_path.display(),
+        );
+        let meta = std::fs::metadata(&so_path).expect("the fixture provider stats");
+        let held = MappedFile {
+            identity: crate::discovery::identity::FileIdentity {
+                dev: meta.dev(),
+                ino: meta.ino(),
+            },
+            fs_magic: Some(K1_RED_OVERLAY_MAGIC),
+        };
+        let mut fixture = LowerProvenScanFixture {
+            maps: maps.into_bytes(),
+            held,
+            outcomes: outcomes.into(),
+            candidates,
+            served,
+            prove_calls: 0,
+        };
+        let mut budget = CaptureWorkBudget::default();
+        let hooks = HookRegistry::builtin();
+        let (outcome, _, _, _) = scan_view_with_examined(
+            &ScanRequest {
+                pid: view.pid(),
+                hints: std::slice::from_ref(&so_path),
+                hooks: &hooks,
+            },
+            &view,
+            &mut budget,
+            &mut fixture,
+            true,
+        )
+        .expect("the scan must complete, not error");
+        let prove_calls = fixture.prove_calls;
+        (outcome, key, prove_calls, budget.work_units_count())
+    }
+
+    /// The real LowerProven arm threads the scan's budget through the
+    /// metered lower resolve: a Held scan and a LowerProven scan over
+    /// identical fixtures differ by exactly one direct lower-resolve
+    /// charge on the caller budget, and the LowerProven scan carries
+    /// no lower-identity gap. A fresh allowance or the unmetered
+    /// primitive at either the helper or the scan call site charges
+    /// the caller nothing for the resolve, collapsing the difference
+    /// to zero.
+    #[test]
+    fn examined_scan_lower_proven_arm_threads_the_caller_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let so_path = dir.path().join("libprov.so");
+        let exe = std::fs::read("/bin/true").expect("a small system ELF reads");
+        std::fs::write(&so_path, &exe).expect("the fixture provider writes");
+
+        // One direct lower-resolve charge on this host's live mount table.
+        let lower_file = std::fs::File::open(&so_path).unwrap();
+        let mut resolve_budget = CaptureWorkBudget::default();
+        let lower_key = lower_proven_key(&lower_file, &mut resolve_budget)
+            .expect("a live budget binds the lower file");
+        let resolve_cost = resolve_budget.work_units_count();
+        assert!(
+            resolve_cost >= 6,
+            "a live resolve charges its caller: {resolve_cost}"
+        );
+
+        // Held scan: the witness proves the held file; no lower resolve.
+        let (_held_outcome, held_key, held_queries, held_delta) = scan_lower_proven_provider(
+            &dir,
+            vec![WitnessOutcome {
+                verdict: WitnessVerdict::SameFile,
+                diagnosis: None,
+            }],
+            Vec::new(),
+            HashMap::new(),
+        );
+        assert_eq!(held_queries, 1, "the held query runs once");
+        assert_eq!(lower_key, held_key, "the lower key equals the maps key");
+
+        // LowerProven scan: other-file held verdict, same-file lower verdict.
+        let (lower_outcome, lower_maps_key, lower_queries, lower_delta) =
+            scan_lower_proven_provider(
+                &dir,
+                vec![
+                    WitnessOutcome {
+                        verdict: WitnessVerdict::OtherFile,
+                        diagnosis: None,
+                    },
+                    WitnessOutcome {
+                        verdict: WitnessVerdict::SameFile,
+                        diagnosis: None,
+                    },
+                ],
+                vec![so_path.clone()],
+                HashMap::from([(so_path, lower_file.try_clone().unwrap())]),
+            );
+        assert_eq!(lower_queries, 2, "held plus lower queries run");
+        assert_eq!(
+            lower_key, lower_maps_key,
+            "the lower key equals the maps key"
+        );
+        assert!(
+            lower_outcome.skipped().iter().all(|skip| !skip
+                .reason
+                .starts_with("lower mapping identity unavailable")),
+            "a live resolve keeps no lower gap: {:?}",
+            lower_outcome.skipped()
+        );
+        assert_eq!(
+            lower_delta - held_delta,
+            resolve_cost,
+            "the scan pays exactly one lower resolve on its own budget \
+             (held {held_delta}, lower {lower_delta}, direct {resolve_cost})"
         );
     }
 

@@ -706,6 +706,26 @@ COVERAGE_RETIRED_REASON = (
     "calls in the retire window were not observed"
 )
 COVERAGE_RETIRED_REASONS = {COVERAGE_RETIRED_REASON}
+# Owned-pause arm failures: a run whose pause arm failed before the first
+# epoch files one fixed gap row under its own subject (render.rs
+# `capture_skipped_out` pause arm). The failed arm's count rides in
+# `evidence.pause_partial`, never in the reason.
+PAUSE_SKIP_SUBJECT = "owned pause"
+PAUSE_ARM_FAILED_REASON = (
+    "the pause arm failed before the first epoch; "
+    "the owned child ran without pause protection"
+)
+PAUSE_ARM_FAILED_REASONS = {PAUSE_ARM_FAILED_REASON}
+# Run first-map stop gaps: a run whose member-stop object (or watchdog)
+# could not start files one fixed gap row under its own subject
+# (render.rs `capture_skipped_out` member-stop arm). No call count is
+# claimed, never guessed.
+MEMBER_STOP_SKIP_SUBJECT = "run first-map stop"
+MEMBER_STOP_UNAVAILABLE_REASON = (
+    "the run first-map stop was unavailable; "
+    "descendants ran without first-map protection"
+)
+MEMBER_STOP_UNAVAILABLE_REASONS = {MEMBER_STOP_UNAVAILABLE_REASON}
 # Learned-file gaps (v0.7.0): a provider the fanotify drain staged files
 # one fixed first-run gap under its own subject; overflow, the
 # per-capture cap and unavailable learning file their own aggregate
@@ -3351,8 +3371,11 @@ def bounded_skip(item):
     learned = item["name"] == LEARNED_SKIP_SUBJECT
     handoff = item["name"] in HANDOFF_SUBJECTS
     coverage_retired = item["name"] == COVERAGE_RETIRED_SUBJECT
+    pause_arm_failed = item["name"] == PAUSE_SKIP_SUBJECT
+    member_stop_unavailable = item["name"] == MEMBER_STOP_SKIP_SUBJECT
     require(
         entry or gated_null or run_tree or learned or handoff or coverage_retired
+        or pause_arm_failed or member_stop_unavailable
         or item["name"] == DISCOVERY_SUBJECT,
         f"unbounded capture skip subject: {item}",
     )
@@ -3364,6 +3387,10 @@ def bounded_skip(item):
         allowed = LEARNED_SKIP_REASONS
     elif coverage_retired:
         allowed = COVERAGE_RETIRED_REASONS
+    elif pause_arm_failed:
+        allowed = PAUSE_ARM_FAILED_REASONS
+    elif member_stop_unavailable:
+        allowed = MEMBER_STOP_UNAVAILABLE_REASONS
     elif handoff:
         allowed = HANDOFF_REASONS_BY_SUBJECT[item["name"]]
     else:

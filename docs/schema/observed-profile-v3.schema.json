@@ -631,7 +631,9 @@
                   "the ring-loss line could not be emitted; loss is unproven",
                   "the terminal kernel evidence read failed; loss is unproven",
                   "the reaped child's tail drain reached its deadline; its events are unproven",
-                  "counting probes were retired mid-capture; calls in the retire window were not observed"
+                  "counting probes were retired mid-capture; calls in the retire window were not observed",
+                  "the pause arm failed before the first epoch; the owned child ran without pause protection",
+                  "the run first-map stop was unavailable; descendants ran without first-map protection"
                 ]
               }
             }

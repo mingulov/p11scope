@@ -1316,6 +1316,28 @@ is `{name: "counting coverage", reason}` with `reason` exactly:
   `evidence.coverage_retired_slots`, and each retire interval rides the
   affected records' `coverage_retired` unobserved window.
 
+Owned-pause arm failures file under their own subject. Each record is
+`{name: "owned pause", reason}` with `reason` exactly:
+
+- `the pause arm failed before the first epoch; the owned child ran
+  without pause protection`: the pause coordinator's arm failed (the
+  owned generation changed, the arm write failed, or the ARMED
+  readback mismatched) and the run continued unpaused. The failed
+  arm's count rides in `evidence.pause_partial`; the row names the
+  protection that was missing, never a call count. Repeat filings
+  dedupe to this one row.
+
+Run first-map stop gaps file under their own subject. Each record is
+`{name: "run first-map stop", reason}` with `reason` exactly:
+
+- `the run first-map stop was unavailable; descendants ran without
+  first-map protection`: the standalone member-stop object (or its
+  watchdog) could not start, so run-tree descendants mapped
+  executable files without stopping for provider attach. The run
+  still learns later mappers' files; the row names the protection
+  that was missing, never a guessed call count. Repeat filings
+  dedupe to this one row.
+
 `evidence.run_tree_handed_back` (integer, `run` documents only, required
 there) counts the handed-back survivors: measured zero when the tree
 retired cleanly. It is annotation only — the paired `run process tree`

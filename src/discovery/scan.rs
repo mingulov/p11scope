@@ -12,7 +12,7 @@ use crate::discovery::elf_needed::read_elf_needed;
 use crate::discovery::hooks::HookRegistry;
 use crate::discovery::identity::{
     ExaminedObject, FileIdentity, MappedFile, Pin, file_inodes_are_unique, forwardable_getter,
-    pin_of,
+    identity_of, pin_of,
 };
 #[cfg(test)]
 use crate::discovery::overlay_witness::GAP_WITNESS_UNAVAILABLE;
@@ -33,7 +33,7 @@ use crate::process::{
     MappedOpenError, MountNamespaceId, MountTableCache, PidPin, ProcessView, ProcessViewId,
 };
 use p11scope_manifest::elf::{ElfAbi, ElfSnapshot, SymbolFact};
-use p11scope_manifest::identity::{InspectedObject, mapping_file_key, open_object};
+use p11scope_manifest::identity::{InspectedObject, open_object};
 use p11scope_manifest::maps::{
     Device, MapEntry, MapIndex, MappedPath, ObjectKey, Resolved, parse_maps,
 };
@@ -10108,7 +10108,7 @@ fn scan_view_examined_mode(
                     // device, so the upper's maps key would collide
                     // across lower files. The lower fd opens in the
                     // observer namespace, hence the observer-side key.
-                    let lower_key = match mapping_file_key(&proof.file) {
+                    let lower_key = match identity_of(&proof.file, budget) {
                         Ok(lower_mapping) => ObjectKey {
                             device: Device {
                                 major: lower_mapping.device_major,

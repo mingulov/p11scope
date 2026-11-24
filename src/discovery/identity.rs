@@ -9019,7 +9019,7 @@ fn overlay_uncertainty(entry: &Entry, kept: &Entry) -> Skipped {
 /// resolves fdinfo's mount ID through mountinfo, so btrfs subvolumes and overlay are
 /// compared in the same representation `/proc/<pid>/maps` uses. Missing mount data is
 /// incomparable and fails closed; `st_dev` is never substituted.
-fn identity_of(
+pub(crate) fn identity_of(
     file: &std::fs::File,
     budget: &mut CaptureWorkBudget,
 ) -> Result<MappingFileKey, String> {

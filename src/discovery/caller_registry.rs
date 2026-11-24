@@ -9410,7 +9410,7 @@ pub(crate) mod tests {
             .extend_from_slice(decisions);
     }
     use std::cell::RefCell;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::rc::Rc;
 
     #[derive(Debug, Clone)]
@@ -9452,6 +9452,14 @@ pub(crate) mod tests {
         reopen_attempts: usize,
         leader_exit_queries: usize,
         gone_calls: u64,
+        /// Pids whose pidfd open fails (FD pressure, seccomp): `open`
+        /// still mints the tick-only fallback pin, recorded in
+        /// `weak_pins`. Liveness keeps comparing start times; only the
+        /// leader-alive proof withholds tick-only generations.
+        pidfd_refused: HashSet<u32>,
+        /// Pins minted while their pid's pidfd was refused: tick-only
+        /// generation evidence, never proof-strong.
+        weak_pins: HashSet<(u32, u64)>,
     }
 
     /// Scripted source: the pid/exit/reuse/exec sequence is programmed,
@@ -9630,6 +9638,19 @@ pub(crate) mod tests {
             }
         }
 
+        /// Refuse every future pidfd open for `pid`: pins minted from
+        /// now on are tick-only fallback pins (see `weak_pins`).
+        pub(crate) fn refuse_pidfd(&self, pid: u32) {
+            self.state.borrow_mut().pidfd_refused.insert(pid);
+        }
+
+        /// Whether `pin` is a tick-only fallback pin (its pidfd open
+        /// was refused), whose start-time equality cannot prove a
+        /// generation.
+        pub(crate) fn pin_is_weak(&self, pin: &(u32, u64)) -> bool {
+            self.state.borrow().weak_pins.contains(pin)
+        }
+
         /// Poison every future numeric-PID reopen; held pins are unaffected.
         pub(crate) fn poison_reopen(&self) {
             self.state.borrow_mut().reopen_poisoned = true;
@@ -9659,7 +9680,11 @@ pub(crate) mod tests {
                 .get(&pid)
                 .filter(|process| process.alive)
                 .ok_or_else(|| format!("no live scripted process {pid}"))?;
-            Ok((pid, process.start_time))
+            let pin = (pid, process.start_time);
+            if state.pidfd_refused.contains(&pid) {
+                state.weak_pins.insert(pin);
+            }
+            Ok(pin)
         }
 
         fn still_the_same(&self, pin: &Self::Pin) -> bool {

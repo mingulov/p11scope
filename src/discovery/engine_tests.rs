@@ -40991,6 +40991,221 @@ fn prefault_manifest_getter_data_prunes_a_removed_objects_bytes_when_its_cursor_
     );
 }
 
+/// A partially spent object retires mid-pass without stopping it: with two
+/// 2-chunk ranges and a 1.5-chunk allowance, one pass reads each object's
+/// first chunk and retires both tails, spending six proof steps (twin: a
+/// zero-only shortfall check stops the whole pass on the nonzero remainder
+/// and abandons the second object).
+#[test]
+fn prefault_manifest_getter_data_continues_past_a_partially_spent_object() {
+    let mut warmup = two_object_warmup_with_len(Some(131072));
+    warmup.engine.budget = CaptureWorkBudget::new(ScanLimits {
+        per_object_bytes: 98304,
+        total_bytes: 8 << 20,
+    });
+    install_two_object_slow_proof(&mut warmup);
+    for (object, base) in warmup.objects.iter().zip(warmup.copies.readable.iter()) {
+        let base = *base as u64;
+        assert_eq!(
+            prefault_candidate_ranges(&warmup.engine, *object),
+            vec![(base, base + 131072)],
+            "premise: one 2-chunk candidate per copy"
+        );
+    }
+    let sites = warmup_sites_for(&warmup.objects);
+    let skips = warmup.engine.counters.object_skips.len();
+    let outcome = warmup
+        .engine
+        .prefault_manifest_getter_data(warmup.id, &sites);
+    assert_eq!(outcome, GetterPrefaultOutcome::Complete);
+    let attempts = warmup.engine.prefault_attempts_for_test();
+    let mut bases: Vec<u64> = warmup
+        .copies
+        .readable
+        .iter()
+        .map(|base| *base as u64)
+        .collect();
+    bases.sort_unstable();
+    assert_eq!(
+        attempts,
+        vec![(bases[0], 65536, true), (bases[1], 65536, true)],
+        "each object's first chunk reads in maps order: {attempts:?}"
+    );
+    assert_eq!(
+        warmup.engine.prefault_proof_attempts_for_test(),
+        6,
+        "one held, batch and re-proof per read chunk, nothing for the retiring tails"
+    );
+    assert_eq!(
+        warmup.engine.counters.object_skips.len(),
+        skips,
+        "retired partial tails file no gap"
+    );
+}
+
+/// An allowance below one chunk retires its object without reading and
+/// without stopping the pass: with two 2-chunk ranges and a 65535-byte
+/// allowance, nothing reads, both ranges prove, and both tails retire
+/// (twin: a zero-only shortfall check stops the whole pass on the first
+/// range's nonzero remainder, so the second range never proves).
+#[test]
+fn prefault_manifest_getter_data_retires_a_sub_chunk_allowance_without_reading() {
+    let mut warmup = two_object_warmup_with_len(Some(131072));
+    warmup.engine.budget = CaptureWorkBudget::new(ScanLimits {
+        per_object_bytes: 65535,
+        total_bytes: 8 << 20,
+    });
+    install_two_object_slow_proof(&mut warmup);
+    for (object, base) in warmup.objects.iter().zip(warmup.copies.readable.iter()) {
+        let base = *base as u64;
+        assert_eq!(
+            prefault_candidate_ranges(&warmup.engine, *object),
+            vec![(base, base + 131072)],
+            "premise: one 2-chunk candidate per copy"
+        );
+    }
+    let sites = warmup_sites_for(&warmup.objects);
+    let skips = warmup.engine.counters.object_skips.len();
+    let outcome = warmup
+        .engine
+        .prefault_manifest_getter_data(warmup.id, &sites);
+    assert_eq!(outcome, GetterPrefaultOutcome::Complete);
+    assert!(
+        warmup.engine.prefault_attempts_for_test().is_empty(),
+        "no chunk fits the allowance, so nothing reads: {:?}",
+        warmup.engine.prefault_attempts_for_test()
+    );
+    assert_eq!(
+        warmup.engine.prefault_proof_attempts_for_test(),
+        4,
+        "both ranges prove their held and batch identities before retiring"
+    );
+    assert_eq!(
+        warmup.engine.counters.object_skips.len(),
+        skips,
+        "retired partial tails file no gap"
+    );
+}
+
+/// An exhausted object's unvisited tail retires across a resume without
+/// re-reading: with A's low range read and deferred on its proof credit,
+/// the next pass re-proves the high tail once, then retires it, and reads
+/// B, spending eight proof steps in total however B interleaves (twin: a
+/// resume that forgets the per-object total re-reads the tail).
+#[test]
+fn prefault_manifest_getter_data_retires_an_exhausted_tail_across_a_resume_without_rereading() {
+    use crate::discovery::identity::{FileIdentity, MappedFile};
+    const TMPFS: u64 = 0x0102_1994;
+    let mut warmup = two_object_warmup();
+    // SAFETY: a private read-only mapping of A's copy at a free low
+    // address, unmapped below before the guard drops.
+    let file_a = std::fs::File::open(&warmup.copies.paths[0]).unwrap();
+    let low = map_fixture_low(&file_a, warmup.padded);
+    warmup.engine.budget = CaptureWorkBudget::new(ScanLimits {
+        per_object_bytes: warmup.padded as u64,
+        total_bytes: 8 << 20,
+    });
+    let object_a = warmup.objects[0];
+    let object_b = warmup.objects[1];
+    let high_a = warmup.copies.readable[0] as u64;
+    let base_b = warmup.copies.readable[1] as u64;
+    let len = warmup.padded as u64;
+    let identity_a = FileIdentity {
+        dev: 7000,
+        ino: 8000,
+    };
+    let identity_b = FileIdentity {
+        dev: 7001,
+        ino: 8001,
+    };
+    warmup.engine.set_prefault_proof_for_test(
+        object_a,
+        MappedFile {
+            identity: identity_a,
+            fs_magic: Some(TMPFS),
+        },
+        vec![
+            ((low as u64, low as u64 + len), Some(identity_a)),
+            ((high_a, high_a + len), Some(identity_a)),
+        ],
+    );
+    warmup.engine.set_prefault_proof_for_test(
+        object_b,
+        MappedFile {
+            identity: identity_b,
+            fs_magic: Some(TMPFS),
+        },
+        vec![((base_b, base_b + len), Some(identity_b))],
+    );
+    assert_eq!(
+        prefault_candidate_ranges(&warmup.engine, object_a),
+        vec![(low as u64, low as u64 + len), (high_a, high_a + len),],
+        "premise: A owns the low and high ranges"
+    );
+    assert_eq!(
+        prefault_candidate_ranges(&warmup.engine, object_b),
+        vec![(base_b, base_b + len)],
+        "premise: B owns one range"
+    );
+    assert!(
+        (low as u64) < base_b && (low as u64) < high_a,
+        "premise: the low range sorts first"
+    );
+    warmup.engine.set_prefault_caps_for_test(None, Some(3));
+    let sites = warmup_sites_for(&warmup.objects);
+    let skips = warmup.engine.counters.object_skips.len();
+    let outcome = warmup
+        .engine
+        .prefault_manifest_getter_data(warmup.id, &sites);
+    assert_eq!(
+        outcome,
+        GetterPrefaultOutcome::Deferred { frame_spent: false },
+        "pass 1 reads the low range and defers on its proof credit"
+    );
+    assert_eq!(
+        warmup.engine.prefault_attempts_for_test(),
+        vec![(low as u64, warmup.padded, true)],
+        "pass 1 reads only the low range: {:?}",
+        warmup.engine.prefault_attempts_for_test()
+    );
+    warmup.engine.set_prefault_caps_for_test(None, None);
+    let outcome = warmup
+        .engine
+        .prefault_manifest_getter_data(warmup.id, &sites);
+    // SAFETY: the successful mapping above, released once.
+    assert_eq!(unsafe { libc::munmap(low, warmup.padded) }, 0);
+    assert_eq!(outcome, GetterPrefaultOutcome::Complete);
+    let attempts = warmup.engine.prefault_attempts_for_test();
+    assert_eq!(attempts.len(), 2, "the low range and B read: {attempts:?}");
+    assert!(
+        attempts
+            .iter()
+            .any(|attempt| attempt.0 == low as u64 && attempt.2),
+        "the low range reads: {attempts:?}"
+    );
+    assert!(
+        attempts
+            .iter()
+            .any(|attempt| attempt.0 == base_b && attempt.2),
+        "B warms under its own allowance: {attempts:?}"
+    );
+    assert!(
+        !attempts.iter().any(|attempt| attempt.0 == high_a),
+        "the exhausted high tail never reads across the resume: {attempts:?}"
+    );
+    assert_eq!(
+        warmup.engine.prefault_proof_attempts_for_test(),
+        8,
+        "three proof steps before the deferral, five after: held, batch \
+         and re-proof for B, held and batch for the retiring tail"
+    );
+    assert_eq!(
+        warmup.engine.counters.object_skips.len(),
+        skips,
+        "retired tails file no gap"
+    );
+}
+
 /// Failed proofs count as attempted operations too: a missing held proof
 /// spends its lookup, and unreadable batch stats spend theirs (twin:
 /// counting only successes would under-report the native work).

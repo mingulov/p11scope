@@ -3506,6 +3506,43 @@ fn joint_birth_witness_deadline_refuses_current_partition() {
 /// refusals, each with its own variant, so delivery falls back at
 /// once instead of retrying them as contention. Stop outranks the
 /// others; a clean capture still takes (control).
+/// The production absence acquisition runs its final-latch preflight
+/// before any session drain, cut or proof read: a later fallible read
+/// must never mask Stopped/AuthorityExhausted/CoverageFailed as
+/// `StreamCut` or `CurrentPartition`. The port takes a live `Session`
+/// (privileged), so this pins its body order like the drain-linkage
+/// contract does; the latch table below pins the gate's outcomes.
+#[test]
+fn production_absence_acquisition_preflights_final_latches_first() {
+    let source = include_str!("../semantic_capture.rs");
+    let start = source
+        .find("pub(crate) fn acquire_absence_birth(")
+        .expect("production acquisition present");
+    let end = source[start..]
+        .find("fn absence_acquire_gate(")
+        .expect("the gate follows the acquisition");
+    let body = &source[start..start + end];
+    let gate = body
+        .find("self.absence_acquire_gate()?;")
+        .expect("the acquisition calls its preflight");
+    let first_session = body
+        .find("session.")
+        .expect("the acquisition reads its session");
+    let commit = body
+        .find("self.commit_absence_with(")
+        .expect("the acquisition commits");
+    assert!(
+        gate < first_session && gate < commit,
+        "the latch preflight precedes every session read and the commit"
+    );
+    let gate_body = &source[start + end..];
+    let gate_end = gate_body.find("\n    }\n").expect("gate body ends");
+    assert!(
+        gate_body[..gate_end].contains("self.capture_ended_refusal()?;"),
+        "the preflight checks the three final latches"
+    );
+}
+
 #[test]
 fn joint_birth_witness_capture_latches_refuse_finally() {
     use crate::attach::BirthObservationRefusal as Refusal;

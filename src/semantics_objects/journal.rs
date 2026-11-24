@@ -28114,6 +28114,10 @@ pub(crate) mod tests {
         /// straddler), then a second refused BEGIN left unvisited:
         /// the refused phase's own tail makes the count a lower bound.
         RefusedReturnedThenRefused,
+        /// A capacity-refused BEGIN strictly above the fence (at the
+        /// successor's birth cut), its return after the cut: a plain
+        /// mismatch, never a straddler of that fence.
+        RefusedAbove,
     }
 
     /// Run one straddle shape: returns the seal's gap, the successor's
@@ -28149,7 +28153,10 @@ pub(crate) mod tests {
         if shape == StraddleShape::TwoRefused || refused_single {
             scene.adapter.limits.open_calls = scene.adapter.open.len();
         }
-        if shape != StraddleShape::BeginAbove {
+        if !matches!(
+            shape,
+            StraddleShape::BeginAbove | StraddleShape::RefusedAbove
+        ) {
             scene.ingest(&call);
             assert_eq!(scene.adapter.consumed_through, begin_at);
         }
@@ -28249,6 +28256,26 @@ pub(crate) mod tests {
             scene.ingest(&call);
             birth_cut = scene.adapter.consumed_through;
         }
+        if shape == StraddleShape::RefusedAbove {
+            scene.adapter.limits.open_calls = scene.adapter.open.len();
+            assert_eq!(
+                scene.ingest(&call),
+                JournalDisposition::BeginRefusedCapacity,
+                "control: the above-fence call is a capacity refusal"
+            );
+            birth_cut = scene.adapter.consumed_through;
+            assert!(
+                birth_cut > fence,
+                "control: the refused BEGIN is above the fence"
+            );
+            scene.ingest_ordinary(ordinary_for(&call, FAILED));
+            assert!(
+                scene.adapter.refused[0]
+                    .corroborated_return
+                    .is_some_and(|at| at > birth_cut),
+                "control: its return lands past the cut"
+            );
+        }
         // The returned shapes carry no END: the corroborated ordinary
         // return is their only terminal evidence.
         if !matches!(
@@ -28262,6 +28289,7 @@ pub(crate) mod tests {
                 | StraddleShape::RefusedReturnedBefore
                 | StraddleShape::RefusedUnreturned
                 | StraddleShape::RefusedReturnedThenRefused
+                | StraddleShape::RefusedAbove
         ) {
             scene.ingest(&end_bytes(&call, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 70));
         }
@@ -28295,6 +28323,44 @@ pub(crate) mod tests {
             .fence_destroyed_proof(&reborn, close_at)
             .expect("the successor's own close fences it");
         (gap, straddler, sealed, decision, begin_at)
+    }
+
+    /// The refused-phase twin of the unfenced cell: two capacity-refused
+    /// BEGINs on an incarnation-0 key (no inherited fence) and an
+    /// attach-observed birth. The refused scan decides on the first with
+    /// the second unread, yet with no fence there is no straddler and no
+    /// lower bound.
+    #[test]
+    fn object_journal_unfenced_refused_tail_flags_no_bound() {
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest_function("C_CreateObject");
+        assert_eq!(proof.key.incarnation, 0, "control: no predecessor");
+        let create = function_id("C_CreateObject");
+        scene.adapter.limits.open_calls = scene.adapter.open.len();
+        for sequence in [3, 4] {
+            assert_eq!(
+                scene.ingest(&begin_bytes(1, sequence, create, 0)),
+                JournalDisposition::BeginRefusedCapacity
+            );
+        }
+        assert_eq!(scene.adapter.refused.len(), 2, "control: two refused rows");
+        let birth = BootstrapReceipt::scripted(
+            proof,
+            BirthKind::AttachObserved,
+            scene.adapter.consumed_through,
+            scene.closure_generation(),
+        );
+        let gap = scene.seal(&birth).err().map(|failure| failure.gap);
+        let marks = scene
+            .adapter
+            .death_marks
+            .get(&proof.key)
+            .map(|marks| (marks.straddler, marks.straddlers_unscanned));
+        assert_eq!(
+            (gap, marks.unwrap_or((None, false))),
+            (Some(JournalGap::BootstrapMismatch), (None, false)),
+            "an unfenced refused tail records neither a straddler nor a bound"
+        );
     }
 
     /// A plain birth mismatch on a key with no inherited fallback
@@ -28409,6 +28475,7 @@ pub(crate) mod tests {
             StraddleShape::RefusedReturnedBefore,
             StraddleShape::RefusedUnreturned,
             StraddleShape::RefusedReturnedThenRefused,
+            StraddleShape::RefusedAbove,
         ]
         .map(|shape| {
             let (gap, straddler, _, decision, begin_at) = fallback_fence_straddle(shape, false);
@@ -28430,6 +28497,7 @@ pub(crate) mod tests {
                 (RefusedReturnedBefore, mismatch, None, (0, false)),
                 (RefusedUnreturned, mismatch, None, (0, true)),
                 (RefusedReturnedThenRefused, mismatch, Some(true), (1, true)),
+                (RefusedAbove, mismatch, None, (0, false)),
             ],
             "an unvisited refused row past the decision is a possible straddler"
         );

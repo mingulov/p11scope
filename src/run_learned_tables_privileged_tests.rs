@@ -78,11 +78,14 @@ struct WorkerGroundTruth {
 /// * zeros form a run prefix with at most one partial immediately
 ///   after them (any hole, late partial or zero after a partial is
 ///   a post-attach loss);
-/// * every miss is disclosed per worker: a fully-missed burst is
-///   contained in one disclosed `mapped_unattached` table window or
-///   ends before its own endpoint's first attach began; the
-///   boundary partial starts inside one such window or straddles
-///   its own endpoint's first attach;
+/// * every miss is disclosed per worker: a fully-missed burst
+///   ends before its own endpoint's first attach began when that
+///   attach is disclosed, else is contained in one disclosed
+///   `mapped_unattached` table window; the boundary partial
+///   straddles its own endpoint's first attach when that attach is
+///   disclosed, else starts inside one such window (a known endpoint
+///   attach overrides the module-wide window, which cannot disclose
+///   a per-endpoint post-attach miss);
 /// * no BPF event loss is on the record (counts would be lower
 ///   bounds, not exact);
 /// * getter-only slots stay withheld while learned standard-layout
@@ -246,13 +249,14 @@ fn check_exact_accounting(
         }
     }
     // Every miss is disclosed per worker, never against the latest
-    // window end: a fully-missed burst is contained in one disclosed
-    // `mapped_unattached` table window, or it ends before its own
-    // endpoint's first attach began (no call entered before
-    // `began_ns` can be counted); the boundary partial starts inside
-    // one such window, or its own endpoint's first attach began
-    // mid-burst. A burst in a hole between two windows, or past its
-    // endpoint's attach, is an undisclosed mid-capture loss.
+    // window end. A known endpoint attach overrides the module-wide
+    // window: a fully-missed burst ends before its own endpoint's
+    // first attach began (no call entered before `began_ns` can be
+    // counted), and the boundary partial's own endpoint attach began
+    // mid-burst. Window containment excuses a miss only while the
+    // endpoint's own attach is undisclosed. A burst in a hole between
+    // two windows, or past its endpoint's attach, is an undisclosed
+    // mid-capture loss.
     let windows = module
         .get("unobserved_windows")
         .and_then(serde_json::Value::as_array)
@@ -314,8 +318,12 @@ fn check_exact_accounting(
                 .iter()
                 .any(|(start, end)| *start <= worker.burst_start_ns && worker.burst_end_ns <= *end);
             let pre_attach = began.is_some_and(|began| worker.burst_end_ns <= began);
+            let disclosed = match began {
+                Some(_) => pre_attach,
+                None => contained,
+            };
             ensure!(
-                contained || pre_attach,
+                disclosed,
                 "worker {index} ({}) missed with its burst [{}ns, {}ns]: inside no single \
                  disclosed mapped_unattached table window ({table_windows:?}) and not before \
                  its own endpoint's first attach ({began:?}): an undisclosed mid-capture loss",
@@ -329,8 +337,12 @@ fn check_exact_accounting(
             });
             let attach_in_burst = began
                 .is_some_and(|began| worker.burst_start_ns < began && began < worker.burst_end_ns);
+            let disclosed = match began {
+                Some(_) => attach_in_burst,
+                None => start_covered,
+            };
             ensure!(
-                start_covered || attach_in_burst,
+                disclosed,
                 "worker {index} ({}) partially observed with its burst [{}ns, {}ns]: starting \
                  inside no disclosed mapped_unattached table window ({table_windows:?}) and \
                  straddling no endpoint first attach of its own ({began:?}): an undisclosed \
@@ -1208,6 +1220,43 @@ mod exact_accounting_tests {
         ];
         let error = check_exact_accounting(&report, PROVIDER, &workers)
             .expect_err("a post-attach miss inside a module-wide window must fail");
+        assert!(
+            format!("{error:#}").contains("mid-capture"),
+            "the failure names the mid-capture loss: {error:#}"
+        );
+    }
+
+    #[test]
+    fn exact_accounting_rejects_a_post_attach_partial_inside_a_module_wide_window() {
+        // Worker 0 missed honestly pre-attach ([50,60] ends before
+        // began=100); worker 1 is partially observed with its burst
+        // [140,160] fully past its own endpoint's first attach
+        // (began=100) but starting inside the module-wide [10,1000]
+        // window; worker 2 is fully observed. The window cannot
+        // disclose a per-endpoint post-attach loss.
+        let mut report = report([Some(0), Some(4), Some(10)]);
+        report["evidence"]["discovery"][0]["unobserved_windows"] = serde_json::json!([
+            {"start_ns": 10, "end_ns": 1000, "reason": "mapped_unattached"},
+        ]);
+        report["evidence"]["discovery"][0]["first_attach_points"] = serde_json::json!([
+            {"file_offset": 0x1000, "began_ns": 100, "attached_ns": 110},
+            {"file_offset": 0x1010, "began_ns": 100, "attached_ns": 110},
+        ]);
+        report["functions"][0]["target"] = serde_json::json!({
+            "object": {"dev": [DEV.0, DEV.1], "ino": INO, "sha256": SHA},
+            "file_offset": 0x1000,
+        });
+        report["functions"][1]["target"] = serde_json::json!({
+            "object": {"dev": [DEV.0, DEV.1], "ino": INO, "sha256": SHA},
+            "file_offset": 0x1010,
+        });
+        let workers = vec![
+            worker(0, 50, 60),
+            worker(1, 140, 160),
+            worker(2, 1100, 1200),
+        ];
+        let error = check_exact_accounting(&report, PROVIDER, &workers)
+            .expect_err("a post-attach partial inside a module-wide window must fail");
         assert!(
             format!("{error:#}").contains("mid-capture"),
             "the failure names the mid-capture loss: {error:#}"

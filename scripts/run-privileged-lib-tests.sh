@@ -594,6 +594,12 @@ inventory::manifest_e2e_tests::privileged_inventory_pid_key_operations_mt_sign_r
 # sizes. Prints KEYSIZE / KEYSIZE_OFF lines (about a minute each).
 inventory::manifest_e2e_tests::privileged_inventory_pid_key_sizes_live_sign_reports_size
 inventory::manifest_e2e_tests::privileged_inventory_pid_key_sizes_off_live_sign_reports_no_size
+# Key-sizes Task 4 privacy canary: the same live shape over a
+# sentinel-guarded sign+verify workload (64-byte K3YS1Z3CANARY! guards
+# beside the S length cell and the V buffers). The marker must appear
+# in none of the JSON report, the event log or the observer log, while
+# both RSA-2048 sizes publish. Prints KEYCANARY lines (about a minute).
+inventory::manifest_e2e_tests::privileged_inventory_pid_key_sizes_canary_no_payload_leak
 # v0.7.1 admission/counting regression cells: each spawns the real
 # observer (P11SCOPE_E2E_OBSERVER, else the p11scope sibling), drives a
 # deterministic workload with exact expected counts, and asserts counted

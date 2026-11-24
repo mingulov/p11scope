@@ -207,6 +207,7 @@
     "inventory::manifest_e2e_tests::privileged_inventory_pid_key_operations_mt_sign_rows_exact",
     "inventory::manifest_e2e_tests::privileged_inventory_pid_key_sizes_live_sign_reports_size",
     "inventory::manifest_e2e_tests::privileged_inventory_pid_key_sizes_off_live_sign_reports_no_size",
+    "inventory::manifest_e2e_tests::privileged_inventory_pid_key_sizes_canary_no_payload_leak",
     "regress071_privileged_tests::privileged_profile_system_bigchild_kills_exact_lp64",
     "regress071_privileged_tests::privileged_profile_system_newcomer_flood_exact_lp64",
     "regress071_privileged_tests::privileged_inventory_system_shortlived_stream_exact_lp64",
@@ -332,7 +333,8 @@
       "attach::tests::sealed_session_drain_linkage_is_behavioral",
       "inventory::manifest_e2e_tests::privileged_inventory_pid_key_operations_mt_sign_rows_exact",
       "inventory::manifest_e2e_tests::privileged_inventory_pid_key_sizes_live_sign_reports_size",
-      "inventory::manifest_e2e_tests::privileged_inventory_pid_key_sizes_off_live_sign_reports_no_size"
+      "inventory::manifest_e2e_tests::privileged_inventory_pid_key_sizes_off_live_sign_reports_no_size",
+      "inventory::manifest_e2e_tests::privileged_inventory_pid_key_sizes_canary_no_payload_leak"
     ]
   },
   "counter_flavor": {

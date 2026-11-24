@@ -3096,3 +3096,484 @@ fn key_sizes_inner(
     println!("{tag} {verdict} ledger={ledger_signs}");
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Key-sizes Task 4 privacy canary: sentinel payload guards beside the live
+// C_Sign length cell (S-protocol) and the live C_Verify buffers
+// (V-protocol) prove no payload byte reaches the JSON report, the event
+// log or the observer log. Two non-vacuity controls: the scanner must
+// find an injected marker copy (positive control), and the RSA-2048 size
+// verdict must publish (the length path ran).
+// ---------------------------------------------------------------------------
+
+/// Must match `CANARY_MARK` in `tests/fixtures/public-cli/keysize_canary.c`
+/// exactly; the positive-control test below pins the spelling from this
+/// side, and the live cell pins it against the workload's SENTINEL line.
+const KEYSIZE_CANARY_MARKER: &[u8] = b"K3YS1Z3CANARY!";
+
+/// PKCS#11 functions the canary workload calls: setup, 3x sign+verify,
+/// teardown. The cell manifest resolves exactly these.
+const KEYSIZE_CANARY_FUNCTIONS: &[&str] = &[
+    "C_Initialize",
+    "C_GetSlotList",
+    "C_OpenSession",
+    "C_Login",
+    "C_GenerateKeyPair",
+    "C_SignInit",
+    "C_Sign",
+    "C_VerifyInit",
+    "C_Verify",
+    "C_DestroyObject",
+    "C_Logout",
+    "C_CloseSession",
+    "C_Finalize",
+];
+
+fn keysize_canary_source() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/public-cli/keysize_canary.c")
+}
+
+/// The canary scanner: true when the marker appears anywhere in the
+/// surface. Byte search, no decoding, so an encoded leak still matches
+/// only when the raw marker bytes are present.
+fn keysize_canary_scan(haystack: &[u8]) -> bool {
+    haystack
+        .windows(KEYSIZE_CANARY_MARKER.len())
+        .any(|window| window == KEYSIZE_CANARY_MARKER)
+}
+
+/// Positive control, unit side: the scanner finds an injected marker in
+/// an otherwise clean report copy. If this fails, the live scan is
+/// vacuous and the cell must fail.
+#[test]
+fn keysize_canary_scanner_finds_an_injected_marker() {
+    let clean = br#"{"object_observations":{"status":"populated","key_operations":[]}}"#;
+    assert!(
+        !keysize_canary_scan(clean),
+        "the scanner is silent on a clean report"
+    );
+    let mut injected = clean.to_vec();
+    injected.extend_from_slice(b" ");
+    injected.extend_from_slice(KEYSIZE_CANARY_MARKER);
+    assert!(
+        keysize_canary_scan(&injected),
+        "the scanner finds an injected marker"
+    );
+}
+
+/// The scanner pins the marker spelling: a truncated or mistyped marker
+/// is not the canary and must not match.
+#[test]
+fn keysize_canary_scanner_pins_the_marker_spelling() {
+    assert_eq!(KEYSIZE_CANARY_MARKER, b"K3YS1Z3CANARY!");
+    assert!(!keysize_canary_scan(b"K3YS1Z3CANARY"), "truncated");
+    assert!(!keysize_canary_scan(b"K3YS1Z3CANARX!"), "mistyped");
+    assert!(keysize_canary_scan(b"xxK3YS1Z3CANARY!yy"), "embedded");
+}
+
+/// Parse the canary LEDGER: (signs, verifies) with the C_Sign/C_Verify
+/// attempt cross-check, so a short run cannot pass as clean.
+fn keysize_canary_ledger_counts(transcript: &str) -> Result<(u64, u64)> {
+    for line in transcript.lines() {
+        let Some(payload) = line.strip_prefix("LEDGER ") else {
+            continue;
+        };
+        let ledger: serde_json::Value = serde_json::from_str(payload).context("LEDGER json")?;
+        ensure!(
+            ledger.get("complete").and_then(serde_json::Value::as_bool) == Some(true),
+            "LEDGER is incomplete"
+        );
+        let key_ops = ledger
+            .get("key_operations")
+            .context("LEDGER key_operations")?;
+        let signs = key_ops
+            .get("signs")
+            .and_then(serde_json::Value::as_u64)
+            .context("LEDGER key_operations.signs")?;
+        let verifies = key_ops
+            .get("verifies")
+            .and_then(serde_json::Value::as_u64)
+            .context("LEDGER key_operations.verifies")?;
+        let functions = ledger
+            .get("functions")
+            .and_then(serde_json::Value::as_array)
+            .context("LEDGER functions")?;
+        for (name, want) in [("C_Sign", signs), ("C_Verify", verifies)] {
+            let attempts: u64 = functions
+                .iter()
+                .filter(|entry| entry.get("name").and_then(serde_json::Value::as_str) == Some(name))
+                .map(|entry| {
+                    entry
+                        .get("attempts")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0)
+                })
+                .sum();
+            ensure!(
+                attempts == want,
+                "LEDGER {name} attempts {attempts} disagree with {want}"
+            );
+        }
+        ensure!(
+            signs == 3 && verifies == 3,
+            "LEDGER is short: {signs}/{verifies}"
+        );
+        return Ok((signs, verifies));
+    }
+    anyhow::bail!("no LEDGER line in the workload transcript")
+}
+
+#[test]
+fn keysize_canary_ledger_parser_accepts_the_full_ledger() {
+    let transcript = "READY pid=1\nSENTINEL marker=K3YS1Z3CANARY! signs=3 verifies=3\nLEDGER {\"schema\":\"p11scope/public-cli-ledger/v2\",\"pid\":1,\"complete\":true,\"functions\":[{\"name\":\"C_SignInit\",\"attempts\":3,\"successful\":3},{\"name\":\"C_Sign\",\"attempts\":3,\"successful\":3},{\"name\":\"C_VerifyInit\",\"attempts\":3,\"successful\":3},{\"name\":\"C_Verify\",\"attempts\":3,\"successful\":3}],\"key_operations\":{\"label\":\"k\",\"signs\":3,\"verifies\":3}}\n";
+    assert_eq!(keysize_canary_ledger_counts(transcript).unwrap(), (3, 3));
+}
+
+#[test]
+fn keysize_canary_ledger_parser_rejects_a_short_run() {
+    let transcript = "LEDGER {\"schema\":\"p11scope/public-cli-ledger/v2\",\"pid\":1,\"complete\":true,\"functions\":[{\"name\":\"C_Sign\",\"attempts\":2},{\"name\":\"C_Verify\",\"attempts\":2}],\"key_operations\":{\"label\":\"k\",\"signs\":2,\"verifies\":2}}\n";
+    let error = keysize_canary_ledger_counts(transcript).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("short"),
+        "unexpected error: {error:#}"
+    );
+}
+
+/// Judge `object_observations` for the canary run: exact sign accounting
+/// with RSA-2048 from `sign_output` (the S-protocol length published),
+/// plus at least one verify row with RSA-2048 from `verify_input` (the
+/// V-protocol length published). Both lengths must publish or the run is
+/// vacuous: a silent length path would pass the marker scan trivially.
+fn judge_keysize_canary_observations(
+    observations: &serde_json::Value,
+    ledger_signs: u64,
+    ledger_verifies: u64,
+) -> Result<String> {
+    let (sign_rows, rows_done, unknown_done) =
+        key_sizes_sign_totals(observations, ledger_signs, "KEYCANARY")?;
+    for row in &sign_rows {
+        let completed = row
+            .get("completed")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        if completed == 0 {
+            continue;
+        }
+        let size = row.get("inferred_size").context("sign row inferred_size")?;
+        ensure!(
+            size.get("status").and_then(serde_json::Value::as_str) == Some("inferred"),
+            "KEYCANARY: sign row size is not inferred: {size}"
+        );
+        let detail = size.get("detail").context("sign size detail")?;
+        ensure!(
+            detail.get("size_class").and_then(serde_json::Value::as_u64) == Some(2048)
+                && detail.get("evidence").and_then(serde_json::Value::as_str)
+                    == Some("sign_output"),
+            "KEYCANARY: sign row is not RSA-2048 from sign_output: {detail}"
+        );
+    }
+    let rows = observations
+        .get("key_operations")
+        .and_then(serde_json::Value::as_array)
+        .context("key_operations rows")?;
+    let verify_rows: Vec<&serde_json::Value> = rows
+        .iter()
+        .filter(|row| {
+            row.get("category").and_then(serde_json::Value::as_str) == Some("verify")
+                && row
+                    .get("completed")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0)
+                    > 0
+        })
+        .collect();
+    ensure!(
+        !verify_rows.is_empty(),
+        "KEYCANARY: no verify landed in a key row (vacuous V-protocol)"
+    );
+    let mut verify_done = 0u64;
+    for row in &verify_rows {
+        let completed = row
+            .get("completed")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        verify_done += completed;
+        let size = row
+            .get("inferred_size")
+            .context("verify row inferred_size")?;
+        ensure!(
+            size.get("status").and_then(serde_json::Value::as_str) == Some("inferred"),
+            "KEYCANARY: verify row size is not inferred: {size}"
+        );
+        let detail = size.get("detail").context("verify size detail")?;
+        ensure!(
+            detail.get("size_class").and_then(serde_json::Value::as_u64) == Some(2048)
+                && detail.get("evidence").and_then(serde_json::Value::as_str)
+                    == Some("verify_input"),
+            "KEYCANARY: verify row is not RSA-2048 from verify_input: {detail}"
+        );
+    }
+    ensure!(
+        verify_done == ledger_verifies,
+        "KEYCANARY: verify rows {verify_done} != ledger {ledger_verifies}"
+    );
+    Ok(format!(
+        "rows={rows_done} unknown={unknown_done} verifies={verify_done} size=rsa2048"
+    ))
+}
+
+#[test]
+fn keysize_canary_judge_accepts_sign_and_verify_rows() {
+    let observations = serde_json::json!({
+        "status": "populated",
+        "key_operations": [
+            {
+                "category": "sign",
+                "completed": 3,
+                "object": 3,
+                "inferred_family": {"status": "inferred", "value": "rsa", "completions": 3},
+                "inferred_size": {
+                    "status": "inferred",
+                    "detail": {"kind": "rsa", "size_class": 2048, "modulus_bytes": 256, "evidence": "sign_output"},
+                    "completions": 3,
+                },
+            },
+            {
+                "category": "verify",
+                "completed": 3,
+                "object": 4,
+                "inferred_family": {"status": "inferred", "value": "rsa", "completions": 3},
+                "inferred_size": {
+                    "status": "inferred",
+                    "detail": {"kind": "rsa", "size_class": 2048, "modulus_bytes": 256, "evidence": "verify_input"},
+                    "completions": 3,
+                },
+            },
+        ],
+        "unknown_key_operations": [],
+    });
+    assert_eq!(
+        judge_keysize_canary_observations(&observations, 3, 3).unwrap(),
+        "rows=3 unknown=0 verifies=3 size=rsa2048"
+    );
+}
+
+#[test]
+fn keysize_canary_judge_rejects_a_missing_verify_row() {
+    let observations = serde_json::json!({
+        "status": "populated",
+        "key_operations": [
+            {
+                "category": "sign",
+                "completed": 3,
+                "object": 3,
+                "inferred_family": {"status": "inferred", "value": "rsa", "completions": 3},
+                "inferred_size": {
+                    "status": "inferred",
+                    "detail": {"kind": "rsa", "size_class": 2048, "modulus_bytes": 256, "evidence": "sign_output"},
+                    "completions": 3,
+                },
+            },
+        ],
+        "unknown_key_operations": [],
+    });
+    let error = judge_keysize_canary_observations(&observations, 3, 3).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("no verify landed"),
+        "unexpected error: {error:#}"
+    );
+}
+
+/// Task 4 privacy canary, live: `inventory --pid --capture native
+/// --key-operations --key-sizes --manifest` over the sentinel-guarded
+/// sign+verify workload. The S length cell and the V buffers sit between
+/// 64-byte `K3YS1Z3CANARY!` guards (with an embedded 256-valued
+/// collision word); the cell asserts the marker appears in none of the
+/// JSON report, the event log or the observer log, while both RSA-2048
+/// sizes publish. Needs an observer binary via `P11SCOPE_E2E_OBSERVER`
+/// or a `p11scope` sibling of this test binary. Prints KEYCANARY lines.
+/// Root BPF lane, serial, about a minute.
+#[test]
+#[ignore = "privileged: live key-sizes canary proves no sentinel payload byte reaches output or logs"]
+fn privileged_inventory_pid_key_sizes_canary_no_payload_leak() -> Result<()> {
+    let module = softhsm_path()?;
+    let observer = observer_binary()?;
+    let workload = E2eWorkload::build_with(
+        &module,
+        &keysize_canary_source(),
+        "keysize_canary",
+        "keycanary",
+    )?;
+    let outcome = keysize_canary_inner(&workload, &module, &observer);
+    keep_workload_on_failure(workload, outcome, "KEYCANARY")
+}
+
+fn keysize_canary_inner(workload: &E2eWorkload, module: &str, observer: &Path) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    const TAG: &str = "KEYCANARY";
+    let manifest = live_manifest(
+        workload,
+        module,
+        KEYSIZE_CANARY_FUNCTIONS,
+        "keycanary-live.json",
+    )?;
+    let out = workload.path("inv.json");
+    let event_log = workload.path("events.jsonl");
+    let gate = workload.path("gate");
+    let workload_out = workload.path("keysize_canary.out");
+    let observer_out = workload.path("observer.out");
+    ensure!(!gate.exists(), "gate {} pre-exists", gate.display());
+    let private_log = |path: &Path| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+    };
+    let workload_stderr = workload_out.with_extension("stderr");
+    let mut target = E2eProcess {
+        child: Command::new(&workload.ledger)
+            .args([
+                module,
+                gate.to_str().context("gate path")?,
+                "1234",
+                "keysize-canary-key",
+            ])
+            .env("SOFTHSM2_CONF", &workload.conf)
+            .env("MT_MIXED_HOLD", "1")
+            .stdin(Stdio::null())
+            .stdout(private_log(&workload_out)?)
+            .stderr(private_log(&workload_stderr)?)
+            .die_with_parent()
+            .spawn()
+            .context("spawning keysize_canary")?,
+        out: workload_out.clone(),
+        stderr: workload_stderr,
+    };
+    target.wait_for("READY ", Duration::from_secs(30))?;
+    let pid = target.child.id();
+    println!("{TAG} workload spawned pid={pid} gate={}", gate.display());
+    let observer_log = std::fs::File::create(&observer_out)?;
+    let mut command = Command::new(observer);
+    command
+        .args([
+            "inventory",
+            "--pid",
+            &pid.to_string(),
+            "--capture",
+            "native",
+            "--key-operations",
+            "--key-sizes",
+            "--manifest",
+            manifest.to_str().context("manifest path")?,
+            "--event-log",
+            event_log.to_str().context("event log path")?,
+            "--duration",
+            "30",
+            "--json",
+            "-o",
+            out.to_str().context("out path")?,
+        ])
+        .stdin(Stdio::null())
+        .stdout(observer_log.try_clone()?)
+        .stderr(observer_log)
+        .die_with_parent();
+    let mut child = command.spawn().context("spawning observer")?;
+    println!("{TAG} observer spawned pid={}", child.id());
+    let needle_deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let active = std::fs::read_to_string(&observer_out).is_ok_and(|text| {
+            text.lines()
+                .any(|line| line.contains("native usage lane active"))
+        });
+        if active {
+            break;
+        }
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!(
+                "the observer exited before the usage lane activated: {}",
+                observer_evidence(&observer_out, &out, &format!("exited {status}"))
+            );
+        }
+        target.ensure_alive("before the usage lane activated")?;
+        ensure!(
+            Instant::now() < needle_deadline,
+            "usage lane never activated (observer pid={}): {}",
+            child.id(),
+            observer_evidence(&observer_out, &out, "still running")
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let transcript = std::fs::read_to_string(&workload_out)?;
+    mt_key_wait_matched(&event_log, &transcript, pid)?;
+    std::fs::write(&gate, b"open\n")?;
+    println!("{TAG} gate opened");
+    target.wait_for("LEDGER ", Duration::from_secs(120))?;
+    let transcript = std::fs::read_to_string(&workload_out)?;
+    let (ledger_signs, ledger_verifies) = keysize_canary_ledger_counts(&transcript)?;
+    ensure!(
+        transcript
+            .lines()
+            .any(|line| line.starts_with("SENTINEL marker=K3YS1Z3CANARY!")),
+        "the workload never planted the canary marker"
+    );
+    target.ensure_alive("after LEDGER before the observer stopped")?;
+    let stop_deadline = Instant::now() + Duration::from_secs(120);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        ensure!(
+            Instant::now() < stop_deadline,
+            "the observer did not stop: {}",
+            observer_evidence(&observer_out, &out, "still running")
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    ensure!(
+        status.success(),
+        "the observer exited with {status}: {}",
+        observer_evidence(&observer_out, &out, &format!("exited {status}"))
+    );
+    // The no-leak verdict: the marker appears in none of the three
+    // observer surfaces. Each surface is scanned as raw bytes, so an
+    // encoded leak still fails only when the raw marker is present.
+    let report_bytes = std::fs::read(&out).context("observer report bytes")?;
+    let event_bytes = std::fs::read(&event_log).context("event log bytes")?;
+    let observer_bytes = std::fs::read(&observer_out).context("observer log bytes")?;
+    for (name, bytes) in [
+        ("report", &report_bytes),
+        ("event log", &event_bytes),
+        ("observer log", &observer_bytes),
+    ] {
+        ensure!(
+            !keysize_canary_scan(bytes),
+            "{TAG}: canary marker leaked into the {name} ({} bytes)",
+            bytes.len()
+        );
+    }
+    // Positive control on the live surfaces: the same scanner finds an
+    // injected marker in the live report copy, so a real leak would fail.
+    let mut injected = report_bytes.clone();
+    injected.extend_from_slice(KEYSIZE_CANARY_MARKER);
+    ensure!(
+        keysize_canary_scan(&injected),
+        "{TAG}: positive control failed: the scanner missed an injected marker"
+    );
+    // Lengths published: both RSA-2048 sizes, or the clean scan is vacuous.
+    let report: serde_json::Value =
+        serde_json::from_str(std::str::from_utf8(&report_bytes).context("report utf8")?)
+            .context("observer report json")?;
+    let observations = report
+        .get("object_observations")
+        .context("object_observations")?;
+    let verdict = judge_keysize_canary_observations(observations, ledger_signs, ledger_verifies)?;
+    println!(
+        "{TAG} {verdict} ledger={ledger_signs}/{ledger_verifies} scanned={}/{}/{}",
+        report_bytes.len(),
+        event_bytes.len(),
+        observer_bytes.len()
+    );
+    Ok(())
+}

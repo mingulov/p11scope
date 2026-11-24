@@ -1683,6 +1683,102 @@ fn privileged_run_tree_unprearmed_shortlived_descendants_reach_high_coverage() {
 }
 
 /// Unprearmed short-lived descendants under `--pause never`: 32 sequential
+/// grandchildren (each 1 iteration, 150 ms linger, the auto-pause twin's
+/// shape) with NO prearm hint. The pause policy governs the owned child
+/// only: run-tree descendants still stop at their first map of an
+/// uncleared executable file until its provider attaches, so no call
+/// enters before its first attach even though nothing is paused. Judged
+/// by exact accounting (owner ruling 2026-11-15) plus the zero-early
+/// pin: `member_stop_attached` proves the hold did it (a fast attach
+/// that merely beat every mapper would leave it zero), and a hook load
+/// refusal fails this cell, never passes it. The verdict stays PARTIAL:
+/// members that retired before admission stay counted gaps (checked
+/// below), exactly as in the auto-pause twin.
+#[test]
+#[ignore = "privileged: run-tree unprearmed shortlived never-pause hold cell (root BPF capture, runtime SoftHSM workload + token)"]
+fn privileged_run_tree_unprearmed_shortlived_never_pause_holds_first_mappers() {
+    const CHILDREN: u32 = 32;
+    let dir = tempfile::tempdir().expect("cell dir");
+    let module = softhsm_path();
+    let conf = init_token(dir.path());
+    let workload = build_c(dir.path(), "rt-workload-ms", TWIN_WORKLOAD_C);
+    open_cell_dir(dir.path());
+    let (_outdir, out) = out_dir();
+    let mut ledgers = Vec::new();
+    let mut script = String::new();
+    for i in 0..CHILDREN {
+        let ledger = dir.path().join(format!("l{i}"));
+        script.push_str(&format!(
+            "{} {} {} 1 150; ",
+            workload.display(),
+            module.display(),
+            ledger.display()
+        ));
+        ledgers.push(ledger);
+    }
+    // Drain settle (see the shell-wrapper cell): two seconds between the
+    // last grandchild and loop end, same PID via `exec`.
+    script.push_str("exec sleep 2");
+    // No --module/--prearm-module: the run must learn the provider file
+    // from its own short-lived descendants. `--pause never` leaves the
+    // owned shell unpaused; the first-map stop still holds the mappers.
+    let mut args = vec![
+        "run".to_string(),
+        "--pause".to_string(),
+        "never".to_string(),
+        "-o".to_string(),
+        out.to_str().expect("utf8 out").to_string(),
+        "--".to_string(),
+    ];
+    args.extend(["sh".to_string(), "-c".to_string(), script]);
+    let mut capture = spawn_run(&args, &conf);
+    let status = capture.wait_expect("run");
+    assert!(status.success(), "run exits with the shell's status");
+    let profile = read_profile(&out);
+    let evidence = profile.get("evidence").expect("evidence");
+    let probes = evidence
+        .get("attached_probes")
+        .and_then(|probes| probes.as_u64())
+        .expect("attached_probes");
+    assert!(probes > 0, "the run attached probes: {profile}");
+    // Exact accounting: every call after its function's first attach
+    // lands; the return counts the calls that entered before one.
+    let early = assert_exact_first_use_accounting(&profile, &module, &ledgers);
+    assert_eq!(
+        early, 0,
+        "calls entered before their first attach with the first-map stop armed: {profile}"
+    );
+    // The hold did it: at least the first mapper resumed attached.
+    let held = evidence
+        .get("member_stop_attached")
+        .and_then(|held| held.as_u64())
+        .expect("member_stop_attached");
+    assert!(
+        held >= 1,
+        "the first-map stop held a mapper until attach: {profile}"
+    );
+    // The verdict stays PARTIAL: members that retired before admission
+    // stay counted gaps (checked below).
+    assert_eq!(verdict(&profile), "PARTIAL", "{profile}");
+    let learned = evidence
+        .get("learned_staged_files")
+        .and_then(|learned| learned.as_u64())
+        .expect("learned_staged_files");
+    assert!(
+        learned >= 1,
+        "the run staged the learned provider file: {profile}"
+    );
+    let gaps = evidence
+        .get("pid_descendant_gaps")
+        .and_then(|gaps| gaps.as_u64())
+        .expect("pid_descendant_gaps");
+    assert!(
+        gaps > 0,
+        "members that retired before admission stay counted: {profile}"
+    );
+}
+
+/// Unprearmed short-lived descendants under `--pause never`: 32 sequential
 /// grandchildren (each 300 ms linger, twice the auto-pause twin's 150 ms)
 /// with NO prearm hint. Frames admit (the pause never holds them back), so
 /// the first admitted mapper's frame scan commits the provider key before

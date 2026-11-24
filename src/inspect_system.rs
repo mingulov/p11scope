@@ -9407,6 +9407,100 @@ int main(int argc, char **argv) {
             );
         }
 
+        /// Fix8 (confirmation-loss detail sinks): the `member_losses`
+        /// detail the sweep files for an unproven generation reaches the
+        /// inspect process table twice — public JSON `reason` and the
+        /// human text `reason` line — so both renderers must carry it
+        /// verbatim, and the carried detail must never claim a change.
+        #[test]
+        fn attribution_loss_detail_reaches_json_and_text_reasons() {
+            let detail =
+                "the process generation could not be revalidated during the confirmation read";
+            let mut catalog = super::catalog_with(vec![super::object(
+                "/opt/vendor/libprovider.so",
+                42,
+                None,
+                100,
+                AdmissionRecord::Unresolved {
+                    reasons: vec!["fixture".into()],
+                },
+            )]);
+            catalog.processes[0].status = MemberStatus::NotSelected {
+                loss: Some(format!(
+                    "{}: {detail}",
+                    AttributionLoss::GenerationChanged.label()
+                )),
+            };
+            catalog
+                .attribution_losses
+                .insert(AttributionLoss::GenerationChanged, 1);
+            let document = render_json(&catalog);
+            let process = document["processes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|process| process["pid"] == 100)
+                .unwrap();
+            let want = format!("generation_changed: {detail}");
+            assert_eq!(
+                process["reason"],
+                want.as_str(),
+                "the JSON reason carries the filed detail"
+            );
+            assert_eq!(
+                document["scan"]["attribution_losses"]["generation_changed"], 1,
+                "the category count stays on the stable label"
+            );
+            let text = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
+            assert!(
+                text.contains(&format!("reason      generation_changed: {detail}")),
+                "the text reason carries the filed detail: {text}"
+            );
+            let rendered_detail = process["reason"]
+                .as_str()
+                .unwrap()
+                .strip_prefix("generation_changed: ")
+                .unwrap();
+            assert_eq!(
+                rendered_detail, detail,
+                "the JSON reason carries the filed detail verbatim"
+            );
+            assert!(
+                !rendered_detail.contains("changed") && !text.contains("generation changed"),
+                "no rendered detail claims a change without proof"
+            );
+        }
+
+        /// Fix8 (member-scan generation wording drift guard): the three
+        /// still-the-same brackets in the member scan file their reason
+        /// into the same JSON/text sinks, so their proof-neutral
+        /// wordings are pinned in production source: current wordings
+        /// present, superseded change claims absent.
+        #[test]
+        fn member_scan_generation_wording_never_claims_a_change() {
+            let source = include_str!("inspect_system.rs");
+            for current in [
+                "the process generation could not be revalidated before inspect",
+                "the process generation could not be revalidated while inspect was scanning",
+                "the process generation could not be revalidated while inspect was pinning",
+            ] {
+                assert!(
+                    source.contains(current),
+                    "the current wording stays quoted in production source: {current:?}"
+                );
+            }
+            for old in [
+                "the process generation changed before inspect",
+                "the process generation changed while inspect was scanning",
+                "the process generation changed while inspect was pinning",
+            ] {
+                assert!(
+                    !source.contains(old),
+                    "a superseded change claim must not return: {old:?}"
+                );
+            }
+        }
+
         /// An unselected pid whose phase-1 maps snapshot was unavailable
         /// keeps its own per-pid gap and stays listed: nothing examined
         /// its mappings, so the fold must not claim it maps no object.

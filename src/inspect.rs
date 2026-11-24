@@ -1045,7 +1045,7 @@ mod tests {
             4242,
             true,
             &mut stdout,
-            Err("process generation changed while inspect was scanning".into()),
+            Err("process generation could not be revalidated while inspect was scanning".into()),
         )
         .unwrap();
         assert_eq!(code, 1);
@@ -1055,7 +1055,7 @@ mod tests {
         assert_eq!(document["scan"]["status"], "failed");
         assert_eq!(
             document["scan"]["reason"],
-            "process generation changed while inspect was scanning"
+            "process generation could not be revalidated while inspect was scanning"
         );
         assert_eq!(document["modules"], serde_json::json!([]));
         assert_eq!(document["skipped"], serde_json::json!([]));
@@ -1184,15 +1184,90 @@ mod tests {
             4242,
             false,
             &mut stdout,
-            Err("process generation changed while inspect was pinning".into()),
+            Err("process generation could not be revalidated while inspect was pinning".into()),
         )
         .unwrap();
         assert_eq!(code, 1);
         assert_eq!(
             String::from_utf8(stdout).unwrap(),
-            "p11scope: cannot inspect pid 4242: process generation changed while inspect was \
+            "p11scope: cannot inspect pid 4242: process generation could not be revalidated while inspect was \
              pinning\n"
         );
+    }
+
+    /// Fix8 (retained brackets): every still-the-same bracket refuses
+    /// proof-neutral when the pin stops holding — never a change
+    /// claim. The bools are scripted (a pin poll error on a live,
+    /// unchanged process fails the same way), one per bracket.
+    #[test]
+    fn retained_brackets_refuse_proof_neutral() {
+        let scan: fn(&mut usize) -> Result<(), String> = |_| Ok(());
+        let pin: fn(&mut usize, &()) -> Result<(), String> = |_, _| Ok(());
+        let mut before = 0usize;
+        let error = scan_and_pin_retained_with(&mut before, |_| false, scan, pin)
+            .expect_err("a pin that never holds refuses before inspect");
+        assert_eq!(
+            error, "process generation could not be revalidated before inspect",
+            "the before bracket never claims a change without proof"
+        );
+        let mut scanning = 0usize;
+        let error = scan_and_pin_retained_with(
+            &mut scanning,
+            |calls| {
+                *calls += 1;
+                *calls == 1
+            },
+            scan,
+            pin,
+        )
+        .expect_err("a pin lost mid-scan refuses while scanning");
+        assert_eq!(
+            error, "process generation could not be revalidated while inspect was scanning",
+            "the scanning bracket never claims a change without proof"
+        );
+        let mut pinning = 0usize;
+        let error = scan_and_pin_retained_with(
+            &mut pinning,
+            |calls| {
+                *calls += 1;
+                *calls <= 2
+            },
+            scan,
+            pin,
+        )
+        .expect_err("a pin lost mid-pin refuses while pinning");
+        assert_eq!(
+            error, "process generation could not be revalidated while inspect was pinning",
+            "the pinning bracket never claims a change without proof"
+        );
+    }
+
+    /// Fix8 (retained-bracket wording drift guard): the three bracket
+    /// wordings are pinned in production source — current wordings
+    /// present, superseded change claims absent.
+    #[test]
+    fn retained_bracket_wording_never_claims_a_change() {
+        let source = include_str!("inspect.rs");
+        for current in [
+            "process generation could not be revalidated before inspect",
+            "process generation could not be revalidated while inspect was scanning",
+            "process generation could not be revalidated while inspect was pinning",
+        ] {
+            assert!(
+                source.contains(current),
+                "the current wording stays quoted in production source: {current:?}"
+            );
+        }
+        for old in [
+            "process generation changed before inspect",
+            "process generation changed while inspect was scanning",
+            "process generation changed while inspect was pinning",
+        ] {
+            assert!(
+                !source.contains(old),
+                "a superseded change claim must not return: {old:?}"
+            );
+        }
     }
 
     /// Hard errors never reach the diagnosis renderer: a pid that names

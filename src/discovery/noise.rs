@@ -629,7 +629,7 @@ mod tests {
             ),
             (
                 "/usr/lib/libpool.so",
-                "broad fixed-family: pool table 0 refused (the mappings moved or the generation could not be revalidated during validation); the pool layout is unverified, so no fixed-family tables were added",
+                "broad fixed-family: pool table 0 refused (pool table stability could not be revalidated during validation); the pool layout is unverified, so no fixed-family tables were added",
             ),
         ] {
             assert_eq!(

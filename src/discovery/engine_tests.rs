@@ -94209,6 +94209,9 @@ fn export_lowering_before_a_stale_view_refuses_proof_neutral() {
 /// cover the post-validation check, the unstable-table refusal, the
 /// broad-pool refusal, the invariant context and the inner
 /// loader-attachment mark, which no deterministic fixture drives.
+/// Fix8: the table-validation texts are cause-neutral too — an
+/// `Unstable` refusal also covers maps reread, memory-read and budget
+/// failures on a live, unchanged process, so they claim no movement.
 #[test]
 fn revalidation_vocabulary_never_claims_a_change() {
     for text in [
@@ -94220,8 +94223,8 @@ fn revalidation_vocabulary_never_claims_a_change() {
         LOADER_ATTACH_STALE_REASON,
     ] {
         assert!(
-            !text.contains("changed") && !text.contains("change"),
-            "a failed revalidation proves neither exit nor change: {text:?}"
+            !text.contains("changed") && !text.contains("change") && !text.contains(" moved "),
+            "a failed revalidation proves neither exit, change nor movement: {text:?}"
         );
     }
     assert_eq!(
@@ -94234,11 +94237,11 @@ fn revalidation_vocabulary_never_claims_a_change() {
     );
     assert_eq!(
         UNSTABLE_TABLE_VALIDATION_REASON,
-        "a published table moved or the process generation could not be revalidated during validation"
+        "a published table's stability could not be revalidated during validation"
     );
     assert_eq!(
         BROAD_UNSTABLE_TABLE_REASON,
-        "the mappings moved or the generation could not be revalidated during validation"
+        "pool table stability could not be revalidated during validation"
     );
     assert_eq!(
         LOADER_ATTACH_INVARIANT_AROUND_RECHECK,
@@ -94248,6 +94251,159 @@ fn revalidation_vocabulary_never_claims_a_change() {
         LOADER_ATTACH_STALE_REASON,
         "loader generation, mapping, or pinned identity could not be revalidated during attach"
     );
+}
+
+/// Fix8 (revalidation vocabulary drift guard): the const-value pins
+/// above cover the const definitions, but a fresh old-text literal at
+/// a use-site would pass them. This pins the use-sites in production
+/// source instead: each const name occurs exactly at its definition
+/// plus its filing sites, every current wording is present quoted,
+/// and no superseded changed/moved wording returns.
+#[test]
+fn revalidation_vocabulary_use_sites_reference_their_consts() {
+    let source = include_str!("engine.rs");
+    for (name, sites) in [
+        ("STALE_VIEW_REASON", 2),
+        ("STALE_EXPORT_LOWERING_BEFORE", 1),
+        ("STALE_EXPORT_LOWERING_DURING", 1),
+        ("UNSTABLE_TABLE_VALIDATION_REASON", 1),
+        ("BROAD_UNSTABLE_TABLE_REASON", 1),
+        ("LOADER_ATTACH_INVARIANT_AROUND_RECHECK", 1),
+        ("LOADER_ATTACH_STALE_REASON", 1),
+    ] {
+        assert_eq!(
+            source.matches(name).count(),
+            1 + sites,
+            "{name} stays referenced at its definition and each filing site"
+        );
+    }
+    for current in [
+        "accepted process generation could not be revalidated during attach preparation; its discovery claims were removed",
+        "process generation could not be revalidated before export lowering",
+        "process generation could not be revalidated during export lowering",
+        "a published table's stability could not be revalidated during validation",
+        "pool table stability could not be revalidated during validation",
+        "dynamic loader attachment invariant failed around a failed generation recheck",
+        "loader generation, mapping, or pinned identity could not be revalidated during attach",
+    ] {
+        assert!(
+            source.contains(current),
+            "the current wording stays quoted in production source: {current:?}"
+        );
+    }
+    for old in [
+        "accepted process generation changed during attach preparation; its discovery claims were removed",
+        "process generation changed before export lowering",
+        "process generation changed during export lowering",
+        "a published table moved or the process generation changed during validation",
+        "a published table moved or the process generation could not be revalidated during validation",
+        "the mappings moved or the generation changed during validation",
+        "the mappings moved or the generation could not be revalidated during validation",
+        "dynamic loader attachment invariant failed around generation change",
+        "loader generation, mapping, or pinned identity changed during attach",
+    ] {
+        assert!(
+            !source.contains(old),
+            "a superseded changed/moved wording must not return: {old:?}"
+        );
+    }
+}
+
+/// Fix8 (broad-pool Unstable cause fidelity): a memory-read refusal on
+/// a live, unchanged pin refuses with the cause-neutral wording —
+/// never a movement claim. The maps index names a readable range the
+/// live child never mapped, so only the read fails.
+#[test]
+fn broad_pool_memory_refusal_on_a_live_pin_is_cause_neutral() {
+    let child = ExitMappingChildGuard(
+        std::process::Command::new("sleep")
+            .arg("30")
+            .die_with_parent()
+            .spawn()
+            .unwrap(),
+    );
+    let view = ProcessView::open(ProcessViewId(4247), child.0.id()).unwrap();
+    assert!(
+        view.still_the_same(),
+        "premise: the pin is live and unchanged"
+    );
+    let maps =
+        parse_maps(b"500000000000-500000001000 r--p 00000000 08:01 999 /libpool.so\n").unwrap();
+    let index = MapIndex::new(&maps).unwrap();
+    let mut module = ScannedModule {
+        key_is_identity: false,
+        module_hint: None,
+        mapped_identity: None,
+        view: view.id(),
+        mount_namespace: view.mount_namespace(),
+        key: ObjectKey {
+            device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+            inode: 999,
+        },
+        double_loaded: false,
+        same_file_loads: 1,
+        pre_copy_up: None,
+        path: "/libpool.so".into(),
+        tables_scan_finished: false,
+        decoder_abi: None,
+        exports: vec![],
+        tables: vec![],
+        interfaces: vec![],
+    };
+    let mut tallies = BroadTallies::default();
+    let error = broad_pool_table(
+        &view,
+        &mut module,
+        &index,
+        &mut CaptureWorkBudget::default(),
+        0x500000000000,
+        LinuxLayout::Lp64,
+        &mut tallies,
+    )
+    .expect_err("an unreadable pool address refuses validation");
+    assert!(
+        view.still_the_same(),
+        "premise: the pin stayed live across the refusal"
+    );
+    assert_eq!(
+        error, "pool table stability could not be revalidated during validation",
+        "a read refusal on a live pin claims no movement"
+    );
+    assert!(
+        !error.contains("moved") && !error.contains("changed"),
+        "the refusal stays cause-neutral: {error:?}"
+    );
+}
+
+/// Fix8 (inventory new-view staleness): a newly admitted view that no
+/// longer revalidates files the same proof-neutral skip as the removal
+/// path; a live view files nothing. The helper carries the filing the
+/// tick records through its First candidate.
+#[test]
+fn stale_new_views_file_one_neutral_skip_each() {
+    let live = ProcessView::open(ProcessViewId(901), std::process::id()).unwrap();
+    let mut child = ExitMappingChildGuard(
+        std::process::Command::new("sleep")
+            .arg("30")
+            .die_with_parent()
+            .spawn()
+            .unwrap(),
+    );
+    let dying = ProcessView::open(ProcessViewId(902), child.0.id()).unwrap();
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    assert!(
+        !dying.still_the_same(),
+        "premise: the reaped view fails revalidation"
+    );
+    let views: Vec<InventoryNewView> = vec![
+        (live, Vec::new(), PinnedObjects::empty()),
+        (dying, Vec::new(), PinnedObjects::empty()),
+    ];
+    let skips = stale_new_view_skips(&views);
+    assert_eq!(skips.len(), 1, "{skips:?}");
+    assert_eq!(skips[0].subject, "process view");
+    assert_eq!(skips[0].reason, STALE_VIEW_REASON);
 }
 
 /// The export-hook generation-change mark: silent for an ending group,

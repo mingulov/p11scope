@@ -12011,6 +12011,21 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
     Ok(())
 }
 
+/// One proof-neutral skip per newly admitted view that no longer
+/// revalidates in the same tick (the admission scan raced an exit or a
+/// pin failure). The First candidate records these even when the stale
+/// preflight below returns before the Final build.
+fn stale_new_view_skips(new_views: &[InventoryNewView]) -> Vec<Skipped> {
+    new_views
+        .iter()
+        .filter(|(view, _, _)| !view.still_the_same())
+        .map(|_| Skipped {
+            subject: "process view".into(),
+            reason: STALE_VIEW_REASON.into(),
+        })
+        .collect()
+}
+
 fn remove_stale_views(discovered: &mut Engine, stale: &[ProcessViewId]) -> Result<usize> {
     let accepted: BTreeSet<_> = discovered.views.iter().map(ProcessView::id).collect();
     let stale: BTreeSet<_> = stale
@@ -34386,14 +34401,7 @@ impl Engine {
         failed_refresh_pids.extend(failed_admission_pids);
         skipped.extend(admission_skips);
 
-        for (view, _, _) in new_views.iter() {
-            if !view.still_the_same() {
-                skipped.push(Skipped {
-                    subject: "process view".into(),
-                    reason: STALE_VIEW_REASON.into(),
-                });
-            }
-        }
+        skipped.extend(stale_new_view_skips(new_views));
         let mut new_view_pids: BTreeSet<_> =
             new_views.iter().map(|(view, _, _)| view.pid()).collect();
         let mut deferred_new_view_records = Vec::new();

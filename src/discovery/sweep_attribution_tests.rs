@@ -831,6 +831,27 @@ fn confirmation_requires_the_pin_to_hold_and_the_exe_to_stay() {
     ));
 }
 
+/// Fix8 (confirmation generation loss): a pin that stops naming its
+/// generation while the pid stays live files a proof-neutral detail —
+/// never a change claim. The detail reaches the inspect process table
+/// (JSON `reason` and the text `reason` line), so it must stay true
+/// for a pin/read failure on an unchanged process too.
+#[test]
+fn confirmation_generation_loss_files_a_proof_neutral_detail() {
+    let turned = Io {
+        same: false,
+        ..Io::healthy()
+    };
+    let Confirmation::Lost(loss, detail) = confirm(turned) else {
+        panic!("a pin that stops naming its generation is a loss");
+    };
+    assert_eq!(loss, AttributionLoss::GenerationChanged);
+    assert_eq!(
+        detail, "the process generation could not be revalidated during the confirmation read",
+        "the filed detail never claims a change without proof"
+    );
+}
+
 #[test]
 fn a_gone_process_is_an_exit_at_every_step() {
     for io in [

@@ -498,14 +498,22 @@ fn wait_ready(capture: &mut GuardedChild) {
     }
 }
 
-/// Reads the LEDGER file (written by the workload on completion).
+/// Reads the LEDGER file (written by the workload on completion) and
+/// validates its known eight-counter shape: every exact cell inherits
+/// the guard, so silence or impossible counts fail here instead of
+/// passing a count comparison against nothing observed.
 fn read_ledger_file(ledger: &Path) -> BTreeMap<String, u64> {
     let deadline = Instant::now() + TIMEOUT;
     loop {
         if let Ok(text) = std::fs::read_to_string(ledger)
             && let Some(line) = text.lines().find(|l| l.starts_with("LEDGER "))
         {
-            return parse_ledger(line);
+            let counts = parse_ledger(line);
+            assert!(
+                validate_workload_ledger(&counts),
+                "the workload ledger must have its known eight-counter shape: {counts:?}"
+            );
+            return counts;
         }
         assert!(Instant::now() < deadline, "workload never wrote its ledger");
         std::thread::sleep(Duration::from_millis(50));
@@ -710,7 +718,7 @@ fn run_positive(
     let go = dir.path().join("go");
     let ledger = dir.path().join("ledger.txt");
     let out = dir.path().join("out.json");
-    let (_workload, pid) = spawn_workload(&workload, &module, &go, &ledger, &conf, false, false);
+    let (mut workload, pid) = spawn_workload(&workload, &module, &go, &ledger, &conf, false, false);
     // Held to the end of the capture (dropped after the output is read).
     let mut _cgroup: Option<CellCgroup> = None;
     let mut args = vec!["profile".to_string(), format!("--{scope}")];
@@ -739,6 +747,7 @@ fn run_positive(
     wait_ready(&mut capture);
     std::fs::write(&go, b"go\n").expect("release the workload");
     let ledger_counts = read_ledger_file(&ledger);
+    wait_workload_success(&mut workload);
     let status = capture.wait_expect("capture");
     assert!(status.success(), "capture exits clean");
     let text = std::fs::read_to_string(&out).expect("read profile");
@@ -820,6 +829,8 @@ fn privileged_profile_pid_prearm_twin_exact_window() {
     // GO pre-created: the workload runs to completion (and holds F)
     // before the capture exists.
     let (_workload, pid) = spawn_workload(&workload, &module, &go, &ledger, &conf, true, true);
+    // Hold workload: killed on drop by design, so no exit gate (its
+    // ledger proves its pre-attach calls).
     let ledger_counts = read_ledger_file(&ledger);
     assert!(
         ledger_counts.values().sum::<u64>() > 0,
@@ -904,7 +915,8 @@ fn privileged_trace_system_prearm_clean_exact_counts() {
     let go = dir.path().join("go");
     let ledger = dir.path().join("ledger.txt");
     let out = dir.path().join("out.jsonl");
-    let (_workload, _pid) = spawn_workload(&workload, &module, &go, &ledger, &conf, false, false);
+    let (mut workload, _pid) =
+        spawn_workload(&workload, &module, &go, &ledger, &conf, false, false);
     let args = vec![
         "trace".to_string(),
         "--system".to_string(),
@@ -923,6 +935,7 @@ fn privileged_trace_system_prearm_clean_exact_counts() {
     wait_ready(&mut capture);
     std::fs::write(&go, b"go\n").expect("release the workload");
     let ledger_counts = read_ledger_file(&ledger);
+    wait_workload_success(&mut workload);
     let status = capture.wait_expect("capture");
     assert!(status.success(), "capture exits clean");
     let text = std::fs::read_to_string(&out).expect("read trace");
@@ -1158,6 +1171,8 @@ fn privileged_trace_system_prearm_shared_provider_honest_accounting() {
         true,
         true,
     );
+    // Hold workload: killed on drop by design, so no exit gate (its
+    // ledger proves its pre-attach calls).
     let holder_counts = read_ledger_file(&holder_ledger);
     assert!(
         holder_counts.values().sum::<u64>() > 0,
@@ -1168,7 +1183,8 @@ fn privileged_trace_system_prearm_shared_provider_honest_accounting() {
     let go = dir.path().join("go");
     let ledger = dir.path().join("ledger.txt");
     let out = dir.path().join("out.jsonl");
-    let (_main, main_pid) = spawn_workload(&workload, &module, &go, &ledger, &conf, false, false);
+    let (mut main, main_pid) =
+        spawn_workload(&workload, &module, &go, &ledger, &conf, false, false);
     let args = vec![
         "trace".to_string(),
         "--system".to_string(),
@@ -1187,6 +1203,7 @@ fn privileged_trace_system_prearm_shared_provider_honest_accounting() {
     wait_ready(&mut capture);
     std::fs::write(&go, b"go\n").expect("release the workload");
     let ledger_counts = read_ledger_file(&ledger);
+    wait_workload_success(&mut main);
     let status = capture.wait_expect("capture");
     assert!(status.success(), "capture exits clean");
     let text = std::fs::read_to_string(&out).expect("read trace");

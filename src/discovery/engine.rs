@@ -617,6 +617,14 @@ pub struct Engine {
     /// before building anything.
     #[cfg(test)]
     owned_learn_proofs_built_for_test: u64,
+    /// Test-only fault injection: fail the held-file duplicate in
+    /// [`Self::stage_learned_file`] (descriptor-pressure shape).
+    #[cfg(test)]
+    fail_learned_stage_clone_for_test: bool,
+    /// Test-only fault injection: fail the held-file stat in
+    /// [`Self::stage_learned_file`].
+    #[cfg(test)]
+    fail_learned_stage_stat_for_test: bool,
     /// Fresh tables the per-module merge cap dropped (counted overflow,
     /// never silent). Drops are only possible past 64 distinct tables
     /// for one module, far above any legitimate provider surface.
@@ -5322,6 +5330,16 @@ struct OwnedLearnProof {
 /// file's digest plus the raw observation (mount namespace, maps
 /// key, path). See `owned_learned_staged`.
 type OwnedLearnedKey = (String, crate::process::MountNamespaceId, ObjectKey, String);
+
+/// What one [`Engine::stage_learned_file`] call did: terminal
+/// (staged, refused past the cap, or settled through another path —
+/// the key is noted either way) or failed duplicating/statting the
+/// held file (nothing noted, so a later proof re-attempts).
+enum LearnedStageOutcome {
+    Terminal,
+    CloneFailed,
+    StatFailed,
+}
 
 /// The already-staged key for one proof, resolved in the proof's own
 /// source store (the draining call's pins for fresh proofs, the
@@ -14879,6 +14897,10 @@ impl Engine {
             owned_learn_naming_for_test: 0,
             #[cfg(test)]
             owned_learn_proofs_built_for_test: 0,
+            #[cfg(test)]
+            fail_learned_stage_clone_for_test: false,
+            #[cfg(test)]
+            fail_learned_stage_stat_for_test: false,
             merge_tables_dropped: 0,
             learned_frame_owed: false,
             owned_watch_unproven: BTreeMap::new(),
@@ -25066,7 +25088,9 @@ impl Engine {
             self.owned_learn_file_probes_for_test =
                 self.owned_learn_file_probes_for_test.saturating_add(1);
         }
-        self.stage_learned_file(
+        // Fresh proofs regenerate next apply, so a duplicate/stat
+        // failure here is a silent retry, never loss.
+        let _ = self.stage_learned_file(
             file,
             &proof.path,
             loader_exe,
@@ -25108,7 +25132,7 @@ impl Engine {
             self.owned_learn_file_probes_for_test =
                 self.owned_learn_file_probes_for_test.saturating_add(1);
         }
-        self.stage_learned_file(
+        let _ = self.stage_learned_file(
             file,
             &entry.proof.path,
             loader_exe,
@@ -25134,13 +25158,21 @@ impl Engine {
         loader_unknown_reason: Option<&'static str>,
         key: Option<OwnedLearnedKey>,
         proving_retained: bool,
-    ) {
+    ) -> LearnedStageOutcome {
         use std::os::unix::fs::MetadataExt as _;
+        #[cfg(test)]
+        if self.fail_learned_stage_clone_for_test {
+            return LearnedStageOutcome::CloneFailed;
+        }
         let Ok(held) = file.try_clone() else {
-            return;
+            return LearnedStageOutcome::CloneFailed;
         };
+        #[cfg(test)]
+        if self.fail_learned_stage_stat_for_test {
+            return LearnedStageOutcome::StatFailed;
+        }
         let Ok(meta) = held.metadata() else {
-            return;
+            return LearnedStageOutcome::StatFailed;
         };
         let identity = (meta.dev(), meta.ino());
         if self.learned_settled.contains(&identity)
@@ -25153,7 +25185,7 @@ impl Engine {
             // this apply): remember the exact key so later
             // applies skip before the duplicate/stat.
             self.note_owned_learned_staged(key);
-            return;
+            return LearnedStageOutcome::Terminal;
         }
         // The loader name arrives charged (named under the proving
         // view's pidfd by the caller): staging never re-resolves a
@@ -25179,6 +25211,7 @@ impl Engine {
         // Terminal either way (refusal settles the identity):
         // later applies skip before the duplicate/stat.
         self.note_owned_learned_staged(key);
+        LearnedStageOutcome::Terminal
     }
 
     /// Remembers one owned-run proof's exact key as staged, settled,

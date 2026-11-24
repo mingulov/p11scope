@@ -4243,3 +4243,142 @@ fn carried_fix5_table_coverage_requires_version_and_walk() {
         "an identical table covers"
     );
 }
+
+/// Queues one deferred proof with tables (hg-5 shape): the drain
+/// must commit the prepared tables and separately settle the file,
+/// so a file failure refuses loudly while the tables still union.
+fn fix5_queue_deferred_proof_with_tables(
+    engine: &mut Engine,
+    view: &ProcessView,
+    key_minor: u64,
+    mount_id: u64,
+) {
+    let key = overlay_key(key_minor);
+    let mut module = overlay_module(key);
+    module.view = view.id();
+    assert!(
+        !module.tables.is_empty(),
+        "the proof carries tables to harvest"
+    );
+    let source = overlay_view_pin(&module, mount_id, OVERLAY_SHA, 1, false);
+    let object = source
+        .id_for_scanned(&module, module.key, &module.path)
+        .expect("the fixture pin resolves");
+    engine.defer_owned_learn_proof(
+        &OwnedLearnProof {
+            view: view.id(),
+            path: OVERLAY_PATH.into(),
+            object,
+            loader_exe: None,
+            loader_unknown_reason: None,
+            module,
+        },
+        view,
+        &source,
+    );
+    assert_eq!(
+        engine.owned_learn_deferred.len(),
+        1,
+        "the proof queues with its custody"
+    );
+}
+
+#[test]
+fn carried_fix5_clone_failure_refuses_deferred_file() {
+    // hg-5 loss accounting: a deferred proof whose held file cannot
+    // be duplicated (descriptor pressure) refuses loudly with counted
+    // loss and a named gap instead of vanishing silently after its
+    // pop. The prepared tables still commit: file and tables are
+    // independent outcomes, as on the refused-generation path.
+    let me = std::process::id();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 40,
+        path: "/".into(),
+        dir: Arc::new(File::open("/").expect("open root dir")),
+    };
+    engine.owned_run_pid = Some(424242);
+    engine.next_view_id = 100;
+    let view = ProcessView::open(ProcessViewId(65), me).expect("own view opens");
+    fix5_queue_deferred_proof_with_tables(&mut engine, &view, 9997, 8406);
+    engine.fail_learned_stage_clone_for_test = true;
+    let loss_before = engine.learned_event_loss_for_test();
+    let mut scratch = PinnedObjects::empty();
+    engine.learn_owned_proofs_with_views(&mut scratch, &[], &[], None);
+    assert!(
+        engine.owned_learn_deferred.is_empty(),
+        "the drain pops the failed entry"
+    );
+    assert_eq!(
+        engine.learned_event_loss_for_test(),
+        loss_before + 1,
+        "the duplicate failure carries counted loss"
+    );
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.reason.contains("duplicat")),
+        "the refusal names the duplicate failure: {:?}",
+        engine.counters.object_skips,
+    );
+    assert!(
+        engine.pending_learned.is_empty(),
+        "no file stages without its duplicate"
+    );
+    assert_eq!(
+        engine.run_learned_modules.len(),
+        1,
+        "the prepared tables still commit (independent outcome)"
+    );
+}
+
+#[test]
+fn carried_fix5_stat_failure_refuses_deferred_file() {
+    // hg-5 loss accounting, stat arm: a deferred proof whose held
+    // file cannot be statted refuses loudly with counted loss and a
+    // named gap; its prepared tables still commit.
+    let me = std::process::id();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 41,
+        path: "/".into(),
+        dir: Arc::new(File::open("/").expect("open root dir")),
+    };
+    engine.owned_run_pid = Some(424242);
+    engine.next_view_id = 100;
+    let view = ProcessView::open(ProcessViewId(66), me).expect("own view opens");
+    fix5_queue_deferred_proof_with_tables(&mut engine, &view, 9998, 8407);
+    engine.fail_learned_stage_stat_for_test = true;
+    let loss_before = engine.learned_event_loss_for_test();
+    let mut scratch = PinnedObjects::empty();
+    engine.learn_owned_proofs_with_views(&mut scratch, &[], &[], None);
+    assert!(
+        engine.owned_learn_deferred.is_empty(),
+        "the drain pops the failed entry"
+    );
+    assert_eq!(
+        engine.learned_event_loss_for_test(),
+        loss_before + 1,
+        "the stat failure carries counted loss"
+    );
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.reason.contains("metadata")),
+        "the refusal names the stat failure: {:?}",
+        engine.counters.object_skips,
+    );
+    assert!(
+        engine.pending_learned.is_empty(),
+        "no file stages without its stat"
+    );
+    assert_eq!(
+        engine.run_learned_modules.len(),
+        1,
+        "the prepared tables still commit (independent outcome)"
+    );
+}

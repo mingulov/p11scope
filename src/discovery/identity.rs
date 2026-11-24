@@ -17290,10 +17290,7 @@ mod tests {
         reset_exact_scan_counters_for_test();
         let file = open_regular(Path::new("/bin/sh")).unwrap();
         let mount_id = fd_mount_id(&file).unwrap();
-        assert_ne!(
-            "9000001", mount_id,
-            "decoys must not match the fd mount"
-        );
+        assert_ne!("9000001", mount_id, "decoys must not match the fd mount");
         let table = format!(
             "9000001 1 8:1 / /decoy rw - ext4 /dev/decoy rw\r\n{mount_id} 1 9:9 / /target rw - ext4 /dev/target rw\r\n"
         );
@@ -17318,10 +17315,7 @@ mod tests {
         reset_exact_scan_counters_for_test();
         let file = open_regular(Path::new("/bin/sh")).unwrap();
         let mount_id = fd_mount_id(&file).unwrap();
-        assert_ne!(
-            "9000001", mount_id,
-            "decoys must not match the fd mount"
-        );
+        assert_ne!("9000001", mount_id, "decoys must not match the fd mount");
         let table = format!(
             "9000001 1 8:1 / /decoy rw - ext4 /dev/decoy rw\n{mount_id} 1 9:9 / /target rw - ext4 /dev/target rw"
         );

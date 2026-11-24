@@ -3446,7 +3446,9 @@ a silent drop.
   cannot decode stays getter-only; both keep their existing named
   gaps.
 - Kernels/conditions: all kernels; short-lived descendants under
-  `run` with the pause chain disarmed (`--pause never`) or refused.
+  `run` when the first-map stop object is refused by the kernel
+  (`--pause never` keeps the stop; only a refused stop object leaves
+  the window open).
 - Disclosure: the windows and gap counts above, in text and JSON;
   the learned-table store holds 32 modules beside the 32 learned
   files, and either cap refusal is named and counted

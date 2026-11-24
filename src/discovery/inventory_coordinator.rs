@@ -1188,6 +1188,20 @@ fn stash_stale_checks() -> u64 {
     STASH_STALE_CHECKS.with(std::cell::Cell::get)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The credit left each time a held head's own stash charge did
+    /// not fit (test-observed: the partly spent holds).
+    static HELD_STASH_LEFTOVERS: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Drains the recorded held-head stash leftovers of this thread.
+#[cfg(test)]
+fn take_held_stash_leftovers() -> Vec<usize> {
+    HELD_STASH_LEFTOVERS.with(|left| std::mem::take(&mut *left.borrow_mut()))
+}
+
 /// One staged native owner: all preparation I/O (fresh observation,
 /// warm view, guarded scan, prepared reconciliation, pin preflight)
 /// complete before the final membership sample, awaiting the
@@ -2084,7 +2098,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// is its prepared executable verdict when it stages an unbound
     /// image with a stashed EXEC), `None` while it waits. Bound rows,
     /// re-observations and rows without a stash entry read nothing.
-    fn prepare_held_decision(&mut self, credit: &mut StageCredit) -> Option<Option<UnboundExe>> {
+    fn prepare_held_decision(
+        &mut self,
+        credit: &mut StageCredit,
+    ) -> Option<Option<(StashedExec, UnboundExe)>> {
         let Some(HeldStage::Decision(decision)) = self.held_stage.front() else {
             return Some(None);
         };
@@ -2138,9 +2155,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             }
         });
         if !credit.take(stash_reads) {
+            #[cfg(test)]
+            HELD_STASH_LEFTOVERS.with(|left| left.borrow_mut().push(credit.left));
             return None;
         }
-        Some(self.head_work.resolved.take().map(|(_, exe)| exe))
+        Some(self.head_work.resolved.take())
     }
 
     /// Live-process reads are trusted only under agreeing pidns
@@ -11634,7 +11653,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     fn stage_witness(
         &mut self,
         decision: Decision,
-        prepared_exe: Option<UnboundExe>,
+        prepared_exe: Option<(StashedExec, UnboundExe)>,
     ) -> Result<(), String> {
         let Decision {
             row,
@@ -11743,13 +11762,18 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 // backfills it, later loss flips it).
                 // The stash's resolution was prepared, under the
                 // staging credit, before this row staged.
-                debug_assert_eq!(
-                    prepared_exe.as_ref().map(|exe| (exe.dev, exe.ino)),
-                    self.exec_exe.get(&cookie).map(|exec| (exec.dev, exec.ino)),
+                debug_assert!(
+                    match (&prepared_exe, self.exec_exe.get(&cookie)) {
+                        (Some((resolved_for, exe)), Some(now)) => {
+                            resolved_for.same_image(now) && (exe.dev, exe.ino) == (now.dev, now.ino)
+                        }
+                        (None, None) => true,
+                        _ => false,
+                    },
                     "a stashed EXEC stages exactly its prepared verdict"
                 );
                 let exe = match prepared_exe {
-                    Some(exe) => exe,
+                    Some((_, exe)) => exe,
                     None if self.has_exec_tombstone(&cookie)
                         || self.exec_evidence_lost(cookie.domain()) =>
                     {
@@ -45142,6 +45166,8 @@ int main(void) {
         // first. Every cold-path count from 40 to 63 is driven, so each
         // leftover 0, 1 and 2 occurs.
         let mut held_with_verdict = 0;
+        take_held_stash_leftovers();
+        let mut leftovers = std::collections::BTreeSet::new();
         for cold in 40..=63u64 {
             let (mut native, _) = watched_native();
             native.scene.source.spawn(9, 600);
@@ -45180,6 +45206,7 @@ int main(void) {
             let domain = native.domain;
             native.stage(NativeBatch::Finish { domain });
             native.scene.coordinator.commit_batch(false).unwrap();
+            leftovers.extend(take_held_stash_leftovers());
             if native.scene.coordinator.held_stage.is_empty() {
                 continue;
             }
@@ -45194,7 +45221,11 @@ int main(void) {
         }
         assert!(
             held_with_verdict >= 3,
-            "the head waits on its stash charge at three or more leftovers: {held_with_verdict}"
+            "held with a verdict: {held_with_verdict}"
+        );
+        assert!(
+            [0, 1, 2].iter().all(|left| leftovers.contains(left)),
+            "the head waits on its stash charge with 0, 1 and 2 units left: {leftovers:?}"
         );
     }
 
@@ -45205,39 +45236,7 @@ int main(void) {
         // row waits with its verdict. A re-stash of the row's EXEC
         // (same cookie, new image) lands before it stages: the staged
         // verdict names the current EXEC, never the discarded one.
-        // The cold-path count that spends the Finish credit exactly up
-        // to the row's stash read depends on the resolver's own charge,
-        // so the fixture searches it (deterministic per tree).
-        let domain_of = |native: &NativeScene| native.domain;
-        let mut found = None;
-        for cold in (40..=63u64).rev() {
-            // A capture stash, so the row's own stash read is charged.
-            let (mut native, _) = watched_native();
-            native.scene.coordinator.set_exe_index_dirs(Vec::new());
-            let base = cold_exe_paths(&native);
-            if base > cold {
-                continue;
-            }
-            admit_cold_exe_callers(&mut native, (cold - base) as u32);
-            native.execs(vec![exec_record(41, 9, 100, 8, 99)]);
-            let staged = native.read(vec![native.row(41, 1, 9, 210, 0)]);
-            assert_eq!(staged.decided, 0);
-            let domain = domain_of(&native);
-            native.stage(NativeBatch::Finish { domain });
-            let waits_with_verdict = native.scene.coordinator.held_stage.len() == 1
-                && native
-                    .scene
-                    .coordinator
-                    .head_work
-                    .resolved
-                    .as_ref()
-                    .is_some_and(|(_, exe)| (exe.dev, exe.ino) == (8, 99));
-            if waits_with_verdict {
-                found = Some(native);
-                break;
-            }
-        }
-        let mut native = found.expect("a completed verdict waits for its row (setup pin)");
+        let mut native = held_head_with_verdict();
         let domain = native.domain;
         native.execs(vec![exec_record(41, 9, 150, 8, 77)]);
         for _ in 0..4 {
@@ -45251,6 +45250,105 @@ int main(void) {
         let exes = scene_unbound_exe(&native);
         assert_eq!(exes.len(), 1);
         assert_eq!((exes[0].dev, exes[0].ino), (8, 77), "{exes:?}");
+    }
+
+    /// Drives the restash fixture to a held head with a completed
+    /// verdict: the cold-path count that spends the Finish credit up
+    /// to the row's stash read depends on the resolver's charge, so it
+    /// is searched (deterministic per tree).
+    fn held_head_with_verdict() -> NativeScene {
+        for cold in (40..=63u64).rev() {
+            let (mut native, _) = watched_native();
+            native.scene.coordinator.set_exe_index_dirs(Vec::new());
+            let base = cold_exe_paths(&native);
+            if base > cold {
+                continue;
+            }
+            admit_cold_exe_callers(&mut native, (cold - base) as u32);
+            native.execs(vec![exec_record(41, 9, 100, 8, 99)]);
+            let staged = native.read(vec![native.row(41, 1, 9, 210, 0)]);
+            assert_eq!(staged.decided, 0);
+            let domain = native.domain;
+            native.stage(NativeBatch::Finish { domain });
+            let waits_with_verdict = native.scene.coordinator.held_stage.len() == 1
+                && native
+                    .scene
+                    .coordinator
+                    .head_work
+                    .resolved
+                    .as_ref()
+                    .is_some_and(|(_, exe)| (exe.dev, exe.ino) == (8, 99));
+            if waits_with_verdict {
+                return native;
+            }
+        }
+        panic!("a completed verdict waits for its row (setup pin)");
+    }
+
+    #[test]
+    fn a_held_verdict_is_discarded_when_its_exec_is_pruned() {
+        // The head's verdict completed, then its departed pid's EXEC
+        // outlives the grace and is pruned while the row waits: the
+        // row stages the lost-record verdict the prune's tombstone
+        // names, never the verdict of a stash entry that is gone.
+        let mut native = held_head_with_verdict();
+        let at = native.stamps.tick();
+        native.scene.coordinator.prune_departed_native_state(at);
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(at + super::EXEC_STATE_GRACE_NS);
+        let cookie = native.row(41, 1, 9, 210, 0).cookie();
+        assert!(
+            !native.scene.coordinator.exec_exe.contains_key(&cookie),
+            "the EXEC was pruned while the row waits (setup pin)"
+        );
+        let domain = native.domain;
+        for _ in 0..4 {
+            if native.scene.coordinator.held_stage.is_empty() {
+                break;
+            }
+            native.stage(NativeBatch::Finish { domain });
+        }
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(native.scene.coordinator.held_stage.is_empty());
+        let exes = scene_unbound_exe(&native);
+        assert_eq!(exes.len(), 1);
+        assert_eq!((exes[0].dev, exes[0].ino), (0, 0), "{exes:?}");
+        assert_eq!(exes[0].resolution, ExeResolution::ExecRecordLost);
+    }
+
+    #[test]
+    fn same_image_compares_every_resolved_field_and_ignores_the_exit_note() {
+        let base = super::StashedExec {
+            dev: 8,
+            ino: 99,
+            hook_ts_ns: 100,
+            pid_host: 9,
+            gone_since: None,
+        };
+        assert!(base.same_image(&base));
+        let noted = super::StashedExec {
+            gone_since: Some(7),
+            ..base
+        };
+        assert!(base.same_image(&noted), "the exit note is bookkeeping");
+        let changed = [
+            super::StashedExec { dev: 9, ..base },
+            super::StashedExec { ino: 77, ..base },
+            super::StashedExec {
+                hook_ts_ns: 150,
+                ..base
+            },
+            super::StashedExec {
+                pid_host: 10,
+                ..base
+            },
+        ];
+        for other in changed {
+            assert!(!base.same_image(&other), "{other:?}");
+            assert!(!other.same_image(&base), "{other:?}");
+        }
     }
 
     #[test]

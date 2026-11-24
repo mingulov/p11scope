@@ -8,9 +8,11 @@
  * C_Sign length cell sits between two 64-byte sentinel payload guards,
  * and every C_Verify scalar call carries the same guards around its
  * buffers, so a BPF over-read of any payload byte would plant the
- * K3YS1Z3CANARY! marker (with an embedded 256-valued collision word)
- * into the observer's output, maps or logs, where the privileged cell
- * scans for it. Gate discipline mirrors mt_sign: only C_Initialize /
+ * pure repeated K3YS1Z3CANARY! marker into the observer's output, maps
+ * or logs, where the privileged cell scans for it. The message buffers
+ * carry the same marker bytes, so an input-payload leak is marked too;
+ * the signature bytes stay genuine SoftHSM output (unmarked by
+ * construction). Gate discipline mirrors mt_sign: only C_Initialize /
  * C_GetSlotList run before READY; keygen and every counted call happen
  * after the gate opens. MT_MIXED_HOLD=1 holds after LEDGER for the
  * capture window. Any unexpected return exits nonzero with no LEDGER.
@@ -57,20 +59,26 @@ typedef struct { CK_ULONG mechanism; void *pParameter; CK_ULONG ulParameterLen; 
 static const char CANARY_MARK[] = "K3YS1Z3CANARY!";
 #define GUARD_LEN 64
 
-static void fill_guard(unsigned char *buf, unsigned tag)
+/* Fill `len` bytes with the pure repeated marker. No embedded length
+ * word: every 8-byte window must fail the RSA-2048 verdict (a 256 word
+ * here would alias the legitimate length and pass both the scan and
+ * the verdict), and the Rust `keysize_canary_c_guards_carry_no_aliasing_word`
+ * test compiles this file and pins that property on its real bytes. */
+static void fill_marked(unsigned char *buf, size_t len)
 {
     size_t mark_len = sizeof(CANARY_MARK) - 1;
     size_t i;
-    for (i = 0; i < GUARD_LEN; i++)
+    for (i = 0; i < len; i++)
         buf[i] = (unsigned char)CANARY_MARK[i % mark_len];
-    /* A 256-valued collision word inside the payload: if BPF ever
-     * mistook payload bytes for a length word, this aliases RSA-2048,
-     * while the surrounding marker still betrays the leak. Copies of
-     * the full marker survive at offsets 0, 28 and 42. */
-    if (GUARD_LEN >= 24) {
-        uint64_t collision = 256;
-        memcpy(buf + 16, &collision, sizeof collision);
-    }
+}
+
+static void fill_guard(unsigned char *buf, unsigned tag)
+{
+    fill_marked(buf, GUARD_LEN);
+    /* Pure repeated marker: intact full copies survive at offsets 0,
+     * 14, 28 and 42, and only the tag digit disturbs the 8-byte tail.
+     * Any word-sized read out of this guard classifies outside the
+     * admission bound, so the size verdict fails it. */
     buf[GUARD_LEN - 1] = (unsigned char)('0' + (tag % 10));
 }
 
@@ -104,13 +112,15 @@ static void target(const char *name, void *address)
 }
 
 /* S-protocol frame: the C_Sign length cell with sentinel payload
- * guards immediately adjacent on both sides. */
+ * guards immediately adjacent on both sides. The message and
+ * signature buffers ride after the guards; only the cell sits
+ * between them. */
 struct sign_frame {
     unsigned char pre[GUARD_LEN];
-    unsigned char msg[32];
-    unsigned char sig[512];
     CK_ULONG siglen;
     unsigned char post[GUARD_LEN];
+    unsigned char msg[32];
+    unsigned char sig[512];
 };
 
 /* V-protocol frame: the C_Verify input buffers with the same guards.
@@ -213,7 +223,10 @@ int main(int argc, char **argv)
         static struct verify_frame vframe;
         fill_guard(sframe.pre, 1);
         fill_guard(sframe.post, 2);
-        memset(sframe.msg, 0xA5, sizeof sframe.msg);
+        /* Mark the input too: SoftHSM signs any bytes, so a leak of
+         * the message payload carries the marker. The signature
+         * buffer keeps genuine output (unmarked by construction). */
+        fill_marked(sframe.msg, sizeof sframe.msg);
         sframe.siglen = sizeof sframe.sig;
         rv = F(fns, 42, CK_RV (*)(CK_SESSION_HANDLE, CK_MECHANISM *, CK_OBJECT_HANDLE))(
             session, &mech, priv);

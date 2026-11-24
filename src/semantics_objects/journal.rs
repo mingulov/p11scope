@@ -25091,12 +25091,8 @@ pub(crate) mod tests {
         );
         let begin2 = begin_bytes(1, 2, open, 0);
         assert_eq!(scene.ingest(&begin2), JournalDisposition::BeginAdmitted);
-        let abandon2 =
-            abandon_bytes(1, 2, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
-        assert_eq!(
-            scene.ingest(&abandon2),
-            JournalDisposition::AbandonStaged
-        );
+        let abandon2 = abandon_bytes(1, 2, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon2), JournalDisposition::AbandonStaged);
         let begin3 = begin_bytes(1, 3, open, 0);
         assert_eq!(scene.ingest(&begin3), JournalDisposition::BeginAdmitted);
         assert_eq!(

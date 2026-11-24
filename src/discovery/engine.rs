@@ -7744,8 +7744,8 @@ fn skip_is_ending_refusal(skip: &Skipped) -> bool {
 /// snapshots, and every budget stop — none of those is an exit finding,
 /// so they stay loud whatever the pin proves.
 const MID_SCAN_EXIT_RACE_DETAILS: [&str; 6] = [
-    "process generation changed before target access",
-    "process generation changed during target access",
+    "process generation could not be revalidated before target access",
+    "process generation could not be revalidated during target access",
     "original process exited before proc acquisition",
     "original process exited during proc acquisition",
     "original process exited while proc identity was read",
@@ -10702,26 +10702,28 @@ fn bind_pending_corroboration(
     Ok(corroborated)
 }
 
-const STALE_VIEW_REASON: &str = "accepted process generation changed during attach preparation; its discovery claims were removed";
+const STALE_VIEW_REASON: &str = "accepted process generation could not be revalidated during attach preparation; its discovery claims were removed";
 
 /// Operator-facing texts for a failed process-generation revalidation.
 /// A failed revalidation proves neither exit nor change — the pin may
 /// have erred on a live, unchanged process — so these texts must never
 /// claim the generation changed. Each is pinned by its behavioral or
 /// const-value test; the sweep restores the old claim per site.
-const STALE_EXPORT_LOWERING_BEFORE: &str = "process generation changed before export lowering";
-const STALE_EXPORT_LOWERING_DURING: &str = "process generation changed during export lowering";
+const STALE_EXPORT_LOWERING_BEFORE: &str =
+    "process generation could not be revalidated before export lowering";
+const STALE_EXPORT_LOWERING_DURING: &str =
+    "process generation could not be revalidated during export lowering";
 const UNSTABLE_TABLE_VALIDATION_REASON: &str =
-    "a published table moved or the process generation changed during validation";
+    "a published table moved or the process generation could not be revalidated during validation";
 const BROAD_UNSTABLE_TABLE_REASON: &str =
-    "the mappings moved or the generation changed during validation";
+    "the mappings moved or the generation could not be revalidated during validation";
 const LOADER_ATTACH_INVARIANT_AROUND_RECHECK: &str =
-    "dynamic loader attachment invariant failed around generation change";
+    "dynamic loader attachment invariant failed around a failed generation recheck";
 /// The loss mark a loader-attachment generation check files for a live
 /// generation it could not revalidate (proof-neutral; the mark helper
 /// stays silent for an exited or ending group).
 const LOADER_ATTACH_STALE_REASON: &str =
-    "loader generation, mapping, or pinned identity changed during attach";
+    "loader generation, mapping, or pinned identity could not be revalidated during attach";
 
 /// The record a failed post-detach terminal drain publishes. It announces a
 /// *retry*, so it is only true while the journal that owes it is still
@@ -12201,7 +12203,8 @@ enum ExactReadRefusal {
     Unreadable,
     /// The bytes at the address are not a function table.
     Undecodable,
-    /// The mappings moved, or the generation changed, under the read.
+    /// The mappings moved, or the generation could not be revalidated,
+    /// under the read.
     Unstable,
     /// A decode budget ceiling stopped the validation.
     Budget,
@@ -17213,9 +17216,10 @@ impl Engine {
         }
     }
 
-    /// A retained generation changed under an operation that needed it. Loss —
-    /// unless the retained original pin *proves* the process simply ended, the
-    /// same authority `queue_retirement` and the live-record rule already use:
+    /// A retained generation could not be revalidated under an operation
+    /// that needed it. Loss — unless the retained original pin *proves*
+    /// the process simply ended, the same authority `queue_retirement`
+    /// and the live-record rule already use:
     /// a `--cgroup` capture of a workload that forks per unit of work loses a
     /// generation mid-arm every time one of its subprocesses finishes, and that
     /// is the ordinary end of a process. Timing proof goes either way.
@@ -20484,7 +20488,7 @@ impl Engine {
                         if !candidate.delta.replace.is_empty() {
                             self.mark_partial(
                                 "live discovery replacement",
-                                "a process generation changed before downgraded exact targets were replaced; they were deactivated",
+                                "a process generation could not be revalidated before downgraded exact targets were replaced; they were deactivated",
                             );
                         }
                         // The deactivated slots' surviving owners are refreshed
@@ -21197,7 +21201,7 @@ impl Engine {
             self.retire_stale_candidate_sources(session, &mut candidate, &dropped, &mut *outcome);
             self.mark_partial(
                 "live discovery generation",
-                "a process generation changed after link mutation; its targets were retired before context cleanup",
+                "a process generation could not be revalidated after link mutation; its targets were retired before context cleanup",
             );
         } else if !outcome.unpublished_views.is_empty() {
             let unpublished = outcome.unpublished_views.clone();
@@ -21244,7 +21248,7 @@ impl Engine {
             if !unattached.is_empty() {
                 self.mark_partial(
                     "live discovery attach",
-                    "a process generation changed before new exact targets were attached; they were deactivated for a later attempt",
+                    "a process generation could not be revalidated before new exact targets were attached; they were deactivated for a later attempt",
                 );
             }
         }
@@ -26499,9 +26503,10 @@ impl Engine {
         (retire, complete, skipped, attached)
     }
 
-    /// The generation changed around a dynamic export attachment: loss,
-    /// unless its group exited or is in its final exit, which can make no
-    /// further call through the hook. Timing proof goes either way.
+    /// The generation could not be revalidated around a dynamic export
+    /// attachment: loss, unless its group exited or is in its final
+    /// exit, which can make no further call through the hook. Timing
+    /// proof goes either way.
     fn mark_export_generation_change(&mut self, view: ProcessViewId) {
         if self.original_ending(view) {
             self.invalidate_causal_timing();
@@ -26509,7 +26514,7 @@ impl Engine {
         }
         self.mark_partial(
             "live export hook",
-            "the process generation changed around a dynamic export attachment",
+            "the process generation could not be revalidated around a dynamic export attachment",
         );
     }
 
@@ -27959,7 +27964,7 @@ impl Engine {
                 self.mark_generation_change(
                     view_id,
                     "live loader arming",
-                    "the process generation changed before the loader-arm postcheck",
+                    "the process generation could not be revalidated before the loader-arm postcheck",
                 );
                 // `generation_valid` is false for an exit and a replacement
                 // alike; the retained pin tells them apart, as it does for

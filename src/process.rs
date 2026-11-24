@@ -568,11 +568,11 @@ fn run_while_same_with<T>(
     action: impl FnOnce() -> T,
 ) -> Result<T, String> {
     if !still_the_same() {
-        return Err("process generation changed before target access".into());
+        return Err("process generation could not be revalidated before target access".into());
     }
     let result = action();
     if !still_the_same() {
-        return Err("process generation changed during target access".into());
+        return Err("process generation could not be revalidated during target access".into());
     }
     Ok(result)
 }

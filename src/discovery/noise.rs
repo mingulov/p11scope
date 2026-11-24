@@ -25,7 +25,8 @@ pub enum DiscoveryNoiseClass {
     ObjectMissing,
     /// A scope member could not be retained or scanned (unproven loss).
     ProcessView,
-    /// An accepted generation changed during attach preparation.
+    /// An accepted generation that could not be revalidated during
+    /// attach preparation (stale, not proven changed).
     StaleView,
     /// Anything else discovery skipped.
     Other,
@@ -46,9 +47,11 @@ impl DiscoveryNoiseClass {
 }
 
 /// Classify one `(subject, reason)` skip into its noise class. Pure: no I/O,
-/// no allocation beyond the returned enum. Order matters: the maps-snapshot
-/// and stale-view checks precede the process-ended check because their reasons
-/// contain overlapping substrings (`generation changed`).
+/// no allocation beyond the returned enum. Order matters: the stale-view
+/// check precedes the process-view check because both match the
+/// proof-neutral `could not be revalidated` wording, and the
+/// maps-snapshot check precedes the process-ended check because their
+/// reasons contain overlapping substrings.
 pub fn classify_discovery_noise(subject: &str, reason: &str) -> DiscoveryNoiseClass {
     if reason.contains("mapping validation unavailable")
         || reason.contains("mapping changed during acquisition")
@@ -58,7 +61,7 @@ pub fn classify_discovery_noise(subject: &str, reason: &str) -> DiscoveryNoiseCl
         || reason.contains("maps snapshot was refused")
     {
         DiscoveryNoiseClass::MapsSnapshot
-    } else if reason.contains("accepted process generation changed") {
+    } else if reason.contains("could not be revalidated during attach preparation") {
         DiscoveryNoiseClass::StaleView
     } else if reason.contains("No such process")
         || reason.contains("os error 3")
@@ -66,6 +69,8 @@ pub fn classify_discovery_noise(subject: &str, reason: &str) -> DiscoveryNoiseCl
         || reason.contains("exited before mutation")
         || reason.contains("exited during the snapshot")
         || reason.contains("generation changed")
+        || reason.contains("original process exited")
+        || reason.contains("crossed a process generation change")
         || reason.contains("ESRCH")
     {
         DiscoveryNoiseClass::ProcessEnded
@@ -78,6 +83,7 @@ pub fn classify_discovery_noise(subject: &str, reason: &str) -> DiscoveryNoiseCl
         || reason.contains("could not be retained")
         || reason.contains("could not be scanned")
         || reason.contains("could not be pinned")
+        || reason.contains("could not be revalidated")
         || reason.contains("process-view capacity")
     {
         DiscoveryNoiseClass::ProcessView

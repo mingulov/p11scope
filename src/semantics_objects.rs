@@ -401,10 +401,15 @@ pub(crate) enum ObjectGap {
     /// proven), so the inner key join is withheld under this
     /// precise reason. H9 routes the terminal to the
     /// `same_thread_nested` unknown row; a nested pair whose inner
+    /// call is in the join class (sign/verify/digest/encrypt/decrypt
+    /// access/operation-import) or a neutral S1 operation and
     /// completes without effect alone does not obstruct otherwise
-    /// provable outer outputs, while an inner that fails with an
-    /// object/handle error, or otherwise changes object or session
-    /// state, obstructs them. Cross-thread or unprovable overlap
+    /// provable outer outputs, while any other inner kind
+    /// (creation, destruction, lookup, attribute write,
+    /// session/login lifecycle — including an ordinarily failed
+    /// close), an inner that fails with an object/handle error, or
+    /// one that otherwise changes object or session state, keeps
+    /// the conservative overlap. Cross-thread or unprovable overlap
     /// keeps `SameSessionOverlap`.
     SameThreadNested,
     OverlapUncertain,

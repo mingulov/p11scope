@@ -7229,7 +7229,7 @@ const FINAL_MAPS_UNAVAILABLE_REASON: &str =
 const INITIAL_MAPS_UNAVAILABLE_REASON: &str =
     "memory scan refused: initial mapping validation unavailable";
 const SCAN_GENERATION_CHANGED_REASON: &str =
-    "memory scan refused: process generation changed during acquisition";
+    "memory scan refused: process generation could not be revalidated during acquisition";
 
 /// All provider mappings establish inventory authority. They also cover every
 /// searched data snapshot (even empty ones), complete interface descriptors, and

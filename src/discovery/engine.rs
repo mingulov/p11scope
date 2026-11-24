@@ -19009,19 +19009,34 @@ impl Engine {
         // Carried views are exited: their modules ride for the
         // still-attached objects, but the views themselves must not
         // enter currency, stale or admission checks (the inventory
-        // and conservative-carry precedent). Without this, one
-        // exited member aborts every apply under churn — the
-        // owned-run all-or-nothing attach miss. Exec'd views read
+        // and conservative-carry precedent) — but only when the
+        // candidate carries not-yet-attached work. An abort that
+        // defers two hundred endpoints every tick under churn is the
+        // owned-run all-or-nothing attach miss; a candidate whose
+        // every module already holds plan slots defers nothing by
+        // aborting and keeps strict currency (loader arms pin this:
+        // a dead sibling still denies the tick). Exec'd views read
         // live and still trip the apply-time check, as do views
         // dying during this build.
-        let carried: BTreeSet<ProcessViewId> = modules
-            .iter()
-            .map(|module| module.scanned.view)
-            .filter(|view| {
-                *view != Self::RUN_LEARNED_VIEW_ID
-                    && process_view_provably_dead(&self.views, &[], *view)
-            })
-            .collect();
+        let has_unattached_modules = modules.iter().any(|module| {
+            !self
+                .plan
+                .slots
+                .iter()
+                .any(|slot| slot.object == module.object)
+        });
+        let carried: BTreeSet<ProcessViewId> = if has_unattached_modules {
+            modules
+                .iter()
+                .map(|module| module.scanned.view)
+                .filter(|view| {
+                    *view != Self::RUN_LEARNED_VIEW_ID
+                        && process_view_provably_dead(&self.views, &[], *view)
+                })
+                .collect()
+        } else {
+            BTreeSet::new()
+        };
         if crate::run::capture_diagnostics_on() && !carried.is_empty() {
             eprintln!(
                 "p11scope: candidate build carries {} exited views past currency checks",

@@ -14915,28 +14915,44 @@ fn a_dead_stale_view_beside_a_live_newcomer_target_stays_loud() {
 /// BEFORE the candidate built is carried, not currency-checked. Its
 /// module rides for its file facts, its id stays out of the candidate
 /// views, and the live newcomer's attach applies instead of aborting —
-/// one exited member cannot wedge every apply under churn.
+/// one exited member cannot wedge every apply under churn. Two
+/// readable-table fixtures (distinct files, no merge) with absorbed
+/// pins, so the build itself computes a nonempty delta like a
+/// production frame candidate.
 #[test]
 fn a_view_dead_before_build_rides_carried_and_the_live_apply_proceeds() {
-    let (_fixture, live_view, module, pins) = loaded_seed_provider();
+    let (_live_fixture, live_view, mut live_module, pins_a) =
+        loaded_seed_provider_with_seed_table(false, true);
+    let (mut _dead_fixture, dead_view_live, mut dead_module, pins_b) =
+        loaded_seed_provider_with_seed_table(false, true);
     let live_id = live_view.id();
-    let mut dead = std::process::Command::new("sleep")
-        .arg("30")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    let dead_view = ProcessView::open(ProcessViewId(4401), dead.id()).unwrap();
-    let dead_id = dead_view.id();
-    // Dead BEFORE the build (vs the guard above, which kills after).
-    dead.kill().unwrap();
-    dead.wait().unwrap();
-    let mut engine = Engine::empty();
-    engine.views.push(live_view);
-    engine.views.push(dead_view);
-    let mut dead_module = module.clone();
+    // Distinct view ids: the dead module rides the dead id.
+    let dead_id = ProcessViewId(4401);
     dead_module.view = dead_id;
+    for module in [&mut live_module, &mut dead_module] {
+        module.exports = vec![
+            "C_GetFunctionList".into(),
+            "C_GetInterfaceList".into(),
+            "C_GetInterface".into(),
+        ];
+    }
+    // Dead BEFORE the build (vs the guard above, which kills after):
+    // kill the second fixture's child, then open the dead id on it.
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.views.push(live_view);
+    drop(dead_view_live);
+    let dead_child_pid = _dead_fixture.child.id();
+    engine
+        .views
+        .push(ProcessView::open(dead_id, dead_child_pid).unwrap());
+    _dead_fixture.child.kill().unwrap();
+    _dead_fixture.child.wait().unwrap();
+    let mut pins = pins_a;
+    let skipped = pins.absorb(pins_b);
+    assert!(skipped.is_empty(), "{skipped:?}");
     let mut candidate = engine
-        .live_candidate(pins, vec![module.clone(), dead_module], Vec::new())
+        .live_candidate(pins, vec![live_module.clone(), dead_module], skipped)
         .expect("a seed candidate builds");
     assert!(
         !candidate.views.contains(&dead_id),
@@ -14955,10 +14971,11 @@ fn a_view_dead_before_build_rides_carried_and_the_live_apply_proceeds() {
             .any(|module| module.scanned.view == dead_id),
         "the dead view's module rides for its file facts"
     );
-    // Stage the live newcomer's attach target exactly like the guard.
+    // Stage the live newcomer's attach target exactly like the guard:
+    // the apply must attach real work, not just skip the abort.
     let object = candidate
         .pinned
-        .id_for_scanned(&module, module.key, &module.path)
+        .id_for_scanned(&live_module, live_module.key, &live_module.path)
         .unwrap();
     let owner = candidate
         .plan
@@ -14978,7 +14995,7 @@ fn a_view_dead_before_build_rides_carried_and_the_live_apply_proceeds() {
         .add_provisional_get_function_list(plan::ProvisionalGetFunctionList {
             module: owner,
             object,
-            object_path: module.path.clone(),
+            object_path: live_module.path.clone(),
             file_offset,
         })
         .unwrap()
@@ -14994,6 +15011,7 @@ fn a_view_dead_before_build_rides_carried_and_the_live_apply_proceeds() {
         "no stale abort for a carried view: {:?}",
         outcome.stale_views
     );
+    assert!(outcome.changed, "the live attach applied its staged target");
     assert!(
         engine.counters.object_skips.iter().all(|skip| {
             skip.reason

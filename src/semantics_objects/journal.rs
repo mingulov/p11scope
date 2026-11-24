@@ -24833,10 +24833,11 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn object_journal_replay_bounds_sample_in_one_pass() {
-        // The seal preflight samples the retained table in one
-        // linear pass: one sample call visits each open entry once,
-        // never once per counted category.
+    fn object_journal_replay_bounds_sample_visits_no_entries() {
+        // The seal preflight sizes from maintained populations, never
+        // from a table walk: one sample call over 16 retained entries
+        // visits none. A per-entry preflight would spend uncharged
+        // work outside the service allowance on every seal.
         let scene = keepup_scene_with_retained(16);
         scene.adapter.reset_test_replay_bound_counters_for_test();
         let bounds = super::seal_replay::ReplayBounds::sample(&scene.adapter, &scene.model)
@@ -24849,8 +24850,8 @@ pub(crate) mod tests {
         );
         assert_eq!(
             scene.adapter.test_replay_bound_visits_for_test(),
-            16,
-            "one pass visits each retained entry once"
+            0,
+            "populations bound the reservation with no table visit"
         );
     }
 

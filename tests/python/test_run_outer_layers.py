@@ -34,6 +34,7 @@ silently dropped) rather than count-compared.
 """
 
 import functools
+import glob
 import json
 import os
 import re
@@ -479,7 +480,7 @@ class Prereqs:
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except (subprocess.CalledProcessError, OSError):
             raise OuterError("passwordless sudo is required")
-        for tool in ("pkcs11-tool", "softhsm2-util", "openssl", "p11-kit"):
+        for tool in ("pkcs11-tool", "softhsm2-util", "openssl"):
             if shutil.which(tool) is None:
                 raise OuterError(f"tool missing: {tool}")
         self.spy = probe_first(SPY_CANDIDATES)
@@ -494,8 +495,20 @@ class Prereqs:
             raise OuterError("libsofthsm2.so not found")
         if self.opensc is None:
             raise OuterError("opensc-pkcs11.so not found")
-        listed = subprocess.run(["p11-kit", "list-modules"], capture_output=True, text=True)
-        if "libsofthsm2" not in listed.stdout:
+        # Default (system) p11-kit config must register SoftHSM: a live
+        # `p11-kit list-modules` cannot prove it, since SoftHSM shows no
+        # tokens without our per-test SOFTHSM2_CONF. A system .module file
+        # naming the probed SoftHSM file is the registration proof.
+        registered = False
+        for path in (glob.glob("/usr/share/p11-kit/modules/*.module")
+                     + glob.glob("/etc/pkcs11/modules/*.module")):
+            try:
+                text = Path(path).read_text()
+            except OSError:
+                continue
+            if self.softhsm in text and "enabled: no" not in text:
+                registered = True
+        if not registered:
             raise OuterError("default p11-kit config does not route SoftHSM")
 
 

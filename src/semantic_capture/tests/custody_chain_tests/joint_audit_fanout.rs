@@ -33523,7 +33523,7 @@ fn joint_drain_proof_slice_yields_and_resumes_through_bounded_seal() {
     assert_eq!(
         ports.read().1.adapter().test_drain_proof_visits_for_test(),
         1,
-        "one slice classifies one entry, no more"
+        "one slice derives one member, no more"
     );
     let mut remaining = 64;
     assert_eq!(
@@ -33544,7 +33544,7 @@ fn joint_drain_proof_slice_yields_and_resumes_through_bounded_seal() {
     assert_eq!(
         ports.read().1.adapter().test_drain_proof_visits_for_test(),
         2,
-        "resumption classifies only the remainder, never discards"
+        "resumption derives only the remainder, never discards"
     );
     assert!(
         !seal.effects.effects.iter().any(|effect| matches!(

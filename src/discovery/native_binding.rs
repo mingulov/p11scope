@@ -776,6 +776,11 @@ struct DomainState {
     /// attempted in queue order without ever scanning the pending
     /// rows. A row sits here exactly when its `resight_due` holds.
     owed: VecDeque<u64>,
+    /// A covered exit decision held past the holder pool this staging:
+    /// the front row waits for its budgeted retry. Reset on every
+    /// absorption and set on `Hold`; the receipt reports it beside
+    /// the owed queue so the stop machine reads on for the retry.
+    decision_owed: bool,
     /// Absolute positions consumed from the front by decisions: row
     /// `pending[i]` sits at `popped + i`. Front-only pops keep every
     /// queued position stable without re-indexing.
@@ -821,6 +826,7 @@ impl DomainState {
             exec_ns: HashMap::new(),
             pending: VecDeque::new(),
             owed: VecDeque::new(),
+            decision_owed: false,
             popped: 0,
             next_pos: 0,
             batch_seq: 0,
@@ -1607,6 +1613,7 @@ impl NativeBinder {
         exit_validator: Option<&dyn ExitWitnessValidator>,
     ) {
         let index = self.domain_index(batch.domain);
+        self.domains[index].decision_owed = false;
         let limit = self.limits.exec_tgids;
         let state = &mut self.domains[index];
         for record in &batch.records {
@@ -1672,6 +1679,7 @@ impl NativeBinder {
     ) -> ResightOutcome {
         let index = self.domain_index(batch.domain);
         self.domains[index].batch_seq += 1;
+        self.domains[index].decision_owed = false;
         let limits = self.limits;
         let state = &mut self.domains[index];
         let metadata_health = batch.phase == crate::attach::capture::CapturePhase::Active
@@ -2271,10 +2279,38 @@ impl NativeBinder {
             .is_some_and(|index| !self.domains[*index].owed.is_empty())
     }
 
+    /// Whether `domain` still owes a covered exit decision: a front
+    /// row's validation deferred past the holder pool this staging and
+    /// holds for its budgeted retry. The stop machine reads on while
+    /// this holds instead of finishing at the first exact refresh.
+    pub(crate) fn decision_owed(&self, domain: NativeDomainId) -> bool {
+        self.domain_indices
+            .get(&domain)
+            .is_some_and(|index| self.domains[*index].decision_owed)
+    }
+
+    /// The front row's tgid when it is a covered exit snapshot waiting
+    /// for its decide-time revalidation: the coordinator reserves its
+    /// scan before the staging's other phases spend the pool, so the
+    /// held front progresses even while they stay busy.
+    pub(crate) fn covered_exit_retry_pid(&self, domain: NativeDomainId) -> Option<u32> {
+        let state = self
+            .domain_indices
+            .get(&domain)
+            .map(|index| &self.domains[*index])?;
+        let front = state.pending.front()?;
+        (front.retained_is_exit
+            && front.retained.is_some()
+            && state.horizons_cover(front)
+            && !state.awaits_revalidation(front))
+        .then_some(front.row.host_tgid)
+    }
+
     pub(crate) fn finish(&mut self, domain: NativeDomainId) {
         let index = self.domain_index(domain);
         self.domains[index].finished = true;
         self.domains[index].owed.clear();
+        self.domains[index].decision_owed = false;
         while let Some(pending) = self.domains[index].pending.pop_front() {
             self.domains[index].popped += 1;
             self.census.pending -= 1;
@@ -2380,10 +2416,13 @@ impl NativeBinder {
                 DecideOutcome::Hold => {
                     // The front row's exit validation deferred past the
                     // holder pool: the row keeps the front for the next
-                    // staging, and no later row decides past it.
+                    // staging, and no later row decides past it. The
+                    // owed decision is reported beside the owed queue
+                    // so the stop machine retries it before finishing.
                     let state = &mut self.domains[index];
                     state.popped -= 1;
                     state.pending.push_front(pending);
+                    state.decision_owed = true;
                     self.census.pending += 1;
                     return;
                 }

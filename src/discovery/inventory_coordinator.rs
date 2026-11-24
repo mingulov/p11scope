@@ -1606,6 +1606,7 @@ struct HolderScanBudget {
     spent: Cell<u64>,
     deferrals: Cell<u64>,
     queued_holds: Cell<u64>,
+    reserved: Cell<u64>,
 }
 
 impl HolderScanBudget {
@@ -1614,6 +1615,7 @@ impl HolderScanBudget {
             spent: Cell::new(0),
             deferrals: Cell::new(0),
             queued_holds: Cell::new(0),
+            reserved: Cell::new(0),
         }
     }
 
@@ -1625,14 +1627,36 @@ impl HolderScanBudget {
         self.spent.set(0);
         self.deferrals.set(0);
         self.queued_holds.set(0);
+        self.reserved.set(0);
+    }
+
+    /// Reserve `units` of this staging's pool for the held front's
+    /// decide-time revalidation: ordinary scans stop before the
+    /// reservation, while the front's own charge spends past it (up
+    /// to the limit), so a held front progresses even while the
+    /// staging's other phases stay busy.
+    fn set_reservation(&self, units: usize) {
+        self.reserved.set(units as u64);
     }
 
     /// Charge `units` holder inspections, or defer: false past the
-    /// pool (counting one deferral for the named exhaustion gap).
+    /// pool minus the held front's reservation (counting one deferral
+    /// for the named exhaustion gap).
     fn try_charge(&self, units: usize) -> bool {
+        self.charge_against(units, Self::limit().saturating_sub(self.reserved.get()))
+    }
+
+    /// The held front's own validator charge: spends past the
+    /// reservation (capped at the limit), since the reservation was
+    /// set aside for exactly this scan.
+    fn try_charge_front(&self, units: usize) -> bool {
+        self.charge_against(units, Self::limit())
+    }
+
+    fn charge_against(&self, units: usize, cap: u64) -> bool {
         let units = units as u64;
         let next = self.spent.get().saturating_add(units);
-        if next > Self::limit() {
+        if next > cap {
             self.note_deferral();
             return false;
         }
@@ -1954,7 +1978,9 @@ impl<Source: ProcessSource> ExitWitnessValidator for RetainedGate<'_, Source> {
         // the batch health gate (the row carries the health of the
         // read that produced it). A shrunk exit or a later
         // overlapping holder refuses here; a scan past the pool
-        // holds the row instead of deciding on a partial scan.
+        // holds the row instead of deciding on a partial scan. The
+        // charge spends past the held front's reservation, which the
+        // staging set aside for exactly this scan.
         match self.hooks.hook_state(pid) {
             ExitHookState::Blinded => return HolderScan::Absent,
             ExitHookState::Deferred => {
@@ -1963,7 +1989,7 @@ impl<Source: ProcessSource> ExitWitnessValidator for RetainedGate<'_, Source> {
             }
             ExitHookState::Ready => {}
         }
-        if !self.pool.try_charge(self.adapter.proven_count(pid)) {
+        if !self.pool.try_charge_front(self.adapter.proven_count(pid)) {
             return HolderScan::Deferred;
         }
         let mut containing = self
@@ -10681,6 +10707,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 // instant). Absorption stages no registry mutation, so
                 // staging order is unchanged.
                 self.holder_pool.reset();
+                self.reserve_held_front(batch.domain);
+                // Terminal refreshes are witness-only: drain the queued
+                // hooks here once stopped, or no lifecycle staging
+                // remains to stamp them. Active capture drains on its
+                // lifecycle batches instead, leaving witness stagings
+                // to their rows.
+                if self.stopped {
+                    self.drain_deferred_hooks();
+                }
                 let gate = RetainedGate {
                     adapter: &self.adapter,
                     allowed: self.retained_fallback_allowed(&batch),
@@ -10727,8 +10762,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 // (Absorption reads only EXEC records, horizons and
                 // failures, so the order is otherwise unobservable.)
                 // Stamping and the absorption below share one fresh
-                // holder pool, the deferred hooks draining first.
+                // holder pool, the deferred hooks draining first. The
+                // held front's scan is reserved before the drain so it
+                // progresses even while the drain stays busy.
                 self.holder_pool.reset();
+                self.reserve_held_front(batch.domain);
                 self.note_leader_exits(&batch);
                 let gate = RetainedGate {
                     adapter: &self.adapter,
@@ -10781,9 +10819,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         receipt.events.extend(hook_events);
         if let Some(domain) = resight_domain {
             receipt.resight_owed = self.binder.resight_owed(domain);
-            // Seamed: the binder reports held exit decisions once the
-            // continuation lands; until then no decision is ever owed.
-            receipt.decision_owed = false;
+            receipt.decision_owed = self.binder.decision_owed(domain);
         }
         self.reconcile_count_eligibility(identity, &mut RecoveryWorkBudget::new());
         if let Some((domain, finished, began_ns, gap_free)) = tombstone_cleanup {
@@ -10982,18 +11018,24 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// select a caller — the kernel tgid is looked up as an
     /// observer-/proc pid — so every exit is dropped silently: no gap, no
     /// fence.
-    fn note_leader_exits(&mut self, batch: &DiscoveryBatch) {
+    /// Deferred hooks stamp first on the fresh pool, in arrival
+    /// order; the first hook past the pool stops the drain with the
+    /// queue intact for the next staging. Every visit charges: one
+    /// unit for the queue/index work plus the scan, so blind drops
+    /// and zero-holder scans (whose holders folded) still pay for
+    /// their visits. Hooks for a pid blinded after they queued are
+    /// dropped past a charged visit: their stamps could never
+    /// complete a resolution. Both lifecycle and witness stagings
+    /// drain (witness-only terminal refreshes would otherwise strand
+    /// queued hooks with no lifecycle staging left to stamp them;
+    /// witness stagings drain only once stopped (see the witness arm).
+    fn drain_deferred_hooks(&mut self) {
+        // Kernel tgids cannot select observer pids under a mismatched
+        // numbering: nothing stamps and the queue stays intact, like
+        // the fresh-record path's silent drop.
         if !crate::pidns::numbering().agrees() {
             return;
         }
-        // Deferred hooks stamp first on the fresh pool, in arrival
-        // order; the first hook past the pool stops the drain with
-        // the queue intact for the next lifecycle staging. Every
-        // visit charges: one unit for the queue/index work plus the
-        // scan, so blind drops and zero-holder scans (whose holders
-        // folded) still pay for their visits. Hooks for a pid blinded
-        // after they queued are dropped past a charged visit: their
-        // stamps could never complete a resolution.
         while let Some((pid, hook)) = self.deferred_hooks.peek_for_drain() {
             if self.deferred_hooks.hook_state(pid) == ExitHookState::Blinded {
                 if !self.holder_pool.try_charge(1) {
@@ -11011,6 +11053,25 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             self.deferred_hooks.pop_drained();
             self.stamp_leader_exit_hook(pid, hook);
         }
+    }
+
+    /// Reserve the held front's validator scan before this staging's
+    /// other phases spend the pool. Zero when no covered exit row
+    /// waits at the front (the common case: no reservation).
+    fn reserve_held_front(&self, domain: NativeDomainId) {
+        let units = self
+            .binder
+            .covered_exit_retry_pid(domain)
+            .map(|pid| self.adapter.proven_count(pid))
+            .unwrap_or(0);
+        self.holder_pool.set_reservation(units);
+    }
+
+    fn note_leader_exits(&mut self, batch: &DiscoveryBatch) {
+        if !crate::pidns::numbering().agrees() {
+            return;
+        }
+        self.drain_deferred_hooks();
         // All records drained after stop share one finite allowance.
         // Unproved final records are disposed, never queued for retry.
         let mut final_work = crate::process::leader_exit::LeaderExitReadBudget::for_commit();
@@ -45911,8 +45972,9 @@ int main(void) {
         // A sighted row whose exit retry re-defers on queued hooks
         // holds while covered: the decision waits for the retry
         // instead of settling on the Exited sighting, and binds its
-        // true holder once the hooks drain. The storm queues 71 hooks
-        // so 12 still gate the pid past the covering drain.
+        // true holder once the hooks drain. The storm queues 182 hooks
+        // so 5 still gate the pid when the covering read's own drain
+        // stops (stopped witness stagings drain too).
         agreeing(|| {
             let (mut native, holders) = hot_pid_system_native(1100);
             stamp_hot_exits(&mut native, 7, 60);
@@ -45925,7 +45987,10 @@ int main(void) {
             );
             assert!(native.scene.coordinator.adapter.live_id(7).is_some());
             native.query_answer(7, 1600, CookieQuery::Exited);
-            let storm: Vec<u64> = (0..130).map(|i| 200_000 + i).collect();
+            // Two production-sized storm batches queue 182 hooks: the
+            // first queues 141 past the pool, the second drains 59 and
+            // queues 100 more past the spent pool.
+            let storm: Vec<u64> = (0..200).map(|i| 200_000 + i).collect();
             let at = native.stamps.tick();
             native.stage(NativeBatch::Lifecycle(leader_exit_drain_many(
                 native.domain,
@@ -45935,9 +46000,24 @@ int main(void) {
             )));
             assert_eq!(
                 native.scene.coordinator.deferred_hooks.queue_len_for_test(),
-                71,
-                "the storm queues 71 hooks past the pool"
+                141,
+                "the first storm batch queues 141 hooks past the pool"
             );
+            let storm2: Vec<u64> = (0..100).map(|i| 300_000 + i).collect();
+            let at = native.stamps.tick();
+            native.stage(NativeBatch::Lifecycle(leader_exit_drain_many(
+                native.domain,
+                at,
+                7,
+                &storm2,
+            )));
+            assert_eq!(
+                native.scene.coordinator.deferred_hooks.queue_len_for_test(),
+                182,
+                "the second storm batch leaves 182 hooks queued"
+            );
+            // Terminal refresh: witness stagings drain from here on.
+            native.scene.coordinator.stopped = true;
             let row = hot_rows(&native, 59, 1).pop().unwrap();
             native.read(vec![row]);
             assert_eq!(
@@ -45945,13 +46025,13 @@ int main(void) {
                 1,
                 "the gated row waits for its exit retry"
             );
-            // The covering drain stamps 59 hooks and stops with 12
+            // The covering drain stamps 59 hooks and stops with 64
             // still queued; the row stays undecided without horizons.
             native.drain();
             assert_eq!(
                 native.scene.coordinator.deferred_hooks.queue_len_for_test(),
-                12,
-                "the drain stops intact with 12 hooks still queued"
+                64,
+                "the drain stops intact with 64 hooks still queued"
             );
             // Horizons cover the row but its retry re-defers on the
             // queued hooks: it holds, never settling on its sighting.
@@ -46539,10 +46619,11 @@ int main(void) {
 
     #[test]
     fn a_system_scope_witness_staging_drains_queued_exit_hooks() {
-        // Queued exit hooks drain on witness stagings too, not only on
-        // lifecycle drains: after a storm queues 11 hooks, a
-        // witness-only staging stamps them and the row resolves
-        // against the drained stamps with no owed attempt left.
+        // Once stopped, queued exit hooks drain on witness stagings
+        // too, not only on lifecycle drains: after a storm queues 11
+        // hooks, a witness-only terminal refresh stamps them and the
+        // row resolves against the drained stamps with no owed attempt
+        // left.
         agreeing(|| {
             let (mut native, _) = hot_pid_system_native(1100);
             let hooks: Vec<u64> = (0..70).map(|i| 1_050 + i * 100).collect();
@@ -46558,6 +46639,8 @@ int main(void) {
                 59,
                 "the storm stamps exactly the hooks inside the pool"
             );
+            // Terminal refresh: witness-only from here on.
+            native.scene.coordinator.stopped = true;
             let row = hot_rows(&native, 65, 1).pop().unwrap();
             native.read(vec![row]);
             assert_eq!(

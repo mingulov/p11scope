@@ -3239,6 +3239,16 @@ fn keysize_canary_ledger_parser_rejects_a_short_run() {
     );
 }
 
+#[test]
+fn keysize_canary_ledger_parser_rejects_attempt_count_mismatch() {
+    let transcript = "LEDGER {\"schema\":\"p11scope/public-cli-ledger/v2\",\"pid\":1,\"complete\":true,\"functions\":[{\"name\":\"C_Sign\",\"attempts\":2},{\"name\":\"C_Verify\",\"attempts\":3}],\"key_operations\":{\"label\":\"k\",\"signs\":3,\"verifies\":3}}\n";
+    let error = keysize_canary_ledger_counts(transcript).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("C_Sign attempts 2 disagree with 3"),
+        "unexpected error: {error:#}"
+    );
+}
+
 /// Judge `object_observations` for the canary run: exact sign accounting
 /// with RSA-2048 from `sign_output` (the S-protocol length published),
 /// plus at least one verify row with RSA-2048 from `verify_input` (the
@@ -3249,29 +3259,10 @@ fn judge_keysize_canary_observations(
     ledger_signs: u64,
     ledger_verifies: u64,
 ) -> Result<String> {
-    let (sign_rows, rows_done, unknown_done) =
-        key_sizes_sign_totals(observations, ledger_signs, "KEYCANARY")?;
-    for row in &sign_rows {
-        let completed = row
-            .get("completed")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0);
-        if completed == 0 {
-            continue;
-        }
-        let size = row.get("inferred_size").context("sign row inferred_size")?;
-        ensure!(
-            size.get("status").and_then(serde_json::Value::as_str) == Some("inferred"),
-            "KEYCANARY: sign row size is not inferred: {size}"
-        );
-        let detail = size.get("detail").context("sign size detail")?;
-        ensure!(
-            detail.get("size_class").and_then(serde_json::Value::as_u64) == Some(2048)
-                && detail.get("evidence").and_then(serde_json::Value::as_str)
-                    == Some("sign_output"),
-            "KEYCANARY: sign row is not RSA-2048 from sign_output: {detail}"
-        );
-    }
+    // Signs reuse the shared sizes judge verbatim (exact accounting plus
+    // RSA-2048 from `sign_output`, with its own reject suite), so the
+    // S-protocol half of this verdict adds no unpinned clauses.
+    let sign_verdict = judge_key_sizes_observations(observations, ledger_signs)?;
     let rows = observations
         .get("key_operations")
         .and_then(serde_json::Value::as_array)
@@ -3317,9 +3308,7 @@ fn judge_keysize_canary_observations(
         verify_done == ledger_verifies,
         "KEYCANARY: verify rows {verify_done} != ledger {ledger_verifies}"
     );
-    Ok(format!(
-        "rows={rows_done} unknown={unknown_done} verifies={verify_done} size=rsa2048"
-    ))
+    Ok(format!("{sign_verdict} verifies={verify_done}"))
 }
 
 #[test]
@@ -3354,7 +3343,7 @@ fn keysize_canary_judge_accepts_sign_and_verify_rows() {
     });
     assert_eq!(
         judge_keysize_canary_observations(&observations, 3, 3).unwrap(),
-        "rows=3 unknown=0 verifies=3 size=rsa2048"
+        "rows=3 unknown=0 total=3 size=rsa2048 verifies=3"
     );
 }
 
@@ -3380,6 +3369,97 @@ fn keysize_canary_judge_rejects_a_missing_verify_row() {
     let error = judge_keysize_canary_observations(&observations, 3, 3).unwrap_err();
     assert!(
         format!("{error:#}").contains("no verify landed"),
+        "unexpected error: {error:#}"
+    );
+}
+
+fn keysize_canary_verify_case(size: serde_json::Value, completed: u64) -> serde_json::Value {
+    serde_json::json!({
+        "status": "populated",
+        "key_operations": [
+            {
+                "category": "sign",
+                "completed": 3,
+                "object": 3,
+                "inferred_family": {"status": "inferred", "value": "rsa", "completions": 3},
+                "inferred_size": {
+                    "status": "inferred",
+                    "detail": {"kind": "rsa", "size_class": 2048, "modulus_bytes": 256, "evidence": "sign_output"},
+                    "completions": 3,
+                },
+            },
+            {
+                "category": "verify",
+                "completed": completed,
+                "object": 4,
+                "inferred_family": {"status": "inferred", "value": "rsa", "completions": completed},
+                "inferred_size": size,
+            },
+        ],
+        "unknown_key_operations": [],
+    })
+}
+
+#[test]
+fn keysize_canary_judge_rejects_an_unsized_verify_row() {
+    let observations = keysize_canary_verify_case(
+        serde_json::json!({"status": "unknown", "detail": null, "completions": 0}),
+        3,
+    );
+    let error = judge_keysize_canary_observations(&observations, 3, 3).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("verify row size is not inferred"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn keysize_canary_judge_rejects_a_wrong_verify_size_class() {
+    let observations = keysize_canary_verify_case(
+        serde_json::json!({
+            "status": "inferred",
+            "detail": {"kind": "rsa", "size_class": 3072, "modulus_bytes": 384, "evidence": "verify_input"},
+            "completions": 3,
+        }),
+        3,
+    );
+    let error = judge_keysize_canary_observations(&observations, 3, 3).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("not RSA-2048 from verify_input"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn keysize_canary_judge_rejects_a_wrong_verify_evidence() {
+    let observations = keysize_canary_verify_case(
+        serde_json::json!({
+            "status": "inferred",
+            "detail": {"kind": "rsa", "size_class": 2048, "modulus_bytes": 256, "evidence": "sign_output"},
+            "completions": 3,
+        }),
+        3,
+    );
+    let error = judge_keysize_canary_observations(&observations, 3, 3).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("not RSA-2048 from verify_input"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn keysize_canary_judge_rejects_short_verify_accounting() {
+    let observations = keysize_canary_verify_case(
+        serde_json::json!({
+            "status": "inferred",
+            "detail": {"kind": "rsa", "size_class": 2048, "modulus_bytes": 256, "evidence": "verify_input"},
+            "completions": 2,
+        }),
+        2,
+    );
+    let error = judge_keysize_canary_observations(&observations, 3, 3).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("verify rows 2 != ledger 3"),
         "unexpected error: {error:#}"
     );
 }

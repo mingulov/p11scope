@@ -1529,6 +1529,14 @@ mod holder_scan_state_tests {
         );
         assert!(!pool.try_charge(1), "the spent pool refuses past the limit");
         assert_eq!(pool.deferrals(), 1, "only the over-limit refusal exhausts");
+        // The payload keeps the largest attempted total: a further
+        // over-limit refusal records its own total past the first.
+        assert!(!pool.try_charge(1_100));
+        assert_eq!(
+            pool.over_limit_attempted(),
+            66_636,
+            "the payload keeps the largest attempted total"
+        );
     }
 
     #[test]

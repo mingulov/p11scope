@@ -294,6 +294,116 @@ fn build_workload(dir: &Path) -> PathBuf {
     out
 }
 
+/// Minimal steady provider stub for the fixture-stability twins: one
+/// slot, one mechanism, every fill matching its count.
+const STABLE_STUB_C: &str = r#"
+#include <stddef.h>
+typedef unsigned long ck_ulong_t;
+typedef ck_ulong_t ck_rv_t;
+typedef ck_ulong_t ck_slot_id_t;
+typedef ck_ulong_t ck_mechanism_type_t;
+ck_rv_t C_Initialize(void *p) { (void)p; return 0; }
+ck_rv_t C_Finalize(void *p) { (void)p; return 0; }
+ck_rv_t C_GetInfo(unsigned char *info) { (void)info; return 0; }
+ck_rv_t C_GetSlotList(unsigned char token, ck_slot_id_t *slots, ck_ulong_t *count) {
+    (void)token;
+    if (slots == NULL) { *count = 1; return 0; }
+    if (*count > 0) { slots[0] = 1; *count = 1; }
+    return 0;
+}
+ck_rv_t C_GetSlotInfo(ck_slot_id_t slot, unsigned char *info) { (void)slot; (void)info; return 0; }
+ck_rv_t C_GetTokenInfo(ck_slot_id_t slot, unsigned char *info) { (void)slot; (void)info; return 0; }
+ck_rv_t C_GetMechanismList(ck_slot_id_t slot, ck_mechanism_type_t *mechs, ck_ulong_t *count) {
+    (void)slot;
+    if (mechs == NULL) { *count = 1; return 0; }
+    if (*count > 0) { mechs[0] = 0; *count = 1; }
+    return 0;
+}
+ck_rv_t C_GetMechanismInfo(ck_slot_id_t slot, ck_mechanism_type_t mech, unsigned char *info) {
+    (void)slot; (void)mech; (void)info; return 0;
+}
+"#;
+
+/// Mechanism-drift stub: the count query reports one mechanism but the
+/// fill returns zero, so a second mechanism-list attempt yields no
+/// mechanism info.
+const DRIFT_MECH_STUB_C: &str = r#"
+#include <stddef.h>
+typedef unsigned long ck_ulong_t;
+typedef ck_ulong_t ck_rv_t;
+typedef ck_ulong_t ck_slot_id_t;
+typedef ck_ulong_t ck_mechanism_type_t;
+ck_rv_t C_Initialize(void *p) { (void)p; return 0; }
+ck_rv_t C_Finalize(void *p) { (void)p; return 0; }
+ck_rv_t C_GetInfo(unsigned char *info) { (void)info; return 0; }
+ck_rv_t C_GetSlotList(unsigned char token, ck_slot_id_t *slots, ck_ulong_t *count) {
+    (void)token;
+    if (slots == NULL) { *count = 1; return 0; }
+    if (*count > 0) { slots[0] = 1; *count = 1; }
+    return 0;
+}
+ck_rv_t C_GetSlotInfo(ck_slot_id_t slot, unsigned char *info) { (void)slot; (void)info; return 0; }
+ck_rv_t C_GetTokenInfo(ck_slot_id_t slot, unsigned char *info) { (void)slot; (void)info; return 0; }
+ck_rv_t C_GetMechanismList(ck_slot_id_t slot, ck_mechanism_type_t *mechs, ck_ulong_t *count) {
+    (void)slot;
+    if (mechs == NULL) { *count = 1; return 0; }
+    *count = 0;
+    return 0;
+}
+ck_rv_t C_GetMechanismInfo(ck_slot_id_t slot, ck_mechanism_type_t mech, unsigned char *info) {
+    (void)slot; (void)mech; (void)info; return 0;
+}
+"#;
+
+/// Slot-drift stub: the count query reports one slot but the fill
+/// returns zero, so a second slot-list attempt yields no listed slot.
+const DRIFT_SLOT_STUB_C: &str = r#"
+#include <stddef.h>
+typedef unsigned long ck_ulong_t;
+typedef ck_ulong_t ck_rv_t;
+typedef ck_ulong_t ck_slot_id_t;
+typedef ck_ulong_t ck_mechanism_type_t;
+ck_rv_t C_Initialize(void *p) { (void)p; return 0; }
+ck_rv_t C_Finalize(void *p) { (void)p; return 0; }
+ck_rv_t C_GetInfo(unsigned char *info) { (void)info; return 0; }
+ck_rv_t C_GetSlotList(unsigned char token, ck_slot_id_t *slots, ck_ulong_t *count) {
+    (void)token;
+    if (slots == NULL) { *count = 1; return 0; }
+    *count = 0;
+    return 0;
+}
+ck_rv_t C_GetSlotInfo(ck_slot_id_t slot, unsigned char *info) { (void)slot; (void)info; return 0; }
+ck_rv_t C_GetTokenInfo(ck_slot_id_t slot, unsigned char *info) { (void)slot; (void)info; return 0; }
+ck_rv_t C_GetMechanismList(ck_slot_id_t slot, ck_mechanism_type_t *mechs, ck_ulong_t *count) {
+    (void)slot;
+    if (mechs == NULL) { *count = 1; return 0; }
+    if (*count > 0) { mechs[0] = 0; *count = 1; }
+    return 0;
+}
+ck_rv_t C_GetMechanismInfo(ck_slot_id_t slot, ck_mechanism_type_t mech, unsigned char *info) {
+    (void)slot; (void)mech; (void)info; return 0;
+}
+"#;
+
+/// Compiles a stub provider with the system compiler.
+fn build_stub(dir: &Path, name: &str, source: &str) -> PathBuf {
+    let src = dir.join(format!("{name}.c"));
+    std::fs::write(&src, source).expect("write stub source");
+    let out = dir.join(format!("{name}.so"));
+    let compile = Command::new("gcc")
+        .args(["-O2", "-shared", "-fPIC", "-o"])
+        .arg(&out)
+        .arg(&src)
+        .output()
+        .expect("execute gcc for the stub");
+    assert!(
+        compile.status.success(),
+        "stub compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    out
+}
+
 /// A child with a poll-bounded line reader on one piped stream and
 /// kill-on-drop (never hangs, only fails loudly).
 struct GuardedChild {
@@ -475,6 +585,23 @@ fn spawn_workload(
     (guarded, pid)
 }
 
+/// Runs the workload against a stub provider with GO pre-created and
+/// returns its exit status plus the ledger path (for the steady
+/// control to validate; drift refusals emit no ledger).
+fn run_workload_against_stub(
+    workload: &Path,
+    stub: &Path,
+    dir: &Path,
+) -> (std::process::ExitStatus, PathBuf) {
+    let go = dir.join("stub-go");
+    let ledger = dir.join("stub-ledger.txt");
+    let conf = dir.join("stub.conf");
+    std::fs::write(&conf, "").expect("dummy stub conf");
+    let (mut child, _pid) = spawn_workload(workload, stub, &go, &ledger, &conf, false, true);
+    let status = child.wait_expect("stub workload exit");
+    (status, ledger)
+}
+
 /// Spawns a capture with stderr piped; returns the guarded child.
 fn spawn_capture(args: &[String]) -> GuardedChild {
     let mut child = Command::new(bin())
@@ -598,6 +725,57 @@ fn workload_exit_gate_fails_a_nonzero_exit() {
     assert!(
         failed.is_err(),
         "a nonzero workload exit must fail the gate"
+    );
+}
+
+/// A ledger line repeating a counter name never yields counts: the
+/// producer refuses duplicate keys before map insertion instead of
+/// letting last-wins collapse a conflict into healthy counts.
+#[test]
+fn ledger_file_reader_rejects_a_duplicate_counter() {
+    let dir = tempfile::tempdir().expect("cell dir");
+    let ledger = dir.path().join("ledger.txt");
+    let iters = u64::from(ITERS);
+    std::fs::write(
+        &ledger,
+        format!(
+            "LEDGER C_Initialize=0 C_Initialize=1 C_Finalize=1 C_GetInfo={iters} C_GetSlotList={} \
+             C_GetSlotInfo={iters} C_GetTokenInfo={iters} C_GetMechanismList={} \
+             C_GetMechanismInfo={iters}\n",
+            2 * iters,
+            2 * iters,
+        ),
+    )
+    .expect("write duplicate-key ledger");
+    let rejected =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read_ledger_file(&ledger)));
+    assert!(
+        rejected.is_err(),
+        "a conflicting repeated counter must not yield counts"
+    );
+}
+
+/// A ledger file holding two records never yields counts: the
+/// producer requires exactly one complete record instead of taking
+/// the first matching line.
+#[test]
+fn ledger_file_reader_rejects_a_duplicate_record() {
+    let dir = tempfile::tempdir().expect("cell dir");
+    let ledger = dir.path().join("ledger.txt");
+    let iters = u64::from(ITERS);
+    let line = format!(
+        "LEDGER C_Initialize=1 C_Finalize=1 C_GetInfo={iters} C_GetSlotList={} \
+         C_GetSlotInfo={iters} C_GetTokenInfo={iters} C_GetMechanismList={} \
+         C_GetMechanismInfo={iters}\n",
+        2 * iters,
+        2 * iters,
+    );
+    std::fs::write(&ledger, format!("{line}{line}")).expect("write duplicate-record ledger");
+    let rejected =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read_ledger_file(&ledger)));
+    assert!(
+        rejected.is_err(),
+        "a repeated ledger record must not yield counts"
     );
 }
 
@@ -2251,6 +2429,107 @@ fn workload_ledger_validator_requires_hot_finalize() {
     let mut cold = good.clone();
     cold.insert("C_Finalize".to_string(), 0);
     assert!(!validate_workload_ledger(&cold));
+}
+
+/// A shrinking list never validates: five listed slots with ten
+/// mechanism-list attempts and zero mechanism-info calls means every
+/// fill returned empty after a non-empty count, and ten slot-list
+/// attempts with zero listed slots means every fill returned empty
+/// after a non-empty count. The fixture refuses both shapes with
+/// exit 3 (see the drift-stub twins), so a successful run never
+/// emits them; the validator still refuses them if they appear.
+#[test]
+fn workload_ledger_validator_rejects_a_shrinking_list() {
+    fn ledger(pairs: &[(&str, u64)]) -> BTreeMap<String, u64> {
+        pairs
+            .iter()
+            .map(|(name, count)| ((*name).to_string(), *count))
+            .collect()
+    }
+    let mech_drifted = ledger(&[
+        ("C_Initialize", 1),
+        ("C_Finalize", 1),
+        ("C_GetInfo", u64::from(ITERS)),
+        ("C_GetSlotList", 2 * u64::from(ITERS)),
+        ("C_GetSlotInfo", u64::from(ITERS)),
+        ("C_GetTokenInfo", u64::from(ITERS)),
+        ("C_GetMechanismList", 2 * u64::from(ITERS)),
+        ("C_GetMechanismInfo", 0),
+    ]);
+    assert!(
+        !validate_workload_ledger(&mech_drifted),
+        "a mechanism list that shrinks to zero never validates"
+    );
+    let slot_drifted = ledger(&[
+        ("C_Initialize", 1),
+        ("C_Finalize", 1),
+        ("C_GetInfo", u64::from(ITERS)),
+        ("C_GetSlotList", 2 * u64::from(ITERS)),
+        ("C_GetSlotInfo", 0),
+        ("C_GetTokenInfo", 0),
+        ("C_GetMechanismList", 0),
+        ("C_GetMechanismInfo", 0),
+    ]);
+    assert!(
+        !validate_workload_ledger(&slot_drifted),
+        "a slot list that shrinks to zero never validates"
+    );
+}
+
+/// Steady control: the fixture exits clean against a stable stub and
+/// its ledger validates through the shared producer.
+#[test]
+fn workload_fixture_accepts_a_stable_stub_ledger() {
+    let dir = tempfile::tempdir().expect("cell dir");
+    let workload = build_workload(dir.path());
+    let stub = build_stub(dir.path(), "stable-stub", STABLE_STUB_C);
+    let (status, ledger) = run_workload_against_stub(&workload, &stub, dir.path());
+    assert!(status.success(), "a stable stub must exit clean: {status}");
+    let counts = read_ledger_file(&ledger);
+    assert!(
+        validate_workload_ledger(&counts),
+        "the stable stub ledger validates: {counts:?}"
+    );
+}
+
+/// A mechanism list that reports one mechanism and fills zero fails
+/// the fixture with exit 3 instead of emitting a ledger the
+/// validator must refuse.
+#[test]
+fn workload_fixture_rejects_a_shrinking_mechanism_list() {
+    let dir = tempfile::tempdir().expect("cell dir");
+    let workload = build_workload(dir.path());
+    let stub = build_stub(dir.path(), "drift-mech-stub", DRIFT_MECH_STUB_C);
+    let (status, ledger) = run_workload_against_stub(&workload, &stub, dir.path());
+    assert_eq!(
+        status.code(),
+        Some(3),
+        "a shrinking mechanism list fails the fixture"
+    );
+    assert!(
+        !ledger.is_file(),
+        "no ledger is emitted on a fixture refusal"
+    );
+}
+
+/// A slot list that reports one slot and fills zero fails the
+/// fixture with exit 3 instead of emitting a ledger the validator
+/// must refuse.
+#[test]
+fn workload_fixture_rejects_a_shrinking_slot_list() {
+    let dir = tempfile::tempdir().expect("cell dir");
+    let workload = build_workload(dir.path());
+    let stub = build_stub(dir.path(), "drift-slot-stub", DRIFT_SLOT_STUB_C);
+    let (status, ledger) = run_workload_against_stub(&workload, &stub, dir.path());
+    assert_eq!(
+        status.code(),
+        Some(3),
+        "a shrinking slot list fails the fixture"
+    );
+    assert!(
+        !ledger.is_file(),
+        "no ledger is emitted on a fixture refusal"
+    );
 }
 
 /// Whether the exact module record names the private-mount holder as

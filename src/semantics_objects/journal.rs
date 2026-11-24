@@ -22916,11 +22916,14 @@ pub(crate) mod tests {
             "no session opens out of order: {:?}",
             success.effects.effects,
         );
+        // The unfenced Ticket loss voids the bootstrap, so the sibling
+        // close-all settles against a stale snapshot and names the
+        // void: the counted loss surfaces as `BootstrapUnproven`.
         assert!(
             success.effects.effects.iter().any(|effect| matches!(
                 effect,
                 ObjectEffect::Gap {
-                    reason: super::ObjectGap::OutcomeLost
+                    reason: super::ObjectGap::BootstrapUnproven
                 }
             )),
             "the unproven drain keeps its counted loss: {:?}",

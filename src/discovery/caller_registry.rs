@@ -12379,6 +12379,33 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn pool_exhaustion_suppressed_aggregate_counts_once() {
+        // Under a one-entry gap cap filled by an unrelated gap, every
+        // exhaustion filing suppresses — but the condition counts one
+        // suppression, never one per merged staging.
+        let mut registry =
+            CallerRegistry::new(RegistryLimits::new(64, 64, 64, 1, 1 << 20, 64).unwrap());
+        registry.record_gap(RegistryGap {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: "unrelated".into(),
+            reason: "the gap that fills the cap".into(),
+            budget: None,
+        });
+        registry.publish();
+        registry.record_aggregated_exhaustion(1, 66_000, 65_536);
+        registry.publish();
+        registry.record_aggregated_exhaustion(2, 66_560, 65_536);
+        registry.publish();
+        registry.record_aggregated_exhaustion(1, 66_000, 65_536);
+        registry.publish();
+        assert_eq!(registry.gaps().len(), 1, "{:?}", registry.gaps());
+        assert_eq!(registry.gaps()[0].subject, "unrelated");
+        assert_eq!(registry.gaps_suppressed(), 1);
+    }
+
+    #[test]
     fn aggregated_unrouted_gaps_separate_pre_binding_from_bound_drains() {
         // Pre-binding sheds ("with 0 bindings") forgive against the
         // pre-binding note; post-binding sheds stay loss. Merging

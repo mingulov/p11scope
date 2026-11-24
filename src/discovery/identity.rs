@@ -9105,8 +9105,10 @@ fn scan_mount_table_for_row_with<'table>(
     // INV-2 byte strides (reader precedent): at most 8 KiB scanned
     // per byte credit, with a stop poll before looking past each
     // boundary, so a stop landing mid-row refuses without scanning
-    // the rest. Short-row totals are unchanged (the boundary is
-    // never reached).
+    // the rest. The byte meter is cumulative across rows, so a table
+    // of many short rows totalling past 8 KiB charges one byte credit
+    // per additional 8 KiB; a single short row never reaches the
+    // boundary.
     let mut byte_stride_used = 0usize;
     loop {
         if !first_stride {
@@ -9120,9 +9122,10 @@ fn scan_mount_table_for_row_with<'table>(
         first_stride = false;
         // INV-2: each row is spent before it is scanned, so an
         // exhausted allowance refuses without examining any row byte.
-        // Totals match the old post-stride spend exactly, including
-        // the full first stride after an early match (no later stride
-        // is read, charged, or stop-polled).
+        // Row-spend totals match the old post-stride spend exactly,
+        // including the full first stride after an early match (no
+        // later stride is read, charged, or stop-polled); byte strides
+        // add at most one credit per 8 KiB scanned (cumulative).
         let mut stride_rows = 0usize;
         let mut found = None;
         for _ in 0..MOUNTINFO_STRIDE {

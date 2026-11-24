@@ -729,6 +729,8 @@ fn read_mountinfo_pass<R: Read>(
         let mut byte_stride_used = 0usize;
         let chunk_base = progress.table.len();
         for (index, byte) in chunk[..read].iter().enumerate() {
+            // Invalid input fails fast before the stride spend below,
+            // so a bad byte never charges its boundary credit.
             if !progress.encoding.next(*byte) {
                 return Err(format!(
                     "mount table is not valid UTF-8: invalid sequence at byte {}",

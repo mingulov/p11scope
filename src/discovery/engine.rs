@@ -26810,9 +26810,10 @@ impl Engine {
     /// maps-key fast path) spend no credit. Maps enumeration, the
     /// carried-index build and the merge stride in units of 64 with
     /// frame, deadline and work-budget polls. The capture frame,
-    /// deadline and ceilings may stop a pass sooner; every pass at
-    /// production caps completes, refuses or advances at least one
-    /// range, so the pass count is finite.
+    /// deadline and ceilings may stop a pass sooner with zero progress;
+    /// apart from such a stop, every pass at production caps completes,
+    /// refuses or advances at least one range, so the pass count is
+    /// finite.
     const GETTER_PREFAULT_READS_PER_PASS: usize = 64;
     const GETTER_PREFAULT_PROOFS_PER_PASS: usize = 64;
     /// Maps entries per enumeration stride: polled for frame, deadline
@@ -26901,8 +26902,13 @@ impl Engine {
             Self::GETTER_PREFAULT_READS_PER_PASS,
             Self::GETTER_PREFAULT_PROOFS_PER_PASS,
         );
-        // A pass always makes progress when work remains: the clamps keep
-        // a zero test cap from deferring forever.
+        // The clamps keep a zero test cap from deferring trivially
+        // forever, but they do not guarantee progress: a slow range needs
+        // 3 proof credits per pass (held lookup, batch stat, re-proof —
+        // the held cache is per-pass, so the lookup re-spends every
+        // pass) and a fast-only warmup needs 2 (held lookup plus
+        // re-proof); below that a pass defers without progress. Only the
+        // test seam can set such caps; production runs 64/64.
         let reads_per_pass = reads_per_pass.max(1);
         let proofs_per_pass = proofs_per_pass.max(1);
         let mut objects: Vec<PinnedObjectId> = sites.iter().map(|site| site.0).collect();
@@ -27116,8 +27122,9 @@ impl Engine {
         // Prove and read the pending ranges in maps order, one range at a
         // time: each range is proved and read (as far as the caps allow)
         // before the next range's held lookup runs, so no pass spends
-        // all credits looking ahead — every pass at production caps
-        // completes, refuses or advances at least one range. Every
+        // all credits looking ahead — apart from a frame, deadline or
+        // ceiling stop, every pass at production caps completes, refuses
+        // or advances at least one range. Every
         // held-identity lookup, batch stat and read-time re-proof is
         // admitted under the proof cap before the work (including
         // errors); the maps-key fast path spends no credit. Every chunk

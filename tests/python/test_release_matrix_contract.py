@@ -561,6 +561,77 @@ class MatrixContract(unittest.TestCase):
         self.assertIsNotNone(guard)
         self.assertEqual(set(guard.group(1).replace("\\\n", " ").split()), helpers)
 
+    # Every staged runner's references to repository files, by the variable
+    # each resolves them through, with the transitive files its helpers read.
+    # Self-test-only references run from a checkout, never from a stage.
+    RUNNER_REFERENCES = {
+        "scripts/qualify-public-cli.sh": (("HERE", "scripts/"), ("SRC", "tests/fixtures/public-cli/")),
+        "scripts/run-privileged-lib-tests.sh": (("REPO_ROOT", ""),),
+        "scripts/qualify-inventory-native.sh": (("REPO", ""),),
+        "scripts/qualify-release-matrix.sh": (("REPO", ""), ("R", "")),
+        "scripts/ci/build-counter-fixtures.sh": (("REPO_ROOT", ""),),
+        "scripts/ci/build-wrap-fixtures.sh": (("REPO_ROOT", ""),),
+    }
+    SELF_TEST_ONLY = {"tests/python/test_inventory_capacity_oracle.py", "tests/python/test_release_matrix_contract.py"}
+    TRANSITIVE = {
+        # build-counter-fixtures.sh builds "$REPO_ROOT/tests/fixtures/$src" for these sources
+        "scripts/ci/build-counter-fixtures.sh": {"tests/fixtures/counter-banks.c",
+                                                 "tests/fixtures/counter-bank-growth.c"},
+        # prepare-diagnostics-wrap.py reads its ledger, the included base and the pin helper
+        "tests/fixtures/operator-output/prepare-diagnostics-wrap.py": {
+            "tests/fixtures/operator-output/diagnostics-wrap-ledger.c",
+            "tests/fixtures/public-cli/demotion-ledger.c", "scripts/mapped-provider-pin.py"},
+    }
+
+    def test_every_staged_runner_reference_is_staged(self):
+        staged = set(CHECKER_MOD["SOURCE_FILES"])
+        missing = {}
+        for runner, roots in self.RUNNER_REFERENCES.items():
+            self.assertIn(runner, staged)
+            text = (ROOT / runner).read_text()
+            found = set()
+            for var, prefix in roots:
+                for name in re.findall(r'\$\{?%s\}?/([A-Za-z0-9_./-]+\.(?:py|sh|c))\b' % var, text):
+                    found.add(prefix + name)
+            # A runner that names its files only through a variable has them in TRANSITIVE.
+            self.assertTrue(found or runner in self.TRANSITIVE, runner)
+            for name in sorted(found - self.SELF_TEST_ONLY):
+                self.assertTrue((ROOT / name).is_file(), (runner, name))
+                if name not in staged:
+                    missing.setdefault(runner, []).append(name)
+        for owner, names in self.TRANSITIVE.items():
+            self.assertIn(owner, staged)
+            missing.update({owner: sorted(names - staged)} if names - staged else {})
+        counter = (ROOT / "scripts/ci/build-counter-fixtures.sh").read_text()
+        self.assertEqual({"tests/fixtures/" + s for s in re.findall(r'^build ([A-Za-z0-9_-]+\.c) ', counter, re.M)},
+                         self.TRANSITIVE["scripts/ci/build-counter-fixtures.sh"])
+        self.assertEqual(missing, {})
+
+    def test_staged_lib_runner_without_a_helper_refuses_before_any_setup(self):
+        repo, stage = self.clone_source()
+        staged = stage / "artifacts/source"
+        repo.rename(self.base / "unavailable original checkout")
+        binary = self.base / "not-a-libtest"
+        binary.write_text("#!/bin/sh\nexit 0\n"); binary.chmod(0o755)
+        runner = staged / "scripts/run-privileged-lib-tests.sh"
+        def run(name):
+            out = self.base / ("lib-" + name)
+            return subprocess.run([str(runner), str(binary), str(out)], text=True, capture_output=True,
+                                  timeout=30)
+        healthy = run("healthy")
+        self.assertNotIn("required helper missing", healthy.stderr)
+        for name in ("build-counter-fixtures.sh", "build-wrap-fixtures.sh", "prepare-btrfs-tmpdir.sh"):
+            with self.subTest(helper=name):
+                path = staged / "scripts/ci" / name
+                self.assertTrue(os.access(path, os.X_OK), "staged helper lost its mode")
+                content = path.read_bytes(); path.unlink()
+                try:
+                    result = run(name)
+                    self.assertEqual(result.returncode, 64, result.stdout + result.stderr)
+                    self.assertIn("required helper missing: %s" % path, result.stderr)
+                finally:
+                    path.write_bytes(content); path.chmod(0o755)
+
     def test_staged_shell_without_a_helper_refuses_before_any_cell(self):
         repo, stage = self.clone_source()
         staged = stage / "artifacts/source/scripts"

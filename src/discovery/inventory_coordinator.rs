@@ -11036,29 +11036,22 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
     }
 
-    /// Files the named exhaustion gap when this staging spent past
-    /// the holder-scan pool: the owed rows, held decisions and
-    /// unstamped exits retry on a later batch. Stable text, so repeats
-    /// aggregate. Rows held only by their pid's queued hooks file the
-    /// separate unbudgeted waiting gap instead: a queue-only hold is
-    /// waiting evidence, never a failed charge.
+    /// Files the named exhaustion aggregate when this staging spent
+    /// past the holder-scan pool: the owed rows, held decisions and
+    /// unstamped exits retry on a later batch. Per-staging attempted
+    /// totals vary, so the filing aggregates lane-wide (one row with
+    /// the deferred-scan count and the largest attempted total)
+    /// instead of one gap row per total. Rows held only by their
+    /// pid's queued hooks file the separate unbudgeted waiting gap
+    /// instead: a queue-only hold is waiting evidence, never a failed
+    /// charge.
     fn record_holder_pool_exhaustion(&mut self) {
         if self.holder_pool.deferrals() > 0 {
-            self.registry.record_gap(RegistryGap {
-                caller: None,
-                module: None,
-                pid: None,
-                subject: "holder scan pool exhausted".into(),
-                reason: "a per-PID holder scan deferred past the staging's holder-scan pool \
-                     (1,024 visit credits of 64 units); the owed rows, held decisions and \
-                     unstamped exits retry on a later batch"
-                    .into(),
-                budget: Some(BudgetRefusal {
-                    resource: "holder_scan_units",
-                    limit: HolderScanBudget::limit() as usize,
-                    requested: self.holder_pool.over_limit_attempted() as usize,
-                }),
-            });
+            self.registry.record_aggregated_exhaustion(
+                self.holder_pool.deferrals(),
+                self.holder_pool.over_limit_attempted(),
+                HolderScanBudget::limit(),
+            );
         }
         if self.holder_pool.reserved_holds() > 0 {
             self.registry.record_gap(RegistryGap {

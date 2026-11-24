@@ -45052,6 +45052,119 @@ int main(void) {
         assert_eq!(exes[0].resolution, ExeResolution::PathUnknown);
     }
 
+    // ---- Held-head resume on changed inputs (r7b) ----
+
+    #[test]
+    fn no_retry_mark_settles_while_staging_is_held() {
+        // Settlement waits behind held staging: a retained 3 -> 43
+        // mark is queued for the domain when a Finish flushes a row
+        // whose cold executable learn outlasts the credit. While that
+        // row is held no mark settles (a held re-decision would decide
+        // it first); once the queue drains, the mark settles exactly
+        // once with its full 40-call subtotal.
+        let mut native = retained_with_growth();
+        native.answer(9, 600, 99);
+        native.read(Vec::new());
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.scene.coordinator.set_exe_index_dirs(Vec::new());
+        admit_cold_exe_callers(&mut native, 70);
+        native.execs(vec![exec_record(77, 12, 100, 8, 99)]);
+        let staged = native.read(vec![native.row(77, 1, 12, 210, 0)]);
+        assert_eq!(staged.decided, 0, "no horizon yet: the row stays pending");
+        assert!(!native.scene.coordinator.retry_owed.is_empty());
+        let domain = native.domain;
+        let mut held_totals = Vec::new();
+        for _ in 0..8 {
+            let receipt = native.stage(NativeBatch::Finish { domain });
+            native.scene.coordinator.commit_batch(false).unwrap();
+            let held = !native.scene.coordinator.held_stage.is_empty();
+            if held {
+                held_totals.push(terminal_retry_total(&native));
+            }
+            if !receipt.settlement_owed {
+                break;
+            }
+        }
+        assert!(!held_totals.is_empty(), "the fixture holds a row (setup pin)");
+        assert!(
+            held_totals.iter().all(|total| *total == 0),
+            "nothing settles while staging is held: {held_totals:?}"
+        );
+        assert_eq!(terminal_retry_total(&native), 40, "settled exactly once");
+        assert!(native.scene.coordinator.retry_owed.is_empty());
+    }
+
+    #[test]
+    fn an_in_progress_resolution_restarts_when_its_exec_is_restashed() {
+        // The head's resolution is mid-way through a resumable system
+        // index build when the row's EXEC is re-stashed with a new
+        // image: the job restarts for the current EXEC, so the staged
+        // verdict names it, never the superseded one.
+        let dir = tempfile::tempdir().unwrap();
+        for n in 0..100 {
+            std::fs::write(dir.path().join(format!("tool-{n:03}")), b"x").unwrap();
+        }
+        let (mut native, _) = watched_native();
+        native
+            .scene
+            .coordinator
+            .set_exe_index_dirs(vec![dir.path().to_path_buf()]);
+        native.execs(vec![exec_record(41, 9, 100, 8, 99)]);
+        let staged = native.read(vec![native.row(41, 1, 9, 210, 0)]);
+        assert_eq!(staged.decided, 0);
+        let domain = native.domain;
+        native.stage(NativeBatch::Finish { domain });
+        assert!(
+            native
+                .scene
+                .coordinator
+                .head_work
+                .resolve
+                .as_ref()
+                .is_some_and(|job| job.is_for(9, 8, 99, 100)),
+            "the resolution is in progress for the first EXEC (setup pin)"
+        );
+        native.execs(vec![exec_record(41, 9, 150, 8, 77)]);
+        for _ in 0..8 {
+            if native.scene.coordinator.held_stage.is_empty() {
+                break;
+            }
+            native.stage(NativeBatch::Finish { domain });
+        }
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(native.scene.coordinator.held_stage.is_empty());
+        let exes = scene_unbound_exe(&native);
+        assert_eq!(exes.len(), 1);
+        assert_eq!((exes[0].dev, exes[0].ino), (8, 77), "{exes:?}");
+    }
+
+    #[test]
+    fn a_held_head_reproves_pre_admission_space_when_its_keys_grow() {
+        // Space proven for one key does not cover two: the latch is
+        // re-proven for the new key count, so a grown key set starts
+        // the charged prune cycle instead of overflowing unpruned.
+        let (mut native, _) = watched_native();
+        stash_limit(&mut native, 3);
+        stash_rows(&mut native, 6_000..6_002);
+        assert_eq!(native.preadmission().held, 2);
+        let coordinator = &mut native.scene.coordinator;
+        let mut credit = StageCredit::new(STAGE_IO_PER_ACTION);
+        let before = stash_stale_checks();
+        assert!(coordinator.prepare_preadmission(&[None], &mut credit));
+        assert_eq!(stash_stale_checks() - before, 0, "one key fits: read-free");
+        let before = stash_stale_checks();
+        assert!(coordinator.prepare_preadmission(&[None, None], &mut credit));
+        assert_eq!(
+            stash_stale_checks() - before,
+            2,
+            "two keys past the bound run the whole prune cycle"
+        );
+        let before = stash_stale_checks();
+        assert!(coordinator.prepare_preadmission(&[None, None], &mut credit));
+        assert_eq!(stash_stale_checks() - before, 0, "the same keys stay proven");
+    }
+
     // ---- Bounded staging slow work (r7, F1 class) ----
 
     /// Admit `n` callers whose executables are distinct cold paths

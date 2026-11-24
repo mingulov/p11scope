@@ -22885,6 +22885,313 @@ fn wait_member_maps_settled(pid: u32) -> bool {
     false
 }
 
+/// RAII guard for the forced-consult thread-local in these twins:
+/// sets true on creation, false on drop, so a panicking test never
+/// pollutes the worker thread for the next test.
+struct ForcePreopenConsultGuard;
+impl ForcePreopenConsultGuard {
+    fn new() -> Self {
+        crate::discovery::scan::FORCE_PREOPEN_FACTS_CONSULT.with(|force| force.set(true));
+        Self
+    }
+}
+impl Drop for ForcePreopenConsultGuard {
+    fn drop(&mut self) {
+        crate::discovery::scan::FORCE_PREOPEN_FACTS_CONSULT.with(|force| force.set(false));
+    }
+}
+
+/// A hit can only skip a negative, never authorize: a stored entry
+/// whose facts export a hooked name still re-proves through the full
+/// path instead of skipping. The member preloads a hook-bearing
+/// provider; the test seeds a hook-bearing hit for it (providers never
+/// store, so the seed simulates a stored provider-facts entry) and the
+/// repeat still re-opens it while other mappings reuse. Deleting the
+/// hit-time hook check would skip the provider (zero re-opens).
+#[test]
+fn owned_tree_watch_repeat_with_hook_bearing_hit_still_reproves() {
+    use std::os::unix::fs::MetadataExt as _;
+    let dir = tempfile::tempdir().expect("watch cgroup dir");
+    let provider = dir.path().join("hook-provider.so");
+    build_fixture_so_with_bootstrap(&provider, "HOOK-0001");
+    let mut sleeper = std::process::Command::new("sh")
+        .args(["-c", "LD_PRELOAD= sleep 30"])
+        .env("LD_PRELOAD", &provider)
+        .spawn()
+        .expect("spawn preloaded shell");
+    let mut preloaded = false;
+    for _ in 0..100 {
+        let maps = std::fs::read_to_string(format!("/proc/{}/maps", sleeper.id()))
+            .expect("read sleeper maps");
+        if maps.lines().any(|line| line.contains("hook-provider.so")) {
+            preloaded = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        preloaded,
+        "the sleeper maps the hook-bearing provider (non-vacuous preload)"
+    );
+    std::fs::write(
+        dir.path().join("cgroup.procs"),
+        format!("{}\n", sleeper.id()),
+    )
+    .expect("write cgroup.procs");
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 7,
+        path: dir.path().into(),
+        dir: Arc::new(File::open(dir.path()).expect("open watch dir")),
+    };
+    engine.owned_run_pid = Some(std::process::id());
+    engine.owned_watch_run_budget_ns = u64::MAX;
+    let _force = ForcePreopenConsultGuard::new();
+    let first = 1_000u64;
+    let count_first = std::rc::Rc::new(std::cell::Cell::new(0u32));
+    {
+        let count_first = count_first.clone();
+        crate::discovery::identity::provider_metadata_read_test::observe(
+            move |_| count_first.set(count_first.get() + 1),
+            || engine.owned_tree_watch(Some(first)),
+        );
+    }
+    assert!(
+        count_first.get() > 4,
+        "the first visit reads provider metadata (non-vacuous): {}",
+        count_first.get()
+    );
+    // Seed a hook-bearing hit for the provider's key: the maps identity
+    // from its mapping line plus the target pin, under the current
+    // namespace (the member shares it).
+    let maps = std::fs::read_to_string(format!("/proc/{}/maps", sleeper.id()))
+        .expect("read member maps for provider key");
+    let mut provider_key = None;
+    for line in maps.lines() {
+        if line.contains("hook-provider.so") {
+            let mut parts = line.split_whitespace();
+            let _range = parts.next().expect("maps range");
+            let _perms = parts.next().expect("maps perms");
+            let _offset = parts.next().expect("maps offset");
+            let dev = parts.next().expect("maps device");
+            let inode: u64 = parts
+                .next()
+                .expect("maps inode")
+                .parse()
+                .expect("inode parses");
+            let mut dev_parts = dev.split(':');
+            let major =
+                u64::from_str_radix(dev_parts.next().expect("major"), 16).expect("major parses");
+            let minor =
+                u64::from_str_radix(dev_parts.next().expect("minor"), 16).expect("minor parses");
+            let target = std::fs::metadata(&provider).expect("stat provider");
+            let ns_meta = std::fs::metadata("/proc/self/ns/mnt").expect("stat observer mount ns");
+            let key = crate::discovery::scan::PreopenFileKey::for_target(
+                crate::process::MountNamespaceId {
+                    device: ns_meta.dev(),
+                    inode: ns_meta.ino(),
+                },
+                p11scope_manifest::maps::Device { major, minor },
+                inode,
+                &target,
+            );
+            provider_key = Some(key);
+            break;
+        }
+    }
+    let provider_key = provider_key.expect("the provider mapping names a key");
+    let hook_facts = crate::discovery::scan::ElfExportFacts {
+        abi: p11scope_manifest::elf::ElfAbi::Lp64,
+        exports: vec![("C_GetFunctionList".to_string(), 0x100)],
+        getter_present: false,
+        witness_fault: false,
+        excluded_anchor_ranges: Vec::new(),
+    };
+    let stored_ns = crate::attach::monotonic_ns().expect("monotonic clock reads");
+    assert!(
+        engine.budget.note_preopen_facts(
+            provider_key,
+            crate::discovery::scan::PreopenEntry {
+                facts: hook_facts,
+                stored_ns,
+            },
+        ),
+        "the hook-bearing seed stores"
+    );
+    let count_second = std::rc::Rc::new(std::cell::Cell::new(0u32));
+    {
+        let count_second = count_second.clone();
+        crate::discovery::identity::provider_metadata_read_test::observe(
+            move |_| count_second.set(count_second.get() + 1),
+            || engine.owned_tree_watch(Some(first + OWNED_WATCH_SCAN_MIN_NS)),
+        );
+    }
+    assert!(
+        engine.budget.preopen_hits_for_test() > 0,
+        "the repeat hits (including the seeded provider entry)"
+    );
+    assert!(
+        count_second.get() > 0,
+        "the hook-bearing hit falls through and re-opens (not skipped): {}",
+        count_second.get()
+    );
+    assert!(
+        count_second.get() < count_first.get(),
+        "only the provider re-opens (other mappings reuse): first={} second={}",
+        count_first.get(),
+        count_second.get()
+    );
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
+/// Foreign mount namespaces never consult even when forced: the
+/// member runs in a fresh user plus mount namespace (unprivileged
+/// `unshare`), so every group skips and the repeat serves zero hits.
+/// Forcing the namespace check true would hit on the repeat.
+#[test]
+fn owned_tree_watch_repeat_in_foreign_mount_ns_skips_consult() {
+    let dir = tempfile::tempdir().expect("watch cgroup dir");
+    let mut sleeper = std::process::Command::new("unshare")
+        .args(["-U", "-m", "--propagation", "unchanged", "sleep", "30"])
+        .spawn()
+        .expect("spawn unshared sleeper (needs unshare(1) and user namespaces)");
+    assert!(
+        wait_member_maps_settled(sleeper.id()),
+        "the member exec'd and settled before tracking"
+    );
+    let observer_ns = std::fs::read_link("/proc/self/ns/mnt").expect("read observer mount ns");
+    let member_ns =
+        std::fs::read_link(format!("/proc/{}/ns/mnt", sleeper.id())).expect("read member mount ns");
+    assert_ne!(
+        observer_ns, member_ns,
+        "the member runs in a foreign mount namespace (non-vacuous)"
+    );
+    std::fs::write(
+        dir.path().join("cgroup.procs"),
+        format!("{}\n", sleeper.id()),
+    )
+    .expect("write cgroup.procs");
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 7,
+        path: dir.path().into(),
+        dir: Arc::new(File::open(dir.path()).expect("open watch dir")),
+    };
+    engine.owned_run_pid = Some(std::process::id());
+    engine.owned_watch_run_budget_ns = u64::MAX;
+    let _force = ForcePreopenConsultGuard::new();
+    let first = 1_000u64;
+    engine.owned_tree_watch(Some(first));
+    let scans_after_first: u32 = engine
+        .owned_watch_unproven
+        .values()
+        .map(|entry| entry.scans)
+        .sum();
+    assert_eq!(scans_after_first, 1, "one visit after the first run");
+    engine.owned_tree_watch(Some(first + OWNED_WATCH_SCAN_MIN_NS));
+    let scans_after_second: u32 = engine
+        .owned_watch_unproven
+        .values()
+        .map(|entry| entry.scans)
+        .sum();
+    assert_eq!(
+        scans_after_second, 2,
+        "the rotation still visits the foreign-ns member"
+    );
+    assert_eq!(
+        engine.budget.preopen_hits_for_test(),
+        0,
+        "foreign-namespace groups never hit (all skip)"
+    );
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
+/// Replacing a mapped file by rename misses: the path names a new
+/// inode, so the consult key changes and the repeat does not serve the
+/// old file's facts. Unlike overwrite (same inode, re-read), the
+/// renamed path fails the opened-file identity guard, so the twin
+/// asserts the hit delta (all but the renamed group hit) instead of
+/// re-read bytes. An always-hit cache would hit the renamed group too.
+#[test]
+fn owned_tree_watch_repeat_after_file_replace_by_rename_misses() {
+    let dir = tempfile::tempdir().expect("watch cgroup dir");
+    let libc = ["usr/lib/x86_64-linux-gnu/libc.so.6", "usr/lib64/libc.so.6"]
+        .into_iter()
+        .map(|relative| std::path::PathBuf::from("/").join(relative))
+        .find(|candidate| candidate.is_file())
+        .expect("a system libc to copy");
+    let loader = [
+        "usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+        "usr/lib64/ld-linux-x86-64.so.2",
+    ]
+    .into_iter()
+    .map(|relative| std::path::PathBuf::from("/").join(relative))
+    .find(|candidate| candidate.is_file())
+    .expect("a system loader to rename with");
+    let copy = dir.path().join("preload-libc.so.6");
+    std::fs::copy(&libc, &copy).expect("copy libc for preloading");
+    let mut sleeper = std::process::Command::new("sh")
+        .args(["-c", "LD_PRELOAD= sleep 30"])
+        .env("LD_PRELOAD", &copy)
+        .spawn()
+        .expect("spawn preloaded shell");
+    let mut preloaded = false;
+    for _ in 0..100 {
+        let maps = std::fs::read_to_string(format!("/proc/{}/maps", sleeper.id()))
+            .expect("read sleeper maps");
+        if maps.lines().any(|line| line.contains("preload-libc.so.6")) {
+            preloaded = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        preloaded,
+        "the sleeper maps the preloaded copy (non-vacuous preload)"
+    );
+    std::fs::write(
+        dir.path().join("cgroup.procs"),
+        format!("{}\n", sleeper.id()),
+    )
+    .expect("write cgroup.procs");
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 7,
+        path: dir.path().into(),
+        dir: Arc::new(File::open(dir.path()).expect("open watch dir")),
+    };
+    engine.owned_run_pid = Some(std::process::id());
+    engine.owned_watch_run_budget_ns = u64::MAX;
+    let _force = ForcePreopenConsultGuard::new();
+    let first = 1_000u64;
+    engine.owned_tree_watch(Some(first));
+    assert_eq!(
+        engine.budget.preopen_hits_for_test(),
+        0,
+        "the cold first visit misses every group"
+    );
+    engine.owned_tree_watch(Some(first + OWNED_WATCH_SCAN_MIN_NS));
+    let hits_after_second = engine.budget.preopen_hits_for_test();
+    assert!(
+        hits_after_second > 0,
+        "the unchanged repeat hits (non-vacuous reuse): {hits_after_second}"
+    );
+    let replacement = dir.path().join("replacement.so.6");
+    std::fs::copy(&loader, &replacement).expect("stage the replacement file");
+    std::fs::rename(&replacement, &copy).expect("rename over the preloaded copy");
+    engine.owned_tree_watch(Some(first + 2 * OWNED_WATCH_SCAN_MIN_NS));
+    let hits_after_third = engine.budget.preopen_hits_for_test();
+    assert_eq!(
+        hits_after_third,
+        2 * hits_after_second - 1,
+        "the renamed group misses while the rest hit: second={hits_after_second} third={hits_after_third}"
+    );
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
 /// Rotation reaches every member, not just the extremes: with three
 /// unproven members the middle pid scans within three runs instead
 /// of starving behind the newest and oldest.

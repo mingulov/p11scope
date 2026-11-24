@@ -40671,6 +40671,109 @@ fn prefault_manifest_getter_data_drops_a_removed_objects_bytes_when_its_cursor_r
     );
 }
 
+/// An exhausted object's later ranges retire without another proof: with
+/// A owning three allowance-sized ranges and B one, the pass reads A's
+/// first range and B's, retires A's tail, and spends exactly seven proof
+/// steps however the ranges interleave (twin: re-proving a retired
+/// object's ranges spends an eighth step for nothing).
+#[test]
+fn prefault_manifest_getter_data_skips_an_exhausted_objects_ranges_without_reproving() {
+    use crate::discovery::identity::{FileIdentity, MappedFile};
+    const TMPFS: u64 = 0x0102_1994;
+    let mut warmup = two_object_warmup();
+    // SAFETY: two private read-only mappings of A's copy, unmapped below
+    // before the guard drops.
+    let file_a = std::fs::File::open(&warmup.copies.paths[0]).unwrap();
+    let extra_a = map_fixture_readonly(&file_a, warmup.padded);
+    let extra_b = map_fixture_readonly(&file_a, warmup.padded);
+    warmup.engine.budget = CaptureWorkBudget::new(ScanLimits {
+        per_object_bytes: warmup.padded as u64,
+        total_bytes: 8 << 20,
+    });
+    let object_a = warmup.objects[0];
+    let object_b = warmup.objects[1];
+    let base_b = warmup.copies.readable[1] as u64;
+    let len = warmup.padded as u64;
+    let mut bases_a: Vec<u64> = vec![
+        warmup.copies.readable[0] as u64,
+        extra_a as u64,
+        extra_b as u64,
+    ];
+    bases_a.sort_unstable();
+    bases_a.dedup();
+    assert_eq!(bases_a.len(), 3, "premise: three distinct A ranges");
+    let identity_a = FileIdentity {
+        dev: 7000,
+        ino: 8000,
+    };
+    let identity_b = FileIdentity {
+        dev: 7001,
+        ino: 8001,
+    };
+    let scripted_a: Vec<((u64, u64), Option<FileIdentity>)> = bases_a
+        .iter()
+        .map(|base| ((*base, *base + len), Some(identity_a)))
+        .collect();
+    warmup.engine.set_prefault_proof_for_test(
+        object_a,
+        MappedFile {
+            identity: identity_a,
+            fs_magic: Some(TMPFS),
+        },
+        scripted_a,
+    );
+    warmup.engine.set_prefault_proof_for_test(
+        object_b,
+        MappedFile {
+            identity: identity_b,
+            fs_magic: Some(TMPFS),
+        },
+        vec![((base_b, base_b + len), Some(identity_b))],
+    );
+    assert_eq!(
+        prefault_candidate_ranges(&warmup.engine, object_a).len(),
+        3,
+        "premise: A owns three candidates"
+    );
+    assert_eq!(
+        prefault_candidate_ranges(&warmup.engine, object_b),
+        vec![(base_b, base_b + len)],
+        "premise: B owns one candidate"
+    );
+    let sites = warmup_sites_for(&warmup.objects);
+    let outcome = warmup
+        .engine
+        .prefault_manifest_getter_data(warmup.id, &sites);
+    // SAFETY: each successful mapping above, released once.
+    assert_eq!(unsafe { libc::munmap(extra_a, warmup.padded) }, 0);
+    assert_eq!(unsafe { libc::munmap(extra_b, warmup.padded) }, 0);
+    assert_eq!(outcome, GetterPrefaultOutcome::Complete);
+    let attempts = warmup.engine.prefault_attempts_for_test();
+    assert_eq!(
+        attempts.len(),
+        2,
+        "A's first range and B read: {attempts:?}"
+    );
+    assert!(
+        attempts
+            .iter()
+            .any(|attempt| attempt.0 == base_b && attempt.2),
+        "B warms under its own allowance: {attempts:?}"
+    );
+    assert!(
+        attempts
+            .iter()
+            .any(|attempt| bases_a.contains(&attempt.0) && attempt.2),
+        "exactly one A range reads: {attempts:?}"
+    );
+    assert_eq!(
+        warmup.engine.prefault_proof_attempts_for_test(),
+        7,
+        "one held, batch and re-proof per read range, one batch for the \
+         retiring range, nothing for the skipped one"
+    );
+}
+
 /// Failed proofs count as attempted operations too: a missing held proof
 /// spends its lookup, and unreadable batch stats spend theirs (twin:
 /// counting only successes would under-report the native work).

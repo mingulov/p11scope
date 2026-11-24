@@ -239,10 +239,13 @@ python3 -I scripts/release-matrix-contract.py --judge STAGE --contract STAGE/con
 scripts/qualify-release-matrix.sh --judge-stage STAGE --contract STAGE/contract.json
 ```
 
-Hermetic validation honors the caller's private disk `TMPDIR`:
+Hermetic validation honors the caller's private disk `TMPDIR`. `--self-test`
+is the qualifying run: as a non-root user it runs the whole contract suite
+in a copy of its declared inputs (`scripts/runner_inputs.py`), and a skip, an
+empty run or an undeclared input fails it. Running the suite file directly is
+a development convenience, not that check.
 
 ```sh
-python3 -I tests/python/test_release_matrix_contract.py -v
 scripts/qualify-release-matrix.sh --self-test
 bash -n scripts/qualify-release-matrix.sh
 shellcheck scripts/qualify-release-matrix.sh

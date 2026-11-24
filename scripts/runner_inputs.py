@@ -20,8 +20,8 @@ SELF = "scripts/runner_inputs.py"
 # Every declared .sh input is launched directly and must be executable,
 # except these, which are only sourced (`. scripts/lib.sh`) or read.
 SOURCED = ("scripts/cleanup-traps.sh", "scripts/lib.sh", "scripts/product-build.sh")
-# Runs a mode's self-test suite strictly (no skip passes; every repository
-# file the suite reads must be declared for that mode).
+# Runs a mode's self-test suite strictly, in a copy of that mode's declared
+# inputs (no skip passes; an undeclared file is absent there).
 _STRICT = "scripts/strict-selftest.py"
 
 _PIN = "scripts/mapped-provider-pin.py"
@@ -48,13 +48,26 @@ _NATIVE = ("scripts/inventory-native-oracle.py", "scripts/qualify-cgroup-trace.p
 _MATRIX_RUNNERS = ("scripts/qualify-public-cli.sh", "scripts/qualify-inventory-native.sh",
                    "scripts/run-privileged-lib-tests.sh")
 _MATRIX_STAGE = tuple(dict.fromkeys(_MATRIX_RUNNERS + _PUBLIC + _NATIVE + _LIB))
+# The canary object inputs release-matrix-contract.py hashes and stages for
+# --object-input (sources, runtime sources, producer sources).
+CANARY_SOURCE_FILES = ("scripts/verify-canaries.sh", "scripts/product-build.sh", "scripts/lib.sh",
+    "scripts/lane-lib-oracle-1.py", "scripts/cleanup-traps.sh", "scripts/_loader.py",
+    "scripts/capture-stopped-canary.py", "scripts/canary_process_custody.py",
+    "scripts/check-canary-evidence.py", "scripts/check-capture-evidence.py", "scripts/check-bpf-map-defs.py",
+    "scripts/dump-owned-bpf-maps.py", "scripts/qualify-task-storage-canary.py", ".release-rust-version",
+    "scripts/fixtures/canary_workload.c", "scripts/fixtures/privacy-stack-workload.c")
+CANARY_RUNTIME_SOURCES = ("scripts/fixtures/canary_workload.c", "crates/discover/tests/fixture/version_matrix.c",
+    "scripts/build-task-storage-reader.sh", "scripts/native/dump-task-storage.c", "scripts/native/dump-task-storage.bpf.c")
+CANARY_PRODUCER_SOURCES = ("scripts/verify-canaries.sh", "scripts/product-build.sh", "scripts/cargo.sh",
+    "scripts/release-matrix-contract.py", ".release-rust-version", "build.rs", "src/lib.rs")
+_CANARY = CANARY_SOURCE_FILES + CANARY_RUNTIME_SOURCES + CANARY_PRODUCER_SOURCES
 # The compiler pin, the candidate build and its fixture.
 _MATRIX_HOST = (".release-rust-version", "scripts/cargo.sh", "scripts/prepare-dependencies.py",
                 "scripts/fixtures/exec_churn.c")
-# --self-test runs the contract suite strictly: it and every file it loads,
-# reads or runs (strict-selftest.py refuses a read of any other repository file).
+# --self-test runs the contract suite strictly, in a copy of these inputs:
+# it and every file it or its children load, read or run.
 _MATRIX_SELF_TEST = (
-    _STRICT, "build.rs", "src/lib.rs", "scripts/_loader.py", "scripts/canary_process_custody.py",
+    _STRICT, "scripts/_loader.py", "scripts/canary_process_custody.py",
     "tests/python/json_signal_lifetime_probe.py",
     "tests/python/test_release_matrix_contract.py", "tests/python/test_canary_evidence.py",
     "tests/python/test_canary_object.py", "tests/python/test_canary_workload.py",
@@ -87,12 +100,13 @@ RUNNERS = {
     # stage: the guest's inner script; its bootstrap check names the judge
     # and this file, then --verify-inputs binds every staged source.
     # checkout: the host driver. Every host mode (dry run, plan, build,
-    # stage writing) reads the whole guest stage from the checkout plus the
-    # host-only files, refused before the first read; self-test also the suite.
+    # stage writing, --object-input) reads the whole guest stage from the
+    # checkout plus the host-only files and the canary object inputs, refused
+    # before the first read; self-test also the suite.
     "scripts/qualify-release-matrix.sh": {
         "stage": (STAGE, _MATRIX_STAGE),
-        "checkout": (CHECKOUT, _MATRIX_STAGE + _MATRIX_HOST),
-        "self-test": (CHECKOUT, _MATRIX_STAGE + _MATRIX_HOST + _MATRIX_SELF_TEST)},
+        "checkout": (CHECKOUT, tuple(dict.fromkeys(_MATRIX_STAGE + _MATRIX_HOST + _CANARY))),
+        "self-test": (CHECKOUT, tuple(dict.fromkeys(_MATRIX_STAGE + _MATRIX_HOST + _CANARY + _MATRIX_SELF_TEST)))},
 }
 
 

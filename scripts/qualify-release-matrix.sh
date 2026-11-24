@@ -39,6 +39,10 @@ REPO=$(cd "$(dirname "$0")/.." && pwd -P)
 # --self-test anywhere selects the self-test mode (a superset of checkout).
 _MODE=checkout
 for _arg in "$@"; do [ "$_arg" != "--self-test" ] || _MODE=self-test; done
+# --self-test is a whole mode: no other option may divert it (an earlier
+# dry-run or judge dispatch would return without running the suite).
+[ "$_MODE" != self-test ] || [ "$#" -eq 1 ] || {
+  echo "qualify-release-matrix.sh: --self-test takes no other option" >&2; exit 2; }
 python3 -I "$REPO/scripts/runner_inputs.py" check "$REPO" scripts/qualify-release-matrix.sh "$_MODE" || exit 64
 RUST=$(cat "$REPO/.release-rust-version") && [ -n "$RUST" ] || {
   echo "qualify-release-matrix.sh: compiler pin unreadable or empty: $REPO/.release-rust-version" >&2; exit 64; }
@@ -265,8 +269,12 @@ preflight() {
 # or host path is needed, so hosted CI runs it.
 self_test() {
   # The real shell plan and judge are exercised through bounded controlled files.
-  # The whole suite, always (no selection, no environment): a skip, an
-  # empty run or a read of an undeclared input fails.
+  # The whole suite, always (no selection, no environment), in a copy of
+  # this mode's declared inputs: a skip, an empty run or a read of an
+  # undeclared input fails. Root reads any mode bits, so the suite's
+  # unreadable-input cases need an ordinary user.
+  [ "$(id -u)" != 0 ] || {
+    echo "qualify-release-matrix.sh: --self-test must run as a non-root user" >&2; return 64; }
   python3 -I "$REPO/scripts/strict-selftest.py" "$REPO" scripts/qualify-release-matrix.sh self-test \
     "$REPO/tests/python/test_release_matrix_contract.py"
 }

@@ -567,12 +567,10 @@ class MatrixContract(unittest.TestCase):
     SIBLING = re.compile(r'''(?:with_name\(\s*|parent\s*/\s*)['"]([A-Za-z0-9_.-]+\.(?:py|sh|c))['"]''')
     SELF_TEST_ONLY = {"tests/python/test_inventory_capacity_oracle.py", "tests/python/test_release_matrix_contract.py",
                       "scripts/strict-selftest.py"}
-    # (runner, file): self-test inputs the text scan cannot see, found by
-    # strict-selftest.py's audit of the real suite run (which refuses any
-    # undeclared read, so a new one fails the self-test itself).
+    # (runner, file): self-test inputs the text scan cannot see. The strict
+    # self-test runs in a copy of the declared inputs only, so a new one is
+    # absent there and fails the self-test itself.
     SELF_TEST_OBSERVED = {
-        ("scripts/qualify-release-matrix.sh", "build.rs"): "the canary producer receipt hashes it",
-        ("scripts/qualify-release-matrix.sh", "src/lib.rs"): "the canary producer receipt hashes it",
         ("scripts/qualify-release-matrix.sh", "scripts/_loader.py"): "imported by module name",
         ("scripts/qualify-release-matrix.sh", "scripts/canary_process_custody.py"): "imported by module name",
         ("scripts/qualify-release-matrix.sh", "tests/python/json_signal_lifetime_probe.py"):
@@ -694,6 +692,19 @@ class MatrixContract(unittest.TestCase):
         runners = INPUTS["RUNNERS"]
         staged = set(CHECKER_MOD["SOURCE_FILES"])
         self.assertEqual(staged, set(INPUTS["staged_sources"]()))
+        # hungerg r11g #3: the host reads (hashes, stages) every canary object
+        # input for --object-input; the contract reads the very lists the
+        # checkout preflight checks.
+        contract = (ROOT / "scripts/release-matrix-contract.py").read_text()
+        for name in ("CANARY_SOURCE_FILES", "CANARY_RUNTIME_SOURCES", "CANARY_PRODUCER_SOURCES"):
+            self.assertEqual(CHECKER_MOD[name], INPUTS[name], name)
+            self.assertEqual(re.findall(r'^%s = (.*)$' % name, contract, re.M), ['_DECLARED["%s"]' % name])
+        everything = set(INPUTS["CANARY_SOURCE_FILES"] + INPUTS["CANARY_RUNTIME_SOURCES"]
+                         + INPUTS["CANARY_PRODUCER_SOURCES"])
+        canary = lambda runner: everything if runner == "scripts/qualify-release-matrix.sh" else set()
+        # The producer receipt binds the crate's build inputs and the wrapper that builds it.
+        self.assertLessEqual({"build.rs", "src/lib.rs", "scripts/cargo.sh", ".release-rust-version"},
+                             set(INPUTS["CANARY_PRODUCER_SOURCES"]))
         # hungerg/spark r11e: no mode (input-free ones included) can drop out
         # of the declaration, and no exemption outlives its mode.
         self.assertEqual({r: set(modes) for r, modes in runners.items()}, self.MODES)
@@ -717,9 +728,9 @@ class MatrixContract(unittest.TestCase):
                         expected = set()
                     elif mode == "self-test":
                         expected = self.closure(runner, self_test=True) | {
-                            name for (owner, name) in self.SELF_TEST_OBSERVED if owner == runner}
+                            name for (owner, name) in self.SELF_TEST_OBSERVED if owner == runner} | canary(runner)
                     elif where == INPUTS["CHECKOUT"]:
-                        expected = closure - self.SELF_TEST_ONLY
+                        expected = (closure - self.SELF_TEST_ONLY) | canary(runner)
                     else:
                         expected = closure - self.SELF_TEST_ONLY - set(self.HOST_ONLY)
                     self.assertEqual(set(inputs), expected, (runner, mode))
@@ -776,6 +787,25 @@ class MatrixContract(unittest.TestCase):
         shells = {n for modes in INPUTS["RUNNERS"].values() for _, inputs in modes.values() for n in inputs
                   if n.endswith(".sh")}
         self.assertEqual(set(INPUTS["SOURCED"]), {n for n in shells if not os.access(ROOT / n, os.X_OK)})
+        # hungerg r11g #4, independently of both: the exemptions are exactly
+        # the declared shells some declared shell sources (`. path`), and no
+        # declared shell launches one of them.
+        sourced, launched = set(), set()
+        for owner in sorted(shells):
+            for line in (ROOT / owner).read_text().splitlines():
+                code = line.split("#", 1)[0] if line.lstrip().startswith("#") else line
+                for name in shells:
+                    if name not in code:
+                        continue
+                    if re.match(r'\s*(?:\.|source)\s+"?(?:\$\{?\w+\}?/)?%s"?\s*$' % re.escape(name), code):
+                        sourced.add(name)
+                    elif re.search(r'(?:^|[;&|(]|then|do|\s)\s*"?(?:\$\{?\w+\}?/|\./)?%s"?(?:\s|$)'
+                                   % re.escape(name), code) and not re.search(r'\bbash\s+"?\S*%s' % re.escape(name), code):
+                        launched.add(name)
+        self.assertEqual(sourced, set(INPUTS["SOURCED"]))
+        self.assertEqual(sourced & launched, set())
+        self.assertLessEqual({"scripts/ci/build-counter-fixtures.sh", "scripts/ci/build-wrap-fixtures.sh",
+                              "scripts/cargo.sh"}, launched)
         # A sourced shell input needs no execute bit; a launched one does.
         library = root / "scripts/lib.sh"
         library.parent.mkdir(parents=True, exist_ok=True); shutil.copy2(ROOT / "scripts/lib.sh", library)
@@ -946,9 +976,9 @@ class MatrixContract(unittest.TestCase):
         check("scripts/qualify-inventory-native.sh", "self-test", repo, repo)
         check("scripts/qualify-release-matrix.sh", "checkout", repo, repo)
         check("scripts/qualify-release-matrix.sh", "self-test", repo, repo)
+        check("scripts/qualify-release-matrix.sh", "stage", repo, staged)
         if not unreadable:  # visible, and never a strict self-test pass
             self.skipTest("the unreadable twins need a non-root user")
-        check("scripts/qualify-release-matrix.sh", "stage", repo, staged)
 
     def staged_native(self):
         repo, stage = self.clone_source()
@@ -3704,33 +3734,60 @@ def check_d4_ready_pair(pair, cells, lanes, lanes_all, runnable):
 
 
 class StrictSelfTest(unittest.TestCase):
-    """codex r11f #1/#2: the strict self-test runner, on small owned suites."""
+    """codex r11f #1/#2, spark r11g: the strict runner on small owned suites.
+    The suite runs in a copy of its declared inputs, so every way of reading
+    an undeclared file (in process or in a child) finds nothing there."""
     STRICT = ROOT / "scripts" / "strict-selftest.py"
     DECLARATION = (
         'SELF = "scripts/runner_inputs.py"\n'
-        'RUNNERS = {"r.sh": {"self-test": ("checkout", ("data/ok.txt", "suite.py"))}}\n'
+        'RUNNERS = {"r.sh": {"self-test": ("checkout", ("data/ok.txt", "suite.py", "helper_ok.py"))}}\n'
         'def required(runner, mode):\n    return RUNNERS[runner][mode][1]\n')
+    HEADER = ("import os, subprocess, sys, unittest\nfrom pathlib import Path\n"
+              "ROOT = Path(__file__).resolve().parent\n")
 
-    def run_suite(self, body, *names):
+    def make_root(self, raw, body):
+        root = Path(raw) / "checkout"
+        (root / "scripts").mkdir(parents=True); (root / "data").mkdir()
+        (root / "scripts/runner_inputs.py").write_text(self.DECLARATION)
+        (root / "r.sh").write_text("#!/bin/sh\n"); (root / "r.sh").chmod(0o755)
+        (root / "data/ok.txt").write_text("ok\n"); (root / "data/secret.txt").write_text("secret\n")
+        (root / "helper_ok.py").write_text("VALUE = 1\n"); (root / "helper_secret.py").write_text("VALUE = 2\n")
+        (root / "scripts" / "helper_scripts_only.py").write_text("VALUE = 3\n")
+        (root / "suite.py").write_text(self.HEADER + body.replace("CHECKOUT", repr(str(root))))
+        return root
+
+    def strict(self, root, *names, env=None):
+        result = subprocess.run([sys.executable, "-I", str(self.STRICT), str(root), "r.sh", "self-test",
+                                 str(root / "suite.py"), *names], capture_output=True, text=True, timeout=60,
+                                cwd=root, env=dict(os.environ, **(env or {})))
+        return result.returncode, result.stdout + result.stderr
+
+    def run_suite(self, body, *names, env=None):
         with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as raw:
-            root = Path(raw)
-            (root / "scripts").mkdir(); (root / "data").mkdir()
-            (root / "scripts/runner_inputs.py").write_text(self.DECLARATION)
-            (root / "data/ok.txt").write_text("ok\n"); (root / "data/secret.txt").write_text("secret\n")
-            (root / "suite.py").write_text(
-                "import subprocess, unittest\nfrom pathlib import Path\nROOT = Path(%r)\n" % str(root) + body)
-            result = subprocess.run([sys.executable, "-I", str(self.STRICT), str(root), "r.sh", "self-test",
-                                     str(root / "suite.py"), *names], capture_output=True, text=True, timeout=60,
-                                    cwd=self.STRICT.parent)
-            return result.returncode, result.stdout + result.stderr
+            return self.strict(self.make_root(raw, body), *names, env=env)
 
     def test_pass_reads_only_declared_inputs(self):
-        rc, text = self.run_suite("class T(unittest.TestCase):\n"
-                                  "    def test_a(self):\n        (ROOT / 'data/ok.txt').read_text()\n")
+        # Declared reads and imports and a written file pass; a variable
+        # naming the checkout is removed (and reported), others are kept.
+        rc, text = self.run_suite(
+            "import helper_ok\nclass T(unittest.TestCase):\n    def test_a(self):\n"
+            "        (ROOT / 'data/ok.txt').read_text()\n        open(ROOT / 'written', 'w').write('x')\n"
+            "        assert os.environ['STRICT_PROBE_DIR'] == '/nowhere'\n",
+            env={"STRICT_PROBE_DIR": "/nowhere"})
         self.assertEqual(rc, 0, text)
-        self.assertIn("strict self-test passed: 1 tests, 0 skipped", text)
+        self.assertIn("strict self-test passed: 1 tests, 0 skipped, run in a copy of its 5 declared inputs", text)
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as raw:
+            root = self.make_root(raw, "class T(unittest.TestCase):\n    def test_a(self):\n"
+                                       "        assert not any(CHECKOUT in v for v in os.environ.values())\n")
+            rc, text = self.strict(root, env={"STRICT_PROBE_DIR": str(root / "data")})
+            self.assertEqual(rc, 0, text)
+            self.assertIn("checkout variables removed: ", text)
+            self.assertIn("STRICT_PROBE_DIR", text)
+        self.assertNotIn("checkout variables removed", self.run_suite(
+            "class T(unittest.TestCase):\n    def test_a(self):\n        pass\n")[1])
 
     def test_every_non_pass_fails(self):
+        undeclared = "secret.txt"
         rows = {
             "skip": ("    def test_a(self):\n        self.skipTest('x')\n", "1 skipped (a skip is never a pass)"),
             "skip in subtest": ("    def test_a(self):\n        with self.subTest(i=1):\n"
@@ -3739,19 +3796,85 @@ class StrictSelfTest(unittest.TestCase):
                                  "1 expected failures"),
             "failure": ("    def test_a(self):\n        self.fail('x')\n", "1 failed, 0 errors"),
             "empty": ("    pass\n", "no test ran"),
-            "undeclared read": ("    def test_a(self):\n        (ROOT / 'data/secret.txt').read_text()\n",
-                                "read undeclared input(s) of r.sh self-test: data/secret.txt"),
-            "undeclared launch": ("    def test_a(self):\n"
-                                  "        subprocess.run(['/bin/true', str(ROOT / 'data/secret.txt')])\n",
-                                  "read undeclared input(s) of r.sh self-test: data/secret.txt"),
+            # Every read route to an undeclared file finds it absent in the copy.
+            "read": ("    def test_a(self):\n        (ROOT / 'data/secret.txt').read_text()\n", undeclared),
+            "read-write open": ("    def test_a(self):\n        open(ROOT / 'data/secret.txt', 'r+').read()\n",
+                                undeclared),
+            "O_RDWR": ("    def test_a(self):\n        os.close(os.open(ROOT / 'data/secret.txt', os.O_RDWR))\n",
+                       undeclared),
+            "dir_fd": ("    def test_a(self):\n        d = os.open(ROOT / 'data', os.O_RDONLY)\n"
+                       "        os.close(os.open('secret.txt', os.O_RDONLY, dir_fd=d))\n", undeclared),
+            "relative": ("    def test_a(self):\n        open('data/secret.txt').read()\n", undeclared),
+            "child argv": ("    def test_a(self):\n        subprocess.run(['cat', str(ROOT / 'data/secret.txt')],"
+                           " check=True)\n", "1 errors"),
+            "child shell string": ("    def test_a(self):\n        subprocess.run('cat ' + str(ROOT / "
+                                   "'data/secret.txt'), shell=True, check=True)\n", "1 errors"),
+            "child -c body": ("    def test_a(self):\n        subprocess.run([sys.executable, '-c', 'open(%r).read()'"
+                              " % str(ROOT / 'data/secret.txt')], check=True)\n", "1 errors"),
+            "import found only beside the runner": ("    def test_a(self):\n        import helper_scripts_only\n",
+                                                     "helper_scripts_only"),
+            "undeclared import": ("import helper_secret\nclass U(unittest.TestCase):\n    def test_b(self):\n"
+                                  "        pass\n", "helper_secret"),
+            "checkout by its own path": ("    def test_a(self):\n        open(CHECKOUT + '/data/secret.txt').read()\n",
+                                         "reached the checkout outside its declared copy (open"),
+            "child given the checkout path": ("    def test_a(self):\n        subprocess.run(['true', CHECKOUT])\n",
+                                              "subprocess.Popen"),
         }
         for name, (body, message) in rows.items():
             with self.subTest(case=name):
                 rc, text = self.run_suite("class T(unittest.TestCase):\n" + body)
                 self.assertEqual(rc, 1, text)
-                self.assertIn("strict self-test failed: " , text)
+                self.assertIn("strict self-test failed: ", text)
                 self.assertIn(message, text)
+                if name.startswith(("checkout", "child given")):
+                    self.assertIn("reached the checkout outside its declared copy", text)
                 self.assertNotIn("strict self-test passed", text)
+
+    def test_a_warm_bytecode_cache_never_hides_an_import(self):
+        # spark r11g F1: run twice; the second run sees a warm checkout cache.
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as raw:
+            root = self.make_root(raw, "import helper_secret\nclass T(unittest.TestCase):\n"
+                                       "    def test_a(self):\n        pass\n")
+            subprocess.run([sys.executable, "-c", "import sys; sys.path.insert(0, %r); import helper_secret, suite"
+                            % str(root)], check=True, cwd=root)
+            self.assertTrue(list(root.glob("__pycache__/helper_secret*.pyc")))
+            for run in ("first", "second"):
+                with self.subTest(run=run):
+                    rc, text = self.strict(root)
+                    self.assertEqual(rc, 1, text)
+                    self.assertIn("helper_secret", text)
+
+    def test_the_copy_is_a_clean_one_commit_checkout(self):
+        rc, text = self.run_suite(
+            "class T(unittest.TestCase):\n    def test_a(self):\n"
+            "        git = lambda *a: subprocess.run(['git', '-C', str(ROOT), *a], capture_output=True, text=True,"
+            " check=True).stdout\n"
+            "        assert git('status', '--porcelain') == '', git('status', '--porcelain')\n"
+            "        assert git('rev-list', '--count', 'HEAD').strip() == '1'\n"
+            "        assert sorted(git('ls-files').split()) == ['data/ok.txt', 'helper_ok.py', 'r.sh',"
+            " 'scripts/runner_inputs.py', 'suite.py']\n")
+        self.assertEqual(rc, 0, text)
+
+    def test_setup_refusals_are_named(self):
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as raw:
+            root = self.make_root(raw, "class T(unittest.TestCase):\n    def test_a(self):\n        pass\n")
+            (root / "data/ok.txt").unlink()
+            rc, text = self.strict(root)
+            self.assertEqual(rc, 1, text)
+            self.assertIn("strict self-test failed: declared input missing: %s" % (root / "data/ok.txt"), text)
+            (root / "data/ok.txt").write_text("ok\n")
+            rc, text = self.strict(root, env={"PATH": "/nonexistent"})
+            self.assertEqual(rc, 1, text)
+            self.assertIn("strict self-test failed: git is required", text)
+
+    def test_an_undeclared_suite_is_refused(self):
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as raw:
+            root = self.make_root(raw, "class T(unittest.TestCase):\n    def test_a(self):\n        pass\n")
+            (root / "other.py").write_text((root / "suite.py").read_text())
+            result = subprocess.run([sys.executable, "-I", str(self.STRICT), str(root), "r.sh", "self-test",
+                                     str(root / "other.py")], capture_output=True, text=True, timeout=60)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn("the suite other.py is not a declared input of r.sh self-test", result.stderr)
 
     def test_selection_is_argv_only(self):
         body = ("class T(unittest.TestCase):\n    def test_a(self):\n        pass\n"
@@ -3759,20 +3882,42 @@ class StrictSelfTest(unittest.TestCase):
         rc, text = self.run_suite(body, "T.test_a")
         self.assertEqual(rc, 0, text)
         self.assertIn("1 tests, 0 skipped", text)
-        rc, text = self.run_suite(body)
+        # hungerg r11g #5: no environment narrows the selection.
+        hostile = {"P11SCOPE_MATRIX_SELF_TEST_K": "test_a", "UNITTEST_K": "test_a", "PYTHONWARNINGS": "ignore"}
+        rc, text = self.run_suite(body, env=hostile)
         self.assertEqual(rc, 1, text)
+        self.assertIn("1 failed, 0 errors", text)
+        self.assertIn("test_b", text)
 
     def test_runners_call_it_with_a_fixed_selection(self):
         matrix = (ROOT / "scripts/qualify-release-matrix.sh").read_text()
         body = matrix.split("self_test() {", 1)[1].split("\n}\n", 1)[0]
         self.assertEqual([l.strip() for l in body.splitlines() if l.strip() and not l.strip().startswith("#")], [
+            '[ "$(id -u)" != 0 ] || {',
+            'echo "qualify-release-matrix.sh: --self-test must run as a non-root user" >&2; return 64; }',
             'python3 -I "$REPO/scripts/strict-selftest.py" "$REPO" scripts/qualify-release-matrix.sh self-test \\',
             '"$REPO/tests/python/test_release_matrix_contract.py"'])
         native = (ROOT / "scripts/qualify-inventory-native.sh").read_text()
-        self.assertIn('timeout 60 python3 -I "$REPO/scripts/strict-selftest.py" "$REPO" '
+        self.assertIn('timeout 300 python3 -I "$REPO/scripts/strict-selftest.py" "$REPO" '
                       'scripts/qualify-inventory-native.sh self-test \\\n'
-                      '        "$REPO/tests/python/test_inventory_capacity_oracle.py" \\\n'
-                      '        CapacityFixtureTests C8GatePredicateTests C8GateFixtureTests || die', native)
+                      '        "$REPO/tests/python/test_inventory_capacity_oracle.py" || die', native)
+        # The oracle's own CapacityOracleTests self-test is strict too.
+        oracle = (ROOT / "scripts/inventory-native-oracle.py").read_text()
+        body = oracle.split("def capacity_self_test():", 1)[1].split("\ndef ", 1)[0]
+        for clause in ("result.testsRun > 0", "result.wasSuccessful()", "not result.skipped",
+                       "not result.expectedFailures", "not result.unexpectedSuccesses"):
+            self.assertIn(clause, body)
+
+    def test_self_test_takes_no_other_option(self):
+        # hungerg r11g #6: an earlier dispatch can never divert --self-test.
+        for argv in (["--self-test", "--dry-run"], ["--dry-run", "--self-test"],
+                     ["--self-test", "--kernels", "host"]):
+            with self.subTest(argv=argv):
+                result = subprocess.run(["bash", str(ROOT / "scripts/qualify-release-matrix.sh"), *argv],
+                                        capture_output=True, text=True, timeout=60)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("--self-test takes no other option", result.stderr)
+                self.assertNotIn("dry-run:", result.stdout)
 
 
 if __name__ == "__main__":

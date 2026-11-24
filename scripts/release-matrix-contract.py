@@ -174,19 +174,14 @@ EXITS = {"version.log": "version", "doctor.log": "doctor", "qual.log": "qual",
          "backend/inv-pid.stderr": "inv_pid", "backend/inv-sys.stderr": "inv_sys"}
 RUNTIME_SOURCES = ("tests/fixtures/public-cli/inventory-ledger.c", "scripts/fixtures/exec_churn.c",
                    "tests/fixtures/public-cli/prearm-first-use.c")
-# The staged sources: every stage-mode runner and the inputs it declares in
-# runner_inputs.py, the one declaration its preflight checks too.
-SOURCE_FILES = runpy.run_path(str(Path(__file__).resolve().with_name("runner_inputs.py")))["staged_sources"]()
-CANARY_SOURCE_FILES = ("scripts/verify-canaries.sh", "scripts/product-build.sh", "scripts/lib.sh",
-    "scripts/lane-lib-oracle-1.py", "scripts/cleanup-traps.sh", "scripts/_loader.py",
-    "scripts/capture-stopped-canary.py", "scripts/canary_process_custody.py",
-    "scripts/check-canary-evidence.py", "scripts/check-capture-evidence.py", "scripts/check-bpf-map-defs.py",
-    "scripts/dump-owned-bpf-maps.py", "scripts/qualify-task-storage-canary.py", ".release-rust-version",
-    "scripts/fixtures/canary_workload.c", "scripts/fixtures/privacy-stack-workload.c")
-CANARY_RUNTIME_SOURCES = ("scripts/fixtures/canary_workload.c", "crates/discover/tests/fixture/version_matrix.c",
-    "scripts/build-task-storage-reader.sh", "scripts/native/dump-task-storage.c", "scripts/native/dump-task-storage.bpf.c")
-CANARY_PRODUCER_SOURCES = ("scripts/verify-canaries.sh", "scripts/product-build.sh", "scripts/cargo.sh",
-    "scripts/release-matrix-contract.py", ".release-rust-version", "build.rs", "src/lib.rs")
+# The staged sources (every stage-mode runner and the inputs it declares)
+# and the canary object inputs come from runner_inputs.py, the one
+# declaration the runners' preflight checks too.
+_DECLARED = runpy.run_path(str(Path(__file__).resolve().with_name("runner_inputs.py")))
+SOURCE_FILES = _DECLARED["staged_sources"]()
+CANARY_SOURCE_FILES = _DECLARED["CANARY_SOURCE_FILES"]
+CANARY_RUNTIME_SOURCES = _DECLARED["CANARY_RUNTIME_SOURCES"]
+CANARY_PRODUCER_SOURCES = _DECLARED["CANARY_PRODUCER_SOURCES"]
 CANARY_PAYLOADS = ("p11scope", "p11scope-discover", "canary_workload", "matrix-provider.so",
     "privacy-provider.so", "dump-task-storage", "dump-task-storage.bpf.o", "default-ebpf")
 CANARY_BUILD_ENV = ("P11SCOPE_SMALL_RING", "P11SCOPE_SMALL_STATE_MAPS", "P11SCOPE_SMALL_DISCOVERY_RING",

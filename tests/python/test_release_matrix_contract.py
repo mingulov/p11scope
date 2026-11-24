@@ -14,6 +14,7 @@ import re
 import runpy
 import shlex
 import shutil
+import signal
 import stat
 import struct
 import subprocess
@@ -25,6 +26,10 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[2]
 CHECKER = ROOT / "scripts/release-matrix-contract.py"
 CHECKER_MOD = runpy.run_path(str(CHECKER))
+INPUTS = runpy.run_path(str(ROOT / "scripts/runner_inputs.py"))
+# Every repository file any runner mode reads, staged or checkout-only.
+DECLARED = set(CHECKER_MOD["SOURCE_FILES"]) | set(CHECKER_MOD["RUNTIME_SOURCES"]) | {
+    name for modes in INPUTS["RUNNERS"].values() for _, inputs in modes.values() for name in inputs}
 CHECK_IGNORED_MOD = runpy.run_path(str(ROOT / "scripts/check-ignored-tests.py"))
 PRIV_RUNNER = ROOT / "scripts/run-privileged-lib-tests.sh"
 OVERLAY_CELL = ("discovery::sweep_attribution::tests::d4_overlay_cells::"
@@ -473,7 +478,7 @@ class MatrixContract(unittest.TestCase):
         # The clone holds exactly the staged source list (codex r10 #1:
         # a hand-kept copy hid the missing loader).
         repo = self.base / "source-clone"
-        for name in sorted(set(CHECKER_MOD["SOURCE_FILES"]) | set(CHECKER_MOD["RUNTIME_SOURCES"])):
+        for name in sorted(DECLARED):
             path = repo / name; path.parent.mkdir(parents=True, exist_ok=True); shutil.copy2(ROOT / name, path)
         stage = self.base / "clone-stage"
         receipt = candidate_receipt(self.bins, self.base / "clone-build.json", repo)
@@ -545,23 +550,6 @@ class MatrixContract(unittest.TestCase):
                     staged.write_bytes(content); source.write_bytes(content)
         contract_path.write_text(json.dumps(original))
 
-    def test_public_cli_shell_siblings_are_all_staged(self):
-        # Every helper and fixture source the staged public CLI shell
-        # resolves next to itself is in the staged source list, and the
-        # shell's startup guard names exactly its helpers.
-        text = (ROOT / "scripts/qualify-public-cli.sh").read_text()
-        helpers = set(re.findall(r'\$HERE/([A-Za-z0-9_.-]+\.(?:py|sh))', text))
-        fixtures = set(re.findall(r'\$SRC/([A-Za-z0-9_.-]+\.c)', text))
-        self.assertIn("qualify_records.py", helpers)
-        self.assertGreaterEqual(len(fixtures), 7)
-        staged = set(CHECKER_MOD["SOURCE_FILES"])
-        self.assertEqual(sorted("scripts/" + h for h in helpers if "scripts/" + h not in staged), [])
-        self.assertEqual(sorted("tests/fixtures/public-cli/" + f for f in fixtures
-                                if "tests/fixtures/public-cli/" + f not in staged), [])
-        guard = re.search(r'for _helper in ([^;]+); do', text)
-        self.assertIsNotNone(guard)
-        self.assertEqual(set(guard.group(1).replace("\\\n", " ").split()), helpers)
-
     # Every staged script's references to repository files (codex r11 #1:
     # the whole checkout-free closure, Python helpers included): through a
     # runner variable, a repository-relative literal (runpy/ROOT paths and
@@ -611,7 +599,7 @@ class MatrixContract(unittest.TestCase):
         staged = set(CHECKER_MOD["SOURCE_FILES"])
         missing, used = {}, set()
         for owner in sorted(staged):
-            if not owner.endswith((".py", ".sh")) or owner == self.DECLARATION:
+            if not owner.endswith((".py", ".sh")) or owner in (self.DECLARATION, INPUTS["SELF"]):
                 continue
             for name in sorted(self.references(owner) - self.SELF_TEST_ONLY):
                 if (owner, name) in self.OUTSIDE_STAGE:
@@ -640,41 +628,192 @@ class MatrixContract(unittest.TestCase):
         # A commented mention is not a reference.
         self.assertNotIn("scripts/check-ignored-tests.py", self.references("scripts/run-privileged-lib-tests.sh"))
 
-    def test_native_driver_guard_names_its_runtime_inputs(self):
-        text = (ROOT / "scripts/qualify-inventory-native.sh").read_text()
-        guard = re.search(r'for _input in ([^;]+); do', text)
-        self.assertIsNotNone(guard)
-        self.assertEqual(set(guard.group(1).replace("\\\n", " ").split()),
-                         self.references("scripts/qualify-inventory-native.sh") - self.SELF_TEST_ONLY)
+    # Text that names a file without reading it (an unscheduled cell's reason).
+    PROSE = {("scripts/run-privileged-lib-tests.sh", "scripts/ci/stop-races.sh")}
+
+    def closure(self, owner):
+        """Every repository file `owner` reads, file by file through the
+        scripts it runs. Self-test-only files count as direct references
+        only; the contract (the declaration under test) is read, not walked."""
+        seen, todo = set(), [owner]
+        while todo:
+            current = todo.pop()
+            for name in self.references(current):
+                if name in (owner, INPUTS["SELF"]) or (current, name) in self.PROSE:
+                    continue
+                if name in self.SELF_TEST_ONLY and current != owner:
+                    continue
+                if name not in seen:
+                    seen.add(name)
+                    if name.endswith((".py", ".sh")) and name != self.DECLARATION and name not in self.SELF_TEST_ONLY:
+                        todo.append(name)
+        return seen
+
+    def test_every_runner_mode_declares_exactly_what_it_reads(self):
+        # codex r11c #1 (third round of the staging class): one declaration,
+        # scripts/runner_inputs.py, is both the staged list and every
+        # runner's preflight. Each runner's modes together declare exactly
+        # its file-level closure; a staged mode also declares everything
+        # its staged helpers read, and every shell it runs is a declared runner.
+        runners = INPUTS["RUNNERS"]
+        staged = set(CHECKER_MOD["SOURCE_FILES"])
+        self.assertEqual(staged, set(INPUTS["staged_sources"]()))
+        self.assertIn(INPUTS["SELF"], staged)
+        for runner, modes in runners.items():
+            with self.subTest(runner=runner):
+                closure = self.closure(runner)
+                self.assertEqual(set().union(*(set(inputs) for _, inputs in modes.values())), closure)
+                for mode, (where, inputs) in modes.items():
+                    self.assertIn(where, (INPUTS["STAGE"], INPUTS["CHECKOUT"]))
+                    self.assertEqual(len(inputs), len(set(inputs)), (runner, mode))
+                    if where != INPUTS["STAGE"]:
+                        continue
+                    self.assertEqual(set(inputs) & self.SELF_TEST_ONLY, set(), (runner, mode))
+                    self.assertLessEqual(set(inputs) | {runner}, staged, (runner, mode))
+                    for name in inputs:
+                        if name.endswith(".sh"):
+                            self.assertIn(name, runners, (runner, mode, name))
+                        if name.endswith((".py", ".sh")) and name != self.DECLARATION:
+                            self.assertLessEqual(self.closure(name) - self.SELF_TEST_ONLY - {runner}, set(inputs),
+                                                 (runner, mode, name))
+        # A checkout-only input is never staged.
+        stage_inputs = {n for modes in runners.values() for w, inputs in modes.values() if w == INPUTS["STAGE"]
+                        for n in inputs}
+        checkout_only = {n for modes in runners.values() for w, inputs in modes.values() if w == INPUTS["CHECKOUT"]
+                         for n in inputs} - stage_inputs
+        self.assertEqual(checkout_only & staged, set())
+        # Every staged shell is a declared runner.
+        self.assertEqual({n for n in staged if n.endswith(".sh")}, {
+            r for r, modes in runners.items() if any(w == INPUTS["STAGE"] for w, _ in modes.values())})
+
+    def test_declared_shell_inputs_must_be_executable(self):
+        root = self.base / "exec-root"
+        names = INPUTS["required"]("scripts/run-privileged-lib-tests.sh", "run")
+        for name in names:
+            path = root / name; path.parent.mkdir(parents=True, exist_ok=True); shutil.copy2(ROOT / name, path)
+        self.assertEqual(INPUTS["missing"](str(root), "scripts/run-privileged-lib-tests.sh", "run"), [])
+        helper = root / "scripts/ci/prepare-btrfs-tmpdir.sh"
+        helper.chmod(0o644)
+        self.assertEqual(INPUTS["missing"](str(root), "scripts/run-privileged-lib-tests.sh", "run"), [str(helper)])
+
+    def test_every_runner_with_inputs_runs_the_declared_preflight(self):
+        for runner, modes in INPUTS["RUNNERS"].items():
+            text = (ROOT / runner).read_text()
+            needs = any(inputs for where, inputs in modes.values()
+                        if not (runner == "scripts/qualify-release-matrix.sh" and where == INPUTS["STAGE"]))
+            with self.subTest(runner=runner):
+                calls = re.findall(r'runner_inputs\.py" check "[^"]+" (\S+) ', text)
+                self.assertEqual(set(calls), {runner} if needs else set())
+        # The guest stage's preflight binds every staged source before any runner.
+        inner = (ROOT / "scripts/qualify-release-matrix.sh").read_text()
+        verify = inner.index('--verify-inputs "$STAGE"')
+        self.assertLess(verify, inner.index('"$R/scripts/qualify-public-cli.sh"'))
+
+    def run_tool(self, argv, env=None, ignore_hup=False):
+        merged = dict(os.environ, **(env or {}))
+        def preexec():
+            if ignore_hup:
+                signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        return subprocess.run(argv, text=True, capture_output=True, timeout=120, env=merged,
+                              cwd=self.base, preexec_fn=preexec)
+
+    def test_every_runner_mode_refuses_each_missing_input_before_setup(self):
+        # For every runner and mode: a healthy run passes preflight and stops
+        # at a named later check; removing each declared input (and the
+        # declaration itself) refuses with exit 64, names that exact path and
+        # creates no output. Stage modes run checkout-free.
+        repo, stage = self.clone_source()
+        staged = stage / "artifacts/source"
+        binary = self.base / "not-a-libtest"
+        binary.write_text("#!/bin/sh\nexit 0\n"); binary.chmod(0o755)
+        contract = stage / "contract.json"
+        def cases(root):
+            sh = lambda name: ["bash", str(root / name)]
+            native = sh("scripts/qualify-inventory-native.sh")
+            return {
+                ("scripts/qualify-public-cli.sh", "run"): [
+                    (lambda out: sh("scripts/qualify-public-cli.sh") + ["/bin/true", str(out)],
+                     {"P11SCOPE_PUBLIC_CLI_CELLS": "not-a-cell"}, False, (64, "unsupported subset cell"))],
+                ("scripts/qualify-inventory-native.sh", "run"): [
+                    (lambda out: native + ["/bin/true", "--lane", "scan", "--capacity", "boundary", "--max-endpoints",
+                                           "4096", "--demand", "4097", "--base", str(out)], {}, False,
+                     (70, "must run as root")),
+                    (lambda out: native + ["/bin/true", "--lane", "native", "--base", str(out)], {}, False,
+                     (70, "must run as root"))],
+                ("scripts/qualify-inventory-native.sh", "self-test"): [
+                    (lambda out: native + ["--self-test"], {}, True, (70, "positive control failed"))],
+                ("scripts/run-privileged-lib-tests.sh", "run"): [
+                    (lambda out: sh("scripts/run-privileged-lib-tests.sh") + [str(binary), str(out)], {}, False,
+                     (64, "must be run as root"))],
+                ("scripts/ci/build-counter-fixtures.sh", "run"): [
+                    (lambda out: sh("scripts/ci/build-counter-fixtures.sh") + [str(out)], {}, False, (0, ""))],
+                ("scripts/ci/build-wrap-fixtures.sh", "run"): [
+                    (lambda out: sh("scripts/ci/build-wrap-fixtures.sh") + [str(out)], {}, False, (0, ""))],
+                ("scripts/qualify-release-matrix.sh", "checkout"): [
+                    (lambda out: sh("scripts/qualify-release-matrix.sh") + ["--write-inner-stage", str(stage),
+                                                                            "--contract", str(contract)],
+                     {}, False, (0, ""))],
+                ("scripts/qualify-release-matrix.sh", "stage"): [
+                    (lambda out: sh("scripts/qualify-release-matrix.sh") + ["--write-inner-stage", str(stage),
+                                                                            "--contract", str(contract)],
+                     {}, False, (0, ""))],
+            }
+        declared = {(r, m) for r, modes in INPUTS["RUNNERS"].items() for m, (_, inputs) in modes.items() if inputs}
+        self.assertEqual(set(cases(repo)), declared)
+        inner = stage / "inner.sh"
+        def check(runner, mode, root, remove_root):
+            where = INPUTS["RUNNERS"][runner][mode][0]
+            names = list(INPUTS["required"](runner, mode))
+            if mode != "stage":
+                names.append(INPUTS["SELF"])
+            for number, (argv, env, hup, (rc, marker)) in enumerate(cases(root)[(runner, mode)]):
+                for name in [None] + names:
+                    with self.subTest(runner=runner, mode=mode, invocation=number, missing=name):
+                        label = "out-%s-%s-%d-%s" % (Path(runner).name, mode, number, name or "healthy")
+                        out = self.base / label.replace("/", "_")
+                        path = remove_root / name if name else None
+                        if path is not None:
+                            content, mode_bits = path.read_bytes(), path.stat().st_mode
+                            path.unlink()
+                        try:
+                            result = self.run_tool(argv(out), env, hup)
+                        finally:
+                            if path is not None:
+                                path.write_bytes(content); path.chmod(mode_bits)
+                        text = result.stdout + result.stderr
+                        if name is None:
+                            self.assertEqual(result.returncode, rc, text)
+                            self.assertIn(marker, text)
+                            self.assertNotIn("required input missing", text)
+                        elif mode == "stage":
+                            self.assertEqual(result.returncode, 1, text)
+                            self.assertIn(name, text)
+                            self.assertFalse(inner.exists())
+                        else:
+                            self.assertEqual(result.returncode, 64, text)
+                            self.assertIn("required input missing: %s" % path, text)
+                            self.assertFalse(out.exists())
+                            if marker:  # refused at preflight, never at the later check
+                                self.assertNotIn(marker, text)
+                        if inner.exists():
+                            inner.unlink()
+                        if out.exists():
+                            shutil.rmtree(out)
+        moved = self.base / "unavailable original checkout"
+        repo.rename(moved)
+        for runner, mode in sorted(declared):
+            if INPUTS["RUNNERS"][runner][mode][0] == INPUTS["STAGE"] and runner != "scripts/qualify-release-matrix.sh":
+                check(runner, mode, staged, staged)
+        moved.rename(repo)
+        check("scripts/qualify-inventory-native.sh", "self-test", repo, repo)
+        check("scripts/qualify-release-matrix.sh", "checkout", repo, repo)
+        check("scripts/qualify-release-matrix.sh", "stage", repo, staged)
 
     def staged_native(self):
         repo, stage = self.clone_source()
         staged = stage / "artifacts/source"
         repo.rename(self.base / "unavailable original checkout")
         return staged
-
-    def test_staged_native_driver_without_an_input_refuses_before_any_work(self):
-        staged = self.staged_native()
-        driver = staged / "scripts/qualify-inventory-native.sh"
-        def run():
-            return subprocess.run(["bash", str(driver), "/bin/true", "--lane", "unknown"],
-                                  text=True, capture_output=True, timeout=30)
-        healthy = run()
-        self.assertEqual(healthy.returncode, 64, healthy.stdout + healthy.stderr)
-        self.assertIn("--lane must be scan or native", healthy.stderr)
-        self.assertNotIn("required input missing", healthy.stderr)
-        for name in ("scripts/inventory-native-oracle.py", "scripts/qualify-cgroup-trace.py",
-                     "scripts/mapped-provider-pin.py", "tests/fixtures/public-cli/inventory-ledger.c"):
-            with self.subTest(input=name):
-                path = staged / name
-                content = path.read_bytes(); path.unlink()
-                try:
-                    result = run()
-                    self.assertEqual(result.returncode, 64, result.stdout + result.stderr)
-                    self.assertIn("required input missing: %s" % path, result.stderr)
-                    self.assertNotIn("--lane must be", result.stderr)
-                finally:
-                    path.write_bytes(content)
 
     def test_staged_native_c8_calibration_runs_checkout_free(self):
         # The staged driver's actual C8 prepare seam with four parent-held
@@ -711,50 +850,6 @@ class MatrixContract(unittest.TestCase):
             self.assertFalse(receipt.exists())
         finally:
             helper.write_bytes(content)
-
-    def test_staged_lib_runner_without_a_helper_refuses_before_any_setup(self):
-        repo, stage = self.clone_source()
-        staged = stage / "artifacts/source"
-        repo.rename(self.base / "unavailable original checkout")
-        binary = self.base / "not-a-libtest"
-        binary.write_text("#!/bin/sh\nexit 0\n"); binary.chmod(0o755)
-        runner = staged / "scripts/run-privileged-lib-tests.sh"
-        def run(name):
-            out = self.base / ("lib-" + name)
-            return subprocess.run([str(runner), str(binary), str(out)], text=True, capture_output=True,
-                                  timeout=30)
-        healthy = run("healthy")
-        self.assertNotIn("required helper missing", healthy.stderr)
-        for name in ("build-counter-fixtures.sh", "build-wrap-fixtures.sh", "prepare-btrfs-tmpdir.sh"):
-            with self.subTest(helper=name):
-                path = staged / "scripts/ci" / name
-                self.assertTrue(os.access(path, os.X_OK), "staged helper lost its mode")
-                content = path.read_bytes(); path.unlink()
-                try:
-                    result = run(name)
-                    self.assertEqual(result.returncode, 64, result.stdout + result.stderr)
-                    self.assertIn("required helper missing: %s" % path, result.stderr)
-                finally:
-                    path.write_bytes(content); path.chmod(0o755)
-
-    def test_staged_shell_without_a_helper_refuses_before_any_cell(self):
-        repo, stage = self.clone_source()
-        staged = stage / "artifacts/source/scripts"
-        repo.rename(self.base / "unavailable original checkout")
-        for name in ("qualify_records.py", "inventory-mt-gate.py"):
-            with self.subTest(helper=name):
-                content = (staged / name).read_bytes()
-                (staged / name).unlink()
-                try:
-                    out = self.base / ("refused-" + name)
-                    result = subprocess.run(["bash", str(staged / "qualify-public-cli.sh"), "--control-fifo",
-                                             "/bin/false", str(out), "/bin/true"],
-                                            text=True, capture_output=True, timeout=10)
-                    self.assertEqual(result.returncode, 64, result.stdout + result.stderr)
-                    self.assertIn("required helper missing: %s" % (staged / name), result.stderr)
-                    self.assertFalse(out.exists())
-                finally:
-                    (staged / name).write_bytes(content)
 
     def test_runtime_ledger_drift_is_rejected_before_inner_generation(self):
         repo, stage = self.clone_source()
@@ -1787,7 +1882,7 @@ class MatrixContract(unittest.TestCase):
     def retained_object_inputs(self, cells=(("full", 64),), native_inputs=None, tag=""):
         repo = self.base / ("original object source" + tag)
         names = set().union(*(set(CHECKER_MOD[key]) for key in
-            ("SOURCE_FILES", "RUNTIME_SOURCES", "CANARY_SOURCE_FILES", "CANARY_RUNTIME_SOURCES", "CANARY_PRODUCER_SOURCES")))
+            ("SOURCE_FILES", "RUNTIME_SOURCES", "CANARY_SOURCE_FILES", "CANARY_RUNTIME_SOURCES", "CANARY_PRODUCER_SOURCES"))) | DECLARED
         for name in names:
             target = repo / name
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -2457,8 +2552,8 @@ class MatrixContract(unittest.TestCase):
         # contract sealing and judge are the production bytes and entrypoints.
         repo = self.base / "controlled-source"
         (repo / "scripts").mkdir(parents=True)
-        for path in (RUNNER, CHECKER, ROOT / "scripts/public-cli-oracle.py", ROOT / "scripts/system-scope-measure.py",
-                     ROOT / "scripts/check-capture-evidence.py"):
+        for path in (RUNNER, CHECKER, ROOT / "scripts/runner_inputs.py", ROOT / "scripts/public-cli-oracle.py",
+                     ROOT / "scripts/system-scope-measure.py", ROOT / "scripts/check-capture-evidence.py"):
             shutil.copy2(path, repo / "scripts" / path.name)
         for name in ("qualify-public-cli.sh", "qualify-inventory-native.sh", "run-privileged-lib-tests.sh"):
             path = repo / "scripts" / name
@@ -2474,10 +2569,10 @@ class MatrixContract(unittest.TestCase):
             path.chmod(0o755)
         # Every other staged source (the full SOURCE_FILES list) is a
         # controlled stand-in.
-        for name in sorted((set(CHECKER_MOD["SOURCE_FILES"]) | set(CHECKER_MOD["RUNTIME_SOURCES"]))
-                           - {"scripts/" + p.name for p in repo.joinpath("scripts").iterdir()}):
+        for name in sorted(DECLARED - {"scripts/" + p.name for p in repo.joinpath("scripts").iterdir()}):
             path = repo / name; path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("controlled external fixture\n")
+            if name.endswith(".sh"): path.chmod(0o755)
         for name in ("p11scope", "p11scope-bpfmulti"):
             path = self.bins / name
             path.write_text("#!/bin/bash\nprintf '%s\\n' \"$@\" > \"$CONTROL_ARGS/" + name + ".args\"\necho controlled\nexit 0\n")

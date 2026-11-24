@@ -1080,6 +1080,41 @@ class BoundedReadTests(unittest.TestCase):
         for name, data, want in rows:
             self.check("input " + name, dict(copy.deepcopy(case), raw={"sig2.stderr": data}), limit, want)
 
+    def test_descriptor_reads_at_most_limit_plus_one(self):
+        # codex r11c #2: the descriptor itself stops at limit + 1 bytes (no
+        # buffered read-ahead), across several read chunks too.
+        held = []
+        original = Q.open_regular
+
+        def spy(path, rule, what):
+            fd, info = original(path, rule, what)
+            held.append(os.dup(fd))
+            return fd, info
+
+        rows = ((16384, 4096, True), (4096, 4096, False), (10, 4096, False),
+                (Q.READ_CHUNK * 2 + 9, Q.READ_CHUNK * 2 + 5, True), (Q.READ_CHUNK * 2 + 5, Q.READ_CHUNK * 2 + 5, False))
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "input"
+            for size, limit, refused in rows:
+                with self.subTest(size=size, limit=limit):
+                    path.write_bytes(b" " * size)
+                    Q.open_regular = spy
+                    try:
+                        if refused:
+                            with self.assertRaises(Q.Refusal) as raised:
+                                Q.read_bounded(str(path), "fresh.run", "input", limit)
+                            self.assertEqual(raised.exception.rule, "fresh.run")
+                        else:
+                            data, _ = Q.read_bounded(str(path), "fresh.run", "input", limit)
+                            self.assertEqual(len(data), size)
+                    finally:
+                        Q.open_regular = original
+                    dup = held.pop()
+                    try:
+                        self.assertEqual(os.lseek(dup, 0, os.SEEK_CUR), min(size, limit + 1))
+                    finally:
+                        os.close(dup)
+
     def test_cgroup_procs(self):
         limit = 65  # the healthy 7 bytes plus whole "7\n" rows
         healthy = member_case()["procs"].encode()

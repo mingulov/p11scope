@@ -27,13 +27,11 @@ ORACLE=$HERE/public-cli-oracle.py
 # Every structured-evidence decision below is one judge of the typed
 # loader (strict records, run-bound inputs, declared rules).
 RECORDS=$HERE/qualify_records.py
-# Every sibling this shell runs is staged with it (release-matrix-contract
-# SOURCE_FILES); a stage without one refuses here, before any cell.
-for _helper in public-cli-oracle.py qualify_records.py release-matrix-contract.py mapped-provider-pin.py \
-    inventory-mt-oracle.py system-cell-census.py inventory-mt-gate.py; do
-  [ -f "$HERE/$_helper" ] || { echo "qualify-public-cli.sh: required helper missing: $HERE/$_helper" >&2; exit 64; }
-done
-unset _helper
+# Every input this shell reads is declared once in runner_inputs.py, the
+# declaration the release stage is built from; a missing one refuses here,
+# before any cell.
+[ -f "$HERE/runner_inputs.py" ] || { echo "qualify-public-cli.sh: required input missing: $HERE/runner_inputs.py" >&2; exit 64; }
+python3 -I "$HERE/runner_inputs.py" check "$HERE/.." scripts/qualify-public-cli.sh run || exit 64
 CONTROL=0
 CONTROL_KIND=gated
 if [ "${1:-}" = --control-gated ]; then CONTROL=1; shift

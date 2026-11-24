@@ -45,6 +45,7 @@ PID_MAX = 4194304
 MAX_INPUT_BYTES = 64 * 1024 * 1024
 # The stamp is three short fields; a larger stamp is not one this loader wrote.
 MAX_STAMP_BYTES = 4096
+READ_CHUNK = 1024 * 1024
 
 # -- rules ---------------------------------------------------------------
 
@@ -312,13 +313,24 @@ def read_bounded(path, rule, what, limit, newer_than_ns=None):
     more bytes than the limit refuses under `rule`; it is never truncated
     to a prefix. With `newer_than_ns`, an input older than that refuses."""
     fd, info = open_regular(path, rule, what)
-    with os.fdopen(fd, "rb") as handle:
+    chunks = []
+    try:
         if newer_than_ns is not None:
             require(info.st_mtime_ns >= newer_than_ns, rule,
                     "%s %s predates this run's stamp (stale)" % (what, path))
         # The bytes read from this descriptor decide the size, not a
-        # metadata size that could change after fstat.
-        data = handle.read(limit + 1)
+        # metadata size that could change after fstat. Unbuffered: the
+        # descriptor never reads more than limit + 1 bytes.
+        budget = limit + 1
+        while budget > 0:
+            chunk = os.read(fd, min(budget, READ_CHUNK))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            budget -= len(chunk)
+    finally:
+        os.close(fd)
+    data = b"".join(chunks)
     require(len(data) <= limit, rule, "%s %s exceeds the %d-byte limit" % (what, path, limit))
     return data, info
 

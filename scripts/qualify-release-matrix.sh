@@ -52,6 +52,11 @@ CONTRACT=""
 OBJECT_ARGS=()
 GUEST_DISK_ARGS=()
 CHECKER=$REPO/scripts/release-matrix-contract.py
+# The host driver's inputs are declared once in runner_inputs.py (the guest
+# stage's are bound by --verify-inputs from the same declaration).
+[ -f "$REPO/scripts/runner_inputs.py" ] || {
+  echo "qualify-release-matrix.sh: required input missing: $REPO/scripts/runner_inputs.py" >&2; exit 64; }
+python3 -I "$REPO/scripts/runner_inputs.py" check "$REPO" scripts/qualify-release-matrix.sh checkout || exit 64
 
 usage() {
   sed -n '2,30p' "$0" >&2

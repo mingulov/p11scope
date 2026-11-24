@@ -30,7 +30,7 @@ RECORDS=$HERE/qualify_records.py
 # Every input this shell reads is declared once in runner_inputs.py, the
 # declaration the release stage is built from; a missing one refuses here,
 # before any cell.
-[ -f "$HERE/runner_inputs.py" ] || { echo "qualify-public-cli.sh: required input missing: $HERE/runner_inputs.py" >&2; exit 64; }
+[ -f "$HERE/runner_inputs.py" ] && [ -r "$HERE/runner_inputs.py" ] || { echo "qualify-public-cli.sh: required input missing: $HERE/runner_inputs.py" >&2; exit 64; }
 python3 -I "$HERE/runner_inputs.py" check "$HERE/.." scripts/qualify-public-cli.sh run || exit 64
 CONTROL=0
 CONTROL_KIND=gated

@@ -1168,6 +1168,39 @@ class BoundedReadTests(unittest.TestCase):
                         Q.os.read = original_read
                     self.assertTrue(closed(opened.pop()), name)
 
+    def test_open_regular_closes_on_every_refusal(self):
+        # hungerg r11e #3: a non-regular file and a failing fstat after the
+        # open both close the descriptor open_regular opened.
+        original_open, original_fstat = os.open, os.fstat
+        for name in ("fifo", "fstat error"):
+            with self.subTest(case=name), tempfile.TemporaryDirectory() as raw:
+                path = Path(raw) / "input"
+                if name == "fifo":
+                    os.mkfifo(path)
+                else:
+                    path.write_bytes(b"x\n")
+                opened = []
+
+                def spy_open(*args, **kwargs):
+                    fd = original_open(*args, **kwargs)
+                    opened.append(fd)
+                    return fd
+
+                def failing_fstat(fd):
+                    raise OSError(5, "controlled fstat failure")
+
+                Q.os.open = spy_open
+                if name == "fstat error":
+                    Q.os.fstat = failing_fstat
+                try:
+                    with self.assertRaises(Q.Refusal if name == "fifo" else OSError):
+                        Q.open_regular(str(path), "fresh.run", "input")
+                finally:
+                    Q.os.open, Q.os.fstat = original_open, original_fstat
+                self.assertEqual(len(opened), 1, name)
+                with self.assertRaises(OSError, msg=name):
+                    os.fstat(opened[0])
+
     def test_cgroup_procs(self):
         limit = 65  # the healthy 7 bytes plus whole "7\n" rows
         healthy = member_case()["procs"].encode()

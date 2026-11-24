@@ -26,7 +26,7 @@ import json
 import sys
 from pathlib import Path
 
-PINNED_VERSION = "0.2.3"
+PINNED_VERSION = "0.3.1"
 # Suffix of the known oracle-side misattribution node (docs/notes/phase4-oracle.md):
 # test_v32_interface_negotiated carries test_v30's trace. Matched by suffix so
 # venv and source-checkout prefixes both work.

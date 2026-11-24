@@ -148,7 +148,7 @@ def make_unit(target, status="passed", returncode=0, passed=129, skipped=4):
 
 
 def results_doc(units):
-    return {"provenance": {"framework": {"version": "0.2.3"}},
+    return {"provenance": {"framework": {"version": "0.3.1"}},
             "summary": dict(SUMMARY), "units": units}
 
 

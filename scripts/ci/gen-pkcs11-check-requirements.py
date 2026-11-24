@@ -28,8 +28,8 @@ HEADER = (
     "# Installed with `pip install --require-hashes -r scripts/ci/pkcs11-check-requirements.txt` by the pkcs11-check-smoke and",
     "# pkcs11-check-full jobs in .github/workflows/privileged-tests.yml. Every requirement",
     "# carries the sha256 of each published artifact (all wheels plus the sdist),",
-    "# so any runner Python resolves the same bytes. Generated 2026-11-14 from the",
-    "# working 0.2.3 closure via the PyPI JSON API; to regenerate on a version bump,",
+    "# so any runner Python resolves the same bytes. Generated 2026-11-24 from the",
+    "# working 0.3.1 closure via the PyPI JSON API; to regenerate on a version bump,",
     "# install the new version into a scratch venv, smoke-test the cell, then run",
     "# scripts/ci/gen-pkcs11-check-requirements.py against that venv and review the diff.",
 )

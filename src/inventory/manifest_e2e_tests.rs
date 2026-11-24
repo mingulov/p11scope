@@ -4042,28 +4042,36 @@ fn keysize_canary_owned_map_ids(pid: u32) -> Result<Vec<u32>> {
     Ok(ids)
 }
 
-/// (name, type) from `bpftool map show id <id> -j`, which prints an
-/// object for one map and a one-element array on some versions.
-/// Unnamed maps read `<unnamed>`; the dump still scans them.
-fn keysize_canary_map_identity(shown: &[u8], id: u32) -> Result<(String, String)> {
-    let parsed: serde_json::Value = serde_json::from_slice(shown)
-        .with_context(|| format!("KEYCANARY: map {id} show output is not JSON"))?;
-    let entry = if let Some(first) = parsed.get(0) {
-        first
-    } else {
-        &parsed
-    };
-    let name = entry
-        .get("name")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("<unnamed>")
-        .to_string();
-    let kind = entry
-        .get("type")
-        .and_then(serde_json::Value::as_str)
-        .with_context(|| format!("KEYCANARY: map {id} show output has no type"))?
-        .to_string();
-    Ok((name, kind))
+/// (id, name, type) for every entry of `bpftool map list -j`: one
+/// call classifies the whole owned set, so the scan stays inside the
+/// observer's capture window. Unnamed maps read `<unnamed>`; entries
+/// without an id or a type fail the caller.
+fn keysize_canary_listed_identities(listed: &[u8]) -> Result<Vec<(u32, String, String)>> {
+    let parsed: serde_json::Value =
+        serde_json::from_slice(listed).context("KEYCANARY: bpftool map list output is not JSON")?;
+    let entries = parsed
+        .as_array()
+        .context("KEYCANARY: bpftool map list is not an array")?;
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let id = entry
+            .get("id")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|id| u32::try_from(id).ok())
+            .context("KEYCANARY: map list entry has no id")?;
+        let name = entry
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("<unnamed>")
+            .to_string();
+        let kind = entry
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .with_context(|| format!("KEYCANARY: map {id} list entry has no type"))?
+            .to_string();
+        out.push((id, name, kind));
+    }
+    Ok(out)
 }
 
 /// The owned-map scan result: dumped (and scanned) maps, ringbufs the
@@ -4123,25 +4131,32 @@ fn keysize_canary_scan_owned_maps(pid: u32, dump_dir: &Path) -> Result<KeysizeCa
     let mut task_storage = Vec::new();
     let mut bytes = 0u64;
     let mut combined = Vec::new();
+    let list = Command::new("bpftool")
+        .args(["map", "list", "-j"])
+        .output()
+        .context("KEYCANARY: spawning bpftool map list")?;
+    ensure!(
+        list.status.success(),
+        "{TAG}: bpftool map list failed: {}",
+        String::from_utf8_lossy(&list.stderr)
+            .chars()
+            .take(200)
+            .collect::<String>()
+    );
+    let identities: std::collections::HashMap<u32, (String, String)> =
+        keysize_canary_listed_identities(&list.stdout)?
+            .into_iter()
+            .map(|(id, name, kind)| (id, (name, kind)))
+            .collect();
     for id in ids {
-        let show = Command::new("bpftool")
-            .args(["map", "show", "id", &id.to_string(), "-j"])
-            .output()
-            .context("KEYCANARY: spawning bpftool map show")?;
-        ensure!(
-            show.status.success(),
-            "{TAG}: bpftool map show id {id} failed: {}",
-            String::from_utf8_lossy(&show.stderr)
-                .chars()
-                .take(200)
-                .collect::<String>()
-        );
-        let (name, kind) = keysize_canary_map_identity(&show.stdout, id)?;
+        let (name, kind) = identities.get(&id).with_context(|| {
+            format!("{TAG}: owned map {id} vanished before the scan (the observer may have exited)")
+        })?;
         if kind == "ringbuf" {
             rings.push(format!("{name} ({id})"));
             continue;
         }
-        if keysize_canary_is_undumpable_task_storage(&kind) {
+        if keysize_canary_is_undumpable_task_storage(kind) {
             task_storage.push(format!("{name} ({id}/{kind})"));
             continue;
         }
@@ -4199,24 +4214,20 @@ fn keysize_canary_fdinfo_parser_collects_map_ids() {
 }
 
 #[test]
-fn keysize_canary_map_identity_parses_both_show_shapes() {
-    let object = br#"{"id": 9, "type": "hash", "name": "EVIDENCE_START"}"#;
+fn keysize_canary_listed_identities_parse_the_map_list() {
+    let list = br#"[{"id": 9, "type": "hash", "name": "EVIDENCE_START"},{"id": 4, "type": "ringbuf", "name": "EVENTS"},{"id": 2, "type": "array"}]"#;
     assert_eq!(
-        keysize_canary_map_identity(object, 9).unwrap(),
-        ("EVIDENCE_START".to_string(), "hash".to_string())
+        keysize_canary_listed_identities(list).unwrap(),
+        vec![
+            (9, "EVIDENCE_START".to_string(), "hash".to_string()),
+            (4, "EVENTS".to_string(), "ringbuf".to_string()),
+            (2, "<unnamed>".to_string(), "array".to_string()),
+        ]
     );
-    let array = br#"[{"id": 4, "type": "ringbuf", "name": "EVENTS"}]"#;
-    assert_eq!(
-        keysize_canary_map_identity(array, 4).unwrap(),
-        ("EVENTS".to_string(), "ringbuf".to_string())
-    );
-    let unnamed = br#"{"id": 2, "type": "array"}"#;
-    assert_eq!(
-        keysize_canary_map_identity(unnamed, 2).unwrap(),
-        ("<unnamed>".to_string(), "array".to_string())
-    );
-    assert!(keysize_canary_map_identity(b"not json", 1).is_err());
-    assert!(keysize_canary_map_identity(br#"{"id": 1, "name": "X"}"#, 1).is_err());
+    assert!(keysize_canary_listed_identities(b"not json").is_err());
+    assert!(keysize_canary_listed_identities(br#"{"id": 1}"#).is_err());
+    assert!(keysize_canary_listed_identities(br#"[{"id": 1, "name": "X"}]"#).is_err());
+    assert!(keysize_canary_listed_identities(br#"[{"type": "hash"}]"#).is_err());
 }
 
 #[test]
@@ -4254,7 +4265,7 @@ fn keysize_canary_task_storage_matches_the_whole_class() {
 /// undumpable and never read), while both RSA-2048 sizes publish.
 /// Needs an observer binary via `P11SCOPE_E2E_OBSERVER` or a `p11scope`
 /// sibling of this test binary, plus `bpftool` for the map dumps.
-/// Prints KEYCANARY lines. Root BPF lane, serial, about a minute.
+/// Prints KEYCANARY lines. Root BPF lane, serial, about 80 seconds.
 #[test]
 #[ignore = "privileged: live key-sizes canary proves no sentinel payload byte reaches output, maps or logs"]
 fn privileged_inventory_pid_key_sizes_canary_no_payload_leak() -> Result<()> {
@@ -4332,7 +4343,7 @@ fn keysize_canary_inner(workload: &E2eWorkload, module: &str, observer: &Path) -
             "--event-log",
             event_log.to_str().context("event log path")?,
             "--duration",
-            "30",
+            "60",
             "--json",
             "--verbose",
             "-o",
@@ -4386,13 +4397,15 @@ fn keysize_canary_inner(workload: &E2eWorkload, module: &str, observer: &Path) -
     // observer owns is dumped and scanned raw+hex while it still runs
     // (maps die with the process, so no post-stop dump exists). Rings
     // are listed, not dumped: they drain into the scanned outputs.
+    let scan_started = Instant::now();
     let map_scan = keysize_canary_scan_owned_maps(child.id(), &workload.path("mapdumps"))?;
     println!(
-        "{TAG} maps dumped={} rings={} taskstorage={} bytes={} rings=[{}] taskstorage=[{}]",
+        "{TAG} maps dumped={} rings={} taskstorage={} bytes={} secs={} rings=[{}] taskstorage=[{}]",
         map_scan.dumped.len(),
         map_scan.rings.len(),
         map_scan.task_storage.len(),
         map_scan.bytes,
+        scan_started.elapsed().as_secs(),
         map_scan.rings.join(", "),
         map_scan.task_storage.join(", ")
     );

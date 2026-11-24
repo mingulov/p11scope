@@ -24787,10 +24787,13 @@ impl Engine {
             let Some(front) = self.owned_learn_deferred.front() else {
                 break;
             };
-            // Direct-child proofs need no learning (their scan-owned
-            // slots persist): judged from the defer-time snapshot,
-            // never from the recyclable numeric id.
-            if front.is_direct_child {
+            // Direct-child proofs from a retained prover need no
+            // learning (its scan-owned slots persist): judged from
+            // the defer-time snapshots, never from the recyclable
+            // numeric id. A newcomer owned-child proof (uncommitted
+            // at defer) stages under credit below instead: its rows
+            // may never commit, so skipping would lose it silently.
+            if front.is_direct_child && front.proving_retained {
                 self.owned_learn_deferred.pop_front();
                 continue;
             }
@@ -25462,7 +25465,10 @@ impl Engine {
     fn drain_owned_learn_backlog_at_shutdown(&mut self) {
         let mut scratch = PinnedObjects::empty();
         while let Some(entry) = self.owned_learn_deferred.pop_front() {
-            if entry.is_direct_child {
+            // Same gate as the paced drain: only a retained
+            // direct-child proof skips; a newcomer owned-child proof
+            // stages before the flush.
+            if entry.is_direct_child && entry.proving_retained {
                 continue;
             }
             if entry.scan_pins.file_for(entry.proof.object).is_none() {

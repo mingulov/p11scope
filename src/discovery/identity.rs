@@ -9057,9 +9057,10 @@ pub(crate) fn identity_of(
 /// The mount-id row for one exact mount id, scanned in INV-2 strides
 /// of at most [`MOUNTINFO_STRIDE`] lines per credit with a stop poll
 /// between strides: a whole-table scan would charge nothing and answer
-/// nothing until the end. Returns the matched row on an exact
-/// mount-id match, `Ok(None)` when the table does not name the id,
-/// and `Err` on budget refusal or stop.
+/// nothing until the end. Each row is spent before it is visited, so
+/// refusal precedes the work it refuses. Returns the matched row on an
+/// exact mount-id match, `Ok(None)` when the table does not name the
+/// id, and `Err` on budget refusal or stop.
 fn scan_mount_table_for_row_with<'table>(
     table: &'table str,
     mount_id: &str,
@@ -9078,9 +9079,18 @@ fn scan_mount_table_for_row_with<'table>(
             }
         }
         first_stride = false;
+        // INV-2: each row is spent before it is visited, so an
+        // exhausted allowance refuses without visiting any row. Totals
+        // match the old post-stride spend exactly, including the full
+        // first stride after an early match (no later stride is read,
+        // charged, or stop-polled).
         let mut stride_rows = 0usize;
         let mut found = None;
-        for row in rows.by_ref().take(MOUNTINFO_STRIDE) {
+        for _ in 0..MOUNTINFO_STRIDE {
+            let Some(row) = rows.next() else {
+                break;
+            };
+            budget.spend(1).map_err(str::to_string)?;
             stride_rows += 1;
             #[cfg(test)]
             EXACT_ROWS_VISITED.with(|counter| counter.set(counter.get() + 1));
@@ -9091,9 +9101,6 @@ fn scan_mount_table_for_row_with<'table>(
                 }
             }
         }
-        budget
-            .spend(u64::try_from(stride_rows).unwrap_or(u64::MAX))
-            .map_err(str::to_string)?;
         if let Some(row) = found {
             return Ok(Some(row));
         }
@@ -9109,16 +9116,18 @@ fn scan_mount_table_for_row_with<'table>(
 /// parser — so the parse and every error string stay the shared
 /// implementation's, while no whole-table scan runs uncharged. One
 /// credit covers the fdinfo row, one the delegate's bounded re-read.
+/// INV-2: the fdinfo credit is spent before the fdinfo read, so an
+/// exhausted allowance refuses without issuing any I/O.
 fn mapping_file_key_in_mountinfo_metered_with(
     file: &std::fs::File,
     mountinfo: &str,
     budget: &mut CaptureWorkBudget,
     stop: impl FnMut(&mut CaptureWorkBudget) -> Option<&'static str>,
 ) -> Result<MappingFileKey, String> {
+    budget.spend(1).map_err(str::to_string)?;
     #[cfg(test)]
     METERED_FDINFO_CALLS.with(|counter| counter.set(counter.get() + 1));
     let mount_id = fd_mount_id(file)?;
-    budget.spend(1).map_err(str::to_string)?;
     let row = scan_mount_table_for_row_with(mountinfo, &mount_id, budget, stop)?;
     budget.spend(1).map_err(str::to_string)?;
     // An unmatched id resolves against the empty table, which the

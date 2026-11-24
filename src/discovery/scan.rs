@@ -643,28 +643,35 @@ fn read_mountinfo_pass<R: Read>(
             .len()
             .checked_add(read)
             .ok_or_else(|| MOUNTINFO_CEILING_REASON.to_string())?;
-        let newlines = chunk[..read].iter().filter(|byte| **byte == b'\n').count();
-        #[cfg(test)]
-        {
-            READER_BYTES_SCANNED.with(|counter| counter.set(counter.get() + read as u64));
-            READER_NEWLINES_SCANNED.with(|counter| counter.set(counter.get() + newlines as u64));
-        }
-        let next_newline_count = progress
-            .newline_count
-            .checked_add(newlines)
-            .ok_or_else(|| MOUNTINFO_ENTRY_CEILING_REASON.to_string())?;
-        let next_lines = next_newline_count
-            .checked_add(usize::from(chunk[read - 1] != b'\n'))
-            .ok_or_else(|| MOUNTINFO_ENTRY_CEILING_REASON.to_string())?;
-        let added_lines = next_lines.saturating_sub(progress.observed_lines);
-        // INV-2: at most MOUNTINFO_STRIDE new lines per credit, with a
-        // stop poll between strides, so a stop landing mid-table
-        // refuses instead of charging the whole table in one unbounded
-        // spend. Totals match the old single spend exactly.
-        let mut remaining_lines = added_lines;
-        let mut first_stride = true;
-        while remaining_lines > 0 {
-            if !first_stride {
+        // INV-2: the chunk is scanned in bounded strides — at most
+        // MOUNTINFO_STRIDE new lines or MOUNTINFO_BYTE_STRIDE bytes per
+        // credit, with a stop poll before looking past each boundary —
+        // so a stop landing mid-chunk refuses without scanning the
+        // rest. Line totals match the old whole-chunk scan exactly;
+        // byte strides only bound newline-free runs (a normal 64-line
+        // stride never reaches 8 KiB, and completing a line stride
+        // covers its bytes).
+        let prev_partial = progress.observed_lines > progress.newline_count;
+        let mut first_newline_free = prev_partial;
+        let mut chunk_newlines = 0usize;
+        let mut pending_lines = 0usize;
+        let mut lines_charged = 0usize;
+        let mut byte_stride_used = 0usize;
+        for byte in chunk[..read].iter() {
+            if pending_lines == MOUNTINFO_STRIDE {
+                if progress.observed_lines
+                    .checked_add(lines_charged)
+                    .and_then(|lines| lines.checked_add(MOUNTINFO_STRIDE))
+                    .is_none_or(|lines| lines > MAX_MOUNTINFO_ENTRIES)
+                {
+                    return Err(MOUNTINFO_ENTRY_CEILING_REASON.into());
+                }
+                budget
+                    .spend(u64::try_from(MOUNTINFO_STRIDE).unwrap_or(u64::MAX))
+                    .map_err(str::to_string)?;
+                lines_charged += MOUNTINFO_STRIDE;
+                pending_lines = 0;
+                byte_stride_used = 0;
                 if let Some(reason) = budget.stopped_reason() {
                     return Err(reason.into());
                 }
@@ -672,16 +679,63 @@ fn read_mountinfo_pass<R: Read>(
                     return Err(reason.into());
                 }
             }
-            first_stride = false;
-            let stride = remaining_lines.min(MOUNTINFO_STRIDE);
+            if byte_stride_used == MOUNTINFO_BYTE_STRIDE {
+                budget.spend(1).map_err(str::to_string)?;
+                byte_stride_used = 0;
+                if let Some(reason) = budget.stopped_reason() {
+                    return Err(reason.into());
+                }
+                if let Some(reason) = deadline(budget) {
+                    return Err(reason.into());
+                }
+            }
+            #[cfg(test)]
+            READER_BYTES_SCANNED.with(|counter| counter.set(counter.get() + 1));
+            byte_stride_used += 1;
+            if *byte == b'\n' {
+                #[cfg(test)]
+                READER_NEWLINES_SCANNED.with(|counter| counter.set(counter.get() + 1));
+                chunk_newlines += 1;
+                if first_newline_free {
+                    first_newline_free = false;
+                } else {
+                    pending_lines += 1;
+                }
+            }
+        }
+        // A trailing partial line is new unless it continues the same
+        // prior partial (no newline in this chunk while the previous
+        // chunk ended mid-line): a newline first completes the prior
+        // partial for free, leaving the new trailing bytes uncounted.
+        pending_lines +=
+            usize::from(chunk[read - 1] != b'\n' && (chunk_newlines > 0 || !prev_partial));
+        let next_newline_count = progress.newline_count
+            .checked_add(chunk_newlines)
+            .ok_or_else(|| MOUNTINFO_ENTRY_CEILING_REASON.to_string())?;
+        while pending_lines > 0 {
+            let stride = pending_lines.min(MOUNTINFO_STRIDE);
+            if progress.observed_lines
+                .checked_add(lines_charged)
+                .and_then(|lines| lines.checked_add(stride))
+                .is_none_or(|lines| lines > MAX_MOUNTINFO_ENTRIES)
+            {
+                return Err(MOUNTINFO_ENTRY_CEILING_REASON.into());
+            }
             budget
                 .spend(u64::try_from(stride).unwrap_or(u64::MAX))
                 .map_err(str::to_string)?;
-            remaining_lines -= stride;
+            lines_charged += stride;
+            pending_lines -= stride;
+        }
+        if byte_stride_used == MOUNTINFO_BYTE_STRIDE {
+            budget.spend(1).map_err(str::to_string)?;
         }
         if u64::try_from(next_len).unwrap_or(u64::MAX) > table_cap {
             return Err(MOUNTINFO_CEILING_REASON.into());
         }
+        let next_lines = progress.observed_lines
+            .checked_add(lines_charged)
+            .ok_or_else(|| MOUNTINFO_ENTRY_CEILING_REASON.to_string())?;
         if next_lines > MAX_MOUNTINFO_ENTRIES {
             return Err(MOUNTINFO_ENTRY_CEILING_REASON.into());
         }
@@ -21488,6 +21542,31 @@ int main(int argc, char **argv) {
             "one read plus the first byte stride: {}",
             budget.work_units
         );
+    }
+
+    /// A line split across chunks counts once: the first chunk's
+    /// trailing partial is the same line the next chunk continues, so
+    /// a newline-free continuation ending mid-line adds no new line.
+    #[test]
+    fn mountinfo_reader_cross_chunk_partial_counts_once() {
+        reset_reader_scan_counters_for_test();
+        let mut reader = RecordingReader::new([
+            ReaderStep::Bytes(b"ab".to_vec()),
+            ReaderStep::Bytes(b"cd".to_vec()),
+            ReaderStep::Eof,
+        ]);
+        let mut budget = CaptureWorkBudget::default();
+        assert_eq!(
+            read_mountinfo_with(&mut reader, &mut budget, 8, |_| None).unwrap(),
+            "abcd"
+        );
+        assert_eq!(
+            budget.work_units, 4,
+            "three reads plus the one split line: {}",
+            budget.work_units
+        );
+        assert_eq!(reader_newlines_scanned_for_test(), 0);
+        assert_eq!(reader_bytes_scanned_for_test(), 4);
     }
 
     /// INV-2 twins: 64 rows resolve in a single line credit with no

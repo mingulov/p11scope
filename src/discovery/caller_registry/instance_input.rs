@@ -2544,7 +2544,14 @@ impl CallerRegistry {
 
     /// Pop one queued reseed image (O(1)).
     pub(crate) fn pop_joint_reseed_queue(&mut self) -> Option<p11scope_ebpf_common::ImageIdentity> {
-        self.joint_reseed_queue.pop()
+        let popped = self.joint_reseed_queue.pop();
+        if let Some(image) = &popped {
+            Self::reseed_queued_dec(
+                &mut self.joint_reseed_queued,
+                (image.task_cookie, image.exec_id),
+            );
+        }
+        popped
     }
 
     /// Push one unfinished reseed image back (O(1)).

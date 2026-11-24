@@ -3485,10 +3485,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 
     /// Take queued reseed images for fresh births, clearing the queue.
-    pub(crate) fn drain_joint_reseed_queue(&mut self) -> Vec<p11scope_ebpf_common::ImageIdentity> {
-        self.registry.drain_joint_reseed_queue()
-    }
-
     /// Pop one queued reseed image (O(1)).
     pub(crate) fn pop_joint_reseed_queue(&mut self) -> Option<p11scope_ebpf_common::ImageIdentity> {
         self.registry.pop_joint_reseed_queue()

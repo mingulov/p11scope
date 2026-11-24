@@ -42096,7 +42096,7 @@ fn seal_walk_reseed_scans_visit_at_most_64() {
 #[test]
 fn seal_walk_rearm_visits_at_most_64() {
     use p11scope_ebpf_common::ImageIdentity;
-    let (mut scene, _ingested, _attached, _grant) = seal_walk_65_birth_originals();
+    let (scene, _ingested, _attached, _grant) = seal_walk_65_birth_originals();
     let image = ImageIdentity {
         task_cookie: 71,
         exec_id: 0,

@@ -10985,15 +10985,24 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
         // Deferred hooks stamp first on the fresh pool, in arrival
         // order; the first hook past the pool stops the drain with
-        // the queue intact for the next lifecycle staging. Hooks for
-        // a pid blinded after they queued are dropped: their stamps
-        // could never complete a resolution.
+        // the queue intact for the next lifecycle staging. Every
+        // visit charges: one unit for the queue/index work plus the
+        // scan, so blind drops and zero-holder scans (whose holders
+        // folded) still pay for their visits. Hooks for a pid blinded
+        // after they queued are dropped past a charged visit: their
+        // stamps could never complete a resolution.
         while let Some((pid, hook)) = self.deferred_hooks.peek_for_drain() {
             if self.deferred_hooks.hook_state(pid) == ExitHookState::Blinded {
+                if !self.holder_pool.try_charge(1) {
+                    break;
+                }
                 self.deferred_hooks.pop_drained();
                 continue;
             }
-            if !self.holder_pool.try_charge(self.adapter.proven_count(pid)) {
+            if !self
+                .holder_pool
+                .try_charge(self.adapter.proven_count(pid).saturating_add(1))
+            {
                 break;
             }
             self.deferred_hooks.pop_drained();
@@ -46210,6 +46219,69 @@ int main(void) {
             assert_eq!(
                 stamped, 58,
                 "the blind drain's visits cost one fresh stamp"
+            );
+        });
+    }
+
+    #[test]
+    fn a_system_scope_blind_drain_stops_intact_past_the_pool() {
+        // Blind-hook visits stop the drain intact past the pool like
+        // stamps: 59 queued hot hooks plus 965 queued hooks of a
+        // pid blinded behind them drain 59 scans and exactly 577
+        // visits (65,536 units) before stopping with 388 still queued;
+        // the next drain completes them.
+        agreeing(|| {
+            let mut scene = CaptureScene::new(2);
+            scene
+                .coordinator
+                .begin_capture_coverage(CaptureScopeCoverage::System);
+            let mut native = NativeScene::over(scene, 0);
+            native.scene.attach_all(100, ScopeCustody::System);
+            let _hot = admit_hot_pid(&mut native.scene, 7, 1100);
+            let _doomed = admit_hot_pid(&mut native.scene, 9, 1100);
+            native.scene.coordinator.commit_batch(false).unwrap();
+            native.scene.coordinator.engine.scope = Scope::System;
+            native.scene.coordinator.exit_clocks_comparable = true;
+            // One batch queues 59 hot hooks, then 965 hooks of pid 9
+            // before the queue overflows and blinds it.
+            let at = native.stamps.tick();
+            let mut storm = leader_exit_drain_many(native.domain, at, 7, &{
+                (0..118).map(|i| 300_000 + i).collect::<Vec<_>>()
+            });
+            let doomed = leader_exit_drain_many(native.domain, at, 9, &{
+                (0..1100).map(|i| 400_000 + i).collect::<Vec<_>>()
+            });
+            storm.records.extend(doomed.records);
+            native.stage(NativeBatch::Lifecycle(storm));
+            assert_eq!(
+                native.scene.coordinator.deferred_hooks.queue_len_for_test(),
+                1_024,
+                "59 hot hooks queue ahead of 965 hooks of the blinded pid"
+            );
+            assert!(
+                native
+                    .scene
+                    .coordinator
+                    .registry
+                    .staged_gaps_for_test()
+                    .iter()
+                    .any(|gap| gap.subject == "deferred leader-exit hook dropped"
+                        && gap.pid == Some(9)),
+                "the overflow blinds pid 9"
+            );
+            // The next drain stamps the 59 hot hooks and drops exactly
+            // 577 blind visits before stopping intact.
+            native.drain();
+            assert_eq!(
+                native.scene.coordinator.deferred_hooks.queue_len_for_test(),
+                388,
+                "the blind drain stops intact past the pool"
+            );
+            native.drain();
+            assert_eq!(
+                native.scene.coordinator.deferred_hooks.queue_len_for_test(),
+                0,
+                "the next drain completes the blind visits"
             );
         });
     }

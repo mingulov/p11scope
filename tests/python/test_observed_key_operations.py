@@ -1298,6 +1298,29 @@ class ObservedRsaTests(unittest.TestCase):
                     with self.assertRaises(ORACLE.OracleRefusal):
                         ORACLE.check_section(mutated)
 
+    def test_h9_v7_size_detail_specimens_pin_all_crossed_curve_widths(self):
+        # Every crossed EC curve/width pair sits in the shared
+        # refused table, so the checker loop above refuses each
+        # single-curve widening through both detail slots (the same
+        # table drives the v7/v9 schema twins).
+        with open(ROOT / "tests" / "fixtures" / "key-operations"
+                  / "size-detail-specimens.json",
+                  encoding="utf-8") as stream:
+            specimens = json.load(stream)
+        refused = specimens["refused"]
+        pairs = (("p256", 64), ("p384", 96), ("p521", 132))
+        for curve, _ in pairs:
+            for _, octets in pairs:
+                if (curve, octets) in pairs:
+                    continue
+                with self.subTest(curve=curve, octets=octets):
+                    self.assertTrue(
+                        any(detail.get("kind") == "ec"
+                            and detail.get("curve") == curve
+                            and detail.get("octets") == octets
+                            for detail in refused.values()),
+                        f"crossed {curve}/{octets} sits in the refused table")
+
     def test_h9_v7_size_detail_checker_requires_integer_tokens(self):
         # Deliberate input-token rule: the checker demands integer
         # JSON tokens for ranged integer fields (rsa_nonstandard

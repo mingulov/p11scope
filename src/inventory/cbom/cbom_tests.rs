@@ -1185,6 +1185,61 @@ fn cbom_limit_only_mac_mechanisms_classify_mac() {
     }
 }
 
+/// Verbose CBOM marks provider-reported support: a limit-only MAC
+/// row carries the no-use qualifier while an observed row has none —
+/// the same distinction JSON draws with its description and marker.
+/// Totals and call counts stay exact.
+#[test]
+fn cbom_verbose_marks_limit_only_support_without_use() {
+    let bytes = inventory_document_with_info(
+        vec![caller("c0", Some("/bin/driver"))],
+        vec![module("m0", "/lib/p.so", Some(&"a".repeat(64)))],
+        vec![edge(
+            "c0",
+            "m0",
+            Some(vec![mechanism_row(
+                1082,
+                Some("CKM_SHA256_RSA_PKCS"),
+                &["sign"],
+                4,
+            )]),
+        )],
+        vec![],
+        vec![
+            mechanism_limit_row("c0", 0, 0x1083),
+            mechanism_limit_row("c0", 0, 1082),
+        ],
+    );
+    let projection = parse_input(&bytes).unwrap();
+    let mut verbose = Vec::new();
+    super::render::render_verbose(&projection, &mut verbose).unwrap();
+    let verbose = String::from_utf8(verbose).expect("utf8");
+    assert!(
+        verbose.contains("algorithms (2):"),
+        "the algorithm total stays: {verbose}"
+    );
+    let mac_line = verbose
+        .lines()
+        .find(|line| line.contains("CKM_AES_MAC"))
+        .expect("the limit-only MAC row");
+    assert!(
+        mac_line.contains("(provider-reported support; no use observed)"),
+        "the limit-only row carries the qualifier: {verbose}"
+    );
+    assert!(
+        mac_line.contains("0 calls"),
+        "zero calls stay exact: {verbose}"
+    );
+    let used_line = verbose
+        .lines()
+        .find(|line| line.contains("CKM_SHA256_RSA_PKCS"))
+        .expect("the observed row");
+    assert!(
+        !used_line.contains("provider-reported support"),
+        "the observed row carries no qualifier: {verbose}"
+    );
+}
+
 /// A limit-only row with an unregistered mechanism id stays
 /// nameless, never guessed: the bare-hex name, the no-use
 /// description and the marker — with the honest `unknown`

@@ -4138,3 +4138,101 @@ fn key_ops_concise_skips_zero_completed_valued_rows() {
         "no zero-count segment:\n{snapshot}"
     );
 }
+
+/// A genuinely typeless size conflict names no established side: an
+/// `unknown`-labeled row without frozen key-type evidence whose
+/// inferred EC size conflicts with no second side renders the
+/// conflict without claiming an established key type.
+#[test]
+fn key_ops_verbose_size_conflict_without_type_names_no_established_side() {
+    let mut observations = populated(9);
+    observations.key_operations.push(key_row_inferred(
+        11,
+        "sign",
+        "key",
+        10,
+        "unknown",
+        RowInference {
+            family: FamilyState {
+                status: InferredStatus::Inferred,
+                value: Some(KeyFamily::Ec),
+                completions: 10,
+                value_completions: 10,
+                conflict_value: None,
+                conflict_completions: 0,
+                further: 0,
+                reason: None,
+                further_seen: 0,
+            },
+            size: SizeState {
+                status: InferredStatus::Conflicting,
+                detail: Some((
+                    SizeDetail::Ec {
+                        curve: Some("p256"),
+                        octets: 64,
+                    },
+                    EvidenceTag::SignOutput,
+                )),
+                completions: 10,
+                conflict_detail: None,
+                further: 0,
+                reason: None,
+                further_seen: Vec::new(),
+                rsa_further_seen: [0; 32],
+                wrapped_further_seen: None,
+            },
+        },
+    ));
+    let mut presentation = key_ops_presentation(observations);
+    presentation.key_sizes_requested = true;
+    let snapshot =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    let block = key_ops_block(&snapshot);
+    let line = block
+        .iter()
+        .find(|line| line.contains("key row"))
+        .expect("one row line");
+    assert!(
+        line.contains(
+            "size conflicting (EC P-256 (from signature length))"
+        ),
+        "the typeless conflict names no established side:\n{snapshot}"
+    );
+    assert!(
+        !line.contains("vs established"),
+        "no established side is claimed:\n{snapshot}"
+    );
+}
+
+/// Type-only and typeless rows split their counts: one
+/// `unknown`-labeled row with frozen key-type evidence and one
+/// without render one size-unestablished line and one DEMO-4 line,
+/// each with its own row — never a merged never-established count.
+#[test]
+fn key_ops_line_splits_type_only_from_typeless_counts() {
+    let mut observations = populated(9);
+    let mut typed = key_row("sign", "key", 2, 0, 0, "operations");
+    typed.object = 11;
+    typed.metadata_at_use = "unknown";
+    // The implementation commit marks this row's frozen key-type
+    // evidence (no such field exists yet); the assertions below
+    // already demand the split count.
+    observations.key_operations.push(typed);
+    let mut typeless = key_row("sign", "key", 3, 0, 0, "operations");
+    typeless.object = 12;
+    typeless.metadata_at_use = "unknown";
+    observations.key_operations.push(typeless);
+    let presentation = key_ops_presentation(observations);
+    let snapshot = render_snapshot(&presentation);
+    let block = key_ops_block(&snapshot);
+    assert_eq!(
+        block,
+        vec![
+            "key operations: 0 keys on 1 provider; rev 9 populated; 0 sessions",
+            "  unidentified provider: sign 5 completed, 0 returned errors, 0 active operations",
+            "  type unknown (not established while observed) (1 key row)",
+            "  size unknown (key type established while observed) (1 key row)",
+        ],
+        "each footer keeps its own row:\n{snapshot}"
+    );
+}

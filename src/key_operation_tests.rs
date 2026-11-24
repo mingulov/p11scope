@@ -35021,6 +35021,214 @@ fn keymeta_type_only_checks_family() {
     );
 }
 
+/// A type-only established fact (sealed class plus RSA key type, no
+/// modulus bits) rows `unknown` yet conflicts with an ECDSA terminal
+/// length through the key-type gate: JSON keeps the conflicting
+/// inference beside the retained type, and both text blocks count
+/// the row as size-unestablished with its type established — never
+/// as never-established. The typeless control (no query at all)
+/// infers cleanly and keeps the DEMO-4 wording with its counts.
+#[test]
+fn keymeta_type_only_splits_from_typeless_in_text_and_json() {
+    use crate::key_operation_projection::{ObjectObservations, ObsStatus};
+
+    fn drive(with_type_query: bool) -> ObjectObservations {
+        let mut scene = JointScene::new();
+        let bootstrap = scene.bootstrap();
+        let mut staging = JointStaging::select_joint(Some(&bootstrap));
+        let mut joint = EdgeSemantics::default();
+        let mut keyuse = KeyUseReducer::new();
+        let mut sink = Vec::new();
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+        );
+        if with_type_query {
+            let query = ShapedS1 {
+                getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16)],
+                ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+            };
+            drive_quantum(
+                &mut scene,
+                &mut staging,
+                &mut joint,
+                &mut keyuse,
+                &mut sink,
+                &query,
+            );
+        }
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &ShapedS1::shaped("C_SignInit", CkRv::OK.0, 0x1041, init_capture()),
+        );
+        let sign = ShapedS1 {
+            length_value: Some(64),
+            ..ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture())
+        };
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &sign,
+        );
+        crate::key_operation_projection::producer::commit(
+            1,
+            &[&staging],
+            &scene.model.project(),
+            &keyuse,
+        )
+    }
+
+    // Type-only: the sealed query froze class plus RSA type.
+    let committed = drive(true);
+    assert_eq!(committed.status, ObsStatus::Populated);
+    assert_eq!(committed.reason, "none");
+    let row = committed
+        .key_operations
+        .iter()
+        .find(|row| row.category == "sign")
+        .expect("one sign row");
+    assert_eq!(row.metadata_at_use, "unknown");
+    assert_eq!(
+        (row.started, row.completed, row.failed, row.active),
+        (1, 1, 0, 0)
+    );
+    let inferred = row.inferred.as_ref().expect("the sign row infers");
+    assert_eq!(inferred.family.value, Some(KeyFamily::Ec));
+    assert_eq!(inferred.family.status, InferredStatus::Conflicting);
+    assert_eq!(inferred.size.status, InferredStatus::Conflicting);
+    let object = committed
+        .objects
+        .iter()
+        .find(|object| object.object == row.object)
+        .expect("the row's object stands");
+    assert_eq!(object.established.key_type.scalar, Some(0));
+    assert_eq!(object.established.key_type.source, Some("query"));
+    assert_eq!(
+        object.established.modulus_bits.status, "unknown",
+        "no modulus bits were ever established"
+    );
+    assert_eq!(object.label, None, "type-only keeps no combined label");
+    let section = crate::key_operation_projection::object_observations_json(&committed);
+    let json_row = section["key_operations"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .find(|row| row["category"] == "sign")
+        .cloned()
+        .expect("one sign row");
+    assert_eq!(json_row["metadata_at_use"], "unknown");
+    assert_eq!(json_row["inferred_family"]["status"], "conflicting");
+    assert_eq!(json_row["inferred_family"]["value"], "ec");
+    assert_eq!(json_row["inferred_size"]["status"], "conflicting");
+    assert_eq!(json_row["inferred_size"]["detail"]["kind"], "ec_class");
+    assert!(json_row["inferred_size"]["detail"].get("curve").is_none());
+    assert_eq!(json_row["inferred_size"]["detail"]["octets"], 64);
+    assert!(
+        json_row.get("type_established").is_none(),
+        "no wire change beside the text split: {json_row}"
+    );
+    let object_id = row.object;
+    let mut presentation = harness_presentation();
+    presentation.object_observations = committed;
+    presentation.key_sizes_requested = true;
+    let concise = render_snapshot_with_verbosity(&presentation, TextVerbosity::Concise);
+    assert_eq!(
+        key_ops_text_block(&concise),
+        vec![
+            "key operations: 1 key on 1 provider; rev 1 populated; 1 session".to_string(),
+            "  unidentified provider: sign 1 completed, 0 returned errors, 0 active operations (conflicting: 1)".to_string(),
+            "  size unknown (key type established while observed) (1 key row)".to_string(),
+        ],
+        "the entire concise block splits the type-only row:\n{concise}"
+    );
+    let verbose = render_snapshot_with_verbosity(&presentation, TextVerbosity::Verbose);
+    assert_eq!(
+        key_ops_text_block(&verbose),
+        vec![
+            "key operations: 1 key on 1 provider; rev 1 populated; 1 session".to_string(),
+            "  unidentified provider: sign 1 completed, 0 returned errors, 0 active operations (conflicting: 1) (i3)".to_string(),
+            format!(
+                "  key row i3 object {object_id} sign key (unknown): family conflicting (EC: 1); size conflicting (EC 256-bit class (from signature length) vs established key type)"
+            ),
+            "  size unknown (key type established while observed) (1 key row)".to_string(),
+        ],
+        "the entire verbose block agrees line and count:\n{verbose}"
+    );
+
+    // Typeless control: no query, so ECDSA infers cleanly and the
+    // DEMO-4 wording keeps its row with exact counts.
+    let committed = drive(false);
+    assert_eq!(committed.status, ObsStatus::Populated);
+    let row = committed
+        .key_operations
+        .iter()
+        .find(|row| row.category == "sign")
+        .expect("one sign row");
+    assert_eq!(row.metadata_at_use, "unknown");
+    assert_eq!(
+        (row.started, row.completed, row.failed, row.active),
+        (1, 1, 0, 0)
+    );
+    let inferred = row.inferred.as_ref().expect("the sign row infers");
+    assert_eq!(inferred.family.value, Some(KeyFamily::Ec));
+    assert_eq!(inferred.family.status, InferredStatus::Inferred);
+    assert_eq!(inferred.size.status, InferredStatus::Inferred);
+    let object = committed
+        .objects
+        .iter()
+        .find(|object| object.object == row.object)
+        .expect("the row's object stands");
+    assert_eq!(object.label, None, "no type is guessed");
+    let section = crate::key_operation_projection::object_observations_json(&committed);
+    let json_row = section["key_operations"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .find(|row| row["category"] == "sign")
+        .cloned()
+        .expect("one sign row");
+    assert_eq!(json_row["inferred_family"]["status"], "inferred");
+    assert_eq!(json_row["inferred_size"]["status"], "inferred");
+    let object_id = row.object;
+    let mut presentation = harness_presentation();
+    presentation.object_observations = committed;
+    presentation.key_sizes_requested = true;
+    let concise = render_snapshot_with_verbosity(&presentation, TextVerbosity::Concise);
+    assert_eq!(
+        key_ops_text_block(&concise),
+        vec![
+            "key operations: 1 key on 1 provider; rev 1 populated; 1 session".to_string(),
+            "  unidentified provider: sign 1 completed, 0 returned errors, 0 active operations (probably EC 256-bit class: 1)".to_string(),
+            "  type unknown (not established while observed) (1 key row)".to_string(),
+        ],
+        "the control keeps the DEMO-4 line:\n{concise}"
+    );
+    let verbose = render_snapshot_with_verbosity(&presentation, TextVerbosity::Verbose);
+    assert_eq!(
+        key_ops_text_block(&verbose),
+        vec![
+            "key operations: 1 key on 1 provider; rev 1 populated; 1 session".to_string(),
+            "  unidentified provider: sign 1 completed, 0 returned errors, 0 active operations (probably EC 256-bit class: 1) (i3)".to_string(),
+            format!(
+                "  key row i3 object {object_id} sign key (unknown): probably EC (from mechanism); EC 256-bit class (from signature length)"
+            ),
+            "  type unknown (not established while observed) (1 key row)".to_string(),
+        ],
+        "the control verbose block agrees:\n{verbose}"
+    );
+}
+
 /// A rowless park refusal still discloses in a versioned section: with
 /// no proved rows the refusal promotes the section to v9 (the refused
 /// park's unwraps also partition unknown with their mechanism ids)
@@ -36220,6 +36428,43 @@ fn key_operation_schema_v9_detail_slots_share_specimens_with_checker() {
             !validator.is_valid(&block),
             "refused {name} is refused in v9 conflict_detail"
         );
+    }
+}
+
+/// The shared size-detail table pins every crossed EC
+/// curve/width pair: all six off-diagonal combinations sit in
+/// `refused`, so the v7 and v9 schema twins and the command-line
+/// checker twin refuse each single-curve widening through both
+/// detail slots.
+#[test]
+fn key_operation_size_specimens_pin_all_crossed_curve_widths() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let specimens: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            root.join("tests/fixtures/key-operations/size-detail-specimens.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let refused = specimens["refused"].as_object().expect("refused table");
+    let pairs = [("p256", 64), ("p384", 96), ("p521", 132)];
+    for (curve, _) in &pairs {
+        for (_, octets) in &pairs {
+            let crossed = pairs
+                .iter()
+                .all(|(valid_curve, valid_octets)| valid_curve != curve || valid_octets != octets);
+            if !crossed {
+                continue;
+            }
+            assert!(
+                refused.values().any(|detail| {
+                    detail["kind"] == "ec"
+                        && detail["curve"] == *curve
+                        && detail["octets"] == *octets
+                }),
+                "crossed {curve}/{octets} sits in the refused table"
+            );
+        }
     }
 }
 

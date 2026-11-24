@@ -41206,6 +41206,98 @@ fn prefault_manifest_getter_data_retires_an_exhausted_tail_across_a_resume_witho
     );
 }
 
+/// A spent window stops the pass at once without retiring or reading:
+/// with three 1-chunk ranges and the window tripped to 1000 bytes at
+/// the second range's proof poll, the first chunk reads and the pass
+/// completes with five proof steps and no gap (twin: an always-retire
+/// call site proves the third range too, spending seven).
+#[test]
+fn prefault_manifest_getter_data_completes_on_a_spent_window_without_retiring() {
+    use crate::discovery::identity::{FileIdentity, MappedFile};
+    const TMPFS: u64 = 0x0102_1994;
+    let mut warmup = two_object_warmup_with_len(Some(65536));
+    // SAFETY: a private read-only mapping of A's copy at a free low
+    // address, unmapped below before the guard drops.
+    let file_a = std::fs::File::open(&warmup.copies.paths[0]).unwrap();
+    let low = map_fixture_low(&file_a, warmup.padded);
+    warmup.engine.budget = CaptureWorkBudget::new(ScanLimits {
+        per_object_bytes: 65536,
+        total_bytes: 8 << 20,
+    });
+    let object_a = warmup.objects[0];
+    let object_b = warmup.objects[1];
+    let high_a = warmup.copies.readable[0] as u64;
+    let base_b = warmup.copies.readable[1] as u64;
+    let len = warmup.padded as u64;
+    let identity_a = FileIdentity {
+        dev: 7000,
+        ino: 8000,
+    };
+    let identity_b = FileIdentity {
+        dev: 7001,
+        ino: 8001,
+    };
+    warmup.engine.set_prefault_proof_for_test(
+        object_a,
+        MappedFile {
+            identity: identity_a,
+            fs_magic: Some(TMPFS),
+        },
+        vec![
+            ((low as u64, low as u64 + len), Some(identity_a)),
+            ((high_a, high_a + len), Some(identity_a)),
+        ],
+    );
+    warmup.engine.set_prefault_proof_for_test(
+        object_b,
+        MappedFile {
+            identity: identity_b,
+            fs_magic: Some(TMPFS),
+        },
+        vec![((base_b, base_b + len), Some(identity_b))],
+    );
+    assert_eq!(
+        prefault_candidate_ranges(&warmup.engine, object_a),
+        vec![(low as u64, low as u64 + len), (high_a, high_a + len),],
+        "premise: A owns the low and high ranges"
+    );
+    assert_eq!(
+        prefault_candidate_ranges(&warmup.engine, object_b),
+        vec![(base_b, base_b + len)],
+        "premise: B owns one range"
+    );
+    assert!(
+        (low as u64) < base_b && (low as u64) < high_a,
+        "premise: the low range sorts first"
+    );
+    warmup.engine.set_prefault_window_trip_for_test(2, 1000);
+    let sites = warmup_sites_for(&warmup.objects);
+    let skips = warmup.engine.counters.object_skips.len();
+    let outcome = warmup
+        .engine
+        .prefault_manifest_getter_data(warmup.id, &sites);
+    // SAFETY: the successful mapping above, released once.
+    assert_eq!(unsafe { libc::munmap(low, warmup.padded) }, 0);
+    assert_eq!(outcome, GetterPrefaultOutcome::Complete);
+    assert_eq!(
+        warmup.engine.prefault_attempts_for_test(),
+        vec![(low as u64, warmup.padded, true)],
+        "only the first chunk reads before the tripped ceiling: {:?}",
+        warmup.engine.prefault_attempts_for_test()
+    );
+    assert_eq!(
+        warmup.engine.prefault_proof_attempts_for_test(),
+        5,
+        "held, batch and re-proof for the read chunk, held and batch \
+         for the ceiling range, nothing for the unreached tail"
+    );
+    assert_eq!(
+        warmup.engine.counters.object_skips.len(),
+        skips,
+        "a spent window files no gap"
+    );
+}
+
 /// The warmup shortfall decision retires exactly when the object cannot
 /// fit the chunk while the window still admits it: every quadrant and
 /// boundary of the two legs (unit: the decision is pure, so the table
@@ -41230,7 +41322,7 @@ fn prefault_shortfall_retires_only_a_fittable_window_with_an_unfittable_object()
         (0, 1000, 65536, false),
         (32768, 1000, 65536, false),
         // Boundary: the window admits exactly the chunk.
-        (0, 65536, 65536, true),
+        (65535, 65536, 65536, true),
         (32768, 65536, 65536, true),
         (65536, 65535, 65536, false),
     ];

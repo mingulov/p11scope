@@ -14308,6 +14308,12 @@ struct GetterPrefaultTestSeam {
     /// `getter_prefault_latch_frame_trip`). One-shot per arming; `None`
     /// disables. Other sites' polls never count down.
     frame_trip: Cell<Option<(GetterPrefaultStrideSite, u32)>>,
+    /// Deterministic window-trip countdown: after this many more
+    /// per-range proof polls, the warmup debits the capture window down
+    /// to the armed remainder through the production counters (see
+    /// `getter_prefault_latch_window_trip`). One-shot per arming; `None`
+    /// disables.
+    window_trip: Cell<Option<(u32, u64)>>,
     /// Scripted target-memory open failure: the lazy mem open fails
     /// through the same handler as a production open failure.
     fail_mem_open: Cell<bool>,
@@ -27184,6 +27190,8 @@ impl Engine {
             }
             #[cfg(test)]
             self.getter_prefault_latch_frame_trip(GetterPrefaultStrideSite::Proof);
+            #[cfg(test)]
+            self.getter_prefault_latch_window_trip();
             if self.frame_work_exhausted() {
                 cursor.op_bytes = op_bytes.clone();
                 Self::store_prefault_resume(&mut cursor);
@@ -27733,6 +27741,37 @@ impl Engine {
         }
     }
 
+    /// Test-only window-trip countdown for the per-range proof poll:
+    /// when the armed poll count reaches zero, debits the capture
+    /// window down to the armed remainder through the same counters
+    /// earlier discovery work uses (`record_window_io`), so the
+    /// production `allowed_io` gate below alone decides the ceiling
+    /// leg — removing the gate reads the tripped range instead of
+    /// stopping. One-shot per arming; `None` disables. Production has
+    /// no trip.
+    #[cfg(test)]
+    fn getter_prefault_latch_window_trip(&mut self) {
+        let Some(seam) = self.getter_prefault_for_test.as_ref() else {
+            return;
+        };
+        let Some((remaining, remainder)) = seam.window_trip.get() else {
+            return;
+        };
+        if remaining > 0 {
+            seam.window_trip.set(Some((remaining - 1, remainder)));
+        }
+        if remaining <= 1 {
+            let debit = self
+                .budget
+                .remaining_window_io()
+                .unwrap_or(0)
+                .saturating_sub(remainder);
+            self.budget
+                .record_window_io(usize::try_from(debit).unwrap_or(usize::MAX));
+            seam.window_trip.set(None);
+        }
+    }
+
     /// Test-only proof-attempt tally: counts attempted held lookups,
     /// batch stats and read-time re-proofs, successes and errors alike.
     #[cfg(test)]
@@ -27877,6 +27916,18 @@ impl Engine {
             .get_or_insert_default()
             .frame_trip
             .set(Some((site, after)));
+    }
+
+    /// Test-only: after `after` more per-range proof polls, debit the
+    /// capture window down to `remainder` bytes — the post-maps
+    /// remainder earlier discovery work can leave (the production
+    /// `allowed_io` gate alone decides the ceiling leg).
+    #[cfg(test)]
+    fn set_prefault_window_trip_for_test(&mut self, after: u32, remainder: u64) {
+        self.getter_prefault_for_test
+            .get_or_insert_default()
+            .window_trip
+            .set(Some((after, remainder)));
     }
 
     /// Test-only: every read attempt so far, in order, as

@@ -707,7 +707,16 @@ class SpyParserTwins(unittest.TestCase):
 
     def test_truncated_entry_refuses(self):
         with self.assertRaises(OuterError):
-            parse_spy_log(spy_text([("C_Initialize", 0)]) + "\n9: C_Login\n")
+            parse_spy_log(spy_text([("C_Initialize", 0)]) + "\n1: C_Login\n")
+
+    def test_unclosed_entry_before_next_refuses(self):
+        # The Login entry never closes: the next entry must refuse even
+        # though a later return would close the log cleanly (isolates the
+        # entry check from the end-of-log backstop).
+        text = spy_text([("C_Initialize", 0)])
+        text += "\n1: C_Login\n2: C_Initialize\nReturned:  0 CKR_OK\n"
+        with self.assertRaises(OuterError):
+            parse_spy_log(text)
 
     def test_skipped_sequence_refuses(self):
         text = spy_text([("C_Initialize", 0), ("C_Login", 0)]).replace("\n1: C_Login", "\n2: C_Login")
@@ -727,6 +736,11 @@ class SpyParserTwins(unittest.TestCase):
     def test_empty_log_refuses(self):
         with self.assertRaises(OuterError):
             parse_spy_log("*************** OpenSC PKCS#11 spy *****************\n")
+
+    def test_loaded_without_calls_refuses(self):
+        with self.assertRaises(OuterError):
+            parse_spy_log("*************** OpenSC PKCS#11 spy *****************\n"
+                          'Loaded: "/x.so"\n')
 
 
 class ProxyJudgeTwins(unittest.TestCase):
@@ -797,10 +811,12 @@ class ProxyJudgeTwins(unittest.TestCase):
 
     def test_phantom_in_flight_fails(self):
         def stuck(report, _ledger):
+            # A completed call that is also in flight (entered twice,
+            # returned once: the double-seen shape): counts stay exact so
+            # only the phantom prong can fail this.
             report["evidence"]["in_flight_at_end"] = 1
             for row in report["functions"]:
                 if row["names"] == ["C_Login"] and (row["module"] or {}).get("sha256") == SPY_SHA:
-                    row["calls"] -= 1
                     row["in_flight"] = 1
         verdict = self.verdict(stuck)
         self.assertFalse(verdict, verdict.detail)
@@ -817,6 +833,38 @@ class ProxyJudgeTwins(unittest.TestCase):
         verdict = self.verdict(orphan)
         self.assertFalse(verdict, verdict.detail)
 
+    def test_unknown_counted_fails(self):
+        def anon(report, _ledger):
+            row = function_row("C_Login", BACKEND_SHA, 1)
+            row["names"] = ["unknown"]
+            report["functions"].append(row)
+        verdict = self.verdict(anon)
+        self.assertFalse(verdict, verdict.detail)
+
+    def test_aliased_counted_refuses(self):
+        def alias(report, _ledger):
+            row = function_row("C_Login", BACKEND_SHA, 1)
+            row["names"] = ["C_Login", "C_Login"]
+            row["aliased"] = True
+            report["functions"].append(row)
+        ledger, report = proxy_fixture(alias)
+        with self.assertRaises(OuterError):
+            judge_proxy_outer(report, ledger, 0, 2, 2)
+
+    def test_missing_backend_module_refuses(self):
+        ledger, report = proxy_fixture()
+        report["capture"]["modules"] = [m for m in report["capture"]["modules"]
+                                        if "libsofthsm2" not in m["path"]]
+        with self.assertRaises(OuterError):
+            judge_proxy_outer(report, ledger, 0, 2, 2)
+
+    def test_missing_spy_module_refuses(self):
+        ledger, report = proxy_fixture()
+        report["capture"]["modules"] = [m for m in report["capture"]["modules"]
+                                        if "pkcs11-spy" not in m["path"]]
+        with self.assertRaises(OuterError):
+            judge_proxy_outer(report, ledger, 0, 2, 2)
+
     def test_tool_effect_mismatch_fails(self):
         ledger, report = proxy_fixture()
         verdict = judge_proxy_outer(report, ledger, 0, 2, 1)
@@ -826,6 +874,76 @@ class ProxyJudgeTwins(unittest.TestCase):
         verdict = self.verdict(lambda report, _ledger: report["evidence"].__setitem__(
             "interface_selection", {"tuples": []}))
         self.assertFalse(verdict, verdict.detail)
+
+    def test_gfl_backend_zero_without_acquisition_fails(self):
+        def zero(report, _ledger):
+            for row in report["functions"]:
+                if row["names"] == ["C_GetFunctionList"]:
+                    row["calls"] = 0
+        verdict = self.verdict(zero)
+        self.assertFalse(verdict, verdict.detail)
+        self.assertIn("C_GetFunctionList", verdict.detail)
+
+    def test_gfl_backend_zero_with_acquisition_passes(self):
+        def zero_and_prove(report, _ledger):
+            for row in report["functions"]:
+                if row["names"] == ["C_GetFunctionList"]:
+                    row["calls"] = 0
+            report["evidence"]["interface_selection"]["tuples"][0]["table_match"] = True
+        verdict = self.verdict(zero_and_prove)
+        self.assertTrue(verdict, verdict.detail)
+
+    def test_gfl_spy_mismatch_fails(self):
+        def add_spy_gfl(report, _ledger):
+            report["functions"].append(function_row("C_GetFunctionList", SPY_SHA, 1))
+        verdict = self.verdict(add_spy_gfl)
+        self.assertFalse(verdict, verdict.detail)
+        self.assertIn("C_GetFunctionList", verdict.detail)
+
+    def test_gi_backend_two_fails(self):
+        def add_backend_gi(report, _ledger):
+            report["functions"].append(function_row("C_GetInterface", BACKEND_SHA, 2))
+        verdict = self.verdict(add_backend_gi)
+        self.assertFalse(verdict, verdict.detail)
+        self.assertIn("C_GetInterface", verdict.detail)
+
+    def test_gi_spy_observed_fails(self):
+        def add_spy_gi(report, _ledger):
+            report["functions"].append(function_row("C_GetInterface", SPY_SHA, 1))
+        verdict = self.verdict(add_spy_gi)
+        self.assertFalse(verdict, verdict.detail)
+        self.assertIn("C_GetInterface", verdict.detail)
+
+    def test_gi_tuples_forbidden_without_ledger(self):
+        ledger = parse_spy_log(spy_text([("C_Initialize", 0)]))
+        _, report = proxy_fixture()
+        verdict = judge_proxy_outer(report, ledger, 0, 2, 2)
+        self.assertFalse(verdict, verdict.detail)
+        self.assertIn("C_GetInterface", verdict.detail)
+
+    def test_gfl_ledger_two_fails(self):
+        # The fixture ledger plus two GFLs, both observed on the spy
+        # layer: every other leg stays exact, so only the 0/1 range
+        # clause can fail this.
+        ledger = parse_spy_log(spy_text([("C_GetInterface", 0), ("C_Initialize", 0),
+                                         ("C_GetSlotList", 0), ("C_Login", 0),
+                                         ("C_GetAttributeValue", 0), ("C_GetAttributeValue", 6),
+                                         ("C_GetFunctionList", 0), ("C_GetFunctionList", 0)]))
+        _, report = proxy_fixture()
+        report["functions"].append(function_row("C_GetFunctionList", SPY_SHA, 2))
+        verdict = judge_proxy_outer(report, ledger, 0, 2, 2)
+        self.assertFalse(verdict, verdict.detail)
+        self.assertIn("C_GetFunctionList", verdict.detail)
+
+    def test_report_schema_must_be_v3(self):
+        with self.assertRaises(OuterError):
+            parse_report('{"schema": "p11scope/observed-profile/v1"}')
+
+    def test_report_duplicate_key_refuses(self):
+        # Duplicate non-schema key: only the duplicate check can refuse
+        # this (the schema itself stays valid).
+        with self.assertRaises(OuterError):
+            parse_report('{"schema": "p11scope/observed-profile/v3", "a": 1, "a": 2}')
 
 
 class OpenscJudgeTwins(unittest.TestCase):
@@ -897,6 +1015,36 @@ class OpenscJudgeTwins(unittest.TestCase):
                                            and (r["module"] or {}).get("sha256") in (SPY_SHA, BACKEND_SHA))]
         verdict = self.verdict(drop_both)
         self.assertFalse(verdict, verdict.detail)
+
+    def test_gap_rejects_spy_exact_with_backend_failure(self):
+        def drop_backend_init(report, _ledger):
+            report["functions"] = [r for r in report["functions"]
+                                   if not (r["names"] == ["C_Initialize"]
+                                           and (r["module"] or {}).get("sha256") == BACKEND_SHA)]
+        verdict = self.verdict(drop_backend_init)
+        self.assertFalse(verdict, verdict.detail)
+
+    def test_gap_rejects_spy_error_mismatch(self):
+        # Spy counts exact but an error mismatches: the gap branch sees
+        # no deficit, so only the deficit-required clause can fail this.
+        def err_spy_init(report, _ledger):
+            for row in report["functions"]:
+                if row["names"] == ["C_Initialize"] and (row["module"] or {}).get("sha256") == SPY_SHA:
+                    row["errors"] += 1
+        verdict = self.verdict(err_spy_init)
+        self.assertFalse(verdict, verdict.detail)
+
+    def test_window_bounds_must_order(self):
+        def drop_init_and_scramble(report, _ledger):
+            report["functions"] = [r for r in report["functions"]
+                                   if not (r["names"] == ["C_Initialize"]
+                                           and (r["module"] or {}).get("sha256") == SPY_SHA)]
+            for record in report["evidence"]["discovery"]:
+                for window in record.get("unobserved_windows") or []:
+                    window["start_ns"], window["end_ns"] = window["end_ns"], window["start_ns"]
+        ledger, report = opensc_fixture(drop_init_and_scramble)
+        with self.assertRaises(OuterError):
+            judge_opensc_outer(report, ledger, 1, "Available slots:\n")
 
     def test_wrong_finalize_shape_fails(self):
         def single(report, _ledger):

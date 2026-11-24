@@ -3904,6 +3904,7 @@ impl KeyUseReducer {
                     primary: slot.primary,
                     established,
                     established_type,
+                    key_type: receipt.key_type,
                 }
             })
             .collect();
@@ -3916,10 +3917,15 @@ impl KeyUseReducer {
             );
             self.unknown_activate(slot);
         }
-        // Touched proved buckets forward-fill their parks.
+        // Touched proved buckets forward-fill their parks
+        // and freeze any key-type evidence their receipt
+        // carried.
         for assoc in associations.iter() {
             if let AssocBucket::Proved(bucket) = assoc.bucket {
                 self.forward_fill(bucket, assoc.established);
+                if assoc.key_type.is_some() {
+                    self.type_established.insert(bucket);
+                }
             }
         }
         self.open.insert(

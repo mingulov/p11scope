@@ -1137,6 +1137,7 @@ impl ModelState {
                     key,
                     begin,
                     entry_ns: 100,
+                    begin_thread: 10,
                     function: crate::kinds::function_id("C_SignInit").expect("catalog"),
                     kind: CallKind::Object(ObjectAction::Access),
                     session: HandleInput::Absent,

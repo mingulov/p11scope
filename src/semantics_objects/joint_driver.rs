@@ -544,10 +544,36 @@ impl JointCaptureOwner {
 
     /// Complete a sliced scoped recovery: build its failure (stuck
     /// domains only; no watermark, no invalidation, no global cut),
-    /// record the scoped scope, and carry the void. Mirrors the
+    /// record the scoped scope, and carry the void. A stream
+    /// recovery completes with the fence-all scope, the stream
+    /// watermark and the stream scope instead. Mirrors the
     /// completion tail of [`Self::void_ingest_break_bounded`]; keep
     /// the two in sync.
     fn finish_scoped_recovery(&mut self, recovery: super::ScopedRecovery) {
+        if recovery.stream {
+            // The fence-all phase accumulated every domain in key
+            // order; the failure scopes them without re-sorting.
+            let failure = SealFailure {
+                take_failed: None,
+                scope: super::SealFailureScope::AffectedDomains(recovery.stream_scope),
+                gap: INGEST_BREAK_VOID_GAP,
+                effects: recovery.effects,
+                h3_voided: None,
+                fence: Some(recovery.upper),
+            };
+            // The stream watermark breaks absence/attach chains
+            // stream-wide; scoped voids must not set it.
+            self.adapter.last_audit_failure = Some(self.adapter.consumed_through);
+            self.last_void_scope = Some(JointVoidScope::Stream);
+            self.carry_pending_void(
+                failure,
+                recovery.bytes,
+                recovery
+                    .lease
+                    .expect("a break void carries its prepaid lease"),
+            );
+            return;
+        }
         let mut domains: Vec<crate::semantics_objects::ObjectDomain> = recovery
             .scope
             .domains
@@ -564,6 +590,7 @@ impl JointCaptureOwner {
         domains.sort();
         domains.dedup();
         let failure = SealFailure {
+            take_failed: None,
             scope: super::SealFailureScope::AffectedDomains(domains),
             gap: INGEST_BREAK_VOID_GAP,
             effects: recovery.effects,
@@ -571,7 +598,13 @@ impl JointCaptureOwner {
             fence: Some(recovery.upper),
         };
         self.last_void_scope = Some(JointVoidScope::Scoped);
-        self.carry_pending_void(failure, recovery.bytes, recovery.lease);
+        self.carry_pending_void(
+            failure,
+            recovery.bytes,
+            recovery
+                .lease
+                .expect("a break void carries its prepaid lease"),
+        );
     }
 
     /// Drive one bounded void call through the caller's budget: the

@@ -1839,6 +1839,27 @@ pub(super) struct StagedDisposalCursor {
     )>,
 }
 
+/// Gap subject for an instance fold deferred while a staged disposal
+/// drains: the fold would mutate the association fallback under the
+/// disposal's budgeted cursors and drop its preserved reducer.
+pub(crate) const FOLD_DEFERRED_DISPOSAL_SUBJECT: &str = "fold deferred: staged disposal in flight";
+
+/// Gap reason for a disposal-deferred fold: constant, so every
+/// deferral of one instance folds into its row's repeats.
+pub(crate) const FOLD_DEFERRED_DISPOSAL_REASON: &str = "the retired instance and its staged feeds remain in inventory while a void disposal drains; the fold retries after the disposal";
+
+/// Gap subject for a staged disposal that lost its instance
+/// mid-disposal: the record was removed while its feed's cursor (with
+/// its preserved reducer) was in flight.
+pub(crate) const STAGED_DISPOSAL_INSTANCE_LOST_SUBJECT: &str =
+    "staged disposal instance retired mid-disposal";
+
+/// Gap reason for a mid-disposal instance loss: constant, so every
+/// loss folds into repeats. The cursor's already-disposed preserved
+/// unknown-key rows vanish with it; the remaining staged heads (if
+/// any) disposed synchronously at removal.
+pub(crate) const STAGED_DISPOSAL_INSTANCE_LOST_REASON: &str = "the instance under disposal was removed before its staged calls disposed; its preserved unknown-key rows are lost";
+
 impl CallerRegistry {
     /// Census at immutable publication, never on the semantic ingress path.
     /// The byte pool and these counts cover both legacy and instance reducers.
@@ -3422,6 +3443,15 @@ impl CallerRegistry {
         });
     }
 
+    /// Whether a stranded staged disposal still owns work: while set,
+    /// no instance fold may run (its synchronous fallback mutations
+    /// would break the disposal's budgeted cursors, and its record
+    /// removal would drop the cursor's preserved reducer). The fold
+    /// defers with a counted gap and retries after the disposal.
+    pub(crate) fn staged_disposal_pending(&self) -> bool {
+        self.staged_disposal.is_some()
+    }
+
     /// Test-only read of the disposal feed-visit counter.
     #[cfg(test)]
     pub(crate) fn test_disposal_reads_for_test(&self) -> usize {
@@ -3475,6 +3505,21 @@ impl CallerRegistry {
                 self.test_disposal_reads
                     .set(self.test_disposal_reads.get() + 1);
                 let Some(record) = self.instance_state.semantics.get_mut(&id) else {
+                    // The instance under disposal was removed (folded)
+                    // while its cursor — with its preserved reducer of
+                    // already-disposed completions — was in flight. Those
+                    // unknown-key rows vanish with the cursor; count the
+                    // loss as a named gap, never silently. Unreachable
+                    // while folds defer (see `take_instance_for_fold`),
+                    // kept as defense-in-depth for future removal paths.
+                    self.record_gap(RegistryGap {
+                        caller: None,
+                        module: None,
+                        pid: None,
+                        subject: STAGED_DISPOSAL_INSTANCE_LOST_SUBJECT.into(),
+                        reason: STAGED_DISPOSAL_INSTANCE_LOST_REASON.into(),
+                        budget: None,
+                    });
                     cursor.current = None;
                     cursor.done_upto = Some(id);
                     continue;
@@ -3589,6 +3634,32 @@ impl CallerRegistry {
         &mut self,
         id: RegistryInstanceId,
     ) -> Option<TakenInstance> {
+        // While a staged disposal drains, no fold may run: the
+        // retirement-time synchronous disposal would mutate the
+        // association fallback under the disposal's budgeted cursors
+        // (stale-prev splices corrupt chains), and removing the record
+        // would drop the in-flight cursor's preserved reducer (silent
+        // row loss). Defer every instance — staged, S1-only or empty —
+        // with a counted gap; the fold retries after the disposal.
+        // The coordinator's per-caller veto (see `retire_inner`) keeps
+        // callers whole; this backstop covers direct takes.
+        if self.staged_disposal.is_some() {
+            let (caller, module) = self
+                .instance_state
+                .records
+                .get(&id)
+                .map(|record| (Some(record.caller), Some(record.module)))
+                .unwrap_or((None, None));
+            self.record_gap(RegistryGap {
+                caller,
+                module,
+                pid: None,
+                subject: FOLD_DEFERRED_DISPOSAL_SUBJECT.into(),
+                reason: FOLD_DEFERRED_DISPOSAL_REASON.into(),
+                budget: None,
+            });
+            return None;
+        }
         let live = self
             .instance_state
             .records
@@ -4534,6 +4605,11 @@ impl CallerRegistry {
         // as the reduce path): its starts teed, so its loss
         // terminals must tee too — else opens stick active (C5).
         let joint_accounting = self.joint_accounting;
+        // Read before the record borrow below: while a staged disposal
+        // drains, no synchronous fallback mutation may run (its budgeted
+        // cursors own the table). Takes defer above; applies never
+        // overlap the void phase.
+        let disposal_pending = self.staged_disposal.is_some();
         let state = self
             .instance_state
             .semantics
@@ -4558,6 +4634,10 @@ impl CallerRegistry {
         // no-op (empty staging, no live machines).
         let (feed, reducer_slot) = (&mut state.feed, &mut state.semantics);
         if feed.mode() == FeedMode::Joint {
+            debug_assert!(
+                !disposal_pending,
+                "no sync fallback disposal while a budgeted disposal owns the table"
+            );
             feed.preserve_and_dispose_below_barrier(
                 boundary,
                 None,
@@ -4569,6 +4649,10 @@ impl CallerRegistry {
         }
         if let Some(reducer) = reducer_slot.as_mut() {
             if joint_accounting {
+                debug_assert!(
+                    !disposal_pending,
+                    "no sync fallback tee while a budgeted disposal owns the table"
+                );
                 let mut outer = NoSink;
                 let mut tee = KeyUseTee::new(
                     &mut outer,
@@ -8197,5 +8281,161 @@ mod staged_disposal_gate_tests {
                 && registry.take_instance_for_fold(second).is_some(),
             "deferred folds complete after the disposal"
         );
+    }
+
+    /// A disposal that loses its instance mid-disposal counts the loss:
+    /// remove the record under an in-flight cursor directly (bypassing
+    /// the fold deferral, as a future removal path might), poll to
+    /// completion, and assert the named gap. Unreachable through the
+    /// fold while takes defer; kept as defense-in-depth.
+    #[test]
+    fn staged_disposal_lost_instance_counts_its_gap() {
+        let mut registry = CallerRegistry::new(RegistryLimits::default_limits());
+        let pool = SemanticResourcePool::default();
+        let mut ledger = StagingLedger::with_resources(pool.reserver());
+        ledger.prepare_capacity().unwrap();
+        let id = RegistryInstanceId::from_raw(11);
+        let mut record = empty_record(id);
+        record.feed = crate::semantics_key_use::JointStaging::select_joint_for_test();
+        for position in 1..=2u64 {
+            let facts = SemanticCall {
+                function: "C_SignInit".into(),
+                session: 6100 + position,
+                mechanism: 0x000d,
+                capture: p11scope_ebpf_common::capture::MECHANISM_VALUE
+                    | p11scope_ebpf_common::capture::OUTPUT_NON_NULL,
+                ts_ns: 100 * position,
+                ..SemanticCall::default()
+            };
+            let origin = EffectOrigin {
+                function: "C_SignInit".into(),
+                session: 6100 + position,
+                ts_ns: 100 * position,
+            };
+            record
+                .feed
+                .stage(facts, origin, position, &mut ledger)
+                .unwrap();
+        }
+        registry.instance_state.semantics.insert(id, record);
+        registry.start_staged_disposal();
+        let (done, _) = registry.poll_staged_disposal(&mut ledger, 64);
+        assert!(!done, "two Bounded heads span several credits");
+        // Bypass the fold deferral: remove the record directly while
+        // its cursor (with its preserved reducer) is in flight.
+        registry.instance_state.semantics.remove(&id);
+        let mut polls = 1usize;
+        loop {
+            let (done, spent) = registry.poll_staged_disposal(&mut ledger, 64);
+            assert!(spent <= 64, "poll {polls} spent {spent} above 64");
+            polls += 1;
+            if done {
+                break;
+            }
+            assert!(polls < 4096, "the disposal must complete");
+        }
+        let lost = registry
+            .staged_scope_gaps_for_test()
+            .into_iter()
+            .filter(|(subject, reason)| {
+                subject == STAGED_DISPOSAL_INSTANCE_LOST_SUBJECT
+                    && reason == STAGED_DISPOSAL_INSTANCE_LOST_REASON
+            })
+            .count();
+        assert_eq!(lost, 1, "the lost cursor counts exactly one named gap");
+    }
+
+    /// A synchronous fallback disposal while a budgeted disposal owns
+    /// the table fails fast in debug builds. Takes defer above, so
+    /// production never poses this; the assert catches regressions
+    /// (e.g., an apply path overlapping the void phase). Release
+    /// builds omit the check.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "no sync fallback disposal while a budgeted disposal owns the table")]
+    fn staged_disposal_sync_fallback_disposal_while_pending_panics_in_debug() {
+        let mut registry = CallerRegistry::new(RegistryLimits::default_limits());
+        let pool = SemanticResourcePool::default();
+        let mut ledger = StagingLedger::with_resources(pool.reserver());
+        ledger.prepare_capacity().unwrap();
+        let id = RegistryInstanceId::from_raw(21);
+        let mut record = empty_record(id);
+        record.feed = crate::semantics_key_use::JointStaging::select_joint_for_test();
+        registry.instance_state.semantics.insert(id, record);
+        // A records entry for the invalidate tail (take is bypassed).
+        registry.instance_state.records.insert(
+            id,
+            InstanceRecord {
+                id,
+                key: InstanceKey::scripted(
+                    NativeDomainId::try_mint().expect("fresh domain"),
+                    ImageIdentity {
+                        task_cookie: 200,
+                        exec_id: 1,
+                    },
+                    InstanceId::from_raw(9),
+                    ModuleKey::Physical {
+                        dev_major: 1,
+                        dev_minor: 2,
+                        ino: 9,
+                        sha256: None,
+                    },
+                ),
+                caller: CallerId(1),
+                module: ModuleId(1),
+                state: InstanceLifecycle::Observed,
+                reason: None,
+                first_seen_ns: 0,
+                last_seen_ns: 0,
+            },
+        );
+        registry.start_staged_disposal();
+        assert!(registry.staged_disposal_pending());
+        registry.invalidate_instance(id, None, InstanceReason::TaskRetired, true, None);
+    }
+
+    /// A synchronous fallback tee while a budgeted disposal owns the
+    /// table fails fast in debug builds, like the disposal arm above.
+    /// Posed on an S1Only feed (no staged disposal) with live S1 under
+    /// Joint accounting, so only the tee arm trips.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "no sync fallback tee while a budgeted disposal owns the table")]
+    fn staged_disposal_sync_fallback_tee_while_pending_panics_in_debug() {
+        let mut registry = CallerRegistry::new(RegistryLimits::default_limits());
+        let id = RegistryInstanceId::from_raw(22);
+        let mut record = empty_record(id);
+        record.semantics = Some(EdgeSemantics::default());
+        registry.instance_state.semantics.insert(id, record);
+        registry.instance_state.records.insert(
+            id,
+            InstanceRecord {
+                id,
+                key: InstanceKey::scripted(
+                    NativeDomainId::try_mint().expect("fresh domain"),
+                    ImageIdentity {
+                        task_cookie: 201,
+                        exec_id: 1,
+                    },
+                    InstanceId::from_raw(10),
+                    ModuleKey::Physical {
+                        dev_major: 1,
+                        dev_minor: 2,
+                        ino: 10,
+                        sha256: None,
+                    },
+                ),
+                caller: CallerId(1),
+                module: ModuleId(1),
+                state: InstanceLifecycle::Observed,
+                reason: None,
+                first_seen_ns: 0,
+                last_seen_ns: 0,
+            },
+        );
+        registry.joint_accounting = true;
+        registry.start_staged_disposal();
+        assert!(registry.staged_disposal_pending());
+        registry.invalidate_instance(id, None, InstanceReason::TaskRetired, true, None);
     }
 }

@@ -823,6 +823,10 @@ impl<C> ReservationTable<C> {
             self.slots[at].operation.is_none(),
             "only a popped vacancy restores"
         );
+        // Unindexed tables scanned (no list pop), so nothing restores.
+        if !self.indexed() {
+            return;
+        }
         Self::free_push(&mut self.free_head, &mut self.slots, at);
     }
 
@@ -1649,8 +1653,26 @@ impl<C> ReservationTable<C> {
     /// leaf for the free-list pop (head + link as one alloc-read,
     /// matching the sync-walk count). `Yield` returns WITHOUT popping
     /// when the credit is exhausted (caller yields); `Full` reports
-    /// no vacant slot (caller refuses).
+    /// no vacant slot (caller refuses). Unindexed tables keep no free
+    /// list, so they scan for a vacancy linearly instead — one leaf
+    /// per visited slot, yielding with nothing taken when the credit
+    /// runs out (the retry re-scans idempotently), refusing Full only
+    /// when no vacancy exists. Production tables are indexed; the
+    /// linear arm keeps larger tables honest.
     pub(super) fn budgeted_free_pop(&mut self, gate: &mut LeafBudget) -> FreePopOutcome {
+        if !self.indexed() {
+            for at in 0..self.slots.len() {
+                if !gate.try_charge() {
+                    return FreePopOutcome::Yield;
+                }
+                #[cfg(test)]
+                self.test_leaf_reads.set(self.test_leaf_reads.get() + 1);
+                if self.slots[at].operation.is_none() {
+                    return FreePopOutcome::Slot(at);
+                }
+            }
+            return FreePopOutcome::Full;
+        }
         if !gate.try_charge() {
             return FreePopOutcome::Yield;
         }
@@ -2580,6 +2602,30 @@ mod tests {
         table.release(Role::H8Open, key(3)).unwrap();
         assert_eq!((table.census(), table.bytes()), (0, 0));
         table.release_role(Role::Raw);
+    }
+
+    #[test]
+    fn resource_reservations_unindexed_budgeted_pop_scans_linearly() {
+        // Unindexed tables keep no free list: the budgeted pop scans
+        // for a vacancy (one leaf per visited slot) instead of
+        // refusing Full. A refused charge yields with nothing taken
+        // (the retry re-scans); only a truly full table refuses.
+        let mut table = ReservationTable::<()>::try_new(MAX_INDEXED + 1).unwrap();
+        assert!(!table.indexed());
+        let mut gate = LeafBudget::new(0);
+        assert_eq!(table.budgeted_free_pop(&mut gate), FreePopOutcome::Yield);
+        assert_eq!(gate.spent(), 0, "a refused charge reads nothing");
+        let mut gate = LeafBudget::new(64);
+        assert_eq!(table.budgeted_free_pop(&mut gate), FreePopOutcome::Slot(0));
+        assert_eq!(gate.spent(), 1, "the fresh vacancy costs one visit");
+        table.init_fresh_operation(0);
+        let mut gate = LeafBudget::new(64);
+        assert_eq!(table.budgeted_free_pop(&mut gate), FreePopOutcome::Slot(1));
+        assert_eq!(gate.spent(), 2, "one occupied head plus its vacancy");
+        table.free_restore(1);
+        let mut gate = LeafBudget::new(1);
+        assert_eq!(table.budgeted_free_pop(&mut gate), FreePopOutcome::Yield);
+        assert_eq!(gate.spent(), 1, "the one credit dies on the occupied head");
     }
 
     #[test]

@@ -8120,6 +8120,135 @@ fn demotion_retirement_round5_folded_instances_stay_exact() {
     assert_eq!(departed["operations"]["settled_open"], 0);
 }
 
+/// A caller that owns instances defers its fold while a staged
+/// disposal drains: retire keeps the row carried under a counted gap
+/// (its instance folds would mutate the fallback under budgeted
+/// cursors), and folds it after the disposal completes.
+#[test]
+fn retire_defers_callers_with_instances_while_disposal_pending() {
+    use crate::discovery::caller_registry::instance_input::{
+        AdmittedInstance, FOLD_DEFERRED_DISPOSAL_SUBJECT, InstanceKey,
+    };
+    use p11scope_ebpf_common::ImageIdentity;
+    let mut scene = Scene::shared();
+    let caller = scene.caller;
+    let module_key = {
+        let coordinator = &scene.native.scene.coordinator;
+        let edge = coordinator
+            .registry()
+            .edges_of(caller)
+            .next()
+            .expect("the shared scene stages one edge");
+        coordinator
+            .registry()
+            .module(edge.module)
+            .expect("the edge module is retained")
+            .key
+            .clone()
+    };
+    let key = InstanceKey::scripted(
+        scene.native.domain,
+        ImageIdentity {
+            task_cookie: 41,
+            exec_id: 1,
+        },
+        crate::discovery::instances::InstanceId::from_raw(3),
+        module_key,
+    );
+    scene
+        .native
+        .scene
+        .coordinator
+        .registry_mut()
+        .note_instance(AdmittedInstance::scripted(key, caller));
+    scene.native.scene.coordinator.commit_batch(false).unwrap();
+    scene.native.scene.source.kill(7);
+    scene.native.scene.coordinator.observe_empty_pass(
+        &mut UnavailableImageGuard,
+        &mut scene.native.cookies,
+        "test instance exit",
+        1000,
+    );
+    scene.native.scene.coordinator.commit_batch(false).unwrap();
+    // The instance's feed (empty S1Only) holds a disposal: start it
+    // and retire before polling, so the veto sees it pending.
+    scene.native.scene.coordinator.start_staged_disposal();
+    assert!(
+        scene
+            .native
+            .scene
+            .coordinator
+            .registry()
+            .staged_disposal_pending(),
+        "the disposal pends before its first poll"
+    );
+    scene
+        .native
+        .scene
+        .coordinator
+        .note_rendered_callers(&[caller]);
+    assert_eq!(
+        scene
+            .native
+            .scene
+            .coordinator
+            .retire_rendered_callers(1001, None)
+            .retired,
+        0,
+        "the owning caller defers while the disposal pends"
+    );
+    let deferred = scene
+        .native
+        .scene
+        .coordinator
+        .registry()
+        .staged_scope_gaps_for_test()
+        .into_iter()
+        .filter(|(subject, _)| subject == FOLD_DEFERRED_DISPOSAL_SUBJECT)
+        .count();
+    assert_eq!(deferred, 1, "the deferred caller counts its gap");
+    assert!(
+        scene
+            .native
+            .scene
+            .coordinator
+            .adapter
+            .record(caller)
+            .is_some(),
+        "the deferred row keeps its facts"
+    );
+    loop {
+        let (done, _) = scene.native.scene.coordinator.poll_staged_disposal(64);
+        if done {
+            break;
+        }
+    }
+    assert!(
+        !scene
+            .native
+            .scene
+            .coordinator
+            .registry()
+            .staged_disposal_pending(),
+        "the disposal completes"
+    );
+    scene
+        .native
+        .scene
+        .coordinator
+        .note_rendered_callers(&[caller]);
+    assert_eq!(
+        scene
+            .native
+            .scene
+            .coordinator
+            .retire_rendered_callers(1002, None)
+            .retired,
+        1,
+        "the deferred caller folds after the disposal"
+    );
+}
+
 /// A folded instance keeps its join keys in its module's departed
 /// aggregate: the instance label still resolves to its caller after
 /// the row leaves `instances[]`, with drops counted.

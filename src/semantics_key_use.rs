@@ -1911,6 +1911,9 @@ impl JointStaging {
                     break;
                 }
                 let head = self.staged.pop_front().expect("front verified above");
+                // Conservative unbound, like the budgeted disposal arm:
+                // no seal evidence, so `internal=false` always and inner
+                // calls disposed here read `unbound`.
                 throwaway.observe_with_effects(&head.facts, &head.origin, &mut tee);
                 let bytes = head.charged_bytes();
                 let (position, native) = (head.position, head.resource_native);
@@ -5281,6 +5284,15 @@ impl FeedDisposalCursor {
                     let mut capture = CaptureSink {
                         effects: Vec::new(),
                     };
+                    // Conservative unbound: disposal observes without seal
+                    // evidence, so `observe_with_effects` hard-codes
+                    // `internal=false` and every Started effect drains with
+                    // nesting unproven. Refused and receipt-less terminals
+                    // keep their unknown-row route, but NSS self-test inner
+                    // calls disposed after a void read `unbound`, never
+                    // `same_thread_nested` (the budgeted drain threads the
+                    // flag through; the disposal path only ever carries
+                    // false). Pinned by the conservative-unbound twin.
                     throwaway.observe_with_effects(&popped.facts, &popped.origin, &mut capture);
                     self.pending_effects.extend(capture.effects);
                 }
@@ -5688,6 +5700,64 @@ mod disposal_tests {
             0,
             "every fallback association released exactly once"
         );
+    }
+
+    /// Disposal is conservative unbound: without seal evidence the
+    /// Started drain carries `internal=false` always, so disposed
+    /// heads (including NSS self-test inner calls after a void) read
+    /// `unbound`-family reasons, never `same_thread_nested`.
+    #[test]
+    fn feed_disposal_is_conservative_unbound_never_nested() {
+        let pool = SemanticResourcePool::default();
+        let mut ledger = StagingLedger::with_resources(pool.reserver());
+        ledger.prepare_capacity().unwrap();
+        let mut fallback = StagingLedger::with_resources(pool.reserver());
+        fallback.prepare_capacity().unwrap();
+        let mut feed = joint_feed();
+        let instance =
+            crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(31);
+        for position in 1..=4u64 {
+            let session = 3000 + position;
+            feed.stage(
+                init_call("C_SignInit", session, 0x000d, 100 + position),
+                origin("C_SignInit", session, 100 + position),
+                position,
+                &mut ledger,
+            )
+            .unwrap();
+        }
+        let mut cursor = FeedDisposalCursor::new(instance, true);
+        let mut keyuse = KeyUseReducer::new();
+        let mut polls = 0;
+        loop {
+            let mut gate = LeafBudget::new(64);
+            let done = cursor.poll(
+                &mut feed,
+                &mut ledger,
+                Some(&mut fallback),
+                &mut keyuse,
+                &mut gate,
+            );
+            polls += 1;
+            if done {
+                break;
+            }
+            assert!(polls < 64, "the disposal must complete");
+        }
+        assert_eq!(unknown_sums(&keyuse)[3], 4, "four truncated Unknown rows");
+        let nested_at = UNKNOWN_REASONS
+            .iter()
+            .position(|reason| *reason == SAME_THREAD_NESTED_REASON)
+            .expect("the frozen vocabulary names nesting");
+        for (cat_at, category) in UNKNOWN_CATEGORIES.iter().enumerate() {
+            let at = cat_at * UNKNOWN_REASONS.len() + nested_at;
+            let row = &keyuse.unknown_counters()[at];
+            assert_eq!(
+                row.unknown + row.completed + row.failed + row.cancelled,
+                0,
+                "category {category} keeps no nested rows"
+            );
+        }
     }
 
     #[test]

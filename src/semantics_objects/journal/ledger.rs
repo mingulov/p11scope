@@ -361,6 +361,13 @@ impl StagingLedger {
         bytes: u64,
         credit: u64,
     ) -> Result<ReservationId, LedgerRefusal> {
+        // No budgeted H8 void in flight: a synchronous insert under its
+        // retained chain/occupied state would corrupt the sweep (stale
+        // splices). The machine defers collection while voiding.
+        debug_assert!(
+            self.h8_void.is_none(),
+            "no sync charge while a budgeted void owns the table"
+        );
         let total = self
             .charged_bytes()
             .saturating_sub(credit)
@@ -528,6 +535,12 @@ impl StagingLedger {
     }
 
     fn release_role(&mut self, role: Role, key: RoleKey) {
+        // No budgeted H8 void in flight: a synchronous unlink under its
+        // retained chain/occupied state would corrupt the sweep.
+        debug_assert!(
+            self.h8_void.is_none(),
+            "no sync release while a budgeted void owns the table"
+        );
         if let Some(table) = self.table.as_mut() {
             drop(table.release(role, key));
         }
@@ -1121,6 +1134,39 @@ mod tests {
         );
         drop(ledger);
         assert_eq!(pool.snapshot().charged_bytes, baseline);
+    }
+
+    /// A synchronous charge while a budgeted H8 void owns the table
+    /// fails fast in debug builds (it would corrupt the sweep's
+    /// retained chain state). The machine defers collection while
+    /// voiding, so production never poses this; the assert catches
+    /// regressions. Release builds omit the check.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "no sync charge while a budgeted void owns the table")]
+    fn shared_ledger_sync_charge_while_void_pending_panics_in_debug() {
+        let pool = SemanticResourcePool::default();
+        let mut ledger = StagingLedger::with_resources(pool.reserver());
+        ledger.prepare_capacity().unwrap();
+        ledger.charge_h8open(1, 10).unwrap();
+        ledger.start_h8_void();
+        assert!(ledger.h8_void_pending());
+        let _ = ledger.charge_h8open(2, 10);
+    }
+
+    /// A synchronous release while a budgeted H8 void owns the table
+    /// fails fast in debug builds, like the charge arm above.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "no sync release while a budgeted void owns the table")]
+    fn shared_ledger_sync_release_while_void_pending_panics_in_debug() {
+        let pool = SemanticResourcePool::default();
+        let mut ledger = StagingLedger::with_resources(pool.reserver());
+        ledger.prepare_capacity().unwrap();
+        ledger.charge_h8open(1, 10).unwrap();
+        ledger.start_h8_void();
+        assert!(ledger.h8_void_pending());
+        ledger.release_h8open(1);
     }
 
     #[test]

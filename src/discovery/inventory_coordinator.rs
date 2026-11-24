@@ -6959,6 +6959,33 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 self.rendered_callers.remove(&id);
                 continue;
             }
+            // A staged disposal in flight vetoes callers that own
+            // instances: their folds would mutate the association
+            // fallback under the disposal's budgeted cursors (chain
+            // corruption) and drop its preserved reducer (silent row
+            // loss). The row stays carried (nothing here removes it)
+            // under a counted gap and retries after the disposal;
+            // siblings still fold around it. Callers without instances
+            // fold normally (their folds touch no fallback state).
+            if self.registry.staged_disposal_pending()
+                && folded.as_ref().is_some_and(|ctx| {
+                    ctx.instances_by_caller
+                        .get(&id)
+                        .is_some_and(|v| !v.is_empty())
+                })
+            {
+                self.registry.record_gap(RegistryGap {
+                    caller: Some(id),
+                    module: None,
+                    pid: None,
+                    subject: crate::discovery::caller_registry::instance_input::FOLD_DEFERRED_DISPOSAL_SUBJECT
+                        .into(),
+                    reason: crate::discovery::caller_registry::instance_input::FOLD_DEFERRED_DISPOSAL_REASON
+                        .into(),
+                    budget: None,
+                });
+                continue;
+            }
             // Charge the member work before running it: the pre-indexed
             // sizes make this O(1) lookups — no range scans run here —
             // covering cookies, pair targets and recoveries, edges,

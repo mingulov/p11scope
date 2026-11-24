@@ -1430,7 +1430,7 @@
     {
       "file": "src/inventory/manifest_e2e_tests.rs",
       "path": "inventory::manifest_e2e_tests::privileged_inventory_pid_key_sizes_canary_no_payload_leak",
-      "reason": "privileged: live key-sizes canary proves no sentinel payload byte reaches output or logs",
+      "reason": "privileged: live key-sizes canary proves no sentinel payload byte reaches output, maps or logs",
       "cell": "privileged"
     },
     {

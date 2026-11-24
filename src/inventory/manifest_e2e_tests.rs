@@ -3101,8 +3101,9 @@ fn key_sizes_inner(
 // Key-sizes Task 4 privacy canary: sentinel payload guards beside the live
 // C_Sign length cell (S-protocol) and the live C_Verify buffers
 // (V-protocol) prove no payload byte reaches the JSON report, the event
-// log or the observer log. Two non-vacuity controls: the scanner must
-// find an injected marker copy (positive control), and the RSA-2048 size
+// log, the observer log (verbose text included) or any dumpable BPF map
+// owned by the observer. Non-vacuity controls: every scanner must find
+// an injected marker copy (positive controls), and the RSA-2048 size
 // verdict must publish (the length path ran).
 // ---------------------------------------------------------------------------
 
@@ -3142,6 +3143,29 @@ fn keysize_canary_scan(haystack: &[u8]) -> bool {
         .any(|window| window == KEYSIZE_CANARY_MARKER)
 }
 
+/// The map-dump scanner: the raw scan (BTF-decoded strings read as
+/// ASCII) plus the hex scan (`bpftool map dump` prints values as hex
+/// bytes, so marker bytes retained in a map read as hex, not ASCII).
+/// The hex pass strips whitespace, lowercases, and matches the
+/// hex-of-marker contiguously, so plain hex dumps of any width match.
+fn keysize_canary_scan_map_dump(haystack: &[u8]) -> bool {
+    if keysize_canary_scan(haystack) {
+        return true;
+    }
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut needle = Vec::with_capacity(KEYSIZE_CANARY_MARKER.len() * 2);
+    for byte in KEYSIZE_CANARY_MARKER {
+        needle.push(HEX[(byte >> 4) as usize]);
+        needle.push(HEX[(byte & 0x0f) as usize]);
+    }
+    let flat: Vec<u8> = haystack
+        .iter()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .map(|byte| byte.to_ascii_lowercase())
+        .collect();
+    flat.windows(needle.len()).any(|window| window == needle)
+}
+
 /// Positive control, unit side: the scanner finds an injected marker in
 /// an otherwise clean report copy. If this fails, the live scan is
 /// vacuous and the cell must fail.
@@ -3169,6 +3193,185 @@ fn keysize_canary_scanner_pins_the_marker_spelling() {
     assert!(!keysize_canary_scan(b"K3YS1Z3CANARY"), "truncated");
     assert!(!keysize_canary_scan(b"K3YS1Z3CANARX!"), "mistyped");
     assert!(keysize_canary_scan(b"xxK3YS1Z3CANARY!yy"), "embedded");
+}
+
+/// The map-dump scanner is silent on a clean bpftool-style hex dump
+/// and finds marker bytes in every dump encoding: BTF-decoded ASCII,
+/// spaced lowercase hex, and uppercase hex across line breaks.
+#[test]
+fn keysize_canary_map_dump_scanner_finds_every_dump_encoding() {
+    let clean = b"key: 00 00 00 00  value:\n01 00 00 00 00 00 00 00";
+    assert!(
+        !keysize_canary_scan_map_dump(clean),
+        "silent on a clean hex dump"
+    );
+    assert!(
+        !keysize_canary_scan_map_dump(b""),
+        "silent on an empty dump"
+    );
+    assert!(
+        !keysize_canary_scan_map_dump(b"key: 4b 33"),
+        "silent on a short dump"
+    );
+    let ascii = b"value: { .buf = \"K3YS1Z3CANARY!\" }";
+    assert!(
+        keysize_canary_scan_map_dump(ascii),
+        "finds BTF-decoded ASCII"
+    );
+    // K3YS1Z3CANARY! as spaced lowercase hex (one line and wrapped).
+    let hex = b"key: 00 00 00 00  value: 4b 33 59 53 31 5a 33 43 41 4e 41 52 59 21";
+    assert!(keysize_canary_scan_map_dump(hex), "finds spaced hex");
+    let wrapped = b"value:\n4B 33 59 53 31 5A 33 43\n41 4E 41 52 59 21\n00 00 00 00";
+    assert!(
+        keysize_canary_scan_map_dump(wrapped),
+        "finds wrapped uppercase hex"
+    );
+    // A truncated hex tail (13 of 14 bytes) is not the marker.
+    let short = b"value: 4b 33 59 53 31 5a 33 43 41 4e 41 52 59";
+    assert!(
+        !keysize_canary_scan_map_dump(short),
+        "a 13-byte hex tail does not match"
+    );
+}
+
+/// Probe the REAL fixture source: compile `keysize_canary.c` with its
+/// `main` renamed and dump 4x64 guard bytes (tags 1-4), 32 message
+/// bytes and a geometry line. Returns the 288 payload bytes plus the
+/// `MARK`/`FRAME` trailer. Any drift between this probe and the live
+/// workload build fails loudly here first.
+fn keysize_canary_c_probe() -> Result<(Vec<u8>, String)> {
+    let source = std::fs::read_to_string(keysize_canary_source())?;
+    let renamed = source.replacen("int main(int argc", "int fixture_main(int argc", 1);
+    ensure!(
+        renamed != source && !renamed.contains("int main(int argc"),
+        "the fixture main rename missed: probe needs exactly one main"
+    );
+    let dir = tempfile::tempdir()?;
+    let dumper = dir.path().join("canary_probe.c");
+    std::fs::write(
+        &dumper,
+        format!(
+            "{renamed}\n\
+             #include <stddef.h>\n\
+             #include <stdio.h>\n\
+             int main(void) {{\n\
+                 unsigned char guard[GUARD_LEN];\n\
+                 unsigned char msg[32];\n\
+                 for (unsigned tag = 1; tag <= 4; tag++) {{\n\
+                     fill_guard(guard, tag);\n\
+                     if (fwrite(guard, 1, GUARD_LEN, stdout) != GUARD_LEN) return 1;\n\
+                 }}\n\
+                 fill_marked(msg, sizeof msg);\n\
+                 if (fwrite(msg, 1, sizeof msg, stdout) != sizeof msg) return 1;\n\
+                 printf(\"MARK %s\\n\", CANARY_MARK);\n\
+                 printf(\n\
+                     \"FRAME siglen=%zu post=%zu size=%zu\\n\",\n\
+                     offsetof(struct sign_frame, siglen),\n\
+                     offsetof(struct sign_frame, post),\n\
+                     sizeof(struct sign_frame));\n\
+                 return 0;\n\
+             }}\n"
+        ),
+    )?;
+    let binary = dir.path().join("canary_probe");
+    let status = Command::new("cc")
+        .args(["-O2"])
+        .arg(&dumper)
+        .arg("-o")
+        .arg(&binary)
+        .args(["-ldl", "-lpthread"])
+        .status()
+        .context("compiling the canary probe")?;
+    ensure!(status.success(), "the canary probe build failed");
+    let output = Command::new(&binary)
+        .output()
+        .context("running the canary probe")?;
+    ensure!(
+        output.status.success(),
+        "the canary probe exited {}",
+        output.status
+    );
+    ensure!(
+        output.stdout.len() > 288,
+        "the canary probe printed {} bytes, want 288 plus a trailer",
+        output.stdout.len()
+    );
+    let payload = output.stdout[..288].to_vec();
+    let trailer = String::from_utf8(output.stdout[288..].to_vec())?;
+    Ok((payload, trailer))
+}
+
+/// The C guards carry no aliasing word: every 8-byte window of the
+/// real fixture's guard and message bytes differs from the legitimate
+/// RSA-2048 length and classifies outside it, full marker copies sit
+/// at offsets 0/14/28/42 of every guard, and the S length cell sits
+/// exactly between the guards. Kills re-introduction of a 256-valued
+/// (or any verdict-passing) word anywhere in the planted payload.
+#[test]
+fn keysize_canary_c_guards_carry_no_aliasing_word() {
+    use crate::keymeta::{EvidenceTag, SizeDetail, SizeOutcome, classify_size};
+
+    const RSA_SHA256_PKCS: u64 = 0x40; // CKM_SHA256_RSA_PKCS, the workload mechanism
+    const RSA2048: SizeOutcome = SizeOutcome::Inferred(SizeDetail::Rsa {
+        size_class: Some(2048),
+        modulus_bytes: 256,
+    });
+    let (payload, trailer) = keysize_canary_c_probe().unwrap();
+    let mut lines = trailer.lines();
+    assert_eq!(
+        lines.next().unwrap(),
+        format!("MARK {}", String::from_utf8_lossy(KEYSIZE_CANARY_MARKER)),
+        "the C marker spelling matches the Rust scanner"
+    );
+    let frame = lines.next().unwrap();
+    let geometry: Vec<usize> = frame
+        .split_whitespace()
+        .skip(1)
+        .map(|field| field.split('=').nth(1).unwrap().parse().unwrap())
+        .collect();
+    assert_eq!(
+        geometry.as_slice(),
+        &[64, 72, 680],
+        "siglen sits between the guards (pre ends at 64, post starts at 72): {frame}"
+    );
+    // Guards (4x64) plus the marked message (32): every window fails.
+    assert_eq!(payload.len(), 4 * 64 + 32);
+    for (index, guard) in payload[..4 * 64].chunks_exact(64).enumerate() {
+        let intact: Vec<usize> = (0..=64 - KEYSIZE_CANARY_MARKER.len())
+            .filter(|off| &guard[*off..*off + KEYSIZE_CANARY_MARKER.len()] == KEYSIZE_CANARY_MARKER)
+            .collect();
+        assert_eq!(
+            intact.as_slice(),
+            &[0, 14, 28, 42],
+            "guard {index} keeps four intact marker copies"
+        );
+        assert!(
+            keysize_canary_scan(guard),
+            "guard {index} trips the bulk scanner"
+        );
+    }
+    for (offset, window) in payload.windows(8).enumerate() {
+        // Windows straddling two dumped regions mix unrelated bytes;
+        // the live reads never span regions, so only in-region
+        // windows count. Regions: guards at 0..256, message at 256..288.
+        let end = offset + 8;
+        let in_region = (offset < 256 && end <= 256) || offset >= 256;
+        if !in_region {
+            continue;
+        }
+        let word = u64::from_le_bytes(window.try_into().unwrap());
+        assert_ne!(
+            word, 256,
+            "guard word 256 at offset {offset} aliases RSA-2048"
+        );
+        for tag in [EvidenceTag::SignOutput, EvidenceTag::VerifyInput] {
+            assert_ne!(
+                classify_size(Some(RSA_SHA256_PKCS), tag, word),
+                RSA2048,
+                "guard word {word} at offset {offset} classifies RSA-2048 via {tag:?}"
+            );
+        }
+    }
 }
 
 /// Parse the canary LEDGER: (signs, verifies) with the C_Sign/C_Verify
@@ -3251,9 +3454,12 @@ fn keysize_canary_ledger_parser_rejects_attempt_count_mismatch() {
 
 /// Judge `object_observations` for the canary run: exact sign accounting
 /// with RSA-2048 from `sign_output` (the S-protocol length published),
-/// plus at least one verify row with RSA-2048 from `verify_input` (the
+/// plus exact verify accounting with RSA-2048 from `verify_input` (the
 /// V-protocol length published). Both lengths must publish or the run is
 /// vacuous: a silent length path would pass the marker scan trivially.
+/// The verify half mirrors the shared sign judge clause for clause
+/// (family, kind, modulus, completions, race-bucket accounting), so a
+/// payload-sourced verify length fails here, not just in the scan.
 fn judge_keysize_canary_observations(
     observations: &serde_json::Value,
     ledger_signs: u64,
@@ -3278,37 +3484,104 @@ fn judge_keysize_canary_observations(
                     > 0
         })
         .collect();
+    let unknown = observations
+        .get("unknown_key_operations")
+        .and_then(serde_json::Value::as_array)
+        .context("unknown_key_operations")?;
+    let mut unknown_done = 0u64;
+    for bucket in unknown.iter().filter(|bucket| {
+        bucket.get("category").and_then(serde_json::Value::as_str) == Some("verify")
+    }) {
+        let reason = bucket
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .context("unknown verify reason")?;
+        ensure!(
+            reason == "key_join_lost" || reason == "unbound",
+            "KEYCANARY: unknown verify bucket {reason} is not a known race bucket"
+        );
+        unknown_done += bucket
+            .get("completed")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+    }
+    let rows_done: u64 = verify_rows
+        .iter()
+        .map(|row| {
+            row.get("completed")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        })
+        .sum();
     ensure!(
-        !verify_rows.is_empty(),
+        rows_done > 0,
         "KEYCANARY: no verify landed in a key row (vacuous V-protocol)"
     );
-    let mut verify_done = 0u64;
+    ensure!(
+        rows_done + unknown_done == ledger_verifies,
+        "KEYCANARY: observer-vs-ledger verify mismatch: rows {rows_done} + unknown {unknown_done} != ledger {ledger_verifies}"
+    );
     for row in &verify_rows {
         let completed = row
             .get("completed")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0);
-        verify_done += completed;
+        let object = row.get("object").and_then(serde_json::Value::as_u64);
+        let family = row
+            .get("inferred_family")
+            .context("verify row inferred_family")?;
+        ensure!(
+            family.get("status").and_then(serde_json::Value::as_str) == Some("inferred"),
+            "KEYCANARY: object {object:?} family status is {}, want inferred",
+            family.get("status").unwrap_or(&serde_json::Value::Null)
+        );
+        ensure!(
+            family.get("value").and_then(serde_json::Value::as_str) == Some("rsa"),
+            "KEYCANARY: object {object:?} family value is not rsa: {family}"
+        );
+        ensure!(
+            family
+                .get("completions")
+                .and_then(serde_json::Value::as_u64)
+                == Some(completed),
+            "KEYCANARY: object {object:?} family completions disagree with completed {completed}: {family}"
+        );
         let size = row
             .get("inferred_size")
             .context("verify row inferred_size")?;
         ensure!(
             size.get("status").and_then(serde_json::Value::as_str) == Some("inferred"),
-            "KEYCANARY: verify row size is not inferred: {size}"
+            "KEYCANARY: object {object:?} size status is {}, want inferred",
+            size.get("status").unwrap_or(&serde_json::Value::Null)
         );
         let detail = size.get("detail").context("verify size detail")?;
         ensure!(
-            detail.get("size_class").and_then(serde_json::Value::as_u64) == Some(2048)
-                && detail.get("evidence").and_then(serde_json::Value::as_str)
-                    == Some("verify_input"),
-            "KEYCANARY: verify row is not RSA-2048 from verify_input: {detail}"
+            detail.get("kind").and_then(serde_json::Value::as_str) == Some("rsa"),
+            "KEYCANARY: object {object:?} size kind is not rsa: {detail}"
+        );
+        ensure!(
+            detail.get("size_class").and_then(serde_json::Value::as_u64) == Some(2048),
+            "KEYCANARY: object {object:?} size_class is not 2048: {detail}"
+        );
+        ensure!(
+            detail
+                .get("modulus_bytes")
+                .and_then(serde_json::Value::as_u64)
+                == Some(256),
+            "KEYCANARY: object {object:?} modulus_bytes is not 256: {detail}"
+        );
+        ensure!(
+            detail.get("evidence").and_then(serde_json::Value::as_str) == Some("verify_input"),
+            "KEYCANARY: object {object:?} size evidence is not verify_input: {detail}"
+        );
+        ensure!(
+            size.get("completions").and_then(serde_json::Value::as_u64) == Some(completed),
+            "KEYCANARY: object {object:?} size completions disagree with completed {completed}: {size}"
         );
     }
-    ensure!(
-        verify_done == ledger_verifies,
-        "KEYCANARY: verify rows {verify_done} != ledger {ledger_verifies}"
-    );
-    Ok(format!("{sign_verdict} verifies={verify_done}"))
+    Ok(format!(
+        "{sign_verdict} verifies={rows_done} vunknown={unknown_done}"
+    ))
 }
 
 #[test]
@@ -3343,7 +3616,45 @@ fn keysize_canary_judge_accepts_sign_and_verify_rows() {
     });
     assert_eq!(
         judge_keysize_canary_observations(&observations, 3, 3).unwrap(),
-        "rows=3 unknown=0 total=3 size=rsa2048 verifies=3"
+        "rows=3 unknown=0 total=3 size=rsa2048 verifies=3 vunknown=0"
+    );
+}
+
+#[test]
+fn keysize_canary_judge_accepts_verify_with_a_race_bucket() {
+    let observations = serde_json::json!({
+        "status": "populated",
+        "key_operations": [
+            {
+                "category": "sign",
+                "completed": 3,
+                "object": 3,
+                "inferred_family": {"status": "inferred", "value": "rsa", "completions": 3},
+                "inferred_size": {
+                    "status": "inferred",
+                    "detail": {"kind": "rsa", "size_class": 2048, "modulus_bytes": 256, "evidence": "sign_output"},
+                    "completions": 3,
+                },
+            },
+            {
+                "category": "verify",
+                "completed": 2,
+                "object": 4,
+                "inferred_family": {"status": "inferred", "value": "rsa", "completions": 2},
+                "inferred_size": {
+                    "status": "inferred",
+                    "detail": {"kind": "rsa", "size_class": 2048, "modulus_bytes": 256, "evidence": "verify_input"},
+                    "completions": 2,
+                },
+            },
+        ],
+        "unknown_key_operations": [
+            {"category": "verify", "completed": 1, "reason": "key_join_lost"},
+        ],
+    });
+    assert_eq!(
+        judge_keysize_canary_observations(&observations, 3, 3).unwrap(),
+        "rows=3 unknown=0 total=3 size=rsa2048 verifies=2 vunknown=1"
     );
 }
 
@@ -3408,7 +3719,8 @@ fn keysize_canary_judge_rejects_an_unsized_verify_row() {
     );
     let error = judge_keysize_canary_observations(&observations, 3, 3).unwrap_err();
     assert!(
-        format!("{error:#}").contains("verify row size is not inferred"),
+        format!("{error:#}").contains("size status is")
+            && format!("{error:#}").contains("want inferred"),
         "unexpected error: {error:#}"
     );
 }
@@ -3425,7 +3737,7 @@ fn keysize_canary_judge_rejects_a_wrong_verify_size_class() {
     );
     let error = judge_keysize_canary_observations(&observations, 3, 3).unwrap_err();
     assert!(
-        format!("{error:#}").contains("not RSA-2048 from verify_input"),
+        format!("{error:#}").contains("size_class is not 2048"),
         "unexpected error: {error:#}"
     );
 }
@@ -3442,7 +3754,41 @@ fn keysize_canary_judge_rejects_a_wrong_verify_evidence() {
     );
     let error = judge_keysize_canary_observations(&observations, 3, 3).unwrap_err();
     assert!(
-        format!("{error:#}").contains("not RSA-2048 from verify_input"),
+        format!("{error:#}").contains("size evidence is not verify_input"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn keysize_canary_judge_rejects_a_wrong_verify_kind() {
+    let observations = keysize_canary_verify_case(
+        serde_json::json!({
+            "status": "inferred",
+            "detail": {"kind": "ec", "size_class": 2048, "modulus_bytes": 256, "evidence": "verify_input"},
+            "completions": 3,
+        }),
+        3,
+    );
+    let error = judge_keysize_canary_observations(&observations, 3, 3).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("size kind is not rsa"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn keysize_canary_judge_rejects_a_wrong_verify_modulus() {
+    let observations = keysize_canary_verify_case(
+        serde_json::json!({
+            "status": "inferred",
+            "detail": {"kind": "rsa", "size_class": 2048, "modulus_bytes": 384, "evidence": "verify_input"},
+            "completions": 3,
+        }),
+        3,
+    );
+    let error = judge_keysize_canary_observations(&observations, 3, 3).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("modulus_bytes is not 256"),
         "unexpected error: {error:#}"
     );
 }
@@ -3459,22 +3805,422 @@ fn keysize_canary_judge_rejects_short_verify_accounting() {
     );
     let error = judge_keysize_canary_observations(&observations, 3, 3).unwrap_err();
     assert!(
-        format!("{error:#}").contains("verify rows 2 != ledger 3"),
+        format!("{error:#}").contains("rows 2 + unknown 0 != ledger 3"),
         "unexpected error: {error:#}"
     );
 }
 
-/// Task 4 privacy canary, live: `inventory --pid --capture native
-/// --key-operations --key-sizes --manifest` over the sentinel-guarded
-/// sign+verify workload. The S length cell and the V buffers sit between
-/// 64-byte `K3YS1Z3CANARY!` guards (with an embedded 256-valued
-/// collision word); the cell asserts the marker appears in none of the
-/// JSON report, the event log or the observer log, while both RSA-2048
-/// sizes publish. Needs an observer binary via `P11SCOPE_E2E_OBSERVER`
-/// or a `p11scope` sibling of this test binary. Prints KEYCANARY lines.
-/// Root BPF lane, serial, about a minute.
+fn keysize_canary_verify_case_with_family(
+    family: serde_json::Value,
+    size_completions: u64,
+    completed: u64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "status": "populated",
+        "key_operations": [
+            {
+                "category": "sign",
+                "completed": 3,
+                "object": 3,
+                "inferred_family": {"status": "inferred", "value": "rsa", "completions": 3},
+                "inferred_size": {
+                    "status": "inferred",
+                    "detail": {"kind": "rsa", "size_class": 2048, "modulus_bytes": 256, "evidence": "sign_output"},
+                    "completions": 3,
+                },
+            },
+            {
+                "category": "verify",
+                "completed": completed,
+                "object": 4,
+                "inferred_family": family,
+                "inferred_size": {
+                    "status": "inferred",
+                    "detail": {"kind": "rsa", "size_class": 2048, "modulus_bytes": 256, "evidence": "verify_input"},
+                    "completions": size_completions,
+                },
+            },
+        ],
+        "unknown_key_operations": [],
+    })
+}
+
 #[test]
-#[ignore = "privileged: live key-sizes canary proves no sentinel payload byte reaches output or logs"]
+fn keysize_canary_judge_rejects_an_uninferred_verify_family() {
+    let observations = keysize_canary_verify_case_with_family(
+        serde_json::json!({"status": "unknown", "value": null, "completions": 0}),
+        3,
+        3,
+    );
+    let error = judge_keysize_canary_observations(&observations, 3, 3).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("family status is")
+            && format!("{error:#}").contains("want inferred"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn keysize_canary_judge_rejects_a_verify_row_without_inferred_keys() {
+    let observations = serde_json::json!({
+        "status": "populated",
+        "key_operations": [
+            {
+                "category": "sign",
+                "completed": 3,
+                "object": 3,
+                "inferred_family": {"status": "inferred", "value": "rsa", "completions": 3},
+                "inferred_size": {
+                    "status": "inferred",
+                    "detail": {"kind": "rsa", "size_class": 2048, "modulus_bytes": 256, "evidence": "sign_output"},
+                    "completions": 3,
+                },
+            },
+            {
+                "category": "verify",
+                "completed": 3,
+                "object": 4,
+            },
+        ],
+        "unknown_key_operations": [],
+    });
+    let error = judge_keysize_canary_observations(&observations, 3, 3).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("verify row inferred_family"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn keysize_canary_judge_rejects_a_verify_size_without_detail() {
+    let observations = keysize_canary_verify_case(
+        serde_json::json!({"status": "inferred", "completions": 3}),
+        3,
+    );
+    let error = judge_keysize_canary_observations(&observations, 3, 3).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("verify size detail"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn keysize_canary_judge_rejects_a_wrong_verify_family() {
+    let observations = keysize_canary_verify_case_with_family(
+        serde_json::json!({"status": "inferred", "value": "ec", "completions": 3}),
+        3,
+        3,
+    );
+    let error = judge_keysize_canary_observations(&observations, 3, 3).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("family value is not rsa"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn keysize_canary_judge_rejects_verify_family_completions_mismatch() {
+    let observations = keysize_canary_verify_case_with_family(
+        serde_json::json!({"status": "inferred", "value": "rsa", "completions": 2}),
+        3,
+        3,
+    );
+    let error = judge_keysize_canary_observations(&observations, 3, 3).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("family completions disagree"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn keysize_canary_judge_rejects_verify_size_completions_mismatch() {
+    let observations = keysize_canary_verify_case_with_family(
+        serde_json::json!({"status": "inferred", "value": "rsa", "completions": 3}),
+        2,
+        3,
+    );
+    let error = judge_keysize_canary_observations(&observations, 3, 3).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("size completions disagree"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn keysize_canary_judge_rejects_a_non_race_verify_bucket() {
+    let observations = serde_json::json!({
+        "status": "populated",
+        "key_operations": [
+            {
+                "category": "sign",
+                "completed": 3,
+                "object": 3,
+                "inferred_family": {"status": "inferred", "value": "rsa", "completions": 3},
+                "inferred_size": {
+                    "status": "inferred",
+                    "detail": {"kind": "rsa", "size_class": 2048, "modulus_bytes": 256, "evidence": "sign_output"},
+                    "completions": 3,
+                },
+            },
+            {
+                "category": "verify",
+                "completed": 2,
+                "object": 4,
+                "inferred_family": {"status": "inferred", "value": "rsa", "completions": 2},
+                "inferred_size": {
+                    "status": "inferred",
+                    "detail": {"kind": "rsa", "size_class": 2048, "modulus_bytes": 256, "evidence": "verify_input"},
+                    "completions": 2,
+                },
+            },
+        ],
+        "unknown_key_operations": [
+            {"category": "verify", "completed": 1, "reason": "metadata_unknown"},
+        ],
+    });
+    let error = judge_keysize_canary_observations(&observations, 3, 3).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("not a known race bucket"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn keysize_canary_judge_rejects_an_all_unknown_verify_run() {
+    let observations = serde_json::json!({
+        "status": "populated",
+        "key_operations": [
+            {
+                "category": "sign",
+                "completed": 3,
+                "object": 3,
+                "inferred_family": {"status": "inferred", "value": "rsa", "completions": 3},
+                "inferred_size": {
+                    "status": "inferred",
+                    "detail": {"kind": "rsa", "size_class": 2048, "modulus_bytes": 256, "evidence": "sign_output"},
+                    "completions": 3,
+                },
+            },
+        ],
+        "unknown_key_operations": [
+            {"category": "verify", "completed": 3, "reason": "unbound"},
+        ],
+    });
+    let error = judge_keysize_canary_observations(&observations, 3, 3).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("no verify landed"),
+        "unexpected error: {error:#}"
+    );
+}
+
+/// `map_id:` values in one fdinfo file's text: the BPF maps one held
+/// descriptor pins. Pure parser over text so the unit test pins it
+/// without a live process.
+fn keysize_canary_map_ids_in_fdinfo(text: &str) -> Vec<u32> {
+    text.lines()
+        .filter_map(|line| line.strip_prefix("map_id:"))
+        .filter_map(|id| id.trim().parse::<u32>().ok())
+        .collect()
+}
+
+/// BPF map ids owned by a live process: every `map_id:` in its
+/// `/proc/<pid>/fdinfo`, deduplicated. Unreadable entries (a closing
+/// descriptor racing the scan) are skipped; a dead process yields no
+/// directory and fails the caller.
+fn keysize_canary_owned_map_ids(pid: u32) -> Result<Vec<u32>> {
+    let mut ids = Vec::new();
+    for entry in std::fs::read_dir(format!("/proc/{pid}/fdinfo"))
+        .with_context(|| format!("KEYCANARY: /proc/{pid}/fdinfo is unreadable"))?
+    {
+        let Ok(text) = std::fs::read_to_string(entry?.path()) else {
+            continue;
+        };
+        ids.extend(keysize_canary_map_ids_in_fdinfo(&text));
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    Ok(ids)
+}
+
+/// (name, type) from `bpftool map show id <id> -j`, which prints an
+/// object for one map and a one-element array on some versions.
+/// Unnamed maps read `<unnamed>`; the dump still scans them.
+fn keysize_canary_map_identity(shown: &[u8], id: u32) -> Result<(String, String)> {
+    let parsed: serde_json::Value = serde_json::from_slice(shown)
+        .with_context(|| format!("KEYCANARY: map {id} show output is not JSON"))?;
+    let entry = if let Some(first) = parsed.get(0) {
+        first
+    } else {
+        &parsed
+    };
+    let name = entry
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("<unnamed>")
+        .to_string();
+    let kind = entry
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .with_context(|| format!("KEYCANARY: map {id} show output has no type"))?
+        .to_string();
+    Ok((name, kind))
+}
+
+/// The owned-map scan result: dumped (and scanned) maps, ringbufs the
+/// kernel cannot dump, and the scanned dump bytes. Only names and
+/// counts ever print; dump contents stay in 0600 scratch files.
+struct KeysizeCanaryMapScan {
+    dumped: Vec<String>,
+    rings: Vec<String>,
+    bytes: u64,
+}
+
+/// The length stash must be among the dumped maps: without
+/// `EVIDENCE_START` the map scan never covered the surface that holds
+/// retained length cells, so the cell must fail, not pass thin.
+fn keysize_canary_dumped_covers_evidence_start(dumped: &[String]) -> bool {
+    dumped
+        .iter()
+        .any(|entry| entry.starts_with("EVIDENCE_START "))
+}
+
+/// Dump every dumpable BPF map owned by the live observer and scan
+/// each dump raw+hex for the canary marker. Ringbufs
+/// (`EVENTS`/`DISCOVERY`/`INFO`) are not bpftool-dumpable; the
+/// observer drains them into the scanned report, event log and
+/// observer log, so they are listed, not dumped. Any other refusal, a
+/// missing `EVIDENCE_START`, or a failed positive control fails the
+/// cell: an unscanned map is a hole, not a pass.
+fn keysize_canary_scan_owned_maps(pid: u32, dump_dir: &Path) -> Result<KeysizeCanaryMapScan> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    const TAG: &str = "KEYCANARY";
+    let ids = keysize_canary_owned_map_ids(pid)?;
+    ensure!(
+        !ids.is_empty(),
+        "{TAG}: the observer (pid {pid}) holds no BPF maps to scan"
+    );
+    std::fs::create_dir_all(dump_dir)?;
+    let mut dumped = Vec::new();
+    let mut rings = Vec::new();
+    let mut bytes = 0u64;
+    let mut combined = Vec::new();
+    for id in ids {
+        let show = Command::new("bpftool")
+            .args(["map", "show", "id", &id.to_string(), "-j"])
+            .output()
+            .context("KEYCANARY: spawning bpftool map show")?;
+        ensure!(
+            show.status.success(),
+            "{TAG}: bpftool map show id {id} failed: {}",
+            String::from_utf8_lossy(&show.stderr)
+                .chars()
+                .take(200)
+                .collect::<String>()
+        );
+        let (name, kind) = keysize_canary_map_identity(&show.stdout, id)?;
+        if kind == "ringbuf" {
+            rings.push(format!("{name} ({id})"));
+            continue;
+        }
+        let dump = Command::new("bpftool")
+            .args(["map", "dump", "id", &id.to_string()])
+            .output()
+            .context("KEYCANARY: spawning bpftool map dump")?;
+        ensure!(
+            dump.status.success(),
+            "{TAG}: bpftool map dump id {id} ({name}) refused: {}",
+            String::from_utf8_lossy(&dump.stderr)
+                .chars()
+                .take(200)
+                .collect::<String>()
+        );
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(dump_dir.join(format!("map-{id}.txt")))?
+            .write_all(&dump.stdout)?;
+        bytes += dump.stdout.len() as u64;
+        ensure!(
+            !keysize_canary_scan_map_dump(&dump.stdout),
+            "{TAG}: canary marker leaked into BPF map {name} ({id})"
+        );
+        combined.extend_from_slice(&dump.stdout);
+        dumped.push(format!("{name} ({id})"));
+    }
+    ensure!(
+        keysize_canary_dumped_covers_evidence_start(&dumped),
+        "{TAG}: EVIDENCE_START is missing from the dumped maps: {dumped:?}"
+    );
+    combined.extend_from_slice(KEYSIZE_CANARY_MARKER);
+    ensure!(
+        keysize_canary_scan_map_dump(&combined),
+        "{TAG}: map positive control failed: the scanner missed an injected marker"
+    );
+    Ok(KeysizeCanaryMapScan {
+        dumped,
+        rings,
+        bytes,
+    })
+}
+
+#[test]
+fn keysize_canary_fdinfo_parser_collects_map_ids() {
+    let text = "pos:\t0\nflags:\t02000002\nmnt_id:\t12\nmap_type:\t1\nmap_id:\t7\nmemlock:\t4096\n";
+    assert_eq!(keysize_canary_map_ids_in_fdinfo(text), vec![7]);
+    let multi = "map_id:\t3\nmap_id:\t11\n";
+    assert_eq!(keysize_canary_map_ids_in_fdinfo(multi), vec![3, 11]);
+    assert!(keysize_canary_map_ids_in_fdinfo("pos:\t0\nflags:\t0\n").is_empty());
+    assert!(keysize_canary_map_ids_in_fdinfo("map_id:\tnot-a-number\n").is_empty());
+}
+
+#[test]
+fn keysize_canary_map_identity_parses_both_show_shapes() {
+    let object = br#"{"id": 9, "type": "hash", "name": "EVIDENCE_START"}"#;
+    assert_eq!(
+        keysize_canary_map_identity(object, 9).unwrap(),
+        ("EVIDENCE_START".to_string(), "hash".to_string())
+    );
+    let array = br#"[{"id": 4, "type": "ringbuf", "name": "EVENTS"}]"#;
+    assert_eq!(
+        keysize_canary_map_identity(array, 4).unwrap(),
+        ("EVENTS".to_string(), "ringbuf".to_string())
+    );
+    let unnamed = br#"{"id": 2, "type": "array"}"#;
+    assert_eq!(
+        keysize_canary_map_identity(unnamed, 2).unwrap(),
+        ("<unnamed>".to_string(), "array".to_string())
+    );
+    assert!(keysize_canary_map_identity(b"not json", 1).is_err());
+    assert!(keysize_canary_map_identity(br#"{"id": 1, "name": "X"}"#, 1).is_err());
+}
+
+#[test]
+fn keysize_canary_evidence_start_cover_requires_the_stash() {
+    let with = vec!["START (3)".to_string(), "EVIDENCE_START (9)".to_string()];
+    assert!(keysize_canary_dumped_covers_evidence_start(&with));
+    let without = vec!["START (3)".to_string(), "EVENTS (4)".to_string()];
+    assert!(!keysize_canary_dumped_covers_evidence_start(&without));
+    assert!(!keysize_canary_dumped_covers_evidence_start(&[]));
+    // A prefix impostor (no blank after the name) does not count.
+    let impostor = vec!["EVIDENCE_STARTERS (9)".to_string()];
+    assert!(!keysize_canary_dumped_covers_evidence_start(&impostor));
+}
+
+/// Task 4 privacy canary, live: `inventory --pid --capture native
+/// --key-operations --key-sizes --manifest --verbose` over the
+/// sentinel-guarded sign+verify workload. The S length cell and the V
+/// buffers sit between pure repeated `K3YS1Z3CANARY!` guards; the cell
+/// asserts the marker appears in none of the JSON report, the event
+/// log, the verbose observer log or any dumpable owned BPF map (rings
+/// drain into the scanned outputs), while both RSA-2048 sizes publish.
+/// Needs an observer binary via `P11SCOPE_E2E_OBSERVER` or a `p11scope`
+/// sibling of this test binary, plus `bpftool` for the map dumps.
+/// Prints KEYCANARY lines. Root BPF lane, serial, about a minute.
+#[test]
+#[ignore = "privileged: live key-sizes canary proves no sentinel payload byte reaches output, maps or logs"]
 fn privileged_inventory_pid_key_sizes_canary_no_payload_leak() -> Result<()> {
     let module = softhsm_path()?;
     let observer = observer_binary()?;
@@ -3552,6 +4298,7 @@ fn keysize_canary_inner(workload: &E2eWorkload, module: &str, observer: &Path) -
             "--duration",
             "30",
             "--json",
+            "--verbose",
             "-o",
             out.to_str().context("out path")?,
         ])
@@ -3598,7 +4345,20 @@ fn keysize_canary_inner(workload: &E2eWorkload, module: &str, observer: &Path) -
             .any(|line| line.starts_with("SENTINEL marker=K3YS1Z3CANARY!")),
         "the workload never planted the canary marker"
     );
-    target.ensure_alive("after LEDGER before the observer stopped")?;
+    target.ensure_alive("after LEDGER before the owned-map scan")?;
+    // The owned-map verdict, mid-flight: every dumpable map the live
+    // observer owns is dumped and scanned raw+hex while it still runs
+    // (maps die with the process, so no post-stop dump exists). Rings
+    // are listed, not dumped: they drain into the scanned outputs.
+    let map_scan = keysize_canary_scan_owned_maps(child.id(), &workload.path("mapdumps"))?;
+    println!(
+        "{TAG} maps dumped={} rings={} bytes={} rings=[{}]",
+        map_scan.dumped.len(),
+        map_scan.rings.len(),
+        map_scan.bytes,
+        map_scan.rings.join(", ")
+    );
+    target.ensure_alive("after the owned-map scan before the observer stopped")?;
     let stop_deadline = Instant::now() + Duration::from_secs(120);
     let status = loop {
         if let Some(status) = child.try_wait()? {
@@ -3617,7 +4377,8 @@ fn keysize_canary_inner(workload: &E2eWorkload, module: &str, observer: &Path) -
         observer_evidence(&observer_out, &out, &format!("exited {status}"))
     );
     // The no-leak verdict: the marker appears in none of the three
-    // observer surfaces. Each surface is scanned as raw bytes, so an
+    // observer surfaces (the observer log carries the verbose text
+    // channel too). Each surface is scanned as raw bytes, so an
     // encoded leak still fails only when the raw marker is present.
     let report_bytes = std::fs::read(&out).context("observer report bytes")?;
     let event_bytes = std::fs::read(&event_log).context("event log bytes")?;
@@ -3650,10 +4411,12 @@ fn keysize_canary_inner(workload: &E2eWorkload, module: &str, observer: &Path) -
         .context("object_observations")?;
     let verdict = judge_keysize_canary_observations(observations, ledger_signs, ledger_verifies)?;
     println!(
-        "{TAG} {verdict} ledger={ledger_signs}/{ledger_verifies} scanned={}/{}/{}",
+        "{TAG} {verdict} ledger={ledger_signs}/{ledger_verifies} scanned={}/{}/{} maps={}/{}",
         report_bytes.len(),
         event_bytes.len(),
-        observer_bytes.len()
+        observer_bytes.len(),
+        map_scan.dumped.len(),
+        map_scan.rings.len(),
     );
     Ok(())
 }

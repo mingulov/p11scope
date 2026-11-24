@@ -13031,22 +13031,47 @@ fn refreshed_scans_equal(
         )
 }
 
-/// Tables kept per module by `merge_scanned_module`. A provider file
-/// holds a legacy function list plus a handful of versioned interface
-/// tables (single digits); 64 is far above any legitimate surface while
-/// bounding run-long union growth (the run-learned store already caps
-/// modules, not tables per module). Past it, fresh tables drop and count
-/// instead of appending.
+/// Speculative tables kept per module by `merge_scanned_module`. A
+/// provider file holds a legacy function list plus a handful of
+/// versioned interface tables (single digits); 64 is far above any
+/// legitimate surface while bounding run-long union growth (the
+/// run-learned store already caps modules, not tables per module).
+/// Past it, fresh heuristic tables drop and count instead of appending;
+/// live-returned tables are proof (an observed export return), never
+/// speculation, so they always admit: entry truncation sorts them first
+/// and the union appends them past the cap.
 const MAX_MERGED_TABLES_PER_MODULE: usize = 64;
 
-/// Truncate an over-cap module before it enters the store: tables past
-/// the cap drop and count, interfaces that pointed at them keep their
-/// row with no table link, and the finished claim clears (a truncating
-/// skip, like any other: the stored module no longer spans the whole
-/// surface, so the sole-complete grant must not fire on it).
+/// Truncate an over-cap module before it enters the store: proven
+/// (live-returned) tables sort first so the tail that drops and counts
+/// is speculative, interfaces that pointed at a dropped table keep
+/// their row with no table link, and the finished claim clears (a
+/// truncating skip, like any other: the stored module no longer spans
+/// the whole surface, so the sole-complete grant must not fire on it).
 fn truncate_module_tables_to_cap(module: &mut ScannedModule) -> u64 {
     if module.tables.len() <= MAX_MERGED_TABLES_PER_MODULE {
         return 0;
+    }
+    if module.tables.iter().any(|table| table.live_return) {
+        // Stable partition, live first: an observed return proves the
+        // provider serves calls through its table, so proof survives
+        // the speculative cap. Interface links follow their tables
+        // through the permutation; a stale link unlinks (fail-closed,
+        // like a dropped table in the union below).
+        let mut indexed: Vec<(usize, ScannedTable)> = std::mem::take(&mut module.tables)
+            .into_iter()
+            .enumerate()
+            .collect();
+        indexed.sort_by_key(|(_, table)| !table.live_return);
+        let mut remap = vec![0usize; indexed.len()];
+        module.tables.reserve(indexed.len());
+        for (new, (old, table)) in indexed.into_iter().enumerate() {
+            remap[old] = new;
+            module.tables.push(table);
+        }
+        for interface in &mut module.interfaces {
+            interface.table = interface.table.and_then(|index| remap.get(index).copied());
+        }
     }
     let dropped = module.tables.len() - MAX_MERGED_TABLES_PER_MODULE;
     module.tables.truncate(MAX_MERGED_TABLES_PER_MODULE);
@@ -13157,7 +13182,9 @@ impl CarriedModuleKey {
 /// Union `incoming` into its same-file module, or file it beside its
 /// ABI-mismatched twin. Returns how many fresh tables the per-module
 /// cap dropped (counted overflow, never silent): callers accumulate it
-/// on the engine. Identical tables dedup free and never count.
+/// on the engine. Identical tables dedup free and never count, and
+/// live-returned tables always admit (proof, never speculation), even
+/// past the speculative cap.
 fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedModule) -> u64 {
     let Some(position) = modules.iter().position(|module| {
         module.view == incoming.view
@@ -13307,10 +13334,14 @@ fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedM
                 })
             }
             None => {
-                if existing.tables.len() >= MAX_MERGED_TABLES_PER_MODULE {
-                    // Past the cap the fresh table drops and counts; a
-                    // dropped static table still re-opens finished-ness
-                    // (the union no longer spans the whole surface).
+                if existing.tables.len() >= MAX_MERGED_TABLES_PER_MODULE && incoming_is_static {
+                    // Past the cap a fresh speculative table drops and
+                    // counts; a dropped static table still re-opens
+                    // finished-ness (the union no longer spans the whole
+                    // surface). A live table is proof, not speculation,
+                    // so it appends past the cap: dropping an observed
+                    // return would lose real calls, and the observation
+                    // already passed and can never be re-taken.
                     dropped = dropped.saturating_add(1);
                     appended_static |= incoming_is_static;
                     None

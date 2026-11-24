@@ -41812,10 +41812,8 @@ fn merge_scanned_module_keeps_live_tables_past_the_merge_cap() {
     let mut tables: Vec<ScannedTable> = (0..cap as u64 + 3).map(table).collect();
     tables.push(live_table(0));
     let mut entered = Vec::new();
-    let dropped = merge_scanned_module(
-        &mut entered,
-        module(tables, vec![interface(Some(cap + 3))]),
-    );
+    let dropped =
+        merge_scanned_module(&mut entered, module(tables, vec![interface(Some(cap + 3))]));
     assert_eq!(dropped, 4);
     assert_eq!(entered.len(), 1);
     assert_eq!(entered[0].tables.len(), cap);

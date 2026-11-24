@@ -2027,6 +2027,10 @@ enum MixedRefusalControl {
     ImageOnly,
 }
 
+/// Calls C's proof-destroying close replayed or disposed (its two
+/// retained calls), named in the fallback-fence gap's `calls=`.
+const FALLBACK_CLOSE_UNITS: u64 = 2;
+
 fn mixed_image_and_exact_refusal_pending(scenario: MixedRefusalControl) {
     use crate::semantics_key_use::FeedMode;
     use crate::semantics_objects::journal::{EndpointClass, JournalGap, endpoint_class};
@@ -2331,6 +2335,49 @@ fn mixed_image_and_exact_refusal_pending(scenario: MixedRefusalControl) {
     assert!(
         successor.reseed_supersedes(&c_proof),
         "the refused C key binds its fenced successor, never the dead key"
+    );
+    // The close discloses its typed decision as exactly one registry
+    // gap on C's caller (the delivery arm's only production write of
+    // the fallback-fence disclosure): reason rebuilt from the typed
+    // fence the adapter recorded, never parsed back from text.
+    let fenced = coordinator
+        .joint_capture()
+        .adapter()
+        .fallback_fence_for_test(&c_proof)
+        .expect("the proof-destroying close fenced C's key");
+    let decision = crate::semantics_objects::journal::FallbackFenceDecision {
+        fence: fenced.fence,
+        chain: 0,
+        backoff_passes: 0,
+        successor_allowed: true,
+        straddlers: 0,
+    };
+    assert_eq!(
+        (fenced.chain, fenced.wait),
+        (0, 0),
+        "C sealed before its close: no unproductive chain"
+    );
+    let registry = coordinator.registry();
+    let disclosed = registry
+        .gaps()
+        .iter()
+        .cloned()
+        .chain(registry.staged_gaps_for_test())
+        .filter(|gap| {
+            gap.subject == crate::semantics_objects::journal::joint_audit::FALLBACK_FENCED_SUBJECT
+        })
+        .map(|gap| (gap.caller, gap.module, gap.pid, gap.reason, gap.budget))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        disclosed,
+        vec![(
+            Some(c.caller()),
+            None,
+            None,
+            decision.gap_reason(FALLBACK_CLOSE_UNITS),
+            None
+        )],
+        "one fallback-fence gap, exactly the typed decision"
     );
     let work =
         failures[0].effects.effects.len() + coordinator.registry().joint_history_targets().count();

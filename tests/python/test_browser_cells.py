@@ -135,9 +135,17 @@ FF_CC_MISS_CAUSE = "learned_never_scanned"
 #: spawn-window timing (skipped, loader_discovery, pid_descendant_gaps,
 #: surfaces), the one unconfirmed pause member (pause_partial), and —
 #: only when the bundled provider really missed — its named window.
+#: Two further causes are racy across runs (1/9 so far): the p11-kit
+#: lookalike-table selection stays incomplete (interface_selection;
+#: forwarding-layer attribution only, while the asserted softokn
+#: linkage stays exact beside it), and loader races leave windows
+#: unprotected (unprotected_live_windows; first-use-loss class, guarded
+#: by the linkage exactness like the learned-file skip: a lost cc Init
+#: fails Init==1, never passes silently).
 _FF_CC_RUN_GAPS = frozenset({
     "modules_skipped", "skipped", "surfaces", "pause_partial",
     "loader_discovery", "pid_descendant_gaps",
+    "unprotected_live_windows", "interface_selection",
     FF_CC_MISS_CAUSE,
 })
 #: FF-CC verdict: default discovery-all runs always carry concrete

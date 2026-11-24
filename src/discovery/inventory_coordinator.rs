@@ -38050,6 +38050,555 @@ int main(void) {
     }
 
     #[test]
+    fn a_system_scope_blind_post_stamp_read_proves_no_lifetime() {
+        // An inconclusive post-stamp leader-state read (the stat is
+        // unreadable while the group pin holds) proves no leader-alive
+        // instant: the pin still names the generation, but nothing
+        // shows the leader lived at the stamp. The foreign reuser's
+        // row stays module-level instead of binding the false interval.
+        agreeing(|| {
+            let (mut native, caller) = proven_system_native_shaped(Some(200), |source| {
+                source.blind(7);
+            });
+            assert_eq!(
+                native.scene.coordinator.adapter.leader_alive_ns(caller),
+                None,
+                "an unreadable post-stamp state proves no lifetime"
+            );
+            retire_then_exits(&mut native, &[450]);
+            // An unadmitted fork child reuses the number and fires the row.
+            native.scene.source.spawn(7, 601);
+            let row = native.row(41, 1, 7, 400, 0);
+            native.witness(vec![row]);
+            assert_eq!(bound_census(&native), (1, 0, 0));
+            assert_eq!(no_live_caller(&native), Some(1));
+            assert!(
+                !matches!(native.scene.coverage(caller), UseCoverage::Counted { .. }),
+                "{:?}",
+                native.scene.coverage(caller)
+            );
+        });
+    }
+
+    #[test]
+    fn a_system_scope_tick_only_pin_proves_no_lifetime() {
+        // A tick-only fallback pin (its pidfd open was refused) holds
+        // the same start time, but equal ticks cannot distinguish two
+        // generations: no leader-alive proof exists. The reuser's row
+        // stays module-level.
+        agreeing(|| {
+            let mut scene = CaptureScene::new(2);
+            scene.source.spawn(7, 500);
+            scene.source.refuse_pidfd(7);
+            scene.coordinator.adapter.reconcile_detected(
+                &[7].into_iter().collect(),
+                &mut |_| ImageAuthority::ScanPinned,
+                50,
+                &mut || Some(200),
+            );
+            let caller = scene.coordinator.adapter.live_id(7).expect("admitted");
+            let record = scene.coordinator.adapter.record(caller).unwrap();
+            assert_eq!((record.first_seen_ns, record.admitted_ns), (50, 200));
+            assert_eq!(
+                scene.coordinator.adapter.leader_alive_ns(caller),
+                None,
+                "a tick-only pin proves no lifetime"
+            );
+            scene
+                .coordinator
+                .begin_capture_coverage(CaptureScopeCoverage::System);
+            let mut native = NativeScene::over(scene, 0);
+            native.scene.attach_all(100, ScopeCustody::System);
+            native.scene.project(7, 120);
+            native.scene.coordinator.commit_batch(false).unwrap();
+            native.scene.coordinator.engine.scope = Scope::System;
+            native.scene.coordinator.exit_clocks_comparable = true;
+            retire_then_exits(&mut native, &[450]);
+            native.scene.source.spawn(7, 601);
+            let row = native.row(41, 1, 7, 400, 0);
+            native.witness(vec![row]);
+            assert_eq!(bound_census(&native), (1, 0, 0));
+            assert_eq!(no_live_caller(&native), Some(1));
+            assert!(
+                !matches!(native.scene.coverage(caller), UseCoverage::Counted { .. }),
+                "{:?}",
+                native.scene.coverage(caller)
+            );
+        });
+    }
+
+    #[test]
+    fn a_system_scope_exited_sighting_with_deferred_exit_scan_binds_on_retry() {
+        // The row's read-time sighting answers Exited while its exit
+        // scan defers past the holder pool: the sighting is kept and
+        // the exit retry runs before any decision, so the row binds
+        // its true holder with no extra native query.
+        agreeing(|| {
+            let (mut native, holders) = hot_pid_system_native(1100);
+            stamp_hot_exits(&mut native, 7, 60);
+            // A live successor holds the tgid at read time; its cookie
+            // query answers Exited (the task died during the query).
+            native.scene.source.spawn(7, 1600);
+            native.scene.coordinator.adapter.reconcile_detected(
+                &[7].into_iter().collect(),
+                &mut |_| ImageAuthority::ScanPinned,
+                50,
+                &mut || Some(400_000),
+            );
+            assert!(native.scene.coordinator.adapter.live_id(7).is_some());
+            native.query_answer(7, 1600, CookieQuery::Exited);
+            native.read(hot_rows(&native, 0, 60));
+            assert_eq!(
+                native.scene.coordinator.binder.owed_len_for_test(),
+                1,
+                "the read defers exactly the row past the pool"
+            );
+            assert_eq!(
+                native.cookies.queries, 60,
+                "one read-time query per row, none for the retry yet"
+            );
+            native.drain();
+            native.witness(Vec::new());
+            native.witness(Vec::new());
+            assert_eq!(bound_census(&native), (60, 60, 0));
+            assert_holders_edged(&native, &holders[..60]);
+            assert_eq!(
+                native.cookies.queries, 60,
+                "the exit retry spends no native query"
+            );
+        });
+    }
+
+    #[test]
+    fn a_system_scope_deferred_exit_scan_runs_before_the_late_live_query() {
+        // A sightingless row whose exit scan deferred at read time must
+        // consult its exit interval before any late live query: the
+        // live successor arrived after the event, so the row binds its
+        // true holder and the retry spends no native query.
+        agreeing(|| {
+            let (mut native, holders) = hot_pid_system_native(1100);
+            stamp_hot_exits(&mut native, 7, 60);
+            native.read(hot_rows(&native, 0, 60));
+            assert_eq!(
+                native.scene.coordinator.binder.owed_len_for_test(),
+                1,
+                "the read defers exactly the row past the pool"
+            );
+            assert_eq!(
+                native.cookies.queries, 0,
+                "no live caller at read time, no query"
+            );
+            // A live successor arrives before the retry and would
+            // answer the deferred row's own ticket.
+            native.scene.source.spawn(7, 1600);
+            native.scene.coordinator.adapter.reconcile_detected(
+                &[7].into_iter().collect(),
+                &mut |_| ImageAuthority::ScanPinned,
+                300_000,
+                &mut || Some(400_000),
+            );
+            native.answer(7, 1600, 5059);
+            native.drain();
+            native.witness(Vec::new());
+            native.witness(Vec::new());
+            assert_eq!(bound_census(&native), (60, 60, 0));
+            assert_holders_edged(&native, &holders[..60]);
+            assert_eq!(
+                native.cookies.queries, 0,
+                "the exit retry runs before any live query"
+            );
+        });
+    }
+
+    #[test]
+    fn a_system_scope_deferred_exit_scan_absent_still_binds_the_late_live_caller() {
+        // Exit-first ordering keeps the late-binding fallthrough: with
+        // no exit proof the owed retry still consults the live caller
+        // and binds it, spending exactly one query per row.
+        agreeing(|| {
+            let (mut native, _) = hot_pid_system_native(1100);
+            // No exits stamped: the exit path stays Absent.
+            let mut rows = hot_rows(&native, 0, 59);
+            rows.push(native.row(5059, 9059, 7, 500_000, 0));
+            native.read(rows);
+            assert_eq!(
+                native.scene.coordinator.binder.owed_len_for_test(),
+                60,
+                "every row waits for its retry"
+            );
+            native.scene.source.spawn(7, 1600);
+            native.scene.coordinator.adapter.reconcile_detected(
+                &[7].into_iter().collect(),
+                &mut |_| ImageAuthority::ScanPinned,
+                300_000,
+                &mut || Some(400_000),
+            );
+            let successor = native
+                .scene
+                .coordinator
+                .adapter
+                .live_id(7)
+                .expect("successor admitted");
+            native.scene.project(7, 400_010);
+            native.scene.coordinator.commit_batch(false).unwrap();
+            native.answer(7, 1600, 5059);
+            native.witness(Vec::new());
+            native.witness(Vec::new());
+            assert_only_holder_edged(&native, successor);
+            assert_eq!(
+                native.cookies.queries, 60,
+                "one live query per owed row, none for the Absent exit scans"
+            );
+        });
+    }
+
+    #[test]
+    fn a_system_scope_queued_hook_hold_files_no_budget_payload() {
+        // A row held only by its pid's queued hooks waits on evidence,
+        // not on a failed charge: its staging files the waiting gap
+        // with no budget-overrun payload and no pool-exhausted gap.
+        agreeing(|| {
+            let mut scene = CaptureScene::new(2);
+            scene
+                .coordinator
+                .begin_capture_coverage(CaptureScopeCoverage::System);
+            let mut native = NativeScene::over(scene, 0);
+            native.scene.attach_all(100, ScopeCustody::System);
+            let _storm = admit_hot_pid(&mut native.scene, 7, 1100);
+            let _gated = admit_hot_pid(&mut native.scene, 9, 1100);
+            native.scene.coordinator.commit_batch(false).unwrap();
+            native.scene.coordinator.engine.scope = Scope::System;
+            native.scene.coordinator.exit_clocks_comparable = true;
+            // The gated pid's wide exit stamps while its stamps are complete.
+            let at = native.stamps.tick();
+            native.stage(NativeBatch::Lifecycle(leader_exit_drain_many(
+                native.domain,
+                at,
+                9,
+                &[100_000],
+            )));
+            // A storm for the hot pid defers its tail, and the gated
+            // pid's small hook past the spent pool.
+            let storm_hooks: Vec<u64> = (0..60).map(|i| 200_000 + i).collect();
+            let at = native.stamps.tick();
+            let mut storm = leader_exit_drain_many(native.domain, at, 7, &storm_hooks);
+            let small = leader_exit_drain_many(native.domain, at, 9, &[1001]);
+            storm.records.extend(small.records);
+            native.stage(NativeBatch::Lifecycle(storm));
+            // A witness staging with only the gated row: its resolve
+            // holds on the queued hook while the fresh pool charges
+            // nothing past it. Gaps apply at commit, so the per-staging
+            // disclosure is read from the staged list.
+            let staged_before = native
+                .scene
+                .coordinator
+                .registry
+                .staged_gaps_for_test()
+                .len();
+            let row = native.row(41, 1, 9, 1050, 0);
+            native.read(vec![row]);
+            assert_eq!(
+                native.scene.coordinator.binder.owed_len_for_test(),
+                1,
+                "the gated row waits for its hook"
+            );
+            let staged = native.scene.coordinator.registry.staged_gaps_for_test();
+            let fresh = &staged[staged_before..];
+            assert_eq!(
+                fresh.len(),
+                1,
+                "the holding staging files exactly one gap: {fresh:?}"
+            );
+            assert_eq!(
+                fresh[0].subject, "exit resolution waiting on queued hooks",
+                "a queue-only hold names the wait: {fresh:?}"
+            );
+            assert_eq!(
+                fresh[0].budget, None,
+                "a queue-only hold carries no budget-overrun payload: {fresh:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_system_scope_pool_charge_failure_keeps_its_budget_payload() {
+        // A staging that actually spends past the holder-scan pool
+        // files the pool-exhausted gap with its structured budget,
+        // beside any queue-only wait.
+        agreeing(|| {
+            let (mut native, _) = hot_pid_system_native(1100);
+            let staged_before = native
+                .scene
+                .coordinator
+                .registry
+                .staged_gaps_for_test()
+                .len();
+            let storm: Vec<u64> = (0..70).map(|i| 200_000 + i).collect();
+            let at = native.stamps.tick();
+            native.stage(NativeBatch::Lifecycle(leader_exit_drain_many(
+                native.domain,
+                at,
+                7,
+                &storm,
+            )));
+            let staged = native.scene.coordinator.registry.staged_gaps_for_test();
+            let fresh = &staged[staged_before..];
+            assert!(
+                fresh.iter().any(|gap| gap.subject == "holder scan pool exhausted"
+                    && gap.budget
+                        == Some(crate::discovery::caller_registry::BudgetRefusal {
+                            resource: "holder_scan_units",
+                            limit: 65_536,
+                            requested: 65_537,
+                        })),
+                "a charge failure files the budgeted gap: {fresh:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_system_scope_blinded_hook_drain_visits_charge_the_pool() {
+        // Draining queued hooks of a pid blinded after they queued
+        // still visits every entry: those visits charge the staging's
+        // pool, so one fewer fresh hook stamps past them.
+        agreeing(|| {
+            let (mut native, _) = hot_pid_system_native(1100);
+            let holders8 = admit_hot_pid(&mut native.scene, 8, 1100);
+            native.scene.coordinator.commit_batch(false).unwrap();
+            // A storm overflows the deferred queue and blinds pid 7
+            // with 1,024 hooks still queued behind it.
+            let storm: Vec<u64> = (0..1100).map(|i| 200_000 + i).collect();
+            let at = native.stamps.tick();
+            native.stage(NativeBatch::Lifecycle(leader_exit_drain_many(
+                native.domain,
+                at,
+                7,
+                &storm,
+            )));
+            // Sixty fresh hooks for pid 8 share their staging with the
+            // blind drain: 58 stamp past its 1,024 visits, 2 defer.
+            let fresh: Vec<u64> = (0..60).map(|i| 1_050 + i * 100).collect();
+            let at = native.stamps.tick();
+            native.stage(NativeBatch::Lifecycle(leader_exit_drain_many(
+                native.domain,
+                at,
+                8,
+                &fresh,
+            )));
+            let stamped = holders8
+                .iter()
+                .filter(|id| {
+                    native
+                        .scene
+                        .coordinator
+                        .leader_exit_witness
+                        .contains_key(id)
+                })
+                .count();
+            assert_eq!(
+                stamped, 58,
+                "the blind drain's visits cost one fresh stamp"
+            );
+        });
+    }
+
+    #[test]
+    fn a_system_scope_deferred_drain_stops_intact_past_the_pool() {
+        // A storm fed in production-sized batches queues faster than
+        // the drain stamps: each staging stamps exactly what fits and
+        // stops with its queue intact, so the queue grows by the
+        // scripted 11 hooks per batch until the drain itself saturates.
+        agreeing(|| {
+            let (mut native, _) = hot_pid_system_native(1100);
+            let mut queued = Vec::new();
+            for batch in 0..7 {
+                let hooks: Vec<u64> =
+                    (0..70).map(|i| 200_000 + batch * 1_000 + i).collect();
+                let at = native.stamps.tick();
+                native.stage(NativeBatch::Lifecycle(leader_exit_drain_many(
+                    native.domain,
+                    at,
+                    7,
+                    &hooks,
+                )));
+                queued.push(native.scene.coordinator.deferred_hooks.queue_len_for_test());
+            }
+            assert_eq!(queued, [11, 22, 33, 44, 55, 66, 77]);
+        });
+    }
+
+    #[test]
+    fn a_system_scope_hook_overflow_in_production_batches_blinds_only_its_pid() {
+        // The 1,100-hook overflow fed the way production feeds it (256
+        // records per quantum): the hot pid still blinds with the named
+        // loss gap and its rows keep their live-miss gaps, while a
+        // quiet control pid binds its own holder.
+        agreeing(|| {
+            let (mut native, _) = hot_pid_system_native(1100);
+            native.scene.source.spawn(8, 600);
+            native.scene.coordinator.adapter.reconcile_detected(
+                &[8].into_iter().collect(),
+                &mut |_| ImageAuthority::ScanPinned,
+                50,
+                &mut || Some(200),
+            );
+            let control = native
+                .scene
+                .coordinator
+                .adapter
+                .live_id(8)
+                .expect("control admitted");
+            native.scene.project(8, 250);
+            native.scene.source.kill(8);
+            native.scene.coordinator.adapter.reconcile(
+                &BTreeSet::new(),
+                &mut |_| ImageAuthority::ScanPinned,
+                500,
+            );
+            native.scene.coordinator.commit_batch(false).unwrap();
+            for batch in 0..8 {
+                let storm: Vec<u64> =
+                    (0..256).map(|i| 200_000 + batch * 1_000 + i).collect();
+                let at = native.stamps.tick();
+                native.stage(NativeBatch::Lifecycle(leader_exit_drain_many(
+                    native.domain,
+                    at,
+                    7,
+                    &storm,
+                )));
+            }
+            let at = native.stamps.tick();
+            native.stage(NativeBatch::Lifecycle(leader_exit_drain_many(
+                native.domain,
+                at,
+                8,
+                &[450],
+            )));
+            let endpoint = native.scene.delta.endpoints[0];
+            let blinded =
+                WitnessRow::scripted(native.domain, 41, 1, endpoint.object, endpoint.id, 7, 1025);
+            let held =
+                WitnessRow::scripted(native.domain, 42, 1, endpoint.object, endpoint.id, 8, 300);
+            native.witness(vec![blinded, held]);
+            assert_eq!(bound_census(&native), (2, 1, 0));
+            assert_eq!(no_live_caller(&native), Some(1));
+            assert_only_holder_edged(&native, control);
+            let blinded_gap = native
+                .scene
+                .coordinator
+                .registry
+                .gaps()
+                .iter()
+                .find(|gap| gap.subject == "deferred leader-exit hook dropped")
+                .expect("the dropped hook files the named loss gap");
+            assert_eq!(blinded_gap.pid, Some(7));
+            assert_eq!(
+                blinded_gap.budget,
+                Some(crate::discovery::caller_registry::BudgetRefusal {
+                    resource: "deferred_exit_hooks",
+                    limit: 1024,
+                    requested: 1025,
+                })
+            );
+        });
+    }
+
+    #[test]
+    fn a_system_scope_drain_visit_cost_holds_one_more_hook() {
+        // Every drained hook visit charges its staging: after a storm
+        // queues one hot hook and 464 single-holder hooks, the next
+        // staging's drain spends the visits plus the scans, so 57 of
+        // its 60 fresh hooks stamp and 3 defer.
+        agreeing(|| {
+            let (mut native, _) = hot_pid_system_native(1100);
+            native.scene.source.spawn(9, 500);
+            native.scene.coordinator.adapter.reconcile_detected(
+                &[9].into_iter().collect(),
+                &mut |_| ImageAuthority::ScanPinned,
+                50,
+                &mut || Some(1_000),
+            );
+            assert!(native.scene.coordinator.adapter.live_id(9).is_some());
+            native.scene.project(9, 1_010);
+            native.scene.source.kill(9);
+            native.scene.coordinator.adapter.reconcile(
+                &BTreeSet::new(),
+                &mut |_| ImageAuthority::ScanPinned,
+                300_000,
+            );
+            native.scene.coordinator.commit_batch(false).unwrap();
+            assert_eq!(native.scene.coordinator.adapter.proven_count(9), 1);
+            // Sixty hot hooks spend the pool; the 1,100 single-holder
+            // hooks behind them stamp 636 and queue 464.
+            let at = native.stamps.tick();
+            let mut storm = leader_exit_drain_many(native.domain, at, 7, &{
+                (0..60).map(|i| 200_000 + i).collect::<Vec<_>>()
+            });
+            let small = leader_exit_drain_many(native.domain, at, 9, &{
+                (0..1100).map(|i| 300_000 + i).collect::<Vec<_>>()
+            });
+            storm.records.extend(small.records);
+            native.stage(NativeBatch::Lifecycle(storm));
+            assert_eq!(
+                native.scene.coordinator.deferred_hooks.queue_len_for_test(),
+                465,
+                "the storm queues one hot hook and 464 small hooks"
+            );
+            // Sixty fresh hot hooks share their staging with that
+            // drain: 57 stamp past its visits, 3 defer.
+            let fresh: Vec<u64> = (0..60).map(|i| 400_000 + i).collect();
+            let at = native.stamps.tick();
+            native.stage(NativeBatch::Lifecycle(leader_exit_drain_many(
+                native.domain,
+                at,
+                7,
+                &fresh,
+            )));
+            assert_eq!(
+                native.scene.coordinator.deferred_hooks.queue_len_for_test(),
+                3,
+                "the drain's visit cost holds one more fresh hook"
+            );
+        });
+    }
+
+    #[test]
+    fn a_system_scope_witness_staging_drains_queued_exit_hooks() {
+        // Queued exit hooks drain on witness stagings too, not only on
+        // lifecycle drains: after a storm queues 11 hooks, a
+        // witness-only staging stamps them and the row resolves
+        // against the drained stamps with no owed attempt left.
+        agreeing(|| {
+            let (mut native, _) = hot_pid_system_native(1100);
+            let hooks: Vec<u64> = (0..70).map(|i| 1_050 + i * 100).collect();
+            let at = native.stamps.tick();
+            native.stage(NativeBatch::Lifecycle(leader_exit_drain_many(
+                native.domain,
+                at,
+                7,
+                &hooks,
+            )));
+            assert_eq!(
+                native.scene.coordinator.leader_exit_witness.len(),
+                59,
+                "the storm stamps exactly the hooks inside the pool"
+            );
+            let row = hot_rows(&native, 65, 1).pop().unwrap();
+            native.read(vec![row]);
+            assert_eq!(
+                native.scene.coordinator.leader_exit_witness.len(),
+                70,
+                "the witness staging drains the queued hooks"
+            );
+            assert_eq!(
+                native.scene.coordinator.binder.owed_len_for_test(),
+                0,
+                "the row resolves against the drained stamps"
+            );
+        });
+    }
+
+    #[test]
     fn a_cgroup_scope_retained_row_stays_unbound() {
         // PID-scope-only fallback under cgroup scope: only the engine
         // scope differs from the bound twin (production cgroup batches

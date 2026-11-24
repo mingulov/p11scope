@@ -9798,15 +9798,12 @@ impl JournalAdapter {
         }
         let mut credit = self.inline_credit.min(SCOPED_RECOVERY_SLICE);
         let allowance = credit;
-        loop {
-            // One indexed step past the cursor over the candidate
-            // index: no table scan, no candidate vector, no borrow
-            // held across the cached derivation below.
-            let Some(native) =
-                next_member_after(&self.drain_proof_candidates, self.drain_proof_cursor)
-            else {
-                break;
-            };
+        // One indexed step past the cursor over the candidate index
+        // per iteration: no table scan, no candidate vector, no borrow
+        // held across the cached derivation below.
+        while let Some(native) =
+            next_member_after(&self.drain_proof_candidates, self.drain_proof_cursor)
+        {
             if credit == 0 {
                 self.inline_spent = self.inline_spent.saturating_add(allowance - credit);
                 return Err(self.wait(SealWait::DrainProofPending));

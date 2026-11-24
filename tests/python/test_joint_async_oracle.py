@@ -3216,5 +3216,27 @@ class S1Twins(unittest.TestCase):
             self.assertNotIn("Traceback", refused.stderr)
 
 
+class EcCurveWidthTwins(unittest.TestCase):
+    def test_async_ec_curve_binds_exact_width(self):
+        oracle = require_oracle(self)
+        pairs = (("p256", 64), ("p384", 96), ("p521", 132))
+        for curve, octets in pairs:
+            with self.subTest(curve=curve):
+                oracle._check_size_detail(
+                    {"kind": "ec", "curve": curve, "octets": octets,
+                     "evidence": "sign_output"},
+                    "size detail")
+        for curve, _ in pairs:
+            for _, octets in pairs:
+                if (curve, octets) in pairs:
+                    continue
+                with self.subTest(curve=curve, octets=octets):
+                    with self.assertRaises(oracle.LedgerError):
+                        oracle._check_size_detail(
+                            {"kind": "ec", "curve": curve, "octets": octets,
+                             "evidence": "sign_output"},
+                            "size detail")
+
+
 if __name__ == "__main__":
     unittest.main()

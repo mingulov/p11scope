@@ -30134,6 +30134,22 @@ fn keymeta_ec_size_class_renders_in_json() {
         validator.is_valid(&rendered),
         "the size-class detail validates"
     );
+    let schema_file: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            root.join("docs/schema/inventory-v1-object-observations-v9.schema.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let mut slot_schema = serde_json::json!({"$ref": "#/$defs/inferred_size"});
+    slot_schema["$defs"] = schema_file["$defs"].clone();
+    let validator = jsonschema::options()
+        .build(&slot_schema)
+        .expect("v9 inferred-size schema builds");
+    assert!(
+        validator.is_valid(&rendered),
+        "the size-class detail validates against v9 too"
+    );
 }
 
 /// Forward-filled wrapped material never conflicts with typed size
@@ -36125,6 +36141,84 @@ fn key_operation_schema_v7_detail_slots_share_specimens_with_checker() {
         assert!(
             !validator.is_valid(&block),
             "refused {name} is refused in conflict_detail"
+        );
+    }
+}
+
+/// The shared size-detail specimens run through the v9 slots too:
+/// every valid specimen validates in `detail` and
+/// `conflict_detail`, every refused specimen (including crossed
+/// curve/width pairs) is refused in both — through the real
+/// v9 `inferred_size` reference, so a v9-only regression fails.
+#[test]
+fn key_operation_schema_v9_detail_slots_share_specimens_with_checker() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let specimens: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            root.join("tests/fixtures/key-operations/size-detail-specimens.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let schema_file: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            root.join("docs/schema/inventory-v1-object-observations-v9.schema.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let mut slot_schema = serde_json::json!({"$ref": "#/$defs/inferred_size"});
+    slot_schema["$defs"] = schema_file["$defs"].clone();
+    let validator = jsonschema::options()
+        .build(&slot_schema)
+        .expect("v9 inferred-size schema builds");
+    let valid = specimens["valid"].as_object().expect("valid table");
+    let refused = specimens["refused"].as_object().expect("refused table");
+    assert!(
+        valid.len() >= 2 && refused.len() >= 6,
+        "the shared table carries both valid details and all six refusals"
+    );
+    let first_valid = valid.values().next().expect("a valid detail");
+    for (name, detail) in valid {
+        let block = serde_json::json!({
+            "status": "inferred",
+            "detail": detail,
+            "completions": 1,
+        });
+        assert!(
+            validator.is_valid(&block),
+            "valid {name} validates in v9 detail"
+        );
+        let block = serde_json::json!({
+            "status": "conflicting",
+            "detail": first_valid,
+            "completions": 2,
+            "conflict_detail": detail,
+        });
+        assert!(
+            validator.is_valid(&block),
+            "valid {name} validates in v9 conflict_detail"
+        );
+    }
+    for (name, detail) in refused {
+        let block = serde_json::json!({
+            "status": "inferred",
+            "detail": detail,
+            "completions": 1,
+        });
+        assert!(
+            !validator.is_valid(&block),
+            "refused {name} is refused in v9 detail"
+        );
+        let block = serde_json::json!({
+            "status": "conflicting",
+            "detail": first_valid,
+            "completions": 2,
+            "conflict_detail": detail,
+        });
+        assert!(
+            !validator.is_valid(&block),
+            "refused {name} is refused in v9 conflict_detail"
         );
     }
 }

@@ -18,6 +18,18 @@
       "kind": "ec_class",
       "octets": 64,
       "evidence": "sign_output"
+    },
+    "ec_384": {
+      "kind": "ec",
+      "curve": "p384",
+      "octets": 96,
+      "evidence": "sign_output"
+    },
+    "ec_521": {
+      "kind": "ec",
+      "curve": "p521",
+      "octets": 132,
+      "evidence": "sign_output"
     }
   },
   "refused": {
@@ -55,6 +67,12 @@
       "kind": "ec",
       "curve": "ed25519",
       "octets": 64,
+      "evidence": "sign_output"
+    },
+    "crossed curve width": {
+      "kind": "ec",
+      "curve": "p256",
+      "octets": 132,
       "evidence": "sign_output"
     }
   }

@@ -1127,6 +1127,105 @@ fn cbom_limit_only_mechanism_names_support_truthfully() {
     );
 }
 
+/// Limit-only MAC mechanisms classify as message authentication,
+/// never block ciphers: the AES MAC spellings and their legacy
+/// siblings (here DES) reach the MAC rule before the block-cipher
+/// family fallback — with the support marker, zero calls and no
+/// observed functions.
+#[test]
+fn cbom_limit_only_mac_mechanisms_classify_mac() {
+    let bytes = inventory_document_with_info(
+        vec![caller("c0", Some("/bin/driver"))],
+        vec![module("m0", "/lib/p.so", Some(&"a".repeat(64)))],
+        vec![edge("c0", "m0", None)],
+        vec![],
+        vec![
+            mechanism_limit_row("c0", 0, 0x1083),
+            mechanism_limit_row("c0", 0, 0x1084),
+            mechanism_limit_row("c0", 0, 0x123),
+        ],
+    );
+    let projection = parse_input(&bytes).unwrap();
+    assert_eq!(projection.unknowns.mechanisms_unknown_primitive, 0);
+    let document = super::render::render_json(&projection);
+    for (id, name) in [
+        (0x1083, "CKM_AES_MAC"),
+        (0x1084, "CKM_AES_MAC_GENERAL"),
+        (0x123, "CKM_DES_MAC"),
+    ] {
+        let algorithm =
+            library_component(&document, &format!("p11scope:mechanism:0x{id:x}"));
+        assert_eq!(algorithm["name"], name, "0x{id:x} keeps its registered name");
+        assert_eq!(
+            algorithm["description"],
+            "Mechanism reported by the provider (C_GetMechanismInfo); no use observed."
+        );
+        assert_eq!(
+            algorithm["cryptoProperties"]["algorithmProperties"]["primitive"],
+            "mac",
+            "0x{id:x} classifies as a MAC"
+        );
+        assert!(
+            algorithm["cryptoProperties"]["algorithmProperties"]
+                .get("cryptoFunctions")
+                .is_none(),
+            "no observed functions on 0x{id:x}"
+        );
+        let properties = algorithm["properties"].as_array().expect("properties");
+        let value = |key: &str| {
+            properties
+                .iter()
+                .find(|property| property["name"] == key)
+                .and_then(|property| property["value"].as_str())
+        };
+        assert_eq!(value("p11scope:limit_only"), Some("true"));
+        assert_eq!(value("p11scope:calls"), Some("0"));
+        assert_eq!(value("p11scope:functions"), Some(""));
+    }
+}
+
+/// A limit-only row with an unregistered mechanism id stays
+/// nameless, never guessed: the bare-hex name, the no-use
+/// description and the marker — with the honest `unknown`
+/// primitive, outside the unknown-primitive count.
+#[test]
+fn cbom_limit_only_unregistered_mechanism_stays_nameless() {
+    let bytes = inventory_document_with_info(
+        vec![caller("c0", Some("/bin/driver"))],
+        vec![module("m0", "/lib/p.so", Some(&"a".repeat(64)))],
+        vec![edge("c0", "m0", None)],
+        vec![],
+        vec![mechanism_limit_row("c0", 0, 0x1234)],
+    );
+    let projection = parse_input(&bytes).unwrap();
+    let limit_only = projection
+        .mechanisms
+        .iter()
+        .find(|mechanism| mechanism.id == 0x1234)
+        .expect("the limit-only mechanism");
+    assert!(limit_only.limit_only);
+    assert_eq!(limit_only.name, None, "no name is guessed");
+    assert_eq!(projection.unknowns.mechanisms_unknown_primitive, 0);
+    let document = super::render::render_json(&projection);
+    let algorithm = library_component(&document, "p11scope:mechanism:0x1234");
+    assert_eq!(algorithm["name"], "PKCS#11 mechanism 0x1234");
+    assert_eq!(
+        algorithm["description"],
+        "Mechanism reported by the provider (C_GetMechanismInfo); no use observed."
+    );
+    assert_eq!(
+        algorithm["cryptoProperties"]["algorithmProperties"]["primitive"],
+        "unknown"
+    );
+    let properties = algorithm["properties"].as_array().expect("properties");
+    assert!(
+        properties.iter().any(
+            |property| property["name"] == "p11scope:limit_only" && property["value"] == "true"
+        ),
+        "the limit-only marker, got: {properties:?}"
+    );
+}
+
 /// The PQC key types keep their established names in CBOM output:
 /// 73/74/75 read `ml_kem`/`ml_dsa`/`slh_dsa`, never `unknown`.
 #[test]
@@ -1234,6 +1333,31 @@ fn cbom_token_devices_ignore_pin_state_flags() {
     assert_eq!(
         names,
         vec![("TokenMfr Model-X", 0), ("TokenMfr Model-Y", 0),]
+    );
+}
+
+/// The PIN-state mask stops before `CKF_ERROR_STATE`: an
+/// error-state row is a real identity difference and keeps its own
+/// device — a widened mask must not fold it into its sibling.
+#[test]
+fn cbom_token_devices_keep_error_state_distinct() {
+    let mut error = token_row("c1", 0);
+    error["flags"] = json!(6 | 0x1000000);
+    let bytes = inventory_document_with_info(
+        vec![
+            caller("c0", Some("/bin/driver")),
+            caller("c1", Some("/bin/other")),
+        ],
+        vec![module_with_info("m0", "/lib/p.so", Some(&"a".repeat(64)))],
+        vec![edge("c0", "m0", None), edge("c1", "m0", None)],
+        vec![token_row("c0", 0), error],
+        vec![],
+    );
+    let projection = parse_input(&bytes).unwrap();
+    assert_eq!(
+        projection.tokens.len(),
+        2,
+        "error state stays its own device"
     );
 }
 

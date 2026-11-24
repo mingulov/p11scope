@@ -14570,6 +14570,16 @@ impl Engine {
         self.mark_partial("owned pause", reason);
     }
 
+    /// Publishes the run first-map stop's unavailability: descendants
+    /// mapped without stopping for provider attach. The row names the
+    /// missing protection, never a guessed call count.
+    pub(crate) fn note_member_stop_unavailable(&mut self) {
+        self.mark_partial(
+            crate::render::MEMBER_STOP_SKIP_SUBJECT,
+            crate::render::MEMBER_STOP_UNAVAILABLE_REASON,
+        );
+    }
+
     /// Whether discovery retained a live view for `pid`: the owned path
     /// proves its held child survived discovery on the run-tree scope.
     pub(crate) fn retains_pid(&self, pid: u32) -> bool {
@@ -43330,6 +43340,11 @@ impl Engine {
     /// constructor: pid scope on the test process, no views, no requests.
     pub(crate) fn empty_for_test() -> Self {
         Self::empty()
+    }
+
+    /// The filed object skips, for cross-module tests pinning named gaps.
+    pub(crate) fn object_skips_for_test(&self) -> &[crate::discovery::scan::Skipped] {
+        &self.counters.object_skips
     }
 
     /// Charges the capture budget from cross-module tests: work charges

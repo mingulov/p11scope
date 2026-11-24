@@ -2012,6 +2012,17 @@ pub(crate) const RUN_TREE_SUBJECT: &str = "run process tree";
 pub(crate) const RUN_TREE_SURVIVORS: &str = "process-tree members were still present when the command exited; their calls after the run end are out of scope";
 pub(crate) const RUN_TREE_DEGRADED: &str = "only the started command is observed";
 pub(crate) const RUN_TREE_MEMBERSHIP_UNKNOWN: &str = "handed-back descendants are unknown";
+/// Owned-pause gaps file under this subject with one finite reason
+/// (schema v3): the failed arm's count rides in
+/// `evidence.pause_partial`, never in the reason.
+pub(crate) const PAUSE_SKIP_SUBJECT: &str = "owned pause";
+pub(crate) const PAUSE_ARM_FAILED_REASON: &str =
+    "the pause arm failed before the first epoch; the owned child ran without pause protection";
+/// Run first-map stop gaps file under this subject with one finite
+/// reason (schema v3): no call count is claimed, never guessed.
+pub(crate) const MEMBER_STOP_SKIP_SUBJECT: &str = "run first-map stop";
+pub(crate) const MEMBER_STOP_UNAVAILABLE_REASON: &str =
+    "the run first-map stop was unavailable; descendants ran without first-map protection";
 /// Learned-file gaps file under this subject with ten finite reasons
 /// (schema v3): the staged-file count rides in
 /// `evidence.learned_staged_files`, the loss in
@@ -2286,6 +2297,25 @@ pub fn capture_skipped_out(s: &Skipped) -> SkippedOut {
             reason: s.reason.clone(),
         };
     }
+    // Owned-pause arm failures keep their subject and their one finite
+    // reason; anything else under the subject falls through to the
+    // fail-closed generic below instead of breaking the closed vocabulary.
+    if s.subject == PAUSE_SKIP_SUBJECT && s.reason.as_str() == PAUSE_ARM_FAILED_REASON {
+        return SkippedOut {
+            name: s.subject.clone(),
+            reason: s.reason.clone(),
+        };
+    }
+    // First-map-stop unavailability keeps its subject and its one
+    // finite reason (no call count is claimed); anything else under
+    // the subject falls through to the fail-closed generic below.
+    if s.subject == MEMBER_STOP_SKIP_SUBJECT && s.reason.as_str() == MEMBER_STOP_UNAVAILABLE_REASON
+    {
+        return SkippedOut {
+            name: s.subject.clone(),
+            reason: s.reason.clone(),
+        };
+    }
     // Learned-file gaps keep their subject and their ten finite
     // reasons; the counts ride in the `evidence.learned_*` keys.
     // Anything else under the subject falls through to the fail-closed
@@ -2466,6 +2496,44 @@ fn run_tree_gaps_project_under_their_own_subject_with_finite_reasons() {
         assert_eq!(projected.reason, DISCOVERY_UNAVAILABLE, "{reason}");
         let json = serde_json::to_string(&projected).unwrap();
         assert!(!json.contains("permission denied"), "{json}");
+    }
+}
+
+#[test]
+fn pause_arm_and_member_stop_gaps_project_named_without_target_data() {
+    for (subject, reason) in [
+        (PAUSE_SKIP_SUBJECT, PAUSE_ARM_FAILED_REASON),
+        (MEMBER_STOP_SKIP_SUBJECT, MEMBER_STOP_UNAVAILABLE_REASON),
+    ] {
+        let projected = capture_skipped_out(&Skipped {
+            subject: subject.into(),
+            reason: (*reason).into(),
+        });
+        assert_eq!(projected.name, subject);
+        assert_eq!(projected.reason, *reason);
+        let json = serde_json::to_string(&projected).unwrap();
+        assert!(!json.contains("discovery unavailable"), "{json}");
+    }
+    for (subject, reason) in [
+        (
+            PAUSE_SKIP_SUBJECT,
+            "the pause arm failed: bpf map update failed (os error 1)",
+        ),
+        (
+            MEMBER_STOP_SKIP_SUBJECT,
+            "loading the member-stop object failed (os error 1)",
+        ),
+        (PAUSE_SKIP_SUBJECT, MEMBER_STOP_UNAVAILABLE_REASON),
+        (MEMBER_STOP_SKIP_SUBJECT, PAUSE_ARM_FAILED_REASON),
+    ] {
+        let projected = capture_skipped_out(&Skipped {
+            subject: subject.into(),
+            reason: reason.into(),
+        });
+        assert_eq!(projected.name, "discovery subject", "{reason}");
+        assert_eq!(projected.reason, DISCOVERY_UNAVAILABLE, "{reason}");
+        let json = serde_json::to_string(&projected).unwrap();
+        assert!(!json.contains("os error 1"), "{json}");
     }
 }
 
@@ -4860,6 +4928,8 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
                         }
                     } else if skip.name == LEARNED_SKIP_SUBJECT
                         || skip.name == COVERAGE_RETIRED_SUBJECT
+                        || skip.name == PAUSE_SKIP_SUBJECT
+                        || skip.name == MEMBER_STOP_SKIP_SUBJECT
                     {
                         // Named by the histogram below with its count,
                         // not as a skipped function.
@@ -4905,6 +4975,8 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
                     LEARNED_MOUNT_NAMESPACE_REASON,
                     LEARNED_UNMARKED_REASON,
                     COVERAGE_RETIRED_REASON,
+                    PAUSE_ARM_FAILED_REASON,
+                    MEMBER_STOP_UNAVAILABLE_REASON,
                 ] {
                     let hits = ev
                         .skipped

@@ -32,10 +32,15 @@ The copy must not be bypassed.
 - An audit hook fails the run on any event (open, listdir, exec, spawn,
   chdir and so on) whose arguments resolve into the checkout by the same
   rule, relative to the current directory.
-Limits: the hook sees this process only. A child that rebuilds the checkout
-path with nothing naming it, or a child interpreter's own site packages
-(children get no PYTHON* variable), is outside it; nothing the two strict
-suites run does either.
+Limits: string scanning cannot be complete. A path can be spelled in
+ways no scanner of environment values and audit arguments foresees (shell
+expansion, a program's own syntax, a child that builds it), so the scrub
+and the hook close the known spellings only. The complete fix is to run the
+suite in a mount namespace where the checkout path does not exist; that is
+on the v0.8.1 infrastructure list. Also, the hook sees this process
+only: a child that rebuilds the checkout path with nothing naming it, or a
+child interpreter's own site packages (children get no PYTHON* variable),
+is outside it; nothing the two strict suites run does either.
 
 The result is strict: a skip, an expected failure, an unexpected success,
 an empty selection, a failure or an error fails. The selection is fixed by
@@ -59,15 +64,33 @@ RECEIPT = "strict self-test passed"
 SOURCE_EVENTS = {"compile", "exec", "code.__new__", "marshal.loads", "marshal.load", "marshal.dumps"}
 
 
+SHELL_OPERATORS = ";&|()<>`'\"{}!"
+
+
+def shell_words(text):
+    """Shell words of a value: shlex with the operator characters split off
+    (quoted names keep them), each word also with operator characters
+    stripped from both ends (for unbalanced or odd spellings)."""
+    words = []
+    if len(text) <= 65536:
+        try:
+            lexer = shlex.shlex(text, posix=True, punctuation_chars=True)
+            lexer.whitespace_split = True
+            words = list(lexer)
+        except ValueError:
+            words = []
+    if not words:
+        words = text.split()
+    return words + [word.strip(SHELL_OPERATORS) for word in words]
+
+
 def candidates(text):
     """Every reading of a value as a path: the whole value, its os.pathsep
-    parts, its shell words (quotes kept) and their `--opt=` values."""
+    parts, its shell words (quotes kept, operators split off) and their
+    `--opt=` values."""
     out = {text}
     out.update(text.split(os.pathsep))
-    try:
-        words = shlex.split(text) if len(text) <= 65536 else text.split()
-    except ValueError:
-        words = text.split()
+    words = shell_words(text)
     out.update(words)
     out.update(word.split("=", 1)[1] for word in words if "=" in word)
     return {c for c in out if c and "\0" not in c}

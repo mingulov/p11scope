@@ -185,7 +185,13 @@ SOURCE_FILES = ("scripts/release-matrix-contract.py", "scripts/qualify-release-m
                 "tests/fixtures/public-cli/gated.c", "tests/fixtures/public-cli/mt.c",
                 "tests/fixtures/public-cli/inventory-ledger.c", "tests/fixtures/public-cli/prearm-first-use.c",
                 "tests/fixtures/public-cli/cgroup-fork.c", "tests/fixtures/public-cli/chain-parent.c",
-                "tests/fixtures/public-cli/mt_mixed.c", "tests/fixtures/public-cli/mt_fork.c")
+                "tests/fixtures/public-cli/mt_mixed.c", "tests/fixtures/public-cli/mt_fork.c",
+                # run-privileged-lib-tests.sh: counter, wrap and btrfs cells
+                "scripts/ci/build-counter-fixtures.sh", "scripts/ci/build-wrap-fixtures.sh",
+                "scripts/ci/prepare-btrfs-tmpdir.sh", "tests/fixtures/counter-banks.c",
+                "tests/fixtures/counter-bank-growth.c", "tests/fixtures/operator-output/prepare-diagnostics-wrap.py",
+                "tests/fixtures/operator-output/diagnostics-wrap-ledger.c",
+                "tests/fixtures/public-cli/demotion-ledger.c")
 CANARY_SOURCE_FILES = ("scripts/verify-canaries.sh", "scripts/product-build.sh", "scripts/lib.sh",
     "scripts/lane-lib-oracle-1.py", "scripts/cleanup-traps.sh", "scripts/_loader.py",
     "scripts/capture-stopped-canary.py", "scripts/canary_process_custody.py",

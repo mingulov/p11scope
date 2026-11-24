@@ -1721,6 +1721,15 @@ main() {
         return 2
     fi
 
+    # Every helper a selected cell may run sits beside this runner (the
+    # release stage carries them too): refuse by name before any setup.
+    local helper
+    for helper in build-counter-fixtures.sh build-wrap-fixtures.sh prepare-btrfs-tmpdir.sh; do
+        [ -x "$REPO_ROOT/scripts/ci/$helper" ] || {
+            echo "$PROG: required helper missing: $REPO_ROOT/scripts/ci/$helper" >&2
+            return 64
+        }
+    done
     if [ "$(id -u)" -ne 0 ]; then
         echo "$PROG: must be run as root (this campaign loads BPF)" >&2
         return 64

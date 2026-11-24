@@ -136,15 +136,31 @@ def inner(workdir: str, flow_url: str, key_pem: str, cert_pem: str) -> int:
     return 0
 
 
-def run_firefox_cc(name: str, workdir: Path, server, credential) -> FirefoxCCResult:
+def observer_argv(report: Path, inner: list[str], extra_env=None) -> list[str]:
+    """Observer argv for one default-flags run (no capture flags).
+
+    ``extra_env`` rides ``sudo VAR=value`` into the observer itself
+    (diagnostics switches, never capture flags); the owned inner
+    carries only its scrubbed ``/usr/bin/env`` environment.
+    """
+    from profiles import playwright_cache
+    argv = ["sudo", "-n", f"PLAYWRIGHT_BROWSERS_PATH={playwright_cache()}"]
+    for key, value in (extra_env or {}).items():
+        argv.append(f"{key}={value}")
+    return argv + [str(p11scope_bin()), "run", "-o", str(report), "--", *inner]
+
+
+def run_firefox_cc(name: str, workdir: Path, server, credential,
+                   observer_env=None) -> FirefoxCCResult:
     """Run one default-flags ``p11scope run`` Firefox cc visit.
 
     ``server`` is an open ``tls_server.FlowServer`` (CERT_REQUIRED for
     the cc cell, plain for the no-sign control twin); ``credential`` a
-    ``softhsm.ClientCredential``. Returns the typed result; the caller
-    owns the oracle over the report beside ``result.server``.
+    ``softhsm.ClientCredential``. ``observer_env`` passes diagnostics
+    switches to the observer (never capture flags). Returns the typed
+    result; the caller owns the oracle over the report beside
+    ``result.server``.
     """
-    from profiles import playwright_cache
     workdir.mkdir(parents=True, exist_ok=True)
     os.chmod(workdir, 0o700)
     inner_work = workdir / "inner"
@@ -154,13 +170,11 @@ def run_firefox_cc(name: str, workdir: Path, server, credential) -> FirefoxCCRes
     report = workdir / "report.json"
     short_tmp = Path(tempfile.mkdtemp(prefix="p11ffcc-", dir="/var/tmp"))
     os.chmod(short_tmp, 0o700)
-    browsers_path = playwright_cache()
-    argv = ["sudo", "-n", f"PLAYWRIGHT_BROWSERS_PATH={browsers_path}",
-           str(p11scope_bin()), "run", "-o", str(report), "--",
-           "/usr/bin/env", f"HOME={home}", f"TMPDIR={short_tmp}",
-           sys.executable, str(Path(__file__).resolve()), "--inner",
-           str(inner_work), server.url,
-           str(credential.key_pem), str(credential.cert_pem)]
+    inner = ["/usr/bin/env", f"HOME={home}", f"TMPDIR={short_tmp}",
+             sys.executable, str(Path(__file__).resolve()), "--inner",
+             str(inner_work), server.url,
+             str(credential.key_pem), str(credential.cert_pem)]
+    argv = observer_argv(report, inner, observer_env)
     try:
         try:
             proc = subprocess.run(argv, capture_output=True, text=True,
@@ -175,6 +189,11 @@ def run_firefox_cc(name: str, workdir: Path, server, credential) -> FirefoxCCRes
             _reap_firefox_tree(str(inner_work / "ffprofile"))
     finally:
         shutil.rmtree(short_tmp, ignore_errors=True)
+    try:
+        (workdir / "observer.out").write_text(stdout)
+        (workdir / "observer.err").write_text(stderr)
+    except OSError:
+        pass
     _reown(report)
     flow: dict = {}
     flow_path = inner_work / "flow.json"

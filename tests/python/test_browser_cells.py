@@ -3326,6 +3326,26 @@ class BrowserFirefoxCC(unittest.TestCase):
         self.assertEqual(len(found), 2)
         self.assertEqual(missing, [])
 
+    def test_observer_argv_default_and_env(self):
+        """Twin: default-flags observer argv; env rides sudo, never capture."""
+        report = self.work / "report.json"
+        inner = ["/usr/bin/env", "x"]
+        with patch.object(ff_cc, "p11scope_bin",
+                          return_value=Path("/bin/p11scope")):
+            plain = ff_cc.observer_argv(report, inner)
+            self.assertNotIn("--module", plain)
+            self.assertNotIn("--manifest", plain)
+            self.assertNotIn("--prearm-module", plain)
+            self.assertNotIn("--pause", plain)
+            self.assertIn("--", plain)
+            self.assertEqual(plain[-2:], inner)
+            with_env = ff_cc.observer_argv(
+                report, inner, {"P11SCOPE_CAPTURE_DIAGNOSTICS": "1"})
+            self.assertIn("P11SCOPE_CAPTURE_DIAGNOSTICS=1", with_env)
+            self.assertLess(
+                with_env.index("P11SCOPE_CAPTURE_DIAGNOSTICS=1"),
+                with_env.index("/bin/p11scope"))
+
     def test_inner_argv_shape(self):
         """Twin: the owned driver takes exactly --inner WORKDIR URL KEY CERT."""
         driver = ROOT / "tests" / "fixtures" / "browser" / "ff_cc.py"

@@ -13424,7 +13424,8 @@ fn live_table_covers_carrier_table(candidate: &ScannedTable, table: &ScannedTabl
 /// Whether these live rows for one pinned object preserve everything a
 /// riding carrier still supplies: every export, every table entry and
 /// NULL hole, and every interface, with at least the carrier's
-/// live-return and manifest flags per table. Identity alone never
+/// live-return, manifest and extension-impossible evidence per table.
+/// Identity alone never
 /// retires a carrier —
 /// an exports-only or truncated rescan of the same file must not drop
 /// the probes only the carrier decodes. Entry comparison is by stable

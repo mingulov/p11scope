@@ -214,6 +214,10 @@ int main(int argc, char **argv)
             get_slot_list++;
             if (have > count)
                 have = count;
+            if (have == 0) {
+                fprintf(stderr, "workload: slot list changed\n");
+                return 3;
+            }
             for (ck_ulong_t s = 0; s < have; s++) {
                 memset(slot_info, 0, sizeof slot_info);
                 c_get_slot_info(slots[s], slot_info);
@@ -232,6 +236,10 @@ int main(int argc, char **argv)
                     get_mechanism_list++;
                     if (got > mechanisms_count)
                         got = mechanisms_count;
+                    if (got == 0) {
+                        fprintf(stderr, "workload: mechanism list changed\n");
+                        return 3;
+                    }
                     if (got > 0) {
                         memset(mechanism_info, 0, sizeof mechanism_info);
                         c_get_mechanism_info(slots[s], mechanisms[0], mechanism_info);
@@ -500,21 +508,23 @@ impl Drop for GuardedChild {
 }
 
 /// Parses one `LEDGER name=count ...` line into per-function counts.
+/// A repeated counter name is refused before map insertion: last-wins
+/// would collapse a conflicting duplicate into healthy counts.
 fn parse_ledger(line: &str) -> BTreeMap<String, u64> {
     let body = line
         .strip_prefix("LEDGER ")
         .unwrap_or_else(|| panic!("not a ledger line: {line:?}"));
-    body.split_whitespace()
-        .map(|pair| {
-            let (name, count) = pair
-                .split_once('=')
-                .unwrap_or_else(|| panic!("bad ledger pair: {pair:?}"));
-            (
-                name.to_string(),
-                count.parse::<u64>().expect("ledger count"),
-            )
-        })
-        .collect()
+    let mut counts = BTreeMap::new();
+    for pair in body.split_whitespace() {
+        let (name, count) = pair
+            .split_once('=')
+            .unwrap_or_else(|| panic!("bad ledger pair: {pair:?}"));
+        let count = count.parse::<u64>().expect("ledger count");
+        if counts.insert(name.to_string(), count).is_some() {
+            panic!("duplicate ledger counter: {name:?} in {line:?}");
+        }
+    }
+    counts
 }
 
 /// A cell cgroup (created for the `--cgroup` cell; removed on drop).
@@ -628,19 +638,31 @@ fn wait_ready(capture: &mut GuardedChild) {
 /// Reads the LEDGER file (written by the workload on completion) and
 /// validates its known eight-counter shape: every exact cell inherits
 /// the guard, so silence or impossible counts fail here instead of
-/// passing a count comparison against nothing observed.
+/// passing a count comparison against nothing observed. Exactly one
+/// complete record is required: a repeated record would otherwise
+/// survive as identical healthy counts, and a partial write (no
+/// trailing newline yet) keeps polling instead of parsing a prefix.
 fn read_ledger_file(ledger: &Path) -> BTreeMap<String, u64> {
     let deadline = Instant::now() + TIMEOUT;
     loop {
-        if let Ok(text) = std::fs::read_to_string(ledger)
-            && let Some(line) = text.lines().find(|l| l.starts_with("LEDGER "))
-        {
-            let counts = parse_ledger(line);
-            assert!(
-                validate_workload_ledger(&counts),
-                "the workload ledger must have its known eight-counter shape: {counts:?}"
-            );
-            return counts;
+        if let Ok(text) = std::fs::read_to_string(ledger) {
+            let records: Vec<&str> = text
+                .lines()
+                .filter(|line| !line.is_empty())
+                .collect();
+            if !records.is_empty() && text.ends_with('\n') {
+                assert_eq!(
+                    records.len(),
+                    1,
+                    "the workload ledger must hold exactly one record: {records:?}"
+                );
+                let counts = parse_ledger(records[0]);
+                assert!(
+                    validate_workload_ledger(&counts),
+                    "the workload ledger must have its known eight-counter shape: {counts:?}"
+                );
+                return counts;
+            }
         }
         assert!(Instant::now() < deadline, "workload never wrote its ledger");
         std::thread::sleep(Duration::from_millis(50));
@@ -776,6 +798,36 @@ fn ledger_file_reader_rejects_a_duplicate_record() {
     assert!(
         rejected.is_err(),
         "a repeated ledger record must not yield counts"
+    );
+}
+
+/// A partial ledger write (no trailing newline yet) keeps polling
+/// instead of parsing a prefix: the producer only accepts a complete
+/// write, which a background completer supplies.
+#[test]
+fn ledger_file_reader_waits_for_a_complete_write() {
+    let dir = tempfile::tempdir().expect("cell dir");
+    let ledger = dir.path().join("ledger.txt");
+    std::fs::write(&ledger, "LEDGER C_Initialize=1").expect("write partial ledger");
+    let iters = u64::from(ITERS);
+    let complete = format!(
+        "LEDGER C_Initialize=1 C_Finalize=1 C_GetInfo={iters} C_GetSlotList={} \
+         C_GetSlotInfo={iters} C_GetTokenInfo={iters} C_GetMechanismList={} \
+         C_GetMechanismInfo={iters}\n",
+        2 * iters,
+        2 * iters,
+    );
+    let pending = ledger.clone();
+    let completer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        std::fs::write(&pending, complete).expect("complete the ledger");
+    });
+    let counts = read_ledger_file(&ledger);
+    completer.join().expect("completer finishes");
+    assert_eq!(counts.len(), 8);
+    assert!(
+        validate_workload_ledger(&counts),
+        "the completed write validates: {counts:?}"
     );
 }
 

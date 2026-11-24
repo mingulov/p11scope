@@ -21614,6 +21614,97 @@ int main(int argc, char **argv) {
         }
     }
 
+    /// EOF byte-stride twins: a newline-free chunk ending exactly on
+    /// the 8 KiB boundary still charges its final byte stride (one
+    /// read, one trailing line, one byte stride, one EOF probe), while
+    /// the byte below charges no byte stride and the byte above
+    /// charges its stride in-loop. Sizes and totals are literals.
+    #[test]
+    fn mountinfo_reader_eof_byte_stride_twins_charge_the_boundary() {
+        for (size, units_want) in [(8191, 3), (8192, 4), (8193, 4)] {
+            reset_reader_scan_counters_for_test();
+            let chunk = vec![b'x'; size];
+            let mut reader =
+                RecordingReader::new([ReaderStep::Bytes(chunk.clone()), ReaderStep::Eof]);
+            let mut budget = CaptureWorkBudget::default();
+            let table = read_mountinfo_with(&mut reader, &mut budget, 1024 * 1024, |_| None)
+                .expect("the twin chunk must read");
+            assert_eq!(table.into_bytes(), chunk, "size: {size}");
+            assert_eq!(reader_bytes_scanned_for_test(), size as u64, "size: {size}");
+            assert_eq!(reader_newlines_scanned_for_test(), 0, "size: {size}");
+            assert_eq!(budget.work_units, units_want, "size: {size}");
+        }
+    }
+
+    /// The byte-stride bound is 8 KiB literally: the stride twins pin
+    /// the mechanics, this pins the documented number.
+    #[test]
+    fn mountinfo_reader_byte_stride_is_8kib() {
+        assert_eq!(MOUNTINFO_BYTE_STRIDE, 8 * 1024);
+    }
+
+    /// The in-loop entry-ceiling precheck stops the actual newline
+    /// scan, not just the charging: 640 lines past the ceiling refuse
+    /// after exactly ceiling-plus-one-stride terminators instead of
+    /// scanning the whole chunk.
+    #[test]
+    fn mountinfo_reader_entry_ceiling_stops_the_newline_scan() {
+        reset_reader_scan_counters_for_test();
+        let mut excess =
+            RecordingReader::new([ReaderStep::Bytes(vec![b'\n'; MAX_MOUNTINFO_ENTRIES + 640])]);
+        let mut budget = CaptureWorkBudget::default();
+        assert_eq!(
+            read_mountinfo_with(&mut excess, &mut budget, 2 * 1024 * 1024, |_| None).unwrap_err(),
+            MOUNTINFO_ENTRY_CEILING_REASON
+        );
+        assert_eq!(
+            reader_newlines_scanned_for_test(),
+            (MAX_MOUNTINFO_ENTRIES + MOUNTINFO_STRIDE) as u64,
+            "the precheck stops the scan at the first over-ceiling stride: {}",
+            reader_newlines_scanned_for_test()
+        );
+        assert_eq!(
+            budget.work_units,
+            (MAX_MOUNTINFO_ENTRIES + 1) as u64,
+            "one read plus the ceiling lines: {}",
+            budget.work_units
+        );
+    }
+
+    /// Completing a line stride covers its bytes: 64 short lines plus
+    /// an 8 KiB newline-free run, with allowance for exactly the read
+    /// and the lines, scans the whole chunk before the trailing
+    /// charge refuses. Without the reset the byte stride would fire
+    /// 2 KiB early and refuse 2 KiB short.
+    #[test]
+    fn mountinfo_reader_line_stride_covers_its_bytes() {
+        reset_reader_scan_counters_for_test();
+        let mut chunk = "x".repeat(31);
+        chunk.push('\n');
+        let chunk = chunk.repeat(64);
+        let mut chunk = chunk.into_bytes();
+        chunk.extend_from_slice(&vec![b'y'; 8192]);
+        let mut reader = RecordingReader::new([ReaderStep::Bytes(chunk), ReaderStep::Eof]);
+        let mut budget = CaptureWorkBudget::default();
+        assert!(budget.charge(budget.work_ceiling() - 65));
+        assert_eq!(
+            read_mountinfo_with(&mut reader, &mut budget, 1024 * 1024, |_| None).unwrap_err(),
+            WORK_CEILING_REASON
+        );
+        assert_eq!(
+            reader_newlines_scanned_for_test(),
+            64,
+            "all line terminators scanned: {}",
+            reader_newlines_scanned_for_test()
+        );
+        assert_eq!(
+            reader_bytes_scanned_for_test(),
+            64 * 32 + 8192,
+            "lines plus the whole run scanned: {}",
+            reader_bytes_scanned_for_test()
+        );
+    }
+
     /// The observer-table resolve behind the examined-mode lower-file arm
     /// (`scan_view_examined_mode`'s `LowerProven` re-derivation) strides
     /// like every other production resolution: the same key as the

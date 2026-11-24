@@ -24793,8 +24793,13 @@ impl Engine {
             // numeric id. A newcomer owned-child proof (uncommitted
             // at defer) stages under credit below instead: its rows
             // may never commit, so skipping would lose it silently.
+            // Every pop below consumes one stride unit, skips
+            // included: popping drops the entry's proving pin and
+            // stashed files, so an uncharged skip arm closes fds
+            // outside INV-2. Entries past the stride stay queued.
             if front.is_direct_child && front.proving_retained {
                 self.owned_learn_deferred.pop_front();
+                attempted_this_apply = attempted_this_apply.saturating_add(1);
                 continue;
             }
             // The stash must hold the proven file: an entry that
@@ -24802,6 +24807,7 @@ impl Engine {
             // file or vanishing silently.
             if front.scan_pins.file_for(front.proof.object).is_none() {
                 self.owned_learn_deferred.pop_front();
+                attempted_this_apply = attempted_this_apply.saturating_add(1);
                 self.learned_event_loss = self.learned_event_loss.saturating_add(1);
                 self.mark_partial(
                     crate::render::LEARNED_SKIP_SUBJECT,
@@ -24812,6 +24818,7 @@ impl Engine {
             let key = owned_learn_key(&front.scan_pins, &front.proof);
             if self.owned_learned_staged.contains(&key) {
                 let front = self.owned_learn_deferred.pop_front().expect("peeked above");
+                attempted_this_apply = attempted_this_apply.saturating_add(1);
                 if let Some(module) = self.harvest_prepare(&front.scan_pins, &front.proof) {
                     self.harvest_commit(pins, module);
                 }
@@ -25459,9 +25466,10 @@ impl Engine {
     /// when already terminal or unresolvable. Staged files land in
     /// `pending_learned` for the flush; table harvests file into a
     /// scratch target (there is no candidate to install). Unbounded
-    /// like the flush: capture end has no next apply to pace toward,
-    /// and the backlog cap bounds the work (each entry pops once). A
-    /// no-op without queued entries (ordinary captures never queue).
+    /// like the flush: capture end has no next apply to pace toward
+    /// and no stride to charge pops against, and the backlog cap
+    /// bounds the work (each entry pops once). A no-op without
+    /// queued entries (ordinary captures never queue).
     fn drain_owned_learn_backlog_at_shutdown(&mut self) {
         let mut scratch = PinnedObjects::empty();
         while let Some(entry) = self.owned_learn_deferred.pop_front() {

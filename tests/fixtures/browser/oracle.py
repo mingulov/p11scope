@@ -485,9 +485,10 @@ def check_linkage_exact(report: dict[str, Any], mechanism: int,
     Every ``exact`` function must show exactly its count (returned
     calls; errors pinned at zero beside them), no other function may
     appear (an ``"unknown"`` cell hides linkage and fails), and the
-    cells must sum to the row's own ``calls``/``errors`` totals, so a
-    shed or partial linkage cannot pass as exact. Missing row, missing
-    linkage, malformed entries, and count mismatches all fail.
+    cells must sum to the row's own ``calls``/``errors`` totals (exact
+    by construction: every attributed call carries exactly one cell).
+    Missing row, missing linkage, malformed entries, and count
+    mismatches all fail.
     """
     failures = []
     row = None
@@ -516,7 +517,7 @@ def check_linkage_exact(report: dict[str, Any], mechanism: int,
     if sum(cell["calls"] for cell in cells.values()) != row["calls"]:
         failures.append(f"{label}: linkage cells sum to "
                         f"{sum(cell['calls'] for cell in cells.values())}, "
-                        f"row calls={row['calls']} (shed or partial linkage?)")
+                        f"row calls={row['calls']} (linkage accounting drift?)")
     if sum(cell["errors"] for cell in cells.values()) != row["errors"]:
         failures.append(f"{label}: linkage errors sum to "
                         f"{sum(cell['errors'] for cell in cells.values())}, "
@@ -549,9 +550,8 @@ def check_linkage_floored(report: dict[str, Any], mechanism: int,
     (server-driven verification sharing the row with the asserted
     sign legs — the sign family stays fully pinned, and ``"unknown"``
     still fails since it could hide sign legs). Anything else raises.
-    The cell-sum and error-shape rules still apply, so the floors
-    cannot hide shed linkage: with drops at zero the cells still sum
-    to the row totals.
+    The cell-sum and error-shape rules still apply: the cells sum
+    exactly to the row totals, floors included.
     """
     if unlisted not in ("forbid", "allow_verify"):
         raise ValueError(f"{label}: unlisted={unlisted!r}, want forbid|allow_verify")
@@ -590,7 +590,7 @@ def check_linkage_floored(report: dict[str, Any], mechanism: int,
     if sum(cell["calls"] for cell in cells.values()) != row["calls"]:
         failures.append(f"{label}: linkage cells sum to "
                         f"{sum(cell['calls'] for cell in cells.values())}, "
-                        f"row calls={row['calls']} (shed or partial linkage?)")
+                        f"row calls={row['calls']} (linkage accounting drift?)")
     if sum(cell["errors"] for cell in cells.values()) != row["errors"]:
         failures.append(f"{label}: linkage errors sum to "
                         f"{sum(cell['errors'] for cell in cells.values())}, "
@@ -666,12 +666,13 @@ def system_softokn_sha(report: dict[str, Any], bundled_path: str) -> str:
 
 
 def check_no_state_drops(report: dict[str, Any]) -> list[str]:
-    """No semantic state admission drop voided the strict linkage sums.
+    """No semantic state admission drop pressured this capture.
 
-    A dropped linkage cell sheds silently from ``by_function`` while
-    the row totals still count it, so the cell-sum equality above
-    would fail without this leg naming the cause. Healthy captures
-    keep both counters at zero.
+    The linkage sums are exact by construction, but a pressured run
+    sheds rows, bindings, and module cells elsewhere: a missed Init
+    leg under pressure is lost attribution, not a background change.
+    Healthy captures keep both counters at zero; a nonzero drop fails
+    the strict table instead of letting pressure pass as a shape.
     """
     failures = []
     for key in ("semantic_state_drops", "semantic_history_drops"):

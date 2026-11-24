@@ -278,6 +278,20 @@ revision. The per-id table holds 256 distinct ids per capture; shed
 observations count in `evidence.mechanism_id_overflow` and force
 `PARTIAL`.
 
+Every `mechanisms[]` row also carries `by_function`: the function x
+mechanism linkage — one `{function, calls, errors}` entry per PKCS#11
+function name whose calls attributed to the id, in name order.
+`function` is the calling slot's single authorized name; observations
+through unnamed or aliased (multi-name) slots bucket under
+`"unknown"` instead of guessing. The entries sum exactly to the row's
+`calls`/`errors`: every attributed call carries exactly one function
+cell, recorded beside the row count. The row's `ops` names the
+operation families; `by_function` names which calls drove them.
+`cgroups[].mechanisms[]` rows carry no `by_function` (they carry no
+`ops` either); use the row plus `by_module` for the provider split.
+Like `registered` and `name`, this is a v3-additive disclosure with no
+new schema revision.
+
 The observer and `p11scope inspect` make zero PKCS #11 calls. Only the explicit
 offline `p11scope-discover` helper loads a provider and makes exactly ten
 pre-initialization `C_GetInterface` calls. Selection evidence is therefore a

@@ -5968,6 +5968,13 @@ struct MechanismOut {
     /// Empty when no observation carried an attributable sole-owner
     /// module the document's discovery list names.
     by_module: Vec<ByModuleOut>,
+    /// Per-function partition of `calls`/`errors`, in function-name
+    /// order: the function x mechanism linkage — which calls drove
+    /// this mechanism id. `unknown` buckets observations through
+    /// unnamed or aliased slots, never guessing. The cells sum
+    /// exactly to the row totals: every attributed call carries
+    /// exactly one function cell, recorded beside the row count.
+    by_function: Vec<ByFunctionOut>,
 }
 
 /// One provider's share of a mechanism row: the same `{dev, ino,
@@ -5979,6 +5986,18 @@ struct MechanismOut {
 #[derive(Serialize)]
 struct ByModuleOut {
     module: ModuleRef,
+    calls: u64,
+    errors: u64,
+}
+
+/// One function name's share of a mechanism row: the function x
+/// mechanism linkage cell — the calls/errors for this id attributed
+/// through slots carrying `function`. `unknown` buckets unnamed and
+/// aliased slots. The entries sum exactly to the row totals: every
+/// attributed call carries exactly one function cell.
+#[derive(Serialize)]
+struct ByFunctionOut {
+    function: String,
     calls: u64,
     errors: u64,
 }
@@ -6566,6 +6585,15 @@ fn profile_mechanisms_out(
                         })
                 })
                 .collect();
+            let by_function: Vec<ByFunctionOut> = m
+                .by_function
+                .iter()
+                .map(|(function, cell)| ByFunctionOut {
+                    function: function.clone(),
+                    calls: cell.calls,
+                    errors: cell.errors,
+                })
+                .collect();
             MechanismOut {
                 mechanism: *id,
                 mechanism_hex: format!("0x{id:x}"),
@@ -6584,6 +6612,7 @@ fn profile_mechanisms_out(
                 params_omitted,
                 note,
                 by_module,
+                by_function,
             }
         })
         .collect()
@@ -18291,6 +18320,45 @@ pub(crate) mod tests {
         );
         assert_eq!(row["by_module"][0]["module"]["ino"], 11);
         assert_eq!(row["by_module"][0]["calls"], 1);
+    }
+
+    /// Every mechanism row carries its function x mechanism linkage:
+    /// one `by_function` entry per driving function name, in name
+    /// order, each with its calls/errors. The entries partition the
+    /// row: their sums equal the row totals.
+    #[test]
+    fn profile_json_mechanism_rows_carry_function_linkage() {
+        let mut state = crate::semantics::State::with_policy(
+            &init_sign_plan(),
+            crate::attach::CapturePolicy::Allowlisted,
+        );
+        let shape_none = p11scope_ebpf_common::shape::NONE;
+        state.observe(&init_event(0, 0x1087, shape_none, 0, 0, 0));
+        state.observe(&sign_op_event());
+        state.observe(&init_event(0, 0x1087, shape_none, 0, 0, 0));
+        let mut failed = sign_op_event();
+        failed.rv = 0x5;
+        state.observe(&failed);
+
+        let mut ev = evidence();
+        ev.discovery.modules = vec![discovered_fixture()];
+        ev.verdict();
+        let capture = capture_fixture();
+        let v = profile_json(&[], VersionedEvidence::wrap(&ev), &state, &capture);
+
+        assert_eq!(v["mechanisms"].as_array().unwrap().len(), 1);
+        let row = &v["mechanisms"][0];
+        assert_eq!(row["mechanism"], 0x1087);
+        assert_eq!(row["calls"], 4);
+        assert_eq!(row["errors"], 1);
+        assert_eq!(
+            row["by_function"],
+            serde_json::json!([
+                {"function": "C_Sign", "calls": 2, "errors": 1},
+                {"function": "C_SignInit", "calls": 2, "errors": 0},
+            ]),
+            "per-function partition of the row, in name order: {row}"
+        );
     }
 
     #[test]

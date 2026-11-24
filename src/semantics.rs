@@ -67,6 +67,20 @@ pub struct MechStat {
     /// from it: purge and reconciliation drop both together, and a cell
     /// can never outlive its row.
     pub by_module: BTreeMap<ModuleId, MechCallStat>,
+    /// Per-function partition of this row's `calls`/`errors`: the
+    /// function x mechanism linkage — function name -> calls/errors
+    /// whose mechanism attribution came through a slot carrying that
+    /// name, using the row's own error rule. The name is the slot's
+    /// single authorized name, else `"unknown"` (unnamed slots and
+    /// aliased multi-name slots never attribute to one function, so
+    /// they bucket instead of guessing). Recorded beside every
+    /// `record_call`, so the cells sum exactly to the row totals:
+    /// every attributed call carries exactly one function cell. Like
+    /// `ops`, uncharged: only semantic slots record (unknown names
+    /// stay count-only by construction in `descriptor_index`), so the
+    /// keys are the closed function vocabulary plus `"unknown"`.
+    /// Living inside the row like `by_module`, dropped with it.
+    pub by_function: BTreeMap<String, MechFunctionStat>,
     /// At least one observation arrived through a standard-layout-only
     /// slot (scan layout evidence, no manifest). JSON renders the
     /// attribution basis from this and `attributed_confirmed`.
@@ -451,6 +465,180 @@ mod corrective_tests {
         assert_eq!(row.calls, 1);
         assert_eq!(row.by_module.len(), 1);
         assert_eq!(row.by_module[&crate::plan::ModuleId(0)].calls, 1);
+    }
+
+    /// One `C_SignInit` slot per naming shape: slot 0 singly named
+    /// (the control), slot 1 unnamed, slot 2 `unknown`-named, slot 3
+    /// aliased across two names. All share the sign-init descriptor
+    /// and sole module 0 — only the names vary, so only the
+    /// function linkage may differ.
+    fn linkage_naming_plan() -> AttachPlan {
+        let slot = |index: u32, names: Vec<String>| Slot {
+            index,
+            descriptor_index: crate::kinds::function_id("C_SignInit").unwrap() + 1,
+            object: crate::plan::TEST_PINNED_OBJECT,
+            object_path: "/opt/p11.so".into(),
+            file_offset: index as u64 * 0x10,
+            aliased: names.len() >= 2,
+            names,
+            semantics: crate::kinds::descriptor("C_SignInit").unwrap(),
+            semantic_authorized: true,
+            semantic_ambiguous: false,
+            fork_safe: false,
+            module_ids: vec![crate::plan::ModuleId(0)],
+        };
+        AttachPlan::from_slots(vec![
+            slot(0, vec!["C_SignInit".into()]),
+            slot(1, vec![]),
+            slot(2, vec![crate::plan::UNKNOWN_FUNCTION_NAME.into()]),
+            slot(3, vec!["C_SignInit".into(), "C_VerifyInit".into()]),
+        ])
+    }
+
+    #[test]
+    fn linkage_splits_mechanism_calls_and_errors_by_function() {
+        // One multipart op (Init + Update x2 + Final, all OK) plus one
+        // single-part op whose completion fails: every Init leg and
+        // every binding-attributed leg lands on its own event's slot
+        // name, errors follow the row rule (nonzero rv), and the
+        // cells sum exactly to the row totals.
+        let p = plan(&["C_SignInit", "C_SignUpdate", "C_SignFinal", "C_Sign"]);
+        let mut state = State::new(&p);
+        state.observe(&mechanism(&p, "C_SignInit", 7, 0x1087, 0));
+        state.observe(&event(&p, "C_SignUpdate", 7, 0));
+        state.observe(&event(&p, "C_SignUpdate", 7, 0));
+        state.observe(&event(&p, "C_SignFinal", 7, 0));
+        state.observe(&mechanism(&p, "C_SignInit", 7, 0x1087, 0));
+        state.observe(&event(&p, "C_Sign", 7, CkRv::GENERAL_ERROR.0));
+
+        let row = &state.mechanisms()[&0x1087];
+        assert_eq!((row.calls, row.errors), (6, 1));
+        assert_eq!(row.by_function.len(), 4);
+        assert_eq!(
+            row.by_function["C_SignInit"],
+            MechFunctionStat {
+                calls: 2,
+                errors: 0
+            }
+        );
+        assert_eq!(
+            row.by_function["C_SignUpdate"],
+            MechFunctionStat {
+                calls: 2,
+                errors: 0
+            }
+        );
+        assert_eq!(
+            row.by_function["C_SignFinal"],
+            MechFunctionStat {
+                calls: 1,
+                errors: 0
+            }
+        );
+        assert_eq!(
+            row.by_function["C_Sign"],
+            MechFunctionStat {
+                calls: 1,
+                errors: 1
+            }
+        );
+        assert_eq!(
+            row.by_function.values().map(|cell| cell.calls).sum::<u64>(),
+            row.calls
+        );
+        assert_eq!(
+            row.by_function
+                .values()
+                .map(|cell| cell.errors)
+                .sum::<u64>(),
+            row.errors
+        );
+    }
+
+    #[test]
+    fn linkage_buckets_unnamed_and_aliased_slots() {
+        // The control slot names its cell; empty, `unknown`, and
+        // multi-name slots never attribute to one function, so their
+        // observations share the `unknown` bucket instead of guessing.
+        let p = linkage_naming_plan();
+        let mut state = State::new(&p);
+        for (slot, session) in [(0u32, 7u64), (1, 8), (2, 9), (3, 10)] {
+            let mut init = mechanism(&p, "C_SignInit", session, 0x1087, 0);
+            init.slot = slot;
+            state.observe(&init);
+        }
+
+        let row = &state.mechanisms()[&0x1087];
+        assert_eq!(row.calls, 4);
+        assert_eq!(row.by_function.len(), 2);
+        assert_eq!(
+            row.by_function["C_SignInit"],
+            MechFunctionStat {
+                calls: 1,
+                errors: 0
+            }
+        );
+        assert_eq!(
+            row.by_function[crate::plan::UNKNOWN_FUNCTION_NAME],
+            MechFunctionStat {
+                calls: 3,
+                errors: 0
+            }
+        );
+    }
+
+    #[test]
+    fn linkage_cells_take_no_budget_keys() {
+        // Limit-4 twin of `module_cell_refused_while_cgroup_cell_admitted`:
+        // the first event admits history, cgroup, row and cgroup-mechanism
+        // keys (1-4) and refuses the module cell — but the function cell
+        // still records, like the `ops` set: the keys are the closed
+        // function vocabulary plus `"unknown"`, so no hostile input
+        // grows this and no budget key is spent. Kills a charging
+        // mutant (an `admit(1)` here refuses the cell at this limit).
+        let p = plan(&["C_SignInit"]);
+        let mut state = State::with_limit(&p, 4);
+        state.observe(&mechanism(&p, "C_SignInit", 7, 0x1087, 0));
+
+        let row = state
+            .mechanisms()
+            .get(&0x1087)
+            .expect("row admitted before its breakdowns");
+        assert_eq!(row.calls, 1);
+        assert!(
+            row.by_module.is_empty(),
+            "module cell still refused at this limit: {row:?}"
+        );
+        assert_eq!(
+            row.by_function["C_SignInit"],
+            MechFunctionStat {
+                calls: 1,
+                errors: 0
+            },
+            "function cell takes no key: {row:?}"
+        );
+    }
+
+    #[test]
+    fn purge_modules_drops_the_function_breakdown_with_its_rows() {
+        let p = plan(&["C_SignInit"]);
+        let mut state = State::new(&p);
+        state.observe(&mechanism(&p, "C_SignInit", 7, 0x1087, 0));
+        assert_eq!(state.mechanisms()[&0x1087].by_function.len(), 1);
+
+        state.purge_modules(&BTreeSet::from([crate::plan::ModuleId(0)]));
+        assert!(state.mechanisms().is_empty());
+
+        state.observe(&mechanism(&p, "C_SignInit", 7, 0x1087, 0));
+        let row = &state.mechanisms()[&0x1087];
+        assert_eq!(row.calls, 1);
+        assert_eq!(
+            row.by_function["C_SignInit"],
+            MechFunctionStat {
+                calls: 1,
+                errors: 0
+            }
+        );
     }
 
     #[test]
@@ -2610,6 +2798,31 @@ pub struct MechCallStat {
     pub attributed_confirmed: bool,
 }
 
+/// One function name's share of a mechanism row: calls/errors
+/// attributed through slots carrying that name, using the row's own
+/// error rule. Unlike [`MechCallStat`] there are no membership flags:
+/// every cell shares its row's reads, so the row's own flags already
+/// name the authority.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct MechFunctionStat {
+    pub calls: u64,
+    pub errors: u64,
+}
+
+/// The function name one mechanism observation attributes to: the
+/// slot's single authorized name, else `"unknown"`. Unnamed slots
+/// (`[]`, `["unknown"]`) and aliased multi-name slots never name one
+/// function, so they bucket instead of guessing — mirroring the
+/// `functions[]` unattributed bucketing, so linkage can hide nothing.
+fn linkage_function_name(names: &[String]) -> &str {
+    if let [name] = names
+        && name != crate::plan::UNKNOWN_FUNCTION_NAME
+    {
+        return name;
+    }
+    crate::plan::UNKNOWN_FUNCTION_NAME
+}
+
 /// Aggregate stats for one `cgroup_id` — a directory inode number
 /// (`docs/privacy/allowlist-v1.md`'s `cgroup_id` entry). Exists so one
 /// node-wide attach over a cgroup shared by several containers/pods (e.g.
@@ -3668,6 +3881,10 @@ impl State {
             meta.standard_layout,
             !meta.standard_layout,
         );
+        // Last, beside the other breakdowns: uncharged, so the
+        // cgroup/module admission order the budget twins pin is
+        // untouched by this call.
+        self.record_function_mechanism(mechanism, &meta.names, ev.rv);
     }
 
     fn apply_init(&mut self, process: ProcessKey, ev: &Event, meta: &SlotMeta) {
@@ -3791,6 +4008,8 @@ impl State {
                 from_standard_layout,
                 from_confirmed,
             );
+            // Last, as in `record_requested_mechanism`.
+            self.record_function_mechanism(mechanism, &meta.names, ev.rv);
         }
 
         let retain = match meta.semantics.transition {
@@ -4442,6 +4661,22 @@ impl State {
             if rv != 0 {
                 cell.errors += 1;
             }
+        }
+    }
+
+    fn record_function_mechanism(&mut self, mechanism: u64, names: &[String], rv: u64) {
+        // The capture-wide row always exists at our call sites; without
+        // a rendered row there is no breakdown to record into. Like the
+        // `ops` set, uncharged: the keys are the closed function
+        // vocabulary plus `"unknown"`, so no hostile input grows this.
+        let name = linkage_function_name(names);
+        let Some(stat) = self.mechanisms.get_mut(&mechanism) else {
+            return;
+        };
+        let cell = stat.by_function.entry(name.to_owned()).or_default();
+        cell.calls += 1;
+        if rv != 0 {
+            cell.errors += 1;
         }
     }
 

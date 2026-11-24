@@ -747,8 +747,10 @@ hold phase accordingly. Keep the workload alive past attach (a sleep/hold phase,
 daemons via `profile --pid`). `run` holds the child at each loader hit
 by default (`--pause auto`), and the release qualification captured
 every call of a child that `dlopen`s SoftHSM2. With `run --pause never`,
-expect the earliest post-load calls to be absent from the counts; pass
-it only for runs that must not delay the child.
+expect the direct child's earliest post-load calls to be absent from
+the counts (its descendants still stop at their first map of an unseen
+executable until its provider attaches); pass it only for runs that
+must not delay the child itself.
 
 `p11scope-discover --module <provider.so> -o manifest.json` is that optional
 offline path. It executes provider code in its own unprivileged process; the
@@ -960,8 +962,8 @@ child is placed in a dedicated cgroup under the observer's own cgroup;
 that is the root only when the observer itself runs in the root cgroup,
 so every descendant — `fork`/`exec` children, `sh -c` and `env`
 wrappers, double forks — is born in the cgroup. The direct child is
-held by the pause chain. With the pause armed (the default),
-descendants are stopped too, but only briefly: the first time a member
+held by the pause chain. Descendants are stopped too, whatever the
+pause policy, but only briefly: the first time a member
 of the run cgroup maps an executable file the capture has not seen,
 the kernel stops it (`SIGSTOP`) before it runs that file's code. The
 observer proves the file, attaches a provider's probes, and resumes
@@ -990,12 +992,13 @@ A job-control shell inside the command can
 see such a child briefly stopped (`CLD_STOPPED`), and other threads of a
 stopped member may see one `EINTR` from a blocking call (`epoll_wait`,
 `semop`, `sigtimedwait`, a socket read under `SO_RCVTIMEO`) after the
-resume. With `--pause never`
-(or when the kernel refuses the stop object) descendants are never
+resume. When the kernel refuses the stop object, descendants are never
 stopped: a short-lived descendant that cold-loads the provider teaches
 the run its file for every later mapper, while the first mapper's own
 calls made before the attach stay missing and the run reports
 `PARTIAL` with `pid_descendant_gaps` plus the learned-file gap row.
+`--pause never` does not disable the stop: it leaves the direct child
+unpaused while descendants still stop at first map.
 The run also learns the transient member's decoded provider tables,
 not just its file: when a short-lived descendant maps a getter-only
 provider (hidden table symbols, nothing to pre-arm), the owned-tree

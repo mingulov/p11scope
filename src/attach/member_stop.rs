@@ -1,8 +1,8 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Run-tree first-map stop hooks: the standalone member-stop object
-//! (`crates/ebpf/native/member_stop.c`) for an owned, pause-armed `run`
-//! on its cgroup scope. The first time a run member maps an executable
+//! (`crates/ebpf/native/member_stop.c`) for an owned `run` on its cgroup
+//! scope, whatever the pause policy. The first time a run member maps an executable
 //! file this capture has not cleared, the kernel stops the member with a
 //! pending row; the engine (`discovery::engine::member_stop`) inspects the
 //! file, attaches a provider's probes, clears the file and resumes the

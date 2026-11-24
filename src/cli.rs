@@ -774,7 +774,7 @@ start (a provider loaded after start needs --prearm-module <provider.so>; with r
 required). The detail is the function's own counter values between selection and close; an exec of the owned child in between withholds it with a named reason
 while a leader exit that is the last lifecycle record ends the window cleanly.
 The selection attempt is recorded in the report; aggregate and detail counts are never summed.
---pause auto (default) pauses only when the child would load unobserved; never does not pause the child (for runs that must not delay it); always pauses on every load.
+--pause auto (default) pauses only when the child would load unobserved; never does not pause the child (for runs that must not delay it) though its descendants still stop at their first map of an unseen executable; always pauses on every load.
 --kill-on-timeout ends the child when --duration expires instead of leaving it running.
 --track-short-lived also records exec-time detail (extra detail; default off): the kernel records exec-time
 executable identity and the child's own execs are grouped by linkage.

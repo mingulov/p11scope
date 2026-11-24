@@ -939,7 +939,7 @@ pub struct PauseKey {
 
 /// Run-tree first-map stops: pending stops, one row per stopped tgid.
 /// The kernel inserts a row (no-overwrite) and sends one SIGSTOP when a
-/// member of an owned, pause-armed run maps an executable file it has
+/// member of an owned run maps an executable file it has
 /// not seen cleared; userspace inspects the file, attaches any provider
 /// it proves, clears the file, removes the row and resumes the member.
 pub const MEMBER_STOP_ENTRIES: u32 = 1024;

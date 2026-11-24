@@ -43,6 +43,8 @@ STAMP_SCHEMA = "p11scope/qualify-stamp/v1"
 U64_LIMIT = 2**64
 PID_MAX = 4194304
 MAX_INPUT_BYTES = 64 * 1024 * 1024
+# The stamp is three short fields; a larger stamp is not one this loader wrote.
+MAX_STAMP_BYTES = 4096
 
 # -- rules ---------------------------------------------------------------
 
@@ -305,17 +307,35 @@ def open_regular(path, rule, what):
     return fd, info
 
 
-def read_fd(fd, limit):
+def read_bounded(path, rule, what, limit, newer_than_ns=None):
+    """Every file read: one descriptor, at most `limit` bytes. A file with
+    more bytes than the limit refuses under `rule`; it is never truncated
+    to a prefix. With `newer_than_ns`, an input older than that refuses."""
+    fd, info = open_regular(path, rule, what)
     with os.fdopen(fd, "rb") as handle:
-        return handle.read(limit + 1)
+        if newer_than_ns is not None:
+            require(info.st_mtime_ns >= newer_than_ns, rule,
+                    "%s %s predates this run's stamp (stale)" % (what, path))
+        # The bytes read from this descriptor decide the size, not a
+        # metadata size that could change after fstat.
+        data = handle.read(limit + 1)
+    require(len(data) <= limit, rule, "%s %s exceeds the %d-byte limit" % (what, path, limit))
+    return data, info
+
+
+def decode_text(data, rule, what, path, encoding="utf-8"):
+    try:
+        return data.decode(encoding)
+    except UnicodeDecodeError:
+        raise Refusal(rule, "%s %s is not %s" % (what, path, encoding)) from None
 
 
 class Run:
     """The current run: its stamp time bounds every input below."""
 
     def __init__(self, stamp_path, run_id, cell):
-        fd, info = open_regular(stamp_path, FRESH_RUN, "run stamp")
-        stamp = STAMP.check(strict_json(read_fd(fd, MAX_INPUT_BYTES).decode("utf-8", "replace"), "run stamp"))
+        data, info = read_bounded(stamp_path, FRESH_RUN, "run stamp", MAX_STAMP_BYTES)
+        stamp = STAMP.check(strict_json(decode_text(data, FRESH_RUN, "run stamp", stamp_path), "run stamp"))
         require(stamp["run_id"] == run_id and run_id != "", FRESH_RUN,
                 "run stamp run id %r is not this run %r" % (stamp["run_id"], run_id))
         require(stamp["cell"] == cell, FRESH_RUN,
@@ -336,23 +356,8 @@ class Run:
         return self.read(path, what, binary)
 
     def read(self, path, what, binary=False):
-        fd, info = open_regular(path, FRESH_FILE, what)
-        try:
-            require(info.st_mtime_ns >= self.stamp_ns, FRESH_FILE,
-                    "%s %s predates this run's stamp (stale)" % (what, path))
-        except Refusal:
-            os.close(fd)
-            raise
-        # The bytes read from this descriptor decide the size, not a
-        # metadata size that could change after fstat.
-        data = read_fd(fd, MAX_INPUT_BYTES)
-        require(len(data) <= MAX_INPUT_BYTES, FRESH_FILE, "%s %s exceeds the size limit" % (what, path))
-        if binary:
-            return data
-        try:
-            return data.decode("utf-8")
-        except UnicodeDecodeError:
-            raise Refusal(FRESH_FILE, "%s %s is not UTF-8" % (what, path))
+        data, _ = read_bounded(path, FRESH_FILE, what, MAX_INPUT_BYTES, self.stamp_ns)
+        return data if binary else decode_text(data, FRESH_FILE, what, path)
 
 
 ARG_INT = declare("arg.integer", "every numeric argument is an exact decimal integer")
@@ -491,12 +496,13 @@ def judge_fifo(args):
 
 MEMBER_LINES = declare("cgroup.procs-lines", "cgroup.procs is one decimal pid per line")
 MEMBER_ONCE = declare("cgroup.procs-once", "the moved pid is listed exactly once")
+MEMBER_READ = declare("cgroup.procs-read", "cgroup.procs is one regular file within the size limit")
 
 
 def judge_cgroup_member(args):
     pid = arg_int(args.pid, "pid", 1, PID_MAX)
-    with open(args.procs, encoding="ascii", errors="replace") as handle:
-        text = handle.read()
+    data, _ = read_bounded(args.procs, MEMBER_READ, "cgroup.procs", MAX_INPUT_BYTES)
+    text = decode_text(data, MEMBER_LINES, "cgroup.procs", args.procs, "ascii")
     rows = text.split("\n")
     if rows and rows[-1] == "":
         rows.pop()

@@ -1,6 +1,6 @@
 {
   "schema": "p11scope/privileged-campaign/v1",
-  "default_floor": 278,
+  "default_floor": 283,
   "default_cells": [
     "attach::async_value_flags_tests::privileged_async_getid_null_output_sets_value_unreadable_ia32",
     "attach::async_value_flags_tests::privileged_async_getid_null_output_sets_value_unreadable_lp64",
@@ -138,6 +138,7 @@
     "discovery::confirm_shards::tests::privileged_sharded_confirmation_equals_the_serial_production_probe",
     "discovery::engine::tests::stamped_legacy_fixture_reports_no_surface_gap",
     "discovery::engine::tests::exit_mappings_live_cgroup_split_and_default_twin",
+    "discovery::engine::flood_admission_tests::privileged_profile_system_flood_shortlived_exact_per_window",
     "discovery::engine::pressure_native_tests::pressure_live256_unparked_head_control_admits",
     "discovery::engine::pressure_native_tests::pressure_live256_genuine_episode_admits_late_then_head",
     "discovery::engine::pressure_native_tests::pressure_live256_all_blocked_twin_refuses_once",
@@ -206,6 +207,10 @@
     "inventory::manifest_e2e_tests::privileged_inventory_pid_key_operations_mt_sign_rows_exact",
     "inventory::manifest_e2e_tests::privileged_inventory_pid_key_sizes_live_sign_reports_size",
     "inventory::manifest_e2e_tests::privileged_inventory_pid_key_sizes_off_live_sign_reports_no_size",
+    "regress071_privileged_tests::privileged_profile_system_bigchild_kills_exact_lp64",
+    "regress071_privileged_tests::privileged_profile_system_newcomer_flood_exact_lp64",
+    "regress071_privileged_tests::privileged_inventory_system_shortlived_stream_exact_lp64",
+    "regress071_privileged_tests::privileged_profile_system_bind_mount_two_view_exact_lp64",
     "inventory_present::reload_disclosure_privileged_tests::privileged_inventory_reload_disclosure_lists_churned_identity",
     "inventory_present::reload_disclosure_privileged_tests::privileged_inventory_reload_disclosure_omits_key_without_churn",
     "metrics::counter_reader::tests::counter_reader_native_maps_match_all_modes",

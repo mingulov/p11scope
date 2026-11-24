@@ -1744,6 +1744,11 @@ pub(crate) struct NativeStop<L> {
     /// front row waits for its budgeted retry. The terminal refresh
     /// reads on for it like `staged_resight_owed`.
     staged_decision_owed: bool,
+    /// Whether the last staged terminal-refresh sweep completed
+    /// gap-free: the deadline re-entry decides through the shared
+    /// step on it, like the blocking driver. `None` before the first
+    /// terminal-refresh staging.
+    staged_post_witness_exact: Option<bool>,
 }
 
 /// What one terminal-refresh read decided: read on within the
@@ -1812,6 +1817,7 @@ impl<L> NativeStop<L> {
             retirement: None,
             staged_resight_owed: false,
             staged_decision_owed: false,
+            staged_post_witness_exact: None,
         }
     }
 
@@ -1938,6 +1944,7 @@ impl<L> NativeStop<L> {
                         // refresh was exact — never a refresh-loss
                         // misreport); the remaining rows file
                         // incomplete, as accounted.
+                        self.staged_post_witness_exact = Some(exact);
                         let owed = self.staged_resight_owed || self.staged_decision_owed;
                         let expired = now >= self.refresh_deadline.unwrap();
                         self.phase = match terminal_refresh_step(exact, owed, expired) {
@@ -2028,7 +2035,20 @@ impl<L> NativeStop<L> {
             NativeStopPhase::PostWitness => {
                 let end = self.refresh_deadline.unwrap();
                 if self.refresh_attempted && now >= end {
-                    self.phase = NativeStopPhase::RefreshLoss;
+                    // Past the deadline the last staged sweep decides
+                    // through the shared step, exactly like the
+                    // blocking driver: an exact sweep still finishes,
+                    // and only an inexact one reports the refresh
+                    // loss. ReadOn is unreachable past the deadline
+                    // (the truth-table test pins it); it maps like the
+                    // staging arm so the two sites share one shape.
+                    let owed = self.staged_resight_owed || self.staged_decision_owed;
+                    let exact = self.staged_post_witness_exact.unwrap_or(false);
+                    self.phase = match terminal_refresh_step(exact, owed, true) {
+                        TerminalRefreshStep::ReadOn => NativeStopPhase::PostWitness,
+                        TerminalRefreshStep::FinishExact => NativeStopPhase::Finish,
+                        TerminalRefreshStep::RefreshLoss => NativeStopPhase::RefreshLoss,
+                    };
                 } else {
                     let batch = self
                         .lane

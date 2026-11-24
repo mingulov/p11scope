@@ -7561,14 +7561,6 @@ thread_local! {
     pub(crate) static FORCE_PREOPEN_FACTS_CONSULT: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
 }
-
-/// The examined-mode lower-file mapping key: the observer-side key for
-/// the proven lower fd, re-derived through the shared metered resolve
-/// on the caller's budget — never a fresh allowance, never the
-/// unmetered primitive. The lower fd opens in the observer namespace,
-/// hence the observer-side key; the lower file's facts cache under
-/// this key since the cache pin carries no device. Failure keeps the
-/// named gap, so the file stays learnable through ordinary scans.
 // (device, inode) of the file the last `lower_proven_key` call was
 // asked to bind (test seam).
 #[cfg(test)]
@@ -7589,6 +7581,13 @@ pub(crate) fn reset_lower_proven_resolved_for_test() {
     LOWER_PROVEN_RESOLVED.with(|seam| seam.set(None));
 }
 
+/// The examined-mode lower-file mapping key: the observer-side key for
+/// the proven lower fd, re-derived through the shared metered resolve
+/// on the caller's budget — never a fresh allowance, never the
+/// unmetered primitive. The lower fd opens in the observer namespace,
+/// hence the observer-side key; the lower file's facts cache under
+/// this key since the cache pin carries no device. Failure keeps the
+/// named gap, so the file stays learnable through ordinary scans.
 pub(crate) fn lower_proven_key(
     file: &File,
     budget: &mut CaptureWorkBudget,

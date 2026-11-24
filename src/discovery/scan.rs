@@ -7569,10 +7569,35 @@ thread_local! {
 /// hence the observer-side key; the lower file's facts cache under
 /// this key since the cache pin carries no device. Failure keeps the
 /// named gap, so the file stays learnable through ordinary scans.
+/// (device, inode) of the file the last `lower_proven_key` call was
+/// asked to bind (test seam).
+#[cfg(test)]
+thread_local! {
+    static LOWER_PROVEN_RESOLVED: std::cell::Cell<Option<(u64, u64)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The file the last `lower_proven_key` call received (test seam).
+#[cfg(test)]
+pub(crate) fn lower_proven_resolved_for_test() -> Option<(u64, u64)> {
+    LOWER_PROVEN_RESOLVED.with(std::cell::Cell::get)
+}
+
+/// Reset the lower-resolve seam (test seam).
+#[cfg(test)]
+pub(crate) fn reset_lower_proven_resolved_for_test() {
+    LOWER_PROVEN_RESOLVED.with(|seam| seam.set(None));
+}
+
 pub(crate) fn lower_proven_key(
     file: &File,
     budget: &mut CaptureWorkBudget,
 ) -> Result<ObjectKey, String> {
+    #[cfg(test)]
+    if let Ok(metadata) = file.metadata() {
+        use std::os::unix::fs::MetadataExt as _;
+        LOWER_PROVEN_RESOLVED.with(|seam| seam.set(Some((metadata.dev(), metadata.ino()))));
+    }
     match identity_of(file, budget) {
         Ok(lower_mapping) => Ok(ObjectKey {
             device: Device {
@@ -22024,6 +22049,69 @@ int main(int argc, char **argv) {
             resolve_cost,
             "the scan pays exactly one lower resolve on its own budget \
              (held {held_delta}, lower {lower_delta}, direct {resolve_cost})"
+        );
+    }
+
+    /// The real LowerProven arm resolves the proven lower FD, not the
+    /// stale upper file: with distinct upper and lower files, the
+    /// scan's lower resolve binds the lower file's identity. The
+    /// charge-delta twin above cannot see a wrong-FD swap (same file,
+    /// same charge), so this pins the descriptor instead of the cost —
+    /// and asserts no cross-read cost equality, staying immune to
+    /// mount-table churn.
+    #[test]
+    fn examined_scan_lower_proven_arm_resolves_the_proven_lower_file() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let upper_path = dir.path().join("libprov.so");
+        let lower_path = dir.path().join("liblower.so");
+        let exe = std::fs::read("/bin/true").expect("a small system ELF reads");
+        std::fs::write(&upper_path, &exe).expect("the upper provider writes");
+        std::fs::write(&lower_path, &exe).expect("the lower provider writes");
+        let upper_id = {
+            let meta = std::fs::metadata(&upper_path).expect("the upper provider stats");
+            (meta.dev(), meta.ino())
+        };
+        let lower_file = std::fs::File::open(&lower_path).unwrap();
+        let lower_id = {
+            let meta = lower_file.metadata().expect("the lower provider stats");
+            (meta.dev(), meta.ino())
+        };
+        assert_ne!(upper_id, lower_id, "the twin files are distinct objects");
+
+        reset_lower_proven_resolved_for_test();
+        let (lower_outcome, _, lower_queries, _) = scan_lower_proven_provider(
+            &dir,
+            vec![
+                WitnessOutcome {
+                    verdict: WitnessVerdict::OtherFile,
+                    diagnosis: None,
+                },
+                WitnessOutcome {
+                    verdict: WitnessVerdict::SameFile,
+                    diagnosis: None,
+                },
+            ],
+            vec![lower_path.clone()],
+            HashMap::from([(lower_path, lower_file.try_clone().unwrap())]),
+        );
+        assert_eq!(lower_queries, 2, "held plus lower queries run");
+        assert_eq!(
+            lower_proven_resolved_for_test(),
+            Some(lower_id),
+            "the arm resolves the proven lower file"
+        );
+        assert_ne!(
+            lower_proven_resolved_for_test(),
+            Some(upper_id),
+            "the stale upper file is never resolved"
+        );
+        assert!(
+            lower_outcome.skipped().iter().all(|skip| !skip
+                .reason
+                .starts_with("lower mapping identity unavailable")),
+            "a live resolve keeps no lower gap: {:?}",
+            lower_outcome.skipped()
         );
     }
 

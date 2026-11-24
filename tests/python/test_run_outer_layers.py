@@ -10,20 +10,22 @@ spy log (one entry per forwarded call, every entry closed by a
 objects). The report's typed records (`functions[]`, `evidence.*`)
 are judged against that ledger; log text never scores.
 
-- RPO-PROXY (`test_rpo_proxy_outer_exact`): strict-exact. The 110-call
-  list burst must be counted 1:1 at the spy layer (the tool's own
-  calls) and at the SoftHSM backend modulo the exact proxy-enumeration
-  rule below; the proxy closure stays a NAMED skip by design. There is
-  deliberately no miss-tolerant branch: a clean total miss would
-  satisfy any window-based gap and make the cell vacuous, so every
-  deficit fails.
-- RPO-OPENSC (`test_rpo_opensc_outer`): exact-or-honest-gap. The four
-  backend calls are exact in both branches; the spy layer is either
-  exact or an honest gap (a real deficit, a `late_discovery` window
-  naming the spy with exact bounds, no surplus anywhere, zero
-  in-flight, PARTIAL, zero loss). The gap branch is not tolerance: it
-  fails a missing window, any surplus, any phantom in-flight entry, or
-  an exact claim over a deficit (one twin per prong).
+- RPO-PROXY (`test_rpo_proxy_outer`): exact-or-prefix-gap. The spy
+  layer (the tool's own calls) is either counted 1:1 or missed exactly
+  on a ledger-ordered prefix of at most the first two calls
+  (`C_Initialize`, then `C_GetSlotList`): the spy's table is
+  heap-published at the tool's `C_GetInterface` return and attaches
+  ~150-250 ms later, while `C_Initialize` fires microseconds after the
+  return, so the first call is physically uncatchable without a
+  synchronous hold. The gap branch is exact, never tolerant: the
+  missed set must equal the ledger prefix exactly, books must balance
+  per function, and it still forbids surplus, phantoms, missing
+  windows, and exact claims (one twin per prong). The backend legs and
+  the proxy closure skip stay strict-exact as below.
+- RPO-OPENSC (`test_rpo_opensc_outer`): exact-or-prefix-gap with the
+  same ledger-prefix rule (at most the first two calls). The backend
+  legs are exact in both branches, including the adjudicated double
+  `C_Finalize`.
 
 Both cells forbid phantoms strictly: the spy log proves every call
 returned, so any `in_flight` is a tracking artifact, never a live
@@ -88,13 +90,15 @@ class OuterError(Exception):
 
 
 class SpyLedger:
-    """One parsed spy log: exact per-function counts and error counts."""
+    """One parsed spy log: exact per-function counts, error counts, and
+    the call sequence in ledger order (for the prefix rule)."""
 
-    def __init__(self, loaded, counts, errors, total):
+    def __init__(self, loaded, counts, errors, total, order):
         self.loaded = loaded
         self.counts = counts
         self.errors = errors
         self.total = total
+        self.order = order
 
 
 def parse_spy_log(text):
@@ -111,6 +115,7 @@ def parse_spy_log(text):
         raise OuterError("spy log lacks the OpenSC banner in its first lines")
     loaded = None
     counts, errors = Counter(), Counter()
+    order = []
     pending = None
     expect = 0
     total = 0
@@ -133,6 +138,7 @@ def parse_spy_log(text):
                 raise OuterError(f"spy sequence {seq}, want {expect}")
             pending = entry.group(2)
             counts[pending] += 1
+            order.append(pending)
             total += 1
             expect += 1
             continue
@@ -154,7 +160,7 @@ def parse_spy_log(text):
         raise OuterError(f"spy log ends with entry {pending} unclosed")
     if total == 0:
         raise OuterError("spy log holds no calls")
-    return SpyLedger(loaded, counts, errors, total)
+    return SpyLedger(loaded, counts, errors, total, order)
 
 
 def parse_report(text):
@@ -331,6 +337,73 @@ def check_gfl_gi(report, ledger, backend, spyview, backend_indexes, failures, no
         notes.append(f"gi: backend={gi_back} spy-ledger={gi_spy} tuples={isel}")
 
 
+#: Table calls the gap may miss, in ledger order. The spy's table is
+#: heap-published at the tool's interface return and attaches after it,
+#: so only a leading prefix can precede attach; anything past the first
+#: two calls is mid-burst and fails like any other miss.
+PREFIX_ALLOW = ("C_Initialize", "C_GetSlotList")
+
+
+def table_order(ledger):
+    return [fn for fn in ledger.order
+            if fn not in ("C_GetFunctionList", "C_GetInterface")]
+
+
+def check_spy_prefix_gap(report, ledger, spyview, failures, notes):
+    """Exact-or-prefix-gap verdict core for one spy layer.
+
+    Returns "exact" or "prefix-gap". Exact needs every table function
+    1:1 with exact errors. Otherwise the miss must be exactly the
+    ledger's leading prefix (at most `C_Initialize` then
+    `C_GetSlotList`), books must balance per function, and the full
+    honest disclosure must hold (window, PARTIAL, zero in-flight, zero
+    loss, no surplus, no unattributed rows). Anything else fails.
+    """
+    order = table_order(ledger)
+    mark = len(failures)
+    if order[:2] != ["C_Initialize", "C_GetSlotList"]:
+        failures.append(f"ledger shape drifted: table order starts {order[:2]!r}")
+        return "exact"
+    notes.append(f"ledger: total={ledger.total} prefix-ok")
+    exact, missed = True, []
+    for fn in sorted(set(ledger.counts) | set(spyview.calls)):
+        if fn in ("C_GetFunctionList", "C_GetInterface"):
+            continue
+        want, got = ledger.counts.get(fn, 0), spyview.calls.get(fn, 0)
+        wanterr, goterr = ledger.errors.get(fn, 0), spyview.errors.get(fn, 0)
+        if want != got or wanterr != goterr:
+            exact = False
+            if got < want and goterr == wanterr:
+                missed.append(fn)
+            else:
+                failures.append(
+                    f"spy {fn}: obs calls={got} errs={goterr}, "
+                    f"spy calls={want} errs={wanterr}")
+    if exact:
+        notes.append("spy: exact")
+        return "exact"
+    if set(missed) not in ({"C_Initialize"}, {"C_Initialize", "C_GetSlotList"}):
+        failures.append(f"spy miss is not the ledger prefix: {sorted(missed)!r}")
+        return "exact"
+    surplus = [fn for fn in sorted(set(ledger.counts) | set(spyview.calls))
+               if fn not in ("C_GetFunctionList", "C_GetInterface")
+               and spyview.calls.get(fn, 0) > ledger.counts.get(fn, 0)]
+    if surplus:
+        failures.append(f"gap branch with phantom surplus: {surplus!r}")
+    record = discovery_record(report, "pkcs11-spy")
+    window = late_window(record) if record is not None else None
+    if window is None:
+        failures.append("gap branch without a late_discovery window naming the spy")
+    else:
+        notes.append(f"gap window: [{window['start_ns']},{window['end_ns']}]")
+    if report.get("evidence", {}).get("completeness") != "PARTIAL":
+        failures.append("gap branch while the report claims completeness="
+                        f"{report.get('evidence', {}).get('completeness')!r}")
+    if len(failures) == mark:
+        return "prefix-gap"
+    return "exact"
+
+
 def judge_proxy_outer(report, ledger, tool_rc, priv_objects, pub_objects):
     """Strict-exact verdict for RPO-PROXY (no miss-tolerant branch)."""
     failures, notes = [], []
@@ -384,17 +457,72 @@ def judge_proxy_outer(report, ledger, tool_rc, priv_objects, pub_objects):
     return Verdict(not failures, "exact", detail)
 
 
+def judge_proxy_outer_prefix_gap(report, ledger, tool_rc, priv_objects, pub_objects):
+    """Exact-or-prefix-gap verdict for RPO-PROXY.
+
+    Same legs as the strict judge, except the spy layer uses the
+    prefix-gap core: exact when every forwarded call is counted,
+    otherwise green only for exactly the ledger's leading prefix with
+    its full typed disclosure (books balanced, window, PARTIAL, zero
+    in-flight, zero loss, no surplus).
+    """
+    failures, notes = [], []
+    if tool_rc != 0 or priv_objects != 2 or pub_objects != 2:
+        failures.append(
+            f"tool effect: rc={tool_rc} priv={priv_objects} pub={pub_objects}, want rc=0 priv=2 pub=2")
+    else:
+        notes.append("tool: rc=0 objects=2+2")
+    _, _, backend, spyview, unattributed, unknown = split_layers(report, "libsofthsm2.so")
+    modules = report.get("capture", {}).get("modules", [])
+    backend_indexes = {i for i, m in enumerate(modules) if "libsofthsm2.so" in (m.get("path") or "")}
+    for fn in sorted(set(ledger.counts) | set(backend.calls)):
+        if fn in ("C_GetFunctionList", "C_GetInterface"):
+            continue
+        want, got = ledger.counts.get(fn, 0), backend.calls.get(fn, 0)
+        wanterr, goterr = ledger.errors.get(fn, 0), backend.errors.get(fn, 0)
+        if fn == "C_GetSlotList":
+            # The proxy enumerates slots for itself on top of the
+            # forwarded calls (measured +4 on both hosts): a surplus
+            # here is proxy-internal traffic, recorded never pinned,
+            # while a deficit or an error mismatch still fails.
+            if got < want or goterr != wanterr:
+                failures.append(f"backend {fn}: obs={got}/{goterr} spy={want}/{wanterr}")
+            else:
+                notes.append(f"backend {fn}: obs={got} spy={want} (surplus={got - want})")
+        elif want != got or wanterr != goterr:
+            failures.append(
+                f"backend {fn}: obs calls={got} errs={goterr}, spy calls={want} errs={wanterr}")
+    check_gfl_gi(report, ledger, backend, spyview, backend_indexes, failures, notes)
+    branch = check_spy_prefix_gap(report, ledger, spyview, failures, notes)
+    skips = report.get("evidence", {}).get("modules_skipped") or []
+    if not any("libp11-kit" in (s.get("name") or "") and "not counted" in (s.get("reason") or "")
+               for s in skips):
+        failures.append(f"proxy closure skip missing: {[(s.get('name'), (s.get('reason') or '')[:60]) for s in skips]!r}")
+    else:
+        notes.append("proxy: closure skip named")
+    check_hygiene(report, unattributed, unknown, failures, notes)
+    detail = "; ".join(notes + (["FAIL: " + " | ".join(failures)] if failures else []))
+    if failures:
+        branch = "exact"
+    elif branch == "prefix-gap":
+        missed = sorted(fn for fn in ledger.counts
+                        if fn not in ("C_GetFunctionList", "C_GetInterface")
+                        and spyview.calls.get(fn, 0) < ledger.counts.get(fn, 0))
+        detail += f"; missed-before-attach (ledger-exact): {missed!r}"
+    return Verdict(not failures, branch, detail)
+
+
 OPENSC_LEDGER_SET = {"C_GetInterface": 1, "C_Initialize": 1, "C_GetSlotList": 1, "C_Finalize": 1}
 
 
 def judge_opensc_outer(report, ledger, tool_rc, tool_out):
-    """Exact-or-honest-gap verdict for RPO-OPENSC.
+    """Exact-or-prefix-gap verdict for RPO-OPENSC.
 
     The backend legs are exact in both branches. The spy layer passes
-    exact when every forwarded call is counted, else passes as an
-    honest gap only when the miss carries its full typed disclosure:
-    a real deficit, a `late_discovery` window naming the spy, no
-    surplus anywhere, zero in-flight, and PARTIAL. Anything else fails.
+    exact when every forwarded call is counted, else passes as a
+    prefix gap only for exactly the ledger's leading prefix with its
+    full typed disclosure (books balanced, window, PARTIAL, zero
+    in-flight, zero loss, no surplus). Anything else fails.
     """
     failures, notes = [], []
     if tool_rc != 1 or "Available slots:" not in tool_out:
@@ -425,41 +553,16 @@ def judge_opensc_outer(report, ledger, tool_rc, tool_out):
     else:
         notes.append("backend: Init/SlotList exact, adjudicated double Finalize")
     check_gfl_gi(report, ledger, backend, spyview, backend_indexes, failures, notes)
-    spy_exact = all(spyview.calls.get(fn, 0) == 1 and spyview.errors.get(fn, 0) == 0
-                    for fn in ("C_Initialize", "C_GetSlotList", "C_Finalize"))
-    spy_exact &= spyview.calls.get("C_GetInterface", 0) == 0
-    if spy_exact and not failures:
-        check_hygiene(report, unattributed, unknown, failures, notes)
-        detail = "; ".join(notes + (["FAIL: " + " | ".join(failures)] if failures else []))
-        return Verdict(not failures, "exact", detail)
-    if not failures:
-        notes.append("spy: deficit, trying the honest-gap branch")
-    # Honest-gap branch: every prong below must hold, else the miss is
-    # dishonest and fails. The window bounds and the observed counts
-    # are the gap's exact contents; the missed prefix stays unknown.
-    missed = [fn for fn in ("C_Initialize", "C_GetSlotList", "C_Finalize")
-              if spyview.calls.get(fn, 0) < 1]
-    if not missed:
-        failures.append("gap branch without a real spy deficit")
-    surplus = [fn for fn in set(ledger.counts) | set(spyview.calls)
-               if fn not in ("C_GetFunctionList", "C_GetInterface")
-               and spyview.calls.get(fn, 0) > ledger.counts.get(fn, 0)]
-    if surplus:
-        failures.append(f"gap branch with phantom surplus: {surplus!r}")
-    record = discovery_record(report, "pkcs11-spy")
-    window = late_window(record) if record is not None else None
-    if window is None:
-        failures.append("gap branch without a late_discovery window naming the spy")
-    else:
-        notes.append(f"gap window: [{window['start_ns']},{window['end_ns']}]")
-    if report.get("evidence", {}).get("completeness") != "PARTIAL":
-        failures.append("gap branch while the report claims completeness="
-                        f"{report.get('evidence', {}).get('completeness')!r}")
+    branch = check_spy_prefix_gap(report, ledger, spyview, failures, notes)
     check_hygiene(report, unattributed, unknown, failures, notes)
     detail = "; ".join(notes + (["FAIL: " + " | ".join(failures)] if failures else []))
-    branch = "honest-gap" if not failures else "exact"
-    if not failures:
-        detail += f"; missed-before-attach unknown: {missed!r}"
+    if failures:
+        branch = "exact"
+    elif branch == "prefix-gap":
+        missed = sorted(fn for fn in ledger.counts
+                        if fn not in ("C_GetFunctionList", "C_GetInterface")
+                        and spyview.calls.get(fn, 0) < ledger.counts.get(fn, 0))
+        detail += f"; missed-before-attach (ledger-exact): {missed!r}"
     return Verdict(not failures, branch, detail)
 
 
@@ -577,7 +680,7 @@ class LiveOuterCells(unittest.TestCase):
     """The two live cells (self-skipping without the gate prerequisites)."""
 
     @gate
-    def test_rpo_proxy_outer_exact(self, prereqs):
+    def test_rpo_proxy_outer(self, prereqs):
         workdir = tempfile.mkdtemp(prefix="rpo-proxy-")
         conf, label = make_soft_token(workdir)
         print(f"\nRPO-PROXY artifacts: {workdir}")
@@ -588,7 +691,7 @@ class LiveOuterCells(unittest.TestCase):
              "--token-label", label, "--login", "--pin", "1234"])
         priv = out.count("Private Key Object")
         pub = out.count("Public Key Object")
-        verdict = judge_proxy_outer(report, ledger, rc, priv, pub)
+        verdict = judge_proxy_outer_prefix_gap(report, ledger, rc, priv, pub)
         print(f"RPO-PROXY branch={verdict.branch}: {verdict.detail}")
         self.assertTrue(verdict, f"{verdict.detail}\nartifacts: {workdir}")
 
@@ -946,6 +1049,70 @@ class ProxyJudgeTwins(unittest.TestCase):
             parse_report('{"schema": "p11scope/observed-profile/v3", "a": 1, "a": 2}')
 
 
+class ProxyPrefixGapTwins(unittest.TestCase):
+    def verdict(self, mutate=None):
+        ledger, report = proxy_fixture(mutate)
+        return judge_proxy_outer_prefix_gap(report, ledger, 0, 2, 2)
+
+    def test_exact_shape_passes_exact(self):
+        verdict = self.verdict()
+        self.assertTrue(verdict, verdict.detail)
+        self.assertEqual(verdict.branch, "exact")
+
+    def test_init_only_miss_passes_prefix_gap(self):
+        def drop_init(report, _ledger):
+            report["functions"] = [r for r in report["functions"]
+                                   if not (r["names"] == ["C_Initialize"]
+                                           and (r["module"] or {}).get("sha256") == SPY_SHA)]
+        verdict = self.verdict(drop_init)
+        self.assertTrue(verdict, verdict.detail)
+        self.assertEqual(verdict.branch, "prefix-gap")
+        self.assertIn("C_Initialize", verdict.detail)
+
+    def test_init_slotlist_miss_passes_prefix_gap(self):
+        def drop_prefix(report, _ledger):
+            report["functions"] = [r for r in report["functions"]
+                                   if not (r["names"] in (["C_Initialize"], ["C_GetSlotList"])
+                                           and (r["module"] or {}).get("sha256") == SPY_SHA)]
+        verdict = self.verdict(drop_prefix)
+        self.assertTrue(verdict, verdict.detail)
+        self.assertEqual(verdict.branch, "prefix-gap")
+
+    def test_mid_miss_rejected(self):
+        def drop_login(report, _ledger):
+            report["functions"] = [r for r in report["functions"]
+                                   if not (r["names"] == ["C_Login"]
+                                           and (r["module"] or {}).get("sha256") == SPY_SHA)]
+        verdict = self.verdict(drop_login)
+        self.assertFalse(verdict, verdict.detail)
+        self.assertIn("prefix", verdict.detail)
+
+    def test_slotlist_only_miss_rejected(self):
+        def drop_slotlist(report, _ledger):
+            report["functions"] = [r for r in report["functions"]
+                                   if not (r["names"] == ["C_GetSlotList"]
+                                           and (r["module"] or {}).get("sha256") == SPY_SHA)]
+        verdict = self.verdict(drop_slotlist)
+        self.assertFalse(verdict, verdict.detail)
+
+    def test_prefix_gap_rejects_phantom(self):
+        def drop_and_stick(report, _ledger):
+            report["functions"] = [r for r in report["functions"]
+                                   if not (r["names"] == ["C_Initialize"]
+                                           and (r["module"] or {}).get("sha256") == SPY_SHA)]
+            report["evidence"]["in_flight_at_end"] = 1
+        verdict = self.verdict(drop_and_stick)
+        self.assertFalse(verdict, verdict.detail)
+        self.assertIn("phantom", verdict.detail)
+
+    def test_prefix_gap_rejects_total_miss(self):
+        def drop_all_spy(report, _ledger):
+            report["functions"] = [r for r in report["functions"]
+                                   if (r["module"] or {}).get("sha256") != SPY_SHA]
+        verdict = self.verdict(drop_all_spy)
+        self.assertFalse(verdict, verdict.detail)
+
+
 class OpenscJudgeTwins(unittest.TestCase):
     def verdict(self, mutate=None, rc=1, out="Available slots:\n"):
         ledger, report = opensc_fixture(mutate)
@@ -963,8 +1130,26 @@ class OpenscJudgeTwins(unittest.TestCase):
                                            and (r["module"] or {}).get("sha256") == SPY_SHA)]
         verdict = self.verdict(drop_init)
         self.assertTrue(verdict, verdict.detail)
-        self.assertEqual(verdict.branch, "honest-gap")
+        self.assertEqual(verdict.branch, "prefix-gap")
         self.assertIn("C_Initialize", verdict.detail)
+
+    def test_gap_allows_init_slotlist_prefix(self):
+        def drop_prefix(report, _ledger):
+            report["functions"] = [r for r in report["functions"]
+                                   if not (r["names"] in (["C_Initialize"], ["C_GetSlotList"])
+                                           and (r["module"] or {}).get("sha256") == SPY_SHA)]
+        verdict = self.verdict(drop_prefix)
+        self.assertTrue(verdict, verdict.detail)
+        self.assertEqual(verdict.branch, "prefix-gap")
+
+    def test_gap_rejects_non_init_miss(self):
+        def drop_slotlist(report, _ledger):
+            report["functions"] = [r for r in report["functions"]
+                                   if not (r["names"] == ["C_GetSlotList"]
+                                           and (r["module"] or {}).get("sha256") == SPY_SHA)]
+        verdict = self.verdict(drop_slotlist)
+        self.assertFalse(verdict, verdict.detail)
+        self.assertIn("prefix", verdict.detail)
 
     def test_gap_without_window_fails(self):
         def drop_both(report, _ledger):

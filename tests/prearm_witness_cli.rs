@@ -1731,16 +1731,21 @@ fn privileged_profile_system_learned_provider_second_round_catches_oneshots() {
         "resume capture after round 1"
     );
     // Wait for the learning event itself (the diagnostics staging line
-    // names the copy), then a few ordinary frames for the expedited
-    // attach, so the rate below measures steady-state catching, not
-    // arm latency on a small or loaded host.
-    let copy_name = copy
-        .file_name()
-        .expect("copy file name")
-        .to_string_lossy()
-        .into_owned();
+    // names the copy with the round-1 loader and one missed load),
+    // then a few ordinary frames for the expedited attach, so the
+    // rate below measures steady-state catching, not arm latency on a
+    // small or loaded host. The round-1 loader has exited before the
+    // drain, so its exe link is usually already unreadable: either
+    // the tool path or the finite unknown releases the rounds.
+    let copy_display = copy.to_str().expect("utf8 copy path").to_owned();
+    let tool_loader = std::fs::canonicalize(&tool)
+        .expect("canonical tool path")
+        .to_str()
+        .expect("utf8 tool path")
+        .to_owned();
     wait_pred(&mut capture, "learned staging", |line| {
-        is_fresh_staging_line_for(line, &copy_name)
+        is_fresh_staging_line_for(line, &copy_display, &tool_loader, 1)
+            || is_fresh_staging_line_for(line, &copy_display, "loader exe link unreadable", 1)
     });
     std::thread::sleep(Duration::from_secs(10));
     // Round 2: twenty one-shot runs, no retry masking the rate.
@@ -1998,19 +2003,32 @@ fn learned_private_mount_oracle_requires_the_full_round() {
 }
 
 /// Whether a capture-diagnostics line is the fresh-staging record for
-/// the exact `file_name`: the engine emits
+/// the exact held module (`expected_display`), the expected loader
+/// (`expected_loader`), and the expected missed-load count
+/// (`expected_loads`): the engine emits
 /// `p11scope: learned provider {display} (first loaded by {loader}):
 /// {loads} earlier loads missed; attached for later runs` exactly once
-/// per newly staged file. Another copy, an `already staged` note, an
-/// `already scan-covered; not staged` refusal, or gap prose never
-/// match: the name is boundary-pinned (`/name (`), the shape is exact.
-fn is_fresh_staging_line_for(line: &str, file_name: &str) -> bool {
+/// per newly staged file. A same-basename file in another directory,
+/// an unexpected loader, and a malformed or unexpected count never
+/// match: the display and loader compare exactly and the count parses
+/// as a number. An `already staged` note, an `already scan-covered;
+/// not staged` refusal, or gap prose never match either.
+fn is_fresh_staging_line_for(
+    line: &str,
+    expected_display: &str,
+    expected_loader: &str,
+    expected_loads: u64,
+) -> bool {
     // The engine emits `p11scope: learned provider {display} (first
     // loaded by {loader}): {loads} earlier loads missed; attached for
-    // later runs` exactly once per newly staged file. Only the display
-    // field names the file: the basename must end the display at a
-    // slash boundary, and the loader segment must keep its own
-    // "<loader>): <loads>" shape, so loader free text can never match.
+    // later runs` exactly once per newly staged file. The display
+    // field must equal the held module's path (a basename match in
+    // another directory is foreign evidence), the loader field must
+    // equal the expected loader spelling, and the loads field must
+    // parse as the expected count (free text or a wrong number never
+    // matches, which also defeats loader text smuggling an extra
+    // "<loader>): <loads>" separator: the smuggled loads side never
+    // parses).
     const PREFIX: &str = "p11scope: learned provider ";
     const MID: &str = " (first loaded by ";
     const SUFFIX: &str = " earlier loads missed; attached for later runs";
@@ -2025,94 +2043,126 @@ fn is_fresh_staging_line_for(line: &str, file_name: &str) -> bool {
         return false;
     };
     let (display, after) = rest.split_at(split);
-    let loader = &after[MID.len()..];
-    display
-        .strip_suffix(file_name)
-        .is_some_and(|prefix| prefix.ends_with('/'))
-        && loader.contains("): ")
-        && !loader.contains(MID)
+    let loader_and_loads = &after[MID.len()..];
+    let Some((loader, loads_text)) = loader_and_loads.split_once("): ") else {
+        return false;
+    };
+    if loader.contains(MID) || loader.contains("): ") {
+        return false;
+    }
+    let Ok(loads) = loads_text.parse::<u64>() else {
+        return false;
+    };
+    display == expected_display && loader == expected_loader && loads == expected_loads
 }
 
 /// Negative controls for the staging gate above: only the fresh
 /// staging record for the exact file may release the workload.
 #[test]
 fn fresh_staging_line_names_the_exact_file_and_shape() {
-    let file_name = "libprivatemnt-123-p28.so";
+    let display = "/tmp/cell/mnt/libprivatemnt-123-p28.so";
+    let loader = "/tmp/cell/p28-mnt-holder";
     assert!(is_fresh_staging_line_for(
         "p11scope: learned provider /tmp/cell/mnt/libprivatemnt-123-p28.so (first loaded by /tmp/cell/p28-mnt-holder): 1 earlier loads missed; attached for later runs\n",
-        file_name,
+        display,
+        loader,
+        1,
     ));
     // Another copy's fresh staging is foreign evidence.
     assert!(!is_fresh_staging_line_for(
         "p11scope: learned provider /tmp/cell/mnt/libprivatemnt-456-p28.so (first loaded by /tmp/cell/p28-mnt-holder): 1 earlier loads missed; attached for later runs\n",
-        file_name,
+        display,
+        loader,
+        1,
     ));
     // A refusal in place of staging, for the same file.
     assert!(!is_fresh_staging_line_for(
         "p11scope: learned provider /tmp/cell/mnt/libprivatemnt-123-p28.so already staged; loader note added\n",
-        file_name,
+        display,
+        loader,
+        1,
     ));
     assert!(!is_fresh_staging_line_for(
         "p11scope: learned provider /tmp/cell/mnt/libprivatemnt-123-p28.so already scan-covered; not staged\n",
-        file_name,
+        display,
+        loader,
+        1,
     ));
     // Gap prose without the staging shape.
     assert!(!is_fresh_staging_line_for(
         "note: learned provider file libprivatemnt-123-p28.so learned after its first use\n",
-        file_name,
+        display,
+        loader,
+        1,
     ));
     // A substring trap: a longer name sharing the file name as a prefix.
     assert!(!is_fresh_staging_line_for(
         "p11scope: learned provider /tmp/cell/mnt/libprivatemnt-123-p28.so.evil (first loaded by /tmp/cell/p28-mnt-holder): 1 earlier loads missed; attached for later runs\n",
-        file_name,
+        display,
+        loader,
+        1,
     ));
 }
 
-/// The requested basename inside the free-text loader field is foreign
+/// The requested display inside the free-text loader field is foreign
 /// evidence: only the display field names the staged file. A line
-/// staging `/tmp/other.so` whose loader text carries the requested
-/// basename must never release the workload.
+/// staging `/tmp/other.so` whose loader text carries a nested
+/// separator must never release the workload.
 #[test]
 fn fresh_staging_line_rejects_loader_field_injection() {
-    let file_name = "libprivatemnt-123-p28.so";
+    let display = "/tmp/cell/mnt/libprivatemnt-123-p28.so";
+    let loader = "/tmp/cell/p28-mnt-holder";
     assert!(!is_fresh_staging_line_for(
         "p11scope: learned provider /tmp/other.so (first loaded by /tmp/cell/libprivatemnt-123-p28.so (first loaded by /tmp/x): 1 earlier loads missed; attached for later runs\n",
-        file_name,
+        display,
+        loader,
+        1,
     ));
 }
 
-/// Only the exact staging shape for the exact display basename gates
-/// the workload: leading space, trailing junk, a loader segment
-/// without its "<loader>): <loads>" shape, or the basename without
-/// its slash boundary never match.
+/// Only the exact staging shape for the exact display gates the
+/// workload: leading space, trailing junk, a loader segment without
+/// its "<loader>): <loads>" shape, or a display with an extra path
+/// prefix never match.
 #[test]
 fn fresh_staging_line_rejects_malformed_staging_lines() {
-    let file_name = "libprivatemnt-123-p28.so";
+    let display = "/tmp/cell/mnt/libprivatemnt-123-p28.so";
+    let loader = "/tmp/cell/p28-mnt-holder";
     // Leading space before the diagnostics tag.
     assert!(!is_fresh_staging_line_for(
         "  p11scope: learned provider /tmp/cell/mnt/libprivatemnt-123-p28.so (first loaded by /tmp/cell/p28-mnt-holder): 1 earlier loads missed; attached for later runs\n",
-        file_name,
+        display,
+        loader,
+        1,
     ));
     // Trailing junk past the exact shape.
     assert!(!is_fresh_staging_line_for(
         "p11scope: learned provider /tmp/cell/mnt/libprivatemnt-123-p28.so (first loaded by /tmp/cell/p28-mnt-holder): 1 earlier loads missed; attached for later runs; retried\n",
-        file_name,
+        display,
+        loader,
+        1,
     ));
     // Loader segment without the "<loader>): <loads>" shape.
     assert!(!is_fresh_staging_line_for(
         "p11scope: learned provider /tmp/cell/mnt/libprivatemnt-123-p28.so (first loaded by 1 earlier loads missed; attached for later runs\n",
-        file_name,
+        display,
+        loader,
+        1,
     ));
-    // Basename as a suffix without its slash boundary.
+    // A display the expected path merely ends: exact equality rejects.
     assert!(!is_fresh_staging_line_for(
         "p11scope: learned provider /tmp/cell/mnt/prefixlibprivatemnt-123-p28.so (first loaded by /tmp/cell/p28-mnt-holder): 1 earlier loads missed; attached for later runs\n",
-        file_name,
+        display,
+        loader,
+        1,
     ));
     // A display path carrying its own loader separator: the split
     // would land inside the display, so the loader side must reject.
     assert!(!is_fresh_staging_line_for(
         "p11scope: learned provider /tmp/cell/mnt/libprivatemnt-123-p28.so (first loaded by impostor) (first loaded by /tmp/cell/p28-mnt-holder): 1 earlier loads missed; attached for later runs\n",
-        file_name,
+        display,
+        loader,
+        1,
     ));
 }
 
@@ -2121,14 +2171,19 @@ fn fresh_staging_line_rejects_malformed_staging_lines() {
 /// may release the workload.
 #[test]
 fn fresh_staging_line_rejects_the_same_basename_elsewhere() {
-    let file_name = "libprivatemnt-123-p28.so";
+    let display = "/tmp/cell/mnt/libprivatemnt-123-p28.so";
+    let loader = "/tmp/cell/p28-mnt-holder";
     assert!(!is_fresh_staging_line_for(
         "p11scope: learned provider /tmp/other/mnt/libprivatemnt-123-p28.so (first loaded by /tmp/cell/p28-mnt-holder): 1 earlier loads missed; attached for later runs\n",
-        file_name,
+        display,
+        loader,
+        1,
     ));
     assert!(!is_fresh_staging_line_for(
         "p11scope: learned provider /tmp/cell/other/libprivatemnt-123-p28.so (first loaded by /tmp/cell/p28-mnt-holder): 1 earlier loads missed; attached for later runs\n",
-        file_name,
+        display,
+        loader,
+        1,
     ));
 }
 
@@ -2137,18 +2192,25 @@ fn fresh_staging_line_rejects_the_same_basename_elsewhere() {
 /// number, never free text or zero.
 #[test]
 fn fresh_staging_line_rejects_malformed_load_counts() {
-    let file_name = "libprivatemnt-123-p28.so";
+    let display = "/tmp/cell/mnt/libprivatemnt-123-p28.so";
+    let loader = "/tmp/cell/p28-mnt-holder";
     assert!(!is_fresh_staging_line_for(
         "p11scope: learned provider /tmp/cell/mnt/libprivatemnt-123-p28.so (first loaded by /tmp/cell/p28-mnt-holder): many earlier loads missed; attached for later runs\n",
-        file_name,
+        display,
+        loader,
+        1,
     ));
     assert!(!is_fresh_staging_line_for(
         "p11scope: learned provider /tmp/cell/mnt/libprivatemnt-123-p28.so (first loaded by /tmp/cell/p28-mnt-holder): 0 earlier loads missed; attached for later runs\n",
-        file_name,
+        display,
+        loader,
+        1,
     ));
     assert!(!is_fresh_staging_line_for(
         "p11scope: learned provider /tmp/cell/mnt/libprivatemnt-123-p28.so (first loaded by /tmp/cell/p28-mnt-holder): 1x earlier loads missed; attached for later runs\n",
-        file_name,
+        display,
+        loader,
+        1,
     ));
 }
 
@@ -2156,10 +2218,51 @@ fn fresh_staging_line_rejects_malformed_load_counts() {
 /// full display path, expected loader, and one earlier load missed.
 #[test]
 fn fresh_staging_line_accepts_the_healthy_record() {
-    let file_name = "libprivatemnt-123-p28.so";
+    let display = "/tmp/cell/mnt/libprivatemnt-123-p28.so";
+    let loader = "/tmp/cell/p28-mnt-holder";
     assert!(is_fresh_staging_line_for(
         "p11scope: learned provider /tmp/cell/mnt/libprivatemnt-123-p28.so (first loaded by /tmp/cell/p28-mnt-holder): 1 earlier loads missed; attached for later runs\n",
-        file_name,
+        display,
+        loader,
+        1,
+    ));
+}
+
+/// The gate binds the loader and the count exactly: a different
+/// loader or a different count never matches, while the finite
+/// unknown loader matches when it is the expected one (the
+/// second-round cell's exited-loader arm).
+#[test]
+fn fresh_staging_line_binds_loader_and_loads_exactly() {
+    let display = "/tmp/cell/mnt/libprivatemnt-123-p28.so";
+    let loader = "/tmp/cell/p28-mnt-holder";
+    // A different loader for the same display and count.
+    assert!(!is_fresh_staging_line_for(
+        "p11scope: learned provider /tmp/cell/mnt/libprivatemnt-123-p28.so (first loaded by /tmp/other/p28-mnt-holder): 1 earlier loads missed; attached for later runs\n",
+        display,
+        loader,
+        1,
+    ));
+    // A different count for the same display and loader.
+    assert!(!is_fresh_staging_line_for(
+        "p11scope: learned provider /tmp/cell/mnt/libprivatemnt-123-p28.so (first loaded by /tmp/cell/p28-mnt-holder): 2 earlier loads missed; attached for later runs\n",
+        display,
+        loader,
+        1,
+    ));
+    // The finite unknown loader matches when expected.
+    assert!(is_fresh_staging_line_for(
+        "p11scope: learned provider /tmp/cell/mnt/libprivatemnt-123-p28.so (first loaded by loader exe link unreadable): 1 earlier loads missed; attached for later runs\n",
+        display,
+        "loader exe link unreadable",
+        1,
+    ));
+    // ... and never matches an expected named loader.
+    assert!(!is_fresh_staging_line_for(
+        "p11scope: learned provider /tmp/cell/mnt/libprivatemnt-123-p28.so (first loaded by loader exe link unreadable): 1 earlier loads missed; attached for later runs\n",
+        display,
+        loader,
+        1,
     ));
 }
 
@@ -2632,34 +2735,49 @@ fn workload_fixture_rejects_a_shrinking_slot_list() {
 }
 
 /// Whether the exact module record names the private-mount holder as
-/// its first loader: the holder lives for the whole capture, so its
-/// executable is always readable at learn time and the finite unknown
-/// is not accepted here (one-shot loaders in other cells keep their
-/// allowance).
-fn private_mount_loader_named(first_loaded_by: &serde_json::Value) -> bool {
+/// its first loader: the reported executable must equal the holder's
+/// own `/proc/<pid>/exe` spelling (`expected_exe`, read while it
+/// lives). The holder lives for the whole capture, so its executable
+/// is always readable at learn time and the finite unknown is not
+/// accepted here (one-shot loaders in other cells keep their
+/// allowance). A same-named program elsewhere is foreign evidence.
+fn private_mount_loader_named(first_loaded_by: &serde_json::Value, expected_exe: &str) -> bool {
     first_loaded_by
         .get("exe")
         .and_then(|exe| exe.as_str())
-        .is_some_and(|exe| exe.ends_with("p28-mnt-holder"))
+        .is_some_and(|exe| exe == expected_exe)
 }
 
 /// Negative controls for the loader naming above: only the holder's
 /// executable counts.
 #[test]
 fn private_mount_loader_naming_requires_the_holder_exe() {
-    assert!(private_mount_loader_named(&serde_json::json!({
-        "exe": "/tmp/cell/p28-mnt-holder",
-    })));
+    let expected = "/tmp/cell/p28-mnt-holder";
+    assert!(private_mount_loader_named(
+        &serde_json::json!({
+            "exe": "/tmp/cell/p28-mnt-holder",
+        }),
+        expected
+    ));
     // The finite unknown is refused here: the holder is always alive.
-    assert!(!private_mount_loader_named(&serde_json::json!({
-        "exe_unknown_reason": "loader exe link unreadable",
-    })));
+    assert!(!private_mount_loader_named(
+        &serde_json::json!({
+            "exe_unknown_reason": "loader exe link unreadable",
+        }),
+        expected
+    ));
     // Another program's executable is foreign evidence.
-    assert!(!private_mount_loader_named(&serde_json::json!({
-        "exe": "/usr/bin/pkcs11-tool",
-    })));
+    assert!(!private_mount_loader_named(
+        &serde_json::json!({
+            "exe": "/usr/bin/pkcs11-tool",
+        }),
+        expected
+    ));
     // A missing loader record names nothing.
-    assert!(!private_mount_loader_named(&serde_json::json!({})));
+    assert!(!private_mount_loader_named(
+        &serde_json::json!({}),
+        expected
+    ));
 }
 
 /// The holder's basename in another directory is foreign evidence:
@@ -2667,12 +2785,19 @@ fn private_mount_loader_naming_requires_the_holder_exe() {
 /// same-named program elsewhere.
 #[test]
 fn private_mount_loader_naming_rejects_the_same_basename_elsewhere() {
-    assert!(!private_mount_loader_named(&serde_json::json!({
-        "exe": "/tmp/other/p28-mnt-holder",
-    })));
-    assert!(!private_mount_loader_named(&serde_json::json!({
-        "exe": "/other/cell/p28-mnt-holder",
-    })));
+    let expected = "/tmp/cell/p28-mnt-holder";
+    assert!(!private_mount_loader_named(
+        &serde_json::json!({
+            "exe": "/tmp/other/p28-mnt-holder",
+        }),
+        expected
+    ));
+    assert!(!private_mount_loader_named(
+        &serde_json::json!({
+            "exe": "/other/cell/p28-mnt-holder",
+        }),
+        expected
+    ));
 }
 
 /// Exact counts in both directions against a validated ledger: every
@@ -2914,21 +3039,26 @@ fn privileged_profile_system_learned_provider_private_mount_is_learned_and_count
         "the holder must map nothing of the copy"
     );
 
+    // The holder's own executable spelling, read while it lives:
+    // the staging gate and the final loader verdict below both bind
+    // to it exactly (a same-named program elsewhere is foreign).
+    let holder_exe = std::fs::read_link(format!("/proc/{holder_pid}/exe"))
+        .expect("holder exe link")
+        .to_str()
+        .expect("utf8 holder exe")
+        .to_owned();
     // The learning event itself (the fresh-staging record for the
-    // exact copy): bounded, so an unlearned file fails on the verdict
-    // below instead of hanging. Then a few ordinary frames for the
-    // expedited attach, so the workload measures steady-state
-    // catching, not arm latency.
-    let copy_name = copy
-        .file_name()
-        .expect("copy file name")
-        .to_string_lossy()
-        .into_owned();
+    // exact copy, the holder loader, and one missed load): bounded,
+    // so an unlearned file fails on the verdict below instead of
+    // hanging. Then a few ordinary frames for the expedited attach,
+    // so the workload measures steady-state catching, not arm
+    // latency.
+    let copy_display = copy.to_str().expect("utf8 copy path").to_owned();
     let staged_seen = wait_pred_within(
         &mut capture,
         "learned staging",
         Duration::from_secs(300),
-        |line| is_fresh_staging_line_for(line, &copy_name),
+        |line| is_fresh_staging_line_for(line, &copy_display, &holder_exe, 1),
     );
     std::thread::sleep(Duration::from_secs(10));
     // The workload maps the same copy from the observer's namespace
@@ -2970,7 +3100,8 @@ fn privileged_profile_system_learned_provider_private_mount_is_learned_and_count
     let (counts_exact, spurious) = ledger_counts_match(&observed, &ledger_counts);
     // The provider is listed with the program that first loaded it.
     let first = record.get("first_loaded_by");
-    let loader_named = first.is_some_and(private_mount_loader_named);
+    let loader_named =
+        first.is_some_and(|first| private_mount_loader_named(first, &holder_exe));
     let pre_attach_loads = first
         .and_then(|first| first.get("pre_attach_loads"))
         .and_then(|loads| loads.as_u64());

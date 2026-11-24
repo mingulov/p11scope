@@ -1779,13 +1779,8 @@ fn privileged_profile_system_learned_provider_second_round_catches_oneshots() {
     let first = record
         .get("first_loaded_by")
         .unwrap_or_else(|| panic!("learned module names its first loader: {record}"));
-    let exe = first.get("exe").and_then(|exe| exe.as_str());
-    let unknown = first
-        .get("exe_unknown_reason")
-        .and_then(|reason| reason.as_str());
     assert!(
-        exe.is_some_and(|exe| exe.ends_with("pkcs11-tool"))
-            || unknown == Some("loader exe link unreadable"),
+        second_round_loader_named(first, tool_loader.as_str()),
         "first loader named or finitely unknown: {first}"
     );
     let pre_attach_loads = first
@@ -2802,16 +2797,11 @@ fn private_mount_loader_naming_rejects_the_same_basename_elsewhere() {
 /// canonical path (`expected_exe`), or the finite unknown when the
 /// round-1 loader already exited (its exe link unreadable at drain).
 /// A same-named program elsewhere is foreign evidence.
-fn second_round_loader_named(
-    first_loaded_by: &serde_json::Value,
-    _expected_exe: &str,
-) -> bool {
-    // RED: suffix check mirrors the privileged cell's current verdict;
-    // the twin below must fail until the exact binding lands.
+fn second_round_loader_named(first_loaded_by: &serde_json::Value, expected_exe: &str) -> bool {
     first_loaded_by
         .get("exe")
         .and_then(|exe| exe.as_str())
-        .is_some_and(|exe| exe.ends_with("pkcs11-tool"))
+        .is_some_and(|exe| exe == expected_exe)
         || first_loaded_by
             .get("exe_unknown_reason")
             .and_then(|reason| reason.as_str())

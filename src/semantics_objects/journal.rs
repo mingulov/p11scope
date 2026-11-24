@@ -2273,6 +2273,13 @@ pub(crate) struct JournalAdapter {
     /// without a signature change.
     #[cfg(test)]
     test_drain_proof_visits: std::cell::Cell<usize>,
+    /// Test-only drain-proof cursor reads: every `next_member_after`
+    /// look-ahead the budgeted walk performs, charged or not. The
+    /// walk reads one member past its charged visits per slice (the
+    /// yield-triggering fetch or the terminal `None`), so the bound
+    /// twin pins reads against visits plus slices.
+    #[cfg(test)]
+    test_drain_proof_cursor_reads: std::cell::Cell<usize>,
     /// Test-only replay-bound preflight calls and the open entries
     /// sampled across them: the joint retry loop must sample once per
     /// bounded seal, in one linear pass.
@@ -2412,6 +2419,8 @@ impl JournalAdapter {
             test_seal_census_visits: 0,
             #[cfg(test)]
             test_drain_proof_visits: std::cell::Cell::new(0),
+            #[cfg(test)]
+            test_drain_proof_cursor_reads: std::cell::Cell::new(0),
             #[cfg(test)]
             test_replay_bound_samples: std::cell::Cell::new(0),
             #[cfg(test)]
@@ -2969,6 +2978,28 @@ impl JournalAdapter {
     #[cfg(test)]
     pub(crate) fn reset_test_drain_proof_visits_for_test(&self) {
         self.test_drain_proof_visits.set(0);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_drain_proof_cursor_reads_for_test(&self) -> usize {
+        self.test_drain_proof_cursor_reads.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_test_drain_proof_cursor_reads_for_test(&self) {
+        self.test_drain_proof_cursor_reads.set(0);
+    }
+
+    /// The next drain-proof candidate past the persisted cursor: the
+    /// one budgeted-walk look-ahead, counted in test builds so the
+    /// bound twin pins control reads against charged visits.
+    fn next_drain_candidate(&self) -> Option<JournalNativeKey> {
+        #[cfg(test)]
+        {
+            self.test_drain_proof_cursor_reads
+                .set(self.test_drain_proof_cursor_reads.get() + 1);
+        }
+        next_member_after(&self.drain_proof_candidates, self.drain_proof_cursor)
     }
 
     #[cfg(test)]
@@ -9801,9 +9832,7 @@ impl JournalAdapter {
         // One indexed step past the cursor over the candidate index
         // per iteration: no table scan, no candidate vector, no borrow
         // held across the cached derivation below.
-        while let Some(native) =
-            next_member_after(&self.drain_proof_candidates, self.drain_proof_cursor)
-        {
+        while let Some(native) = self.next_drain_candidate() {
             if credit == 0 {
                 self.inline_spent = self.inline_spent.saturating_add(allowance - credit);
                 return Err(self.wait(SealWait::DrainProofPending));
@@ -22796,6 +22825,140 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn object_journal_abandon_first_drain_refuses_sibling_close_all_in_reverse_window() {
+        // Reverse-window twin of the forward causal-order refusal above:
+        // the opener abandons (@2) BEFORE its ordinary return lands (@5),
+        // with a sibling C_CloseAllSessions BEGIN (@3) and END (@4) staged
+        // between the abandonment and the late return. Completing at the
+        // abandonment cut would open the session BEFORE the close-all
+        // applied (leaving no live session), where the true order
+        // (close-all at 4, then the opener return at 5) leaves it live.
+        // A lifecycle drain with staged history between its abandonment
+        // and its late return keeps the counted Ticket loss at the
+        // observed cut instead of replaying out of order. Without the
+        // reverse-interval probe the drain completes at cut 2 with a
+        // moved SessionOpened effect.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+        let mut scene = Scene::new(image_default());
+        let open = function_id("C_OpenSession");
+        let close_all = function_id("C_CloseAllSessions");
+        scene.attest_function("C_OpenSession");
+        let proof = scene.attest_function("C_CloseAllSessions");
+        let begin = begin_bytes(1, 1, open, 0);
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        let sibling = begin_bytes(1, 2, close_all, 0);
+        assert_eq!(scene.ingest(&sibling), JournalDisposition::BeginAdmitted);
+        assert_eq!(
+            scene.ingest(&end_bytes_absent(&sibling, 0, ENTRY_NS + 70)),
+            JournalDisposition::EndStaged
+        );
+        assert_eq!(
+            scene.ingest_ordinary(ordinary_for(&begin, 0)),
+            JournalDisposition::ReturnObserved
+        );
+        let mut pad = ordinary_for(&begin, 0);
+        pad.slot = 99;
+        scene.ingest_ordinary(pad);
+        assert_eq!(
+            scene.adapter.drain_proof_candidates,
+            BTreeSet::from([(1, 1)]),
+            "the late return stages the reverse-window candidate"
+        );
+        let bootstrap = scene.bootstrap(proof, 0);
+        let outcome = scene.seal(&bootstrap);
+        let effects = match &outcome {
+            Ok(success) => &success.effects.effects,
+            Err(failure) => &failure.effects.effects,
+        };
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, ObjectEffect::SessionOpened { .. })),
+            "no session opens out of order: {effects:?}",
+        );
+        assert_eq!(
+            scene
+                .adapter
+                .keys
+                .get(&proof.key)
+                .expect("sealed key")
+                .bounded_upper,
+            Some(5),
+            "the Ticket bound names the observed late return",
+        );
+        assert!(
+            scene.model.project().sessions.is_empty(),
+            "no session survives the unproven drain"
+        );
+        if let Ok(success) = &outcome {
+            assert!(
+                success.prefix.settled().iter().any(|call| call.abandoned),
+                "a sealing drain keeps its loss: {:?}",
+                success.prefix.settled()
+            );
+        }
+    }
+
+    #[test]
+    fn object_journal_reverse_window_empty_across_ordinary_gap_completes() {
+        // Healthy reverse twin: the opener abandons (@2) before its late
+        // return (@4), with only an unrelated ordinary CALL (@3) between
+        // them. Ordinary CALL ordinals are observations, not Begin/End
+        // events, so the reverse window stays empty and the drain
+        // completes at the abandonment cut. Without bidirectional
+        // certification (reverse always refuses) this twin keeps its loss.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+        let mut scene = Scene::new(image_default());
+        let open = function_id("C_OpenSession");
+        let proof = scene.attest_function("C_OpenSession");
+        let begin = begin_bytes(1, 1, open, 0);
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        let mut gap = ordinary_for(&begin, 0);
+        gap.slot = 99;
+        scene.ingest_ordinary(gap);
+        assert_eq!(
+            scene.ingest_ordinary(ordinary_for(&begin, 0)),
+            JournalDisposition::ReturnObserved
+        );
+        assert_eq!(
+            scene
+                .adapter
+                .open
+                .get(&(1, 1))
+                .expect("staged opener")
+                .corroborated_return,
+            Some(4),
+            "the gap ordinary does not corroborate the opener"
+        );
+        let mut pad = ordinary_for(&begin, 0);
+        pad.slot = 99;
+        scene.ingest_ordinary(pad);
+        let bootstrap = scene.bootstrap(proof, 0);
+        let success = scene
+            .seal(&bootstrap)
+            .expect("the empty reverse window seals");
+        let drained = *success
+            .prefix
+            .settled()
+            .iter()
+            .find(|call| call.begin_cut == 1)
+            .expect("the drained call settles");
+        assert!(
+            !drained.abandoned,
+            "the gap-spanning drain completes: {drained:?}"
+        );
+        assert_eq!(
+            drained.end_cut,
+            Some(2),
+            "the completion cut is the abandonment ordinal"
+        );
+    }
+
+    #[test]
     fn object_journal_ticket_voids_seal_on_higher_sibling_end() {
         // Pre-existing Ticket-mechanics control for the causal-order
         // twin: an object function (always-Ticket, never drained)
@@ -23990,6 +24153,328 @@ pub(crate) mod tests {
             scene.adapter.drain_proof_candidates,
             scene.adapter.drain_candidate_mirror_for_test(),
             "the second seal keeps the candidate mirror exact"
+        );
+    }
+
+    #[test]
+    fn object_journal_inline_proof_and_doom_share_one_allowance() {
+        // Class S twin: one drain candidate plus one dooming unbounded
+        // abandonment under a single inline unit. The proof slice spends
+        // the unit deriving the member; the doom rejection then defers
+        // its per-row work to the holder instead of spending the same
+        // allowance a second time. Without sharing, the seal spends 2
+        // against the 1 it was given.
+        use p11scope_ebpf_common::object_journal::{
+            JOURNAL_REASON_ENTRY_COLLISION, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST,
+        };
+        let mut scene = Scene::new(image_default());
+        let open = function_id("C_OpenSession");
+        let create = function_id("C_CreateObject");
+        scene.attest_function("C_OpenSession");
+        let proof = scene.attest_function("C_CreateObject");
+        let begin = begin_bytes(1, 1, open, 0);
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        assert_eq!(
+            scene.ingest_ordinary(ordinary_for(&begin, 0)),
+            JournalDisposition::ReturnObserved
+        );
+        let drain_abandon =
+            abandon_bytes(1, 1, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
+        assert_eq!(
+            scene.ingest(&drain_abandon),
+            JournalDisposition::AbandonStaged
+        );
+        let doom_begin = begin_bytes(1, 2, create, 0);
+        assert_eq!(scene.ingest(&doom_begin), JournalDisposition::BeginAdmitted);
+        let doom_abandon = abandon_bytes(1, 2, JOURNAL_REASON_ENTRY_COLLISION, (COOKIE, EXEC));
+        assert_eq!(
+            scene.ingest(&doom_abandon),
+            JournalDisposition::AbandonStaged
+        );
+        let mut pad = ordinary_for(&begin, 0);
+        pad.slot = 99;
+        scene.ingest_ordinary(pad);
+        assert_eq!(
+            scene.adapter.drain_proof_candidates,
+            BTreeSet::from([(1, 1)]),
+            "exactly the drained opener needs a proof"
+        );
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.adapter.test_drain_proof_visits.set(0);
+        scene.adapter.bound_inline_credit_for_test(1);
+        let failure = scene
+            .seal(&bootstrap)
+            .expect_err("the dooming abandonment refuses the key");
+        assert_eq!(failure.gap, JournalGap::DomainTainted);
+        assert!(
+            scene
+                .adapter
+                .keys
+                .get(&proof.key)
+                .expect("sealed key")
+                .refused,
+            "the mutating abandonment keeps its permanent refusal"
+        );
+        assert_eq!(
+            scene.adapter.test_drain_proof_visits_for_test(),
+            1,
+            "the proof slice derives its member before the doom defers"
+        );
+        assert_eq!(
+            scene.adapter.take_inline_spent(),
+            1,
+            "proof derivation and doom settlement share the single unit"
+        );
+    }
+
+    #[test]
+    fn object_journal_drain_proof_snapshot_survives_sibling_prune() {
+        // Snapshot twin: two keys share one image. A's opener drain is
+        // blocked by B's staged BEGIN (@3) and END (@4) inside its
+        // window (2, 5). B seals first at the frontier: B converts and
+        // prunes its own rows, removing the blockers from the shared
+        // ordinal index. A then seals at the SAME frontier and must
+        // keep the failed proof it derived before the prune — a later
+        // recomputation would see the pruned index and complete A,
+        // making A's disposition depend on the order its siblings seal.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        const OTHER_SESSION: u64 = 0x2222_2222_2222_2222;
+        let mut scene = Scene::new(image_default());
+        let proof_a = scene.attest_session_function(SESSION, "C_OpenSession");
+        let mut other = AttestationFixture::new(image_default());
+        let proof_b = scene
+            .adapter
+            .attest_key(&other.admit_session(OTHER_SESSION))
+            .expect("second key attests");
+        assert_ne!(proof_a, proof_b);
+        let open = function_id("C_OpenSession");
+        let create = function_id("C_CreateObject");
+        let begin_a = begin_bytes(1, 1, open, 0);
+        scene.ingest(&begin_a);
+        assert_eq!(
+            scene.ingest_ordinary(ordinary_for(&begin_a, 0)),
+            JournalDisposition::ReturnObserved
+        );
+        let mut begin_b = begin_bytes(2, 1, create, 0);
+        put_u64(&mut begin_b, 80, OTHER_SESSION);
+        scene.ingest(&begin_b);
+        scene.admit_other_end(
+            &mut other,
+            "C_CreateObject",
+            &end_bytes(&begin_b, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60),
+        );
+        scene.ingest(&end_bytes(&begin_b, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
+        let abandon_a = abandon_bytes(1, 1, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon_a), JournalDisposition::AbandonStaged);
+        let mut pad = ordinary_for(&begin_a, 0);
+        pad.slot = 99;
+        scene.ingest_ordinary(pad);
+        assert_eq!(
+            scene.adapter.drain_proof_candidates,
+            BTreeSet::from([(1, 1)]),
+            "only the blocked opener needs a proof"
+        );
+        let sealed_through_before = scene
+            .adapter
+            .keys
+            .get(&proof_a.key)
+            .expect("A attested")
+            .sealed_through;
+        let bootstrap_b = scene.bootstrap(proof_b, 0);
+        let sealed_b = scene.seal(&bootstrap_b).expect("B seals its call");
+        assert_eq!(sealed_b.prefix.settled().len(), 1);
+        assert_eq!(sealed_b.prefix.settled()[0].begin_cut, 3);
+        assert!(
+            scene.adapter.open.contains_key(&(1, 1)),
+            "B's seal never prunes A's staged opener"
+        );
+        assert_eq!(
+            scene.adapter.drain_ordinals,
+            scene.adapter.drain_index_mirror_for_test(),
+            "B's prune keeps the ordinal mirror exact"
+        );
+        assert!(
+            !scene
+                .adapter
+                .drain_ordinals
+                .iter()
+                .any(|(_, ordinal)| *ordinal == 3 || *ordinal == 4),
+            "B's blockers left the shared index: {:?}",
+            scene.adapter.drain_ordinals
+        );
+        assert_eq!(
+            scene
+                .adapter
+                .keys
+                .get(&proof_a.key)
+                .expect("A attested")
+                .sealed_through,
+            sealed_through_before,
+            "A's frontier never advances under B's seal"
+        );
+        let bootstrap_a = scene.bootstrap(proof_a, 0);
+        let success_a = scene
+            .seal(&bootstrap_a)
+            .expect("A seals with its loss, never refused");
+        assert!(
+            !success_a
+                .effects
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, ObjectEffect::SessionOpened { .. })),
+            "A keeps its failed proof, never completes late: {:?}",
+            success_a.effects.effects,
+        );
+        assert_eq!(
+            scene
+                .adapter
+                .keys
+                .get(&proof_a.key)
+                .expect("A sealed")
+                .bounded_upper,
+            Some(2),
+            "A's Ticket bound names its observed return",
+        );
+        assert!(
+            success_a.prefix.settled().iter().any(|call| call.abandoned),
+            "A settles its drain as a loss: {:?}",
+            success_a.prefix.settled()
+        );
+    }
+
+    #[test]
+    fn object_journal_unblocked_drain_completes_after_sibling_prune() {
+        // Healthy snapshot twin: A drains with an empty window (2, 3)
+        // while B's rows (@4, @5) sit outside it. B seals first and
+        // prunes; A then seals at the same frontier and completes at
+        // its abandonment cut. Pruning only removes blockers, so a
+        // cached pass stays a pass — this twin stays green even under
+        // a direct re-probe, pinning the snapshot's one direction.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        const OTHER_SESSION: u64 = 0x2222_2222_2222_2222;
+        let mut scene = Scene::new(image_default());
+        let proof_a = scene.attest_session_function(SESSION, "C_OpenSession");
+        let mut other = AttestationFixture::new(image_default());
+        let proof_b = scene
+            .adapter
+            .attest_key(&other.admit_session(OTHER_SESSION))
+            .expect("second key attests");
+        let open = function_id("C_OpenSession");
+        let create = function_id("C_CreateObject");
+        let begin_a = begin_bytes(1, 1, open, 0);
+        scene.ingest(&begin_a);
+        assert_eq!(
+            scene.ingest_ordinary(ordinary_for(&begin_a, 0)),
+            JournalDisposition::ReturnObserved
+        );
+        let abandon_a = abandon_bytes(1, 1, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon_a), JournalDisposition::AbandonStaged);
+        let mut begin_b = begin_bytes(2, 1, create, 0);
+        put_u64(&mut begin_b, 80, OTHER_SESSION);
+        scene.ingest(&begin_b);
+        scene.admit_other_end(
+            &mut other,
+            "C_CreateObject",
+            &end_bytes(&begin_b, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60),
+        );
+        scene.ingest(&end_bytes(&begin_b, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
+        let mut pad = ordinary_for(&begin_a, 0);
+        pad.slot = 99;
+        scene.ingest_ordinary(pad);
+        let bootstrap_b = scene.bootstrap(proof_b, 0);
+        scene.seal(&bootstrap_b).expect("B seals its call");
+        let bootstrap_a = scene.bootstrap(proof_a, 0);
+        let success = scene.seal(&bootstrap_a).expect("A seals after B prunes");
+        let drained = *success
+            .prefix
+            .settled()
+            .iter()
+            .find(|call| call.begin_cut == 1)
+            .expect("the drained call settles");
+        assert!(
+            !drained.abandoned,
+            "the unblocked drain completes after the prune: {drained:?}"
+        );
+        assert_eq!(
+            drained.end_cut,
+            Some(3),
+            "the completion cut is the abandonment ordinal"
+        );
+    }
+
+    #[test]
+    fn object_journal_drain_proof_cursor_reads_bounded_by_visits_and_slices() {
+        // The budgeted walk reads its cursor once per charged visit
+        // plus one look-ahead per slice: 65 candidates yield once
+        // (64 visits, 65 reads: the 65th fetch triggers the yield)
+        // and resume (1 visit, 1 terminal `None` read). A walk that
+        // re-read its cursor would report more reads than visits plus
+        // slices. Cursor navigation is control work outside the leaf
+        // unit; every other budgeted cursor in the crate pays before
+        // it reads through the `Paid` token, and this is the one
+        // look-ahead the twin pins.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+        const DRAINS: u64 = 65;
+        let mut scene = Scene::new(image_default());
+        let open = function_id("C_OpenSession");
+        scene.attest_function_n("C_OpenSession", DRAINS as usize);
+        let proof = scene.attest_function("C_OpenSession");
+        for sequence in 1..=DRAINS {
+            let begin = begin_bytes(1, sequence, open, 0);
+            assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+            assert_eq!(
+                scene.ingest_ordinary(ordinary_for(&begin, 0)),
+                JournalDisposition::ReturnObserved
+            );
+            let abandon = abandon_bytes(
+                1,
+                sequence,
+                JOURNAL_REASON_SYNC_RETURN_RESULT_LOST,
+                (COOKIE, EXEC),
+            );
+            assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        }
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.adapter.reset_test_drain_proof_visits_for_test();
+        scene.adapter.reset_test_drain_proof_cursor_reads_for_test();
+        let first = scene
+            .seal(&bootstrap)
+            .expect_err("the first slice yields at the budget boundary");
+        assert_eq!(first.gap, JournalGap::BoundNotReady);
+        assert_eq!(
+            scene.adapter.last_seal_wait(),
+            SealWait::DrainProofPending,
+            "the yield names its resume cause"
+        );
+        assert_eq!(
+            scene.adapter.test_drain_proof_visits_for_test(),
+            64,
+            "one slice derives one credit, no more"
+        );
+        assert_eq!(
+            scene.adapter.test_drain_proof_cursor_reads_for_test(),
+            65,
+            "the yield-triggering fetch is the slice's one look-ahead"
+        );
+        let success = scene.seal(&bootstrap).expect("resumption completes");
+        assert_eq!(
+            scene.adapter.test_drain_proof_visits_for_test(),
+            DRAINS as usize,
+            "resumption derives only the remainder, never discards"
+        );
+        assert_eq!(
+            scene.adapter.test_drain_proof_cursor_reads_for_test(),
+            DRAINS as usize + 2,
+            "two slices read exactly one look-ahead each"
+        );
+        assert_eq!(
+            success.prefix.settled().len(),
+            DRAINS as usize,
+            "every staged drain settles"
         );
     }
 

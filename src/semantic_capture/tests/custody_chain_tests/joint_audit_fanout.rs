@@ -33686,6 +33686,228 @@ fn joint_drain_proof_retry_samples_its_preflight_once() {
 }
 
 #[test]
+fn joint_replay_preflight_costs_no_table_visits_under_one_unit() {
+    // Class S twin: 65 proof-needing drains plus their retained rows
+    // under a single service unit. The seal derives one member,
+    // charges it and yields; the replay preflight that sized the
+    // reservation must cost no table visit of its own — bounds come
+    // from maintained populations, never from a per-entry scan. A
+    // sampling preflight visits every retained row uncharged.
+    use crate::semantics_objects::journal::tests::abandon_bytes;
+    use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+    use pkcs11_types::CkRv;
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    let (target, pid) = fixture.replay_target();
+    let image = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .semantic_bindings()
+        .get(target.caller())
+        .unwrap()
+        .image();
+    for sequence in [2u64, 3] {
+        let (begin, ordinary) =
+            fixture
+                .scene
+                .encoded_with_rv(pid, 0, "C_SignUpdate", sequence, CkRv::DEVICE_REMOVED.0);
+        let mut abandon = abandon_bytes(
+            u64::from(pid),
+            sequence,
+            JOURNAL_REASON_SYNC_RETURN_RESULT_LOST,
+            (image.task_cookie, image.exec_id),
+        );
+        abandon[24..32].copy_from_slice(&begin[24..32]);
+        abandon[48..52].copy_from_slice(&begin[104..108]);
+        abandon[56..64].copy_from_slice(&begin[48..56]);
+        let source = fixture.scene.drain.source_mut();
+        source.push_record(begin.to_vec());
+        source.push_record(ordinary[24..392].to_vec());
+        source.push_record(abandon.to_vec());
+    }
+    let mut frame = fixture.audited(2, 2, &BirthFault);
+    assert!(
+        frame.failure_for_test().is_none(),
+        "clean audit: {:?}",
+        frame.failure_for_test()
+    );
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture_mut()
+        .adapter_mut()
+        .populate_unique_foreign_open_rows_for_test(63);
+    let h0 = fixture.scene.real.h0.clone();
+    let mut births = NativeFrameBirths {
+        h0: &h0,
+        attached: &fixture.attached,
+        retained: &mut fixture.births,
+        seen: Vec::new(),
+        unreadable: false,
+    };
+    let mut ports = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_frame_ports(&fixture.scene.producers)
+        .unwrap();
+    frame.bind_targets(&ports).unwrap();
+    ports
+        .read()
+        .1
+        .adapter()
+        .reset_test_replay_bound_counters_for_test();
+    ports
+        .read()
+        .1
+        .adapter()
+        .reset_test_drain_proof_visits_for_test();
+    let mut remaining = 1;
+    assert_eq!(
+        frame.seal_next_bounded(&mut ports, &mut births, &BirthFault, &mut remaining),
+        Ok(QuantumSealProgress::LocalPending),
+        "the one-unit service yields with its slice cached"
+    );
+    assert_eq!(remaining, 0, "the single visit spends the unit");
+    assert_eq!(
+        ports.read().1.adapter().test_drain_proof_visits_for_test(),
+        1,
+        "the service makes positive progress before it yields"
+    );
+    assert_eq!(
+        ports
+            .read()
+            .1
+            .adapter()
+            .test_replay_bound_samples_for_test(),
+        1,
+        "one bounded seal samples its preflight once, never per retry"
+    );
+    assert_eq!(
+        ports.read().1.adapter().test_replay_bound_visits_for_test(),
+        0,
+        "the preflight sizes from populations, never from a table scan"
+    );
+}
+
+#[test]
+fn joint_mixed_proof_and_doom_share_one_allowance() {
+    // Class S twin: one drain candidate plus one dooming abandonment
+    // under a single service unit on the production frame. The proof
+    // slice spends the unit deriving the member; the doom rejection
+    // parks with its per-row work deferred, and a second service
+    // completes it. Spending the allowance twice trips the caller's
+    // checked debit instead of settling silently.
+    use crate::semantics_objects::journal::tests::abandon_bytes;
+    use p11scope_ebpf_common::object_journal::{
+        JOURNAL_REASON_EXEC_EXIT, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST,
+    };
+    use pkcs11_types::CkRv;
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    let (target, pid) = fixture.replay_target();
+    let proof = target.bootstrap().proof();
+    let image = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .semantic_bindings()
+        .get(target.caller())
+        .unwrap()
+        .image();
+    let mut stage = |sequence: u64, name: &str, rv: u64, reason: u32| {
+        let (begin, ordinary) = fixture.scene.encoded_with_rv(pid, 0, name, sequence, rv);
+        let mut abandon = abandon_bytes(
+            u64::from(pid),
+            sequence,
+            reason,
+            (image.task_cookie, image.exec_id),
+        );
+        abandon[24..32].copy_from_slice(&begin[24..32]);
+        abandon[48..52].copy_from_slice(&begin[104..108]);
+        abandon[56..64].copy_from_slice(&begin[48..56]);
+        let source = fixture.scene.drain.source_mut();
+        source.push_record(begin.to_vec());
+        source.push_record(ordinary[24..392].to_vec());
+        source.push_record(abandon.to_vec());
+    };
+    stage(
+        2,
+        "C_SignUpdate",
+        CkRv::SESSION_HANDLE_INVALID.0,
+        JOURNAL_REASON_EXEC_EXIT,
+    );
+    stage(
+        4,
+        "C_SignUpdate",
+        CkRv::DEVICE_REMOVED.0,
+        JOURNAL_REASON_SYNC_RETURN_RESULT_LOST,
+    );
+    let mut frame = fixture.audited(2, 2, &BirthFault);
+    assert!(
+        frame.failure_for_test().is_none(),
+        "clean audit: {:?}",
+        frame.failure_for_test()
+    );
+    let h0 = fixture.scene.real.h0.clone();
+    let mut births = NativeFrameBirths {
+        h0: &h0,
+        attached: &fixture.attached,
+        retained: &mut fixture.births,
+        seen: Vec::new(),
+        unreadable: false,
+    };
+    let mut ports = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_frame_ports(&fixture.scene.producers)
+        .unwrap();
+    frame.bind_targets(&ports).unwrap();
+    ports
+        .read()
+        .1
+        .adapter()
+        .reset_test_drain_proof_visits_for_test();
+    let mut remaining = 1;
+    assert_eq!(
+        frame.seal_next_bounded(&mut ports, &mut births, &BirthFault, &mut remaining),
+        Ok(QuantumSealProgress::DeliveryReady),
+        "the doomed seal parks its deferred rejection"
+    );
+    assert_eq!(remaining, 0, "the single visit spends the unit");
+    assert_eq!(
+        ports.read().1.adapter().test_drain_proof_visits_for_test(),
+        1,
+        "the proof slice derives its member before the doom parks"
+    );
+    assert!(
+        ports.read().1.adapter().proof_refused_for_test(proof),
+        "the dooming abandonment keeps its permanent refusal"
+    );
+    let mut births = NativeFrameBirths {
+        h0: &h0,
+        attached: &fixture.attached,
+        retained: &mut fixture.births,
+        seen: Vec::new(),
+        unreadable: false,
+    };
+    let mut remaining = 64;
+    frame
+        .seal_next_bounded(&mut ports, &mut births, &BirthFault, &mut remaining)
+        .expect("the second service completes the parked doom");
+    assert!(
+        ports.read().1.adapter().proof_refused_for_test(proof),
+        "the doomed key stays refused"
+    );
+}
+
+#[test]
 fn joint_replay_step_capacity_refusal_preserves_original() {
     let mut fixture = CanonicalFanoutScene::prior_sealed();
     let (_, pid) = fixture.replay_target();

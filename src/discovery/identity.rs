@@ -3739,16 +3739,79 @@ impl PinnedObjects {
         self
     }
 
-    /// Whether any raw alias still names `id`: a view-owned raw mapping
+    /// Every object a raw alias still names: a view-owned raw mapping
     /// to it, or a global (mount-namespace-less) raw mapping to it.
     /// Carrier-pin reclaim keeps aliased ids even when claimless and
     /// rowless (run-learned tables and global observations alias here).
-    pub(crate) fn object_has_raw_aliases(&self, id: PinnedObjectId) -> bool {
-        self.raw_to_id.iter().any(|(raw, mapped)| {
-            *mapped == id
-                && (raw.mount_namespace.is_none()
-                    || self.raw_ownership.values().any(|owned| owned.contains(raw)))
-        })
+    /// Prebuilt once per reclaim pass: per-id alias scans would repeat
+    /// the raw walk per candidate.
+    pub(crate) fn raw_aliased_ids(&self) -> BTreeSet<PinnedObjectId> {
+        let owned: BTreeSet<&RawObjectInstance> = self.raw_ownership.values().flatten().collect();
+        self.raw_to_id
+            .iter()
+            .filter(|(raw, _)| raw.mount_namespace.is_none() || owned.contains(*raw))
+            .map(|(_, id)| *id)
+            .collect()
+    }
+
+    /// Test-only: a weak share of one entry's file, for proving the
+    /// last strong share dropped (reclaim closes). Downgrades inside
+    /// so the handle itself keeps nothing alive.
+    #[cfg(test)]
+    pub(crate) fn weak_file_for_test(
+        &self,
+        id: PinnedObjectId,
+    ) -> Option<std::sync::Weak<std::fs::File>> {
+        self.by_id
+            .get(&id)
+            .map(|entry| std::sync::Arc::downgrade(entry.file.arc()))
+    }
+
+    /// Extracts the proof-scoped pins for one owned-learn proof:
+    /// its own file entry (by `object`, resolved in this same
+    /// store) plus its table-entry dependency entries (by content
+    /// through `module`), with their raw mappings. Deferred proofs
+    /// stash this at defer time (stable custody across the proving
+    /// scan's death); the drain absorbs it exactly like a fresh
+    /// harvest. Verdicts (rejections, refusals, claims) stay behind:
+    /// the extraction carries pins, never store verdicts. `None`
+    /// when the own file resolves nowhere here (a missing entry
+    /// dependency merely skips: the file still stages, and the
+    /// later bind reports the unpinned entry loudly per entry).
+    pub(crate) fn extract_proof_pins(
+        &self,
+        object: PinnedObjectId,
+        module: &ScannedModule,
+    ) -> Option<PinnedObjects> {
+        if !self.by_id.contains_key(&object) {
+            return None;
+        }
+        let mut out = PinnedObjects::empty();
+        out.overlay_uncertain = self.overlay_uncertain;
+        out.changed.set(self.changed.get());
+        out.next_id = self.next_id;
+        let mut take = |id: PinnedObjectId| {
+            if let Some(entry) = self.by_id.get(&id) {
+                out.by_id.insert(id, entry.clone());
+            }
+            for (raw, mapped) in self.raw_to_id.iter() {
+                if *mapped == id {
+                    out.raw_to_id.insert(raw.clone(), id);
+                }
+            }
+        };
+        take(object);
+        for entry in module.tables.iter().flat_map(|table| &table.entries) {
+            let Some(raw) = RawObjectInstance::scanned(module, entry.object, &entry.object_path)
+            else {
+                continue;
+            };
+            let Some(id) = self.raw_to_id.get(&raw).copied() else {
+                continue;
+            };
+            take(id);
+        }
+        Some(out)
     }
 
     /// Removes one reclaimable carrier-only object: its entry, its raw
@@ -3757,9 +3820,9 @@ impl PinnedObjects {
     /// manifest, prearm or context owner still needs the id; this
     /// scrubs defensively so a missed claimant cannot strand. Returns
     /// true when an entry was removed. Synchronous, like
-    /// [`Self::remove_view_except`]: carrier detach retires at most a
-    /// few objects per tick (carriers merge by file), so closes stay
-    /// bounded without a handoff.
+    /// [`Self::remove_view_except`]: retirement paces at one stride
+    /// of drops per assembly upstream, so closes stay bounded
+    /// without a handoff.
     pub(crate) fn remove_unowned_object(&mut self, id: PinnedObjectId) -> bool {
         if !self.by_id.contains_key(&id) {
             return false;
@@ -28798,5 +28861,187 @@ mod tests {
             "the lone filing is scrubbed"
         );
         assert_eq!(pinned.pinned().count(), 0);
+    }
+
+    #[test]
+    fn extract_proof_pins_carries_own_and_entry_pins_without_verdicts() {
+        // Proof-scoped extraction: the own file entry (by object id)
+        // plus the table-entry dependency entries (by content),
+        // with their raw mappings — and nothing else (no foreign
+        // entries, no rejections, no claims). An unknown object
+        // extracts to nothing; a missing entry dependency merely
+        // skips.
+        use std::collections::BTreeSet;
+        let key = overlay(880);
+        let dep = overlay(881);
+        let mut main = module(key);
+        main.tables[0].entries.push(ScannedEntry {
+            name: "C_Dependency",
+            object: dep,
+            object_path: PATH.into(),
+            file_offset: 0x2200,
+        });
+        let mut store = PinnedObjects::empty();
+        assert!(
+            store
+                .absorb(view_pin(&main, 8800, SHA, 1, false))
+                .is_empty()
+        );
+        // One scan, one mount namespace: the dependency pin files
+        // under the proving main's namespace, as production scans
+        // do, so the entry raw resolves to it.
+        let mut dep_module = module(dep);
+        dep_module.mount_namespace = main.mount_namespace;
+        assert!(
+            store
+                .absorb(view_pin(&dep_module, 8801, SHA, 1, false))
+                .is_empty()
+        );
+        let foreign = overlay(882);
+        assert!(
+            store
+                .absorb(view_pin(&module(foreign), 8802, SHA, 1, false))
+                .is_empty()
+        );
+        store.reapply_rejected_keys(&BTreeSet::from([overlay(883)]));
+        let own_id = store
+            .id_for_scanned(&main, main.key, &main.path)
+            .expect("the own file resolves");
+        let dep_id = store
+            .id_for_scanned(&main, dep, PATH)
+            .expect("the entry dependency resolves");
+        let foreign_id = store
+            .id_for_scanned(&module(foreign), foreign, PATH)
+            .expect("the foreign file resolves in the source");
+        let extracted = store
+            .extract_proof_pins(own_id, &main)
+            .expect("the own file extracts");
+        assert!(
+            extracted.summary(own_id).is_some(),
+            "the extraction carries the own file"
+        );
+        assert!(
+            extracted.summary(dep_id).is_some(),
+            "the extraction carries the entry dependency"
+        );
+        assert!(
+            extracted.summary(foreign_id).is_none(),
+            "the extraction carries no foreign entry"
+        );
+        assert_eq!(
+            extracted.id_for_scanned(&main, main.key, &main.path),
+            Some(own_id),
+            "the own raw resolves in the extraction"
+        );
+        assert!(
+            extracted.rejected_keys.is_empty(),
+            "the extraction carries no verdicts"
+        );
+        assert!(
+            extracted.ownership.is_empty(),
+            "the extraction carries no claims"
+        );
+        assert_eq!(
+            extracted.next_id, store.next_id,
+            "the extraction preserves the id upper bound"
+        );
+        // An unknown object extracts to nothing, and a missing
+        // dependency merely skips.
+        assert!(
+            PinnedObjects::empty()
+                .extract_proof_pins(own_id, &main)
+                .is_none(),
+            "an unresolvable own file extracts to nothing"
+        );
+        assert!(
+            store
+                .extract_proof_pins(PinnedObjectId(4242), &main)
+                .is_none(),
+            "an unknown object extracts to nothing"
+        );
+        let mut store = PinnedObjects::empty();
+        assert!(
+            store
+                .absorb(view_pin(&main, 8803, SHA, 1, false))
+                .is_empty()
+        );
+        let solo_id = store
+            .id_for_scanned(&main, main.key, &main.path)
+            .expect("the solo file resolves");
+        let partial = store
+            .extract_proof_pins(solo_id, &main)
+            .expect("the own file still extracts");
+        let partial_own = partial
+            .id_for_scanned(&main, main.key, &main.path)
+            .expect("the own raw resolves in the partial extraction");
+        assert!(
+            partial.summary(partial_own).is_some(),
+            "the partial extraction carries the own file"
+        );
+        assert!(
+            partial.id_for_scanned(&main, dep, PATH).is_none(),
+            "the missing dependency merely skips"
+        );
+    }
+
+    #[test]
+    fn raw_aliased_ids_covers_owned_and_global_aliases_only() {
+        // The prebuilt reclaim set: view-owned raws and global
+        // (mount-namespace-less) raws name their objects; a raw
+        // neither owned nor global names nothing.
+        use std::collections::BTreeSet;
+        let key = overlay(890);
+        let main = module(key);
+        let mut store = PinnedObjects::empty();
+        assert!(
+            store
+                .absorb(view_pin(&main, 8900, SHA, 1, false))
+                .is_empty()
+        );
+        let owned_id = store
+            .id_for_scanned(&main, main.key, &main.path)
+            .expect("the own file resolves");
+        let view = crate::process::ProcessViewId(90);
+        store
+            .raw_ownership
+            .entry(view)
+            .or_default()
+            .insert(RawObjectInstance::scanned(&main, main.key, &main.path).unwrap());
+        let global_key = overlay(891);
+        let global_module = module(global_key);
+        assert!(
+            store
+                .absorb(view_pin(&global_module, 8901, SHA, 1, false))
+                .is_empty()
+        );
+        let global_id = store
+            .id_for_scanned(&global_module, global_module.key, &global_module.path)
+            .expect("the global file resolves");
+        // Globalize its raw in place (production global raws come
+        // from manifest/prearm pins; the shape is what matters).
+        let global_raw =
+            RawObjectInstance::scanned(&global_module, global_module.key, &global_module.path)
+                .unwrap();
+        let mut globalized = global_raw.clone();
+        globalized.mount_namespace = None;
+        store.raw_to_id.remove(&global_raw);
+        store.raw_to_id.insert(globalized, global_id);
+        let lone_key = overlay(892);
+        let lone_module = module(lone_key);
+        assert!(
+            store
+                .absorb(view_pin(&lone_module, 8902, SHA, 1, false))
+                .is_empty()
+        );
+        let lone_id = store
+            .id_for_scanned(&lone_module, lone_module.key, &lone_module.path)
+            .expect("the lone file resolves");
+        let aliased = store.raw_aliased_ids();
+        assert_eq!(
+            aliased,
+            BTreeSet::from([owned_id, global_id]),
+            "owned and global raws alias; the lone raw aliases nothing"
+        );
+        assert!(!aliased.contains(&lone_id), "the lone id stays reclaimable");
     }
 }

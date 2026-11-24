@@ -1732,6 +1732,7 @@ fn claimless_rebuild_binds_carried_modules_without_claiming_them() {
             &BTreeSet::new(),
             &fresh,
             &retired,
+            None,
         )
         .unwrap();
     assert_eq!(candidate.modules.len(), 2, "both modules bind");
@@ -24164,6 +24165,7 @@ fn learn_owned_proofs_persists_decoded_tables_for_live_candidates() {
             &BTreeSet::new(),
             &BTreeSet::new(),
             &BTreeSet::new(),
+            None,
         )
         .expect("a live candidate builds over the learned tables");
     assert_eq!(
@@ -24313,6 +24315,7 @@ fn learned_candidate_module_count(engine: &mut Engine) -> usize {
             &BTreeSet::new(),
             &BTreeSet::new(),
             &BTreeSet::new(),
+            None,
         )
         .expect("a live candidate builds over the learned tables")
         .modules
@@ -24495,6 +24498,7 @@ fn learned_table_bind_loss_files_the_dedicated_counted_row() {
             &BTreeSet::new(),
             &BTreeSet::new(),
             &BTreeSet::new(),
+            None,
         )
         .expect("a live candidate builds over the unbound learned tables");
     assert!(
@@ -24557,6 +24561,7 @@ fn learned_table_abi_mismatch_files_the_dedicated_counted_row() {
             &BTreeSet::new(),
             &BTreeSet::new(),
             &BTreeSet::new(),
+            None,
         )
         .expect("a live candidate builds over the ABI-mismatched learned tables");
     assert!(
@@ -24776,6 +24781,7 @@ fn live_candidate_refuses_unproven_learned_entries_before_attach_in_host_wide_sc
                 &BTreeSet::new(),
                 &BTreeSet::new(),
                 &BTreeSet::new(),
+                None,
             )
             .expect("a live candidate builds over the learned tables");
         assert_eq!(
@@ -98244,6 +98250,7 @@ fn live_candidate_refuses_uncorroborated_entries_without_function_proof() {
             &BTreeSet::new(),
             &BTreeSet::new(),
             &BTreeSet::new(),
+            None,
         )
         .expect("a live candidate builds over the refused table");
     assert_eq!(candidate.modules.len(), 1);
@@ -99953,6 +99960,7 @@ fn merge_ownership_e4_lowering_shared_pin_stays_claimless() {
             &BTreeSet::new(),
             &fresh,
             &BTreeSet::new(),
+            None,
         )
         .unwrap();
     assert!(
@@ -100078,6 +100086,7 @@ fn merge_ownership_e4_lowering_carried_provider_stays_claimless() {
             &BTreeSet::new(),
             &fresh,
             &BTreeSet::new(),
+            None,
         )
         .unwrap();
     assert!(
@@ -100150,6 +100159,7 @@ fn merge_ownership_e5_loader_scan_shared_pin_stays_claimless() {
             &BTreeSet::new(),
             &fresh,
             &BTreeSet::new(),
+            None,
         )
         .unwrap();
     mo_assert_retired_claimless(&candidate.pinned, "loader scan rebuild");
@@ -100256,6 +100266,7 @@ fn merge_ownership_e5_loader_scan_carried_provider_stays_claimless() {
             &BTreeSet::new(),
             &fresh,
             &BTreeSet::new(),
+            None,
         )
         .unwrap();
     mo_assert_retired_claimless(&candidate.pinned, "loader scan rebuild");
@@ -100298,6 +100309,7 @@ fn merge_ownership_e6_learned_staging_shared_pin_stays_claimless() {
             &BTreeSet::new(),
             &BTreeSet::new(),
             &BTreeSet::new(),
+            None,
         )
         .unwrap();
     mo_assert_retired_claimless(&candidate.pinned, "learned staging rebuild");
@@ -100376,6 +100388,7 @@ fn merge_ownership_e6_learned_staging_carried_provider_stays_claimless() {
             &BTreeSet::new(),
             &BTreeSet::new(),
             &BTreeSet::new(),
+            None,
         )
         .unwrap();
     mo_assert_retired_claimless(&candidate.pinned, "learned staging rebuild");

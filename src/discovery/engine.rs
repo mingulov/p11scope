@@ -539,18 +539,17 @@ pub struct Engine {
     /// Learned candidates refused by the per-capture file cap.
     learned_cap_skipped: u64,
     /// Owned-run proofs whose files already staged, settled, or refused:
-    /// exact (pinned object, scan identity) keys. Later proofs for the
-    /// same file skip the held-file duplicate/stat before either check
-    /// (INV-2: no repeated native calls or closes across applies) while
-    /// their tables still harvest. Bounded like `learned_settled`: past
-    /// the cap new keys are not retained and fall back to the
-    /// stat-then-settled path under the per-apply stride.
-    owned_learned_staged: BTreeSet<(
-        PinnedObjectId,
-        crate::process::MountNamespaceId,
-        ObjectKey,
-        String,
-    )>,
+    /// exact (proving-file digest, scan identity) keys. Later proofs
+    /// for the same file skip the held-file duplicate/stat before
+    /// either check (INV-2: no repeated native calls or closes across
+    /// applies) while their tables still harvest. Bounded like
+    /// `learned_settled`: past the cap new keys are not retained and
+    /// fall back to the stat-then-settled path under the per-apply
+    /// stride. The digest (never a store-local numeric id) keys the
+    /// file: watch scans mint ids independently, so a numeric leg
+    /// would both miss skips (same file, new id) and false-skip
+    /// (different file, colliding id).
+    owned_learned_staged: BTreeSet<OwnedLearnedKey>,
     /// Test-only: held-file probes (`file_for` reaches) and staging
     /// attempts (proofs passing the per-apply stride gate) performed by
     /// [`Self::learn_owned_proofs`], cumulative per engine.
@@ -579,19 +578,22 @@ pub struct Engine {
     /// [`Self::learn_owned_proofs`] apply: each apply starts at
     /// `cursor % proofs.len()` and advances the cursor past the proofs it
     /// attempted, so a persistently unstageable head cannot starve the tail
-    /// across applies (bounded rotation over regenerated apply-path
-    /// proofs; watch proofs that pace out wait in
-    /// `owned_learn_deferred` instead, since their rows are transient).
+    /// across applies (bounded rotation over regenerated committed-row
+    /// proofs; proofs whose rows cannot regenerate wait in
+    /// `owned_learn_deferred` instead).
     owned_learn_cursor: u64,
-    /// Paced-out watch proofs held past their scan (F4): the watch
-    /// builds proofs from a transient scan and removes its entry
-    /// after the paced call, so without this a member that exits
-    /// before the next round takes its unattempted proofs with it.
-    /// Each entry holds its proving pin, so a later drain names and
-    /// stages it under credit without another scan of the PID.
+    /// Paced-out proofs whose rows cannot regenerate, held past
+    /// their scan (F4): the watch builds proofs from a transient
+    /// scan and removes its entry after the paced call, so without
+    /// this a member that exits before the next round takes its
+    /// unattempted proofs with it; newcomer proofs queue here too
+    /// when their rows may never commit. Each entry holds stable
+    /// custody (proving pin plus proving pins), so a later drain
+    /// names and stages it under credit without another scan.
     /// Bounded by [`OWNED_LEARN_DEFERRED_CAP`]; past it excess
-    /// proofs refuse loudly with counted loss. Apply-path proofs
-    /// never queue here (their rows regenerate next apply).
+    /// proofs refuse loudly with counted loss. Proofs from
+    /// committed rows never queue here (their rows regenerate next
+    /// apply).
     owned_learn_deferred: VecDeque<DeferredOwnedLearn>,
     /// Test-only: loader namings (`loader_name_for_proving_view` /
     /// pidfd naming) performed by [`Self::learn_owned_proofs`],
@@ -5305,17 +5307,51 @@ struct OwnedLearnProof {
     module: ScannedModule,
 }
 
-/// One paced-out watch proof held past its scan (F4): the unnamed
-/// proof shell plus the proving view's retained pin (shared `Arc`,
-/// no FD dup). The pin keeps the pidfd open, so a later drain names
+/// The already-staged key for one owned-learn proof: the proving
+/// file's digest plus the raw observation (mount namespace, maps
+/// key, path). See `owned_learned_staged`.
+type OwnedLearnedKey = (String, crate::process::MountNamespaceId, ObjectKey, String);
+
+/// The already-staged key for one proof, resolved in the proof's own
+/// source store (the draining call's pins for fresh proofs, the
+/// stashed proving pins for deferred ones): the proving file's
+/// digest plus the raw observation. Store-local numeric ids never
+/// enter the key (see `owned_learned_staged`).
+fn owned_learn_key(source: &PinnedObjects, proof: &OwnedLearnProof) -> OwnedLearnedKey {
+    let digest = source
+        .summary(proof.object)
+        .map(|summary| summary.sha256.to_string())
+        .unwrap_or_default();
+    (
+        digest,
+        proof.module.mount_namespace,
+        proof.module.key,
+        proof.module.path.clone(),
+    )
+}
+
+/// One paced-out owned-learn proof held past its scan (F4): the proof
+/// shell plus the proving view's retained pin (shared `Arc`, no FD
+/// dup) plus the proving scan's proof-scoped pins (shared `Rc`, no
+/// new FDs; the engine is tick-synchronous, so a thread-share type
+/// would lie). The pin keeps the pidfd open, so a later drain names
 /// the exact proving generation under credit even after the member
 /// exits — a recycled pid is never named, and an exited loader
 /// resolves to the finite unknown exactly as a live naming would.
-/// Bounded by [`OWNED_LEARN_DEFERRED_CAP`]; past it excess proofs
-/// refuse loudly with counted loss instead of queueing.
+/// The stashed pins keep the proven file, so the drain stages and
+/// harvests from the proving namespace no matter which store the
+/// draining call passes (scan-local ids never cross stores). The
+/// proving view's owned-child-ness and retention are snapshotted at
+/// defer time: the numeric view id may recycle before the drain, and
+/// a recycled id must never drop the proof or silence its first-use
+/// row. Bounded by [`OWNED_LEARN_DEFERRED_CAP`]; past it excess
+/// proofs refuse loudly with counted loss instead of queueing.
 struct DeferredOwnedLearn {
     proof: OwnedLearnProof,
     pin: std::sync::Arc<crate::process::PidPin>,
+    scan_pins: std::rc::Rc<PinnedObjects>,
+    is_direct_child: bool,
+    proving_retained: bool,
 }
 
 /// How many paced-out watch proofs wait past their scan (two
@@ -5541,6 +5577,13 @@ pub(crate) struct BacklogOutcome {
 /// One graph credit's leaf budget (system scale): a cursor phase spends up
 /// to this many leaf units per credit. Native calls stay `work = 1`.
 pub(crate) const GRAPH_STRIDE: usize = 64;
+
+/// Carrier rows one assembly retires: at most one stride, however
+/// many accumulated while absence was unproven. Each drop closes its
+/// carrier-only file at the commit swap (INV-2: closes are slow
+/// work), so the bound keeps closes per assembly to one stride; the
+/// rest ride and re-evaluate next tick.
+const CARRIED_RETIRE_PER_ASSEMBLY: usize = GRAPH_STRIDE;
 
 /// How long a graph tolerates a no-witness native wait that observes no
 /// release before it takes the finite incomplete stop (§1.9): stay-`Pending`
@@ -13308,16 +13351,25 @@ fn merge_scanned_module_counted(
 }
 
 /// Whether one live table preserves everything a carrier table still
-/// supplies: same version and walk, at least the carrier's live-return
-/// and manifest flags, and every entry, NULL hole and unpinned record.
-/// Entry comparison is by stable file offsets (never generation-local
-/// addresses). Index order never participates: a legitimate table
-/// reorder still covers, since coverage is by content.
+/// supplies: the same stable table identity (file offset), same
+/// version and walk, at least the carrier's live-return, manifest
+/// and extension-impossible evidence, and every entry, NULL hole and
+/// unpinned record. Entry comparison is by stable file offsets
+/// (never generation-local addresses). Index order never
+/// participates: a legitimate table reorder still covers, since
+/// coverage is by content — but identical content at a different
+/// offset is a different table (retiring on it would drop the
+/// carrier's table evidence and re-attribute its interface), and a
+/// table whose offset is unavailable on exactly one side fails
+/// closed. Two unattributable identical tables cover: their
+/// publication is observably equivalent.
 fn live_table_covers_carrier_table(candidate: &ScannedTable, table: &ScannedTable) -> bool {
     candidate.version == table.version
         && candidate.walk == table.walk
         && (!table.live_return || candidate.live_return)
         && (!table.manifest_supported || candidate.manifest_supported)
+        && (!table.extension_impossible || candidate.extension_impossible)
+        && candidate.file_offset == table.file_offset
         && table
             .entries
             .iter()
@@ -13343,11 +13395,13 @@ fn live_table_covers_carrier_table(candidate: &ScannedTable, table: &ScannedTabl
 /// row-local indices, so coverage resolves each linked interface
 /// against its owning row's table: a carrier interface linked to table
 /// A is covered only by a live interface with the same index, name,
-/// flags and private name whose own linked table covers A. A live
-/// interface linked to a different table never covers: retiring on a
-/// redirected link would drop the carrier's only witness for A while
-/// both tables' raw entry sets remain. A dangling carrier link (or a
-/// live link that dangles) fails closed and keeps the carrier.
+/// flags and private name whose own linked table covers A (same
+/// stable offset and at least A's evidence — identical content at a
+/// different offset is a different table). A live interface linked
+/// to a different table never covers: retiring on a redirected link
+/// would drop the carrier's only witness for A while both tables'
+/// raw entry sets remain. A dangling carrier link (or a live link
+/// that dangles) fails closed and keeps the carrier.
 fn carrier_covered_by_live(carrier: &ScannedModule, live: &[&ScannedModule]) -> bool {
     if !carrier
         .exports
@@ -13419,6 +13473,12 @@ fn carrier_covered_by_live(carrier: &ScannedModule, live: &[&ScannedModule]) -> 
 /// that maps the file but preserves none of the carrier's table
 /// targets keeps the carrier even when absence is otherwise proven:
 /// dropping it would retire attached probes behind a live mapper.
+///
+/// Drops pace at [`CARRIED_RETIRE_PER_ASSEMBLY`]: carriers accumulate
+/// while absence is unproven and would otherwise flush all at once
+/// on the first complete, serviced walk. The rest ride and
+/// re-evaluate next tick, so retirement converges over ticks instead
+/// of bulk-dropping.
 fn normalize_carried_modules(
     raw_modules: &mut Vec<ScannedModule>,
     pins: &PinnedObjects,
@@ -13453,22 +13513,35 @@ fn normalize_carried_modules(
             live_by_object.entry(object).or_default().push(module);
         }
     }
+    let mut retired_this_assembly: usize = 0;
     merged.retain(|carrier| {
         if newly_carried.contains(&CarriedModuleKey::of(carrier)) {
             return true;
         }
         let Some(object) = pins.id_for_scanned(carrier, carrier.key, &carrier.path) else {
-            // Unresolvable through these pins: keep unless absence rules
-            // out every other mapper.
+            // Unresolvable through these pins: no pin closes ride
+            // this drop, so it paces nothing — keep unless absence
+            // rules out every other mapper.
             return !absence_proven;
         };
-        match live_by_object.get(&object) {
+        let drop = match live_by_object.get(&object) {
             // No live row maps the file: drop only on proven absence.
-            None => !absence_proven,
+            None => absence_proven,
             // A live row maps the file: drop only when it preserves
             // everything the carrier still supplies.
-            Some(rows) => !carrier_covered_by_live(carrier, rows),
+            Some(rows) => carrier_covered_by_live(carrier, rows),
+        };
+        if !drop {
+            return true;
         }
+        // Paced retirement (INV-2): each drop closes its carrier-only
+        // file at the commit swap, so at most one stride retires per
+        // assembly; the rest ride and re-evaluate next tick.
+        if retired_this_assembly >= CARRIED_RETIRE_PER_ASSEMBLY {
+            return true;
+        }
+        retired_this_assembly = retired_this_assembly.saturating_add(1);
+        false
     });
     raw_modules.extend(merged);
 }
@@ -19237,6 +19310,7 @@ impl Engine {
             &BTreeSet::new(),
             &ridden,
             &BTreeSet::new(),
+            None,
         )
     }
 
@@ -19247,6 +19321,7 @@ impl Engine {
     /// slots). The choke derives the claim authority from these plus the
     /// engine's live views (spec §3); entry points declare tick events,
     /// never suppression sets.
+    #[allow(clippy::too_many_arguments)]
     fn live_candidate_with_events(
         &mut self,
         pinned: PinnedObjects,
@@ -19255,6 +19330,7 @@ impl Engine {
         declined: &BTreeSet<ProcessViewId>,
         fresh: &BTreeSet<ProcessViewId>,
         retired: &BTreeSet<ProcessViewId>,
+        pre_carriers: Option<&BTreeSet<PinnedObjectId>>,
     ) -> Result<LiveCandidate> {
         self.live_candidate_with_pending(
             pinned,
@@ -19264,6 +19340,7 @@ impl Engine {
             declined,
             fresh,
             retired,
+            pre_carriers,
         )
     }
 
@@ -19277,8 +19354,23 @@ impl Engine {
         declined: &BTreeSet<ProcessViewId>,
         fresh: &BTreeSet<ProcessViewId>,
         retired: &BTreeSet<ProcessViewId>,
+        pre_carriers: Option<&BTreeSet<PinnedObjectId>>,
     ) -> Result<LiveCandidate> {
         self.loader_plan_cache = None;
+        // Carrier objects with rows at rebuild entry, before the
+        // row-loss arms below (rejection, binding) run. Assemblies
+        // union this with their pre-normalize set (which predates
+        // newly-carried rows); builders without normalize pass
+        // `None` and retire purely from this snapshot. Either way
+        // the post-bind prune below sees every object that had a
+        // carrier row when the rebuild began.
+        let mut pre_carriers: BTreeSet<PinnedObjectId> = pre_carriers.cloned().unwrap_or_default();
+        pre_carriers.extend(
+            raw_modules
+                .iter()
+                .filter(|module| module.view == Self::CARRIED_VIEW_ID)
+                .filter_map(|module| pinned.id_for_scanned(module, module.key, &module.path)),
+        );
         let merge_head_start = crate::attach::monotonic_ns();
         self.pending_rejected_keys
             .extend(pinned.newly_rejected_keys(&self.pinned));
@@ -19388,6 +19480,12 @@ impl Engine {
         for view in authority.denied(&ridden, retired) {
             pinned.drop_view_claims(view);
         }
+        // Every row-loss arm ran (normalize before this rebuild, the
+        // rejection filter and strict binding above): reclaim
+        // carrier-only pins against the final surviving rows now,
+        // while the assembly still knows which rows survived. Later
+        // stages only read pins and rows, never drop rows.
+        self.prune_retired_carrier_pins(&mut pinned, &pre_carriers, &modules);
         let merge_mid_start = crate::attach::monotonic_ns();
         self.note_object_skips(binding_skips);
         self.stage_timings.span(
@@ -19819,7 +19917,9 @@ impl Engine {
                 .collect();
             // The scanned view is this rebuild's fresh view; committed
             // carried views ride through it. The choke authorizes the
-            // former and denies the latter (spec §3).
+            // former and denies the latter (spec §3). No normalize
+            // runs here: the rebuild snapshots its riding carriers
+            // itself for the post-bind prune.
             let fresh = BTreeSet::from([view]);
             let mut candidate = self.live_candidate_with_events(
                 candidate_pins,
@@ -19828,6 +19928,7 @@ impl Engine {
                 &BTreeSet::new(),
                 &fresh,
                 &BTreeSet::new(),
+                None,
             )?;
             if candidate.delta.new.is_empty()
                 && candidate.delta.replace.is_empty()
@@ -19964,10 +20065,6 @@ impl Engine {
             absence_proven,
             &mut self.merge_tables_dropped,
         );
-        // The replay retired the final carrier for these objects (if
-        // any): reclaim their carrier-only pins now, while the
-        // assembly still knows which rows survived.
-        self.prune_retired_carrier_pins(&mut pinned, &pre_carriers, &raw_modules);
         self.stage_timings.span(
             crate::timing::StageKind::Merge,
             "conservative_assemble",
@@ -19990,6 +20087,9 @@ impl Engine {
             })
             .map(|module| module.scanned.view)
             .collect();
+        // The pre-normalize carrier set rides into the rebuild so
+        // the post-bind prune retires normalize losses together
+        // with rejection and binding losses, through one path.
         let mut candidate = self.live_candidate_with_events(
             pinned,
             raw_modules,
@@ -19997,6 +20097,7 @@ impl Engine {
             &BTreeSet::new(),
             &BTreeSet::new(),
             retirements,
+            Some(&pre_carriers),
         )?;
         candidate.views.retain(|view| !carried.contains(view));
         Ok(candidate)
@@ -22853,7 +22954,8 @@ impl Engine {
         merge_scanned_module_counted(&mut raw_modules, lowered, &mut self.merge_tables_dropped);
         // The observed view is this rebuild's fresh view; committed
         // carried views ride through it. The choke authorizes the former
-        // and denies the latter (spec §3).
+        // and denies the latter (spec §3). No normalize runs here: the
+        // rebuild snapshots its riding carriers itself.
         let observed_view = self.views[position].id();
         let fresh = BTreeSet::from([observed_view]);
         let mut candidate = self.live_candidate_with_events(
@@ -22863,6 +22965,7 @@ impl Engine {
             &BTreeSet::new(),
             &fresh,
             &BTreeSet::new(),
+            None,
         )?;
         candidate.views.insert(self.views[position].id());
         let observed = candidate_timing_keys(&candidate, std::slice::from_ref(&observed_module));
@@ -23797,7 +23900,8 @@ impl Engine {
         }
         // The scanned view is this rebuild's fresh view; committed
         // carried views ride through it. The choke authorizes the former
-        // and denies the latter (spec §3).
+        // and denies the latter (spec §3). No normalize runs here: the
+        // rebuild snapshots its riding carriers itself.
         let fresh = BTreeSet::from([view_id]);
         let mut candidate = self.live_candidate_with_events(
             candidate_pins,
@@ -23806,6 +23910,7 @@ impl Engine {
             &BTreeSet::new(),
             &fresh,
             &BTreeSet::new(),
+            None,
         )?;
         candidate.views.insert(self.views[position].id());
         let observed = candidate_timing_keys(&candidate, &export_modules);
@@ -24335,7 +24440,36 @@ impl Engine {
             self.owned_watch_cursor = Some(pid);
         }
     }
+}
 
+/// Builds unnamed owned-learn proof shells for one scan's eligible
+/// modules (decoded tables or interfaces, resolving in these pins):
+/// the watch producer's construction. Shells carry no loader naming;
+/// the consumer names each under its proving pidfd once a stride
+/// credit is available (INV-2).
+fn build_owned_learn_proofs(
+    modules: &[ScannedModule],
+    pins: &PinnedObjects,
+    view: ProcessViewId,
+) -> Vec<OwnedLearnProof> {
+    modules
+        .iter()
+        .filter(|module| !module.tables.is_empty() || !module.interfaces.is_empty())
+        .filter_map(|module| {
+            pins.id_for_scanned(module, module.key, &module.path)
+                .map(|object| OwnedLearnProof {
+                    view,
+                    path: module.path.clone(),
+                    object,
+                    loader_exe: None,
+                    loader_unknown_reason: None,
+                    module: module.clone(),
+                })
+        })
+        .collect()
+}
+
+impl Engine {
     /// Scans one watched member through a fresh transient view and
     /// stages any provider file the scan proves, harvesting the
     /// scan's decoded tables beside it; the member then leaves
@@ -24432,21 +24566,7 @@ impl Engine {
         // (INV-2). The view is still held here, and paced-out proofs
         // queue with its pin, so learning later never re-resolves
         // the bare pid.
-        let proofs: Vec<OwnedLearnProof> = modules
-            .iter()
-            .filter(|module| !module.tables.is_empty() || !module.interfaces.is_empty())
-            .filter_map(|module| {
-                pins.id_for_scanned(module, module.key, &module.path)
-                    .map(|object| OwnedLearnProof {
-                        view: view.id(),
-                        path: module.path.clone(),
-                        object,
-                        loader_exe: None,
-                        loader_unknown_reason: None,
-                        module: module.clone(),
-                    })
-            })
-            .collect();
+        let proofs: Vec<OwnedLearnProof> = build_owned_learn_proofs(&modules, &pins, view.id());
         #[cfg(test)]
         {
             self.owned_learn_proofs_built_for_test = self
@@ -24615,18 +24735,19 @@ impl Engine {
     /// I/O-bearing steps here, so each apply attempts at most one
     /// [`GRAPH_STRIDE`] of proofs, and every naming happens here under
     /// a credit — producers build proofs unnamed and exit before any
-    /// naming outside owned runs. Apply-path proofs that pace out
-    /// regenerate from committed and carried rows on the next apply,
-    /// and the start offset rotates past the proofs this apply
-    /// attempted, so a persistently unstageable head cannot starve the
-    /// tail. Watch proofs that pace out wait in
-    /// `owned_learn_deferred` (their rows are transient and cannot
-    /// regenerate); a later drain names and stages them under credit
-    /// without another scan. Proofs whose exact (pinned object, scan
-    /// identity) key already staged, settled, or refused skip the
-    /// duplicate/stat before either check while their tables still
-    /// harvest, so a repeat apply over an already-settled carrier
-    /// performs no file operation at all.
+    /// naming outside owned runs. Proofs from committed rows that
+    /// pace out regenerate on the next apply, and the start offset
+    /// rotates past the proofs this apply attempted, so a
+    /// persistently unstageable head cannot starve the tail. Proofs
+    /// whose rows cannot regenerate (watch proofs from transient
+    /// scans, newcomer proofs from rows that may never commit) wait
+    /// in `owned_learn_deferred` with stable custody; a later drain
+    /// names and stages them under credit without another scan.
+    /// Proofs whose exact (file digest, scan identity) key already
+    /// staged, settled, or refused skip the duplicate/stat before
+    /// either check while their tables still harvest, so a repeat
+    /// apply over an already-settled carrier performs no file
+    /// operation at all.
     /// Test-only shorthand for [`Self::learn_owned_proofs_with_views`]
     /// with no newcomer or watch views (pre-named proofs stage without
     /// further naming). Production callers pass their proving views.
@@ -24639,9 +24760,10 @@ impl Engine {
     /// hold: `extra_views` carries newcomer views not yet committed
     /// (apply path), and `watch_view` carries the synchronously
     /// scanned member (watch path). Unnamed proofs name through these
-    /// under a stride credit; paced-out watch proofs queue into
-    /// `owned_learn_deferred` with their proving pin, while paced-out
-    /// apply proofs drop and regenerate.
+    /// under a stride credit; paced-out proofs whose rows cannot
+    /// regenerate (watch proofs, newcomer proofs) queue into
+    /// `owned_learn_deferred` with stable custody, while paced-out
+    /// proofs from committed rows drop and regenerate.
     fn learn_owned_proofs_with_views(
         &mut self,
         pins: &mut PinnedObjects,
@@ -24652,28 +24774,44 @@ impl Engine {
         if self.owned_run_pid.is_none() || !matches!(self.scope, Scope::Cgroup { .. }) {
             return;
         }
-        // Drain the watch backlog first (FIFO, under the same stride):
-        // each entry names through its stashed pin and stages, or
-        // harvests and drops when already terminal. Entries left past
-        // the stride stay queued for the next apply.
+        // Drain the backlog first (FIFO, under the same stride):
+        // each entry names through its stashed pin and stages from
+        // its stashed proving pins, or harvests and drops when
+        // already terminal. The drain store only receives aliases
+        // (harvest target); files and staged keys always resolve in
+        // the stashed proving namespace, never in the draining
+        // call's foreign ids. Entries left past the stride stay
+        // queued for the next apply.
         let mut attempted_this_apply: usize = 0;
         while attempted_this_apply < GRAPH_STRIDE {
             let Some(front) = self.owned_learn_deferred.front() else {
                 break;
             };
-            if self.owned_run_view(front.proof.view) {
+            // Direct-child proofs need no learning (their scan-owned
+            // slots persist): judged from the defer-time snapshot,
+            // never from the recyclable numeric id.
+            if front.is_direct_child {
                 self.owned_learn_deferred.pop_front();
                 continue;
             }
-            let key = (
-                front.proof.object,
-                front.proof.module.mount_namespace,
-                front.proof.module.key,
-                front.proof.module.path.clone(),
-            );
+            // The stash must hold the proven file: an entry that
+            // does not refuses loudly instead of staging a foreign
+            // file or vanishing silently.
+            if front.scan_pins.file_for(front.proof.object).is_none() {
+                self.owned_learn_deferred.pop_front();
+                self.learned_event_loss = self.learned_event_loss.saturating_add(1);
+                self.mark_partial(
+                    crate::render::LEARNED_SKIP_SUBJECT,
+                    "a deferred owned-learn proof named no proving file; it was refused",
+                );
+                continue;
+            }
+            let key = owned_learn_key(&front.scan_pins, &front.proof);
             if self.owned_learned_staged.contains(&key) {
                 let front = self.owned_learn_deferred.pop_front().expect("peeked above");
-                self.harvest_run_learned_tables(&mut *pins, &front.proof);
+                if let Some(module) = self.harvest_prepare(&front.scan_pins, &front.proof) {
+                    self.harvest_commit(pins, module);
+                }
                 continue;
             }
             let deferred = self.owned_learn_deferred.pop_front().expect("peeked above");
@@ -24689,9 +24827,9 @@ impl Engine {
                 None,
                 Some(&deferred.pin),
             );
-            self.stage_owned_learn_proof(
+            self.stage_deferred_owned_learn_proof(
                 pins,
-                &deferred.proof,
+                &deferred,
                 loader_exe,
                 loader_unknown_reason,
                 key,
@@ -24719,12 +24857,7 @@ impl Engine {
             if self.owned_run_view(proof.view) {
                 continue;
             }
-            let key = (
-                proof.object,
-                proof.module.mount_namespace,
-                proof.module.key,
-                proof.module.path.clone(),
-            );
+            let key = owned_learn_key(pins, proof);
             if self.owned_learned_staged.contains(&key) {
                 // Exact identity learned before: the tables still
                 // harvest (aliases exist, the union converges), but no
@@ -24734,12 +24867,32 @@ impl Engine {
             }
             if attempted_this_apply >= GRAPH_STRIDE {
                 // Paced past the stride (after the backlog drain
-                // above): apply-path proofs regenerate next apply
-                // from the rows that produced them, while watch
-                // proofs (transient rows) queue with their proving
-                // pin or refuse loudly when the queue is full.
+                // above). Committed rows (live or carried) regenerate
+                // next apply, so their proofs drop; newcomer rows may
+                // never commit (a stale, refused or failed apply
+                // publishes nothing), so a proof the committed set
+                // cannot rebuild queues with stable custody — or
+                // refuses loudly when the queue is full or its
+                // proving view is already gone.
+                if proof.view == Self::CARRIED_VIEW_ID
+                    || self.views.iter().any(|view| view.id() == proof.view)
+                {
+                    continue;
+                }
                 if let Some(view) = watch_view {
-                    self.defer_owned_learn_proof(proof, view);
+                    self.defer_owned_learn_proof(proof, view, pins);
+                } else if let Some(view) = extra_views
+                    .iter()
+                    .find(|view| view.id() == proof.view)
+                    .copied()
+                {
+                    self.defer_owned_learn_proof(proof, view, pins);
+                } else {
+                    self.learned_event_loss = self.learned_event_loss.saturating_add(1);
+                    self.mark_partial(
+                        crate::render::LEARNED_SKIP_SUBJECT,
+                        "an owned run learning proof paced out after its proving view is gone; it was refused",
+                    );
                 }
                 continue;
             }
@@ -24752,10 +24905,18 @@ impl Engine {
             }
             let (loader_exe, loader_unknown_reason) =
                 self.name_owned_learn_proof(proof, extra_views, watch_view, None);
-            // The staging body below is shared with the backlog drain
-            // except for its loader inputs; keep both in
-            // `stage_owned_learn_proof`.
-            self.stage_owned_learn_proof(pins, proof, loader_exe, loader_unknown_reason, key);
+            // Fresh proofs attempt against live views: retention is
+            // judged now (deferred proofs carry their defer-time
+            // snapshot instead).
+            let proving_retained = self.views.iter().any(|view| view.id() == proof.view);
+            self.stage_owned_learn_proof(
+                pins,
+                proof,
+                loader_exe,
+                loader_unknown_reason,
+                key,
+                proving_retained,
+            );
         }
         self.owned_learn_cursor = self.owned_learn_cursor.wrapping_add(new_attempted as u64);
     }
@@ -24804,43 +24965,65 @@ impl Engine {
         (None, Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON))
     }
 
-    /// Queues one paced-out watch proof with its proving pin (F4), or
-    /// refuses it loudly with counted loss when the backlog is full.
-    /// Apply-path proofs never reach here (their rows regenerate).
-    fn defer_owned_learn_proof(&mut self, proof: &OwnedLearnProof, view: &ProcessView) {
+    /// Queues one paced-out proof whose rows cannot regenerate (F4)
+    /// with stable custody: the proving view's pin plus the proving
+    /// scan's proof-scoped pins, extracted from `source_pins` while
+    /// they still match. Refuses loudly with counted loss when the
+    /// backlog is full or when the proof names no proving file here.
+    /// Proofs from committed rows never reach here (their rows
+    /// regenerate next apply).
+    fn defer_owned_learn_proof(
+        &mut self,
+        proof: &OwnedLearnProof,
+        view: &ProcessView,
+        source_pins: &PinnedObjects,
+    ) {
         if self.owned_learn_deferred.len() >= OWNED_LEARN_DEFERRED_CAP {
             self.learned_cap_skipped = self.learned_cap_skipped.saturating_add(1);
             self.mark_partial(
                 crate::render::LEARNED_SKIP_SUBJECT,
-                "owned run learning deferred backlog is full; one watch proof refused",
+                "owned run learning deferred backlog is full; one proof refused",
             );
             return;
         }
+        let Some(stash) = source_pins.extract_proof_pins(proof.object, &proof.module) else {
+            self.learned_event_loss = self.learned_event_loss.saturating_add(1);
+            self.mark_partial(
+                crate::render::LEARNED_SKIP_SUBJECT,
+                "an owned run learning proof named no proving file; it was refused",
+            );
+            return;
+        };
+        // Snapshot the proving generation's owned-child-ness and
+        // retention from the live view: the numeric id may recycle
+        // before the drain, and the drain must judge the proving
+        // generation, never the id's current holder.
+        let proving_retained = self.views.iter().any(|known| known.id() == view.id());
+        let is_direct_child = self.owned_run_pid.is_some_and(|owned| view.pid() == owned);
         self.owned_learn_deferred.push_back(DeferredOwnedLearn {
             proof: proof.clone(),
             pin: view.retained_pin_arc().clone(),
+            scan_pins: std::rc::Rc::new(stash),
+            is_direct_child,
+            proving_retained,
         });
     }
 
-    /// Stages one attempted owned-learn proof: harvests its tables,
-    /// then duplicates, stats and files (or refuses) its provider
-    /// file exactly like a fanotify-learned file. Shared by the
-    /// backlog drain and the fresh-proof loop; the caller holds the
-    /// stride credit and supplies the charged loader naming.
+    /// Stages one attempted fresh owned-learn proof: harvests its
+    /// tables, then duplicates, stats and files (or refuses) its
+    /// provider file exactly like a fanotify-learned file. The caller
+    /// holds the stride credit and supplies the charged loader
+    /// naming; the file resolves in the caller's pins (fresh proofs
+    /// share their call's namespace).
     fn stage_owned_learn_proof(
         &mut self,
         pins: &mut PinnedObjects,
         proof: &OwnedLearnProof,
         loader_exe: Option<String>,
         loader_unknown_reason: Option<&'static str>,
-        key: (
-            PinnedObjectId,
-            crate::process::MountNamespaceId,
-            ObjectKey,
-            String,
-        ),
+        key: OwnedLearnedKey,
+        proving_retained: bool,
     ) {
-        use std::os::unix::fs::MetadataExt as _;
         self.harvest_run_learned_tables(&mut *pins, proof);
         let Some(file) = pins.file_for(proof.object) else {
             return;
@@ -24850,6 +25033,76 @@ impl Engine {
             self.owned_learn_file_probes_for_test =
                 self.owned_learn_file_probes_for_test.saturating_add(1);
         }
+        self.stage_learned_file(
+            file,
+            &proof.path,
+            loader_exe,
+            loader_unknown_reason,
+            key,
+            proving_retained,
+        );
+    }
+
+    /// Stages one drained deferred owned-learn proof: its tables
+    /// harvest from the stashed proving pins and its file stages
+    /// from the stashed handle, with aliases joining the drain
+    /// target (the draining apply's candidate, or scratch at capture
+    /// end). The caller holds the stride credit (or the capture-end
+    /// flush) and supplies the charged loader naming.
+    fn stage_deferred_owned_learn_proof(
+        &mut self,
+        target: &mut PinnedObjects,
+        entry: &DeferredOwnedLearn,
+        loader_exe: Option<String>,
+        loader_unknown_reason: Option<&'static str>,
+        key: OwnedLearnedKey,
+    ) {
+        let prepared = self.harvest_prepare(&entry.scan_pins, &entry.proof);
+        let Some(file) = entry.scan_pins.file_for(entry.proof.object) else {
+            // Unreachable via the drain (unresolvable entries refuse
+            // before their attempt): hand-built states still settle
+            // loudly, never silently, after whatever tables prepared
+            // above.
+            self.learned_event_loss = self.learned_event_loss.saturating_add(1);
+            self.mark_partial(
+                crate::render::LEARNED_SKIP_SUBJECT,
+                "a deferred owned-learn proof named no proving file; it was refused",
+            );
+            return;
+        };
+        #[cfg(test)]
+        {
+            self.owned_learn_file_probes_for_test =
+                self.owned_learn_file_probes_for_test.saturating_add(1);
+        }
+        self.stage_learned_file(
+            file,
+            &entry.proof.path,
+            loader_exe,
+            loader_unknown_reason,
+            key,
+            entry.proving_retained,
+        );
+        if let Some(module) = prepared {
+            self.harvest_commit(target, module);
+        }
+    }
+
+    /// Files one attempted proof's held provider file: duplicates,
+    /// stats and files (or refuses) it exactly like a
+    /// fanotify-learned file. Shared by fresh staging (held file
+    /// from the caller's pins) and deferred staging (held file from
+    /// the stashed proving pins).
+    fn stage_learned_file(
+        &mut self,
+        file: &std::fs::File,
+        display_path: &str,
+        loader_exe: Option<String>,
+        loader_unknown_reason: Option<&'static str>,
+        key: OwnedLearnedKey,
+        proving_retained: bool,
+    ) {
+        use std::os::unix::fs::MetadataExt as _;
         let Ok(held) = file.try_clone() else {
             return;
         };
@@ -24875,12 +25128,11 @@ impl Engine {
         // view's retention travels too: a retained prover's
         // scan-owned slots persist, so its staging owes no
         // first-use gap when the key is scan-covered.
-        let proving_retained = self.views.iter().any(|view| view.id() == proof.view);
         let learned = crate::fanotify::LearnedCandidate {
             file: held,
             dev: identity.0,
             ino: identity.1,
-            display_path: proof.path.clone(),
+            display_path: display_path.to_owned(),
             loader_exe,
             loader_unknown_reason,
             run_learned: true,
@@ -24900,15 +25152,7 @@ impl Engine {
     /// or refused. Bounded like [`Self::note_learned_settled`]: past
     /// the cap new keys are not retained and fall back to the
     /// stat-then-settled path under the per-apply stride.
-    fn note_owned_learned_staged(
-        &mut self,
-        key: (
-            PinnedObjectId,
-            crate::process::MountNamespaceId,
-            ObjectKey,
-            String,
-        ),
-    ) {
+    fn note_owned_learned_staged(&mut self, key: OwnedLearnedKey) {
         const OWNED_LEARNED_KEYS_CAP: usize = 8192;
         if self.owned_learned_staged.len() < OWNED_LEARNED_KEYS_CAP
             || self.owned_learned_staged.contains(&key)
@@ -24949,8 +25193,29 @@ impl Engine {
     /// first-map stop holds resume with table probes attached
     /// instead of at their bound.
     fn harvest_run_learned_tables(&mut self, pins: &mut PinnedObjects, proof: &OwnedLearnProof) {
+        // Fresh proofs share their call's namespace: source and
+        // target are one store. Deferred proofs split them (stashed
+        // proving pins as source, the draining store as target) via
+        // prepare/commit directly.
+        if let Some(module) = self.harvest_prepare(pins, proof) {
+            self.harvest_commit(pins, module);
+        }
+    }
+
+    /// Checks one proof's decoded tables for the run-persistent union
+    /// and merges its proving pins: the generation check reads the
+    /// proving `source` store (never the draining call's foreign
+    /// ids), and a pin gap under the reserved owner absorbs the
+    /// source and aliases there. Returns the normalized module for
+    /// [`Self::harvest_commit`], or `None` when the tables refuse
+    /// (empty, replaced generation, past the table cap).
+    fn harvest_prepare(
+        &mut self,
+        source: &PinnedObjects,
+        proof: &OwnedLearnProof,
+    ) -> Option<ScannedModule> {
         if proof.module.tables.is_empty() && proof.module.interfaces.is_empty() {
-            return;
+            return None;
         }
         // File-generation check: the union below keys on
         // (mount namespace, key, path) with no digest, so a proof
@@ -24969,7 +25234,10 @@ impl Engine {
         // per-view proof fence resolves the learned digest.
         let mut learned_query = proof.module.clone();
         learned_query.view = Self::RUN_LEARNED_VIEW_ID;
-        let generation_changed = pins
+        // The first harvest of a module has no committed pin to
+        // compare with, so run-learned refusal protects re-harvests
+        // only; the first sight always applies.
+        let generation_changed = source
             .summary(proof.object)
             .map(|summary| summary.sha256)
             .filter(|digest| !digest.is_empty())
@@ -24992,7 +25260,7 @@ impl Engine {
                     proof.path
                 );
             }
-            return;
+            return None;
         }
         let mut module = proof.module.clone();
         module.view = Self::RUN_LEARNED_VIEW_ID;
@@ -25036,7 +25304,7 @@ impl Engine {
                     proof.path
                 );
             }
-            return;
+            return None;
         }
         // Absorb the proving scan's pins while the module has a pin
         // gap under the reserved owner, then alias its raws there:
@@ -25051,7 +25319,7 @@ impl Engine {
             .pinned
             .module_aliased_under(&module, Self::RUN_LEARNED_VIEW_ID)
         {
-            let absorbed = self.pinned.absorb(pins.clone());
+            let absorbed = self.pinned.absorb(source.clone());
             attribution::note_all(&absorbed);
             for skip in absorbed {
                 if !self.counters.object_skips.contains(&skip) {
@@ -25060,17 +25328,30 @@ impl Engine {
             }
             self.pinned
                 .alias_scanned_module_under(&module, Self::RUN_LEARNED_VIEW_ID);
-            // The apply path harvests after the candidate cloned
-            // committed pins, and the commit installs that clone: file
-            // the same aliases into the candidate pins (the apply path
-            // passes &mut candidate.pinned; other callers pass scratch
-            // pins) or the commit drops the harvest and the next gap
-            // tick unbinds the run-learned modules and retires every
-            // slot.
-            pins.alias_scanned_module_under(&module, Self::RUN_LEARNED_VIEW_ID);
         }
+        Some(module)
+    }
+
+    /// Unions one prepared module into the run-persistent store and
+    /// files its aliases into the harvest `target` (the draining
+    /// apply's candidate, or scratch at capture end). The apply path
+    /// harvests after the candidate cloned committed pins, and the
+    /// commit installs that clone: without the target aliases the
+    /// commit drops the harvest and the next gap tick unbinds the
+    /// run-learned modules and retires every slot. The alias call is
+    /// idempotent, so filing unconditionally matches the old
+    /// gap-gated filing exactly (a target that already holds the
+    /// aliases from its clone gains nothing).
+    fn harvest_commit(&mut self, target: &mut PinnedObjects, module: ScannedModule) {
+        target.alias_scanned_module_under(&module, Self::RUN_LEARNED_VIEW_ID);
         let before = self.run_learned_modules.clone();
         let drops_before = self.merge_tables_dropped;
+        // Display shape for the diagnostics below (normalization
+        // keeps the path and the table/interface counts, so this
+        // matches the incoming proof exactly).
+        let display_path = module.path.clone();
+        let display_tables = module.tables.len();
+        let display_interfaces = module.interfaces.len();
         merge_scanned_module_counted(
             &mut self.run_learned_modules,
             module,
@@ -25079,16 +25360,16 @@ impl Engine {
         if crate::run::capture_diagnostics_on() {
             eprintln!(
                 "p11scope: run-learned tables for {}: {} tables {} interfaces (store {} modules)",
-                proof.path,
-                proof.module.tables.len(),
-                proof.module.interfaces.len(),
+                display_path,
+                display_tables,
+                display_interfaces,
                 self.run_learned_modules.len(),
             );
             let fresh_drops = self.merge_tables_dropped.saturating_sub(drops_before);
             if fresh_drops > 0 {
                 eprintln!(
                     "p11scope: run-learned tables for {}: {} table{} past the per-module cap dropped ({} total)",
-                    proof.path,
+                    display_path,
                     fresh_drops,
                     if fresh_drops == 1 { "" } else { "s" },
                     self.merge_tables_dropped,
@@ -25136,11 +25417,12 @@ impl Engine {
     }
 
     /// Stops file learning at capture end: joins the drain first (no
-    /// send is in flight afterwards), stages everything it sent, then
-    /// files the lost tail loudly when the drain reports one (an
-    /// unsent message or unread queue contents at shutdown). The
-    /// channel closing after the join is the expected terminal state,
-    /// never drain death. Idempotent and a no-op without a learner.
+    /// send is in flight afterwards), settles the owned-learn
+    /// backlog, stages everything sent, then files the lost tail
+    /// loudly when the drain reports one (an unsent message or unread
+    /// queue contents at shutdown). The channel closing after the
+    /// join is the expected terminal state, never drain death.
+    /// Idempotent and a no-op without a learner.
     pub(crate) fn shutdown_file_learning(&mut self) {
         let mut lost_tail = false;
         // Set before the pump below: the drain's sender closing during
@@ -25152,6 +25434,11 @@ impl Engine {
             // pin work inside the join), its tallies land as usual.
             lost_tail = learner.shutdown_and_join_pumping(|| self.service_learned_files_inner(0));
         }
+        // Settle the owned-learn backlog before the flush below: a
+        // paced-out proof queued for a member that exited would
+        // otherwise vanish silently at the boundary. Staged files
+        // join the flush normally.
+        self.drain_owned_learn_backlog_at_shutdown();
         self.flush_learned_files_at_capture_end();
         self.learned_rx = None;
         if lost_tail {
@@ -25159,6 +25446,53 @@ impl Engine {
             self.mark_partial(
                 crate::render::LEARNED_SKIP_SUBJECT,
                 crate::render::LEARNED_OVERFLOW_REASON,
+            );
+        }
+    }
+
+    /// End-of-capture drain of paced-out owned-learn proofs (F4
+    /// terminal): each queued entry stages from its stashed proving
+    /// pins (no scan store survives this late) or settles loudly
+    /// when already terminal or unresolvable. Staged files land in
+    /// `pending_learned` for the flush; table harvests file into a
+    /// scratch target (there is no candidate to install). Unbounded
+    /// like the flush: capture end has no next apply to pace toward,
+    /// and the backlog cap bounds the work (each entry pops once). A
+    /// no-op without queued entries (ordinary captures never queue).
+    fn drain_owned_learn_backlog_at_shutdown(&mut self) {
+        let mut scratch = PinnedObjects::empty();
+        while let Some(entry) = self.owned_learn_deferred.pop_front() {
+            if entry.is_direct_child {
+                continue;
+            }
+            if entry.scan_pins.file_for(entry.proof.object).is_none() {
+                self.learned_event_loss = self.learned_event_loss.saturating_add(1);
+                self.mark_partial(
+                    crate::render::LEARNED_SKIP_SUBJECT,
+                    "a deferred owned-learn proof named no proving file at capture end; it was refused",
+                );
+                continue;
+            }
+            let key = owned_learn_key(&entry.scan_pins, &entry.proof);
+            if self.owned_learned_staged.contains(&key) {
+                if let Some(module) = self.harvest_prepare(&entry.scan_pins, &entry.proof) {
+                    self.harvest_commit(&mut scratch, module);
+                }
+                continue;
+            }
+            #[cfg(test)]
+            {
+                self.owned_learn_stage_attempts_for_test =
+                    self.owned_learn_stage_attempts_for_test.saturating_add(1);
+            }
+            let (loader_exe, loader_unknown_reason) =
+                self.name_owned_learn_proof(&entry.proof, &[], None, Some(&entry.pin));
+            self.stage_deferred_owned_learn_proof(
+                &mut scratch,
+                &entry,
+                loader_exe,
+                loader_unknown_reason,
+                key,
             );
         }
     }
@@ -25824,7 +26158,9 @@ impl Engine {
                 .map(|module| module.scanned.clone())
                 .collect();
             // No tick events here: committed carried views ride through
-            // this rebuild and the choke denies them (spec §3).
+            // this rebuild and the choke denies them (spec §3). No
+            // normalize runs here: the rebuild snapshots its riding
+            // carriers itself.
             let candidate = engine.live_candidate_with_events(
                 candidate_pins,
                 raw_modules,
@@ -25832,6 +26168,7 @@ impl Engine {
                 &BTreeSet::new(),
                 &BTreeSet::new(),
                 &BTreeSet::new(),
+                None,
             )?;
             let mut additions_allowed = true;
             let outcome =
@@ -26304,6 +26641,7 @@ impl Engine {
             &BTreeSet::new(),
             fresh,
             retired,
+            None,
         );
         self.selection_claims = old_claims;
         self.selection_tables = old_tables;
@@ -33096,38 +33434,59 @@ impl Engine {
 
     /// Reclaims carrier-only pins whose final carrier just retired.
     /// `pre_carriers` holds the pinned objects that had carrier rows
-    /// before [`normalize_carried_modules`] ran; `raw_modules` and
-    /// `pins` are the post-normalize assembly inputs. An object whose
-    /// rows are all gone still holds its opened file and raw aliases
-    /// in the pin store (the exit commit carried the pin while
-    /// shedding the old view's claims, and the quiet detach edits
-    /// only the module vector) — for an otherwise unowned provider
-    /// that share pins the file and blocks handle-table reaping
-    /// forever. Each such object is removed only when no co-owner
-    /// still needs it: no rows (any view, including live and
-    /// run-learned), no claims, no raw aliases (view-owned or
-    /// global), no selection claim/table/binding reference, no
-    /// manifest-fallback replacement, and no prearm watch or witness.
-    /// Shared dependencies survive (a live row or any other owner
-    /// keeps the pin). Synchronous, like the view-retirement reclaim:
-    /// carriers merge by file, so at most a few objects retire per
-    /// tick. Returns how many pins were removed.
+    /// before this rebuild's row-loss arms ran (normalize, rejection,
+    /// binding); `bound` holds the final surviving rows and `pins`
+    /// the post-bind pin store. An object whose rows are all gone
+    /// still holds its opened file and raw aliases in the pin store
+    /// (the exit commit carried the pin while shedding the old
+    /// view's claims) — for an otherwise unowned provider that share
+    /// pins the file and blocks handle-table reaping forever. Each
+    /// such object is removed only when no co-owner still needs it:
+    /// no rows (any view, including live and run-learned), no
+    /// claims, no raw aliases (view-owned or global), no selection
+    /// claim/table/binding reference, no manifest-fallback
+    /// replacement, and no prearm watch or witness. Shared
+    /// dependencies survive (a live row or any other owner keeps the
+    /// pin). Runs once per rebuild, after every row-loss arm, so
+    /// normalize, rejection and binding losses all retire through
+    /// this one path. Removes at most one normalize stride per
+    /// assembly (retirement paces there); closes ride the commit
+    /// swap, like the view-retirement reclaim. Returns how many pins
+    /// were removed.
     fn prune_retired_carrier_pins(
         &mut self,
         pins: &mut PinnedObjects,
         pre_carriers: &BTreeSet<PinnedObjectId>,
-        raw_modules: &[ScannedModule],
+        bound: &[ReconciledModule],
     ) -> usize {
         if pre_carriers.is_empty() {
             return 0;
         }
-        let mut rowed: BTreeSet<PinnedObjectId> = BTreeSet::new();
-        for module in raw_modules {
-            if let Some(id) = pins.id_for_scanned(module, module.key, &module.path) {
-                rowed.insert(id);
-            }
-        }
+        let rowed: BTreeSet<PinnedObjectId> = bound.iter().map(|module| module.object).collect();
         let claimless = pins.carried_ids();
+        let aliased = pins.raw_aliased_ids();
+        // Co-owner references, prebuilt once per rebuild: scanning
+        // these collections per retiring id would repeat the walks
+        // per candidate. Each leg below matches the guard it
+        // precomputes exactly (see the per-clause twins).
+        let mut selection_referenced: BTreeSet<PinnedObjectId> = BTreeSet::new();
+        selection_referenced.extend(
+            self.selection_claims
+                .keys()
+                .flat_map(|key| [key.hook_owner, key.selected_object]),
+        );
+        selection_referenced.extend(self.selection_tables.values().map(|fact| fact.object));
+        selection_referenced.extend(
+            self.selection_bindings
+                .values()
+                .map(|binding| binding.object),
+        );
+        let manifest_referenced: BTreeSet<PinnedObjectId> = self
+            .counters
+            .manifest_fallbacks
+            .iter()
+            .map(|fallback| fallback.replacement)
+            .collect();
         let mut removed = 0usize;
         for id in pre_carriers
             .iter()
@@ -33137,27 +33496,13 @@ impl Engine {
             if !claimless.contains(&id) {
                 continue;
             }
-            if pins.object_has_raw_aliases(id) {
+            if aliased.contains(&id) {
                 continue;
             }
-            if self
-                .selection_claims
-                .keys()
-                .any(|key| key.hook_owner == id || key.selected_object == id)
-                || self.selection_tables.values().any(|fact| fact.object == id)
-                || self
-                    .selection_bindings
-                    .values()
-                    .any(|binding| binding.object == id)
-            {
+            if selection_referenced.contains(&id) {
                 continue;
             }
-            if self
-                .counters
-                .manifest_fallbacks
-                .iter()
-                .any(|fallback| fallback.replacement == id)
-            {
+            if manifest_referenced.contains(&id) {
                 continue;
             }
             if self.prearm.watches().contains_key(&id) {
@@ -33410,10 +33755,6 @@ impl Engine {
             absence_proven,
             &mut self.merge_tables_dropped,
         );
-        // The tick retired the final carrier for these objects (if
-        // any): reclaim their carrier-only pins now, while the
-        // assembly still knows which rows survived.
-        self.prune_retired_carrier_pins(&mut candidate_pins, &pre_carriers, &raw_modules);
         self.stage_timings.span(
             crate::timing::StageKind::Merge,
             "inventory_assemble",
@@ -33438,6 +33779,9 @@ impl Engine {
             .collect();
         let admitted: BTreeSet<ProcessViewId> =
             new_views.iter().map(|(view, _, _)| view.id()).collect();
+        // The pre-normalize carrier set rides into the rebuild so
+        // the post-bind prune retires normalize losses together
+        // with rejection and binding losses, through one path.
         let mut candidate = self.live_candidate_with_events(
             candidate_pins,
             raw_modules,
@@ -33445,6 +33789,7 @@ impl Engine {
             declined,
             &admitted,
             removed,
+            Some(&pre_carriers),
         )?;
         candidate.views.retain(|view| !carried.contains(view));
         candidate

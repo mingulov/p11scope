@@ -680,7 +680,8 @@ impl Engine {
             .collect();
         // This release retires `owner` (whose modules do not ride); retained
         // carried views ride through the rebuild and the choke denies them
-        // (spec §3).
+        // (spec §3). No normalize runs here: the rebuild snapshots its
+        // riding carriers itself.
         let retired = BTreeSet::from([owner]);
         let mut candidate = self.live_candidate_with_events(
             pinned,
@@ -689,6 +690,7 @@ impl Engine {
             &BTreeSet::new(),
             &BTreeSet::new(),
             &retired,
+            None,
         )?;
         self.preflight_candidate_publication(&candidate)?;
         record_object_skips(
@@ -1130,7 +1132,8 @@ impl Engine {
         pins.reset_scan_pin_claims();
         // The reconciled owner is this rebuild's fresh view; retained
         // carried views ride through it. The choke authorizes the former
-        // and denies the latter (spec §3).
+        // and denies the latter (spec §3). No normalize runs here: the
+        // rebuild snapshots its riding carriers itself.
         let fresh = BTreeSet::from([id]);
         let candidate = self.live_candidate_with_events(
             pins,
@@ -1139,6 +1142,7 @@ impl Engine {
             &BTreeSet::new(),
             &fresh,
             &BTreeSet::new(),
+            None,
         )?;
         let claim_count = self.views.iter().try_fold(0usize, |total, view| {
             let Some(claims) = candidate.pinned.view_claims(view.id()) else {

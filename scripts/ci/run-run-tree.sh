@@ -4,7 +4,7 @@
 # run-run-tree.sh TESTBIN OUTDIR
 # run-run-tree.sh --self-test
 #
-# Runs the 9 run-tree CLI cells (tests/run_tree.rs) as root
+# Runs the 10 run-tree CLI cells (tests/run_tree.rs) as root
 # with exact-positive judging: every cell drives the real command line
 # against SoftHSM and must exit 0 with exactly one passed test. The
 # run-tree CI job calls this on the host leg directly and inside vng
@@ -17,6 +17,7 @@
 #   privileged_run_tree_many_children_land_exact
 #   privileged_run_tree_unprearmed_shortlived_descendants_reach_high_coverage
 #   privileged_run_tree_unprearmed_shortlived_never_pause_still_learns
+#   privileged_run_tree_unprearmed_shortlived_never_pause_holds_first_mappers
 #   privileged_run_tree_unprearmed_shortlived_parallel_never_pause_covers_waves
 #   privileged_run_tree_arming_exhaustion_still_stages_and_counts
 #   privileged_run_tree_non_member_provider_is_never_staged
@@ -62,6 +63,7 @@ privileged_run_tree_outliving_child_is_disclosed
 privileged_run_tree_many_children_land_exact
 privileged_run_tree_unprearmed_shortlived_descendants_reach_high_coverage
 privileged_run_tree_unprearmed_shortlived_never_pause_still_learns
+privileged_run_tree_unprearmed_shortlived_never_pause_holds_first_mappers
 privileged_run_tree_unprearmed_shortlived_parallel_never_pause_covers_waves
 privileged_run_tree_arming_exhaustion_still_stages_and_counts
 privileged_run_tree_non_member_provider_is_never_staged
@@ -276,7 +278,7 @@ run_self_test() {
     POSITIVE='test one ... ok
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s'
     # Every curated cell passes on the healthy shape (this also pins the
-    # nine names: a dropped or renamed cell fails here, not silently). A
+    # ten names: a dropped or renamed cell fails here, not silently). A
     # declared intermittent cell's pass is an ordinary qualified pass.
     for cell in "${CELLS[@]}"; do
         LOG_BODY=$POSITIVE

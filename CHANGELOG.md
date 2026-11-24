@@ -180,7 +180,8 @@ versioned separately and are opaque, exact dispatch keys.
   only by <user>`; `root-only` only for root-owned files).
 - `run`, `inventory --cgroup` and `inventory --system` captures no
   longer drop attached providers when processes turn over; calls no
-  longer go missing without a gap row.
+  longer go missing without a gap row (verified on 6.6.157, 6.12.111
+  and 7.4-rc2; 7.3.1 was not re-run).
 - Retiring the last Joint feed no longer hides proved key-operation
   rows or erases named loss counts: the fold carries the departing
   feed's finite counters and final authority into bounded

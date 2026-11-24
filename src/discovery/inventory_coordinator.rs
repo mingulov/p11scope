@@ -45422,18 +45422,22 @@ int main(void) {
         assert_eq!((exes[0].dev, exes[0].ino), (8, 77), "{exes:?}");
     }
 
-    #[test]
-    fn a_held_backfill_never_attaches_a_superseded_exec() {
-        // EXEC A for an unjoined image waits in the held queue on its
-        // cold learn; EXEC B for the same cookie replaces it in the
-        // stash and queues behind. Where the credit that completes A's
-        // learn leaves too little for B, the pass commits with B still
-        // waiting: A's superseded pair is never attached, and B's lands
-        // once it resolves (the latest EXEC wins). The cold-path count
-        // placing that boundary is searched (deterministic per tree).
+    /// EXEC A for an unjoined image waits in the held queue on its
+    /// cold learn; EXEC B for the same cookie replaces it in the stash
+    /// and queues behind. Where the credit that completes A's learn
+    /// leaves too little for B, the pass commits with B still waiting:
+    /// A's superseded pair is never published, and B's full verdict
+    /// lands once it resolves (the latest EXEC wins). The cold-path
+    /// count placing that boundary is searched (deterministic per tree
+    /// and trust setting). Returns how many counts left B waiting.
+    fn superseded_backfill_cells(trusted: bool) -> usize {
         let mut b_waited = 0;
         for cold in 64..=127u32 {
             let (mut native, _) = NativeScene::new();
+            // Live-process reads are charged only when trusted: pin
+            // the trust inputs instead of inheriting the host's.
+            native.scene.coordinator.exit_clocks_comparable = trusted;
+            native.scene.coordinator.timens_boottime_ok = Some(trusted);
             native.scene.coordinator.set_exe_index_dirs(Vec::new());
             native.witness(vec![native.row(41, 1, 9, 210, 0)]);
             assert_eq!(
@@ -45454,9 +45458,13 @@ int main(void) {
             assert_ne!(
                 (exes[0].dev, exes[0].ino),
                 (8, 99),
-                "the superseded EXEC never publishes ({cold} cold paths)"
+                "the superseded EXEC never publishes ({cold} cold paths, trusted {trusted})"
             );
-            if !native.scene.coordinator.held_stage.is_empty() {
+            let b_is_head = matches!(
+                native.scene.coordinator.held_stage.front(),
+                Some(HeldStage::Backfill { exec, .. }) if exec.ino == 77
+            );
+            if native.scene.coordinator.held_stage.len() == 1 && b_is_head {
                 b_waited += 1;
             }
             for _ in 0..8 {
@@ -45470,10 +45478,111 @@ int main(void) {
             let exes = scene_unbound_exe(&native);
             assert_eq!((exes[0].dev, exes[0].ino), (8, 77), "{cold}: {exes:?}");
         }
+        b_waited
+    }
+
+    #[test]
+    fn a_held_backfill_never_attaches_a_superseded_exec_untrusted_reads() {
+        let waited = superseded_backfill_cells(false);
         assert!(
-            b_waited >= 1,
-            "some pass commits with B still waiting (setup pin)"
+            waited >= 1,
+            "some pass commits with only B waiting (setup pin): {waited}"
         );
+    }
+
+    #[test]
+    fn a_held_backfill_never_attaches_a_superseded_exec_trusted_reads() {
+        let waited = superseded_backfill_cells(true);
+        assert!(
+            waited >= 1,
+            "some pass commits with only B waiting (setup pin): {waited}"
+        );
+    }
+
+    #[test]
+    fn a_held_backfill_still_attaches_after_its_exec_is_pruned() {
+        // The removal arm of the superseded-backfill guard: A waits on
+        // its cold learn, then its departed pid's stash entry outlives
+        // the grace and is pruned. A did arrive and nothing replaced
+        // it, so its verdict still attaches.
+        let (mut native, _) = NativeScene::new();
+        native.scene.coordinator.set_exe_index_dirs(Vec::new());
+        native.witness(vec![native.row(41, 1, 9, 210, 0)]);
+        admit_cold_exe_callers(&mut native, 100);
+        native.execs(vec![exec_record(41, 9, 100, 8, 99)]);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            native.scene.coordinator.held_stage.len(),
+            1,
+            "A waits (setup pin)"
+        );
+        let at = native.stamps.tick();
+        native.scene.coordinator.prune_departed_native_state(at);
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(at + super::EXEC_STATE_GRACE_NS);
+        let cookie = native.row(41, 1, 9, 210, 0).cookie();
+        assert!(
+            !native.scene.coordinator.exec_exe.contains_key(&cookie),
+            "A's stash entry was pruned while it waits (setup pin)"
+        );
+        for _ in 0..8 {
+            if native.scene.coordinator.held_stage.is_empty() {
+                break;
+            }
+            native.read(Vec::new());
+        }
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(native.scene.coordinator.held_stage.is_empty());
+        let exes = scene_unbound_exe(&native);
+        assert_eq!((exes[0].dev, exes[0].ino), (8, 99), "{exes:?}");
+    }
+
+    #[test]
+    fn a_published_exec_is_replaced_at_once_when_a_newer_exec_arrives() {
+        // EXEC A attached and published; EXEC B for the same cookie
+        // then arrives while its resolution must wait (200 new cold
+        // caller paths). The commit with B waiting already names B's
+        // joined pair, provisionally without a path, never A's; B's
+        // resolved verdict replaces the provisional one later.
+        let (mut native, _) = NativeScene::new();
+        native.scene.coordinator.set_exe_index_dirs(Vec::new());
+        native.witness(vec![native.row(41, 1, 9, 210, 0)]);
+        native.execs(vec![exec_record(41, 9, 100, 8, 99)]);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(native.scene.coordinator.held_stage.is_empty());
+        let exes = scene_unbound_exe(&native);
+        assert_eq!(
+            (exes[0].dev, exes[0].ino),
+            (8, 99),
+            "A published (setup pin)"
+        );
+        admit_cold_exe_callers(&mut native, 200);
+        native.execs(vec![exec_record(41, 9, 150, 8, 77)]);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(
+            !native.scene.coordinator.held_stage.is_empty(),
+            "B waits on its learn (setup pin)"
+        );
+        let exes = scene_unbound_exe(&native);
+        assert_eq!(exes.len(), 1);
+        assert_eq!(
+            (exes[0].dev, exes[0].ino, exes[0].path.clone()),
+            (8, 77, None),
+            "{exes:?}"
+        );
+        assert_eq!(exes[0].resolution, ExeResolution::PathUnknown);
+        for _ in 0..8 {
+            if native.scene.coordinator.held_stage.is_empty() {
+                break;
+            }
+            native.read(Vec::new());
+        }
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(native.scene.coordinator.held_stage.is_empty());
+        let exes = scene_unbound_exe(&native);
+        assert_eq!((exes[0].dev, exes[0].ino), (8, 77), "{exes:?}");
     }
 
     #[test]

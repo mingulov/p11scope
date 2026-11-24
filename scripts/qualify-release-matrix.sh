@@ -31,6 +31,12 @@
 set -uo pipefail
 
 REPO=$(cd "$(dirname "$0")/.." && pwd -P)
+# Every host input (the guest stage's sources, the compiler pin, the build
+# and self-test files) is declared once in runner_inputs.py; a missing one
+# refuses here, before the first read. The guest checks its own copy.
+[ -f "$REPO/scripts/runner_inputs.py" ] || {
+  echo "qualify-release-matrix.sh: required input missing: $REPO/scripts/runner_inputs.py" >&2; exit 64; }
+python3 -I "$REPO/scripts/runner_inputs.py" check "$REPO" scripts/qualify-release-matrix.sh checkout || exit 64
 RUST=$(cat "$REPO/.release-rust-version")
 LOCK=/var/tmp/p11scope-ws-tmp/privileged.lock
 QUIET=/var/tmp/p11scope-ws-tmp/QUIET-WINDOW
@@ -52,11 +58,6 @@ CONTRACT=""
 OBJECT_ARGS=()
 GUEST_DISK_ARGS=()
 CHECKER=$REPO/scripts/release-matrix-contract.py
-# The host driver's inputs are declared once in runner_inputs.py (the guest
-# stage's are bound by --verify-inputs from the same declaration).
-[ -f "$REPO/scripts/runner_inputs.py" ] || {
-  echo "qualify-release-matrix.sh: required input missing: $REPO/scripts/runner_inputs.py" >&2; exit 64; }
-python3 -I "$REPO/scripts/runner_inputs.py" check "$REPO" scripts/qualify-release-matrix.sh checkout || exit 64
 
 usage() {
   sed -n '2,30p' "$0" >&2
@@ -307,6 +308,11 @@ PYARGS
     cat <<'INNER'
 P=$STAGE/artifacts/p11scope
 BM=$STAGE/artifacts/p11scope-bpfmulti
+# Bootstrap: the judge and the input declaration it loads; every other
+# staged input is bound by --verify-inputs below, before any runner.
+for _input in scripts/release-matrix-contract.py scripts/runner_inputs.py; do
+  [ -f "$R/$_input" ] || { echo "matrix inner: required input missing: $R/$_input" >&2; exit 64; }
+done
 python3 -I "$R/scripts/release-matrix-contract.py" --verify-launch-policy || exit 1
 [ "$(id -u)" = 0 ] || { echo 'matrix inner requires root' >&2; exit 1; }
 python3 -I "$R/scripts/release-matrix-contract.py" --verify-inputs "$STAGE" --contract "$STAGE/contract.json" || exit 1

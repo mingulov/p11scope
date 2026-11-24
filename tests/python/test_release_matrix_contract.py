@@ -569,6 +569,7 @@ class MatrixContract(unittest.TestCase):
     # (staged owner, file): why that owner never loads the file from a stage
     OUTSIDE_STAGE = {
         ("scripts/qualify-release-matrix.sh", "scripts/cargo.sh"): "build_bins builds in the checkout before staging",
+        ("scripts/qualify-release-matrix.sh", ".release-rust-version"): "the host's compiler pin; the stage never reads it",
         ("scripts/qualify-release-matrix.sh", "scripts/fixtures/exec_churn.c"):
             "build_bins hashes it in the checkout; the stage carries it as artifacts/lib-source",
         ("scripts/run-privileged-lib-tests.sh", "scripts/ci/stop-races.sh"):
@@ -588,7 +589,7 @@ class MatrixContract(unittest.TestCase):
                          if not line.lstrip().startswith("#"))
         found = set()
         for var, prefix in cls.RUNNER_REFERENCES.get(owner, ()):
-            for name in re.findall(r'\$\{?%s\}?/([A-Za-z0-9_./-]+\.(?:py|sh|c))\b' % var, text):
+            for name in re.findall(r'\$\{?%s\}?/([A-Za-z0-9_./-]+\.(?:py|sh|c)\b|\.release-rust-version)' % var, text):
                 found.add(prefix + name)
         found.update(cls.LITERAL.findall(text))
         here = str(Path(owner).parent)
@@ -628,6 +629,15 @@ class MatrixContract(unittest.TestCase):
         # A commented mention is not a reference.
         self.assertNotIn("scripts/check-ignored-tests.py", self.references("scripts/run-privileged-lib-tests.sh"))
 
+    # Read only by the host driver in a source checkout, never in a stage.
+    HOST_ONLY = {
+        ".release-rust-version": "the host's compiler pin for the candidate build and plan",
+        "scripts/cargo.sh": "build_bins builds in the checkout before staging",
+        "scripts/prepare-dependencies.py": "cargo.sh prepares pinned dependencies for that build",
+        "scripts/fixtures/exec_churn.c": "build_bins hashes it in the checkout; staged as artifacts/lib-source",
+    }
+    # Modes that read no repository input.
+    INPUT_FREE = {("scripts/run-privileged-lib-tests.sh", "list"): "--list modes print the curation, run no helper"}
     # Text that names a file without reading it (an unscheduled cell's reason).
     PROSE = {("scripts/run-privileged-lib-tests.sh", "scripts/ci/stop-races.sh")}
 
@@ -662,10 +672,19 @@ class MatrixContract(unittest.TestCase):
         for runner, modes in runners.items():
             with self.subTest(runner=runner):
                 closure = self.closure(runner)
-                self.assertEqual(set().union(*(set(inputs) for _, inputs in modes.values())), closure)
                 for mode, (where, inputs) in modes.items():
                     self.assertIn(where, (INPUTS["STAGE"], INPUTS["CHECKOUT"]))
                     self.assertEqual(len(inputs), len(set(inputs)), (runner, mode))
+                    # Per mode, never a union: a checkout mode reads the
+                    # runner's whole closure; a stage mode all of it but the
+                    # self-test and host-only files; a named mode nothing.
+                    if (runner, mode) in self.INPUT_FREE:
+                        expected = set()
+                    elif where == INPUTS["CHECKOUT"]:
+                        expected = closure
+                    else:
+                        expected = closure - self.SELF_TEST_ONLY - set(self.HOST_ONLY)
+                    self.assertEqual(set(inputs), expected, (runner, mode))
                     if where != INPUTS["STAGE"]:
                         continue
                     self.assertEqual(set(inputs) & self.SELF_TEST_ONLY, set(), (runner, mode))
@@ -752,7 +771,9 @@ class MatrixContract(unittest.TestCase):
                 ("scripts/qualify-release-matrix.sh", "checkout"): [
                     (lambda out: sh("scripts/qualify-release-matrix.sh") + ["--write-inner-stage", str(stage),
                                                                             "--contract", str(contract)],
-                     {}, False, (0, ""))],
+                     {}, False, (0, "")),
+                    (lambda out: sh("scripts/qualify-release-matrix.sh") + ["--dry-run", "--kernels", "host"],
+                     {}, False, (0, "dry-run: no build, no guests started"))],
                 ("scripts/qualify-release-matrix.sh", "stage"): [
                     (lambda out: sh("scripts/qualify-release-matrix.sh") + ["--write-inner-stage", str(stage),
                                                                             "--contract", str(contract)],
@@ -785,6 +806,7 @@ class MatrixContract(unittest.TestCase):
                             self.assertEqual(result.returncode, rc, text)
                             self.assertIn(marker, text)
                             self.assertNotIn("required input missing", text)
+                            self.assertNotIn("No such file", text)
                         elif mode == "stage":
                             self.assertEqual(result.returncode, 1, text)
                             self.assertIn(name, text)
@@ -795,6 +817,7 @@ class MatrixContract(unittest.TestCase):
                             self.assertFalse(out.exists())
                             if marker:  # refused at preflight, never at the later check
                                 self.assertNotIn(marker, text)
+                            self.assertNotIn("No such file", text)  # nothing read before preflight
                         if inner.exists():
                             inner.unlink()
                         if out.exists():
@@ -2569,7 +2592,9 @@ class MatrixContract(unittest.TestCase):
             path.chmod(0o755)
         # Every other staged source (the full SOURCE_FILES list) is a
         # controlled stand-in.
-        for name in sorted(DECLARED - {"scripts/" + p.name for p in repo.joinpath("scripts").iterdir()}):
+        shutil.copy2(ROOT / ".release-rust-version", repo / ".release-rust-version")
+        for name in sorted(DECLARED - {"scripts/" + p.name for p in repo.joinpath("scripts").iterdir()}
+                           - {".release-rust-version"}):
             path = repo / name; path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("controlled external fixture\n")
             if name.endswith(".sh"): path.chmod(0o755)
@@ -2621,6 +2646,36 @@ class MatrixContract(unittest.TestCase):
         self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
         self.assertNotIn("compiler-invoked", run.stdout + run.stderr)
         return stage, boot, run, env
+
+    def test_generated_guest_preflight_refuses_each_missing_staged_input(self):
+        # codex r11d #2: the generated guest's own preflight, after a healthy
+        # stage write. The judge and the declaration are a named bootstrap
+        # refusal (64); every other staged input is a --verify-inputs
+        # rejection (1). Neither reaches a runner (no controlled .args).
+        stage, boot, run, env = self.generated_guest()
+        self.assertTrue((self.base / "qualify-public-cli.sh.args").is_file(), run.stdout + run.stderr)
+        source = stage / "artifacts/source"
+        for name in sorted(CHECKER_MOD["SOURCE_FILES"]):
+            with self.subTest(missing=name):
+                for marker in self.base.glob("*.args"):
+                    marker.unlink()
+                path = source / name
+                content, bits = path.read_bytes(), path.stat().st_mode
+                path.unlink()
+                try:
+                    result = subprocess.run(["bash", str(stage / "inner.sh")], cwd=ROOT, capture_output=True,
+                                            text=True, env=env, timeout=30)
+                finally:
+                    path.write_bytes(content); path.chmod(bits)
+                text = result.stdout + result.stderr
+                if name in ("scripts/release-matrix-contract.py", "scripts/runner_inputs.py"):
+                    self.assertEqual(result.returncode, 64, text)
+                    self.assertIn("matrix inner: required input missing: %s" % path, text)
+                else:
+                    self.assertEqual(result.returncode, 1, text)
+                    self.assertIn(name, text)
+                    self.assertNotIn("required input missing", text)
+                self.assertEqual(sorted(p.name for p in self.base.glob("*.args")), [])
 
     def test_generated_guest_executes_mt12_exact_selectors_and_fails_bad_evidence(self):
         self.generated_guest()

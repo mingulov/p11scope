@@ -1319,6 +1319,11 @@ impl HolderScanBudget {
     fn queued_holds(&self) -> u64 {
         self.queued_holds.get()
     }
+
+    #[cfg(test)]
+    fn spent_for_test(&self) -> u64 {
+        self.spent.get()
+    }
 }
 
 /// Deferred leader-exit hooks: stamps that did not fit their
@@ -1460,6 +1465,37 @@ mod holder_scan_state_tests {
         pool.reset();
         assert_eq!(pool.deferrals(), 0);
         assert!(pool.try_charge(1_100));
+    }
+
+    #[test]
+    fn holder_pool_reservation_holds_are_not_pool_exhaustion() {
+        // An ordinary scan refused only by the held front's
+        // reservation (its total fits the pool) waits for the front:
+        // it counts no budget deferral, and the front's own scan
+        // still spends past the reservation up to the limit. Only a
+        // total past the limit exhausts the pool.
+        let pool = HolderScanBudget::new();
+        pool.set_reservation(1_100);
+        assert!(pool.try_charge(64_436));
+        assert!(
+            !pool.try_charge(1_100),
+            "the reservation holds the ordinary scan"
+        );
+        assert_eq!(
+            pool.deferrals(),
+            0,
+            "a reservation hold is not pool exhaustion"
+        );
+        assert!(
+            pool.try_charge_front(1_100),
+            "the front spends its reservation"
+        );
+        assert!(!pool.try_charge(1), "the spent pool refuses past the limit");
+        assert_eq!(
+            pool.deferrals(),
+            1,
+            "only the over-limit refusal exhausts"
+        );
     }
 
     #[test]
@@ -38370,6 +38406,75 @@ int main(void) {
     }
 
     #[test]
+    fn a_system_scope_resight_deferred_exit_scan_retries_before_the_late_live_query() {
+        // A sightingless row read Absent (no deferral at read) whose
+        // re-sight exit scan defers on a queued hook must still
+        // consult its exit interval before any late live query: the
+        // live successor arrived after the event, so the row binds
+        // its true holder and the retry spends no native query.
+        agreeing(|| {
+            let (mut native, holders) = hot_pid_system_native(1100);
+            native.read(hot_rows(&native, 0, 3));
+            assert_eq!(
+                native.scene.coordinator.binder.owed_len_for_test(),
+                3,
+                "the Absent read owes every row with no deferral"
+            );
+            assert_eq!(
+                native.cookies.queries, 0,
+                "no live caller at read time, no query"
+            );
+            // A storm stamps the hot pid's exits and queues one more
+            // hook: the next re-sight finds the exit interval
+            // relevant but deferred on the queued hook.
+            let hot: Vec<u64> = (0..59).map(|i| 1_050 + i * 100).collect();
+            let at = native.stamps.tick();
+            let mut storm = leader_exit_drain_many(native.domain, at, 7, &hot);
+            let tail = leader_exit_drain_many(native.domain, at, 7, &[1_050 + 59 * 100]);
+            storm.records.extend(tail.records);
+            native.stage(NativeBatch::Lifecycle(storm));
+            assert_eq!(
+                native.scene.coordinator.deferred_hooks.queue_len_for_test(),
+                1,
+                "the storm queues exactly the tail hook"
+            );
+            // The re-sight defers on the queued hook without spending
+            // a query; the rows keep their owed attempts.
+            native.read(Vec::new());
+            assert_eq!(
+                native.scene.coordinator.binder.owed_len_for_test(),
+                3,
+                "the deferred re-sight keeps every row owed"
+            );
+            assert_eq!(
+                native.cookies.queries, 0,
+                "a deferred scan queries nothing"
+            );
+            // A live successor arrives before the retry and would
+            // answer the deferred rows' tickets.
+            native.scene.source.spawn(7, 1600);
+            native.scene.coordinator.adapter.reconcile_detected(
+                &[7].into_iter().collect(),
+                &mut |_| ImageAuthority::ScanPinned,
+                300_000,
+                &mut || Some(400_000),
+            );
+            native.scene.project(7, 400_010);
+            native.scene.coordinator.commit_batch(false).unwrap();
+            native.answer(7, 1600, 5059);
+            native.drain();
+            native.witness(Vec::new());
+            native.witness(Vec::new());
+            assert_eq!(
+                native.cookies.queries, 0,
+                "the exit retry runs before any live query"
+            );
+            assert_eq!(bound_census(&native), (3, 3, 0));
+            assert_holders_edged(&native, &holders[..3]);
+        });
+    }
+
+    #[test]
     fn a_system_scope_absent_exit_retry_does_not_rescan_on_its_miss() {
         // A deferred exit retry that answers Absent keeps that answer
         // for its visit: when the live lookup then misses, the pass
@@ -38872,6 +38977,48 @@ int main(void) {
     }
 
     #[test]
+    fn a_system_scope_reservation_hold_files_no_pool_exhaustion_gap() {
+        // A staging whose ordinary scans waited only on the held
+        // front's reservation files the reservation wait with no
+        // budget-overrun payload, never the pool-exhausted gap: no
+        // attempted total passed the pool.
+        let mut scene = CaptureScene::new(2);
+        let coordinator = &mut scene.coordinator;
+        coordinator.holder_pool.reset();
+        coordinator.holder_pool.set_reservation(1_100);
+        assert!(coordinator.holder_pool.try_charge(64_436));
+        assert!(!coordinator.holder_pool.try_charge(1_100));
+        let staged_before = coordinator.registry.staged_gaps_for_test().len();
+        coordinator.record_holder_pool_exhaustion();
+        let staged = coordinator.registry.staged_gaps_for_test();
+        let fresh = &staged[staged_before..];
+        assert_eq!(
+            fresh.len(),
+            1,
+            "the holding staging files exactly one gap: {fresh:?}"
+        );
+        assert_eq!(
+            fresh[0].subject, "holder scans held for the front's reservation",
+            "a reservation hold names the wait: {fresh:?}"
+        );
+        assert_eq!(
+            fresh[0].budget, None,
+            "a reservation hold carries no budget-overrun payload: {fresh:?}"
+        );
+        // A later staging without holds files nothing: no stale wait
+        // leaks past the pool reset.
+        coordinator.holder_pool.reset();
+        let staged_before = coordinator.registry.staged_gaps_for_test().len();
+        coordinator.record_holder_pool_exhaustion();
+        let staged = coordinator.registry.staged_gaps_for_test();
+        assert!(
+            staged[staged_before..].is_empty(),
+            "no stale wait leaks past the reset: {:?}",
+            &staged[staged_before..]
+        );
+    }
+
+    #[test]
     fn a_system_scope_blinded_hook_drain_visits_charge_the_pool() {
         // Draining queued hooks of a pid blinded after they queued
         // still visits every entry: those visits charge the staging's
@@ -39131,6 +39278,66 @@ int main(void) {
                 native.scene.coordinator.deferred_hooks.queue_len_for_test(),
                 3,
                 "the drain's visit cost holds one more fresh hook"
+            );
+        });
+    }
+
+    #[test]
+    fn a_system_scope_zero_holder_drain_visit_charges_one_unit() {
+        // A queued hook whose holders all folded still pays for its
+        // drain visit: the stamp scan finds no holders, but the visit
+        // costs exactly one unit of its staging's pool.
+        agreeing(|| {
+            let mut scene = CaptureScene::new(2);
+            scene
+                .coordinator
+                .begin_capture_coverage(CaptureScopeCoverage::System);
+            let mut native = NativeScene::over(scene, 0);
+            native.scene.attach_all(100, ScopeCustody::System);
+            let _storm = admit_hot_pid(&mut native.scene, 7, 1100);
+            let doomed = admit_hot_pid(&mut native.scene, 9, 1100);
+            native.scene.coordinator.commit_batch(false).unwrap();
+            native.scene.coordinator.engine.scope = Scope::System;
+            native.scene.coordinator.exit_clocks_comparable = true;
+            // Fifty-nine hot hooks spend the pool; pid 9's hook
+            // queues behind them.
+            let hot: Vec<u64> = (0..59).map(|i| 200_000 + i).collect();
+            let at = native.stamps.tick();
+            let mut storm = leader_exit_drain_many(native.domain, at, 7, &hot);
+            let small = leader_exit_drain_many(native.domain, at, 9, &[1001]);
+            storm.records.extend(small.records);
+            native.stage(NativeBatch::Lifecycle(storm));
+            assert_eq!(
+                native.scene.coordinator.deferred_hooks.queue_len_for_test(),
+                1,
+                "pid 9's hook queues past the spent pool"
+            );
+            // Every holder folds while the hook queues: the visit
+            // finds no holders left.
+            native.scene.coordinator.note_rendered_callers(&doomed);
+            let receipt = native
+                .scene
+                .coordinator
+                .retire_rendered_callers(600, None);
+            assert_eq!(
+                receipt.retired, 1100,
+                "every holder folds before the drain"
+            );
+            assert_eq!(
+                native.scene.coordinator.adapter.proven_count(9),
+                0,
+                "no holder survives the fold"
+            );
+            native.drain();
+            assert_eq!(
+                native.scene.coordinator.deferred_hooks.queue_len_for_test(),
+                0,
+                "the zero-holder hook drains"
+            );
+            assert_eq!(
+                native.scene.coordinator.holder_pool.spent_for_test(),
+                1,
+                "the zero-holder visit costs exactly one unit"
             );
         });
     }

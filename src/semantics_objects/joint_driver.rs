@@ -537,6 +537,14 @@ impl JointCaptureOwner {
         self.void_cleanup.is_some() || self.adapter.scoped_recovery.is_some()
     }
 
+    /// Whether a sliced scoped recovery stands: its Voiding visits
+    /// charge per entry against the tick budget (so collection
+    /// behind it sees the honest remainder), while stream sweeps
+    /// keep the coarse visit credit.
+    pub(crate) fn scoped_recovery_pending(&self) -> bool {
+        self.adapter.scoped_recovery.is_some()
+    }
+
     /// Publish a completed void cleanup into `pending_void`, merging
     /// fences exactly as the synchronous void did.
     fn publish_void_cleanup(&mut self) {

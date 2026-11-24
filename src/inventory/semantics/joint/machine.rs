@@ -1448,6 +1448,11 @@ pub(crate) struct LiveJointMachine {
     /// frontier stand, so a scan that consumed its whole reserve
     /// still leaves the next tick's reserve to the park.
     watchdog_barrier_decision: Option<WatchdogBarrierDecision>,
+    /// Skip the absence scan on the next Idle visit only: a sliced
+    /// recovery that just completed continues its pre-void visit
+    /// (void check, then collection on the honest remainder)
+    /// instead of restarting the scan. Taken at Idle entry.
+    skip_absence_once: bool,
     /// Set when the running service latched an audit-step refusal (at
     /// Auditing, or at Audited with its retained frame) the exit
     /// abandon can dispose in full; cleared by the re-arm. Every other
@@ -1567,6 +1572,7 @@ impl LiveJointMachine {
             audit_no_progress_polls: 0,
             audit_no_progress_trip: None,
             watchdog_barrier_decision: None,
+            skip_absence_once: false,
             rearm_eligible: false,
             running_rearms: 0,
             rearm_window: [None; RUNNING_REARM_LIMIT as usize],
@@ -3374,7 +3380,13 @@ impl LiveJointMachine {
                 // No collection, binder or New can precede this scan. One
                 // accepted current image is paired with one real attached
                 // target per action; no Mapped-only selector/cross-product.
-                if q.is_none()
+                // A sliced recovery that just completed continues its
+                // pre-void visit below (void check, then collection on
+                // the honest remainder) instead of restarting the
+                // scan: the next visit scans normally.
+                let skip_absence = std::mem::take(&mut self.skip_absence_once);
+                if !skip_absence
+                    && q.is_none()
                     && self.grant.is_some()
                     && let Some((binding, adapter)) =
                         coordinator.joint_absence_parts(self.absence_binding)
@@ -3515,7 +3527,13 @@ impl LiveJointMachine {
                         Err(_) => return (Phase::Idle, Err(SemanticRefusal::Unavailable)),
                     };
                     if started && coordinator.joint_capture().void_cleanup_pending() {
-                        budget.spend(1);
+                        // The transition credit pays the stream void's
+                        // synchronous start work; a begun scoped
+                        // recovery charges exactly per entry in its
+                        // slices, so it takes no credit here.
+                        if !coordinator.joint_capture().scoped_recovery_pending() {
+                            budget.spend(1);
+                        }
                         return (Phase::Voiding, Ok(Step::Continue));
                     }
                     if started {
@@ -3626,15 +3644,26 @@ impl LiveJointMachine {
             }
             Phase::Voiding => {
                 // One resumable void credit: at most 64 leaf units of
-                // slot/link sweep, debiting one action. Collection and
-                // publication stay deferred until the sweep completes and
-                // the owner publishes the fenced void. Shared by running
-                // and Finish (both arrive here from Idle).
+                // slot/link sweep, debiting one action — or one scoped
+                // recovery slice, debiting exactly what it drove (per
+                // entry, like the bounded seam, so collection behind
+                // it sees the honest remainder; an empty completion
+                // spends nothing but still needs the live budget).
+                // Collection and publication stay deferred until the
+                // sweep completes and the owner publishes the fenced
+                // void. Shared by running and Finish (both arrive here
+                // from Idle).
                 if !budget.available() {
                     return (Phase::Voiding, Ok(Step::Yield));
                 }
-                let (done, _spent) = coordinator.joint_capture_mut().poll_void_cleanup(64);
-                budget.spend(1);
+                let scoped = coordinator.joint_capture().scoped_recovery_pending();
+                let units = if scoped {
+                    budget.remaining_actions.min(64)
+                } else {
+                    64
+                };
+                let (done, spent) = coordinator.joint_capture_mut().poll_void_cleanup(units);
+                budget.spend(if scoped { spent } else { 1 });
                 if !done {
                     return (Phase::Voiding, Ok(Step::Continue));
                 }
@@ -3662,6 +3691,7 @@ impl LiveJointMachine {
                                 .label()
                         ),
                     );
+                    self.skip_absence_once = true;
                     return (Phase::Idle, Ok(Step::Continue));
                 }
                 coordinator.start_staged_disposal();

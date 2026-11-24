@@ -1607,6 +1607,8 @@ struct HolderScanBudget {
     deferrals: Cell<u64>,
     queued_holds: Cell<u64>,
     reserved: Cell<u64>,
+    reserved_holds: Cell<u64>,
+    over_limit_attempted: Cell<u64>,
 }
 
 impl HolderScanBudget {
@@ -1616,6 +1618,8 @@ impl HolderScanBudget {
             deferrals: Cell::new(0),
             queued_holds: Cell::new(0),
             reserved: Cell::new(0),
+            reserved_holds: Cell::new(0),
+            over_limit_attempted: Cell::new(0),
         }
     }
 
@@ -1628,6 +1632,8 @@ impl HolderScanBudget {
         self.deferrals.set(0);
         self.queued_holds.set(0);
         self.reserved.set(0);
+        self.reserved_holds.set(0);
+        self.over_limit_attempted.set(0);
     }
 
     /// Reserve `units` of this staging's pool for the held front's
@@ -1639,9 +1645,11 @@ impl HolderScanBudget {
         self.reserved.set(units as u64);
     }
 
-    /// Charge `units` holder inspections, or defer: false past the
-    /// pool minus the held front's reservation (counting one deferral
-    /// for the named exhaustion gap).
+    /// Charge `units` holder inspections, or refuse: false past the
+    /// pool minus the held front's reservation. A refusal past the
+    /// pool counts one deferral for the named exhaustion gap; a
+    /// refusal within the pool (held for the reservation alone)
+    /// counts one reservation wait instead.
     fn try_charge(&self, units: usize) -> bool {
         self.charge_against(units, Self::limit().saturating_sub(self.reserved.get()))
     }
@@ -1657,21 +1665,50 @@ impl HolderScanBudget {
         let units = units as u64;
         let next = self.spent.get().saturating_add(units);
         if next > cap {
-            self.note_deferral();
+            if next > Self::limit() {
+                self.note_deferral(next);
+            } else {
+                // Over the reservation-capped allowance but within
+                // the pool: the scan waits for the held front, it
+                // does not exhaust the pool.
+                self.note_reserved_hold();
+            }
             return false;
         }
         self.spent.set(next);
         true
     }
 
-    /// One scan that actually spent past the pool: counts for the
-    /// budgeted exhaustion gap.
-    fn note_deferral(&self) {
+    /// One scan whose total actually passed the pool: counts for the
+    /// budgeted exhaustion gap, keeping the largest attempted total
+    /// for its payload.
+    fn note_deferral(&self, attempted: u64) {
         self.deferrals.set(self.deferrals.get().saturating_add(1));
+        self.over_limit_attempted
+            .set(self.over_limit_attempted.get().max(attempted));
     }
 
     fn deferrals(&self) -> u64 {
         self.deferrals.get()
+    }
+
+    /// One scan held without charging for the held front's
+    /// reservation: counts for the unbudgeted reservation-wait gap,
+    /// never the exhaustion payload.
+    fn note_reserved_hold(&self) {
+        self.reserved_holds
+            .set(self.reserved_holds.get().saturating_add(1));
+    }
+
+    fn reserved_holds(&self) -> u64 {
+        self.reserved_holds.get()
+    }
+
+    /// The largest attempted holder-scan total refused past the
+    /// pool this staging (past the limit whenever a deferral
+    /// counted): the exhaustion gap reports it.
+    fn over_limit_attempted(&self) -> u64 {
+        self.over_limit_attempted.get()
     }
 
     /// One scan held without charging (its pid's stamps are
@@ -11011,8 +11048,21 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 budget: Some(BudgetRefusal {
                     resource: "holder_scan_units",
                     limit: HolderScanBudget::limit() as usize,
-                    requested: HolderScanBudget::limit() as usize + 1,
+                    requested: self.holder_pool.over_limit_attempted() as usize,
                 }),
+            });
+        }
+        if self.holder_pool.reserved_holds() > 0 {
+            self.registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: "holder scans held for the front's reservation".into(),
+                reason: "a per-PID holder scan waited on capacity reserved for the held \
+                     front's decide-time revalidation; the owed rows and held decisions \
+                     retry on a later batch"
+                    .into(),
+                budget: None,
             });
         }
         if self.holder_pool.queued_holds() > 0 {
@@ -14820,6 +14870,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// handoffs release their custody now; staged facts still drain
     /// through `commit_batch`. The classic loop calls this exactly
     /// once per run through `LaneHost::stop_coordinator`.
+    #[cfg_attr(not(test), allow(dead_code))] // Reached via `LaneHost::stop_coordinator` on every stop path.
     pub(crate) fn stop(&mut self) {
         if self.stopped {
             return;
@@ -46415,7 +46466,9 @@ int main(void) {
     fn a_system_scope_pool_charge_failure_keeps_its_budget_payload() {
         // A staging that actually spends past the holder-scan pool
         // files the pool-exhausted gap with its structured budget,
-        // beside any queue-only wait.
+        // beside any queue-only wait. The payload reports the actual
+        // attempted total: 59 hot scans spend 64,900 units, so the
+        // 60th scan's attempt reaches 66,000 past the 65,536 pool.
         agreeing(|| {
             let (mut native, _) = hot_pid_system_native(1100);
             let staged_before = native
@@ -46442,7 +46495,7 @@ int main(void) {
                             == Some(crate::discovery::caller_registry::BudgetRefusal {
                                 resource: "holder_scan_units",
                                 limit: 65_536,
-                                requested: 65_537,
+                                requested: 66_000,
                             })),
                 "a charge failure files the budgeted gap: {fresh:?}"
             );

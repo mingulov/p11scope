@@ -1825,8 +1825,20 @@ impl SemanticCapture {
     /// image, so its next continued observation offers one more birth
     /// for a reseed. Only the Joint machine calls this, for the
     /// coordinator's reseed queue. Returns how many keys re-armed.
-    pub(crate) fn rearm_image_for_reseed(&mut self, image: ImageIdentity) -> usize {
+    pub(crate) fn rearm_image_for_reseed(&mut self, image: ImageIdentity) -> (usize, bool) {
         self.router.rearm_image_for_reseed(image)
+    }
+
+    /// Test-only re-arm scan visits (seal work bound).
+    #[cfg(test)]
+    pub(crate) fn rearm_scan_visits_for_test(&self) -> usize {
+        self.router.rearm_scan_visits_for_test()
+    }
+
+    /// Test-only: reset the re-arm scan counter.
+    #[cfg(test)]
+    pub(crate) fn reset_rearm_scan_visits_for_test(&self) {
+        self.router.reset_rearm_scan_visits_for_test()
     }
 
     /// Count coordinator admissions that found no binding for their

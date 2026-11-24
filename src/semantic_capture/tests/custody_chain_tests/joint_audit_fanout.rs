@@ -42054,21 +42054,40 @@ fn seal_walk_reseed_scans_visit_at_most_64() {
         let (held, attached) = HeldProviders::with_attachment(1, &["C_CreateObject"]);
         let mut scene = JointScene::from_held(held, Some(attached));
         let coordinator = &mut scene.real.scene.coordinator;
-        coordinator
-            .registry_mut()
-            .pose_many_feeds_for_test(feeds);
+        coordinator.registry_mut().pose_many_feeds_for_test(feeds);
         coordinator.registry().reset_reseed_visits_for_test();
-        coordinator.queue_reseed_for_awaiting_feeds();
-        coordinator.tick_reseed_cooldowns();
-        let (queue, tick, _) = coordinator.registry().reseed_visits_for_test();
-        assert!(
-            queue <= 64,
-            "{feeds} feeds: reseed queue scan visited {queue}, bound is 64"
-        );
-        assert!(
-            tick <= 64,
-            "{feeds} feeds: cooldown tick visited {tick}, bound is 64"
-        );
+        // Sliced scans: each call visits at most 64 rows; loop to
+        // completion and bound every slice.
+        let mut calls = 0;
+        loop {
+            let before = coordinator.registry().reseed_visits_for_test().0;
+            let (_, done) = coordinator.queue_reseed_for_awaiting_feeds();
+            let slice = coordinator.registry().reseed_visits_for_test().0 - before;
+            calls += 1;
+            assert!(
+                slice <= 64,
+                "{feeds} feeds: queue slice {calls} visited {slice}, bound is 64"
+            );
+            if done {
+                break;
+            }
+            assert!(calls < 10, "65 feeds complete in two slices");
+        }
+        let mut calls = 0;
+        loop {
+            let before = coordinator.registry().reseed_visits_for_test().1;
+            let done = coordinator.tick_reseed_cooldowns();
+            let slice = coordinator.registry().reseed_visits_for_test().1 - before;
+            calls += 1;
+            assert!(
+                slice <= 64,
+                "{feeds} feeds: tick slice {calls} visited {slice}, bound is 64"
+            );
+            if done {
+                break;
+            }
+            assert!(calls < 10, "65 feeds complete in two slices");
+        }
     }
 }
 
@@ -42085,12 +42104,26 @@ fn seal_walk_rearm_visits_at_most_64() {
     let mut owned = scene.real.h0.0.borrow_mut();
     let HeldH0 { capture, .. } = &mut *owned;
     capture.reset_rearm_scan_visits_for_test();
-    let _ = capture.rearm_image_for_reseed(image);
-    assert!(
-        capture.rearm_scan_visits_for_test() <= 64,
-        "65 observed keys: re-arm visited {}, bound is 64",
-        capture.rearm_scan_visits_for_test(),
-    );
+    // Sliced re-arm: each call visits at most 64 files; loop to
+    // completion and bound every slice.
+    let mut total = 0;
+    let mut calls = 0;
+    loop {
+        let before = capture.rearm_scan_visits_for_test();
+        let (rearmed, done) = capture.rearm_image_for_reseed(image);
+        let slice = capture.rearm_scan_visits_for_test() - before;
+        calls += 1;
+        assert!(
+            slice <= 64,
+            "re-arm slice {calls} visited {slice}, bound is 64"
+        );
+        total += rearmed;
+        if done {
+            break;
+        }
+        assert!(calls < 10, "65 files complete in two slices");
+    }
+    assert_eq!(total, 65, "all 65 files re-arm across slices");
 }
 
 /// Seal work bound: an image-router check visits at most 64 registry

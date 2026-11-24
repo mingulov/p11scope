@@ -2458,13 +2458,14 @@ impl AttestedSemanticLane {
     /// image on the live capture's router. Only the Joint machine
     /// calls this, for the coordinator's reseed queue. A shell lane
     /// has no capture and re-arms nothing. Returns how many keys
-    /// re-armed.
-    pub(crate) fn rearm_image_for_reseed(&mut self, image: ImageIdentity) -> usize {
+    /// re-armed this call and whether the image completed (see the
+    /// router's sliced re-arm).
+    pub(crate) fn rearm_image_for_reseed(&mut self, image: ImageIdentity) -> (usize, bool) {
         #[cfg(test)]
         self.reseed_rearm_calls.push(image);
         self.live
             .as_mut()
-            .map_or(0, |live| live.capture.rearm_image_for_reseed(image))
+            .map_or((0, true), |live| live.capture.rearm_image_for_reseed(image))
     }
 
     /// Tests-only reseed wiring log: every image the Joint machine

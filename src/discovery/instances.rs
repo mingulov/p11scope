@@ -870,6 +870,11 @@ pub(crate) struct InstanceRouter {
     /// visited (seal work bound). Production pays nothing.
     #[cfg(test)]
     rearm_scan_visits: std::cell::Cell<usize>,
+    /// Resumable re-arm cursor per image (INV-2): the next file slot
+    /// to arm. Absent starts from the first file; completion removes
+    /// the entry. Retirements and evictions leave stale cursors
+    /// harmless (the range scan skips missing keys).
+    rearm_progress: BTreeMap<ImageKey, u32>,
 }
 
 pub(crate) struct ObservationLoss {
@@ -956,6 +961,7 @@ impl InstanceRouter {
             carry_ranges: 0,
             #[cfg(test)]
             rearm_scan_visits: std::cell::Cell::new(0),
+            rearm_progress: BTreeMap::new(),
         }
     }
 
@@ -1088,36 +1094,71 @@ impl InstanceRouter {
     /// Re-arm the birth retry for every observed file of one voided
     /// image, so its next continued observation offers one more birth
     /// for a reseed. Unknown and retired images re-arm nothing.
-    /// Returns how many keys re-armed.
-    pub(crate) fn rearm_image_for_reseed(&mut self, image: ImageIdentity) -> usize {
+    /// Re-arm one image's birth retries for a reseed, in slices of
+    /// at most 64 files (INV-2): returns how many keys re-armed this
+    /// call and whether the image completed. A retired image
+    /// completes at once with zero. The ordered scan visits only
+    /// this image's files from its cursor; callers loop until done,
+    /// spending one credit per call.
+    pub(crate) fn rearm_image_for_reseed(&mut self, image: ImageIdentity) -> (usize, bool) {
+        const REARM_SLICE: usize = 64;
         let key = ImageKey::from(image);
         if self.image_retired(key) {
-            return 0;
+            self.rearm_progress.remove(&key);
+            return (0, true);
         }
+        let from = self.rearm_progress.get(&key).copied().unwrap_or(0);
+        let mut files = Vec::new();
         #[cfg(test)]
         let mut visited = 0usize;
-        let files: Vec<u32> = self
-            .observed
-            .keys()
-            .filter_map(|(owner, file)| {
-                #[cfg(test)]
-                {
-                    visited += 1;
-                }
-                (*owner == key).then_some(*file)
-            })
-            .collect();
+        for ((owner, file), _) in self.observed.range((
+            std::ops::Bound::Included((key, from)),
+            std::ops::Bound::Unbounded,
+        )) {
+            if *owner != key {
+                break;
+            }
+            #[cfg(test)]
+            {
+                visited += 1;
+            }
+            files.push(*file);
+            if files.len() >= REARM_SLICE {
+                break;
+            }
+        }
         #[cfg(test)]
         self.rearm_scan_visits
             .set(self.rearm_scan_visits.get().saturating_add(visited));
         let mut rearmed = 0;
-        for file in files {
-            self.arm_birth_retry((key, file));
-            if self.birth_retry.contains_key(&(key, file)) {
+        let mut last = None;
+        for file in &files {
+            self.arm_birth_retry((key, *file));
+            if self.birth_retry.contains_key(&(key, *file)) {
                 rearmed += 1;
             }
+            last = Some(*file);
         }
-        rearmed
+        // Done unless a further file for this image exists past the
+        // last one armed (a short slice always completes).
+        let more = files.len() >= REARM_SLICE
+            && last.is_some_and(|last| {
+                self.observed
+                    .range((
+                        std::ops::Bound::Excluded((key, last)),
+                        std::ops::Bound::Unbounded,
+                    ))
+                    .next()
+                    .is_some_and(|((owner, _), _)| *owner == key)
+            });
+        if more {
+            let next = last.map_or(from, |last| last.saturating_add(1));
+            self.rearm_progress.insert(key, next);
+            (rearmed, false)
+        } else {
+            self.rearm_progress.remove(&key);
+            (rearmed, true)
+        }
     }
 
     /// Test-only re-arm scan visits (seal work bound).

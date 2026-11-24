@@ -689,7 +689,7 @@ mod full_image {
         );
         r.end_birth_retry(identity, FILE);
         assert!(!r.birth_retry_armed(identity, FILE));
-        assert_eq!(r.rearm_image_for_reseed(identity), 1);
+        assert_eq!(r.rearm_image_for_reseed(identity), (1, true));
         assert!(r.birth_retry_armed(identity, FILE));
         assert!(
             r.note_birth_offer(identity, FILE, Q::scripted(99)),
@@ -697,13 +697,13 @@ mod full_image {
         );
         assert_eq!(
             r.rearm_image_for_reseed(image(0x99, 0)),
-            0,
+            (0, true),
             "an unknown image re-arms nothing"
         );
         r.retire_image(identity);
         assert_eq!(
             r.rearm_image_for_reseed(identity),
-            0,
+            (0, true),
             "a retired image re-arms nothing"
         );
     }

@@ -1659,6 +1659,11 @@ pub(super) struct InstanceState {
     records: BTreeMap<RegistryInstanceId, InstanceRecord>,
     semantics: BTreeMap<RegistryInstanceId, InstanceSemanticRecord>,
     by_key: HashMap<InstanceKey, RegistryInstanceId>,
+    /// Refcount of applied keys by (task cookie, exec id, router)
+    /// (INV-2): the re-offer guard reads this instead of scanning
+    /// `by_key`. Domain and module stay ignored (a superset, fail
+    /// safe). Maintained beside every `by_key` mutation.
+    by_image_router: HashMap<(u64, u64, u64), usize>,
     next_id: u32,
     limit: usize,
     occupied: usize,
@@ -1718,6 +1723,12 @@ pub(super) struct InstanceState {
     cooldown_tick_visits: std::cell::Cell<usize>,
     #[cfg(test)]
     image_router_check_visits: std::cell::Cell<usize>,
+    /// Resumable reseed-scan cursors (INV-2): the last semantic id
+    /// visited. Absent starts from the first record; completion
+    /// clears the cursor. Retirements leave stale cursors harmless
+    /// (the range scan skips missing ids).
+    reseed_queue_after: Option<RegistryInstanceId>,
+    cooldown_after: Option<RegistryInstanceId>,
 }
 
 impl Default for InstanceState {
@@ -1726,6 +1737,7 @@ impl Default for InstanceState {
             records: BTreeMap::new(),
             semantics: BTreeMap::new(),
             by_key: HashMap::new(),
+            by_image_router: HashMap::new(),
             next_id: 0,
             limit: MAX_REGISTRY_INSTANCES,
             occupied: 0,
@@ -1755,6 +1767,8 @@ impl Default for InstanceState {
             cooldown_tick_visits: std::cell::Cell::new(0),
             #[cfg(test)]
             image_router_check_visits: std::cell::Cell::new(0),
+            reseed_queue_after: None,
+            cooldown_after: None,
         }
     }
 }
@@ -2524,7 +2538,48 @@ impl CallerRegistry {
     /// The Joint machine drains this after births to re-arm their
     /// router retries.
     pub(crate) fn drain_joint_reseed_queue(&mut self) -> Vec<p11scope_ebpf_common::ImageIdentity> {
+        self.joint_reseed_queued.clear();
         std::mem::take(&mut self.joint_reseed_queue)
+    }
+
+    /// Pop one queued reseed image (O(1)).
+    pub(crate) fn pop_joint_reseed_queue(&mut self) -> Option<p11scope_ebpf_common::ImageIdentity> {
+        self.joint_reseed_queue.pop()
+    }
+
+    /// Push one unfinished reseed image back (O(1)).
+    pub(crate) fn push_joint_reseed_queue(&mut self, image: p11scope_ebpf_common::ImageIdentity) {
+        Self::reseed_queued_inc(
+            &mut self.joint_reseed_queued,
+            (image.task_cookie, image.exec_id),
+        );
+        self.joint_reseed_queue.push(image);
+    }
+
+    /// Count one queued reseed image.
+    fn reseed_queued_inc(
+        index: &mut std::collections::HashMap<(u64, u64), usize>,
+        slot: (u64, u64),
+    ) {
+        *index.entry(slot).or_default() = index.get(&slot).copied().unwrap_or(0).saturating_add(1);
+    }
+
+    /// Release one queued reseed image.
+    fn reseed_queued_dec(
+        index: &mut std::collections::HashMap<(u64, u64), usize>,
+        slot: (u64, u64),
+    ) {
+        if let Some(count) = index.get_mut(&slot) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                index.remove(&slot);
+            }
+        }
+    }
+
+    /// Whether reseed images remain queued.
+    pub(crate) fn joint_reseed_queue_is_empty(&self) -> bool {
+        self.joint_reseed_queue.is_empty()
     }
 
     /// Queue reseed images for live Joint feeds. The machine calls
@@ -2538,7 +2593,7 @@ impl CallerRegistry {
     /// ignores a later birth. Bounded by the queue cap; the scan
     /// itself is bounded by the registry limit. Returns how many
     /// images were queued.
-    pub(crate) fn queue_reseed_for_joint_feeds(&mut self) -> usize {
+    pub(crate) fn queue_reseed_for_joint_feeds(&mut self) -> (usize, bool) {
         use crate::semantics_key_use::FeedMode;
         self.queue_reseed_where(|record| record.feed.mode() == FeedMode::Joint)
     }
@@ -2551,7 +2606,7 @@ impl CallerRegistry {
     /// rate-limited (one birth per image per quantum at most).
     /// Bounded by the queue cap; the scan itself is bounded by the
     /// registry limit. Returns how many images were queued.
-    pub(crate) fn queue_reseed_for_awaiting_feeds(&mut self) -> usize {
+    pub(crate) fn queue_reseed_for_awaiting_feeds(&mut self) -> (usize, bool) {
         self.queue_reseed_where(|record| record.feed.reseed_eligible())
     }
 
@@ -2594,20 +2649,37 @@ impl CallerRegistry {
     /// were offered: the pass that serves a cooldown still refuses its
     /// births as stuck-barred, and the lifted feed re-offers on the
     /// next pass. The scan itself is bounded by the registry limit.
-    pub(crate) fn tick_reseed_cooldowns(&mut self) {
+    /// Tick one quantum off every feed's stuck-degrade cooldown in
+    /// slices of 64 records (INV-2): returns whether the scan
+    /// completed. Callers loop until done, spending one credit per
+    /// call; the cursor persists across calls.
+    pub(crate) fn tick_reseed_cooldowns(&mut self) -> bool {
+        const TICK_SLICE: usize = 64;
         // A served cooldown in a healthy session lifts the stuck bar
         // (fresh proof of health; no void needed), so the reseed queue
         // scan right after this tick can offer the fresh birth.
         let healthy = self.reseed_session_healthy();
-        #[cfg(test)]
         let mut visited = 0usize;
-        for record in self.instance_state.semantics.values_mut() {
-            #[cfg(test)]
-            {
-                visited += 1;
-            }
+        let mut last = None;
+        let after = self.instance_state.cooldown_after;
+        let range = match after {
+            None => self.instance_state.semantics.range_mut((
+                std::ops::Bound::<RegistryInstanceId>::Unbounded,
+                std::ops::Bound::<RegistryInstanceId>::Unbounded,
+            )),
+            Some(done) => self.instance_state.semantics.range_mut((
+                std::ops::Bound::Excluded(done),
+                std::ops::Bound::<RegistryInstanceId>::Unbounded,
+            )),
+        };
+        for (id, record) in range {
+            visited += 1;
+            last = Some(*id);
             record.feed.tick_reseed_cooldown();
             record.feed.lift_settled_stuck_bar(healthy);
+            if visited >= TICK_SLICE {
+                break;
+            }
         }
         #[cfg(test)]
         self.instance_state.cooldown_tick_visits.set(
@@ -2616,28 +2688,60 @@ impl CallerRegistry {
                 .get()
                 .saturating_add(visited),
         );
+        let more = visited >= TICK_SLICE
+            && last.is_some_and(|done| {
+                self.instance_state
+                    .semantics
+                    .range((
+                        std::ops::Bound::Excluded(done),
+                        std::ops::Bound::<RegistryInstanceId>::Unbounded,
+                    ))
+                    .next()
+                    .is_some()
+            });
+        if more {
+            self.instance_state.cooldown_after = last;
+            false
+        } else {
+            self.instance_state.cooldown_after = None;
+            true
+        }
     }
 
+    /// Queue reseed images in slices of 64 semantics (INV-2):
+    /// returns how many images queued this call and whether the scan
+    /// completed. Callers loop until done, spending one credit per
+    /// call; the cursor persists across calls.
     fn queue_reseed_where(
         &mut self,
         mut eligible: impl FnMut(&InstanceSemanticRecord) -> bool,
-    ) -> usize {
+    ) -> (usize, bool) {
+        const QUEUE_SLICE: usize = 64;
         let mut queued = 0usize;
-        #[cfg(test)]
         let mut visited = 0usize;
-        let ids: Vec<RegistryInstanceId> = self
-            .instance_state
-            .semantics
-            .iter()
-            .filter(|(_, record)| {
-                #[cfg(test)]
-                {
-                    visited += 1;
-                }
-                eligible(record)
-            })
-            .map(|(id, _)| *id)
-            .collect();
+        let after = self.instance_state.reseed_queue_after;
+        let mut ids = Vec::new();
+        let mut last = None;
+        let range = match after {
+            None => self.instance_state.semantics.range((
+                std::ops::Bound::<RegistryInstanceId>::Unbounded,
+                std::ops::Bound::<RegistryInstanceId>::Unbounded,
+            )),
+            Some(done) => self.instance_state.semantics.range((
+                std::ops::Bound::Excluded(done),
+                std::ops::Bound::<RegistryInstanceId>::Unbounded,
+            )),
+        };
+        for (id, record) in range {
+            visited += 1;
+            last = Some(*id);
+            if eligible(record) {
+                ids.push(*id);
+            }
+            if visited >= QUEUE_SLICE {
+                break;
+            }
+        }
         #[cfg(test)]
         self.instance_state.reseed_queue_visits.set(
             self.instance_state
@@ -2650,16 +2754,42 @@ impl CallerRegistry {
                 continue;
             };
             let image = record.key.image;
-            if self.joint_reseed_queue.contains(&image) {
+            if self
+                .joint_reseed_queued
+                .contains_key(&(image.task_cookie, image.exec_id))
+            {
                 continue;
             }
             if self.joint_reseed_queue.len() >= crate::discovery::instances::MAX_PENDING {
                 break;
             }
+            Self::reseed_queued_inc(
+                &mut self.joint_reseed_queued,
+                (image.task_cookie, image.exec_id),
+            );
             self.joint_reseed_queue.push(image);
             queued += 1;
         }
-        queued
+        // Done unless a further semantic record exists past the last
+        // one visited (a short slice always completes).
+        let more = visited >= QUEUE_SLICE
+            && last.is_some_and(|done| {
+                self.instance_state
+                    .semantics
+                    .range((
+                        std::ops::Bound::Excluded(done),
+                        std::ops::Bound::<RegistryInstanceId>::Unbounded,
+                    ))
+                    .next()
+                    .is_some()
+            });
+        if more {
+            self.instance_state.reseed_queue_after = last;
+            (queued, false)
+        } else {
+            self.instance_state.reseed_queue_after = None;
+            (queued, true)
+        }
     }
 
     /// Queue one reseed image (a fenced void ending the test arranges
@@ -2670,6 +2800,10 @@ impl CallerRegistry {
         &mut self,
         image: p11scope_ebpf_common::ImageIdentity,
     ) {
+        Self::reseed_queued_inc(
+            &mut self.joint_reseed_queued,
+            (image.task_cookie, image.exec_id),
+        );
         self.joint_reseed_queue.push(image);
     }
 
@@ -2853,23 +2987,66 @@ impl CallerRegistry {
     /// image plus router exactly; domain and module are ignored (a
     /// superset, fail safe: over-protection only delays a futile
     /// eviction).
+    /// Count one applied key under its (image, router) index.
+    fn image_router_inc(index: &mut HashMap<(u64, u64, u64), usize>, key: &InstanceKey) {
+        *index
+            .entry((key.image.task_cookie, key.image.exec_id, key.router.get()))
+            .or_default() = index
+            .get(&(key.image.task_cookie, key.image.exec_id, key.router.get()))
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(1);
+    }
+
+    /// Release one applied key from its (image, router) index.
+    fn image_router_dec(index: &mut HashMap<(u64, u64, u64), usize>, key: &InstanceKey) {
+        let slot = (key.image.task_cookie, key.image.exec_id, key.router.get());
+        if let Some(count) = index.get_mut(&slot) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                index.remove(&slot);
+            }
+        }
+    }
+
     pub(crate) fn joint_image_router_registered(
         &self,
         image: p11scope_ebpf_common::ImageIdentity,
         routers: &[crate::discovery::instances::InstanceId],
     ) -> bool {
-        self.instance_state.by_key.keys().any(|key| {
-            #[cfg(test)]
-            self.instance_state.image_router_check_visits.set(
-                self.instance_state
-                    .image_router_check_visits
-                    .get()
-                    .saturating_add(1),
-            );
-            key.image.task_cookie == image.task_cookie
-                && key.image.exec_id == image.exec_id
-                && routers.contains(&key.router)
-        })
+        // INV-2: the (image, router) index replaces the by_key scan
+        // (one lookup per router). Past 64 routers the guard stays
+        // fail-safe protected instead of scanning further: over-
+        // protection only delays a futile eviction.
+        if routers.len() > crate::semantics_objects::journal::SCOPED_RECOVERY_SLICE {
+            return true;
+        }
+        #[cfg(test)]
+        self.instance_state.image_router_check_visits.set(
+            self.instance_state
+                .image_router_check_visits
+                .get()
+                .saturating_add(routers.len()),
+        );
+        let indexed = routers.iter().any(|router| {
+            self.instance_state.by_image_router.contains_key(&(
+                image.task_cookie,
+                image.exec_id,
+                router.get(),
+            ))
+        });
+        // Debug oracle: the index matches a full by_key scan.
+        #[cfg(test)]
+        debug_assert_eq!(
+            indexed,
+            self.instance_state.by_key.keys().any(|key| {
+                key.image.task_cookie == image.task_cookie
+                    && key.image.exec_id == image.exec_id
+                    && routers.contains(&key.router)
+            }),
+            "the image-router index matches the by_key scan"
+        );
+        indexed
     }
 
     /// Test-only reseed visit counts (seal work bound).
@@ -2963,6 +3140,10 @@ impl CallerRegistry {
             return;
         };
         if self.joint_reseed_queue.len() < crate::discovery::instances::MAX_PENDING {
+            Self::reseed_queued_inc(
+                &mut self.joint_reseed_queued,
+                (image.task_cookie, image.exec_id),
+            );
             self.joint_reseed_queue.push(image);
         }
     }
@@ -3262,6 +3443,10 @@ impl CallerRegistry {
                 if batch.audited().fence().is_some() {
                     let image = self.instance_state.records[&id].key.image;
                     if self.joint_reseed_queue.len() < crate::discovery::instances::MAX_PENDING {
+                        Self::reseed_queued_inc(
+                            &mut self.joint_reseed_queued,
+                            (image.task_cookie, image.exec_id),
+                        );
                         self.joint_reseed_queue.push(image);
                     }
                 }
@@ -3325,6 +3510,10 @@ impl CallerRegistry {
         {
             let image = self.instance_state.records[&id].key.image;
             if self.joint_reseed_queue.len() < crate::discovery::instances::MAX_PENDING {
+                Self::reseed_queued_inc(
+                    &mut self.joint_reseed_queued,
+                    (image.task_cookie, image.exec_id),
+                );
                 self.joint_reseed_queue.push(image);
             }
         }
@@ -3654,7 +3843,9 @@ impl CallerRegistry {
             self.invalidate_instance(id, None, InstanceReason::TaskRetired, true, None);
         }
         let record = self.instance_state.records.remove(&id)?;
-        self.instance_state.by_key.remove(&record.key);
+        if self.instance_state.by_key.remove(&record.key).is_some() {
+            Self::image_router_dec(&mut self.instance_state.by_image_router, &record.key);
+        }
         let semantic = self.instance_state.semantics.remove(&id);
         if semantic.as_ref().is_some_and(|row| row.semantics.is_some()) {
             debug_assert!(self.instance_state.occupied > 0);
@@ -3994,7 +4185,14 @@ impl CallerRegistry {
         };
         let id = RegistryInstanceId(self.instance_state.next_id);
         self.instance_state.next_id = next;
-        self.instance_state.by_key.insert(input.key.clone(), id);
+        if self
+            .instance_state
+            .by_key
+            .insert(input.key.clone(), id)
+            .is_none()
+        {
+            Self::image_router_inc(&mut self.instance_state.by_image_router, &input.key);
+        }
         // Feed selection, once at registration: an installed Joint
         // receipt selects Joint (consumed — one receipt, one feed);
         // without one the feed stays S1Only, exactly as before.

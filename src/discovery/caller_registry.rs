@@ -4211,6 +4211,10 @@ pub(crate) struct CallerRegistry {
     /// a fresh birth at/above the fence. Bounded; beyond the cap the
     /// feed stays S1Only with its deferred gap (no silent recovery).
     joint_reseed_queue: Vec<p11scope_ebpf_common::ImageIdentity>,
+    /// Refcount of queued reseed images by (task cookie, exec id)
+    /// (INV-2): duplicate checks read this instead of scanning the
+    /// queue. Maintained beside every queue mutation.
+    joint_reseed_queued: HashMap<(u64, u64), usize>,
     /// Calls shed unrouted after S1 proved a caller other than
     /// every bound one: counted as foreign not-attributed beside
     /// the bound callers' key-operation rows.
@@ -4447,6 +4451,7 @@ impl CallerRegistry {
             key_projection: None,
             joint_direct_fallback: 0,
             joint_reseed_queue: Vec::new(),
+            joint_reseed_queued: HashMap::new(),
             foreign_unrouted_calls: 0,
             settlement_latency: None,
             module_init: BTreeMap::new(),

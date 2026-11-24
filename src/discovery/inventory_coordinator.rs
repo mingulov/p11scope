@@ -3489,15 +3489,30 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.registry.drain_joint_reseed_queue()
     }
 
+    /// Pop one queued reseed image (O(1)).
+    pub(crate) fn pop_joint_reseed_queue(&mut self) -> Option<p11scope_ebpf_common::ImageIdentity> {
+        self.registry.pop_joint_reseed_queue()
+    }
+
+    /// Push one unfinished reseed image back (O(1)).
+    pub(crate) fn push_joint_reseed_queue(&mut self, image: p11scope_ebpf_common::ImageIdentity) {
+        self.registry.push_joint_reseed_queue(image)
+    }
+
+    /// Whether reseed images remain queued.
+    pub(crate) fn joint_reseed_queue_is_empty(&self) -> bool {
+        self.registry.joint_reseed_queue_is_empty()
+    }
+
     /// Queue reseed images for live Joint feeds after a voided
     /// collect. Returns how many images were queued.
-    pub(crate) fn queue_reseed_for_joint_feeds(&mut self) -> usize {
+    pub(crate) fn queue_reseed_for_joint_feeds(&mut self) -> (usize, bool) {
         self.registry.queue_reseed_for_joint_feeds()
     }
 
     /// Queue reseed images for feeds waiting on a rebirth. Returns
     /// how many images were queued.
-    pub(crate) fn queue_reseed_for_awaiting_feeds(&mut self) -> usize {
+    pub(crate) fn queue_reseed_for_awaiting_feeds(&mut self) -> (usize, bool) {
         self.registry.queue_reseed_for_awaiting_feeds()
     }
 
@@ -3512,7 +3527,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 
     /// Tick one quantum off every feed's stuck-degrade cooldown.
-    pub(crate) fn tick_reseed_cooldowns(&mut self) {
+    pub(crate) fn tick_reseed_cooldowns(&mut self) -> bool {
         self.registry.tick_reseed_cooldowns()
     }
 

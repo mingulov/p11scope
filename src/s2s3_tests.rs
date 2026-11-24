@@ -6248,15 +6248,15 @@ fn newsite_truncated_invalidated_row_is_not_contentless_v6() {
         );
     }
     assert_eq!(v.label, None, "no established fact survives to label");
-    // The committed section carries v6 from the hidden truncation flag
-    // with no visible v6 content: the producer/qualifier mismatch.
+    // The committed section selects no v6 from the hidden truncation
+    // flag alone: the version follows visible content.
     let staging = JointStaging::select_s1_only();
     let keyuse = KeyUseReducer::new();
     let committed = commit(1, &[&staging], &projection, &keyuse);
-    assert_eq!(
+    assert_ne!(
         observations_version(&committed),
         OBSERVATIONS_VERSION_V6,
-        "the hidden truncation flag selects v6"
+        "a row with no visible v6 content selects no v6"
     );
     let rendered = object_observations_json(&committed);
     assert_eq!(
@@ -6295,8 +6295,8 @@ fn newsite_truncated_invalidated_row_is_not_contentless_v6() {
                 })
         });
     assert!(
-        visible,
-        "a v6 row carries visible v6 content: version={} row={row}",
+        !visible,
+        "the row carries no visible v6 content: version={} row={row}",
         rendered["version"],
     );
 }

@@ -2160,6 +2160,14 @@ pub(crate) struct JournalAdapter {
     /// visit, so resumption after a yield never re-derives and never
     /// discards the derived prefix.
     drain_proof_cursor: Option<JournalNativeKey>,
+    /// Maintained replay-bound populations: open begins still
+    /// unconverted, terminals awaiting conversion, and staged
+    /// abandonments. Every open-table mutation keeps them exact (see
+    /// the counter mirror twin), so `ReplayBounds::sample` sizes its
+    /// reservation in O(1) with zero table visits.
+    replay_begins_unconverted: usize,
+    replay_terminals_pending: usize,
+    replay_abandoned: usize,
     floors: BTreeMap<u64, u64>,
     /// One ordered Session EVENTS/boot-clock namespace. Non-evicted
     /// physical-thread return fences complement native sequence floors:
@@ -2390,6 +2398,9 @@ impl JournalAdapter {
             drain_proof_cache: BTreeMap::new(),
             drain_proof_cache_frontier: None,
             drain_proof_cursor: None,
+            replay_begins_unconverted: 0,
+            replay_terminals_pending: 0,
+            replay_abandoned: 0,
             floors: BTreeMap::new(),
             physical_return_floors: BTreeMap::new(),
             refused: Vec::new(),
@@ -3035,6 +3046,32 @@ impl JournalAdapter {
             }
         }
         mirror
+    }
+
+    /// Test-only exact mirror of the replay-bound counters, rebuilt
+    /// from the open table: (unconverted begins, terminals awaiting
+    /// conversion, staged abandonments). The maintenance twin asserts
+    /// the live triple against this reconstruction after every mutation.
+    #[cfg(test)]
+    pub(crate) fn replay_counter_mirror_for_test(&self) -> (usize, usize, usize) {
+        let mut begins = 0;
+        let mut terminals = 0;
+        let mut abandoned = 0;
+        for entry in self.open.values() {
+            begins += usize::from(entry.converted_ticket.is_none());
+            terminals += usize::from(entry.end.is_some() && !entry.end_converted);
+            abandoned += usize::from(entry.abandon.is_some());
+        }
+        (begins, terminals, abandoned)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replay_counters_for_test(&self) -> (usize, usize, usize) {
+        (
+            self.replay_begins_unconverted,
+            self.replay_terminals_pending,
+            self.replay_abandoned,
+        )
     }
 
     /// Test-only exact mirror of the drain-proof candidate index,
@@ -4234,6 +4271,24 @@ impl JournalAdapter {
         } else {
             self.drain_proof_candidates.remove(&native);
         }
+    }
+
+    /// Add one open entry's replay-bound contribution: an unconverted
+    /// begin, a terminal awaiting conversion, a staged abandonment.
+    fn replay_count_add(&mut self, entry: &OpenEntry) {
+        self.replay_begins_unconverted += usize::from(entry.converted_ticket.is_none());
+        self.replay_terminals_pending +=
+            usize::from(entry.end.is_some() && !entry.end_converted);
+        self.replay_abandoned += usize::from(entry.abandon.is_some());
+    }
+
+    /// Remove one open entry's replay-bound contribution. Exact (plain
+    /// `-=`): any drift panics in test builds instead of hiding.
+    fn replay_count_sub(&mut self, entry: &OpenEntry) {
+        self.replay_begins_unconverted -= usize::from(entry.converted_ticket.is_none());
+        self.replay_terminals_pending -=
+            usize::from(entry.end.is_some() && !entry.end_converted);
+        self.replay_abandoned -= usize::from(entry.abandon.is_some());
     }
 
     /// Remove one open entry, keeping the S1-only subject index exact.
@@ -24525,6 +24580,96 @@ pub(crate) mod tests {
             DRAINS as usize,
             "every staged drain settles"
         );
+    }
+
+    #[test]
+    fn object_journal_replay_counters_mirror_the_open_table() {
+        // Every open-table mutation keeps the replay-bound counters
+        // exact: the live (begins, terminals, abandoned) triple matches
+        // the rebuilt mirror after each staging step, each conversion
+        // and prune inside one seal, a bulk wipe, and both synthetic
+        // bulk inserts. Dropping any site's maintenance breaks its
+        // checkpoint below.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+        let mut scene = Scene::new(image_default());
+        let open = function_id("C_OpenSession");
+        scene.attest_function_n("C_OpenSession", 2);
+        let proof = scene.attest_function("C_OpenSession");
+        let check = |scene: &Scene, expected: (usize, usize, usize), step: &str| {
+            assert_eq!(
+                scene.adapter.replay_counters_for_test(),
+                expected,
+                "live triple at {step}"
+            );
+            assert_eq!(
+                scene.adapter.replay_counter_mirror_for_test(),
+                expected,
+                "mirror triple at {step}"
+            );
+        };
+        check(&scene, (0, 0, 0), "fresh scene");
+        let begin1 = begin_bytes(1, 1, open, 0);
+        assert_eq!(scene.ingest(&begin1), JournalDisposition::BeginAdmitted);
+        check(&scene, (1, 0, 0), "first begin");
+        assert_eq!(
+            scene.ingest(&end_bytes_absent(&begin1, 0, ENTRY_NS + 50)),
+            JournalDisposition::EndStaged
+        );
+        check(&scene, (1, 1, 0), "first end");
+        assert!(scene.adapter.clear_open_end_for_test((1, 1)));
+        check(&scene, (1, 0, 0), "cleared end");
+        assert_eq!(
+            scene.ingest(&end_bytes_absent(&begin1, 0, ENTRY_NS + 60)),
+            JournalDisposition::EndStaged
+        );
+        check(&scene, (1, 1, 0), "re-staged end");
+        let begin2 = begin_bytes(1, 2, open, 0);
+        assert_eq!(scene.ingest(&begin2), JournalDisposition::BeginAdmitted);
+        check(&scene, (2, 1, 0), "second begin");
+        assert_eq!(
+            scene.ingest_ordinary(ordinary_for(&begin2, 0)),
+            JournalDisposition::ReturnObserved
+        );
+        check(&scene, (2, 1, 0), "corroboration changes no counter");
+        let abandon2 =
+            abandon_bytes(1, 2, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
+        assert_eq!(
+            scene.ingest(&abandon2),
+            JournalDisposition::AbandonStaged
+        );
+        check(&scene, (2, 1, 1), "second abandon");
+        let mut pad = ordinary_for(&begin1, 0);
+        pad.slot = 99;
+        scene.ingest_ordinary(pad);
+        let bootstrap = scene.bootstrap(proof, 0);
+        let success = scene.seal(&bootstrap).expect("both calls settle");
+        assert_eq!(success.prefix.settled().len(), 2);
+        check(&scene, (0, 0, 0), "seal converts and prunes everything");
+        let begin3 = begin_bytes(1, 3, open, 0);
+        assert_eq!(scene.ingest(&begin3), JournalDisposition::BeginAdmitted);
+        check(&scene, (1, 0, 0), "third begin");
+        scene.adapter.clear_open();
+        check(&scene, (0, 0, 0), "bulk wipe zeroes every counter");
+        // Synthetic bulk inserts keep the counters exact too, including
+        // abandon-carrying rows cloned from an abandoned template.
+        let mut bulk = Scene::new(image_default());
+        check(&bulk, (0, 0, 0), "fresh bulk scene");
+        let template_begin = begin_bytes(1, 1, open, 0);
+        assert_eq!(
+            bulk.ingest(&template_begin),
+            JournalDisposition::BeginAdmitted
+        );
+        let template_abandon =
+            abandon_bytes(1, 1, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
+        assert_eq!(
+            bulk.ingest(&template_abandon),
+            JournalDisposition::AbandonStaged
+        );
+        check(&bulk, (1, 0, 1), "abandoned template");
+        bulk.adapter.populate_foreign_open_rows_for_test(2);
+        check(&bulk, (3, 0, 1), "normalized synthetic rows");
+        bulk.adapter.populate_unique_foreign_open_rows_for_test(2);
+        check(&bulk, (5, 0, 3), "abandon-carrying synthetic rows");
     }
 
     #[test]

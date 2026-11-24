@@ -93,12 +93,15 @@ pub(crate) struct LedgerReleaseCursor {
 /// through the shared write path. The caller retains the cursor
 /// (and its payload lease) until insert or refusal commits.
 /// Refusals match the synchronous mint exactly; tickets never
-/// recycle and refusals never consume one.
+/// recycle and refusals never consume one. On unindexed tables the
+/// free scan resumes at `free_scan` across commit retries (indexed
+/// tables pop from their free list and never read it).
 pub(crate) struct LedgerMintCursor {
     bytes: u64,
     bytes_usize: usize,
     ticket: u64,
     walk: MintWalkCursor,
+    free_scan: usize,
     phase: LedgerMintPhase,
 }
 
@@ -304,6 +307,30 @@ impl StagingLedger {
         };
         let table =
             ReservationTable::try_new(MAX_UNSETTLED_STAGED).map_err(|_| LedgerRefusal::Full)?;
+        self.table = Some(table);
+        self.table_storage = storage;
+        Ok(())
+    }
+
+    /// Test-only capacity install with an explicit slot count: mints
+    /// against unindexed tables pin the free-scan resume cursor.
+    /// Production always prepares exactly `MAX_UNSETTLED_STAGED`.
+    #[cfg(test)]
+    pub(crate) fn prepare_capacity_with_slots_for_test(
+        &mut self,
+        slots: usize,
+    ) -> Result<(), LedgerRefusal> {
+        if self.table.is_some() {
+            return Ok(());
+        }
+        let bytes = ReservationTable::<Option<ResourceLease>>::allocation_bytes(slots)
+            .and_then(|bytes| bytes.checked_add(OWNED_ALLOCATION_PADDING))
+            .ok_or(LedgerRefusal::Full)?;
+        let storage = match &self.reserver {
+            Some(reserver) => Some(reserver.reserve(bytes).map_err(|_| LedgerRefusal::Full)?),
+            None => None,
+        };
+        let table = ReservationTable::try_new(slots).map_err(|_| LedgerRefusal::Full)?;
         self.table = Some(table);
         self.table_storage = storage;
         Ok(())
@@ -702,6 +729,7 @@ impl StagingLedger {
             bytes_usize,
             ticket,
             walk,
+            free_scan: 0,
             phase: LedgerMintPhase::Walk,
         })
     }
@@ -716,6 +744,7 @@ impl StagingLedger {
         let fresh = self.start_keyassoc_mint(cursor.bytes)?;
         cursor.ticket = fresh.ticket;
         cursor.walk = fresh.walk;
+        cursor.free_scan = fresh.free_scan;
         cursor.phase = LedgerMintPhase::Walk;
         Ok(())
     }
@@ -801,7 +830,7 @@ impl StagingLedger {
                         drop(charge);
                         return MintStepOutcome::Done(Err(LedgerRefusal::Full));
                     };
-                    let slot = match table.budgeted_free_pop(gate) {
+                    let slot = match table.budgeted_free_pop(&mut cursor.free_scan, gate) {
                         FreePopOutcome::Yield => {
                             drop(charge);
                             return MintStepOutcome::Yield;
@@ -813,6 +842,11 @@ impl StagingLedger {
                         FreePopOutcome::Slot(at) => at,
                     };
                     if !gate.try_charge_n(COMMIT_LINK_LEAVES) {
+                        // The retry re-pops: reset the free scan to the
+                        // restored slot so an unindexed retry re-scans
+                        // it instead of striding past (indexed tables
+                        // re-pop from their free list either way).
+                        cursor.free_scan = slot;
                         table.free_restore(slot);
                         drop(charge);
                         return MintStepOutcome::Yield;
@@ -844,6 +878,13 @@ impl StagingLedger {
     }
 
     pub(crate) fn release_all_h8open(&mut self) {
+        // Same guard as the single-release funnel: no budgeted H8
+        // void in flight (the stop-path teardown must not unlink
+        // under the sweep's retained chain/occupied state either).
+        debug_assert!(
+            self.h8_void.is_none(),
+            "no sync release while a budgeted void owns the table"
+        );
         if let Some(table) = self.table.as_mut() {
             table.release_role(Role::H8Open);
         }
@@ -1406,5 +1447,101 @@ mod tests {
         assert_eq!(gate.spent(), 3, "pop plus two link heads, with no re-walk");
         assert_eq!(fallback.test_leaf_reads_for_test(), 3);
         assert_eq!(fallback.census(), 1);
+    }
+
+    /// A budgeted mint on an unindexed table with its head window
+    /// occupied completes within bounded 64-credit retries: the free
+    /// scan resumes past the visited head instead of re-scanning from
+    /// zero forever (no resume wedges the minting disposal, which
+    /// re-polls with a fresh gate per credit).
+    #[test]
+    fn budgeted_mint_unindexed_head_window_completes_with_bounded_retries() {
+        let mut fallback = StagingLedger::new();
+        // One past the indexed cutoff (13,106 indexed, 13,107 linear).
+        fallback
+            .prepare_capacity_with_slots_for_test(13_107)
+            .unwrap();
+        for _ in 0..64 {
+            fallback.mint_keyassoc(16).unwrap();
+        }
+        assert_eq!(fallback.census(), 64);
+        let mut cursor = fallback.start_keyassoc_mint(16).unwrap();
+        let mut done = None;
+        for retry in 0..1000 {
+            let mut gate = LeafBudget::new(64);
+            match fallback.mint_step(&mut cursor, &mut gate) {
+                MintStepOutcome::Yield => {
+                    assert!(gate.spent() <= 64, "retry {retry} spent above INV-2");
+                }
+                MintStepOutcome::Done(result) => {
+                    done = Some(result);
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            done,
+            Some(Ok(65)),
+            "the resumed scan mints past the occupied head"
+        );
+        assert_eq!(fallback.census(), 65);
+    }
+
+    /// A link-grant yield after a pop resets the free scan to the
+    /// restored slot, so the retry re-takes it instead of striding
+    /// past. Driven with one-credit gates so the walk-completing call
+    /// deterministically pops and link-yields in one step; the reset
+    /// itself is pinned white-box (behaviorally the census gate would
+    /// mask a strided restore).
+    #[test]
+    fn budgeted_mint_link_yield_resets_free_scan_to_restored_slot() {
+        let mut fallback = StagingLedger::new();
+        fallback
+            .prepare_capacity_with_slots_for_test(13_107)
+            .unwrap();
+        let mut cursor = fallback.start_keyassoc_mint(16).unwrap();
+        let mut committed = false;
+        for _ in 0..14_000 {
+            let mut gate = LeafBudget::new(1);
+            let outcome = fallback.mint_step(&mut cursor, &mut gate);
+            if matches!(cursor.phase, LedgerMintPhase::Commit) {
+                assert!(
+                    matches!(outcome, MintStepOutcome::Yield),
+                    "the one credit pops but cannot grant both link heads"
+                );
+                committed = true;
+                break;
+            }
+        }
+        assert!(committed, "the walk completes within its bound");
+        assert_eq!(
+            cursor.free_scan, 0,
+            "the link yield resets the scan to the restored slot"
+        );
+        assert_eq!(fallback.census(), 0, "a yielded commit mints nothing");
+        let mut gate = LeafBudget::new(64);
+        assert!(
+            matches!(
+                fallback.mint_step(&mut cursor, &mut gate),
+                MintStepOutcome::Done(Ok(1))
+            ),
+            "the retry commits the restored slot"
+        );
+        assert_eq!(fallback.census(), 1);
+    }
+
+    /// A restarted mint pairs its fresh walk with a fresh free scan:
+    /// the interleaved mint that stole the walked ticket invalidates
+    /// the retained scan position along with the walk (white-box pin
+    /// of the reset).
+    #[test]
+    fn budgeted_mint_restart_resets_free_scan() {
+        let pool = SemanticResourcePool::default();
+        let mut fallback = StagingLedger::with_resources(pool.reserver());
+        fallback.prepare_capacity().unwrap();
+        let mut cursor = fallback.start_keyassoc_mint(16).unwrap();
+        cursor.free_scan = 64;
+        fallback.restart_keyassoc_mint(&mut cursor).unwrap();
+        assert_eq!(cursor.free_scan, 0, "a restarted mint re-scans from zero");
     }
 }

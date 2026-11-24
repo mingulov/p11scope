@@ -1655,22 +1655,31 @@ impl<C> ReservationTable<C> {
     /// when the credit is exhausted (caller yields); `Full` reports
     /// no vacant slot (caller refuses). Unindexed tables keep no free
     /// list, so they scan for a vacancy linearly instead — one leaf
-    /// per visited slot, yielding with nothing taken when the credit
-    /// runs out (the retry re-scans idempotently), refusing Full only
-    /// when no vacancy exists. Production tables are indexed; the
-    /// linear arm keeps larger tables honest.
-    pub(super) fn budgeted_free_pop(&mut self, gate: &mut LeafBudget) -> FreePopOutcome {
+    /// per visited slot, resuming at `resume` and saving the next
+    /// visit there on `Yield`, so retries progress across credits
+    /// and `Full` waits for full coverage. A restored slot re-scans
+    /// from its own index (the caller resets `resume` to it).
+    /// Production tables are indexed; the linear arm keeps larger
+    /// tables honest.
+    pub(super) fn budgeted_free_pop(
+        &mut self,
+        resume: &mut usize,
+        gate: &mut LeafBudget,
+    ) -> FreePopOutcome {
         if !self.indexed() {
-            for at in 0..self.slots.len() {
+            for at in *resume..self.slots.len() {
                 if !gate.try_charge() {
+                    *resume = at;
                     return FreePopOutcome::Yield;
                 }
                 #[cfg(test)]
                 self.test_leaf_reads.set(self.test_leaf_reads.get() + 1);
                 if self.slots[at].operation.is_none() {
+                    *resume = at + 1;
                     return FreePopOutcome::Slot(at);
                 }
             }
+            *resume = self.slots.len();
             return FreePopOutcome::Full;
         }
         if !gate.try_charge() {
@@ -2609,23 +2618,43 @@ mod tests {
         // Unindexed tables keep no free list: the budgeted pop scans
         // for a vacancy (one leaf per visited slot) instead of
         // refusing Full. A refused charge yields with nothing taken
-        // (the retry re-scans); only a truly full table refuses.
+        // (the retry resumes past the visited head); only a truly
+        // full table refuses, after full coverage.
         let mut table = ReservationTable::<()>::try_new(MAX_INDEXED + 1).unwrap();
         assert!(!table.indexed());
         let mut gate = LeafBudget::new(0);
-        assert_eq!(table.budgeted_free_pop(&mut gate), FreePopOutcome::Yield);
+        let mut resume = 0;
+        assert_eq!(
+            table.budgeted_free_pop(&mut resume, &mut gate),
+            FreePopOutcome::Yield
+        );
         assert_eq!(gate.spent(), 0, "a refused charge reads nothing");
+        assert_eq!(resume, 0, "a refused first charge visits nothing");
         let mut gate = LeafBudget::new(64);
-        assert_eq!(table.budgeted_free_pop(&mut gate), FreePopOutcome::Slot(0));
+        let mut resume = 0;
+        assert_eq!(
+            table.budgeted_free_pop(&mut resume, &mut gate),
+            FreePopOutcome::Slot(0)
+        );
         assert_eq!(gate.spent(), 1, "the fresh vacancy costs one visit");
+        assert_eq!(resume, 1, "a taken vacancy advances the scan past it");
         table.init_fresh_operation(0);
         let mut gate = LeafBudget::new(64);
-        assert_eq!(table.budgeted_free_pop(&mut gate), FreePopOutcome::Slot(1));
+        let mut resume = 0;
+        assert_eq!(
+            table.budgeted_free_pop(&mut resume, &mut gate),
+            FreePopOutcome::Slot(1)
+        );
         assert_eq!(gate.spent(), 2, "one occupied head plus its vacancy");
         table.free_restore(1);
         let mut gate = LeafBudget::new(1);
-        assert_eq!(table.budgeted_free_pop(&mut gate), FreePopOutcome::Yield);
+        let mut resume = 0;
+        assert_eq!(
+            table.budgeted_free_pop(&mut resume, &mut gate),
+            FreePopOutcome::Yield
+        );
         assert_eq!(gate.spent(), 1, "the one credit dies on the occupied head");
+        assert_eq!(resume, 1, "the yield saves its next visit");
     }
 
     #[test]
@@ -2641,9 +2670,10 @@ mod tests {
         }
         assert_eq!(table.census(), 64);
         let mut found = None;
+        let mut resume = 0;
         for retry in 0..300 {
             let mut gate = LeafBudget::new(64);
-            match table.budgeted_free_pop(&mut gate) {
+            match table.budgeted_free_pop(&mut resume, &mut gate) {
                 FreePopOutcome::Slot(at) => {
                     found = Some(at);
                     break;
@@ -2672,9 +2702,10 @@ mod tests {
         }
         assert_eq!(table.census(), MAX_INDEXED + 1);
         let mut refused = false;
+        let mut resume = 0;
         for retry in 0..300 {
             let mut gate = LeafBudget::new(64);
-            match table.budgeted_free_pop(&mut gate) {
+            match table.budgeted_free_pop(&mut resume, &mut gate) {
                 FreePopOutcome::Full => {
                     refused = true;
                     break;
@@ -2688,6 +2719,31 @@ mod tests {
             }
         }
         assert!(refused, "bounded retries cover the full table and refuse");
+    }
+
+    #[test]
+    fn resource_reservations_unindexed_budgeted_pop_restores_from_its_own_index() {
+        // The restore protocol: after a pop advances past its slot,
+        // the caller resets the scan to the restored slot and the
+        // retry re-takes it (the mint's link-grant yield). Striding
+        // past would strand the restored vacancy behind the scan.
+        let mut table = ReservationTable::<()>::try_new(MAX_INDEXED + 1).unwrap();
+        assert!(!table.indexed());
+        let mut gate = LeafBudget::new(64);
+        let mut resume = 0;
+        assert_eq!(
+            table.budgeted_free_pop(&mut resume, &mut gate),
+            FreePopOutcome::Slot(0)
+        );
+        assert_eq!(resume, 1, "a taken vacancy advances the scan past it");
+        table.free_restore(0);
+        resume = 0;
+        let mut gate = LeafBudget::new(64);
+        assert_eq!(
+            table.budgeted_free_pop(&mut resume, &mut gate),
+            FreePopOutcome::Slot(0),
+            "the restored slot re-scans from its own index"
+        );
     }
 
     #[test]

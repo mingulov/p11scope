@@ -40,13 +40,14 @@ use crate::discovery::loader::{LoaderContextId, LoaderContextSpec, LoaderRegistr
 use crate::discovery::noise::DiscoveryNoiseAggregator;
 use crate::discovery::scan::{
     CaptureWorkBudget, LoaderElfFacts, LoaderFactsKey, MapsReadBuffers, MapsReadLimits,
-    ObjectExports, ScanOutcome, ScanRequest, ScannedEntry, ScannedInterface, ScannedModule,
-    ScannedTable, Skipped, decode_exact_table, decode_observed_words, decoded_table_addresses,
-    exact_legacy_prefix_bytes, exact_table_addresses_n, exact_table_bytes, export_agreement,
-    index_maps_or_refuse, is_provider_mapping, published_walk, read_elf_snapshot,
-    read_maps_or_refuse, read_maps_or_refuse_with_buffers, scan_process_view,
-    scan_process_view_examined, scan_process_view_without_memory, scan_skip_truncates,
-    table_evidence_score, table_has_only_opaque_interfaces, table_linkage, target_layout,
+    ObjectExports, PER_OBJECT_ALLOWANCE_REASON, ScanOutcome, ScanRequest, ScannedEntry,
+    ScannedInterface, ScannedModule, ScannedTable, Skipped, decode_exact_table,
+    decode_observed_words, decoded_table_addresses, exact_legacy_prefix_bytes,
+    exact_table_addresses_n, exact_table_bytes, export_agreement, index_maps_or_refuse,
+    is_provider_mapping, published_walk, read_elf_snapshot, read_maps_or_refuse,
+    read_maps_or_refuse_with_buffers, scan_process_view, scan_process_view_examined,
+    scan_process_view_without_memory, scan_skip_truncates, table_evidence_score,
+    table_has_only_opaque_interfaces, table_linkage, target_layout,
 };
 use crate::discovery::scheduler::{
     DiscoveryScheduler, InventoryCadence, MAX_NEWCOMER_ADMISSIONS_PER_TICK, MAX_PENDING_REFRESH,
@@ -14164,10 +14165,39 @@ struct GetterPrefaultCursor {
     next: usize,
     /// Absolute resume address within `ranges[next]`.
     next_addr: u64,
-    /// Cumulative read bytes for the per-object allowance.
-    op_bytes: u64,
+    /// Cumulative read bytes per object for the per-object allowance.
+    /// An object owes an entry only after a byte reads for it; absence
+    /// reads as zero.
+    op_bytes: BTreeMap<PinnedObjectId, u64>,
     /// False when the frame was spent before enumeration ran.
     enumerated: bool,
+}
+
+impl GetterPrefaultCursor {
+    /// Cumulative bytes read for `object` (zero when nothing read for
+    /// it yet).
+    fn op_bytes_for(&self, object: PinnedObjectId) -> u64 {
+        self.op_bytes.get(&object).copied().unwrap_or(0)
+    }
+
+    /// A fresh cursor for `objects`, keeping cumulative bytes only for
+    /// objects still present: a removed object's debit never transfers
+    /// to a replacement object.
+    fn fresh_for_objects(
+        objects: Vec<PinnedObjectId>,
+        carried: &BTreeMap<PinnedObjectId, u64>,
+    ) -> Self {
+        let mut op_bytes = carried.clone();
+        op_bytes.retain(|object, _| objects.contains(object));
+        Self {
+            objects,
+            ranges: Vec::new(),
+            next: 0,
+            next_addr: 0,
+            op_bytes,
+            enumerated: false,
+        }
+    }
 }
 
 /// One warmup candidate range: its maps address, the first matching
@@ -26810,10 +26840,10 @@ impl Engine {
     /// maps-key fast path) spend no credit. Maps enumeration, the
     /// carried-index build and the merge stride in units of 64 with
     /// frame, deadline and work-budget polls. The capture frame,
-    /// deadline and ceilings may stop a pass sooner with zero progress;
-    /// apart from such a stop, every pass at production caps completes,
-    /// refuses or advances at least one range, so the pass count is
-    /// finite.
+    /// deadline and ceilings may stop a pass sooner, possibly before it
+    /// completes, refuses or advances anything; apart from such a stop,
+    /// every pass at production caps completes, refuses or advances at
+    /// least one range, so the pass count is finite.
     const GETTER_PREFAULT_READS_PER_PASS: usize = 64;
     const GETTER_PREFAULT_PROOFS_PER_PASS: usize = 64;
     /// Maps entries per enumeration stride: polled for frame, deadline
@@ -26868,10 +26898,12 @@ impl Engine {
     /// Limits: only file-backed ranges are faulted (heap and
     /// anonymous-BSS tables stay exposed); every byte read spends the
     /// capture's window I/O budget through the file-content rule, and the
-    /// per-object allowance spans passes through the cursor; under an
-    /// Inventory policy with no active scan the allowance is zero, so
-    /// this faults nothing; and a page can be reclaimed again before the
-    /// getter returns. A same-generation remap between one chunk's
+    /// per-object allowance spans passes through the cursor's per-object
+    /// totals; an object past its allowance retires its remaining ranges
+    /// without stopping other objects, and only a spent window stops the
+    /// pass. Under an Inventory policy with no active scan the allowance
+    /// is zero, so this faults nothing; and a page can be reclaimed again
+    /// before the getter returns. A same-generation remap between one chunk's
     /// re-proof stat and its first byte remains a residual microsecond
     /// window, matching the ordinary scan's guard-to-read shape; the
     /// per-chunk re-proof keeps it to one stat-to-read pair per chunk,
@@ -26933,8 +26965,8 @@ impl Engine {
             return Complete;
         }
         // A spent frame yields before any read, keeping (or opening) the
-        // cursor for the next pass. Read bytes stay cumulative for the
-        // per-object allowance across the reopen.
+        // cursor for the next pass. Per-object read bytes stay cumulative
+        // across the reopen.
         if self.frame_work_exhausted() {
             self.getter_prefault_keep_cursor_for_frame_yield(view, &objects);
             return Deferred { frame_spent: true };
@@ -26997,28 +27029,24 @@ impl Engine {
             });
         }
         // Revalidate the cursor against the fresh rendering: new objects
-        // restart the enumeration (read bytes stay cumulative for the
-        // per-object allowance), while carried ranges keep their
-        // per-range next offset only under an identical (address, key,
-        // object) rendering. Proof never carries: `proven` is recomputed
-        // every pass (a stable maps tuple proves nothing on Btrfs), while
-        // `refused` carries (a denial needs no re-proof and is never
-        // re-read). Anything else is dropped. The merge is linear via an
-        // index, never repeated whole-vector searches.
+        // restart the enumeration (survivors keep their per-object read
+        // bytes; a removed object's debit never transfers), while carried
+        // ranges keep their per-range next offset only under an identical
+        // (address, key, object) rendering. Proof never carries: `proven`
+        // is recomputed every pass (a stable maps tuple proves nothing on
+        // Btrfs), while `refused` carries (a denial needs no re-proof and
+        // is never re-read). Anything else is dropped. The merge is linear
+        // via an index, never repeated whole-vector searches.
         let mut cursor = self.getter_prefault_cursors.remove(&view);
         if cursor
             .as_ref()
             .is_none_or(|cursor| cursor.objects != objects)
         {
-            let carried_bytes = cursor.as_ref().map(|cursor| cursor.op_bytes).unwrap_or(0);
-            cursor = Some(GetterPrefaultCursor {
-                objects,
-                ranges: Vec::new(),
-                next: 0,
-                next_addr: 0,
-                op_bytes: carried_bytes,
-                enumerated: false,
-            });
+            let carried = cursor
+                .as_ref()
+                .map(|cursor| cursor.op_bytes.clone())
+                .unwrap_or_default();
+            cursor = Some(GetterPrefaultCursor::fresh_for_objects(objects, &carried));
         }
         let mut cursor = cursor.expect("a warmup cursor is always present here");
         let carried = std::mem::take(&mut cursor.ranges);
@@ -27138,7 +27166,8 @@ impl Engine {
         let mut held_cache: BTreeMap<PinnedObjectId, Option<MappedFile>> = BTreeMap::new();
         let mut mem: Option<std::fs::File> = None;
         let mut chunk = [0u8; Self::GETTER_PREFAULT_CHUNK];
-        let mut op_bytes = cursor.op_bytes;
+        let mut op_bytes = cursor.op_bytes.clone();
+        let mut exhausted: BTreeSet<PinnedObjectId> = BTreeSet::new();
         let mut reads_spent = 0usize;
         for index in 0..cursor.ranges.len() {
             if cursor.ranges[index].refused
@@ -27146,10 +27175,17 @@ impl Engine {
             {
                 continue;
             }
+            if exhausted.contains(&cursor.ranges[index].object) {
+                // This object's allowance ran out earlier in the pass:
+                // retire its remaining ranges without another proof.
+                let end = cursor.ranges[index].end;
+                cursor.ranges[index].next_addr = end;
+                continue;
+            }
             #[cfg(test)]
             self.getter_prefault_latch_frame_trip(GetterPrefaultStrideSite::Proof);
             if self.frame_work_exhausted() {
-                cursor.op_bytes = op_bytes;
+                cursor.op_bytes = op_bytes.clone();
                 Self::store_prefault_resume(&mut cursor);
                 self.getter_prefault_cursors.insert(view, cursor);
                 return Deferred { frame_spent: true };
@@ -27160,7 +27196,7 @@ impl Engine {
             let object = cursor.ranges[index].object;
             if let std::collections::btree_map::Entry::Vacant(slot) = held_cache.entry(object) {
                 if proofs_spent >= proofs_per_pass {
-                    cursor.op_bytes = op_bytes;
+                    cursor.op_bytes = op_bytes.clone();
                     Self::store_prefault_resume(&mut cursor);
                     self.getter_prefault_cursors.insert(view, cursor);
                     return Deferred { frame_spent: false };
@@ -27196,7 +27232,7 @@ impl Engine {
                 continue;
             } else {
                 if proofs_spent >= proofs_per_pass {
-                    cursor.op_bytes = op_bytes;
+                    cursor.op_bytes = op_bytes.clone();
                     Self::store_prefault_resume(&mut cursor);
                     self.getter_prefault_cursors.insert(view, cursor);
                     return Deferred { frame_spent: false };
@@ -27258,7 +27294,7 @@ impl Engine {
                 self.getter_prefault_latch_frame_trip(GetterPrefaultStrideSite::Read);
                 if self.frame_work_exhausted() {
                     cursor.ranges[index].next_addr = addr;
-                    cursor.op_bytes = op_bytes;
+                    cursor.op_bytes = op_bytes.clone();
                     Self::store_prefault_resume(&mut cursor);
                     self.getter_prefault_cursors.insert(view, cursor);
                     return Deferred { frame_spent: true };
@@ -27268,18 +27304,28 @@ impl Engine {
                 }
                 if reads_spent >= reads_per_pass {
                     cursor.ranges[index].next_addr = addr;
-                    cursor.op_bytes = op_bytes;
+                    cursor.op_bytes = op_bytes.clone();
                     Self::store_prefault_resume(&mut cursor);
                     self.getter_prefault_cursors.insert(view, cursor);
                     return Deferred { frame_spent: false };
                 }
                 let len = (end - addr).min(chunk.len() as u64) as usize;
-                if self.budget.allowed_io(op_bytes, len) < len {
+                let used = op_bytes.get(&object).copied().unwrap_or(0);
+                if self.budget.allowed_io(used, len) < len {
+                    if self.budget.io_shortfall_reason(used) == PER_OBJECT_ALLOWANCE_REASON {
+                        // This object's allowance is spent: retire its
+                        // remaining ranges and continue with other
+                        // objects while window budget remains. Only a
+                        // spent window stops the pass.
+                        exhausted.insert(object);
+                        cursor.ranges[index].next_addr = end;
+                        break;
+                    }
                     return Complete;
                 }
                 if proofs_spent >= proofs_per_pass {
                     cursor.ranges[index].next_addr = addr;
-                    cursor.op_bytes = op_bytes;
+                    cursor.op_bytes = op_bytes.clone();
                     Self::store_prefault_resume(&mut cursor);
                     self.getter_prefault_cursors.insert(view, cursor);
                     return Deferred { frame_spent: false };
@@ -27339,7 +27385,8 @@ impl Engine {
                         // collection work too would double-charge a large
                         // data walk against the small shared allowance.
                         self.budget.record_window_io(read);
-                        op_bytes = op_bytes.saturating_add(read as u64);
+                        let entry = op_bytes.entry(object).or_insert(0);
+                        *entry = entry.saturating_add(read as u64);
                         reads_spent += 1;
                         if read != len {
                             // Best-effort, never retried: the unread tail
@@ -27378,11 +27425,11 @@ impl Engine {
 
     /// Keeps the view's warmup cursor across a frame yield before its
     /// replacement is ready: an existing cursor for the same objects
-    /// stays intact (ranges, offsets and bytes; only `enumerated`
-    /// flips, since this pass enumerated nothing), otherwise a fresh
-    /// empty cursor opens with the carried byte total. Old progress
-    /// retires only against a completed fresh enumeration, never on a
-    /// yield.
+    /// stays intact (ranges, offsets and per-object bytes; only
+    /// `enumerated` flips, since this pass enumerated nothing),
+    /// otherwise a fresh empty cursor opens keeping only still-present
+    /// objects' bytes. Old progress retires only against a completed
+    /// fresh enumeration, never on a yield.
     fn getter_prefault_keep_cursor_for_frame_yield(
         &mut self,
         view: ProcessViewId,
@@ -27391,27 +27438,13 @@ impl Engine {
         let Some(cursor) = self.getter_prefault_cursors.get_mut(&view) else {
             self.getter_prefault_cursors.insert(
                 view,
-                GetterPrefaultCursor {
-                    objects: objects.to_vec(),
-                    ranges: Vec::new(),
-                    next: 0,
-                    next_addr: 0,
-                    op_bytes: 0,
-                    enumerated: false,
-                },
+                GetterPrefaultCursor::fresh_for_objects(objects.to_vec(), &BTreeMap::new()),
             );
             return;
         };
         if cursor.objects.as_slice() != objects {
-            let carried_bytes = cursor.op_bytes;
-            *cursor = GetterPrefaultCursor {
-                objects: objects.to_vec(),
-                ranges: Vec::new(),
-                next: 0,
-                next_addr: 0,
-                op_bytes: carried_bytes,
-                enumerated: false,
-            };
+            let carried = cursor.op_bytes.clone();
+            *cursor = GetterPrefaultCursor::fresh_for_objects(objects.to_vec(), &carried);
             return;
         }
         cursor.enumerated = false;
@@ -27693,9 +27726,9 @@ impl Engine {
 
     /// Restarts the view's warmup cursor when it enumerated a different
     /// object set than `sites` (emptied, remapped, or re-filtered), so
-    /// the settle block never pins a view with nothing to warm. Read
-    /// bytes stay cumulative for the per-object allowance; the next pass
-    /// re-enumerates under the new objects.
+    /// the settle block never pins a view with nothing to warm. Survivors
+    /// keep their per-object bytes; the next pass re-enumerates under the
+    /// new objects.
     fn retire_stale_prefault_cursor(
         &mut self,
         view: ProcessViewId,
@@ -27715,21 +27748,14 @@ impl Engine {
                 self.getter_prefault_cursors.remove(&view);
                 return;
             }
-            let carried_bytes = self
+            let carried = self
                 .getter_prefault_cursors
                 .get(&view)
-                .map(|cursor| cursor.op_bytes)
-                .unwrap_or(0);
+                .map(|cursor| cursor.op_bytes.clone())
+                .unwrap_or_default();
             self.getter_prefault_cursors.insert(
                 view,
-                GetterPrefaultCursor {
-                    objects,
-                    ranges: Vec::new(),
-                    next: 0,
-                    next_addr: 0,
-                    op_bytes: carried_bytes,
-                    enumerated: false,
-                },
+                GetterPrefaultCursor::fresh_for_objects(objects, &carried),
             );
         }
     }

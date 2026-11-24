@@ -37784,7 +37784,7 @@ fn prefault_manifest_getter_data_resumes_across_passes_from_its_saved_cursor() {
             ranges[next].0
         );
         assert_eq!(
-            cursor.op_bytes,
+            cursor.op_bytes_for(object),
             lens[..next].iter().sum::<u64>(),
             "pass {pass} carries its read bytes for the per-object allowance"
         );
@@ -39789,7 +39789,7 @@ fn prefault_manifest_getter_data_carries_read_bytes_across_a_proof_yield() {
         "the pending range keeps its offset"
     );
     assert_eq!(
-        cursor.op_bytes,
+        cursor.op_bytes_for(object),
         (ranges[0].1 - ranges[0].0) + (ranges[1].1 - ranges[1].0),
         "the yield carries the pass's read bytes"
     );
@@ -39874,7 +39874,8 @@ fn prefault_manifest_getter_data_carries_read_bytes_across_a_held_yield() {
         .expect("a deferred pass saves its cursor")
         .clone();
     assert_eq!(
-        cursor.op_bytes, padded as u64,
+        cursor.op_bytes_for(objects[0]) + cursor.op_bytes_for(objects[1]),
+        padded as u64,
         "the yield carries the warmed range's bytes"
     );
     assert_eq!(
@@ -39942,7 +39943,8 @@ fn prefault_manifest_getter_data_keeps_progress_when_the_frame_expires_mid_read(
         "the pending range keeps its offset"
     );
     assert_eq!(
-        cursor.op_bytes, 65536,
+        cursor.op_bytes_for(object),
+        65536,
         "the yield carries the warmed chunk's bytes"
     );
     let attempts = engine.prefault_attempts_for_test();
@@ -40033,7 +40035,8 @@ fn prefault_manifest_getter_data_carries_read_bytes_across_a_reproof_yield() {
         "the pending range keeps its offset"
     );
     assert_eq!(
-        cursor.op_bytes, 65536,
+        cursor.op_bytes_for(object),
+        65536,
         "the yield carries the warmed chunk's bytes"
     );
     assert_eq!(
@@ -40117,7 +40120,7 @@ fn prefault_manifest_getter_data_meters_every_reproof_under_the_proof_cap() {
         "pass 1 proves exactly two ranges under the shared cap"
     );
     assert_eq!(
-        cursor.op_bytes,
+        cursor.op_bytes_for(object),
         (ranges[0].1 - ranges[0].0) + (ranges[1].1 - ranges[1].0),
         "pass 1 carries its read bytes across the proof-credit deferral"
     );

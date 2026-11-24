@@ -1961,17 +1961,37 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         // process then. An exit during admission, an inconclusive state
         // read, or a tick-only pin fails the proof instead of
         // discarding the genuine exit or minting a false interval.
-        let proven = admitted_ns != 0
+        let mut proven = admitted_ns != 0
             && self
                 .callers
                 .get(&id)
                 .and_then(|tracked| tracked.pin.as_ref())
                 .is_some_and(|pin| self.source.leader_proven_live(pid, pin));
+        // The proven interval's image label must postdate the proof:
+        // the admission sampled it before the stamp, so an exec in
+        // between would leave the interval labeled with the pre-exec
+        // image. Re-sample now: a later observation supersedes, and an
+        // unreadable image withholds the proof instead of minting a
+        // possibly mislabeled interval. Any exec at or after the stamp
+        // still vetoes through the recorded hook; an exec before it is
+        // already reflected in this sample. (The display-only launcher
+        // hint keeps its admission sample.)
+        let mut fresh_exe = None;
+        if proven {
+            match self.source.exe_identity(pid) {
+                Some(exe) => fresh_exe = Some(exe),
+                None => proven = false,
+            }
+        }
         let tracked = self
             .callers
             .get_mut(&id)
             .expect("the admitted caller retains its record");
         tracked.record.admitted_ns = admitted_ns;
+        if let Some(exe) = fresh_exe {
+            tracked.record.exe = Some(exe);
+            tracked.record.exec_observed = true;
+        }
         tracked.leader_alive_ns = proven.then_some(admitted_ns);
         if proven {
             self.proven_by_pid.entry(pid).or_default().push(id);

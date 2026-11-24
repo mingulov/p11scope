@@ -3835,7 +3835,8 @@ fn carried_fix5_backlog_skip_pops_pace_one_stride_per_apply() {
             &source,
         );
         let back = engine.owned_learn_deferred.back().expect("just queued");
-        let staged_key = super::owned_learn_key(&back.scan_pins, &back.proof);
+        let staged_key = super::owned_learn_key(&back.scan_pins, &back.proof)
+            .expect("the hashed fixture proofs key");
         engine.owned_learned_staged.insert(staged_key);
     }
     assert_eq!(

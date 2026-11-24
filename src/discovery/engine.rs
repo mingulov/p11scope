@@ -548,7 +548,8 @@ pub struct Engine {
     /// stride. The digest (never a store-local numeric id) keys the
     /// file: watch scans mint ids independently, so a numeric leg
     /// would both miss skips (same file, new id) and false-skip
-    /// (different file, colliding id).
+    /// (different file, colliding id). Only hashed proofs consult or
+    /// record here; unhashed proofs bypass the set (fail closed).
     owned_learned_staged: BTreeSet<OwnedLearnedKey>,
     /// Test-only: held-file probes (`file_for` reaches) and staging
     /// attempts (proofs passing the per-apply stride gate) performed by
@@ -5316,18 +5317,23 @@ type OwnedLearnedKey = (String, crate::process::MountNamespaceId, ObjectKey, Str
 /// source store (the draining call's pins for fresh proofs, the
 /// stashed proving pins for deferred ones): the proving file's
 /// digest plus the raw observation. Store-local numeric ids never
-/// enter the key (see `owned_learned_staged`).
-fn owned_learn_key(source: &PinnedObjects, proof: &OwnedLearnProof) -> OwnedLearnedKey {
+/// enter the key (see `owned_learned_staged`). `None` when the
+/// proving file carries no digest: an empty digest proves nothing
+/// (two generations of one locus would share one `""` key), so
+/// unhashed proofs bypass the staged set in both directions and pay
+/// one duplicate/stat per attempt under the stride instead of ever
+/// false-skipping.
+fn owned_learn_key(source: &PinnedObjects, proof: &OwnedLearnProof) -> Option<OwnedLearnedKey> {
     let digest = source
         .summary(proof.object)
         .map(|summary| summary.sha256.to_string())
-        .unwrap_or_default();
-    (
+        .filter(|digest| !digest.is_empty())?;
+    Some((
         digest,
         proof.module.mount_namespace,
         proof.module.key,
         proof.module.path.clone(),
-    )
+    ))
 }
 
 /// One paced-out owned-learn proof held past its scan (F4): the proof
@@ -24816,7 +24822,10 @@ impl Engine {
                 continue;
             }
             let key = owned_learn_key(&front.scan_pins, &front.proof);
-            if self.owned_learned_staged.contains(&key) {
+            if key
+                .as_ref()
+                .is_some_and(|key| self.owned_learned_staged.contains(key))
+            {
                 let front = self.owned_learn_deferred.pop_front().expect("peeked above");
                 attempted_this_apply = attempted_this_apply.saturating_add(1);
                 if let Some(module) = self.harvest_prepare(&front.scan_pins, &front.proof) {
@@ -24868,7 +24877,10 @@ impl Engine {
                 continue;
             }
             let key = owned_learn_key(pins, proof);
-            if self.owned_learned_staged.contains(&key) {
+            if key
+                .as_ref()
+                .is_some_and(|key| self.owned_learned_staged.contains(key))
+            {
                 // Exact identity learned before: the tables still
                 // harvest (aliases exist, the union converges), but no
                 // held file is duplicated, statted, or closed again.
@@ -25031,7 +25043,7 @@ impl Engine {
         proof: &OwnedLearnProof,
         loader_exe: Option<String>,
         loader_unknown_reason: Option<&'static str>,
-        key: OwnedLearnedKey,
+        key: Option<OwnedLearnedKey>,
         proving_retained: bool,
     ) {
         self.harvest_run_learned_tables(&mut *pins, proof);
@@ -25065,7 +25077,7 @@ impl Engine {
         entry: &DeferredOwnedLearn,
         loader_exe: Option<String>,
         loader_unknown_reason: Option<&'static str>,
-        key: OwnedLearnedKey,
+        key: Option<OwnedLearnedKey>,
     ) {
         let prepared = self.harvest_prepare(&entry.scan_pins, &entry.proof);
         let Some(file) = entry.scan_pins.file_for(entry.proof.object) else {
@@ -25109,7 +25121,7 @@ impl Engine {
         display_path: &str,
         loader_exe: Option<String>,
         loader_unknown_reason: Option<&'static str>,
-        key: OwnedLearnedKey,
+        key: Option<OwnedLearnedKey>,
         proving_retained: bool,
     ) {
         use std::os::unix::fs::MetadataExt as _;
@@ -25161,9 +25173,14 @@ impl Engine {
     /// Remembers one owned-run proof's exact key as staged, settled,
     /// or refused. Bounded like [`Self::note_learned_settled`]: past
     /// the cap new keys are not retained and fall back to the
-    /// stat-then-settled path under the per-apply stride.
-    fn note_owned_learned_staged(&mut self, key: OwnedLearnedKey) {
+    /// stat-then-settled path under the per-apply stride. `None`
+    /// (unhashed proof) records nothing: the next proof attempts
+    /// again instead of consulting a proof-less key.
+    fn note_owned_learned_staged(&mut self, key: Option<OwnedLearnedKey>) {
         const OWNED_LEARNED_KEYS_CAP: usize = 8192;
+        let Some(key) = key else {
+            return;
+        };
         if self.owned_learned_staged.len() < OWNED_LEARNED_KEYS_CAP
             || self.owned_learned_staged.contains(&key)
         {
@@ -25488,7 +25505,10 @@ impl Engine {
                 continue;
             }
             let key = owned_learn_key(&entry.scan_pins, &entry.proof);
-            if self.owned_learned_staged.contains(&key) {
+            if key
+                .as_ref()
+                .is_some_and(|key| self.owned_learned_staged.contains(key))
+            {
                 if let Some(module) = self.harvest_prepare(&entry.scan_pins, &entry.proof) {
                     self.harvest_commit(&mut scratch, module);
                 }

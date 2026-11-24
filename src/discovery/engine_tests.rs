@@ -40774,6 +40774,223 @@ fn prefault_manifest_getter_data_skips_an_exhausted_objects_ranges_without_repro
     );
 }
 
+/// A removed object's debit never returns with it: with A warmed one
+/// chunk and deferred, a pass over B alone prunes A's total, so when A
+/// returns it re-warms under a fresh allowance (twin: carrying A's total
+/// through its absence suppresses its return).
+#[test]
+fn prefault_manifest_getter_data_restarts_a_returned_objects_allowance_after_its_removal() {
+    let mut warmup = two_object_warmup_with_len(Some(131072));
+    warmup.engine.budget = CaptureWorkBudget::new(ScanLimits {
+        per_object_bytes: 65536,
+        total_bytes: 8 << 20,
+    });
+    install_two_object_slow_proof(&mut warmup);
+    for (object, base) in warmup.objects.iter().zip(warmup.copies.readable.iter()) {
+        let base = *base as u64;
+        assert_eq!(
+            prefault_candidate_ranges(&warmup.engine, *object),
+            vec![(base, base + 131072)],
+            "premise: one 2-chunk candidate per copy"
+        );
+    }
+    let object_a = warmup.objects[0];
+    let object_b = warmup.objects[1];
+    let base_a = warmup.copies.readable[0] as u64;
+    let base_b = warmup.copies.readable[1] as u64;
+    warmup.engine.set_prefault_caps_for_test(Some(1), None);
+    let sites_a = warmup_sites_for(&warmup.objects[..1]);
+    let outcome = warmup
+        .engine
+        .prefault_manifest_getter_data(warmup.id, &sites_a);
+    assert_eq!(
+        outcome,
+        GetterPrefaultOutcome::Deferred { frame_spent: false },
+        "pass 1 warms A's first chunk and defers on its read credit"
+    );
+    let sites_b = warmup_sites_for(&warmup.objects[1..]);
+    let outcome = warmup
+        .engine
+        .prefault_manifest_getter_data(warmup.id, &sites_b);
+    assert_eq!(
+        outcome,
+        GetterPrefaultOutcome::Deferred { frame_spent: false },
+        "pass 2 warms B's first chunk and defers on its read credit"
+    );
+    let cursor = warmup
+        .engine
+        .getter_prefault_cursors
+        .get(&warmup.id)
+        .expect("a deferred pass saves its cursor")
+        .clone();
+    assert!(
+        !cursor.op_bytes.contains_key(&object_a),
+        "the rescan prunes the removed object's total"
+    );
+    assert_eq!(
+        cursor.op_bytes_for(object_b),
+        65536,
+        "the surviving object's total carries"
+    );
+    warmup.engine.set_prefault_caps_for_test(None, None);
+    let outcome = warmup
+        .engine
+        .prefault_manifest_getter_data(warmup.id, &sites_a);
+    assert_eq!(outcome, GetterPrefaultOutcome::Complete);
+    let attempts = warmup.engine.prefault_attempts_for_test();
+    assert_eq!(
+        attempts,
+        vec![
+            (base_a, 65536, true),
+            (base_b, 65536, true),
+            (base_a, 65536, true),
+        ],
+        "the returned object re-warms under a fresh allowance: {attempts:?}"
+    );
+}
+
+/// A frame yield that removes an object prunes its debit: with A warmed
+/// one chunk and deferred, a spent frame over B alone carries no A
+/// total, B's pass defers clean, and when A returns it re-warms under a
+/// fresh allowance (twin: carrying A's total through the yield
+/// suppresses its return).
+#[test]
+fn prefault_manifest_getter_data_prunes_a_removed_objects_bytes_across_a_frame_yield() {
+    let mut warmup = two_object_warmup_with_len(Some(131072));
+    warmup.engine.budget = CaptureWorkBudget::new(ScanLimits {
+        per_object_bytes: 65536,
+        total_bytes: 8 << 20,
+    });
+    install_two_object_slow_proof(&mut warmup);
+    let object_a = warmup.objects[0];
+    let base_a = warmup.copies.readable[0] as u64;
+    let base_b = warmup.copies.readable[1] as u64;
+    warmup.engine.set_prefault_caps_for_test(Some(1), None);
+    let sites_a = warmup_sites_for(&warmup.objects[..1]);
+    let outcome = warmup
+        .engine
+        .prefault_manifest_getter_data(warmup.id, &sites_a);
+    assert_eq!(
+        outcome,
+        GetterPrefaultOutcome::Deferred { frame_spent: false },
+        "pass 1 warms A's first chunk and defers on its read credit"
+    );
+    warmup.engine.frame_deadline_ns = Some(0);
+    let sites_b = warmup_sites_for(&warmup.objects[1..]);
+    let outcome = warmup
+        .engine
+        .prefault_manifest_getter_data(warmup.id, &sites_b);
+    assert_eq!(
+        outcome,
+        GetterPrefaultOutcome::Deferred { frame_spent: true },
+        "pass 2 yields before enumerating under the spent frame"
+    );
+    let cursor = warmup
+        .engine
+        .getter_prefault_cursors
+        .get(&warmup.id)
+        .expect("a frame yield keeps its cursor")
+        .clone();
+    assert!(
+        !cursor.op_bytes.contains_key(&object_a),
+        "the yield prunes the removed object's total"
+    );
+    assert_eq!(
+        warmup.engine.prefault_attempts_for_test().len(),
+        1,
+        "the frame yield attempts nothing"
+    );
+    warmup.engine.frame_deadline_ns = Some(u64::MAX);
+    let outcome = warmup
+        .engine
+        .prefault_manifest_getter_data(warmup.id, &sites_b);
+    assert_eq!(
+        outcome,
+        GetterPrefaultOutcome::Deferred { frame_spent: false },
+        "pass 3 warms B's first chunk and defers on its read credit"
+    );
+    warmup.engine.set_prefault_caps_for_test(None, None);
+    let outcome = warmup
+        .engine
+        .prefault_manifest_getter_data(warmup.id, &sites_a);
+    assert_eq!(outcome, GetterPrefaultOutcome::Complete);
+    assert_eq!(
+        warmup.engine.prefault_attempts_for_test(),
+        vec![
+            (base_a, 65536, true),
+            (base_b, 65536, true),
+            (base_a, 65536, true),
+        ],
+        "the returned object re-warms under a fresh allowance: {:?}",
+        warmup.engine.prefault_attempts_for_test()
+    );
+}
+
+/// Retiring a stale cursor prunes the removed object's debit: with A
+/// warmed one chunk and deferred, retiring against B alone drops A's
+/// total, B's pass defers clean, and when A returns it re-warms under a
+/// fresh allowance (twin: carrying A's total through the retire
+/// suppresses its return).
+#[test]
+fn prefault_manifest_getter_data_prunes_a_removed_objects_bytes_when_its_cursor_retires() {
+    let mut warmup = two_object_warmup_with_len(Some(131072));
+    warmup.engine.budget = CaptureWorkBudget::new(ScanLimits {
+        per_object_bytes: 65536,
+        total_bytes: 8 << 20,
+    });
+    install_two_object_slow_proof(&mut warmup);
+    let object_a = warmup.objects[0];
+    let base_a = warmup.copies.readable[0] as u64;
+    let base_b = warmup.copies.readable[1] as u64;
+    warmup.engine.set_prefault_caps_for_test(Some(1), None);
+    let sites_a = warmup_sites_for(&warmup.objects[..1]);
+    let outcome = warmup
+        .engine
+        .prefault_manifest_getter_data(warmup.id, &sites_a);
+    assert_eq!(
+        outcome,
+        GetterPrefaultOutcome::Deferred { frame_spent: false },
+        "pass 1 warms A's first chunk and defers on its read credit"
+    );
+    let sites_b = warmup_sites_for(&warmup.objects[1..]);
+    warmup
+        .engine
+        .retire_stale_prefault_cursor(warmup.id, &sites_b);
+    let cursor = warmup
+        .engine
+        .getter_prefault_cursors
+        .get(&warmup.id)
+        .expect("the retire keeps a cursor for the new set")
+        .clone();
+    assert!(
+        !cursor.op_bytes.contains_key(&object_a),
+        "the retire prunes the removed object's total"
+    );
+    let outcome = warmup
+        .engine
+        .prefault_manifest_getter_data(warmup.id, &sites_b);
+    assert_eq!(
+        outcome,
+        GetterPrefaultOutcome::Deferred { frame_spent: false },
+        "pass 2 warms B's first chunk and defers on its read credit"
+    );
+    warmup.engine.set_prefault_caps_for_test(None, None);
+    let outcome = warmup
+        .engine
+        .prefault_manifest_getter_data(warmup.id, &sites_a);
+    assert_eq!(outcome, GetterPrefaultOutcome::Complete);
+    assert_eq!(
+        warmup.engine.prefault_attempts_for_test(),
+        vec![
+            (base_a, 65536, true),
+            (base_b, 65536, true),
+            (base_a, 65536, true),
+        ],
+        "the returned object re-warms under a fresh allowance: {:?}",
+        warmup.engine.prefault_attempts_for_test()
+    );
+}
+
 /// Failed proofs count as attempted operations too: a missing held proof
 /// spends its lookup, and unreadable batch stats spend theirs (twin:
 /// counting only successes would under-report the native work).

@@ -9788,19 +9788,25 @@ impl JournalAdapter {
     /// table scan). Conservative: any same-image BEGIN, END or
     /// abandonment in the window blocks, including entries that would
     /// not convert here; lone drains carry consecutive cuts with no
-    /// integer between them, so they always pass. A return observed
-    /// at or after its abandonment has nothing between them by
-    /// construction, so the window is vacuously empty (and the range
-    /// below never inverts). Refused begins live outside the open
-    /// table and stay out of the window, as do ordinary CALL ordinals
-    /// (observations, not Begin/End events).
+    /// integer between them, so they always pass. The probe runs in
+    /// both directions: a return observed before its abandonment must
+    /// not move past staged dependent history, and neither must a
+    /// late return observed after it (a sibling close-all staged
+    /// between the two applies at its own cut either way). Equal cuts
+    /// short-circuit (the range API refuses equal excluded bounds).
+    /// Refused begins live outside the
+    /// open table and stay out of the window, as do ordinary CALL
+    /// ordinals (observations, not Begin/End events).
     fn drain_window_empty(&self, image: (u64, u64), returned: u64, abandoned: u64) -> bool {
-        if returned >= abandoned {
+        use std::ops::Bound::Excluded;
+        if returned == abandoned {
+            // The range API refuses equal excluded bounds; equal cuts
+            // hold nothing between them by construction.
             return true;
         }
-        use std::ops::Bound::Excluded;
+        let (lo, hi) = (returned.min(abandoned), returned.max(abandoned));
         self.drain_ordinals
-            .range((Excluded((image, returned)), Excluded((image, abandoned))))
+            .range((Excluded((image, lo)), Excluded((image, hi))))
             .next()
             .is_none()
     }
@@ -22867,16 +22873,27 @@ pub(crate) mod tests {
             "the late return stages the reverse-window candidate"
         );
         let bootstrap = scene.bootstrap(proof, 0);
-        let outcome = scene.seal(&bootstrap);
-        let effects = match &outcome {
-            Ok(success) => &success.effects.effects,
-            Err(failure) => &failure.effects.effects,
-        };
+        let success = scene
+            .seal(&bootstrap)
+            .expect("the loss above the sibling cut seals");
         assert!(
-            !effects
+            !success
+                .effects
+                .effects
                 .iter()
                 .any(|effect| matches!(effect, ObjectEffect::SessionOpened { .. })),
-            "no session opens out of order: {effects:?}",
+            "no session opens out of order: {:?}",
+            success.effects.effects,
+        );
+        assert!(
+            success.effects.effects.iter().any(|effect| matches!(
+                effect,
+                ObjectEffect::Gap {
+                    reason: super::ObjectGap::OutcomeLost
+                }
+            )),
+            "the unproven drain keeps its counted loss: {:?}",
+            success.effects.effects,
         );
         assert_eq!(
             scene
@@ -22892,13 +22909,11 @@ pub(crate) mod tests {
             scene.model.project().sessions.is_empty(),
             "no session survives the unproven drain"
         );
-        if let Ok(success) = &outcome {
-            assert!(
-                success.prefix.settled().iter().any(|call| call.abandoned),
-                "a sealing drain keeps its loss: {:?}",
-                success.prefix.settled()
-            );
-        }
+        assert!(
+            success.prefix.settled().iter().any(|call| call.abandoned),
+            "the drain settles as a loss: {:?}",
+            success.prefix.settled()
+        );
     }
 
     #[test]

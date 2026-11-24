@@ -361,7 +361,7 @@ def check_spy_prefix_gap(report, ledger, spyview, failures, notes):
     """
     order = table_order(ledger)
     mark = len(failures)
-    if order[:2] != ["C_Initialize", "C_GetSlotList"]:
+    if order[:2] != list(PREFIX_ALLOW):
         failures.append(f"ledger shape drifted: table order starts {order[:2]!r}")
         return "exact"
     notes.append(f"ledger: total={ledger.total} prefix-ok")
@@ -382,7 +382,8 @@ def check_spy_prefix_gap(report, ledger, spyview, failures, notes):
     if exact:
         notes.append("spy: exact")
         return "exact"
-    if set(missed) not in ({"C_Initialize"}, {"C_Initialize", "C_GetSlotList"}):
+    allowed = {frozenset(PREFIX_ALLOW[:1]), frozenset(PREFIX_ALLOW[:2])}
+    if frozenset(missed) not in allowed:
         failures.append(f"spy miss is not the ledger prefix: {sorted(missed)!r}")
         return "exact"
     surplus = [fn for fn in sorted(set(ledger.counts) | set(spyview.calls))
@@ -1065,6 +1066,24 @@ class ProxyPrefixGapTwins(unittest.TestCase):
         self.assertTrue(verdict, verdict.detail)
         self.assertEqual(verdict.branch, "prefix-gap")
 
+    def test_prefix_allow_pins_the_two_call_prefix(self):
+        # The gap's upper edge lives in PREFIX_ALLOW and the judge
+        # derives its accepted sets from it: widening the constant
+        # must fail here, not silently widen the gap.
+        self.assertEqual(PREFIX_ALLOW, ("C_Initialize", "C_GetSlotList"))
+
+    def test_three_deep_leading_miss_rejected(self):
+        # K<=2 is the whole gap: a 3-deep leading miss (Init,
+        # SlotList, Login) is mid-burst, not a prefix gap.
+        def drop_three(report, _ledger):
+            report["functions"] = [r for r in report["functions"]
+                                   if not (r["names"] in (["C_Initialize"], ["C_GetSlotList"],
+                                                          ["C_Login"])
+                                           and (r["module"] or {}).get("sha256") == SPY_SHA)]
+        verdict = self.verdict(drop_three)
+        self.assertFalse(verdict, verdict.detail)
+        self.assertIn("prefix", verdict.detail)
+
     def test_mid_miss_rejected(self):
         def drop_login(report, _ledger):
             report["functions"] = [r for r in report["functions"]
@@ -1128,6 +1147,19 @@ class OpenscJudgeTwins(unittest.TestCase):
         verdict = self.verdict(drop_prefix)
         self.assertTrue(verdict, verdict.detail)
         self.assertEqual(verdict.branch, "prefix-gap")
+
+    def test_three_deep_leading_miss_rejected(self):
+        # The opensc ledger holds 3 table calls (Init, SlotList,
+        # Finalize): missing all three is a total miss, never a
+        # 2-deep prefix gap.
+        def drop_three(report, _ledger):
+            report["functions"] = [r for r in report["functions"]
+                                   if not (r["names"] in (["C_Initialize"], ["C_GetSlotList"],
+                                                          ["C_Finalize"])
+                                           and (r["module"] or {}).get("sha256") == SPY_SHA)]
+        verdict = self.verdict(drop_three)
+        self.assertFalse(verdict, verdict.detail)
+        self.assertIn("prefix", verdict.detail)
 
     def test_gap_rejects_non_init_miss(self):
         def drop_slotlist(report, _ledger):

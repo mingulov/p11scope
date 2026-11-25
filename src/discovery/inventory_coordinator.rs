@@ -839,9 +839,11 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// so pruning never double-counts it. Past the bound a due row is
     /// folded into `pair_dropped_totals` and `pair_prune_overflow`
     /// counts it once, so neither the map nor the counters grow.
-    /// Tombstones past the keep window drain by age on the same pass
-    /// (counted in the same overflow); the stop-time domain finish
-    /// stays as the backstop.
+    /// Tombstones past the keep window drain on the same pass only
+    /// for gone tasks whose base is past the window too (counted in
+    /// the same overflow); a live task's tombstone stays for its
+    /// late revival, and the stop-time domain finish stays as the
+    /// backstop.
     pair_dropped_tombstones: HashMap<PairKey, PrunedPairBase>,
     /// Exact aggregate of pruned dropped-pair bases per key class
     /// (domain and object): rows and saturating base total. Counts stay
@@ -1178,11 +1180,13 @@ const EXEC_STATE_GRACE_NS: u64 = 180 * 1_000_000_000;
 const MAX_PRUNED_PAIR_TOMBSTONES: usize = 65_536;
 /// How long a pruned dropped-pair tombstone stays available to a late
 /// revival: two prune graces past the prune that created it. Older
-/// tombstones drain by age every pass (their bases already joined the
-/// exact class aggregate at prune time) and `pair_prune_overflow`
-/// counts each age fold once, like a bound fold — so the map stays
-/// flat under churn instead of living until domain stop. A later
-/// revival past an expired tombstone starts from zero, exactly like
+/// tombstones drain every pass only for gone tasks whose base is
+/// past the window too (their bases already joined the exact class
+/// aggregate at prune time) and `pair_prune_overflow` counts each
+/// age fold once, like a bound fold — so the map stays flat under
+/// churn instead of living until domain stop, while a live task's
+/// tombstone stays for its late revival. A later revival past a
+/// drained (gone-task) tombstone starts from zero, exactly like
 /// past a bound-folded row.
 const PAIR_TOMBSTONE_KEEP_NS: u64 = 2 * EXEC_STATE_GRACE_NS;
 /// Pruned EXEC stashes remembered per cookie. Past it the domain latches
@@ -6427,11 +6431,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// row is folded into the same exact aggregate and the overflow
     /// counts it once, so `pair_targets` never grows without bound and
     /// no base is forgotten silently (only exact per-pair revival is
-    /// lost, and the published overflow count says so). Tombstones
-    /// older than the keep window drain by age on the same pass (their
-    /// bases already joined the aggregate at prune time): the overflow
-    /// counts each age fold once, so the tombstone map stays flat
-    /// under churn instead of living until domain stop.
+    /// lost, and the published overflow count says so). A tombstone
+    /// past the keep window drains on the same pass only for a gone
+    /// task whose base is past the window too (its base already
+    /// joined the aggregate at prune time): the overflow counts each
+    /// age fold once, so the tombstone map stays flat under churn
+    /// instead of living until domain stop, while a live task's
+    /// tombstone stays for its late revival.
     fn prune_dropped_pair_targets(&mut self, now_ns: u64) {
         let due: Vec<PairKey> = self
             .pair_targets
@@ -6446,10 +6452,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             })
             .collect();
         for key in due {
-            let Some(PairTarget::Dropped { base, base_since }) = self.pair_targets.get(&key) else {
+            let Some(PairTarget::Dropped {
+                base,
+                base_since,
+                pid,
+            }) = self.pair_targets.get(&key)
+            else {
                 continue;
             };
-            let (base, base_since) = (*base, *base_since);
+            let (base, base_since, pid) = (*base, *base_since, *pid);
             self.pair_targets.remove(&key);
             let class = PairKeyClass {
                 domain: key.image.domain(),
@@ -6468,24 +6479,43 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         base,
                         base_since,
                         pruned_since: now_ns,
+                        pid,
                     },
                 );
             } else {
                 self.pair_prune_overflow = self.pair_prune_overflow.saturating_add(1);
             }
         }
-        // Age drain: tombstones past the keep window leave the map;
-        // their bases stay in the exact aggregate, and the overflow
-        // counts each age fold once, like a bound fold.
-        let mut expired = 0u64;
-        self.pair_dropped_tombstones.retain(|_, tomb| {
-            if now_ns.saturating_sub(tomb.pruned_since) >= PAIR_TOMBSTONE_KEEP_NS {
-                expired = expired.saturating_add(1);
-                false
-            } else {
-                true
+        // Age drain: a tombstone past the keep window leaves the map
+        // only for a gone task whose base is past the window too; the
+        // base stays in the exact aggregate, and the overflow counts
+        // each age fold once, like a bound fold. One liveness read
+        // per distinct pid per pass.
+        let drain_due: Vec<(PairKey, u32)> = self
+            .pair_dropped_tombstones
+            .iter()
+            .filter(|(_, tomb)| {
+                now_ns.saturating_sub(tomb.pruned_since) >= PAIR_TOMBSTONE_KEEP_NS
+                    && now_ns.saturating_sub(tomb.base_since) >= PAIR_TOMBSTONE_KEEP_NS
+            })
+            .map(|(key, tomb)| (*key, tomb.pid))
+            .collect();
+        let mut gone_memo: HashMap<u32, bool> = HashMap::new();
+        {
+            let source = self.adapter.source();
+            for (_, pid) in &drain_due {
+                gone_memo
+                    .entry(*pid)
+                    .or_insert_with(|| *pid == 0 || source.gone(*pid));
             }
-        });
+        }
+        let mut expired = 0u64;
+        for (key, pid) in drain_due {
+            if gone_memo.get(&pid).copied().unwrap_or(false) {
+                self.pair_dropped_tombstones.remove(&key);
+                expired = expired.saturating_add(1);
+            }
+        }
         self.pair_prune_overflow = self.pair_prune_overflow.saturating_add(expired);
     }
 
@@ -6564,8 +6594,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             let (base, base_since) = self.pair_drop_base(&key);
             let base = base.max(recovery.watermark);
             let _ = self.take_pruned_pair_base(&key);
-            self.pair_targets
-                .insert(key, PairTarget::Dropped { base, base_since });
+            let pid = self.record_pid_or_unknown(recovery.caller);
+            self.pair_targets.insert(
+                key,
+                PairTarget::Dropped {
+                    base,
+                    base_since,
+                    pid,
+                },
+            );
             self.pair_counts.remove(&key);
             self.placement_generations.remove(&key);
         }
@@ -6608,7 +6645,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     fn drop_caller_pairs_for_fold(&mut self, id: CallerId, pairs: &mut PairFoldWork) {
         let keys: Vec<PairKey> = pairs.targets.remove(&id).unwrap_or_default();
         for key in keys {
-            self.drop_pair_target_for_fold(key, pairs);
+            self.drop_pair_target_for_fold(id, key, pairs);
         }
         // Dropped or pruned pairs keep their exact base for the grace
         // prune and revival, but their recoveries name this caller and
@@ -6633,8 +6670,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// silently. A stuck recovery naming a different caller (a revival
     /// past it) stays for its own caller's fold; only its target drops
     /// here. This never touches `recoveries` or the service order
-    /// directly — the settle owns both.
-    fn drop_pair_target_for_fold(&mut self, key: PairKey, pairs: &mut PairFoldWork) {
+    /// directly — the settle owns both. The dropped pid names the
+    /// folded caller.
+    fn drop_pair_target_for_fold(
+        &mut self,
+        caller: CallerId,
+        key: PairKey,
+        pairs: &mut PairFoldWork,
+    ) {
         #[cfg(test)]
         {
             self.fold_pair_drop_visits = self.fold_pair_drop_visits.saturating_add(1);
@@ -6661,8 +6704,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
         let (base, base_since) = self.pair_drop_base(&key);
         let _ = self.take_pruned_pair_base(&key);
-        self.pair_targets
-            .insert(key, PairTarget::Dropped { base, base_since });
+        let pid = self.record_pid_or_unknown(caller);
+        self.pair_targets.insert(
+            key,
+            PairTarget::Dropped {
+                base,
+                base_since,
+                pid,
+            },
+        );
         self.pair_counts.remove(&key);
         self.placement_generations.remove(&key);
     }
@@ -6904,8 +6954,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             })
     }
 
-    /// Dropped pair rows folded past the exact tombstone bound (each
-    /// counted once, when it leaves the map).
+    /// Dropped pair rows folded out of the exact tombstone map —
+    /// past the tombstone bound, or past the keep window for a gone
+    /// task (each counted once, when it leaves the map).
     pub(crate) fn pair_prune_overflow(&self) -> u64 {
         self.pair_prune_overflow
     }
@@ -11031,11 +11082,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 }
                 self.registry
                     .note_retirement_count_gap(caller, new_base, count.count);
+                let pid = self.record_pid_or_unknown(caller);
                 self.pair_targets.insert(
                     key,
                     PairTarget::Dropped {
                         base: count.count,
                         base_since: count.anchor_ns,
+                        pid,
                     },
                 );
                 self.pair_counts.remove(&key);
@@ -11507,7 +11560,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 ..
             }) => (*base, *staged, *staged_ns, *base_since),
             Some(
-                PairTarget::Dropped { base, base_since }
+                PairTarget::Dropped {
+                    base, base_since, ..
+                }
                 | PairTarget::Suspended {
                     base, base_since, ..
                 },
@@ -11922,11 +11977,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                             },
                         );
                     } else {
+                        let pid = self.record_pid_or_unknown(pending.caller);
                         self.pair_targets.insert(
                             key,
                             PairTarget::Dropped {
                                 base: pending.observation.count,
                                 base_since: pending.observation.anchor_ns,
+                                pid,
                             },
                         );
                         self.pair_counts.remove(&key);
@@ -12786,7 +12843,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     | PairTarget::Bound {
                         base, base_since, ..
                     }
-                    | PairTarget::Dropped { base, base_since }
+                    | PairTarget::Dropped {
+                        base, base_since, ..
+                    }
                     | PairTarget::Suspended {
                         base, base_since, ..
                     },
@@ -12794,6 +12853,17 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 None => None,
             })
             .unwrap_or((0, 0))
+    }
+
+    /// The owning pid for a freshly dropped base: the named caller's
+    /// record pid, or unknown (0) when its record is already gone. A
+    /// folded record names a departed task, so the age drain treats
+    /// unknown like gone; every live drop resolves a real pid.
+    fn record_pid_or_unknown(&self, caller: CallerId) -> u32 {
+        self.adapter
+            .record(caller)
+            .map(|record| record.pid)
+            .unwrap_or(0)
     }
 
     fn drop_pair_count(&mut self, row: &WitnessRow, reason: DiagnosticReason) -> u64 {
@@ -12818,8 +12888,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             recorder.record(record);
         }
         let _ = self.take_pruned_pair_base(&key);
-        self.pair_targets
-            .insert(key, PairTarget::Dropped { base, base_since });
+        let pid = row.host_tgid;
+        self.pair_targets.insert(
+            key,
+            PairTarget::Dropped {
+                base,
+                base_since,
+                pid,
+            },
+        );
         self.pair_counts.remove(&key);
         base
     }
@@ -15409,15 +15486,19 @@ struct PairKeyClass {
     object: u32,
 }
 
-/// One pruned dropped pair's absolute base, its read anchor, and the
-/// pass it left the live map: a late revival rebases past exactly
-/// this, so pruning never double-counts, and a tombstone older than
-/// the keep window drains by age instead of living until domain stop.
+/// One pruned dropped pair's absolute base, its read anchor, the
+/// pass it left the live map, and the host tgid that produced the
+/// base: a late revival rebases past exactly this, so pruning never
+/// double-counts. A tombstone past the keep window drains only for a
+/// gone task whose base is past the window too; a live task's
+/// tombstone stays until its task is gone (or the bound folds it,
+/// counted), instead of living until domain stop.
 #[derive(Debug, Clone, Copy)]
 struct PrunedPairBase {
     base: u64,
     base_since: u64,
     pruned_since: u64,
+    pid: u32,
 }
 
 /// Exact aggregate of pruned dropped-pair bases for one class.
@@ -15568,8 +15649,15 @@ enum PairTarget {
     /// (attributed or disclosed history), so a later witness row for
     /// the same pair rebinds past it instead of re-absorbing it (round
     /// 4, rebind). `base_since` is the PRE bound for the `base` read: a
-    /// revival's growth windows from the drop.
-    Dropped { base: u64, base_since: u64 },
+    /// revival's growth windows from the drop. `pid` is the host tgid
+    /// that produced the base, carried into the prune tombstone so the
+    /// age drain keeps a live task's base (0 when the owning record
+    /// was already gone; the drain treats unknown like gone).
+    Dropped {
+        base: u64,
+        base_since: u64,
+        pid: u32,
+    },
     /// Exact, previously placed history remains; future ownership needs a fresh fence.
     Suspended {
         caller: CallerId,
@@ -28432,6 +28520,7 @@ exit 0
             PairTarget::Dropped {
                 base: 20,
                 base_since: 1_000,
+                pid: 7,
             },
         );
         native.scene.coordinator.pair_targets.insert(
@@ -28439,6 +28528,7 @@ exit 0
             PairTarget::Dropped {
                 base: 7,
                 base_since: 1_000,
+                pid: 7,
             },
         );
         let before = 27u64 + native.scene.coordinator.dropped_pair_base_total_for_test();
@@ -28490,6 +28580,7 @@ exit 0
             PairTarget::Dropped {
                 base: 9,
                 base_since: 5_000,
+                pid: 7,
             },
         );
         native
@@ -44031,6 +44122,7 @@ int main(void) {
                 base: 5,
                 base_since: 100,
                 pruned_since: 100,
+                pid: 7,
             },
         );
         native.stage(NativeBatch::Finish {
@@ -44074,6 +44166,7 @@ int main(void) {
                 PairTarget::Dropped {
                     base: 10 + index as u64,
                     base_since: 1_000,
+                    pid: 7,
                 },
             );
         }
@@ -44120,11 +44213,14 @@ int main(void) {
             exec: 1,
             object: 0,
         };
+        // Pid 9 is never spawned: the task is gone, so the age drain
+        // still expires its tombstone.
         native.scene.coordinator.pair_targets.insert(
             key,
             PairTarget::Dropped {
                 base: 5,
                 base_since: 1_000,
+                pid: 9,
             },
         );
         native
@@ -44180,6 +44276,7 @@ int main(void) {
             PairTarget::Dropped {
                 base: 5,
                 base_since: at,
+                pid: 7,
             },
         );
         native
@@ -44225,11 +44322,14 @@ int main(void) {
         assert_eq!(native.scene.coordinator.pair_prune_overflow_for_test(), 0);
     }
 
-    /// Revival past the tombstone keep window (R2 twin F4): a pruned
-    /// dropped pair whose tombstone already age-drained revives from
-    /// zero — the live Pending target carries base 0 while the class
-    /// aggregate still holds the pruned base exactly once, and the
-    /// age-fold overflow does not move.
+    /// Revival past the tombstone keep window for a gone task (R2
+    /// twin F4): a pruned dropped pair whose tombstone already
+    /// age-drained revives from zero — the live Pending target
+    /// carries base 0 while the class aggregate still holds the
+    /// pruned base exactly once, and the age-fold overflow does not
+    /// move. (Pid 9 is never spawned: the drain still expires a gone
+    /// task's tombstone; a live task's tombstone survives — see the
+    /// live-task twin below.)
     #[test]
     fn revived_pair_past_the_tombstone_window_restarts_from_zero_with_aggregate_intact() {
         let (mut native, caller) = NativeScene::new();
@@ -44244,6 +44344,7 @@ int main(void) {
             PairTarget::Dropped {
                 base: 5,
                 base_since: at,
+                pid: 9,
             },
         );
         native
@@ -44313,6 +44414,7 @@ int main(void) {
             PairTarget::Dropped {
                 base: 5,
                 base_since: at,
+                pid: 7,
             },
         );
         native
@@ -44323,6 +44425,16 @@ int main(void) {
         assert_eq!(
             native.scene.coordinator.dropped_pair_tombstones_for_test(),
             1
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .pair_dropped_tombstones
+                .get(&key)
+                .map(|tomb| tomb.pid),
+            Some(7),
+            "the prune carries the owning pid into the tombstone"
         );
         // Past the keep window pid 7 is still live: the tombstone
         // stays instead of draining by age.
@@ -44399,9 +44511,13 @@ int main(void) {
         assert!(
             matches!(
                 native.scene.coordinator.pair_targets.get(&key),
-                Some(PairTarget::Dropped { base: 5, .. })
+                Some(PairTarget::Dropped {
+                    base: 5,
+                    pid: 7,
+                    ..
+                })
             ),
-            "the quiet pair drops with its base"
+            "the quiet pair drops with its base and its row's pid"
         );
         // Quiet past the grace prunes (the absorbed anchor runs one
         // tick past the row stamp); quiet past the keep window must
@@ -44413,6 +44529,16 @@ int main(void) {
         assert_eq!(
             native.scene.coordinator.dropped_pair_tombstones_for_test(),
             1
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .pair_dropped_tombstones
+                .get(&key)
+                .map(|tomb| tomb.pid),
+            Some(7),
+            "the prune carries the row's pid into the tombstone"
         );
         native
             .scene
@@ -44456,18 +44582,17 @@ int main(void) {
             exec: 1,
             object: 0,
         };
-        native
-            .scene
-            .coordinator
-            .pair_dropped_tombstones
-            .insert(
-                key,
-                PrunedPairBase {
-                    base: 5,
-                    base_since: at,
-                    pruned_since: 1_000,
-                },
-            );
+        // Pid 9 is never spawned: the task is gone, so only the
+        // growth guard keeps this tombstone.
+        native.scene.coordinator.pair_dropped_tombstones.insert(
+            key,
+            PrunedPairBase {
+                base: 5,
+                base_since: at,
+                pruned_since: 1_000,
+                pid: 9,
+            },
+        );
         // The tombstone is exactly the keep window old, but its base
         // grew ten ticks short of it: the drain keeps it.
         native
@@ -44483,6 +44608,369 @@ int main(void) {
             native.scene.coordinator.pair_prune_overflow_for_test(),
             0,
             "no age fold for the kept tombstone"
+        );
+    }
+
+    /// An unknown owning pid (the record was already gone when the
+    /// pair dropped) drains like a gone task: the fold settles
+    /// departed callers, so unknown is gone, and the counted
+    /// overflow names the fold.
+    #[test]
+    fn unknown_pid_tombstone_drains_like_a_gone_task() {
+        let (mut native, _caller) = NativeScene::new();
+        let at = native.stamps.tick();
+        let key = PairKey {
+            image: DomainCookie::scripted(native.domain, 41),
+            exec: 1,
+            object: 0,
+        };
+        native.scene.coordinator.pair_targets.insert(
+            key,
+            PairTarget::Dropped {
+                base: 5,
+                base_since: at,
+                pid: 0,
+            },
+        );
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(at + EXEC_STATE_GRACE_NS);
+        assert_eq!(
+            native.scene.coordinator.dropped_pair_tombstones_for_test(),
+            1
+        );
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(at + EXEC_STATE_GRACE_NS + 2 * EXEC_STATE_GRACE_NS);
+        assert_eq!(
+            native.scene.coordinator.dropped_pair_tombstones_for_test(),
+            0,
+            "an unknown pid drains past the keep window"
+        );
+        assert_eq!(native.scene.coordinator.pruned_pair_totals(), (1, 5));
+        assert_eq!(
+            native.scene.coordinator.pair_prune_overflow_for_test(),
+            1,
+            "the age fold counts exactly once"
+        );
+    }
+
+    /// A gone task's tombstone still keeps its full window: a pass
+    /// before the keep window ends drains nothing and counts nothing.
+    #[test]
+    fn gone_task_tombstone_keeps_its_full_window() {
+        let (mut native, _caller) = NativeScene::new();
+        let at = native.stamps.tick();
+        let key = PairKey {
+            image: DomainCookie::scripted(native.domain, 41),
+            exec: 1,
+            object: 0,
+        };
+        native.scene.coordinator.pair_targets.insert(
+            key,
+            PairTarget::Dropped {
+                base: 5,
+                base_since: at,
+                pid: 9,
+            },
+        );
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(at + EXEC_STATE_GRACE_NS);
+        assert_eq!(
+            native.scene.coordinator.dropped_pair_tombstones_for_test(),
+            1
+        );
+        // One grace short of the keep window: the tombstone stays.
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(at + 2 * EXEC_STATE_GRACE_NS);
+        assert_eq!(
+            native.scene.coordinator.dropped_pair_tombstones_for_test(),
+            1,
+            "a young tombstone survives even for a gone task"
+        );
+        assert_eq!(
+            native.scene.coordinator.pair_prune_overflow_for_test(),
+            0,
+            "no age fold before the window ends"
+        );
+    }
+
+    /// A rejected publication without a recovery drops with the
+    /// pending caller's pid: the live task's tombstone survives the
+    /// keep window for its late revival.
+    #[test]
+    fn rejected_publication_drops_with_the_pending_caller_pid() {
+        let (mut native, caller) = NativeScene::new();
+        let at = native.stamps.tick();
+        let key = PairKey {
+            image: DomainCookie::scripted(native.domain, 41),
+            exec: 1,
+            object: 0,
+        };
+        let endpoint = native.scene.delta.endpoints[0].id;
+        native.scene.coordinator.pair_targets.insert(
+            key,
+            PairTarget::Pending {
+                caller,
+                modules: Vec::new(),
+                staged: 5,
+                staged_ns: at,
+                endpoint,
+                base: 5,
+                base_since: at,
+            },
+        );
+        native
+            .scene
+            .coordinator
+            .placement_generations
+            .insert(key, Some(0));
+        native.scene.coordinator.pending_ids.insert(
+            41,
+            PendingCountObservation {
+                key,
+                caller,
+                endpoint,
+                observation: PairCount {
+                    count: 7,
+                    first_ns: at,
+                    anchor_ns: at,
+                    last_ns: at,
+                    retirement_usable: false,
+                    diagnostic_observation: 0,
+                    diagnostic_transition: 0,
+                },
+                generation: Some(0),
+                origin: PendingCountOrigin::Untracked,
+                diagnostic: None,
+            },
+        );
+        crate::discovery::caller_registry::tests::deliver_pending_decisions(
+            &mut native.scene.coordinator.registry,
+            &[crate::discovery::caller_registry::PendingCountDecision {
+                pending_id: 41,
+                outcome: PendingCountOutcome::Rejected {
+                    reason: PendingRejection::Ambiguous,
+                },
+            }],
+        );
+        native.scene.coordinator.finalize_pending_counts();
+        assert!(
+            matches!(
+                native.scene.coordinator.pair_targets.get(&key),
+                Some(PairTarget::Dropped {
+                    base: 7,
+                    pid: 7,
+                    ..
+                })
+            ),
+            "the rejection drops with the pending caller's pid"
+        );
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(at + EXEC_STATE_GRACE_NS);
+        assert_eq!(
+            native.scene.coordinator.dropped_pair_tombstones_for_test(),
+            1
+        );
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(at + EXEC_STATE_GRACE_NS + 2 * EXEC_STATE_GRACE_NS);
+        assert_eq!(
+            native.scene.coordinator.dropped_pair_tombstones_for_test(),
+            1,
+            "the rejected live caller's tombstone survives the drain"
+        );
+    }
+
+    /// A demotion without retirement metadata drops with the bound
+    /// caller's pid: the live task's tombstone survives the drain.
+    #[test]
+    fn demotion_without_metadata_drops_with_the_bound_caller_pid() {
+        let (mut native, caller) = NativeScene::new();
+        let at = native.stamps.tick();
+        let key = PairKey {
+            image: DomainCookie::scripted(native.domain, 41),
+            exec: 1,
+            object: 0,
+        };
+        let endpoint = native.scene.delta.endpoints[0].id;
+        native.scene.coordinator.pair_targets.insert(
+            key,
+            PairTarget::Bound {
+                caller,
+                module: ModuleKey::physical(8, 1, 7002, None, "/fold/demote-pair.so"),
+                endpoint,
+                base: 5,
+                staged: 5,
+                staged_ns: at,
+                base_since: at,
+            },
+        );
+        // No recovery: the demote arm drops instead of re-resolving.
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 7)]);
+        assert!(
+            matches!(
+                native.scene.coordinator.pair_targets.get(&key),
+                Some(PairTarget::Dropped {
+                    base: 7,
+                    pid: 7,
+                    ..
+                })
+            ),
+            "the demotion drops with the bound caller's pid"
+        );
+        let since = match native.scene.coordinator.pair_targets.get(&key) {
+            Some(PairTarget::Dropped { base_since, .. }) => *base_since,
+            _ => unreachable!("the demotion just dropped"),
+        };
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(since + EXEC_STATE_GRACE_NS);
+        assert_eq!(
+            native.scene.coordinator.dropped_pair_tombstones_for_test(),
+            1
+        );
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(since + EXEC_STATE_GRACE_NS + 2 * EXEC_STATE_GRACE_NS);
+        assert_eq!(
+            native.scene.coordinator.dropped_pair_tombstones_for_test(),
+            1,
+            "the demoted live caller's tombstone survives the drain"
+        );
+    }
+
+    /// A settled recovery for a live caller drops with that caller's
+    /// pid: the tombstone survives the keep window for the live task.
+    #[test]
+    fn settled_recovery_drops_with_its_live_caller_pid() {
+        let (mut native, caller) = NativeScene::new();
+        let at = native.stamps.tick();
+        let key = PairKey {
+            image: DomainCookie::scripted(native.domain, 41),
+            exec: 1,
+            object: 0,
+        };
+        let endpoint = native.scene.delta.endpoints[0].id;
+        native.scene.coordinator.pair_targets.insert(
+            key,
+            PairTarget::Bound {
+                caller,
+                module: ModuleKey::physical(8, 1, 7000, None, "/fold/settle-pair.so"),
+                endpoint,
+                base: 5,
+                staged: 5,
+                staged_ns: at,
+                base_since: at,
+            },
+        );
+        let recovery = PairRecovery::scripted(caller, 0, ModuleId(3));
+        native.scene.coordinator.recovery_order.push(key);
+        native
+            .scene
+            .coordinator
+            .settle_pair_recovery(key, recovery, None, None);
+        assert!(
+            matches!(
+                native.scene.coordinator.pair_targets.get(&key),
+                Some(PairTarget::Dropped {
+                    base: 5,
+                    pid: 7,
+                    ..
+                })
+            ),
+            "the settle drops with the live caller's pid"
+        );
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(at + EXEC_STATE_GRACE_NS);
+        assert_eq!(
+            native.scene.coordinator.dropped_pair_tombstones_for_test(),
+            1
+        );
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(at + EXEC_STATE_GRACE_NS + 2 * EXEC_STATE_GRACE_NS);
+        assert_eq!(
+            native.scene.coordinator.dropped_pair_tombstones_for_test(),
+            1,
+            "the settled live caller's tombstone survives the drain"
+        );
+    }
+
+    /// A caller fold drops its live pair targets with the folded
+    /// caller's record pid: the pid plumbing resolves the record.
+    #[test]
+    fn caller_fold_drops_pair_targets_with_the_record_pid() {
+        let (mut native, caller) = NativeScene::new();
+        let at = native.stamps.tick();
+        let key = PairKey {
+            image: DomainCookie::scripted(native.domain, 41),
+            exec: 1,
+            object: 0,
+        };
+        let endpoint = native.scene.delta.endpoints[0].id;
+        native.scene.coordinator.pair_targets.insert(
+            key,
+            PairTarget::Bound {
+                caller,
+                module: ModuleKey::physical(8, 1, 7001, None, "/fold/record-pair.so"),
+                endpoint,
+                base: 5,
+                staged: 5,
+                staged_ns: at,
+                base_since: at,
+            },
+        );
+        let mut work = PairFoldWork {
+            targets: HashMap::from([(caller, vec![key])]),
+            recoveries: HashMap::new(),
+            order_pos: HashMap::new(),
+        };
+        native
+            .scene
+            .coordinator
+            .drop_caller_pairs_for_fold(caller, &mut work);
+        assert!(
+            matches!(
+                native.scene.coordinator.pair_targets.get(&key),
+                Some(PairTarget::Dropped {
+                    base: 5,
+                    pid: 7,
+                    ..
+                })
+            ),
+            "the fold drops with the record pid"
+        );
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(at + EXEC_STATE_GRACE_NS);
+        assert_eq!(
+            native.scene.coordinator.dropped_pair_tombstones_for_test(),
+            1
+        );
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(at + EXEC_STATE_GRACE_NS + 2 * EXEC_STATE_GRACE_NS);
+        assert_eq!(
+            native.scene.coordinator.dropped_pair_tombstones_for_test(),
+            1,
+            "the folded record's live tombstone survives the drain"
         );
     }
 

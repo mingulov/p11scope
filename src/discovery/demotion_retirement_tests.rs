@@ -9039,6 +9039,7 @@ fn demotion_retirement_round6_gone_caller_recovery_settles_without_suspend() {
         PairTarget::Dropped {
             base,
             base_since: 300,
+            pid: 7,
         },
     );
     scene.native.scene.coordinator.pair_counts.remove(&key);

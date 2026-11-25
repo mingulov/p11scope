@@ -16,6 +16,8 @@ import tomllib
 import unittest
 from pathlib import Path
 
+import yaml
+
 ROOT = Path(__file__).resolve().parents[2]
 DAEMONSET = ROOT / "deploy/k8s/20-daemonset.yaml"
 DEPLOY_README = ROOT / "deploy/README.md"
@@ -97,6 +99,30 @@ class DeployDefaultsTests(unittest.TestCase):
     def test_rebuild_recipe_keeps_full_features(self):
         self.assertNotIn("--no-default-features", DEPLOY_README.read_text(),
                          "the published image holds the FULL binary, not P0 bytes")
+
+    def test_kind_workload_requests_keep_hosted_kind_schedulable(self):
+        expected = {
+            "ledger-a": ({"cpu": "50m", "memory": "32Mi"}, {"cpu": "500m", "memory": "128Mi"}),
+            "ledger-b": ({"cpu": "50m", "memory": "32Mi"}, {"cpu": "500m", "memory": "128Mi"}),
+            "ledger-p": ({"cpu": "50m", "memory": "32Mi"}, {"cpu": "500m", "memory": "128Mi"}),
+            "ledger-n": ({"cpu": "50m", "memory": "32Mi"}, {"cpu": "500m", "memory": "128Mi"}),
+            "ledger-t": ({"cpu": "50m", "memory": "32Mi"}, {"cpu": "500m", "memory": "128Mi"}),
+            "ledger-c": ({"cpu": "50m", "memory": "32Mi"}, {"cpu": "500m", "memory": "128Mi"}),
+            "idle": ({"cpu": "10m", "memory": "16Mi"}, {"cpu": "100m", "memory": "32Mi"}),
+        }
+        seen = {}
+        for path in (ROOT / "deploy/k8s/e2e/workloads.yaml",
+                     ROOT / "deploy/k8s/e2e/workloads-copyup.yaml"):
+            for document in yaml.safe_load_all(path.read_text()):
+                if not isinstance(document, dict) or document.get("kind") != "Pod":
+                    continue
+                containers = document["spec"]["containers"]
+                self.assertEqual(len(containers), 1)
+                seen[document["metadata"]["name"]] = containers[0]["resources"]
+        self.assertEqual(set(seen), set(expected))
+        for name, (requests, limits) in expected.items():
+            self.assertEqual(seen[name].get("requests"), requests, name)
+            self.assertEqual(seen[name].get("limits"), limits, name)
 
 
 if __name__ == "__main__":

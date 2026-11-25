@@ -798,6 +798,23 @@ impl JournalDomainProof {
             era,
         }
     }
+
+    /// Tests-only superseding proof: the same admission binding at the
+    /// next incarnation, mimicking the fresh incarnation a void-fenced
+    /// death mints. The mint itself is pinned at the adapter (void
+    /// fenced dead bindings mint); this poses the proof it produces
+    /// for the birth association's stuck-bar pressure cell, which
+    /// cannot drive a real death through its two-quantum fixture.
+    #[cfg(test)]
+    pub(crate) fn superseding_for_test(&self) -> Self {
+        Self {
+            key: JournalDomainKey {
+                incarnation: self.key.incarnation.saturating_add(1),
+                ..self.key
+            },
+            era: self.era,
+        }
+    }
 }
 
 /// One image's birth evidence: its first consumed ordinal in any form

@@ -43961,6 +43961,7 @@ fn joint_birth_backoff_refusal_precedes_witness_reservation() {
             EarlyBirthGate::Unhealthy,
             "joint_birth_reseed_session_unhealthy",
         ),
+        (EarlyBirthGate::Stuck, "joint_birth_reseed_stuck_barred"),
     ] {
         // A batch-wide deferral (association or plan storage) names
         // no caller; a per-key resource deferral names the birth's.
@@ -44004,13 +44005,15 @@ type DeferredBirthGap = (Option<CallerId>, String);
 /// birth-deferred reasons and the re-offer count. Without a clamp the
 /// helper also pins the no-install, no-consume, no-witness controls.
 /// Which early birth gate a pressure cell poses: segment doom (with
-/// an optional successor backoff), or an unhealthy session over a
-/// resumable fallback segment. (The stuck bar needs a superseding
-/// incarnation's proof, which this two-quantum fixture never mints.)
+/// an optional successor backoff), an unhealthy session over a
+/// resumable fallback segment, or the stuck bar over a barred
+/// fallback segment with Q2's claim posed superseding (the next
+/// incarnation the two-quantum fixture never mints).
 #[derive(Clone, Copy, Debug)]
 enum EarlyBirthGate {
     Doom(Option<u32>),
     Unhealthy,
+    Stuck,
 }
 
 fn doomed_segment_birth_refusals_with(
@@ -44068,11 +44071,13 @@ fn doomed_segment_birth_refusals_with(
         .clone();
     let backoff = match gate {
         EarlyBirthGate::Doom(backoff) => backoff,
-        EarlyBirthGate::Unhealthy => None,
+        EarlyBirthGate::Unhealthy | EarlyBirthGate::Stuck => None,
     };
     let doomed = BootstrapReceipt::scripted(proof, BirthKind::AttachObserved, 7, 0);
     // An unhealthy session gates a resumable segment: the health gate
-    // alone refuses it.
+    // alone refuses it. A stuck bar gates a barred fallback segment
+    // with Q2's claim posed superseding: the bar alone refuses it
+    // (same proof would be doom, unbarred would proceed).
     let resumable = matches!(gate, EarlyBirthGate::Unhealthy);
     scene
         .real
@@ -44087,6 +44092,61 @@ fn doomed_segment_birth_refusals_with(
             .coordinator
             .registry_mut()
             .pose_session_unhealthy_for_test();
+    }
+    if matches!(gate, EarlyBirthGate::Stuck) {
+        scene
+            .real
+            .scene
+            .coordinator
+            .registry_mut()
+            .pose_stuck_bar_for_test(&key);
+        scene
+            .real
+            .scene
+            .coordinator
+            .pose_first_claim_superseding_for_test();
+        // Controls: the posed claim supersedes the old receipt, the
+        // stuck probe alone fires, and the same proof would not bar.
+        let batch = scene
+            .real
+            .scene
+            .coordinator
+            .prepared_semantic_batch()
+            .expect("Q2 prepared");
+        let input = batch.admissions().next().expect("Q2 admitted");
+        let superseding = batch
+            .claims()
+            .next()
+            .expect("Q2 claimed")
+            .1
+            .as_ref()
+            .expect("the claim attests")
+            .clone();
+        assert!(
+            superseding.reseed_supersedes(&doomed.proof()),
+            "Stuck: the posed claim supersedes the old receipt"
+        );
+        assert!(
+            !proof.reseed_supersedes(&doomed.proof()),
+            "Stuck control: the original proof does not supersede"
+        );
+        let registry = scene.real.scene.coordinator.registry();
+        assert!(
+            registry.joint_reselect_stuck_barred(input, &superseding),
+            "Stuck: the barred feed probes stuck-barred on the superseding proof"
+        );
+        assert!(
+            !registry.joint_reselect_stuck_barred(input, &proof),
+            "Stuck control: the same proof does not probe stuck-barred"
+        );
+        assert!(
+            !registry.joint_reselect_segment_doomed(input, &superseding),
+            "Stuck control: the superseding birth is not segment-doomed"
+        );
+        assert!(
+            !registry.joint_reselect_unhealthy(input),
+            "Stuck control: the session is healthy"
+        );
     }
     if let Some(wait) = backoff {
         scene

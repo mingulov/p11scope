@@ -3108,6 +3108,17 @@ impl CallerRegistry {
         }
     }
 
+    /// Tests-only stuck-bar pose for one applied key's feed, beside
+    /// the fallback pose above.
+    #[cfg(test)]
+    pub(crate) fn pose_stuck_bar_for_test(&mut self, key: &InstanceKey) {
+        if let Some(id) = self.instance_state.by_key.get(key).copied()
+            && let Some(record) = self.instance_state.semantics.get_mut(&id)
+        {
+            record.feed.pose_stuck_bar_for_test();
+        }
+    }
+
     pub(crate) fn joint_staged_count(&self, target: &JointFeedTarget) -> Option<usize> {
         let record = self.instance_state.semantics.get(&target.id)?;
         (record.caller == target.caller

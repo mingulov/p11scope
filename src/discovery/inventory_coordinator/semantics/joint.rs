@@ -2164,6 +2164,29 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
     }
 
+    /// Test-only: supersede the pending prepared batch's first
+    /// attested claim, so a stuck-bar pressure cell births onto the
+    /// next incarnation its two-quantum fixture never mints. The
+    /// posed proof keeps the binding and era, bumps the incarnation,
+    /// and still matches its admission (incarnation is not part of
+    /// the admission match); the mint it mimics is pinned at the
+    /// adapter. The posed claim dies with the abandoned batch.
+    #[cfg(test)]
+    pub(crate) fn pose_first_claim_superseding_for_test(&mut self) {
+        if let Some(PendingSemanticBatch::Prepared(batch)) = self
+            .semantic_finalizer
+            .as_mut()
+            .and_then(|state| state.pending_semantic.as_mut())
+        {
+            for entry in &mut batch.entries {
+                if let Some(Ok(proof)) = entry.claim.as_mut() {
+                    *proof = proof.superseding_for_test();
+                    break;
+                }
+            }
+        }
+    }
+
     pub(crate) fn dispose_prepared_claims_s1(&mut self) {
         self.dispose_prepared_claims_s1_for_cause(BirthDisposeCause::S1Finalize);
     }

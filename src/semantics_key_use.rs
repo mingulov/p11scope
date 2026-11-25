@@ -920,6 +920,16 @@ impl JointStaging {
         self.reseeded_stuck_streak = 0;
     }
 
+    /// Tests-only stuck-bar pose: the association's stuck-bar pressure
+    /// cell bars a feed directly (driving four stuck passes needs a
+    /// reseeded segment the two-quantum fixture never builds). Mirrors
+    /// the stuck-degrade outcome: fresh reseeds barred until a void or
+    /// a served cooldown in a healthy session lifts it.
+    #[cfg(test)]
+    pub(crate) fn pose_stuck_bar_for_test(&mut self) {
+        self.fresh_reseed_barred = true;
+    }
+
     /// Why [`Self::try_reselect_joint`] would refuse this receipt
     /// (`None`: it would reseed), without changing the feed. The staging
     /// predicate asks it so an original staged in the reseed's own pass

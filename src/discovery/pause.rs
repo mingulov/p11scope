@@ -2372,7 +2372,8 @@ impl PauseCoordinator {
         // The arm-failure release debt is independent of the epoch above:
         // a stop may still hold the child, so the final cleanup probes
         // liveness and resumes once. A gone child settles silently; a
-        // failure is collected and the debt stays for a retry.
+        // failure is collected and the debt stays unpaid, with the
+        // parent-death SIGCONT arm as the final protective resume.
         if self.release_owed {
             match io.original_exited() {
                 Ok(true) => {
@@ -9322,14 +9323,39 @@ mod tests {
         io.events.clear();
         let error = coordinator.arm(&mut io).unwrap_err();
         assert!(error.lifecycle());
-        assert!(
-            error.to_string().contains(MSG_RELEASE_FAILED_REPEATEDLY),
-            "escalation names its cause: {error}"
+        assert_eq!(
+            error.to_string(),
+            format!("{MSG_RELEASE_FAILED_REPEATEDLY}; resume"),
+            "the lifecycle error names the bound and preserves the final release failure"
         );
         assert!(coordinator.release_owed);
         assert_eq!(coordinator.release_failures, MAX_RELEASE_FAILURES);
         assert_eq!(io.release_unproven_notes, 3);
         assert!(io.events.contains(&"resume"));
+        assert_eq!(
+            coordinator.counters(),
+            PauseCounters {
+                attempts: 2,
+                confirmed: 0,
+                partial: 1,
+                unavailable: 0,
+            },
+            "the escalation opens its own attempt before the run loop closes it"
+        );
+
+        coordinator.note_failed_cycle(false);
+        assert_eq!(
+            coordinator.counters(),
+            PauseCounters {
+                attempts: 2,
+                confirmed: 0,
+                partial: 2,
+                unavailable: 0,
+            },
+            "the run loop closes the escalation attempt as its own partial"
+        );
+        assert_eq!(coordinator.refusal(), Some(PauseRefusal::Refused));
+        assert!(coordinator.counters().valid());
     }
 
     #[test]
@@ -9352,6 +9378,34 @@ mod tests {
         coordinator.cleanup(&mut io).unwrap();
         assert!(io.events.contains(&"resume"));
         assert!(io.resumed);
+        assert!(!coordinator.release_owed);
+        assert_eq!(coordinator.release_failures, 0);
+    }
+
+    #[test]
+    fn terminal_cleanup_release_liveness_doubt_still_resumes() {
+        let mut io = FakeIo {
+            same_generation: false,
+            authorization: Some(PAUSE_ARMED),
+            fail_resume: true,
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.key_issued = true;
+
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Disabled);
+        assert!(coordinator.release_owed);
+
+        io.fail_resume = false;
+        io.fail_original_exited = true;
+        io.resumed = false;
+        io.events.clear();
+        coordinator.cleanup(&mut io).unwrap();
+        assert!(io.resumed);
+        assert_eq!(
+            io.events.iter().filter(|event| **event == "resume").count(),
+            1
+        );
         assert!(!coordinator.release_owed);
         assert_eq!(coordinator.release_failures, 0);
     }

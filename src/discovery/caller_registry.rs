@@ -7934,6 +7934,17 @@ impl CallerRegistry {
                 .saturating_add(image.calls);
             return;
         }
+        if self.unidentified_images_saturated || self.unidentified_images() >= limit as u64 {
+            // The run-wide bound is lifetime, not retained: retention
+            // folding drains the map after every apply while decisions
+            // stagger across applies, so the map alone may never fill.
+            // A genuinely new cookie past the total drops disclosed
+            // instead of growing the count past the bound.
+            self.unidentified_images_saturated = true;
+            self.unidentified_pids_dropped =
+                self.unidentified_pids_dropped.saturating_add(1);
+            return;
+        }
         Self::insert_unbound_image(
             &mut self.unidentified_images,
             &mut self.unidentified_images_saturated,

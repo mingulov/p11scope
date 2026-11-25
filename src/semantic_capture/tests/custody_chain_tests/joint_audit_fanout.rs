@@ -28782,6 +28782,22 @@ impl JointBirthEvidenceSource for RefuseOneBirth<'_> {
     }
 }
 
+/// Fail every birth-evidence take with a scripted final refusal:
+/// the capture-ended sibling twin's stand-in (no stop needed; the
+/// refusal alone must route the fallback).
+struct FailTakesAlways {
+    refusal: BirthObservationRefusal,
+}
+impl JointBirthEvidenceSource for FailTakesAlways {
+    fn take_for(
+        &mut self,
+        _target: &JointFeedTarget,
+        _binding: &SemanticCallerBinding,
+    ) -> Result<SessionBirthEvidence, BirthObservationRefusal> {
+        Err(self.refusal)
+    }
+}
+
 /// Fail one birth-evidence take with partition contention, then
 /// serve native takes: the transient-take twin's stand-in.
 struct FailTakeOnce<'a> {
@@ -30822,6 +30838,328 @@ fn seal_pending_across_stop_incomplete(mixed: bool) {
                 != crate::semantics_objects::journal::joint_audit::FALLBACK_FENCED_SUBJECT),
         "a capture-ended close never names its calls twice"
     );
+}
+
+/// Round r3 (D1 siblings): the capture-ended gate covers every
+/// final refusal, not just Stopped. Scripted AuthorityExhausted
+/// takes (no stop) route the same fallback: no retry, the frame
+/// completes, and each gap names its own refusal with its exact
+/// count. Incomplete heads dispose (never replay).
+#[test]
+fn joint_seal_exhausted_take_falls_back_incomplete_entries() {
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    fixture.push_two_without_end("C_SignInit", 2);
+    let fault = FrameFault::clean();
+    let mut frame = fixture.audited(2, 2, &fault);
+    let before = fixture.feeds();
+    let mut takes = FailTakesAlways {
+        refusal: BirthObservationRefusal::AuthorityExhausted,
+    };
+    let mut steps = Vec::new();
+    {
+        let mut ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        frame.bind_targets(&ports).unwrap();
+        for _ in 0..16 {
+            let sealed = frame.seal_next(&mut ports, &mut takes, &fault);
+            let delivered = frame.deliver_next(&mut ports);
+            let done = delivered == Ok(QuantumSealProgress::Complete);
+            steps.push((sealed, delivered));
+            if done {
+                break;
+            }
+        }
+    }
+    assert_eq!(
+        steps,
+        vec![
+            (
+                Ok(QuantumSealProgress::DeliveryReady),
+                Ok(QuantumSealProgress::LocalPending)
+            ),
+            (
+                Ok(QuantumSealProgress::DeliveryReady),
+                Ok(QuantumSealProgress::Complete)
+            ),
+        ],
+        "each consumer falls back on its first visit; nothing retries"
+    );
+    {
+        // No stop ran, so keys stay live and the fallback releases
+        // every stranded open, including prior-sealed history (all
+        // already counted): the tables end empty, not pristine.
+        let owner = fixture.scene.real.scene.coordinator.joint_capture();
+        assert_eq!(
+            owner.adapter().invocation_claims_for_test(),
+            (0, Vec::new()),
+            "stop-loss consumes every claim it verifies"
+        );
+        assert!(
+            owner.adapter().retained_starts_for_test().is_empty(),
+            "stop-loss consumes every open entry it verifies"
+        );
+    }
+    let feeds = fixture.feeds();
+    assert_eq!(feeds.len(), 2);
+    assert!(
+        feeds
+            .iter()
+            .all(|feed| feed.staged == 0 && feed.fallback && !feed.degraded),
+        "both feeds fall back with nothing left staged"
+    );
+    for feed in &feeds {
+        let was = before
+            .iter()
+            .find(|old| old.id == feed.id)
+            .expect("feed persists across the stop frame");
+        assert_eq!(
+            feed.reduced - was.reduced,
+            0,
+            "incomplete heads never replay"
+        );
+        assert_eq!(
+            feed.disposed - was.disposed,
+            1,
+            "each incomplete head disposes once"
+        );
+    }
+    use crate::semantics_objects::journal::joint_audit::{
+        CAPTURE_ENDED_SUBJECT, FALLBACK_FENCED_SUBJECT, capture_ended_reason,
+    };
+    let expected_reason = capture_ended_reason(BirthObservationRefusal::AuthorityExhausted, 1);
+    assert_eq!(
+        expected_reason,
+        "the capture ended before the seal could take its birth evidence \
+         (AuthorityExhausted); fell back with counted loss (1 calls)",
+        "control: the reason renders the refusal and the count"
+    );
+    let registry = fixture.scene.real.scene.coordinator.registry();
+    let mut ended = registry
+        .gaps()
+        .iter()
+        .cloned()
+        .chain(registry.staged_gaps_for_test())
+        .filter(|gap| gap.subject == CAPTURE_ENDED_SUBJECT)
+        .collect::<Vec<_>>();
+    ended.sort_by_key(|gap| gap.caller);
+    let mut expected = feeds
+        .iter()
+        .map(|feed| crate::discovery::caller_registry::RegistryGap {
+            caller: Some(feed.caller),
+            module: None,
+            pid: None,
+            subject: CAPTURE_ENDED_SUBJECT.to_string(),
+            reason: expected_reason.clone(),
+            budget: None,
+        })
+        .collect::<Vec<_>>();
+    expected.sort_by_key(|gap| gap.caller);
+    assert_eq!(
+        ended, expected,
+        "one capture-ended gap per feed, each naming its own refusal"
+    );
+    assert!(
+        registry
+            .gaps()
+            .iter()
+            .cloned()
+            .chain(registry.staged_gaps_for_test())
+            .all(|gap| gap.subject != FALLBACK_FENCED_SUBJECT),
+        "a capture-ended close never names its calls twice"
+    );
+}
+
+/// Round r3 (D1 interaction): a replay-resource failure striking an
+/// incomplete fallback disposes exactly once (single pop, single
+/// count): the resource and stop-loss flags share one dispose arm,
+/// never double-counting, and the gap still names the single lost
+/// call.
+#[test]
+fn joint_seal_pending_across_stop_disposes_incomplete_once_under_resource_failure() {
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    fixture.push_two_without_end("C_SignInit", 2);
+    let fault = FrameFault::clean();
+    let mut frame = fixture.audited(2, 2, &fault);
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture_mut()
+        .adapter_mut()
+        .inject_replay_resource_failure_for_test();
+    let before = fixture.feeds();
+    let h0 = fixture.scene.real.h0.clone();
+    let _ = h0.0.borrow_mut().capture.stop();
+    assert!(
+        h0.0.borrow().capture.stopped,
+        "control: the capture is stopped"
+    );
+    let mut takes = NativeFrameBirths {
+        h0: &h0,
+        attached: &fixture.attached,
+        retained: &mut fixture.births,
+        seen: Vec::new(),
+        unreadable: false,
+    };
+    let mut completed = false;
+    {
+        let mut ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        frame.bind_targets(&ports).unwrap();
+        for _ in 0..16 {
+            let _ = frame.seal_next(&mut ports, &mut takes, &fault);
+            if frame.deliver_next(&mut ports) == Ok(QuantumSealProgress::Complete) {
+                completed = true;
+                break;
+            }
+        }
+    }
+    drop(takes);
+    assert!(completed, "resource failure still completes the fallback");
+    let feeds = fixture.feeds();
+    assert_eq!(feeds.len(), 2);
+    for feed in &feeds {
+        let was = before
+            .iter()
+            .find(|old| old.id == feed.id)
+            .expect("feed persists across the stop frame");
+        assert_eq!(
+            feed.reduced - was.reduced,
+            0,
+            "incomplete heads never replay, even under resource failure"
+        );
+        assert_eq!(
+            feed.disposed - was.disposed,
+            1,
+            "each incomplete head disposes exactly once"
+        );
+    }
+    use crate::semantics_objects::journal::joint_audit::{
+        CAPTURE_ENDED_SUBJECT, capture_ended_reason,
+    };
+    let registry = fixture.scene.real.scene.coordinator.registry();
+    let ended = registry
+        .gaps()
+        .iter()
+        .cloned()
+        .chain(registry.staged_gaps_for_test())
+        .filter(|gap| gap.subject == CAPTURE_ENDED_SUBJECT)
+        .collect::<Vec<_>>();
+    assert_eq!(ended.len(), 2, "one capture-ended gap per feed");
+    for gap in &ended {
+        assert_eq!(
+            gap.reason,
+            capture_ended_reason(BirthObservationRefusal::Stopped, 1),
+            "each gap counts its single lost call"
+        );
+    }
+}
+
+/// Round r3 (D1 resume): the stop-loss verification records and
+/// dispose flag survive budgeted slices. Five incomplete calls per
+/// feed exceed one slice, so completing with identical gaps and
+/// counts proves resumption across real slices; the unbounded
+/// delivery takes two iterations, so exceeding that proves it.
+#[test]
+fn joint_seal_pending_across_stop_falls_back_incomplete_bounded_slices() {
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    for sequence in 2..7 {
+        fixture.push_two_without_end("C_SignInit", sequence);
+    }
+    let fault = FrameFault::clean();
+    let mut frame = fixture.audited(10, 10, &fault);
+    let before = fixture.feeds();
+    let h0 = fixture.scene.real.h0.clone();
+    let _ = h0.0.borrow_mut().capture.stop();
+    let mut takes = NativeFrameBirths {
+        h0: &h0,
+        attached: &fixture.attached,
+        retained: &mut fixture.births,
+        seen: Vec::new(),
+        unreadable: false,
+    };
+    let mut completed = false;
+    let mut iterations = 0u32;
+    {
+        let mut ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        frame.bind_targets(&ports).unwrap();
+        // Seal unbounded (takes are atomic); deliver a bounded
+        // slice, refilled every iteration.
+        for _ in 0..512 {
+            iterations += 1;
+            let _ = frame.seal_next(&mut ports, &mut takes, &fault);
+            let mut work = 8usize;
+            let mut diagnosis =
+                crate::semantics_objects::journal::joint_audit::DeliverDiagnosis::default();
+            if frame.deliver_next_bounded(&mut ports, &mut work, &mut diagnosis)
+                == Ok(QuantumSealProgress::Complete)
+            {
+                completed = true;
+                break;
+            }
+        }
+    }
+    drop(takes);
+    assert!(completed, "bounded slices still complete the fallback");
+    assert!(
+        iterations > 2,
+        "bounded delivery actually slices (took {iterations} iterations)"
+    );
+    let feeds = fixture.feeds();
+    assert_eq!(feeds.len(), 2);
+    for feed in &feeds {
+        let was = before
+            .iter()
+            .find(|old| old.id == feed.id)
+            .expect("feed persists across the stop frame");
+        assert_eq!(feed.staged, 0, "nothing left staged");
+        assert_eq!(
+            feed.reduced - was.reduced,
+            0,
+            "incomplete heads never replay"
+        );
+        assert_eq!(
+            feed.disposed - was.disposed,
+            5,
+            "each incomplete head disposes once"
+        );
+    }
+    use crate::semantics_objects::journal::joint_audit::{
+        CAPTURE_ENDED_SUBJECT, capture_ended_reason,
+    };
+    let registry = fixture.scene.real.scene.coordinator.registry();
+    let ended = registry
+        .gaps()
+        .iter()
+        .cloned()
+        .chain(registry.staged_gaps_for_test())
+        .filter(|gap| gap.subject == CAPTURE_ENDED_SUBJECT)
+        .collect::<Vec<_>>();
+    assert_eq!(ended.len(), 2, "one capture-ended gap per feed");
+    for gap in &ended {
+        assert_eq!(
+            gap.reason,
+            capture_ended_reason(BirthObservationRefusal::Stopped, 5),
+            "each gap counts its five lost calls"
+        );
+    }
 }
 
 #[test]

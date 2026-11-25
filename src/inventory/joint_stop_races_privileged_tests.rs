@@ -4818,28 +4818,46 @@ fn stop_reconciliation_refuses_a_shed_row_with_an_unknown_drop_word() {
 
 /// Seal pending across stop, live (stop-time seal stall): the Finish
 /// holds its seal take with the test seam (partition contention,
-/// pending) across the production stop. The Finish is the single
-/// stop (FinishStop runs the H0 stop inside the Finish drive; no
-/// direct capture stop, no q2 Running quantum): its quantum collects
-/// the complete return, stops H0, then its seal holds while the hold
-/// masks the Stopped latch. Clearing the hold lets the take hit its
-/// final Stopped refusal (no retry). The feed falls back at once, and
-/// its calls land in one named capture-ended gap with their exact
-/// count. The Finish then publishes, winds down, and hands off with
-/// no latch, no trip, no abandon and no semantic_unavailable. Before
-/// the fix the stopped take read as partition contention and every
-/// delivery retried forever (the live s12b/s12c finish stall).
+/// pending) across the production stop, with the held call still in
+/// flight. The Finish is the single stop (FinishStop runs the H0 stop
+/// inside the Finish drive; no direct capture stop, no q2 Running
+/// quantum): its seal holds while the hold masks the Stopped latch,
+/// and clearing the hold lets the take hit its final Stopped refusal
+/// (no retry). The feeds fall back at once, and their calls land in
+/// named capture-ended gaps with their exact counts. The Finish then
+/// publishes, winds down, and hands off with no latch, no trip, no
+/// abandon and no semantic_unavailable. Before the fix the stopped
+/// take read as partition contention and every delivery retried
+/// forever (the live s12b/s12c finish stall); before the r3 fix the
+/// fallback refused its incomplete entries and the Finish abandoned.
 #[test]
 #[ignore = "privileged: live Joint seal pending across stop falls back with named loss"]
 fn privileged_joint_seal_pending_across_stop_falls_back_live_lp64() -> Result<()> {
+    seal_cell_across_stop(false)
+}
+
+/// Busy-host shed across stop, live: the same cell with its q1 shed
+/// forced deterministically (every q1 tick sheds with the real
+/// CoverageFault label and counting). The shed is acceptable only as
+/// a counted, named gap (partial, never stop): the held call stays
+/// in flight across the production Finish, the Finish publishes, and
+/// the verdict pins the exact shed records plus the end-state
+/// equation. Silent shedding, or a Finish that abandons, is red.
+#[test]
+#[ignore = "privileged: live Joint shed across stop publishes with named loss"]
+fn privileged_joint_seal_shed_across_stop_falls_back_live_lp64() -> Result<()> {
+    seal_cell_across_stop(true)
+}
+
+fn seal_cell_across_stop(force_shed: bool) -> Result<()> {
     use crate::inventory_promotion::lifecycle::NativeCompletionSource as _;
     use crate::semantics_objects::journal::SealBootstrapCounts;
     use crate::semantics_objects::journal::joint_audit::{
         CAPTURE_ENDED_SUBJECT, capture_ended_reason,
     };
 
-    const INDEX: usize = 100;
-    let tag = format!("wp7-seal-stop{INDEX}");
+    let index = if force_shed { 101 } else { 100 };
+    let tag = format!("wp7-seal-stop{index}");
     let workload = JointWorkload::build()?;
     let soft_manifest = provider_joint_manifest(
         workload.workload.dir.path(),
@@ -4853,8 +4871,8 @@ fn privileged_joint_seal_pending_across_stop_falls_back_live_lp64() -> Result<()
         &["C_SignInit", "C_Sign"],
         "wp7-seal-held.dr37.json",
     )?;
-    let release = workload.path(&format!("release{INDEX}"));
-    let go = workload.path(&format!("go{INDEX}"));
+    let release = workload.path(&format!("release{index}"));
+    let go = workload.path(&format!("go{index}"));
     let _ = std::fs::remove_file(&release);
     let release_c = std::ffi::CString::new(release.to_str().context("release path")?)
         .context("release path holds NUL")?;
@@ -4879,7 +4897,7 @@ fn privileged_joint_seal_pending_across_stop_falls_back_live_lp64() -> Result<()
         vec![soft_manifest.to_path_buf(), held_manifest.to_path_buf()],
     )?;
     let process_a = workload.spawn(
-        &format!("A{INDEX}"),
+        &format!("A{index}"),
         &[
             "a",
             "--cell",
@@ -4900,7 +4918,7 @@ fn privileged_joint_seal_pending_across_stop_falls_back_live_lp64() -> Result<()
         .context("soft-copy path")?
         .to_string();
     let process_b = workload.spawn(
-        &format!("B{INDEX}"),
+        &format!("B{index}"),
         &[
             "b", "--cell", "B", "--module", &soft_path, "--go", &go_arg, "--iters", "2", "--hold",
         ],
@@ -4910,6 +4928,14 @@ fn privileged_joint_seal_pending_across_stop_falls_back_live_lp64() -> Result<()
     std::fs::write(&go, "go\n").context("releasing the live-joint gate")?;
     process_a.wait_for("HELD ", Duration::from_secs(60))?;
     process_b.wait_for("DONE ", Duration::from_secs(120))?;
+    // Forced shed (shed cell only): every q1 tick sheds with the real
+    // CoverageFault label and counting, so all four attempts install
+    // nothing deterministically.
+    if force_shed {
+        lane.live_capture_mut()
+            .expect("live capture")
+            .pose_fail_batches_for_test(true);
+    }
     // q1 installs both Joint feeds (A held, B done). On a loaded host a
     // first quantum can shed and publish with 0 feeds; retry boundedly
     // until both install, so the seal below has staged history to fall
@@ -4942,13 +4968,23 @@ fn privileged_joint_seal_pending_across_stop_falls_back_live_lp64() -> Result<()
             break;
         }
     }
+    if force_shed {
+        lane.live_capture_mut()
+            .expect("live capture")
+            .pose_fail_batches_for_test(false);
+        ensure!(
+            q1_feeds == 0,
+            "{tag}: the forced shed installs nothing (got {q1_feeds} feeds)"
+        );
+    }
     let q1_end_ns = monotonic_ns();
     let t_enter = ledger_stamp(&process_a.out, "HELD ")?;
     ensure!(
         t_enter < q1_end_ns,
         "{tag}: the held call entered before q1 ended: {t_enter} < {q1_end_ns}"
     );
-    // Shed branch (busy host): q1 never installed both feeds. The shed
+    // Shed branch (busy host, or the forced shed cell): q1 never
+    // installed both feeds. The shed
     // is acceptable only as a counted, named gap (partial, never
     // stop): the held call stays in flight across the production
     // Finish (same skeleton as the full branch, minus the hold: with
@@ -6013,6 +6049,23 @@ fn privileged_joint_seal_pending_across_stop_falls_back_live_lp64() -> Result<()
     ensure!(
         feed_endings == expected_endings_sorted,
         "{tag}: fallback feed endings for both callers (got {feed_endings:?})"
+    );
+    // A capture-ended close never fences (no successor can follow an
+    // ended capture) and never names its loss twice.
+    let fenced = driver
+        .coordinator
+        .registry()
+        .gaps()
+        .iter()
+        .cloned()
+        .chain(driver.coordinator.registry().staged_gaps_for_test())
+        .filter(|gap| {
+            gap.subject == crate::semantics_objects::journal::joint_audit::FALLBACK_FENCED_SUBJECT
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        fenced.is_empty(),
+        "{tag}: no fallback-fenced gap on a capture-ended close (got {fenced:?})"
     );
     // End-state equation: every entered call is attributed,
     // slot-refused, instance-refused, disclosed-shed, or named in

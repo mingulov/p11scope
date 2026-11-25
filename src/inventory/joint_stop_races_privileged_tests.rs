@@ -5482,11 +5482,10 @@ fn privileged_joint_seal_pending_across_stop_falls_back_live_lp64() -> Result<()
         );
         return Ok(());
     }
-    eprintln!("JOINT_STOP {tag}: q1 published in {q1_polls} polls; releasing for the finish");
-    {
-        let _release = std::fs::File::create(&release)?;
-    }
-    process_a.wait_for("RETURNED ", Duration::from_secs(60))?;
+    eprintln!(
+        "JOINT_STOP {tag}: q1 published in {q1_polls} polls; \
+         the held call stays in flight across the stop"
+    );
     eprintln!(
         "JOINT_STOP {tag}: pre-finish baseline: drive={:?} stash={:?} stuck={:?}",
         lane.joint_drive_state_for_test(),
@@ -5495,17 +5494,17 @@ fn privileged_joint_seal_pending_across_stop_falls_back_live_lp64() -> Result<()
     );
     // Hold the seal take across the stop with the test seam, then stop
     // through the PRODUCTION sequencing: the Finish is the single stop
-    // (no direct capture stop, no q2 Running quantum). The held call
-    // was released above, so its entry is complete; the Finish
-    // quantum collects it, runs the H0 stop inside FinishStop, then
-    // its seal takes for the staged entry hold as partition
-    // contention (retry, pending) while the hold masks the Stopped
-    // latch; clearing the hold lets the take hit its final Stopped
-    // refusal (no retry), falling back with counted loss.
-    // Deterministic: the hold flag pins the seal pending by
-    // construction, and the phase order (FinishStop before the seal)
-    // puts the production stop before the first take. Only an S1
-    // build precludes the cell here (no journal feed at all).
+    // (no direct capture stop, no q2 Running quantum), with the held
+    // call still in flight. The Finish quantum runs the H0 stop
+    // inside FinishStop, then its seal takes for the staged entry
+    // hold as partition contention (retry, pending) while the hold
+    // masks the Stopped latch; clearing the hold lets the take hit
+    // its final Stopped refusal (no retry), falling back with
+    // counted loss. Deterministic: the hold flag pins the seal
+    // pending by construction, and the phase order (FinishStop
+    // before the seal) puts the production stop before the first
+    // take. Only an S1 build precludes the cell here (no journal
+    // feed at all).
     if matches!(joint_branch(&coordinator), JointBranch::S1) {
         eprintln!("P11SCOPE_CELL_BRANCH={tag}:s1-precluded");
         anyhow::bail!(
@@ -5819,9 +5818,12 @@ fn privileged_joint_seal_pending_across_stop_falls_back_live_lp64() -> Result<()
             std::thread::sleep(Duration::from_millis(10));
         }
     }
-    // The held call was released before the finish; it exits
-    // cleanly on its own. Wait for its clean exit (already done
-    // returns at once).
+    // The held call stayed in flight across the stop; release it now
+    // so it exits cleanly (its post-stop return is never collected:
+    // the call itself was already counted at entry).
+    {
+        let _release = std::fs::File::create(&release)?;
+    }
     process_a.wait_for("DONE ", Duration::from_secs(60))?;
     // Typed records: the final Stopped refusal, the named stop-loss gap
     // with its exact count, exit 0, no semantic_unavailable. The holds
@@ -5841,6 +5843,25 @@ fn privileged_joint_seal_pending_across_stop_falls_back_live_lp64() -> Result<()
         counts.take_failed,
     );
     let caller_a = caller_of(driver.coordinator, process_a.pid())?;
+    let caller_b = caller_of(driver.coordinator, process_b.pid())?;
+    let edge_a = joint_edge_snapshot(driver.coordinator, process_a.pid(), "live-joint-held.so")?;
+    let edge_b = joint_edge_snapshot(driver.coordinator, process_b.pid(), "soft-copy.so")?;
+    let (per_function_a, total_a, bad_a) = ledger_calls(&process_a.out)?;
+    let (per_function_b, total_b, bad_b) = ledger_calls(&process_b.out)?;
+    let (a_semantic, a_count_only) = ledger_semantic_split(&per_function_a);
+    let (b_semantic, b_count_only) = ledger_semantic_split(&per_function_b);
+    let lane_shed = driver
+        .semantic
+        .as_ref()
+        .expect("lane")
+        .shed_calls_disclosed();
+    eprintln!(
+        "JOINT_STOP {tag}: end: ledger_a total={total_a} bad={bad_a} sem={a_semantic} \
+         co={a_count_only} api={:?} | ledger_b total={total_b} bad={bad_b} sem={b_semantic} \
+         co={b_count_only} api={:?} shed={lane_shed}",
+        edge_a.api_returns, edge_b.api_returns,
+    );
+    let history_subject = crate::inventory_present::JOINT_RETAINED_S1_SUBJECT.to_string();
     let mut ended = driver
         .coordinator
         .registry()
@@ -5851,6 +5872,18 @@ fn privileged_joint_seal_pending_across_stop_falls_back_live_lp64() -> Result<()
         .filter(|gap| gap.subject == CAPTURE_ENDED_SUBJECT)
         .collect::<Vec<_>>();
     ended.sort_by_key(|gap| gap.caller);
+    let mut feed_endings = driver
+        .coordinator
+        .registry()
+        .gaps()
+        .iter()
+        .cloned()
+        .chain(driver.coordinator.registry().staged_gaps_for_test())
+        .filter(|gap| {
+            gap.subject == history_subject && gap.reason == "joint_seal_bootstrap_mismatch_fallback"
+        })
+        .collect::<Vec<_>>();
+    feed_endings.sort_by_key(|gap| gap.caller);
     for gap in driver.coordinator.registry().gaps().iter() {
         eprintln!(
             "JOINT_STOP {tag}: gap {:?} {:?} caller={:?}",
@@ -5858,11 +5891,13 @@ fn privileged_joint_seal_pending_across_stop_falls_back_live_lp64() -> Result<()
         );
     }
     // Exit 0: the finish publishes, winds down and hands off with no
-    // latch, no trip and no first error. The post-finish branch is
-    // linked (the Finish installed the feeds it sealed).
+    // latch, no trip and no first error. The post-finish branch fell
+    // back (q1's two installed feeds sealed across the stop, then
+    // closed to S1Only at their Stopped takes; the link latch held).
     ensure!(
-        matches!(joint_branch(driver.coordinator), JointBranch::Linked),
-        "{tag}: the seal ran linked (feeds={} journal_linked={})",
+        driver.coordinator.registry().joint_feeds() == 0
+            && driver.coordinator.registry().journal_linked(),
+        "{tag}: the seal fell back after running linked (feeds={} journal_linked={})",
         driver.coordinator.registry().joint_feeds(),
         driver.coordinator.registry().journal_linked(),
     );
@@ -5895,13 +5930,14 @@ fn privileged_joint_seal_pending_across_stop_falls_back_live_lp64() -> Result<()
         begin == "polling",
         "{tag}: the finish begins polling (got {begin})"
     );
-    // The final Stopped refusal: exactly one seal take hits it (the
-    // Finish's held-then-stopped call). The holds above counted as
-    // contention (at least one, budget-dependent); nothing else fails
-    // a take.
+    // The final Stopped refusal: one seal take per installed feed
+    // hits it (the stop latches every take: A's held call and B's
+    // drained-but-revisited consumer). The holds above counted as
+    // contention (at least one, budget-dependent); nothing else
+    // fails a take.
     ensure!(
-        stopped_takes == 1,
-        "{tag}: exactly one seal take hits Stopped (got {stopped_takes}, total {total_takes})"
+        stopped_takes == 2,
+        "{tag}: one seal take per feed hits Stopped (got {stopped_takes}, total {total_takes})"
     );
     ensure!(
         current_takes >= 1,
@@ -5914,26 +5950,121 @@ fn privileged_joint_seal_pending_across_stop_falls_back_live_lp64() -> Result<()
          (got total {total_takes}: {:?})",
         counts.take_failed,
     );
-    // The named stop-loss gap with its exact count: one gap for A's
-    // caller, one call, pinned text.
-    let expected_reason = capture_ended_reason(crate::attach::BirthObservationRefusal::Stopped, 1);
+    // The named stop-loss gaps with their exact counts: A's held
+    // call lands with 1 call; B's drained consumer falls back with
+    // 0 lost (its Stopped take still records the fallback). Pinned
+    // text, sorted by caller.
+    let expected_reason_a =
+        capture_ended_reason(crate::attach::BirthObservationRefusal::Stopped, 1);
+    let expected_reason_b =
+        capture_ended_reason(crate::attach::BirthObservationRefusal::Stopped, 0);
     ensure!(
-        expected_reason
+        expected_reason_a
             == "the capture ended before the seal could take its birth evidence \
                  (Stopped); fell back with counted loss (1 calls)",
         "{tag}: control: the reason renders the refusal and the count"
     );
-    let expected = vec![crate::discovery::caller_registry::RegistryGap {
-        caller: Some(caller_a),
-        module: None,
-        pid: None,
-        subject: CAPTURE_ENDED_SUBJECT.to_string(),
-        reason: expected_reason,
-        budget: None,
-    }];
     ensure!(
-        ended == expected,
-        "{tag}: one capture-ended gap for A's caller with 1 call (got {ended:?})"
+        expected_reason_b
+            == "the capture ended before the seal could take its birth evidence \
+                 (Stopped); fell back with counted loss (0 calls)",
+        "{tag}: control: the empty fallback renders zero loss"
+    );
+    let expected = vec![
+        crate::discovery::caller_registry::RegistryGap {
+            caller: Some(caller_a),
+            module: None,
+            pid: None,
+            subject: CAPTURE_ENDED_SUBJECT.to_string(),
+            reason: expected_reason_a,
+            budget: None,
+        },
+        crate::discovery::caller_registry::RegistryGap {
+            caller: Some(caller_b),
+            module: None,
+            pid: None,
+            subject: CAPTURE_ENDED_SUBJECT.to_string(),
+            reason: expected_reason_b,
+            budget: None,
+        },
+    ];
+    let mut expected_sorted = expected;
+    expected_sorted.sort_by_key(|gap| gap.caller);
+    ensure!(
+        ended == expected_sorted,
+        "{tag}: capture-ended gaps for both callers with exact counts (got {ended:?})"
+    );
+    // Both feeds name their endings: one fallback gap per caller,
+    // pinned text, sorted by caller.
+    let expected_endings: Vec<crate::discovery::caller_registry::RegistryGap> =
+        [caller_a, caller_b]
+            .iter()
+            .map(|caller| crate::discovery::caller_registry::RegistryGap {
+                caller: Some(*caller),
+                module: None,
+                pid: None,
+                subject: history_subject.clone(),
+                reason: "joint_seal_bootstrap_mismatch_fallback".to_string(),
+                budget: None,
+            })
+            .collect();
+    let mut expected_endings_sorted = expected_endings;
+    expected_endings_sorted.sort_by_key(|gap| gap.caller);
+    ensure!(
+        feed_endings == expected_endings_sorted,
+        "{tag}: fallback feed endings for both callers (got {feed_endings:?})"
+    );
+    // End-state equation: every entered call is attributed,
+    // slot-refused, instance-refused, disclosed-shed, or named in
+    // the capture-ended gaps (A: 1, B: 0, pinned above). A silent
+    // drop breaks the equation.
+    let slot_a = count_disclosed_gaps(
+        driver.coordinator,
+        "semantic input refused",
+        "slot",
+        Some(caller_a),
+    );
+    let slot_b = count_disclosed_gaps(
+        driver.coordinator,
+        "semantic input refused",
+        "slot",
+        Some(caller_b),
+    );
+    let inst_a = driver
+        .coordinator
+        .registry()
+        .instance_calls_refused(caller_a);
+    let inst_b = driver
+        .coordinator
+        .registry()
+        .instance_calls_refused(caller_b);
+    let api_a = edge_a.api_returns.unwrap_or(0);
+    let api_b = edge_b.api_returns.unwrap_or(0);
+    ensure!(
+        api_a <= a_semantic,
+        "{tag}: a never over-attributes: api {api_a} <= sem {a_semantic}"
+    );
+    ensure!(
+        api_b <= b_semantic,
+        "{tag}: b never over-attributes: api {api_b} <= sem {b_semantic}"
+    );
+    ensure!(
+        slot_a <= a_count_only,
+        "{tag}: a never over-refuses: slot {slot_a} <= count-only {a_count_only}"
+    );
+    ensure!(
+        slot_b <= b_count_only,
+        "{tag}: b never over-refuses: slot {slot_b} <= count-only {b_count_only}"
+    );
+    let entered = total_a + total_b;
+    ensure!(
+        entered == api_a + api_b + lane_shed + slot_a + slot_b + inst_a + inst_b + 1,
+        "{tag}: every entered call is attributed, slot-refused, instance-refused, \
+         disclosed-shed or capture-ended: entered {entered} (a {total_a} + b \
+         {total_b}) vs api {} + shed {lane_shed} + slot {} + inst {} + ended 1",
+        api_a + api_b,
+        slot_a + slot_b,
+        inst_a + inst_b,
     );
     // No semantic_unavailable: the lane never stops with loss, and no
     // abandon gap appears without an abandonment.
@@ -5966,7 +6097,7 @@ fn privileged_joint_seal_pending_across_stop_falls_back_live_lp64() -> Result<()
         "{tag}: no abandon gap without abandonment (got {abandon_gap:?})"
     );
     eprintln!(
-        "P11SCOPE_CELL_BRANCH={tag}:linked:published:{finish_polls}:{wound_polls}:{}:{}",
+        "P11SCOPE_CELL_BRANCH={tag}:fallback:published:{finish_polls}:{wound_polls}:{}:{}",
         u8::from(taken),
         u8::from(minted),
     );

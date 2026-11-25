@@ -29290,6 +29290,27 @@ impl CanonicalFanoutScene {
         }
     }
 
+    /// One H0-admitted call whose journal entry keeps START
+    /// without its END (the live in-flight shape: admitted, staged,
+    /// but never returned). H0 genuinely admits the ordinary
+    /// physical return while the journal retains START alone;
+    /// completeness of H3 cannot invent END.
+    fn push_admitted_without_end(&mut self, pid: u32, name: &str, sequence: u64) {
+        let (begin, end) = self.scene.encoded(pid, 0, name, sequence);
+        self.scene.drain.source_mut().push_record(begin.to_vec());
+        self.scene
+            .drain
+            .source_mut()
+            .push_record(end[24..392].to_vec());
+    }
+
+    /// [`Self::push_admitted_without_end`] on both feeds.
+    fn push_two_without_end(&mut self, name: &str, sequence: u64) {
+        for pid in [std::process::id(), self._child.id()] {
+            self.push_admitted_without_end(pid, name, sequence);
+        }
+    }
+
     fn push_distinct_create(&mut self, pid: u32, sequence: u64, result: u64) {
         let (begin, _) = self.scene.encoded(pid, 0, "C_CreateObject", sequence);
         let end = crate::semantics_objects::journal::tests::end_bytes_result(
@@ -30555,6 +30576,200 @@ fn seal_pending_across_stop(inject_resource_failure: bool) {
         u64::from(inject_resource_failure),
         "only the injected resource failure disposes a head"
     );
+    assert_eq!(
+        first_take,
+        Some(Some(Some(BirthObservationRefusal::Stopped))),
+        "the stopped capture refuses the take with its own final variant"
+    );
+    use crate::semantics_objects::journal::joint_audit::{
+        CAPTURE_ENDED_SUBJECT, capture_ended_reason,
+    };
+    assert_eq!(
+        capture_ended_reason(BirthObservationRefusal::Stopped, 1),
+        "the capture ended before the seal could take its birth evidence \
+         (Stopped); fell back with counted loss (1 calls)",
+        "control: the reason renders the refusal and the count"
+    );
+    let registry = fixture.scene.real.scene.coordinator.registry();
+    let mut ended = registry
+        .gaps()
+        .iter()
+        .cloned()
+        .chain(registry.staged_gaps_for_test())
+        .filter(|gap| gap.subject == CAPTURE_ENDED_SUBJECT)
+        .collect::<Vec<_>>();
+    ended.sort_by_key(|gap| gap.caller);
+    let mut expected = feeds
+        .iter()
+        .map(|feed| crate::discovery::caller_registry::RegistryGap {
+            caller: Some(feed.caller),
+            module: None,
+            pid: None,
+            subject: CAPTURE_ENDED_SUBJECT.to_string(),
+            // Pinned as text: the count must reach the rendered reason.
+            reason: "the capture ended before the seal could take its birth \
+                     evidence (Stopped); fell back with counted loss (1 calls)"
+                .to_string(),
+            budget: None,
+        })
+        .collect::<Vec<_>>();
+    expected.sort_by_key(|gap| gap.caller);
+    assert_eq!(
+        ended, expected,
+        "one capture-ended gap per feed, each with its exact call count"
+    );
+    assert!(
+        registry
+            .gaps()
+            .iter()
+            .cloned()
+            .chain(registry.staged_gaps_for_test())
+            .all(|gap| gap.subject
+                != crate::semantics_objects::journal::joint_audit::FALLBACK_FENCED_SUBJECT),
+        "a capture-ended close never names its calls twice"
+    );
+}
+
+/// Round r3 (D1): a seal still pending when the capture stops, for
+/// entries whose END never arrives (in flight at stop), falls back
+/// at once with counted loss like a complete entry: no retry, the
+/// frame completes, and each call lands in the named stop-loss gap
+/// with its exact count. Incomplete heads dispose (never replay),
+/// so nothing is silent and nothing is wrongly attributed. Before
+/// the fix the fallback preflight refused DispositionMismatch (no
+/// END to verify) and the live Finish abandoned. The admitted
+/// calls stage through the ordinary path; only their journal END
+/// is missing, exactly the live held-call shape.
+#[test]
+fn joint_seal_pending_across_stop_falls_back_incomplete_entries() {
+    seal_pending_across_stop_incomplete(false);
+}
+
+/// The same stop with mixed consumers: one complete control plus
+/// one in-flight entry on the same frame. Both fall back with
+/// exact per-feed counts; the complete twin keeps its replay
+/// shape while the incomplete head disposes.
+#[test]
+fn joint_seal_pending_across_stop_falls_back_mixed_complete_incomplete() {
+    seal_pending_across_stop_incomplete(true);
+}
+
+fn seal_pending_across_stop_incomplete(mixed: bool) {
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    let pristine = {
+        let owner = fixture.scene.real.scene.coordinator.joint_capture();
+        (
+            owner.adapter().invocation_claims_for_test(),
+            owner.adapter().retained_starts_for_test(),
+        )
+    };
+    if mixed {
+        fixture.scene.push(std::process::id(), 0, "C_SignInit", 2);
+        fixture.push_admitted_without_end(fixture._child.id(), "C_SignInit", 2);
+    } else {
+        fixture.push_two_without_end("C_SignInit", 2);
+    }
+    let fault = FrameFault::clean();
+    let mut frame = fixture.audited(2, 2, &fault);
+    let before = fixture.feeds();
+    let h0 = fixture.scene.real.h0.clone();
+    let _ = h0.0.borrow_mut().capture.stop();
+    assert!(
+        h0.0.borrow().capture.stopped,
+        "control: the capture is stopped"
+    );
+    let mut takes = NativeFrameBirths {
+        h0: &h0,
+        attached: &fixture.attached,
+        retained: &mut fixture.births,
+        seen: Vec::new(),
+        unreadable: false,
+    };
+    let mut steps = Vec::new();
+    let mut first_take = None;
+    {
+        let mut ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        frame.bind_targets(&ports).unwrap();
+        for _ in 0..16 {
+            let sealed = frame.seal_next(&mut ports, &mut takes, &fault);
+            if first_take.is_none() {
+                first_take = Some(frame.failure_for_test().map(|failure| failure.take_failed));
+            }
+            let delivered = frame.deliver_next(&mut ports);
+            let done = delivered == Ok(QuantumSealProgress::Complete);
+            steps.push((sealed, delivered));
+            if done {
+                break;
+            }
+        }
+    }
+    drop(takes);
+    assert_eq!(
+        steps,
+        vec![
+            (
+                Ok(QuantumSealProgress::DeliveryReady),
+                Ok(QuantumSealProgress::LocalPending)
+            ),
+            (
+                Ok(QuantumSealProgress::DeliveryReady),
+                Ok(QuantumSealProgress::Complete)
+            ),
+        ],
+        "each consumer falls back on its first visit; nothing retries"
+    );
+    {
+        let owner = fixture.scene.real.scene.coordinator.joint_capture();
+        assert_eq!(
+            owner.adapter().invocation_claims_for_test(),
+            pristine.0,
+            "stop-loss consumes its claims"
+        );
+        assert_eq!(
+            owner.adapter().retained_starts_for_test(),
+            pristine.1,
+            "stop-loss consumes its open entries"
+        );
+    }
+    let feeds = fixture.feeds();
+    assert_eq!(feeds.len(), 2);
+    assert!(
+        feeds
+            .iter()
+            .all(|feed| feed.staged == 0 && feed.fallback && !feed.degraded),
+        "both feeds fall back with nothing left staged (a clean stop never degrades)"
+    );
+    let self_caller = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .adapter()
+        .live_id(std::process::id())
+        .expect("self pid admitted");
+    for feed in &feeds {
+        let was = before
+            .iter()
+            .find(|old| old.id == feed.id)
+            .expect("feed persists across the stop frame");
+        let incomplete = !mixed || feed.caller != self_caller;
+        assert_eq!(
+            feed.reduced - was.reduced,
+            u64::from(!incomplete),
+            "only the complete consumer replays (incomplete never attributes)"
+        );
+        assert_eq!(
+            feed.disposed - was.disposed,
+            u64::from(incomplete),
+            "only the incomplete consumer disposes its head as loss"
+        );
+    }
     assert_eq!(
         first_take,
         Some(Some(Some(BirthObservationRefusal::Stopped))),

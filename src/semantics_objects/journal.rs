@@ -9384,6 +9384,81 @@ impl JournalAdapter {
         Ok(Some(claim.admission))
     }
 
+    /// The capture-ended twin of [`Self::completed_fallback_original`]
+    /// (D1): match a staged-but-incomplete open entry (START
+    /// retained, END never arrived) to its staged admission for
+    /// counted stop-loss disposal. Same identity, admission and
+    /// state linkage as the completed check, except H0
+    /// corroboration (expected: H0 corroborates the admitted
+    /// return while the journal END is missing, and corroboration
+    /// does not close the entry); every END-derived comparison
+    /// (END ordinal and agreement, return event and timestamp, H8
+    /// completion staging, return floors) is absent because no END
+    /// exists to compare. Returns the admission on a match, `None`
+    /// for entries outside this key, and refuses mismatched
+    /// entries exactly like the completed check, so a wrong image,
+    /// a double claimant or a converted entry still refuses at
+    /// stop instead of counting.
+    #[allow(clippy::too_many_arguments)]
+    fn incomplete_stop_loss_original(
+        &self,
+        entry: &OpenEntry,
+        audit: &JournalAuditReceipt,
+        key: JournalDomainKey,
+        frontier: ConsumptionOrdinal,
+        staged_max: u64,
+        target: &crate::discovery::caller_registry::instance_input::JointFeedTarget,
+        registry: &crate::discovery::caller_registry::CallerRegistry,
+    ) -> Result<Option<u64>, joint_driver::RawQuantumRefusal> {
+        use joint_driver::RawQuantumRefusal;
+        let shape = shape_of_entry(entry);
+        let Some(claimants) = self.claims.get(&shape.identity) else {
+            return Ok(None);
+        };
+        let Some(mine) = claimants.get(&key).filter(|claims| !claims.is_empty()) else {
+            return Ok(None);
+        };
+        if entry.end.is_some() {
+            return Ok(None);
+        }
+        if mine.len() != 1
+            || claimants
+                .values()
+                .filter(|claims| !claims.is_empty())
+                .count()
+                != 1
+            || entry.begin_ordinal > frontier.0
+            || entry.image != (key.cookie, key.exec)
+            || entry.converted_ticket.is_some()
+            || entry.converted_for.is_some()
+            || entry.call_key.is_some()
+            || entry.end_converted
+            || entry.abandon.is_some()
+            || entry.raw_resource.is_none()
+            || entry.s1only_subject.is_some()
+        {
+            return Err(RawQuantumRefusal::DispositionMismatch);
+        }
+        let claim = mine.front().expect("one original admission");
+        if !claim_names_shape(&shape, claim) {
+            return Err(RawQuantumRefusal::DispositionMismatch);
+        }
+        registry
+            .joint_staged_resource(target, claim.admission)
+            .ok_or(RawQuantumRefusal::DispositionMismatch)?;
+        // No END was ever collected, so no collected origin
+        // exists; a present-but-wrong origin still refuses.
+        if claim.admission > staged_max
+            || claim.admission >= audit.h0_below
+            || entry
+                .collected_origin
+                .is_some_and(|origin| origin.position() != claim.admission)
+        {
+            return Err(RawQuantumRefusal::DispositionMismatch);
+        }
+        Ok(Some(claim.admission))
+    }
+
     /// Validate the original suffix once, in bounded work, before any fallback
     /// effect or S1 replay. The same frame/cursor then commits only one exact
     /// completed H8 owner after each actual H9 disposition. No callback,
@@ -9435,6 +9510,15 @@ impl JournalAdapter {
         {
             return Err(RawQuantumRefusal::DispositionMismatch);
         }
+        // D1: a take refused because the capture ended disposes
+        // staged-but-incomplete originals as counted stop-loss
+        // below; any other failure keeps the completed-only
+        // verification, so a non-final refusal still refuses.
+        let stop_loss = batch
+            .audited()
+            .failure()
+            .take_failed
+            .is_some_and(|refusal| refusal.capture_ended());
         if let Some(total) = batch.cursor.suffix {
             if registry.joint_staged_count(target) != total.checked_sub(batch.cursor.consumed) {
                 return Err(RawQuantumRefusal::DispositionMismatch);
@@ -9465,25 +9549,172 @@ impl JournalAdapter {
                     batch.cursor.suffix = Some(expected);
                     break;
                 };
-                if self
-                    .completed_fallback_original(
-                        entry,
-                        audit,
-                        key,
-                        frontier,
-                        *staged_max,
-                        target,
-                        registry,
-                    )?
-                    .is_some()
-                {
-                    batch.cursor.verified = batch
-                        .cursor
-                        .verified
-                        .checked_add(1)
-                        .ok_or(RawQuantumRefusal::Capacity)?;
+                // Owned copy: stop-loss disposal below mutates the
+                // open table, which ends the shared iteration borrow.
+                let native_key = *native;
+                if !stop_loss {
+                    if self
+                        .completed_fallback_original(
+                            entry,
+                            audit,
+                            key,
+                            frontier,
+                            *staged_max,
+                            target,
+                            registry,
+                        )?
+                        .is_some()
+                    {
+                        batch.cursor.verified = batch
+                            .cursor
+                            .verified
+                            .checked_add(1)
+                            .ok_or(RawQuantumRefusal::Capacity)?;
+                    }
+                } else {
+                    // D1 stop-loss classification (see the method docs
+                    // for each track's contract).
+                    enum StopLossTrack {
+                        Complete,
+                        IncompleteStaged,
+                        StaleSilent,
+                        UnclaimedCount,
+                        Skip,
+                    }
+                    let track = {
+                        let shape = shape_of_entry(entry);
+                        let mine_len = self
+                            .claims
+                            .get(&shape.identity)
+                            .and_then(|claimants| claimants.get(&key))
+                            .map_or(0, |claims| claims.len());
+                        let has_any_claims = self
+                            .claims
+                            .get(&shape.identity)
+                            .is_some_and(|m| m.values().any(|claims| !claims.is_empty()));
+                        let staged_some = mine_len == 1
+                            && self
+                                .claims
+                                .get(&shape.identity)
+                                .and_then(|m| m.get(&key))
+                                .and_then(|mine| mine.front())
+                                .is_some_and(|claim| {
+                                    registry
+                                        .joint_staged_resource(target, claim.admission)
+                                        .is_some()
+                                });
+                        if mine_len > 1 {
+                            // Ambiguous claims never resolve here (the
+                            // taint path owns them).
+                            StopLossTrack::Skip
+                        } else if staged_some {
+                            if entry.end.is_some() {
+                                StopLossTrack::Complete
+                            } else {
+                                StopLossTrack::IncompleteStaged
+                            }
+                        } else if mine_len == 1 {
+                            StopLossTrack::StaleSilent
+                        } else if !has_any_claims {
+                            StopLossTrack::UnclaimedCount
+                        } else {
+                            StopLossTrack::Skip
+                        }
+                    };
+                    match track {
+                        StopLossTrack::Complete => {
+                            if self
+                                .completed_fallback_original(
+                                    entry,
+                                    audit,
+                                    key,
+                                    frontier,
+                                    *staged_max,
+                                    target,
+                                    registry,
+                                )?
+                                .is_some()
+                            {
+                                batch.cursor.verified = batch
+                                    .cursor
+                                    .verified
+                                    .checked_add(1)
+                                    .ok_or(RawQuantumRefusal::Capacity)?;
+                            }
+                        }
+                        StopLossTrack::IncompleteStaged => {
+                            if let Some(admission) = self.incomplete_stop_loss_original(
+                                entry,
+                                audit,
+                                key,
+                                frontier,
+                                *staged_max,
+                                target,
+                                registry,
+                            )? {
+                                // Staged heads carry no native
+                                // without an END, so head
+                                // consumption reads it back from
+                                // here.
+                                batch.cursor.stop_loss.push((native_key, admission));
+                                batch.cursor.verified = batch
+                                    .cursor
+                                    .verified
+                                    .checked_add(1)
+                                    .ok_or(RawQuantumRefusal::Capacity)?;
+                            }
+                        }
+                        StopLossTrack::StaleSilent => {
+                            // Claimed but unstaged: the head was
+                            // already counted (delivered, disposed,
+                            // or refused-and-counted at staging), so
+                            // release the stranded open, claim and H8
+                            // quietly. Never S1-owned and never
+                            // void-owned: those have their own
+                            // disposers.
+                            let release = entry.s1only_subject.is_none()
+                                && entry.abandon.is_none()
+                                && self.key_is_live(key);
+                            if release {
+                                let identity = identity_of_begin(&entry.begin);
+                                let ordinal = entry.begin_ordinal;
+                                let claimed = self
+                                    .take_open(native_key)
+                                    .and_then(|_| self.consume_claim(&identity, key))
+                                    .is_some();
+                                if claimed {
+                                    self.ledger.release_h8open(ordinal);
+                                }
+                            }
+                        }
+                        StopLossTrack::UnclaimedCount => {
+                            // Never claimed, never staged, never
+                            // counted: the stop makes its loss final,
+                            // so dispose and count it here. Image-key
+                            // linkage attributes it to this consumer;
+                            // take-open makes the count exactly-once
+                            // across consumers.
+                            let image_ok = entry.image == (key.cookie, key.exec);
+                            let clean = entry.s1only_subject.is_none()
+                                && entry.abandon.is_none()
+                                && entry.converted_ticket.is_none()
+                                && entry.converted_for.is_none()
+                                && entry.call_key.is_none()
+                                && !entry.end_converted
+                                && self.key_is_live(key);
+                            if entry.end.is_none()
+                                && image_ok
+                                && clean
+                                && let Some(entry) = self.take_open(native_key)
+                            {
+                                self.ledger.release_h8open(entry.begin_ordinal);
+                                batch.note_head_disposed();
+                            }
+                        }
+                        StopLossTrack::Skip => {}
+                    }
                 }
-                batch.cursor.after = Some(*native);
+                batch.cursor.after = Some(native_key);
             }
         }
         let before = registry
@@ -9496,7 +9727,70 @@ impl JournalAdapter {
                     .open
                     .get(&native)
                     .ok_or(RawQuantumRefusal::DispositionMismatch)?;
-                if self.completed_fallback_original(
+                if entry.end.is_none() {
+                    // D1 (i): the staged head kept its invocation
+                    // but the open entry never grew an END.
+                    if !stop_loss {
+                        return Err(RawQuantumRefusal::DispositionMismatch);
+                    }
+                    if self.incomplete_stop_loss_original(
+                        entry,
+                        audit,
+                        key,
+                        frontier,
+                        *staged_max,
+                        target,
+                        registry,
+                    )? != Some(admission)
+                    {
+                        return Err(RawQuantumRefusal::DispositionMismatch);
+                    }
+                    if let Some(position) = batch
+                        .cursor
+                        .stop_loss
+                        .iter()
+                        .position(|&(_, found)| found == admission)
+                    {
+                        batch.cursor.stop_loss.swap_remove(position);
+                    }
+                    batch.cursor.stop_loss_dispose = true;
+                } else if self.completed_fallback_original(
+                    entry,
+                    audit,
+                    key,
+                    frontier,
+                    *staged_max,
+                    target,
+                    registry,
+                )? != Some(admission)
+                {
+                    return Err(RawQuantumRefusal::DispositionMismatch);
+                } else {
+                    batch.cursor.stop_loss_dispose = false;
+                }
+                Some((native, admission))
+            }
+            Some((admission, None)) => {
+                // D1 (ii): staged head without an invocation (no END
+                // collected): the verification recorded its native.
+                if !stop_loss {
+                    return Err(RawQuantumRefusal::DispositionMismatch);
+                }
+                let position = batch
+                    .cursor
+                    .stop_loss
+                    .iter()
+                    .position(|&(_, found)| found == admission)
+                    .ok_or(RawQuantumRefusal::DispositionMismatch)?;
+                let (native, _) = batch.cursor.stop_loss.swap_remove(position);
+                let entry = self
+                    .open
+                    .get(&native)
+                    .ok_or(RawQuantumRefusal::DispositionMismatch)?;
+                if entry.end.is_some() {
+                    return Err(RawQuantumRefusal::DispositionMismatch);
+                }
+                if self.incomplete_stop_loss_original(
                     entry,
                     audit,
                     key,
@@ -9508,10 +9802,13 @@ impl JournalAdapter {
                 {
                     return Err(RawQuantumRefusal::DispositionMismatch);
                 }
+                batch.cursor.stop_loss_dispose = true;
                 Some((native, admission))
             }
-            Some((_, None)) => return Err(RawQuantumRefusal::DispositionMismatch),
-            None if before == 0 => None,
+            None if before == 0 => {
+                batch.cursor.stop_loss_dispose = false;
+                None
+            }
             None => return Err(RawQuantumRefusal::DispositionMismatch),
         };
         let outcome =

@@ -634,6 +634,18 @@ pub(super) struct FailureReplayCursor {
     /// only its own head.
     replayed: usize,
     disposed: usize,
+    /// Stop-loss natives (D1): open entries verified as
+    /// staged-but-incomplete under a capture-ended take, as
+    /// (native, admission) pairs awaiting head consumption. Staged
+    /// heads carry no native without an END, so verification
+    /// records it; head consumption removes it. Bounded by the
+    /// open table the verification already walks.
+    pub(super) stop_loss: Vec<(super::JournalNativeKey, u64)>,
+    /// This slice's head disposes as stop-loss (D1) instead of
+    /// replaying: set by the completed-fallback head check when
+    /// the head's open entry has no END under a capture-ended
+    /// take, consumed by the shared tail.
+    pub(super) stop_loss_dispose: bool,
 }
 
 impl FailureReplayCursor {
@@ -679,6 +691,13 @@ impl<'q> FailureBatchDelivery<'q> {
     /// consumer instead of its failure's own disposition.
     pub(crate) fn forced_disposition(&self) -> Option<SealFailureDisposition> {
         self.forced_disposition
+    }
+
+    /// Take (and clear) this slice's stop-loss dispose flag (D1).
+    /// The shared tail takes it on entry, so a slice that never
+    /// pops (Held, Yielded) cannot leak it into a later head.
+    pub(crate) fn take_stop_loss_dispose(&mut self) -> bool {
+        std::mem::take(&mut self.cursor.stop_loss_dispose)
     }
     pub(crate) fn effects_complete(&self) -> bool {
         self.audited.originals[self.cursor.slot..]

@@ -1749,6 +1749,10 @@ impl JointStaging {
         mut assoc_fallback: Option<&mut crate::semantics_objects::journal::StagingLedger>,
         remaining: &mut usize,
     ) -> (FailureBatchProgress, u64) {
+        // D1: take the stop-loss dispose flag on entry, so a slice
+        // that never pops (Held, Yielded) cannot leak it into a
+        // later head; the wrapper re-arms it every slice.
+        let stop_loss_dispose = batch.take_stop_loss_dispose();
         let audited = batch.audited();
         if self.selected_receipt.as_ref().map(BootstrapReceipt::domain) != Some(audited.domain())
             || !audited.matches_ledger(ledger)
@@ -1857,7 +1861,11 @@ impl JointStaging {
         let head = self.staged.pop_front().expect("retained original head");
         self.frontier = head.position;
         let mut refused = 0;
-        if loss || batch.resource_failed() {
+        // D1: a capture-ended take disposes its stop-loss head
+        // instead of replaying it: the head's END will never
+        // arrive, so replay would invent the return. Counted by
+        // the same disposed total the stop-loss gap names.
+        if loss || batch.resource_failed() || stop_loss_dispose {
             self.history_disposed = self.history_disposed.saturating_add(1);
             batch.note_head_disposed();
             head.release(ledger);

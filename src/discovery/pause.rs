@@ -9324,8 +9324,11 @@ mod tests {
         let error = coordinator.arm(&mut io).unwrap_err();
         assert!(error.lifecycle());
         assert_eq!(
-            error.to_string(),
-            format!("{MSG_RELEASE_FAILED_REPEATEDLY}; resume"),
+            error.messages,
+            vec![
+                "owned child release failed repeatedly; ending the capture so the child is not left stopped".to_owned(),
+                "resume".to_owned(),
+            ],
             "the lifecycle error names the bound and preserves the final release failure"
         );
         assert!(coordinator.release_owed);

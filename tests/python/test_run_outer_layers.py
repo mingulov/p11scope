@@ -405,6 +405,55 @@ def check_spy_prefix_gap(report, ledger, spyview, failures, notes):
     return "exact"
 
 
+def proxy_layer_counts(report):
+    """Counted proxy-layer calls, keyed by single function name.
+
+    The MUST-FIX signal lives here: `split_layers` drops proxy rows
+    (neither backend nor spy), so the outer judges cannot see the
+    proxy leg without this count.
+    """
+    modules = report.get("capture", {}).get("modules", [])
+    sha = {m["sha256"] for m in modules
+           if "libp11-kit" in (m.get("path") or "") and m.get("sha256")}
+    calls = Counter()
+    for row in report.get("functions", []):
+        if row.get("calls", 0) <= 0:
+            continue
+        mod = row.get("module") or {}
+        names = row.get("names") or ["unknown"]
+        if mod.get("sha256") in sha and names != ["unknown"] and len(names) == 1:
+            calls[names[0]] += row.get("calls", 0)
+    return calls
+
+
+def check_proxy_live_table(report, failures, notes):
+    """MUST-FIX signal leg: a counting proxy run must carry its live table.
+
+    The proxy's function-list return is observed live (linkage
+    "live_return" on its discovery record); the merge-cap regression
+    dropped exactly that table. With zero counted proxy calls no live
+    table can exist (the pre-existing P1 arrival race is the known
+    zero-count cause), so the signal is unobservable and the leg only
+    names that in notes: failing here would conflate the MUST-FIX
+    signal with the arrival race. Judging a zero-count proxy leg stays
+    future work (SR-F5); this leg only asserts on counting runs.
+    """
+    proxy = proxy_layer_counts(report)
+    if sum(proxy.values()) == 0:
+        notes.append("proxy: 0 counted calls (P1 arrival shape; live signal unobservable)")
+        return
+    records = [rec for rec in (report.get("evidence", {}).get("discovery") or [])
+               if "libp11-kit" in (rec.get("path") or "")]
+    tables = [t for rec in records for t in (rec.get("tables") or [])]
+    live = [t for t in tables if t.get("linkage") == "live_return"]
+    if not live:
+        failures.append(
+            f"proxy: {sum(proxy.values())} counted calls but no live_return discovery table "
+            f"({len(tables)} tables; MUST-FIX signal absent)")
+    else:
+        notes.append(f"proxy: {len(tables)} tables incl {len(live)} live")
+
+
 def judge_proxy_common_legs(report, ledger, tool_rc, priv_objects, pub_objects):
     """Tool, backend, and interface legs shared by both proxy judges.
 
@@ -419,6 +468,7 @@ def judge_proxy_common_legs(report, ledger, tool_rc, priv_objects, pub_objects):
     else:
         notes.append("tool: rc=0 objects=2+2")
     notes.append(f"ledger: total={ledger.total}")
+    check_proxy_live_table(report, failures, notes)
     _, _, backend, spyview, unattributed, unknown = split_layers(report, "libsofthsm2.so")
     modules = report.get("capture", {}).get("modules", [])
     backend_indexes = {i for i, m in enumerate(modules) if "libsofthsm2.so" in (m.get("path") or "")}
@@ -708,6 +758,7 @@ def spy_text(entries, loaded="/real/provider.so"):
 
 BACKEND_SHA = "b" * 64
 SPY_SHA = "s" * 64
+PROXY_SHA = "p" * 64
 
 
 def function_row(name, sha, calls, errors=0, in_flight=0, rvs=None, offset=4096):
@@ -1035,6 +1086,53 @@ class ProxyJudgeTwins(unittest.TestCase):
         # this (the schema itself stays valid).
         with self.assertRaises(OuterError):
             parse_report('{"schema": "p11scope/observed-profile/v3", "a": 1, "a": 2}')
+
+
+def proxy_live_fixture(live=True, counted=True):
+    """proxy_fixture plus a proxy module, proxy rows, and a proxy record.
+
+    `live` controls whether the proxy discovery record carries a
+    live_return table; `counted` controls whether any proxy row counts.
+    """
+    ledger, report = proxy_fixture()
+    report["capture"]["modules"].append({"path": "/m/libp11-kit.so.0", "sha256": PROXY_SHA})
+    if counted:
+        report["functions"].extend([
+            function_row("C_Initialize", PROXY_SHA, 1),
+            function_row("C_GetSlotList", PROXY_SHA, 1),
+        ])
+    tables = [{"linkage": "heuristic", "version": "3.1"}]
+    if live:
+        tables.append({"linkage": "live_return", "version": "3.1"})
+    report["evidence"]["discovery"].append({"path": "/m/libp11-kit.so.0", "tables": tables})
+    return ledger, report
+
+
+class ProxyLiveSignalTwins(unittest.TestCase):
+    def test_counting_proxy_with_live_table_passes_with_signal_note(self):
+        ledger, report = proxy_live_fixture(live=True, counted=True)
+        verdict = judge_proxy_outer(report, ledger, 0, 2, 2)
+        self.assertTrue(verdict, verdict.detail)
+        self.assertIn("tables incl 1 live", verdict.detail)
+
+    def test_counting_proxy_without_live_table_fails_must_fix(self):
+        ledger, report = proxy_live_fixture(live=False, counted=True)
+        verdict = judge_proxy_outer(report, ledger, 0, 2, 2)
+        self.assertFalse(verdict, verdict.detail)
+        self.assertIn("MUST-FIX signal absent", verdict.detail)
+
+    def test_zero_proxy_p1_shape_names_unobservable_signal(self):
+        ledger, report = proxy_live_fixture(live=False, counted=False)
+        verdict = judge_proxy_outer(report, ledger, 0, 2, 2)
+        self.assertTrue(verdict, verdict.detail)
+        self.assertIn("P1 arrival shape", verdict.detail)
+        self.assertNotIn("MUST-FIX signal absent", verdict.detail)
+
+    def test_prefix_gap_judge_sees_the_live_signal_too(self):
+        ledger, report = proxy_live_fixture(live=True, counted=True)
+        verdict = judge_proxy_outer_prefix_gap(report, ledger, 0, 2, 2)
+        self.assertTrue(verdict, verdict.detail)
+        self.assertIn("tables incl 1 live", verdict.detail)
 
 
 class ProxyPrefixGapTwins(unittest.TestCase):

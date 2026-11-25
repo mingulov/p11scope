@@ -11039,7 +11039,6 @@ fn discovery_evidence(
                 None
             })?;
             let pre_copy_up = pinned.summary(m.object).is_some_and(|pin| pin.pre_copy_up);
-            let pre_copy_up = pinned.summary(m.object).is_some_and(|pin| pin.pre_copy_up);
             Some(render::DiscoveredModule {
                 id: m.id,
                 admission_class: m.admission_class,

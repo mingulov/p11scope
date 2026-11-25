@@ -1320,6 +1320,8 @@ ALLOWED = {
     # A further ancestor's exe, its optional fields and the chain gap.
     ("parent-chain", ("report", "callers", 1, "launched_by", "*", "exe")): "a further ancestor's exe is nullable",
     ("parent-chain", ("report", "callers", 1, "launched_by_gap")): "a gap object is optional when the chain is whole",
+    # A prep row's recording count: any positive integer is a valid count.
+    ("cgroup-inventory", ("report", "gaps", "*", "repeats")): "any positive recording count is valid",
 }
 
 

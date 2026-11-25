@@ -974,10 +974,10 @@ def judge_cgroup_inventory(args):
         if kind == "prep":
             require(g["caller"] is None and g["pid"] is None and g["module"] is None, GAP_PREP,
                     "malformed interrupted preparation scope: %r" % (g,))
-            require("budget" in g and g["budget"] is None, GAP_PREP,
-                    "malformed interrupted preparation budget: %r" % (g,))
-            require("repeats" in g and type(g["repeats"]) is int and g["repeats"] >= 1, GAP_PREP,
-                    "malformed interrupted preparation count: %r" % (g,))
+            require_type("budget" in g and g["budget"] is None, GAP_PREP,
+                         "malformed interrupted preparation budget: %r" % (g,))
+            require_type("repeats" in g and type(g["repeats"]) is int and g["repeats"] >= 1, GAP_PREP,
+                         "malformed interrupted preparation count: %r" % (g,))
     retained = [g for k, g in kinds if k == "retained"]
     if retained:
         require(any(k == "deadline" for k, _ in kinds), GAP_RETAINED,

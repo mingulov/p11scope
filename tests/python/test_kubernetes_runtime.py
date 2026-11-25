@@ -99,6 +99,14 @@ class SummaryTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     self.check(cell, rows)
         rows = k1_rows()
+        next(row for row in rows if row["check"] == "trace-exact")["calls"] = 1199
+        with self.assertRaises(ValueError):
+            self.check("K1", rows)
+        rows = k1_rows()
+        next(row for row in rows if row["check"] == "trace-exact")["pid_namespace_causes"] = []
+        with self.assertRaises(ValueError):
+            self.check("K1", rows)
+        rows = k1_rows()
         next(row for row in rows if row["check"] == "copy-up-neg")["calls"] = 3600
         with self.assertRaises(ValueError):
             self.check("K1", rows)
@@ -106,6 +114,18 @@ class SummaryTests(unittest.TestCase):
         next(row for row in rows if row["check"] == "copy-up-neg")["pid_namespace_causes"] = []
         with self.assertRaises(ValueError):
             self.check("K1", rows)
+        rows = k1_rows()
+        next(row for row in rows if row["check"] == "copy-up-neg")["modules"] = ["/tmp/copyup/other.so"]
+        with self.assertRaises(ValueError):
+            self.check("K1", rows)
+        rows = k1_rows()
+        next(row for row in rows if row["check"] == "copy-up-neg")["skipped_rows"] = 2
+        with self.assertRaises(ValueError):
+            self.check("K1", rows)
+        rows = k2_rows()
+        rows[-1]["causes"] = ["pid_descendant_gaps"]
+        with self.assertRaises(ValueError):
+            self.check("K2", rows)
         for leg, disclosure in (("attached-zero", []), ("absent", []), ("unknown", ["loader_discovery"])):
             rows = k2_rows()
             rows[-1].update(leg=leg, disclosure=disclosure)

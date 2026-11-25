@@ -373,6 +373,30 @@ self_test() {
         fi
     done
     rm -rf "$ledger_stub"
+    wait_stub=$(mktemp -d "${TMPDIR:-/tmp}/p11scope-kind-wait-XXXXXX")
+    kc() {
+        case "$*" in
+            "-n $WL_NS wait --for=condition=Ready pod --all --timeout=240s") return 1 ;;
+            "-n $WL_NS get pods -o wide")
+                printf '%s\n' 'NAME READY STATUS' 'ledger-c 0/1 Pending' ;;
+            "-n $WL_NS get events --sort-by=.metadata.creationTimestamp")
+                printf '%s\n' 'LAST SEEN TYPE REASON OBJECT MESSAGE' '1m Warning FailedScheduling pod/ledger-c Insufficient cpu' ;;
+            *) return 9 ;;
+        esac
+    }
+    if wait_for_workload_pods >"$wait_stub/out" 2>&1; then
+        echo "failed workload wait accepted" >&2
+        exit 1
+    fi
+    if ! grep -q 'ledger-c 0/1 Pending' "$wait_stub/out"; then
+        echo "failed workload wait lost the wide pod listing" >&2
+        exit 1
+    fi
+    if ! grep -q 'FailedScheduling' "$wait_stub/out"; then
+        echo "failed workload wait lost the namespace events" >&2
+        exit 1
+    fi
+    rm -rf "$wait_stub"
     trap - EXIT
     echo "kind-e2e self-test: OK"
     exit 0

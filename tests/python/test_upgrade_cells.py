@@ -91,6 +91,8 @@ class UpgradeGate5ContractTests(unittest.TestCase):
             "new_version",
             "old_package_version",
             "new_package_version",
+            "old_installed_package_version",
+            "new_installed_package_version",
             "doctor_old_rc",
             "doctor_new_rc",
             "doctor_rcs_equal",
@@ -119,6 +121,8 @@ class UpgradeGate5ContractTests(unittest.TestCase):
         self.assertEqual(passed["gate"], 5)
         self.assertEqual(passed["binary"], "/usr/bin/p11scope")
         self.assertEqual(passed["status"], "pass")
+        self.assertEqual(passed["old_installed_package_version"], "0.7.1")
+        self.assertEqual(passed["new_installed_package_version"], "0.7.2")
         self.assertIs(passed["doctor_rcs_equal"], True)
         self.assertIs(passed["canary_survived"], True)
         self.assertEqual(len(passed["canary_recovery_sha_before"]), 64)

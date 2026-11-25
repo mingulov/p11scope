@@ -44,6 +44,7 @@ done
 P11SCOPE_BIN="/usr/bin/p11scope"
 OLD_VERSION=""; NEW_VERSION=""
 OLD_PACKAGE_VERSION=""; NEW_PACKAGE_VERSION=""
+OLD_INSTALLED_PACKAGE_VERSION=""; NEW_INSTALLED_PACKAGE_VERSION=""
 DOCTOR_OLD_RC=-1; DOCTOR_NEW_RC=-1
 CAPTURE_OLD_RC=-1; CAPTURE_NEW_RC=-1
 CANARY_RECOVERY_SHA_BEFORE=""; CANARY_RECOVERY_SHA_AFTER=""
@@ -62,6 +63,8 @@ emit_result() {
   GATE5_NEW_VERSION="$NEW_VERSION" \
   GATE5_OLD_PACKAGE_VERSION="$OLD_PACKAGE_VERSION" \
   GATE5_NEW_PACKAGE_VERSION="$NEW_PACKAGE_VERSION" \
+  GATE5_OLD_INSTALLED_PACKAGE_VERSION="$OLD_INSTALLED_PACKAGE_VERSION" \
+  GATE5_NEW_INSTALLED_PACKAGE_VERSION="$NEW_INSTALLED_PACKAGE_VERSION" \
   GATE5_DOCTOR_OLD_RC="$DOCTOR_OLD_RC" \
   GATE5_DOCTOR_NEW_RC="$DOCTOR_NEW_RC" \
   GATE5_CAPTURE_OLD_RC="$CAPTURE_OLD_RC" \
@@ -105,6 +108,8 @@ result = {
     "new_version": text("GATE5_NEW_VERSION"),
     "old_package_version": text("GATE5_OLD_PACKAGE_VERSION"),
     "new_package_version": text("GATE5_NEW_PACKAGE_VERSION"),
+    "old_installed_package_version": text("GATE5_OLD_INSTALLED_PACKAGE_VERSION"),
+    "new_installed_package_version": text("GATE5_NEW_INSTALLED_PACKAGE_VERSION"),
     "doctor_old_rc": doctor_old,
     "doctor_new_rc": doctor_new,
     "doctor_rcs_equal": doctor_old in (0, 1) and doctor_old == doctor_new,
@@ -146,6 +151,8 @@ run_self_test() {
   NEW_VERSION="0.7.2"
   OLD_PACKAGE_VERSION="0.7.1"
   NEW_PACKAGE_VERSION="0.7.2"
+  OLD_INSTALLED_PACKAGE_VERSION="0.7.1"
+  NEW_INSTALLED_PACKAGE_VERSION="0.7.2"
   DOCTOR_OLD_RC=0
   DOCTOR_NEW_RC=0
   CAPTURE_OLD_RC=0
@@ -291,6 +298,14 @@ upgrade_new() {
   fi
 }
 
+installed_package_version() {
+  if [ "$FORMAT" = deb ]; then
+    dpkg-query -W -f='${Version}' p11scope 2>/dev/null
+  else
+    rpm -q --queryformat '%{VERSION}' p11scope 2>/dev/null
+  fi
+}
+
 run_doctor() {
   log="$1"
   if "$P11SCOPE_BIN" doctor > "$log" 2>&1; then
@@ -318,6 +333,8 @@ install_old || fail "old install failed (see install-old.log)"
 # 2. Old installed version must be 0.7.1.
 OLD_VERSION="$(installed_version)" || fail "cannot run installed old binary"
 [ "$OLD_VERSION" = "0.7.1" ] || fail "old version is '$OLD_VERSION', expected 0.7.1"
+OLD_INSTALLED_PACKAGE_VERSION="$(installed_package_version)" || fail "package manager does not list old p11scope"
+[ "$OLD_INSTALLED_PACKAGE_VERSION" = "$OLD_VERSION" ] || fail "old package manager version is '$OLD_INSTALLED_PACKAGE_VERSION', expected '$OLD_VERSION'"
 # 3. Old doctor (no scope). rc 0 (all requested lanes passed) or 1 (a
 # requested lane unavailable, e.g. no CAP_BPF in a container) both prove
 # the binary runs and reports; only 2+ (usage/crash) or a missing Doctor
@@ -374,12 +391,8 @@ CANARY_REPORT_SHA_AFTER="$(hash_file "$CANARY_REPORT")" || fail "cannot hash sav
 [ "$CANARY_RECOVERY_SHA_BEFORE" = "$CANARY_RECOVERY_SHA_AFTER" ] || fail "recovery canary changed across upgrade"
 [ "$CANARY_REPORT_SHA_BEFORE" = "$CANARY_REPORT_SHA_AFTER" ] || fail "saved-report canary changed across upgrade"
 # 10. Package manager agrees the new version is installed.
-if [ "$FORMAT" = deb ]; then
-  INSTALLED_PACKAGE_VERSION="$(dpkg-query -W -f='${Version}' p11scope 2>/dev/null)" || fail "dpkg does not list p11scope"
-else
-  INSTALLED_PACKAGE_VERSION="$(rpm -q --queryformat '%{VERSION}' p11scope 2>/dev/null)" || fail "rpm does not list p11scope"
-fi
-[ "$INSTALLED_PACKAGE_VERSION" = "$NEW_VERSION" ] || fail "package manager version is '$INSTALLED_PACKAGE_VERSION', expected '$NEW_VERSION'"
+NEW_INSTALLED_PACKAGE_VERSION="$(installed_package_version)" || fail "package manager does not list new p11scope"
+[ "$NEW_INSTALLED_PACKAGE_VERSION" = "$NEW_VERSION" ] || fail "package manager version is '$NEW_INSTALLED_PACKAGE_VERSION', expected '$NEW_VERSION'"
 
 emit_result "pass" "$RESULT"
 echo "GATE5 PASS ($FORMAT): 0.7.1 -> $NEW_VERSION, doctor+capture ok, canaries survived" >&2

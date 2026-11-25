@@ -24806,12 +24806,20 @@ fn live_candidate_refuses_unproven_learned_entries_before_attach_in_host_wide_sc
             "only the proven learned entry binds in {label} scope: {entries:?}"
         );
         let skips = &engine.counters.object_skips;
+        assert!(
+            skips
+                .iter()
+                .any(|skip| skip.subject == crate::render::LEARNED_SKIP_SUBJECT
+                    && skip.reason == crate::render::LEARNED_TABLE_UNBOUND_REASON),
+            "the unproven learned entries name the learned input in {label} scope: {skips:?}"
+        );
+        let unpinned = &candidate.modules[0].scanned.tables[0].unpinned;
         for name in ["C_GetSlotList", "C_OpenSession"] {
             assert!(
-                skips
+                unpinned
                     .iter()
                     .any(|skip| skip.subject == name && skip.reason.contains("not attached")),
-                "the unproven learned {name} refuses in {label} scope: {skips:?}"
+                "the unproven learned {name} keeps its entry row in {label} scope: {unpinned:?}"
             );
         }
         assert!(

@@ -12333,6 +12333,19 @@ pub(crate) fn bind_scanned_modules_strict_gated(
     bind_scanned_modules_inner(modules, pinned, true, authority)
 }
 
+/// The lost-stream row for a run-persistent learned module's
+/// refused entry: the finite learned-tables row, like the
+/// module-level arms. The table keeps the per-entry detail for its
+/// local consumers; the lost stream names the learned capture
+/// input, since a path-carrying row would collapse to the generic
+/// discovery row and hide which input lost its tables.
+fn learned_table_unbound_skip() -> Skipped {
+    Skipped {
+        subject: crate::render::LEARNED_SKIP_SUBJECT.into(),
+        reason: crate::render::LEARNED_TABLE_UNBOUND_REASON.into(),
+    }
+}
+
 fn bind_scanned_modules_inner(
     modules: &[ScannedModule],
     pinned: &mut PinnedObjects,
@@ -12343,12 +12356,22 @@ fn bind_scanned_modules_inner(
     let mut reconciled = Vec::new();
     let mut lost = Vec::new();
     for module in modules {
-        let Some(object) = pinned.id_for_scanned_with_carry(
-            module,
-            module.key,
-            &module.path,
-            !authority.authorizes(module.view),
-        ) else {
+        // A rejected module key never binds, even when its plain raw
+        // still resolves to the witness-kept pre-copy-up file: the
+        // key failed closed, so no identity under it is comparable.
+        // Rebuild and snapshot binds carry no engine pre-filter, so
+        // the choke refuses here for every caller.
+        let object = if pinned.rejects(module.key) {
+            None
+        } else {
+            pinned.id_for_scanned_with_carry(
+                module,
+                module.key,
+                &module.path,
+                !authority.authorizes(module.view),
+            )
+        };
+        let Some(object) = object else {
             // A run-persistent learned module that cannot bind names
             // the finite learned-tables row: its path-carrying skip
             // would collapse to the generic discovery row and hide
@@ -12390,6 +12413,11 @@ fn bind_scanned_modules_inner(
             continue;
         }
         let mut scanned = module.clone();
+        // A run-persistent learned module's refused entries name the
+        // finite learned-tables row in the lost stream (the table
+        // keeps the per-entry detail); every other module files the
+        // per-entry row in both.
+        let learned_view = module.view == crate::discovery::engine::Engine::RUN_LEARNED_VIEW_ID;
         let mut entry_objects = Vec::with_capacity(scanned.tables.len());
         let mut forward_verified = Vec::with_capacity(scanned.tables.len());
         // Entries of one module name few distinct (object, path) pairs, and
@@ -12411,7 +12439,16 @@ fn bind_scanned_modules_inner(
                 .into_iter()
                 .zip(&original.entries)
             {
-                let target = *resolved
+                // A rejected dependency key never binds, even when
+                // its plain raw still resolves to the witness-kept
+                // pre-copy-up file: binding it would credit calls at
+                // the unproven file's offsets under the kept file's
+                // name. Same-file entries are exempt: a rejected
+                // module key drops the whole module above.
+                let target = if original.object != module.key && pinned.rejects(original.object) {
+                    None
+                } else {
+                    *resolved
                     .entry((original.object, original.object_path.as_str()))
                     .or_insert_with(|| {
                         pinned.id_for_scanned_with_carry(
@@ -12421,6 +12458,7 @@ fn bind_scanned_modules_inner(
                             !authority.authorizes(module.view),
                         )
                     });
+                };
                 match target {
                     Some(id)
                         if matches!(
@@ -12463,7 +12501,11 @@ fn bind_scanned_modules_inner(
                                 ),
                             };
                             table.unpinned.push(skip.clone());
-                            lost.push(skip);
+                            if learned_view {
+                                lost.push(learned_table_unbound_skip());
+                            } else {
+                                lost.push(skip);
+                            }
                         } else if strict_uncorroborated && !corroborated && {
                             // Carried proof (retention): this pin set
                             // proved the offset when first bound, so a
@@ -12493,7 +12535,11 @@ fn bind_scanned_modules_inner(
                                 ),
                             };
                             table.unpinned.push(skip.clone());
-                            lost.push(skip);
+                            if learned_view {
+                                lost.push(learned_table_unbound_skip());
+                            } else {
+                                lost.push(skip);
+                            }
                         } else {
                             ids.push(id);
                             verified.push(verified_forward);
@@ -12516,7 +12562,11 @@ fn bind_scanned_modules_inner(
                             },
                         };
                         table.unpinned.push(skip.clone());
-                        lost.push(skip);
+                        if learned_view {
+                            lost.push(learned_table_unbound_skip());
+                        } else {
+                            lost.push(skip);
+                        }
                     }
                 }
             }
@@ -15007,8 +15057,9 @@ mod tests {
         // uprobes at garbage offsets in whatever file the decode
         // resolved into (there: mid-instruction inside the python
         // executable), and the target dies executing them. The view
-        // field is inert at this helper level (strictness comes from
-        // the caller's bool); the engine test pins the wiring.
+        // routes the lost row (the learned view names the learned
+        // input; strictness comes from the caller's bool); the engine
+        // test pins the wiring.
         const VERIFIED_OFFSET: u64 = 0xebe0;
         const DANGLING_OFFSET: u64 = 0x20;
         let provider = overlay(220);
@@ -15072,11 +15123,23 @@ mod tests {
             "the unverified run-learned forward never binds: {entries:?}"
         );
         assert_eq!(skipped.len(), 1, "exactly the unverified forward refuses");
-        assert_eq!(skipped[0].subject, "C_Sign");
+        assert_eq!(
+            skipped[0].subject,
+            crate::render::LEARNED_SKIP_SUBJECT,
+            "the lost stream names the learned input"
+        );
+        assert_eq!(
+            skipped[0].reason,
+            crate::render::LEARNED_TABLE_UNBOUND_REASON,
+            "the lost stream names the learned outcome"
+        );
+        let unpinned = &bound[0].scanned.tables[0].unpinned;
+        assert_eq!(unpinned.len(), 1, "the table keeps the entry detail");
+        assert_eq!(unpinned[0].subject, "C_Sign");
         assert!(
-            skipped[0].reason.contains("not attached"),
-            "the refusal names the outcome: {}",
-            skipped[0].reason
+            unpinned[0].reason.contains("not attached"),
+            "the entry row names the outcome: {}",
+            unpinned[0].reason
         );
     }
 

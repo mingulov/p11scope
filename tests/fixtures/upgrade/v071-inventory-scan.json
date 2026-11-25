@@ -1,0 +1,336 @@
+{
+  "budgets": {
+    "callers": {
+      "limit": 4096,
+      "occupied": 1,
+      "refused": 0
+    },
+    "counters": {
+      "cap": 18446744073709551615,
+      "observed_edges": 0,
+      "saturated_edges": 0
+    },
+    "edges": {
+      "limit": 32768,
+      "occupied": 1,
+      "refused": 0
+    },
+    "endpoints": {
+      "limit": 1048576,
+      "occupied": 0,
+      "refused": 0
+    },
+    "instance_negative_state": {
+      "exhausted": false,
+      "limit": 4096,
+      "occupied": 0,
+      "refused": 0
+    },
+    "instance_semantic_resources": {
+      "charged_bytes": 1048752,
+      "limit_bytes": 167772160,
+      "occupancy": {
+        "active_machines": 0,
+        "async_function_bytes": 0,
+        "async_function_capacity_bytes": 0,
+        "detached_calls": 0,
+        "mechanisms": 0,
+        "open_bindings": 0,
+        "operation_categories": 0,
+        "origin_capacity_elements": 0,
+        "origin_elements": 0,
+        "origin_vectors": 0,
+        "pending_calls": 0,
+        "provenance_function_bytes": 0,
+        "provenance_function_capacity_bytes": 0,
+        "provenance_functions": 0,
+        "provenance_returns": 0
+      },
+      "peak_charged_bytes": 1048752,
+      "refused": 0
+    },
+    "instance_semantic_state": {
+      "limit": 4096,
+      "occupied": 0,
+      "refused": 0,
+      "shared_limit": 32768,
+      "shared_occupied": 0,
+      "unknown_edges": 0
+    },
+    "instances": {
+      "limit": 4096,
+      "occupied": 0,
+      "refused": 0
+    },
+    "inventory_attach_modules": {
+      "limit": 32768,
+      "occupied": 1,
+      "refused": 0
+    },
+    "inventory_endpoints": {
+      "limit": 32768,
+      "occupied": 0,
+      "refused": 0
+    },
+    "modules": {
+      "limit": 4096,
+      "occupied": 1,
+      "refused": 0
+    },
+    "native_preadmission": null,
+    "retained_history": {
+      "limit": 8192,
+      "retained": 2,
+      "suppressed": 0
+    },
+    "semantic_state": {
+      "limit": 32768,
+      "occupied": 0,
+      "refused": 0,
+      "status": "withheld",
+      "unknown_edges": 1
+    }
+  },
+  "caller_metadata": {
+    "budget_refusals": "0",
+    "discarded": "0",
+    "historical": 0,
+    "mode": "none",
+    "peak_retained_bytes": "0",
+    "pending": 0,
+    "refresh_failures": "0",
+    "retained_bytes": "0",
+    "sampled": 0,
+    "stale": 0,
+    "started": "0",
+    "unknown": 0
+  },
+  "callers": [
+    {
+      "first_seen_ns": 31193079160198,
+      "id": "c0",
+      "image": {
+        "authority": "scan_pinned",
+        "exe": {
+          "dev": 1,
+          "ino": 101,
+          "mtime_nanos": 0,
+          "mtime_secs": 10,
+          "path": "/work/f2/bin/catalog-driver"
+        },
+        "exec_id": null,
+        "exec_observed": true,
+        "task_cookie": null
+      },
+      "incarnation": 0,
+      "last_seen_ns": 31193079160198,
+      "launched_by": [
+        {
+          "exe": "launcher",
+          "folded": 1,
+          "pid": 4265,
+          "start_time": 3119305
+        },
+        {
+          "exe": "launcher",
+          "pid": 4262,
+          "start_time": 2489255
+        },
+        {
+          "exe": "launcher",
+          "pid": 4263,
+          "start_time": 2489250
+        }
+      ],
+      "launched_by_gap": {
+        "reason": "parent chain truncated after 4 ancestors",
+        "subject": "caller parent chain"
+      },
+      "launched_by_origin": "chain",
+      "launched_by_unit": null,
+      "lifecycle": "mapped",
+      "lifecycle_reason": null,
+      "pid": 4266,
+      "retired": false,
+      "start_time": 3119306,
+      "start_time_unit": "clock_ticks_since_boot"
+    }
+  ],
+  "clock": {
+    "basis": "CLOCK_MONOTONIC",
+    "unit": "ns"
+  },
+  "edges": [
+    {
+      "caller": "c0",
+      "entries": {
+        "cap": 18446744073709551615,
+        "count": 0,
+        "coverage": {
+          "detail": null,
+          "first_ns": null,
+          "lossy": null,
+          "reason": "scan_only",
+          "since_ns": null,
+          "state": "unknown",
+          "until_ns": null
+        },
+        "first_seen_ns": null,
+        "in_flight": false,
+        "last_seen_ns": null,
+        "observation": "unknown (usage observation unavailable)",
+        "saturated": false
+      },
+      "mapping": {
+        "evidence": "deep_scan",
+        "first_seen_ns": 31193079160198,
+        "interruptions": 0,
+        "last_seen_ns": 31193079160198,
+        "reason": null,
+        "state": "mapped"
+      },
+      "mechanisms": null,
+      "module": "m0",
+      "operations": null,
+      "semantics": "unknown (semantic capture withheld)"
+    }
+  ],
+  "gaps": [
+    {
+      "budget": null,
+      "caller": null,
+      "module": null,
+      "pid": null,
+      "reason": "no BPF image identity; scan-lane incarnations by pidfd/start-time with exe-identity exec detection",
+      "repeats": 1,
+      "subject": "exact image authority unavailable"
+    },
+    {
+      "budget": null,
+      "caller": "c0",
+      "module": null,
+      "pid": 4266,
+      "reason": "Permission denied (os error 13)",
+      "repeats": 1,
+      "subject": "/proc/4266/mem"
+    }
+  ],
+  "gaps_suppressed": 0,
+  "instances": [],
+  "layer_totals": {
+    "forwarding_entries": 0,
+    "logical_entries": 0
+  },
+  "modules": [
+    {
+      "admission": {
+        "class": "heuristic",
+        "endpoints": 0,
+        "history": [],
+        "note": "scan-only admission: manifest corroboration was not consulted",
+        "reasons": [],
+        "state": "admitted"
+      },
+      "id": "m0",
+      "identity": {
+        "build_id": "0000000000000000000000000000000000000001",
+        "device": {
+          "major": 8,
+          "minor": 1
+        },
+        "inode": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002",
+        "source": "mountinfo"
+      },
+      "initialize": {
+        "already_initialized": 0,
+        "calls": 0,
+        "detail": "semantic lane unavailable",
+        "last_error_rv": null,
+        "ok": 0,
+        "status": "unknown"
+      },
+      "lifecycle": "mapped",
+      "paths": [
+        "/usr/lib/softhsm/libsofthsm2.so"
+      ],
+      "unbound_use": null,
+      "unloaded_observed": false
+    }
+  ],
+  "object_observations": {
+    "budgets": {
+      "allocation_refused": false,
+      "encoded_bytes": 409,
+      "key_rows": {
+        "limit": 65536,
+        "occupied": 0,
+        "refused": 0
+      },
+      "object_rows": {
+        "limit": 65536,
+        "occupied": 0,
+        "refused": 0
+      },
+      "refusal_reason": "none",
+      "unknown_rows": {
+        "occupied": 0
+      }
+    },
+    "gaps": {
+      "rows": [],
+      "suppressed": 0
+    },
+    "key_operations": [],
+    "objects": [],
+    "reason": "journal_unavailable",
+    "revision": 1,
+    "sessions": [],
+    "status": "unavailable",
+    "unknown_key_operations": [],
+    "version": 1
+  },
+  "observation": {
+    "ended_ns": 31193093453092,
+    "native_witnesses": {
+      "bound": 0,
+      "identity_budget_exhausted": false,
+      "identity_unavailable": 0,
+      "integrity": 0,
+      "pending": 0,
+      "placement": {
+        "ambiguous": 0,
+        "edge": 0,
+        "module": 0,
+        "unresolved": 0
+      },
+      "rows": 0,
+      "unbound": 0,
+      "unbound_images": 0,
+      "unbound_images_saturated": false,
+      "unbound_reasons": {}
+    },
+    "passes": 1,
+    "semantic_capture": {
+      "admitted_endpoints": 0,
+      "continuity_cuts": 0,
+      "events_lost": 0,
+      "final_drain": null,
+      "refused_endpoints": 0,
+      "status": "disabled",
+      "stop_quiescence": "not_requested",
+      "unrouted_returns": 0
+    },
+    "started_ns": 31193073731611,
+    "usage_feed": false
+  },
+  "pid_namespace": {
+    "kernel_pids": "initial",
+    "observer": "initial",
+    "proc_pids": "observer"
+  },
+  "prearm": [],
+  "schema": "p11scope/inventory/v1",
+  "scope": "pid:4266",
+  "semantic_edges": []
+}

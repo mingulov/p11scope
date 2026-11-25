@@ -1,0 +1,1949 @@
+{
+  "budgets": {
+    "callers": {
+      "limit": 4096,
+      "occupied": 1,
+      "refused": 0
+    },
+    "counters": {
+      "cap": 18446744073709551615,
+      "observed_edges": 1,
+      "saturated_edges": 0
+    },
+    "edges": {
+      "limit": 32768,
+      "occupied": 1,
+      "refused": 0
+    },
+    "endpoints": {
+      "limit": 1048576,
+      "occupied": 68,
+      "refused": 0
+    },
+    "instance_negative_state": {
+      "exhausted": false,
+      "limit": 4096,
+      "occupied": 2,
+      "refused": 0
+    },
+    "instance_semantic_resources": {
+      "charged_bytes": 2476189,
+      "limit_bytes": 167772160,
+      "occupancy": {
+        "active_machines": 0,
+        "async_function_bytes": 0,
+        "async_function_capacity_bytes": 0,
+        "detached_calls": 0,
+        "mechanisms": 2,
+        "open_bindings": 0,
+        "operation_categories": 2,
+        "origin_capacity_elements": 0,
+        "origin_elements": 0,
+        "origin_vectors": 0,
+        "pending_calls": 0,
+        "provenance_function_bytes": 33,
+        "provenance_function_capacity_bytes": 33,
+        "provenance_functions": 3,
+        "provenance_returns": 2
+      },
+      "peak_charged_bytes": 18111094,
+      "refused": 0
+    },
+    "instance_semantic_state": {
+      "limit": 4096,
+      "occupied": 1,
+      "refused": 0,
+      "shared_limit": 32768,
+      "shared_occupied": 1,
+      "unknown_edges": 0
+    },
+    "instances": {
+      "limit": 4096,
+      "occupied": 1,
+      "refused": 0
+    },
+    "inventory_attach_modules": {
+      "limit": 32768,
+      "occupied": 1,
+      "refused": 0
+    },
+    "inventory_endpoints": {
+      "limit": 32768,
+      "occupied": 68,
+      "refused": 0
+    },
+    "modules": {
+      "limit": 4096,
+      "occupied": 1,
+      "refused": 0
+    },
+    "native_preadmission": {
+      "limit": 4096,
+      "occupied": 0,
+      "pruned": 0,
+      "refused": 0
+    },
+    "retained_history": {
+      "limit": 8192,
+      "retained": 11,
+      "suppressed": 0
+    },
+    "semantic_state": {
+      "limit": 32768,
+      "occupied": 0,
+      "refused": 0,
+      "status": "withheld",
+      "unknown_edges": 1
+    }
+  },
+  "caller_metadata": {
+    "budget_refusals": "0",
+    "discarded": "0",
+    "historical": 0,
+    "mode": "none",
+    "peak_retained_bytes": "0",
+    "pending": 0,
+    "refresh_failures": "0",
+    "retained_bytes": "0",
+    "sampled": 0,
+    "stale": 0,
+    "started": "0",
+    "unknown": 0
+  },
+  "callers": [
+    {
+      "first_seen_ns": 32974386480218,
+      "id": "c0",
+      "image": {
+        "authority": "scan_pinned",
+        "exe": {
+          "dev": 1,
+          "ino": 105,
+          "mtime_nanos": 0,
+          "mtime_secs": 10,
+          "path": "/work/f2/bin/steady-keys"
+        },
+        "exec_id": null,
+        "exec_observed": true,
+        "task_cookie": null
+      },
+      "incarnation": 0,
+      "last_seen_ns": 33012699757111,
+      "launched_by": [
+        {
+          "exe": "launcher",
+          "folded": 1,
+          "pid": 4261,
+          "start_time": 3296936
+        },
+        {
+          "exe": "launcher",
+          "pid": 4262,
+          "start_time": 2489255
+        },
+        {
+          "exe": "launcher",
+          "pid": 4263,
+          "start_time": 2489250
+        }
+      ],
+      "launched_by_gap": {
+        "reason": "parent chain truncated after 4 ancestors",
+        "subject": "caller parent chain"
+      },
+      "launched_by_origin": "chain",
+      "launched_by_unit": null,
+      "lifecycle": "exited",
+      "lifecycle_reason": "process exited (pid names no live process)",
+      "pid": 4264,
+      "retired": true,
+      "start_time": 3296937,
+      "start_time_unit": "clock_ticks_since_boot"
+    }
+  ],
+  "clock": {
+    "basis": "CLOCK_MONOTONIC",
+    "unit": "ns"
+  },
+  "edges": [
+    {
+      "caller": "c0",
+      "entries": {
+        "cap": 18446744073709551615,
+        "count": 27,
+        "coverage": {
+          "detail": "the PID target exited",
+          "first_ns": null,
+          "lossy": true,
+          "reason": null,
+          "since_ns": 32977606852626,
+          "state": "counted",
+          "until_ns": null
+        },
+        "first_seen_ns": 32977606852626,
+        "in_flight": false,
+        "last_seen_ns": 33012702559937,
+        "observation": "observed",
+        "saturated": false
+      },
+      "mapping": {
+        "evidence": "deep_scan",
+        "first_seen_ns": 32975422246640,
+        "interruptions": 0,
+        "last_seen_ns": 33011662434569,
+        "reason": "process exited (pid names no live process)",
+        "state": "ended"
+      },
+      "mechanisms": null,
+      "module": "m0",
+      "operations": null,
+      "semantics": "unknown (per-edge summary withheld; see semantic children)"
+    }
+  ],
+  "gaps": [
+    {
+      "budget": null,
+      "caller": null,
+      "module": null,
+      "pid": null,
+      "reason": "no BPF image identity; scan-lane incarnations by pidfd/start-time with exe-identity exec detection",
+      "repeats": 1,
+      "subject": "exact image authority unavailable"
+    },
+    {
+      "budget": null,
+      "caller": null,
+      "module": null,
+      "pid": null,
+      "reason": "count manifest refused: manifest provider is not exactly mapped in the collected scope",
+      "repeats": 1,
+      "subject": "/work/f2/work/v071-manifest-softhsm.json"
+    },
+    {
+      "budget": null,
+      "caller": null,
+      "module": null,
+      "pid": null,
+      "reason": "not mapped in the target",
+      "repeats": 1,
+      "subject": "/usr/lib/softhsm/libsofthsm2.so"
+    },
+    {
+      "budget": null,
+      "caller": null,
+      "module": null,
+      "pid": null,
+      "reason": "6 calls shed without a route (unobserved=6) with 0 bindings",
+      "repeats": 1,
+      "subject": "semantic calls unrouted"
+    },
+    {
+      "budget": null,
+      "caller": "c0",
+      "module": null,
+      "pid": null,
+      "reason": "caller_custody_unproven",
+      "repeats": 1,
+      "subject": "semantic admission refused"
+    },
+    {
+      "budget": null,
+      "caller": null,
+      "module": null,
+      "pid": null,
+      "reason": "3 calls shed without a route (retired=3) with 1 bindings",
+      "repeats": 1,
+      "subject": "semantic calls unrouted"
+    },
+    {
+      "budget": null,
+      "caller": "c0",
+      "module": null,
+      "pid": null,
+      "reason": "joint_seal_h3_loss_history_loss",
+      "repeats": 1,
+      "subject": "Joint key operations unavailable; retained S1"
+    },
+    {
+      "budget": null,
+      "caller": null,
+      "module": null,
+      "pid": null,
+      "reason": "joint_void_h3_loss_history_loss",
+      "repeats": 1,
+      "subject": "Joint key operations unavailable; retained S1"
+    },
+    {
+      "budget": null,
+      "caller": null,
+      "module": null,
+      "pid": null,
+      "reason": "cannot inventory pid 4264: the process could not be read; its modules are unknown, not absent",
+      "repeats": 6,
+      "subject": "scan pass produced no observation"
+    },
+    {
+      "budget": null,
+      "caller": null,
+      "module": null,
+      "pid": null,
+      "reason": "PID custody lost: the PID target exited; every watched no-use interval ends at the earlier of the custody instant and the last clean read; a watch starting at or after that instant reads unknown, and no watch starts again",
+      "repeats": 1,
+      "subject": "native capture scope custody unproven"
+    },
+    {
+      "budget": null,
+      "caller": null,
+      "module": null,
+      "pid": null,
+      "reason": "PID custody was lost: PID custody lost: the PID target exited; providers admitted from now on are not attached and their usage is not covered",
+      "repeats": 1,
+      "subject": "native capture refused an extend"
+    }
+  ],
+  "gaps_suppressed": 0,
+  "instances": [
+    {
+      "caller": "c0",
+      "first_seen_ns": 32976481999915,
+      "id": "i0",
+      "last_seen_ns": 33011693547940,
+      "module": "m0",
+      "reason": "task_retired",
+      "state": "retired"
+    }
+  ],
+  "joint_audit_subjects": {
+    "audits": 17,
+    "marks": 0,
+    "refusals_after_first_rearm": 0,
+    "refusals_before_first_rearm": 0
+  },
+  "layer_totals": {
+    "forwarding_entries": 0,
+    "logical_entries": 27
+  },
+  "modules": [
+    {
+      "admission": {
+        "class": "operator",
+        "endpoints": 68,
+        "history": [],
+        "note": "count admission includes explicit manifest targets validated against the mapped provider",
+        "reasons": [],
+        "state": "admitted"
+      },
+      "id": "m0",
+      "identity": {
+        "build_id": "0000000000000000000000000000000000000001",
+        "device": {
+          "major": 8,
+          "minor": 1
+        },
+        "inode": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002",
+        "source": "mountinfo"
+      },
+      "initialize": {
+        "already_initialized": 0,
+        "calls": 0,
+        "detail": "no C_Initialize seen since the semantic lane started",
+        "last_error_rv": null,
+        "ok": 0,
+        "status": "unseen"
+      },
+      "lifecycle": "unknown",
+      "paths": [
+        "/usr/lib/softhsm/libsofthsm2.so"
+      ],
+      "unbound_use": null,
+      "unloaded_observed": false
+    }
+  ],
+  "object_observations": {
+    "budgets": {
+      "allocation_refused": false,
+      "encoded_bytes": 19177,
+      "key_rows": {
+        "limit": 65536,
+        "occupied": 8,
+        "refused": 0
+      },
+      "object_rows": {
+        "limit": 65536,
+        "occupied": 16,
+        "refused": 0
+      },
+      "refusal_reason": "none",
+      "unknown_rows": {
+        "occupied": 1
+      }
+    },
+    "gaps": {
+      "rows": [
+        {
+          "reason": "outcome_lost",
+          "repeats": 1,
+          "subject": "model"
+        }
+      ],
+      "suppressed": 0
+    },
+    "key_operations": [
+      {
+        "active": 0,
+        "cancelled": 0,
+        "category": "sign",
+        "completed": 1,
+        "failed": 0,
+        "instance": "i0",
+        "key_join_lost": 0,
+        "metadata_at_use": "unknown",
+        "object": 2,
+        "role": "key",
+        "started": 1,
+        "unit": "operations",
+        "unknown": 0
+      },
+      {
+        "active": 0,
+        "cancelled": 0,
+        "category": "sign",
+        "completed": 1,
+        "failed": 0,
+        "instance": "i0",
+        "key_join_lost": 0,
+        "metadata_at_use": "unknown",
+        "object": 4,
+        "role": "key",
+        "started": 1,
+        "unit": "operations",
+        "unknown": 0
+      },
+      {
+        "active": 0,
+        "cancelled": 0,
+        "category": "sign",
+        "completed": 1,
+        "failed": 0,
+        "instance": "i0",
+        "key_join_lost": 0,
+        "metadata_at_use": "unknown",
+        "object": 6,
+        "role": "key",
+        "started": 1,
+        "unit": "operations",
+        "unknown": 0
+      },
+      {
+        "active": 0,
+        "cancelled": 0,
+        "category": "sign",
+        "completed": 1,
+        "failed": 0,
+        "instance": "i0",
+        "key_join_lost": 0,
+        "metadata_at_use": "unknown",
+        "object": 8,
+        "role": "key",
+        "started": 1,
+        "unit": "operations",
+        "unknown": 0
+      },
+      {
+        "active": 0,
+        "cancelled": 0,
+        "category": "sign",
+        "completed": 1,
+        "failed": 0,
+        "instance": "i0",
+        "key_join_lost": 0,
+        "metadata_at_use": "unknown",
+        "object": 10,
+        "role": "key",
+        "started": 1,
+        "unit": "operations",
+        "unknown": 0
+      },
+      {
+        "active": 0,
+        "cancelled": 0,
+        "category": "sign",
+        "completed": 1,
+        "failed": 0,
+        "instance": "i0",
+        "key_join_lost": 0,
+        "metadata_at_use": "unknown",
+        "object": 12,
+        "role": "key",
+        "started": 1,
+        "unit": "operations",
+        "unknown": 0
+      },
+      {
+        "active": 0,
+        "cancelled": 0,
+        "category": "sign",
+        "completed": 1,
+        "failed": 0,
+        "instance": "i0",
+        "key_join_lost": 0,
+        "metadata_at_use": "unknown",
+        "object": 14,
+        "role": "key",
+        "started": 1,
+        "unit": "operations",
+        "unknown": 0
+      },
+      {
+        "active": 0,
+        "cancelled": 0,
+        "category": "sign",
+        "completed": 1,
+        "failed": 0,
+        "instance": "i0",
+        "key_join_lost": 0,
+        "metadata_at_use": "unknown",
+        "object": 16,
+        "role": "key",
+        "started": 1,
+        "unit": "operations",
+        "unknown": 0
+      }
+    ],
+    "objects": [
+      {
+        "accessing_sessions": 0,
+        "attribution": "valid",
+        "attribution_reason": null,
+        "birth": {
+          "end_ns": 32977661601554,
+          "start_ns": 32977606857906
+        },
+        "creation": "generate_pair",
+        "established": {
+          "class": {
+            "status": "unknown",
+            "value": null
+          },
+          "ec_params": {
+            "status": "unknown",
+            "value": null
+          },
+          "key_type": {
+            "status": "unknown",
+            "value": null
+          },
+          "modulus_bits": {
+            "status": "unknown",
+            "value": null
+          },
+          "token": {
+            "status": "unknown",
+            "value": null
+          },
+          "value_len": {
+            "status": "unknown",
+            "value": null
+          }
+        },
+        "label": null,
+        "lifetime": "retired",
+        "lifetime_reason": "outcome_lost",
+        "object": 1,
+        "origin": "created",
+        "queries": {
+          "class": "not_queried",
+          "ec_params": "not_queried",
+          "key_type": "not_queried",
+          "modulus_bits": "not_queried",
+          "token": "not_queried",
+          "value_len": "not_queried"
+        },
+        "requested": {
+          "class": {
+            "status": "unknown",
+            "value": null
+          },
+          "ec_params": {
+            "status": "unknown",
+            "value": null
+          },
+          "key_type": {
+            "status": "unknown",
+            "value": null
+          },
+          "modulus_bits": {
+            "status": "value",
+            "value": 2048
+          },
+          "token": {
+            "status": "unknown",
+            "value": null
+          },
+          "value_len": {
+            "status": "unknown",
+            "value": null
+          }
+        },
+        "session": 1,
+        "successful_key_references": 0,
+        "successful_references": 0
+      },
+      {
+        "accessing_sessions": 0,
+        "attribution": "valid",
+        "attribution_reason": null,
+        "birth": {
+          "end_ns": 32977661601554,
+          "start_ns": 32977606857906
+        },
+        "creation": "generate_pair",
+        "established": {
+          "class": {
+            "status": "unknown",
+            "value": null
+          },
+          "ec_params": {
+            "status": "unknown",
+            "value": null
+          },
+          "key_type": {
+            "status": "unknown",
+            "value": null
+          },
+          "modulus_bits": {
+            "status": "unknown",
+            "value": null
+          },
+          "token": {
+            "status": "unknown",
+            "value": null
+          },
+          "value_len": {
+            "status": "unknown",
+            "value": null
+          }
+        },
+        "label": null,
+        "lifetime": "retired",
+        "lifetime_reason": "outcome_lost",
+        "object": 2,
+        "origin": "created",
+        "queries": {
+          "class": "not_queried",
+          "ec_params": "not_queried",
+          "key_type": "not_queried",
+          "modulus_bits": "not_queried",
+          "token": "not_queried",
+          "value_len": "not_queried"
+        },
+        "requested": {
+          "class": {
+            "status": "unknown",
+            "value": null
+          },
+          "ec_params": {
+            "status": "unknown",
+            "value": null
+          },
+          "key_type": {
+            "status": "unknown",
+            "value": null
+          },
+          "modulus_bits": {
+            "status": "unknown",
+            "value": null
+          },
+          "token": {
+            "status": "unknown",
+            "value": null
+          },
+          "value_len": {
+            "status": "unknown",
+            "value": null
+          }
+        },
+        "session": 1,
+        "successful_key_references": 1,
+        "successful_references": 1
+      },
+      {
+        "accessing_sessions": 0,
+        "attribution": "valid",
+        "attribution_reason": null,
+        "birth": {
+          "end_ns": 32981776424384,
+          "start_ns": 32981663049878
+        },
+        "creation": "generate_pair",
+        "established": {
+          "class": {
+            "status": "unknown",
+            "value": null
+          },
+          "ec_params": {
+            "status": "unknown",
+            "value": null
+          },
+          "key_type": {
+            "status": "unknown",
+            "value": null
+          },
+          "modulus_bits": {
+            "status": "unknown",
+            "value": null
+          },
+          "token": {
+            "status": "unknown",
+            "value": null
+          },
+          "value_len": {
+            "status": "unknown",
+            "value": null
+          }
+        },
+        "label": null,
+        "lifetime": "retired",
+        "lifetime_reason": "outcome_lost",
+        "object": 3,
+        "origin": "created",
+        "queries": {
+          "class": "not_queried",
+          "ec_params": "not_queried",
+          "key_type": "not_queried",
+          "modulus_bits": "not_queried",
+          "token": "not_queried",
+          "value_len": "not_queried"
+        },
+        "requested": {
+          "class": {
+            "status": "unknown",
+            "value": null
+          },
+          "ec_params": {
+            "status": "unknown",
+            "value": null
+          },
+          "key_type": {
+            "status": "unknown",
+            "value": null
+          },
+          "modulus_bits": {
+            "status": "value",
+            "value": 2048
+          },
+          "token": {
+            "status": "unknown",
+            "value": null
+          },
+          "value_len": {
+            "status": "unknown",
+            "value": null
+          }
+        },
+        "session": 1,
+        "successful_key_references": 0,
+        "successful_references": 0
+      },
+      {
+        "accessing_sessions": 0,
+        "attribution": "valid",
+        "attribution_reason": null,
+        "birth": {
+          "end_ns": 32981776424384,
+          "start_ns": 32981663049878
+        },
+        "creation": "generate_pair",
+        "established": {
+          "class": {
+            "status": "unknown",
+            "value": null
+          },
+          "ec_params": {
+            "status": "unknown",
+            "value": null
+          },
+          "key_type": {
+            "status": "unknown",
+            "value": null
+          },
+          "modulus_bits": {
+            "status": "unknown",
+            "value": null
+          },
+          "token": {
+            "status": "unknown",
+            "value": null
+          },
+          "value_len": {
+            "status": "unknown",
+            "value": null
+          }
+        },
+        "label": null,
+        "lifetime": "retired",
+        "lifetime_reason": "outcome_lost",
+        "object": 4,
+        "origin": "created",
+        "queries": {
+          "class": "not_queried",
+          "ec_params": "not_queried",
+          "key_type": "not_queried",
+          "modulus_bits": "not_queried",
+          "token": "not_queried",
+          "value_len": "not_queried"
+        },
+        "requested": {
+          "class": {
+            "status": "unknown",
+            "value": null
+          },
+          "ec_params": {
+            "status": "unknown",
+            "value": null
+          },
+          "key_type": {
+            "status": "unknown",
+            "value": null
+          },
+          "modulus_bits": {
+            "status": "unknown",
+            "value": null
+          },
+          "token": {
+            "status": "unknown",
+            "value": null
+          },
+          "value_len": {
+            "status": "unknown",
+            "value": null
+          }
+        },
+        "session": 1,
+        "successful_key_references": 1,
+        "successful_references": 1
+      },
+      {
+        "accessing_sessions": 0,
+        "attribution": "valid",
+        "attribution_reason": null,
+        "birth": {
+          "end_ns": 32985814061987,
+          "start_ns": 32985777733652
+        },
+        "creation": "generate_pair",
+        "established": {
+          "class": {
+            "status": "unknown",
+            "value": null
+          },
+          "ec_params": {
+            "status": "unknown",
+            "value": null
+          },
+          "key_type": {
+            "status": "unknown",
+            "value": null
+          },
+          "modulus_bits": {
+            "status": "unknown",
+            "value": null
+          },
+          "token": {
+            "status": "unknown",
+            "value": null
+          },
+          "value_len": {
+            "status": "unknown",
+            "value": null
+          }
+        },
+        "label": null,
+        "lifetime": "retired",
+        "lifetime_reason": "outcome_lost",
+        "object": 5,
+        "origin": "created",
+        "queries": {
+          "class": "not_queried",
+          "ec_params": "not_queried",
+          "key_type": "not_queried",
+          "modulus_bits": "not_queried",
+          "token": "not_queried",
+          "value_len": "not_queried"
+        },
+        "requested": {
+          "class": {
+            "status": "unknown",
+            "value": null
+          },
+          "ec_params": {
+            "status": "unknown",
+            "value": null
+          },
+          "key_type": {
+            "status": "unknown",
+            "value": null
+          },
+          "modulus_bits": {
+            "status": "value",
+            "value": 2048
+          },
+          "token": {
+            "status": "unknown",
+            "value": null
+          },
+          "value_len": {
+            "status": "unknown",
+            "value": null
+          }
+        },
+        "session": 1,
+        "successful_key_references": 0,
+        "successful_references": 0
+      },
+      {
+        "accessing_sessions": 0,
+        "attribution": "valid",
+        "attribution_reason": null,
+        "birth": {
+          "end_ns": 32985814061987,
+          "start_ns": 32985777733652
+        },
+        "creation": "generate_pair",
+        "established": {
+          "class": {
+            "status": "unknown",
+            "value": null
+          },
+          "ec_params": {
+            "status": "unknown",
+            "value": null
+          },
+          "key_type": {
+            "status": "unknown",
+            "value": null
+          },
+          "modulus_bits": {
+            "status": "unknown",
+            "value": null
+          },
+          "token": {
+            "status": "unknown",
+            "value": null
+          },
+          "value_len": {
+            "status": "unknown",
+            "value": null
+          }
+        },
+        "label": null,
+        "lifetime": "retired",
+        "lifetime_reason": "outcome_lost",
+        "object": 6,
+        "origin": "created",
+        "queries": {
+          "class": "not_queried",
+          "ec_params": "not_queried",
+          "key_type": "not_queried",
+          "modulus_bits": "not_queried",
+          "token": "not_queried",
+          "value_len": "not_queried"
+        },
+        "requested": {
+          "class": {
+            "status": "unknown",
+            "value": null
+          },
+          "ec_params": {
+            "status": "unknown",
+            "value": null
+          },
+          "key_type": {
+            "status": "unknown",
+            "value": null
+          },
+          "modulus_bits": {
+            "status": "unknown",
+            "value": null
+          },
+          "token": {
+            "status": "unknown",
+            "value": null
+          },
+          "value_len": {
+            "status": "unknown",
+            "value": null
+          }
+        },
+        "session": 1,
+        "successful_key_references": 1,
+        "successful_references": 1
+      },
+      {
+        "accessing_sessions": 0,
+        "attribution": "valid",
+        "attribution_reason": null,
+        "birth": {
+          "end_ns": 32989885659224,
+          "start_ns": 32989815117048
+        },
+        "creation": "generate_pair",
+        "established": {
+          "class": {
+            "status": "unknown",
+            "value": null
+          },
+          "ec_params": {
+            "status": "unknown",
+            "value": null
+          },
+          "key_type": {
+            "status": "unknown",
+            "value": null
+          },
+          "modulus_bits": {
+            "status": "unknown",
+            "value": null
+          },
+          "token": {
+            "status": "unknown",
+            "value": null
+          },
+          "value_len": {
+            "status": "unknown",
+            "value": null
+          }
+        },
+        "label": null,
+        "lifetime": "retired",
+        "lifetime_reason": "outcome_lost",
+        "object": 7,
+        "origin": "created",
+        "queries": {
+          "class": "not_queried",
+          "ec_params": "not_queried",
+          "key_type": "not_queried",
+          "modulus_bits": "not_queried",
+          "token": "not_queried",
+          "value_len": "not_queried"
+        },
+        "requested": {
+          "class": {
+            "status": "unknown",
+            "value": null
+          },
+          "ec_params": {
+            "status": "unknown",
+            "value": null
+          },
+          "key_type": {
+            "status": "unknown",
+            "value": null
+          },
+          "modulus_bits": {
+            "status": "value",
+            "value": 2048
+          },
+          "token": {
+            "status": "unknown",
+            "value": null
+          },
+          "value_len": {
+            "status": "unknown",
+            "value": null
+          }
+        },
+        "session": 1,
+        "successful_key_references": 0,
+        "successful_references": 0
+      },
+      {
+        "accessing_sessions": 0,
+        "attribution": "valid",
+        "attribution_reason": null,
+        "birth": {
+          "end_ns": 32989885659224,
+          "start_ns": 32989815117048
+        },
+        "creation": "generate_pair",
+        "established": {
+          "class": {
+            "status": "unknown",
+            "value": null
+          },
+          "ec_params": {
+            "status": "unknown",
+            "value": null
+          },
+          "key_type": {
+            "status": "unknown",
+            "value": null
+          },
+          "modulus_bits": {
+            "status": "unknown",
+            "value": null
+          },
+          "token": {
+            "status": "unknown",
+            "value": null
+          },
+          "value_len": {
+            "status": "unknown",
+            "value": null
+          }
+        },
+        "label": null,
+        "lifetime": "retired",
+        "lifetime_reason": "outcome_lost",
+        "object": 8,
+        "origin": "created",
+        "queries": {
+          "class": "not_queried",
+          "ec_params": "not_queried",
+          "key_type": "not_queried",
+          "modulus_bits": "not_queried",
+          "token": "not_queried",
+          "value_len": "not_queried"
+        },
+        "requested": {
+          "class": {
+            "status": "unknown",
+            "value": null
+          },
+          "ec_params": {
+            "status": "unknown",
+            "value": null
+          },
+          "key_type": {
+            "status": "unknown",
+            "value": null
+          },
+          "modulus_bits": {
+            "status": "unknown",
+            "value": null
+          },
+          "token": {
+            "status": "unknown",
+            "value": null
+          },
+          "value_len": {
+            "status": "unknown",
+            "value": null
+          }
+        },
+        "session": 1,
+        "successful_key_references": 1,
+        "successful_references": 1
+      },
+      {
+        "accessing_sessions": 0,
+        "attribution": "valid",
+        "attribution_reason": null,
+        "birth": {
+          "end_ns": 32993943354654,
+          "start_ns": 32993886982076
+        },
+        "creation": "generate_pair",
+        "established": {
+          "class": {
+            "status": "unknown",
+            "value": null
+          },
+          "ec_params": {
+            "status": "unknown",
+            "value": null
+          },
+          "key_type": {
+            "status": "unknown",
+            "value": null
+          },
+          "modulus_bits": {
+            "status": "unknown",
+            "value": null
+          },
+          "token": {
+            "status": "unknown",
+            "value": null
+          },
+          "value_len": {
+            "status": "unknown",
+            "value": null
+          }
+        },
+        "label": null,
+        "lifetime": "retired",
+        "lifetime_reason": "outcome_lost",
+        "object": 9,
+        "origin": "created",
+        "queries": {
+          "class": "not_queried",
+          "ec_params": "not_queried",
+          "key_type": "not_queried",
+          "modulus_bits": "not_queried",
+          "token": "not_queried",
+          "value_len": "not_queried"
+        },
+        "requested": {
+          "class": {
+            "status": "unknown",
+            "value": null
+          },
+          "ec_params": {
+            "status": "unknown",
+            "value": null
+          },
+          "key_type": {
+            "status": "unknown",
+            "value": null
+          },
+          "modulus_bits": {
+            "status": "value",
+            "value": 2048
+          },
+          "token": {
+            "status": "unknown",
+            "value": null
+          },
+          "value_len": {
+            "status": "unknown",
+            "value": null
+          }
+        },
+        "session": 1,
+        "successful_key_references": 0,
+        "successful_references": 0
+      },
+      {
+        "accessing_sessions": 0,
+        "attribution": "valid",
+        "attribution_reason": null,
+        "birth": {
+          "end_ns": 32993943354654,
+          "start_ns": 32993886982076
+        },
+        "creation": "generate_pair",
+        "established": {
+          "class": {
+            "status": "unknown",
+            "value": null
+          },
+          "ec_params": {
+            "status": "unknown",
+            "value": null
+          },
+          "key_type": {
+            "status": "unknown",
+            "value": null
+          },
+          "modulus_bits": {
+            "status": "unknown",
+            "value": null
+          },
+          "token": {
+            "status": "unknown",
+            "value": null
+          },
+          "value_len": {
+            "status": "unknown",
+            "value": null
+          }
+        },
+        "label": null,
+        "lifetime": "retired",
+        "lifetime_reason": "outcome_lost",
+        "object": 10,
+        "origin": "created",
+        "queries": {
+          "class": "not_queried",
+          "ec_params": "not_queried",
+          "key_type": "not_queried",
+          "modulus_bits": "not_queried",
+          "token": "not_queried",
+          "value_len": "not_queried"
+        },
+        "requested": {
+          "class": {
+            "status": "unknown",
+            "value": null
+          },
+          "ec_params": {
+            "status": "unknown",
+            "value": null
+          },
+          "key_type": {
+            "status": "unknown",
+            "value": null
+          },
+          "modulus_bits": {
+            "status": "unknown",
+            "value": null
+          },
+          "token": {
+            "status": "unknown",
+            "value": null
+          },
+          "value_len": {
+            "status": "unknown",
+            "value": null
+          }
+        },
+        "session": 1,
+        "successful_key_references": 1,
+        "successful_references": 1
+      },
+      {
+        "accessing_sessions": 0,
+        "attribution": "valid",
+        "attribution_reason": null,
+        "birth": {
+          "end_ns": 32998132810637,
+          "start_ns": 32997944630127
+        },
+        "creation": "generate_pair",
+        "established": {
+          "class": {
+            "status": "unknown",
+            "value": null
+          },
+          "ec_params": {
+            "status": "unknown",
+            "value": null
+          },
+          "key_type": {
+            "status": "unknown",
+            "value": null
+          },
+          "modulus_bits": {
+            "status": "unknown",
+            "value": null
+          },
+          "token": {
+            "status": "unknown",
+            "value": null
+          },
+          "value_len": {
+            "status": "unknown",
+            "value": null
+          }
+        },
+        "label": null,
+        "lifetime": "retired",
+        "lifetime_reason": "outcome_lost",
+        "object": 11,
+        "origin": "created",
+        "queries": {
+          "class": "not_queried",
+          "ec_params": "not_queried",
+          "key_type": "not_queried",
+          "modulus_bits": "not_queried",
+          "token": "not_queried",
+          "value_len": "not_queried"
+        },
+        "requested": {
+          "class": {
+            "status": "unknown",
+            "value": null
+          },
+          "ec_params": {
+            "status": "unknown",
+            "value": null
+          },
+          "key_type": {
+            "status": "unknown",
+            "value": null
+          },
+          "modulus_bits": {
+            "status": "value",
+            "value": 2048
+          },
+          "token": {
+            "status": "unknown",
+            "value": null
+          },
+          "value_len": {
+            "status": "unknown",
+            "value": null
+          }
+        },
+        "session": 1,
+        "successful_key_references": 0,
+        "successful_references": 0
+      },
+      {
+        "accessing_sessions": 0,
+        "attribution": "valid",
+        "attribution_reason": null,
+        "birth": {
+          "end_ns": 32998132810637,
+          "start_ns": 32997944630127
+        },
+        "creation": "generate_pair",
+        "established": {
+          "class": {
+            "status": "unknown",
+            "value": null
+          },
+          "ec_params": {
+            "status": "unknown",
+            "value": null
+          },
+          "key_type": {
+            "status": "unknown",
+            "value": null
+          },
+          "modulus_bits": {
+            "status": "unknown",
+            "value": null
+          },
+          "token": {
+            "status": "unknown",
+            "value": null
+          },
+          "value_len": {
+            "status": "unknown",
+            "value": null
+          }
+        },
+        "label": null,
+        "lifetime": "retired",
+        "lifetime_reason": "outcome_lost",
+        "object": 12,
+        "origin": "created",
+        "queries": {
+          "class": "not_queried",
+          "ec_params": "not_queried",
+          "key_type": "not_queried",
+          "modulus_bits": "not_queried",
+          "token": "not_queried",
+          "value_len": "not_queried"
+        },
+        "requested": {
+          "class": {
+            "status": "unknown",
+            "value": null
+          },
+          "ec_params": {
+            "status": "unknown",
+            "value": null
+          },
+          "key_type": {
+            "status": "unknown",
+            "value": null
+          },
+          "modulus_bits": {
+            "status": "unknown",
+            "value": null
+          },
+          "token": {
+            "status": "unknown",
+            "value": null
+          },
+          "value_len": {
+            "status": "unknown",
+            "value": null
+          }
+        },
+        "session": 1,
+        "successful_key_references": 1,
+        "successful_references": 1
+      },
+      {
+        "accessing_sessions": 0,
+        "attribution": "valid",
+        "attribution_reason": null,
+        "birth": {
+          "end_ns": 33002167590686,
+          "start_ns": 33002134082958
+        },
+        "creation": "generate_pair",
+        "established": {
+          "class": {
+            "status": "unknown",
+            "value": null
+          },
+          "ec_params": {
+            "status": "unknown",
+            "value": null
+          },
+          "key_type": {
+            "status": "unknown",
+            "value": null
+          },
+          "modulus_bits": {
+            "status": "unknown",
+            "value": null
+          },
+          "token": {
+            "status": "unknown",
+            "value": null
+          },
+          "value_len": {
+            "status": "unknown",
+            "value": null
+          }
+        },
+        "label": null,
+        "lifetime": "retired",
+        "lifetime_reason": "outcome_lost",
+        "object": 13,
+        "origin": "created",
+        "queries": {
+          "class": "not_queried",
+          "ec_params": "not_queried",
+          "key_type": "not_queried",
+          "modulus_bits": "not_queried",
+          "token": "not_queried",
+          "value_len": "not_queried"
+        },
+        "requested": {
+          "class": {
+            "status": "unknown",
+            "value": null
+          },
+          "ec_params": {
+            "status": "unknown",
+            "value": null
+          },
+          "key_type": {
+            "status": "unknown",
+            "value": null
+          },
+          "modulus_bits": {
+            "status": "value",
+            "value": 2048
+          },
+          "token": {
+            "status": "unknown",
+            "value": null
+          },
+          "value_len": {
+            "status": "unknown",
+            "value": null
+          }
+        },
+        "session": 1,
+        "successful_key_references": 0,
+        "successful_references": 0
+      },
+      {
+        "accessing_sessions": 0,
+        "attribution": "valid",
+        "attribution_reason": null,
+        "birth": {
+          "end_ns": 33002167590686,
+          "start_ns": 33002134082958
+        },
+        "creation": "generate_pair",
+        "established": {
+          "class": {
+            "status": "unknown",
+            "value": null
+          },
+          "ec_params": {
+            "status": "unknown",
+            "value": null
+          },
+          "key_type": {
+            "status": "unknown",
+            "value": null
+          },
+          "modulus_bits": {
+            "status": "unknown",
+            "value": null
+          },
+          "token": {
+            "status": "unknown",
+            "value": null
+          },
+          "value_len": {
+            "status": "unknown",
+            "value": null
+          }
+        },
+        "label": null,
+        "lifetime": "retired",
+        "lifetime_reason": "outcome_lost",
+        "object": 14,
+        "origin": "created",
+        "queries": {
+          "class": "not_queried",
+          "ec_params": "not_queried",
+          "key_type": "not_queried",
+          "modulus_bits": "not_queried",
+          "token": "not_queried",
+          "value_len": "not_queried"
+        },
+        "requested": {
+          "class": {
+            "status": "unknown",
+            "value": null
+          },
+          "ec_params": {
+            "status": "unknown",
+            "value": null
+          },
+          "key_type": {
+            "status": "unknown",
+            "value": null
+          },
+          "modulus_bits": {
+            "status": "unknown",
+            "value": null
+          },
+          "token": {
+            "status": "unknown",
+            "value": null
+          },
+          "value_len": {
+            "status": "unknown",
+            "value": null
+          }
+        },
+        "session": 1,
+        "successful_key_references": 1,
+        "successful_references": 1
+      },
+      {
+        "accessing_sessions": 0,
+        "attribution": "valid",
+        "attribution_reason": null,
+        "birth": {
+          "end_ns": 33006203562937,
+          "start_ns": 33006168705105
+        },
+        "creation": "generate_pair",
+        "established": {
+          "class": {
+            "status": "unknown",
+            "value": null
+          },
+          "ec_params": {
+            "status": "unknown",
+            "value": null
+          },
+          "key_type": {
+            "status": "unknown",
+            "value": null
+          },
+          "modulus_bits": {
+            "status": "unknown",
+            "value": null
+          },
+          "token": {
+            "status": "unknown",
+            "value": null
+          },
+          "value_len": {
+            "status": "unknown",
+            "value": null
+          }
+        },
+        "label": null,
+        "lifetime": "retired",
+        "lifetime_reason": "outcome_lost",
+        "object": 15,
+        "origin": "created",
+        "queries": {
+          "class": "not_queried",
+          "ec_params": "not_queried",
+          "key_type": "not_queried",
+          "modulus_bits": "not_queried",
+          "token": "not_queried",
+          "value_len": "not_queried"
+        },
+        "requested": {
+          "class": {
+            "status": "unknown",
+            "value": null
+          },
+          "ec_params": {
+            "status": "unknown",
+            "value": null
+          },
+          "key_type": {
+            "status": "unknown",
+            "value": null
+          },
+          "modulus_bits": {
+            "status": "value",
+            "value": 2048
+          },
+          "token": {
+            "status": "unknown",
+            "value": null
+          },
+          "value_len": {
+            "status": "unknown",
+            "value": null
+          }
+        },
+        "session": 1,
+        "successful_key_references": 0,
+        "successful_references": 0
+      },
+      {
+        "accessing_sessions": 0,
+        "attribution": "valid",
+        "attribution_reason": null,
+        "birth": {
+          "end_ns": 33006203562937,
+          "start_ns": 33006168705105
+        },
+        "creation": "generate_pair",
+        "established": {
+          "class": {
+            "status": "unknown",
+            "value": null
+          },
+          "ec_params": {
+            "status": "unknown",
+            "value": null
+          },
+          "key_type": {
+            "status": "unknown",
+            "value": null
+          },
+          "modulus_bits": {
+            "status": "unknown",
+            "value": null
+          },
+          "token": {
+            "status": "unknown",
+            "value": null
+          },
+          "value_len": {
+            "status": "unknown",
+            "value": null
+          }
+        },
+        "label": null,
+        "lifetime": "retired",
+        "lifetime_reason": "outcome_lost",
+        "object": 16,
+        "origin": "created",
+        "queries": {
+          "class": "not_queried",
+          "ec_params": "not_queried",
+          "key_type": "not_queried",
+          "modulus_bits": "not_queried",
+          "token": "not_queried",
+          "value_len": "not_queried"
+        },
+        "requested": {
+          "class": {
+            "status": "unknown",
+            "value": null
+          },
+          "ec_params": {
+            "status": "unknown",
+            "value": null
+          },
+          "key_type": {
+            "status": "unknown",
+            "value": null
+          },
+          "modulus_bits": {
+            "status": "unknown",
+            "value": null
+          },
+          "token": {
+            "status": "unknown",
+            "value": null
+          },
+          "value_len": {
+            "status": "unknown",
+            "value": null
+          }
+        },
+        "session": 1,
+        "successful_key_references": 1,
+        "successful_references": 1
+      }
+    ],
+    "reason": "authority_lost",
+    "revision": 43,
+    "sessions": [
+      {
+        "origin": "first_observed",
+        "session": 1,
+        "status": "lost"
+      }
+    ],
+    "status": "partial",
+    "unattributed": [],
+    "unknown_key_operations": [
+      {
+        "active": 0,
+        "cancelled": 0,
+        "category": "generate_key_pair",
+        "completed": 8,
+        "failed": 0,
+        "reason": "not_applicable",
+        "unit": "operations",
+        "unknown": 0
+      }
+    ],
+    "version": 4
+  },
+  "observation": {
+    "attach": {
+      "fallback": null,
+      "mechanism": "uprobe-multi",
+      "scope_filter": "kernel-pid+bpf",
+      "selection": "auto"
+    },
+    "ended_ns": 33018074319458,
+    "lane": "native",
+    "lifecycle": {
+      "failed_quanta": 0,
+      "malformed": 0,
+      "records": 1,
+      "recovery_rescans": 0,
+      "ring_loss": 0
+    },
+    "native_witnesses": {
+      "bound": 1,
+      "identity_budget_exhausted": false,
+      "identity_unavailable": 0,
+      "integrity": 0,
+      "pending": 0,
+      "placement": {
+        "ambiguous": 0,
+        "edge": 1,
+        "module": 0,
+        "unresolved": 0
+      },
+      "rows": 1,
+      "unbound": 0,
+      "unbound_images": 0,
+      "unbound_images_saturated": false,
+      "unbound_reasons": {}
+    },
+    "passes": 43,
+    "retirement": "closed",
+    "semantic_capture": {
+      "admitted_endpoints": 68,
+      "continuity_cuts": 0,
+      "events_lost": 0,
+      "final_drain": true,
+      "refused_endpoints": 0,
+      "status": "stopped",
+      "stop_quiescence": "quiesced",
+      "unrouted_returns": 0
+    },
+    "settlement": "unsettled",
+    "started_ns": 32969941234253,
+    "usage_feed": true
+  },
+  "pid_namespace": {
+    "kernel_pids": "initial",
+    "observer": "initial",
+    "proc_pids": "observer"
+  },
+  "prearm": [],
+  "schema": "p11scope/inventory/v1",
+  "scope": "pid:4264",
+  "semantic_edges": [
+    {
+      "api_returns": {
+        "count": 24,
+        "historical_only_returns": 0,
+        "saturated": false,
+        "unit": "api_returns"
+      },
+      "caller": "c0",
+      "coverage": {
+        "lossy": true,
+        "reasons": [
+          "capture_stopped",
+          "instance_retired",
+          "semantic_loss",
+          "task_retired"
+        ]
+      },
+      "entries": {
+        "count": null,
+        "observation": "unavailable",
+        "unit": "api_entries"
+      },
+      "instance": "i0",
+      "mechanisms": [
+        {
+          "calls": 8,
+          "errors": 0,
+          "evidence": {
+            "functions": [
+              "C_GenerateKeyPair"
+            ],
+            "returns": [
+              {
+                "name": "CKR_OK",
+                "rv": 0,
+                "rv_hex": "0x0"
+              }
+            ],
+            "truncated": false
+          },
+          "last_seen_ns": 33006203562937,
+          "mechanism": 0,
+          "mechanism_hex": "0x0",
+          "name": "CKM_RSA_PKCS_KEY_PAIR_GEN",
+          "operations": [
+            "generate_key_pair"
+          ]
+        },
+        {
+          "calls": 16,
+          "errors": 0,
+          "evidence": {
+            "functions": [
+              "C_Sign",
+              "C_SignInit"
+            ],
+            "returns": [
+              {
+                "name": "CKR_OK",
+                "rv": 0,
+                "rv_hex": "0x0"
+              }
+            ],
+            "truncated": false
+          },
+          "last_seen_ns": 33006204503793,
+          "mechanism": 64,
+          "mechanism_hex": "0x40",
+          "name": "CKM_SHA256_RSA_PKCS",
+          "operations": [
+            "sign"
+          ]
+        }
+      ],
+      "module": "m0",
+      "operations": {
+        "active": [],
+        "calls": 24,
+        "cancelled": 0,
+        "completed": 16,
+        "dropped": 0,
+        "evidence": {
+          "async_duplicates": 0,
+          "async_evictions": 0,
+          "auth_state_ambiguities": 0,
+          "operation_state_imports": 0,
+          "semantic_capture_failures": 0,
+          "session_cancel_ambiguities": 0,
+          "session_cancel_unknown_flags": 0,
+          "state_reconciliations": 0,
+          "unmatched_closes": 0
+        },
+        "failed": 0,
+        "last_seen_ns": 33006204503793,
+        "orphans": 0,
+        "started": 16,
+        "unknown": 0
+      },
+      "semantics": "observed"
+    }
+  ]
+}

@@ -1,0 +1,723 @@
+{
+  "schema": "p11scope-manifest/5",
+  "module_path": "/usr/lib/softhsm/libsofthsm2.so",
+  "objects": [
+    {
+      "id": 0,
+      "path": "/usr/lib/softhsm/libsofthsm2.so",
+      "identity": {
+        "kind": "gnu_build_id",
+        "value": "0000000000000000000000000000000000000001",
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002",
+        "reusable": true,
+        "note": null
+      }
+    }
+  ],
+  "provenance_objects": [
+    {
+      "device_major": 8,
+      "device_minor": 1,
+      "path": "/usr/lib/libgcc_s.so.1",
+      "inode": 106,
+      "identity": {
+        "kind": "gnu_build_id",
+        "value": "0000000000000000000000000000000000000003",
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000004",
+        "reusable": true,
+        "note": null
+      }
+    },
+    {
+      "device_major": 8,
+      "device_minor": 1,
+      "path": "/usr/lib/libstdc++.so.6.0.35",
+      "inode": 107,
+      "identity": {
+        "kind": "gnu_build_id",
+        "value": "0000000000000000000000000000000000000005",
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000006",
+        "reusable": true,
+        "note": null
+      }
+    },
+    {
+      "device_major": 8,
+      "device_minor": 1,
+      "path": "/usr/lib/libzstd.so.1.5.7",
+      "inode": 108,
+      "identity": {
+        "kind": "gnu_build_id",
+        "value": "0000000000000000000000000000000000000007",
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000008",
+        "reusable": true,
+        "note": null
+      }
+    },
+    {
+      "device_major": 8,
+      "device_minor": 1,
+      "path": "/usr/lib/libcrypto.so.3",
+      "inode": 109,
+      "identity": {
+        "kind": "gnu_build_id",
+        "value": "0000000000000000000000000000000000000009",
+        "sha256": "000000000000000000000000000000000000000000000000000000000000000a",
+        "reusable": true,
+        "note": null
+      }
+    },
+    {
+      "device_major": 8,
+      "device_minor": 1,
+      "path": "/usr/lib/libz.so.1.3.1",
+      "inode": 110,
+      "identity": {
+        "kind": "gnu_build_id",
+        "value": "000000000000000000000000000000000000000b",
+        "sha256": "000000000000000000000000000000000000000000000000000000000000000c",
+        "reusable": true,
+        "note": null
+      }
+    },
+    {
+      "device_major": 8,
+      "device_minor": 1,
+      "path": "/usr/lib/softhsm/libsofthsm2.so",
+      "inode": 104,
+      "identity": {
+        "kind": "gnu_build_id",
+        "value": "0000000000000000000000000000000000000001",
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002",
+        "reusable": true,
+        "note": null
+      }
+    },
+    {
+      "device_major": 8,
+      "device_minor": 1,
+      "path": "/usr/lib/ld-linux-x86-64.so.2",
+      "inode": 111,
+      "identity": {
+        "kind": "gnu_build_id",
+        "value": "000000000000000000000000000000000000000d",
+        "sha256": "000000000000000000000000000000000000000000000000000000000000000e",
+        "reusable": true,
+        "note": null
+      }
+    },
+    {
+      "device_major": 8,
+      "device_minor": 1,
+      "path": "/usr/lib/libc.so.6",
+      "inode": 112,
+      "identity": {
+        "kind": "gnu_build_id",
+        "value": "000000000000000000000000000000000000000f",
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000010",
+        "reusable": true,
+        "note": null
+      }
+    },
+    {
+      "device_major": 8,
+      "device_minor": 1,
+      "path": "/usr/lib/libm.so.6",
+      "inode": 113,
+      "identity": {
+        "kind": "gnu_build_id",
+        "value": "0000000000000000000000000000000000000011",
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000012",
+        "reusable": true,
+        "note": null
+      }
+    },
+    {
+      "device_major": 8,
+      "device_minor": 1,
+      "path": "/work/v071/p11scope-discover-0.7.1-x86_64-linux-gnu/p11scope-discover",
+      "inode": 114,
+      "identity": {
+        "kind": "gnu_build_id",
+        "value": "0000000000000000000000000000000000000013",
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000014",
+        "reusable": true,
+        "note": null
+      }
+    }
+  ],
+  "interface_list": {
+    "status": "absent"
+  },
+  "surfaces": [
+    {
+      "source": {
+        "kind": "legacy_function_list"
+      },
+      "acquisition": {
+        "status": "ok"
+      },
+      "version": {
+        "major": 2,
+        "minor": 40
+      },
+      "walk": {
+        "status": "full"
+      },
+      "functions": [
+        {
+          "name": "C_Initialize",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 162400
+          }
+        },
+        {
+          "name": "C_Finalize",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 162448
+          }
+        },
+        {
+          "name": "C_GetInfo",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 162496
+          }
+        },
+        {
+          "name": "C_GetFunctionList",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 162352
+          }
+        },
+        {
+          "name": "C_GetSlotList",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 162544
+          }
+        },
+        {
+          "name": "C_GetSlotInfo",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 162624
+          }
+        },
+        {
+          "name": "C_GetTokenInfo",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 162688
+          }
+        },
+        {
+          "name": "C_GetMechanismList",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 162752
+          }
+        },
+        {
+          "name": "C_GetMechanismInfo",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 162832
+          }
+        },
+        {
+          "name": "C_InitToken",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 162912
+          }
+        },
+        {
+          "name": "C_InitPIN",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 162992
+          }
+        },
+        {
+          "name": "C_SetPIN",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 163072
+          }
+        },
+        {
+          "name": "C_OpenSession",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 163168
+          }
+        },
+        {
+          "name": "C_CloseSession",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 163264
+          }
+        },
+        {
+          "name": "C_CloseAllSessions",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 163312
+          }
+        },
+        {
+          "name": "C_GetSessionInfo",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 163360
+          }
+        },
+        {
+          "name": "C_GetOperationState",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 163424
+          }
+        },
+        {
+          "name": "C_SetOperationState",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 163504
+          }
+        },
+        {
+          "name": "C_Login",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 163600
+          }
+        },
+        {
+          "name": "C_Logout",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 163680
+          }
+        },
+        {
+          "name": "C_CreateObject",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 163728
+          }
+        },
+        {
+          "name": "C_CopyObject",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 163808
+          }
+        },
+        {
+          "name": "C_DestroyObject",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 163904
+          }
+        },
+        {
+          "name": "C_GetObjectSize",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 163968
+          }
+        },
+        {
+          "name": "C_GetAttributeValue",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 164048
+          }
+        },
+        {
+          "name": "C_SetAttributeValue",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 164128
+          }
+        },
+        {
+          "name": "C_FindObjectsInit",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 164208
+          }
+        },
+        {
+          "name": "C_FindObjects",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 164288
+          }
+        },
+        {
+          "name": "C_FindObjectsFinal",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 164368
+          }
+        },
+        {
+          "name": "C_EncryptInit",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 164416
+          }
+        },
+        {
+          "name": "C_Encrypt",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 164496
+          }
+        },
+        {
+          "name": "C_EncryptUpdate",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 164592
+          }
+        },
+        {
+          "name": "C_EncryptFinal",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 164688
+          }
+        },
+        {
+          "name": "C_DecryptInit",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 164768
+          }
+        },
+        {
+          "name": "C_Decrypt",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 164848
+          }
+        },
+        {
+          "name": "C_DecryptUpdate",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 164944
+          }
+        },
+        {
+          "name": "C_DecryptFinal",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 165040
+          }
+        },
+        {
+          "name": "C_DigestInit",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 165120
+          }
+        },
+        {
+          "name": "C_Digest",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 165184
+          }
+        },
+        {
+          "name": "C_DigestUpdate",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 165280
+          }
+        },
+        {
+          "name": "C_DigestKey",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 165360
+          }
+        },
+        {
+          "name": "C_DigestFinal",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 165424
+          }
+        },
+        {
+          "name": "C_SignInit",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 165504
+          }
+        },
+        {
+          "name": "C_Sign",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 165584
+          }
+        },
+        {
+          "name": "C_SignUpdate",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 165680
+          }
+        },
+        {
+          "name": "C_SignFinal",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 165760
+          }
+        },
+        {
+          "name": "C_SignRecoverInit",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 165840
+          }
+        },
+        {
+          "name": "C_SignRecover",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 165920
+          }
+        },
+        {
+          "name": "C_VerifyInit",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 166016
+          }
+        },
+        {
+          "name": "C_Verify",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 166096
+          }
+        },
+        {
+          "name": "C_VerifyUpdate",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 166192
+          }
+        },
+        {
+          "name": "C_VerifyFinal",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 166272
+          }
+        },
+        {
+          "name": "C_VerifyRecoverInit",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 166352
+          }
+        },
+        {
+          "name": "C_VerifyRecover",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 166432
+          }
+        },
+        {
+          "name": "C_DigestEncryptUpdate",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 166528
+          }
+        },
+        {
+          "name": "C_DecryptDigestUpdate",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 166624
+          }
+        },
+        {
+          "name": "C_SignEncryptUpdate",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 166720
+          }
+        },
+        {
+          "name": "C_DecryptVerifyUpdate",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 166816
+          }
+        },
+        {
+          "name": "C_GenerateKey",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 166912
+          }
+        },
+        {
+          "name": "C_GenerateKeyPair",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 167008
+          }
+        },
+        {
+          "name": "C_WrapKey",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 167120
+          }
+        },
+        {
+          "name": "C_UnwrapKey",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 167232
+          }
+        },
+        {
+          "name": "C_DeriveKey",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 167344
+          }
+        },
+        {
+          "name": "C_SeedRandom",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 167456
+          }
+        },
+        {
+          "name": "C_GenerateRandom",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 167536
+          }
+        },
+        {
+          "name": "C_GetFunctionStatus",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 167616
+          }
+        },
+        {
+          "name": "C_CancelFunction",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 167664
+          }
+        },
+        {
+          "name": "C_WaitForSlotEvent",
+          "resolution": {
+            "status": "resolved",
+            "object": 0,
+            "file_offset": 167712
+          }
+        }
+      ]
+    }
+  ],
+  "vendor_interfaces": [],
+  "alias_groups": [],
+  "selection_evidence": {
+    "acquisition": "export_absent",
+    "queries": [],
+    "tables": [],
+    "selection_truncated": false
+  }
+}

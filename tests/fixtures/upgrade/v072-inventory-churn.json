@@ -1,0 +1,739 @@
+{
+  "budgets": {
+    "callers": {
+      "late_refused": 0,
+      "limit": 4096,
+      "occupied": 3,
+      "refused": 0,
+      "retired": 10,
+      "retired_with_calls": 3
+    },
+    "counters": {
+      "cap": 18446744073709551615,
+      "observed_edges": 3,
+      "saturated_edges": 0
+    },
+    "departed_use": {
+      "identities_dropped": 0,
+      "mech_overflow": 0
+    },
+    "edges": {
+      "folded": 4,
+      "folded_entries": 51,
+      "limit": 32768,
+      "occupied": 1,
+      "refused": 0
+    },
+    "endpoints": {
+      "limit": 1048576,
+      "occupied": 68,
+      "refused": 0
+    },
+    "instance_negative_state": {
+      "exhausted": false,
+      "limit": 4096,
+      "occupied": 0,
+      "refused": 0
+    },
+    "instance_semantic_resources": {
+      "charged_bytes": 1049104,
+      "limit_bytes": 167772160,
+      "occupancy": {
+        "active_machines": 0,
+        "async_function_bytes": 0,
+        "async_function_capacity_bytes": 0,
+        "detached_calls": 0,
+        "mechanisms": 0,
+        "open_bindings": 0,
+        "operation_categories": 0,
+        "origin_capacity_elements": 0,
+        "origin_elements": 0,
+        "origin_vectors": 0,
+        "pending_calls": 0,
+        "provenance_function_bytes": 0,
+        "provenance_function_capacity_bytes": 0,
+        "provenance_functions": 0,
+        "provenance_returns": 0
+      },
+      "peak_charged_bytes": 1049404,
+      "refused": 0
+    },
+    "instance_semantic_state": {
+      "limit": 4096,
+      "occupied": 0,
+      "refused": 0,
+      "shared_limit": 32768,
+      "shared_occupied": 0,
+      "unknown_edges": 0
+    },
+    "instances": {
+      "folded": 0,
+      "limit": 4096,
+      "occupied": 0,
+      "refused": 0
+    },
+    "inventory_attach_modules": {
+      "limit": 32768,
+      "occupied": 1,
+      "refused": 0
+    },
+    "inventory_endpoints": {
+      "limit": 32768,
+      "occupied": 68,
+      "refused": 0
+    },
+    "modules": {
+      "limit": 4096,
+      "occupied": 1,
+      "refused": 0
+    },
+    "native_departed": {
+      "exec_prune_overflow": 0,
+      "pair_dropped_base": 0,
+      "pair_dropped_rows": 0,
+      "pair_prune_overflow": 0
+    },
+    "native_preadmission": {
+      "limit": 4096,
+      "occupied": 0,
+      "pruned": 4,
+      "refused": 0
+    },
+    "retained_history": {
+      "limit": 8192,
+      "retained": 9,
+      "suppressed": 0
+    },
+    "semantic_state": {
+      "limit": 32768,
+      "occupied": 0,
+      "refused": 0,
+      "status": "withheld",
+      "unknown_edges": 5
+    }
+  },
+  "caller_metadata": {
+    "budget_refusals": "0",
+    "discarded": "0",
+    "historical": 0,
+    "mode": "none",
+    "peak_retained_bytes": "0",
+    "pending": 0,
+    "refresh_failures": "0",
+    "retained_bytes": "0",
+    "sampled": 0,
+    "stale": 0,
+    "started": "0",
+    "unknown": 0
+  },
+  "callers": [
+    {
+      "first_seen_ns": 31815693276478,
+      "id": "c0",
+      "image": {
+        "authority": "scan_pinned",
+        "exe": {
+          "dev": 1,
+          "ino": 100,
+          "mtime_nanos": 0,
+          "mtime_secs": 10,
+          "path": "/usr/bin/dash"
+        },
+        "exec_id": null,
+        "exec_observed": true,
+        "task_cookie": null
+      },
+      "incarnation": 0,
+      "last_seen_ns": 31836354185569,
+      "launched_by": [],
+      "launched_by_gap": {
+        "reason": "parent chain not sampled in cgroup transaction",
+        "subject": "caller parent chain"
+      },
+      "launched_by_origin": "gap",
+      "launched_by_unit": null,
+      "lifecycle": "mapped",
+      "lifecycle_reason": null,
+      "pid": 4267,
+      "retired": false,
+      "start_time": 3181106,
+      "start_time_unit": "clock_ticks_since_boot"
+    },
+    {
+      "first_seen_ns": 31815693276478,
+      "id": "c1",
+      "image": {
+        "authority": "scan_pinned",
+        "exe": {
+          "dev": 1,
+          "ino": 101,
+          "mtime_nanos": 0,
+          "mtime_secs": 10,
+          "path": "/work/f2/bin/catalog-driver"
+        },
+        "exec_id": null,
+        "exec_observed": true,
+        "task_cookie": null
+      },
+      "incarnation": 0,
+      "last_seen_ns": 31836354185569,
+      "launched_by": [],
+      "launched_by_gap": {
+        "reason": "parent chain not sampled in cgroup transaction",
+        "subject": "caller parent chain"
+      },
+      "launched_by_origin": "gap",
+      "launched_by_unit": null,
+      "lifecycle": "mapped",
+      "lifecycle_reason": null,
+      "pid": 4268,
+      "retired": false,
+      "start_time": 3181122,
+      "start_time_unit": "clock_ticks_since_boot"
+    },
+    {
+      "first_seen_ns": 31827661889434,
+      "id": "c12",
+      "image": {
+        "authority": "scan_pinned",
+        "exe": {
+          "dev": 1,
+          "ino": 102,
+          "mtime_nanos": 0,
+          "mtime_secs": 10,
+          "path": "/usr/bin/sleep"
+        },
+        "exec_id": null,
+        "exec_observed": true,
+        "task_cookie": null
+      },
+      "incarnation": 0,
+      "last_seen_ns": 31836354185569,
+      "launched_by": [],
+      "launched_by_gap": {
+        "reason": "parent chain not sampled in cgroup transaction",
+        "subject": "caller parent chain"
+      },
+      "launched_by_origin": "gap",
+      "launched_by_unit": null,
+      "lifecycle": "mapped",
+      "lifecycle_reason": null,
+      "pid": 4269,
+      "retired": false,
+      "start_time": 3182741,
+      "start_time_unit": "clock_ticks_since_boot"
+    }
+  ],
+  "clock": {
+    "basis": "CLOCK_MONOTONIC",
+    "unit": "ns"
+  },
+  "edges": [
+    {
+      "caller": "c1",
+      "entries": {
+        "cap": 18446744073709551615,
+        "count": 0,
+        "coverage": {
+          "detail": null,
+          "first_ns": null,
+          "lossy": null,
+          "reason": "scope_membership_unproven",
+          "since_ns": null,
+          "state": "unknown",
+          "until_ns": null
+        },
+        "first_seen_ns": null,
+        "in_flight": false,
+        "last_seen_ns": null,
+        "observation": "unknown (usage observation unavailable)",
+        "saturated": false
+      },
+      "mapping": {
+        "evidence": "deep_scan",
+        "first_seen_ns": 31815693276478,
+        "interruptions": 0,
+        "last_seen_ns": 31836354185569,
+        "reason": null,
+        "state": "mapped"
+      },
+      "mechanisms": null,
+      "module": "m0",
+      "operations": null,
+      "semantics": "unknown (semantic capture withheld)"
+    }
+  ],
+  "gaps": [
+    {
+      "budget": null,
+      "caller": "c0",
+      "module": null,
+      "pid": 4267,
+      "reason": "no settled expected native image for this caller in the acquisition domain; scan-pinned fallback retained",
+      "repeats": 17,
+      "subject": "native owner activation refused"
+    },
+    {
+      "budget": null,
+      "caller": "c1",
+      "module": null,
+      "pid": 4268,
+      "reason": "no settled expected native image for this caller in the acquisition domain; scan-pinned fallback retained",
+      "repeats": 17,
+      "subject": "native owner activation refused"
+    },
+    {
+      "budget": null,
+      "caller": null,
+      "module": null,
+      "pid": 4270,
+      "reason": "original cgroup transaction custody could not be revalidated",
+      "repeats": 1,
+      "subject": "caller admission failed"
+    },
+    {
+      "budget": null,
+      "caller": null,
+      "module": null,
+      "pid": null,
+      "reason": "cgroup member generation could not be pinned or read",
+      "repeats": 1,
+      "subject": "cgroup scope transaction incomplete"
+    },
+    {
+      "budget": null,
+      "caller": null,
+      "module": "m0",
+      "pid": null,
+      "reason": "/usr/lib/softhsm/libsofthsm2.so: native witness rows of this module were not bound to a caller incarnation (first: no live caller incarnation held the tgid when the row was read); module-level positive use only, never attributed by pid",
+      "repeats": 1,
+      "subject": "used by an unidentified caller image"
+    },
+    {
+      "budget": null,
+      "caller": null,
+      "module": "m0",
+      "pid": null,
+      "reason": "a demoted count placed post-demotion growth on this module (3 placements): each placed edge's count covers a workload segment starting at its base read, never the whole workload, so per-segment exactness is unverifiable and only the ledger window's upper bound applies",
+      "repeats": 1,
+      "subject": "demoted count placed"
+    },
+    {
+      "budget": null,
+      "caller": "c6",
+      "module": null,
+      "pid": 4271,
+      "reason": "no settled expected native image for this caller in the acquisition domain; scan-pinned fallback retained",
+      "repeats": 1,
+      "subject": "native owner activation refused"
+    },
+    {
+      "budget": null,
+      "caller": null,
+      "module": null,
+      "pid": null,
+      "reason": "cgroup member scan was incomplete",
+      "repeats": 2,
+      "subject": "cgroup scope transaction incomplete"
+    },
+    {
+      "budget": null,
+      "caller": "c12",
+      "module": null,
+      "pid": 4269,
+      "reason": "no settled expected native image for this caller in the acquisition domain; scan-pinned fallback retained",
+      "repeats": 8,
+      "subject": "native owner activation refused"
+    }
+  ],
+  "gaps_suppressed": 0,
+  "instances": [],
+  "layer_totals": {
+    "forwarding_entries": 0,
+    "logical_entries": 51
+  },
+  "modules": [
+    {
+      "admission": {
+        "class": "corroborated",
+        "endpoints": 68,
+        "history": [],
+        "note": "scan-only admission: manifest corroboration was not consulted",
+        "reasons": [],
+        "state": "admitted"
+      },
+      "departed_use": {
+        "callers": 4,
+        "edges": 4,
+        "entries": {
+          "count": 51,
+          "coverage": {
+            "counted": 3,
+            "first_min_ns": null,
+            "lossy": 0,
+            "pid_exit": 0,
+            "since_min_ns": 31820965473851,
+            "unknown": {
+              "caller_exited_before_match": 1
+            },
+            "until_max_ns": null,
+            "watched_no_use": 0,
+            "witnessed": 0
+          },
+          "first_min_ns": 31820965473851,
+          "forwarding": 0,
+          "in_flight": 0,
+          "last_max_ns": 31828930376797,
+          "logical": 51,
+          "observation": {
+            "observed": 3,
+            "unknown (usage observation unavailable)": 1
+          },
+          "saturated": 0
+        },
+        "first_ns": 31817400296536,
+        "folded_instances": [],
+        "folded_instances_dropped": 0,
+        "folded_instances_saturated": false,
+        "identities": [
+          {
+            "authority": "scan_pinned",
+            "caller": "c2",
+            "exe": {
+              "dev": 1,
+              "ino": 103,
+              "mtime_nanos": 0,
+              "mtime_secs": 10,
+              "path": "/work/f2/bin/shortlived-sign"
+            },
+            "exec_observed": true,
+            "first_seen_ns": 31815693276478,
+            "incarnation": 0,
+            "last_seen_ns": 31817340661476,
+            "lifecycle": "exited",
+            "lifecycle_reason": "process exited (pid names no live process)",
+            "metadata_status": null,
+            "pid": 4272,
+            "start_time": 3181536
+          },
+          {
+            "authority": "scan_pinned",
+            "caller": "c5",
+            "exe": {
+              "dev": 1,
+              "ino": 103,
+              "mtime_nanos": 0,
+              "mtime_secs": 10,
+              "path": "/work/f2/bin/shortlived-sign"
+            },
+            "exec_observed": true,
+            "first_seen_ns": 31819541797890,
+            "incarnation": 0,
+            "last_seen_ns": 31820772219187,
+            "lifecycle": "exited",
+            "lifecycle_reason": "process exited (pid names no live process)",
+            "metadata_status": null,
+            "pid": 4273,
+            "start_time": 3181937
+          },
+          {
+            "authority": "scan_pinned",
+            "caller": "c8",
+            "exe": {
+              "dev": 1,
+              "ino": 103,
+              "mtime_nanos": 0,
+              "mtime_secs": 10,
+              "path": "/work/f2/bin/shortlived-sign"
+            },
+            "exec_observed": true,
+            "first_seen_ns": 31823997336599,
+            "incarnation": 0,
+            "last_seen_ns": 31825373844031,
+            "lifecycle": "exited",
+            "lifecycle_reason": "process exited (pid names no live process)",
+            "metadata_status": null,
+            "pid": 4274,
+            "start_time": 3182339
+          },
+          {
+            "authority": "scan_pinned",
+            "caller": "c11",
+            "exe": {
+              "dev": 1,
+              "ino": 103,
+              "mtime_nanos": 0,
+              "mtime_secs": 10,
+              "path": "/work/f2/bin/shortlived-sign"
+            },
+            "exec_observed": true,
+            "first_seen_ns": 31827661889434,
+            "incarnation": 0,
+            "last_seen_ns": 31828876217924,
+            "lifecycle": "exited",
+            "lifecycle_reason": "process exited (pid names no live process)",
+            "metadata_status": null,
+            "pid": 4275,
+            "start_time": 3182741
+          }
+        ],
+        "identities_dropped": 0,
+        "identities_saturated": false,
+        "instances": {
+          "api_returns": 0,
+          "api_returns_saturated_rows": 0,
+          "first_min_ns": null,
+          "folded": 0,
+          "historical_only_returns": 0,
+          "last_max_ns": null,
+          "loss_reasons": {},
+          "lossy_rows": 0,
+          "null_reasons": 0,
+          "observed": 0,
+          "reasons": {},
+          "retired": 0,
+          "settled_live": 0,
+          "uncertain": 0
+        },
+        "mapping": {
+          "evidence": {
+            "deep_scan": 4,
+            "maps_match": 0
+          },
+          "first_min_ns": 31815693276478,
+          "interruptions": 0,
+          "last_max_ns": 31827661889434,
+          "reasons": {
+            "process exited (pid names no live process)": 4
+          },
+          "reasons_overflow": 0,
+          "state": {
+            "ended": 4,
+            "mapped": 0,
+            "uncertain": 0
+          }
+        },
+        "mechanisms": null,
+        "mechanisms_overflow": {
+          "calls": 0,
+          "errors": 0,
+          "mechs": 0
+        },
+        "operations": null,
+        "semantics": {
+          "labels": {
+            "unknown (semantic capture withheld)": 4
+          }
+        }
+      },
+      "id": "m0",
+      "identity": {
+        "build_id": "0000000000000000000000000000000000000001",
+        "device": {
+          "major": 8,
+          "minor": 1
+        },
+        "inode": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002",
+        "source": "mountinfo"
+      },
+      "initialize": {
+        "already_initialized": 0,
+        "calls": 0,
+        "detail": "semantic lane unavailable",
+        "last_error_rv": null,
+        "ok": 0,
+        "status": "unknown"
+      },
+      "lifecycle": "mapped",
+      "paths": [
+        "/usr/lib/softhsm/libsofthsm2.so"
+      ],
+      "unbound_use": {
+        "entries": 52,
+        "executables": [
+          {
+            "calls_at_least": 3,
+            "dev": {
+              "major": 8,
+              "minor": 2
+            },
+            "exe": null,
+            "first_call_ns": 31816380969899,
+            "identity_ambiguous": false,
+            "identity_candidates": [],
+            "ino": 115,
+            "pid_host": 4272,
+            "resolution": "no_exec_record"
+          },
+          {
+            "calls_at_least": 18,
+            "dev": {
+              "major": 8,
+              "minor": 1
+            },
+            "exe": null,
+            "first_call_ns": 31817380466302,
+            "identity_ambiguous": false,
+            "identity_candidates": [],
+            "ino": 103,
+            "pid_host": 4276,
+            "resolution": "path_unknown"
+          },
+          {
+            "calls_at_least": 18,
+            "dev": {
+              "major": 8,
+              "minor": 1
+            },
+            "exe": null,
+            "first_call_ns": 31821391284524,
+            "identity_ambiguous": false,
+            "identity_candidates": [],
+            "ino": 103,
+            "pid_host": 4277,
+            "resolution": "path_unknown"
+          },
+          {
+            "calls_at_least": 13,
+            "dev": {
+              "major": 8,
+              "minor": 1
+            },
+            "exe": "/work/f2/bin/shortlived-sign",
+            "first_call_ns": 31825410854529,
+            "identity_ambiguous": false,
+            "identity_candidates": [
+              "/work/f2/bin/shortlived-sign"
+            ],
+            "ino": 103,
+            "pid_host": 4278,
+            "resolution": "proc_alive"
+          }
+        ],
+        "first_ns": 31816380969899,
+        "images": 4,
+        "images_saturated": false,
+        "pids": [
+          {
+            "first_call_ns": 31816380969899,
+            "pid_host": 4272
+          },
+          {
+            "first_call_ns": 31817380466302,
+            "pid_host": 4276
+          },
+          {
+            "first_call_ns": 31821391284524,
+            "pid_host": 4277
+          },
+          {
+            "first_call_ns": 31825410854529,
+            "pid_host": 4278
+          }
+        ],
+        "pids_dropped": 0,
+        "reasons": {
+          "no_live_caller": 4
+        },
+        "rows": 4
+      },
+      "unloaded_observed": false
+    }
+  ],
+  "object_observations": {
+    "budgets": {
+      "allocation_refused": false,
+      "encoded_bytes": 410,
+      "key_rows": {
+        "limit": 65536,
+        "occupied": 0,
+        "refused": 0
+      },
+      "object_rows": {
+        "limit": 65536,
+        "occupied": 0,
+        "refused": 0
+      },
+      "refusal_reason": "none",
+      "unknown_rows": {
+        "occupied": 0
+      }
+    },
+    "gaps": {
+      "rows": [],
+      "suppressed": 0
+    },
+    "key_operations": [],
+    "objects": [],
+    "reason": "journal_unavailable",
+    "revision": 18,
+    "sessions": [],
+    "status": "unavailable",
+    "unknown_key_operations": [],
+    "version": 1
+  },
+  "observation": {
+    "attach": {
+      "fallback": null,
+      "mechanism": "uprobe-multi",
+      "scope_filter": "bpf-cgroup",
+      "selection": "auto"
+    },
+    "ended_ns": 31836951739466,
+    "lane": "native",
+    "lifecycle": {
+      "failed_quanta": 0,
+      "malformed": 0,
+      "records": 25,
+      "recovery_rescans": 0,
+      "ring_loss": 0
+    },
+    "native_witnesses": {
+      "bound": 3,
+      "identity_budget_exhausted": false,
+      "identity_unavailable": 0,
+      "integrity": 0,
+      "pending": 0,
+      "placement": {
+        "ambiguous": 0,
+        "edge": 3,
+        "module": 4,
+        "unresolved": 0
+      },
+      "rows": 7,
+      "unbound": 4,
+      "unbound_images": 4,
+      "unbound_images_saturated": false,
+      "unbound_reasons": {
+        "no_live_caller": 4
+      }
+    },
+    "passes": 18,
+    "retirement": "closed",
+    "semantic_capture": {
+      "admitted_endpoints": 0,
+      "continuity_cuts": 0,
+      "events_lost": 0,
+      "final_drain": null,
+      "length_insert_failures": 0,
+      "length_stash_mismatches": 0,
+      "refused_endpoints": 0,
+      "status": "disabled",
+      "stop_quiescence": "not_requested",
+      "unrouted_returns": 0
+    },
+    "settlement": "unsettled",
+    "started_ns": 31812894067847,
+    "usage_feed": false
+  },
+  "pid_namespace": {
+    "kernel_pids": "initial",
+    "observer": "initial",
+    "proc_pids": "observer"
+  },
+  "prearm": [],
+  "schema": "p11scope/inventory/v1",
+  "scope": "cgroup",
+  "semantic_edges": []
+}

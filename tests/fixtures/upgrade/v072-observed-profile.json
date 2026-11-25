@@ -1,0 +1,4134 @@
+{
+  "capture": {
+    "caller": {
+      "exe": "/work/f2/bin/shortlived-sign",
+      "exe_unknown_reason": null
+    },
+    "drain_interval_ms": 1000,
+    "end": "2026-11-25T21:00:39Z",
+    "kernel": "7.0.0-44-generic",
+    "mode": "profile",
+    "modules": [
+      {
+        "build_id": "0000000000000000000000000000000000000001",
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "path": "/usr/lib/softhsm/libsofthsm2.so",
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      }
+    ],
+    "privacy_mode": "allowlisted",
+    "ring_bytes": 33554432,
+    "scope": "pid",
+    "start": "2026-11-25T21:00:26Z"
+  },
+  "cgroups": [
+    {
+      "calls": 43,
+      "cgroup_id": 13263,
+      "errors": 0,
+      "label": "user.slice/user-1000.slice/session-c2.scope",
+      "mechanisms": [
+        {
+          "attribution_basis": "standard_layout",
+          "calls": 40,
+          "errors": 0,
+          "mechanism": 64,
+          "mechanism_hex": "0x40",
+          "name": "CKM_SHA256_RSA_PKCS",
+          "registered": true
+        }
+      ],
+      "unadmitted": 0,
+      "workload": "session-c2.scope"
+    }
+  ],
+  "evidence": {
+    "abi_refusals": 0,
+    "active_slots": 0,
+    "aliased": [],
+    "async_duplicates": 0,
+    "async_evictions": 0,
+    "async_orphans": 0,
+    "async_target_failures": 0,
+    "attach_backend": {
+      "fallback": null,
+      "scope_filter": "kernel-pid+bpf",
+      "selection": "auto"
+    },
+    "attach_failures": [],
+    "attach_gap_ms": null,
+    "attach_mechanisms": [
+      "uprobe-multi"
+    ],
+    "attached_probes": 136,
+    "auth_state_ambiguities": 0,
+    "authority": "hash-pinned",
+    "cgroup_scope_failures": 0,
+    "completeness": "COMPLETE",
+    "coverage_retired_slots": 0,
+    "discovery": [
+      {
+        "attached_at_ns": 32916683823828,
+        "build_id": "0000000000000000000000000000000000000001",
+        "corroborated": false,
+        "corroboration": [
+          "single_source"
+        ],
+        "dev": [
+          8,
+          1
+        ],
+        "first_attach_points": [
+          {
+            "attached_ns": 32916683760839,
+            "began_ns": 32916672815511,
+            "file_offset": 162352
+          },
+          {
+            "attached_ns": 32916683692409,
+            "began_ns": 32916672815511,
+            "file_offset": 162400
+          },
+          {
+            "attached_ns": 32916683758094,
+            "began_ns": 32916672815511,
+            "file_offset": 162448
+          },
+          {
+            "attached_ns": 32916683760208,
+            "began_ns": 32916672815511,
+            "file_offset": 162496
+          },
+          {
+            "attached_ns": 32916683761290,
+            "began_ns": 32916672815511,
+            "file_offset": 162544
+          },
+          {
+            "attached_ns": 32916683768824,
+            "began_ns": 32916672815511,
+            "file_offset": 162624
+          },
+          {
+            "attached_ns": 32916683769425,
+            "began_ns": 32916672815511,
+            "file_offset": 162688
+          },
+          {
+            "attached_ns": 32916683769856,
+            "began_ns": 32916672815511,
+            "file_offset": 162752
+          },
+          {
+            "attached_ns": 32916683770337,
+            "began_ns": 32916672815511,
+            "file_offset": 162832
+          },
+          {
+            "attached_ns": 32916683771279,
+            "began_ns": 32916672815511,
+            "file_offset": 162912
+          },
+          {
+            "attached_ns": 32916683771709,
+            "began_ns": 32916672815511,
+            "file_offset": 162992
+          },
+          {
+            "attached_ns": 32916683773012,
+            "began_ns": 32916672815511,
+            "file_offset": 163072
+          },
+          {
+            "attached_ns": 32916683773533,
+            "began_ns": 32916672815511,
+            "file_offset": 163168
+          },
+          {
+            "attached_ns": 32916683773994,
+            "began_ns": 32916672815511,
+            "file_offset": 163264
+          },
+          {
+            "attached_ns": 32916683774455,
+            "began_ns": 32916672815511,
+            "file_offset": 163312
+          },
+          {
+            "attached_ns": 32916683774905,
+            "began_ns": 32916672815511,
+            "file_offset": 163360
+          },
+          {
+            "attached_ns": 32916683775356,
+            "began_ns": 32916672815511,
+            "file_offset": 163424
+          },
+          {
+            "attached_ns": 32916683776579,
+            "began_ns": 32916672815511,
+            "file_offset": 163504
+          },
+          {
+            "attached_ns": 32916683793180,
+            "began_ns": 32916672815511,
+            "file_offset": 163600
+          },
+          {
+            "attached_ns": 32916683793771,
+            "began_ns": 32916672815511,
+            "file_offset": 163680
+          },
+          {
+            "attached_ns": 32916683794192,
+            "began_ns": 32916672815511,
+            "file_offset": 163728
+          },
+          {
+            "attached_ns": 32916683794633,
+            "began_ns": 32916672815511,
+            "file_offset": 163808
+          },
+          {
+            "attached_ns": 32916683795054,
+            "began_ns": 32916672815511,
+            "file_offset": 163904
+          },
+          {
+            "attached_ns": 32916683795464,
+            "began_ns": 32916672815511,
+            "file_offset": 163968
+          },
+          {
+            "attached_ns": 32916683795885,
+            "began_ns": 32916672815511,
+            "file_offset": 164048
+          },
+          {
+            "attached_ns": 32916683797037,
+            "began_ns": 32916672815511,
+            "file_offset": 164128
+          },
+          {
+            "attached_ns": 32916683797538,
+            "began_ns": 32916672815511,
+            "file_offset": 164208
+          },
+          {
+            "attached_ns": 32916683797919,
+            "began_ns": 32916672815511,
+            "file_offset": 164288
+          },
+          {
+            "attached_ns": 32916683798390,
+            "began_ns": 32916672815511,
+            "file_offset": 164368
+          },
+          {
+            "attached_ns": 32916683798861,
+            "began_ns": 32916672815511,
+            "file_offset": 164416
+          },
+          {
+            "attached_ns": 32916683799282,
+            "began_ns": 32916672815511,
+            "file_offset": 164496
+          },
+          {
+            "attached_ns": 32916683799753,
+            "began_ns": 32916672815511,
+            "file_offset": 164592
+          },
+          {
+            "attached_ns": 32916683800694,
+            "began_ns": 32916672815511,
+            "file_offset": 164688
+          },
+          {
+            "attached_ns": 32916683802398,
+            "began_ns": 32916672815511,
+            "file_offset": 164768
+          },
+          {
+            "attached_ns": 32916683802798,
+            "began_ns": 32916672815511,
+            "file_offset": 164848
+          },
+          {
+            "attached_ns": 32916683803239,
+            "began_ns": 32916672815511,
+            "file_offset": 164944
+          },
+          {
+            "attached_ns": 32916683803750,
+            "began_ns": 32916672815511,
+            "file_offset": 165040
+          },
+          {
+            "attached_ns": 32916683804191,
+            "began_ns": 32916672815511,
+            "file_offset": 165120
+          },
+          {
+            "attached_ns": 32916683804882,
+            "began_ns": 32916672815511,
+            "file_offset": 165184
+          },
+          {
+            "attached_ns": 32916683805984,
+            "began_ns": 32916672815511,
+            "file_offset": 165280
+          },
+          {
+            "attached_ns": 32916683806465,
+            "began_ns": 32916672815511,
+            "file_offset": 165360
+          },
+          {
+            "attached_ns": 32916683806906,
+            "began_ns": 32916672815511,
+            "file_offset": 165424
+          },
+          {
+            "attached_ns": 32916683807367,
+            "began_ns": 32916672815511,
+            "file_offset": 165504
+          },
+          {
+            "attached_ns": 32916683807838,
+            "began_ns": 32916672815511,
+            "file_offset": 165584
+          },
+          {
+            "attached_ns": 32916683808319,
+            "began_ns": 32916672815511,
+            "file_offset": 165680
+          },
+          {
+            "attached_ns": 32916683808860,
+            "began_ns": 32916672815511,
+            "file_offset": 165760
+          },
+          {
+            "attached_ns": 32916683809972,
+            "began_ns": 32916672815511,
+            "file_offset": 165840
+          },
+          {
+            "attached_ns": 32916683810533,
+            "began_ns": 32916672815511,
+            "file_offset": 165920
+          },
+          {
+            "attached_ns": 32916683810984,
+            "began_ns": 32916672815511,
+            "file_offset": 166016
+          },
+          {
+            "attached_ns": 32916683811455,
+            "began_ns": 32916672815511,
+            "file_offset": 166096
+          },
+          {
+            "attached_ns": 32916683811956,
+            "began_ns": 32916672815511,
+            "file_offset": 166192
+          },
+          {
+            "attached_ns": 32916683812477,
+            "began_ns": 32916672815511,
+            "file_offset": 166272
+          },
+          {
+            "attached_ns": 32916683813018,
+            "began_ns": 32916672815511,
+            "file_offset": 166352
+          },
+          {
+            "attached_ns": 32916683814060,
+            "began_ns": 32916672815511,
+            "file_offset": 166432
+          },
+          {
+            "attached_ns": 32916683814611,
+            "began_ns": 32916672815511,
+            "file_offset": 166528
+          },
+          {
+            "attached_ns": 32916683815092,
+            "began_ns": 32916672815511,
+            "file_offset": 166624
+          },
+          {
+            "attached_ns": 32916683815653,
+            "began_ns": 32916672815511,
+            "file_offset": 166720
+          },
+          {
+            "attached_ns": 32916683816184,
+            "began_ns": 32916672815511,
+            "file_offset": 166816
+          },
+          {
+            "attached_ns": 32916683816725,
+            "began_ns": 32916672815511,
+            "file_offset": 166912
+          },
+          {
+            "attached_ns": 32916683817286,
+            "began_ns": 32916672815511,
+            "file_offset": 167008
+          },
+          {
+            "attached_ns": 32916683819290,
+            "began_ns": 32916672815511,
+            "file_offset": 167120
+          },
+          {
+            "attached_ns": 32916683819821,
+            "began_ns": 32916672815511,
+            "file_offset": 167232
+          },
+          {
+            "attached_ns": 32916683820271,
+            "began_ns": 32916672815511,
+            "file_offset": 167344
+          },
+          {
+            "attached_ns": 32916683820732,
+            "began_ns": 32916672815511,
+            "file_offset": 167456
+          },
+          {
+            "attached_ns": 32916683821213,
+            "began_ns": 32916672815511,
+            "file_offset": 167536
+          },
+          {
+            "attached_ns": 32916683822786,
+            "began_ns": 32916672815511,
+            "file_offset": 167616
+          },
+          {
+            "attached_ns": 32916683823307,
+            "began_ns": 32916672815511,
+            "file_offset": 167664
+          },
+          {
+            "attached_ns": 32916683823828,
+            "began_ns": 32916672815511,
+            "file_offset": 167712
+          }
+        ],
+        "first_attached_at_ns": 32916683823828,
+        "ino": 104,
+        "interfaces": 0,
+        "objects": [
+          {
+            "build_id": "0000000000000000000000000000000000000001",
+            "dev": [
+              8,
+              1
+            ],
+            "identity_source": "mountinfo",
+            "ino": 104,
+            "note": null,
+            "path": "/usr/lib/softhsm/libsofthsm2.so",
+            "sha256": "0000000000000000000000000000000000000000000000000000000000000002",
+            "sources": [
+              "scan"
+            ]
+          }
+        ],
+        "path": "/usr/lib/softhsm/libsofthsm2.so",
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002",
+        "skipped": [],
+        "sources": [
+          "scan"
+        ],
+        "tables": [
+          {
+            "entries": 68,
+            "exports_agreeing": 68,
+            "file_offset": 938016,
+            "linkage": "exports",
+            "source": "scan",
+            "version": [
+              2,
+              40
+            ]
+          }
+        ],
+        "unobserved_windows": [
+          {
+            "end_ns": 32916683823828,
+            "reason": "late_discovery",
+            "start_ns": 32913181297938
+          }
+        ]
+      }
+    ],
+    "discovery_conflicts": 0,
+    "discovery_read_failures": 0,
+    "discovery_ring_loss": 0,
+    "discovery_state_failures": 0,
+    "discovery_truncated": 0,
+    "discovery_uncorroborated": 0,
+    "discovery_uncorroborated_candidates": 0,
+    "drain_proven": true,
+    "event_loss": 0,
+    "fork_state_ambiguities": 0,
+    "gap_classes": {
+      "attribution": {
+        "causes": [],
+        "status": "attested"
+      },
+      "observation": {
+        "causes": [],
+        "status": "exact"
+      },
+      "open_calls": 0,
+      "semantics": {
+        "causes": [],
+        "status": "complete"
+      },
+      "settlement": "proven",
+      "stdout_data_sink": false
+    },
+    "handoff_child_pid": null,
+    "in_flight_at_end": 0,
+    "interface_list": "absent",
+    "interface_selection": {
+      "inventory_surfaces": [
+        {
+          "kind": "legacy",
+          "module": 0,
+          "ordinal": 0
+        }
+      ],
+      "providers": [],
+      "selection_truncated": false,
+      "standard_exports": [
+        {
+          "module": 0,
+          "status": "legacy_absent"
+        }
+      ],
+      "tuples": []
+    },
+    "kernel_control": {
+      "capture_halted": false,
+      "identity_budget_exhausted": false,
+      "identity_unavailable": 0,
+      "owner_admission_failures": 0,
+      "owner_poison": [],
+      "root_affiliation_failures": []
+    },
+    "learned_cap_skipped": 0,
+    "learned_event_loss": 0,
+    "learned_staged_files": 0,
+    "loader_discovery": {
+      "benign_hits": 0,
+      "dlopen_timing": {
+        "known_pre_relocation": 0,
+        "none": 0,
+        "pause_protected": 0,
+        "qualified_pre_constructor": 0,
+        "unproven": 1
+      },
+      "hits": 0,
+      "initial_set_capture": {
+        "eligible": 0,
+        "none": 0,
+        "pause_protected": 0
+      },
+      "initial_set_timing": {
+        "known_pre_relocation": 0,
+        "none": 0,
+        "pause_protected": 0,
+        "qualified_pre_constructor": 0,
+        "unproven": 0
+      },
+      "state_read_failures": 0,
+      "strategies": {
+        "debug_state_every_hit": 1,
+        "dlopen_return": 0,
+        "unavailable": 0
+      }
+    },
+    "malformed_records": 0,
+    "manifest_object_fallbacks": [],
+    "mechanism_id_overflow": 0,
+    "member_stop_attached": 0,
+    "member_stop_unattached": 0,
+    "module_ambiguous": 0,
+    "module_unresolved_slots": 0,
+    "modules_skipped": [],
+    "multi_rebuild_gaps": 0,
+    "object_capture": {
+      "available": true,
+      "reason": null
+    },
+    "operation_state_imports": 0,
+    "orphan_ops": 0,
+    "p11scope_env": [
+      {
+        "effect": "experiment-only broad provider admission; anything but exactly \"1\" keeps the narrow default",
+        "name": "P11SCOPE_BROAD_ADMIT",
+        "value": null
+      },
+      {
+        "effect": "p11scope-discover loader-environment marker; a forged value is rejected, never trusted",
+        "name": "P11SCOPE_LOADER_ENV_SANITIZED",
+        "value": null
+      },
+      {
+        "effect": "disables kernel file-open learning under --system; exactly \"1\" disables it, anything else keeps learning on",
+        "name": "P11SCOPE_DISABLE_FILE_LEARNING",
+        "value": null
+      }
+    ],
+    "pause": "none",
+    "pause_attempts": 0,
+    "pause_confirmed": 0,
+    "pause_engine_incomplete_retirements": 0,
+    "pause_partial": 0,
+    "pause_unavailable": 0,
+    "pending_at_end": 0,
+    "pid_descendant_gaps": 0,
+    "pid_descendant_gaps_admitted": 0,
+    "pid_namespace": {
+      "kernel_pids": "initial",
+      "observer": "initial",
+      "proc_pids": "observer"
+    },
+    "process_tracking_evictions": 0,
+    "process_tracking_failures": 0,
+    "process_tracking_fallbacks": 0,
+    "provider_changed": false,
+    "ring_accounting": {
+      "discovery": {
+        "consumed": 1,
+        "dropped": 0,
+        "produced": 1,
+        "still_queued": 0,
+        "unexplained": 0
+      },
+      "events": {
+        "consumed": 43,
+        "dropped": 0,
+        "produced": 43,
+        "still_queued": 0,
+        "unexplained": 0
+      }
+    },
+    "rv_update_failures": 0,
+    "scan_ms": 43,
+    "scan_unavailable": null,
+    "scheduling": {
+      "capture_discovery_loss": 0,
+      "capture_event_loss": 0,
+      "detach_discovery_loss": 0,
+      "detach_event_loss": 0,
+      "discovery_deferrals": 0,
+      "drain_budget_exhaustions": 0,
+      "drain_repolls": 0,
+      "inter_drain_gap": {
+        "max_ms": 22,
+        "p50_ms": 2,
+        "p99_ms": 8,
+        "samples": 4910
+      },
+      "longest_op": {
+        "duration_ms": 44,
+        "op": "scan_view",
+        "stage": "scan"
+      },
+      "max_inter_drain_gap_ms": 22,
+      "newcomer_queue": {
+        "admitted": 0,
+        "admitted_unknown": 0,
+        "dropped": 0,
+        "dropped_unknown": 0,
+        "marks_dropped": 0,
+        "max_admitted_age_ms": null,
+        "max_dropped_age_ms": null,
+        "mean_admitted_age_ms": null,
+        "oldest_pending_age_ms": null,
+        "pending": 0
+      },
+      "phase_mono_ns": {
+        "attach_mono_ns": 32916689475585,
+        "loop_end_mono_ns": 32929848965544,
+        "loop_end_reason": "target_exit",
+        "loop_start_mono_ns": 32916689843060
+      },
+      "phase_ms": {
+        "detach": 0,
+        "discovery": 58,
+        "discovery_terminal": 0,
+        "drain": 15,
+        "maps": 11,
+        "render": 28
+      },
+      "resource": {
+        "end": {
+          "read_bytes": 19927040,
+          "rss_kb": 151884,
+          "stime_ms": 3520,
+          "utime_ms": 2890,
+          "write_bytes": 28672
+        },
+        "last_periodic": {
+          "read_bytes": 19914752,
+          "rss_kb": 151120,
+          "stime_ms": 3520,
+          "utime_ms": 2870,
+          "write_bytes": 24576
+        },
+        "max_rss_kb": 159236,
+        "readiness": {
+          "read_bytes": 19824640,
+          "rss_kb": 93524,
+          "stime_ms": 2960,
+          "utime_ms": 1080,
+          "write_bytes": 20480
+        },
+        "samples": 49,
+        "start": {
+          "read_bytes": 18837504,
+          "rss_kb": 46980,
+          "stime_ms": 200,
+          "utime_ms": 420,
+          "write_bytes": 16384
+        }
+      },
+      "sink_dropped_bytes": 0,
+      "sink_policy": "bounded-wait-drop",
+      "sink_stall_ms": 0,
+      "sink_timeouts": 0,
+      "stage_invocations": {
+        "attach": 10,
+        "bind": 3,
+        "cleanup": 2,
+        "drain": 4912,
+        "merge": 9,
+        "pin": 2,
+        "plan": 3,
+        "projection": 11,
+        "scan": 1
+      },
+      "stage_ms": {
+        "attach": 69,
+        "bind": 3,
+        "cleanup": 0,
+        "drain": 153,
+        "merge": 3,
+        "pin": 55,
+        "plan": 10,
+        "projection": 4,
+        "scan": 44
+      },
+      "stage_unknown_clock": 0,
+      "tail_publishes": 0,
+      "tail_skips": 17,
+      "terminal_drain_bound": 65536,
+      "terminal_drain_truncated": false
+    },
+    "semantic_capture_failures": 0,
+    "semantic_history_drops": 0,
+    "semantic_key_budget": 262144,
+    "semantic_state_drops": 0,
+    "semantic_unverified_slots": 0,
+    "session_cancel_ambiguities": 0,
+    "session_cancel_unknown_flags": 0,
+    "shape_decode_failures": 0,
+    "shape_decode_total_failures": 0,
+    "skipped": [],
+    "slots": 68,
+    "start_insert_failures": 0,
+    "state_reconciliations": 0,
+    "stop_quiescence": {
+      "post_q_discovery": false,
+      "post_q_events": false,
+      "state": "proven"
+    },
+    "surfaces": [
+      {
+        "acquisition": "ok",
+        "functions": 68,
+        "source": "/usr/lib/softhsm/libsofthsm2.so table 2.40",
+        "walk": "full"
+      }
+    ],
+    "table_entries": 68,
+    "task_uprobe_link_losses": 0,
+    "template_tail_failures": 0,
+    "templates_truncated": false,
+    "unmatched_closes": 1,
+    "unmatched_returns": 0,
+    "unprotected_live_windows": 0,
+    "unpublished_mechanisms": 0,
+    "unregistered_mechanisms": 0,
+    "unregistered_standard_layout_mechanisms": 0,
+    "uretprobe_override": null,
+    "vendor_interfaces": 0,
+    "verdict_detail": "clean_proven"
+  },
+  "functions": [
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_Initialize"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 0,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 162400,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 1,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 1440156,
+        "p50": 1048576,
+        "p95": 1048576,
+        "p99": 1048576,
+        "total": 1440156
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_Finalize"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 1,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {
+        "0x0000000000000000": 1
+      },
+      "rv_names": {
+        "0x0000000000000000": "CKR_OK"
+      },
+      "target": {
+        "file_offset": 162448,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_GetInfo"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 2,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 162496,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_GetFunctionList"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 3,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 162352,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_GetSlotList"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 4,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 162544,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_GetSlotInfo"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 5,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 162624,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_GetTokenInfo"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 6,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 162688,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_GetMechanismList"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 7,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 162752,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_GetMechanismInfo"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 8,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 162832,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_InitToken"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 9,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 162912,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_InitPIN"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 10,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 162992,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_SetPIN"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 11,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 163072,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_OpenSession"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 12,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 163168,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 1,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 17303,
+        "p50": 16384,
+        "p95": 16384,
+        "p99": 16384,
+        "total": 17303
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_CloseSession"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 13,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {
+        "0x0000000000000000": 1
+      },
+      "rv_names": {
+        "0x0000000000000000": "CKR_OK"
+      },
+      "target": {
+        "file_offset": 163264,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_CloseAllSessions"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 14,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 163312,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_GetSessionInfo"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 15,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 163360,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_GetOperationState"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 16,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 163424,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_SetOperationState"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 17,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 163504,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_Login"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 18,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 163600,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 1,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 294227,
+        "p50": 262144,
+        "p95": 262144,
+        "p99": 262144,
+        "total": 294227
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_Logout"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 19,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {
+        "0x0000000000000000": 1
+      },
+      "rv_names": {
+        "0x0000000000000000": "CKR_OK"
+      },
+      "target": {
+        "file_offset": 163680,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_CreateObject"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 20,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 163728,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_CopyObject"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 21,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 163808,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_DestroyObject"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 22,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 163904,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_GetObjectSize"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 23,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 163968,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_GetAttributeValue"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 24,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 164048,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_SetAttributeValue"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 25,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 164128,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_FindObjectsInit"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 26,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 164208,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_FindObjects"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 27,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 164288,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_FindObjectsFinal"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 28,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 164368,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_EncryptInit"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 29,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 164416,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_Encrypt"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 30,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 164496,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_EncryptUpdate"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 31,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 164592,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_EncryptFinal"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 32,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 164688,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_DecryptInit"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 33,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 164768,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_Decrypt"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 34,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 164848,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_DecryptUpdate"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 35,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 164944,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_DecryptFinal"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 36,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 165040,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_DigestInit"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 37,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 165120,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_Digest"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 38,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 165184,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_DigestUpdate"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 39,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 165280,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_DigestKey"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 40,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 165360,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_DigestFinal"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 41,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 165424,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 20,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 499796,
+        "p50": 262144,
+        "p95": 262144,
+        "p99": 262144,
+        "total": 6013489
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_SignInit"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 42,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {
+        "0x0000000000000000": 20
+      },
+      "rv_names": {
+        "0x0000000000000000": "CKR_OK"
+      },
+      "target": {
+        "file_offset": 165504,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 20,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 1369452,
+        "p50": 524288,
+        "p95": 1048576,
+        "p99": 1048576,
+        "total": 18775565
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_Sign"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 43,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {
+        "0x0000000000000000": 20
+      },
+      "rv_names": {
+        "0x0000000000000000": "CKR_OK"
+      },
+      "target": {
+        "file_offset": 165584,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_SignUpdate"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 44,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 165680,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_SignFinal"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 45,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 165760,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_SignRecoverInit"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 46,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 165840,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_SignRecover"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 47,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 165920,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_VerifyInit"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 48,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 166016,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_Verify"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 49,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 166096,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_VerifyUpdate"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 50,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 166192,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_VerifyFinal"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 51,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 166272,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_VerifyRecoverInit"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 52,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 166352,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_VerifyRecover"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 53,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 166432,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_DigestEncryptUpdate"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 54,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 166528,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_DecryptDigestUpdate"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 55,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 166624,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_SignEncryptUpdate"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 56,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 166720,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_DecryptVerifyUpdate"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 57,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 166816,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_GenerateKey"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 58,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 166912,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_GenerateKeyPair"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 59,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 167008,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_WrapKey"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 60,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 167120,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_UnwrapKey"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 61,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 167232,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_DeriveKey"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 62,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 167344,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_SeedRandom"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 63,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 167456,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_GenerateRandom"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 64,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 167536,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_GetFunctionStatus"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 65,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 167616,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_CancelFunction"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 66,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 167664,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    },
+    {
+      "aliased": false,
+      "calls": 0,
+      "errors": 0,
+      "forwarding_layer": false,
+      "in_flight": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "total": 0
+      },
+      "module": {
+        "dev": [
+          8,
+          1
+        ],
+        "ino": 104,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+      },
+      "module_ambiguous": false,
+      "module_unresolved": false,
+      "names": [
+        "C_WaitForSlotEvent"
+      ],
+      "ordinals": [
+        {
+          "ordinal": 67,
+          "table_file_offset": 938016
+        }
+      ],
+      "pending_returns": 0,
+      "rv_counts": {},
+      "rv_names": {},
+      "target": {
+        "file_offset": 167712,
+        "object": {
+          "dev": [
+            8,
+            1
+          ],
+          "ino": 104,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    }
+  ],
+  "lane": "profile",
+  "layer_totals": {
+    "forwarding": {
+      "calls": 0,
+      "errors": 0,
+      "in_flight": 0
+    },
+    "logical": {
+      "calls": 43,
+      "errors": 0,
+      "in_flight": 0
+    }
+  },
+  "logins": {},
+  "mechanisms": [
+    {
+      "attribution_basis": "standard_layout",
+      "by_module": [
+        {
+          "calls": 40,
+          "errors": 0,
+          "module": {
+            "dev": [
+              8,
+              1
+            ],
+            "ino": 104,
+            "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+          }
+        }
+      ],
+      "calls": 40,
+      "errors": 0,
+      "latency_ns": {
+        "approximate": true,
+        "max": 1369452,
+        "p50": 262144,
+        "p95": 1048576,
+        "p99": 1048576,
+        "total": 24789054
+      },
+      "mechanism": 64,
+      "mechanism_hex": "0x40",
+      "name": "CKM_SHA256_RSA_PKCS",
+      "note": "parameter decoding was disabled by allowlisted capture policy",
+      "ops": [
+        "sign"
+      ],
+      "params": null,
+      "params_omitted": "policy",
+      "registered": true
+    }
+  ],
+  "schema": "p11scope/observed-profile/v3",
+  "sessions": {
+    "async_opened": 0,
+    "balance": 0,
+    "closed": 0,
+    "inherited": 0,
+    "opened": 0,
+    "peak_concurrent": 0
+  },
+  "templates": {
+    "note": "template capture was disabled by allowlisted capture policy; an empty operation list is not evidence that no template was used",
+    "operations": []
+  }
+}

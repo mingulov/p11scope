@@ -1,0 +1,1378 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://p11scope/observed-profile/v3.schema.json",
+  "title": "p11scope observed-profile v3 document",
+  "description": "Consumer aid for live v3 profile and v3-metrics documents (SYSPLAN residual F-50). The evidence object is closed per lane; the release oracle (scripts/check-capture-evidence.py) is the enforcement behind this file, and tests/python/test_schema_json.py keeps the two in agreement. Terminal trace EVIDENCE objects are not documents and are out of scope, as are historical v2 shapes.",
+  "type": "object",
+  "required": ["schema", "lane", "capture", "evidence", "functions"],
+  "properties": {
+    "schema": {
+      "enum": ["p11scope/observed-profile/v3", "p11scope/observed-profile/v3-metrics"]
+    },
+    "lane": {"enum": ["profile", "metrics"]},
+    "capture": {
+      "type": "object",
+      "required": ["mode", "privacy_mode", "scope", "ring_bytes", "drain_interval_ms", "modules"],
+      "properties": {
+        "mode": {"enum": ["profile", "metrics"]},
+        "privacy_mode": {"type": "string"},
+        "scope": {"enum": ["pid", "cgroup", "system"]},
+        "ring_bytes": {"type": "integer", "minimum": 0},
+        "drain_interval_ms": {"type": "integer", "minimum": 0},
+        "modules": {"type": "array"},
+        "caller": {
+          "type": "object",
+          "description": "Pid-scope target identity, present only for pid scope with resolved caller identity: exactly one of exe/exe_unknown_reason is non-null. exec_to_exe names the end-of-capture program after a proven exec (absent, never null, otherwise).",
+          "properties": {
+            "exe": {"type": ["string", "null"]},
+            "exe_unknown_reason": {"type": ["string", "null"]},
+            "exec_to_exe": {"type": "string"}
+          }
+        }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "abi_refusals", "active_slots",
+        "aliased", "async_duplicates", "async_evictions",
+        "async_orphans", "async_target_failures", "attach_backend", "attach_failures",
+        "attach_gap_ms", "attached_probes", "auth_state_ambiguities",
+        "authority", "cgroup_scope_failures", "completeness", "discovery",
+        "discovery_conflicts", "discovery_read_failures", "discovery_ring_loss",
+        "discovery_state_failures", "discovery_truncated",
+        "discovery_uncorroborated", "discovery_uncorroborated_candidates",
+        "drain_proven", "event_loss", "fork_state_ambiguities", "gap_classes",
+        "handoff_child_pid", "in_flight_at_end", "interface_list",
+        "kernel_control",
+        "loader_discovery", "malformed_records", "manifest_object_fallbacks",
+        "mechanism_id_overflow",
+        "module_ambiguous", "module_unresolved_slots", "modules_skipped", "object_capture",
+        "operation_state_imports",
+        "orphan_ops", "p11scope_env", "pause", "pause_attempts", "pid_namespace",
+        "pause_confirmed", "pause_engine_incomplete_retirements", "pause_partial",
+        "pause_unavailable", "pending_at_end",
+        "process_tracking_evictions", "process_tracking_failures",
+        "process_tracking_fallbacks", "provider_changed", "ring_accounting",
+        "rv_update_failures",
+        "scan_ms", "scan_unavailable", "scheduling",
+        "semantic_capture_failures", "semantic_history_drops",
+        "semantic_key_budget",
+        "semantic_unverified_slots",
+        "semantic_state_drops", "session_cancel_ambiguities",
+        "session_cancel_unknown_flags", "shape_decode_failures",
+        "shape_decode_total_failures", "skipped", "slots",
+        "start_insert_failures", "state_reconciliations", "stop_quiescence", "surfaces",
+        "table_entries", "task_uprobe_link_losses", "template_tail_failures",
+        "templates_truncated", "unmatched_closes", "unmatched_returns",
+        "unprotected_live_windows",
+        "unpublished_mechanisms",
+        "unregistered_mechanisms", "unregistered_standard_layout_mechanisms",
+        "uretprobe_override", "vendor_interfaces",
+        "verdict_detail"
+      ],
+      "properties": {
+        "abi_refusals": {"type": "integer", "minimum": 0},
+        "active_slots": {"type": "integer", "minimum": 0},
+        "aliased": {"type": "array", "items": {"type": "array", "items": {"type": "string"}}},
+        "async_duplicates": {"type": "integer", "minimum": 0},
+        "async_evictions": {"type": "integer", "minimum": 0},
+        "async_orphans": {"type": "integer", "minimum": 0},
+        "async_target_failures": {"type": "integer", "minimum": 0},
+        "attach_failures": {"type": "array", "items": {"type": "string"}},
+        "attach_gap_ms": {"type": ["integer", "null"], "minimum": 0},
+        "attached_probes": {"type": "integer", "minimum": 0},
+        "auth_state_ambiguities": {"type": "integer", "minimum": 0},
+        "authority": {"const": "hash-pinned"},
+        "cgroup_scope_failures": {"type": "integer", "minimum": 0},
+        "child_still_running": {"type": "boolean"},
+        "completeness": {"enum": ["COMPLETE", "PARTIAL"]},
+        "counter_collection": {
+          "description": "Optional availability of the accepted cumulative counter snapshot. Cached ticks retain its original read window; failed attempts retain its mode and generation.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "generation", "read_window", "status", "health", "discontinuity", "failure"],
+          "properties": {
+            "mode": {"enum": ["counts", "timestamps", "latency"]},
+            "generation": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+            "read_window": {
+              "oneOf": [
+                {"type": "null"},
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["started_ns", "finished_ns"],
+                  "properties": {
+                    "started_ns": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                    "finished_ns": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615}
+                  }
+                }
+              ]
+            },
+            "status": {"enum": ["fresh", "stale"]},
+            "health": {
+              "oneOf": [
+                {"type": "null"},
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["saturated", "contended"],
+                  "properties": {
+                    "saturated": {"const": false},
+                    "contended": {"const": false}
+                  }
+                }
+              ]
+            },
+            "discontinuity": {"type": "boolean"},
+            "failure": {"enum": [
+              null, "read_shape", "read_budget", "read_stats", "read_rvs", "read_health",
+              "read_kernel_evidence", "bank_routing", "bank_quarantined", "topology",
+              "mode", "generation_rollback", "limits", "saturated", "contended",
+              "kernel_evidence", "fold_overflow", "regressed", "projection"
+            ]},
+            "bank_gaps": {
+              "description": "Optional per-bank gap disclosure, present only when the acquisition was partial.",
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["failed_slots", "health_failed", "kernel_failed"],
+              "properties": {
+                "failed_slots": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                "health_failed": {"type": "boolean"},
+                "kernel_failed": {"type": "boolean"}
+              },
+              "not": {
+                "properties": {
+                  "failed_slots": {"const": 0},
+                  "health_failed": {"const": false},
+                  "kernel_failed": {"const": false}
+                }
+              }
+            }
+          },
+          "allOf": [
+            {
+              "if": {"properties": {"status": {"const": "fresh"}}},
+              "then": {"properties": {"failure": {"type": "null"}}},
+              "else": {"properties": {"failure": {"type": "string"}, "health": {"type": "null"}}}
+            },
+            {
+              "if": {
+                "properties": {
+                  "status": {"const": "fresh"},
+                  "bank_gaps": {"properties": {"health_failed": {"const": true}}, "required": ["health_failed"]}
+                },
+                "required": ["status", "bank_gaps"]
+              },
+              "then": {"properties": {"health": {"type": "null"}}},
+              "else": {
+                "if": {"properties": {"status": {"const": "fresh"}}, "required": ["status"]},
+                "then": {"properties": {"health": {"type": "object"}}}
+              }
+            }
+          ]
+        },
+        "discovery": {"type": "array"},
+        "discovery_conflicts": {"type": "integer", "minimum": 0},
+        "discovery_read_failures": {"type": "integer", "minimum": 0},
+        "discovery_ring_loss": {"type": "integer", "minimum": 0},
+        "discovery_state_failures": {"type": "integer", "minimum": 0},
+        "discovery_truncated": {"type": "integer", "minimum": 0},
+        "discovery_uncorroborated": {"type": "integer", "minimum": 0},
+        "discovery_uncorroborated_candidates": {"type": "integer", "minimum": 0},
+        "deep_scan_selection": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["processes", "deep_scanned", "shape_covered", "scan_cap"],
+          "properties": {
+            "processes": {"type": "integer", "minimum": 0},
+            "deep_scanned": {"type": "integer", "minimum": 0},
+            "shape_covered": {"type": "integer", "minimum": 0},
+            "scan_cap": {"type": "integer", "minimum": 0}
+          }
+        },
+        "discovery_retry_classes": {
+          "type": "object",
+          "propertyNames": {"enum": ["process-ended", "maps-snapshot", "object-missing", "process-view", "stale-view", "other"]},
+          "additionalProperties": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+          "minProperties": 1
+        },
+        "drain_proven": {"type": "boolean"},
+        "stop_quiescence": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["state", "post_q_events", "post_q_discovery"],
+          "properties": {
+            "state": {"enum": ["not_reached", "proven", "unproven"]},
+            "post_q_events": {"type": "boolean"},
+            "post_q_discovery": {"type": "boolean"}
+          }
+        },
+        "event_loss": {"type": "integer", "minimum": 0},
+        "fork_state_ambiguities": {"type": "integer", "minimum": 0},
+        "gap_exe_hints": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["label", "scope", "links_provider", "links_pkcs11_loader",
+                       "no_static_link_within_scope", "unknown"],
+          "properties": {
+            "label": {"const": "STATIC HINT"},
+            "scope": {"const": "D-transitive depth=2 objects<=32 edges<=128 exe-bytes<=1MiB capture-bytes<=64MiB names<=255B verdicts<=1024"},
+            "links_provider": {"type": "integer", "minimum": 0},
+            "links_pkcs11_loader": {"type": "integer", "minimum": 0},
+            "no_static_link_within_scope": {"type": "integer", "minimum": 0},
+            "unknown": {"type": "integer", "minimum": 0}
+          }
+        },
+        "gap_exit_mappings": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mapped", "unknown"],
+          "properties": {
+            "mapped": {"type": "integer", "minimum": 0},
+            "unknown": {"type": "integer", "minimum": 0}
+          }
+        },
+        "handoff_child_pid": {"type": ["integer", "null"], "minimum": 1},
+        "in_flight_at_end": {"type": "integer", "minimum": 0},
+        "kernel_control": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["capture_halted", "owner_poison", "owner_admission_failures",
+                       "identity_unavailable", "identity_budget_exhausted",
+                       "root_affiliation_failures"],
+          "properties": {
+            "capture_halted": {"type": "boolean"},
+            "owner_poison": {"type": "array", "uniqueItems": true, "items": {"enum": [
+              "bad_control", "lookup_unknown", "bad_record", "delete_failed",
+              "bookkeeping_failed", "refund_failed", "classifier_failed",
+              "state_delete_failed", "start_key_mismatch", "start_count_mismatch",
+              "start_row_missing", "directory_mismatch", "unknown"]}},
+            "owner_admission_failures": {"type": "integer", "minimum": 0},
+            "identity_unavailable": {"type": "integer", "minimum": 0},
+            "identity_budget_exhausted": {"type": "boolean"},
+            "root_affiliation_failures": {"type": "array", "uniqueItems": true, "items": {"enum": [
+              "bad_control", "capacity", "reserve_contention", "create_failed",
+              "existing_child", "bad_cell", "exit_classifier", "exit_delete",
+              "refund_failed", "unknown"]}}
+          }
+        },
+        "interface_list": {"type": "string"},
+        "loader_discovery": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["strategies", "dlopen_timing", "initial_set_timing", "initial_set_capture", "hits", "state_read_failures"],
+          "properties": {
+            "strategies": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["debug_state_every_hit", "dlopen_return", "unavailable"],
+              "properties": {
+                "debug_state_every_hit": {"type": "integer", "minimum": 0},
+                "dlopen_return": {"type": "integer", "minimum": 0},
+                "unavailable": {"type": "integer", "minimum": 0}
+              }
+            },
+            "dlopen_timing": {"$ref": "#/$defs/loader_timing"},
+            "initial_set_timing": {"$ref": "#/$defs/loader_timing"},
+            "initial_set_capture": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["eligible", "none", "pause_protected"],
+              "properties": {
+                "eligible": {"type": "integer", "minimum": 0},
+                "none": {"type": "integer", "minimum": 0},
+                "pause_protected": {"type": "integer", "minimum": 0}
+              }
+            },
+            "hits": {"type": "integer", "minimum": 0},
+            "benign_hits": {"type": "integer", "minimum": 0},
+            "state_read_failures": {"type": "integer", "minimum": 0}
+          }
+        },
+        "legacy_collection": {
+          "description": "Optional legacy gap disclosure, present only when the legacy aggregate read was partial.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["unread_stats", "rv_failed", "unknown_evidence"],
+          "properties": {
+            "unread_stats": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+            "rv_failed": {"type": "boolean"},
+            "unknown_evidence": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {"enum": [
+                "ring_loss", "start_insert_failures", "unmatched_returns",
+                "rv_update_failures", "cgroup_scope_failures",
+                "semantic_capture_failures", "template_tail_failures",
+                "unregistered_mechanisms", "abi_refusals",
+                "owner", "cookie", "root"
+              ]}
+            }
+          },
+          "not": {
+            "properties": {
+              "unread_stats": {"const": 0},
+              "rv_failed": {"const": false},
+              "unknown_evidence": {"maxItems": 0}
+            }
+          }
+        },
+        "malformed_records": {"type": "integer", "minimum": 0},
+        "manifest_object_fallbacks": {
+          "type": "array",
+          "maxItems": 512,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["manifest", "object", "reason", "replacement"],
+            "properties": {
+              "manifest": {"type": "integer", "minimum": 0},
+              "object": {"type": "integer", "minimum": 0, "maximum": 511},
+              "reason": {"enum": ["open_stale", "identity_mismatch"]},
+              "replacement": {"type": "object"}
+            }
+          }
+        },
+        "mechanism_id_overflow": {"type": "integer", "minimum": 0},
+        "module_ambiguous": {"type": "integer", "minimum": 0},
+        "modules_skipped": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "reason"],
+            "properties": {
+              "name": {"type": "string"},
+              "reason": {"type": "string"}
+            }
+          }
+        },
+        "excluded_modules": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "dev", "ino", "processes"],
+            "properties": {
+              "path": {"type": "string"},
+              "dev": {"type": "integer", "minimum": 0},
+              "ino": {"type": "integer", "minimum": 0},
+              "processes": {"type": "integer", "minimum": 1}
+            }
+          }
+        },
+        "unmatched_excludes": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "unmatched_forwarding": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "unmatched_modules": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "operation_state_imports": {"type": "integer", "minimum": 0},
+        "orphan_ops": {"type": "integer", "minimum": 0},
+        "p11scope_env": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "effect", "value"],
+            "properties": {
+              "name": {"enum": ["P11SCOPE_BROAD_ADMIT", "P11SCOPE_LOADER_ENV_SANITIZED", "P11SCOPE_DISABLE_FILE_LEARNING"]},
+              "effect": {"type": "string", "minLength": 1},
+              "value": {"type": ["string", "null"]}
+            }
+          }
+        },
+        "pause": {"enum": ["none", "sigstop", "partial"]},
+        "pause_attempts": {"type": "integer", "minimum": 0},
+        "pause_confirmed": {"type": "integer", "minimum": 0},
+        "pause_engine_incomplete_retirements": {"type": "integer", "minimum": 0},
+        "pause_partial": {"type": "integer", "minimum": 0},
+        "pause_refused": {"enum": ["interrupted", "refused"]},
+        "pause_unavailable": {"type": "integer", "minimum": 0},
+        "pending_at_end": {"type": "integer", "minimum": 0},
+        "process_tracking_evictions": {"type": "integer", "minimum": 0},
+        "process_tracking_failures": {"type": "integer", "minimum": 0},
+        "process_tracking_fallbacks": {"type": "integer", "minimum": 0},
+        "pid_namespace": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "observer": {"enum": ["initial", "nested", "unknown"]},
+            "kernel_pids": {"const": "initial"},
+            "proc_pids": {"enum": ["observer", "foreign"]}
+          },
+          "required": ["observer", "kernel_pids", "proc_pids"]
+        },
+        "provider_changed": {"type": "boolean"},
+        "ring_accounting": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "discovery": {"$ref": "#/$defs/ring_account"},
+            "events": {"$ref": "#/$defs/ring_account"}
+          }
+        },
+        "run_tree_handed_back": {"type": "integer", "minimum": 0},
+        "rv_update_failures": {"type": "integer", "minimum": 0},
+        "scan_ms": {"type": "integer", "minimum": 0},
+        "scan_unavailable": {"type": ["string", "null"]},
+        "scheduling": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["drain_repolls", "drain_budget_exhaustions", "capture_event_loss", "detach_event_loss", "capture_discovery_loss", "detach_discovery_loss", "terminal_drain_bound", "terminal_drain_truncated", "sink_policy", "sink_stall_ms", "sink_timeouts", "sink_dropped_bytes", "max_inter_drain_gap_ms", "discovery_deferrals", "stage_unknown_clock", "tail_publishes", "tail_skips", "phase_ms", "phase_mono_ns", "stage_ms", "stage_invocations", "longest_op", "inter_drain_gap", "newcomer_queue", "resource"],
+          "properties": {
+            "drain_repolls": {"type": "integer", "minimum": 0},
+            "drain_budget_exhaustions": {"type": "integer", "minimum": 0},
+            "capture_event_loss": {"type": "integer", "minimum": 0},
+            "detach_event_loss": {"type": "integer", "minimum": 0, "description": "EVENTS ring losses accrued after the capture loop ended through the terminal snapshot (the quiesce + terminal-drain window): the terminal reading minus the loop-end reading. Excludes anything lost during or after the post-publication producer detach."},
+            "capture_discovery_loss": {"type": "integer", "minimum": 0},
+            "detach_discovery_loss": {"type": "integer", "minimum": 0, "description": "Discovery-ring losses accrued after the capture loop ended through the terminal snapshot (the quiesce + terminal-drain window): the terminal reading minus the loop-end reading. Excludes anything lost during or after the post-publication producer detach."},
+            "terminal_drain_bound": {"const": 65536},
+            "terminal_drain_truncated": {"type": "boolean"},
+            "sink_policy": {"const": "bounded-wait-drop"},
+            "sink_stall_ms": {"type": "integer", "minimum": 0},
+            "sink_timeouts": {"type": "integer", "minimum": 0},
+            "sink_dropped_bytes": {"type": "integer", "minimum": 0},
+            "max_inter_drain_gap_ms": {"type": "integer", "minimum": 0},
+            "discovery_deferrals": {"type": "integer", "minimum": 0, "description": "Live discovery frames that spent their work budget and deferred the rest of their discovery work, in order, to the next frame. A scheduling fact, never a loss; work still undone after the terminal drain is published as a loss instead."},
+            "stage_unknown_clock": {"type": "integer", "minimum": 0, "description": "Stage spans dropped for a failed clock read; in no total."},
+            "tail_publishes": {"type": "integer", "minimum": 0, "description": "Batch-tail publications executed."},
+            "tail_skips": {"type": "integer", "minimum": 0, "description": "Batch-tail publications skipped as provably redundant."},
+            "phase_ms": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["discovery", "discovery_terminal", "drain", "maps", "render", "detach"],
+              "properties": {
+                "discovery": {"type": "integer", "minimum": 0},
+                "discovery_terminal": {"type": "integer", "minimum": 0},
+                "drain": {"type": "integer", "minimum": 0},
+                "maps": {"type": "integer", "minimum": 0},
+                "render": {"type": "integer", "minimum": 0},
+                "detach": {"type": "integer", "minimum": 0, "description": "Wall time of producer-detach work completed before publication, in whole milliseconds. The terminal callback publishes before the producers detach (quiesce-then-publish, so the report never waits on link teardown), so Detailed reports carry 0 here: post-publication teardown is explicitly unmeasured in the report, by design."}
+              }
+            },
+            "phase_mono_ns": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["attach_mono_ns", "loop_start_mono_ns", "loop_end_mono_ns", "loop_end_reason"],
+              "properties": {
+                "attach_mono_ns": {"type": ["integer", "null"], "minimum": 0, "description": "Authoritative CLOCK_MONOTONIC reading when the session became fully attached, or null when the capture never reached its loop."},
+                "loop_start_mono_ns": {"type": ["integer", "null"], "minimum": 0, "description": "Authoritative CLOCK_MONOTONIC reading at the first capture-loop tick, or null when the loop never started."},
+                "loop_end_mono_ns": {"type": ["integer", "null"], "minimum": 0, "description": "Authoritative CLOCK_MONOTONIC reading when the capture loop ended, or null when the loop never ended."},
+                "loop_end_reason": {"enum": ["expiry", "operator_stop", "target_exit", "limit_reached", "error", "unstarted"]}
+              }
+            },
+            "stage_ms": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["scan", "pin", "bind", "plan", "merge", "projection", "attach", "drain", "cleanup"],
+              "description": "Per-stage wall time in whole milliseconds, cumulative leaf-span sums (a different clock from phase_ms; no identity between them).",
+              "properties": {
+                "scan": {"type": "integer", "minimum": 0},
+                "pin": {"type": "integer", "minimum": 0},
+                "bind": {"type": "integer", "minimum": 0},
+                "plan": {"type": "integer", "minimum": 0},
+                "merge": {"type": "integer", "minimum": 0},
+                "projection": {"type": "integer", "minimum": 0},
+                "attach": {"type": "integer", "minimum": 0},
+                "drain": {"type": "integer", "minimum": 0},
+                "cleanup": {"type": "integer", "minimum": 0}
+              }
+            },
+            "stage_invocations": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["scan", "pin", "bind", "plan", "merge", "projection", "attach", "drain", "cleanup"],
+              "description": "Per-stage recorded span counts.",
+              "properties": {
+                "scan": {"type": "integer", "minimum": 0},
+                "pin": {"type": "integer", "minimum": 0},
+                "bind": {"type": "integer", "minimum": 0},
+                "plan": {"type": "integer", "minimum": 0},
+                "merge": {"type": "integer", "minimum": 0},
+                "projection": {"type": "integer", "minimum": 0},
+                "attach": {"type": "integer", "minimum": 0},
+                "drain": {"type": "integer", "minimum": 0},
+                "cleanup": {"type": "integer", "minimum": 0}
+              }
+            },
+            "longest_op": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["stage", "op", "duration_ms"],
+              "description": "The capture's longest single recorded span; all null when none was recorded.",
+              "properties": {
+                "stage": {"type": ["string", "null"], "enum": ["scan", "pin", "bind", "plan", "merge", "projection", "attach", "drain", "cleanup", null]},
+                "op": {"type": ["string", "null"]},
+                "duration_ms": {"type": ["integer", "null"], "minimum": 0}
+              }
+            },
+            "inter_drain_gap": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["samples", "p50_ms", "p99_ms", "max_ms"],
+              "description": "Bounded inter-drain gap distribution; quantiles are bucket upper bounds, max is exact.",
+              "properties": {
+                "samples": {"type": "integer", "minimum": 0},
+                "p50_ms": {"type": ["integer", "null"], "minimum": 0},
+                "p99_ms": {"type": ["integer", "null"], "minimum": 0},
+                "max_ms": {"type": ["integer", "null"], "minimum": 0}
+              }
+            },
+            "newcomer_queue": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["admitted", "admitted_unknown", "max_admitted_age_ms", "mean_admitted_age_ms", "pending", "oldest_pending_age_ms", "dropped", "dropped_unknown", "max_dropped_age_ms", "marks_dropped"],
+              "description": "Newcomer/refresh queue ages in whole milliseconds.",
+              "properties": {
+                "admitted": {"type": "integer", "minimum": 0},
+                "admitted_unknown": {"type": "integer", "minimum": 0},
+                "max_admitted_age_ms": {"type": ["integer", "null"], "minimum": 0},
+                "mean_admitted_age_ms": {"type": ["integer", "null"], "minimum": 0},
+                "pending": {"type": "integer", "minimum": 0},
+                "oldest_pending_age_ms": {"type": ["integer", "null"], "minimum": 0},
+                "dropped": {"type": "integer", "minimum": 0},
+                "dropped_unknown": {"type": "integer", "minimum": 0},
+                "max_dropped_age_ms": {"type": ["integer", "null"], "minimum": 0},
+                "marks_dropped": {"type": "integer", "minimum": 0}
+              }
+            },
+            "resource": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["samples", "max_rss_kb", "start", "readiness", "end", "last_periodic"],
+              "description": "Capture-process /proc/self resource timeline.",
+              "properties": {
+                "samples": {"type": "integer", "minimum": 0},
+                "max_rss_kb": {"type": ["integer", "null"], "minimum": 0, "description": "Maximum periodic RSS in KiB. It includes the EVENTS ring's double user mapping (about twice the ring size, about 64 MiB at the 32M default), which is not extra memory: the ring is charged once as locked kernel memory."},
+                "start": {"$ref": "#/$defs/resource_sample"},
+                "readiness": {"$ref": "#/$defs/resource_sample"},
+                "end": {"$ref": "#/$defs/resource_sample"},
+                "last_periodic": {"$ref": "#/$defs/resource_sample"}
+              }
+            }
+          }
+        },
+        "semantic_capture_failures": {"type": "integer", "minimum": 0},
+        "semantic_history_drops": {"type": "integer", "minimum": 0},
+        "semantic_key_budget": {"type": "integer", "minimum": 0},
+        "semantic_state_drops": {"type": "integer", "minimum": 0},
+        "session_cancel_ambiguities": {"type": "integer", "minimum": 0},
+        "session_cancel_unknown_flags": {"type": "integer", "minimum": 0},
+        "shape_decode_failures": {"type": "integer", "minimum": 0},
+        "shape_decode_total_failures": {"type": "integer", "minimum": 0},
+        "skipped": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "reason"],
+            "properties": {
+              "name": {"type": "string"},
+              "reason": {
+                "enum": [
+                  "null pointer",
+                  "function entry unavailable",
+                  "function table unavailable in file-backed data",
+                  "discovery unavailable",
+                  "shared-overlay physical identity is uncertain; a distinct byte-identical instance may be unobserved",
+                  "physical identity is ambiguous; the collision group was not attached",
+                  "unsupported function-table version; the scanner does not walk this layout",
+                  "static probe coverage gap incomplete",
+                  "static probes detached and exact pairs reattached",
+                  "capture process-view capacity was exhausted; remaining generations were not scanned",
+                  "discovery deep-scan selection was capped; unselected processes may contain undiscovered providers",
+                  "loader context capacity 256 is exhausted",
+                  "loader contexts 249-256 are reserved for the run's own command; a descendant arm past 248 was refused",
+                  "a deferred loader memory scan exceeded the bounded loader-context ledger",
+                  "the bounded loader-arm catch-up ledger was full",
+                  "manifest object unavailable",
+                  "prearm object unavailable",
+                  "discovery transport unavailable",
+                  "process-tree members were still present when the command exited; their calls after the run end are out of scope",
+                  "only the started command is observed",
+                  "handed-back descendants are unknown",
+                  "a provider file was learned after its first use; its earlier calls were not observed",
+                  "file-learning events were lost; some provider files may not have been learned",
+                  "file learning reached its 32-file per-capture cap; further provider files were not learned",
+                  "file learning was unavailable; short-lived first loads of new provider files were not learned",
+                  "a provider file was replaced or deleted before staging; it was not learned",
+                  "file learning was disabled by the operator; short-lived first loads of new provider files were not learned",
+                  "file learning cannot see filesystems outside the observer's mount namespace; provider files opened only there were not learned",
+                  "some filesystems were not marked for file learning, or a re-mark pass was still pending or could not start; short-lived first loads of new provider files opened only there were not learned",
+                  "the owned startup step failed before the capture loop; the report holds what was captured up to the failure",
+                  "the owned startup step failed before the capture loop; the trace holds what was captured up to the failure",
+                  "the terminal identity recheck failed; provider sameness is unproven",
+                  "the reaped child's tail could not be retired; its events may be missing or double-counted",
+                  "the reaped child's tail drain was cancelled; its events are unproven",
+                  "the reaped child's tail drain failed; its events are unproven",
+                  "the terminal event drain failed; calls past the failure are unproven",
+                  "the EVENTS reader could not be opened; calls are unproven",
+                  "the terminal counter read failed; counts are unproven",
+                  "the ring-loss line could not be emitted; loss is unproven",
+                  "the terminal kernel evidence read failed; loss is unproven",
+                  "the reaped child's tail drain reached its deadline; its events are unproven"
+                ]
+              }
+            }
+          }
+        },
+        "slots": {"type": "integer", "minimum": 0},
+        "snapshot_failure": {"enum": ["read_shape", "read_budget", "read_stats", "read_rvs", "read_health", "read_kernel_evidence", "bank_routing", "bank_quarantined", "topology", "mode", "generation_rollback", "limits", "saturated", "contended", "kernel_evidence", "fold_overflow", "regressed", "projection", "legacy_slots", "legacy_kernel", "unavailable"]},
+        "start_insert_failures": {"type": "integer", "minimum": 0},
+        "state_reconciliations": {"type": "integer", "minimum": 0},
+        "surfaces": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["walk", "functions", "acquisition", "source"],
+            "properties": {
+              "walk": {"type": "string"},
+              "functions": {"type": "integer", "minimum": 0},
+              "acquisition": {"type": "string"},
+              "source": {"type": "string"}
+            }
+          }
+        },
+        "table_entries": {"type": "integer", "minimum": 0},
+        "task_uprobe_link_losses": {"type": "integer", "minimum": 0},
+        "target_exec_hints": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["label", "scope", "links_provider", "links_pkcs11_loader",
+                       "no_static_link_within_scope", "unknown"],
+          "properties": {
+            "label": {"const": "STATIC HINT"},
+            "scope": {"const": "D-transitive depth=2 objects<=32 edges<=128 exe-bytes<=1MiB capture-bytes<=64MiB names<=255B verdicts<=1024"},
+            "links_provider": {"type": "integer", "minimum": 0},
+            "links_pkcs11_loader": {"type": "integer", "minimum": 0},
+            "no_static_link_within_scope": {"type": "integer", "minimum": 0},
+            "unknown": {"type": "integer", "minimum": 0}
+          }
+        },
+        "template_tail_failures": {"type": "integer", "minimum": 0},
+        "templates_truncated": {"type": "boolean"},
+        "unmatched_closes": {"type": "integer", "minimum": 0},
+        "unmatched_returns": {"type": "integer", "minimum": 0},
+        "unpublished_mechanisms": {"type": "integer", "minimum": 0},
+        "unregistered_mechanisms": {"type": "integer", "minimum": 0},
+        "unregistered_standard_layout_mechanisms": {"type": "integer", "minimum": 0},
+        "uretprobe_override": {
+          "type": ["object", "null"],
+          "properties": {
+            "flag": {"const": "--allow-uretprobe-on-confined-target"},
+            "reason": {"type": "string", "minLength": 1}
+          },
+          "required": ["flag", "reason"]
+        },
+        "vendor_interfaces": {"type": "integer", "minimum": 0},
+        "verdict_detail": {"enum": ["clean_proven", "clean_but_unproven", "attribution_only", "concrete_gap"]},
+        "semantic_unverified_slots": {"type": "integer", "minimum": 0},
+        "unprotected_live_windows": {"type": "integer", "minimum": 0},
+        "module_unresolved_slots": {"type": "integer", "minimum": 0},
+        "gap_classes": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["observation", "attribution", "semantics", "open_calls", "settlement", "stdout_data_sink"],
+          "properties": {
+            "observation": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["status", "causes"],
+              "properties": {
+                "status": {"enum": ["exact", "lossy"]},
+                "causes": {"type": "array", "uniqueItems": true, "items": {"type": "string"}}
+              }
+            },
+            "attribution": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["status", "causes"],
+              "properties": {
+                "status": {"enum": ["attested", "withheld"]},
+                "causes": {"type": "array", "uniqueItems": true, "items": {"type": "string"}}
+              }
+            },
+            "semantics": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["status", "causes"],
+              "properties": {
+                "status": {"enum": ["complete", "degraded", "not_applicable"]},
+                "causes": {"type": "array", "uniqueItems": true, "items": {"type": "string"}}
+              }
+            },
+            "open_calls": {"type": "integer", "minimum": 0},
+            "settlement": {"enum": ["proven", "unproven"]},
+            "stdout_data_sink": {"type": "boolean"}
+          }
+        },
+        "interface_selection": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["providers", "standard_exports", "inventory_surfaces", "tuples", "selection_truncated"],
+          "properties": {
+            "providers": {
+              "type": "array",
+              "maxItems": 512,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["module", "coverage"],
+                "properties": {
+                  "module": {"type": "integer", "minimum": 0},
+                  "coverage": {"enum": ["observed", "observed_uncovered", "absent_covered", "absent_uncovered"]}
+                }
+              }
+            },
+            "standard_exports": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["module", "status"],
+                "properties": {
+                  "module": {"type": "integer", "minimum": 0},
+                  "status": {"enum": ["present", "outside_module", "legacy_absent", "required_absent", "unresolved"]}
+                }
+              }
+            },
+            "inventory_surfaces": {
+              "type": "array",
+              "maxItems": 512,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["module", "ordinal", "kind"],
+                "properties": {
+                  "module": {"type": "integer", "minimum": 0},
+                  "ordinal": {"type": "integer", "minimum": 0},
+                  "kind": {"enum": ["legacy", "interface"]}
+                }
+              }
+            },
+            "tuples": {
+              "type": "array",
+              "maxItems": 16,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["module", "request", "rv", "result", "table_match", "inventory_matches", "authority", "count"],
+                "properties": {
+                  "module": {"type": "integer", "minimum": 0},
+                  "request": {"$ref": "#/$defs/selection_request"},
+                  "rv": {"type": "integer", "minimum": 0},
+                  "result": {
+                    "anyOf": [{"$ref": "#/$defs/selection_result"}, {"type": "null"}]
+                  },
+                  "table_match": {"type": "boolean"},
+                  "inventory_matches": {
+                    "type": "array",
+                    "maxItems": 16,
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["surface", "name_agrees", "version_agrees"],
+                      "properties": {
+                        "surface": {"type": "integer", "minimum": 0},
+                        "name_agrees": {"type": "boolean"},
+                        "version_agrees": {"type": "boolean"}
+                      }
+                    }
+                  },
+                  "authority": {"enum": ["inventory", "selection_count_only", "none"]},
+                  "count": {"type": "integer", "minimum": 1}
+                }
+              }
+            },
+            "selection_truncated": {"type": "boolean"}
+          }
+        },
+        "attach_mechanisms": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"enum": ["per-offset", "uprobe-multi"]}
+        },
+        "attach_backend": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["selection", "fallback", "scope_filter"],
+          "properties": {
+            "selection": {"enum": ["auto", "multi", "singles"]},
+            "fallback": {"type": ["string", "null"], "minLength": 1},
+            "scope_filter": {"enum": ["kernel-pid+bpf", "perf-task+bpf", null]}
+          }
+        },
+        "object_capture": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["available", "reason"],
+          "properties": {
+            "available": {"type": "boolean"},
+            "reason": {"enum": ["not_enabled", null]}
+          }
+        },
+        "pid_descendant_gaps": {"type": "integer", "minimum": 0},
+        "multi_rebuild_gaps": {"type": "integer", "minimum": 0},
+        "learned_staged_files": {"type": "integer", "minimum": 0},
+        "learned_event_loss": {"type": "integer", "minimum": 0},
+        "learned_cap_skipped": {"type": "integer", "minimum": 0},
+        "selected_detail": {
+          "description": "Optional additive 6.15 endpoint-selection envelope (--select-endpoint beside counter captures). Closed nested shape; the release oracle is the enforcement behind this file. Never carries process identity.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["events"],
+          "properties": {
+            "selection": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["endpoint"],
+              "properties": {
+                "endpoint": {"type": "string", "minLength": 1},
+                "slot": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+                "file_offset": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                "names": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+                "refusal": {"enum": [
+                  "promotion_disabled", "promotion_busy", "promotion_duplicate",
+                  "promotion_already_detailed", "promotion_exhausted",
+                  "promotion_foreign_capture", "promotion_stale_view",
+                  "promotion_unknown_caller", "promotion_caller_retired",
+                  "promotion_caller_changed", "promotion_provider_changed",
+                  "promotion_provider_unloaded", "promotion_manifest_unavailable",
+                  "promotion_endpoint_ambiguous", "promotion_endpoint_dependency",
+                  "promotion_scope_ended", "promotion_scope_unsupported",
+                  "promotion_preparation_failed", "promotion_activation_failed",
+                  "promotion_capacity", "broad_not_counter", "broad_stopping",
+                  "child_shape", "not_published", "foreign", "changed",
+                  "quarantined", "budget", "endpoint_unresolved",
+                  "child_foreign_slot", "broad_plan_topology", "window_active",
+                  "endpoint_unknown", "bundle_unavailable"
+                ]}
+              },
+              "allOf": [
+                {"if": {"required": ["slot"]}, "then": {"required": ["endpoint", "slot", "file_offset"]}},
+                {"if": {"required": ["file_offset"]}, "then": {"required": ["endpoint", "slot", "file_offset"]}}
+              ]
+            },
+            "events": {
+              "type": "array",
+              "items": {
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["event", "request", "caller", "provider", "seq"],
+                    "properties": {
+                      "event": {"enum": ["reserved", "bound", "cas_won", "cas_refused", "closed", "cancelled_unactivated"]},
+                      "request": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                      "caller": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+                      "provider": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+                      "seq": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                      "note": {"type": "string"}
+                    }
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["event", "request", "caller", "provider", "view", "endpoint_offset", "refusal"],
+                    "properties": {
+                      "event": {"const": "close_refused"},
+                      "request": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                      "caller": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+                      "provider": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+                      "view": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                      "endpoint_offset": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                      "refusal": {"enum": ["broad_not_counter", "broad_stopping", "child_shape", "not_published", "foreign", "changed", "quarantined", "budget"]}
+                    }
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["event", "request", "caller", "provider", "refusal", "seq"],
+                    "properties": {
+                      "event": {"const": "reserve_refused"},
+                      "request": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                      "caller": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+                      "provider": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+                      "refusal": {"enum": ["broad_not_counter", "broad_stopping", "child_shape", "not_published", "foreign", "changed", "quarantined", "budget", "endpoint_unresolved", "child_foreign_slot", "broad_plan_topology", "window_active"]},
+                      "seq": {"type": ["integer", "null"], "minimum": 0, "maximum": 18446744073709551615}
+                    }
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["event", "request", "caller", "provider", "reason"],
+                    "properties": {
+                      "event": {"const": "start_refused"},
+                      "request": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                      "caller": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+                      "provider": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+                      "reason": {"enum": ["control disabled", "another promotion is outstanding", "same pair already requested", "pair already detailed", "request serials exhausted", "foreign capture", "view expired", "unknown caller", "caller retired", "caller identity changed", "provider changed", "provider unloaded", "no manifest permission", "ambiguous endpoints", "dependency endpoints outside closure", "parent scope ended", "parent scope unsupported", "preparation failed", "activation failed", "install capacity unavailable"]}
+                    }
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["event", "request", "outcome", "reason"],
+                    "properties": {
+                      "event": {"const": "promotion_outcome"},
+                      "request": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                      "outcome": {"const": "refused"},
+                      "reason": {"enum": ["control disabled", "another promotion is outstanding", "same pair already requested", "pair already detailed", "request serials exhausted", "foreign capture", "view expired", "unknown caller", "caller retired", "caller identity changed", "provider changed", "provider unloaded", "no manifest permission", "ambiguous endpoints", "dependency endpoints outside closure", "parent scope ended", "parent scope unsupported", "preparation failed", "activation failed", "install capacity unavailable"]}
+                    }
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["event", "request", "outcome", "reason"],
+                    "properties": {
+                      "event": {"const": "promotion_outcome"},
+                      "request": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                      "outcome": {"const": "ended"},
+                      "reason": {"enum": ["cancelled by operator", "run stopped", "lane closed"]}
+                    }
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["event", "request", "outcome", "caller", "provider"],
+                    "properties": {
+                      "event": {"const": "promotion_outcome"},
+                      "request": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                      "outcome": {"const": "active"},
+                      "caller": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+                      "provider": {"type": "integer", "minimum": 0, "maximum": 4294967295}
+                    }
+                  }
+                ]
+              }
+            },
+            "lineage": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["request", "caller", "provider", "view", "endpoint_offset", "broad_original_index", "broad_generation", "detail_generation", "broad_read_seq_before", "broad_read_seq_after", "broad_mark_before", "broad_mark_after", "drift", "after_read"],
+              "properties": {
+                "request": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                "caller": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+                "provider": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+                "view": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                "endpoint_offset": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                "broad_original_index": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+                "broad_generation": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+                "detail_generation": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                "broad_read_seq_before": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                "broad_read_seq_after": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                "broad_mark_before": {"$ref": "#/$defs/selected_detail_bracket_mark"},
+                "broad_mark_after": {"$ref": "#/$defs/selected_detail_bracket_mark"},
+                "drift": {
+                  "anyOf": [
+                    {"type": "null"},
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["kind", "before", "after"],
+                      "properties": {
+                        "kind": {"const": "generation"},
+                        "before": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+                        "after": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615}
+                      }
+                    },
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["kind", "before", "after"],
+                      "properties": {
+                        "kind": {"const": "indices"},
+                        "before": {"type": "array", "items": {"type": "integer", "minimum": 0, "maximum": 4294967295}},
+                        "after": {"type": "array", "items": {"type": "integer", "minimum": 0, "maximum": 4294967295}}
+                      }
+                    },
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["kind", "bank", "before", "after"],
+                      "properties": {
+                        "kind": {"const": "bank_ids"},
+                        "bank": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+                        "before": {"type": ["integer", "null"], "minimum": 0, "maximum": 4294967295},
+                        "after": {"type": ["integer", "null"], "minimum": 0, "maximum": 4294967295}
+                      }
+                    },
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["kind", "before", "after"],
+                      "properties": {
+                        "kind": {"const": "transaction"},
+                        "before": {"type": ["integer", "null"], "minimum": 1, "maximum": 18446744073709551615},
+                        "after": {"type": ["integer", "null"], "minimum": 1, "maximum": 18446744073709551615}
+                      }
+                    }
+                  ]
+                },
+                "after_read": {"enum": ["matched", "unavailable", "mismatched:generation", "mismatched:mode", "mismatched:read_failed", "mismatched:health", "mismatched:kernel", "mismatched:rows", "mismatched:rejected"]}
+              }
+            },
+            "aggregate": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["scope", "unit", "mode", "seq_before", "seq_after", "mode_mixed", "rows"],
+              "properties": {
+                "scope": {"const": "broad"},
+                "unit": {"const": "calls"},
+                "mode": {"enum": ["counts", "timestamps", "latency"]},
+                "seq_before": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                "seq_after": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                "mode_mixed": {"type": "boolean"},
+                "rows": {
+                  "type": "array",
+                  "items": {"anyOf": [{"$ref": "#/$defs/selected_detail_row_counts"}, {"$ref": "#/$defs/selected_detail_row_timestamps"}, {"$ref": "#/$defs/selected_detail_row_latency"}]}
+                }
+              },
+              "allOf": [
+                {"if": {"properties": {"mode": {"const": "counts"}}}, "then": {"properties": {"rows": {"items": {"$ref": "#/$defs/selected_detail_row_counts"}}}}},
+                {"if": {"properties": {"mode": {"const": "timestamps"}}}, "then": {"properties": {"rows": {"items": {"$ref": "#/$defs/selected_detail_row_timestamps"}}}}},
+                {"if": {"properties": {"mode": {"const": "latency"}}}, "then": {"properties": {"rows": {"items": {"$ref": "#/$defs/selected_detail_row_latency"}}}}}
+              ]
+            },
+            "detail": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["scope", "unit", "mode", "detail_generation", "mode_mixed", "rows"],
+              "properties": {
+                "scope": {"const": "detail"},
+                "unit": {"const": "calls"},
+                "mode": {"enum": ["counts", "timestamps", "latency"]},
+                "detail_generation": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                "mode_mixed": {"type": "boolean"},
+                "rows": {
+                  "type": "array",
+                  "items": {"anyOf": [{"$ref": "#/$defs/selected_detail_row_counts"}, {"$ref": "#/$defs/selected_detail_row_timestamps"}, {"$ref": "#/$defs/selected_detail_row_latency"}]}
+                }
+              },
+              "allOf": [
+                {"if": {"properties": {"mode": {"const": "counts"}}}, "then": {"properties": {"rows": {"items": {"$ref": "#/$defs/selected_detail_row_counts"}}}}},
+                {"if": {"properties": {"mode": {"const": "timestamps"}}}, "then": {"properties": {"rows": {"items": {"$ref": "#/$defs/selected_detail_row_timestamps"}}}}},
+                {"if": {"properties": {"mode": {"const": "latency"}}}, "then": {"properties": {"rows": {"items": {"$ref": "#/$defs/selected_detail_row_latency"}}}}}
+              ]
+            }
+          }
+        }
+      }
+    },
+    "functions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["names", "aliased", "target", "ordinals", "module", "module_ambiguous", "module_unresolved", "calls"],
+        "properties": {
+          "names": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+          "latency_ns": {
+            "description": "Timing availability from the measured counter capability. Null is unmeasured; numeric zero remains a measured value.",
+            "oneOf": [
+              {"type": "null"},
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["approximate", "p50", "p95", "p99", "total", "max"],
+                "properties": {
+                  "approximate": {"const": true},
+                  "p50": {"type": ["integer", "null"], "minimum": 0, "maximum": 18446744073709551615},
+                  "p95": {"type": ["integer", "null"], "minimum": 0, "maximum": 18446744073709551615},
+                  "p99": {"type": ["integer", "null"], "minimum": 0, "maximum": 18446744073709551615},
+                  "total": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                  "max": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615}
+                }
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["approximate", "p50", "p95", "p99", "total", "max"],
+                "properties": {
+                  "approximate": {"const": false},
+                  "p50": {"type": "null"},
+                  "p95": {"type": "null"},
+                  "p99": {"type": "null"},
+                  "total": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                  "max": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615}
+                }
+              }
+            ]
+          },
+          "target": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["object", "file_offset"],
+            "properties": {
+              "object": {
+                "type": ["object", "null"],
+                "additionalProperties": false,
+                "required": ["dev", "ino", "sha256"],
+                "properties": {
+                  "dev": {"type": "array", "items": {"type": "integer", "minimum": 0}},
+                  "ino": {"type": "integer", "minimum": 0},
+                  "sha256": {"type": ["string", "null"]}
+                }
+              },
+              "file_offset": {"type": "integer", "minimum": 0}
+            }
+          },
+          "ordinals": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["table_file_offset", "ordinal"],
+              "properties": {
+                "table_file_offset": {"type": ["integer", "null"], "minimum": 0},
+                "ordinal": {"type": "integer", "minimum": 0, "maximum": 103}
+              }
+            }
+          },
+          "initialization": {
+            "description": "Optional v3-additive Initialize claim, present only on rows that name C_Initialize with at least one positively counted return. The outcome class over the row's own completed calls; potential_provider is a true-only likelihood, never proof. Absent means Initialize was not observed on this row.",
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["outcome"],
+            "properties": {
+              "outcome": {"enum": ["ok", "already_initialized", "error", "mixed"]},
+              "potential_provider": {"const": true}
+            }
+          },
+          "rv_names": {
+            "description": "V3-additive CKR_* names for the rv_counts keys that have a registered name, keyed by the same 16-digit hex strings. Unregistered (vendor) codes are absent; their rv_counts hex key is the verbatim rendering. Render-time presentation of already-captured return codes; rv_counts is unchanged.",
+            "type": "object",
+            "additionalProperties": {"type": "string", "minLength": 1}
+          },
+          "unnamed_reasons": {
+            "description": "V3-additive reason set for rows whose names stayed [\"unknown\"], sorted. Present exactly on unknown rows (absent, never null or empty, on named rows). heuristic_table: a scan-decoded table with no interface linkage, live return, manifest, or export proof. selection_without_standard_proof: a manifest selection table no exact-standard v3 query proved.",
+            "type": "array",
+            "minItems": 1,
+            "items": {"enum": ["heuristic_table", "selection_without_standard_proof"]}
+          }
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"lane": {"const": "profile"}}},
+      "then": {
+        "properties": {
+          "schema": {"const": "p11scope/observed-profile/v3"},
+          "evidence": {
+            "required": ["interface_selection", "attach_mechanisms", "pid_descendant_gaps", "multi_rebuild_gaps", "learned_staged_files", "learned_event_loss", "learned_cap_skipped"]
+          }
+        },
+        "required": ["mechanisms", "sessions", "logins", "templates", "cgroups"]
+      }
+    },
+    {
+      "if": {"properties": {"lane": {"const": "metrics"}}},
+      "then": {
+        "properties": {
+          "schema": {"const": "p11scope/observed-profile/v3-metrics"},
+          "evidence": {
+            "not": {
+              "anyOf": [
+                {"required": ["interface_selection"]},
+                {"required": ["attach_mechanisms"]},
+                {"required": ["pid_descendant_gaps"]},
+                {"required": ["multi_rebuild_gaps"]},
+                {"required": ["learned_staged_files"]},
+                {"required": ["learned_event_loss"]},
+                {"required": ["learned_cap_skipped"]},
+                {"required": ["gap_exit_mappings"]}
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"evidence": {
+          "required": ["counter_collection"],
+          "properties": {"counter_collection": {"properties": {"mode": {"const": "counts"}}}}
+        }}
+      },
+      "then": {
+        "properties": {"functions": {"items": {
+          "required": ["latency_ns"],
+          "properties": {"latency_ns": {"$ref": "#/properties/functions/items/properties/latency_ns/oneOf/0"}}
+        }}}
+      }
+    },
+    {
+      "if": {
+        "properties": {"evidence": {
+          "required": ["counter_collection"],
+          "properties": {"counter_collection": {"properties": {"mode": {"const": "timestamps"}}}}
+        }}
+      },
+      "then": {
+        "properties": {"functions": {"items": {
+          "required": ["latency_ns"],
+          "properties": {"latency_ns": {"$ref": "#/properties/functions/items/properties/latency_ns/oneOf/2"}}
+        }}}
+      }
+    },
+    {
+      "if": {
+        "properties": {"evidence": {
+          "required": ["counter_collection"],
+          "properties": {"counter_collection": {"properties": {"mode": {"const": "latency"}}}}
+        }}
+      },
+      "then": {
+        "properties": {"functions": {"items": {
+          "required": ["latency_ns"],
+          "properties": {"latency_ns": {"$ref": "#/properties/functions/items/properties/latency_ns/oneOf/1"}}
+        }}}
+      }
+    }
+  ],
+  "$defs": {
+    "ring_account": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["produced", "consumed", "dropped"],
+      "description": "One ring's cross-check account: kernel submitted (produced) and refused (dropped) totals against the userspace drained (consumed) total and the queued remainder. still_queued/unexplained are absent exactly when the remainder is structurally unknowable (a live EVENTS ring).",
+      "properties": {
+        "produced": {"type": "integer", "minimum": 0},
+        "consumed": {"type": "integer", "minimum": 0},
+        "dropped": {"type": "integer", "minimum": 0},
+        "still_queued": {"type": "integer", "minimum": 0},
+        "unexplained": {"type": "integer", "minimum": 0}
+      }
+    },
+    "resource_sample": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rss_kb", "utime_ms", "stime_ms", "read_bytes", "write_bytes"],
+      "description": "One capture-process resource sample; every field is null when its read or parse failed.",
+      "properties": {
+        "rss_kb": {"type": ["integer", "null"], "minimum": 0, "description": "Resident set in kibibytes, from /proc/self/statm."},
+        "utime_ms": {"type": ["integer", "null"], "minimum": 0, "description": "User CPU time in whole milliseconds, from /proc/self/stat."},
+        "stime_ms": {"type": ["integer", "null"], "minimum": 0, "description": "System CPU time in whole milliseconds, from /proc/self/stat."},
+        "read_bytes": {"type": ["integer", "null"], "minimum": 0, "description": "Storage bytes read (the read_bytes key), from /proc/self/io."},
+        "write_bytes": {"type": ["integer", "null"], "minimum": 0, "description": "Storage bytes written (the write_bytes key), from /proc/self/io."}
+      }
+    },
+    "loader_timing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["qualified_pre_constructor", "known_pre_relocation", "unproven", "none", "pause_protected"],
+      "properties": {
+        "qualified_pre_constructor": {"type": "integer", "minimum": 0},
+        "known_pre_relocation": {"type": "integer", "minimum": 0},
+        "unproven": {"type": "integer", "minimum": 0},
+        "none": {"type": "integer", "minimum": 0},
+        "pause_protected": {"type": "integer", "minimum": 0}
+      }
+    },
+    "selection_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "flags"],
+      "properties": {
+        "name": {"enum": ["null", "exact_standard", "other", "unreadable"]},
+        "version": {"enum": ["null", "unreadable", "v2_40", "v3_0", "v3_1", "v3_2", "other"]},
+        "flags": {"type": "integer", "minimum": 0}
+      }
+    },
+    "selection_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "flags"],
+      "properties": {
+        "name": {"enum": ["null", "exact_standard", "other", "unreadable"]},
+        "version": {"enum": ["null", "unreadable", "v2_40", "v3_0", "v3_1", "v3_2", "other"]},
+        "flags": {"enum": ["zero", "fork_safe", "other"]}
+      }
+    },
+    "selected_detail_bracket_mark": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["seq", "generation", "indices", "bank_ids", "transaction"],
+      "properties": {
+        "seq": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "generation": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+        "indices": {"type": "array", "items": {"type": "integer", "minimum": 0, "maximum": 4294967295}},
+        "bank_ids": {
+          "type": "array",
+          "items": {
+            "type": "array", "minItems": 2, "maxItems": 2,
+            "items": {"type": "integer", "minimum": 0, "maximum": 4294967295}
+          }
+        },
+        "transaction": {"type": ["integer", "null"], "minimum": 1, "maximum": 18446744073709551615}
+      }
+    },
+    "selected_detail_rv_counts": {
+      "description": "Return-value rows keyed by the canonical decimal u64 the collector renders; possibly empty.",
+      "type": "object",
+      "propertyNames": {"pattern": "^(0|[1-9][0-9]*)$"},
+      "additionalProperties": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615}
+    },
+    "selected_detail_row_counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["slot", "object", "file_offset", "entered", "returned", "errors", "rv_counts"],
+      "properties": {
+        "slot": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+        "object": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+        "file_offset": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "entered": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "returned": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "errors": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "rv_counts": {"$ref": "#/$defs/selected_detail_rv_counts"}
+      }
+    },
+    "selected_detail_row_timestamps": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["slot", "object", "file_offset", "entered", "returned", "errors", "rv_counts", "total_ns", "max_ns"],
+      "properties": {
+        "slot": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+        "object": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+        "file_offset": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "entered": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "returned": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "errors": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "rv_counts": {"$ref": "#/$defs/selected_detail_rv_counts"},
+        "total_ns": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "max_ns": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615}
+      }
+    },
+    "selected_detail_row_latency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["slot", "object", "file_offset", "entered", "returned", "errors", "rv_counts", "total_ns", "max_ns", "buckets"],
+      "properties": {
+        "slot": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+        "object": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+        "file_offset": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "entered": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "returned": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "errors": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "rv_counts": {"$ref": "#/$defs/selected_detail_rv_counts"},
+        "total_ns": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "max_ns": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "buckets": {
+          "type": "array", "minItems": 32, "maxItems": 32,
+          "items": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615}
+        }
+      }
+    }
+  }
+}

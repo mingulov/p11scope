@@ -7431,8 +7431,21 @@ mod conservative_copy {
                             &mut self.extra,
                             bytes_for::<Vec<PinnedObjectId>>(source.tables.len())?,
                         )?;
-                        add(&mut self.extra, text_bytes(&source.path)?)?;
-                        add(&mut self.extra, text_bytes(MODULE_ABI)?)?;
+                        // A learned module's skip names the finite
+                        // learned-tables row instead of its path; cover
+                        // the longer subject either way.
+                        add(
+                            &mut self.extra,
+                            text_bytes(&source.path)?.max(text_bytes(
+                                crate::render::LEARNED_SKIP_SUBJECT,
+                            )?),
+                        )?;
+                        add(
+                            &mut self.extra,
+                            text_bytes(MODULE_ABI)?.max(text_bytes(
+                                crate::render::LEARNED_TABLE_UNBOUND_REASON,
+                            )?),
+                        )?;
                         self.max_skips = self
                             .max_skips
                             .checked_add(1)
@@ -7536,18 +7549,27 @@ mod conservative_copy {
                         if let Some(entry) = table.entries.get(self.item) {
                             add(&mut self.bytes, charge_text(&entry.object_path)?)?;
                             add(&mut self.extra, normalization_bound(&entry.object_path)?)?;
-                            let strings = text_bytes(entry.name)?
-                                .checked_add(text_bytes(&entry.object_path)?)
-                                .and_then(|bytes| {
-                                    bytes.checked_add(
-                                        ENTRY_MISSING
-                                            .len()
-                                            .max(ENTRY_ABI.len())
-                                            .max(UNVERIFIED_FORWARD_REFUSAL.len())
-                                            .max(UNVERIFIED_INTERFACE_FORWARD_REFUSAL.len())
-                                            .max(UNVERIFIED_INTERFACE_LIST_FORWARD_REFUSAL.len()),
-                                    )
-                                })
+                            // A learned entry's lost copy names the finite
+                            // learned-tables row instead of the per-entry
+                            // detail; cover the longer text either way.
+                            let subject = text_bytes(entry.name)?.max(text_bytes(
+                                crate::render::LEARNED_SKIP_SUBJECT,
+                            )?);
+                            let reason = text_bytes(&entry.object_path)?
+                                .checked_add(
+                                    ENTRY_MISSING
+                                        .len()
+                                        .max(ENTRY_ABI.len())
+                                        .max(UNVERIFIED_FORWARD_REFUSAL.len())
+                                        .max(UNVERIFIED_INTERFACE_FORWARD_REFUSAL.len())
+                                        .max(UNVERIFIED_INTERFACE_LIST_FORWARD_REFUSAL.len()),
+                                )
+                                .ok_or(GraphRefusal::Overflow)?
+                                .max(text_bytes(
+                                    crate::render::LEARNED_TABLE_UNBOUND_REASON,
+                                )?);
+                            let strings = subject
+                                .checked_add(reason)
                                 .ok_or(GraphRefusal::Overflow)?;
                             add(
                                 &mut self.extra,
@@ -8133,6 +8155,19 @@ mod conservative_copy {
                     }
                     BindPhase::ProviderResolve => {
                         let key = self.module.as_ref().ok_or(GraphRefusal::Identity)?.key;
+                        // A rejected module key never binds, even when its
+                        // plain raw still resolves to the witness-kept
+                        // pre-copy-up file: the key failed closed, so no
+                        // identity under it is comparable. The
+                        // collected-graph seal carries no engine pre-filter,
+                        // so the choke refuses here for every sealed input,
+                        // exactly like `bind_scanned_modules`.
+                        if pins.rejects(key) {
+                            drop(self.normalized.take());
+                            self.skip_reason = MODULE_MISSING;
+                            self.phase = BindPhase::ModuleSkip;
+                            return Ok(());
+                        }
                         match self.resolve_normalized(pins, key)? {
                             None => {
                                 self.skip_reason = MODULE_MISSING;
@@ -8159,13 +8194,34 @@ mod conservative_copy {
                         if self.skip_copy.is_none() {
                             self.skip_copy = Some(SkipCopy::new());
                         } else {
-                            let subject = &self.module.as_ref().ok_or(GraphRefusal::Identity)?.path;
-                            if self
-                                .skip_copy
-                                .as_mut()
-                                .ok_or(GraphRefusal::Identity)?
-                                .advance(subject, "", self.skip_reason)
-                            {
+                            // A run-persistent learned module that cannot
+                            // bind names the finite learned-tables row: its
+                            // path-carrying skip would collapse to the
+                            // generic discovery row and hide which capture
+                            // input lost its tables. Same row as
+                            // `learned_table_unbound_skip`, copied bounded.
+                            let learned = self.module.as_ref().is_some_and(|module| {
+                                module.view
+                                    == crate::discovery::engine::Engine::RUN_LEARNED_VIEW_ID
+                            });
+                            let done = if learned {
+                                self.skip_copy
+                                    .as_mut()
+                                    .ok_or(GraphRefusal::Identity)?
+                                    .advance(
+                                        crate::render::LEARNED_SKIP_SUBJECT,
+                                        crate::render::LEARNED_TABLE_UNBOUND_REASON,
+                                        "",
+                                    )
+                            } else {
+                                let subject =
+                                    &self.module.as_ref().ok_or(GraphRefusal::Identity)?.path;
+                                self.skip_copy
+                                    .as_mut()
+                                    .ok_or(GraphRefusal::Identity)?
+                                    .advance(subject, "", self.skip_reason)
+                            };
+                            if done {
                                 let skip =
                                     self.skip_copy.take().ok_or(GraphRefusal::Identity)?.skip;
                                 self.skipped.push(skip);
@@ -8245,6 +8301,20 @@ mod conservative_copy {
                     }
                     BindPhase::EntryResolve => {
                         let key = self.entry.as_ref().ok_or(GraphRefusal::Identity)?.object;
+                        let module_key =
+                            self.module.as_ref().ok_or(GraphRefusal::Identity)?.key;
+                        // A rejected dependency key never binds, even when
+                        // its plain raw still resolves to the witness-kept
+                        // pre-copy-up file: binding it would credit calls at
+                        // the unproven file's offsets under the kept file's
+                        // name. Same-file entries are exempt: a rejected
+                        // module key drops the whole module above.
+                        if key != module_key && pins.rejects(key) {
+                            drop(self.normalized.take());
+                            self.skip_reason = ENTRY_MISSING;
+                            self.phase = BindPhase::EntrySkip;
+                            return Ok(());
+                        }
                         let candidate = self.resolve_normalized(pins, key)?;
                         let provider = self.object.ok_or(GraphRefusal::Identity)?;
                         let compatible = candidate.is_some_and(|target| {
@@ -8257,8 +8327,6 @@ mod conservative_copy {
                             // a cross-object getter forward must resolve
                             // by name in the pinned target's own exports.
                             let entry = self.entry.as_ref().ok_or(GraphRefusal::Identity)?;
-                            let module_key =
-                                self.module.as_ref().ok_or(GraphRefusal::Identity)?.key;
                             if entry.object != module_key
                                 && forwardable_getter(entry.name)
                                 && !forwarded_bootstrap_verified(entry, &pins.exports_for(id))
@@ -8313,13 +8381,33 @@ mod conservative_copy {
                         if self.skip_copy.is_none() {
                             self.skip_copy = Some(SkipCopy::new());
                         } else {
-                            let skip = self.skip_primary.as_ref().ok_or(GraphRefusal::Identity)?;
-                            if self
-                                .skip_copy
-                                .as_mut()
-                                .ok_or(GraphRefusal::Identity)?
-                                .advance(&skip.subject, &skip.reason, "")
-                            {
+                            // The table keeps the per-entry detail for its
+                            // local consumers; the lost stream names the
+                            // learned capture input for a run-persistent
+                            // learned module, exactly like
+                            // `bind_scanned_modules`.
+                            let learned = self.module.as_ref().is_some_and(|module| {
+                                module.view
+                                    == crate::discovery::engine::Engine::RUN_LEARNED_VIEW_ID
+                            });
+                            let done = if learned {
+                                self.skip_copy
+                                    .as_mut()
+                                    .ok_or(GraphRefusal::Identity)?
+                                    .advance(
+                                        crate::render::LEARNED_SKIP_SUBJECT,
+                                        crate::render::LEARNED_TABLE_UNBOUND_REASON,
+                                        "",
+                                    )
+                            } else {
+                                let skip =
+                                    self.skip_primary.as_ref().ok_or(GraphRefusal::Identity)?;
+                                self.skip_copy
+                                    .as_mut()
+                                    .ok_or(GraphRefusal::Identity)?
+                                    .advance(&skip.subject, &skip.reason, "")
+                            };
+                            if done {
                                 let copy =
                                     self.skip_copy.take().ok_or(GraphRefusal::Identity)?.skip;
                                 let primary =

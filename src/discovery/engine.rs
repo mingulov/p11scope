@@ -19614,11 +19614,10 @@ impl Engine {
         let ridden: BTreeSet<ProcessViewId> =
             raw_modules.iter().map(|module| module.view).collect();
         // Entry-dependency rejections never drop the whole module here:
-        // the strict binder below keeps the module's valid entries and
-        // files a per-entry skip for each unusable one (a rejected key's
-        // raws no longer resolve, so those entries cannot bind). Only a
-        // rejected module key — the module's own identity — discards
-        // the module before the bind.
+        // a rejected key's raws still resolve to the kept file, so the
+        // strict binder below refuses those entries while keeping the
+        // module's valid ones. Only a rejected module key — the
+        // module's own identity — discards the module before the bind.
         raw_modules.retain(|module| !pinned.rejects(module.key));
         if crate::run::capture_diagnostics_on() && raw_with_learned > raw_before_learned {
             eprintln!(

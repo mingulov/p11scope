@@ -1,7 +1,7 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-3.0-or-later
 # SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
-# run-cell-script.sh NAME P11SCOPE OUTDIR [--expected-failure CELL ...] [--allow-nonqualifying CELL ...] [--require CELL ...]
+# run-cell-script.sh NAME P11SCOPE OUTDIR [--expected-failure CELL ...] [--intermittent-failure CELL ...] [--allow-nonqualifying CELL ...] [--require CELL ...] [--known-failing-results PATH --known-failing-runner RUNNER --known-failing-host HOST]
 # Generic cell-script template: runs scripts/ci/<NAME>.sh P11SCOPE OUTDIR,
 # then validates OUTDIR/results.jsonl with check-cell-results.py.
 # Must run as root; the workflow invokes this wrapper through privilege
@@ -11,7 +11,7 @@
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd) || exit 2
 REPO=$(cd "$HERE/../.." && pwd) || exit 2
-if [ $# -lt 3 ]; then echo "usage: run-cell-script.sh NAME P11SCOPE OUTDIR [--expected-failure CELL ...] [--allow-nonqualifying CELL ...] [--require CELL ...]" >&2; exit 2; fi
+if [ $# -lt 3 ]; then echo "usage: run-cell-script.sh NAME P11SCOPE OUTDIR [--expected-failure CELL ...] [--intermittent-failure CELL ...] [--allow-nonqualifying CELL ...] [--require CELL ...] [--known-failing-results PATH --known-failing-runner RUNNER --known-failing-host HOST]" >&2; exit 2; fi
 NAME=$1; P11SCOPE=$2; OUT=$3; shift 3
 case $NAME in
   *[/.]*|"") echo "run-cell-script: NAME must be a bare script name without path" >&2; exit 2 ;;
@@ -24,6 +24,8 @@ while [ $# -gt 0 ]; do
   case $1 in
     --expected-failure) shift; [ $# -gt 0 ] || { echo "run-cell-script: --expected-failure needs a cell name" >&2; exit 2; }; EXPECTED+=(--expected-failure "$1"); shift ;;
     --allow-nonqualifying) shift; [ $# -gt 0 ] || { echo "run-cell-script: --allow-nonqualifying needs a cell name" >&2; exit 2; }; EXPECTED+=(--allow-nonqualifying "$1"); shift ;;
+    --intermittent-failure) shift; [ $# -gt 0 ] || { echo "run-cell-script: --intermittent-failure needs a cell name" >&2; exit 2; }; EXPECTED+=(--intermittent-failure "$1"); shift ;;
+    --known-failing-results|--known-failing-runner|--known-failing-host) option=$1; shift; [ $# -gt 0 ] || { echo "run-cell-script: $option needs a value" >&2; exit 2; }; EXPECTED+=("$option" "$1"); shift ;;
     --require) shift; [ $# -gt 0 ] || { echo "run-cell-script: --require needs a cell name" >&2; exit 2; }; EXPECTED+=(--require "$1"); shift ;;
     *) echo "run-cell-script: unknown option: $1" >&2; exit 2 ;;
   esac

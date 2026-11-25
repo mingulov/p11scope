@@ -3,58 +3,49 @@
 # SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Validate and judge the tracked known-failing test list.
 
-`tests/known-failing.json` is schema `p11scope/known-failing/v1`. Each row is
-one typed exception owned by a named known issue; it is not a mechanism for
-declaring an ordinary regression expected. Required row fields are `path`,
-`test`, `issue`, `target`, `runner`, `signature`, `lane` and `mode`; optional
-fields are `hosts`, `since` and `evidence`. `signature` is a JSON object of
-typed verdict/record fields (for example `{"cell": "X", "branch": "y"}`),
-never text to search for in a log.
+`tests/known-failing.json` is schema `p11scope/known-failing/v1`. A row is
+one typed exception owned by one or more named known issues; it is never a
+mechanism for declaring an ordinary regression expected. Required fields are
+`path`, `test`, `cell`, `issues`, `target`, `runner`, `signature`, `lane`,
+`mode`, `reason` and `last_green_sha`; optional fields are `hosts`, `since`,
+`evidence` and `invocation`. `issues` is a nonempty unique list of KI-nn ids
+(one plan row names two issues). `reason` is the plain human reason;
+`last_green_sha` is the newest passing commit as a 40-hex SHA. `signature`
+is a nested JSON record of enum-like typed values only, never a log line or
+a textual pattern.
 
-Known-issue authority is typed too. Once `docs/known-limitations.md` gains
-`## Known limitations in 0.7.2`, that section must carry exactly one block of
-the form:
+Known-issue authority is the typed `p11scope/known-issues/v1` block in the
+`## Known limitations in 0.7.2` section of docs/known-limitations.md. Until
+that section lands, only an empty list is valid.
 
-    <!-- p11scope-known-issues-v1
-    {"schema":"p11scope/known-issues/v1","issues":[{"id":"KI-01","test":true}]}
-    -->
+Static validation checks row shape, executable test/cell discovery, suite
+registration, issue/row exact equality, runner declarations per invocation
+stream (never a workflow-wide union), and exact `cell: known-failing`
+ignored-test entries. The eleven pre-existing inverted declarations are a
+closed legacy baseline until their 0.7.3 migration.
 
-The block is the authority for named issue ids and for which issues have a
-test. Every registry id must also have a prose `### KI-nn` heading in the
-same section, and every such heading must be registered; this is structural
-Markdown identity, not log-text matching. Until that section lands, only an
-empty known-failing list is valid; this keeps the pre-docs integration window
-fail-closed without inventing a second issue authority.
-
-Static validation checks row shape, exact test existence, Python-suite
-registration, the issue/row set equality, and exact equality with the runner
-declarations (`EXPECTED_FAILURE_TESTS`, workflow `--expected-failure` /
-`--intermittent-failure` cells, and `cell: known-failing` entries in
-`tests/ignored-tests.json`). The eleven pre-existing declarations are a closed
-legacy baseline until their 0.7.3 migration; any additional declaration must
-be a typed row. With `--results`, the checker also judges one typed result
-document of schema
+With `--results`, the checker judges schema
 `p11scope/known-failing-results/v1`:
 
     {
       "schema": "p11scope/known-failing-results/v1",
       "runner": "python-suite",
-      "host": "fedora",
+      "host": "github",
+      "complete": true,
+      "selection": [
+        {"path": "tests/python/test_x.py", "test": "C.test_x", "invocation": []}
+      ],
       "results": [
-        {"path": "tests/python/test_x.py", "test": "C.test_x",
-         "passed": false, "signature": {"cell": "X", "branch": "y"}}
+        {"path": "tests/python/test_x.py", "test": "C.test_x", "invocation": [],
+         "state": "failed", "signature": {"cell": "X", "branch": "y"}}
       ]
     }
 
-Every applicable row for the result runner and host must have exactly one
-observation. An `always` row that passes is stale. A failing observation not
-covered by a row is an ordinary failure. A covered failure whose typed
-signature differs by even one field is an ordinary failure. Comparison is
-JSON-value equality, never log-text matching. Until the legacy declarations
-are migrated in 0.7.3, a producer keeps those cells in the old runner's input
-rather than copying them into this result document; every other failure in
-the selected runner output must be present so the unlisted-failure rule stays
-closed.
+The selection is the producer's executable inventory, recorded before or by
+the runner framework itself. Selection and result keys must be nonempty,
+unique and exactly one-to-one, and `complete` must be true; therefore
+deleting a failing row cannot turn red into green. Empty selections fail
+closed. Comparison is recursive type-sensitive JSON equality.
 
 Usage:
   python3 -I scripts/check-known-failing.py [--root DIR] [--list PATH]
@@ -62,13 +53,17 @@ Usage:
 """
 
 import argparse
-import ast
-import importlib.util
 import json
 import math
+import os
 import re
+import shlex
+import shutil
+import subprocess
 import sys
 from pathlib import Path
+
+import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 LIST_SCHEMA = "p11scope/known-failing/v1"
@@ -78,49 +73,35 @@ ISSUE_HEADING = "## Known limitations in 0.7.2"
 ISSUE_MARKER = "<!-- p11scope-known-issues-v1"
 TARGETS = {"0.7.3", "0.8.0"}
 MODES = {"always", "intermittent"}
-HOSTS = {"fedora", "fedora-sm1", "vng"}
-BASE_RUNNERS = {"privileged-lib", "python-suite", "host-matrix"}
+HOSTS = {"fedora", "fedora-sm1", "vng", "github"}
+BASE_RUNNERS = {"privileged-lib", "python-suite"}
 REQUIRED_ROW_FIELDS = {
-    "path", "test", "issue", "target", "runner", "signature", "lane", "mode",
+    "path", "test", "cell", "issues", "target", "runner", "signature",
+    "lane", "mode", "reason", "last_green_sha",
 }
-OPTIONAL_ROW_FIELDS = {"hosts", "since", "evidence"}
-RESULT_TOP_FIELDS = {"schema", "runner", "host", "results"}
-RESULT_ROW_FIELDS = {"path", "test", "passed", "signature"}
+OPTIONAL_ROW_FIELDS = {"hosts", "since", "evidence", "invocation"}
+RESULT_TOP_FIELDS = {"schema", "runner", "host", "complete", "selection", "results"}
+RESULT_SELECTION_FIELDS = {"path", "test", "invocation"}
+RESULT_ROW_FIELDS = {"path", "test", "invocation", "state", "signature"}
+RESULT_STATES = {"passed", "failed", "error", "skipped", "unexpected_success", "not_run"}
 ISSUE_RE = re.compile(r"^KI-[0-9]{2}$")
-TEST_ATTR_RE = re.compile(r"#\s*\[\s*test\s*\]")
-FN_AT_RE = re.compile(r"(?:pub(?:\([^)]*\))?\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\b")
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+SIGNATURE_KEY_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+TYPED_STRING_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:+|-]{0,127}$")
 TEXTUAL_SIGNATURE_KEY_TOKENS = {
     "detail", "log", "message", "output", "pattern", "regex", "stderr",
     "stdout", "text",
 }
 
-
-def textual_signature_key(key):
-    camel_split = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", key)
-    tokens = (token for token in re.split(r"[_\-.]+", camel_split.lower()) if token)
-    return any(token in TEXTUAL_SIGNATURE_KEY_TOKENS for token in tokens)
-
-# The pre-existing inverted privileged-lib declarations. They are legacy
-# machinery, explicitly not known-issue rows in v0.7.2; the exact-equality
-# check below nevertheless prevents a new legacy declaration from being added
-# silently. They move to typed rows only when their owner gives them issue ids.
+# Closed legacy baselines. They are not typed rows in v0.7.2; a migration
+# patch removes a name here and adds its typed row in the same change.
 LEGACY_PRIVILEGED_LIB = frozenset({
     "discovery::engine::tests::exit_loader_balanced_benign_transaction_needs_no_terminal_truncation",
     "inventory::privileged_tests::privileged_identity_kernel_sweep_cell_lp64",
     "inventory::privileged_tests::privileged_identity_kernel_multipass_reuse_lp64",
 })
-
-# The pre-existing check-cell-results declarations. As with the privileged
-# legacy cells above, they are not known-issue rows in v0.7.2; they are a
-# closed legacy baseline so rule 3 still compares exact sets rather than
-# tolerating any additional untracked exception. A 0.7.3 migration patch
-# moves one of these names into a typed row and removes it from the baseline
-# in the same change.
 LEGACY_CELL_EXPECTED = frozenset({
-    "profile-cgroup",
-    "trace-cgroup",
-    "profile-pid-ia32",
-    "run-ia32",
+    "profile-cgroup", "trace-cgroup", "profile-pid-ia32", "run-ia32",
 })
 LEGACY_CELL_INTERMITTENT = frozenset({
     "privileged_run_tree_unprearmed_shortlived_descendants_reach_high_coverage",
@@ -128,6 +109,8 @@ LEGACY_CELL_INTERMITTENT = frozenset({
     "privileged_run_tree_unprearmed_shortlived_parallel_never_pause_covers_waves",
     "privileged_run_tree_arming_exhaustion_still_stages_and_counts",
 })
+PUBLIC_CLI_RUNNER = "cell:scripts/qualify-public-cli.sh"
+RUN_TREE_RUNNER = "cell:scripts/ci/run-run-tree.sh"
 
 
 class DuplicateKeyError(ValueError):
@@ -158,9 +141,7 @@ def strict_json(text, label):
 def valid_runner(value):
     if not isinstance(value, str):
         return False
-    if value in BASE_RUNNERS:
-        return True
-    return value.startswith("cell:") and len(value) > len("cell:")
+    return value in BASE_RUNNERS or (value.startswith("cell:") and len(value) > len("cell:"))
 
 
 def valid_relative_path(value):
@@ -168,8 +149,22 @@ def valid_relative_path(value):
         return False
     if value.startswith("/") or "\\" in value:
         return False
-    parts = value.split("/")
-    return all(part not in ("", ".", "..") for part in parts)
+    return all(part not in ("", ".", "..") for part in value.split("/"))
+
+
+def valid_invocation(value):
+    return (isinstance(value, list)
+            and all(isinstance(argument, str) and argument for argument in value))
+
+
+def typed_string(value):
+    return isinstance(value, str) and TYPED_STRING_RE.fullmatch(value) is not None
+
+
+def textual_signature_key(key):
+    camel_split = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", key)
+    tokens = (token for token in re.split(r"[_\-.]+", camel_split.lower()) if token)
+    return any(token in TEXTUAL_SIGNATURE_KEY_TOKENS for token in tokens)
 
 
 def signature_problems(value, where="signature"):
@@ -183,19 +178,22 @@ def signature_problems(value, where="signature"):
                 problems.append(f"{path} must not be an empty object")
                 return
             for key, child in node.items():
-                if not isinstance(key, str) or not key:
-                    problems.append(f"{path} has a non-string or empty key")
+                if not isinstance(key, str) or not SIGNATURE_KEY_RE.fullmatch(key):
+                    problems.append(f"{path}.{key!r} is not a typed snake-case field name")
                     continue
                 if textual_signature_key(key):
-                    problems.append(
-                        f"{path}.{key} is free-text/log matching; use a typed verdict branch or record field")
+                    problems.append(f"{path}.{key} is free-text/log matching; use a typed verdict branch or record field")
                 walk(child, f"{path}.{key}")
         elif isinstance(node, list):
             for index, child in enumerate(node):
                 walk(child, f"{path}[{index}]")
-        elif isinstance(node, float) and not math.isfinite(node):
-            problems.append(f"{path} must be a finite JSON number")
-        elif node is None or isinstance(node, (str, int, float, bool)):
+        elif isinstance(node, str):
+            if not typed_string(node):
+                problems.append(f"{path} must be a stable typed token, not prose, log text or raw output")
+        elif isinstance(node, float):
+            if not math.isfinite(node):
+                problems.append(f"{path} must be a finite JSON number")
+        elif node is None or isinstance(node, (int, bool)):
             return
         else:
             problems.append(f"{path} has a non-JSON value of type {type(node).__name__}")
@@ -213,8 +211,7 @@ def validate_row(raw, index):
     missing = sorted(REQUIRED_ROW_FIELDS - keys)
     problems = []
     if missing:
-        problems.append(f"{label}: missing required fields: {', '.join(missing)}")
-        return problems, None
+        return [f"{label}: missing required fields: {', '.join(missing)}"], None
     unknown = sorted(keys - allowed)
     if unknown:
         problems.append(f"{label}: unknown fields: {', '.join(unknown)}")
@@ -222,8 +219,13 @@ def validate_row(raw, index):
         problems.append(f"{label}: path must be a clean repository-relative POSIX path")
     if not isinstance(raw["test"], str) or not raw["test"]:
         problems.append(f"{label}: test must be a nonempty exact test or cell id")
-    if not isinstance(raw["issue"], str) or not ISSUE_RE.fullmatch(raw["issue"]):
-        problems.append(f"{label}: issue must be a known-issue id KI-nn")
+    if not typed_string(raw["cell"]):
+        problems.append(f"{label}: cell must be a stable typed cell token")
+    issues = raw["issues"]
+    if (not isinstance(issues, list) or not issues
+            or any(not isinstance(issue, str) or not ISSUE_RE.fullmatch(issue) for issue in issues)
+            or len(set(issues)) != len(issues)):
+        problems.append(f"{label}: issues must be a nonempty unique list of KI-nn ids")
     if not isinstance(raw["target"], str) or raw["target"] not in TARGETS:
         problems.append(f"{label}: target must be one of {', '.join(sorted(TARGETS))}")
     if not valid_runner(raw["runner"]):
@@ -233,16 +235,32 @@ def validate_row(raw, index):
         problems.append(f"{label}: lane must name the lane that owns the fix")
     if not isinstance(raw["mode"], str) or raw["mode"] not in MODES:
         problems.append(f"{label}: mode must be always or intermittent")
+    if not isinstance(raw["reason"], str) or not raw["reason"].strip() or any(
+            ord(character) < 32 or ord(character) == 127 for character in raw["reason"]):
+        problems.append(f"{label}: reason must be nonempty printable plain text")
+    if not isinstance(raw["last_green_sha"], str) or not SHA_RE.fullmatch(raw["last_green_sha"]):
+        problems.append(f"{label}: last_green_sha must be a 40-hex commit SHA")
     if "hosts" in raw:
         hosts = raw["hosts"]
         if (not isinstance(hosts, list) or not hosts
                 or any(not isinstance(host, str) or host not in HOSTS for host in hosts)
                 or len(set(hosts)) != len(hosts)):
             problems.append(f"{label}: hosts must be a unique nonempty subset of {', '.join(sorted(HOSTS))}")
+    if "invocation" in raw and not valid_invocation(raw["invocation"]):
+        problems.append(f"{label}: invocation must be a list of nonempty argument strings")
     for key in ("since", "evidence"):
         if key in raw and (not isinstance(raw[key], str) or not raw[key].strip()):
             problems.append(f"{label}: {key} must be a nonempty string when present")
     return problems, raw
+
+
+def row_invocation(row):
+    return row.get("invocation", [])
+
+
+def row_key(row):
+    invocation = tuple(row_invocation(row))
+    return (row["path"], row["test"], invocation)
 
 
 def load_list(path):
@@ -340,109 +358,106 @@ def load_issue_registry(root):
     return True, registry, problems
 
 
-def import_module(path, name):
-    spec = importlib.util.spec_from_file_location(name, path)
-    if spec is None or spec.loader is None:
-        raise ValueError(f"cannot load {path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+def python_tests_executable(root, row):
+    probe = root / "scripts/typed-python-suite.py"
+    suite = root / row["path"]
+    if not probe.is_file():
+        return False
+    command = [sys.executable, "-I", str(probe), "--list", str(suite), *row_invocation(row)]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if result.returncode != 0:
+        return False
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return False
+    tests = payload.get("tests")
+    return isinstance(tests, list) and row["test"] in tests
 
 
-def python_tests(path):
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    tests = set()
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test"):
-            tests.add(node.name)
-        elif isinstance(node, ast.ClassDef):
-            for child in node.body:
-                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and child.name.startswith("test"):
-                    tests.add(f"{node.name}.{child.name}")
-    return tests
+def shell_cells_executable(root, row):
+    script = root / row["path"]
+    if not os.access(script, os.X_OK):
+        return False
+    try:
+        result = subprocess.run([str(script), "--list-cells"], capture_output=True,
+                                text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if result.returncode != 0:
+        return False
+    cells = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    return row["test"] in cells
 
 
-def rust_crate_base(root, path):
-    """Module segments implied by the ordinary Rust file layout.
+def cargo_list_probe(root, row):
+    """Executable Rust test discovery through cargo and libtest --list.
 
-    Integration targets under tests/ are crate roots. Library/bin modules use
-    their conventional path below src/ (with mod.rs elided). A nonstandard
-    #[path] layout is deliberately not guessed: its exact id is treated as
-    absent rather than risking a false positive.
+    This probe runs only when a Rust row exists. Integration tests use their
+    target stem; root library tests use --lib. Nonstandard crate layouts fail
+    closed rather than guessing.
     """
-    relative = path.relative_to(root)
-    parts = list(relative.parts)
-    if len(parts) == 2 and parts[0] == "tests" and parts[1].endswith(".rs"):
-        return []
-    if parts and parts[0] == "src":
-        module_parts = parts[1:]
-    elif len(parts) >= 3 and parts[0] == "crates" and parts[2] == "src":
-        module_parts = parts[3:]
+    relative = Path(row["path"])
+    cargo = shutil.which("cargo")
+    if cargo is None:
+        return False
+    if len(relative.parts) == 2 and relative.parts[0] == "tests" and relative.suffix == ".rs":
+        target_args = ["--test", relative.stem]
+    elif relative.parts and relative.parts[0] == "src":
+        target_args = ["--lib"]
     else:
-        return None
-    if not module_parts:
-        return []
-    if module_parts in (["lib.rs"], ["main.rs"]):
-        return []
-    if module_parts[-1] == "mod.rs":
-        module_parts = module_parts[:-1]
-    else:
-        module_parts[-1] = module_parts[-1][:-3] if module_parts[-1].endswith(".rs") else module_parts[-1]
-    return [part for part in module_parts if part]
-
-
-def rust_tests(root, path):
-    helper_path = root / "scripts/check-ignored-tests.py"
-    helper = import_module(helper_path, "p11scope_check_ignored_for_known_failing")
-    base = rust_crate_base(root, path)
-    if base is None:
-        return set()
-    text = path.read_text(encoding="utf-8")
-    stripped = helper.strip_code(text)
-    found = set()
-    for match in TEST_ATTR_RE.finditer(stripped):
+        return False
+    toolchain_file = root / ".release-rust-version"
+    try:
+        toolchain = toolchain_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        return False
+    command = [cargo, f"+{toolchain}", "test", "--locked", "--offline", "--no-run",
+               "--message-format=json", *target_args]
+    try:
+        built = subprocess.run(command, cwd=root, capture_output=True, text=True, timeout=600)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if built.returncode != 0:
+        return False
+    executables = []
+    for line in built.stdout.splitlines():
         try:
-            cursor = helper.attribute_end(stripped, match.start())
-        except ValueError:
+            artifact = json.loads(line)
+        except json.JSONDecodeError:
             continue
-        while True:
-            while cursor < len(stripped) and stripped[cursor].isspace():
-                cursor += 1
-            if stripped.startswith("#[", cursor):
-                try:
-                    cursor = helper.attribute_end(stripped, cursor)
-                except ValueError:
-                    break
-                continue
-            break
-        fn_match = FN_AT_RE.match(stripped, cursor)
-        if fn_match is None:
+        if artifact.get("reason") == "compiler-artifact" and artifact.get("executable"):
+            target = artifact.get("target", {})
+            if target.get("test"):
+                executables.append(artifact["executable"])
+    if len(executables) != 1:
+        return False
+    found = set()
+    for ignored in (False, True):
+        command = [executables[0], "--list", "--format", "terse"]
+        if ignored:
+            command.append("--ignored")
+        try:
+            listed = subprocess.run(command, cwd=root, capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
             continue
-        segments = base + helper.inline_mods_at(stripped, match.start()) + [fn_match.group(1)]
-        found.add("::".join(segments))
-    return found
-
-
-def shell_cells(path):
-    cells = set()
-    for line in path.read_text(encoding="utf-8").splitlines():
-        match = re.match(r"^\s*([A-Za-z0-9_.+|-]+)\s*\)", line)
-        if match is None:
-            continue
-        cells.update(part for part in match.group(1).split("|") if part)
-    return cells
+        if listed.returncode == 0:
+            found.update(line[:-5].strip() for line in listed.stdout.splitlines() if line.endswith(": test"))
+    return row["test"] in found
 
 
 def test_exists(root, row):
-    path = root / row["path"]
     try:
         if row["path"].endswith(".py"):
-            return row["test"] in python_tests(path)
-        if row["path"].endswith(".rs"):
-            return row["test"] in rust_tests(root, path)
+            return python_tests_executable(root, row)
         if row["path"].endswith(".sh"):
-            return row["test"] in shell_cells(path)
-    except (OSError, SyntaxError, ValueError):
+            return shell_cells_executable(root, row)
+        if row["path"].endswith(".rs"):
+            return cargo_list_probe(root, row)
+    except (OSError, ValueError):
         return False
     return False
 
@@ -455,11 +470,13 @@ def python_suite_registered(root, row):
         return False
     registry_path = root / "scripts/run-python-suites.py"
     try:
-        registry = import_module(registry_path, "p11scope_python_suite_registry_for_known_failing")
-    except (OSError, SyntaxError, ValueError):
+        namespace = {}
+        exec(compile(registry_path.read_text(encoding="utf-8"), str(registry_path), "exec"), namespace)
+    except (OSError, SyntaxError):
         return False
     name = row["path"][len(prefix):]
-    return any(entry == name for entry, _args in getattr(registry, "RUN", []))
+    invocation = row_invocation(row)
+    return any(entry == name and list(args) == invocation for entry, args in namespace.get("RUN", []))
 
 
 def validate_privileged_runner(root, rows):
@@ -469,13 +486,11 @@ def validate_privileged_runner(root, rows):
         if wanted_new:
             return ["privileged-lib rows exist but scripts/run-privileged-lib-tests.sh is missing"]
         return []
-    try:
-        helper = import_module(root / "scripts/check-ignored-tests.py",
-                               "p11scope_check_ignored_for_privileged_known_failing")
-        lists = helper.runner_lists(runner_path)
-    except (OSError, SyntaxError, ValueError) as exc:
-        return [f"privileged-lib runner declaration cannot be read: {exc}"]
-    actual = set(lists.get("EXPECTED_FAILURE_TESTS", set()))
+    text = runner_path.read_text(encoding="utf-8")
+    match = re.search(r"(?ms)^EXPECTED_FAILURE_TESTS=\(\n(.*?)^\)", text)
+    if match is None:
+        return ["privileged-lib runner declaration cannot be read: no EXPECTED_FAILURE_TESTS array"]
+    actual = {line.strip() for line in match.group(1).splitlines() if line.strip() and not line.strip().startswith("#")}
     expected = set(LEGACY_PRIVILEGED_LIB) | wanted_new
     problems = []
     missing = sorted(expected - actual)
@@ -491,34 +506,121 @@ def cell_runner_script_present(root, row):
     if not row["runner"].startswith("cell:"):
         return True
     script = row["runner"][len("cell:"):]
-    if not valid_relative_path(script):
-        return False
-    return (root / script).is_file()
+    return valid_relative_path(script) and (root / script).is_file()
 
 
-def workflow_cell_declarations(root):
-    """(--expected-failure cells, --intermittent-failure cells) in CI."""
-    path = root / ".github/workflows/privileged-tests.yml"
-    try:
-        text = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return None, None, [f"{path}: missing workflow carrying check-cell-results declarations"]
-    except OSError as exc:
-        return None, None, [f"{path}: cannot read workflow declarations: {exc}"]
-    expected = set()
-    intermittent = set()
-    for line in text.splitlines():
-        if line.lstrip().startswith("#"):
+OPTION_ARITY = {
+    "--expected-failure": 1,
+    "--intermittent-failure": 1,
+    "--allow-nonqualifying": 1,
+    "--require": 1,
+    "--known-failing-runner": 1,
+    "--known-failing-results": 1,
+    "--known-failing-host": 1,
+}
+COMMAND_BOUNDARY = {
+    ";", "&&", "||", "|", "then", "do", "done", "fi", "if", "else", "elif",
+    "python3", "sudo", "env", "PY", "EOF",
+}
+
+
+def parse_invocation(tokens, start, kind):
+    positionals = []
+    options = {name: [] for name in OPTION_ARITY}
+    cursor = start + 1
+    while cursor < len(tokens):
+        token = tokens[cursor]
+        if token in COMMAND_BOUNDARY or token.startswith(">") or token.startswith("<"):
+            break
+        if token.startswith("scripts/"):
+            break
+        if token.startswith("--"):
+            if "=" in token:
+                name, value = token.split("=", 1)
+                values = [value]
+            else:
+                name = token
+                values = []
+            if name not in OPTION_ARITY:
+                break
+            needed = OPTION_ARITY[name] - len(values)
+            if needed > 0:
+                if cursor + needed >= len(tokens):
+                    break
+                values.extend(tokens[cursor + 1:cursor + 1 + needed])
+                cursor += needed
+            options[name].extend(values)
+        else:
+            positionals.append(token)
+        cursor += 1
+    if kind == "check-cell-results":
+        results = positionals[0] if positionals else None
+    else:
+        results = positionals[2] + "/results.jsonl" if len(positionals) >= 3 else None
+    runner = (options["--known-failing-runner"] or [None])[-1]
+    if runner is None and kind == "run-cell-script" and positionals:
+        runner = f"cell:scripts/ci/{positionals[0]}.sh"
+    return {
+        "kind": kind,
+        "runner": runner,
+        "results": results,
+        "expected": options["--expected-failure"],
+        "intermittent": options["--intermittent-failure"],
+        "known_results": (options["--known-failing-results"] or [None])[-1],
+        "known_host": (options["--known-failing-host"] or [None])[-1],
+        "explicit_runner": bool(options["--known-failing-runner"]),
+    }
+
+
+def workflow_invocations(root):
+    workflow_dir = root / ".github" / "workflows"
+    invocations = []
+    problems = []
+    if not workflow_dir.is_dir():
+        return [], [f"{workflow_dir}: missing workflow directory"]
+    for path in sorted(workflow_dir.glob("*.yml")):
+        try:
+            document = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except (OSError, yaml.YAMLError) as exc:
+            problems.append(f"{path}: cannot parse workflow: {exc}")
             continue
-        expected.update(
-            match.group(1).strip("'\"")
-            for match in re.finditer(r"--expected-failure(?:=|\s+)([^\s\\]+)", line)
-        )
-        intermittent.update(
-            match.group(1).strip("'\"")
-            for match in re.finditer(r"--intermittent-failure(?:=|\s+)([^\s\\]+)", line)
-        )
-    return expected, intermittent, []
+        jobs = document.get("jobs") if isinstance(document, dict) else None
+        if not isinstance(jobs, dict):
+            continue
+        for job_name, job in jobs.items():
+            steps = job.get("steps") if isinstance(job, dict) else None
+            if not isinstance(steps, list):
+                continue
+            for step_index, step in enumerate(steps, 1):
+                script = step.get("run") if isinstance(step, dict) else None
+                if not isinstance(script, str):
+                    continue
+                # Comments often explain that the wrapper "validates with
+                # check-cell-results.py"; they are not invocations. YAML run
+                # blocks are shell, so full-line shell comments are removed
+                # before tokenization.
+                executable_script = "\n".join(
+                    line for line in script.splitlines() if not line.lstrip().startswith("#"))
+                try:
+                    tokens = shlex.split(executable_script, comments=False, posix=True)
+                except ValueError:
+                    continue
+                for index, token in enumerate(tokens):
+                    kind = None
+                    if token.endswith("scripts/ci/check-cell-results.py") or token.endswith("check-cell-results.py"):
+                        kind = "check-cell-results"
+                    elif token.endswith("scripts/ci/run-cell-script.sh") or token.endswith("run-cell-script.sh"):
+                        kind = "run-cell-script"
+                    if kind is None:
+                        continue
+                    invocation = parse_invocation(tokens, index, kind)
+                    invocation.update({
+                        "workflow": str(path.relative_to(root)),
+                        "job": str(job_name),
+                        "step": step_index,
+                    })
+                    invocations.append(invocation)
+    return invocations, problems
 
 
 def validate_cell_runner_declarations(root, rows):
@@ -527,29 +629,65 @@ def validate_cell_runner_declarations(root, rows):
     for row in cell_rows:
         if not cell_runner_script_present(root, row):
             problems.append(f"{row['test']}: cell runner script does not exist: {row['runner']}")
-    expected_actual, intermittent_actual, read_problems = workflow_cell_declarations(root)
-    problems.extend(read_problems)
-    if read_problems:
+    invocations, scan_problems = workflow_invocations(root)
+    problems.extend(scan_problems)
+    if scan_problems:
         return problems
 
-    always_rows = {row["test"] for row in cell_rows if row["mode"] == "always"}
-    intermittent_rows = {row["test"] for row in cell_rows if row["mode"] == "intermittent"}
-    overlap = sorted(always_rows & intermittent_rows)
+    # Real result wiring is part of the declaration contract: every checker
+    # invocation has a typed runner identity and result output. A workflow
+    # cannot satisfy the gate by retaining a checker that only judges text.
+    for invocation in invocations:
+        where = f"{invocation['workflow']}:{invocation['job']}:{invocation['step']}"
+        if invocation["runner"] is None or not valid_runner(invocation["runner"]):
+            problems.append(f"{where}: declaration invocation lacks a typed known-failing runner")
+        if not invocation["known_results"]:
+            problems.append(f"{where}: check-cell-results invocation does not emit typed known-failing results")
+        if not invocation["known_host"]:
+            problems.append(f"{where}: check-cell-results invocation lacks a typed host")
+
+    groups = {}
+    for invocation in invocations:
+        if invocation["runner"] is None or invocation["results"] is None:
+            continue
+        key = (invocation["runner"], invocation["workflow"], invocation["job"], invocation["results"])
+        groups.setdefault(key, []).append(invocation)
+
+    rows_by_runner = {}
+    for row in cell_rows:
+        rows_by_runner.setdefault(row["runner"], []).append(row)
+
+    for (runner, workflow, job, results), sites in sorted(groups.items()):
+        first = sites[0]
+        for site in sites[1:]:
+            if sorted(site["expected"]) != sorted(first["expected"]) or sorted(site["intermittent"]) != sorted(first["intermittent"]):
+                problems.append(
+                    f"{workflow}:{job}:{results}: repeated declarations for one runner/results stream differ")
+                break
+        runner_rows = rows_by_runner.get(runner, [])
+        allowed_always = set(LEGACY_CELL_EXPECTED) | {row["test"] for row in runner_rows if row["mode"] == "always"}
+        allowed_intermittent = set(LEGACY_CELL_INTERMITTENT) | {row["test"] for row in runner_rows if row["mode"] == "intermittent"}
+        extra_always = sorted(set(first["expected"]) - allowed_always)
+        extra_intermittent = sorted(set(first["intermittent"]) - allowed_intermittent)
+        if extra_always:
+            problems.append(f"{runner} declarations have undeclared expected cells: " + ", ".join(extra_always))
+        if extra_intermittent:
+            problems.append(f"{runner} declarations have undeclared intermittent cells: " + ", ".join(extra_intermittent))
+
+    for row in cell_rows:
+        matching = []
+        for (runner, _workflow, _job, _results), sites in groups.items():
+            if runner != row["runner"]:
+                continue
+            declared = set(sites[0]["expected"]) if row["mode"] == "always" else set(sites[0]["intermittent"])
+            if row["test"] in declared:
+                matching.append(sites[0])
+        if not matching:
+            problems.append(f"{row['runner']} has no per-runner declaration for {row['test']}")
+    overlap = sorted({row["test"] for row in cell_rows if row["mode"] == "always"}
+                     & {row["test"] for row in cell_rows if row["mode"] == "intermittent"})
     if overlap:
         problems.append("cell rows declare the same cell both always and intermittent: " + ", ".join(overlap))
-
-    expected_wanted = set(LEGACY_CELL_EXPECTED) | always_rows
-    intermittent_wanted = set(LEGACY_CELL_INTERMITTENT) | intermittent_rows
-    for label, actual, wanted in (
-        ("--expected-failure", expected_actual, expected_wanted),
-        ("--intermittent-failure", intermittent_actual, intermittent_wanted),
-    ):
-        missing = sorted(wanted - actual)
-        extra = sorted(actual - wanted)
-        if missing:
-            problems.append(f"workflow {label} declarations missing known-failing rows: " + ", ".join(missing))
-        if extra:
-            problems.append(f"workflow {label} has undeclared expected/intermittent cells: " + ", ".join(extra))
     return problems
 
 
@@ -604,13 +742,14 @@ def validate_static(root, list_path):
     if rows and not registry_present:
         problems.append("no typed known-issue registry: rows cannot name a known issue before the 0.7.2 section lands")
     elif registry_present and not registry_problems:
-        row_issues = {row["issue"] for row in rows}
+        row_issues = {issue for row in rows for issue in row["issues"]}
         known_ids = set(registry)
         test_yes = {issue for issue, has_test in registry.items() if has_test}
         unknown_issues = sorted(row_issues - known_ids)
         if unknown_issues:
             problems.append("rows name issues that are not a named known issue: " + ", ".join(unknown_issues))
-        missing_issue_rows = sorted(test_yes - row_issues)
+        covered_yes = {issue for row in rows for issue in row["issues"] if issue in test_yes}
+        missing_issue_rows = sorted(test_yes - covered_yes)
         if missing_issue_rows:
             problems.append("test=yes issues without rows: " + ", ".join(missing_issue_rows))
         rows_not_test_yes = sorted((row_issues & known_ids) - test_yes)
@@ -619,7 +758,7 @@ def validate_static(root, list_path):
 
     seen_row_keys = set()
     for row in rows:
-        key = (row["runner"], row["path"], row["test"])
+        key = (row["runner"], *row_key(row))
         if key in seen_row_keys:
             problems.append(f"duplicate row for {row['runner']} {row['path']} {row['test']}: split composite cells instead")
         seen_row_keys.add(key)
@@ -634,13 +773,18 @@ def validate_static(root, list_path):
             problems.append(f"{row['path']}: path escapes the repository root")
             continue
         if not test_exists(root, row):
-            problems.append(f"{row['path']}: test id not found exactly: {row['test']}")
+            problems.append(f"{row['path']}: executable discovery did not find exact test id: {row['test']}")
         if not python_suite_registered(root, row):
-            problems.append(f"{row['path']}: suite is not registered in scripts/run-python-suites.py")
+            problems.append(f"{row['path']}: suite invocation is not registered in scripts/run-python-suites.py")
     problems.extend(validate_privileged_runner(root, rows))
     problems.extend(validate_cell_runner_declarations(root, rows))
     problems.extend(validate_ignored_known_failing(root, rows))
     return rows, problems, registry_present
+
+
+def validate_invocation_value(value, label, problems):
+    if not valid_invocation(value):
+        problems.append(f"{label}: invocation must be a list of nonempty argument strings")
 
 
 def validate_result_document(path):
@@ -654,7 +798,7 @@ def validate_result_document(path):
     if data is None:
         return None, problems
     if not isinstance(data, dict) or set(data) != RESULT_TOP_FIELDS:
-        problems.append("results: top level must have exactly schema/runner/host/results")
+        problems.append("results: top level must have exactly schema/runner/host/complete/selection/results")
         return None, problems
     if data.get("schema") != RESULT_SCHEMA:
         problems.append(f"results: schema must be {RESULT_SCHEMA}")
@@ -662,57 +806,76 @@ def validate_result_document(path):
         problems.append("results: runner is not in the closed runner vocabulary")
     if not isinstance(data.get("host"), str) or data["host"] not in HOSTS:
         problems.append(f"results: host must be one of {', '.join(sorted(HOSTS))}")
+    if data.get("complete") is not True:
+        problems.append("results: complete must be true; an incomplete or failed-to-complete run is not a result set")
+    raw_selection = data.get("selection")
     raw_results = data.get("results")
+    if not isinstance(raw_selection, list) or not raw_selection:
+        problems.append("results: selection must be a nonempty executable inventory")
+        return None, problems
     if not isinstance(raw_results, list):
         problems.append("results: results must be a list")
         return None, problems
-    rows = []
-    seen = set()
-    for index, raw in enumerate(raw_results, 1):
-        label = f"results row {index}"
-        if not isinstance(raw, dict) or set(raw) != RESULT_ROW_FIELDS:
-            problems.append(f"{label}: must have exactly path/test/passed/signature")
+
+    selection = {}
+    for index, raw in enumerate(raw_selection, 1):
+        label = f"selection row {index}"
+        if not isinstance(raw, dict) or set(raw) != RESULT_SELECTION_FIELDS:
+            problems.append(f"{label}: must have exactly path/test/invocation")
             continue
-        path_value = raw.get("path")
-        test_value = raw.get("test")
-        key = None
-        if isinstance(path_value, str) and isinstance(test_value, str):
-            key = (path_value, test_value)
-            if key in seen:
-                problems.append(f"{label}: duplicate result for {key[1]}")
-                continue
-            seen.add(key)
         if not valid_relative_path(raw["path"]):
             problems.append(f"{label}: path must be a clean repository-relative POSIX path")
         if not isinstance(raw["test"], str) or not raw["test"]:
             problems.append(f"{label}: test must be a nonempty exact test or cell id")
-        if not isinstance(raw["passed"], bool):
-            problems.append(f"{label}: passed must be a boolean")
-        if raw["signature"] is not None:
+        validate_invocation_value(raw["invocation"], label, problems)
+        key = (raw["path"], raw["test"], tuple(raw["invocation"]) if valid_invocation(raw["invocation"]) else ())
+        if key in selection:
+            problems.append(f"{label}: duplicate selected test {raw['test']}")
+        selection[key] = raw
+
+    results = {}
+    for index, raw in enumerate(raw_results, 1):
+        label = f"results row {index}"
+        if not isinstance(raw, dict) or set(raw) != RESULT_ROW_FIELDS:
+            problems.append(f"{label}: must have exactly path/test/invocation/state/signature")
+            continue
+        if not valid_relative_path(raw["path"]):
+            problems.append(f"{label}: path must be a clean repository-relative POSIX path")
+        if not isinstance(raw["test"], str) or not raw["test"]:
+            problems.append(f"{label}: test must be a nonempty exact test or cell id")
+        validate_invocation_value(raw["invocation"], label, problems)
+        if raw["state"] not in RESULT_STATES:
+            problems.append(f"{label}: state is not in the closed terminal-state vocabulary")
+        if raw["state"] == "passed":
+            if raw["signature"] is not None:
+                problems.append(f"{label}: a passing result must carry a null signature")
+        else:
             problems.extend(f"{label}: {problem}" for problem in signature_problems(raw["signature"]))
-        if raw["passed"] and raw["signature"] is not None:
-            problems.append(f"{label}: a passing result must carry a null signature")
-        rows.append(raw)
+        key = (raw["path"], raw["test"], tuple(raw["invocation"]) if valid_invocation(raw["invocation"]) else ())
+        if key in results:
+            problems.append(f"{label}: duplicate result for {raw['test']}")
+        results[key] = raw
+
+    missing_results = sorted(set(selection) - set(results))
+    missing_selection = sorted(set(results) - set(selection))
+    if missing_results:
+        problems.append("results: selected tests without terminal results: "
+                        + ", ".join(key[1] for key in missing_results))
+    if missing_selection:
+        problems.append("results: terminal results outside the selection: "
+                        + ", ".join(key[1] for key in missing_selection))
     if problems:
         return None, problems
+    data["selection_typed"] = selection
+    data["results_typed"] = results
     return data, []
 
 
 def json_exact_equal(left, right):
-    """Type-sensitive equality for strict JSON values.
-
-    Python's ordinary equality intentionally conflates bool/int and int/float
-    (`True == 1`, `1 == 1.0`). The ledger compares typed records, so those
-    are different values here. Strict JSON parsing has already rejected NaN
-    and infinities; the copysign check keeps signed zero distinct as well.
-    """
     if type(left) is not type(right):
         return False
     if isinstance(left, dict):
-        return (
-            set(left) == set(right)
-            and all(json_exact_equal(left[key], right[key]) for key in left)
-        )
+        return set(left) == set(right) and all(json_exact_equal(left[key], right[key]) for key in left)
     if isinstance(left, list):
         return len(left) == len(right) and all(
             json_exact_equal(left_item, right_item)
@@ -727,36 +890,49 @@ def host_applies(row, host):
     return "hosts" not in row or host in row["hosts"]
 
 
+def legacy_exempt(runner, test):
+    if runner == "privileged-lib":
+        return test in LEGACY_PRIVILEGED_LIB
+    if runner == PUBLIC_CLI_RUNNER:
+        return test in LEGACY_CELL_EXPECTED
+    if runner == RUN_TREE_RUNNER:
+        return test in LEGACY_CELL_INTERMITTENT
+    return False
+
+
 def evaluate_results(rows, document):
     problems = []
     runner = document["runner"]
     host = document["host"]
     applicable = [row for row in rows if row["runner"] == runner and host_applies(row, host)]
-    results_by_key = {(entry["path"], entry["test"]): entry for entry in document["results"]}
-    listed_keys = {(row["path"], row["test"]) for row in applicable}
+    results_by_key = document["results_typed"]
+    listed_keys = {row_key(row) for row in applicable}
     expected_failures = 0
     intermittent_passes = 0
     for row in applicable:
-        key = (row["path"], row["test"])
-        if key not in results_by_key:
-            problems.append(f"listed row has no result: {row['test']} ({row['issue']})")
+        key = row_key(row)
+        result = results_by_key.get(key)
+        if result is None:
+            problems.append(f"listed row has no selected terminal result: {row['test']} ({'/'.join(row['issues'])})")
             continue
-        result = results_by_key[key]
-        if result["passed"] and row["mode"] == "always":
-            problems.append(f"stale row: {row['test']} passed but {row['issue']} is still listed always-failing")
-        elif result["passed"]:
+        if result["state"] == "passed" and row["mode"] == "always":
+            problems.append(f"stale row: {row['test']} passed but {'/'.join(row['issues'])} is still listed always-failing")
+        elif result["state"] == "passed":
             intermittent_passes += 1
         elif not json_exact_equal(result["signature"], row["signature"]):
             problems.append(
-                f"failure signature mismatch for {row['test']} ({row['issue']}): "
+                f"failure signature mismatch for {row['test']} ({'/'.join(row['issues'])}): "
                 f"got {json.dumps(result['signature'], sort_keys=True)}, "
                 f"want {json.dumps(row['signature'], sort_keys=True)}")
         else:
             expected_failures += 1
     for key, result in results_by_key.items():
-        if key not in listed_keys and result["passed"] is False:
-            problems.append(f"failing test not listed: {key[1]} at {key[0]}")
-    return problems, expected_failures, intermittent_passes, len(applicable), len(document["results"])
+        if key in listed_keys or result["state"] == "passed":
+            continue
+        if legacy_exempt(runner, key[1]):
+            continue
+        problems.append(f"failing test not listed: {key[1]} at {key[0]} ({result['state']})")
+    return problems, expected_failures, intermittent_passes, len(applicable), len(results_by_key)
 
 
 def parse_args(argv):

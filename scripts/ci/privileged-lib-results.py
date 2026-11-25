@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
+"""Merge the privileged lib runner's structured selection/verdict records.
+
+Input is not results.txt and not test logs: run-privileged-lib-tests.sh writes
+a selection file (one exact libtest id per line) and a verdict TSV whose
+verdicts are closed runner tokens. This converter proves the two sets are
+nonempty, unique and exactly one-to-one, maps every id through
+tests/ignored-tests.json, and emits p11scope/known-failing-results/v1.
+"""
+import json
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+VERDICT_STATE = {
+    "PASS": ("passed", None),
+    "FAIL": ("failed", {"oracle": "libtest-summary", "verdict": "FAIL"}),
+    "SKIP": ("skipped", {"oracle": "runner-preflight", "verdict": "SKIP"}),
+    "XFAIL": ("failed", {"oracle": "runner-xfail", "verdict": "XFAIL"}),
+    # XPASS means libtest itself passed in an inverted legacy cell. The typed
+    # stream records the truthful terminal test state; the shell runner still
+    # fails the legacy campaign separately.
+    "XPASS": ("passed", None),
+}
+
+
+def main(argv):
+    if len(argv) != 4:
+        print("usage: privileged-lib-results.py SELECTION VERDICTS OUTPUT HOST", file=sys.stderr)
+        return 2
+    selection_path = Path(argv[0])
+    verdicts_path = Path(argv[1])
+    output_path = Path(argv[2])
+    host = argv[3]
+    if host not in {"fedora", "fedora-sm1", "vng", "github"}:
+        print("privileged-lib-results: unknown host", file=sys.stderr)
+        return 1
+    try:
+        selected = [line.strip() for line in selection_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        verdict_rows = []
+        for number, line in enumerate(verdicts_path.read_text(encoding="utf-8").splitlines(), 1):
+            parts = line.split("\t")
+            if len(parts) != 2:
+                print(f"privileged-lib-results: malformed verdict line {number}", file=sys.stderr)
+                return 1
+            verdict_rows.append(tuple(parts))
+    except OSError as error:
+        print(f"privileged-lib-results: cannot read structured records: {error}", file=sys.stderr)
+        return 1
+    if not selected or len(selected) != len(set(selected)):
+        print("privileged-lib-results: selection is empty or duplicated", file=sys.stderr)
+        return 1
+    verdict_names = [name for name, _verdict in verdict_rows]
+    if len(verdict_names) != len(set(verdict_names)) or set(verdict_names) != set(selected):
+        print("privileged-lib-results: verdict rows are not exactly one-to-one with the selection", file=sys.stderr)
+        return 1
+    try:
+        registry = json.loads((ROOT / "tests/ignored-tests.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        print(f"privileged-lib-results: cannot read ignored-test registry: {error}", file=sys.stderr)
+        return 1
+    files = {}
+    ambiguous = set()
+    for site in registry.get("sites", []):
+        if isinstance(site, dict) and isinstance(site.get("path"), str) and isinstance(site.get("file"), str):
+            if site["path"] in files and files[site["path"]] != site["file"]:
+                ambiguous.add(site["path"])
+            files.setdefault(site["path"], site["file"])
+    for name in ambiguous:
+        files.pop(name, None)
+    selection = []
+    results = []
+    for name, verdict in verdict_rows:
+        if verdict not in VERDICT_STATE:
+            print(f"privileged-lib-results: verdict outside the closed vocabulary for {name}", file=sys.stderr)
+            return 1
+        path = files.get(name)
+        if path is None:
+            print(f"privileged-lib-results: no unambiguous ignored-test source path for {name}", file=sys.stderr)
+            return 1
+        state, signature = VERDICT_STATE[verdict]
+        identity = {"path": path, "test": name, "invocation": []}
+        selection.append(identity)
+        results.append({**identity, "state": state, "signature": signature})
+    document = {
+        "schema": "p11scope/known-failing-results/v1",
+        "runner": "privileged-lib",
+        "host": host,
+        "complete": True,
+        "selection": selection,
+        "results": results,
+    }
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = output_path.with_suffix(output_path.suffix + ".tmp")
+        temporary.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        temporary.replace(output_path)
+    except OSError as error:
+        print(f"privileged-lib-results: cannot write output: {error}", file=sys.stderr)
+        return 1
+    print(f"privileged-lib-results: typed {len(results)} selected terminal rows")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

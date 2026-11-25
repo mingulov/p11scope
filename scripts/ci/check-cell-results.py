@@ -32,6 +32,7 @@ Usage:
 """
 
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -65,6 +66,9 @@ def main(argv):
     allowed_smoke = []
     required = []
     positional = []
+    known_results = []
+    known_runner = []
+    known_host = []
     iterator = iter(argv)
     for token in iterator:
         if token == "--expected-failure":
@@ -93,6 +97,21 @@ def main(argv):
                 allowed_smoke.append(next(iterator))
             except StopIteration:
                 return fail("--allow-nonqualifying needs a cell name")
+        elif token == "--known-failing-results":
+            try:
+                known_results.append(next(iterator))
+            except StopIteration:
+                return fail("--known-failing-results needs a path")
+        elif token == "--known-failing-runner":
+            try:
+                known_runner.append(next(iterator))
+            except StopIteration:
+                return fail("--known-failing-runner needs a runner")
+        elif token == "--known-failing-host":
+            try:
+                known_host.append(next(iterator))
+            except StopIteration:
+                return fail("--known-failing-host needs a host")
         elif token == "--require":
             try:
                 required.append(next(iterator))
@@ -102,8 +121,10 @@ def main(argv):
             return fail(f"unknown option: {token}")
         else:
             positional.append(token)
+    if len(known_results) != len(known_runner) or len(known_results) != len(known_host) or len(known_results) > 1:
+        return fail("--known-failing-results, --known-failing-runner and --known-failing-host must appear together at most once")
     if len(positional) != 1:
-        return fail("usage: check-cell-results.py RESULTS.JSONL [--expected-failure CELL ...] [--intermittent-failure CELL ...] [--allow-nonqualifying CELL ...] [--require CELL ...]")
+        return fail("usage: check-cell-results.py RESULTS.JSONL [--expected-failure CELL ...] [--intermittent-failure CELL ...] [--allow-nonqualifying CELL ...] [--require CELL ...] [--known-failing-results PATH --known-failing-runner RUNNER --known-failing-host HOST]")
     path = Path(positional[0])
     try:
         text = path.read_text(encoding="utf-8")
@@ -193,6 +214,18 @@ def main(argv):
     missing_required = sorted(set(required) - seen)
     if missing_required:
         problems.append("missing required cells: " + ", ".join(missing_required))
+    if not problems and known_results:
+        emit_error = emit_known_failing_results(
+            rows, Path(known_results[0]), known_runner[0], known_host[0])
+        if emit_error is not None:
+            problems.append(emit_error)
+        else:
+            checker = Path(__file__).resolve().parents[2] / "scripts" / "check-known-failing.py"
+            judged = subprocess.run(
+                [sys.executable, "-I", str(checker), "--results", str(known_results[0])],
+                text=True)
+            if judged.returncode != 0:
+                problems.append("known-failing ledger judgment failed")
     if problems:
         for problem in problems:
             print(f"check-cell-results: {problem}", file=sys.stderr)
@@ -210,6 +243,74 @@ def main(argv):
     else:
         print(f"check-cell-results: {len(rows)} rows ok ({len(actual)} expected failures)")
     return 0
+
+
+def ignored_test_files():
+    registry_path = Path(__file__).resolve().parents[2] / "tests" / "ignored-tests.json"
+    try:
+        registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    files = {}
+    ambiguous = set()
+    for site in registry.get("sites", []):
+        if not isinstance(site, dict):
+            continue
+        test = site.get("path")
+        file_name = site.get("file")
+        if not isinstance(test, str) or not isinstance(file_name, str):
+            continue
+        if test in files and files[test] != file_name:
+            ambiguous.add(test)
+        files.setdefault(test, file_name)
+    for test in ambiguous:
+        files.pop(test, None)
+    return files
+
+
+def emit_known_failing_results(rows, output, runner, host):
+    """Write the typed v1 selection/result document for this terminal row set."""
+    if not runner.startswith("cell:") or len(runner) <= len("cell:"):
+        return "known-failing runner for cell results must be cell:<script>"
+    if host not in {"fedora", "fedora-sm1", "vng", "github"}:
+        return "known-failing host is not in the closed host vocabulary"
+    root = Path(__file__).resolve().parents[2]
+    test_files = ignored_test_files()
+    runner_path = runner[len("cell:"):]
+    runner_file_ok = bool(runner_path) and not runner_path.startswith("/") and (root / runner_path).is_file()
+    selection = []
+    results = []
+    for row in rows:
+        cell = row["cell"]
+        path = test_files.get(cell)
+        if path is None:
+            if not runner_file_ok:
+                return f"cannot type the source path for cell {cell}: not in ignored-tests and runner file is absent"
+            path = runner_path
+        identity = {"path": path, "test": cell, "invocation": []}
+        selection.append(identity)
+        passed = row["pass"]
+        results.append({
+            **identity,
+            "state": "passed" if passed else "failed",
+            "signature": None if passed else {"cell": cell, "qualification": row["qualification"]},
+        })
+    document = {
+        "schema": "p11scope/known-failing-results/v1",
+        "runner": runner,
+        "host": host,
+        "complete": True,
+        "selection": selection,
+        "results": results,
+    }
+    try:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        temporary = output.with_suffix(output.suffix + ".tmp")
+        temporary.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        temporary.replace(output)
+    except OSError as error:
+        return f"cannot write typed known-failing results: {error}"
+    return None
 
 
 if __name__ == "__main__":

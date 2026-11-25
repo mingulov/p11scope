@@ -101,6 +101,8 @@ validate_selectors
 def run_record_typed_verdict(source, verdict_dir, *arguments):
     function = shell_function(source, "record_typed_verdict")
     verdicts = verdict_dir / "verdicts.tsv"
+    if verdicts.exists():
+        verdicts.unlink()
     command = " ".join(shlex.quote(str(argument)) for argument in arguments)
     harness = f"""set -u
 PROG=run-privileged-lib-tests.sh
@@ -1321,6 +1323,7 @@ class RealTypedWorkflowInvocationTests(unittest.TestCase):
 class PrivilegedLibTypedRunnerBoundaryTests(unittest.TestCase):
     def setUp(self):
         self.source = PRIVILEGED_RUNNER.read_text(encoding="utf-8")
+        self.yml = PRIV_YML.read_text(encoding="utf-8")
 
     def test_record_typed_verdict_emits_one_row_with_the_optional_sidecar_field(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1349,28 +1352,26 @@ class PrivilegedLibTypedRunnerBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             outcome = run_privileged_runner_with_fake_binary(
                 Path(temporary), self.source, selector, "fail-typed")
-        expected_tsv = selector.encode() + b"\tFAIL\t" + str(
-            outcome["outdir"] / "evidence/0-anchor_maps_validate_real_handles/typed-failure.json").encode() + b"\n"
-        self.assertEqual(expected_tsv, outcome["verdicts"])
-        self.assertTrue(outcome["typed_output"].is_file(),
-                        outcome["run"].stdout + outcome["run"].stderr)
-        document = json.loads(outcome["typed_output"].read_text(encoding="utf-8"))
-        self.assertEqual(document["results"][0]["signature"], {"cell": "X", "branch": "exact_branch"})
-        self.assertNotIn("selector matches no curated test", outcome["run"].stderr)
-
+            expected_tsv = selector.encode() + b"\tFAIL\t" + str(
+                outcome["outdir"] / "evidence/0-anchor_maps_validate_real_handles/typed-failure.json").encode() + b"\n"
+            self.assertEqual(expected_tsv, outcome["verdicts"])
+            self.assertTrue(outcome["typed_output"].is_file(),
+                            outcome["run"].stdout + outcome["run"].stderr)
+            document = json.loads(outcome["typed_output"].read_text(encoding="utf-8"))
+            self.assertEqual(document["results"][0]["signature"], {"cell": "X", "branch": "exact_branch"})
+            self.assertNotIn("selector matches no curated test", outcome["run"].stderr)
     def test_real_runner_pipeline_positive_passes_the_checker(self):
         selector = "attach::identity_iter::tests::anchor_maps_validate_real_handles"
         with tempfile.TemporaryDirectory() as temporary:
             outcome = run_privileged_runner_with_fake_binary(
                 Path(temporary), self.source, selector, "pass")
-        self.assertEqual(outcome["run"].returncode, 0,
-                         outcome["run"].stdout + outcome["run"].stderr)
-        document = json.loads(outcome["typed_output"].read_text(encoding="utf-8"))
-        self.assertEqual(document["results"][0]["state"], "passed")
-        self.assertIsNone(document["results"][0]["signature"])
-
+            self.assertEqual(outcome["run"].returncode, 0,
+                             outcome["run"].stdout + outcome["run"].stderr)
+            document = json.loads(outcome["typed_output"].read_text(encoding="utf-8"))
+            self.assertEqual(document["results"][0]["state"], "passed")
+            self.assertIsNone(document["results"][0]["signature"])
     def test_a_typed_row_selector_reaches_execution_instead_of_selector_refusal(self):
-        typed_name = "attach::tests::sealed_session_drain_linkage_is_behavioral"
+        typed_name = "attach::inventory::activation::privileged_tests::detailed_sweep_test!"
         for array in ("DEFAULT_TESTS", "ALTERNATIVE_TESTS", "LONG_TESTS", "BTRFS_TESTS",
                       "OVERLAY_TESTS", "EXPECTED_FAILURE_TESTS", "SKIP_TESTS"):
             self.assertNotIn(typed_name, shell_array(self.source, array))
@@ -1381,13 +1382,12 @@ class PrivilegedLibTypedRunnerBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             outcome = run_privileged_runner_with_fake_binary(
                 Path(temporary), injected, typed_name, "fail-typed")
-        self.assertNotIn("selector matches no curated test", outcome["run"].stderr)
-        self.assertEqual(typed_name + "\n", outcome["selection"])
-        rows = outcome["verdicts"].splitlines()
-        self.assertEqual(1, len(rows))
-        self.assertEqual(3, len(rows[0].split(b"\t")))
-        self.assertEqual((typed_name + "\tXFAIL").encode(), rows[0].split(b"\t")[0] + b"\t" + rows[0].split(b"\t")[1])
-
+            self.assertNotIn("selector matches no curated test", outcome["run"].stderr)
+            self.assertEqual(typed_name + "\n", outcome["selection"])
+            rows = outcome["verdicts"].splitlines()
+            self.assertEqual(1, len(rows))
+            self.assertEqual(3, len(rows[0].split(b"\t")))
+            self.assertEqual((typed_name + "\tXFAIL").encode(), rows[0].split(b"\t")[0] + b"\t" + rows[0].split(b"\t")[1])
     def test_typed_privileged_records_are_uploaded_for_ci_evidence(self):
         shard = job_body(self.yml, "privileged-shard")
         upload = shard.split("name: Upload the shard results and logs", 1)[1]

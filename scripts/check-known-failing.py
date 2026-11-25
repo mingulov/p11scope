@@ -546,14 +546,21 @@ COMMAND_BOUNDARY = {
 def parse_invocation(tokens, start, kind):
     positionals = []
     options = {name: [] for name in OPTION_ARITY}
+    option_sequence = []
     cursor = start + 1
     while cursor < len(tokens):
         token = tokens[cursor]
+        if not token.strip():
+            cursor += 1
+            continue
         if token in COMMAND_BOUNDARY or token.startswith(">") or token.startswith("<"):
             break
         if token.startswith("scripts/"):
             break
-        if token.startswith("--"):
+        array_match = re.fullmatch(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\[@\]\}", token)
+        if array_match is not None:
+            option_sequence.append(("array-expansion", array_match.group(1)))
+        elif token.startswith("--"):
             if "=" in token:
                 name, value = token.split("=", 1)
                 values = [value]
@@ -569,6 +576,7 @@ def parse_invocation(tokens, start, kind):
                 values.extend(tokens[cursor + 1:cursor + 1 + needed])
                 cursor += needed
             options[name].extend(values)
+            option_sequence.extend((name, value) for value in values)
         else:
             positionals.append(token)
         cursor += 1
@@ -590,6 +598,7 @@ def parse_invocation(tokens, start, kind):
         "known_results": (options["--known-failing-results"] or [None])[-1],
         "known_host": (options["--known-failing-host"] or [None])[-1],
         "explicit_runner": bool(options["--known-failing-runner"]),
+        "option_sequence": option_sequence,
     }
 
 
@@ -685,7 +694,8 @@ def validate_cell_runner_declarations(root, rows):
     for (runner, workflow, job, results), sites in sorted(groups.items()):
         first = sites[0]
         for site in sites[1:]:
-            if sorted(site["expected"]) != sorted(first["expected"]) or sorted(site["intermittent"]) != sorted(first["intermittent"]):
+            if any(sorted(site[key]) != sorted(first[key])
+                   for key in ("expected", "intermittent", "required", "nonqualifying")):
                 problems.append(
                     f"{workflow}:{job}:{results}: repeated declarations for one runner/results stream differ")
                 break

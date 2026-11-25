@@ -567,6 +567,95 @@ fn projection_refuses_unsupported_schemas() {
     assert!(error.contains("no schema string"), "{error}");
 }
 
+/// Real v0.7.1 captures (official release binary). See
+/// `tests/fixtures/upgrade/README.md` for provenance.
+const KEYOPS071: &[u8] =
+    include_bytes!("../../../tests/fixtures/upgrade/v071-inventory-keyops.json");
+const PROFILE071: &[u8] =
+    include_bytes!("../../../tests/fixtures/upgrade/v071-observed-profile.json");
+const METRICS071: &[u8] =
+    include_bytes!("../../../tests/fixtures/upgrade/v071-observed-metrics.json");
+
+/// A real v0.7.1 `--key-operations` inventory converts: its key
+/// components render, every qualified established slot counts as
+/// source-unrecorded (v0.7.1 files carry no `source` field), and no
+/// supplier or token components appear (v0.7.1 has no provider
+/// info). This capture admitted no keys, so both counts are zero by
+/// consistency, counted independently from the file itself; the
+/// nonzero counting proof needs established key rows (see README).
+#[test]
+fn cbom_v071_keyops_inventory_converts() {
+    let projection = parse_input(KEYOPS071).unwrap();
+    let document = super::render::render_json(&projection);
+    let properties = document["metadata"]["properties"]
+        .as_array()
+        .expect("metadata properties");
+    let tally = |name: &str| {
+        properties
+            .iter()
+            .find(|prop| prop["name"] == name)
+            .unwrap_or_else(|| panic!("{name} tally"))["value"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let file: Value = serde_json::from_slice(KEYOPS071).unwrap();
+    let mut qualified = 0u64;
+    for key in file["object_observations"]["objects"]
+        .as_array()
+        .expect("object rows")
+    {
+        for slot in [
+            "class",
+            "key_type",
+            "modulus_bits",
+            "value_len",
+            "ec_params",
+            "token",
+        ] {
+            if key["established"][slot]["status"] == "value" {
+                qualified += 1;
+            }
+        }
+    }
+    assert_eq!(
+        tally("p11scope:established_source_unrecorded"),
+        qualified.to_string()
+    );
+    assert_eq!(tally("p11scope:established_source_query"), "0");
+    assert_eq!(tally("p11scope:established_source_creation_success"), "0");
+    assert!(
+        projection
+            .providers
+            .iter()
+            .all(|provider| provider.supplier.is_none()),
+        "no supplier without provider info"
+    );
+    assert!(projection.tokens.is_empty(), "no token devices");
+}
+
+/// A real v0.7.1 profile converts with its provider and mechanism rows.
+#[test]
+fn cbom_v071_profile_converts() {
+    let projection = parse_input(PROFILE071).unwrap();
+    assert_eq!(projection.providers.len(), 1);
+    assert_eq!(projection.mechanisms.len(), 1);
+    assert_eq!(projection.mechanisms[0].calls, 44);
+    assert_eq!(projection.completeness.as_deref(), Some("COMPLETE"));
+    assert!(projection.profile_note.is_some());
+    assert!(projection.keys.is_empty());
+}
+
+/// A real v0.7.1 metrics file is refused with the exact remedy.
+#[test]
+fn cbom_v071_metrics_refusal_is_exact() {
+    let error = parse_input(METRICS071).unwrap_err().to_string();
+    assert_eq!(
+        error,
+        "unsupported CBOM input schema: p11scope/observed-profile/v3-metrics: metrics output has no mechanism rows; save `profile -o`"
+    );
+}
+
 #[test]
 fn metrics_refusal_names_the_profile_command() {
     let error = parse_input(

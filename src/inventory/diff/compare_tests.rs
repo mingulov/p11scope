@@ -2267,6 +2267,121 @@ fn mixed_version_after() -> Value {
     v
 }
 
+/// Real captures: v0.7.1 (official release binary) and current
+/// (this tree) inventories. See `tests/fixtures/upgrade/README.md`
+/// for provenance and the sanitizer rules.
+const UPGRADE_SCAN071: &[u8] =
+    include_bytes!("../../../tests/fixtures/upgrade/v071-inventory-scan.json");
+const UPGRADE_NATIVE071: &[u8] =
+    include_bytes!("../../../tests/fixtures/upgrade/v071-inventory-native.json");
+const UPGRADE_CHURN071: &[u8] =
+    include_bytes!("../../../tests/fixtures/upgrade/v071-inventory-churn.json");
+const UPGRADE_CHURN072: &[u8] =
+    include_bytes!("../../../tests/fixtures/upgrade/v072-inventory-churn.json");
+
+fn upgrade_snapshot(bytes: &[u8]) -> Snapshot {
+    input::parse_snapshot(bytes).unwrap()
+}
+
+/// Real v0.7.1 inventories diffed against themselves report zero
+/// changes and no fold limitation (same-version inputs agree).
+#[test]
+fn real_v071_inventories_self_diff_to_zero() {
+    for (name, bytes, pre_fold) in [
+        ("scan", UPGRADE_SCAN071, true),
+        ("native", UPGRADE_NATIVE071, true),
+        ("churn", UPGRADE_CHURN071, true),
+        ("churn072", UPGRADE_CHURN072, false),
+    ] {
+        let snapshot = upgrade_snapshot(bytes);
+        assert_eq!(snapshot.pre_fold_input, pre_fold, "{name} era");
+        let report = compare(&snapshot, &snapshot);
+        assert!(
+            report.summary.application_groups_compared > 0,
+            "{name} compares no groups"
+        );
+        assert!(
+            report.application_changes.is_empty(),
+            "{name} self-diff changed: {:?}",
+            report.application_changes
+        );
+        assert!(
+            report
+                .module_contents
+                .iter()
+                .all(|row| row.changes.is_empty()),
+            "{name} module diff changed"
+        );
+        assert!(
+            report.module_path_changes.is_empty(),
+            "{name} path diff changed"
+        );
+        assert!(
+            !report.limitations.contains(&"pre_fold_input".to_owned()),
+            "{name} self-diff names no fold limitation"
+        );
+    }
+}
+
+/// Real mixed-version churn: the v0.7.1 side holds exited signers as
+/// live rows, the current side folded them. The comparison carries
+/// the fold limitation, the folded group keeps presence `both` with
+/// its `departed_use` change, and no group reads added or removed —
+/// in both directions.
+#[test]
+fn real_mixed_churn_keeps_every_group_present() {
+    let old = upgrade_snapshot(UPGRADE_CHURN071);
+    let new = upgrade_snapshot(UPGRADE_CHURN072);
+    assert!(old.pre_fold_input);
+    assert!(!new.pre_fold_input);
+    for (left, right) in [(&old, &new), (&new, &old)] {
+        let report = compare(left, right);
+        assert!(
+            report.limitations.contains(&"pre_fold_input".to_owned()),
+            "mixed versions name the fold limitation: {:?}",
+            report.limitations
+        );
+        assert_eq!(
+            report.comparison.application_paths,
+            vec![
+                "/work/f2/bin/catalog-driver".to_string(),
+                "/work/f2/bin/shortlived-sign".to_string()
+            ]
+        );
+        let by_path = |path: &str| {
+            report
+                .application_changes
+                .iter()
+                .find(|row| report.comparison.application_paths[row.key.exe_path_ref.0] == path)
+                .unwrap_or_else(|| panic!("{path} has a change row"))
+        };
+        let churn = by_path("/work/f2/bin/shortlived-sign");
+        assert_eq!(churn.presence, Presence::Both);
+        assert!(
+            churn.changes.contains(&"departed_use"),
+            "the folded group names its fold: {:?}",
+            churn.changes
+        );
+        let steady = by_path("/work/f2/bin/catalog-driver");
+        assert_eq!(steady.presence, Presence::Both);
+        assert!(
+            !steady.changes.contains(&"departed_use")
+                && !steady.changes.contains(&"content_presence"),
+            "the fold leaks no presence change onto the steady group: {:?}",
+            steady.changes
+        );
+        assert!(
+            !report
+                .application_changes
+                .iter()
+                .any(|row| row.presence != Presence::Both),
+            "no group reads added or removed"
+        );
+        assert_eq!(report.module_contents.len(), 1);
+        assert_eq!(report.module_contents[0].presence, Presence::Both);
+    }
+}
+
 fn rendered(report: &model::DiffReport) -> Vec<String> {
     let mut verbose = Vec::new();
     render_text(report, &mut verbose).unwrap();

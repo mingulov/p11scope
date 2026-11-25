@@ -229,6 +229,8 @@ pub static EBPF_JOURNAL_OBJECT: &[u8] = aya::include_bytes_aligned!(concat!(
 #[cfg(not(p11scope_journal))]
 pub static EBPF_JOURNAL_OBJECT: &[u8] = &[];
 
+#[cfg(test)]
+mod compat_v071_tests;
 pub(crate) mod history;
 #[cfg(test)]
 mod key_operation_tests;

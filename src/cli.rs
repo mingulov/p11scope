@@ -7401,6 +7401,39 @@ mod tests {
         );
     }
 
+    /// A real v0.7.1 discovery manifest (official release helper,
+    /// SoftHSM) parses, validates clean, and passes the
+    /// `--exclude-module` check; the attested basename still conflicts.
+    /// See `tests/fixtures/upgrade/README.md` for provenance.
+    #[test]
+    fn v071_manifest_accepted_and_excludes_checked() {
+        const MANIFEST: &[u8] =
+            include_bytes!("../tests/fixtures/upgrade/v071-manifest-softhsm.json");
+        let manifest: p11scope_manifest::manifest::Manifest =
+            serde_json::from_slice(MANIFEST).unwrap();
+        assert_eq!(manifest.schema, p11scope_manifest::manifest::SCHEMA);
+        assert!(
+            crate::manifest_input::validate_structure(&manifest).is_empty(),
+            "real manifest validates clean"
+        );
+        assert!(!manifest.surfaces.is_empty());
+        assert!(!crate::manifest_input::is_getter_only(&manifest));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v071-softhsm.json");
+        std::fs::write(&path, MANIFEST).unwrap();
+        assert!(
+            validate_manifest_excludes(std::slice::from_ref(&path), &[PathBuf::from("other.so")])
+                .is_ok()
+        );
+        assert!(
+            validate_manifest_excludes(
+                std::slice::from_ref(&path),
+                &[PathBuf::from("libsofthsm2.so")]
+            )
+            .is_err()
+        );
+    }
+
     /// A `--manifest` attesting an excluded provider is refused at startup
     /// with the same named-error shape; unreadable manifests are left for
     /// discovery to report precisely.

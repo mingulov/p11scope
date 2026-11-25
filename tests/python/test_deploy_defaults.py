@@ -102,7 +102,7 @@ class DeployDefaultsTests(unittest.TestCase):
 
     def test_kind_workload_requests_keep_hosted_kind_schedulable(self):
         expected = {
-            "ledger-a": ({"cpu": "50m", "memory": "32Mi"}, {"cpu": "500m", "memory": "128Mi"}),
+            "ledger-a": ({"cpu": "500m", "memory": "128Mi"}, {"cpu": "500m", "memory": "128Mi"}),
             "ledger-b": ({"cpu": "50m", "memory": "32Mi"}, {"cpu": "500m", "memory": "128Mi"}),
             "ledger-p": ({"cpu": "50m", "memory": "32Mi"}, {"cpu": "500m", "memory": "128Mi"}),
             "ledger-n": ({"cpu": "50m", "memory": "32Mi"}, {"cpu": "500m", "memory": "128Mi"}),
@@ -123,6 +123,13 @@ class DeployDefaultsTests(unittest.TestCase):
         for name, (requests, limits) in expected.items():
             self.assertEqual(seen[name].get("requests"), requests, name)
             self.assertEqual(seen[name].get("limits"), limits, name)
+        self.assertEqual(seen["ledger-a"]["requests"], seen["ledger-a"]["limits"],
+                         "ledger-a keeps the hosted Guaranteed cgroup depth")
+        workload_cpu = sum(int(seen[name]["requests"]["cpu"][:-1]) for name in expected)
+        hosted_cpu = 950 + 50 + workload_cpu
+        self.assertEqual(hosted_cpu, 1760,
+                         "hosted kind budget: measured system pods + observer + workloads")
+        self.assertLessEqual(hosted_cpu, 4000)
 
 
 if __name__ == "__main__":

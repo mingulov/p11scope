@@ -28380,6 +28380,9 @@ exit 0
         native.scene.coordinator.note_rendered_callers(&[id]);
         let receipt = native.scene.coordinator.retire_rendered_callers(300, None);
         assert_eq!(receipt.retired, 1, "the exited caller folds");
+        // The fold stages the gap; the production commit publishes it.
+        // Publish here so the assertion reads the applied record.
+        native.scene.coordinator.registry.publish();
         let gaps: Vec<String> = native
             .scene
             .coordinator
@@ -28392,6 +28395,665 @@ exit 0
         assert!(
             gaps.iter().any(|reason| reason.contains("(10, 16]")),
             "withheld (10, 16] disclosed as a retirement-count gap, got {gaps:?}"
+        );
+    }
+
+    /// Shared-key Bound/Pending twins of the overlap RED: the settle
+    /// must cover every live target variant, not just Suspended. Two
+    /// exited callers, each with a live target and a stalled recovery
+    /// sharing one key and a withheld (10, 16] prefix. Both folds
+    /// disclose one exact typed retirement-count gap each, land the
+    /// Dropped base exactly, and leave no recovery or order slot.
+    #[test]
+    fn fold_discloses_shared_withheld_prefix_for_bound_and_pending_targets() {
+        use crate::discovery::caller_registry::{DEMOTED_COUNT_REJECTED, RegistryGap};
+        let (mut native, _live) = NativeScene::new();
+        let domain = native.domain;
+        let bound_id = stage_exited_caller(&mut native, 5010, 100);
+        let bound_key = PairKey::scripted(domain, 510, 0, 0);
+        native.scene.coordinator.pair_targets.insert(
+            bound_key,
+            PairTarget::scripted_bound(
+                bound_id,
+                ModuleKey::physical(8, 1, 7100, None, "/fold/bound.so"),
+                0,
+                10,
+                10,
+            ),
+        );
+        let mut bound_recovery = PairRecovery::scripted(bound_id, 0, ModuleId(3));
+        bound_recovery.watermark = 10;
+        bound_recovery.withheld_through = 16;
+        bound_recovery.discarded_through = 10;
+        native
+            .scene
+            .coordinator
+            .recoveries
+            .insert(bound_key, bound_recovery);
+        native.scene.coordinator.recovery_order.push(bound_key);
+        let pending_id = stage_exited_caller(&mut native, 5020, 100);
+        let pending_key = PairKey::scripted(domain, 520, 0, 0);
+        native.scene.coordinator.pair_targets.insert(
+            pending_key,
+            PairTarget::Pending {
+                caller: pending_id,
+                modules: vec![ModuleKey::physical(8, 1, 7200, None, "/fold/pending.so")],
+                staged: 10,
+                staged_ns: 0,
+                endpoint: EndpointId(0),
+                base: 10,
+                base_since: 0,
+            },
+        );
+        let mut pending_recovery = PairRecovery::scripted(pending_id, 0, ModuleId(3));
+        pending_recovery.watermark = 10;
+        pending_recovery.withheld_through = 16;
+        pending_recovery.discarded_through = 10;
+        native
+            .scene
+            .coordinator
+            .recoveries
+            .insert(pending_key, pending_recovery);
+        native.scene.coordinator.recovery_order.push(pending_key);
+        native
+            .scene
+            .coordinator
+            .note_rendered_callers(&[bound_id, pending_id]);
+        let receipt = native.scene.coordinator.retire_rendered_callers(300, None);
+        assert_eq!(receipt.retired, 2, "both exited callers fold");
+        native.scene.coordinator.registry.publish();
+        for id in [bound_id, pending_id] {
+            let expected = RegistryGap {
+                caller: Some(id),
+                module: None,
+                pid: None,
+                subject: DEMOTED_COUNT_REJECTED.into(),
+                reason: "the current physical owner is not proven for absolute count range (10, 16] (6 unattributed calls); historical counts remain and no witness or module-level use is recorded".into(),
+                budget: None,
+            };
+            let gaps: Vec<RegistryGap> = native
+                .scene
+                .coordinator
+                .registry
+                .gaps()
+                .iter()
+                .filter(|gap| gap.subject == DEMOTED_COUNT_REJECTED && gap.caller == Some(id))
+                .cloned()
+                .collect();
+            assert_eq!(gaps, vec![expected], "one exact typed gap for {id:?}");
+        }
+        assert!(
+            native.scene.coordinator.recoveries.is_empty(),
+            "no recovery survives its caller"
+        );
+        assert!(
+            native.scene.coordinator.recovery_order.is_empty(),
+            "the service order is exact"
+        );
+        for key in [bound_key, pending_key] {
+            assert!(
+                matches!(
+                    native.scene.coordinator.pair_targets.get(&key),
+                    Some(PairTarget::Dropped { base: 10, .. })
+                ),
+                "the dropped base lands exactly for {key:?}"
+            );
+        }
+    }
+
+    /// Shared-key held twin: a live suspended target, a stalled
+    /// recovery with withheld (10, 16], and a held cumulative read at
+    /// 20 for the same caller. The fold gaps the held read together
+    /// with the prefix as one exact typed (10, 20] gap and lands the
+    /// Dropped base at the held absolute — never drops the held read
+    /// silently beside the prefix.
+    #[test]
+    fn fold_gaps_held_read_with_shared_withheld_prefix() {
+        use crate::discovery::caller_registry::{DEMOTED_COUNT_REJECTED, RegistryGap};
+        let (mut native, _live) = NativeScene::new();
+        let domain = native.domain;
+        let id = stage_exited_caller(&mut native, 5030, 100);
+        let key = PairKey::scripted(domain, 530, 0, 0);
+        native.scene.coordinator.pair_targets.insert(
+            key,
+            PairTarget::Suspended {
+                caller: id,
+                endpoint: EndpointId(0),
+                base: 10,
+                base_since: 0,
+            },
+        );
+        let mut recovery = PairRecovery::scripted(id, 0, ModuleId(3));
+        recovery.watermark = 10;
+        recovery.withheld_through = 16;
+        recovery.discarded_through = 10;
+        native.scene.coordinator.recoveries.insert(key, recovery);
+        native.scene.coordinator.recovery_order.push(key);
+        native.scene.coordinator.pair_counts.insert(
+            key,
+            HeldPairCount::new(PairCount {
+                count: 20,
+                first_ns: 90,
+                anchor_ns: 100,
+                last_ns: 110,
+                retirement_usable: true,
+                diagnostic_observation: 0,
+                diagnostic_transition: 0,
+            }),
+        );
+        native.scene.coordinator.note_rendered_callers(&[id]);
+        let receipt = native.scene.coordinator.retire_rendered_callers(300, None);
+        assert_eq!(receipt.retired, 1, "the exited caller folds");
+        native.scene.coordinator.registry.publish();
+        let expected = RegistryGap {
+            caller: Some(id),
+            module: None,
+            pid: None,
+            subject: DEMOTED_COUNT_REJECTED.into(),
+            reason: "the current physical owner is not proven for absolute count range (10, 20] (10 unattributed calls); historical counts remain and no witness or module-level use is recorded".into(),
+            budget: None,
+        };
+        let gaps: Vec<RegistryGap> = native
+            .scene
+            .coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == DEMOTED_COUNT_REJECTED && gap.caller == Some(id))
+            .cloned()
+            .collect();
+        assert_eq!(
+            gaps,
+            vec![expected],
+            "the held read joins the prefix in one exact gap"
+        );
+        assert!(
+            native.scene.coordinator.recoveries.is_empty(),
+            "no recovery survives its caller"
+        );
+        assert!(
+            native.scene.coordinator.recovery_order.is_empty(),
+            "the service order is exact"
+        );
+        assert!(
+            matches!(
+                native.scene.coordinator.pair_targets.get(&key),
+                Some(PairTarget::Dropped { base: 20, .. })
+            ),
+            "the dropped base lands at the held absolute"
+        );
+    }
+
+    /// Stranded twins: stalled recoveries with withheld (10, 16] on
+    /// keys with no live target — one recovery-only (the F5 churn
+    /// shape, but with a prefix the F5 twin lacks) and one beside a
+    /// Dropped target. Loop 2 settles both with one exact typed gap
+    /// each. Kills a dropped stranded settle.
+    #[test]
+    fn fold_discloses_stranded_withheld_prefix_on_disjoint_keys() {
+        use crate::discovery::caller_registry::{DEMOTED_COUNT_REJECTED, RegistryGap};
+        let (mut native, _live) = NativeScene::new();
+        let domain = native.domain;
+        let bare_id = stage_exited_caller(&mut native, 5040, 100);
+        let bare_key = PairKey::scripted(domain, 540, 0, 0);
+        let mut bare = PairRecovery::scripted(bare_id, 0, ModuleId(3));
+        bare.watermark = 10;
+        bare.withheld_through = 16;
+        bare.discarded_through = 10;
+        native.scene.coordinator.recoveries.insert(bare_key, bare);
+        native.scene.coordinator.recovery_order.push(bare_key);
+        let dropped_id = stage_exited_caller(&mut native, 5050, 100);
+        let dropped_key = PairKey::scripted(domain, 550, 0, 0);
+        native.scene.coordinator.pair_targets.insert(
+            dropped_key,
+            PairTarget::Dropped {
+                base: 10,
+                base_since: 0,
+            },
+        );
+        let mut dropped = PairRecovery::scripted(dropped_id, 0, ModuleId(3));
+        dropped.watermark = 10;
+        dropped.withheld_through = 16;
+        dropped.discarded_through = 10;
+        native
+            .scene
+            .coordinator
+            .recoveries
+            .insert(dropped_key, dropped);
+        native.scene.coordinator.recovery_order.push(dropped_key);
+        native
+            .scene
+            .coordinator
+            .note_rendered_callers(&[bare_id, dropped_id]);
+        let receipt = native.scene.coordinator.retire_rendered_callers(300, None);
+        assert_eq!(receipt.retired, 2, "both exited callers fold");
+        native.scene.coordinator.registry.publish();
+        for id in [bare_id, dropped_id] {
+            let expected = RegistryGap {
+                caller: Some(id),
+                module: None,
+                pid: None,
+                subject: DEMOTED_COUNT_REJECTED.into(),
+                reason: "the current physical owner is not proven for absolute count range (10, 16] (6 unattributed calls); historical counts remain and no witness or module-level use is recorded".into(),
+                budget: None,
+            };
+            let gaps: Vec<RegistryGap> = native
+                .scene
+                .coordinator
+                .registry
+                .gaps()
+                .iter()
+                .filter(|gap| gap.subject == DEMOTED_COUNT_REJECTED && gap.caller == Some(id))
+                .cloned()
+                .collect();
+            assert_eq!(gaps, vec![expected], "one exact typed gap for {id:?}");
+        }
+        assert!(
+            native.scene.coordinator.recoveries.is_empty(),
+            "no stranded recovery survives its caller"
+        );
+        assert!(
+            native.scene.coordinator.recovery_order.is_empty(),
+            "the service order is exact"
+        );
+    }
+
+    /// Revival guard twin: one key with a live Bound target naming a
+    /// new caller and a stuck recovery naming an old caller with
+    /// withheld (10, 16]. Folding the new caller drops only its target
+    /// and leaves the old recovery (and its order slot) untouched with
+    /// no gap for the old caller; folding the old caller then discloses
+    /// the exact typed (10, 16] gap. Kills a fix that settles any
+    /// same-key recovery regardless of caller.
+    #[test]
+    fn fold_leaves_other_callers_recovery_for_its_own_fold() {
+        use crate::discovery::caller_registry::{DEMOTED_COUNT_REJECTED, RegistryGap};
+        let (mut native, _live) = NativeScene::new();
+        let domain = native.domain;
+        let old = stage_exited_caller(&mut native, 5060, 100);
+        let new = stage_exited_caller(&mut native, 5070, 100);
+        let key = PairKey::scripted(domain, 560, 0, 0);
+        native.scene.coordinator.pair_targets.insert(
+            key,
+            PairTarget::scripted_bound(
+                new,
+                ModuleKey::physical(8, 1, 7300, None, "/fold/revived.so"),
+                0,
+                10,
+                10,
+            ),
+        );
+        let mut stuck = PairRecovery::scripted(old, 0, ModuleId(3));
+        stuck.watermark = 10;
+        stuck.withheld_through = 16;
+        stuck.discarded_through = 10;
+        native.scene.coordinator.recoveries.insert(key, stuck);
+        native.scene.coordinator.recovery_order.push(key);
+        native.scene.coordinator.note_rendered_callers(&[new]);
+        let first = native.scene.coordinator.retire_rendered_callers(300, None);
+        assert_eq!(first.retired, 1, "the new caller folds first");
+        native.scene.coordinator.registry.publish();
+        assert!(
+            native.scene.coordinator.recoveries.contains_key(&key),
+            "the old recovery survives the new caller's fold"
+        );
+        assert_eq!(
+            native.scene.coordinator.recovery_order,
+            vec![key],
+            "its order slot survives exactly"
+        );
+        assert!(
+            native
+                .scene
+                .coordinator
+                .registry
+                .gaps()
+                .iter()
+                .all(|gap| gap.caller != Some(old)),
+            "no gap names the old caller yet"
+        );
+        assert!(
+            matches!(
+                native.scene.coordinator.pair_targets.get(&key),
+                Some(PairTarget::Dropped { base: 10, .. })
+            ),
+            "only the new target drops"
+        );
+        native.scene.coordinator.note_rendered_callers(&[old]);
+        let second = native.scene.coordinator.retire_rendered_callers(300, None);
+        assert_eq!(second.retired, 1, "the old caller folds next");
+        native.scene.coordinator.registry.publish();
+        let expected = RegistryGap {
+            caller: Some(old),
+            module: None,
+            pid: None,
+            subject: DEMOTED_COUNT_REJECTED.into(),
+            reason: "the current physical owner is not proven for absolute count range (10, 16] (6 unattributed calls); historical counts remain and no witness or module-level use is recorded".into(),
+            budget: None,
+        };
+        let gaps: Vec<RegistryGap> = native
+            .scene
+            .coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == DEMOTED_COUNT_REJECTED && gap.caller == Some(old))
+            .cloned()
+            .collect();
+        assert_eq!(gaps, vec![expected], "the old fold discloses exactly");
+        assert!(
+            native.scene.coordinator.recoveries.is_empty(),
+            "no recovery survives both folds"
+        );
+        assert!(
+            native.scene.coordinator.recovery_order.is_empty(),
+            "the service order is exact"
+        );
+    }
+
+    /// Servicing twin: a Dropped pair with a stalled recovery carrying
+    /// withheld (10, 16] for a live caller. Per-pass servicing settles
+    /// it (a Dropped pair never suspends) with one exact typed gap and
+    /// removes it from the map and order without touching the Dropped
+    /// base. Kills a dropped servicing settle for non-live pairs.
+    #[test]
+    fn servicing_settles_dropped_recovery_with_exact_gap() {
+        use crate::discovery::caller_registry::{DEMOTED_COUNT_REJECTED, RegistryGap};
+        let (mut native, live) = NativeScene::new();
+        let domain = native.domain;
+        let key = PairKey::scripted(domain, 570, 0, 0);
+        native.scene.coordinator.pair_targets.insert(
+            key,
+            PairTarget::Dropped {
+                base: 10,
+                base_since: 100,
+            },
+        );
+        let mut recovery = PairRecovery::scripted(live, 0, ModuleId(3));
+        recovery.watermark = 10;
+        recovery.withheld_through = 16;
+        recovery.discarded_through = 10;
+        native.scene.coordinator.recoveries.insert(key, recovery);
+        native.scene.coordinator.recovery_order.push(key);
+        native
+            .scene
+            .coordinator
+            .reconcile_count_eligibility(&mut native.cookies, &mut RecoveryWorkBudget::new());
+        native.scene.coordinator.registry.publish();
+        let expected = RegistryGap {
+            caller: Some(live),
+            module: None,
+            pid: None,
+            subject: DEMOTED_COUNT_REJECTED.into(),
+            reason: "the current physical owner is not proven for absolute count range (10, 16] (6 unattributed calls); historical counts remain and no witness or module-level use is recorded".into(),
+            budget: None,
+        };
+        let gaps: Vec<RegistryGap> = native
+            .scene
+            .coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == DEMOTED_COUNT_REJECTED && gap.caller == Some(live))
+            .cloned()
+            .collect();
+        assert_eq!(gaps, vec![expected], "servicing discloses exactly");
+        assert!(
+            native.scene.coordinator.recoveries.is_empty(),
+            "the settled recovery leaves the map"
+        );
+        assert!(
+            native.scene.coordinator.recovery_order.is_empty(),
+            "the service order is exact"
+        );
+        assert!(
+            matches!(
+                native.scene.coordinator.pair_targets.get(&key),
+                Some(PairTarget::Dropped {
+                    base: 10,
+                    base_since: 100
+                })
+            ),
+            "the Dropped base stays untouched"
+        );
+    }
+
+    /// Servicing twin: a live Suspended target and recovery sharing one
+    /// key for a caller with no record (folded or otherwise forgotten).
+    /// Servicing settles with one exact typed gap, drops the target,
+    /// and removes the recovery — never suspends a dead caller back to
+    /// life. Kills a dropped servicing settle for record-gone pairs.
+    #[test]
+    fn servicing_settles_record_gone_recovery_and_drops_its_target() {
+        use crate::discovery::caller_registry::{DEMOTED_COUNT_REJECTED, RegistryGap};
+        let (mut native, _live) = NativeScene::new();
+        let domain = native.domain;
+        let gone = CallerId(9999);
+        assert!(
+            native.scene.coordinator.adapter.record(gone).is_none(),
+            "the scripted caller has no record"
+        );
+        let key = PairKey::scripted(domain, 580, 0, 0);
+        native.scene.coordinator.pair_targets.insert(
+            key,
+            PairTarget::Suspended {
+                caller: gone,
+                endpoint: EndpointId(0),
+                base: 10,
+                base_since: 0,
+            },
+        );
+        let mut recovery = PairRecovery::scripted(gone, 0, ModuleId(3));
+        recovery.watermark = 10;
+        recovery.withheld_through = 16;
+        recovery.discarded_through = 10;
+        native.scene.coordinator.recoveries.insert(key, recovery);
+        native.scene.coordinator.recovery_order.push(key);
+        native
+            .scene
+            .coordinator
+            .reconcile_count_eligibility(&mut native.cookies, &mut RecoveryWorkBudget::new());
+        native.scene.coordinator.registry.publish();
+        let expected = RegistryGap {
+            caller: Some(gone),
+            module: None,
+            pid: None,
+            subject: DEMOTED_COUNT_REJECTED.into(),
+            reason: "the current physical owner is not proven for absolute count range (10, 16] (6 unattributed calls); historical counts remain and no witness or module-level use is recorded".into(),
+            budget: None,
+        };
+        let gaps: Vec<RegistryGap> = native
+            .scene
+            .coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == DEMOTED_COUNT_REJECTED && gap.caller == Some(gone))
+            .cloned()
+            .collect();
+        assert_eq!(gaps, vec![expected], "servicing discloses exactly");
+        assert!(
+            native.scene.coordinator.recoveries.is_empty(),
+            "the settled recovery leaves the map"
+        );
+        assert!(
+            native.scene.coordinator.recovery_order.is_empty(),
+            "the service order is exact"
+        );
+        assert!(
+            matches!(
+                native.scene.coordinator.pair_targets.get(&key),
+                Some(PairTarget::Dropped { base: 10, .. })
+            ),
+            "the dead caller's target drops"
+        );
+    }
+
+    /// Servicing discipline twin: a live Bound pair with a stalled
+    /// recovery for a live caller survives per-pass servicing — every
+    /// servicing path reinserts or settles, nothing drops. Kills a
+    /// dropped reinsert on the taken path.
+    #[test]
+    fn servicing_retains_live_recovery() {
+        let (mut native, live) = NativeScene::new();
+        let domain = native.domain;
+        let key = PairKey::scripted(domain, 590, 0, 0);
+        native.scene.coordinator.pair_targets.insert(
+            key,
+            PairTarget::scripted_bound(
+                live,
+                ModuleKey::physical(8, 1, 7400, None, "/fold/live.so"),
+                0,
+                10,
+                10,
+            ),
+        );
+        let mut recovery = PairRecovery::scripted(live, 0, ModuleId(3));
+        recovery.watermark = 10;
+        recovery.withheld_through = 10;
+        recovery.discarded_through = 10;
+        native.scene.coordinator.recoveries.insert(key, recovery);
+        native.scene.coordinator.recovery_order.push(key);
+        native
+            .scene
+            .coordinator
+            .reconcile_count_eligibility(&mut native.cookies, &mut RecoveryWorkBudget::new());
+        assert!(
+            native.scene.coordinator.recoveries.contains_key(&key),
+            "the live recovery survives servicing"
+        );
+        assert_eq!(
+            native.scene.coordinator.recovery_order,
+            vec![key],
+            "its order slot survives exactly"
+        );
+    }
+
+    /// Purge twin: a Dropped pair past the grace with a stalled
+    /// recovery sharing the key. Pruning aggregates the base exactly
+    /// into the tombstone and leaves the recovery for servicing, which
+    /// then discloses the exact typed gap. Prune never touches
+    /// recoveries; servicing owns the settle.
+    #[test]
+    fn purge_keeps_recovery_for_servicing_settle() {
+        use crate::discovery::caller_registry::{DEMOTED_COUNT_REJECTED, RegistryGap};
+        let (mut native, live) = NativeScene::new();
+        let domain = native.domain;
+        let key = PairKey::scripted(domain, 600, 0, 0);
+        native.scene.coordinator.pair_targets.insert(
+            key,
+            PairTarget::Dropped {
+                base: 10,
+                base_since: 0,
+            },
+        );
+        let mut recovery = PairRecovery::scripted(live, 0, ModuleId(3));
+        recovery.watermark = 10;
+        recovery.withheld_through = 16;
+        recovery.discarded_through = 10;
+        native.scene.coordinator.recoveries.insert(key, recovery);
+        native.scene.coordinator.recovery_order.push(key);
+        native
+            .scene
+            .coordinator
+            .prune_dropped_pair_targets(EXEC_STATE_GRACE_NS + 1000);
+        assert!(
+            native.scene.coordinator.pair_targets.get(&key).is_none(),
+            "the due Dropped row leaves the live map"
+        );
+        let tomb = native
+            .scene
+            .coordinator
+            .pair_dropped_tombstones
+            .get(&key)
+            .expect("the exact base survives in a tombstone");
+        assert_eq!((tomb.base, tomb.base_since), (10, 0));
+        assert!(
+            native.scene.coordinator.recoveries.contains_key(&key),
+            "the recovery stays for servicing"
+        );
+        native
+            .scene
+            .coordinator
+            .reconcile_count_eligibility(&mut native.cookies, &mut RecoveryWorkBudget::new());
+        native.scene.coordinator.registry.publish();
+        let expected = RegistryGap {
+            caller: Some(live),
+            module: None,
+            pid: None,
+            subject: DEMOTED_COUNT_REJECTED.into(),
+            reason: "the current physical owner is not proven for absolute count range (10, 16] (6 unattributed calls); historical counts remain and no witness or module-level use is recorded".into(),
+            budget: None,
+        };
+        let gaps: Vec<RegistryGap> = native
+            .scene
+            .coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == DEMOTED_COUNT_REJECTED && gap.caller == Some(live))
+            .cloned()
+            .collect();
+        assert_eq!(gaps, vec![expected], "servicing discloses exactly");
+        assert!(
+            native.scene.coordinator.recoveries.is_empty(),
+            "the settled recovery leaves the map"
+        );
+        assert!(
+            native.scene.coordinator.recovery_order.is_empty(),
+            "the service order is exact"
+        );
+    }
+
+    /// Stop twin: stopping the coordinator never clears recoveries or
+    /// their order slots, and a stopped retirement folds nothing — the
+    /// withheld prefix stays intact for the resume. Kills a stop that
+    /// drops recovery state.
+    #[test]
+    fn stop_keeps_recoveries_for_later_settle() {
+        let (mut native, _live) = NativeScene::new();
+        let domain = native.domain;
+        let id = stage_exited_caller(&mut native, 5080, 100);
+        let key = PairKey::scripted(domain, 610, 0, 0);
+        native.scene.coordinator.pair_targets.insert(
+            key,
+            PairTarget::Suspended {
+                caller: id,
+                endpoint: EndpointId(0),
+                base: 10,
+                base_since: 0,
+            },
+        );
+        let mut recovery = PairRecovery::scripted(id, 0, ModuleId(3));
+        recovery.watermark = 10;
+        recovery.withheld_through = 16;
+        recovery.discarded_through = 10;
+        native.scene.coordinator.recoveries.insert(key, recovery);
+        native.scene.coordinator.recovery_order.push(key);
+        native.scene.coordinator.stop();
+        native.scene.coordinator.note_rendered_callers(&[id]);
+        let receipt = native.scene.coordinator.retire_rendered_callers(300, None);
+        assert_eq!(receipt.retired, 0, "a stopped retirement folds nothing");
+        let kept = native
+            .scene
+            .coordinator
+            .recoveries
+            .get(&key)
+            .expect("the recovery survives stop");
+        assert_eq!(
+            (
+                kept.caller,
+                kept.watermark,
+                kept.withheld_through,
+                kept.discarded_through
+            ),
+            (id, 10, 16, 10),
+            "the withheld prefix stays intact"
+        );
+        assert_eq!(
+            native.scene.coordinator.recovery_order,
+            vec![key],
+            "its order slot survives exactly"
         );
     }
 

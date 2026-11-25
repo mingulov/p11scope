@@ -1036,6 +1036,9 @@ class BrowserCells(unittest.TestCase):
 
         No browser, no profiler, no sudo: only the argv the real
         observer would inherit (firefox branch, so no NSS seeding).
+        The firefox path is stubbed: these twins assert argv shape,
+        never the resolved binary, so they run where no browser is
+        installed.
         """
         captured: dict = {}
 
@@ -1046,7 +1049,9 @@ class BrowserCells(unittest.TestCase):
         workdir = self.work / "cell"
         with patch("subprocess.run", side_effect=fake_run), \
                 patch.object(cells, "p11scope_bin",
-                             return_value=Path("/bin/p11scope")):
+                             return_value=Path("/bin/p11scope")), \
+                patch.object(cells, "firefox_binary",
+                             return_value=Path("/bin/firefox")):
             cells.run_direct("PROBE", "firefox", workdir,
                              "http://127.0.0.1:1/", **kwargs)
         return captured["argv"]

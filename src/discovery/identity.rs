@@ -16020,6 +16020,205 @@ mod tests {
     }
 
     #[test]
+    fn scanned_rebind_cursor_refuses_rejected_dependency_entries() {
+        // The collected-graph rebind cursor is a second
+        // attach-granting binder: it resolves modules and entries by
+        // direct `raw_to_id` lookup. A rejected dependency key's
+        // merged plain raw still resolves to the witness-kept lower
+        // file, so the cursor must refuse those entries with the
+        // reconciled row — binding them would credit calls at the
+        // upper file's offsets under the lower file's name — while
+        // the wrapper's valid entry binds and owns the only claim.
+        // Same bug shape as the `bind_scanned_modules` choke,
+        // through `poll_scanned_rebind` to Ready.
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        let (mut pins, dependency, lower_path, _) = rejected_copyup_pins();
+        let provider = overlay(80);
+        let mut wrapper = module(provider);
+        wrapper.mount_namespace = module(dependency).mount_namespace;
+        wrapper.tables[0].live_return = true;
+        wrapper.tables[0].entries.push(ScannedEntry {
+            name: "C_Login",
+            object: dependency,
+            object_path: lower_path.into(),
+            file_offset: 0x2000,
+        });
+        let skipped = pins.absorb(view_pin(&wrapper, 3, SHA, 9, false));
+        assert!(skipped.is_empty(), "the wrapper pins cleanly: {skipped:?}");
+        assert!(
+            pins.rejects(dependency),
+            "the fixture still fails the dependency closed"
+        );
+        let pool = SemanticResourcePool::default();
+        let reserve = pool.reserver();
+        let selection = conservative_selection(&pool, BTreeSet::new(), BTreeSet::new());
+        let mut cursor = PinnedConservativeCursor::new();
+        finish_conservative_copy(&pins, &mut cursor, &selection, &reserve);
+        assert!(
+            cursor
+                .pinned()
+                .expect("the pins copy is ready")
+                .rejects(dependency),
+            "the pins copy carries the rejection"
+        );
+        let raw = vec![wrapper.clone()];
+        let (mut input, _) = retained_rebind_inputs(&pool, &raw, false);
+        let mut rebind = ScannedRebindCursor::new();
+        finish_scanned_rebind(&mut cursor, &mut input, &mut rebind, &reserve);
+        let modules = rebind.modules().expect("the rebind is ready");
+        assert_eq!(modules.len(), 1, "the wrapper module binds");
+        let entries = &modules[0].scanned.tables[0].entries;
+        assert_eq!(
+            entries.len(),
+            1,
+            "only the valid entry binds: {entries:?}"
+        );
+        assert_eq!(entries[0].name, "C_Initialize");
+        assert_eq!(
+            modules[0].entry_objects[0].len(),
+            1,
+            "only the valid entry owns a target"
+        );
+        let skips = rebind.skipped().expect("skips ride with the rebind");
+        assert_eq!(skips.len(), 1, "one entry refuses: {skips:?}");
+        assert_eq!(skips[0].subject, "C_Login");
+        assert!(
+            skips[0]
+                .reason
+                .contains("could not be reconciled to a comparable pinned object"),
+            "the rejected dependency keeps the reconciled row: {}",
+            skips[0].reason
+        );
+        let claims = cursor
+            .reference_rebind_claims_for_test(wrapper.view)
+            .expect("the wrapper view files claims");
+        assert_eq!(
+            claims.targets.len(),
+            1,
+            "only the valid entry owns a claim: {:?}",
+            claims.targets
+        );
+        assert_eq!(claims.targets[0].1, 0x1000);
+    }
+
+    #[test]
+    fn scanned_rebind_cursor_refuses_rejected_module_keys() {
+        // The cursor's provider arm refuses a rejected module key
+        // itself, not just its entries: the collected-graph seal
+        // carries no engine pre-filter, so a module whose own key
+        // failed closed must drop here with the identity row even
+        // though its plain raw still resolves to the witness-kept
+        // lower file.
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        let (pins, dependency, lower_path, _) = rejected_copyup_pins();
+        let mut module = module(dependency);
+        module.path = lower_path.into();
+        assert!(
+            pins.id_for_scanned(&module, dependency, lower_path)
+                .is_some(),
+            "the rejected module key still resolves (the bug shape)"
+        );
+        let pool = SemanticResourcePool::default();
+        let reserve = pool.reserver();
+        let selection = conservative_selection(&pool, BTreeSet::new(), BTreeSet::new());
+        let mut cursor = PinnedConservativeCursor::new();
+        finish_conservative_copy(&pins, &mut cursor, &selection, &reserve);
+        let raw = vec![module];
+        let (mut input, _) = retained_rebind_inputs(&pool, &raw, false);
+        let mut rebind = ScannedRebindCursor::new();
+        finish_scanned_rebind(&mut cursor, &mut input, &mut rebind, &reserve);
+        let modules = rebind.modules().expect("the rebind is ready");
+        assert!(
+            modules.is_empty(),
+            "the rejected module never binds: {modules:?}"
+        );
+        let skips = rebind.skipped().expect("skips ride with the rebind");
+        assert_eq!(skips.len(), 1, "one module refuses: {skips:?}");
+        assert_eq!(skips[0].subject, lower_path);
+        assert!(
+            skips[0]
+                .reason
+                .contains("module has no comparable pinned identity"),
+            "the rejected module keeps the identity row: {}",
+            skips[0].reason
+        );
+    }
+
+    #[test]
+    fn scanned_rebind_cursor_routes_learned_refusals_to_the_learned_row() {
+        // The cursor funnels every skip for a run-persistent learned
+        // module to the finite learned-tables row: a path-carrying
+        // row would collapse to the generic discovery row and hide
+        // which capture input lost its tables. The table keeps the
+        // per-entry detail for its local consumers, exactly like
+        // `bind_scanned_modules`.
+        use crate::discovery::engine::Engine;
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        let (mut pins, dependency, lower_path, _) = rejected_copyup_pins();
+        let provider = overlay(70);
+        let mut scanned = module(provider);
+        scanned.view = Engine::RUN_LEARNED_VIEW_ID;
+        scanned.mount_namespace = module(dependency).mount_namespace;
+        scanned.tables[0].entries.push(ScannedEntry {
+            name: "C_Login",
+            object: dependency,
+            object_path: lower_path.into(),
+            file_offset: 0x2000,
+        });
+        let skipped = pins.absorb(view_pin(&scanned, 1, SHA, 1, false));
+        assert!(skipped.is_empty(), "the learned module pins cleanly: {skipped:?}");
+        let mut rejected_module = module(dependency);
+        rejected_module.view = Engine::RUN_LEARNED_VIEW_ID;
+        rejected_module.path = lower_path.into();
+        let pool = SemanticResourcePool::default();
+        let reserve = pool.reserver();
+        let selection = conservative_selection(&pool, BTreeSet::new(), BTreeSet::new());
+        let mut cursor = PinnedConservativeCursor::new();
+        finish_conservative_copy(&pins, &mut cursor, &selection, &reserve);
+        let raw = vec![scanned, rejected_module];
+        let (mut input, _) = retained_rebind_inputs(&pool, &raw, false);
+        let mut rebind = ScannedRebindCursor::new();
+        finish_scanned_rebind(&mut cursor, &mut input, &mut rebind, &reserve);
+        let modules = rebind.modules().expect("the rebind is ready");
+        assert_eq!(modules.len(), 1, "the learned module binds");
+        let entries = &modules[0].scanned.tables[0].entries;
+        assert_eq!(
+            entries.len(),
+            1,
+            "only the valid entry binds: {entries:?}"
+        );
+        assert_eq!(entries[0].name, "C_Initialize");
+        let unpinned = &modules[0].scanned.tables[0].unpinned;
+        assert_eq!(
+            unpinned.len(),
+            1,
+            "the table keeps the per-entry detail: {unpinned:?}"
+        );
+        assert_eq!(unpinned[0].subject, "C_Login");
+        assert!(
+            unpinned[0]
+                .reason
+                .contains("could not be reconciled to a comparable pinned object"),
+            "the table row keeps its detail: {}",
+            unpinned[0].reason
+        );
+        let skips = rebind.skipped().expect("skips ride with the rebind");
+        assert_eq!(
+            skips.len(),
+            2,
+            "the refused entry and module each file one row: {skips:?}"
+        );
+        for skip in skips {
+            assert_eq!(skip.subject, crate::render::LEARNED_SKIP_SUBJECT);
+            assert_eq!(
+                skip.reason,
+                crate::render::LEARNED_TABLE_UNBOUND_REASON,
+                "every learned refusal names the learned input: {skips:?}"
+            );
+        }
+    }
+
+    #[test]
     fn learned_view_entry_refusals_file_the_learned_row() {
         // Every per-entry refusal arm names the finite learned-tables
         // row for a run-persistent learned module: a path-carrying

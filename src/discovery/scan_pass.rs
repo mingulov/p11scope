@@ -111,12 +111,23 @@ pub(crate) fn scan_in_progress_reason(done: usize, total: usize, tables: usize) 
 /// else misses and scans fresh. `None` when the image was unreadable
 /// (no worse than the pre-exec check: pid plus start time still bind
 /// the task).
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct DecodeCursorKey {
     pub(crate) pid: u32,
     pub(crate) start_time: u64,
     pub(crate) file: InspectedFileKey,
     pub(crate) exec: Option<Vec<u8>>,
+}
+
+impl std::fmt::Debug for DecodeCursorKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecodeCursorKey")
+            .field("pid", &self.pid)
+            .field("start_time", &self.start_time)
+            .field("file", &self.file)
+            .field("exec", &self.exec.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 /// One data mapping's snapshot identity within a cursor fingerprint, in

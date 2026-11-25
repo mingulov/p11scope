@@ -3790,26 +3790,29 @@ impl PinnedObjects {
         out.overlay_uncertain = self.overlay_uncertain;
         out.changed.set(self.changed.get());
         out.next_id = self.next_id;
-        let mut take = |id: PinnedObjectId| {
-            if let Some(entry) = self.by_id.get(&id) {
-                out.by_id.insert(id, entry.clone());
-            }
-            for (raw, mapped) in self.raw_to_id.iter() {
-                if *mapped == id {
-                    out.raw_to_id.insert(raw.clone(), id);
-                }
-            }
-        };
-        take(object);
+        // One pass: collect every wanted id first (the own file
+        // plus each resolvable table-entry dependency), then sweep
+        // `raw_to_id` once. Taking per wanted id repeats the walk
+        // per dependency.
+        let mut wanted: BTreeSet<PinnedObjectId> = BTreeSet::from([object]);
         for entry in module.tables.iter().flat_map(|table| &table.entries) {
             let Some(raw) = RawObjectInstance::scanned(module, entry.object, &entry.object_path)
             else {
                 continue;
             };
-            let Some(id) = self.raw_to_id.get(&raw).copied() else {
-                continue;
-            };
-            take(id);
+            if let Some(id) = self.raw_to_id.get(&raw).copied() {
+                wanted.insert(id);
+            }
+        }
+        for id in &wanted {
+            if let Some(entry) = self.by_id.get(id) {
+                out.by_id.insert(*id, entry.clone());
+            }
+        }
+        for (raw, mapped) in self.raw_to_id.iter() {
+            if wanted.contains(mapped) {
+                out.raw_to_id.insert(raw.clone(), *mapped);
+            }
         }
         Some(out)
     }
@@ -29094,14 +29097,12 @@ mod tests {
             .extract_proof_pins(own_id, &main)
             .expect("the own file extracts");
         let wanted = BTreeSet::from([own_id, dep_a_id, dep_b_id]);
-        let extracted_ids: BTreeSet<PinnedObjectId> =
-            extracted.by_id.keys().copied().collect();
+        let extracted_ids: BTreeSet<PinnedObjectId> = extracted.by_id.keys().copied().collect();
         assert_eq!(
             extracted_ids, wanted,
             "the extraction carries exactly the wanted entries"
         );
-        let mapped_ids: BTreeSet<PinnedObjectId> =
-            extracted.raw_to_id.values().copied().collect();
+        let mapped_ids: BTreeSet<PinnedObjectId> = extracted.raw_to_id.values().copied().collect();
         assert_eq!(
             mapped_ids, wanted,
             "the extraction maps exactly the wanted raws"

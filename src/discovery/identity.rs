@@ -2223,15 +2223,16 @@ impl PinnedObjects {
                 }
             }
         }
-        // Every incoming rejection replays: proven collisions and
-        // same-view refuse-then-file contradictions are both key-level
-        // fail-closed evidence. An unavailable observation never marks
-        // its key rejected, so it cannot poison the merge. Replayed
-        // keys keep the same entry-removing routing refusal a
-        // cross-partition collision takes, and the proven marker
-        // propagates only for proven collisions.
-        for key in other.rejected_keys.iter().copied() {
-            self.reject_observation(key);
+        // Only replayable contradictions replay. `rejected_keys` also
+        // carries unproven routing marks reapplied onto planning
+        // scratches; those must not poison a proven peer when the
+        // scratch is absorbed. A proven collision — including a
+        // same-view refuse-then-file contradiction, which is marked
+        // proven at its rejection site — is key-level fail-closed
+        // evidence and keeps the same entry-removing routing refusal a
+        // cross-partition collision takes.
+        for key in other.proven_collision_keys.iter().copied() {
+            self.reject_key(key);
         }
         self.proven_collision_keys
             .extend(other.proven_collision_keys.iter().copied());
@@ -2908,6 +2909,8 @@ impl PinnedObjects {
         preserve: &[PinnedObjectId],
         proof: RetirementProof,
     ) -> Vec<Skipped> {
+        // The proof gates the caller, not this path: the purge carries
+        // carried_ids() exactly as dev did (no behavior change).
         let _ = proof;
         self.replace_view_pins(view, incoming, preserve)
     }
@@ -3026,6 +3029,8 @@ impl PinnedObjects {
         preserve: &[PinnedObjectId],
         proof: RetirementProof,
     ) {
+        // The proof gates the caller, not this path: the purge carries
+        // carried_ids() exactly as dev did (no behavior change).
         let _ = proof;
         self.prune_view_pins_to_modules(view, surviving, preserve)
     }
@@ -3435,11 +3440,23 @@ impl PinnedObjects {
             return None;
         };
         self.bump_revision();
-        // The retiring view's scan records go with its claims. Kept
-        // custody under a dead ID only closes the carry fence for live
-        // peers and resolves for a reused ID without its own proof; the
-        // carried ids themselves survive through `keep` below.
+        // Carried pins keep the scan custody that proves them while
+        // the carry lives; custody for pins outside `keep` retires
+        // with the view. The post-purge pruning below drops every
+        // carried row whose object did not survive, so the record
+        // never outlives the carry, and `release_view_id` clears the
+        // rest before the numeric ID can be reused.
         let removed_raws = self.raw_ownership.remove(&view).unwrap_or_default();
+        let (kept_raws, removed_raws): (BTreeSet<RawObjectInstance>, BTreeSet<RawObjectInstance>) =
+            removed_raws
+                .into_iter()
+                .partition(|raw| self.raw_to_id.get(raw).is_some_and(|id| keep.contains(id)));
+        if !kept_raws.is_empty() {
+            self.raw_ownership
+                .entry(view)
+                .or_default()
+                .extend(kept_raws);
+        }
         let retained_raws: BTreeSet<_> = self
             .raw_ownership
             .values()
@@ -3515,7 +3532,9 @@ impl PinnedObjects {
     /// [`retire_view_only_if_proven_gone`](Self::retire_view_only_if_proven_gone),
     /// except ids in `keep` survive the by-id/raw purge as claimless carried
     /// pins. `IdentityChanged` never carries: the proof itself says the old
-    /// generation's pins were superseded.
+    /// generation's pins were superseded. That arm is unreachable from the
+    /// four keep sites (their proofs come from `classify_retirement`,
+    /// which never returns it); only direct producers name it.
     pub fn retire_view_except_proven(
         &mut self,
         view: ProcessViewId,
@@ -4054,27 +4073,43 @@ impl PinnedObjects {
         key: ObjectKey,
         path: &str,
     ) -> Option<PinnedObjectId> {
+        self.id_for_scanned_with_carry(module, key, path, false)
+    }
+
+    /// Scan resolution, optionally trusting ownerless retirement custody
+    /// for a module the candidate rebuild is carrying rather than filing
+    /// as a fresh scan. Fresh/reused views never pass `allow_retired`:
+    /// their numeric ID must not inherit a previous generation's proof.
+    fn id_for_scanned_with_carry(
+        &self,
+        module: &ScannedModule,
+        key: ObjectKey,
+        path: &str,
+        allow_retired: bool,
+    ) -> Option<PinnedObjectId> {
         let raw = RawObjectInstance::scanned(module, key, path)?;
-        if self
-            .raw_ownership
-            .get(&module.view)
-            .is_some_and(|owned| owned.contains(&raw))
+        if (self.ownership.contains_key(&module.view) || allow_retired)
+            && self
+                .raw_ownership
+                .get(&module.view)
+                .is_some_and(|owned| owned.contains(&raw))
         {
             return self.raw_to_id.get(&raw).copied();
         }
         let id = self.raw_to_id.get(&raw).copied()?;
-        // A raw alias that survives without its view's scan custody is
+        // A raw alias that survives without live scan custody is
         // retained carry evidence: the alias itself was filed only after
-        // the pin proved this exact namespace/key/path. Do not let a live
-        // view ride a peer's proof, though: while live scan custody owns
-        // the identical raw, the proof belongs to someone else and the
-        // fence stays closed. Once every proven owner has retired, the
-        // claimless carried pin (including proof-variant pre-copy-up rows)
-        // must remain resolvable.
+        // the pin proved this exact namespace/key/path. Ownerless rows
+        // are retirement metadata, not a live fence. Do not let a live
+        // view ride a peer's proof, though: while a view with claims
+        // owns the identical raw, the proof belongs to someone else and
+        // the fence stays closed. Once every proven owner has retired,
+        // the claimless carried pin (including proof-variant pre-copy-up
+        // rows) must remain resolvable.
         if self
             .raw_ownership
-            .values()
-            .any(|owned| owned.contains(&raw))
+            .iter()
+            .any(|(owner, owned)| self.ownership.contains_key(owner) && owned.contains(&raw))
         {
             return None;
         }
@@ -11169,6 +11204,12 @@ fn record_scanned_candidate(
             // this filing.
             if pinned.refused_keys.contains(&(view, entry.raw.key)) {
                 pinned.reject_observation(entry.raw.key);
+                // The filed observation proves the earlier refusal
+                // now contradicts its own view. Mark the key as a
+                // replayable proven collision so the contradiction
+                // survives absorb into the committed set; a bare
+                // unproven rejected-key mark is not replayable.
+                pinned.proven_collision_keys.insert(entry.raw.key);
                 pinned.ambiguous_keys.insert(entry.raw.key);
                 skipped.push(Skipped {
                     subject: entry.raw.path.clone(),
@@ -11506,7 +11547,12 @@ fn bind_scanned_modules_inner(
     let mut reconciled = Vec::new();
     let mut lost = Vec::new();
     for module in modules {
-        let Some(object) = pinned.id_for_scanned(module, module.key, &module.path) else {
+        let Some(object) = pinned.id_for_scanned_with_carry(
+            module,
+            module.key,
+            &module.path,
+            !authority.authorizes(module.view),
+        ) else {
             // A run-persistent learned module that cannot bind names
             // the finite learned-tables row: its path-carrying skip
             // would collapse to the generic discovery row and hide
@@ -11572,7 +11618,12 @@ fn bind_scanned_modules_inner(
                 let target = *resolved
                     .entry((original.object, original.object_path.as_str()))
                     .or_insert_with(|| {
-                        pinned.id_for_scanned(module, original.object, &original.object_path)
+                        pinned.id_for_scanned_with_carry(
+                            module,
+                            original.object,
+                            &original.object_path,
+                            !authority.authorizes(module.view),
+                        )
                     });
                 match target {
                     Some(id)
@@ -15109,7 +15160,9 @@ mod tests {
         );
 
         let mut refused = pin_set(&[(overlay(102), SHA, 7), (overlay(104), SHA, 9)], false);
-        refused.refused_keys.insert((ProcessViewId(77), overlay(102)));
+        refused
+            .refused_keys
+            .insert((ProcessViewId(77), overlay(102)));
         assert!(
             !one.same_pin_content(&refused),
             "a refused view/key pair is content"
@@ -18874,7 +18927,9 @@ mod tests {
             "the unavailable observation keeps its named skip: {skipped:?}"
         );
         assert!(
-            skipped.iter().any(|skip| skip.reason.contains("TEST refused")),
+            skipped
+                .iter()
+                .any(|skip| skip.reason.contains("TEST refused")),
             "the refused observation keeps its named skip: {skipped:?}"
         );
         record_scanned_candidate(
@@ -20320,9 +20375,7 @@ mod tests {
         let mut committed = view_pin(&module_w, 1, SHA, 1, false);
         test_fixture::record_scan_ownership(&mut committed, module_w.view, key, PATH);
         assert!(
-            committed
-                .id_for_scanned(&module_w, key, PATH)
-                .is_some(),
+            committed.id_for_scanned(&module_w, key, PATH).is_some(),
             "W's pin resolves before the merge"
         );
         // Scratch: V refuses K, then contradicts itself by filing it.
@@ -20462,7 +20515,10 @@ mod tests {
         // without ever filing (the early-return path).
         let mut module_v = module(key);
         module_v.view = v;
-        module_v.mount_namespace = MountNamespaceId { device: 1, inode: 100 };
+        module_v.mount_namespace = MountNamespaceId {
+            device: 1,
+            inode: 100,
+        };
         let raw_v = RawObjectInstance::scanned(&module_v, key, "/v/lib.so").unwrap();
         record_scanned_candidate(
             &mut pins,
@@ -20532,7 +20588,10 @@ mod tests {
         );
         let mut module3 = module(key3);
         module3.view = v;
-        module3.mount_namespace = MountNamespaceId { device: 1, inode: 100 };
+        module3.mount_namespace = MountNamespaceId {
+            device: 1,
+            inode: 100,
+        };
         let raw3 = RawObjectInstance::scanned(&module3, key3, "/v/other.so").unwrap();
         record_scanned_candidate(
             &mut pins,
@@ -20607,7 +20666,12 @@ mod tests {
             "physical identity is ambiguous; the collision group was not attached"
         );
         let rendered = serde_json::to_string(&public).unwrap();
-        for private in ["first.so", "second.so", "retained.so", dir.path().to_str().unwrap()] {
+        for private in [
+            "first.so",
+            "second.so",
+            "retained.so",
+            dir.path().to_str().unwrap(),
+        ] {
             assert!(
                 !rendered.contains(private),
                 "the public ambiguity row leaks {private}: {rendered}"

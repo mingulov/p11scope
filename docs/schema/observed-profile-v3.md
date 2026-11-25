@@ -1320,12 +1320,13 @@ Owned-pause arm failures file under their own subject. Each record is
 `{name: "owned pause", reason}` with `reason` exactly:
 
 - `the pause arm failed before the first epoch; the owned child ran
-  without pause protection`: the pause coordinator's arm failed (the
-  owned generation changed, the arm write failed, or the ARMED
-  readback mismatched) and the run continued unpaused. The failed
-  arm's count rides in `evidence.pause_partial`; the row names the
-  protection that was missing, never a call count. Repeat filings
-  dedupe to this one row.
+  without pause protection`: the pause coordinator refused a re-arm
+  (the owned generation changed before the arm) and the run
+  continued unpaused. Arm-write and ARMED-readback failures disclose
+  via `evidence.pause_partial` and `pause_diag` without this row.
+  The failed arm's count rides in `evidence.pause_partial`; the row
+  names the protection that was missing, never a call count. Repeat
+  filings dedupe to this one row.
 - `the release after a failed pause arm could not be proven; the
   owned child may have waited stopped`: a release signal after a
   failed pause arm failed while the owned child was alive or its

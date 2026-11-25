@@ -216,6 +216,24 @@ class StaticValidationTests(unittest.TestCase):
     def test_privileged_lib_rows_are_refused_until_coverage_counts_xfail(self):
         self.assert_bad_row(row(runner="privileged-lib"), "refused until")
 
+    def test_lane_doc_ki_block_parses_as_the_typed_registry(self):
+        text = (ROOT / "docs/testing/known-failing.md").read_text(encoding="utf-8")
+        self.assertEqual(1, text.count("```markdown"))
+        start = text.index("```markdown\n") + len("```markdown\n")
+        block = text[start:text.index("```", start)]
+        self.assertIn("<!-- p11scope-known-issues-v1", block)
+        f = fixture(self)
+        (f.root / "docs/known-limitations.md").write_text(
+            "# Known limitations\n\n" + block, encoding="utf-8")
+        result = f.run_checker()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("typed issue registry", result.stdout)
+        f.python_suite()
+        f.rows([row(issues=["KI-01"])])
+        result = f.run_checker()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not marked test=yes", result.stderr)
+
     def test_typed_provenance_is_required(self):
         for field in ("cell", "issues", "reason", "last_green_sha"):
             with self.subTest(field=field):

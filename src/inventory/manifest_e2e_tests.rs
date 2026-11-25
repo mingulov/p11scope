@@ -3451,13 +3451,26 @@ fn keysize_canary_verify_map_dump(
     Ok(decoded.cells)
 }
 
-/// The scan-level non-vacuity gate. Individual hash-family maps may be
-/// empty as their true state, but a scan that decoded zero cells in total
-/// scanned nothing and must not pass.
-fn keysize_canary_cells_gate(cells: u64) -> Result<()> {
+/// The scan-level verdict. Individual hash-family maps may be empty as
+/// their true state, and program arrays may be empty as sparse state, but
+/// a scan with no dumped maps, no `EVIDENCE_START` dump, or zero scanned
+/// cells proves nothing and must not pass. Refused entries carry no value
+/// bytes, so they do not count as scanned cells in the total.
+fn keysize_canary_scan_verdict(dumped: &[String], cells: u64, refused: u64) -> Result<()> {
     ensure!(
-        cells > 0,
-        "KEYCANARY: decoded zero cells across all owned BPF maps: refusing a vacuous scan"
+        !dumped.is_empty(),
+        "KEYCANARY: no BPF maps dumped for the observer: refusing a vacuous scan"
+    );
+    ensure!(
+        keysize_canary_dumped_covers_evidence_start(dumped),
+        "KEYCANARY: EVIDENCE_START is missing from the dumped maps: {dumped:?}"
+    );
+    let scanned = cells.checked_sub(refused).with_context(|| {
+        format!("KEYCANARY: refused cells ({refused}) exceed decoded cells ({cells})")
+    })?;
+    ensure!(
+        scanned > 0,
+        "KEYCANARY: scanned zero cells across all owned BPF maps (decoded={cells}, refused={refused}): refusing a vacuous scan"
     );
     Ok(())
 }
@@ -3799,7 +3812,7 @@ fn keysize_canary_refused_gate_admits_only_cgroup_array_refusals() {
 /// a refused hash cell fails once (no retry), with the map identity and
 /// bpftool's refusal text in the error so a lookup-time churn race is
 /// diagnosable. The same refusal shape remains legitimate on exactly
-/// `cgroup_array` and counts as one decoded cell.
+/// `cgroup_array` and counts as one decoded entry, not one scanned cell.
 #[test]
 fn keysize_canary_verify_map_dump_rejects_refused_cells_off_cgroup_array() {
     let dump = br#"[{"key": ["0x00", "0x00", "0x00", "0x00"], "value": {"error": "No such file or directory"}}]"#;
@@ -3822,7 +3835,7 @@ fn keysize_canary_verify_map_dump_rejects_refused_cells_off_cgroup_array() {
         keysize_canary_verify_map_dump("CGROUP_FILTER", 7, "cgroup_array", dump, Some((4, 4)))
             .unwrap(),
         1,
-        "a cgroup_array refusal is admitted and counts as its one decoded cell"
+        "a cgroup_array refusal is admitted and counts as a decoded entry, not a scanned cell"
     );
 }
 
@@ -3844,8 +3857,8 @@ fn keysize_canary_verify_map_dump_rejects_absent_widths() {
 /// The pure verifier returns the number of decoded map cells. It refuses
 /// an all-empty plain-array dump (arrays enumerate every index) while
 /// accepting an all-empty hash or program-array dump as a true empty or
-/// sparse map; the scan-level cells gate refuses zero decoded cells in
-/// total, so every map dumping `[]` still fails the live cell.
+/// sparse map. The scan-level verdict refuses zero scanned cells in total,
+/// so every map dumping `[]` still fails the live cell.
 #[test]
 fn keysize_canary_verify_map_dump_counts_cells_and_checks_empty_dumps() {
     let dump =
@@ -3872,8 +3885,90 @@ fn keysize_canary_verify_map_dump_counts_cells_and_checks_empty_dumps() {
         0,
         "an empty program array is sparse empty state, not a malformed dump"
     );
-    assert!(keysize_canary_cells_gate(0).is_err());
-    assert!(keysize_canary_cells_gate(1).is_ok());
+}
+
+/// The scan-level verdict is an exact table: the dumped-list check comes
+/// first, `EVIDENCE_START` coverage comes before the total, and the total
+/// counts only scanned cells (`cells - refused`). An empty hash-family or
+/// program-array dump can be true state, but if every map dumps empty the
+/// scan is vacuous; likewise, refusals alone prove nothing because they
+/// carry no value bytes.
+#[test]
+fn keysize_canary_scan_verdict_exact_table() {
+    let verdict = |dumped: &[String], cells: u64, refused: u64| {
+        keysize_canary_scan_verdict(dumped, cells, refused).map_err(|error| format!("{error:#}"))
+    };
+    let evidence = || vec!["EVIDENCE_START (9)".to_string()];
+    let no_evidence = || vec!["PAUSE_PIDS (10)".to_string()];
+    let cases = [
+        (
+            vec![],
+            7,
+            0,
+            Err("KEYCANARY: no BPF maps dumped for the observer: refusing a vacuous scan"
+                .to_string()),
+        ),
+        (
+            no_evidence(),
+            0,
+            0,
+            Err("KEYCANARY: EVIDENCE_START is missing from the dumped maps: [\"PAUSE_PIDS (10)\"]"
+                .to_string()),
+        ),
+        (
+            evidence(),
+            0,
+            0,
+            Err("KEYCANARY: scanned zero cells across all owned BPF maps (decoded=0, refused=0): refusing a vacuous scan"
+                .to_string()),
+        ),
+        (
+            evidence(),
+            2,
+            2,
+            Err("KEYCANARY: scanned zero cells across all owned BPF maps (decoded=2, refused=2): refusing a vacuous scan"
+                .to_string()),
+        ),
+        (
+            evidence(),
+            1,
+            2,
+            Err("KEYCANARY: refused cells (2) exceed decoded cells (1)".to_string()),
+        ),
+        (evidence(), 1, 0, Ok(())),
+        (evidence(), 3, 2, Ok(())),
+    ];
+    for (dumped, cells, refused, expected) in cases {
+        assert_eq!(
+            verdict(&dumped, cells, refused),
+            expected,
+            "dumped={dumped:?} cells={cells} refused={refused}"
+        );
+    }
+}
+
+/// The empty-dump kind classification is an exact accept/reject table:
+/// hash-family maps may be genuinely empty and program arrays may be
+/// sparse; enumerated arrays and every unknown kind fail closed.
+#[test]
+fn keysize_canary_empty_kind_table_is_exact() {
+    const EXPECTED: &[(&str, bool)] = &[
+        ("hash", true),
+        ("percpu_hash", true),
+        ("lru_hash", true),
+        ("lru_percpu_hash", true),
+        ("prog_array", true),
+        ("array", false),
+        ("percpu_array", false),
+        ("cgroup_array", false),
+        ("ringbuf", false),
+        ("unknown_kind", false),
+    ];
+    let actual: Vec<(&str, bool)> = EXPECTED
+        .iter()
+        .map(|(kind, _)| (*kind, keysize_canary_kind_may_dump_empty(kind)))
+        .collect();
+    assert_eq!(actual.as_slice(), EXPECTED);
 }
 
 /// The verifier wires both marker scans into the live per-dump path: the
@@ -4892,8 +4987,9 @@ fn keysize_canary_listed_lengths(listed: &[u8]) -> Result<Vec<(u32, usize, usize
 
 /// The owned-map scan result: dumped (and scanned) maps, ringbufs the
 /// kernel cannot dump, identity task storage the kernel cannot dump,
-/// the scanned dump bytes, the decoded cell count, and the refused-cell
-/// count with the maps that refused. Only names and counts ever print;
+/// the scanned dump bytes, the decoded entry count (including refused
+/// entries), and the refused-cell count with the maps that refused. Only
+/// names and counts ever print;
 /// dump contents stay in 0600 scratch files.
 struct KeysizeCanaryMapScan {
     dumped: Vec<String>,
@@ -4959,8 +5055,9 @@ fn keysize_canary_dumped_covers_evidence_start(dumped: &[String]) -> bool {
 /// lookup refusals are counted and gated on the map kind (only
 /// `cgroup_array` may refuse); a bpftool dump refusal, an unaudited
 /// task-storage name, an empty dump of a kind that cannot validly be
-/// empty, zero decoded cells in total, an empty dump list, a missing
-/// `EVIDENCE_START`, or a failed positive control fails the cell: an
+/// empty, zero scanned cells in total (decoded minus refused), an empty
+/// dump list, a missing `EVIDENCE_START`, or a failed positive control
+/// fails the cell: an
 /// unscanned map is a hole, not a pass.
 fn keysize_canary_scan_owned_maps(pid: u32, dump_dir: &Path) -> Result<KeysizeCanaryMapScan> {
     use std::io::Write as _;
@@ -5066,15 +5163,7 @@ fn keysize_canary_scan_owned_maps(pid: u32, dump_dir: &Path) -> Result<KeysizeCa
         combined.extend_from_slice(&dump.stdout);
         dumped.push(format!("{name} ({id})"));
     }
-    keysize_canary_cells_gate(cells)?;
-    ensure!(
-        !dumped.is_empty(),
-        "{TAG}: no BPF maps dumped for the observer (pid {pid}): refusing a vacuous scan"
-    );
-    ensure!(
-        keysize_canary_dumped_covers_evidence_start(&dumped),
-        "{TAG}: EVIDENCE_START is missing from the dumped maps: {dumped:?}"
-    );
+    keysize_canary_scan_verdict(&dumped, cells, refused)?;
     combined.extend_from_slice(KEYSIZE_CANARY_MARKER);
     ensure!(
         keysize_canary_scan_map_dump(&combined),

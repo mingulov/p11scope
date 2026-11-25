@@ -387,21 +387,72 @@ def run_tool(arguments, epoch: int, what: str):
         raise ValueError(f"{what} failed with exit {result.returncode}: {detail}")
 
 
+def debian_copyright() -> bytes:
+    """Machine-readable Debian copyright for the shipped binary bundle."""
+    return b"""Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: p11scope
+Source: https://github.com/mingulov/p11scope
+
+Files: *
+Copyright: 2026 Denis Mingulov <denis@mingulov.com>
+License: GPL-3.0-or-later
+ The userspace observer and helper are free software under GPL-3.0-or-later.
+ The full text is installed at /usr/share/doc/p11scope/LICENSE.
+
+Files: crates/ebpf/* crates/ebpf-common/*
+Copyright: 2026 Denis Mingulov <denis@mingulov.com>
+License: GPL-2.0-only
+ The embedded eBPF programs are free software under GPL-2.0-only.
+ The full text is installed at /usr/share/doc/p11scope/LICENSES/GPL-2.0-only.txt.
+
+Files: third-party/*
+Copyright: many upstream authors
+License: MIT and Apache-2.0
+ The statically linked Rust and native runtime portions carry their own
+ copyright notices and license texts under /usr/share/doc/p11scope/notices/.
+"""
+
+
+def command_first_line(arguments, what: str) -> str:
+    result = subprocess.run(arguments, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if result.returncode != 0:
+        raise ValueError(f"cannot read {what} version")
+    line = result.stdout.decode(errors="replace").splitlines()[0].strip()
+    if not line or any(ord(c) < 32 for c in line):
+        raise ValueError(f"invalid {what} version")
+    return line
+
+
+def dpkg_package_version(name: str) -> str:
+    return command_first_line(["dpkg-query", "-W", f"-f=${{Version}}", name], name)
+
+
+def package_tool_versions() -> dict:
+    """Versions of the floating packaging tools that shape deb/rpm bytes."""
+    return {
+        "dpkg-deb": command_first_line(["dpkg-deb", "--version"], "dpkg-deb"),
+        "rpmbuild": command_first_line(["rpmbuild", "--version"], "rpmbuild"),
+        "zlib1g": dpkg_package_version("zlib1g"),
+    }
+
+
 def build_deb(staging: Path, observer: bytes, helper: bytes, docs,
               version: str, capture_mode: str, epoch: int) -> bytes:
     dpkg_deb = shutil.which("dpkg-deb")
     if not dpkg_deb:
         raise ValueError("dpkg-deb is required to build the DEB package")
     root = staging / "deb"
-    control = (f"Package: p11scope\nVersion: {version}\nSection: utils\n"
-               f"Priority: optional\nArchitecture: amd64\n"
-               f"Maintainer: {SYSTEM_PACKAGE_MAINTAINER}\n"
-               f"Description: {system_package_description(capture_mode, version)}\n")
-    files = {"DEBIAN/control": (control.encode(), 0o644),
-             "usr/bin/p11scope": (observer, 0o755),
+    files = {"usr/bin/p11scope": (observer, 0o755),
              "usr/bin/p11scope-discover": (helper, 0o755)}
     for name, (data, mode) in docs.items():
         files[f"usr/share/doc/p11scope/{name}"] = (data, mode)
+    installed_kib = (sum(len(data) for data, _ in files.values()) + 1023) // 1024
+    control = (f"Package: p11scope\nVersion: {version}\nSection: utils\n"
+               f"Priority: optional\nArchitecture: amd64\n"
+               f"Depends: libc6 (>= 2.34)\nInstalled-Size: {installed_kib}\n"
+               f"Maintainer: {SYSTEM_PACKAGE_MAINTAINER}\n"
+               f"Description: {system_package_description(capture_mode, version)}\n")
+    files["DEBIAN/control"] = (control.encode(), 0o644)
     write_tree(root, files, epoch)
     output = staging / "p11scope.deb"
     run_tool([dpkg_deb, "--build", "--root-owner-group", str(root), str(output)],
@@ -431,7 +482,7 @@ def build_rpm(staging: Path, observer: bytes, helper: bytes, docs,
     doc_entries = "\n".join(f"/usr/share/doc/p11scope/{name}"
                             for name in sorted(docs))
     spec = (f"Name: p11scope\nVersion: {version}\nRelease: 1\n"
-            f"Summary: {SYSTEM_PACKAGE_SUMMARY}\nLicense: GPL-3.0-or-later\n"
+            f"Summary: {SYSTEM_PACKAGE_SUMMARY}\nLicense: GPL-3.0-or-later AND GPL-2.0-only AND MIT AND Apache-2.0\n"
             f"URL: {SYSTEM_PACKAGE_URL}\nBuildArch: x86_64\n"
             "%global __os_install_post %{nil}\n"
             "%description\n"
@@ -481,7 +532,8 @@ def package(root: Path, receipt: Path, notices: Path, source: Path, output: Path
     hashes, binaries = artifacts(receipt, facts["release_artifacts_sha256"])
     notices_files, notices_hash = notices_payload(root, notices, head, tree)
     source_data = source_archive(root, source, head)
-    source_name = f"p11scope-{version}-source.tar.gz"
+    artifact_version = version if capture_mode == "full" else f"{version}+p0"
+    source_name = f"p11scope-{artifact_version}-source.tar.gz"
     pre_provenance = {
         "schema_version": 1, "version": version, "head": head, "tree": tree,
         "build_receipt_status": 0, "release_artifacts_sha256": facts["release_artifacts_sha256"],
@@ -489,6 +541,8 @@ def package(root: Path, receipt: Path, notices: Path, source: Path, output: Path
         "source": {"file": source_name, "sha256": digest(source_data), "format": "networked-source-export-v1"},
         "p11scope_features": list(OFFICIAL_P11SCOPE_FEATURES[capture_mode]),
         "rust": (root / ".release-rust-version").read_text(encoding="utf-8").strip(), "bpf_rust": "nightly-2026-05-20",
+        "clang-18": facts.get("clang_18_version", "unrecorded"),
+        "package_tools": package_tool_versions(),
         "scope": OFFICIAL_SCOPE[capture_mode],
     }
     # System packages embed the pre-package provenance (they cannot contain
@@ -499,16 +553,18 @@ def package(root: Path, receipt: Path, notices: Path, source: Path, output: Path
     licenses.update({"notices/" + name: (data, 0o644) for name, data in notices_files.items()})
     system_docs = dict(licenses)
     system_docs["RELEASE.json"] = (pre_public, 0o644)
+    system_docs["copyright"] = (debian_copyright(), 0o644)
     epoch = commit_epoch(root)
-    deb_name = f"p11scope_{version}_amd64.deb"
-    rpm_name = f"p11scope-{version}-1.x86_64.rpm"
+    package_version = artifact_version
+    deb_name = f"p11scope_{package_version}_amd64.deb"
+    rpm_name = f"p11scope-{package_version}-1.x86_64.rpm"
     with tempfile.TemporaryDirectory(prefix="p11scope-system-", dir=parent) as staging_name:
         staging = Path(staging_name)
         staging.chmod(0o700)
         deb_data = build_deb(staging, binaries[SYSTEM_PACKAGE_OBSERVER], binaries[SYSTEM_PACKAGE_HELPER],
-                             system_docs, version, capture_mode, epoch)
+                             system_docs, package_version, capture_mode, epoch)
         rpm_data = build_rpm(staging, binaries[SYSTEM_PACKAGE_OBSERVER], binaries[SYSTEM_PACKAGE_HELPER],
-                             system_docs, version, capture_mode, epoch)
+                             system_docs, package_version, capture_mode, epoch)
     provenance = dict(pre_provenance)
     provenance["packages"] = {
         "deb": {"file": deb_name, "sha256": digest(deb_data)},
@@ -524,9 +580,9 @@ def package(root: Path, receipt: Path, notices: Path, source: Path, output: Path
     output.mkdir(mode=0o700)
     try:
         builds = (
-            (f"p11scope-{version}-x86_64-linux-musl", "p11scope", "p11scope"),
-            (f"p11scope-discover-{version}-x86_64-linux-gnu", "p11scope-discover", "p11scope-discover-glibc"),
-            (f"p11scope-discover-{version}-x86_64-linux-musl", "p11scope-discover", "p11scope-discover-musl"),
+            (f"p11scope-{package_version}-x86_64-linux-musl", "p11scope", "p11scope"),
+            (f"p11scope-discover-{package_version}-x86_64-linux-gnu", "p11scope-discover", "p11scope-discover-glibc"),
+            (f"p11scope-discover-{package_version}-x86_64-linux-musl", "p11scope-discover", "p11scope-discover-musl"),
         )
         for prefix, installed_name, artifact in builds:
             payload = dict(common)

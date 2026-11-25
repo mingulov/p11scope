@@ -71,6 +71,10 @@ versioned separately and are opaque, exact dispatch keys.
   aggregate. Inventory text names folded departed callers per module:
   a `departed use:` summary row counts the folded callers, entries
   and edges (plus any identities or mechanisms past the row bound).
+  The closed native-witness `unbound_reasons` vocabulary also gains
+  `clocks_incomparable`: a live cookie answer matched, but BPF hook
+  stamps and admission stamps may not share a clock, so the observer
+  refuses the first binding instead of risking wrong attribution.
 
 ### Fixed
 

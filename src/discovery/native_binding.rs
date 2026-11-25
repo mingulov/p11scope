@@ -20,7 +20,11 @@
 //! 3. `X.first_seen_ns <= t0`, or the row predates the admission inside
 //!    a provably clean window (late binding): exec coverage was already
 //!    active at `t0`, and no exec of `T` or lost lifecycle evidence is
-//!    recorded at or after `t0`. The live cookie match (rules 1+2) plus
+//!    recorded at or after `t0`. Rules 3-5 compare BPF hook stamps with
+//!    admission stamps, so a first live binding requires a comparable
+//!    clock pair and otherwise fails closed as
+//!    [`UnboundReason::ClocksIncomparable`]. The live cookie match
+//!    (rules 1+2) plus
 //!    the post-admission horizons (rule 4) then prove the row is this
 //!    incarnation's image: the same task held the same image from the
 //!    row to the sighting, so no pre-admission exec could have swapped
@@ -424,6 +428,9 @@ pub(crate) enum UnboundReason {
     /// Lifecycle evidence (an exec record) may have been lost at or after
     /// the incarnation's admission.
     LifecycleLoss,
+    /// BPF hook stamps and admission stamps may not share a clock, so the
+    /// cross-clock ordering a first live binding needs cannot be proven.
+    ClocksIncomparable,
     /// Several images of one ticket compete for the incarnation.
     ExecAmbiguous,
     /// The row proved its incarnation's image ended; the successor was
@@ -450,6 +457,7 @@ impl UnboundReason {
             Self::BeforeAdmission => "before_admission",
             Self::ExecAfterAdmission => "exec_after_admission",
             Self::LifecycleLoss => "lifecycle_loss",
+            Self::ClocksIncomparable => "clocks_incomparable",
             Self::ExecAmbiguous => "exec_ambiguous",
             Self::ExecTransition => "exec_transition",
             Self::ExecCoverageGap => "exec_coverage_gap",
@@ -470,6 +478,9 @@ impl UnboundReason {
             Self::BeforeAdmission => "the row predates the caller incarnation's admission",
             Self::ExecAfterAdmission => "an exec of the tgid was seen after the admission",
             Self::LifecycleLoss => "lifecycle evidence was lost after the admission",
+            Self::ClocksIncomparable => {
+                "BPF hook stamps and admission stamps may not share a clock"
+            }
             Self::ExecAmbiguous => "several images of one task cookie compete",
             Self::ExecTransition => "the row proved an exec; its successor was admitted later",
             Self::ExecCoverageGap => {
@@ -727,8 +738,9 @@ struct Pending {
 /// monotonic lifetime (admission at or before the event, and strictly
 /// before the observed exit when retired). Anything else is ambiguous
 /// and the row keeps its live-miss gap.
-fn retained_candidate(candidate: &RetainedCaller, event_ns: u64) -> bool {
-    candidate.start_time.is_some()
+fn retained_candidate(candidate: &RetainedCaller, event_ns: u64, clocks_comparable: bool) -> bool {
+    clocks_comparable
+        && candidate.start_time.is_some()
         && candidate.exe_present
         && candidate.exec_observed
         && matches!(
@@ -1476,14 +1488,19 @@ impl NativeBinder {
             // other answer falls through to the live query below.
             let mut exit_hit: Option<RetainedCaller> = None;
             let mut exit_deferred = false;
-            if read_healthy
+            if self.exit_clocks_comparable
+                && read_healthy
                 && live
                     .as_ref()
                     .is_some_and(|caller| caller.first_seen_ns > row.recorded_at_ns)
             {
                 match lookup.try_exit_witnessed_caller(row.host_tgid, row.recorded_at_ns) {
                     HolderScan::Found(witnessed)
-                        if retained_candidate(&witnessed, row.recorded_at_ns) =>
+                        if retained_candidate(
+                            &witnessed,
+                            row.recorded_at_ns,
+                            self.exit_clocks_comparable,
+                        ) =>
                     {
                         exit_hit = Some(witnessed);
                     }
@@ -1522,7 +1539,8 @@ impl NativeBinder {
                         let [only] = held.as_slice() else {
                             return None;
                         };
-                        retained_candidate(only, row.recorded_at_ns).then_some((*only, false))
+                        retained_candidate(only, row.recorded_at_ns, self.exit_clocks_comparable)
+                            .then_some((*only, false))
                     })
                     .or_else(|| {
                         if !(needs_retained && read_healthy) {
@@ -1530,7 +1548,11 @@ impl NativeBinder {
                         }
                         match lookup.try_exit_witnessed_caller(row.host_tgid, row.recorded_at_ns) {
                             HolderScan::Found(witnessed)
-                                if retained_candidate(&witnessed, row.recorded_at_ns) =>
+                                if retained_candidate(
+                                    &witnessed,
+                                    row.recorded_at_ns,
+                                    self.exit_clocks_comparable,
+                                ) =>
                             {
                                 Some((witnessed, true))
                             }
@@ -1661,7 +1683,7 @@ impl NativeBinder {
                 };
                 pending.exit_retry_owed = false;
                 if let HolderScan::Found(only) = verdict
-                    && retained_candidate(&only, event_ns)
+                    && retained_candidate(&only, event_ns, self.exit_clocks_comparable)
                 {
                     pending.retained = Some(only);
                     pending.retained_is_exit = true;
@@ -1691,6 +1713,7 @@ impl NativeBinder {
             // are exhausted. A retry that just answered Absent keeps
             // that answer instead of re-running its scan.
             if !exit_absent_this_visit
+                && self.exit_clocks_comparable
                 && let Some(caller) = hit.as_ref()
                 && self.domains[index].pending.get(rel).is_some_and(|pending| {
                     pending.read_healthy && caller.first_seen_ns > pending.row.recorded_at_ns
@@ -1702,7 +1725,9 @@ impl NativeBinder {
                     .map(|pending| pending.row.recorded_at_ns)
                     .expect("the row was just filtered present");
                 match lookup.try_exit_witnessed_caller(row_tgid, event_ns) {
-                    HolderScan::Found(only) if retained_candidate(&only, event_ns) => {
+                    HolderScan::Found(only)
+                        if retained_candidate(&only, event_ns, self.exit_clocks_comparable) =>
+                    {
                         let state = &mut self.domains[index];
                         let Some(pending) = state.pending.get_mut(rel) else {
                             continue;
@@ -1773,7 +1798,7 @@ impl NativeBinder {
                     pending.resight_due = false;
                     pending.last_attempt = Some(current);
                     if let HolderScan::Found(only) = verdict
-                        && retained_candidate(&only, event_ns)
+                        && retained_candidate(&only, event_ns, self.exit_clocks_comparable)
                     {
                         pending.retained = Some(only);
                         pending.retained_is_exit = true;
@@ -1913,7 +1938,12 @@ impl NativeBinder {
         // The live PID lookup must still name the requested caller.
         let live = lookup.live_caller(pid).filter(|live| live.id == caller)?;
         // A known-invalidated binding: an exec or lost lifecycle evidence
-        // at or after the caller's admission.
+        // at or after the caller's admission. Those orderings are
+        // cross-clock; without a comparable clock no current image is
+        // exportable at all.
+        if !self.exit_clocks_comparable {
+            return None;
+        }
         if state
             .exec_ns
             .get(&pid)
@@ -2019,6 +2049,8 @@ impl NativeBinder {
             Some(UnboundReason::ExecTransition)
         } else if state.callers.get(&request.caller) != Some(&(request.image, request.exec_id)) {
             Some(UnboundReason::ExecAmbiguous)
+        } else if !self.exit_clocks_comparable {
+            Some(UnboundReason::ClocksIncomparable)
         } else if state
             .exec_ns
             .get(&request.pid)
@@ -2312,6 +2344,14 @@ fn decide(
         } else {
             UnboundReason::ExecAmbiguous
         }));
+    }
+    // Rules 3-5 order BPF hook stamps against the admission stamp. When
+    // those clocks may be incomparable every one of those orderings is
+    // meaningless, so a first live binding fails closed before Rule 3.
+    // (The exact-cache and held-image branches above need no clock order:
+    // one is prior proof, the other a live ticket/exec-sequence fact.)
+    if !clocks_comparable {
+        return DecideOutcome::Decided(Binding::Unbound(UnboundReason::ClocksIncomparable));
     }
     // Rule 3: never a row recorded before the admission, unless its
     // pre-admission window is provably clean (late binding).

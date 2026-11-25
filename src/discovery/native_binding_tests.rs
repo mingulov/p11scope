@@ -741,6 +741,7 @@ fn metadata_proof_binds_actual_adapter_original_and_keeps_paired_custody_charge(
     let replacement = Arc::new(PidPin::open(original.pid()).unwrap());
     let domain = NativeDomainId::mint();
     let mut binder = NativeBinder::new(BinderLimits::default());
+    binder.set_exit_clocks_comparable(true); // Scripted common clock.
     binder.metadata_clock_qualified = true; // Scripted native clock envelope.
     binder.note_exec_coverage(ExecCoverage::scripted(domain, 0));
     let mut identity = Identity(domain);
@@ -815,6 +816,387 @@ fn a_row_binds_exactly_once_both_horizons_cover_its_read() {
     assert_eq!(run.verdicts(), vec![bound(x)]);
     assert_eq!(run.binder.census().bound, 1);
     assert_eq!(run.binder.census().pending, 0);
+}
+
+#[test]
+fn comparable_clocks_bind_the_live_row() {
+    // Positive twin of the incomparable-clock refusal below: the same
+    // row, sighting and horizons bind when the cross-clock ordering is
+    // meaningful.
+    let mut run = Run::new();
+    let d = run.domain;
+    let x = run.world.admit(T, 1, 0, 1_000);
+    run.world.answer(T, 1, d, cookie(d, 7));
+    run.read(vec![row(d, 7, 1, T, 1_500)]);
+    run.settle();
+    assert_eq!(run.verdicts(), vec![bound(x)]);
+    let census = run.binder.census();
+    assert_eq!(census.rows, 1);
+    assert_eq!(census.bound, 1);
+    assert_eq!(census.unbound_total(), 0);
+}
+
+#[test]
+fn incomparable_clocks_refuse_the_live_bind_and_count_the_reason() {
+    // Killing test for the live fail-closed gate: the cookie answer is
+    // exact and every horizon arrives, but Rules 3-5 would have to order
+    // BPF hook stamps against the admission stamp across incomparable
+    // clocks. The refusal is a typed census row under its own code.
+    let mut run = Run::new();
+    let d = run.domain;
+    run.world.admit(T, 1, 0, 1_000);
+    run.world.answer(T, 1, d, cookie(d, 7));
+    run.binder.set_exit_clocks_comparable(false);
+    run.read(vec![row(d, 7, 1, T, 1_500)]);
+    run.settle();
+    assert_eq!(
+        run.verdicts(),
+        vec![unbound(UnboundReason::ClocksIncomparable)]
+    );
+    let census = run.binder.census();
+    assert_eq!(census.rows, 1);
+    assert_eq!(census.bound, 0);
+    assert_eq!(census.unbound_total(), 1);
+    assert_eq!(census.pending, 0);
+    assert_eq!(census.unbound.len(), 1);
+    assert_eq!(
+        census.unbound.get(&UnboundReason::ClocksIncomparable),
+        Some(&1)
+    );
+}
+
+#[test]
+fn incomparable_clocks_refuse_a_resighted_live_bind() {
+    // The same live seam through the owed-row re-sight pass: the first
+    // read has no live caller and spends no query; the later pass sights
+    // and queries the live incarnation, then refuses the cross-clock bind.
+    let mut run = Run::new();
+    let d = run.domain;
+    run.binder.set_exit_clocks_comparable(false);
+    run.read(vec![row(d, 7, 1, T, 1_500)]);
+    assert_eq!(run.world.queries, 0);
+    run.world.admit(T, 1, 0, 1_000);
+    run.world.answer(T, 1, d, cookie(d, 7));
+    run.read(Vec::new());
+    assert_eq!(run.world.queries, 1);
+    run.drain(&[]);
+    assert_eq!(
+        run.verdicts(),
+        vec![unbound(UnboundReason::ClocksIncomparable)]
+    );
+    assert_eq!(
+        run.binder
+            .census()
+            .unbound
+            .get(&UnboundReason::ClocksIncomparable),
+        Some(&1)
+    );
+}
+
+/// A lookup whose live incarnation numerically postdates the row and whose
+/// exit scan is instrumented. The scan answer is scripted per test.
+struct ExitFirstLive {
+    pin: Pin,
+    caller: CallerId,
+    live: std::cell::Cell<bool>,
+    scan_calls: std::cell::Cell<usize>,
+    containing: bool,
+}
+
+impl ExitFirstLive {
+    fn new(containing: bool) -> Self {
+        Self {
+            pin: (T, 1),
+            caller: CallerId(0),
+            live: std::cell::Cell::new(true),
+            scan_calls: std::cell::Cell::new(0),
+            containing,
+        }
+    }
+}
+
+impl CallerLookup<Pin> for ExitFirstLive {
+    fn live_caller(&self, pid: u32) -> Option<LiveCaller<'_, Pin>> {
+        (pid == T && self.live.get()).then_some(LiveCaller {
+            id: self.caller,
+            first_seen_ns: 2_000,
+            pin: &self.pin,
+        })
+    }
+
+    fn exit_witnessed_caller(&self, pid: u32, event_ns: u64) -> Option<RetainedCaller> {
+        self.scan_calls.set(self.scan_calls.get() + 1);
+        (pid == T && event_ns == 1_500).then_some(RetainedCaller {
+            id: CallerId(7),
+            first_seen_ns: if self.containing { 1_000 } else { 1_600 },
+            last_seen_ns: 1_800,
+            retired: true,
+            start_time: Some(100),
+            exe_present: true,
+            exec_observed: true,
+            lifecycle: CallerLifecycle::Exited,
+        })
+    }
+}
+
+fn absorb_exit_first_scene(
+    binder: &mut NativeBinder,
+    domain: NativeDomainId,
+    lookup: &ExitFirstLive,
+    rows: Vec<WitnessRow>,
+    at_ns: u64,
+    answers: &HashMap<(Pin, NativeDomainId), CookieQuery>,
+    queries: &mut usize,
+) {
+    binder.absorb_witnesses(
+        &read_at(domain, rows, at_ns, Some(0)),
+        lookup,
+        &mut AnswerTable { answers, queries },
+    );
+}
+
+fn exit_first_binder(domain: NativeDomainId) -> NativeBinder {
+    let mut binder = NativeBinder::new(BinderLimits::default());
+    binder.set_exit_clocks_comparable(false);
+    binder.note_exec_coverage(ExecCoverage::scripted(domain, 0));
+    binder
+}
+
+#[test]
+fn incomparable_clocks_do_not_order_the_read_exit_first_gate() {
+    // Killing test for the read-path comparison itself: the live
+    // incarnation numerically postdates the row, but that ordering is
+    // meaningless here, so the exit scan never runs. An out-of-interval
+    // scan answer isolates this gate from retained-candidate acceptance.
+    let domain = NativeDomainId::mint();
+    let mut binder = exit_first_binder(domain);
+    let lookup = ExitFirstLive::new(false);
+    let mut answers = HashMap::new();
+    answers.insert(((T, 1), domain), cookie(domain, 7));
+    let mut queries = 0;
+    absorb_exit_first_scene(
+        &mut binder,
+        domain,
+        &lookup,
+        vec![row(domain, 7, 1, T, 1_500)],
+        1_000,
+        &answers,
+        &mut queries,
+    );
+    assert_eq!(lookup.scan_calls.get(), 0);
+    assert_eq!(queries, 1);
+    binder.absorb_lifecycle(&drained(domain, &[], 3_000));
+    absorb_exit_first_scene(
+        &mut binder,
+        domain,
+        &lookup,
+        Vec::new(),
+        4_000,
+        &answers,
+        &mut queries,
+    );
+    assert_eq!(
+        binder
+            .take_decisions()
+            .into_iter()
+            .map(|d| d.binding)
+            .collect::<Vec<_>>(),
+        vec![unbound(UnboundReason::ClocksIncomparable)]
+    );
+}
+
+#[test]
+fn incomparable_clocks_do_not_accept_a_read_retained_interval() {
+    // Killing test for retained-interval acceptance on the read path: a
+    // numerically containing interval is still meaningless, so the live
+    // query proceeds and the row reaches the typed clock refusal.
+    let domain = NativeDomainId::mint();
+    let mut binder = exit_first_binder(domain);
+    let lookup = ExitFirstLive::new(true);
+    let mut answers = HashMap::new();
+    answers.insert(((T, 1), domain), cookie(domain, 7));
+    let mut queries = 0;
+    absorb_exit_first_scene(
+        &mut binder,
+        domain,
+        &lookup,
+        vec![row(domain, 7, 1, T, 1_500)],
+        1_000,
+        &answers,
+        &mut queries,
+    );
+    assert_eq!(lookup.scan_calls.get(), 0);
+    assert_eq!(queries, 1);
+    binder.absorb_lifecycle(&drained(domain, &[], 3_000));
+    absorb_exit_first_scene(
+        &mut binder,
+        domain,
+        &lookup,
+        Vec::new(),
+        4_000,
+        &answers,
+        &mut queries,
+    );
+    assert_eq!(
+        binder
+            .take_decisions()
+            .into_iter()
+            .map(|d| d.binding)
+            .collect::<Vec<_>>(),
+        vec![unbound(UnboundReason::ClocksIncomparable)]
+    );
+}
+
+#[test]
+fn incomparable_clocks_do_not_order_the_resight_exit_first_gate() {
+    // The re-sight half of the same routing seam: the first read has no
+    // live caller and owes an attempt. When the live successor appears,
+    // incomparable clocks must not order it after the row to select the
+    // exit scan ahead of the live query.
+    let domain = NativeDomainId::mint();
+    let mut binder = exit_first_binder(domain);
+    let lookup = ExitFirstLive::new(true);
+    lookup.live.set(false);
+    let mut answers = HashMap::new();
+    answers.insert(((T, 1), domain), cookie(domain, 7));
+    let mut queries = 0;
+    absorb_exit_first_scene(
+        &mut binder,
+        domain,
+        &lookup,
+        vec![row(domain, 7, 1, T, 1_500)],
+        1_000,
+        &answers,
+        &mut queries,
+    );
+    assert_eq!(queries, 0);
+    // The first no-live read also consults the retained fallback; this
+    // test isolates the later re-sight comparison by zeroing that count.
+    lookup.scan_calls.set(0);
+    lookup.live.set(true);
+    absorb_exit_first_scene(
+        &mut binder,
+        domain,
+        &lookup,
+        Vec::new(),
+        2_000,
+        &answers,
+        &mut queries,
+    );
+    assert_eq!(lookup.scan_calls.get(), 0);
+    assert_eq!(queries, 1);
+    binder.absorb_lifecycle(&drained(domain, &[], 3_000));
+    assert_eq!(
+        binder
+            .take_decisions()
+            .into_iter()
+            .map(|d| d.binding)
+            .collect::<Vec<_>>(),
+        vec![unbound(UnboundReason::ClocksIncomparable)]
+    );
+}
+
+#[test]
+fn retained_candidate_requires_comparable_clocks_for_interval_containment() {
+    // Direct killing test for the shared interval predicate: identical
+    // scan-time identity and lifetime are eligible only when the event
+    // and interval clocks are comparable.
+    let candidate = RetainedCaller {
+        id: CallerId(7),
+        first_seen_ns: 1_000,
+        last_seen_ns: 2_000,
+        retired: true,
+        start_time: Some(100),
+        exe_present: true,
+        exec_observed: true,
+        lifecycle: CallerLifecycle::Exited,
+    };
+    assert!(retained_candidate(&candidate, 1_500, true));
+    assert!(!retained_candidate(&candidate, 1_500, false));
+}
+
+#[test]
+fn current_and_expected_binding_proofs_require_comparable_clocks() {
+    // Current-image proof is separate from the historical row decision:
+    // it too compares hook evidence with admission stamps. A proof made
+    // while comparable is revoked for new use once the clocks become
+    // incomparable, and a fresh sighting refuses with the new reason.
+    let mut run = Run::new();
+    let d = run.domain;
+    let caller = run.world.admit(T, 1, 0, 1_000);
+    run.world.answer(T, 1, d, cookie(d, 7));
+    run.read(vec![row(d, 7, 1, T, 1_500)]);
+    run.settle();
+    assert_eq!(run.verdicts(), vec![bound(caller)]);
+    let request = CurrentBindingRequest {
+        caller,
+        pid: T,
+        image: DomainCookie::scripted(d, 7),
+        exec_id: 1,
+    };
+    {
+        let lookup = Lookup(&run.world.live, &run.world.retained, &run.world.lookups);
+        assert!(
+            run.binder
+                .expected_owner_image(d, caller, T, &lookup)
+                .is_some()
+        );
+    }
+    let sighting = {
+        let lookup = Lookup(&run.world.live, &run.world.retained, &run.world.lookups);
+        let mut identity = AnswerTable {
+            answers: &run.world.answers,
+            queries: &mut run.world.queries,
+        };
+        run.binder
+            .sight_current_binding_at(request, &lookup, &mut identity, || Some(2_000))
+            .expect("comparable current sighting")
+    };
+    assert!(matches!(
+        run.binder.check_current_binding(&sighting),
+        CurrentBindingCheck::Pending
+    ));
+    run.binder.set_exit_clocks_comparable(false);
+    {
+        let lookup = Lookup(&run.world.live, &run.world.retained, &run.world.lookups);
+        assert!(
+            run.binder
+                .expected_owner_image(d, caller, T, &lookup)
+                .is_none()
+        );
+    }
+    assert!(matches!(
+        run.binder.check_current_binding(&sighting),
+        CurrentBindingCheck::Rejected(UnboundReason::ClocksIncomparable)
+    ));
+    let lookup = Lookup(&run.world.live, &run.world.retained, &run.world.lookups);
+    let mut identity = AnswerTable {
+        answers: &run.world.answers,
+        queries: &mut run.world.queries,
+    };
+    assert!(matches!(
+        run.binder
+            .sight_current_binding_at(request, &lookup, &mut identity, || Some(2_100)),
+        Err(UnboundReason::ClocksIncomparable)
+    ));
+}
+
+#[test]
+fn metadata_binding_requires_exit_clock_comparability() {
+    // Display-only metadata uses the same hook-vs-admission vetoes. Its
+    // separate opt-in qualification is not a bypass of the binder's
+    // comparability gate.
+    let mut run = Run::new();
+    run.binder.metadata_clock_qualified = true;
+    let d = run.domain;
+    let caller = run.world.admit(T, 1, 0, 1_000);
+    let record = metadata_record(caller, T, 1_000);
+    run.world.answer(T, 1, d, cookie(d, 7));
+    run.read(vec![row(d, 7, 1, T, 1_500)]);
+    run.settle();
+    assert!(run.binder.metadata_key(&record).is_some());
+    run.binder.set_exit_clocks_comparable(false);
+    assert!(run.binder.metadata_key(&record).is_none());
 }
 
 #[test]

@@ -2933,8 +2933,8 @@ def demotion_public_health(inventory):
                      all(value > 0 for value in census["unbound_reasons"].values()) and
                      census["rows"] == census["bound"] + census["unbound"] + census["pending"], "public_census_mismatch")
     supported_reasons = {"no_live_caller", "caller_exited", "cookie_unavailable", "cookie_mismatch",
-                         "before_admission", "exec_after_admission", "lifecycle_loss", "exec_ambiguous",
-                         "exec_transition", "exec_coverage_gap", "evidence_incomplete", "capacity"}
+                         "before_admission", "exec_after_admission", "lifecycle_loss", "clocks_incomparable",
+                         "exec_ambiguous", "exec_transition", "exec_coverage_gap", "evidence_incomplete", "capacity"}
     if not census["unbound_reasons"].keys() <= supported_reasons:
         problems.append("unsupported_public_health")
     demotion_fields(census["placement"], {"edge", "module", "ambiguous", "unresolved"})

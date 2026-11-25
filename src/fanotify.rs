@@ -10,6 +10,7 @@
 //! the provider test never leave this module.
 
 use crate::process::LoaderPid;
+use crate::process::metered_io;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
@@ -592,6 +593,7 @@ pub(crate) struct MountIdentity {
 /// `None` when the mountinfo identity fields do not parse — such a
 /// mount can be marked but its coverage cannot be retained, so a
 /// failed mark counts it uncovered (fail-closed).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MountToMark {
     point: std::path::PathBuf,
     identity: Option<MountIdentity>,
@@ -890,14 +892,14 @@ pub(crate) fn loader_exe_for_pidfd(
 /// visible filesystem, tests inject a stalled pass.
 fn arm_with_bound(
     group: OwnedFd,
-    mark: impl FnOnce(&OwnedFd, &AtomicBool) -> (BTreeSet<MountIdentity>, usize) + Send + 'static,
-) -> Option<(OwnedFd, BTreeSet<MountIdentity>, usize)> {
+    mark: impl FnOnce(&OwnedFd, &AtomicBool) -> MarkPassOutcome + Send + 'static,
+) -> Option<(OwnedFd, MarkPassOutcome)> {
     let dup = group.try_clone().ok();
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_helper = Arc::clone(&cancel);
     let pass = run_with_bound("p11scope-learn-mark", LEARN_WORKER_BOUND, move || {
-        let (covered, uncovered) = mark(&group, &cancel_helper);
-        (group, covered, uncovered)
+        let outcome = mark(&group, &cancel_helper);
+        (group, outcome)
     });
     let Some(result) = pass else {
         cancel.store(true, Ordering::Release);
@@ -973,15 +975,17 @@ pub(crate) struct FileLearner {
 /// The armed learner between `start()` and `begin_drain`: the group,
 /// the drain channel, the startup mark coverage, whether the startup
 /// pass left a visible filesystem uncovered (filed as the finite
-/// unavailable-learning gap once the drain runs), this kernel's
-/// measured `FIONREAD` bytes per event (which the drain's tail and
-/// shed divide their snapshots by), and whether that unit was exactly
-/// measured (`true`) or fell back (`false`).
+/// unavailable-learning gap once the drain runs), where the startup
+/// pass stopped offering mounts (the first re-mark resumes after it),
+/// this kernel's measured `FIONREAD` bytes per event (which the
+/// drain's tail and shed divide their snapshots by), and whether that
+/// unit was exactly measured (`true`) or fell back (`false`).
 struct PendingArming {
     group: OwnedFd,
     tx: SyncSender<LearnMsg>,
     covered: BTreeSet<MountIdentity>,
     initial_gap_owed: bool,
+    remark_cursor: Option<std::path::PathBuf>,
     fionread_unit: usize,
     fionread_exact: bool,
 }
@@ -1048,13 +1052,29 @@ impl FileLearner {
         // the group when the hang clears) and learning is unavailable
         // — a named gap, never a hung start.
         let pass = arm_with_bound(group, |group, cancel| {
-            mark_visible_filesystems(group, &BTreeSet::new(), cancel)
+            mark_visible_filesystems(
+                std::path::Path::new("/proc/self/mountinfo"),
+                &BTreeSet::new(),
+                None,
+                &mut pass_budget(),
+                |point, mounts| {
+                    if cancel.load(Ordering::Acquire) {
+                        return MarkOutcome {
+                            resolved: None,
+                            marked: None,
+                        };
+                    }
+                    try_mark_filesystem(group, point, mounts)
+                },
+            )
         });
-        let Some((group, covered, uncovered)) = pass else {
+        let Some((group, outcome)) = pass else {
             return Err(LearnAbsent {
                 reason: "mark pass did not finish within the hung-mount bound".to_string(),
             });
         };
+        let covered = outcome.covered;
+        let uncovered = outcome.uncovered;
         // An identity-less fallback mount that marked successfully
         // leaves the retained set empty with nothing uncovered: that
         // is still a working learner, re-decided at the next pass.
@@ -1080,6 +1100,7 @@ impl FileLearner {
                     tx,
                     covered,
                     initial_gap_owed: uncovered > 0,
+                    remark_cursor: outcome.resume_after,
                     fionread_unit,
                     fionread_exact,
                 }),
@@ -1113,6 +1134,7 @@ impl FileLearner {
                     worker_state,
                     arming.covered,
                     arming.initial_gap_owed,
+                    arming.remark_cursor,
                     arming.fionread_unit,
                     arming.fionread_exact,
                 );
@@ -1247,14 +1269,27 @@ const MARK_COVERAGE_CAP: usize = 8192;
 /// already covered path carries a new mount id, so it never inherits
 /// the dead mount's coverage. Coverage therefore comes from this
 /// retained-identity set alone — traffic on older filesystems can
-/// never stand in for a filesystem whose mark failed. Returns the
-/// next covered set and the uncovered-visible count; a nonzero
+/// never stand in for a filesystem whose mark failed.
+///
+/// Charging (INV-2): one credit per mount offered to `mark`, admitted
+/// first; retained mounts re-cover for free and consume nothing. The
+/// first refusal stops offering — the loop still walks the rest, so
+/// the unattempted remainder is counted uncovered (never silent) and
+/// retained mounts past the stop keep their coverage — and the pass
+/// reports `spent` with `resume_after` set to the last mount offered,
+/// so the next pass continues the rotation after it instead of
+/// re-spending its budget on the same head. A pass that visits every
+/// mount without a refusal resets `resume_after` to `None`. A stale
+/// cursor (its mount left the table) restarts the rotation from the
+/// head. Returns the typed [`MarkPassOutcome`]; a nonzero uncovered
 /// count owes the finite unavailable-learning gap.
 pub(crate) fn evaluate_mark_coverage(
     previously_covered: &BTreeSet<MountIdentity>,
     visible: &[MountToMark],
     mut mark: impl FnMut(&std::path::Path) -> MarkOutcome,
-) -> (BTreeSet<MountIdentity>, usize) {
+    admit: &mut dyn FnMut() -> bool,
+    resume_after: Option<&std::path::Path>,
+) -> MarkPassOutcome {
     // Each entry is judged by its own mark outcome alone, so one
     // pass over the snapshot cannot credit the wrong mount however
     // the table is ordered. The callback reports the mount the held
@@ -1267,7 +1302,29 @@ pub(crate) fn evaluate_mark_coverage(
     // earlier in this same pass.
     let mut covered = BTreeSet::new();
     let mut uncovered = 0usize;
-    for mount in visible {
+    let mut attempted = 0usize;
+    let mut spent = false;
+    let mut resume = resume_after.map(|point| point.to_path_buf());
+    // The rotation resumes after the cursor's mount; a stale cursor
+    // restarts from the head. Mounts before the head keep retained
+    // coverage for free and count uncovered otherwise — this pass
+    // offers them nothing, and the rotation revisits them.
+    let start_at = resume_after
+        .and_then(|point| visible.iter().position(|mount| mount.point == point))
+        .map(|at| at + 1)
+        .unwrap_or(0);
+    for (index, mount) in visible.iter().enumerate() {
+        if index < start_at {
+            if let Some(identity) = mount.identity
+                && previously_covered.contains(&identity)
+                && covered.len() < MARK_COVERAGE_CAP
+            {
+                covered.insert(identity);
+            } else {
+                uncovered += 1;
+            }
+            continue;
+        }
         if let Some(identity) = mount.identity
             && previously_covered.contains(&identity)
             && covered.len() < MARK_COVERAGE_CAP
@@ -1275,6 +1332,15 @@ pub(crate) fn evaluate_mark_coverage(
             covered.insert(identity);
             continue;
         }
+        if !spent {
+            spent = !admit();
+        }
+        if spent {
+            uncovered += 1;
+            continue;
+        }
+        attempted += 1;
+        resume = Some(mount.point.clone());
         let outcome = mark(&mount.point);
         if let Some(marked) = outcome.marked
             && covered.len() < MARK_COVERAGE_CAP
@@ -1292,26 +1358,181 @@ pub(crate) fn evaluate_mark_coverage(
         }
         uncovered += 1;
     }
-    (covered, uncovered)
+    if !spent {
+        resume = None;
+    }
+    MarkPassOutcome {
+        covered,
+        uncovered,
+        attempted,
+        spent,
+        resume_after: resume,
+        table_gap: false,
+    }
+}
+
+/// Cap on the mount-table bytes one mark pass retains: a 50k-mount
+/// table is about 7 MiB, and the pass must never hold it all. Bytes
+/// past the cap are unseen mounts, never silently covered.
+const MOUNTINFO_CAP: usize = 1024 * 1024;
+
+/// One table chunk read: a full capped table costs 16 admitted reads.
+const MOUNTINFO_CHUNK_BYTES: usize = 64 * 1024;
+
+/// One mark pass's credit allowance (INV-2): the table read plus one
+/// credit per mount attempt. A busy home PC shows hundreds of mounts;
+/// the allowance covers those with wide margin and bounds a
+/// pathological table to one bounded pass, resumed by later passes.
+const MARK_PASS_BUDGET: usize = 4096;
+
+/// How one mark pass obtained its mount table. Anything but
+/// [`MountTableOutcome::Complete`] owes the table gap: the pass marks
+/// what it parsed and counts the unseen remainder uncovered, never
+/// `/`-only full coverage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MountTableOutcome {
+    /// The whole table parsed.
+    Complete,
+    /// Only a prefix parsed (the read cap hit, or an admission
+    /// refused mid-read): the rest of the table is unseen.
+    Truncated,
+    /// Nothing usable parsed (unreadable, or zero mounts): the pass
+    /// marks the `/` fallback blind.
+    Unreadable,
+}
+
+/// One mount-table read: the mounts the pass covers plus how the read
+/// went. Checked by exact equality: the mounts parsed and the outcome
+/// decide the pass's gap honestly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MountTableRead {
+    pub mounts: Vec<MountToMark>,
+    pub outcome: MountTableOutcome,
+}
+
+/// The typed outcome of one mark pass, checked by exact equality:
+/// the next covered set, how many visible filesystems it leaves
+/// uncovered (a nonzero count owes the finite unavailable-learning
+/// gap), how many mounts it attempted, whether the budget refused
+/// mid-pass (then `resume_after` continues the rotation on the next
+/// pass and the unattempted remainder is counted, never silent), and
+/// whether the mount table itself owed the gap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MarkPassOutcome {
+    pub covered: BTreeSet<MountIdentity>,
+    pub uncovered: usize,
+    pub attempted: usize,
+    pub spent: bool,
+    pub resume_after: Option<std::path::PathBuf>,
+    pub table_gap: bool,
 }
 
 /// The mounts a mark pass must cover, from the observer's mount
-/// table; an unreadable table falls back to `/` alone, its identity
-/// unknown until a later pass can parse the table.
-fn visible_mounts() -> Vec<MountToMark> {
-    const MOUNTINFO_CAP: usize = 1024 * 1024;
-    let text = std::fs::read_to_string("/proc/self/mountinfo")
-        .ok()
-        .filter(|text| text.len() <= MOUNTINFO_CAP);
-    text.as_deref()
-        .map(mounts_for_marks)
-        .filter(|mounts| !mounts.is_empty())
-        .unwrap_or_else(|| {
-            vec![MountToMark {
+/// table at `mountinfo` (production: `/proc/self/mountinfo`; tests
+/// pass a fixture): a metered chunked read holding at most
+/// `cap_bytes` plus one chunk. The open (with its close) and each
+/// chunk read are admitted first; a refusal truncates the read
+/// instead of failing it, so every refusal path means bytes unseen.
+/// The in-memory parse of the retained bytes is bounded, syscall-free
+/// work and takes no credit. An unreadable table, or one that parses
+/// to zero mounts, falls back to `/` alone with
+/// [`MountTableOutcome::Unreadable`]: the mark is blind and the
+/// unseen table owes the gap.
+fn read_mount_table(
+    mountinfo: &std::path::Path,
+    cap_bytes: usize,
+    admit: &mut dyn FnMut() -> bool,
+) -> MountTableRead {
+    let fallback = || MountTableRead {
+        mounts: vec![MountToMark {
+            point: std::path::PathBuf::from("/"),
+            identity: None,
+        }],
+        outcome: MountTableOutcome::Unreadable,
+    };
+    let Some(path) = mountinfo.to_str() else {
+        return fallback();
+    };
+    let mut file = match metered_io::MeteredFile::open(path, admit) {
+        None => {
+            return MountTableRead {
+                mounts: fallback().mounts,
+                outcome: MountTableOutcome::Truncated,
+            };
+        }
+        Some(Err(_)) => return fallback(),
+        Some(Ok(file)) => file,
+    };
+    let mut kept = Vec::new();
+    let mut chunk = vec![0u8; MOUNTINFO_CHUNK_BYTES];
+    loop {
+        if kept.len() >= cap_bytes {
+            // At the cap: one single-byte probe decides whether the
+            // table continues. More bytes (or an unprovable end, on
+            // refusal or error) truncate; a clean end completes.
+            let probe = file.read(&mut chunk[..1], admit);
+            match probe {
+                Some(Ok(0)) => return finish_mount_table(kept, MountTableOutcome::Complete),
+                _ => return finish_mount_prefix(kept),
+            }
+        }
+        let count = match file.read(&mut chunk, admit) {
+            None => return finish_mount_prefix(kept),
+            Some(Err(_)) => return finish_mount_prefix(kept),
+            Some(Ok(0)) => return finish_mount_table(kept, MountTableOutcome::Complete),
+            Some(Ok(count)) => count,
+        };
+        let room = cap_bytes.saturating_sub(kept.len());
+        kept.extend_from_slice(&chunk[..count.min(room)]);
+        if count > room {
+            // The chunk itself ran past the cap: the table continues.
+            return finish_mount_prefix(kept);
+        }
+    }
+}
+
+/// Parses kept table bytes read to a clean end: every byte parses
+/// (even a final line without its newline, as at end of file), and an
+/// empty parse coerces to [`MountTableOutcome::Unreadable`] — an empty
+/// table proves no mounts, so the `/` fallback is blind.
+fn finish_mount_table(kept: Vec<u8>, outcome: MountTableOutcome) -> MountTableRead {
+    let Ok(text) = String::from_utf8(kept) else {
+        return MountTableRead {
+            mounts: vec![MountToMark {
                 point: std::path::PathBuf::from("/"),
                 identity: None,
-            }]
-        })
+            }],
+            outcome: MountTableOutcome::Unreadable,
+        };
+    };
+    let mounts = mounts_for_marks(&text);
+    if mounts.is_empty() {
+        return MountTableRead {
+            mounts: vec![MountToMark {
+                point: std::path::PathBuf::from("/"),
+                identity: None,
+            }],
+            outcome: MountTableOutcome::Unreadable,
+        };
+    }
+    MountTableRead { mounts, outcome }
+}
+
+/// Parses a truncated table prefix: only complete lines (through the
+/// last newline) parse; the partial tail belongs to the unseen
+/// remainder. Zero complete lines fall back to `/`, still truncated.
+fn finish_mount_prefix(kept: Vec<u8>) -> MountTableRead {
+    let end = kept
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map(|at| at + 1)
+        .unwrap_or(0);
+    let mut read = finish_mount_table(kept[..end].to_vec(), MountTableOutcome::Truncated);
+    if read.outcome == MountTableOutcome::Unreadable {
+        // Zero complete lines: the read stopped early, not cleanly.
+        read.outcome = MountTableOutcome::Truncated;
+    }
+    read
 }
 
 /// The mount identity of a held descriptor: its fdinfo mount id
@@ -1590,43 +1811,52 @@ fn try_mark_filesystem_with(
 }
 
 /// One (re-)mark pass over the visible filesystems, retaining the
-/// coverage earlier passes established. Returns the next covered set
-/// and how many visible filesystems it leaves uncovered. `cancel` is
-/// checked before each mark: a cancelled pass places no further marks
-/// (a mount it already passed keeps its mark; a mount it never reached
-/// stays uncovered), so a detached arming helper stops dirtying the
-/// group once the owner gives up on it.
+/// coverage earlier passes established: reads the mount table at
+/// `mountinfo` (production: `/proc/self/mountinfo`) on the pass
+/// budget, offers each mount to `mark` (which also sees the pass
+/// snapshot for identity credit), and files the table gap when the
+/// table read did not complete — the unseen remainder counts
+/// uncovered, never `/`-only full coverage. Returns the typed
+/// [`MarkPassOutcome`]. The arming pass cancels through its own
+/// `mark` adapter (a cancelled pass places no further marks, so a
+/// detached arming helper stops dirtying the group once the owner
+/// gives up on it); the periodic re-mark runs to completion through
+/// the shared group instead, and drain exit takes the group rather
+/// than waiting for it.
 fn mark_visible_filesystems(
-    group: &OwnedFd,
+    mountinfo: &std::path::Path,
     previously_covered: &BTreeSet<MountIdentity>,
-    cancel: &AtomicBool,
-) -> (BTreeSet<MountIdentity>, usize) {
-    let mounts = visible_mounts();
-    evaluate_mark_coverage(previously_covered, &mounts, |point| {
-        if cancel.load(Ordering::Acquire) {
-            return MarkOutcome {
-                resolved: None,
-                marked: None,
-            };
-        }
-        try_mark_filesystem(group, point, &mounts)
-    })
+    resume_after: Option<&std::path::Path>,
+    admit: &mut dyn FnMut() -> bool,
+    mut mark: impl FnMut(&std::path::Path, &[MountToMark]) -> MarkOutcome,
+) -> MarkPassOutcome {
+    let table = read_mount_table(mountinfo, MOUNTINFO_CAP, admit);
+    let mut outcome = evaluate_mark_coverage(
+        previously_covered,
+        &table.mounts,
+        |point| mark(point, &table.mounts),
+        admit,
+        resume_after,
+    );
+    if table.outcome != MountTableOutcome::Complete {
+        outcome.uncovered += 1;
+        outcome.table_gap = true;
+    }
+    outcome
 }
 
-/// One periodic re-mark pass over the visible filesystems through the
-/// shared group, retaining the coverage earlier passes established.
-/// Returns the next covered set and how many visible filesystems it
-/// leaves uncovered. Never cancelled: the helper runs to completion
-/// (locking the group only around each mark), and drain exit takes
-/// the group instead of waiting for it.
-fn mark_visible_filesystems_shared(
-    shared: &Arc<Mutex<Option<OwnedFd>>>,
-    previously_covered: &BTreeSet<MountIdentity>,
-) -> (BTreeSet<MountIdentity>, usize) {
-    let mounts = visible_mounts();
-    evaluate_mark_coverage(previously_covered, &mounts, |point| {
-        try_mark_filesystem_shared(shared, point, &mounts)
-    })
+/// One mark pass's [`MARK_PASS_BUDGET`] allowance as an admission
+/// closure: production passes spend this and resume on the next pass.
+fn pass_budget() -> impl FnMut() -> bool {
+    let mut remaining = MARK_PASS_BUDGET;
+    move || {
+        if remaining == 0 {
+            false
+        } else {
+            remaining -= 1;
+            true
+        }
+    }
 }
 
 /// Reads the `Pid:` of a pidfd from its fdinfo: the pid belongs to the
@@ -2538,11 +2768,8 @@ fn drain_final_tail_with(
 fn spawn_remark_pass(
     shared: &Arc<Mutex<Option<OwnedFd>>>,
     previous: &BTreeSet<MountIdentity>,
-    pending: &mut Option<Receiver<(BTreeSet<MountIdentity>, usize)>>,
-    mark: impl FnOnce(
-        Arc<Mutex<Option<OwnedFd>>>,
-        BTreeSet<MountIdentity>,
-    ) -> (BTreeSet<MountIdentity>, usize)
+    pending: &mut Option<Receiver<MarkPassOutcome>>,
+    mark: impl FnOnce(Arc<Mutex<Option<OwnedFd>>>, BTreeSet<MountIdentity>) -> MarkPassOutcome
     + Send
     + 'static,
 ) -> bool {
@@ -2571,13 +2798,14 @@ fn spawn_remark_pass(
 
 /// Adopts a landed re-mark result without blocking: `Some` when a pass
 /// finished (adopt its coverage) or died (keep the previous set with
-/// one uncovered — coverage unproven), `None` when a pass is still
-/// running or none is in flight. Called every drain tick so a result
-/// lands promptly; only spawning waits for the 30 s period.
+/// one uncovered — coverage unproven — and the rotation restarted),
+/// `None` when a pass is still running or none is in flight. Called
+/// every drain tick so a result lands promptly; only spawning waits
+/// for the 30 s period.
 fn adopt_remark_result(
     previous: &BTreeSet<MountIdentity>,
-    pending: &mut Option<Receiver<(BTreeSet<MountIdentity>, usize)>>,
-) -> Option<(BTreeSet<MountIdentity>, usize)> {
+    pending: &mut Option<Receiver<MarkPassOutcome>>,
+) -> Option<MarkPassOutcome> {
     let rx = pending.as_ref()?;
     match rx.try_recv() {
         Ok(result) => {
@@ -2587,7 +2815,14 @@ fn adopt_remark_result(
         Err(std::sync::mpsc::TryRecvError::Empty) => None,
         Err(std::sync::mpsc::TryRecvError::Disconnected) => {
             *pending = None;
-            Some((previous.clone(), 1))
+            Some(MarkPassOutcome {
+                covered: previous.clone(),
+                uncovered: 1,
+                attempted: 0,
+                spent: false,
+                resume_after: None,
+                table_gap: false,
+            })
         }
     }
 }
@@ -2658,12 +2893,17 @@ fn store_final_stats(state: &LearnShutdownState, stats: &DrainStats) {
 /// tallies and overflow. Never blocks the engine; the engine never
 /// blocks it past the bounded channel (then the kernel queue absorbs,
 /// then overflow names the loss).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the drain's fixed context, threaded once from the arming"
+)]
 fn drain_loop(
     group: OwnedFd,
     tx: SyncSender<LearnMsg>,
     state: Arc<LearnShutdownState>,
     mut covered: BTreeSet<MountIdentity>,
     initial_gap_owed: bool,
+    mut remark_cursor: Option<std::path::PathBuf>,
     fionread_unit: usize,
     fionread_exact: bool,
 ) {
@@ -2697,7 +2937,7 @@ fn drain_loop(
     let mut last_remark = std::time::Instant::now();
     let mut last_backlog_check = std::time::Instant::now();
     let mut unavailable_sent = false;
-    let mut pending_remark: Option<Receiver<(BTreeSet<MountIdentity>, usize)>> = None;
+    let mut pending_remark: Option<Receiver<MarkPassOutcome>> = None;
     // The startup pass already left a visible filesystem uncovered:
     // name that partial coverage now, once (data-always), instead of
     // letting traffic on the covered filesystems stand in for it.
@@ -2718,10 +2958,10 @@ fn drain_loop(
         // A landed re-mark result is adopted on the tick it lands (the
         // spawn never waits for it), so coverage stays fresh without
         // the drain ever blocking on a mount.
-        if let Some((next_covered, uncovered)) = adopt_remark_result(&covered, &mut pending_remark)
-        {
-            covered = next_covered;
-            if uncovered > 0 && !unavailable_sent {
+        if let Some(outcome) = adopt_remark_result(&covered, &mut pending_remark) {
+            covered = outcome.covered;
+            remark_cursor = outcome.resume_after;
+            if outcome.uncovered > 0 && !unavailable_sent {
                 unavailable_sent = true;
                 if !send_learn(&tx, &state, LearnMsg::Unavailable) {
                     break 'drain;
@@ -2771,22 +3011,30 @@ fn drain_loop(
             // and the tick would otherwise file a false gap (the spawn
             // sees it still pending): adopt again before spawning, so
             // only a pass still running after ~30 s is unproven.
-            if let Some((next_covered, uncovered)) =
-                adopt_remark_result(&covered, &mut pending_remark)
-            {
-                covered = next_covered;
-                if uncovered > 0 && !unavailable_sent {
+            if let Some(outcome) = adopt_remark_result(&covered, &mut pending_remark) {
+                covered = outcome.covered;
+                remark_cursor = outcome.resume_after;
+                if outcome.uncovered > 0 && !unavailable_sent {
                     unavailable_sent = true;
                     if !send_learn(&tx, &state, LearnMsg::Unavailable) {
                         break 'drain;
                     }
                 }
             }
+            let resume = remark_cursor.clone();
             if !spawn_remark_pass(
                 &shared_group,
                 &covered,
                 &mut pending_remark,
-                |shared, prev| mark_visible_filesystems_shared(&shared, &prev),
+                move |shared, prev| {
+                    mark_visible_filesystems(
+                        std::path::Path::new("/proc/self/mountinfo"),
+                        &prev,
+                        resume.as_deref(),
+                        &mut pass_budget(),
+                        |point, mounts| try_mark_filesystem_shared(&shared, point, mounts),
+                    )
+                },
             ) && !unavailable_sent
             {
                 unavailable_sent = true;
@@ -3431,6 +3679,17 @@ mod tests {
         }
     }
 
+    fn pass_outcome(uncovered: usize) -> super::MarkPassOutcome {
+        super::MarkPassOutcome {
+            covered: std::collections::BTreeSet::new(),
+            uncovered,
+            attempted: 0,
+            spent: false,
+            resume_after: None,
+            table_gap: false,
+        }
+    }
+
     /// The mark parser carries mount identity (mount id + filesystem
     /// device) beside each point, and an overmounted point keeps the
     /// topmost (last) mount's identity: the path resolves there.
@@ -3526,9 +3785,10 @@ mod tests {
             visible_mount("/data", 52, 8, 2),
         ];
         // Every add fails now (no CAP_SYS_ADMIN after the shed).
-        let (next, uncovered) = super::evaluate_mark_coverage(&covered, &visible, |_| unresolved());
-        assert_eq!(uncovered, 0, "retained marks stay covered");
-        assert_eq!(next, covered);
+        let outcome =
+            super::evaluate_mark_coverage(&covered, &visible, |_| unresolved(), &mut || true, None);
+        assert_eq!(outcome.uncovered, 0, "retained marks stay covered");
+        assert_eq!(outcome.covered, covered);
     }
 
     /// A different filesystem mounted at an already covered path does
@@ -3540,10 +3800,21 @@ mod tests {
         let covered: std::collections::BTreeSet<super::MountIdentity> =
             [mnt(51, 8, 1)].into_iter().collect();
         let visible = vec![visible_mount("/mnt/provider", 68, 8, 2)];
-        let (next, uncovered) =
-            super::evaluate_mark_coverage(&covered, &visible, |_| failed(68, 8, 2));
-        assert_eq!(uncovered, 1, "the replacement filesystem was never marked");
-        assert!(next.is_empty(), "the dead mount's coverage is not retained");
+        let outcome = super::evaluate_mark_coverage(
+            &covered,
+            &visible,
+            |_| failed(68, 8, 2),
+            &mut || true,
+            None,
+        );
+        assert_eq!(
+            outcome.uncovered, 1,
+            "the replacement filesystem was never marked"
+        );
+        assert!(
+            outcome.covered.is_empty(),
+            "the dead mount's coverage is not retained"
+        );
     }
 
     /// The same device remounted at the same path is a new mount: its
@@ -3554,10 +3825,15 @@ mod tests {
         let covered: std::collections::BTreeSet<super::MountIdentity> =
             [mnt(51, 8, 1)].into_iter().collect();
         let visible = vec![visible_mount("/mnt/provider", 68, 8, 1)];
-        let (next, uncovered) =
-            super::evaluate_mark_coverage(&covered, &visible, |_| failed(68, 8, 1));
-        assert_eq!(uncovered, 1, "a remount is not the marked mount");
-        assert!(next.is_empty());
+        let outcome = super::evaluate_mark_coverage(
+            &covered,
+            &visible,
+            |_| failed(68, 8, 1),
+            &mut || true,
+            None,
+        );
+        assert_eq!(outcome.uncovered, 1, "a remount is not the marked mount");
+        assert!(outcome.covered.is_empty());
     }
 
     /// The very same mount (same mount id and device) seen at a new
@@ -3568,9 +3844,13 @@ mod tests {
         let covered: std::collections::BTreeSet<super::MountIdentity> =
             [mnt(51, 8, 1)].into_iter().collect();
         let visible = vec![visible_mount("/moved/provider", 51, 8, 1)];
-        let (next, uncovered) = super::evaluate_mark_coverage(&covered, &visible, |_| unresolved());
-        assert_eq!(uncovered, 0, "the moved mount's mark still delivers");
-        assert_eq!(next, covered);
+        let outcome =
+            super::evaluate_mark_coverage(&covered, &visible, |_| unresolved(), &mut || true, None);
+        assert_eq!(
+            outcome.uncovered, 0,
+            "the moved mount's mark still delivers"
+        );
+        assert_eq!(outcome.covered, covered);
     }
 
     /// A newly mounted filesystem whose mark fails is uncovered even
@@ -3584,10 +3864,18 @@ mod tests {
             visible_mount("/", 51, 8, 1),
             visible_mount("/mnt/new", 68, 8, 2),
         ];
-        let (next, uncovered) =
-            super::evaluate_mark_coverage(&covered, &visible, |_| failed(68, 8, 2));
-        assert_eq!(uncovered, 1, "the unmarked new filesystem is a gap");
-        assert_eq!(next, covered, "only the retained filesystem is covered");
+        let outcome = super::evaluate_mark_coverage(
+            &covered,
+            &visible,
+            |_| failed(68, 8, 2),
+            &mut || true,
+            None,
+        );
+        assert_eq!(outcome.uncovered, 1, "the unmarked new filesystem is a gap");
+        assert_eq!(
+            outcome.covered, covered,
+            "only the retained filesystem is covered"
+        );
     }
 
     /// A newly mounted filesystem that marks successfully joins the
@@ -3600,16 +3888,22 @@ mod tests {
             visible_mount("/", 51, 8, 1),
             visible_mount("/mnt/new", 68, 8, 2),
         ];
-        let (next, uncovered) = super::evaluate_mark_coverage(&covered, &visible, |point| {
-            if point.as_os_str() == "/mnt/new" {
-                marked(68, 8, 2)
-            } else {
-                unresolved()
-            }
-        });
-        assert_eq!(uncovered, 0);
-        assert!(next.contains(&mnt(68, 8, 2)));
-        assert!(next.contains(&mnt(51, 8, 1)));
+        let outcome = super::evaluate_mark_coverage(
+            &covered,
+            &visible,
+            |point| {
+                if point.as_os_str() == "/mnt/new" {
+                    marked(68, 8, 2)
+                } else {
+                    unresolved()
+                }
+            },
+            &mut || true,
+            None,
+        );
+        assert_eq!(outcome.uncovered, 0);
+        assert!(outcome.covered.contains(&mnt(68, 8, 2)));
+        assert!(outcome.covered.contains(&mnt(51, 8, 1)));
     }
 
     /// An overmount landing between the mountinfo snapshot and the
@@ -3625,23 +3919,35 @@ mod tests {
         let visible = vec![visible_mount("/mnt/provider", 51, 8, 1)];
         // The syscall marked the racing overmount (68), not the
         // snapshot mount (51).
-        let (next, uncovered) =
-            super::evaluate_mark_coverage(&covered, &visible, |_| marked(68, 8, 2));
-        assert_eq!(uncovered, 0, "the resolving overmount is marked");
+        let outcome = super::evaluate_mark_coverage(
+            &covered,
+            &visible,
+            |_| marked(68, 8, 2),
+            &mut || true,
+            None,
+        );
+        assert_eq!(outcome.uncovered, 0, "the resolving overmount is marked");
         assert!(
-            !next.contains(&mnt(51, 8, 1)),
-            "the shadowed mount claims no retained coverage: {next:?}"
+            !outcome.covered.contains(&mnt(51, 8, 1)),
+            "the shadowed mount claims no retained coverage: {:?}",
+            outcome.covered
         );
         assert!(
-            next.contains(&mnt(68, 8, 2)),
-            "the actually-marked mount is retained: {next:?}"
+            outcome.covered.contains(&mnt(68, 8, 2)),
+            "the actually-marked mount is retained: {:?}",
+            outcome.covered
         );
         // After the overmount goes away, a failed re-mark of the
         // reappeared snapshot mount is uncovered, not retained.
-        let (next, uncovered) =
-            super::evaluate_mark_coverage(&next, &visible, |_| failed(51, 8, 1));
-        assert_eq!(uncovered, 1);
-        assert!(next.is_empty());
+        let outcome = super::evaluate_mark_coverage(
+            &outcome.covered,
+            &visible,
+            |_| failed(51, 8, 1),
+            &mut || true,
+            None,
+        );
+        assert_eq!(outcome.uncovered, 1);
+        assert!(outcome.covered.is_empty());
     }
 
     /// With nothing retained, every failed mark is uncovered (the
@@ -3653,15 +3959,21 @@ mod tests {
             visible_mount("/", 51, 8, 1),
             visible_mount("/data", 52, 8, 2),
         ];
-        let (next, uncovered) = super::evaluate_mark_coverage(&covered, &visible, |point| {
-            if point.as_os_str() == "/" {
-                failed(51, 8, 1)
-            } else {
-                failed(52, 8, 2)
-            }
-        });
-        assert_eq!(uncovered, 2);
-        assert!(next.is_empty());
+        let outcome = super::evaluate_mark_coverage(
+            &covered,
+            &visible,
+            |point| {
+                if point.as_os_str() == "/" {
+                    failed(51, 8, 1)
+                } else {
+                    failed(52, 8, 2)
+                }
+            },
+            &mut || true,
+            None,
+        );
+        assert_eq!(outcome.uncovered, 2);
+        assert!(outcome.covered.is_empty());
     }
 
     /// A mark placed through a shadowing mount covers the path: the
@@ -3676,16 +3988,23 @@ mod tests {
         let visible = vec![visible_mount("/usr/lib", 39, 0, 30)];
         // The syscall marked the resolving overmount (51), not the
         // snapshot mount (39).
-        let (next, uncovered) =
-            super::evaluate_mark_coverage(&covered, &visible, |_| marked(51, 0, 42));
-        assert_eq!(uncovered, 0, "the resolving filesystem is marked");
+        let outcome = super::evaluate_mark_coverage(
+            &covered,
+            &visible,
+            |_| marked(51, 0, 42),
+            &mut || true,
+            None,
+        );
+        assert_eq!(outcome.uncovered, 0, "the resolving filesystem is marked");
         assert!(
-            next.contains(&mnt(51, 0, 42)),
-            "the marked mount is retained: {next:?}"
+            outcome.covered.contains(&mnt(51, 0, 42)),
+            "the marked mount is retained: {:?}",
+            outcome.covered
         );
         assert!(
-            !next.contains(&mnt(39, 0, 30)),
-            "the shadowed snapshot claims no coverage: {next:?}"
+            !outcome.covered.contains(&mnt(39, 0, 30)),
+            "the shadowed snapshot claims no coverage: {:?}",
+            outcome.covered
         );
     }
 
@@ -3698,20 +4017,36 @@ mod tests {
     fn learn_transitive_coverage_does_not_retain_the_snapshot() {
         let covered = std::collections::BTreeSet::new();
         let visible = vec![visible_mount("/mnt/provider", 51, 8, 1)];
-        let (next, uncovered) =
-            super::evaluate_mark_coverage(&covered, &visible, |_| marked(68, 8, 2));
-        assert_eq!(uncovered, 0, "the overmount's mark covers the path");
+        let outcome = super::evaluate_mark_coverage(
+            &covered,
+            &visible,
+            |_| marked(68, 8, 2),
+            &mut || true,
+            None,
+        );
+        assert_eq!(outcome.uncovered, 0, "the overmount's mark covers the path");
         assert_eq!(
-            next,
+            outcome.covered,
             [mnt(68, 8, 2)].into_iter().collect(),
             "only the actually-marked mount is retained"
         );
         // The overmount is gone; the reappeared snapshot mount cannot
         // be marked (post-shed re-mark without CAP_SYS_ADMIN).
-        let (next, uncovered) =
-            super::evaluate_mark_coverage(&next, &visible, |_| failed(51, 8, 1));
-        assert_eq!(uncovered, 1, "the unmarked reappearance owes the gap");
-        assert!(next.is_empty(), "the dead overmount is not retained");
+        let outcome = super::evaluate_mark_coverage(
+            &outcome.covered,
+            &visible,
+            |_| failed(51, 8, 1),
+            &mut || true,
+            None,
+        );
+        assert_eq!(
+            outcome.uncovered, 1,
+            "the unmarked reappearance owes the gap"
+        );
+        assert!(
+            outcome.covered.is_empty(),
+            "the dead overmount is not retained"
+        );
     }
 
     /// An unchanged shadowed mount stays covered after the capability
@@ -3728,25 +4063,38 @@ mod tests {
         ];
         // Startup: both paths resolve to the shadowing mount 51 and
         // both marks succeed.
-        let (next, uncovered) =
-            super::evaluate_mark_coverage(&covered, &visible, |_| marked(51, 0, 42));
-        assert_eq!(uncovered, 0, "startup marks cover the shadowed path");
+        let outcome = super::evaluate_mark_coverage(
+            &covered,
+            &visible,
+            |_| marked(51, 0, 42),
+            &mut || true,
+            None,
+        );
         assert_eq!(
-            next,
+            outcome.uncovered, 0,
+            "startup marks cover the shadowed path"
+        );
+        assert_eq!(
+            outcome.covered,
             [mnt(51, 0, 42)].into_iter().collect(),
             "only the actually-marked mount is retained"
         );
         // Unchanged topology after the shed: the retained mount's
         // re-mark is skipped, the shadowed mount's re-mark fails,
         // but the path still resolves to the marked 51.
-        let (next, uncovered) =
-            super::evaluate_mark_coverage(&next, &visible, |_| failed(51, 0, 42));
+        let outcome = super::evaluate_mark_coverage(
+            &outcome.covered,
+            &visible,
+            |_| failed(51, 0, 42),
+            &mut || true,
+            None,
+        );
         assert_eq!(
-            uncovered, 0,
+            outcome.uncovered, 0,
             "unchanged shadow resolving to a marked mount stays covered"
         );
         assert_eq!(
-            next,
+            outcome.covered,
             [mnt(51, 0, 42)].into_iter().collect(),
             "the marked mount stays retained, never the shadowed entry"
         );
@@ -3763,19 +4111,511 @@ mod tests {
             visible_mount("/data", 52, 8, 2),
             visible_mount("/usr/lib", 39, 0, 30),
         ];
-        let (next, uncovered) = super::evaluate_mark_coverage(&covered, &visible, |point| {
-            if point.as_os_str() == "/" {
-                marked(51, 8, 1)
-            } else if point.as_os_str() == "/usr/lib" {
-                marked(68, 0, 42)
+        let outcome = super::evaluate_mark_coverage(
+            &covered,
+            &visible,
+            |point| {
+                if point.as_os_str() == "/" {
+                    marked(51, 8, 1)
+                } else if point.as_os_str() == "/usr/lib" {
+                    marked(68, 0, 42)
+                } else {
+                    failed(52, 8, 2)
+                }
+            },
+            &mut || true,
+            None,
+        );
+        assert_eq!(outcome.uncovered, 1, "only the failed mark owes a gap");
+        assert!(outcome.covered.contains(&mnt(51, 8, 1)));
+        assert!(outcome.covered.contains(&mnt(68, 0, 42)));
+        assert_eq!(outcome.covered.len(), 2);
+    }
+
+    /// A mount table over the 1 MiB read cap must never resolve to
+    /// `/`-only full coverage: the pass marks the parsed prefix and
+    /// the unseen remainder owes the gap even when every mark
+    /// succeeds. Every line is exactly 100 bytes, so the 1 MiB cap
+    /// holds exactly 10485 complete lines; the typed outcome pins
+    /// that count, the single table-gap unit and the reset rotation.
+    /// (Unprivileged: the table is a generated fixture.)
+    #[test]
+    fn learn_oversized_mount_table_owes_uncovered() {
+        // The parsed count is stepwise in the cap, so the value pins
+        // within-step drift the behavior cannot see.
+        assert_eq!(super::MOUNTINFO_CAP, 1024 * 1024);
+        let dir = tempfile::tempdir().unwrap();
+        let table = dir.path().join("mountinfo");
+        let mut text = String::new();
+        for id in 51..10600u64 {
+            let mut line = format!("{id} 23 8:1 / /mnt/m{id} rw,relatime - ext4 /dev/sda1 rw");
+            assert!(line.len() < 99, "the line fits its 100-byte cell: {line:?}");
+            while line.len() < 99 {
+                line.push(' ');
+            }
+            line.push('\n');
+            assert_eq!(line.len(), 100);
+            text.push_str(&line);
+        }
+        assert!(
+            text.len() > 1024 * 1024,
+            "the fixture exceeds the read cap: {} bytes",
+            text.len()
+        );
+        std::fs::write(&table, &text).unwrap();
+        let outcome = super::mark_visible_filesystems(
+            &table,
+            &std::collections::BTreeSet::new(),
+            None,
+            &mut || true,
+            |_, _| marked(51, 8, 1),
+        );
+        assert_eq!(
+            outcome,
+            super::MarkPassOutcome {
+                covered: [mnt(51, 8, 1)].into_iter().collect(),
+                uncovered: 1,
+                attempted: 10485,
+                spent: false,
+                resume_after: None,
+                table_gap: true,
+            },
+            "the parsed prefix marks, the unseen remainder owes exactly the table gap"
+        );
+    }
+
+    /// The table reader's outcomes are exact: a whole table parses
+    /// complete, a cap that lands mid-line keeps only complete lines
+    /// and truncates, and an empty or pseudo-only table falls back to
+    /// `/` blind. (Unprivileged: fixtures.)
+    #[test]
+    fn learn_mount_table_reader_outcomes_are_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = dir.path().join("mountinfo");
+        let lines = [
+            "51 23 8:1 / / rw,relatime - ext4 /dev/sda1 rw\n",
+            "68 23 8:2 / /data rw,relatime - ext4 /dev/sda2 rw\n",
+            "70 23 0:40 / /run rw,relatime - tmpfs tmpfs rw\n",
+        ];
+        let text: String = lines.concat();
+        std::fs::write(&table, &text).unwrap();
+        let all = || {
+            vec![
+                visible_mount("/", 51, 8, 1),
+                visible_mount("/data", 68, 8, 2),
+                visible_mount("/run", 70, 0, 40),
+            ]
+        };
+        // The whole table, and the exact-cap boundary, complete.
+        for cap in [1024 * 1024, text.len()] {
+            assert_eq!(
+                super::read_mount_table(&table, cap, &mut || true),
+                super::MountTableRead {
+                    mounts: all(),
+                    outcome: super::MountTableOutcome::Complete,
+                },
+                "cap {cap} reads the whole table"
+            );
+        }
+        // A cap landing mid-line keeps only complete lines.
+        let cap = lines[0].len() + 10;
+        assert_eq!(
+            super::read_mount_table(&table, cap, &mut || true),
+            super::MountTableRead {
+                mounts: vec![visible_mount("/", 51, 8, 1)],
+                outcome: super::MountTableOutcome::Truncated,
+            },
+            "a mid-line cap keeps the complete prefix"
+        );
+        // An empty table proves no mounts: blind `/`, gap owed.
+        let empty = dir.path().join("empty");
+        std::fs::write(&empty, "").unwrap();
+        assert_eq!(
+            super::read_mount_table(&empty, 1024 * 1024, &mut || true),
+            super::MountTableRead {
+                mounts: vec![super::MountToMark {
+                    point: std::path::PathBuf::from("/"),
+                    identity: None,
+                }],
+                outcome: super::MountTableOutcome::Unreadable,
+            },
+            "an empty table falls back blind"
+        );
+        // A pseudo-only table parses to zero mounts: same fallback.
+        let pseudo = dir.path().join("pseudo");
+        std::fs::write(&pseudo, "51 23 0:44 / /proc rw - proc proc rw\n").unwrap();
+        let read = super::read_mount_table(&pseudo, 1024 * 1024, &mut || true);
+        assert_eq!(read.outcome, super::MountTableOutcome::Unreadable);
+        assert_eq!(read.mounts.len(), 1);
+        assert_eq!(read.mounts[0].point.as_os_str(), "/");
+    }
+
+    /// Table-read charging is exact and refusals truncate: a missing
+    /// table is unreadable, and a budget that covers the open but no
+    /// read truncates with nothing parsed. The complete small read
+    /// costs exactly its open, its data-plus-EOF reads and no row
+    /// charge. (Unprivileged: fixtures.)
+    #[test]
+    fn learn_mount_table_refusal_truncates() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("absent");
+        assert_eq!(
+            super::read_mount_table(&missing, 1024 * 1024, &mut || true),
+            super::MountTableRead {
+                mounts: vec![super::MountToMark {
+                    point: std::path::PathBuf::from("/"),
+                    identity: None,
+                }],
+                outcome: super::MountTableOutcome::Unreadable,
+            },
+            "a missing table falls back blind"
+        );
+        let table = dir.path().join("mountinfo");
+        std::fs::write(&table, "51 23 8:1 / / rw,relatime - ext4 /dev/sda1 rw\n").unwrap();
+        // Two credits open the file; the first chunk read refuses.
+        let mut calls = 0;
+        let mut budget = 2;
+        let read = super::read_mount_table(&table, 1024 * 1024, &mut || {
+            calls += 1;
+            if budget == 0 {
+                false
             } else {
-                failed(52, 8, 2)
+                budget -= 1;
+                true
             }
         });
-        assert_eq!(uncovered, 1, "only the failed mark owes a gap");
-        assert!(next.contains(&mnt(51, 8, 1)));
-        assert!(next.contains(&mnt(68, 0, 42)));
-        assert_eq!(next.len(), 2);
+        assert_eq!(read.outcome, super::MountTableOutcome::Truncated);
+        assert_eq!(read.mounts.len(), 1, "nothing parsed, so `/` stands in");
+        assert_eq!(calls, 3, "the open plus the refused read");
+        // The same table with room completes for exactly 4 credits.
+        let mut calls = 0;
+        let read = super::read_mount_table(&table, 1024 * 1024, &mut || {
+            calls += 1;
+            true
+        });
+        assert_eq!(read.outcome, super::MountTableOutcome::Complete);
+        assert_eq!(calls, 4, "the open, one data read and the EOF read");
+    }
+
+    /// A mark pass spends one credit per mount and resumes across
+    /// passes: with 10 mounts and 4 credits, three passes attempt
+    /// exactly 4, 4 and 2 mounts in rotation order, retained mounts
+    /// re-cover for free, and the last pass resets the cursor.
+    /// (Unprivileged: constructed mounts, injected marks.)
+    #[test]
+    fn learn_mark_pass_charges_and_resumes() {
+        let visible: Vec<super::MountToMark> = (0..10)
+            .map(|n| visible_mount(&format!("/mnt/m{n}"), 51 + n as u64, 8, 1))
+            .collect();
+        let run = |previously: &std::collections::BTreeSet<super::MountIdentity>,
+                   resume: Option<&std::path::Path>| {
+            let mut offered = Vec::new();
+            let mut calls = 0;
+            let mut remaining = 4;
+            let outcome = super::evaluate_mark_coverage(
+                previously,
+                &visible,
+                |point: &std::path::Path| {
+                    offered.push(point.to_path_buf());
+                    let id: u64 = point
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .and_then(|name| name.strip_prefix('m'))
+                        .and_then(|id| id.parse().ok())
+                        .expect("fixture points carry their mount id");
+                    marked(51 + id, 8, 1)
+                },
+                &mut || {
+                    calls += 1;
+                    if remaining == 0 {
+                        false
+                    } else {
+                        remaining -= 1;
+                        true
+                    }
+                },
+                resume,
+            );
+            (outcome, calls, offered)
+        };
+        let point = |n: usize| std::path::PathBuf::from(format!("/mnt/m{n}"));
+        let covered: std::collections::BTreeSet<super::MountIdentity> =
+            std::collections::BTreeSet::new();
+        let (first, calls, offered) = run(&covered, None);
+        assert_eq!(calls, 5, "four grants plus the stop refusal");
+        assert_eq!(
+            offered,
+            vec![point(0), point(1), point(2), point(3)],
+            "the first pass offers the head in order"
+        );
+        assert_eq!(
+            first,
+            super::MarkPassOutcome {
+                covered: (0..4u64).map(|n| mnt(51 + n, 8, 1)).collect(),
+                uncovered: 6,
+                attempted: 4,
+                spent: true,
+                resume_after: Some(point(3)),
+                table_gap: false,
+            }
+        );
+        let (second, calls, offered) = run(&first.covered, first.resume_after.as_deref());
+        assert_eq!(
+            calls, 5,
+            "retained mounts re-cover for free; four grants plus the stop refusal"
+        );
+        assert_eq!(
+            offered,
+            vec![point(4), point(5), point(6), point(7)],
+            "the second pass resumes after the cursor"
+        );
+        assert_eq!(
+            second,
+            super::MarkPassOutcome {
+                covered: (0..8u64).map(|n| mnt(51 + n, 8, 1)).collect(),
+                uncovered: 2,
+                attempted: 4,
+                spent: true,
+                resume_after: Some(point(7)),
+                table_gap: false,
+            }
+        );
+        let (third, calls, offered) = run(&second.covered, second.resume_after.as_deref());
+        assert_eq!(calls, 2, "eight retained mounts cost nothing");
+        assert_eq!(offered, vec![point(8), point(9)], "the tail finishes");
+        assert_eq!(
+            third,
+            super::MarkPassOutcome {
+                covered: (0..10u64).map(|n| mnt(51 + n, 8, 1)).collect(),
+                uncovered: 0,
+                attempted: 2,
+                spent: false,
+                resume_after: None,
+                table_gap: false,
+            },
+            "visiting every mount resets the rotation"
+        );
+    }
+
+    /// Retained mounts re-cover without spending: with no credits at
+    /// all, a fully covered table still resolves with no gap and no
+    /// admission call. (Unprivileged: constructed mounts.)
+    #[test]
+    fn learn_mark_pass_retained_skips_spend_nothing() {
+        let covered: std::collections::BTreeSet<super::MountIdentity> =
+            [mnt(51, 8, 1), mnt(52, 8, 2)].into_iter().collect();
+        let visible = vec![
+            visible_mount("/", 51, 8, 1),
+            visible_mount("/data", 52, 8, 2),
+        ];
+        let mut calls = 0;
+        let outcome = super::evaluate_mark_coverage(
+            &covered,
+            &visible,
+            |_| unresolved(),
+            &mut || {
+                calls += 1;
+                false
+            },
+            None,
+        );
+        assert_eq!(calls, 0, "retained mounts never reach the budget");
+        assert_eq!(
+            outcome,
+            super::MarkPassOutcome {
+                covered,
+                uncovered: 0,
+                attempted: 0,
+                spent: false,
+                resume_after: None,
+                table_gap: false,
+            }
+        );
+    }
+
+    /// A spent pass counts exactly: failed attempts plus the
+    /// unattempted remainder, with the cursor on the last offer.
+    /// (Unprivileged: constructed mounts, injected marks.)
+    #[test]
+    fn learn_mark_pass_counts_failed_and_refused() {
+        let visible: Vec<super::MountToMark> = (0..6)
+            .map(|n| visible_mount(&format!("/mnt/m{n}"), 51 + n as u64, 8, 1))
+            .collect();
+        let mut remaining = 3;
+        let outcome = super::evaluate_mark_coverage(
+            &std::collections::BTreeSet::new(),
+            &visible,
+            |point| {
+                if point.as_os_str() == "/mnt/m1" {
+                    failed(52, 8, 1)
+                } else {
+                    let id: u64 = point
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .and_then(|name| name.strip_prefix('m'))
+                        .and_then(|id| id.parse().ok())
+                        .expect("fixture points carry their mount id");
+                    marked(51 + id, 8, 1)
+                }
+            },
+            &mut || {
+                if remaining == 0 {
+                    false
+                } else {
+                    remaining -= 1;
+                    true
+                }
+            },
+            None,
+        );
+        assert_eq!(
+            outcome,
+            super::MarkPassOutcome {
+                covered: [mnt(51, 8, 1), mnt(53, 8, 1)].into_iter().collect(),
+                uncovered: 4,
+                attempted: 3,
+                spent: true,
+                resume_after: Some(std::path::PathBuf::from("/mnt/m2")),
+                table_gap: false,
+            },
+            "one failure plus three unattempted mounts"
+        );
+    }
+
+    /// The rotation resumes after a failed cursor mount instead of
+    /// re-spending the next pass's budget on it: the failed mount
+    /// counts uncovered without an offer while the pass attempts what
+    /// follows. A stale cursor restarts the rotation from the head.
+    /// (Unprivileged: constructed mounts, injected marks.)
+    #[test]
+    fn learn_mark_pass_resumes_after_a_failed_cursor() {
+        let visible = vec![
+            visible_mount("/mnt/m0", 51, 8, 1),
+            visible_mount("/mnt/m1", 52, 8, 1),
+        ];
+        fn mark(point: &std::path::Path) -> super::MarkOutcome {
+            if point.as_os_str() == "/mnt/m0" {
+                failed(51, 8, 1)
+            } else {
+                marked(52, 8, 1)
+            }
+        }
+        let run = |previously: &std::collections::BTreeSet<super::MountIdentity>,
+                   resume: Option<&std::path::Path>| {
+            let mut remaining = 1;
+            super::evaluate_mark_coverage(
+                previously,
+                &visible,
+                mark,
+                &mut || {
+                    if remaining == 0 {
+                        false
+                    } else {
+                        remaining -= 1;
+                        true
+                    }
+                },
+                resume,
+            )
+        };
+        let empty = std::collections::BTreeSet::new();
+        let first = run(&empty, None);
+        assert_eq!(
+            first,
+            super::MarkPassOutcome {
+                covered: std::collections::BTreeSet::new(),
+                uncovered: 2,
+                attempted: 1,
+                spent: true,
+                resume_after: Some(std::path::PathBuf::from("/mnt/m0")),
+                table_gap: false,
+            },
+            "one failure plus one unattempted mount"
+        );
+        let second = run(&first.covered, first.resume_after.as_deref());
+        assert_eq!(
+            second,
+            super::MarkPassOutcome {
+                covered: [mnt(52, 8, 1)].into_iter().collect(),
+                uncovered: 1,
+                attempted: 1,
+                spent: false,
+                resume_after: None,
+                table_gap: false,
+            },
+            "the failed cursor counts without an offer; the next mount attempts"
+        );
+        let stale = run(&second.covered, Some(std::path::Path::new("/mnt/gone")));
+        assert_eq!(
+            stale,
+            super::MarkPassOutcome {
+                covered: [mnt(52, 8, 1)].into_iter().collect(),
+                uncovered: 1,
+                attempted: 1,
+                spent: false,
+                resume_after: None,
+                table_gap: false,
+            },
+            "a stale cursor restarts the rotation from the head"
+        );
+    }
+
+    /// The production pass budget bounds a pathological table: 4100
+    /// mounts cost their 10-credit table read (open, 8 chunk reads)
+    /// plus one credit per mount, so exactly 4086 mount attempts fit
+    /// and the pass spends with the cursor on the last offer. A
+    /// 4086-mount table completes the rotation. (Unprivileged:
+    /// generated fixtures, injected marks.)
+    #[test]
+    fn learn_mark_pass_budget_bounds_a_pathological_table() {
+        let lines = |count: u64| -> String {
+            let mut text = String::new();
+            for id in 51..51 + count {
+                let mut line = format!("{id} 23 8:1 / /mnt/m{id} rw,relatime - ext4 /dev/sda1 rw");
+                while line.len() < 99 {
+                    line.push(' ');
+                }
+                line.push('\n');
+                assert_eq!(line.len(), 100);
+                text.push_str(&line);
+            }
+            text
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let big = dir.path().join("big");
+        std::fs::write(&big, lines(4100)).unwrap();
+        let outcome = super::mark_visible_filesystems(
+            &big,
+            &std::collections::BTreeSet::new(),
+            None,
+            &mut super::pass_budget(),
+            |_, _| marked(51, 8, 1),
+        );
+        assert_eq!(
+            outcome,
+            super::MarkPassOutcome {
+                covered: [mnt(51, 8, 1)].into_iter().collect(),
+                uncovered: 14,
+                attempted: 4086,
+                spent: true,
+                resume_after: Some(std::path::PathBuf::from("/mnt/m4136")),
+                table_gap: false,
+            },
+            "10 table credits leave exactly 4086 mount attempts"
+        );
+        let exact = dir.path().join("exact");
+        std::fs::write(&exact, lines(4086)).unwrap();
+        let outcome = super::mark_visible_filesystems(
+            &exact,
+            &std::collections::BTreeSet::new(),
+            None,
+            &mut super::pass_budget(),
+            |_, _| marked(51, 8, 1),
+        );
+        assert_eq!(outcome.spent, false, "4086 mounts fit the allowance");
+        assert_eq!(outcome.resume_after, None, "the rotation completes");
+        assert_eq!(outcome.uncovered, 0);
+        assert_eq!(outcome.attempted, 4086);
     }
 
     /// The held descriptor's mount identity takes the snapshot
@@ -4068,11 +4908,16 @@ mod tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let handle = std::thread::spawn(move || {
             let visible = vec![visible_mount("/", 51, 8, 1)];
-            let _ =
-                super::evaluate_mark_coverage(&std::collections::BTreeSet::new(), &visible, |_| {
+            let _ = super::evaluate_mark_coverage(
+                &std::collections::BTreeSet::new(),
+                &visible,
+                |_| {
                     std::thread::sleep(std::time::Duration::from_secs(5));
                     unresolved()
-                });
+                },
+                &mut || true,
+                None,
+            );
             let _ = done_tx.send(());
         });
         let mut learner = super::FileLearner {
@@ -4262,7 +5107,14 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_secs(5));
             saw_cancel_hook.store(cancel.load(Ordering::Acquire), Ordering::Release);
             hook_done_hook.store(true, Ordering::Release);
-            (std::collections::BTreeSet::new(), 0)
+            super::MarkPassOutcome {
+                covered: std::collections::BTreeSet::new(),
+                uncovered: 0,
+                attempted: 0,
+                spent: false,
+                resume_after: None,
+                table_gap: false,
+            }
         });
         let elapsed = start.elapsed();
         assert!(pass.is_none(), "a stalled arming pass times out");
@@ -5127,7 +5979,7 @@ mod tests {
             super::spawn_remark_pass(&shared, &prev, &mut pending, move |_, _| {
                 first.fetch_add(1, Ordering::SeqCst);
                 std::thread::sleep(std::time::Duration::from_secs(2));
-                (std::collections::BTreeSet::new(), 7)
+                pass_outcome(7)
             }),
             "the spawn starts the pass"
         );
@@ -5154,7 +6006,7 @@ mod tests {
         assert!(
             !super::spawn_remark_pass(&shared, &prev, &mut pending, move |_, _| {
                 second.fetch_add(1, Ordering::SeqCst);
-                (std::collections::BTreeSet::new(), 0)
+                pass_outcome(0)
             }),
             "a tick while a pass runs files the gap, not silently skipped"
         );
@@ -5167,7 +6019,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_secs(3));
         assert_eq!(
             super::adopt_remark_result(&prev, &mut pending),
-            Some((std::collections::BTreeSet::new(), 7)),
+            Some(pass_outcome(7)),
             "the landed pass result is adopted"
         );
         assert!(pending.is_none(), "no pass in flight afterwards");
@@ -5182,7 +6034,14 @@ mod tests {
         pending = Some(rx);
         assert_eq!(
             super::adopt_remark_result(&prev, &mut pending),
-            Some((std::collections::BTreeSet::new(), 1)),
+            Some(super::MarkPassOutcome {
+                covered: std::collections::BTreeSet::new(),
+                uncovered: 1,
+                attempted: 0,
+                spent: false,
+                resume_after: None,
+                table_gap: false,
+            }),
             "a dead pass keeps coverage with one uncovered"
         );
         // The next spawn starts fresh again.
@@ -5193,7 +6052,7 @@ mod tests {
             &mut pending,
             move |_, _| {
                 fourth.fetch_add(1, Ordering::SeqCst);
-                (std::collections::BTreeSet::new(), 0)
+                pass_outcome(0)
             },
         ));
         let restarted = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -5221,7 +6080,7 @@ mod tests {
             super::spawn_remark_pass(&shared, &prev, &mut pending, move |_, _| {
                 first.fetch_add(1, Ordering::SeqCst);
                 std::thread::sleep(std::time::Duration::from_secs(30));
-                (std::collections::BTreeSet::new(), 0)
+                pass_outcome(0)
             }),
             "the first pass starts"
         );
@@ -5235,7 +6094,7 @@ mod tests {
         assert!(
             !super::spawn_remark_pass(&shared, &prev, &mut pending, move |_, _| {
                 second.fetch_add(1, Ordering::SeqCst);
-                (std::collections::BTreeSet::new(), 0)
+                pass_outcome(0)
             }),
             "a pass still pending at the next period files the gap"
         );
@@ -5267,14 +6126,14 @@ mod tests {
         assert!(
             super::spawn_remark_pass(&shared, &prev, &mut pending, move |_, _| {
                 first.fetch_add(1, Ordering::SeqCst);
-                (std::collections::BTreeSet::new(), 0)
+                pass_outcome(0)
             }),
             "the first pass starts"
         );
         let landed = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            if let Some((_, uncovered)) = super::adopt_remark_result(&prev, &mut pending) {
-                assert_eq!(uncovered, 0, "the finished pass covered all");
+            if let Some(outcome) = super::adopt_remark_result(&prev, &mut pending) {
+                assert_eq!(outcome.uncovered, 0, "the finished pass covered all");
                 break;
             }
             assert!(
@@ -5288,7 +6147,7 @@ mod tests {
         assert!(
             super::spawn_remark_pass(&shared, &prev, &mut pending, move |_, _| {
                 second.fetch_add(1, Ordering::SeqCst);
-                (std::collections::BTreeSet::new(), 0)
+                pass_outcome(0)
             }),
             "a finished pass starts the next one with no gap"
         );
@@ -5307,10 +6166,19 @@ mod tests {
     fn learn_remark_with_taken_group_marks_nothing() {
         let shared: std::sync::Arc<std::sync::Mutex<Option<std::os::fd::OwnedFd>>> =
             std::sync::Arc::new(std::sync::Mutex::new(None));
-        let (covered, uncovered) =
-            super::mark_visible_filesystems_shared(&shared, &std::collections::BTreeSet::new());
-        assert!(covered.is_empty(), "no group means no marks: {covered:?}");
-        assert!(uncovered > 0, "unmarked mounts count as uncovered");
+        let outcome = super::mark_visible_filesystems(
+            std::path::Path::new("/proc/self/mountinfo"),
+            &std::collections::BTreeSet::new(),
+            None,
+            &mut || true,
+            |point, mounts| super::try_mark_filesystem_shared(&shared, point, mounts),
+        );
+        assert!(
+            outcome.covered.is_empty(),
+            "no group means no marks: {:?}",
+            outcome.covered
+        );
+        assert!(outcome.uncovered > 0, "unmarked mounts count as uncovered");
     }
 
     /// Drain exit closes the group while a re-mark helper is still stuck

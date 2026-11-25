@@ -770,7 +770,7 @@ impl PauseCoordinator {
 
     pub(crate) fn arm(&mut self, io: &mut impl PauseIo) -> Result<ArmResult, PauseError> {
         if self.policy == PausePolicy::Never || !self.rearming_enabled {
-            self.service_disarm_backlog(io);
+            self.service_disarm_backlog(io)?;
             return Ok(ArmResult::Disabled);
         }
         if self.armed {
@@ -917,15 +917,18 @@ impl PauseCoordinator {
     }
 
     /// Settles one arm-failure release attempt into the retry debt: a
-    /// proven release clears it, a failure against a live-or-doubted
-    /// child files the named gap and owes the retry, and a failure
+    /// proven release clears it and its failure count, a failure
+    /// against a live-or-doubted child files the named gap, owes the
+    /// retry, and counts one consecutive failure, and a failure
     /// against a proven-gone child is moot (nothing was owed).
     fn settle_release_attempt(&mut self, io: &mut impl PauseIo, released: bool, gone: bool) {
         if released || gone {
             self.release_owed = false;
+            self.release_failures = 0;
         } else {
             io.note_release_unproven();
             self.release_owed = true;
+            self.release_failures = self.release_failures.saturating_add(1);
         }
     }
 
@@ -937,20 +940,30 @@ impl PauseCoordinator {
     /// landed before it — owed, or protective while the key is
     /// doubted. A gone child settles the release silently (no further
     /// signal is attempted); doubt retries. At most three bounded
-    /// calls per pass (removal, liveness, release).
-    fn service_disarm_backlog(&mut self, io: &mut impl PauseIo) {
+    /// calls per pass (removal, liveness, release). After
+    /// `MAX_RELEASE_FAILURES` consecutive live-or-doubted failures the
+    /// debt escalates to a lifecycle error like the normal-path resume
+    /// failure: the capture ends and settles instead of leaving the
+    /// child stopped with no bound in time.
+    fn service_disarm_backlog(&mut self, io: &mut impl PauseIo) -> Result<(), PauseError> {
         if !self.disarm_owed && !self.release_owed {
-            return;
+            return Ok(());
         }
         if self.disarm_owed {
             self.disarm_owed = io.remove_authorization().is_err();
         }
         if matches!(io.original_exited(), Ok(true)) {
             self.release_owed = false;
-            return;
+            self.release_failures = 0;
+            return Ok(());
         }
         let released = io.resume().is_ok();
         self.settle_release_attempt(io, released, false);
+        if self.release_owed && self.release_failures >= MAX_RELEASE_FAILURES {
+            self.begin_attempt();
+            return self.fail_cycle(io, MSG_RELEASE_FAILED_REPEATEDLY, true);
+        }
+        Ok(())
     }
 
     fn arm_cleanup_failed(
@@ -2354,6 +2367,27 @@ impl PauseCoordinator {
                 errors.push(error);
             } else {
                 self.settle_cleanup_resume_debt();
+            }
+        }
+        // The arm-failure release debt is independent of the epoch above:
+        // a stop may still hold the child, so the final cleanup probes
+        // liveness and resumes once. A gone child settles silently; a
+        // failure is collected and the debt stays for a retry.
+        if self.release_owed {
+            match io.original_exited() {
+                Ok(true) => {
+                    self.release_owed = false;
+                    self.release_failures = 0;
+                }
+                _ => match io.resume() {
+                    Ok(()) => {
+                        self.release_owed = false;
+                        self.release_failures = 0;
+                    }
+                    Err(error) => {
+                        errors.push(error);
+                    }
+                },
             }
         }
         // After every resume is observed: a stopped child must never wait
@@ -9363,6 +9397,46 @@ mod tests {
         assert!(error.lifecycle());
         assert!(io.events.contains(&"resume"));
         assert!(coordinator.release_owed);
+    }
+
+    #[test]
+    fn disarm_backlog_proven_release_resets_the_failure_count_for_later_debt() {
+        let mut io = FakeIo {
+            same_generation: false,
+            authorization: Some(PAUSE_ARMED),
+            fail_remove: true,
+            fail_resume: true,
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.key_issued = true;
+
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Disabled);
+        assert!(coordinator.disarm_owed);
+        assert!(coordinator.release_owed);
+        assert_eq!(coordinator.release_failures, 1);
+
+        // A proven release clears the count even while the disarm stays
+        // doubted: the next protective failure starts from one, not two.
+        io.fail_resume = false;
+        io.events.clear();
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Disabled);
+        assert!(coordinator.disarm_owed);
+        assert!(!coordinator.release_owed);
+        assert_eq!(coordinator.release_failures, 0);
+
+        io.fail_resume = true;
+        io.events.clear();
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Disabled);
+        assert!(coordinator.release_owed);
+        assert_eq!(coordinator.release_failures, 1);
+
+        io.events.clear();
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Disabled);
+        assert_eq!(coordinator.release_failures, 2);
+        let error = coordinator.arm(&mut io).unwrap_err();
+        assert!(error.lifecycle());
+        assert_eq!(coordinator.release_failures, MAX_RELEASE_FAILURES);
     }
 
     #[test]

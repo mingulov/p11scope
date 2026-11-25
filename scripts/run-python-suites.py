@@ -137,6 +137,7 @@ RUN = [
     ("test_key_operations_linked_control.py", []),
     ("test_key_operations_shortlived.py", []),
     ("test_key_operations_system.py", []),
+    ("test_known_failing.py", []),
     ("test_kubernetes_runtime.py", []),
     ("test_kubernetes_runtime_workflow.py", []),
     ("test_legacy32_shape.py", []),

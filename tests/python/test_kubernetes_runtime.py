@@ -78,10 +78,16 @@ class SummaryTests(unittest.TestCase):
 
     def test_missing_duplicate_false_and_ready_only_outputs_fail(self):
         for cell, healthy in (("K1", k1_rows()), ("K2", k2_rows())):
-            for rows in (healthy[1:], healthy + [healthy[0]],
-                         [{**healthy[0], "ok": False}, *healthy[1:]]):
-                with self.subTest(cell=cell, rows=rows), self.assertRaises(ValueError):
-                    self.check(cell, rows)
+            for index, row in enumerate(healthy):
+                mutations = [healthy[:index] + healthy[index + 1:], healthy + [row]]
+                if row.get("ok") is True:
+                    false_rows = copy.deepcopy(healthy)
+                    false_rows[index]["ok"] = False
+                    mutations.append(false_rows)
+                for rows in mutations:
+                    with self.subTest(cell=cell, index=index, check=row["check"], rows=rows), \
+                            self.assertRaises(ValueError):
+                        self.check(cell, rows)
             with self.assertRaises(ValueError):
                 self.check(cell, healthy, "container Ready\n")
 

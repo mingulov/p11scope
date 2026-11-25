@@ -155,7 +155,8 @@ pub(crate) struct LaneWindows {
 
 /// The longest stop waits for the probes to detach before it writes the
 /// report (R-C51-4). Past it the report reads `retirement: unsettled` and
-/// the detach finishes after the report, interruptible by a second signal.
+/// the detach finishes after the report, interruptible by a further stop
+/// once one was already counted.
 pub(crate) const PRE_OUTPUT_RETIREMENT_WAIT: Duration = Duration::from_secs(10);
 
 impl LaneWindows {
@@ -5109,24 +5110,28 @@ fn detach_duration_text(seconds: u64) -> String {
 }
 
 /// The run's end after the stop (R-C51-4): `write` attempts final outputs
-/// (stream end, `-o`, stdout) first; then `outputs_attempted` arms the
-/// second-signal exit; only then does an unsettled retirement reach
-/// `release`, between two progress lines. The exit stops the userspace
-/// wait — the kernel still releases the remaining probes on process
-/// exit, which may take as long as the detach. A reclaimed owner keeps
+/// (stream end, `-o`, stdout) first; then `outputs_attempted` enters
+/// the detach phase and reports whether a stop was already counted;
+/// only then does an unsettled retirement reach `release`, between
+/// two progress lines. A further stop exits the userspace wait at
+/// once — but only once a stop was already counted, so the first
+/// signal of a duration-ended run keeps the report's own exit code.
+/// The kernel still releases the remaining probes on process exit,
+/// which may take as long as the detach. A reclaimed owner keeps
 /// the blocking detach; a retained one stays alive without the closing
 /// progress line. An unsettled Singles detach names its estimated
 /// remaining wait as an upper bound; Multi carries no estimate for
-/// lack of a measured per-link rate.
+/// lack of a measured per-link rate. The hint matches the count:
+/// `again` after a counted stop, `twice` after a `--duration` end.
 pub(crate) fn finish_native<L, T>(
     stopped: Option<Stopped<L>>,
     write: impl FnOnce(Option<&LaneSummary>) -> T,
-    outputs_attempted: &dyn Fn(),
+    outputs_attempted: &dyn Fn() -> bool,
     progress: &mut dyn FnMut(String),
     release: impl FnOnce(Stopped<L>) -> ExitRelease,
 ) -> T {
     let result = write(stopped.as_ref().map(|stopped| &stopped.summary));
-    outputs_attempted();
+    let stop_seen = outputs_attempted();
     if let Some(stopped) = stopped
         && let Retirement::Unsettled(_) = stopped.summary.retirement
     {
@@ -5136,8 +5141,10 @@ pub(crate) fn finish_native<L, T>(
         // count covers every attached endpoint while the pre-output
         // wait already closed some. Multi carries no estimate for lack
         // of a measured rate. Neither tail promises a prompt return:
-        // the second signal stops the userspace wait, and the kernel
-        // still releases the remaining probes on process exit.
+        // a further stop ends the userspace wait at once once one was
+        // counted, and the kernel still releases the remaining probes
+        // on process exit.
+        let presses = if stop_seen { "again" } else { "twice" };
         let (estimate, hint) = match stopped.summary.backend.backend {
             AttachBackend::Singles => {
                 let ms =
@@ -5147,14 +5154,18 @@ pub(crate) fn finish_native<L, T>(
                         ", up to {} remaining",
                         detach_duration_text(ms.div_ceil(1000))
                     ),
-                    "press Ctrl-C again to stop waiting; \
-                     the kernel may still take this long to release the probes",
+                    format!(
+                        "press Ctrl-C {presses} to stop waiting; \
+                         the kernel may still take this long to release the probes"
+                    ),
                 )
             }
             AttachBackend::Multi => (
                 String::new(),
-                "press Ctrl-C again to stop waiting; \
-                 the kernel releases the remaining probes on exit",
+                format!(
+                    "press Ctrl-C {presses} to stop waiting; \
+                     the kernel releases the remaining probes on exit"
+                ),
             ),
         };
         progress(format!(

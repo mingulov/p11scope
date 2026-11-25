@@ -1005,7 +1005,7 @@ pub fn run(
         identity,
         caller_metadata == crate::cli::CallerMetadataMode::Cgroup,
         &|| stop.stopped(),
-        &|| stop.exit_on_next_signal(),
+        &|| stop.note_outputs_attempted(),
         stdout_tty,
         &mut stdout,
         &DashboardIo::stdio(),
@@ -1045,7 +1045,7 @@ fn run_with_writer(
     capture: CaptureMode,
     attach_backend: crate::attach::BackendSelection,
     stop: &dyn Fn() -> bool,
-    outputs_attempted: &dyn Fn(),
+    outputs_attempted: &dyn Fn() -> bool,
     stdout_tty: bool,
     stdout: &mut dyn FinalStdout,
 ) -> Result<i32> {
@@ -1095,7 +1095,7 @@ fn run_with_terminal(
     capture: CaptureMode,
     attach_backend: crate::attach::BackendSelection,
     stop: &dyn Fn() -> bool,
-    outputs_attempted: &dyn Fn(),
+    outputs_attempted: &dyn Fn() -> bool,
     stdout_tty: bool,
     stdout: &mut dyn FinalStdout,
     terminal: &DashboardIo,
@@ -1145,7 +1145,7 @@ fn run_with_terminal_inner(
     capture: CaptureMode,
     attach_backend: crate::attach::BackendSelection,
     stop: &dyn Fn() -> bool,
-    outputs_attempted: &dyn Fn(),
+    outputs_attempted: &dyn Fn() -> bool,
     stdout_tty: bool,
     stdout: &mut dyn FinalStdout,
     terminal: &DashboardIo,
@@ -1198,7 +1198,7 @@ fn run_with_terminal_diagnostics(
     attach_backend: crate::attach::BackendSelection,
     identity: Option<crate::cli::IdentityBackendSelection>,
     stop: &dyn Fn() -> bool,
-    outputs_attempted: &dyn Fn(),
+    outputs_attempted: &dyn Fn() -> bool,
     stdout_tty: bool,
     stdout: &mut dyn FinalStdout,
     terminal: &DashboardIo,
@@ -2064,7 +2064,7 @@ fn run_with_terminal_budget(
     identity: Option<crate::cli::IdentityBackendSelection>,
     caller_metadata: bool,
     stop: &dyn Fn() -> bool,
-    outputs_attempted: &dyn Fn(),
+    outputs_attempted: &dyn Fn() -> bool,
     stdout_tty: bool,
     stdout: &mut dyn FinalStdout,
     terminal: &DashboardIo,
@@ -3005,7 +3005,7 @@ fn finish_failed_startup<Source: ProcessSource>(
     stdout: &mut dyn FinalStdout,
     error: &anyhow::Error,
     second_signal: &dyn Fn() -> bool,
-    outputs_attempted: &dyn Fn(),
+    outputs_attempted: &dyn Fn() -> bool,
     identity: Option<&crate::inspect_system::IdentitySummary>,
 ) -> FinalOutputOutcome {
     // Capture failed before any driver existed, so no publication
@@ -3047,7 +3047,7 @@ fn finish_failed_startup_guarded<Source: ProcessSource>(
     stdout: &mut dyn FinalStdout,
     error: &anyhow::Error,
     second_signal: &dyn Fn() -> bool,
-    outputs_attempted: &dyn Fn(),
+    outputs_attempted: &dyn Fn() -> bool,
     identity: Option<&crate::inspect_system::IdentitySummary>,
 ) -> FinalOutputOutcome {
     if stream.writer.is_some() {
@@ -10505,7 +10505,7 @@ fn run_dashboard(
     sink: Option<AtomicFile>,
     mut stream: EventLogState,
     stop: &dyn Fn() -> bool,
-    outputs_attempted: &dyn Fn(),
+    outputs_attempted: &dyn Fn() -> bool,
     stdout: &mut dyn FinalStdout,
     terminal: &DashboardIo,
     diagnostics: Option<DiagnosticsState>,
@@ -12532,7 +12532,10 @@ mod tests {
                     None,
                     false,
                     &|| false,
-                    &|| attempted.set(true),
+                    &|| {
+                        attempted.set(true);
+                        false
+                    },
                     false,
                     &mut WriterStdout(&mut stdout),
                     &DashboardIo::stdio(),
@@ -12817,7 +12820,7 @@ mod tests {
                     None,
                     false,
                     &|| false,
-                    &|| {},
+                    &|| false,
                     false,
                     &mut WriterStdout(&mut stdout),
                     &DashboardIo::stdio(),
@@ -12911,7 +12914,7 @@ mod tests {
                     None,
                     false,
                     &|| false,
-                    &|| {},
+                    &|| false,
                     false,
                     &mut WriterStdout(&mut stdout),
                     &DashboardIo::stdio(),
@@ -12977,7 +12980,7 @@ mod tests {
                     None,
                     false,
                     &|| false,
-                    &|| {},
+                    &|| false,
                     false,
                     &mut WriterStdout(&mut stdout),
                     &DashboardIo::stdio(),
@@ -13483,7 +13486,7 @@ mod tests {
             None,
             false,
             &|| false,
-            &|| {},
+            &|| false,
             false,
             &mut WriterStdout(&mut stdout),
             &DashboardIo::stdio(),
@@ -13535,7 +13538,7 @@ mod tests {
             None,
             false,
             &|| false,
-            &|| {},
+            &|| false,
             false,
             &mut WriterStdout(&mut stdout),
             &DashboardIo::stdio(),
@@ -13870,7 +13873,7 @@ mod tests {
                     None,
                     false,
                     &|| false,
-                    &|| {},
+                    &|| false,
                     false,
                     &mut WriterStdout(&mut stdout),
                     &DashboardIo::stdio(),
@@ -13984,7 +13987,7 @@ mod tests {
                     None,
                     false,
                     &|| false,
-                    &|| {},
+                    &|| false,
                     false,
                     &mut WriterStdout(&mut stdout),
                     &DashboardIo::stdio(),
@@ -14400,7 +14403,10 @@ mod tests {
                     CaptureMode::Scan,
                     crate::attach::BackendSelection::Auto,
                     &|| classic_pass_publications_for_test() >= 2,
-                    &|| finalized.set(true),
+                    &|| {
+                        finalized.set(true);
+                        false
+                    },
                     false,
                     &mut WriterStdout(&mut stdout),
                     &DashboardIo::stdio(),
@@ -14462,7 +14468,7 @@ mod tests {
             CaptureMode::Scan,
             crate::attach::BackendSelection::Auto,
             &|| false,
-            &|| {},
+            &|| false,
             false,
             &mut WriterStdout(&mut stdout),
             &DashboardIo::stdio(),
@@ -14524,7 +14530,7 @@ mod tests {
             CaptureMode::Scan,
             crate::attach::BackendSelection::Auto,
             &|| false,
-            &|| {},
+            &|| false,
             false,
             &mut WriterStdout(&mut stdout),
             &DashboardIo::stdio(),
@@ -14563,7 +14569,7 @@ mod tests {
             CaptureMode::Scan,
             crate::attach::BackendSelection::Auto,
             &|| false,
-            &|| {},
+            &|| false,
             false,
             &mut WriterStdout(&mut stdout),
             &DashboardIo::stdio(),
@@ -14606,7 +14612,7 @@ mod tests {
             CaptureMode::Scan,
             crate::attach::BackendSelection::Auto,
             &|| false,
-            &|| {},
+            &|| false,
             false,
             &mut WriterStdout(&mut stdout),
             &DashboardIo::stdio(),
@@ -14670,7 +14676,10 @@ mod tests {
             CaptureMode::Scan,
             crate::attach::BackendSelection::Auto,
             &|| false,
-            &|| finalized.set(true),
+            &|| {
+                finalized.set(true);
+                false
+            },
             false,
             &mut WriterStdout(&mut stdout),
             &DashboardIo::stdio(),
@@ -14785,7 +14794,7 @@ mod tests {
             CaptureMode::Scan,
             crate::attach::BackendSelection::Auto,
             &|| false,
-            &|| {},
+            &|| false,
             false,
             &mut stdout,
         )
@@ -14836,7 +14845,7 @@ mod tests {
                 super::CaptureMode::Scan,
                 crate::attach::BackendSelection::Auto,
                 &|| false,
-                &|| {},
+                &|| false,
                 false,
                 &mut super::WriterStdout(&mut stdout),
             )
@@ -14881,7 +14890,7 @@ mod tests {
                 super::CaptureMode::Scan,
                 crate::attach::BackendSelection::Auto,
                 &|| false,
-                &|| {},
+                &|| false,
                 false,
                 &mut super::WriterStdout(&mut stdout),
             )
@@ -14922,7 +14931,7 @@ mod tests {
             super::CaptureMode::Scan,
             crate::attach::BackendSelection::Auto,
             &|| false,
-            &|| {},
+            &|| false,
             false,
             &mut super::WriterStdout(&mut stdout),
         )
@@ -15887,7 +15896,7 @@ mod tests {
                 CaptureMode::Scan,
                 crate::attach::BackendSelection::Auto,
                 &stop,
-                &|| {},
+                &|| false,
                 true,
                 &mut Cancelled { begins: 0 },
                 &terminal,
@@ -16032,6 +16041,7 @@ mod tests {
                         &|| false,
                         &|| {
                             std::fs::write(&finalized, b"output-attempts\n").unwrap();
+                            false
                         },
                         false,
                         &mut FdStdout::new(1, &|| 0),
@@ -16407,7 +16417,10 @@ mod tests {
             CaptureMode::Scan,
             crate::attach::BackendSelection::Auto,
             &|| false,
-            &|| finalized.set(true),
+            &|| {
+                finalized.set(true);
+                false
+            },
             false,
             &mut WriterStdout(&mut stdout),
             &DashboardIo::stdio(),
@@ -16485,7 +16498,7 @@ mod tests {
             CaptureMode::Scan,
             crate::attach::BackendSelection::Auto,
             &|| true,
-            &|| {},
+            &|| false,
             true,
             &mut WriterStdout(&mut ResumeThenFail(slave.as_raw_fd())),
             &terminal,
@@ -16589,7 +16602,7 @@ mod tests {
                 crate::cli::CaptureMode::Scan,
                 crate::attach::BackendSelection::Auto,
                 &|| false,
-                &|| {},
+                &|| false,
                 false,
                 &mut WriterStdout(out),
             )
@@ -19186,7 +19199,7 @@ mod tests {
             CaptureMode::Scan,
             crate::attach::BackendSelection::Auto,
             &|| false,
-            &|| {},
+            &|| false,
             true,
             &mut WriterStdout(&mut stdout),
             &terminal,
@@ -22675,7 +22688,10 @@ mod tests {
             &mut crate::inventory_output::WriterStdout(&mut stdout),
             &error,
             &|| false,
-            &|| finalized.set(true),
+            &|| {
+                finalized.set(true);
+                false
+            },
             None,
         );
         assert!(finalized.get(), "outputs were attempted");
@@ -22733,7 +22749,10 @@ mod tests {
             &mut crate::inventory_output::WriterStdout(&mut stdout),
             &error,
             &|| false,
-            &|| finalized.set(true),
+            &|| {
+                finalized.set(true);
+                false
+            },
             None,
         );
         assert!(finalized.get(), "outputs were attempted");
@@ -22816,7 +22835,10 @@ mod tests {
             &mut crate::inventory_output::WriterStdout(&mut stdout),
             &error,
             &|| false,
-            &|| finalized.set(true),
+            &|| {
+                finalized.set(true);
+                false
+            },
             None,
         );
         assert!(finalized.get(), "outputs were attempted");
@@ -23024,7 +23046,10 @@ mod tests {
             &mut crate::inventory_output::WriterStdout(&mut stdout),
             &error,
             &|| false,
-            &|| finalized.set(true),
+            &|| {
+                finalized.set(true);
+                false
+            },
             None,
         );
         assert!(finalized.get(), "outputs were attempted");
@@ -29024,6 +29049,7 @@ mod promotion_driver_tests {
                             assert!(report.exists());
                             assert_eq!(drops.get(), 0, "no release before output: {case}");
                             order.borrow_mut().push("outputs attempted");
+                            false
                         },
                         &mut |_| panic!("no invented detach progress: {case}"),
                         |_| panic!("no stopped native owner to release: {case}"),

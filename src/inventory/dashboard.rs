@@ -2282,10 +2282,12 @@ fn read_key_byte(fd: std::os::fd::RawFd, into: &mut [u8], wait: Duration) -> boo
 /// SIGKILL cannot be caught — its terminal needs `reset(1)`.
 pub(crate) struct StopFlag {
     signals: Arc<std::sync::atomic::AtomicUsize>,
-    /// Armed once output attempts finish (R-C51-4): a further stop signal
-    /// then ends the process at once (`_exit(128 + signal)`); the kernel
+    /// Set once output attempts finish (R-C51-4): a further stop signal
+    /// then ends the process at once (`_exit(128 + signal)`), but only
+    /// once a stop was already counted — the first signal of a
+    /// duration-ended run keeps the report's own exit code. The kernel
     /// releases whatever the drop was still detaching.
-    exit_on_next: Arc<std::sync::atomic::AtomicBool>,
+    outputs_attempted: Arc<std::sync::atomic::AtomicBool>,
     _hooks: Vec<signal_hook::SigId>,
 }
 
@@ -2294,7 +2296,7 @@ pub(crate) struct StopFlag {
 impl StopFlag {
     pub(crate) fn install() -> Self {
         let signals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let exit_on_next = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let outputs_attempted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut hooks = Vec::new();
         for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
             // An inherited hangup ignore (`nohup p11scope inventory
@@ -2308,13 +2310,17 @@ impl StopFlag {
                 continue;
             }
             let count = Arc::clone(&signals);
-            let armed = Arc::clone(&exit_on_next);
+            let phase = Arc::clone(&outputs_attempted);
             // The callback uses lock-free atomics on supported x86-64, or
             // `_exit` (async-signal-safe); no allocation, no
             // I/O, no locks.
             let hook = unsafe {
                 signal_hook::low_level::register(signal, move || {
-                    if armed.load(Ordering::SeqCst) {
+                    // After the outputs a further stop ends the wait at
+                    // once — but only once a stop was already counted,
+                    // so the first signal of a duration-ended run is
+                    // counted, never fatal.
+                    if phase.load(Ordering::SeqCst) && count.load(Ordering::SeqCst) >= 1 {
                         libc::_exit(128 + signal);
                     }
                     let _ = count.try_update(Ordering::SeqCst, Ordering::SeqCst, |seen| {
@@ -2328,7 +2334,7 @@ impl StopFlag {
         }
         Self {
             signals,
-            exit_on_next,
+            outputs_attempted,
             _hooks: hooks,
         }
     }
@@ -2349,15 +2355,20 @@ impl StopFlag {
     pub(crate) fn test_without_handlers() -> Self {
         Self {
             signals: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            exit_on_next: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            outputs_attempted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             _hooks: Vec::new(),
         }
     }
 
-    /// From now on a stop signal exits the process at once (R-C51-4: the
-    /// output attempts finished; only the blocking probe detach may remain).
-    pub(crate) fn exit_on_next_signal(&self) {
-        self.exit_on_next.store(true, Ordering::SeqCst);
+    /// The output attempts finished (R-C51-4: only the blocking probe
+    /// detach may remain). Returns whether a stop was already counted:
+    /// a further stop signal then exits the process at once, while the
+    /// first signal of a duration-ended run is counted, never fatal.
+    /// The detach hint reads the answer (`again` after a counted stop,
+    /// `twice` after a `--duration` end).
+    pub(crate) fn note_outputs_attempted(&self) -> bool {
+        self.outputs_attempted.store(true, Ordering::SeqCst);
+        self.signal_count() >= 1
     }
 }
 

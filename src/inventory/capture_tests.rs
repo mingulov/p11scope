@@ -70,7 +70,7 @@ const NO_COLLECTION_TICK: Duration = Duration::from_secs(3600);
 fn exit_finalizer_under_test<L, T>(
     stopped: Option<Stopped<L>>,
     write: impl FnOnce(Option<&LaneSummary>) -> T,
-    outputs_attempted: &dyn Fn(),
+    outputs_attempted: &dyn Fn() -> bool,
     progress: &mut dyn FnMut(String),
     release: impl FnOnce(Stopped<L>) -> ExitRelease,
 ) -> T {
@@ -170,7 +170,10 @@ fn exit_finalizer_control(completed: bool) {
                         .push(format!("output:{}", summary.unwrap().retirement.label()));
                     7
                 },
-                &move || arm_log.lock().unwrap().push("armed".into()),
+                &move || {
+                    arm_log.lock().unwrap().push("armed".into());
+                    false
+                },
                 &mut move |line| progress_log.lock().unwrap().push(line),
                 move |stopped| {
                     if completed {
@@ -4735,7 +4738,10 @@ fn the_report_is_written_before_the_blocking_detach() {
             note("report");
             7
         },
-        &|| note("armed"),
+        &|| {
+            note("armed");
+            false
+        },
         &mut |line| {
             note(if line.contains("detached") {
                 "progress:done"
@@ -4812,7 +4818,10 @@ fn failed_pass_publication_retains_native_stop_for_final_sinks() {
             log.borrow_mut().push("report".into());
             log.borrow_mut().push("diagnostics".into());
         },
-        &|| log.borrow_mut().push("armed".into()),
+        &|| {
+            log.borrow_mut().push("armed".into());
+            false
+        },
         &mut |_| {},
         |s| {
             drop(s);
@@ -4950,7 +4959,10 @@ fn zero_pass_prologue_failure_still_finishes_terminal_reads() {
     finish_native(
         Some(stopped),
         |_| log.borrow_mut().push("outputs".into()),
-        &|| log.borrow_mut().push("armed".into()),
+        &|| {
+            log.borrow_mut().push("armed".into());
+            false
+        },
         &mut |_| {},
         |s| {
             drop(s);
@@ -4974,7 +4986,10 @@ fn failed_output_attempt_arms_escape_before_detach() {
             log.borrow_mut().push("output:failed".into());
             Err::<(), _>("sink failed")
         },
-        &|| log.borrow_mut().push("armed".into()),
+        &|| {
+            log.borrow_mut().push("armed".into());
+            false
+        },
         &mut |line| log.borrow_mut().push(line),
         |s| {
             drop(s);
@@ -5102,7 +5117,10 @@ fn stop_event_failure_keeps_native_cleanup_report_and_stdout() {
                 None,
             )
         },
-        &|| log.borrow_mut().push("armed".into()),
+        &|| {
+            log.borrow_mut().push("armed".into());
+            false
+        },
         &mut |_| {},
         |s| {
             drop(s);
@@ -5140,7 +5158,10 @@ fn a_closed_retirement_reports_without_a_detach_phase() {
     finish_native(
         Some(stopped),
         |_| note("report"),
-        &|| note("armed"),
+        &|| {
+            note("armed");
+            false
+        },
         &mut |_| note("progress"),
         |s| {
             drop(s);
@@ -5152,7 +5173,7 @@ fn a_closed_retirement_reports_without_a_detach_phase() {
 
 /// The post-report progress lines for an unsettled retirement with
 /// `attached` endpoints on `backend`.
-fn detach_lines_for(backend: LaneBackend, attached: usize) -> Vec<String> {
+fn detach_lines_for(backend: LaneBackend, attached: usize, stop_seen: bool) -> Vec<String> {
     let log = Log::default();
     let stopped = Stopped {
         events: Vec::new(),
@@ -5171,7 +5192,7 @@ fn detach_lines_for(backend: LaneBackend, attached: usize) -> Vec<String> {
     finish_native(
         Some(stopped),
         |_| {},
-        &|| {},
+        &|| stop_seen,
         &mut |line| lines.push(line),
         |stopped| {
             drop(stopped);
@@ -5187,7 +5208,7 @@ fn detach_lines_for(backend: LaneBackend, attached: usize) -> Vec<String> {
 #[test]
 fn unsettled_singles_detach_line_estimates_remaining_minutes() {
     assert_eq!(
-        detach_lines_for(LaneBackend::singles(), 4683),
+        detach_lines_for(LaneBackend::singles(), 4683, true),
         [
             "p11scope: output attempts finished; detaching the remaining native probes of \
              4683 endpoints, up to about 6 minutes remaining (press Ctrl-C again to stop waiting; \
@@ -5211,7 +5232,7 @@ fn unsettled_singles_detach_estimate_renders_plain_durations() {
         (4683, "about 6 minutes"),
         (67125, "about 2 hours"),
     ] {
-        let lines = detach_lines_for(LaneBackend::singles(), attached);
+        let lines = detach_lines_for(LaneBackend::singles(), attached, true);
         assert_eq!(lines.len(), 2, "attached={attached}: {lines:?}");
         assert!(
             lines[0].contains(&format!("{duration} remaining")),
@@ -5234,10 +5255,45 @@ fn unsettled_multi_detach_line_carries_no_estimate() {
                 scope_filter: ScopeFilter::None,
             },
             20167,
+            true,
         ),
         [
             "p11scope: output attempts finished; detaching the remaining native probes of \
              20167 endpoints (press Ctrl-C again to stop waiting; \
+             the kernel releases the remaining probes on exit)",
+            "p11scope: native probes detached",
+        ]
+    );
+}
+
+/// The detach hint matches the stop count: `again` after a counted
+/// stop, `twice` after a `--duration` end whose first signal is only
+/// counted. Both backends, exact lines.
+#[test]
+fn unsettled_detach_hint_names_again_or_twice() {
+    assert_eq!(
+        detach_lines_for(LaneBackend::singles(), 4683, false),
+        [
+            "p11scope: output attempts finished; detaching the remaining native probes of \
+             4683 endpoints, up to about 6 minutes remaining (press Ctrl-C twice to stop waiting; \
+             the kernel may still take this long to release the probes)",
+            "p11scope: native probes detached",
+        ]
+    );
+    assert_eq!(
+        detach_lines_for(
+            LaneBackend {
+                selection: BackendSelection::Multi,
+                backend: AttachBackend::Multi,
+                fallback: None,
+                scope_filter: ScopeFilter::None,
+            },
+            20167,
+            false,
+        ),
+        [
+            "p11scope: output attempts finished; detaching the remaining native probes of \
+             20167 endpoints (press Ctrl-C twice to stop waiting; \
              the kernel releases the remaining probes on exit)",
             "p11scope: native probes detached",
         ]
@@ -5257,7 +5313,7 @@ fn stop_flag_child_exits_on_the_armed_signal() {
     // Positive control: before arming, a signal only requests the stop.
     assert!(flag.stopped());
     println!("FIRST_SIGNAL_STOPPED");
-    flag.exit_on_next_signal();
+    flag.note_outputs_attempted();
     // SAFETY: as above.
     unsafe { libc::raise(libc::SIGTERM) };
     println!("SURVIVED_SECOND_SIGNAL");
@@ -5280,6 +5336,88 @@ fn after_the_report_a_second_signal_exits_at_once() {
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("FIRST_SIGNAL_STOPPED"), "{stdout}");
+    assert!(!stdout.contains("SURVIVED_SECOND_SIGNAL"), "{stdout}");
+    assert_eq!(
+        output.status.code(),
+        Some(128 + libc::SIGTERM),
+        "{output:?}"
+    );
+}
+
+/// The child half of the duration-end test: inert unless its parent
+/// sets the environment. A run that ended on `--duration` (no stop
+/// counted) arms the detach, takes one SIGTERM, and must survive to
+/// exit with the report's own code.
+#[test]
+fn stop_flag_child_first_signal_after_duration_end_keeps_report_code() {
+    if std::env::var_os("P11SCOPE_STOPFLAG_FIRST_SURVIVES").is_none() {
+        return;
+    }
+    let flag = crate::inventory_dashboard::StopFlag::install();
+    flag.note_outputs_attempted();
+    // SAFETY: raising a signal whose handler is installed.
+    unsafe { libc::raise(libc::SIGTERM) };
+    assert!(flag.stopped());
+    println!("FIRST_SIGNAL_SURVIVED");
+    std::process::exit(7);
+}
+
+/// Audit test 5: after a `--duration` end, the first SIGTERM during
+/// the detach is counted, not fatal — the exit code is the report's
+/// own, never 128 + signal.
+#[test]
+fn first_signal_during_detach_keeps_the_report_code() {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "inventory_capture::tests::stop_flag_child_first_signal_after_duration_end_keeps_report_code",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("P11SCOPE_STOPFLAG_FIRST_SURVIVES", "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("FIRST_SIGNAL_SURVIVED"), "{stdout}");
+    assert_eq!(output.status.code(), Some(7), "{output:?}");
+}
+
+/// The child half of the two-during-detach test: inert unless its
+/// parent sets the environment. A duration-ended run takes two
+/// SIGTERMs during the detach; the second one stops the wait.
+#[test]
+fn stop_flag_child_second_signal_during_detach_exits() {
+    if std::env::var_os("P11SCOPE_STOPFLAG_TWO_DURING_DETACH").is_none() {
+        return;
+    }
+    let flag = crate::inventory_dashboard::StopFlag::install();
+    flag.note_outputs_attempted();
+    // SAFETY: raising a signal whose handler is installed.
+    unsafe { libc::raise(libc::SIGTERM) };
+    assert!(flag.stopped());
+    println!("FIRST_SIGNAL_SURVIVED");
+    // SAFETY: as above.
+    unsafe { libc::raise(libc::SIGTERM) };
+    println!("SURVIVED_SECOND_SIGNAL");
+    std::process::exit(0);
+}
+
+/// The second stop during the detach still stops the userspace wait
+/// at once (128 + signal), even when the run ended on `--duration`.
+#[test]
+fn second_signal_during_detach_exits_at_once() {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "inventory_capture::tests::stop_flag_child_second_signal_during_detach_exits",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("P11SCOPE_STOPFLAG_TWO_DURING_DETACH", "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("FIRST_SIGNAL_SURVIVED"), "{stdout}");
     assert!(!stdout.contains("SURVIVED_SECOND_SIGNAL"), "{stdout}");
     assert_eq!(
         output.status.code(),
@@ -5427,7 +5565,10 @@ fn native_output_boundary_control(
             log.borrow_mut().push("output:result".into());
             outcome
         },
-        &|| log.borrow_mut().push("armed".into()),
+        &|| {
+            log.borrow_mut().push("armed".into());
+            false
+        },
         &mut |_| {},
         |s| {
             drop(s);
@@ -9050,7 +9191,7 @@ mod publication_progress_tests {
                     finish_native(
                         outcome.stopped.take(),
                         |_| driver.scene.note("final-sink"),
-                        &|| {},
+                        &|| false,
                         &mut |_| {},
                         |s| {
                             drop(s);

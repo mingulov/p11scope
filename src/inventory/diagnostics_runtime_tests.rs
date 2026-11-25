@@ -464,7 +464,7 @@ fn diagnostic_alias_is_refused_before_event_log_truncation() {
                 crate::attach::BackendSelection::Auto,
                 None,
                 &|| false,
-                &|| {},
+                &|| false,
                 false,
                 &mut WriterStdout(&mut stdout),
                 &DashboardIo::stdio(),
@@ -509,7 +509,10 @@ fn native_startup_error_exports_failed_footer_and_keeps_primary_error() {
                 crate::attach::BackendSelection::Auto,
                 None,
                 &|| false,
-                &|| finalized.set(true),
+                &|| {
+                    finalized.set(true);
+                    false
+                },
                 false,
                 &mut WriterStdout(&mut stdout),
                 &DashboardIo::stdio(),
@@ -602,7 +605,10 @@ fn failed_started_record_retires_event_log_before_classic_or_dashboard_finalizat
                     crate::attach::BackendSelection::Auto,
                     None,
                     &|| false,
-                    &|| finalized.set(true),
+                    &|| {
+                        finalized.set(true);
+                        false
+                    },
                     dashboard,
                     &mut WriterStdout(&mut stdout),
                     &terminal,
@@ -805,7 +811,10 @@ fn failed_native_startup_cannot_complete_event_stream() {
         &mut WriterStdout(&mut stdout),
         &error,
         &|| false,
-        &|| finalized.set(true),
+        &|| {
+            finalized.set(true);
+            false
+        },
         None,
     );
     assert_eq!(outcome.event_log_confirmed, Some(false));

@@ -893,7 +893,10 @@ fn privileged_native_lane_dashboard_slow_pty_lp64() -> Result<()> {
         CaptureMode::Native,
         crate::attach::BackendSelection::Auto,
         &stop,
-        &|| reported.set(Some(Instant::now())),
+        &|| {
+            reported.set(Some(Instant::now()));
+            false
+        },
         true,
         &mut crate::inventory_output::WriterStdout(&mut stdout),
         &terminal,
@@ -1077,7 +1080,10 @@ fn run_product_modules(
         CaptureMode::Native,
         crate::attach::BackendSelection::Auto,
         stop,
-        &|| reported.set(Some(Instant::now())),
+        &|| {
+            reported.set(Some(Instant::now()));
+            false
+        },
         false,
         &mut crate::inventory_output::WriterStdout(&mut stdout),
     )?;
@@ -1584,7 +1590,7 @@ fn privileged_native_lane_pid_provider_retirement_diagnostics_lp64() -> Result<(
         crate::attach::BackendSelection::Auto,
         None,
         &stop,
-        &|| {},
+        &|| false,
         false,
         &mut WriterStdout(&mut stdout),
         &DashboardIo::stdio(),
@@ -4040,7 +4046,7 @@ impl IdentitySweep {
             crate::attach::BackendSelection::Auto,
             Some(crate::cli::IdentityBackendSelection::Kernel),
             stop,
-            &|| {},
+            &|| false,
             false,
             &mut crate::inventory_output::WriterStdout(&mut stdout),
             &DashboardIo::stdio(),

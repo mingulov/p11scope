@@ -2163,14 +2163,19 @@ Limits that matter in pods:
   waits at most 10 s for the probes before attempting final outputs; a
   detach still running then finishes after those attempts, between the
   stderr lines `p11scope: output attempts finished; detaching the remaining native
-  probes …` and `p11scope: native probes detached`, and a second
-  SIGINT, SIGTERM or SIGHUP after output attempts return stops the
-  userspace wait (status 128 + signal); the kernel still releases the
-  remaining probes on process exit, which may take as long as the
-  detach itself, so the shell may wait too. On
+  probes …` and `p11scope: native probes detached`, and a further stop
+  signal after output attempts return stops the userspace wait
+  (status 128 + signal) — but only once a stop was already counted:
+  a run its operator already stopped needs one more (`press Ctrl-C
+  again`), while a run that ended on `--duration` counts the first
+  signal and keeps the report's exit code, so stopping that wait
+  takes two (`press Ctrl-C twice`); the hint names which. The kernel
+  still releases the remaining probes on process exit, which may take
+  as long as the detach itself, so the shell may wait too. On
   Singles the first line states the remaining wait as an upper bound
   (`… 4683 endpoints, up to about 6 minutes remaining (press Ctrl-C again to
-  stop waiting; the kernel may still take this long to release the probes)`),
+  stop waiting; the kernel may still take this long to release the probes)`
+  after a counted stop, `press Ctrl-C twice` after a `--duration` end),
   computed at 80 ms per link (the top of the measured 18-83 ms/link range);
   the wait is host-dependent, so a fast host finishes well under the estimate.
   Every exec and process exit in scope sends a 920-byte record through

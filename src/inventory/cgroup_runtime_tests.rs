@@ -2302,7 +2302,7 @@ fn run_public_selection(
         None,
         false,
         &|| false,
-        &|| {},
+        &|| false,
         false,
         &mut WriterStdout(stdout),
         &DashboardIo::stdio(),

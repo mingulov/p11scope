@@ -7941,8 +7941,7 @@ impl CallerRegistry {
             // A genuinely new cookie past the total drops disclosed
             // instead of growing the count past the bound.
             self.unidentified_images_saturated = true;
-            self.unidentified_pids_dropped =
-                self.unidentified_pids_dropped.saturating_add(1);
+            self.unidentified_pids_dropped = self.unidentified_pids_dropped.saturating_add(1);
             return;
         }
         Self::insert_unbound_image(

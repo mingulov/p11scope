@@ -44114,14 +44114,13 @@ fn doomed_segment_birth_refusals_with(
             .prepared_semantic_batch()
             .expect("Q2 prepared");
         let input = batch.admissions().next().expect("Q2 admitted");
-        let superseding = batch
+        let superseding = *batch
             .claims()
             .next()
             .expect("Q2 claimed")
             .1
             .as_ref()
-            .expect("the claim attests")
-            .clone();
+            .expect("the claim attests");
         assert!(
             superseding.reseed_supersedes(&doomed.proof()),
             "Stuck: the posed claim supersedes the old receipt"

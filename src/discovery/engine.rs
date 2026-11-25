@@ -16591,10 +16591,7 @@ impl Engine {
             self.merge_live_tables_dropped = self
                 .merge_live_tables_dropped
                 .saturating_add(overflow.live_dropped);
-            self.mark_live_loss(
-                MERGE_LIVE_OVERFLOW_SUBJECT,
-                &merge_live_overflow_reason(),
-            );
+            self.mark_live_loss(MERGE_LIVE_OVERFLOW_SUBJECT, &merge_live_overflow_reason());
             if crate::run::capture_diagnostics_on() {
                 eprintln!(
                     "p11scope: live table merge dropped {} live tables past the per-module live allowance ({} total)",

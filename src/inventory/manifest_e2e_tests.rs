@@ -3199,27 +3199,61 @@ fn keysize_canary_json_dump_array(cells: &serde_json::Value) -> Result<Vec<u8>> 
     cells.iter().map(keysize_canary_json_dump_cell).collect()
 }
 
+/// One decoded `key`/`value` byte array of one `-j` entry: exactly
+/// `expected` bytes (the map's `bytes_key`/`bytes_value` from `bpftool
+/// map list -j`), or the dump fails the caller. Mirrors `_raw_bytes`
+/// in `scripts/dump-owned-bpf-maps.py`, which rejects any other
+/// length: a short or long cell row is a dump the cell cannot trust,
+/// not a pass.
+fn keysize_canary_json_dump_sized_array(
+    cells: &serde_json::Value,
+    expected: usize,
+    what: &str,
+) -> Result<Vec<u8>> {
+    let bytes = keysize_canary_json_dump_array(cells)?;
+    ensure!(
+        bytes.len() == expected,
+        "KEYCANARY: map dump {what} is not {expected} bytes: got {}",
+        bytes.len()
+    );
+    Ok(bytes)
+}
+
 /// Raw bytes of every key/value cell in one `bpftool -j map dump`
-/// document, in document order: entries carry `key` plus `value` (or
-/// per-CPU `values`), with optional BTF `formatted` the text scan
-/// already covers. A `value` may also be the exact refusal blob
-/// `{"error": "<glibc strerror>"}` bpftool emits when the kernel
-/// refuses a cell lookup (`cgroup_array`: no userspace lookup at all —
-/// see `probe_refused_lookup` in `scripts/dump-owned-bpf-maps.py`); a
-/// refused cell holds no bytes for the decoder, but its key still
-/// scans and the blob text still scans. The blob shape is exact (one
-/// `error` string key): the strerror text itself is a glibc fact, not
-/// a kernel fact, so it is never asserted. Strict shape otherwise
-/// (mirrors `normalize_map_dump`): an unknown field fails the caller,
-/// so a dump the cell cannot decode fails closed instead of passing
-/// thin.
-fn keysize_canary_json_dump_cells(dump: &[u8]) -> Result<Vec<u8>> {
+/// document, in document order, plus the refused-cell count: entries
+/// carry `key` plus `value` (or per-CPU `values`), with optional BTF
+/// `formatted` the text scan already covers. Every decoded key must be
+/// exactly `key_len` bytes and every readable value exactly `value_len`
+/// bytes (the map's `bytes_key`/`bytes_value` from `bpftool map list
+/// -j`); a short or long row fails the caller. A `value` may also be
+/// the exact refusal blob `{"error": "<glibc strerror>"}` bpftool
+/// emits when the kernel refuses a cell lookup (`cgroup_array`: no
+/// userspace lookup at all — see `probe_refused_lookup` in
+/// `scripts/dump-owned-bpf-maps.py`); a refused cell holds no bytes
+/// for the decoder, so it skips the value-length check — but it still
+/// counts, and its key still scans and must be exactly `key_len`
+/// bytes. The caller gates the count on the map kind (only
+/// `cgroup_array` may refuse): a refused cell is unscanned surface,
+/// not a pass. The blob shape is exact (one `error` string key): the
+/// strerror text itself is a glibc fact, not a kernel fact, so it is
+/// never asserted. Per-CPU `values` must be non-empty (an empty array
+/// contributes zero bytes and would pass thin); full
+/// possible-CPU-set parity stays out of scope (the cell carries no
+/// possible-CPU metadata). Strict shape otherwise (mirrors
+/// `normalize_map_dump`): an unknown field fails the caller, so a
+/// dump the cell cannot decode fails closed instead of passing thin.
+fn keysize_canary_json_dump_cells(
+    dump: &[u8],
+    key_len: usize,
+    value_len: usize,
+) -> Result<(Vec<u8>, usize)> {
     let parsed: serde_json::Value =
         serde_json::from_slice(dump).context("KEYCANARY: map dump is not JSON")?;
     let entries = parsed
         .as_array()
         .context("KEYCANARY: map dump is not an array")?;
     let mut out = Vec::new();
+    let mut refused = 0usize;
     for entry in entries {
         let object = entry
             .as_object()
@@ -3234,21 +3268,38 @@ fn keysize_canary_json_dump_cells(dump: &[u8]) -> Result<Vec<u8>> {
         keys.sort_unstable();
         match keys.as_slice() {
             ["formatted", "key", "value"] | ["key", "value"] => {
-                out.extend(keysize_canary_json_dump_array(&object["key"])?);
+                out.extend(keysize_canary_json_dump_sized_array(
+                    &object["key"],
+                    key_len,
+                    "key",
+                )?);
                 if let Some(blob) = object["value"].as_object() {
                     ensure!(
                         blob.len() == 1 && blob.get("error").is_some_and(|error| error.is_string()),
                         "KEYCANARY: map dump refused cell is not {{\"error\": str}}"
                     );
+                    refused += 1;
                 } else {
-                    out.extend(keysize_canary_json_dump_array(&object["value"])?);
+                    out.extend(keysize_canary_json_dump_sized_array(
+                        &object["value"],
+                        value_len,
+                        "value",
+                    )?);
                 }
             }
             ["formatted", "key", "values"] | ["key", "values"] => {
-                out.extend(keysize_canary_json_dump_array(&object["key"])?);
+                out.extend(keysize_canary_json_dump_sized_array(
+                    &object["key"],
+                    key_len,
+                    "key",
+                )?);
                 let rows = object["values"]
                     .as_array()
                     .context("KEYCANARY: map dump values is not an array")?;
+                ensure!(
+                    !rows.is_empty(),
+                    "KEYCANARY: map dump per-CPU values are empty"
+                );
                 for row in rows {
                     let row = row
                         .as_object()
@@ -3263,20 +3314,46 @@ fn keysize_canary_json_dump_cells(dump: &[u8]) -> Result<Vec<u8>> {
                             .is_some_and(|cpu| cpu <= u64::from(u32::MAX)),
                         "KEYCANARY: map dump per-CPU row has no u32 cpu"
                     );
-                    out.extend(keysize_canary_json_dump_array(&row["value"])?);
+                    out.extend(keysize_canary_json_dump_sized_array(
+                        &row["value"],
+                        value_len,
+                        "value",
+                    )?);
                 }
             }
             _ => anyhow::bail!("KEYCANARY: map dump entry has unexpected fields: {keys:?}"),
         }
     }
-    Ok(out)
+    Ok((out, refused))
 }
 
-/// True when the marker appears in any decoded key/value cell of one
-/// `-j` dump. Runs beside the text scan (which covers BTF `formatted`
-/// ASCII); a dump that is not decodable fails the caller.
-fn keysize_canary_json_dump_marked(dump: &[u8]) -> Result<bool> {
-    Ok(keysize_canary_scan(&keysize_canary_json_dump_cells(dump)?))
+/// Whether the marker appears in any decoded key/value cell of one
+/// `-j` dump, plus the refused-cell count. Runs beside the text scan
+/// (which covers BTF `formatted` ASCII); a dump that is not decodable
+/// fails the caller. `key_len`/`value_len` are the map's
+/// `bytes_key`/`bytes_value` widths; the caller gates `refused` on
+/// the map kind.
+fn keysize_canary_json_dump_marked(
+    dump: &[u8],
+    key_len: usize,
+    value_len: usize,
+) -> Result<(bool, usize)> {
+    let (bytes, refused) = keysize_canary_json_dump_cells(dump, key_len, value_len)?;
+    Ok((keysize_canary_scan(&bytes), refused))
+}
+
+/// The refused-cell gate: refused cells are legitimate on exactly one
+/// map kind. `cgroup_array` answers every userspace lookup with
+/// -ENOTSUPP (`cgroup_array_map_ops` defines no lookup), so its dumps
+/// carry per-cell refusal blobs by kernel design; any other kind with
+/// a refused cell is unscanned surface hiding behind a "dumped" label
+/// and fails the caller.
+fn keysize_canary_refused_gate(kind: &str, refused: usize) -> Result<()> {
+    ensure!(
+        refused == 0 || kind == "cgroup_array",
+        "KEYCANARY: {refused} refused cells on a {kind} map: only cgroup_array may refuse lookups"
+    );
+    Ok(())
 }
 
 /// The live hex positive-control input: the marker hex-encoded in
@@ -3359,23 +3436,23 @@ fn keysize_canary_map_dump_scanner_finds_every_dump_encoding() {
 fn keysize_canary_json_dump_scanner_finds_marker_in_raw_cells() {
     let hex = br#"[{"key": ["0x00", "0x00"], "value": ["0x4b", "0x33", "0x59", "0x53", "0x31", "0x5a", "0x33", "0x43", "0x41", "0x4e", "0x41", "0x52", "0x59", "0x21"], "formatted": {"key": 0, "value": {}}}]"#;
     assert!(
-        keysize_canary_json_dump_marked(hex).unwrap(),
+        keysize_canary_json_dump_marked(hex, 2, 14).unwrap().0,
         "finds the marker in 0x-hex cells beside formatted output"
     );
     let decimal =
         br#"[{"key": [0, 0], "value": [75, 51, 89, 83, 49, 90, 51, 67, 65, 78, 65, 82, 89, 33]}]"#;
     assert!(
-        keysize_canary_json_dump_marked(decimal).unwrap(),
+        keysize_canary_json_dump_marked(decimal, 2, 14).unwrap().0,
         "finds the marker in decimal-int cells"
     );
     let in_key = br#"[{"key": ["0x4b", "0x33", "0x59", "0x53", "0x31", "0x5a", "0x33", "0x43", "0x41", "0x4e", "0x41", "0x52", "0x59", "0x21"], "value": ["0x00"]}]"#;
     assert!(
-        keysize_canary_json_dump_marked(in_key).unwrap(),
+        keysize_canary_json_dump_marked(in_key, 14, 1).unwrap().0,
         "finds the marker in key cells too"
     );
     let upper = br#"[{"key": ["0x00"], "value": ["0x4B", "0x33", "0x59", "0x53", "0x31", "0x5A", "0x33", "0x43", "0x41", "0x4E", "0x41", "0x52", "0x59", "0x21"]}]"#;
     assert!(
-        keysize_canary_json_dump_marked(upper).unwrap(),
+        keysize_canary_json_dump_marked(upper, 1, 14).unwrap().0,
         "finds the marker in uppercase hex digits"
     );
 }
@@ -3383,15 +3460,38 @@ fn keysize_canary_json_dump_scanner_finds_marker_in_raw_cells() {
 /// The `-j` decoder reads per-CPU `values` rows, not just `value`.
 #[test]
 fn keysize_canary_json_dump_scanner_finds_marker_in_percpu_values() {
-    let dump = br#"[{"key": ["0x00", "0x00", "0x00", "0x00"], "values": [{"cpu": 0, "value": ["0x00", "0x00"]}, {"cpu": 1, "value": ["0x4b", "0x33", "0x59", "0x53", "0x31", "0x5a", "0x33", "0x43", "0x41", "0x4e", "0x41", "0x52", "0x59", "0x21"]}]}]"#;
+    let dump = br#"[{"key": ["0x00", "0x00", "0x00", "0x00"], "values": [{"cpu": 0, "value": ["0x00", "0x00", "0x00", "0x00", "0x00", "0x00", "0x00", "0x00", "0x00", "0x00", "0x00", "0x00", "0x00", "0x00"]}, {"cpu": 1, "value": ["0x4b", "0x33", "0x59", "0x53", "0x31", "0x5a", "0x33", "0x43", "0x41", "0x4e", "0x41", "0x52", "0x59", "0x21"]}]}]"#;
     assert!(
-        keysize_canary_json_dump_marked(dump).unwrap(),
+        keysize_canary_json_dump_marked(dump, 4, 14).unwrap().0,
         "finds the marker in the second CPU row"
     );
     let clean = br#"[{"key": ["0x00"], "values": [{"cpu": 0, "value": ["0x00"]}]}]"#;
     assert!(
-        !keysize_canary_json_dump_marked(clean).unwrap(),
+        !keysize_canary_json_dump_marked(clean, 1, 1).unwrap().0,
         "silent on clean per-CPU rows"
+    );
+}
+
+/// Empty per-CPU values fail closed (tier-1 F1): a `values: []`
+/// entry contributes zero value bytes, so accepting it would pass an
+/// unscanned entry thin. The oracle rejects it (`malformed per-CPU
+/// values` in `scripts/dump-owned-bpf-maps.py`); full
+/// possible-CPU-set parity stays out of scope (the cell carries no
+/// possible-CPU metadata).
+#[test]
+fn keysize_canary_json_dump_scanner_rejects_empty_percpu_values() {
+    assert!(
+        keysize_canary_json_dump_marked(br#"[{"key": ["0x00"], "values": []}]"#, 1, 1).is_err(),
+        "empty per-CPU values fail closed"
+    );
+    assert!(
+        keysize_canary_json_dump_marked(
+            br#"[{"key": ["0x00"], "values": [], "formatted": {"key": 0, "value": {}}}]"#,
+            1,
+            1
+        )
+        .is_err(),
+        "empty per-CPU values fail closed beside formatted output"
     );
 }
 
@@ -3402,11 +3502,11 @@ fn keysize_canary_json_dump_scanner_is_silent_on_clean_dumps() {
     let clean =
         br#"[{"key": ["0x00"], "value": ["0x00", "0x01"]}, {"key": ["0x01"], "value": [2, 3]}]"#;
     assert!(
-        !keysize_canary_json_dump_marked(clean).unwrap(),
+        !keysize_canary_json_dump_marked(clean, 1, 2).unwrap().0,
         "silent on clean hex and decimal cells"
     );
     assert!(
-        !keysize_canary_json_dump_marked(b"[]").unwrap(),
+        !keysize_canary_json_dump_marked(b"[]", 1, 1).unwrap().0,
         "silent on an empty map dump"
     );
 }
@@ -3418,30 +3518,39 @@ fn keysize_canary_json_dump_scanner_is_silent_on_clean_dumps() {
 #[test]
 fn keysize_canary_json_dump_scanner_fails_closed_on_malformed_dumps() {
     // Not JSON at all, and valid JSON of the wrong shape.
-    assert!(keysize_canary_json_dump_marked(b"not json").is_err());
-    assert!(keysize_canary_json_dump_marked(br#"{"key": []}"#).is_err());
-    assert!(keysize_canary_json_dump_marked(b"[42]").is_err());
+    assert!(keysize_canary_json_dump_marked(b"not json", 1, 1).is_err());
+    assert!(keysize_canary_json_dump_marked(br#"{"key": []}"#, 1, 1).is_err());
+    assert!(keysize_canary_json_dump_marked(b"[42]", 1, 1).is_err());
     // A plain-text dump (the `-j` flag dropped) is not JSON: fail closed.
     let plain = b"key: 00 00 00 00  value: 4b 33 59 53 31 5a 33 43 41 4e 41 52 59 21";
-    assert!(keysize_canary_json_dump_marked(plain).is_err());
+    assert!(keysize_canary_json_dump_marked(plain, 1, 1).is_err());
     // Entries with unexpected fields, and rows that are not {cpu, value}.
-    assert!(keysize_canary_json_dump_marked(br#"[{"key": ["0x00"]}]"#).is_err());
-    assert!(
-        keysize_canary_json_dump_marked(br#"[{"key": ["0x00"], "value": ["0x00"], "extra": []}]"#)
-            .is_err()
-    );
+    assert!(keysize_canary_json_dump_marked(br#"[{"key": ["0x00"]}]"#, 1, 1).is_err());
     assert!(
         keysize_canary_json_dump_marked(
-            br#"[{"key": ["0x00"], "value": ["0x00"], "formatted": []}]"#
+            br#"[{"key": ["0x00"], "value": ["0x00"], "extra": []}]"#,
+            1,
+            1
         )
         .is_err()
     );
     assert!(
-        keysize_canary_json_dump_marked(br#"[{"key": ["0x00"], "values": [{"cpu": 0}]}]"#).is_err()
+        keysize_canary_json_dump_marked(
+            br#"[{"key": ["0x00"], "value": ["0x00"], "formatted": []}]"#,
+            1,
+            1
+        )
+        .is_err()
+    );
+    assert!(
+        keysize_canary_json_dump_marked(br#"[{"key": ["0x00"], "values": [{"cpu": 0}]}]"#, 1, 1)
+            .is_err()
     );
     assert!(
         keysize_canary_json_dump_marked(
-            br#"[{"key": ["0x00"], "values": [{"cpu": -1, "value": ["0x00"]}]}]"#
+            br#"[{"key": ["0x00"], "values": [{"cpu": -1, "value": ["0x00"]}]}]"#,
+            1,
+            1
         )
         .is_err()
     );
@@ -3459,7 +3568,7 @@ fn keysize_canary_json_dump_scanner_fails_closed_on_malformed_dumps() {
         br#"[{"key": ["0x00"], "value": "0x00"}]"#.as_slice(),
     ] {
         assert!(
-            keysize_canary_json_dump_marked(bad).is_err(),
+            keysize_canary_json_dump_marked(bad, 1, 1).is_err(),
             "malformed cell fails closed: {}",
             String::from_utf8_lossy(bad)
         );
@@ -3475,17 +3584,19 @@ fn keysize_canary_json_dump_scanner_accepts_refused_cells() {
     let refused =
         br#"[{"key": ["0x00", "0x00", "0x00", "0x00"], "value": {"error": "Unknown error 524"}}]"#;
     assert!(
-        !keysize_canary_json_dump_marked(refused).unwrap(),
+        !keysize_canary_json_dump_marked(refused, 4, 4).unwrap().0,
         "a refused cell with a clean key is clean"
     );
     let marked_key = br#"[{"key": ["0x4b", "0x33", "0x59", "0x53", "0x31", "0x5a", "0x33", "0x43", "0x41", "0x4e", "0x41", "0x52", "0x59", "0x21"], "value": {"error": "Unknown error 524"}}]"#;
     assert!(
-        keysize_canary_json_dump_marked(marked_key).unwrap(),
+        keysize_canary_json_dump_marked(marked_key, 14, 4)
+            .unwrap()
+            .0,
         "a refused cell with a marked key still fails"
     );
     let mixed = br#"[{"key": ["0x00"], "value": {"error": "Unknown error 524"}}, {"key": ["0x01"], "value": ["0x4b", "0x33", "0x59", "0x53", "0x31", "0x5a", "0x33", "0x43", "0x41", "0x4e", "0x41", "0x52", "0x59", "0x21"]}]"#;
     assert!(
-        keysize_canary_json_dump_marked(mixed).unwrap(),
+        keysize_canary_json_dump_marked(mixed, 1, 14).unwrap().0,
         "a marked readable cell beside a refused cell still fails"
     );
     // Dict-shaped values that are not exactly {"error": str} fail closed.
@@ -3497,11 +3608,165 @@ fn keysize_canary_json_dump_scanner_accepts_refused_cells() {
         br#"[{"key": ["0x00"], "value": 42}]"#.as_slice(),
     ] {
         assert!(
-            keysize_canary_json_dump_marked(bad).is_err(),
+            keysize_canary_json_dump_marked(bad, 1, 1).is_err(),
             "a malformed refused cell fails closed: {}",
             String::from_utf8_lossy(bad)
         );
     }
+}
+
+/// The `-j` decoder counts refused cells: the count the live loop
+/// gates on the map kind. Readable cells never count, refused cells
+/// always do — an uncounted refusal would be unscanned surface
+/// passing as clean.
+#[test]
+fn keysize_canary_json_dump_scanner_counts_refused_cells() {
+    let clean = br#"[{"key": ["0x00"], "value": ["0x00"]}]"#;
+    assert_eq!(
+        keysize_canary_json_dump_marked(clean, 1, 1).unwrap(),
+        (false, 0),
+        "readable cells count zero refusals"
+    );
+    assert_eq!(
+        keysize_canary_json_dump_marked(b"[]", 1, 1).unwrap(),
+        (false, 0),
+        "an empty dump counts zero refusals"
+    );
+    // Two refused cgroup_array-shaped entries (4-byte keys, the real
+    // fd-array widths) count two.
+    let two = br#"[{"key": ["0x00", "0x00", "0x00", "0x00"], "value": {"error": "Unknown error 524"}}, {"key": ["0x01", "0x00", "0x00", "0x00"], "value": {"error": "Unknown error 524"}}]"#;
+    assert_eq!(
+        keysize_canary_json_dump_marked(two, 4, 4).unwrap(),
+        (false, 2),
+        "every refused entry counts"
+    );
+    let mixed = br#"[{"key": ["0x00"], "value": {"error": "Unknown error 524"}}, {"key": ["0x01"], "value": ["0x00"]}]"#;
+    assert_eq!(
+        keysize_canary_json_dump_marked(mixed, 1, 1).unwrap(),
+        (false, 1),
+        "a readable cell beside a refused cell does not count"
+    );
+}
+
+/// The refused-cell gate admits refusals on exactly one map kind: a
+/// refused cell on any other kind is unscanned surface hiding behind
+/// a "dumped" label (a hash map whose every lookup failed would pass
+/// unscanned and still count as dumped, including `EVIDENCE_START`).
+#[test]
+fn keysize_canary_refused_gate_admits_only_cgroup_array_refusals() {
+    for kind in [
+        "hash",
+        "lru_hash",
+        "array",
+        "prog_array",
+        "percpu_hash",
+        "percpu_array",
+        "ringbuf",
+        "task_storage",
+    ] {
+        assert!(
+            keysize_canary_refused_gate(kind, 1).is_err(),
+            "{kind} with a refused cell fails closed"
+        );
+        assert!(
+            keysize_canary_refused_gate(kind, 64).is_err(),
+            "{kind} with many refused cells fails closed"
+        );
+        assert!(
+            keysize_canary_refused_gate(kind, 0).is_ok(),
+            "{kind} with zero refusals passes"
+        );
+    }
+    for refused in [0, 1, 64] {
+        assert!(
+            keysize_canary_refused_gate("cgroup_array", refused).is_ok(),
+            "cgroup_array with {refused} refusals passes"
+        );
+    }
+    // The kind match is exact: a near-miss spelling does not pass.
+    assert!(keysize_canary_refused_gate("CGROUP_ARRAY", 1).is_err());
+    assert!(keysize_canary_refused_gate("cgroup_array ", 1).is_err());
+    assert!(keysize_canary_refused_gate("", 1).is_err());
+}
+
+/// The `-j` decoder enforces exact key/value lengths (the map's
+/// `bytes_key`/`bytes_value`): a short or long row is a dump the
+/// cell cannot trust. Refused entries still check the key (their
+/// keys scan) and skip the value length (they carry no bytes).
+#[test]
+fn keysize_canary_json_dump_scanner_enforces_exact_cell_lengths() {
+    // Keys: too short and too long.
+    assert!(
+        keysize_canary_json_dump_marked(br#"[{"key": ["0x00"], "value": ["0x00"]}]"#, 2, 1)
+            .is_err(),
+        "a short key fails closed"
+    );
+    assert!(
+        keysize_canary_json_dump_marked(br#"[{"key": ["0x00", "0x01"], "value": ["0x00"]}]"#, 1, 1)
+            .is_err(),
+        "a long key fails closed"
+    );
+    // Values: too short and too long.
+    assert!(
+        keysize_canary_json_dump_marked(br#"[{"key": ["0x00"], "value": ["0x00"]}]"#, 1, 2)
+            .is_err(),
+        "a short value fails closed"
+    );
+    assert!(
+        keysize_canary_json_dump_marked(br#"[{"key": ["0x00"], "value": ["0x00", "0x01"]}]"#, 1, 1)
+            .is_err(),
+        "a long value fails closed"
+    );
+    // A wrong length in the second entry fails too, not just the first.
+    assert!(
+        keysize_canary_json_dump_marked(
+            br#"[{"key": ["0x00"], "value": ["0x00"]}, {"key": ["0x01"], "value": ["0x01", "0x02"]}]"#,
+            1,
+            1
+        )
+        .is_err(),
+        "a long value in the second entry fails closed"
+    );
+    // Per-CPU rows: the row value must be exactly value_len.
+    assert!(
+        keysize_canary_json_dump_marked(
+            br#"[{"key": ["0x00"], "values": [{"cpu": 0, "value": ["0x00", "0x01"]}]}]"#,
+            1,
+            1
+        )
+        .is_err(),
+        "a long per-CPU row value fails closed"
+    );
+    assert!(
+        keysize_canary_json_dump_marked(
+            br#"[{"key": ["0x00", "0x00"], "values": [{"cpu": 0, "value": ["0x00"]}]}]"#,
+            1,
+            1
+        )
+        .is_err(),
+        "a long per-CPU entry key fails closed"
+    );
+    // Refused entries: the key length still binds, the value length is
+    // vacuous (no bytes were returned).
+    assert!(
+        keysize_canary_json_dump_marked(
+            br#"[{"key": ["0x00"], "value": {"error": "Unknown error 524"}}]"#,
+            4,
+            4
+        )
+        .is_err(),
+        "a short refused-entry key fails closed"
+    );
+    assert_eq!(
+        keysize_canary_json_dump_marked(
+            br#"[{"key": ["0x00", "0x00", "0x00", "0x00"], "value": {"error": "Unknown error 524"}}]"#,
+            4,
+            4096
+        )
+        .unwrap(),
+        (false, 1),
+        "a refused entry skips the value length"
+    );
 }
 
 /// Why the cell dumps with `-j`: a BTF plain-text dump renders retained
@@ -3518,7 +3783,7 @@ fn keysize_canary_btf_decimal_rendering_hides_the_marker_from_the_text_scanner()
     );
     let cells = br#"[{"key": ["0x00"], "value": [75, 51, 89, 83, 49, 90, 51, 67, 65, 78, 65, 82, 89, 33]}]"#;
     assert!(
-        keysize_canary_json_dump_marked(cells).unwrap(),
+        keysize_canary_json_dump_marked(cells, 1, 14).unwrap().0,
         "the -j decoder finds the same bytes as raw cells"
     );
 }
@@ -3529,7 +3794,9 @@ fn keysize_canary_btf_decimal_rendering_hides_the_marker_from_the_text_scanner()
 #[test]
 fn keysize_canary_json_hex_control_fragment_pins_the_live_hex_control() {
     assert!(
-        keysize_canary_json_dump_marked(KEYSIZE_CANARY_JSON_HEX_CONTROL).unwrap(),
+        keysize_canary_json_dump_marked(KEYSIZE_CANARY_JSON_HEX_CONTROL, 1, 14)
+            .unwrap()
+            .0,
         "the decoder finds the control fragment"
     );
     assert!(
@@ -4378,15 +4645,52 @@ fn keysize_canary_listed_identities(listed: &[u8]) -> Result<Vec<(u32, String, S
     Ok(out)
 }
 
+/// (id, `bytes_key`, `bytes_value`) for every entry of `bpftool map
+/// list -j`: the exact cell widths the dump decoder enforces per
+/// map. Strict like the oracle's `snapshot_map_metadata` in
+/// `scripts/dump-owned-bpf-maps.py` (every entry must carry a u32
+/// id, `bytes_key` and `bytes_value`): a map whose widths are
+/// unknown is a map whose dump cannot be length-checked, so the
+/// entry fails the caller. Parsed beside the identities above
+/// (same document, same ids); the live loop looks both up per id.
+fn keysize_canary_listed_lengths(listed: &[u8]) -> Result<Vec<(u32, usize, usize)>> {
+    let parsed: serde_json::Value =
+        serde_json::from_slice(listed).context("KEYCANARY: bpftool map list output is not JSON")?;
+    let entries = parsed
+        .as_array()
+        .context("KEYCANARY: bpftool map list is not an array")?;
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let id = entry
+            .get("id")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|id| u32::try_from(id).ok())
+            .context("KEYCANARY: map list entry has no id")?;
+        let width = |field: &str| {
+            entry
+                .get(field)
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|width| u32::try_from(width).ok())
+                .and_then(|width| usize::try_from(width).ok())
+                .with_context(|| format!("KEYCANARY: map {id} list entry has no u32 {field}"))
+        };
+        out.push((id, width("bytes_key")?, width("bytes_value")?));
+    }
+    Ok(out)
+}
+
 /// The owned-map scan result: dumped (and scanned) maps, ringbufs the
 /// kernel cannot dump, identity task storage the kernel cannot dump,
-/// and the scanned dump bytes. Only names and counts ever print; dump
-/// contents stay in 0600 scratch files.
+/// the scanned dump bytes, and the refused-cell count with the maps
+/// that refused. Only names and counts ever print; dump contents stay
+/// in 0600 scratch files.
 struct KeysizeCanaryMapScan {
     dumped: Vec<String>,
     rings: Vec<String>,
     task_storage: Vec<String>,
     bytes: u64,
+    refused: u64,
+    refused_maps: Vec<String>,
 }
 
 /// Audited undumpable task storage, by bpftool-visible name.
@@ -4433,14 +4737,18 @@ fn keysize_canary_dumped_covers_evidence_start(dumped: &[String]) -> bool {
 /// `bpftool -j` and scan each dump for the canary marker, as text (BTF
 /// `formatted` ASCII) plus decoded raw cells (BTF renders retained
 /// bytes as formatted decimals in plain dumps, which the text passes
-/// cannot read). Ringbufs (`EVENTS`/`DISCOVERY`/`INFO`) are not
-/// bpftool-dumpable; the observer drains them into the scanned report,
-/// event log and observer log, so they are listed, not dumped. The
-/// identity task storage is likewise undumpable by bpftool and listed;
-/// it holds minted identity and epoch words only (no byte buffers).
-/// Any other refusal, an unaudited task-storage name, an empty dump
-/// list, a missing `EVIDENCE_START`, or a failed positive control
-/// fails the cell: an unscanned map is a hole, not a pass.
+/// cannot read). Every decoded cell row must be exactly the map's
+/// `bytes_key`/`bytes_value` widths from `bpftool map list -j`.
+/// Ringbufs (`EVENTS`/`DISCOVERY`/`INFO`) are not bpftool-dumpable;
+/// the observer drains them into the scanned report, event log and
+/// observer log, so they are listed, not dumped. The identity task
+/// storage is likewise undumpable by bpftool and listed; it holds
+/// minted identity and epoch words only (no byte buffers). Per-cell
+/// lookup refusals are counted and gated on the map kind (only
+/// `cgroup_array` may refuse); a bpftool dump refusal, an unaudited
+/// task-storage name, an empty dump list, a missing `EVIDENCE_START`,
+/// or a failed positive control fails the cell: an unscanned map is a
+/// hole, not a pass.
 fn keysize_canary_scan_owned_maps(pid: u32, dump_dir: &Path) -> Result<KeysizeCanaryMapScan> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -4456,6 +4764,8 @@ fn keysize_canary_scan_owned_maps(pid: u32, dump_dir: &Path) -> Result<KeysizeCa
     let mut rings = Vec::new();
     let mut task_storage = Vec::new();
     let mut bytes = 0u64;
+    let mut refused = 0u64;
+    let mut refused_maps = Vec::new();
     let mut combined = Vec::new();
     let list = Command::new("bpftool")
         .args(["map", "list", "-j"])
@@ -4473,6 +4783,11 @@ fn keysize_canary_scan_owned_maps(pid: u32, dump_dir: &Path) -> Result<KeysizeCa
         keysize_canary_listed_identities(&list.stdout)?
             .into_iter()
             .map(|(id, name, kind)| (id, (name, kind)))
+            .collect();
+    let lengths: std::collections::HashMap<u32, (usize, usize)> =
+        keysize_canary_listed_lengths(&list.stdout)?
+            .into_iter()
+            .map(|(id, key_len, value_len)| (id, (key_len, value_len)))
             .collect();
     for id in ids {
         let (name, kind) = identities.get(&id).with_context(|| {
@@ -4513,9 +4828,20 @@ fn keysize_canary_scan_owned_maps(pid: u32, dump_dir: &Path) -> Result<KeysizeCa
             !keysize_canary_scan_map_dump(&dump.stdout),
             "{TAG}: canary marker leaked into BPF map {name} ({id}/{kind})"
         );
-        let marked = keysize_canary_json_dump_marked(&dump.stdout).with_context(|| {
-            format!("{TAG}: cannot decode the BPF map {name} ({id}/{kind}) dump")
+        let (key_len, value_len) = lengths.get(&id).with_context(|| {
+            format!("{TAG}: owned map {name} ({id}/{kind}) has no key/value widths in the map list")
         })?;
+        let (marked, map_refused) =
+            keysize_canary_json_dump_marked(&dump.stdout, *key_len, *value_len).with_context(
+                || format!("{TAG}: cannot decode the BPF map {name} ({id}/{kind}) dump"),
+            )?;
+        keysize_canary_refused_gate(kind, map_refused).with_context(|| {
+            format!("{TAG}: BPF map {name} ({id}/{kind}) refused {map_refused} cell lookups")
+        })?;
+        if map_refused > 0 {
+            refused += map_refused as u64;
+            refused_maps.push(format!("{name} ({id}/{kind}): {map_refused}"));
+        }
         ensure!(
             !marked,
             "{TAG}: canary marker leaked into BPF map {name} ({id}/{kind}) cells"
@@ -4536,8 +4862,10 @@ fn keysize_canary_scan_owned_maps(pid: u32, dump_dir: &Path) -> Result<KeysizeCa
         keysize_canary_scan_map_dump(&combined),
         "{TAG}: map positive control failed: the scanner missed an injected marker"
     );
+    // The control fragment is one key cell and fourteen value cells by
+    // construction (pinned by the fragment test below).
     ensure!(
-        keysize_canary_json_dump_marked(KEYSIZE_CANARY_JSON_HEX_CONTROL)?,
+        keysize_canary_json_dump_marked(KEYSIZE_CANARY_JSON_HEX_CONTROL, 1, 14)?.0,
         "{TAG}: map hex positive control failed: the decoder missed hex-encoded marker cells"
     );
     Ok(KeysizeCanaryMapScan {
@@ -4545,6 +4873,8 @@ fn keysize_canary_scan_owned_maps(pid: u32, dump_dir: &Path) -> Result<KeysizeCa
         rings,
         task_storage,
         bytes,
+        refused,
+        refused_maps,
     })
 }
 
@@ -4573,6 +4903,34 @@ fn keysize_canary_listed_identities_parse_the_map_list() {
     assert!(keysize_canary_listed_identities(br#"{"id": 1}"#).is_err());
     assert!(keysize_canary_listed_identities(br#"[{"id": 1, "name": "X"}]"#).is_err());
     assert!(keysize_canary_listed_identities(br#"[{"type": "hash"}]"#).is_err());
+}
+
+#[test]
+fn keysize_canary_listed_lengths_parse_key_and_value_widths() {
+    let list = br#"[{"id": 9, "type": "hash", "name": "EVIDENCE_START", "bytes_key": 4, "bytes_value": 64},{"id": 4, "type": "ringbuf", "name": "EVENTS", "bytes_key": 0, "bytes_value": 0},{"id": 7, "type": "cgroup_array", "name": "CGROUP_FILTER", "bytes_key": 4, "bytes_value": 4}]"#;
+    assert_eq!(
+        keysize_canary_listed_lengths(list).unwrap(),
+        vec![(9, 4, 64), (4, 0, 0), (7, 4, 4)]
+    );
+    // Widths are opaque u32s; anything missing or non-u32 fails the
+    // caller.
+    assert!(keysize_canary_listed_lengths(b"not json").is_err());
+    assert!(keysize_canary_listed_lengths(br#"{"id": 1}"#).is_err());
+    assert!(keysize_canary_listed_lengths(br#"[{"type": "hash"}]"#).is_err());
+    for bad in [
+        br#"[{"id": 1, "bytes_value": 4}]"#.as_slice(),
+        br#"[{"id": 1, "bytes_key": 4}]"#.as_slice(),
+        br#"[{"id": 1, "bytes_key": "4", "bytes_value": 4}]"#.as_slice(),
+        br#"[{"id": 1, "bytes_key": 4, "bytes_value": -1}]"#.as_slice(),
+        br#"[{"id": 1, "bytes_key": 4, "bytes_value": 4294967296}]"#.as_slice(),
+        br#"[{"id": 1, "bytes_key": 4.0, "bytes_value": 4}]"#.as_slice(),
+    ] {
+        assert!(
+            keysize_canary_listed_lengths(bad).is_err(),
+            "a bad width fails closed: {}",
+            String::from_utf8_lossy(bad)
+        );
+    }
 }
 
 #[test]
@@ -4628,7 +4986,9 @@ fn keysize_canary_task_storage_allowlist_admits_only_audited_maps() {
 /// log, the verbose observer log or any dumpable owned BPF map (rings
 /// drain into the scanned outputs; the identity task storage is
 /// undumpable by bpftool and holds minted identity and epoch words
-/// only), while both RSA-2048 sizes publish.
+/// only; per-cell lookup refusals count and only `cgroup_array` may
+/// refuse; every decoded row must match the map's `bytes_key` /
+/// `bytes_value` widths), while both RSA-2048 sizes publish.
 /// Needs an observer binary via `P11SCOPE_E2E_OBSERVER` or a `p11scope`
 /// sibling of this test binary, plus `bpftool` for the map dumps.
 /// Prints KEYCANARY lines. Root BPF lane, serial, about 80 seconds.
@@ -4767,14 +5127,16 @@ fn keysize_canary_inner(workload: &E2eWorkload, module: &str, observer: &Path) -
     let scan_started = Instant::now();
     let map_scan = keysize_canary_scan_owned_maps(child.id(), &workload.path("mapdumps"))?;
     println!(
-        "{TAG} maps dumped={} rings={} taskstorage={} bytes={} secs={} rings=[{}] taskstorage=[{}]",
+        "{TAG} maps dumped={} rings={} taskstorage={} refused={} bytes={} secs={} rings=[{}] taskstorage=[{}] refusedmaps=[{}]",
         map_scan.dumped.len(),
         map_scan.rings.len(),
         map_scan.task_storage.len(),
+        map_scan.refused,
         map_scan.bytes,
         scan_started.elapsed().as_secs(),
         map_scan.rings.join(", "),
-        map_scan.task_storage.join(", ")
+        map_scan.task_storage.join(", "),
+        map_scan.refused_maps.join(", ")
     );
     target.ensure_alive("after the owned-map scan before the observer stopped")?;
     let stop_deadline = Instant::now() + Duration::from_secs(120);

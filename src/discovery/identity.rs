@@ -3345,6 +3345,13 @@ impl PinnedObjects {
         self.ownership.keys().copied().collect()
     }
 
+    /// Test-only read of every view holding raw scan custody, so the
+    /// carried-row bound (R1) can pin that collapsed views leave none.
+    #[cfg(test)]
+    pub(crate) fn raw_owned_views_for_test(&self) -> Vec<ProcessViewId> {
+        self.raw_ownership.keys().copied().collect()
+    }
+
     /// Ids that stay resolvable without ownership claims anywhere: the
     /// except-carry shape. Global purges spare them (one view's replace
     /// or prune must not drop another view's carried coverage); fully
@@ -3571,6 +3578,22 @@ impl PinnedObjects {
     /// no-op. Never removes pins, raw mappings, or another view's claims.
     pub(crate) fn drop_view_claims(&mut self, view: ProcessViewId) {
         if self.ownership.remove(&view).is_some() {
+            self.bump_revision();
+        }
+    }
+
+    /// Ends the pin custody of a carried view whose every row the
+    /// carried-row bound collapsed (CARRIED → RETIRED as redundant
+    /// carry): its claims (it is outside the authority, so the post-bind
+    /// scrub would drop them anyway) and its claimless raw mappings, so a
+    /// recycled numeric ID inherits nothing from the ended generation.
+    /// Ids and raw aliases stay resolvable: the kept carried row of the
+    /// same file holds the same raw instances, and module-less pins are
+    /// inert. Never touches another view.
+    pub(crate) fn release_collapsed_carried_view(&mut self, view: ProcessViewId) {
+        let claims = self.ownership.remove(&view).is_some();
+        let raws = self.raw_ownership.remove(&view).is_some();
+        if claims || raws {
             self.bump_revision();
         }
     }

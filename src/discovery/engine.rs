@@ -12949,6 +12949,170 @@ fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedM
 /// Union one module and accumulate the per-module cap's counted
 /// overflow into `dropped`: every rebuild and harvest path counts
 /// through this one line, so a refused table is never silent.
+/// One attach contribution a scanned row makes to the plan. Rows of one
+/// file in one mount namespace that make the same contributions bind the
+/// same slots, names and evidence, whatever process generation they came
+/// from: generation-local runtime addresses are left out on purpose.
+#[derive(Debug, PartialEq)]
+enum CarriedContribution<'a> {
+    Target {
+        name: &'static str,
+        object: ObjectKey,
+        object_path: &'a str,
+        file_offset: u64,
+    },
+    Export(&'a str),
+    Table {
+        version: (u8, u8),
+        walk: &'static str,
+        file_offset: Option<u64>,
+        live_return: bool,
+        null_entries: &'a [&'static str],
+        unpinned: usize,
+    },
+    Interface {
+        name_class: &'static str,
+        name_lossy: Option<&'a str>,
+        name_private: Option<&'a [u8]>,
+        flags: u64,
+        table_offset: Option<Option<u64>>,
+    },
+    Loads {
+        double_loaded: bool,
+        same_file_loads: u32,
+    },
+    ScanFinished,
+}
+
+fn carried_contributions(module: &ScannedModule) -> Vec<CarriedContribution<'_>> {
+    let mut items = Vec::new();
+    for table in &module.tables {
+        items.push(CarriedContribution::Table {
+            version: table.version,
+            walk: table.walk,
+            file_offset: table.file_offset,
+            live_return: table.live_return,
+            null_entries: &table.null_entries,
+            unpinned: table.unpinned.len(),
+        });
+        for entry in &table.entries {
+            items.push(CarriedContribution::Target {
+                name: entry.name,
+                object: entry.object,
+                object_path: &entry.object_path,
+                file_offset: entry.file_offset,
+            });
+        }
+    }
+    items.extend(
+        module
+            .exports
+            .iter()
+            .map(|export| CarriedContribution::Export(export.as_str())),
+    );
+    for interface in &module.interfaces {
+        items.push(CarriedContribution::Interface {
+            name_class: interface.name_class,
+            name_lossy: interface.name_lossy.as_deref(),
+            name_private: interface.name_private.as_deref(),
+            flags: interface.flags,
+            table_offset: interface
+                .table
+                .map(|index| module.tables.get(index).and_then(|table| table.file_offset)),
+        });
+    }
+    items.push(CarriedContribution::Loads {
+        double_loaded: module.double_loaded,
+        same_file_loads: module.same_file_loads,
+    });
+    if module.tables_scan_finished {
+        items.push(CarriedContribution::ScanFinished);
+    }
+    items
+}
+
+/// Whether two rows are one file seen from one mount namespace with the
+/// same scan provenance: the only rows whose contributions may stand in
+/// for each other.
+fn same_carried_file(left: &ScannedModule, right: &ScannedModule) -> bool {
+    left.mount_namespace == right.mount_namespace
+        && left.key == right.key
+        && left.path == right.path
+        && left.pre_copy_up == right.pre_copy_up
+        && left.mapped_identity == right.mapped_identity
+        && left.key_is_identity == right.key_is_identity
+        && left.module_hint == right.module_hint
+        && left.decoder_abi == right.decoder_abi
+}
+
+/// The carried-row bound (run-path audit R1). A carried row (a retired
+/// generation's row riding for a still-attached object, spec §2 CARRIED)
+/// keeps its own slots active, and the recycled-ID holdback keeps its
+/// numeric view ID out of admission while it rides. One carried row per
+/// retired view therefore grows the plan inputs without a bound and
+/// exhausts the view IDs under churn (every short-lived descendant that
+/// maps the provider). Carried rows of one file are interchangeable up to
+/// their attach contributions, so only the rows that add a contribution
+/// no other kept carried row of that file makes stay: the rest end their
+/// carry (CARRIED → RETIRED as redundant carry). The slots, names and
+/// evidence the plan binds are unchanged; the kept rows per file are
+/// bounded by that file's distinct contributions, not by churn.
+///
+/// Richer rows go first so one superset row covers its subsets; ties keep
+/// the committed order (the oldest carried row stays, so the plan is
+/// unchanged tick for tick). Rows of authorized views (`carried` false)
+/// are never touched. Returns the views every row of which was collapsed,
+/// so the caller can end their claimless pin custody too.
+fn collapse_redundant_carried_rows(
+    raw_modules: &mut Vec<ScannedModule>,
+    carried: impl Fn(ProcessViewId) -> bool,
+) -> BTreeSet<ProcessViewId> {
+    let mut order: Vec<(usize, usize)> = raw_modules
+        .iter()
+        .enumerate()
+        .filter(|(_, module)| carried(module.view))
+        .map(|(index, module)| (index, carried_contributions(module).len()))
+        .collect();
+    if order.len() < 2 {
+        return BTreeSet::new();
+    }
+    order.sort_by_key(|&(index, items)| (std::cmp::Reverse(items), index));
+    let mut kept: Vec<(usize, Vec<CarriedContribution<'_>>)> = Vec::new();
+    let mut dropped = vec![false; raw_modules.len()];
+    for (index, _) in order {
+        let module = &raw_modules[index];
+        let items = carried_contributions(module);
+        let mut covered: Vec<&CarriedContribution<'_>> = Vec::new();
+        for (kept_index, kept_items) in &kept {
+            if same_carried_file(&raw_modules[*kept_index], module) {
+                covered.extend(kept_items.iter());
+            }
+        }
+        if items.iter().all(|item| covered.contains(&item)) {
+            dropped[index] = true;
+        } else {
+            kept.push((index, items));
+        }
+    }
+    drop(kept);
+    let mut collapsed: BTreeSet<ProcessViewId> = raw_modules
+        .iter()
+        .zip(&dropped)
+        .filter(|(_, dropped)| **dropped)
+        .map(|(module, _)| module.view)
+        .collect();
+    let mut position = 0;
+    raw_modules.retain(|_| {
+        let keep = !dropped[position];
+        position += 1;
+        keep
+    });
+    for module in raw_modules.iter() {
+        collapsed.remove(&module.view);
+    }
+    collapsed
+}
+
 fn merge_scanned_module_counted(
     modules: &mut Vec<ScannedModule>,
     incoming: ScannedModule,
@@ -18784,6 +18948,15 @@ impl Engine {
             "the reserved run-learned owner is never retired"
         );
         let authority = ClaimAuthority::candidate(&live, fresh, declined, retired);
+        // The carried-row bound (R1), enforced once at this choke like the
+        // authority: redundant carried rows end their carry here, and a
+        // view left with no row drops its claimless raw custody, so its
+        // numeric ID returns to admission with nothing to inherit.
+        for view in
+            collapse_redundant_carried_rows(&mut raw_modules, |view| !authority.authorizes(view))
+        {
+            pinned.release_collapsed_carried_view(view);
+        }
         let bind_start = crate::attach::monotonic_ns();
         // Every scope binds strictly: an uncorroborated decode of a
         // table-mimicking provider must prove every entry is a function

@@ -1512,6 +1512,392 @@ fn owned_run_conservative_replay_keeps_carried_pins_claimless() {
     );
 }
 
+/// One churn generation for the R1 carried-row twins: admits a fresh
+/// view that maps the fixture provider (same file, same mount
+/// namespace as the base row) through the real admission rebuild,
+/// commits it, then retires it through `retire` and commits that.
+/// Returns the view id the allocator handed out.
+fn r1_churn_one_generation(
+    engine: &mut Engine,
+    base: &ScannedModule,
+    retire: &mut dyn FnMut(&mut Engine, ProcessViewId) -> LiveCandidate,
+) -> ProcessViewId {
+    let me = std::process::id();
+    let id = engine
+        .allocate_view_id_for_newcomer(me)
+        .expect("churn admission gets a view id");
+    let view = ProcessView::open(id, me).unwrap();
+    let mut module = base.clone();
+    module.view = id;
+    let mut pins = overlay_view_pin(&module, module.key.device.minor + 1, OVERLAY_SHA, 1, true);
+    record_scan_ownership(&mut pins, id, module.key, &module.path);
+    pins.prove_scanned_entries_for_test(std::slice::from_ref(&module));
+    let empty: BTreeSet<ProcessViewId> = BTreeSet::new();
+    let admitted = engine
+        .inventory_candidate(
+            &empty,
+            &[],
+            &[(view, vec![module], pins)],
+            Vec::new(),
+            &empty,
+        )
+        .expect("the churn admission rebuilds");
+    engine.plan = admitted.plan;
+    engine.pinned = admitted.pinned;
+    engine.modules = admitted.modules;
+    engine.views.push(ProcessView::open(id, me).unwrap());
+    // The generation exits: untracked first (the retirement proof reads
+    // the live view list), then the carry rebuild, then the ID release
+    // exactly as the tick does after an accepted apply.
+    engine.views.retain(|held| held.id() != id);
+    let retired = retire(engine, id);
+    engine.plan = retired.plan;
+    engine.pinned = retired.pinned;
+    engine.modules = retired.modules;
+    engine.release_view_id(id);
+    id
+}
+
+/// R1 typed oracle: the carried-row census after one churn generation.
+#[derive(Debug, PartialEq, Eq)]
+struct R1Census {
+    modules: usize,
+    carried_rows: usize,
+    raw_owned_views: usize,
+    slot_active: bool,
+}
+
+fn r1_census(engine: &Engine, object: PinnedObjectId) -> R1Census {
+    let live: BTreeSet<ProcessViewId> = engine.views.iter().map(ProcessView::id).collect();
+    R1Census {
+        modules: engine.modules.len(),
+        carried_rows: engine
+            .modules
+            .iter()
+            .filter(|module| !live.contains(&module.scanned.view))
+            .count(),
+        raw_owned_views: engine.pinned.raw_owned_views_for_test().len(),
+        slot_active: engine
+            .plan
+            .slots
+            .iter()
+            .any(|slot| slot.object == object && engine.plan.is_active(slot.index)),
+    }
+}
+
+fn r1_churn_twin(
+    scope: Scope,
+    owned_run: bool,
+    retire: &mut dyn FnMut(&mut Engine, ProcessViewId) -> LiveCandidate,
+) {
+    // R1 (run-path audit): every short-lived descendant that maps the
+    // provider retires with carry. One carried row per retired view,
+    // which keeps its own slot active and its numeric ID held, grows
+    // `modules` without a bound and exhausts the 1024 view IDs. The
+    // bound: one carried row per distinct attach contribution of one
+    // file, so 1100 generations end exactly where the first one did.
+    let (mut engine, base, object, _) = engine_with_overlay(89);
+    engine.scope = scope;
+    if owned_run {
+        engine.owned_run_pid = Some(424242);
+    }
+    engine
+        .capture_facts
+        .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+        .unwrap();
+    // The fixture row's view (89) is not a live view: it is the first
+    // carried generation. Start minting above it.
+    engine.next_view_id = 90;
+    assert!(engine.plan.is_active(0), "the fixture starts attached");
+    let expected = R1Census {
+        modules: 1,
+        carried_rows: 1,
+        raw_owned_views: 1,
+        slot_active: true,
+    };
+    assert_eq!(r1_census(&engine, object), expected, "fixture census");
+    let mut ids = BTreeSet::new();
+    for generation in 0..1100 {
+        let id = r1_churn_one_generation(&mut engine, &base, retire);
+        ids.insert(id);
+        assert_eq!(
+            r1_census(&engine, object),
+            expected,
+            "generation {generation} (view {id:?}) ends where the first one did"
+        );
+    }
+    assert!(
+        ids.len() <= 2,
+        "the churn recycles its ids instead of minting one per generation: {ids:?}"
+    );
+    // View 1101 (the first past the 1024 capacity had every generation
+    // minted) still gets an ID through the real admission path, and no
+    // capacity row is ever filed.
+    let me = std::process::id();
+    let max_scan_pids = engine.max_scan_pids;
+    let (new_views, _, skipped) = engine.admit_inventory_new_views(
+        vec![me],
+        &AdmissionLedger::Free {
+            backlog: BTreeSet::new(),
+        },
+        max_scan_pids,
+        &mut || Some(0),
+    );
+    assert!(
+        new_views.iter().any(|(view, _, _)| view.pid() == me),
+        "generation 1101 is admitted"
+    );
+    // The admission's own scan of this test process may name unrelated
+    // fixture files; no row anywhere may be a capacity row.
+    let capacity = |skip: &&Skipped| {
+        skip.reason.starts_with("capture process-view capacity")
+            || skip.reason == super::CAPACITY_NO_VICTIM_REASON
+    };
+    assert_eq!(
+        skipped.iter().filter(capacity).count(),
+        0,
+        "admission files no capacity row: {skipped:?}"
+    );
+    assert_eq!(
+        engine.counters.object_skips,
+        Vec::<Skipped>::new(),
+        "the churn files no capacity (or any other) row"
+    );
+}
+
+#[test]
+fn r1_owned_run_conservative_churn_keeps_one_carried_row() {
+    let dir = tempfile::tempdir().expect("scope dir");
+    std::fs::write(dir.path().join("cgroup.procs"), "").expect("cgroup.procs");
+    let cgroup = crate::scope::cgroup(dir.path()).expect("scope");
+    let keys: BTreeSet<ObjectKey> = BTreeSet::new();
+    r1_churn_twin(cgroup, true, &mut |engine, id| {
+        engine
+            .conservative_candidate(&BTreeSet::from([id]), &keys)
+            .expect("the conservative carry rebuilds")
+    });
+}
+
+#[test]
+fn r1_owned_run_removal_churn_keeps_one_carried_row() {
+    let dir = tempfile::tempdir().expect("scope dir");
+    std::fs::write(dir.path().join("cgroup.procs"), "").expect("cgroup.procs");
+    let cgroup = crate::scope::cgroup(dir.path()).expect("scope");
+    let empty: BTreeSet<ProcessViewId> = BTreeSet::new();
+    r1_churn_twin(cgroup, true, &mut |engine, id| {
+        engine
+            .inventory_candidate(&BTreeSet::from([id]), &[], &[], Vec::new(), &empty)
+            .expect("the removal carry rebuilds")
+    });
+}
+
+#[test]
+fn r1_system_removal_churn_keeps_one_carried_row() {
+    let empty: BTreeSet<ProcessViewId> = BTreeSet::new();
+    r1_churn_twin(Scope::System, false, &mut |engine, id| {
+        engine
+            .inventory_candidate(&BTreeSet::from([id]), &[], &[], Vec::new(), &empty)
+            .expect("the removal carry rebuilds")
+    });
+}
+
+/// R1 unit oracle: (view, entry offsets) of every row the bound keeps,
+/// in order, plus the views it reports fully collapsed.
+fn r1_collapse(rows: Vec<ScannedModule>, carried: &[u32]) -> (Vec<(u32, Vec<u64>)>, Vec<u32>) {
+    let mut rows = rows;
+    let carried: BTreeSet<ProcessViewId> = carried.iter().map(|id| ProcessViewId(*id)).collect();
+    let collapsed = collapse_redundant_carried_rows(&mut rows, |view| carried.contains(&view));
+    (
+        rows.iter()
+            .map(|row| {
+                (
+                    row.view.0,
+                    row.tables
+                        .iter()
+                        .flat_map(|table| &table.entries)
+                        .map(|entry| entry.file_offset)
+                        .collect(),
+                )
+            })
+            .collect(),
+        collapsed.into_iter().map(|view| view.0).collect(),
+    )
+}
+
+fn r1_row(view: u32, offsets: &[u64]) -> ScannedModule {
+    let mut row = overlay_module(overlay_key(89));
+    row.view = ProcessViewId(view);
+    let template = row.tables[0].entries[0].clone();
+    row.tables[0].entries = offsets
+        .iter()
+        .map(|offset| ScannedEntry {
+            file_offset: *offset,
+            ..template.clone()
+        })
+        .collect();
+    row
+}
+
+#[test]
+fn r1_collapse_keeps_the_oldest_of_equal_carried_rows() {
+    // Equal contributions (only the generation-local address differs):
+    // the oldest committed row stays, the rest end their carry.
+    let mut newer = r1_row(2, &[0x1000]);
+    newer.tables[0].address = 0x9999_0000;
+    assert_eq!(
+        r1_collapse(
+            vec![r1_row(1, &[0x1000]), newer, r1_row(3, &[0x1000])],
+            &[1, 2, 3]
+        ),
+        (vec![(1, vec![0x1000])], vec![2, 3])
+    );
+}
+
+#[test]
+fn r1_collapse_never_touches_authorized_rows() {
+    // Live rows are not carried: equal live rows all stay, and a carried
+    // row is never collapsed against a live one (the carry keeps its own
+    // coverage until a carried peer makes the same contributions).
+    assert_eq!(
+        r1_collapse(
+            vec![
+                r1_row(1, &[0x1000]),
+                r1_row(2, &[0x1000]),
+                r1_row(3, &[0x1000])
+            ],
+            &[3]
+        ),
+        (
+            vec![(1, vec![0x1000]), (2, vec![0x1000]), (3, vec![0x1000])],
+            vec![]
+        )
+    );
+}
+
+#[test]
+fn r1_collapse_keeps_rows_that_add_a_contribution() {
+    // A different target offset is a different slot: both rows stay.
+    assert_eq!(
+        r1_collapse(vec![r1_row(1, &[0x1000]), r1_row(2, &[0x2000])], &[1, 2]),
+        (vec![(1, vec![0x1000]), (2, vec![0x2000])], vec![])
+    );
+    // A superset covers its subset whatever the committed order: the
+    // richer row goes first, so exactly one row stays.
+    assert_eq!(
+        r1_collapse(
+            vec![r1_row(1, &[0x1000]), r1_row(2, &[0x1000, 0x2000])],
+            &[1, 2]
+        ),
+        (vec![(2, vec![0x1000, 0x2000])], vec![1])
+    );
+    // Other contributions count too. A row that only adds (a finished
+    // scan, an export) covers the plain row, which goes; a row that
+    // differs (a live-returned table, a second load) keeps both.
+    for (label, mutate, kept) in [
+        (
+            "scan finished",
+            (|row: &mut ScannedModule| row.tables_scan_finished = true) as fn(&mut ScannedModule),
+            vec![2],
+        ),
+        (
+            "export",
+            |row| row.exports.push("C_GetInterfaceList".into()),
+            vec![2],
+        ),
+        (
+            "live return",
+            |row| row.tables[0].live_return = true,
+            vec![1, 2],
+        ),
+        ("second load", |row| row.same_file_loads = 2, vec![1, 2]),
+        (
+            "interface",
+            |row| {
+                row.interfaces.push(ScannedInterface {
+                    index: 0,
+                    name_class: "exact_standard",
+                    name_lossy: Some("PKCS 11".into()),
+                    name_private: None,
+                    flags: 0,
+                    table: Some(0),
+                })
+            },
+            vec![2],
+        ),
+    ] {
+        let mut richer = r1_row(2, &[0x1000]);
+        mutate(&mut richer);
+        let (rows, _) = r1_collapse(vec![r1_row(1, &[0x1000]), richer], &[1, 2]);
+        let mut views: Vec<u32> = rows.iter().map(|(view, _)| *view).collect();
+        views.sort_unstable();
+        assert_eq!(views, kept, "{label}");
+    }
+}
+
+#[test]
+fn r1_collapse_never_merges_rows_of_different_files() {
+    // Same contributions, but another file (key), mount namespace or
+    // path: not interchangeable, so every row stays.
+    let other_key = {
+        let mut row = r1_row(2, &[0x1000]);
+        row.key = overlay_key(90);
+        row
+    };
+    let other_namespace = {
+        let mut row = r1_row(3, &[0x1000]);
+        row.mount_namespace.inode += 1;
+        row
+    };
+    let other_path = {
+        let mut row = r1_row(4, &[0x1000]);
+        row.path = "/usr/lib/other/libsofthsm2.so".into();
+        row
+    };
+    // Each remaining provenance field alone also keeps a row apart.
+    let mut other_provenance: Vec<ScannedModule> = Vec::new();
+    for (view, mutate) in [
+        (
+            5,
+            (|row: &mut ScannedModule| row.pre_copy_up = Some(0)) as fn(&mut ScannedModule),
+        ),
+        (6, |row| {
+            row.mapped_identity = Some(crate::discovery::identity::FileIdentity { dev: 1, ino: 2 })
+        }),
+        (7, |row| row.key_is_identity = true),
+        (8, |row| {
+            row.module_hint = Some(PathBuf::from("/opt/hint.so"))
+        }),
+        (9, |row| row.decoder_abi = Some(ElfAbi::Ilp32)),
+    ] {
+        let mut row = r1_row(view, &[0x1000]);
+        mutate(&mut row);
+        other_provenance.push(row);
+    }
+    let mut rows = vec![r1_row(1, &[0x1000]), other_key, other_namespace, other_path];
+    rows.extend(other_provenance);
+    assert_eq!(r1_collapse(rows, &[1, 2, 3, 4, 5, 6, 7, 8, 9]).0.len(), 9);
+}
+
+#[test]
+fn r1_collapse_reports_only_views_left_without_rows() {
+    // View 2 keeps a row for another file, so only its redundant row
+    // goes and its custody stays; view 3 loses its only row.
+    let mut other_file = r1_row(2, &[0x1000]);
+    other_file.key = overlay_key(90);
+    assert_eq!(
+        r1_collapse(
+            vec![
+                r1_row(1, &[0x1000]),
+                r1_row(2, &[0x1000]),
+                other_file,
+                r1_row(3, &[0x1000])
+            ],
+            &[1, 2, 3]
+        ),
+        (vec![(1, vec![0x1000]), (2, vec![0x1000])], vec![3])
+    );
+}
+
 fn real_mount_provider_engine() -> (Engine, ScannedModule, PinnedObjectId) {
     let view = ProcessView::open(ProcessViewId(90), std::process::id()).unwrap();
     let mut module = crate::discovery::identity::test_fixture::small_owned_module(&view);

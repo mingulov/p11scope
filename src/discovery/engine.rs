@@ -24836,6 +24836,12 @@ impl Engine {
             // numeric id. A newcomer owned-child proof (uncommitted
             // at defer) stages under credit below instead: its rows
             // may never commit, so skipping would lose it silently.
+            // Defense-in-depth: the consumer only defers proofs
+            // whose proving view is already gone (committed rows
+            // regenerate instead), so production snapshots always
+            // read unretained and this arm never fires there; it
+            // stays so a future retained prover can never skip
+            // silently (pinned by the retained twin).
             // Every pop below consumes one stride unit, skips
             // included: popping drops the entry's proving pin and
             // stashed files, so an uncharged skip arm closes fds
@@ -25622,7 +25628,8 @@ impl Engine {
         while let Some(entry) = self.owned_learn_deferred.pop_front() {
             // Same gate as the paced drain: only a retained
             // direct-child proof skips; a newcomer owned-child proof
-            // stages before the flush.
+            // stages before the flush. Defense-in-depth, as there:
+            // production snapshots always read unretained.
             if entry.is_direct_child && entry.proving_retained {
                 continue;
             }

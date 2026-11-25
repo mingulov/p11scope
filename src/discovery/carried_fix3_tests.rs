@@ -3540,11 +3540,11 @@ fn carried_fix5_conflicting_target_refuses_harvest_tables() {
         "conflicting tables never union"
     );
     assert!(
-        engine
-            .counters
-            .object_skips
-            .iter()
-            .any(|skip| skip.reason.contains("conflict")),
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.reason
+                == "a deferred harvest conflicted with the draining store's different file \
+                        at the same raw observation; its tables were refused"
+        }),
         "the refusal names the identity conflict: {:?}",
         engine.counters.object_skips,
     );
@@ -4415,11 +4415,10 @@ fn carried_fix5_clone_failure_refuses_deferred_file() {
         "the duplicate failure carries counted loss"
     );
     assert!(
-        engine
-            .counters
-            .object_skips
-            .iter()
-            .any(|skip| skip.reason.contains("duplicat")),
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.reason
+                == "a deferred owned-learn proof's file could not be duplicated; it was refused"
+        }),
         "the refusal names the duplicate failure: {:?}",
         engine.counters.object_skips,
     );
@@ -4523,11 +4522,11 @@ fn carried_fix5_stat_failure_refuses_deferred_file() {
         "the stat failure carries counted loss"
     );
     assert!(
-        engine
-            .counters
-            .object_skips
-            .iter()
-            .any(|skip| skip.reason.contains("metadata")),
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.reason
+                == "a deferred owned-learn proof's file metadata could not be read; it was \
+                        refused"
+        }),
         "the refusal names the stat failure: {:?}",
         engine.counters.object_skips,
     );

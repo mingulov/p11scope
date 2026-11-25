@@ -1946,7 +1946,7 @@ class IgnoredTestsTests(unittest.TestCase):
             "COUNTER_BANK_PROOF_TESTS=0",
             "COUNTER_ARTIFACTS_TESTS=2",
             "DISCOVER_BTRFS_SUBVOL_TESTS=1",
-            "INTEGRATION_TESTS=29",
+            "INTEGRATION_TESTS=30",
         ):
             with self.subTest(pin=pin):
                 self.assertIn(pin, result.stdout)
@@ -2113,6 +2113,7 @@ class IgnoredTestsTests(unittest.TestCase):
                  "privileged_run_tree_many_children_land_exact",
                  "privileged_run_tree_unprearmed_shortlived_descendants_reach_high_coverage",
                  "privileged_run_tree_unprearmed_shortlived_never_pause_still_learns",
+                 "privileged_run_tree_unprearmed_shortlived_never_pause_holds_first_mappers",
                  "privileged_run_tree_unprearmed_shortlived_parallel_never_pause_covers_waves",
                  "privileged_run_tree_arming_exhaustion_still_stages_and_counts",
                  "privileged_run_tree_non_member_provider_is_never_staged"])
@@ -2122,11 +2123,11 @@ class IgnoredTestsTests(unittest.TestCase):
             result = run_runner("--list-integration", str(deps))
         self.assertEqual(result.returncode, 0,
                          result.stdout + result.stderr)
-        self.assertIn("integration (29)", result.stdout)
+        self.assertIn("integration (30)", result.stdout)
         for entry in INTEGRATION_EXPECTED:
             self.assertIn(entry, result.stdout)
         self.assertIn("verify: integration curation selects exactly one "
-                      "test per entry (29 entries)", result.stdout)
+                      "test per entry (30 entries)", result.stdout)
 
     def test_integration_list_mode_refuses_zero_selection(self):
         # The inventory_identity binary below is missing one of its two

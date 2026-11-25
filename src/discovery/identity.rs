@@ -3291,6 +3291,26 @@ impl PinnedObjects {
     /// Scrubs one unproven raw observation and every entry left without a
     /// filed raw. Refusal provenance lives in `refused_keys`; the object
     /// itself stays fail-closed absent unless another alias still proves it.
+    /// Scrubs one view's failed observation of `raw`: drops the view's
+    /// own possibly-partial filing, and the raw itself only when no other
+    /// view's custody shares it. A refusal fails its own observation; a
+    /// proven peer that filed the same raw keeps its pin.
+    fn scrub_observation(&mut self, view: ProcessViewId, raw: &RawObjectInstance) {
+        let shared = self
+            .raw_ownership
+            .iter()
+            .any(|(owner, custody)| *owner != view && custody.contains(raw));
+        if !shared {
+            self.scrub_raw(raw);
+            return;
+        }
+        if let Some(custody) = self.raw_ownership.get_mut(&view)
+            && custody.remove(raw)
+        {
+            self.bump_revision();
+        }
+    }
+
     pub(crate) fn scrub_raw(&mut self, raw: &RawObjectInstance) {
         if self.raw_to_id.remove(raw).is_none() {
             return;
@@ -11450,7 +11470,7 @@ fn record_scanned_candidate(
                 let view_filed = pinned.raw_ownership.get(&view).is_some_and(|raws| {
                     raws.is_fresh() && raws.iter().any(|filed| filed.key == raw.key)
                 });
-                pinned.scrub_raw(&raw);
+                pinned.scrub_observation(view, &raw);
                 if !pinned.has_pre_copy_up_for_key(raw.key) {
                     let pair = pinned
                         .refused_keys
@@ -28599,5 +28619,132 @@ mod tests {
             None,
             "the retired claimless view's custody ends"
         );
+    }
+
+    /// Shared-raw scrub class: a REFUSED observation fails only its own
+    /// view's observation. A proven peer view that filed the same raw (same
+    /// namespace, key and path) keeps its pin in either order, through
+    /// absorb, and the key stays admitted; the refusing view's own custody
+    /// row is dropped.
+    #[test]
+    fn a_refused_observation_keeps_a_peer_views_proven_pin_on_the_shared_raw() {
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let refused = || {
+            Err(PinOutcome::Unproven {
+                cause: UnprovenCause::FallbackRefused,
+                reason: "map_files range refused".to_string(),
+            })
+        };
+        for refused_first in [false, true] {
+            let mut source = image_pins(&[(key, "aaaaaaaa", 1)]);
+            let entry = source.by_id.pop_first().unwrap().1;
+            let raw = entry.raw.clone();
+            let mut pinned = PinnedObjects::empty();
+            let mut skipped = Vec::new();
+            let (peer, refuser) = (ProcessViewId(0), ProcessViewId(1));
+            if refused_first {
+                record_scanned_candidate(
+                    &mut pinned,
+                    refuser,
+                    raw.clone(),
+                    refused(),
+                    &mut skipped,
+                    true,
+                );
+            }
+            record_scanned_candidate(
+                &mut pinned,
+                peer,
+                raw.clone(),
+                Ok(entry),
+                &mut skipped,
+                true,
+            );
+            if !refused_first {
+                record_scanned_candidate(
+                    &mut pinned,
+                    refuser,
+                    raw.clone(),
+                    refused(),
+                    &mut skipped,
+                    true,
+                );
+            }
+            assert_eq!(
+                pinned.pinned().count(),
+                1,
+                "[refused_first={refused_first}] the proven peer survives the refusal"
+            );
+            assert!(pinned.raw_to_id.contains_key(&raw));
+            assert!(
+                pinned
+                    .raw_ownership
+                    .get(&peer)
+                    .is_some_and(|custody| custody.contains(&raw)),
+                "[refused_first={refused_first}] the peer keeps its custody row"
+            );
+            assert!(
+                !pinned
+                    .raw_ownership
+                    .get(&refuser)
+                    .is_some_and(|custody| custody.contains(&raw)),
+                "[refused_first={refused_first}] the refusing view files nothing"
+            );
+            assert!(!pinned.rejects(key));
+            assert!(pinned.refused_keys.contains(&(refuser, key)));
+            assert!(
+                skipped
+                    .iter()
+                    .any(|skip| skip.reason == "map_files range refused"),
+                "the refusal keeps its named skip: {skipped:?}"
+            );
+            let mut aggregate = PinnedObjects::empty();
+            skipped.extend(aggregate.absorb(pinned));
+            assert_eq!(aggregate.pinned().count(), 1);
+            assert!(!aggregate.rejects(key));
+        }
+    }
+
+    /// Healthy twin of the shared-raw scrub: a refusal with no peer custody
+    /// still scrubs the raw it alone filed (the self-contradiction path).
+    #[test]
+    fn a_refused_observation_without_a_peer_scrubs_its_own_filing() {
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let mut source = image_pins(&[(key, "aaaaaaaa", 1)]);
+        let entry = source.by_id.pop_first().unwrap().1;
+        let raw = entry.raw.clone();
+        let mut pinned = PinnedObjects::empty();
+        let mut skipped = Vec::new();
+        let view = ProcessViewId(0);
+        record_scanned_candidate(
+            &mut pinned,
+            view,
+            raw.clone(),
+            Ok(entry),
+            &mut skipped,
+            true,
+        );
+        record_scanned_candidate(
+            &mut pinned,
+            view,
+            raw.clone(),
+            Err(PinOutcome::Unproven {
+                cause: UnprovenCause::FallbackRefused,
+                reason: "map_files range refused".to_string(),
+            }),
+            &mut skipped,
+            true,
+        );
+        assert!(
+            !pinned.raw_to_id.contains_key(&raw),
+            "the lone filing is scrubbed"
+        );
+        assert_eq!(pinned.pinned().count(), 0);
     }
 }

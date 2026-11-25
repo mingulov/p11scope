@@ -153,8 +153,10 @@ CANARY_RECOVERY_SHA_BEFORE="$(sha256sum "$CANARY_RECOVERY" | cut -d' ' -f1)"
 CANARY_REPORT_SHA_BEFORE="$(sha256sum "$CANARY_REPORT" | cut -d' ' -f1)"
 # 5. Upgrade to new.
 upgrade_new || fail "upgrade to new failed (see install-new.log)"
-# 6. New version must match the tree (Cargo.toml).
-EXPECTED_NEW="$(python3 -c "import re; t=open('Cargo.toml').read(); p=t.split('[package]',1)[1].split('\n[',1)[0]; print(re.search(r'^version\s*=\s*\"([0-9.]+)\"', p, re.M).group(1))")"
+# 6. New version must match the tree (Cargo.toml next to this script's repo).
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+EXPECTED_NEW="$(python3 -c "import re,sys; t=open(sys.argv[1]).read(); p=t.split('[package]',1)[1].split('\n[',1)[0]; print(re.search(r'^version\s*=\s*\"([0-9.]+)\"', p, re.M).group(1))" "$REPO_ROOT/Cargo.toml")"
 NEW_VERSION="$(p11scope --version 2>/dev/null | head -n 1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)"
 [ "$NEW_VERSION" = "$EXPECTED_NEW" ] || fail "new version is '$NEW_VERSION', expected '$EXPECTED_NEW'"
 # 7. New doctor (same 0/1 acceptance as old).

@@ -330,5 +330,95 @@ class PublicCliHostWrapperTests(unittest.TestCase):
         self.assertIn('"$rc" -eq 2', self.text)
 
 
+def run_typed_checker(rows, *selection_args, sidecars=None):
+    with tempfile.TemporaryDirectory() as tmp:
+        temp = Path(tmp)
+        path = temp / "results.jsonl"
+        output = temp / "typed.json"
+        with path.open("w", encoding="utf-8") as file:
+            for item in rows:
+                file.write(json.dumps(item) + "\n")
+        for name, content in (sidecars or {}).items():
+            (temp / f"{name}.typed-failure.json").write_text(content, encoding="utf-8")
+        result = subprocess.run(
+            [sys.executable, "-I", str(CHECKER), str(path), *selection_args,
+             "--known-failing-results", str(output),
+             "--known-failing-runner", "cell:scripts/qualify-public-cli.sh",
+             "--known-failing-host", "github"],
+            capture_output=True, text=True, timeout=30)
+        document = json.loads(output.read_text()) if output.exists() else None
+        return result, document
+
+
+class TypedCellResultsTests(unittest.TestCase):
+    def test_exact_independent_selection_passes_and_is_emitted(self):
+        result, document = run_typed_checker(
+            [row("a", True), row("b", True)], "--require", "a", "--require", "b")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([item["test"] for item in document["selection"]], ["a", "b"])
+        self.assertTrue(document["complete"])
+
+    def test_missing_row_leaves_complete_false_even_when_emitted(self):
+        result, document = run_typed_checker(
+            [row("a", True)], "--require", "a", "--require", "b")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing required cells: b", result.stderr)
+        self.assertIsNotNone(document)
+        self.assertFalse(document["complete"])
+        self.assertEqual([item["test"] for item in document["selection"]], ["a", "b"])
+        self.assertEqual([item["test"] for item in document["results"]], ["a"])
+
+    def test_passing_row_outside_typed_selection_fails_closed(self):
+        result, _document = run_typed_checker(
+            [row("a", True), row("extra", True)], "--require", "a")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("outside the typed selection", result.stderr)
+
+    def test_nonqualifying_smoke_is_not_applicable_not_failure_or_pass(self):
+        result, document = run_typed_checker(
+            [row("smoke", False, "nonqualifying", "smoke")],
+            "--allow-nonqualifying", "smoke")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(document["results"][0]["state"], "not_applicable")
+        self.assertEqual(document["results"][0]["signature"],
+                         {"cell": "smoke", "qualification": "nonqualifying"})
+
+    def test_selection_categories_must_not_overlap(self):
+        result, _document = run_typed_checker(
+            [row("smoke", False, "nonqualifying", "smoke")],
+            "--allow-nonqualifying", "smoke", "--require", "smoke")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("typed selection overlap", result.stderr)
+
+
+    def test_failed_cell_can_carry_exact_typed_branch_sidecar(self):
+        signature = {"cell": "a", "branch": "sign_not_attributed", "oracle": "public-cli"}
+        result, document = run_typed_checker(
+            [row("a", False)], "--require", "a",
+            sidecars={"a": json.dumps(signature) + "\n"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("failing test not listed: a", result.stderr)
+        self.assertEqual(document["results"][0]["signature"], signature)
+
+    def test_invalid_cell_typed_branch_sidecar_fails_closed(self):
+        result, _document = run_typed_checker(
+            [row("a", False)], "--require", "a",
+            sidecars={"a": '{"branch":"raw prose with spaces"}\n'})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not a typed signature", result.stderr)
+
+    def test_passing_cell_with_failure_sidecar_is_a_protocol_violation(self):
+        result, _document = run_typed_checker(
+            [row("a", True)], "--require", "a",
+            sidecars={"a": '{"cell":"a","branch":"sign_not_attributed"}\n'})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("passing cell a carries a typed failure record", result.stderr)
+
+    def test_empty_typed_selection_fails_closed(self):
+        result, _document = run_typed_checker([row("a", True)])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("typed selection is empty", result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

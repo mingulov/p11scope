@@ -24,6 +24,7 @@ Usage:
   python3 -I scripts/ci/check-cell-results.py RESULTS.JSONL [--expected-failure CELL ...] [--intermittent-failure CELL ...] [--allow-nonqualifying CELL ...] [--require CELL ...]
 """
 
+import importlib.util
 import json
 import re
 import subprocess
@@ -220,9 +221,24 @@ def main(argv):
     missing_required = sorted(set(required) - seen)
     if missing_required:
         problems.append("missing required cells: " + ", ".join(missing_required))
-    if not problems and known_results:
+    typed_selection = []
+    if known_results:
+        selected_seen = set()
+        for group in (required, expected, intermittent, allowed_smoke):
+            for cell in group:
+                if cell in selected_seen:
+                    problems.append(f"typed selection overlap: {cell}")
+                    continue
+                selected_seen.add(cell)
+                typed_selection.append(cell)
+        if not typed_selection:
+            problems.append("typed selection is empty")
+        outside_selection = sorted(set(seen) - set(typed_selection))
+        if outside_selection:
+            problems.append("rows outside the typed selection: " + ", ".join(outside_selection))
+    if rows and known_results:
         emit_error = emit_known_failing_results(
-            rows, Path(known_results[0]), known_runner[0], known_host[0])
+            rows, Path(known_results[0]), known_runner[0], known_host[0], typed_selection, path.parent)
         if emit_error is not None:
             problems.append(emit_error)
         else:
@@ -271,38 +287,96 @@ def ignored_test_files():
     return files
 
 
-def emit_known_failing_results(rows, output, runner, host):
-    """Write the typed v1 selection/result document for this terminal row set."""
+def known_failing_checker_module():
+    path = Path(__file__).resolve().parents[2] / "scripts/check-known-failing.py"
+    spec = importlib.util.spec_from_file_location("known_failing_checker", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def cell_sidecar_signature(result_dir, cell):
+    if result_dir is None:
+        return None, None
+    path = result_dir / f"{cell}.typed-failure.json"
+    if not path.exists():
+        return None, None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None, f"typed failure record for {cell} is missing or invalid JSON"
+    checker = known_failing_checker_module()
+    problems = checker.signature_problems(value)
+    if isinstance(value, dict) and "branch" not in value:
+        problems.append("signature lacks a typed branch")
+    if problems:
+        return None, f"typed failure record for {cell} is not a typed signature: " + "; ".join(problems)
+    return value, None
+
+
+def emit_known_failing_results(rows, output, runner, host, selected_cells, result_dir=None):
+    """Write typed selection/results for an independently declared cell set."""
     if not runner.startswith("cell:") or len(runner) <= len("cell:"):
         return "known-failing runner for cell results must be cell:<script>"
     if host not in {"fedora", "fedora-sm1", "vng", "github"}:
         return "known-failing host is not in the closed host vocabulary"
+    if not selected_cells:
+        return "typed selection is empty"
+    if len(set(selected_cells)) != len(selected_cells):
+        return "typed selection is duplicated"
     root = Path(__file__).resolve().parents[2]
     test_files = ignored_test_files()
     runner_path = runner[len("cell:"):]
     runner_file_ok = bool(runner_path) and not runner_path.startswith("/") and (root / runner_path).is_file()
-    selection = []
-    results = []
-    for row in rows:
-        cell = row["cell"]
+
+    def identity(cell):
         path = test_files.get(cell)
         if path is None:
             if not runner_file_ok:
-                return f"cannot type the source path for cell {cell}: not in ignored-tests and runner file is absent"
+                return None
             path = runner_path
-        identity = {"path": path, "test": cell, "invocation": []}
-        selection.append(identity)
-        passed = row["pass"]
-        results.append({
-            **identity,
-            "state": "passed" if passed else "failed",
-            "signature": None if passed else {"cell": cell, "qualification": row["qualification"]},
-        })
+        return {"path": path, "test": cell, "invocation": []}
+
+    selection = []
+    for cell in selected_cells:
+        item = identity(cell)
+        if item is None:
+            return f"cannot type the source path for cell {cell}: not in ignored-tests and runner file is absent"
+        selection.append(item)
+
+    results = []
+    covered = set()
+    for row in rows:
+        cell = row["cell"]
+        item = identity(cell)
+        if item is None:
+            return f"cannot type the source path for cell {cell}: not in ignored-tests and runner file is absent"
+        covered.add(cell)
+        qualification = row["qualification"]
+        sidecar, sidecar_error = cell_sidecar_signature(result_dir, cell)
+        if sidecar_error is not None:
+            return sidecar_error
+        if qualification == "nonqualifying":
+            if sidecar is not None:
+                return f"nonqualifying cell {cell} carries a typed failure record"
+            state = "not_applicable"
+            signature = {"cell": cell, "qualification": qualification}
+        elif row["pass"]:
+            if sidecar is not None:
+                return f"passing cell {cell} carries a typed failure record"
+            state = "passed"
+            signature = None
+        else:
+            state = "failed"
+            signature = sidecar if sidecar is not None else {"cell": cell, "qualification": qualification}
+        results.append({**item, "state": state, "signature": signature})
+    selected = set(selected_cells)
+    complete = covered == selected and len(covered) == len(results)
     document = {
         "schema": "p11scope/known-failing-results/v1",
         "runner": runner,
         "host": host,
-        "complete": True,
+        "complete": complete,
         "selection": selection,
         "results": results,
     }

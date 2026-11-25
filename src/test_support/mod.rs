@@ -3,3 +3,4 @@
 //! Test-only shared support.
 
 pub(crate) mod isolation;
+pub(crate) mod typed_failure;

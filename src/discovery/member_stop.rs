@@ -20,6 +20,7 @@
 
 use super::{Engine, EngineSession};
 use p11scope_ebpf_common::{MemberFileKey, MemberStop};
+use p11scope_manifest::maps::ObjectKey;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The kernel half the service drives: the pending rows, the clearance
@@ -120,6 +121,13 @@ pub(crate) struct MemberStopState {
     /// Pinned identities staged by a stop: their staging owes no
     /// first-use row while the stopped mapper still waits.
     pub(crate) stop_staged: BTreeSet<(u64, u64)>,
+    /// The maps key each stop-staged identity pinned under, so a later
+    /// key rejection refuses its holds: no slot ever builds under a
+    /// rejected key, so the hold's attach is impossible (never at the
+    /// bound). One entry per staged identity; bounded like the staged
+    /// set, past the cap an identity goes unrecorded and its hold keeps
+    /// the bound backstop.
+    stop_staged_keys: BTreeMap<(u64, u64), ObjectKey>,
     /// Rows left in place for a retry (counted once as stopped), with
     /// the stop instant their bound runs from.
     retrying: BTreeMap<u32, u64>,
@@ -179,6 +187,24 @@ impl MemberStopState {
             self.refused.insert(identity);
         }
     }
+
+    /// Records the maps key a stop-staged identity pinned under. Only
+    /// stop-queued identities record (their holds wait on the attach);
+    /// ordinary learned files never consult the map. Bounded like the
+    /// staged set: past the cap the key goes unrecorded, counted with
+    /// the staged overflow, and the hold keeps the bound backstop.
+    pub(crate) fn note_stop_staged_key(&mut self, identity: (u64, u64), key: ObjectKey) {
+        if !self.stop_staged.contains(&identity) {
+            return;
+        }
+        if self.stop_staged_keys.len() < MEMBER_STOP_STAGED_CAP
+            || self.stop_staged_keys.contains_key(&identity)
+        {
+            self.stop_staged_keys.insert(identity, key);
+        } else {
+            self.stats.stop_staged_overflow = self.stats.stop_staged_overflow.saturating_add(1);
+        }
+    }
 }
 
 /// Service totals, for the diagnostic summary and the tests.
@@ -209,8 +235,9 @@ pub(crate) struct MemberStopStats {
     /// Held or pending members resumed unattached when the watchdog was
     /// lost: named first-use gap.
     pub(crate) lost_guard_resumes: u64,
-    /// Stop-staged identities not retained past the cap (their staging
-    /// then files the first-use row itself).
+    /// Stop-staged identities not retained past the cap (an unrecorded
+    /// staging files its own first-use row, or its hold keeps the bound
+    /// backstop).
     pub(crate) stop_staged_overflow: u64,
     /// Members resumed unproven because a mapped file is FUSE-backed.
     pub(crate) fuse_resumes: u64,
@@ -584,6 +611,13 @@ impl Engine {
     #[cfg(test)]
     pub(crate) fn member_stop_stats_for_test(&self) -> MemberStopStats {
         self.member_stops.stats
+    }
+
+    /// Whether `identity`'s staging was refused (test probe for the
+    /// refusal record each staging-refusal site owes its holds).
+    #[cfg(test)]
+    pub(crate) fn hold_refused_for_test(&self, identity: (u64, u64)) -> bool {
+        self.member_stops.refused.contains(&identity)
     }
 
     #[cfg(test)]
@@ -1273,11 +1307,13 @@ impl Engine {
         // An unreadable exit state is not a departure: a departed member
         // is withdrawn without a resume, so doubt must resume.
         let departed = held.pin.original_exited().unwrap_or(false);
-        // A refused staging settles without probes: never "attached".
-        let refused = held
-            .providers
-            .iter()
-            .any(|identity| self.member_stops.refused.contains(identity));
+        // A refused staging settles without probes: never "attached". A
+        // rejected staging key refuses too: no slot ever builds under a
+        // rejected key, so the hold's attach is impossible (never at the
+        // bound).
+        let refused = held.providers.iter().any(|identity| {
+            self.member_stops.refused.contains(identity) || self.stop_staged_key_rejected(*identity)
+        });
         // Attached means real session attach stamps, never scheduling
         // flags: a deferred, refused or no-link apply can clear those
         // without one probe live.
@@ -1294,6 +1330,18 @@ impl Engine {
             attached,
             refused,
         }
+    }
+
+    /// Whether a stop-staged identity's maps key has been rejected since
+    /// its staging: no slot ever builds under a rejected key (the bind
+    /// drops every module under it, and rejections commit sticky), so a
+    /// hold on it can never attach and ends refused. Unrecorded
+    /// identities (never staged, or past the cap) keep the bound backstop.
+    fn stop_staged_key_rejected(&self, identity: (u64, u64)) -> bool {
+        self.member_stops
+            .stop_staged_keys
+            .get(&identity)
+            .is_some_and(|key| self.pinned.rejects(*key))
     }
 
     /// Whether the provider file `identity` (its `(st_dev, st_ino)`) is
@@ -1794,6 +1842,65 @@ mod tests {
         }
         // Nothing running: zero coverage, never unknown.
         assert_eq!(member_stop_coverage(&MemberStopStats::default()), (0, 0));
+    }
+
+    /// Staged-key recording keeps stop-queued identities only, under the
+    /// staged cap: an ordinary learned file records nothing, and past the
+    /// cap a key goes unrecorded and counted (its hold keeps the bound
+    /// backstop). Re-recording a retained identity overwrites in place.
+    #[test]
+    fn stop_staged_keys_keep_stop_queued_identities_under_the_cap() {
+        let key = ObjectKey {
+            device: p11scope_manifest::maps::Device { major: 0, minor: 1 },
+            inode: 7,
+        };
+        let mut state = MemberStopState::default();
+        // Ordinary learned files (never stop-queued) record nothing.
+        state.note_stop_staged_key((0, 1), key);
+        assert!(
+            state.stop_staged_keys.is_empty(),
+            "no hold waits: nothing recorded"
+        );
+        // Stop-queued identities record, and re-record in place.
+        state.note_stop_staged((0, 1));
+        state.note_stop_staged_key((0, 1), key);
+        assert_eq!(state.stop_staged_keys.get(&(0, 1)), Some(&key));
+        let key2 = ObjectKey {
+            device: p11scope_manifest::maps::Device { major: 0, minor: 2 },
+            inode: 8,
+        };
+        state.note_stop_staged_key((0, 1), key2);
+        assert_eq!(state.stop_staged_keys.len(), 1);
+        assert_eq!(state.stop_staged_keys.get(&(0, 1)), Some(&key2));
+        // Past the cap a key goes unrecorded and counted.
+        for index in 2..=(MEMBER_STOP_STAGED_CAP as u64 + 1) {
+            state.note_stop_staged((0, index));
+            state.note_stop_staged_key((0, index), key);
+        }
+        assert_eq!(state.stop_staged_keys.len(), MEMBER_STOP_STAGED_CAP);
+        assert_eq!(state.stats.stop_staged_overflow, 1);
+        assert!(
+            !state
+                .stop_staged_keys
+                .contains_key(&(0, MEMBER_STOP_STAGED_CAP as u64 + 1)),
+            "the excess identity goes unrecorded"
+        );
+        // The map's own cap, pinned by direct fill (unreachable through
+        // the recorder alone: the map only ever holds stop-staged
+        // identities, so the staged cap binds first): a full map refuses
+        // the excess key and counts it.
+        let mut full = MemberStopState::default();
+        for index in 0..MEMBER_STOP_STAGED_CAP as u64 {
+            full.stop_staged_keys.insert((0, index), key);
+        }
+        full.stop_staged.insert((9, 9));
+        full.note_stop_staged_key((9, 9), key);
+        assert_eq!(full.stop_staged_keys.len(), MEMBER_STOP_STAGED_CAP);
+        assert_eq!(full.stats.stop_staged_overflow, 1);
+        assert!(
+            !full.stop_staged_keys.contains_key(&(9, 9)),
+            "a full map refuses the excess key"
+        );
     }
 
     #[test]

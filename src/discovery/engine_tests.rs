@@ -98026,10 +98026,7 @@ fn member_stop_rejected_staging_key_refuses_the_hold() {
     let library = fixture._dir.path().join("seed-provider.so");
     // Generation 1.
     touch_for_test(&library, 1_000_000);
-    let pin1 = crate::discovery::identity::pin_of(
-        &std::fs::File::open(&library).unwrap(),
-    )
-    .unwrap();
+    let pin1 = crate::discovery::identity::pin_of(&std::fs::File::open(&library).unwrap()).unwrap();
     stop_member_for_test(pid);
     let key = member_exec_key_for_test(pid, &library);
     let mut io = ScriptedMemberStops::default();
@@ -98051,10 +98048,7 @@ fn member_stop_rejected_staging_key_refuses_the_hold() {
         .and_then(|prearm| prearm.inputs.first().map(|input| input.key));
     // Generation 2: metadata only (bytes identical, ctime stepped).
     touch_for_test(&library, 2_000_000);
-    let pin2 = crate::discovery::identity::pin_of(
-        &std::fs::File::open(&library).unwrap(),
-    )
-    .unwrap();
+    let pin2 = crate::discovery::identity::pin_of(&std::fs::File::open(&library).unwrap()).unwrap();
     assert_ne!(pin1, pin2, "the churn step moves the pin");
     // A second observation (the scan's, live) absorbs and conflicts: the
     // drain would skip the settled identity, so the twin drives the real
@@ -98128,6 +98122,80 @@ fn member_stop_staged_unrejected_hold_stays_held() {
     assert_eq!(stats.refused_resumes, 0, "{stats:?}");
     assert_eq!(stats.timed_out, 0, "{stats:?}");
     assert_eq!(stats.attached_resumes, 0, "{stats:?}");
+}
+
+/// Every reachable learned-staging refusal records the hold refusal for
+/// its identity, so a hold on it ends refused (never at the bound): the
+/// per-capture cap, the replaced-file refusal, and the terminal pin
+/// refusal (driven here through an unidentifiable file). The whole-budget
+/// refusal needs 512+ pinned objects and stays a named residual.
+#[test]
+fn learned_staging_refusals_record_the_hold_refusal() {
+    let mut engine = member_stop_engine();
+    // One file per site: each refusal settles its identity, so sharing
+    // a file would let an earlier site mask a later one.
+    let dir = tempfile::tempdir().unwrap();
+    let bogus = dir.path().join("libbogus-cap.so");
+    std::fs::write(&bogus, b"not an ELF provider at all").unwrap();
+    // The per-capture cap site.
+    let file = std::fs::File::open(&bogus).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    engine.refuse_learned_candidate(crate::fanotify::LearnedCandidate {
+        file,
+        dev,
+        ino,
+        display_path: bogus.to_string_lossy().into_owned(),
+        loader_exe: None,
+        loader_unknown_reason: None,
+        run_learned: false,
+        proving_retained: false,
+    });
+    assert!(
+        engine.hold_refused_for_test((dev, ino)),
+        "the cap refusal records the hold refusal"
+    );
+    // The replaced-file site.
+    let bogus = dir.path().join("libbogus-gone.so");
+    std::fs::write(&bogus, b"not an ELF provider at all").unwrap();
+    let file = std::fs::File::open(&bogus).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    engine.refuse_learned_gone_file((dev, ino), "libbogus-gone.so");
+    assert!(
+        engine.hold_refused_for_test((dev, ino)),
+        "the replaced-file refusal records the hold refusal"
+    );
+    // The terminal pin refusal, through the real staging path: an
+    // unidentifiable file proves nothing and files at once.
+    let bogus = dir.path().join("libbogus-terminal.so");
+    std::fs::write(&bogus, b"not an ELF provider at all").unwrap();
+    let file = std::fs::File::open(&bogus).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    tx.send(crate::fanotify::LearnMsg::Candidate(
+        crate::fanotify::LearnedCandidate {
+            file,
+            dev,
+            ino,
+            display_path: bogus.to_string_lossy().into_owned(),
+            loader_exe: None,
+            loader_unknown_reason: None,
+            run_learned: false,
+            proving_retained: false,
+        },
+    ))
+    .unwrap();
+    let _drain_alive = &tx;
+    engine.set_learned_rx_for_test(rx);
+    engine.service_learned_files();
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        0,
+        "an unidentifiable file never stages"
+    );
+    assert!(
+        engine.hold_refused_for_test((dev, ino)),
+        "the terminal refusal records the hold refusal"
+    );
 }
 
 /// The watchdog gone, the observer alone must not keep anyone stopped:

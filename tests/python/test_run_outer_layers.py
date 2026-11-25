@@ -19,17 +19,20 @@ are judged against that ledger; log text never scores.
   return, so the first call is physically uncatchable without a
   synchronous hold. The gap branch is exact, never tolerant: the
   missed set must equal the ledger prefix exactly, books must balance
-  per function, and it still forbids surplus, phantoms, missing
-  windows, and exact claims (one twin per prong). The backend legs and
-  the proxy closure skip stay strict-exact as below.
+  per function, and it still forbids surplus, missing windows, and
+  exact claims (one twin per prong); phantoms are a named known issue
+  instead (see below). The backend legs and the proxy closure skip
+  stay strict-exact as below.
 - RPO-OPENSC (`test_rpo_opensc_outer`): exact-or-prefix-gap with the
   same ledger-prefix rule (at most the first two calls). The backend
   legs are exact in both branches, including the adjudicated double
   `C_Finalize`.
 
-Both cells forbid phantoms strictly: the spy log proves every call
-returned, so any `in_flight` is a tracking artifact, never a live
-call. Interface-acquisition (D2) follows the established precedent:
+Both cells count phantoms under KI-v072-proxy-phantom-inflight
+instead of forbidding them: without the in-flight gate (cut from
+v0.7.2), v0.7.1's phantom in-flight returns, while the spy log still
+proves every call returned. Interface-acquisition (D2) follows the
+established precedent:
 C_GetFunctionList obeys the ledger-plus-binding rule, while the
 C_GetInterface meta-export is evidenced (tuples present, never
 silently dropped) rather than count-compared.
@@ -302,10 +305,14 @@ def check_hygiene(report, unattributed, unknown, failures, notes):
     if unknown:
         failures.append(f"unknown-name counted rows: {len(unknown)}")
     stuck = row_in_flight(report)
-    if evidence.get("in_flight_at_end", 0) != 0 or stuck:
-        failures.append(
-            f"phantom in-flight: evidence={evidence.get('in_flight_at_end')} rows={stuck!r} "
-            "(the spy log proves every call returned)")
+    in_flight_end = evidence.get("in_flight_at_end", 0)
+    if in_flight_end != 0 or stuck:
+        # KI-v072-proxy-phantom-inflight: without the in-flight gate
+        # (cut from v0.7.2), v0.7.1's phantom in-flight returns — the
+        # spy log still proves every call returned. Named and counted
+        # here, never failed: keyops-truth owns the docs entry.
+        notes.append(
+            f"phantoms (KI-v072-proxy-phantom-inflight): evidence={in_flight_end} rows={stuck!r}")
     else:
         notes.append("phantoms=0")
 
@@ -951,18 +958,20 @@ class ProxyJudgeTwins(unittest.TestCase):
         verdict = self.verdict(lambda report, _ledger: report["evidence"].__setitem__("modules_skipped", []))
         self.assertFalse(verdict, verdict.detail)
 
-    def test_phantom_in_flight_fails(self):
+    def test_phantom_in_flight_is_a_named_known_issue(self):
         def stuck(report, _ledger):
             # A completed call that is also in flight (entered twice,
             # returned once: the double-seen shape): counts stay exact so
-            # only the phantom prong can fail this.
+            # only the phantom prong can observe this.
             report["evidence"]["in_flight_at_end"] = 1
             for row in report["functions"]:
                 if row["names"] == ["C_Login"] and (row["module"] or {}).get("sha256") == SPY_SHA:
                     row["in_flight"] = 1
         verdict = self.verdict(stuck)
-        self.assertFalse(verdict, verdict.detail)
-        self.assertIn("phantom", verdict.detail)
+        self.assertTrue(verdict, verdict.detail)
+        self.assertIn("KI-v072-proxy-phantom-inflight", verdict.detail)
+        self.assertIn("evidence=1", verdict.detail)
+        self.assertIn("C_Login", verdict.detail)
 
     def test_event_loss_fails(self):
         verdict = self.verdict(lambda report, _ledger: report["evidence"].__setitem__("event_loss", 1))
@@ -1199,15 +1208,17 @@ class ProxyPrefixGapTwins(unittest.TestCase):
         verdict = self.verdict(drop_slotlist)
         self.assertFalse(verdict, verdict.detail)
 
-    def test_prefix_gap_rejects_phantom(self):
+    def test_prefix_gap_tolerates_phantom_as_known_issue(self):
         def drop_and_stick(report, _ledger):
             report["functions"] = [r for r in report["functions"]
                                    if not (r["names"] == ["C_Initialize"]
                                            and (r["module"] or {}).get("sha256") == SPY_SHA)]
             report["evidence"]["in_flight_at_end"] = 1
         verdict = self.verdict(drop_and_stick)
-        self.assertFalse(verdict, verdict.detail)
-        self.assertIn("phantom", verdict.detail)
+        self.assertTrue(verdict, verdict.detail)
+        self.assertEqual(verdict.branch, "prefix-gap")
+        self.assertIn("KI-v072-proxy-phantom-inflight", verdict.detail)
+        self.assertIn("evidence=1", verdict.detail)
 
     def test_prefix_gap_rejects_total_miss(self):
         def drop_all_spy(report, _ledger):
@@ -1301,15 +1312,16 @@ class OpenscJudgeTwins(unittest.TestCase):
         self.assertFalse(verdict, verdict.detail)
         self.assertIn("surplus", verdict.detail)
 
-    def test_gap_with_phantom_fails(self):
+    def test_gap_with_phantom_is_a_named_known_issue(self):
         def drop_and_stick(report, _ledger):
             report["functions"] = [r for r in report["functions"]
                                    if not (r["names"] == ["C_Initialize"]
                                            and (r["module"] or {}).get("sha256") == SPY_SHA)]
             report["evidence"]["in_flight_at_end"] = 1
         verdict = self.verdict(drop_and_stick)
-        self.assertFalse(verdict, verdict.detail)
-        self.assertIn("phantom", verdict.detail)
+        self.assertTrue(verdict, verdict.detail)
+        self.assertIn("KI-v072-proxy-phantom-inflight", verdict.detail)
+        self.assertIn("evidence=1", verdict.detail)
 
     def test_gap_with_complete_claim_fails(self):
         def drop_and_claim(report, _ledger):

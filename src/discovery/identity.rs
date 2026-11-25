@@ -3392,6 +3392,16 @@ impl PinnedObjects {
         let removed = self.ownership.remove(&view)?;
         self.bump_revision();
         let removed_raws = self.raw_ownership.remove(&view).unwrap_or_default();
+        let (kept_raws, removed_raws): (BTreeSet<RawObjectInstance>, BTreeSet<RawObjectInstance>) =
+            removed_raws
+                .into_iter()
+                .partition(|raw| self.raw_to_id.get(raw).is_some_and(|id| keep.contains(id)));
+        if !kept_raws.is_empty() {
+            self.raw_ownership
+                .entry(view)
+                .or_default()
+                .extend(kept_raws);
+        }
         let retained_raws: BTreeSet<_> = self
             .raw_ownership
             .values()

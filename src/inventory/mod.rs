@@ -11095,12 +11095,25 @@ pub(crate) fn render_json_from_presentation(presentation: &Presentation) -> serd
             .any(|caller| caller.id == edge.caller)),
         "every rendered edge caller resolves in the presentation"
     );
+    // A row's `caller` names a `callers[]` row or is null: a caller
+    // folded out of the inventory (departed fold) keeps its pid and its
+    // row, never a dangling caller id (v0.7.2 C1).
+    let listed: std::collections::BTreeSet<_> = presentation
+        .callers
+        .iter()
+        .map(|caller| caller.id)
+        .collect();
+    let listed_label = |caller: Option<crate::discovery::caller_registry::CallerId>| {
+        caller
+            .filter(|id| listed.contains(id))
+            .map(|caller| caller.label())
+    };
     let gaps: Vec<serde_json::Value> = presentation
         .gaps
         .iter()
         .map(|gap| {
             serde_json::json!({
-                "caller": gap.caller.map(|caller| caller.label()),
+                "caller": listed_label(gap.caller),
                 "module": gap.module.map(|module| module.label()),
                 "pid": gap.pid,
                 "subject": gap.subject,
@@ -11164,7 +11177,7 @@ pub(crate) fn render_json_from_presentation(presentation: &Presentation) -> serd
             .map(|note| {
                 serde_json::json!({
                     "kind": note.kind.label(),
-                    "caller": note.caller.map(|caller| caller.label()),
+                    "caller": listed_label(note.caller),
                     "module": note.module.map(|module| module.label()),
                     "pid": note.pid,
                     "subject": note.subject,

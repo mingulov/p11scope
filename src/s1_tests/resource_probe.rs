@@ -928,6 +928,9 @@ fn native_semantic_resource_final_types_pinned() {
             >()
             // provider/token/mechanism projection: provider_observations
             + size_of::<Option<crate::inventory_provider_info::ProviderObservations>>()
+            // v0.7.2 typed non-loss rows: notes + notes_suppressed
+            + size_of::<Vec<crate::inventory_present::NoteView>>()
+            + size_of::<u64>()
     );
     // Supporting payload: RoutedCall carries one EventRecord.
     pin!(p11scope_ebpf_common::EventRecord, 368);

@@ -1080,12 +1080,6 @@ impl Presentation {
                 }
             })
             .collect();
-        // A row's caller names a `callers[]` row or nothing: a caller
-        // folded out of the inventory (departed fold) keeps its pid
-        // and its row, never a dangling caller id.
-        let listed: std::collections::BTreeSet<CallerId> =
-            callers.iter().map(|caller| caller.id).collect();
-        let listed_caller = |caller: Option<CallerId>| caller.filter(|id| listed.contains(id));
         let mut gaps: Vec<GapView> = Vec::new();
         let mut notes: Vec<NoteView> = Vec::new();
         for ((gap, &repeats), &class) in registry
@@ -1104,7 +1098,7 @@ impl Presentation {
                         .map(str::to_string)
                         .unwrap_or_else(|| gap.reason.clone());
                     gaps.push(GapView {
-                        caller: listed_caller(gap.caller),
+                        caller: gap.caller,
                         module: gap.module,
                         pid: gap.pid,
                         subject: gap.subject.clone(),
@@ -1116,7 +1110,7 @@ impl Presentation {
                 crate::discovery::caller_registry::GapClass::Note(kind) => {
                     notes.push(NoteView {
                         kind,
-                        caller: listed_caller(gap.caller),
+                        caller: gap.caller,
                         module: gap.module,
                         pid: gap.pid,
                         subject: gap.subject.clone(),

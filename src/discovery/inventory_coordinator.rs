@@ -47910,29 +47910,37 @@ int main(void) {
                 .iter()
                 .all(|caller| caller.id != folded)
         );
-        let gaps: Vec<_> = presentation
-            .gaps
-            .iter()
-            .filter(|gap| gap.subject.ends_with(" row"))
-            .map(|gap| (gap.subject.as_str(), gap.caller, gap.pid))
-            .collect();
+        // The public document is the contract: a row's caller resolves
+        // to a `callers[]` row or is null, its pid kept.
+        let document = crate::inventory::render_json_from_presentation(&presentation);
+        let rows = |key: &str| -> Vec<(String, serde_json::Value, serde_json::Value)> {
+            document[key]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|row| row["subject"].as_str().unwrap().contains(" row"))
+                .map(|row| {
+                    (
+                        row["subject"].as_str().unwrap().to_string(),
+                        row["caller"].clone(),
+                        row["pid"].clone(),
+                    )
+                })
+                .collect()
+        };
+        let label = serde_json::Value::from(listed.label());
         assert_eq!(
-            gaps,
+            rows("gaps"),
             vec![
-                ("listed row", Some(listed), Some(77)),
-                ("folded row", None, Some(77))
+                ("listed row".into(), label.clone(), 77.into()),
+                ("folded row".into(), serde_json::Value::Null, 77.into())
             ]
         );
-        let notes: Vec<_> = presentation
-            .notes
-            .iter()
-            .map(|note| (note.subject.as_str(), note.caller, note.pid))
-            .collect();
         assert_eq!(
-            notes,
+            rows("notes"),
             vec![
-                ("listed row note", Some(listed), Some(77)),
-                ("folded row note", None, Some(77))
+                ("listed row note".into(), label, 77.into()),
+                ("folded row note".into(), serde_json::Value::Null, 77.into())
             ]
         );
     }

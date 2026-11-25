@@ -920,6 +920,10 @@ fn native_semantic_resource_final_types_pinned() {
         1400 + size_of::<crate::inventory_present::PresentationRenderIndex>()
             + 6 * size_of::<Vec<u8>>()
             + 2 * size_of::<u64>()
+            // +8 (folded-key memory overflow publication): one more
+            // inline BudgetView u64 beside the other
+            // departed-retention counters.
+            + size_of::<u64>()
             // a2 re-arm rate: joint_audit_subjects
             + size_of::<
                 Option<

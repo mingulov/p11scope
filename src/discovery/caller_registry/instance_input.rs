@@ -3175,6 +3175,26 @@ impl CallerRegistry {
         record.feed.staged_original_at(index)
     }
 
+    /// Count one attributed stop-loss disposal on one feed's typed
+    /// history counter (N1: every cursor `disposed`++ outside the
+    /// shared tail pairs with one of these, so the feed counter and
+    /// the gap text never disagree). Missing feeds stay silent: the
+    /// fallback preflight already qualified this target.
+    pub(crate) fn note_history_disposed(&mut self, target: &JointFeedTarget) {
+        let Some(record) = self.instance_state.semantics.get_mut(&target.id) else {
+            return;
+        };
+        if record.caller != target.caller
+            || record
+                .feed
+                .selected_receipt()
+                .is_none_or(|receipt| receipt.domain() != target.bootstrap.domain())
+        {
+            return;
+        }
+        record.feed.bump_history_disposed();
+    }
+
     /// Tests-only native-less head: clear one feed's staged head
     /// invocation, so the stop-loss twin drives a staged head with no
     /// native original while its open entry stays retained.

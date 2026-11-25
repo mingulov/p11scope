@@ -30860,10 +30860,10 @@ fn seal_pending_across_stop_incomplete(mixed: bool) {
     );
 }
 
-/// Round r4 (B3): `joint_stop_loss_non_stop_refusals_keep_pre_r3_path`
-/// replaces the r3 exhausted twin below this line's history: only a
-/// Stopped take runs the stop-loss arms, so AuthorityExhausted and
-/// CoverageFailed refuse incomplete entries with nothing disposed.
+// Round r4 (B3): `joint_stop_loss_non_stop_refusals_keep_pre_r3_path`
+// replaces the r3 exhausted twin: only a Stopped take runs the
+// stop-loss arms, so AuthorityExhausted and CoverageFailed refuse
+// incomplete entries with nothing disposed.
 
 /// Round r3 (D1 interaction): a replay-resource failure striking an
 /// incomplete fallback disposes exactly once (single pop, single
@@ -31083,7 +31083,7 @@ enum R4Corrupt {
     MultiClaim,
     TwoKeys,
     OriginWrong,
-    EndDisagree,
+    EntryStamp,
     TsShift,
     DurationShift,
     LedgerBreak,
@@ -31250,12 +31250,7 @@ fn drive_r4_stop_row(row: &R4Row) {
                     ),
                 ),
             ),
-            R4Corrupt::EndDisagree => {
-                let clock = adapter.open_end_clock_for_test(*native);
-                clock.is_some_and(|(_, _, duration)| {
-                    adapter.shift_open_end_clock_for_test(*native, 1, duration)
-                })
-            }
+            R4Corrupt::EntryStamp => adapter.patch_open_end_stamp_for_test(*native),
             R4Corrupt::TsShift => {
                 let clock = adapter.open_end_clock_for_test(*native);
                 clock.is_some_and(|(_, ts, duration)| {
@@ -31668,18 +31663,9 @@ fn joint_stop_loss_predicate_table_publishes_counted_loss() {
             leftover_claims: 0,
             unattributed_rows: 0,
         },
-        // S0a: BEGIN past the frontier (END present and END-less).
-        R4Row {
-            name: "begin_past_frontier_end",
-            push: P::Complete,
-            begin_only: false,
-            takes: T::StoppedCapture,
-            corrupt: C::BeginPastFrontier,
-            unclaimed: U::None,
-            expect: loss,
-            leftover_claims: 0,
-            unattributed_rows: 0,
-        },
+        // S0a: BEGIN past the frontier (END-less isolates the
+        // ordinal; the END-present shape also breaks the ledger link
+        // and refuses, pinned in the custody table).
         R4Row {
             name: "begin_past_frontier_endless",
             push: P::Endless,
@@ -31797,13 +31783,13 @@ fn joint_stop_loss_predicate_table_publishes_counted_loss() {
             leftover_claims: 0,
             unattributed_rows: 0,
         },
-        // END disagrees with BEGIN (rewound clock).
+        // END disagrees with BEGIN (continuity stamp only).
         R4Row {
             name: "end_disagree",
             push: P::Complete,
             begin_only: false,
             takes: T::StoppedCapture,
-            corrupt: C::EndDisagree,
+            corrupt: C::EntryStamp,
             unclaimed: U::None,
             expect: loss,
             leftover_claims: 0,
@@ -31961,6 +31947,19 @@ fn joint_stop_loss_custody_table_refuses_without_change() {
             leftover_claims: 0,
             unattributed_rows: 0,
         },
+        // Custody wins over the BEGIN-ordinal trigger: shifting the
+        // ordinal past the frontier also breaks the ledger link.
+        R4Row {
+            name: "begin_past_frontier_end",
+            push: P::Complete,
+            begin_only: false,
+            takes: T::StoppedCapture,
+            corrupt: C::BeginPastFrontier,
+            unclaimed: U::None,
+            expect: E::Refuse,
+            leftover_claims: 0,
+            unattributed_rows: 0,
+        },
         // Custody: open image disagrees with the key (staged entry).
         R4Row {
             name: "image_foreign",
@@ -32113,12 +32112,9 @@ fn joint_stop_loss_refusal_applies_no_planned_disposal() {
             .unwrap();
         frame.bind_targets(&ports).unwrap();
         for _ in 0..16 {
-            match frame.seal_next(&mut ports, &mut takes, &fault) {
-                Err(refusal) => {
-                    first_err = Some(refusal);
-                    break;
-                }
-                Ok(_) => {}
+            if let Err(refusal) = frame.seal_next(&mut ports, &mut takes, &fault) {
+                first_err = Some(refusal);
+                break;
             }
             match frame.deliver_next(&mut ports) {
                 Err(refusal) => {
@@ -32226,12 +32222,9 @@ fn joint_stop_loss_non_stop_refusals_keep_pre_r3_path() {
                     .unwrap();
                 frame.bind_targets(&ports).unwrap();
                 for _ in 0..16 {
-                    match frame.seal_next(&mut ports, &mut takes, &fault) {
-                        Err(refusal) => {
-                            first_err = Some(refusal);
-                            break;
-                        }
-                        Ok(_) => {}
+                    if let Err(refusal) = frame.seal_next(&mut ports, &mut takes, &fault) {
+                        first_err = Some(refusal);
+                        break;
                     }
                     match frame.deliver_next(&mut ports) {
                         Err(refusal) => {

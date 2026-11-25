@@ -31,7 +31,7 @@ use crate::semantics_objects::{
     CallKey, MAX_FIND_HANDLES, MAX_INPUT_HANDLES, MAX_RESULT_HANDLES, MAX_TEMPLATE_ATTRIBUTES,
 };
 use crate::semantics_objects::{ObjectDomain, ObjectEffect, ObjectSemantics};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::mem::size_of;
 
 /// No Clone or scalar constructor. The original provenance is moved intact;
@@ -367,12 +367,10 @@ pub(crate) fn capture_ended_reason(
 /// to one consumer (B2: several keys bound to the image, or a BEGIN
 /// past the frame frontier): caller-less, counted per image, never
 /// under a consumer.
-#[allow(dead_code)] // RED-first scaffolding: the r4 twins pin it; the fix wires it.
 pub(crate) const STOP_LOSS_UNATTRIBUTED_SUBJECT: &str = "joint seal stop-loss unattributed";
 
 /// Reason text of one unattributed stop-loss gap: the stopping
 /// refusal, the image the lost calls share, and their exact count.
-#[allow(dead_code)] // RED-first scaffolding: the r4 twins pin it; the fix wires it.
 pub(crate) fn stop_loss_unattributed_reason(
     refusal: crate::attach::BirthObservationRefusal,
     image: (u64, u64),
@@ -655,18 +653,32 @@ pub(super) struct FailureReplayCursor {
     /// only its own head.
     replayed: usize,
     disposed: usize,
-    /// Stop-loss natives (D1): open entries verified as
-    /// staged-but-incomplete under a capture-ended take, as
-    /// (native, admission) pairs awaiting head consumption. Staged
+    /// Stop-loss heads (D1/r4): staged admissions the verification
+    /// recorded for counted-loss disposal at head consumption, keyed
+    /// by admission (B5: keyed lookup, never a linear scan). Staged
     /// heads carry no native without an END, so verification
     /// records it; head consumption removes it. Bounded by the
     /// open table the verification already walks.
-    pub(super) stop_loss: Vec<(super::JournalNativeKey, u64)>,
+    pub(super) stop_loss: BTreeMap<u64, super::StopLossHead>,
+    /// Planned stop-loss releases (B4): stale or unclaimed opens the
+    /// walk classified, applied only after validation passes (the
+    /// suffix is set). A refusal between classification and
+    /// application changes nothing and counts nothing.
+    pub(super) stop_loss_plan: Vec<super::PlannedStopRelease>,
+    /// Unattributed stop-loss count (B2): unclaimed opens this
+    /// delivery disposed that no single consumer owns. The close
+    /// names them in one caller-less per-image row, never under a
+    /// consumer; N5 skips the row when the count is 0.
+    pub(super) stop_loss_unattributed: usize,
     /// This slice's head disposes as stop-loss (D1) instead of
     /// replaying: set by the completed-fallback head check when
     /// the head's open entry has no END under a capture-ended
     /// take, consumed by the shared tail.
     pub(super) stop_loss_dispose: bool,
+    /// Stop-loss keyed lookups this delivery performed (B5 INV-2
+    /// pin: one keyed lookup per consumed head, asserted in tests).
+    #[cfg(test)]
+    pub(super) stop_loss_lookups: usize,
 }
 
 impl FailureReplayCursor {
@@ -675,6 +687,17 @@ impl FailureReplayCursor {
     /// (the fallback fence and the parked consumer).
     fn counted_units(&self) -> usize {
         self.replayed.saturating_add(self.disposed)
+    }
+
+    /// Take one recorded stop-loss head by admission (B5: keyed
+    /// O(log n) lookup, never a scan). Counts lookups for the INV-2
+    /// pin in test builds.
+    pub(super) fn stop_loss_take(&mut self, admission: u64) -> Option<super::StopLossHead> {
+        #[cfg(test)]
+        {
+            self.stop_loss_lookups = self.stop_loss_lookups.saturating_add(1);
+        }
+        self.stop_loss.remove(&admission)
     }
 }
 
@@ -777,6 +800,15 @@ impl<'q> FailureBatchDelivery<'q> {
     /// Count one head this delivery disposed as history loss.
     pub(crate) fn note_head_disposed(&mut self) {
         self.cursor.disposed = self.cursor.disposed.saturating_add(1);
+    }
+    /// Count one unclaimed open this delivery disposed as
+    /// unattributed stop-loss (B2): owned by no consumer.
+    pub(crate) fn note_unattributed_stop_loss(&mut self) {
+        self.cursor.stop_loss_unattributed = self.cursor.stop_loss_unattributed.saturating_add(1);
+    }
+    /// Unattributed stop-loss disposals across all this delivery's slices.
+    pub(crate) fn delivered_unattributed(&self) -> usize {
+        self.cursor.stop_loss_unattributed
     }
     /// Heads replayed across all this delivery's slices.
     pub(crate) fn delivered_replayed(&self) -> usize {
@@ -2879,6 +2911,24 @@ impl IngestedJointQuantum {
                             units: Some(units as u64),
                         });
                     }
+                    // B2: unattributed stop-loss: unclaimed opens this
+                    // delivery disposed that no single consumer owns.
+                    // One caller-less row per delivery (a delivery only
+                    // ever sees its own key's image); N5 applies here
+                    // too.
+                    let unattributed = batch.delivered_unattributed();
+                    if unattributed != 0 {
+                        let image = target.bootstrap().proof().key_image();
+                        registry.record_gap(crate::discovery::caller_registry::RegistryGap {
+                            caller: None,
+                            module: None,
+                            pid: None,
+                            subject: STOP_LOSS_UNATTRIBUTED_SUBJECT.to_string(),
+                            reason: stop_loss_unattributed_reason(refusal, image, unattributed),
+                            budget: None,
+                            units: Some(unattributed as u64),
+                        });
+                    }
                 }
                 // A parked consumer's forced fallback lands its named
                 // park gap here, with exact loss counts: the watchdog
@@ -3381,6 +3431,37 @@ pub(crate) mod tests {
             };
             assert_eq!(cursor.counted_units(), units, "{replayed}+{disposed}");
         }
+    }
+
+    /// B5 INV-2 pin: stop-loss head lookup is keyed by admission
+    /// (one keyed removal per recorded head, each counted exactly
+    /// once), never a linear scan.
+    #[test]
+    fn stop_loss_lookup_is_keyed_by_admission() {
+        use super::super::{CallIdentity, StopLossHead};
+        use super::FailureReplayCursor;
+        let identity = CallIdentity::scripted_for_test(7);
+        let mut cursor = FailureReplayCursor::default();
+        for admission in [3u64, 9, 25] {
+            cursor.stop_loss.insert(
+                admission,
+                StopLossHead {
+                    native: (1, admission),
+                    identity,
+                    ambiguous: false,
+                },
+            );
+        }
+        assert_eq!(cursor.stop_loss_lookups, 0);
+        // Out-of-order takes still hit: keyed, not positional.
+        for admission in [25u64, 3, 9] {
+            let head = cursor.stop_loss_take(admission).expect("recorded head");
+            assert_eq!(head.native, (1, admission));
+            assert!(!head.ambiguous);
+        }
+        assert!(cursor.stop_loss_take(3).is_none());
+        assert!(cursor.stop_loss.is_empty());
+        assert_eq!(cursor.stop_loss_lookups, 4, "one counted lookup per take");
     }
 
     #[test]

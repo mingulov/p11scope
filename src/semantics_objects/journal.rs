@@ -523,6 +523,13 @@ pub(crate) struct JournalDomainProof {
     era: u64,
 }
 
+impl JournalDomainProof {
+    /// The proof key's bound image (B2: the unattributed row's image).
+    pub(in crate::semantics_objects) fn key_image(&self) -> (u64, u64) {
+        (self.key.cookie, self.key.exec)
+    }
+}
+
 /// One admitted call's journal-attribution shape: the exact overlap
 /// between H3's admitted facts and a staged BEGIN's wire scalars (plus
 /// the image both sides bind). Original Event duration reconstructs
@@ -596,6 +603,133 @@ pub(crate) struct CallIdentity {
     slot_id: u64,
     flags: u64,
     user_type: u32,
+}
+
+#[cfg(test)]
+impl CallIdentity {
+    /// A scripted identity for cursor unit tests (no wire meaning).
+    pub(crate) fn scripted_for_test(word: u64) -> Self {
+        Self {
+            image: (word, word),
+            function: word as u32,
+            pid_tgid: word,
+            entry_ns: word,
+            slot: word as u32,
+            slot_id: word,
+            flags: word,
+            user_type: word as u32,
+        }
+    }
+}
+
+/// One stop-loss head recorded for counted-loss disposal (r4): the
+/// verification saw a staged admission it cannot replay at stop, so
+/// head consumption disposes it instead. Keyed by admission in the
+/// cursor (B5); the native and identity locate the retained entry
+/// and claims even after an ambiguous sibling consumed the shared
+/// native first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::semantics_objects) struct StopLossHead {
+    pub native: JournalNativeKey,
+    pub identity: CallIdentity,
+    /// Several claims or keys share this entry: consumption drains
+    /// whatever claims remain without asserting admission order.
+    pub ambiguous: bool,
+}
+
+/// One planned stop-loss release (B4): the verification walk
+/// classified a stale or unclaimed open; the apply phase runs the
+/// disposal only after validation passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::semantics_objects) struct PlannedStopRelease {
+    pub native: JournalNativeKey,
+    pub identity: CallIdentity,
+    pub kind: PlannedStopReleaseKind,
+}
+
+/// What one planned release does at apply time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::semantics_objects) enum PlannedStopReleaseKind {
+    /// Claimed but unstaged: release silently (already counted).
+    Stale,
+    /// Unclaimed, sole-bound image, in-frame: dispose and count
+    /// under this consumer.
+    Attributed,
+    /// Unclaimed, multi-bound or post-frontier: dispose and count
+    /// caller-less per image (B2).
+    Unattributed,
+}
+
+/// How head consumption drains one consumed head's claims: exact
+/// heads assert their single claim's admission; tolerant heads
+/// (ambiguous or native-less difference) drain whatever remains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeadConsumeMode {
+    Exact,
+    Tolerant,
+}
+
+/// One of my claims' staged linkage for the stop split: which
+/// admission staged, and whether its binding holds.
+struct StopStagedAdmission {
+    admission: u64,
+    shape_ok: bool,
+    ledger_ok: bool,
+    fingerprint_ok: bool,
+}
+
+/// Every predicate input the stop split reads for one open entry.
+/// Gathered once per entry; decided purely by
+/// [`Self::decide_stop_original`].
+struct StopOriginalEvidence {
+    /// Non-empty claims under my key.
+    my_claims: usize,
+    /// Distinct keys with non-empty claims for this shape.
+    claiming_keys: usize,
+    /// My claims' admissions staged for this feed, with linkage.
+    staged: Vec<StopStagedAdmission>,
+    end_present: bool,
+    image_ok: bool,
+    /// Another disposer owns this entry (conversion or S1-only).
+    owner_marked: bool,
+    abandon: bool,
+    corroborated: bool,
+    raw_present: bool,
+    begin_past_frontier: bool,
+    end_past_frontier: bool,
+    end_agrees: bool,
+    ts_ok: bool,
+    floors_ok: bool,
+    origin_ok: bool,
+    bounds_ok: bool,
+    key_live: bool,
+    me_bound: bool,
+    bound_total: usize,
+}
+
+/// One open entry's stop disposition (r4 B1 split).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StopOriginalOutcome {
+    /// Verified complete: replay this admission.
+    Complete(u64),
+    /// Counted loss: dispose these staged admissions.
+    Loss {
+        admissions: Vec<u64>,
+        ambiguous: bool,
+    },
+    /// Claimed but unstaged: release silently (already counted).
+    Stale,
+    /// Unclaimed, sole-bound in-frame image: dispose and count
+    /// under this consumer.
+    UnclaimedAttributed,
+    /// Unclaimed, multi-bound or post-frontier: dispose and count
+    /// caller-less per image.
+    UnclaimedImage,
+    /// No claim under my key: untouched, uncounted.
+    Outside,
+    /// My claims exist but another owner, an abandon, or a dead
+    /// key keeps this path hands-off: untouched, uncounted.
+    Skip,
 }
 
 /// The entry-time words of one staged BEGIN (open or capacity-refused)
@@ -3796,9 +3930,10 @@ impl JournalAdapter {
 
     /// Tests-only post-frontier BEGIN: move one open original's BEGIN
     /// ordinal past the frame frontier. The H8Open ledger charge stays
-    /// keyed at the original ordinal (production ordinals never shift),
-    /// so the twin's release misses by construction; only the
-    /// BEGIN-ordinal check changes on the fallback path.
+    /// keyed at the original ordinal (re-keying is impossible: one
+    /// H8Open row per operation), so on the END path the ledger link
+    /// breaks too and custody refuses first; the incomplete and
+    /// unclaimed paths check no ledger and isolate the ordinal alone.
     #[cfg(test)]
     pub(crate) fn shift_open_begin_past_frontier_for_test(
         &mut self,
@@ -4062,9 +4197,7 @@ impl JournalAdapter {
 
     #[cfg(test)]
     fn sibling_key_for_test(&mut self, native: JournalNativeKey) -> Option<JournalDomainKey> {
-        let Some(entry) = self.open.get(&native) else {
-            return None;
-        };
+        let entry = self.open.get(&native)?;
         let image = entry.image;
         let sibling = JournalDomainKey {
             domain_tag: u64::MAX,
@@ -4120,6 +4253,50 @@ impl JournalAdapter {
             .copy_from_slice(&ts_ns.to_le_bytes());
         patched[JOURNAL_COMMON_BYTES + 8..JOURNAL_COMMON_BYTES + 16]
             .copy_from_slice(&duration_ns.to_le_bytes());
+        let rows = publish_object_descriptors();
+        let Some(p11scope_ebpf_common::object_journal::JournalRecord::End(end)) =
+            decode_journal_record(&patched, &rows)
+        else {
+            return false;
+        };
+        let Some(mut entry) = self.open.get_mut(&native) else {
+            return false;
+        };
+        entry.end = Some(StagedEnd {
+            ordinal: staged.ordinal,
+            end,
+        });
+        true
+    }
+
+    /// Tests-only END stamp surgery: flip one byte of one open
+    /// original's staged END continuity entry stamp through the real
+    /// record validator, so the twin isolates the END-agreement
+    /// predicate (the stamp feeds nothing else on the path).
+    /// Full-form ENDs only.
+    #[cfg(test)]
+    pub(crate) fn patch_open_end_stamp_for_test(&mut self, native: JournalNativeKey) -> bool {
+        use p11scope_ebpf_common::object_journal::{
+            JOURNAL_COMMON_BYTES, JOURNAL_END_FULL_BYTES, decode_journal_record,
+        };
+        use p11scope_ebpf_common::object_wire::publish_object_descriptors;
+        let Some(entry) = self.open.get(&native) else {
+            return false;
+        };
+        let Some(staged) = entry.end else {
+            return false;
+        };
+        let raw = staged.end.raw_bytes();
+        if raw.len() != JOURNAL_END_FULL_BYTES {
+            return false;
+        }
+        // Event (328) + continuity entry_ip (8): the entry stamp's
+        // first byte. Continuity is private helper data, so the
+        // validator takes the patched record.
+        const STAMP_AT: usize = JOURNAL_COMMON_BYTES + 328 + 8;
+        let mut patched = [0u8; JOURNAL_END_FULL_BYTES];
+        patched.copy_from_slice(raw);
+        patched[STAMP_AT] ^= 0xff;
         let rows = publish_object_descriptors();
         let Some(p11scope_ebpf_common::object_journal::JournalRecord::End(end)) =
             decode_journal_record(&patched, &rows)
@@ -9770,8 +9947,239 @@ impl JournalAdapter {
         popped
     }
 
+    /// The stop split, purely: map one entry's evidence to its
+    /// disposition. `Err` is custody/binding only (a ledger or
+    /// fingerprint mismatch; an image, shape or floor binding break);
+    /// every attributable entry is a counted loss, never a refusal.
+    /// Table-driven unit test below pins each predicate arm.
+    fn decide_stop_original(evidence: &StopOriginalEvidence) -> Result<StopOriginalOutcome, ()> {
+        use StopOriginalOutcome as Outcome;
+        if evidence.my_claims == 0 && evidence.claiming_keys == 0 {
+            if evidence.end_present {
+                return Ok(Outcome::Outside);
+            }
+            let clean = !evidence.owner_marked && !evidence.abandon;
+            if !clean || !evidence.key_live || !evidence.image_ok || !evidence.me_bound {
+                return Ok(Outcome::Outside);
+            }
+            // B2: only a sole-bound in-frame image counts under this
+            // consumer; anything else is caller-less per-image loss.
+            if evidence.bound_total == 1 && !evidence.begin_past_frontier {
+                return Ok(Outcome::UnclaimedAttributed);
+            }
+            return Ok(Outcome::UnclaimedImage);
+        }
+        if evidence.my_claims == 0 {
+            return Ok(Outcome::Outside);
+        }
+        if !evidence.image_ok {
+            return Err(());
+        }
+        let ambiguous = evidence.my_claims != 1 || evidence.claiming_keys != 1;
+        if evidence.staged.is_empty() {
+            if evidence.owner_marked || evidence.abandon || !evidence.key_live {
+                return Ok(Outcome::Skip);
+            }
+            return Ok(Outcome::Stale);
+        }
+        if ambiguous {
+            // Ambiguity loses counted, but per-claim custody still
+            // refuses: a known ledger or fingerprint break stays loud.
+            for staged in &evidence.staged {
+                if !staged.shape_ok || !staged.ledger_ok || !staged.fingerprint_ok {
+                    return Err(());
+                }
+            }
+            if evidence.end_present && !evidence.floors_ok {
+                return Err(());
+            }
+            return Ok(Outcome::Loss {
+                admissions: evidence
+                    .staged
+                    .iter()
+                    .map(|staged| staged.admission)
+                    .collect(),
+                ambiguous: true,
+            });
+        }
+        let Some(staged) = evidence.staged.first() else {
+            // Unreachable: sole claim, sole key, staged non-empty.
+            return Err(());
+        };
+        if !staged.shape_ok || !staged.ledger_ok {
+            return Err(());
+        }
+        if !evidence.end_present {
+            // No END to replay with: every staged END-less entry is a
+            // counted loss once its binding holds (S0 uniform loss).
+            return Ok(Outcome::Loss {
+                admissions: vec![staged.admission],
+                ambiguous: false,
+            });
+        }
+        if !staged.fingerprint_ok || !evidence.floors_ok {
+            return Err(());
+        }
+        if evidence.owner_marked
+            || evidence.begin_past_frontier
+            || evidence.end_past_frontier
+            || evidence.abandon
+            || evidence.corroborated
+            || !evidence.raw_present
+            || !evidence.origin_ok
+            || !evidence.end_agrees
+            || !evidence.ts_ok
+            || !evidence.bounds_ok
+        {
+            return Ok(Outcome::Loss {
+                admissions: vec![staged.admission],
+                ambiguous: false,
+            });
+        }
+        Ok(Outcome::Complete(staged.admission))
+    }
+
+    /// Gather one open entry's stop evidence and decide it (r4 B1).
+    /// Pure classification: no journal mutation.
+    #[allow(clippy::too_many_arguments)]
+    fn classify_stop_original(
+        &self,
+        entry: &OpenEntry,
+        audit: &JournalAuditReceipt,
+        key: JournalDomainKey,
+        frontier: ConsumptionOrdinal,
+        staged_max: u64,
+        target: &crate::discovery::caller_registry::instance_input::JointFeedTarget,
+        registry: &crate::discovery::caller_registry::CallerRegistry,
+    ) -> Result<StopOriginalOutcome, joint_driver::RawQuantumRefusal> {
+        use joint_driver::RawQuantumRefusal;
+        let shape = shape_of_entry(entry);
+        let claimants = self.claims.get(&shape.identity);
+        let my_claims = claimants
+            .and_then(|claimants| claimants.get(&key))
+            .map_or(0, |claims| claims.len());
+        let claiming_keys = claimants.map_or(0, |claimants| {
+            claimants
+                .values()
+                .filter(|claims| !claims.is_empty())
+                .count()
+        });
+        let end_event = entry.end.map(|end| end.end.payload_base().event);
+        let mut staged = Vec::new();
+        if my_claims > 0
+            && let Some(mine) = claimants.and_then(|claimants| claimants.get(&key))
+        {
+            for claim in mine.iter() {
+                let Some(staged_resource) = registry.joint_staged_resource(target, claim.admission)
+                else {
+                    continue;
+                };
+                let shape_ok = claim_names_shape(&shape, claim);
+                let ledger_ok = match entry.end {
+                    Some(_) => self.ledger.matches_completed_staging(
+                        entry.begin_ordinal,
+                        key.domain_tag,
+                        claim.admission,
+                        staged_resource,
+                    ),
+                    // No END to stage against: the incomplete path
+                    // checks no ledger (uniform counted loss).
+                    None => true,
+                };
+                let fingerprint_ok = match &end_event {
+                    Some(event) => fingerprint_matches_event(&claim.returned, event),
+                    None => true,
+                };
+                staged.push(StopStagedAdmission {
+                    admission: claim.admission,
+                    shape_ok,
+                    ledger_ok,
+                    fingerprint_ok,
+                });
+            }
+        }
+        // Sole-claim END-derived linkage (ambiguous entries skip these:
+        // already a loss; only custody still refuses).
+        let sole = my_claims == 1 && claiming_keys == 1;
+        let sole_claim = if sole {
+            claimants
+                .and_then(|claimants| claimants.get(&key))
+                .and_then(|mine| mine.front())
+        } else {
+            None
+        };
+        let sole_admission = match (sole_claim, staged.first()) {
+            (Some(claim), Some(first)) if first.admission == claim.admission => {
+                Some(claim.admission)
+            }
+            _ => None,
+        };
+        let origin_ok = match (sole_admission, entry.collected_origin) {
+            (Some(admission), Some(origin)) => origin.position() == admission,
+            (Some(_), None) => true,
+            _ => true,
+        };
+        let bounds_ok = sole_admission
+            .is_none_or(|admission| admission <= staged_max && admission < audit.h0_below);
+        let end_agrees = match entry.end {
+            Some(end) => end_agrees_with_begin(&entry.begin, &end.end),
+            None => true,
+        };
+        let ts_ok = match (entry.end, sole_claim, &end_event) {
+            (Some(_), Some(claim), Some(event)) => event.ts_ns == claim.return_ns,
+            _ => true,
+        };
+        let floors_ok = match entry.end {
+            Some(_) => self
+                .physical_return_floors
+                .contains_key(&shape.identity.pid_tgid),
+            None => true,
+        };
+        let bound = self.image_keys.get(&entry.image);
+        let evidence = StopOriginalEvidence {
+            my_claims,
+            claiming_keys,
+            staged,
+            end_present: entry.end.is_some(),
+            image_ok: entry.image == (key.cookie, key.exec),
+            owner_marked: entry.converted_ticket.is_some()
+                || entry.converted_for.is_some()
+                || entry.call_key.is_some()
+                || entry.end_converted
+                || entry.s1only_subject.is_some(),
+            abandon: entry.abandon.is_some(),
+            corroborated: entry.corroborated_return.is_some(),
+            raw_present: entry.raw_resource.is_some(),
+            begin_past_frontier: entry.begin_ordinal > frontier.0,
+            end_past_frontier: entry.end.is_some_and(|end| end.ordinal > frontier.0),
+            end_agrees,
+            ts_ok,
+            floors_ok,
+            origin_ok,
+            bounds_ok,
+            key_live: self.key_is_live(key),
+            me_bound: bound.is_some_and(|keys| keys.contains(&key)),
+            bound_total: bound.map_or(0, Vec::len),
+        };
+        Self::decide_stop_original(&evidence).map_err(|()| RawQuantumRefusal::DispositionMismatch)
+    }
+
+    /// Drain every claim under `key` for one identity, returning the
+    /// drained admissions in pop order. Exact heads assert singleton
+    /// equality; ambiguous heads drain whatever remains.
+    fn drain_my_claims(&mut self, identity: &CallIdentity, key: JournalDomainKey) -> Vec<u64> {
+        let mut drained = Vec::new();
+        while let Some(claim) = self.consume_claim(identity, key) {
+            drained.push(claim.admission);
+        }
+        drained
+    }
+
     /// Read one selected physical original. Counts are useful only after
     /// every matching original has passed this exact key/START/END/H9 check.
+    /// Non-stop takes only (B3): maps the stop split back onto the
+    /// pre-r3 contract (verified or outside; everything else refuses),
+    /// so running-path behavior is byte-identical.
     #[allow(clippy::too_many_arguments)]
     fn completed_fallback_original(
         &self,
@@ -9784,140 +10192,16 @@ impl JournalAdapter {
         registry: &crate::discovery::caller_registry::CallerRegistry,
     ) -> Result<Option<u64>, joint_driver::RawQuantumRefusal> {
         use joint_driver::RawQuantumRefusal;
-        let shape = shape_of_entry(entry);
-        let Some(claimants) = self.claims.get(&shape.identity) else {
-            return Ok(None);
-        };
-        let Some(mine) = claimants.get(&key).filter(|claims| !claims.is_empty()) else {
-            return Ok(None);
-        };
-        let Some(end) = entry.end else {
-            return Err(RawQuantumRefusal::DispositionMismatch);
-        };
-        if mine.len() != 1
-            || claimants
-                .values()
-                .filter(|claims| !claims.is_empty())
-                .count()
-                != 1
-            || entry.begin_ordinal > frontier.0
-            || end.ordinal > frontier.0
-            || entry.image != (key.cookie, key.exec)
-            || entry.converted_ticket.is_some()
-            || entry.converted_for.is_some()
-            || entry.call_key.is_some()
-            || entry.end_converted
-            || entry.abandon.is_some()
-            || entry.corroborated_return.is_some()
-            || entry.raw_resource.is_none()
-            || entry.s1only_subject.is_some()
+        match self.classify_stop_original(entry, audit, key, frontier, staged_max, target, registry)
         {
-            return Err(RawQuantumRefusal::DispositionMismatch);
+            Ok(StopOriginalOutcome::Complete(admission)) => Ok(Some(admission)),
+            Ok(
+                StopOriginalOutcome::Outside
+                | StopOriginalOutcome::UnclaimedAttributed
+                | StopOriginalOutcome::UnclaimedImage,
+            ) => Ok(None),
+            Ok(_) | Err(_) => Err(RawQuantumRefusal::DispositionMismatch),
         }
-        let claim = mine.front().expect("one original admission");
-        if !claim_names_shape(&shape, claim) {
-            return Err(RawQuantumRefusal::DispositionMismatch);
-        }
-        let event = end.end.payload_base().event;
-        let staged = registry
-            .joint_staged_resource(target, claim.admission)
-            .ok_or(RawQuantumRefusal::DispositionMismatch)?;
-        if claim.admission > staged_max
-            || claim.admission >= audit.h0_below
-            || entry
-                .collected_origin
-                .is_none_or(|origin| origin.position() != claim.admission)
-            || !end_agrees_with_begin(&entry.begin, &end.end)
-            || !fingerprint_matches_event(&claim.returned, &event)
-            || event.ts_ns != claim.return_ns
-            || !self
-                .physical_return_floors
-                .contains_key(&shape.identity.pid_tgid)
-            || !self.ledger.matches_completed_staging(
-                entry.begin_ordinal,
-                key.domain_tag,
-                claim.admission,
-                staged,
-            )
-        {
-            return Err(RawQuantumRefusal::DispositionMismatch);
-        }
-        Ok(Some(claim.admission))
-    }
-
-    /// The capture-ended twin of [`Self::completed_fallback_original`]
-    /// (D1): match a staged-but-incomplete open entry (START
-    /// retained, END never arrived) to its staged admission for
-    /// counted stop-loss disposal. Same identity, admission and
-    /// state linkage as the completed check, except H0
-    /// corroboration (expected: H0 corroborates the admitted
-    /// return while the journal END is missing, and corroboration
-    /// does not close the entry); every END-derived comparison
-    /// (END ordinal and agreement, return event and timestamp, H8
-    /// completion staging, return floors) is absent because no END
-    /// exists to compare. Returns the admission on a match, `None`
-    /// for entries outside this key, and refuses mismatched
-    /// entries exactly like the completed check, so a wrong image,
-    /// a double claimant or a converted entry still refuses at
-    /// stop instead of counting.
-    #[allow(clippy::too_many_arguments)]
-    fn incomplete_stop_loss_original(
-        &self,
-        entry: &OpenEntry,
-        audit: &JournalAuditReceipt,
-        key: JournalDomainKey,
-        frontier: ConsumptionOrdinal,
-        staged_max: u64,
-        target: &crate::discovery::caller_registry::instance_input::JointFeedTarget,
-        registry: &crate::discovery::caller_registry::CallerRegistry,
-    ) -> Result<Option<u64>, joint_driver::RawQuantumRefusal> {
-        use joint_driver::RawQuantumRefusal;
-        let shape = shape_of_entry(entry);
-        let Some(claimants) = self.claims.get(&shape.identity) else {
-            return Ok(None);
-        };
-        let Some(mine) = claimants.get(&key).filter(|claims| !claims.is_empty()) else {
-            return Ok(None);
-        };
-        if entry.end.is_some() {
-            return Ok(None);
-        }
-        if mine.len() != 1
-            || claimants
-                .values()
-                .filter(|claims| !claims.is_empty())
-                .count()
-                != 1
-            || entry.begin_ordinal > frontier.0
-            || entry.image != (key.cookie, key.exec)
-            || entry.converted_ticket.is_some()
-            || entry.converted_for.is_some()
-            || entry.call_key.is_some()
-            || entry.end_converted
-            || entry.abandon.is_some()
-            || entry.raw_resource.is_none()
-            || entry.s1only_subject.is_some()
-        {
-            return Err(RawQuantumRefusal::DispositionMismatch);
-        }
-        let claim = mine.front().expect("one original admission");
-        if !claim_names_shape(&shape, claim) {
-            return Err(RawQuantumRefusal::DispositionMismatch);
-        }
-        registry
-            .joint_staged_resource(target, claim.admission)
-            .ok_or(RawQuantumRefusal::DispositionMismatch)?;
-        // No END was ever collected, so no collected origin
-        // exists; a present-but-wrong origin still refuses.
-        if claim.admission > staged_max
-            || claim.admission >= audit.h0_below
-            || entry
-                .collected_origin
-                .is_some_and(|origin| origin.position() != claim.admission)
-        {
-            return Err(RawQuantumRefusal::DispositionMismatch);
-        }
-        Ok(Some(claim.admission))
     }
 
     /// Validate the original suffix once, in bounded work, before any fallback
@@ -9971,15 +10255,13 @@ impl JournalAdapter {
         {
             return Err(RawQuantumRefusal::DispositionMismatch);
         }
-        // D1: a take refused because the capture ended disposes
-        // staged-but-incomplete originals as counted stop-loss
-        // below; any other failure keeps the completed-only
-        // verification, so a non-final refusal still refuses.
-        let stop_loss = batch
-            .audited()
-            .failure()
-            .take_failed
-            .is_some_and(|refusal| refusal.capture_ended());
+        // D1/r4: only a Stopped take runs the stop-loss
+        // disposal/release arms below (B3). AuthorityExhausted and
+        // CoverageFailed latch mid-run, so they keep the pre-r3
+        // completed-only verification: a non-stop refusal still
+        // refuses, disposing nothing.
+        let stop_loss = batch.audited().failure().take_failed
+            == Some(crate::attach::BirthObservationRefusal::Stopped);
         if let Some(total) = batch.cursor.suffix {
             if registry.joint_staged_count(target) != total.checked_sub(batch.cursor.consumed) {
                 return Err(RawQuantumRefusal::DispositionMismatch);
@@ -10004,9 +10286,19 @@ impl JournalAdapter {
                     let expected = registry
                         .joint_staged_count(target)
                         .ok_or(RawQuantumRefusal::Admission)?;
-                    if batch.cursor.verified != expected {
+                    if batch.cursor.verified > expected {
+                        // Double-accounted a staged head: custody-grade
+                        // invariant, still a refusal.
                         return Err(RawQuantumRefusal::DispositionMismatch);
                     }
+                    if !stop_loss && batch.cursor.verified != expected {
+                        // Running path: every staged head verifies, or
+                        // the delivery refuses as before.
+                        return Err(RawQuantumRefusal::DispositionMismatch);
+                    }
+                    // At stop the difference (native-less staged heads
+                    // the walk never saw) disposes counted at head
+                    // consumption below instead of refusing (S0b).
                     batch.cursor.suffix = Some(expected);
                     break;
                 };
@@ -10033,69 +10325,49 @@ impl JournalAdapter {
                             .ok_or(RawQuantumRefusal::Capacity)?;
                     }
                 } else {
-                    // D1 stop-loss classification (see the method docs
-                    // for each track's contract).
-                    enum StopLossTrack {
-                        Complete,
-                        IncompleteStaged,
-                        StaleSilent,
-                        UnclaimedCount,
-                        Skip,
-                    }
-                    let track = {
-                        let shape = shape_of_entry(entry);
-                        let mine_len = self
-                            .claims
-                            .get(&shape.identity)
-                            .and_then(|claimants| claimants.get(&key))
-                            .map_or(0, |claims| claims.len());
-                        let has_any_claims = self
-                            .claims
-                            .get(&shape.identity)
-                            .is_some_and(|m| m.values().any(|claims| !claims.is_empty()));
-                        let staged_some = mine_len == 1
-                            && self
-                                .claims
-                                .get(&shape.identity)
-                                .and_then(|m| m.get(&key))
-                                .and_then(|mine| mine.front())
-                                .is_some_and(|claim| {
-                                    registry
-                                        .joint_staged_resource(target, claim.admission)
-                                        .is_some()
-                                });
-                        if mine_len > 1 {
-                            // Ambiguous claims never resolve here (the
-                            // taint path owns them).
-                            StopLossTrack::Skip
-                        } else if staged_some {
-                            if entry.end.is_some() {
-                                StopLossTrack::Complete
-                            } else {
-                                StopLossTrack::IncompleteStaged
-                            }
-                        } else if mine_len == 1 {
-                            StopLossTrack::StaleSilent
-                        } else if !has_any_claims {
-                            StopLossTrack::UnclaimedCount
-                        } else {
-                            StopLossTrack::Skip
+                    // r4 stop split: classify only (B4). Recording into
+                    // the cursor is delivery-local; every journal
+                    // mutation waits for the apply phase after the
+                    // suffix is set, so a later refusal changes nothing.
+                    let identity = identity_of_begin(&entry.begin);
+                    match self.classify_stop_original(
+                        entry,
+                        audit,
+                        key,
+                        frontier,
+                        *staged_max,
+                        target,
+                        registry,
+                    )? {
+                        StopOriginalOutcome::Complete(_) => {
+                            batch.cursor.verified = batch
+                                .cursor
+                                .verified
+                                .checked_add(1)
+                                .ok_or(RawQuantumRefusal::Capacity)?;
                         }
-                    };
-                    match track {
-                        StopLossTrack::Complete => {
-                            if self
-                                .completed_fallback_original(
-                                    entry,
-                                    audit,
-                                    key,
-                                    frontier,
-                                    *staged_max,
-                                    target,
-                                    registry,
-                                )?
-                                .is_some()
-                            {
+                        StopOriginalOutcome::Loss {
+                            admissions,
+                            ambiguous,
+                        } => {
+                            for admission in admissions {
+                                // Staged heads carry no native without
+                                // an END (and skipped-owner heads need
+                                // their identity even if the entry
+                                // vanishes), so head consumption reads
+                                // them back from here.
+                                let old = batch.cursor.stop_loss.insert(
+                                    admission,
+                                    StopLossHead {
+                                        native: native_key,
+                                        identity,
+                                        ambiguous,
+                                    },
+                                );
+                                debug_assert!(
+                                    old.is_none(),
+                                    "one recorded head per staged admission"
+                                );
                                 batch.cursor.verified = batch
                                     .cursor
                                     .verified
@@ -10103,103 +10375,121 @@ impl JournalAdapter {
                                     .ok_or(RawQuantumRefusal::Capacity)?;
                             }
                         }
-                        StopLossTrack::IncompleteStaged => {
-                            if let Some(admission) = self.incomplete_stop_loss_original(
-                                entry,
-                                audit,
-                                key,
-                                frontier,
-                                *staged_max,
-                                target,
-                                registry,
-                            )? {
-                                // Staged heads carry no native
-                                // without an END, so head
-                                // consumption reads it back from
-                                // here.
-                                batch.cursor.stop_loss.push((native_key, admission));
-                                batch.cursor.verified = batch
-                                    .cursor
-                                    .verified
-                                    .checked_add(1)
-                                    .ok_or(RawQuantumRefusal::Capacity)?;
-                            }
+                        StopOriginalOutcome::Stale => {
+                            batch.cursor.stop_loss_plan.push(PlannedStopRelease {
+                                native: native_key,
+                                identity,
+                                kind: PlannedStopReleaseKind::Stale,
+                            });
                         }
-                        StopLossTrack::StaleSilent => {
-                            // Claimed but unstaged: the head was
-                            // already counted (delivered, disposed,
-                            // or refused-and-counted at staging), so
-                            // release the stranded open, claim and H8
-                            // quietly. Never S1-owned and never
-                            // void-owned: those have their own
-                            // disposers. A claimed open whose image
-                            // does not match the key is corruption,
-                            // not staleness, and still refuses.
-                            if entry.image != (key.cookie, key.exec) {
-                                return Err(RawQuantumRefusal::DispositionMismatch);
-                            }
-                            let release = entry.s1only_subject.is_none()
-                                && entry.abandon.is_none()
-                                && self.key_is_live(key);
-                            if release {
-                                let identity = identity_of_begin(&entry.begin);
-                                let ordinal = entry.begin_ordinal;
-                                let claimed = self
-                                    .take_open(native_key)
-                                    .and_then(|_| self.consume_claim(&identity, key))
-                                    .is_some();
-                                if claimed {
-                                    self.ledger.release_h8open(ordinal);
-                                }
-                            }
+                        StopOriginalOutcome::UnclaimedAttributed => {
+                            batch.cursor.stop_loss_plan.push(PlannedStopRelease {
+                                native: native_key,
+                                identity,
+                                kind: PlannedStopReleaseKind::Attributed,
+                            });
                         }
-                        StopLossTrack::UnclaimedCount => {
-                            // Never claimed, never staged, never
-                            // counted: the stop makes its loss final,
-                            // so dispose and count it here. Image-key
-                            // linkage attributes it to this consumer;
-                            // take-open makes the count exactly-once
-                            // across consumers.
-                            let image_ok = entry.image == (key.cookie, key.exec);
-                            let clean = entry.s1only_subject.is_none()
-                                && entry.abandon.is_none()
-                                && entry.converted_ticket.is_none()
-                                && entry.converted_for.is_none()
-                                && entry.call_key.is_none()
-                                && !entry.end_converted
-                                && self.key_is_live(key);
-                            if entry.end.is_none()
-                                && image_ok
-                                && clean
-                                && let Some(entry) = self.take_open(native_key)
-                            {
-                                self.ledger.release_h8open(entry.begin_ordinal);
-                                batch.note_head_disposed();
-                            }
+                        StopOriginalOutcome::UnclaimedImage => {
+                            batch.cursor.stop_loss_plan.push(PlannedStopRelease {
+                                native: native_key,
+                                identity,
+                                kind: PlannedStopReleaseKind::Unattributed,
+                            });
                         }
-                        StopLossTrack::Skip => {}
+                        StopOriginalOutcome::Outside | StopOriginalOutcome::Skip => {}
                     }
                 }
                 batch.cursor.after = Some(native_key);
+            }
+        }
+        // B4 apply phase: validation passed (the suffix is set), so run
+        // the planned releases. `mem::take` runs them once across
+        // slices. Counting happens only when `take_open` succeeds, so a
+        // sibling delivery that applied first keeps every count
+        // exactly-once.
+        if stop_loss {
+            let plan = std::mem::take(&mut batch.cursor.stop_loss_plan);
+            for release in plan {
+                match release.kind {
+                    PlannedStopReleaseKind::Stale => {
+                        if let Some(entry) = self.take_open(release.native) {
+                            let identity = identity_of_begin(&entry.begin);
+                            self.retained_member_dec(
+                                identity,
+                                RetainedMember::Open(release.native),
+                            );
+                            self.ledger.release_h8open(entry.begin_ordinal);
+                            self.drain_my_claims(&identity, key);
+                        } else {
+                            // An ambiguous sibling consumed the shared
+                            // open first: my stale claim still releases.
+                            self.drain_my_claims(&release.identity, key);
+                        }
+                    }
+                    PlannedStopReleaseKind::Attributed => {
+                        if let Some(entry) = self.take_open(release.native) {
+                            self.retained_member_dec(
+                                identity_of_begin(&entry.begin),
+                                RetainedMember::Open(release.native),
+                            );
+                            self.ledger.release_h8open(entry.begin_ordinal);
+                            batch.note_head_disposed();
+                            registry.note_history_disposed(target);
+                        }
+                    }
+                    PlannedStopReleaseKind::Unattributed => {
+                        if let Some(entry) = self.take_open(release.native) {
+                            self.retained_member_dec(
+                                identity_of_begin(&entry.begin),
+                                RetainedMember::Open(release.native),
+                            );
+                            self.ledger.release_h8open(entry.begin_ordinal);
+                            batch.note_unattributed_stop_loss();
+                        }
+                    }
+                }
             }
         }
         let before = registry
             .joint_staged_count(target)
             .ok_or(RawQuantumRefusal::Admission)?;
         let head = registry.joint_staged_head_original(target);
-        let original = match head {
+        // (native, admission, mode, identity): what the shared tail's
+        // pop consumed. Exact heads assert their single claim's
+        // admission; tolerant heads (ambiguous or native-less
+        // difference) drain whatever remains.
+        let original: Option<(
+            Option<JournalNativeKey>,
+            u64,
+            HeadConsumeMode,
+            Option<CallIdentity>,
+        )> = match head {
             Some((admission, Some(native))) => {
-                let entry = self
-                    .open
-                    .get(&native)
-                    .ok_or(RawQuantumRefusal::DispositionMismatch)?;
-                if entry.end.is_none() {
-                    // D1 (i): the staged head kept its invocation
-                    // but the open entry never grew an END.
-                    if !stop_loss {
-                        return Err(RawQuantumRefusal::DispositionMismatch);
-                    }
-                    if self.incomplete_stop_loss_original(
+                let recorded = if stop_loss {
+                    batch.cursor.stop_loss_take(admission)
+                } else {
+                    None
+                };
+                if let Some(recorded) = recorded {
+                    batch.cursor.stop_loss_dispose = true;
+                    Some((
+                        Some(recorded.native),
+                        admission,
+                        if recorded.ambiguous {
+                            HeadConsumeMode::Tolerant
+                        } else {
+                            HeadConsumeMode::Exact
+                        },
+                        Some(recorded.identity),
+                    ))
+                } else if !stop_loss {
+                    // Running path: the walk verified this head
+                    // complete, so re-verify exactly or refuse.
+                    let entry = self
+                        .open
+                        .get(&native)
+                        .ok_or(RawQuantumRefusal::DispositionMismatch)?;
+                    if self.completed_fallback_original(
                         entry,
                         audit,
                         key,
@@ -10211,70 +10501,80 @@ impl JournalAdapter {
                     {
                         return Err(RawQuantumRefusal::DispositionMismatch);
                     }
-                    if let Some(position) = batch
-                        .cursor
-                        .stop_loss
-                        .iter()
-                        .position(|&(_, found)| found == admission)
-                    {
-                        batch.cursor.stop_loss.swap_remove(position);
-                    }
-                    batch.cursor.stop_loss_dispose = true;
-                } else if self.completed_fallback_original(
-                    entry,
-                    audit,
-                    key,
-                    frontier,
-                    *staged_max,
-                    target,
-                    registry,
-                )? != Some(admission)
-                {
-                    return Err(RawQuantumRefusal::DispositionMismatch);
-                } else {
                     batch.cursor.stop_loss_dispose = false;
+                    Some((Some(native), admission, HeadConsumeMode::Exact, None))
+                } else {
+                    // Unmapped stop head: re-classify the current entry.
+                    match self.open.get(&native) {
+                        None => {
+                            // Its open vanished before the walk (dropped
+                            // pre-seal): dispose the counted difference.
+                            batch.cursor.stop_loss_dispose = true;
+                            Some((None, admission, HeadConsumeMode::Tolerant, None))
+                        }
+                        Some(entry) => {
+                            let identity = identity_of_begin(&entry.begin);
+                            match self.classify_stop_original(
+                                entry,
+                                audit,
+                                key,
+                                frontier,
+                                *staged_max,
+                                target,
+                                registry,
+                            )? {
+                                StopOriginalOutcome::Complete(found) if found == admission => {
+                                    batch.cursor.stop_loss_dispose = false;
+                                    Some((
+                                        Some(native),
+                                        admission,
+                                        HeadConsumeMode::Exact,
+                                        Some(identity),
+                                    ))
+                                }
+                                StopOriginalOutcome::Loss { .. } => {
+                                    batch.cursor.stop_loss_dispose = true;
+                                    Some((
+                                        Some(native),
+                                        admission,
+                                        HeadConsumeMode::Tolerant,
+                                        Some(identity),
+                                    ))
+                                }
+                                _ => return Err(RawQuantumRefusal::DispositionMismatch),
+                            }
+                        }
+                    }
                 }
-                Some((native, admission))
             }
             Some((admission, None)) => {
-                // D1 (ii): staged head without an invocation (no END
-                // collected): the verification recorded its native.
                 if !stop_loss {
                     return Err(RawQuantumRefusal::DispositionMismatch);
                 }
-                let position = batch
-                    .cursor
-                    .stop_loss
-                    .iter()
-                    .position(|&(_, found)| found == admission)
-                    .ok_or(RawQuantumRefusal::DispositionMismatch)?;
-                let (native, _) = batch.cursor.stop_loss.swap_remove(position);
-                let entry = self
-                    .open
-                    .get(&native)
-                    .ok_or(RawQuantumRefusal::DispositionMismatch)?;
-                if entry.end.is_some() {
-                    return Err(RawQuantumRefusal::DispositionMismatch);
+                if let Some(recorded) = batch.cursor.stop_loss_take(admission) {
+                    batch.cursor.stop_loss_dispose = true;
+                    Some((
+                        Some(recorded.native),
+                        admission,
+                        if recorded.ambiguous {
+                            HeadConsumeMode::Tolerant
+                        } else {
+                            HeadConsumeMode::Exact
+                        },
+                        Some(recorded.identity),
+                    ))
+                } else {
+                    // Native-less difference head: dispose counted.
+                    batch.cursor.stop_loss_dispose = true;
+                    Some((None, admission, HeadConsumeMode::Tolerant, None))
                 }
-                if self.incomplete_stop_loss_original(
-                    entry,
-                    audit,
-                    key,
-                    frontier,
-                    *staged_max,
-                    target,
-                    registry,
-                )? != Some(admission)
-                {
-                    return Err(RawQuantumRefusal::DispositionMismatch);
-                }
-                batch.cursor.stop_loss_dispose = true;
-                Some((native, admission))
             }
             None if before == 0 => {
                 batch.cursor.stop_loss_dispose = false;
                 None
             }
+            // Unreachable: before > 0 means the staged queue is
+            // non-empty, so a head exists.
             None => return Err(RawQuantumRefusal::DispositionMismatch),
         };
         let outcome =
@@ -10288,18 +10588,34 @@ impl JournalAdapter {
                 Some(after),
                 "one bounded original disposition"
             );
-            let (native, admission) = original.expect("preflight exact consumed head");
-            let (ordinal, identity) = {
-                let entry = self
-                    .take_open(native)
-                    .expect("exclusively retained original");
-                (entry.begin_ordinal, identity_of_begin(&entry.begin))
-            };
-            let claim = self
-                .consume_claim(&identity, key)
-                .expect("preflight original claim");
-            assert_eq!(claim.admission, admission);
-            self.ledger.release_h8open(ordinal);
+            let (native, admission, mode, identity) =
+                original.expect("preflight exact consumed head");
+            match native {
+                Some(native) => {
+                    if let Some(entry) = self.take_open(native) {
+                        let found = identity_of_begin(&entry.begin);
+                        self.retained_member_dec(found, RetainedMember::Open(native));
+                        self.ledger.release_h8open(entry.begin_ordinal);
+                        let drained = self.drain_my_claims(&found, key);
+                        if mode == HeadConsumeMode::Exact {
+                            assert_eq!(drained, vec![admission], "exact original claim");
+                        }
+                    } else if mode == HeadConsumeMode::Exact {
+                        // Exact entries are stable across slices (no
+                        // other delivery can take their native), so a
+                        // vanishing one is a custody-grade invariant.
+                        return Err(RawQuantumRefusal::DispositionMismatch);
+                    } else {
+                        self.drain_my_claims(
+                            &identity.expect("tolerant heads store identity"),
+                            key,
+                        );
+                    }
+                }
+                None => {
+                    // Native-less difference head: nothing retained.
+                }
+            }
             batch.cursor.consumed += 1;
         }
         Ok(outcome)
@@ -14038,6 +14354,426 @@ pub(crate) mod tests {
     pub(crate) const FLAGS: u64 = 0x7070_7070_7070_7070;
     pub(crate) const ENTRY_NS: u64 = 0x3030_3030_3030_3030;
     const ENTRY_IP: u64 = 0x4040_4040_4040_4040;
+
+    /// Round r4 (B1/N3): the stop split as a decision table. Each row
+    /// flips exactly one predicate off the healthy baseline and pins
+    /// the outcome; flipping any mapping arm back must fail its row.
+    /// Frame twins pin the wiring for the scriptable predicates; the
+    /// unscriptable frame-bound rows live only here.
+    #[test]
+    fn stop_split_decision_table() {
+        use StopOriginalOutcome as O;
+        fn staged(admission: u64) -> StopStagedAdmission {
+            StopStagedAdmission {
+                admission,
+                shape_ok: true,
+                ledger_ok: true,
+                fingerprint_ok: true,
+            }
+        }
+        fn healthy_end() -> StopOriginalEvidence {
+            StopOriginalEvidence {
+                my_claims: 1,
+                claiming_keys: 1,
+                staged: vec![staged(3)],
+                end_present: true,
+                image_ok: true,
+                owner_marked: false,
+                abandon: false,
+                corroborated: false,
+                raw_present: true,
+                begin_past_frontier: false,
+                end_past_frontier: false,
+                end_agrees: true,
+                ts_ok: true,
+                floors_ok: true,
+                origin_ok: true,
+                bounds_ok: true,
+                key_live: true,
+                me_bound: true,
+                bound_total: 1,
+            }
+        }
+        fn healthy_endless() -> StopOriginalEvidence {
+            StopOriginalEvidence {
+                end_present: false,
+                ..healthy_end()
+            }
+        }
+        fn loss_one(expect_ambiguous: bool) -> Result<O, ()> {
+            Ok(O::Loss {
+                admissions: vec![3],
+                ambiguous: expect_ambiguous,
+            })
+        }
+        struct Row {
+            name: &'static str,
+            evidence: StopOriginalEvidence,
+            expect: Result<O, ()>,
+        }
+        // Baselines first: healthy entries verify or lose uniformly.
+        assert_eq!(
+            JournalAdapter::decide_stop_original(&healthy_end()),
+            Ok(O::Complete(3)),
+            "baseline: healthy END entry replays",
+        );
+        assert_eq!(
+            JournalAdapter::decide_stop_original(&healthy_endless()),
+            loss_one(false),
+            "baseline: healthy END-less entry is uniform loss",
+        );
+        let rows: Vec<Row> = vec![
+            // Unclaimed arm (B2): no claims at all.
+            Row {
+                name: "unclaimed_end",
+                evidence: {
+                    let mut ev = healthy_end();
+                    ev.my_claims = 0;
+                    ev.claiming_keys = 0;
+                    ev.staged.clear();
+                    ev
+                },
+                expect: Ok(O::Outside),
+            },
+            Row {
+                name: "unclaimed_attributed",
+                evidence: {
+                    let mut ev = healthy_endless();
+                    ev.my_claims = 0;
+                    ev.claiming_keys = 0;
+                    ev.staged.clear();
+                    ev
+                },
+                expect: Ok(O::UnclaimedAttributed),
+            },
+            Row {
+                name: "unclaimed_multi_bound",
+                evidence: {
+                    let mut ev = healthy_endless();
+                    ev.my_claims = 0;
+                    ev.claiming_keys = 0;
+                    ev.staged.clear();
+                    ev.bound_total = 2;
+                    ev
+                },
+                expect: Ok(O::UnclaimedImage),
+            },
+            Row {
+                name: "unclaimed_post_frontier",
+                evidence: {
+                    let mut ev = healthy_endless();
+                    ev.my_claims = 0;
+                    ev.claiming_keys = 0;
+                    ev.staged.clear();
+                    ev.begin_past_frontier = true;
+                    ev
+                },
+                expect: Ok(O::UnclaimedImage),
+            },
+            Row {
+                name: "unclaimed_dead_key",
+                evidence: {
+                    let mut ev = healthy_endless();
+                    ev.my_claims = 0;
+                    ev.claiming_keys = 0;
+                    ev.staged.clear();
+                    ev.key_live = false;
+                    ev
+                },
+                expect: Ok(O::Outside),
+            },
+            Row {
+                name: "unclaimed_dirty",
+                evidence: {
+                    let mut ev = healthy_endless();
+                    ev.my_claims = 0;
+                    ev.claiming_keys = 0;
+                    ev.staged.clear();
+                    ev.abandon = true;
+                    ev
+                },
+                expect: Ok(O::Outside),
+            },
+            Row {
+                name: "other_keys_only",
+                evidence: {
+                    let mut ev = healthy_endless();
+                    ev.my_claims = 0;
+                    ev.claiming_keys = 2;
+                    ev.staged.clear();
+                    ev
+                },
+                expect: Ok(O::Outside),
+            },
+            // Stale arm: my claims, none staged.
+            Row {
+                name: "stale_release",
+                evidence: {
+                    let mut ev = healthy_endless();
+                    ev.staged.clear();
+                    ev
+                },
+                expect: Ok(O::Stale),
+            },
+            Row {
+                name: "stale_abandon_skips",
+                evidence: {
+                    let mut ev = healthy_endless();
+                    ev.staged.clear();
+                    ev.abandon = true;
+                    ev
+                },
+                expect: Ok(O::Skip),
+            },
+            Row {
+                name: "stale_dead_key_skips",
+                evidence: {
+                    let mut ev = healthy_endless();
+                    ev.staged.clear();
+                    ev.key_live = false;
+                    ev
+                },
+                expect: Ok(O::Skip),
+            },
+            // Binding refusals (all paths with my claims).
+            Row {
+                name: "image_refuses",
+                evidence: {
+                    let mut ev = healthy_end();
+                    ev.image_ok = false;
+                    ev
+                },
+                expect: Err(()),
+            },
+            Row {
+                name: "image_refuses_unstaged",
+                evidence: {
+                    let mut ev = healthy_endless();
+                    ev.staged.clear();
+                    ev.image_ok = false;
+                    ev
+                },
+                expect: Err(()),
+            },
+            Row {
+                name: "shape_refuses",
+                evidence: {
+                    let mut ev = healthy_end();
+                    ev.staged[0].shape_ok = false;
+                    ev
+                },
+                expect: Err(()),
+            },
+            // Custody refusals (END path).
+            Row {
+                name: "ledger_refuses",
+                evidence: {
+                    let mut ev = healthy_end();
+                    ev.staged[0].ledger_ok = false;
+                    ev
+                },
+                expect: Err(()),
+            },
+            Row {
+                name: "fingerprint_refuses",
+                evidence: {
+                    let mut ev = healthy_end();
+                    ev.staged[0].fingerprint_ok = false;
+                    ev
+                },
+                expect: Err(()),
+            },
+            Row {
+                name: "floors_refuse",
+                evidence: {
+                    let mut ev = healthy_end();
+                    ev.floors_ok = false;
+                    ev
+                },
+                expect: Err(()),
+            },
+            // Loss triggers (END path): one row per predicate.
+            Row {
+                name: "owner_marked_loses",
+                evidence: {
+                    let mut ev = healthy_end();
+                    ev.owner_marked = true;
+                    ev
+                },
+                expect: loss_one(false),
+            },
+            Row {
+                name: "begin_past_frontier_loses",
+                evidence: {
+                    let mut ev = healthy_end();
+                    ev.begin_past_frontier = true;
+                    ev
+                },
+                expect: loss_one(false),
+            },
+            Row {
+                name: "end_past_frontier_loses",
+                evidence: {
+                    let mut ev = healthy_end();
+                    ev.end_past_frontier = true;
+                    ev
+                },
+                expect: loss_one(false),
+            },
+            Row {
+                name: "abandon_loses",
+                evidence: {
+                    let mut ev = healthy_end();
+                    ev.abandon = true;
+                    ev
+                },
+                expect: loss_one(false),
+            },
+            Row {
+                name: "corroborated_loses",
+                evidence: {
+                    let mut ev = healthy_end();
+                    ev.corroborated = true;
+                    ev
+                },
+                expect: loss_one(false),
+            },
+            Row {
+                name: "raw_missing_loses",
+                evidence: {
+                    let mut ev = healthy_end();
+                    ev.raw_present = false;
+                    ev
+                },
+                expect: loss_one(false),
+            },
+            Row {
+                name: "origin_wrong_loses",
+                evidence: {
+                    let mut ev = healthy_end();
+                    ev.origin_ok = false;
+                    ev
+                },
+                expect: loss_one(false),
+            },
+            Row {
+                name: "end_disagree_loses",
+                evidence: {
+                    let mut ev = healthy_end();
+                    ev.end_agrees = false;
+                    ev
+                },
+                expect: loss_one(false),
+            },
+            Row {
+                name: "ts_wrong_loses",
+                evidence: {
+                    let mut ev = healthy_end();
+                    ev.ts_ok = false;
+                    ev
+                },
+                expect: loss_one(false),
+            },
+            Row {
+                name: "bounds_fail_loses",
+                evidence: {
+                    let mut ev = healthy_end();
+                    ev.bounds_ok = false;
+                    ev
+                },
+                expect: loss_one(false),
+            },
+            // Ambiguity: several claims or keys lose counted (one
+            // staged admission here; custody still refuses).
+            Row {
+                name: "multi_claim_loses",
+                evidence: {
+                    let mut ev = healthy_end();
+                    ev.my_claims = 2;
+                    ev
+                },
+                expect: loss_one(true),
+            },
+            Row {
+                name: "two_keys_lose",
+                evidence: {
+                    let mut ev = healthy_end();
+                    ev.claiming_keys = 2;
+                    ev
+                },
+                expect: loss_one(true),
+            },
+            Row {
+                name: "ambiguous_ledger_refuses",
+                evidence: {
+                    let mut ev = healthy_end();
+                    ev.my_claims = 2;
+                    ev.staged[0].ledger_ok = false;
+                    ev
+                },
+                expect: Err(()),
+            },
+            // Custody wins over loss triggers when both break.
+            Row {
+                name: "custody_beats_trigger",
+                evidence: {
+                    let mut ev = healthy_end();
+                    ev.staged[0].ledger_ok = false;
+                    ev.abandon = true;
+                    ev
+                },
+                expect: Err(()),
+            },
+            // END-less uniform loss ignores linkage predicates.
+            Row {
+                name: "endless_abandon_loses",
+                evidence: {
+                    let mut ev = healthy_endless();
+                    ev.abandon = true;
+                    ev
+                },
+                expect: loss_one(false),
+            },
+            Row {
+                name: "endless_raw_missing_loses",
+                evidence: {
+                    let mut ev = healthy_endless();
+                    ev.raw_present = false;
+                    ev
+                },
+                expect: loss_one(false),
+            },
+            Row {
+                name: "endless_image_refuses",
+                evidence: {
+                    let mut ev = healthy_endless();
+                    ev.image_ok = false;
+                    ev
+                },
+                expect: Err(()),
+            },
+            Row {
+                name: "endless_shape_refuses",
+                evidence: {
+                    let mut ev = healthy_endless();
+                    ev.staged[0].shape_ok = false;
+                    ev
+                },
+                expect: Err(()),
+            },
+        ];
+        for row in &rows {
+            assert_eq!(
+                JournalAdapter::decide_stop_original(&row.evidence),
+                row.expect,
+                "decision row: {}",
+                row.name,
+            );
+        }
+        // Every row above names its mutand: flipping any single arm of
+        // `decide_stop_original` must fail exactly its rows.
+        assert_eq!(rows.len(), 34, "the table covers every predicate arm");
+    }
 
     fn resource_audit(h3: H3DispositionEvidence) -> JournalAuditReceipt {
         JournalAuditReceipt {

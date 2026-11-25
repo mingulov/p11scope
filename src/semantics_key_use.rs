@@ -1276,6 +1276,12 @@ impl JointStaging {
         self.staged.front().map(|head| head.charged_bytes())
     }
 
+    /// Count one attributed stop-loss disposal outside the shared
+    /// tail (N1: paired with the cursor's `disposed`++).
+    pub(crate) fn bump_history_disposed(&mut self) {
+        self.history_disposed = self.history_disposed.saturating_add(1);
+    }
+
     /// Tests-only native-less head: clear the staged head invocation.
     #[cfg(test)]
     pub(crate) fn clear_staged_head_invocation_for_test(&mut self) -> bool {

@@ -2964,7 +2964,7 @@ fn capture_fact_proof_tombstones_block_later_positive_refresh() {
 #[test]
 fn discovery_row_marks_only_the_pre_copy_up_object() {
     let (plan, mut pins) = plan_with_pins(2, 0);
-    let plain = discovery_evidence(
+    let (plain, _) = discovery_evidence(
         &plan,
         &pins,
         &DiscoveryCounters::default(),
@@ -2974,7 +2974,7 @@ fn discovery_row_marks_only_the_pre_copy_up_object() {
     assert_eq!(plain.modules.len(), 1);
     assert_eq!(plain.modules[0].layer, None);
     crate::discovery::identity::test_fixture::mark_pre_copy_up(&mut pins);
-    let marked = discovery_evidence(
+    let (marked, _) = discovery_evidence(
         &plan,
         &pins,
         &DiscoveryCounters::default(),
@@ -2996,7 +2996,7 @@ fn discovery_evidence_without_a_pin_for_a_planned_object_files_a_gap() {
     // Distinct pinless objects per slot, so each dropped row files.
     plan.slots[1].object = crate::discovery::identity::PinnedObjectId(43);
     let pins = crate::discovery::identity::PinnedObjects::empty();
-    let evidence = discovery_evidence(
+    let (evidence, gaps) = discovery_evidence(
         &plan,
         &pins,
         &DiscoveryCounters::default(),
@@ -3007,6 +3007,21 @@ fn discovery_evidence_without_a_pin_for_a_planned_object_files_a_gap() {
         evidence.modules.is_empty(),
         "an unrenderable module leaves no row: {:?}",
         evidence.modules
+    );
+    // Two slots + one module identity, all pinless: one named gap
+    // each, so the loss is counted, not just present.
+    assert_eq!(gaps.len(), 3, "every dropped row files a gap: {gaps:?}");
+    for gap in &gaps {
+        assert_eq!(gap.subject, "planned provider object");
+        assert!(
+            gap.reason.contains("lost its comparable pin") && gap.reason.contains("unattributed"),
+            "unexpected gap reason: {:?}",
+            gap.reason
+        );
+    }
+    assert!(
+        gaps.iter().any(|gap| gap.reason.contains("/opt/p11.so")),
+        "the gap names the planned path: {gaps:?}"
     );
 }
 
@@ -3030,7 +3045,7 @@ fn discovery_evidence_without_a_pin_for_a_planned_slot_files_a_gap() {
     plan.slots[0].object_path = "/opt/p11.so".to_string();
     plan.slots[1].object = crate::discovery::identity::PinnedObjectId(424242);
     plan.slots[1].object_path = "/opt/p11-gone.so".to_string();
-    let evidence = discovery_evidence(
+    let (evidence, gaps) = discovery_evidence(
         &plan,
         &pins,
         &DiscoveryCounters::default(),
@@ -3045,6 +3060,13 @@ fn discovery_evidence_without_a_pin_for_a_planned_slot_files_a_gap() {
             .all(|object| object.path != "/opt/p11-gone.so"),
         "the pinless slot object leaves the row: {:?}",
         evidence.modules[0].objects
+    );
+    assert_eq!(gaps.len(), 1, "one gap for the one dropped object");
+    assert_eq!(gaps[0].subject, "planned provider object");
+    assert!(
+        gaps[0].reason.contains("/opt/p11-gone.so"),
+        "the gap names the dropped slot path: {:?}",
+        gaps[0].reason
     );
 }
 
@@ -3093,7 +3115,7 @@ fn discovery_pair_rows_share_the_merge_view_key() {
     plan.slots[1].object = lower_id;
     plan.slots[1].module_ids = vec![plan::ModuleId(1)];
     plan.slots[1].object_path = merge.to_string();
-    let evidence = discovery_evidence(
+    let (evidence, _) = discovery_evidence(
         &plan,
         &pins,
         &DiscoveryCounters::default(),
@@ -3129,7 +3151,7 @@ fn current_discovery_never_reads_an_inactive_slots_retired_pin() {
     plan.slots[1].object = PinnedObjectId(u32::MAX);
     plan.deactivate(1);
 
-    let evidence = discovery_evidence(
+    let (evidence, _) = discovery_evidence(
         &plan,
         &pins,
         &DiscoveryCounters::default(),
@@ -21210,7 +21232,8 @@ fn evidence_verdict(
             counters,
             &crate::prearm_module::PrearmState::empty(),
             &BTreeMap::new(),
-        ),
+        )
+        .0,
         scheduling: render::SchedulingEvidence::default(),
         stop_quiescence: Default::default(),
         drain_proven: false,
@@ -40678,7 +40701,7 @@ fn exact_loader_pin_is_view_owned_but_not_a_provider_module() {
             .all(|module| module.object != loader),
         "a loader-only pin is not a provider module"
     );
-    let evidence = discovery_evidence(
+    let (evidence, _) = discovery_evidence(
         &candidate.plan,
         &candidate.pinned,
         &DiscoveryCounters::default(),
@@ -40747,7 +40770,7 @@ fn exact_loader_pin_survives_cross_overlay_canonicalization() {
             .iter()
             .all(|slot| slot.object != loader)
     );
-    let evidence = discovery_evidence(
+    let (evidence, _) = discovery_evidence(
         &candidate.plan,
         &candidate.pinned,
         &DiscoveryCounters::default(),
@@ -48595,7 +48618,7 @@ fn an_unpinned_entry_skip_is_bounded_in_every_capture_output() {
     assert_eq!(plan.skipped, vec![gated.clone()]);
     assert_eq!(plan.modules[0].skipped, vec![gated]);
 
-    let discovery = discovery_evidence(
+    let (discovery, _) = discovery_evidence(
         &plan,
         &pinned,
         &DiscoveryCounters::default(),
@@ -49092,7 +49115,7 @@ fn a_partial_capacity_refusal_is_reported_and_only_an_empty_one_is_fatal() {
     // instead of aborting honest: `render::Evidence::verdict` turns a
     // non-empty `modules_skipped` into PARTIAL (see `render`'s own tests).
     let (plan, pins) = plan_with_pins(4, 1);
-    let evidence = discovery_evidence(
+    let (evidence, _) = discovery_evidence(
         &plan,
         &pins,
         &DiscoveryCounters::default(),
@@ -49148,7 +49171,7 @@ fn the_module_record_says_which_corroboration_outcome_it_got() {
             corroboration: vec![([object].into_iter().collect(), corroboration_label(outcome))],
             ..DiscoveryCounters::default()
         };
-        let evidence = discovery_evidence(
+        let (evidence, _) = discovery_evidence(
             &plan,
             &pins,
             &counters,
@@ -49159,7 +49182,7 @@ fn the_module_record_says_which_corroboration_outcome_it_got() {
     }
     // Nothing recorded: one source described it, and the record says so
     // rather than implying a second source failed to.
-    let evidence = discovery_evidence(
+    let (evidence, _) = discovery_evidence(
         &plan,
         &pins,
         &DiscoveryCounters::default(),
@@ -49186,7 +49209,7 @@ fn late_collision_invalidates_fallback_evidence_without_discovery_evidence_panic
         },
     });
 
-    let evidence = discovery_evidence(
+    let (evidence, _) = discovery_evidence(
         &plan,
         &pins,
         &counters,
@@ -49596,6 +49619,7 @@ fn byte_identical_distinct_entry_objects_conflict_and_attach_the_union() {
             &crate::prearm_module::PrearmState::empty(),
             &BTreeMap::new()
         )
+        .0
         .conflicts,
         1,
         "the conflict is the bounded evidence that forces PARTIAL"

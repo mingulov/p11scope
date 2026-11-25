@@ -3524,7 +3524,13 @@ impl CaptureFacts {
         let mut history = self.visible_history().clone();
         let live_views: BTreeSet<_> = modules.iter().map(|module| module.scanned.view).collect();
         prune_selection_inventory(&mut history, &live_views);
-        let current = discovery_evidence(plan, pinned, counters, prearm, learned);
+        let (current, pin_gaps) = discovery_evidence(plan, pinned, counters, prearm, learned);
+        for gap in pin_gaps {
+            history
+                .losses
+                .entry((gap.subject.clone(), gap.reason.clone()))
+                .or_insert(gap);
+        }
 
         // §4.12 by capture end. Each fresh reading replaces the retained one;
         // a publication with nothing to read keeps what the capture already
@@ -10966,18 +10972,33 @@ impl Engine {
 /// the two sources agreed. Identity is `{dev, ino, sha256}` — a path here is
 /// only the label the source that saw it used, and for anything the scan found
 /// that label lives in the *target's* mount namespace.
+///
+/// Total over its inputs: a planned object whose pin vanished before
+/// evidence rendered (file churn between planning and publication)
+/// leaves its row and files a named gap in the returned Vec instead
+/// of panicking the live render path. Callers file those gaps into
+/// history losses, which disclose them and force PARTIAL.
+const PLANNED_OBJECT_WITHOUT_PIN_SUBJECT: &str = "planned provider object";
+
 fn discovery_evidence(
     plan: &plan::AttachPlan,
     pinned: &PinnedObjects,
     counters: &DiscoveryCounters,
     prearm: &crate::prearm_module::PrearmState,
     learned: &BTreeMap<ObjectKey, render::FirstLoadedBy>,
-) -> render::DiscoveryEvidence {
+) -> (render::DiscoveryEvidence, Vec<Skipped>) {
+    fn missing_pin_gap(path: &str) -> Skipped {
+        Skipped {
+            subject: PLANNED_OBJECT_WITHOUT_PIN_SUBJECT.into(),
+            reason: format!(
+                "planned object '{}' lost its comparable pin before evidence rendered; its calls are unattributed",
+                crate::render::escape_controls(path),
+            ),
+        }
+    }
     let summary_of = |id, path: &str| {
-        let pin = pinned
-            .summary(id)
-            .expect("every planned object has a comparable pin");
-        render::ObjectSummary {
+        let pin = pinned.summary(id)?;
+        Some(render::ObjectSummary {
             dev: (pin.key.device.major, pin.key.device.minor),
             ino: pin.key.inode,
             // Absent, not empty: nothing hashed it, so there is no digest to
@@ -10992,12 +11013,13 @@ fn discovery_evidence(
             identity_source: pin.identity_source,
             note: pin.note.map(str::to_string),
             sources: pinned.sources(id),
-        }
+        })
     };
+    let mut gaps: Vec<Skipped> = Vec::new();
     let modules = plan
         .modules
         .iter()
-        .map(|m| {
+        .filter_map(|m| {
             let mut seen = BTreeSet::new();
             let objects: Vec<render::ObjectSummary> = plan
                 .slots
@@ -11005,11 +11027,20 @@ fn discovery_evidence(
                 .filter(|s| {
                     plan.is_active(s.index) && s.module_ids.contains(&m.id) && seen.insert(s.object)
                 })
-                .map(|s| summary_of(s.object, &s.object_path))
+                .filter_map(|s| {
+                    summary_of(s.object, &s.object_path).or_else(|| {
+                        gaps.push(missing_pin_gap(&s.object_path));
+                        None
+                    })
+                })
                 .collect();
-            let identity = summary_of(m.object, &m.path);
+            let identity = summary_of(m.object, &m.path).or_else(|| {
+                gaps.push(missing_pin_gap(&m.path));
+                None
+            })?;
             let pre_copy_up = pinned.summary(m.object).is_some_and(|pin| pin.pre_copy_up);
-            render::DiscoveredModule {
+            let pre_copy_up = pinned.summary(m.object).is_some_and(|pin| pin.pre_copy_up);
+            Some(render::DiscoveredModule {
                 id: m.id,
                 admission_class: m.admission_class,
                 dev: identity.dev,
@@ -11039,7 +11070,7 @@ fn discovery_evidence(
                 first_loaded_by: pinned
                     .summary(m.object)
                     .and_then(|pin| learned.get(&pin.key).cloned()),
-            }
+            })
         })
         .collect();
     let manifest_object_fallbacks = counters
@@ -11059,18 +11090,21 @@ fn discovery_evidence(
             })
         })
         .collect();
-    render::DiscoveryEvidence {
-        modules,
-        conflicts: counters.conflicts,
-        uncorroborated: counters.uncorroborated,
-        module_ambiguous: plan.module_ambiguous as u64,
-        uncorroborated_candidates: plan.uncorroborated_candidates,
-        modules_skipped: plan.modules_skipped.iter().map(skipped_out).collect(),
-        manifest_object_fallbacks,
-        scan_unavailable: counters.scan_unavailable.map(str::to_string),
-        scan_ms: counters.scan_ms,
-        ..render::DiscoveryEvidence::default()
-    }
+    (
+        render::DiscoveryEvidence {
+            modules,
+            conflicts: counters.conflicts,
+            uncorroborated: counters.uncorroborated,
+            module_ambiguous: plan.module_ambiguous as u64,
+            uncorroborated_candidates: plan.uncorroborated_candidates,
+            modules_skipped: plan.modules_skipped.iter().map(skipped_out).collect(),
+            manifest_object_fallbacks,
+            scan_unavailable: counters.scan_unavailable.map(str::to_string),
+            scan_ms: counters.scan_ms,
+            ..render::DiscoveryEvidence::default()
+        },
+        gaps,
+    )
 }
 
 /// Every §4.12 outcome recorded against this module's object — one per
@@ -12425,13 +12459,21 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
     );
     let evidence_start = crate::attach::monotonic_ns();
     // The initial build predates any learning: no module carries a note.
-    let discovery = discovery_evidence(
+    let (discovery, pin_gaps) = discovery_evidence(
         &plan,
         &pinned,
         &counters,
         &discovered.prearm,
         &BTreeMap::new(),
     );
+    for gap in pin_gaps {
+        discovered
+            .capture_facts
+            .visible_history_mut()
+            .losses
+            .entry((gap.subject.clone(), gap.reason.clone()))
+            .or_insert(gap);
+    }
     discovered.stage_timings.span(
         crate::timing::StageKind::Projection,
         "build_initial_evidence",
@@ -19467,13 +19509,21 @@ impl Engine {
         } else if self.capture_facts.history.modules.is_empty()
             && self.capture_facts.history.decoded.is_empty()
         {
-            self.discovery = discovery_evidence(
+            let (discovery, pin_gaps) = discovery_evidence(
                 &self.plan,
                 &self.pinned,
                 &self.counters,
                 &self.prearm,
                 &self.learned_notes,
             );
+            self.discovery = discovery;
+            for gap in pin_gaps {
+                self.capture_facts
+                    .visible_history_mut()
+                    .losses
+                    .entry((gap.subject.clone(), gap.reason.clone()))
+                    .or_insert(gap);
+            }
         } else {
             self.project_capture_facts();
         }

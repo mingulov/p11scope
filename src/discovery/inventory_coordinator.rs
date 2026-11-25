@@ -13970,10 +13970,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
     }
 
-    /// In-scope tasks live at the stop that no completed pass
-    /// enumerated: never-seen pids, and pids whose live generation
-    /// matches no recorded one (pid reuse reads as its own newcomer,
-    /// never as its predecessor). Unknown generations match
+    /// In-scope tasks live at the stop that the latest completed
+    /// pass did not enumerate: never-seen pids, and pids whose live
+    /// generation matches no recorded one (pid reuse reads as its own
+    /// newcomer, never as its predecessor). Enumeration memory keeps
+    /// the latest pass only, so a task an older pass saw but the
+    /// latest missed still reports here. Unknown generations match
     /// conservatively, and pids the exec set already names stay out
     /// (the exec gap reports them instead). Sorted ascending; cgroup
     /// scope reports nothing (transaction coverage, not scan passes).
@@ -14018,9 +14020,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
 
     /// Post-pass newcomers: EXEC hooks for never-admitted pids that
     /// drained after the last completed scan pass, plus the stop-diff
-    /// over tasks live at the stop that no completed pass enumerated
-    /// (starters that never exec leave no hook, so only the diff sees
-    /// them). Each population gets its own scope gap naming the unknown
+    /// over tasks live at the stop that the latest completed pass did
+    /// not enumerate (starters that never exec leave no hook, so only
+    /// the diff sees them). Each population gets its own scope gap
+    /// naming the unknown
     /// provider mappings; a pid the exec gap names never double-reports
     /// in the diff. Silent when nothing is owed or no scan completed
     /// (the zero-pass diagnostic owns that run). Cgroup scope stays
@@ -14076,9 +14079,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
         let pids = Self::bounded_pid_list(newcomers.len(), &newcomers);
         self.note_scope_gap(
-            "processes missed by every scan".into(),
+            "processes missed by the latest scan".into(),
             format!(
-                "{} process(es) live at stop were never enumerated by a completed pass; their provider mappings are unknown ({pids})",
+                "{} process(es) live at stop were not enumerated by the latest completed pass; their provider mappings are unknown ({pids})",
                 newcomers.len()
             ),
         );

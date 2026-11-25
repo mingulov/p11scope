@@ -1007,6 +1007,11 @@ struct Scene {
     /// tables: the discarded scan then holds an unscanned
     /// never-admitted member for the dropped-coverage mark.
     straggler_status: Option<crate::inspect_system::MemberStatus>,
+    /// A process (pid, start) present while `scans < until`, then gone
+    /// from every later catalog (the stop-diff leaver fixture): always
+    /// `NotSelected`, never admitted. A leaver the first pass saw but
+    /// the latest missed still reports in the stop diff.
+    leaver: Option<(u32, u64, usize)>,
     scans: usize,
     /// The first collection waits for this many discovery services (C5.7
     /// threading boundary): it cannot finish unless the loop services the
@@ -1059,6 +1064,7 @@ impl Scene {
             joiner_interfaces: false,
             straggler: None,
             straggler_status: None,
+            leaver: None,
             scans: 0,
             collect_gate: None,
             staged_lifecycle: Vec::new(),
@@ -1125,6 +1131,11 @@ impl Scene {
             members.push((pid, start));
         }
         if let Some((pid, start)) = self.straggler {
+            members.push((pid, start));
+        }
+        if let Some((pid, start, until)) = self.leaver
+            && self.scans < until
+        {
             members.push((pid, start));
         }
         let (key, sha256) = {
@@ -1198,6 +1209,7 @@ impl Scene {
                 .map(|(pid, start)| {
                     let is_joiner = self.joiner.is_some_and(|joiner| joiner.0 == *pid);
                     let is_straggler = self.straggler.is_some_and(|straggler| straggler.0 == *pid);
+                    let is_leaver = self.leaver.is_some_and(|leaver| leaver.0 == *pid);
                     crate::inspect_system::ProcessRecord {
                         application: crate::inspect_identity::InspectApplicationResult::Unknown(
                             crate::inspect_identity::InspectIdentityUnknown::NotExamined,
@@ -1211,6 +1223,8 @@ impl Scene {
                         {
                             forced.clone()
                         } else if is_straggler && self.scans < 2 {
+                            crate::inspect_system::MemberStatus::NotSelected { loss: None }
+                        } else if is_leaver {
                             crate::inspect_system::MemberStatus::NotSelected { loss: None }
                         } else {
                             crate::inspect_system::MemberStatus::Scanned
@@ -9359,7 +9373,7 @@ mod publication_progress_tests {
 
         const POST_PASS_GAP_SUBJECT: &str = "discovery coverage ended before stop";
 
-        const STOP_DIFF_GAP_SUBJECT: &str = "processes missed by every scan";
+        const STOP_DIFF_GAP_SUBJECT: &str = "processes missed by the latest scan";
 
         const STOP_ENUMERATION_LOST_SUBJECT: &str = "stop-time enumeration incomplete";
 
@@ -9961,8 +9975,44 @@ mod publication_progress_tests {
             );
         }
 
-        // An enumerated task live at stop stays silent: the diff reports
-        // only what no completed pass saw.
+        // A task the first pass enumerated but the latest missed still
+        // reports: enumeration memory keeps the latest pass only, so
+        // the gap names the latest completed pass, never every pass.
+        #[test]
+        fn stop_diff_names_a_task_only_the_latest_pass_missed() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[]);
+            driver.stop_on_emission = false;
+            driver.stop_on_scan = Some(3);
+            driver.scene.leaver = Some((99, START + 1, 2));
+            driver.stopped_pids = vec![PID, 99];
+            let outcome = drive(&mut driver, ScriptedLane::new(&log), windows());
+            assert!(
+                outcome.retained.is_none(),
+                "the mid-pass stop discards synchronously"
+            );
+            assert_eq!((driver.scene.scans, driver.applies), (3, 2));
+            let reason = driver
+                .scene
+                .coordinator
+                .registry()
+                .gaps()
+                .iter()
+                .find(|gap| gap.subject == STOP_DIFF_GAP_SUBJECT)
+                .map(|gap| gap.reason.clone())
+                .expect("a task the latest pass missed must mark unknown coverage");
+            assert!(
+                reason.contains("not enumerated by the latest completed pass"),
+                "the gap names the latest pass, got: {reason}"
+            );
+            assert!(
+                reason.contains("(pids 99)"),
+                "the gap names exactly the leaver, got: {reason}"
+            );
+        }
+
+        // A task the latest pass enumerated stays silent at stop: the
+        // diff reports only what the latest completed pass missed.
         #[test]
         fn stop_diff_stays_silent_for_enumerated_tasks() {
             let log = Log::default();

@@ -1487,7 +1487,7 @@ fn churn_anchor_and_churners_settle_through_real_binary() {
         );
         let gaps = doc["gaps"].as_array().unwrap();
         let named = gaps.iter().any(|gap| {
-            (gap["subject"] == "processes missed by every scan"
+            (gap["subject"] == "processes missed by the latest scan"
                 || gap["subject"] == "discovery coverage ended before stop")
                 && gap["reason"]
                     .as_str()
@@ -1495,7 +1495,7 @@ fn churn_anchor_and_churners_settle_through_real_binary() {
         });
         assert!(
             named,
-            "churn-C (pid {churn_c_pid}) born mid-run but never enumerated must be named by the stop disclosure"
+            "churn-C (pid {churn_c_pid}) born mid-run but missed by the latest scan must be named by the stop disclosure"
         );
     } else if churn_c_admitted {
         // Died after admission: retired and folded, never silently

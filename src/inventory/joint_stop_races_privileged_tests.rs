@@ -5988,51 +5988,32 @@ fn seal_cell_across_stop(force_shed: bool) -> Result<()> {
          (got total {total_takes}: {:?})",
         counts.take_failed,
     );
-    // The named stop-loss gaps with their exact counts: A's held
-    // call lands with 1 call; B's drained consumer falls back with
-    // 0 lost (its Stopped take still records the fallback). Pinned
-    // text, sorted by caller.
+    // The named stop-loss gap with its exact count: A's held call
+    // lands with 1 call. B's drained consumer lost nothing, so N5
+    // gives it no row (its fallback is still named by its feed
+    // ending below). Pinned text, sorted by caller.
     let expected_reason_a =
         capture_ended_reason(crate::attach::BirthObservationRefusal::Stopped, 1);
-    let expected_reason_b =
-        capture_ended_reason(crate::attach::BirthObservationRefusal::Stopped, 0);
     ensure!(
         expected_reason_a
             == "the capture ended before the seal could take its birth evidence \
                  (Stopped); fell back with counted loss (1 calls)",
         "{tag}: control: the reason renders the refusal and the count"
     );
-    ensure!(
-        expected_reason_b
-            == "the capture ended before the seal could take its birth evidence \
-                 (Stopped); fell back with counted loss (0 calls)",
-        "{tag}: control: the empty fallback renders zero loss"
-    );
-    let expected = vec![
-        crate::discovery::caller_registry::RegistryGap {
-            caller: Some(caller_a),
-            module: None,
-            pid: None,
-            subject: CAPTURE_ENDED_SUBJECT.to_string(),
-            reason: expected_reason_a,
-            budget: None,
-            units: Some(1),
-        },
-        crate::discovery::caller_registry::RegistryGap {
-            caller: Some(caller_b),
-            module: None,
-            pid: None,
-            subject: CAPTURE_ENDED_SUBJECT.to_string(),
-            reason: expected_reason_b,
-            budget: None,
-            units: Some(0),
-        },
-    ];
+    let expected = vec![crate::discovery::caller_registry::RegistryGap {
+        caller: Some(caller_a),
+        module: None,
+        pid: None,
+        subject: CAPTURE_ENDED_SUBJECT.to_string(),
+        reason: expected_reason_a,
+        budget: None,
+        units: Some(1),
+    }];
     let mut expected_sorted = expected;
     expected_sorted.sort_by_key(|gap| gap.caller);
     ensure!(
         ended == expected_sorted,
-        "{tag}: capture-ended gaps for both callers with exact counts (got {ended:?})"
+        "{tag}: capture-ended gap for the losing caller with its exact count (got {ended:?})"
     );
     // Both feeds name their endings: one fallback gap per caller,
     // pinned text, sorted by caller.
@@ -6075,8 +6056,8 @@ fn seal_cell_across_stop(force_shed: bool) -> Result<()> {
     );
     // End-state equation: every entered call is attributed,
     // slot-refused, instance-refused, disclosed-shed, or named in
-    // the capture-ended gaps (A: 1, B: 0, pinned above). A silent
-    // drop breaks the equation.
+    // the capture-ended gap (A: 1, pinned above; B lost nothing and
+    // gets no row). A silent drop breaks the equation.
     let slot_a = count_disclosed_gaps(
         driver.coordinator,
         "semantic input refused",

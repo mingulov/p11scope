@@ -2844,15 +2844,20 @@ impl IngestedJointQuantum {
                 // one named capture-ended gap with their exact count.
                 if let Some(refusal) = ended_take {
                     let units = batch.delivered_units();
-                    registry.record_gap(crate::discovery::caller_registry::RegistryGap {
-                        caller: Some(target.caller()),
-                        module: None,
-                        pid: None,
-                        subject: CAPTURE_ENDED_SUBJECT.to_string(),
-                        reason: capture_ended_reason(refusal, units),
-                        budget: None,
-                        units: Some(units as u64),
-                    });
+                    // N5: a consumer that lost nothing gets no row (a
+                    // zero row is noise); a loss of 1 or more always
+                    // gets exactly one row.
+                    if units != 0 {
+                        registry.record_gap(crate::discovery::caller_registry::RegistryGap {
+                            caller: Some(target.caller()),
+                            module: None,
+                            pid: None,
+                            subject: CAPTURE_ENDED_SUBJECT.to_string(),
+                            reason: capture_ended_reason(refusal, units),
+                            budget: None,
+                            units: Some(units as u64),
+                        });
+                    }
                 }
                 // A parked consumer's forced fallback lands its named
                 // park gap here, with exact loss counts: the watchdog

@@ -98198,6 +98198,162 @@ fn learned_staging_refusals_record_the_hold_refusal() {
     );
 }
 
+/// A bind that drops a staged identity's module for its rejected key
+/// refuses the hold even when nothing commits: rejections that never
+/// reach the committed pins (a dropped candidate) still prove the attach
+/// impossible, and the hold must not wait for them.
+#[test]
+fn member_stop_bind_rejected_key_refuses_the_hold_without_a_commit() {
+    let (fixture, _view, module, _pins) = loaded_seed_provider();
+    let pid = fixture.child.id();
+    let library = fixture._dir.path().join("seed-provider.so");
+    stop_member_for_test(pid);
+    let key = member_exec_key_for_test(pid, &library);
+    let mut io = ScriptedMemberStops::default();
+    io.rows.insert(pid, member_stop_row(pid, &library, key));
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    assert!(engine.member_stops_held(), "intake holds the mapper");
+    engine.service_learned_files();
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        1,
+        "the staging lands"
+    );
+    let staged_key = engine
+        .prearm_input
+        .as_ref()
+        .and_then(|prearm| prearm.inputs.first().map(|input| input.key))
+        .expect("staging records its key");
+    assert_eq!(
+        module.key, staged_key,
+        "the fixture scan names the staged key"
+    );
+    let file = std::fs::File::open(&library).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    // Reject in a working copy only: the committed pins stay clean, so
+    // only the bind observes the rejection (a dropped candidate).
+    let mut working = engine.pinned.clone();
+    working.reapply_rejected_keys(&std::collections::BTreeSet::from([staged_key]));
+    assert!(working.rejects(staged_key), "the working copy rejects");
+    assert!(
+        !engine.pinned.rejects(staged_key),
+        "committed stays clean: no commit"
+    );
+    let _candidate = engine.live_candidate_with_pending(
+        working,
+        vec![module],
+        Vec::new(),
+        None,
+        &std::collections::BTreeSet::new(),
+        &std::collections::BTreeSet::new(),
+        &std::collections::BTreeSet::new(),
+    );
+    assert!(
+        engine.hold_refused_for_test((dev, ino)),
+        "a bind rejection records the hold refusal"
+    );
+    engine.service_member_stops(&mut io, &mut session, Some(10_000_000));
+    assert!(
+        !engine.member_stops_held(),
+        "a bind rejection refuses the hold"
+    );
+    let stats = engine.member_stop_stats_for_test();
+    assert_eq!(stats.refused_resumes, 1, "{stats:?}");
+    assert_eq!(stats.timed_out, 0, "{stats:?}");
+    assert!(member_resumed_for_test(pid), "the member runs again");
+    assert!(
+        files_the_first_use_row(&engine),
+        "the refused hold files the first-use row"
+    );
+}
+
+/// A bind that drops a module for a rejected entry while its key stays
+/// live refuses nothing: only a rejected key proves the attach
+/// impossible.
+#[test]
+fn member_stop_bind_entry_drop_keeps_the_hold_waiting() {
+    let (fixture, _view, module, _pins) = loaded_seed_provider();
+    let pid = fixture.child.id();
+    let library = fixture._dir.path().join("seed-provider.so");
+    stop_member_for_test(pid);
+    let key = member_exec_key_for_test(pid, &library);
+    let mut io = ScriptedMemberStops::default();
+    io.rows.insert(pid, member_stop_row(pid, &library, key));
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    assert!(engine.member_stops_held(), "intake holds the mapper");
+    engine.service_learned_files();
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        1,
+        "the staging lands"
+    );
+    let staged_key = engine
+        .prearm_input
+        .as_ref()
+        .and_then(|prearm| prearm.inputs.first().map(|input| input.key))
+        .expect("staging records its key");
+    let file = std::fs::File::open(&library).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    // One entry under a dead key, beside the live module key.
+    let mut module = module;
+    assert_eq!(
+        module.key, staged_key,
+        "the fixture scan names the staged key"
+    );
+    let entry_key = p11scope_manifest::maps::ObjectKey {
+        device: staged_key.device,
+        inode: staged_key.inode.wrapping_add(1),
+    };
+    // One synthesized entry under the dead key, beside the live module
+    // key: the bind drops the module for the entry alone.
+    module.tables = vec![ScannedTable {
+        version: (3, 0),
+        walk: "full",
+        entries: vec![ScannedEntry {
+            name: "C_GetFunctionList",
+            object: entry_key,
+            object_path: library.to_string_lossy().into_owned(),
+            file_offset: 0,
+        }],
+        null_entries: Vec::new(),
+        unpinned: Vec::new(),
+        address: 0,
+        file_offset: None,
+        live_return: false,
+        manifest_supported: false,
+        extension_impossible: false,
+    }];
+    let mut working = engine.pinned.clone();
+    working.reapply_rejected_keys(&std::collections::BTreeSet::from([entry_key]));
+    assert!(working.rejects(entry_key), "the entry key rejects");
+    assert!(!working.rejects(staged_key), "the module key stays live");
+    let _candidate = engine.live_candidate_with_pending(
+        working,
+        vec![module],
+        Vec::new(),
+        None,
+        &std::collections::BTreeSet::new(),
+        &std::collections::BTreeSet::new(),
+        &std::collections::BTreeSet::new(),
+    );
+    assert!(
+        !engine.hold_refused_for_test((dev, ino)),
+        "an entry-only drop records no refusal"
+    );
+    engine.service_member_stops(&mut io, &mut session, Some(10_000_000));
+    assert!(
+        engine.member_stops_held(),
+        "the key is live: the hold waits for its attach"
+    );
+    let stats = engine.member_stop_stats_for_test();
+    assert_eq!(stats.refused_resumes, 0, "{stats:?}");
+    assert_eq!(stats.timed_out, 0, "{stats:?}");
+}
+
 /// The watchdog gone, the observer alone must not keep anyone stopped:
 /// the next pass deactivates (and detaches) the stops and resumes every
 /// held and pending member, and later passes resume any row that is

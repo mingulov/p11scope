@@ -235,7 +235,7 @@ class PackageReleaseTests(unittest.TestCase):
         release = json.loads((self.output / "RELEASE.json").read_bytes())
         docs = [*PACKAGE.LICENSES, "notices/notices.json",
                 *(f"notices/{name}" for name in self.notice_manifest["files"]),
-                "RELEASE.json"]
+                "RELEASE.json", "copyright"]
         # DEB data: same observer and glibc helper bytes, docs under
         # /usr/share/doc/p11scope, no set-id bits, no private bytes.
         deb_root = self.base / "deb-root"

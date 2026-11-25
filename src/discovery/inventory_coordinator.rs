@@ -28348,6 +28348,53 @@ exit 0
         assert_eq!(order, 0, "order removals never scan: {order}");
     }
 
+    /// Fold/settle overlap twin: one exited caller whose pair key carries
+    /// BOTH a live suspended target and a stalled recovery with a withheld
+    /// prefix — the production post-suspend shape (suspend names the
+    /// recovery's own caller, and cancel/ownership paths withhold reads
+    /// into it). The fold must still disclose the withheld range as a
+    /// retirement-count gap; dropping the recovery unsettled loses the gap
+    /// silently.
+    #[test]
+    fn fold_discloses_withheld_prefix_when_target_and_recovery_share_a_key() {
+        use crate::discovery::caller_registry::DEMOTED_COUNT_REJECTED;
+        let (mut native, _live) = NativeScene::new();
+        let domain = native.domain;
+        let id = stage_exited_caller(&mut native, 5000, 100);
+        let key = PairKey::scripted(domain, 500, 0, 0);
+        native.scene.coordinator.pair_targets.insert(
+            key,
+            PairTarget::Suspended {
+                caller: id,
+                endpoint: EndpointId(0),
+                base: 10,
+                base_since: 0,
+            },
+        );
+        let mut recovery = PairRecovery::scripted(id, 0, ModuleId(3));
+        recovery.watermark = 10;
+        recovery.withheld_through = 16;
+        recovery.discarded_through = 10;
+        native.scene.coordinator.recoveries.insert(key, recovery);
+        native.scene.coordinator.recovery_order.push(key);
+        native.scene.coordinator.note_rendered_callers(&[id]);
+        let receipt = native.scene.coordinator.retire_rendered_callers(300, None);
+        assert_eq!(receipt.retired, 1, "the exited caller folds");
+        let gaps: Vec<String> = native
+            .scene
+            .coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == DEMOTED_COUNT_REJECTED && gap.caller == Some(id))
+            .map(|gap| gap.reason.clone())
+            .collect();
+        assert!(
+            gaps.iter().any(|reason| reason.contains("(10, 16]")),
+            "withheld (10, 16] disclosed as a retirement-count gap, got {gaps:?}"
+        );
+    }
+
     /// F5 pending twin: a pending binder row — by sighting or by
     /// retained fallback — pins its caller through the fold; draining
     /// it through the production decide path lets the next pass fold.

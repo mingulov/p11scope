@@ -5660,12 +5660,13 @@ mod tests {
         );
         // The detach estimate is a verbose diagnostic; enable it around the
         // driven stop (this privileged case runs in its own process).
-        let previous = crate::cli::set_text_verbosity(crate::cli::TextVerbosity::Verbose);
+        // The crate-wide guard also restores on panic.
+        let _guard = crate::cli::VerbosityTestGuard::set(crate::cli::TextVerbosity::Verbose);
         let stop = std::time::Instant::now();
         let mut out = Vec::new();
         let detached = session.detach_producers_driven(|| false, &mut out);
-        crate::cli::set_text_verbosity(previous);
         detached.unwrap();
+        drop(_guard);
         let wall = stop.elapsed();
         let text = String::from_utf8(out).unwrap();
         assert!(
@@ -5772,13 +5773,14 @@ mod tests {
         });
         // The one-shot estimate is a verbose diagnostic; enable it around the
         // driven stop (this privileged case runs in its own process).
-        let previous = crate::cli::set_text_verbosity(crate::cli::TextVerbosity::Verbose);
+        // The crate-wide guard also restores on panic.
+        let _guard = crate::cli::VerbosityTestGuard::set(crate::cli::TextVerbosity::Verbose);
         let stop = std::time::Instant::now();
         let mut out = Vec::new();
         let error = session
             .detach_producers_driven(|| second.load(Ordering::SeqCst), &mut out)
             .unwrap_err();
-        crate::cli::set_text_verbosity(previous);
+        drop(_guard);
         let wall = stop.elapsed();
         signal.join().unwrap();
         assert!(

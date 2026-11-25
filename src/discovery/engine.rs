@@ -26095,12 +26095,15 @@ impl Engine {
         }
     }
 
-    /// One learned-pin operator line on the verbose channel, through
-    /// the non-blocking diagnostic sink: silent under concise, quiet
-    /// and JSON-shaped runs. Returns whether it printed, so tests
-    /// assert the gate decision through the production drives.
+    /// One learned-pin operator line on the diagnostics channel,
+    /// through the non-blocking diagnostic sink: like every other
+    /// learned and run-learned line it prints under `-v` or
+    /// `P11SCOPE_CAPTURE_DIAGNOSTICS=1`, and stays silent under
+    /// default, quiet and JSON-shaped runs. Returns whether it
+    /// printed, so tests assert the gate decision through the
+    /// production drives.
     fn note_learned_pin_line(line: String) -> bool {
-        if !crate::cli::text_is_verbose() {
+        if !crate::run::capture_diagnostics_on() {
             return false;
         }
         let _ = crate::sink::try_stderr_line(&line);

@@ -86,6 +86,43 @@ pub fn text_is_quiet() -> bool {
     text_verbosity() == TextVerbosity::Quiet
 }
 
+/// Crate-wide test serialization for the process-global text
+/// verbosity: every test that sets verbosity holds this lock, so
+/// interleaved save/set/restore sequences cannot leave the process
+/// at the wrong level for unrelated tests running on other threads.
+#[cfg(test)]
+pub(crate) static TEXT_VERBOSITY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Holds [`TEXT_VERBOSITY_TEST_LOCK`] with a verbosity level until
+/// dropped, restoring the previous level even on panic. The only
+/// way tests set verbosity.
+#[cfg(test)]
+pub(crate) struct VerbosityTestGuard {
+    previous: TextVerbosity,
+    _serial: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl VerbosityTestGuard {
+    pub(crate) fn set(verbosity: TextVerbosity) -> Self {
+        let serial = TEXT_VERBOSITY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous = set_text_verbosity(verbosity);
+        Self {
+            previous,
+            _serial: serial,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for VerbosityTestGuard {
+    fn drop(&mut self) {
+        set_text_verbosity(self.previous);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScopeArg {
     Pid(u32),
@@ -2788,6 +2825,51 @@ pub fn parse_event_bytes(s: &str) -> Result<u64, String> {
 mod tests {
     use super::*;
     use crate::discovery::hooks::HookAbi;
+
+    /// The shared test guard restores the previous level on drop, so
+    /// a failing assertion cannot leak a level into unrelated tests.
+    #[test]
+    fn verbosity_test_guard_restores_on_drop() {
+        let before = text_verbosity();
+        {
+            let _guard = VerbosityTestGuard::set(TextVerbosity::Verbose);
+            assert_eq!(text_verbosity(), TextVerbosity::Verbose);
+        }
+        assert_eq!(text_verbosity(), before, "drop restores the level");
+    }
+
+    /// The shared test lock is one lock: a second thread cannot take
+    /// it while the guard lives, and can once the guard drops.
+    #[test]
+    fn verbosity_test_lock_is_shared_across_threads() {
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (drop_tx, drop_rx) = std::sync::mpsc::channel();
+        let probe = std::thread::spawn(move || {
+            held_rx.recv().expect("holder signals");
+            let blocked = TEXT_VERBOSITY_TEST_LOCK.try_lock().is_err();
+            drop_tx.send(()).expect("release signal");
+            blocked
+        });
+        let guard = VerbosityTestGuard::set(TextVerbosity::Quiet);
+        held_tx.send(()).expect("signal held");
+        drop_rx.recv().expect("probe ran while held");
+        assert!(probe.join().expect("probe thread"), "lock is held");
+        drop(guard);
+        // Other lock users may interleave under parallel runs; the
+        // lock must still free promptly (holders are millisecond
+        // scoped), so wait boundedly instead of asserting once.
+        let start = std::time::Instant::now();
+        loop {
+            if TEXT_VERBOSITY_TEST_LOCK.try_lock().is_ok() {
+                break;
+            }
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(30),
+                "drop releases the lock"
+            );
+            std::thread::yield_now();
+        }
+    }
 
     fn args(v: &[&str]) -> std::vec::IntoIter<String> {
         v.iter()

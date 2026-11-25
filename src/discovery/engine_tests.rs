@@ -90348,13 +90348,10 @@ fn learned_pin_failure_files_after_bounded_retries() {
     );
 }
 
-/// Serializes the learned-pin line tests below: both redirect
-/// process-stderr and flip the process-global verbosity, so they must
-/// never overlap each other.
-static LEARNED_PIN_LINES_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// Redirects process stderr to `path` until dropped (restores even on
-/// panic), mirroring the prearm sentinel capture.
+/// panic), mirroring the prearm sentinel capture. Callers hold the
+/// crate-wide [`crate::cli::VerbosityTestGuard`] across the swap so
+/// concurrent verbosity flips cannot interleave with the capture.
 struct LearnedPinStderrCapture {
     saved: std::os::fd::OwnedFd,
 }
@@ -90387,18 +90384,6 @@ impl Drop for LearnedPinStderrCapture {
             libc::fflush(std::ptr::null_mut());
             libc::dup2(self.saved.as_raw_fd(), 2);
         }
-    }
-}
-
-/// Restores the run-scoped text verbosity on drop, so a failing
-/// assertion cannot leak a level into unrelated tests.
-struct VerbosityRestore {
-    previous: crate::cli::TextVerbosity,
-}
-
-impl Drop for VerbosityRestore {
-    fn drop(&mut self) {
-        crate::cli::set_text_verbosity(self.previous);
     }
 }
 
@@ -90436,16 +90421,61 @@ fn learned_pin_lines_engine() -> (
     (fixture, engine, (dev, ino), tx)
 }
 
-/// Drives one candidate through requeue into filing at `verbosity`,
-/// capturing stderr, and returns the captured text. Asserts the path
-/// ran (requeued, then settled with its structured skip row), so an
+/// Restores `P11SCOPE_CAPTURE_DIAGNOSTICS` on drop. Held under the
+/// crate-wide verbosity guard, which serializes every writer and
+/// reader of this gate's inputs for the test process.
+struct RestoreCaptureDiagnosticsEnv {
+    previous: Option<std::ffi::OsString>,
+}
+
+impl RestoreCaptureDiagnosticsEnv {
+    fn set(value: &str) -> Self {
+        let previous = std::env::var_os("P11SCOPE_CAPTURE_DIAGNOSTICS");
+        // SAFETY: confinement per the struct doc; restored on drop.
+        unsafe {
+            std::env::set_var("P11SCOPE_CAPTURE_DIAGNOSTICS", value);
+        }
+        Self { previous }
+    }
+
+    fn cleared() -> Self {
+        let previous = std::env::var_os("P11SCOPE_CAPTURE_DIAGNOSTICS");
+        // SAFETY: confinement per the struct doc; restored on drop.
+        unsafe {
+            std::env::remove_var("P11SCOPE_CAPTURE_DIAGNOSTICS");
+        }
+        Self { previous }
+    }
+}
+
+impl Drop for RestoreCaptureDiagnosticsEnv {
+    fn drop(&mut self) {
+        // SAFETY: confinement per the struct doc.
+        unsafe {
+            match &self.previous {
+                Some(value) => std::env::set_var("P11SCOPE_CAPTURE_DIAGNOSTICS", value),
+                None => std::env::remove_var("P11SCOPE_CAPTURE_DIAGNOSTICS"),
+            }
+        }
+    }
+}
+
+/// Drives one candidate through requeue into filing at `verbosity`
+/// (plus the diagnostics env var when `with_env`), capturing
+/// stderr, and returns the captured text. Asserts the path ran
+/// (requeued, then settled with its structured skip row), so an
 /// absence assertion on the returned text is non-vacuous.
 fn drive_learned_pin_lines(
     verbosity: crate::cli::TextVerbosity,
     stderr_path: &std::path::Path,
+    with_env: bool,
 ) -> String {
-    let _restore = VerbosityRestore {
-        previous: crate::cli::set_text_verbosity(verbosity),
+    let _guard = crate::cli::VerbosityTestGuard::set(verbosity);
+    let _env = if with_env {
+        RestoreCaptureDiagnosticsEnv::set("1")
+    } else {
+        // Silent phases must not depend on the ambient shell.
+        RestoreCaptureDiagnosticsEnv::cleared()
     };
     let (_fixture, mut engine, (dev, ino), _alive) = learned_pin_lines_engine();
     let (capture, _file) = LearnedPinStderrCapture::start(stderr_path);
@@ -90479,29 +90509,37 @@ fn drive_learned_pin_lines(
     std::fs::read_to_string(stderr_path).expect("read captured stderr")
 }
 
-/// The learned-pin operator lines print only under `-v`: concise,
-/// quiet and JSON-shaped runs stay silent while the structured skip
-/// row still files. (`--json` never arms verbose, so the concise
+/// The learned-pin operator lines print only on the diagnostics
+/// channel: concise, quiet and JSON-shaped runs stay silent while
+/// the structured skip row still files; `-v` and the diagnostics
+/// env var print. (`--json` never arms the channel, so the concise
 /// phase covers it.)
 #[test]
-fn learned_pin_operator_lines_print_only_under_verbose() {
-    let _serial = LEARNED_PIN_LINES_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
+fn learned_pin_operator_lines_print_only_under_diagnostics() {
+    // No outer lock: each phase below re-acquires the crate-wide
+    // guard inside `drive_learned_pin_lines` (a second take here
+    // would deadlock the non-reentrant mutex), and phases re-set
+    // their level, so between-phase interleaving is harmless.
     let dir = tempfile::tempdir().expect("stderr dir");
     for verbosity in [
         crate::cli::TextVerbosity::Concise,
         crate::cli::TextVerbosity::Quiet,
     ] {
         let path = dir.path().join(format!("{verbosity:?}.log"));
-        let text = drive_learned_pin_lines(verbosity, &path);
+        let text = drive_learned_pin_lines(verbosity, &path, false);
         assert!(
             !text.contains("learned pin"),
             "{verbosity:?} prints no learned-pin line: {text:?}"
         );
     }
+    let path = dir.path().join("Env.log");
+    let text = drive_learned_pin_lines(crate::cli::TextVerbosity::Concise, &path, true);
+    assert!(
+        text.contains("learned pin requeued"),
+        "diagnostics env names the requeue without -v: {text:?}"
+    );
     let path = dir.path().join("Verbose.log");
-    let text = drive_learned_pin_lines(crate::cli::TextVerbosity::Verbose, &path);
+    let text = drive_learned_pin_lines(crate::cli::TextVerbosity::Verbose, &path, false);
     assert!(
         text.contains("learned pin requeued"),
         "verbose names the requeue: {text:?}"
@@ -90512,22 +90550,19 @@ fn learned_pin_operator_lines_print_only_under_verbose() {
     );
 }
 
-/// The learned-pin line helper prints only under verbose: concise and
-/// quiet return false with no bytes, verbose returns true with the
-/// line verbatim on the channel.
+/// The learned-pin line helper prints only on the diagnostics
+/// channel: concise and quiet return false with no bytes, verbose
+/// returns true with the line verbatim, and the diagnostics env var
+/// prints without `-v`.
 #[test]
-fn learned_pin_line_helper_prints_only_under_verbose() {
-    let _serial = LEARNED_PIN_LINES_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
+fn learned_pin_line_helper_prints_only_under_diagnostics() {
     let dir = tempfile::tempdir().expect("stderr dir");
     for verbosity in [
         crate::cli::TextVerbosity::Concise,
         crate::cli::TextVerbosity::Quiet,
     ] {
-        let _restore = VerbosityRestore {
-            previous: crate::cli::set_text_verbosity(verbosity),
-        };
+        let _guard = crate::cli::VerbosityTestGuard::set(verbosity);
+        let _env = RestoreCaptureDiagnosticsEnv::cleared();
         let path = dir.path().join(format!("{verbosity:?}.log"));
         let (capture, _file) = LearnedPinStderrCapture::start(&path);
         let printed =
@@ -90540,9 +90575,23 @@ fn learned_pin_line_helper_prints_only_under_verbose() {
             "{verbosity:?} writes no learned-pin line: {text:?}"
         );
     }
-    let _restore = VerbosityRestore {
-        previous: crate::cli::set_text_verbosity(crate::cli::TextVerbosity::Verbose),
-    };
+    {
+        let _guard = crate::cli::VerbosityTestGuard::set(crate::cli::TextVerbosity::Concise);
+        let _env = RestoreCaptureDiagnosticsEnv::set("1");
+        let path = dir.path().join("Env.log");
+        let (capture, _file) = LearnedPinStderrCapture::start(&path);
+        let printed =
+            Engine::note_learned_pin_line("p11scope: learned pin filed (x): y".to_string());
+        drop(capture);
+        assert!(printed, "diagnostics env prints the line");
+        let text = std::fs::read_to_string(&path).expect("read captured stderr");
+        assert!(
+            text.contains("p11scope: learned pin filed (x): y"),
+            "diagnostics env writes the line verbatim: {text:?}"
+        );
+    }
+    let _guard = crate::cli::VerbosityTestGuard::set(crate::cli::TextVerbosity::Verbose);
+    let _env = RestoreCaptureDiagnosticsEnv::cleared();
     let path = dir.path().join("Verbose.log");
     let (capture, _file) = LearnedPinStderrCapture::start(&path);
     let printed = Engine::note_learned_pin_line("p11scope: learned pin filed (x): y".to_string());

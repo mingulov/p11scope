@@ -350,6 +350,7 @@ impl ImageGuard for CountingGuard {
 fn guard_owner_scene(ticket: u64, exec: u64) -> (Engine, NativeBinder, NativeDomainId, BoundImage) {
     let domain = NativeDomainId::mint();
     let mut binder = NativeBinder::new(BinderLimits::default());
+    binder.set_exit_clocks_comparable(true); // Scripted common clock.
     binder.note_exec_coverage(ExecCoverage::scripted(domain, 0));
     let expected = BoundImage::scripted(domain, ticket, exec).unwrap();
     (engine(2, 1), binder, domain, expected)

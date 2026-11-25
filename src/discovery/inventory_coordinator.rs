@@ -13978,6 +13978,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         | UnboundReason::ExecAmbiguous
                         | UnboundReason::ExecTransition
                         | UnboundReason::ExecCoverageGap
+                        | UnboundReason::ClocksIncomparable
                         | UnboundReason::EvidenceIncomplete
                         | UnboundReason::Capacity),
                     ) => {
@@ -17286,6 +17287,7 @@ fn diagnostic_binding_reason(reason: UnboundReason) -> DiagnosticReason {
     match reason {
         UnboundReason::CookieUnavailable
         | UnboundReason::ExecCoverageGap
+        | UnboundReason::ClocksIncomparable
         | UnboundReason::EvidenceIncomplete => DiagnosticReason::BindingUnproven,
         UnboundReason::LifecycleLoss => DiagnosticReason::CaptureLoss,
         UnboundReason::Capacity => DiagnosticReason::BudgetRefused,
@@ -23510,8 +23512,12 @@ pub(crate) mod tests {
             // Scripted scenes define their own clocks: the stale-exit
             // guard always sees comparable stamps here, whatever time
             // namespace the test host runs under. Production
-            // coordinators keep the auto-detected decision.
+            // coordinators keep the auto-detected decision. The
+            // binder sees it too, so binder-direct drivers (which
+            // bypass the stage_native sync) observe the same scripted
+            // clock.
             coordinator.exit_clocks_comparable = true;
+            coordinator.binder.set_exit_clocks_comparable(true);
             let policy = crate::plan::AdmissionPolicy::Inventory(coordinator.attach_set.budget());
             let absorbed = coordinator.attach_set.absorb(
                 &fx::lower_named(std::slice::from_ref(&module), &pins, policy),
@@ -28715,6 +28721,14 @@ exit 0
         /// transitions for manual application. Returns what the binder
         /// proved, in emission order.
         pub(super) fn binder_only(&mut self, rows: Vec<WitnessRow>) -> Vec<ExecTransition> {
+            // No coordinator staging runs here, so sync the current
+            // clock decision the way stage_native does before driving
+            // the binder.
+            let comparable = self.scene.coordinator.exit_clocks_comparable;
+            self.scene
+                .coordinator
+                .binder
+                .set_exit_clocks_comparable(comparable);
             for batch in [
                 self.stamps.read(self.domain, rows),
                 self.stamps.drain(self.domain),

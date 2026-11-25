@@ -832,7 +832,9 @@ and never proves an app identity. See the app identity rows of
   is in no module. A row binds to a caller incarnation only
   when a task-cookie query through the incarnation's held pidfd
   answers the row's own ticket in the row's own capture domain (equal
-  ticket values of two loaded objects never join), the row was recorded
+  ticket values of two loaded objects never join), BPF hook stamps and
+  admission stamps share a comparable clock (the first live binding's
+  ordering checks are meaningless otherwise), the row was recorded
   at or after the incarnation's admission, no exec of that process and
   no lifecycle-record loss was seen since the admission, and no other
   image of the ticket competes; the decision waits for a complete
@@ -859,7 +861,10 @@ and never proves an app identity. See the app identity rows of
   `caller_exited` (it exited during the query), `cookie_unavailable`,
   `cookie_mismatch` (another ticket or none: pid reuse, a nonleader
   exec), `before_admission`, `exec_after_admission`, `lifecycle_loss`,
-  `exec_ambiguous`, `exec_transition` (the row proved an exec; the
+  `clocks_incomparable` (a live cookie answer matched, but BPF hook
+  stamps and admission stamps may not share a clock, so the first
+  binding's ordering cannot be proven), `exec_ambiguous`,
+  `exec_transition` (the row proved an exec; the
   successor was admitted after it), `exec_coverage_gap` (the
   incarnation predates exec coverage and no later scan pass
   revalidated it), `evidence_incomplete` (the capture

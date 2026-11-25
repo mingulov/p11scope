@@ -82,6 +82,7 @@ impl NativeBinder {
     /// intentionally insufficient: it can miss a same-binary earlier reexec.
     pub(crate) fn metadata_key(&self, record: &CallerRecord) -> Option<BinderMetadataKey> {
         if !self.metadata_clock_qualified
+            || !self.exit_clocks_comparable
             || record.retired
             || record.lifecycle != CallerLifecycle::Mapped
             || record.admitted_ns == 0

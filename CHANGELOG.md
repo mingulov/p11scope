@@ -175,6 +175,10 @@ versioned separately and are opaque, exact dispatch keys.
   `.eh_frame_hdr`, under `run --pause never` and when attaching to an
   already-running process (`profile`, `trace` or `inventory` with
   `--pid` or `--system`), where no getter return is seen.
+  The closed native-witness `unbound_reasons` vocabulary also gains
+  `clocks_incomparable`: a live cookie answer matched, but BPF hook
+  stamps and admission stamps may not share a clock, so the observer
+  refuses the first binding instead of risking wrong attribution.
 
 ### Fixed
 

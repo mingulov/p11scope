@@ -285,8 +285,11 @@ mod tests {
 
     impl BinderScene {
         fn new() -> Self {
+            let mut binder = NativeBinder::new(BinderLimits::default());
+            // Scripted scenes define one common clock.
+            binder.set_exit_clocks_comparable(true);
             Self {
-                binder: NativeBinder::new(BinderLimits::default()),
+                binder,
                 live: HashMap::new(),
                 answers: HashMap::new(),
                 clock: 1_000,

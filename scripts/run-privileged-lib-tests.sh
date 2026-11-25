@@ -1696,7 +1696,22 @@ cleanup_btrfs_mount() {
 
 record_typed_verdict() {
     # Closed runner token only; never copy a log line or free-text reason here.
-    printf '%s\t%s\n' "$1" "$2" >>"$TYPED_VERDICTS" || {
+    if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
+        echo "$PROG: typed verdict needs a name, a verdict and at most one sidecar path" >&2
+        exit 1
+    fi
+    local line
+    printf -v line '%s\t%s' "$1" "$2" || {
+        echo "$PROG: cannot format typed verdict for $1" >&2
+        exit 1
+    }
+    if [ "$#" -eq 3 ]; then
+        printf -v line '%s\t%s' "$line" "$3" || {
+            echo "$PROG: cannot format typed verdict sidecar for $1" >&2
+            exit 1
+        }
+    fi
+    printf '%s\n' "$line" >>"$TYPED_VERDICTS" || {
         echo "$PROG: cannot append typed verdict for $1" >&2
         exit 1
     }
@@ -1875,7 +1890,7 @@ main() {
         else
             for candidate in "${DEFAULT_TESTS[@]}" "${ALTERNATIVE_TESTS[@]}" "${LONG_TESTS[@]}" \
                 "${BTRFS_TESTS[@]}" "${OVERLAY_TESTS[@]}" \
-                "${EXPECTED_FAILURE_TESTS[@]}" "${SKIP_TESTS[@]}"; do
+                "${EXPECTED_FAILURE_TESTS[@]}" "${SKIP_TESTS[@]}" "${KNOWN_FAILING_TYPED_TESTS[@]}"; do
                 if selector_matches "$candidate" "$arg"; then matched=1; break; fi
             done
         fi

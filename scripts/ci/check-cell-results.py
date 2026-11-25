@@ -67,6 +67,7 @@ def main(argv):
     intermittent_declarations = []
     allowed_smoke = []
     required = []
+    selection_order = []
     positional = []
     known_results = []
     known_runner = []
@@ -75,7 +76,9 @@ def main(argv):
     for token in iterator:
         if token == "--expected-failure":
             try:
-                expected.append(next(iterator))
+                value = next(iterator)
+                expected.append(value)
+                selection_order.append(value)
             except StopIteration:
                 return fail("--expected-failure needs a cell name")
         elif token == "--intermittent-failure":
@@ -93,10 +96,13 @@ def main(argv):
             if cell not in intermittent_lanes:
                 intermittent_lanes[cell] = []
                 intermittent.append(cell)
+                selection_order.append(cell)
             intermittent_lanes[cell].append(lane)
         elif token == "--allow-nonqualifying":
             try:
-                allowed_smoke.append(next(iterator))
+                value = next(iterator)
+                allowed_smoke.append(value)
+                selection_order.append(value)
             except StopIteration:
                 return fail("--allow-nonqualifying needs a cell name")
         elif token == "--known-failing-results":
@@ -116,7 +122,9 @@ def main(argv):
                 return fail("--known-failing-host needs a host")
         elif token == "--require":
             try:
-                required.append(next(iterator))
+                value = next(iterator)
+                required.append(value)
+                selection_order.append(value)
             except StopIteration:
                 return fail("--require needs a cell name")
         elif token.startswith("-"):
@@ -218,14 +226,19 @@ def main(argv):
         problems.append("missing required cells: " + ", ".join(missing_required))
     typed_selection = []
     if known_results:
-        selected_seen = set()
-        for group in (required, expected, intermittent, allowed_smoke):
+        outcome_seen = set()
+        for group in (expected, intermittent, allowed_smoke):
             for cell in group:
-                if cell in selected_seen:
-                    problems.append(f"typed selection overlap: {cell}")
+                if cell in outcome_seen:
+                    problems.append(f"typed outcome overlap: {cell}")
                     continue
-                selected_seen.add(cell)
-                typed_selection.append(cell)
+                outcome_seen.add(cell)
+        selected_seen = set()
+        for cell in selection_order:
+            if cell in selected_seen:
+                continue
+            selected_seen.add(cell)
+            typed_selection.append(cell)
         if not typed_selection:
             problems.append("typed selection is empty")
         outside_selection = sorted(set(seen) - set(typed_selection))

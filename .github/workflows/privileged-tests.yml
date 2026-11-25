@@ -402,6 +402,9 @@ jobs:
           path: |
             ${{ runner.temp }}/results-${{ matrix.shard }}.txt
             ${{ runner.temp }}/privileged-out/run/results.txt
+            ${{ runner.temp }}/privileged-out/run/known-failing-results.json
+            ${{ runner.temp }}/privileged-out/run/known-failing-selection.txt
+            ${{ runner.temp }}/privileged-out/run/known-failing-verdicts.tsv
             ${{ runner.temp }}/privileged-out/run/logs/
             ${{ runner.temp }}/privileged-out/run/evidence/
           if-no-files-found: warn

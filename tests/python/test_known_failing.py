@@ -314,6 +314,34 @@ class CellDeclarationTests(unittest.TestCase):
         self.assertIn("does not emit typed known-failing results", result.stderr)
 
 
+    def repeated_workflow(self, f, first_option, second_option):
+        def invocation(option):
+            return (
+                "          python3 -I scripts/ci/check-cell-results.py \"$out/results.jsonl\" "
+                + option
+                + " --known-failing-results \"$out/kf.json\""
+                + " --known-failing-runner cell:scripts/ci/cells.sh"
+                + " --known-failing-host github\n"
+            )
+        (f.root / ".github/workflows/main.yml").write_text(
+            "jobs:\n  test:\n    steps:\n      - run: |\n" + invocation(first_option) + invocation(second_option),
+            encoding="utf-8")
+
+    def test_repeated_declarations_compare_required_and_nonqualifying_exactly(self):
+        for option in ("--require alpha", "--allow-nonqualifying smoke"):
+            with self.subTest(option=option):
+                f = fixture(self)
+                f.shell_cell(declarations=False)
+                self.repeated_workflow(f, option, option)
+                result = f.run_checker()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                changed = option.replace("alpha", "beta").replace("smoke", "other-smoke")
+                self.repeated_workflow(f, option, changed)
+                result = f.run_checker()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("repeated declarations for one runner/results stream differ", result.stderr)
+
+
 class ResultDocumentTests(unittest.TestCase):
     def make_f(self):
         f = fixture(self)
@@ -939,7 +967,87 @@ class ProducerMutationSweepTests(unittest.TestCase):
                 outcomes[label] = run.returncode != 0
         self.record(results, "legacy-declaration-scope", outcomes["original"], outcomes["mutant"])
 
-        total = 10
+        # --require is presence evidence and may overlap an outcome class;
+        # only outcome classes themselves are mutually exclusive.
+        cell_order_mutant = cell_source.replace(
+            "        for cell in selection_order:\n            if cell in selected_seen:\n                continue\n",
+            "        for cell in selection_order:\n            if cell in selected_seen:\n                problems.append(f\"typed selection overlap: {cell}\")\n                continue\n",
+            1)
+        outcomes = {}
+        for label, source in (("original", cell_source), ("mutant", cell_order_mutant)):
+            with tempfile.TemporaryDirectory() as temporary:
+                temp = Path(temporary)
+                (temp / "scripts/ci").mkdir(parents=True)
+                (temp / "scripts/check-known-failing.py").write_text(CHECKER.read_text(encoding="utf-8"), encoding="utf-8")
+                (temp / "scripts/qualify-public-cli.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+                (temp / "tests").mkdir()
+                (temp / "tests/known-failing.json").write_text('{"schema":"p11scope/known-failing/v1","rows":[]}\n', encoding="utf-8")
+                (temp / ".github/workflows").mkdir(parents=True)
+                (temp / ".github/workflows/main.yml").write_text("jobs: {}\n", encoding="utf-8")
+                script = temp / "scripts/ci/check-cell-results.py"
+                script.write_text(source, encoding="utf-8")
+                rows_path = temp / "results.jsonl"
+                rows_path.write_text(json.dumps({"cell": "smoke", "pass": False, "detail": "smoke",
+                                                 "qualification": "nonqualifying"}) + "\n", encoding="utf-8")
+                output = temp / "typed.json"
+                run = subprocess.run([sys.executable, "-I", str(script), str(rows_path),
+                                      "--require", "smoke", "--allow-nonqualifying", "smoke",
+                                      "--known-failing-results", str(output),
+                                      "--known-failing-runner", "cell:scripts/qualify-public-cli.sh",
+                                      "--known-failing-host", "github"], capture_output=True, text=True)
+                outcomes[label] = run.returncode == 0
+        self.record(results, "cell-require-orthogonal-selection", outcomes["original"], outcomes["mutant"])
+
+        # Repeated declarations for one runner/results stream compare every
+        # selection category, not only the two legacy outcome lists.
+        repeated_mutant = checker_source.replace(
+            'for key in ("expected", "intermittent", "required", "nonqualifying")):',
+            'for key in ("expected", "intermittent")):', 1)
+
+        def repeated_declaration_refused(source):
+            with tempfile.TemporaryDirectory() as temporary:
+                checker = Path(temporary) / "check-known-failing.py"
+                checker.write_text(source, encoding="utf-8")
+                f = fixture(self)
+                f.shell_cell(declarations=False)
+
+                def invocation(option):
+                    return (
+                        "          python3 -I scripts/ci/check-cell-results.py \"$out/results.jsonl\" "
+                        + option
+                        + " --known-failing-results \"$out/kf.json\""
+                        + " --known-failing-runner cell:scripts/ci/cells.sh"
+                        + " --known-failing-host github\n"
+                    )
+
+                (f.root / ".github/workflows/main.yml").write_text(
+                    "jobs:\n  test:\n    steps:\n      - run: |\n"
+                    + invocation("--require alpha") + invocation("--require beta"), encoding="utf-8")
+                run = subprocess.run([sys.executable, "-I", str(checker), "--root", str(f.root)],
+                                     capture_output=True, text=True)
+                return run.returncode != 0
+
+        self.record(results, "workflow-repeated-selection-categories",
+                    repeated_declaration_refused(checker_source), repeated_declaration_refused(repeated_mutant))
+
+        # The workflow parser preserves the provider matrix shell array
+        # expansion point; dropping it loses the suite=no nonqualifying row.
+        array_mutant = checker_source.replace(
+            '            option_sequence.append(("array-expansion", array_match.group(1)))',
+            '            pass', 1)
+        outcomes = {}
+        for label, source in (("original", checker_source), ("mutant", array_mutant)):
+            with tempfile.TemporaryDirectory() as temporary:
+                script = Path(temporary) / "check-known-failing.py"
+                script.write_text(source, encoding="utf-8")
+                module = load_script(script, f"workflow_parser_{label}")
+                invocations, scan_problems = module.workflow_invocations(ROOT)
+                provider = [item for item in invocations if item["job"] == "pkcs11-check-providers"]
+                outcomes[label] = (not scan_problems and len(provider) == 1 and
+                                   ("array-expansion", "allow_extra") in provider[0]["option_sequence"])
+        self.record(results, "workflow-array-expansion-loss", outcomes["original"], outcomes["mutant"])
+
+        total = 13
         self.assertEqual(results["failures"], [],
                          f"surviving producer mutants: {results['failures']}; killed {results['killed']}/{total}")
         print(f"known-failing producer mutation sweep: {results['killed']}/{total} killed")

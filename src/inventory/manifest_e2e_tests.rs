@@ -3143,11 +3143,11 @@ fn keysize_canary_scan(haystack: &[u8]) -> bool {
         .any(|window| window == KEYSIZE_CANARY_MARKER)
 }
 
-/// The map-dump scanner: the raw scan (BTF-decoded strings read as
-/// ASCII) plus the hex scan (`bpftool map dump` prints values as hex
-/// bytes, so marker bytes retained in a map read as hex, not ASCII).
-/// The hex pass strips whitespace, lowercases, and matches the
-/// hex-of-marker contiguously, so plain hex dumps of any width match.
+/// The map-dump text scanner: the raw scan (BTF-decoded strings read
+/// as ASCII) plus the hex scan (plain hex bytes of any width). It runs
+/// over the `-j` document text beside the cell decoder below, covering
+/// the BTF `formatted` section; it cannot read `-j` byte cells or
+/// decimal renderings (pinned below), which is why the decoder exists.
 fn keysize_canary_scan_map_dump(haystack: &[u8]) -> bool {
     if keysize_canary_scan(haystack) {
         return true;
@@ -3165,6 +3165,110 @@ fn keysize_canary_scan_map_dump(haystack: &[u8]) -> bool {
         .collect();
     flat.windows(needle.len()).any(|window| window == needle)
 }
+
+/// One `bpftool -j map dump` byte cell: a `"0xHH"` hex string or a
+/// 0-255 int (mirrors `_raw_bytes` in
+/// `scripts/dump-owned-bpf-maps.py`; bpftool versions differ).
+/// Anything else fails the caller: an undecodable cell is unscanned
+/// surface, not a pass.
+fn keysize_canary_json_dump_cell(cell: &serde_json::Value) -> Result<u8> {
+    if let Some(byte) = cell.as_u64() {
+        let byte = u8::try_from(byte)
+            .map_err(|_| anyhow::anyhow!("KEYCANARY: map dump cell {byte} is not a byte"))?;
+        return Ok(byte);
+    }
+    let text = cell
+        .as_str()
+        .with_context(|| format!("KEYCANARY: map dump cell is not a byte: {cell}"))?;
+    let hex = text
+        .strip_prefix("0x")
+        .with_context(|| format!("KEYCANARY: map dump cell is not 0x-hex: {text}"))?;
+    ensure!(
+        hex.len() == 2,
+        "KEYCANARY: map dump cell is not one byte: {text}"
+    );
+    u8::from_str_radix(hex, 16)
+        .with_context(|| format!("KEYCANARY: map dump cell is not hex: {text}"))
+}
+
+/// A `key`/`value` byte array of one `-j` entry, decoded to raw bytes.
+fn keysize_canary_json_dump_array(cells: &serde_json::Value) -> Result<Vec<u8>> {
+    let cells = cells
+        .as_array()
+        .context("KEYCANARY: map dump key/value is not an array")?;
+    cells.iter().map(keysize_canary_json_dump_cell).collect()
+}
+
+/// Raw bytes of every key/value cell in one `bpftool -j map dump`
+/// document, in document order: entries carry `key` plus `value` (or
+/// per-CPU `values`), with optional BTF `formatted` the text scan
+/// already covers. Strict shape (mirrors `normalize_map_dump` in
+/// `scripts/dump-owned-bpf-maps.py`): an unknown field fails the
+/// caller, so a dump the cell cannot decode fails closed instead of
+/// passing thin.
+fn keysize_canary_json_dump_cells(dump: &[u8]) -> Result<Vec<u8>> {
+    let parsed: serde_json::Value =
+        serde_json::from_slice(dump).context("KEYCANARY: map dump is not JSON")?;
+    let entries = parsed
+        .as_array()
+        .context("KEYCANARY: map dump is not an array")?;
+    let mut out = Vec::new();
+    for entry in entries {
+        let object = entry
+            .as_object()
+            .context("KEYCANARY: map dump entry is not an object")?;
+        if let Some(formatted) = object.get("formatted") {
+            ensure!(
+                formatted.is_object(),
+                "KEYCANARY: map dump formatted section is not an object"
+            );
+        }
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        match keys.as_slice() {
+            ["formatted", "key", "value"] | ["key", "value"] => {
+                out.extend(keysize_canary_json_dump_array(&object["key"])?);
+                out.extend(keysize_canary_json_dump_array(&object["value"])?);
+            }
+            ["formatted", "key", "values"] | ["key", "values"] => {
+                out.extend(keysize_canary_json_dump_array(&object["key"])?);
+                let rows = object["values"]
+                    .as_array()
+                    .context("KEYCANARY: map dump values is not an array")?;
+                for row in rows {
+                    let row = row
+                        .as_object()
+                        .context("KEYCANARY: map dump per-CPU row is not an object")?;
+                    ensure!(
+                        row.len() == 2 && row.contains_key("cpu") && row.contains_key("value"),
+                        "KEYCANARY: map dump per-CPU row is not {{cpu, value}}"
+                    );
+                    ensure!(
+                        row["cpu"]
+                            .as_u64()
+                            .is_some_and(|cpu| cpu <= u64::from(u32::MAX)),
+                        "KEYCANARY: map dump per-CPU row has no u32 cpu"
+                    );
+                    out.extend(keysize_canary_json_dump_array(&row["value"])?);
+                }
+            }
+            _ => anyhow::bail!("KEYCANARY: map dump entry has unexpected fields: {keys:?}"),
+        }
+    }
+    Ok(out)
+}
+
+/// True when the marker appears in any decoded key/value cell of one
+/// `-j` dump. Runs beside the text scan (which covers BTF `formatted`
+/// ASCII); a dump that is not decodable fails the caller.
+fn keysize_canary_json_dump_marked(dump: &[u8]) -> Result<bool> {
+    Ok(keysize_canary_scan(&keysize_canary_json_dump_cells(dump)?))
+}
+
+/// The live hex positive-control input: the marker hex-encoded in
+/// `bpftool -j` cell layout. The text passes cannot read this encoding
+/// (pinned below), so the control proves the JSON decode path live.
+const KEYSIZE_CANARY_JSON_HEX_CONTROL: &[u8] = br#"[{"key": ["0x00"], "value": ["0x4b", "0x33", "0x59", "0x53", "0x31", "0x5a", "0x33", "0x43", "0x41", "0x4e", "0x41", "0x52", "0x59", "0x21"]}]"#;
 
 /// Positive control, unit side: the scanner finds an injected marker in
 /// an otherwise clean report copy. If this fails, the live scan is
@@ -3231,6 +3335,154 @@ fn keysize_canary_map_dump_scanner_finds_every_dump_encoding() {
     assert!(
         !keysize_canary_scan_map_dump(short),
         "a 13-byte hex tail does not match"
+    );
+}
+
+/// The `-j` decoder finds the marker in raw cells, hex-string or
+/// decimal-int: bpftool versions differ (mirrors `_raw_bytes` in
+/// `scripts/dump-owned-bpf-maps.py`), so both encodings decode.
+#[test]
+fn keysize_canary_json_dump_scanner_finds_marker_in_raw_cells() {
+    let hex = br#"[{"key": ["0x00", "0x00"], "value": ["0x4b", "0x33", "0x59", "0x53", "0x31", "0x5a", "0x33", "0x43", "0x41", "0x4e", "0x41", "0x52", "0x59", "0x21"], "formatted": {"key": 0, "value": {}}}]"#;
+    assert!(
+        keysize_canary_json_dump_marked(hex).unwrap(),
+        "finds the marker in 0x-hex cells beside formatted output"
+    );
+    let decimal =
+        br#"[{"key": [0, 0], "value": [75, 51, 89, 83, 49, 90, 51, 67, 65, 78, 65, 82, 89, 33]}]"#;
+    assert!(
+        keysize_canary_json_dump_marked(decimal).unwrap(),
+        "finds the marker in decimal-int cells"
+    );
+    let in_key = br#"[{"key": ["0x4b", "0x33", "0x59", "0x53", "0x31", "0x5a", "0x33", "0x43", "0x41", "0x4e", "0x41", "0x52", "0x59", "0x21"], "value": ["0x00"]}]"#;
+    assert!(
+        keysize_canary_json_dump_marked(in_key).unwrap(),
+        "finds the marker in key cells too"
+    );
+    let upper = br#"[{"key": ["0x00"], "value": ["0x4B", "0x33", "0x59", "0x53", "0x31", "0x5A", "0x33", "0x43", "0x41", "0x4E", "0x41", "0x52", "0x59", "0x21"]}]"#;
+    assert!(
+        keysize_canary_json_dump_marked(upper).unwrap(),
+        "finds the marker in uppercase hex digits"
+    );
+}
+
+/// The `-j` decoder reads per-CPU `values` rows, not just `value`.
+#[test]
+fn keysize_canary_json_dump_scanner_finds_marker_in_percpu_values() {
+    let dump = br#"[{"key": ["0x00", "0x00", "0x00", "0x00"], "values": [{"cpu": 0, "value": ["0x00", "0x00"]}, {"cpu": 1, "value": ["0x4b", "0x33", "0x59", "0x53", "0x31", "0x5a", "0x33", "0x43", "0x41", "0x4e", "0x41", "0x52", "0x59", "0x21"]}]}]"#;
+    assert!(
+        keysize_canary_json_dump_marked(dump).unwrap(),
+        "finds the marker in the second CPU row"
+    );
+    let clean = br#"[{"key": ["0x00"], "values": [{"cpu": 0, "value": ["0x00"]}]}]"#;
+    assert!(
+        !keysize_canary_json_dump_marked(clean).unwrap(),
+        "silent on clean per-CPU rows"
+    );
+}
+
+/// The `-j` decoder is silent on clean cells and on empty dumps (an
+/// empty map dumps `[]`, which is clean, not malformed).
+#[test]
+fn keysize_canary_json_dump_scanner_is_silent_on_clean_dumps() {
+    let clean =
+        br#"[{"key": ["0x00"], "value": ["0x00", "0x01"]}, {"key": ["0x01"], "value": [2, 3]}]"#;
+    assert!(
+        !keysize_canary_json_dump_marked(clean).unwrap(),
+        "silent on clean hex and decimal cells"
+    );
+    assert!(
+        !keysize_canary_json_dump_marked(b"[]").unwrap(),
+        "silent on an empty map dump"
+    );
+}
+
+/// The `-j` decoder fails closed: every malformed shape errors, so a
+/// dump the cell cannot decode fails the cell instead of passing thin.
+/// Plain (non-`-j`) dumps are not JSON, so a `-j` regression fails here
+/// rather than silently text-scanning.
+#[test]
+fn keysize_canary_json_dump_scanner_fails_closed_on_malformed_dumps() {
+    // Not JSON at all, and valid JSON of the wrong shape.
+    assert!(keysize_canary_json_dump_marked(b"not json").is_err());
+    assert!(keysize_canary_json_dump_marked(br#"{"key": []}"#).is_err());
+    assert!(keysize_canary_json_dump_marked(b"[42]").is_err());
+    // A plain-text dump (the `-j` flag dropped) is not JSON: fail closed.
+    let plain = b"key: 00 00 00 00  value: 4b 33 59 53 31 5a 33 43 41 4e 41 52 59 21";
+    assert!(keysize_canary_json_dump_marked(plain).is_err());
+    // Entries with unexpected fields, and rows that are not {cpu, value}.
+    assert!(keysize_canary_json_dump_marked(br#"[{"key": ["0x00"]}]"#).is_err());
+    assert!(
+        keysize_canary_json_dump_marked(br#"[{"key": ["0x00"], "value": ["0x00"], "extra": []}]"#)
+            .is_err()
+    );
+    assert!(
+        keysize_canary_json_dump_marked(
+            br#"[{"key": ["0x00"], "value": ["0x00"], "formatted": []}]"#
+        )
+        .is_err()
+    );
+    assert!(
+        keysize_canary_json_dump_marked(br#"[{"key": ["0x00"], "values": [{"cpu": 0}]}]"#).is_err()
+    );
+    assert!(
+        keysize_canary_json_dump_marked(
+            br#"[{"key": ["0x00"], "values": [{"cpu": -1, "value": ["0x00"]}]}]"#
+        )
+        .is_err()
+    );
+    // Cells that are not bytes.
+    for bad in [
+        br#"[{"key": ["0x00"], "value": ["0xZZ"]}]"#.as_slice(),
+        br#"[{"key": ["0x00"], "value": ["0x4"]}]"#.as_slice(),
+        br#"[{"key": ["0x00"], "value": ["0x4b00"]}]"#.as_slice(),
+        br#"[{"key": ["0x00"], "value": ["0X4B"]}]"#.as_slice(),
+        br#"[{"key": ["0x00"], "value": ["75"]}]"#.as_slice(),
+        br#"[{"key": ["0x00"], "value": [""]}]"#.as_slice(),
+        br#"[{"key": ["0x00"], "value": [256]}]"#.as_slice(),
+        br#"[{"key": ["0x00"], "value": [-1]}]"#.as_slice(),
+        br#"[{"key": ["0x00"], "value": [true]}]"#.as_slice(),
+        br#"[{"key": ["0x00"], "value": "0x00"}]"#.as_slice(),
+    ] {
+        assert!(
+            keysize_canary_json_dump_marked(bad).is_err(),
+            "malformed cell fails closed: {}",
+            String::from_utf8_lossy(bad)
+        );
+    }
+}
+
+/// Why the cell dumps with `-j`: a BTF plain-text dump renders retained
+/// marker bytes as formatted decimals, which the text passes cannot
+/// read — while the same bytes in `-j` raw cells decode and match.
+/// This pins the hole `-j` closes: reverting to plain dumps hides this
+/// leak shape from the text scan.
+#[test]
+fn keysize_canary_btf_decimal_rendering_hides_the_marker_from_the_text_scanner() {
+    let decimal = b"value: { .bytes = [75, 51, 89, 83, 49, 90, 51, 67, 65, 78, 65, 82, 89, 33] }";
+    assert!(
+        !keysize_canary_scan_map_dump(decimal),
+        "the text passes miss decimal-rendered marker bytes"
+    );
+    let cells = br#"[{"key": ["0x00"], "value": [75, 51, 89, 83, 49, 90, 51, 67, 65, 78, 65, 82, 89, 33]}]"#;
+    assert!(
+        keysize_canary_json_dump_marked(cells).unwrap(),
+        "the -j decoder finds the same bytes as raw cells"
+    );
+}
+
+/// The live hex positive-control fragment is found through the JSON
+/// path and missed by the text passes, so the live control is
+/// load-bearing on the decoder: a dead decoder fails the cell.
+#[test]
+fn keysize_canary_json_hex_control_fragment_pins_the_live_hex_control() {
+    assert!(
+        keysize_canary_json_dump_marked(KEYSIZE_CANARY_JSON_HEX_CONTROL).unwrap(),
+        "the decoder finds the control fragment"
+    );
+    assert!(
+        !keysize_canary_scan_map_dump(KEYSIZE_CANARY_JSON_HEX_CONTROL),
+        "the text passes cannot read the control fragment"
     );
 }
 
@@ -3336,7 +3588,7 @@ fn keysize_canary_c_guards_carry_no_aliasing_word() {
     );
     // Guards (4x64) plus the marked message (32): every window fails.
     assert_eq!(payload.len(), 4 * 64 + 32);
-    for (index, guard) in payload[..4 * 64].chunks_exact(64).enumerate() {
+    for (index, guard) in payload[..4 * 64].as_chunks::<64>().0.iter().enumerate() {
         let intact: Vec<usize> = (0..=64 - KEYSIZE_CANARY_MARKER.len())
             .filter(|off| &guard[*off..*off + KEYSIZE_CANARY_MARKER.len()] == KEYSIZE_CANARY_MARKER)
             .collect();
@@ -4085,17 +4337,35 @@ struct KeysizeCanaryMapScan {
     bytes: u64,
 }
 
-/// Undumpable task storage: task-keyed maps refuse `bpftool map dump`
-/// by kernel construction, so the cell lists them instead of dumping.
-/// Every map of this class holds minted identity words only, never
-/// target-memory reads — `THREAD_OWNER` is the identity/lease/counter
-/// struct (`crates/ebpf/native/task_owner.h`, no length cell and no
-/// payload buffer), `TASK_COOKIE`/`TASK_COOKIE_B`/`ROOT_AFFILIATION`
-/// are single minted ticket words — and all of them load as
-/// `Map::Unsupported`, which no output renderer consumes. Anything
-/// else undumpable fails closed.
-fn keysize_canary_is_undumpable_task_storage(kind: &str) -> bool {
-    kind == "task_storage"
+/// Audited undumpable task storage, by bpftool-visible name.
+/// Task-keyed maps are undumpable by bpftool; they hold minted identity
+/// and epoch words only (no byte buffers) — `THREAD_OWNER` is the
+/// identity/lease/counter struct (`crates/ebpf/native/task_owner.h`,
+/// no length cell and no payload buffer),
+/// `TASK_COOKIE`/`TASK_COOKIE_B`/`ROOT_AFFILIATION` are single minted
+/// ticket words, `PROC_EPOCH` is the epoch record — so the cell lists
+/// them instead of dumping. (`PROC_EPOCH` and `TASK_COOKIE` are read
+/// through a pidfd by `record()`/`cookie()` in
+/// `src/attach/instance.rs`; "undumpable" never meant "unread".) The
+/// kernel truncates map names to 15 chars (`BPF_OBJ_NAME_LEN`), so
+/// `ROOT_AFFILIATION` reads `ROOT_AFFILIATIO` (mirrors
+/// `canonical_map_name` in `scripts/dump-owned-bpf-maps.py`). Anything
+/// outside this allowlist — any other name, any other kind — dumps or
+/// fails closed.
+const KEYSIZE_CANARY_TASK_STORAGE_ALLOWLIST: &[&str] = &[
+    "TASK_COOKIE",
+    "TASK_COOKIE_B",
+    "THREAD_OWNER",
+    "ROOT_AFFILIATIO",
+    "PROC_EPOCH",
+];
+
+/// True only for an audited undumpable task-storage map: the kind must
+/// be `task_storage` and the bpftool-visible name must be allowlisted.
+/// An unknown task-storage name fails the caller, never joins the
+/// exclusion.
+fn keysize_canary_is_audited_task_storage(name: &str, kind: &str) -> bool {
+    kind == "task_storage" && KEYSIZE_CANARY_TASK_STORAGE_ALLOWLIST.contains(&name)
 }
 
 /// The length stash must be among the dumped maps: without
@@ -4107,13 +4377,17 @@ fn keysize_canary_dumped_covers_evidence_start(dumped: &[String]) -> bool {
         .any(|entry| entry.starts_with("EVIDENCE_START "))
 }
 
-/// Dump every dumpable BPF map owned by the live observer and scan
-/// each dump raw+hex for the canary marker. Ringbufs
-/// (`EVENTS`/`DISCOVERY`/`INFO`) are not bpftool-dumpable; the
-/// observer drains them into the scanned report, event log and
-/// observer log, so they are listed, not dumped. The identity task
-/// storage is likewise undumpable and listed, never read. Any other
-/// refusal, a missing `EVIDENCE_START`, or a failed positive control
+/// Dump every dumpable BPF map owned by the live observer with
+/// `bpftool -j` and scan each dump for the canary marker, as text (BTF
+/// `formatted` ASCII) plus decoded raw cells (BTF renders retained
+/// bytes as formatted decimals in plain dumps, which the text passes
+/// cannot read). Ringbufs (`EVENTS`/`DISCOVERY`/`INFO`) are not
+/// bpftool-dumpable; the observer drains them into the scanned report,
+/// event log and observer log, so they are listed, not dumped. The
+/// identity task storage is likewise undumpable by bpftool and listed;
+/// it holds minted identity and epoch words only (no byte buffers).
+/// Any other refusal, an unaudited task-storage name, an empty dump
+/// list, a missing `EVIDENCE_START`, or a failed positive control
 /// fails the cell: an unscanned map is a hole, not a pass.
 fn keysize_canary_scan_owned_maps(pid: u32, dump_dir: &Path) -> Result<KeysizeCanaryMapScan> {
     use std::io::Write as _;
@@ -4156,12 +4430,16 @@ fn keysize_canary_scan_owned_maps(pid: u32, dump_dir: &Path) -> Result<KeysizeCa
             rings.push(format!("{name} ({id})"));
             continue;
         }
-        if keysize_canary_is_undumpable_task_storage(kind) {
+        if kind == "task_storage" {
+            ensure!(
+                keysize_canary_is_audited_task_storage(name, kind),
+                "{TAG}: task-storage map {name} ({id}) is outside the audited exclusion: refusing an unscanned map"
+            );
             task_storage.push(format!("{name} ({id}/{kind})"));
             continue;
         }
         let dump = Command::new("bpftool")
-            .args(["map", "dump", "id", &id.to_string()])
+            .args(["-j", "map", "dump", "id", &id.to_string()])
             .output()
             .context("KEYCANARY: spawning bpftool map dump")?;
         ensure!(
@@ -4183,9 +4461,17 @@ fn keysize_canary_scan_owned_maps(pid: u32, dump_dir: &Path) -> Result<KeysizeCa
             !keysize_canary_scan_map_dump(&dump.stdout),
             "{TAG}: canary marker leaked into BPF map {name} ({id}/{kind})"
         );
+        ensure!(
+            !keysize_canary_json_dump_marked(&dump.stdout)?,
+            "{TAG}: canary marker leaked into BPF map {name} ({id}/{kind}) cells"
+        );
         combined.extend_from_slice(&dump.stdout);
         dumped.push(format!("{name} ({id})"));
     }
+    ensure!(
+        !dumped.is_empty(),
+        "{TAG}: no BPF maps dumped for the observer (pid {pid}): refusing a vacuous scan"
+    );
     ensure!(
         keysize_canary_dumped_covers_evidence_start(&dumped),
         "{TAG}: EVIDENCE_START is missing from the dumped maps: {dumped:?}"
@@ -4194,6 +4480,10 @@ fn keysize_canary_scan_owned_maps(pid: u32, dump_dir: &Path) -> Result<KeysizeCa
     ensure!(
         keysize_canary_scan_map_dump(&combined),
         "{TAG}: map positive control failed: the scanner missed an injected marker"
+    );
+    ensure!(
+        keysize_canary_json_dump_marked(KEYSIZE_CANARY_JSON_HEX_CONTROL)?,
+        "{TAG}: map hex positive control failed: the decoder missed hex-encoded marker cells"
     );
     Ok(KeysizeCanaryMapScan {
         dumped,
@@ -4243,13 +4533,33 @@ fn keysize_canary_evidence_start_cover_requires_the_stash() {
 }
 
 #[test]
-fn keysize_canary_task_storage_matches_the_whole_class() {
-    // Every task-storage map is undumpable, whatever its name.
-    assert!(keysize_canary_is_undumpable_task_storage("task_storage"));
-    // Every other kind dumps (or fails the cell trying).
+fn keysize_canary_task_storage_allowlist_admits_only_audited_maps() {
+    // Every audited name joins the exclusion, with the exact kind.
+    assert_eq!(KEYSIZE_CANARY_TASK_STORAGE_ALLOWLIST.len(), 5);
+    for name in KEYSIZE_CANARY_TASK_STORAGE_ALLOWLIST {
+        assert!(
+            keysize_canary_is_audited_task_storage(name, "task_storage"),
+            "{name} is audited and must be excludable"
+        );
+    }
+    // An unknown task-storage name never joins: it fails the cell.
+    for name in [
+        "EVIL_STORAGE",
+        "TASK_COOKIE_C",
+        "THREAD_OWNERS",
+        "ROOT_AFFILIATION",
+        "root_affiliatio",
+        "",
+    ] {
+        assert!(
+            !keysize_canary_is_audited_task_storage(name, "task_storage"),
+            "{name:?} is not audited and must fail closed"
+        );
+    }
+    // An audited name of another kind dumps (or fails the cell trying).
     for kind in ["hash", "array", "ringbuf", "percpu_array", "prog_array"] {
         assert!(
-            !keysize_canary_is_undumpable_task_storage(kind),
+            !keysize_canary_is_audited_task_storage("TASK_COOKIE", kind),
             "{kind} must not join the task-storage exclusion"
         );
     }
@@ -4262,7 +4572,8 @@ fn keysize_canary_task_storage_matches_the_whole_class() {
 /// asserts the marker appears in none of the JSON report, the event
 /// log, the verbose observer log or any dumpable owned BPF map (rings
 /// drain into the scanned outputs; the identity task storage is
-/// undumpable and never read), while both RSA-2048 sizes publish.
+/// undumpable by bpftool and holds minted identity and epoch words
+/// only), while both RSA-2048 sizes publish.
 /// Needs an observer binary via `P11SCOPE_E2E_OBSERVER` or a `p11scope`
 /// sibling of this test binary, plus `bpftool` for the map dumps.
 /// Prints KEYCANARY lines. Root BPF lane, serial, about 80 seconds.
@@ -4394,9 +4705,10 @@ fn keysize_canary_inner(workload: &E2eWorkload, module: &str, observer: &Path) -
     );
     target.ensure_alive("after LEDGER before the owned-map scan")?;
     // The owned-map verdict, mid-flight: every dumpable map the live
-    // observer owns is dumped and scanned raw+hex while it still runs
-    // (maps die with the process, so no post-stop dump exists). Rings
-    // are listed, not dumped: they drain into the scanned outputs.
+    // observer owns is dumped with `bpftool -j` and scanned (text plus
+    // decoded raw cells) while it still runs (maps die with the
+    // process, so no post-stop dump exists). Rings are listed, not
+    // dumped: they drain into the scanned outputs.
     let scan_started = Instant::now();
     let map_scan = keysize_canary_scan_owned_maps(child.id(), &workload.path("mapdumps"))?;
     println!(

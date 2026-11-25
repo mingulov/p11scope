@@ -5084,9 +5084,10 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
                         fragments.push(tag(format!("{reason}: {hits}")));
                     }
                 }
-                // Per-class retry event counts, in the default text too:
-                // a folded row count no longer hides its multiplicity.
-                if let Some(retries) = retry_breakdown_fragment(ev) {
+                // One retry total in the default text, the per-class
+                // counts under -v: a folded row count no longer hides
+                // its multiplicity either way.
+                if let Some(retries) = retry_breakdown_fragment(ev, verbose) {
                     fragments.push(tag(retries));
                 }
                 // Deep-scan selection over the cap: the counted gap. User
@@ -5511,24 +5512,29 @@ fn retry_class_user_words(label: &str) -> &str {
     }
 }
 
-/// The discovery retry breakdown for the coverage line, default
-/// text included: every nonzero noise class with its event count, so
-/// a folded row count no longer hides its multiplicity. Labels
-/// render in user words (see `retry_class_user_words`); the JSON
-/// breakdown keeps the stable labels untouched. Empty when discovery
-/// never retried.
-fn retry_breakdown_fragment(ev: &Evidence) -> Option<String> {
+/// The discovery retry fragment for the coverage line: one total in
+/// the default text, the per-class breakdown under `-v` (owner rule:
+/// details under -v). Either way a folded row count no longer hides
+/// its multiplicity. Labels render in user words (see
+/// `retry_class_user_words`); the JSON breakdown keeps the stable
+/// labels untouched. Empty when discovery never retried.
+fn retry_breakdown_fragment(ev: &Evidence, verbose: bool) -> Option<String> {
     let mut parts = Vec::new();
+    let mut total = 0u64;
     for (label, count) in &ev.discovery_retry_classes {
         if *count == 0 {
             continue;
         }
+        total = total.saturating_add(*count);
         parts.push(format!("{} x{count}", retry_class_user_words(label)));
     }
     if parts.is_empty() {
         return None;
     }
-    Some(format!("discovery retries: {}", parts.join(", ")))
+    if verbose {
+        return Some(format!("discovery retries: {}", parts.join(", ")));
+    }
+    Some(format!("discovery retries: {total}"))
 }
 
 /// True for an owned run that never paused while its command ran
@@ -11648,12 +11654,12 @@ pub(crate) mod tests {
         assert!(!out.contains("member-stop backstop"), "{out}");
     }
 
-    /// CLI text: the discovery retry breakdown renders its per-class
-    /// event counts in the default text, so a folded row count no
-    /// longer hides its multiplicity. Empty maps render nothing, and
-    /// retries without a skipped row stay quiet.
+    /// CLI text: the default text keeps one discovery retry total
+    /// while -v keeps the per-class event counts, so a folded row
+    /// count no longer hides its multiplicity either way. Empty maps
+    /// render nothing, and retries without a skipped row stay quiet.
     #[test]
-    fn retry_breakdown_renders_per_class_counts_in_default_text() {
+    fn retry_total_in_default_text_breakdown_under_verbose() {
         let mut ev = evidence();
         ev.skipped = vec![SkippedOut {
             name: "discovery subject".into(),
@@ -11665,17 +11671,27 @@ pub(crate) mod tests {
             ("maps-snapshot".to_string(), 0),
         ]);
         ev.verdict();
-        for verbosity in [
+        let out = scope_summary_with_verbosity(
+            "pid",
+            &reports_fixture(),
+            &ev,
             crate::cli::TextVerbosity::Concise,
+        );
+        assert!(out.contains("discovery retries: 87"), "{out}");
+        assert!(!out.contains("other x15"), "{out}");
+        assert!(!out.contains("process view x72"), "{out}");
+        assert!(!out.contains("maps-snapshot"), "{out}");
+        let out = scope_summary_with_verbosity(
+            "pid",
+            &reports_fixture(),
+            &ev,
             crate::cli::TextVerbosity::Verbose,
-        ] {
-            let out = scope_summary_with_verbosity("pid", &reports_fixture(), &ev, verbosity);
-            assert!(
-                out.contains("discovery retries: other x15, process view x72"),
-                "{verbosity:?}: {out}"
-            );
-            assert!(!out.contains("maps-snapshot"), "{verbosity:?}: {out}");
-        }
+        );
+        assert!(
+            out.contains("discovery retries: other x15, process view x72"),
+            "{out}"
+        );
+        assert!(!out.contains("maps-snapshot"), "{out}");
         // Empty maps render no fragment.
         let mut ev = evidence();
         ev.skipped = vec![SkippedOut {
@@ -11709,7 +11725,8 @@ pub(crate) mod tests {
     }
 
     /// CLI text: the verbose dominant-class fragment is gone,
-    /// subsumed by the full breakdown now in the default text.
+    /// subsumed by the retry total in the default text and the full
+    /// breakdown under -v.
     #[test]
     fn verbose_drops_the_dominant_class_fragment() {
         let mut ev = evidence();
@@ -11723,22 +11740,26 @@ pub(crate) mod tests {
             ("other".to_string(), 300),
         ]);
         ev.verdict();
-        for verbosity in [
+        let out = scope_summary_with_verbosity(
+            "pid",
+            &reports_fixture(),
+            &ev,
             crate::cli::TextVerbosity::Concise,
+        );
+        assert!(!out.contains("dominant retry class"), "{out}");
+        assert!(out.contains("discovery retries: 20502"), "{out}");
+        assert!(!out.contains("other x300"), "{out}");
+        let out = scope_summary_with_verbosity(
+            "pid",
+            &reports_fixture(),
+            &ev,
             crate::cli::TextVerbosity::Verbose,
-        ] {
-            let out = scope_summary_with_verbosity("pid", &reports_fixture(), &ev, verbosity);
-            assert!(
-                !out.contains("dominant retry class"),
-                "{verbosity:?}: {out}"
-            );
-            assert!(
-                out.contains(
-                    "discovery retries: other x300, process-ended x341, process view x19861"
-                ),
-                "{verbosity:?}: {out}"
-            );
-        }
+        );
+        assert!(!out.contains("dominant retry class"), "{out}");
+        assert!(
+            out.contains("discovery retries: other x300, process-ended x341, process view x19861"),
+            "{out}"
+        );
     }
 
     /// CLI text: the descendant-gap row splits, in plain words, into
@@ -19704,12 +19725,11 @@ pub(crate) mod tests {
         assert!(!line.contains("262144"), "{line}");
     }
 
-    // Dominant retry class: verbose names the largest discovery retry
-    // class behind the generic skipped rows; both texts name every
+    // Retry counts: concise names one total, verbose names every
     // nonzero class with its count, and the concise default stays one
     // line with it.
     #[test]
-    fn coverage_line_names_the_retry_breakdown_in_both_texts() {
+    fn coverage_line_names_retry_total_in_concise_breakdown_in_verbose() {
         let mut ev = evidence();
         ev.skipped = vec![
             SkippedOut {
@@ -19764,14 +19784,48 @@ pub(crate) mod tests {
             "the skipped list carries no breakdown item: {fragments:?}"
         );
         let line = coverage_line(&ev, false);
-        assert!(
-            line.contains("discovery retries: other x300, process-ended x341, process view x19861"),
-            "{line}"
-        );
+        assert!(line.contains("discovery retries: 20502"), "{line}");
+        assert!(!line.contains("other x300"), "{line}");
         assert!(!line.contains('\n'), "{line}");
     }
 
     // Retry breakdown: classes list alphabetically by label, zero
+    // The default coverage line keeps one retry total while -v
+    // keeps the per-class breakdown (owner rule: details under -v).
+    // The total equals the JSON breakdown sum.
+    #[test]
+    fn concise_retry_total_matches_json_breakdown_sum() {
+        let mut ev = evidence();
+        ev.skipped = vec![SkippedOut {
+            name: "discovery subject".into(),
+            reason: "discovery unavailable".into(),
+        }];
+        ev.discovery_retry_classes = BTreeMap::from([
+            ("process-view".to_string(), 72),
+            ("other".to_string(), 15),
+            ("maps-snapshot".to_string(), 0),
+        ]);
+        ev.verdict();
+        assert_eq!(ev.completeness, "PARTIAL");
+        let line = coverage_line(&ev, false);
+        assert!(line.contains("discovery retries: 87"), "{line}");
+        assert!(!line.contains("other x15"), "{line}");
+        assert!(!line.contains("process view x72"), "{line}");
+        let verbose = coverage_line(&ev, true);
+        assert!(
+            verbose.contains("discovery retries: other x15, process view x72"),
+            "{verbose}"
+        );
+        let json = serde_json::to_value(&ev).unwrap();
+        let sum: u64 = json["discovery_retry_classes"]
+            .as_object()
+            .unwrap()
+            .values()
+            .map(|value| value.as_u64().unwrap())
+            .sum();
+        assert_eq!(sum, 87);
+    }
+
     // counts never render, and an all-zero map renders no fragment
     // in either text.
     #[test]
@@ -19794,14 +19848,16 @@ pub(crate) mod tests {
         ]);
         ev.verdict();
         assert_eq!(ev.completeness, "PARTIAL");
-        for verbosity in [false, true] {
-            let line = coverage_line(&ev, verbosity);
-            assert!(
-                line.contains("discovery retries: other x5, process-ended x5"),
-                "{verbosity}: {line}"
-            );
-            assert!(!line.contains("maps-snapshot"), "{verbosity}: {line}");
-        }
+        let line = coverage_line(&ev, false);
+        assert!(line.contains("discovery retries: 10"), "concise: {line}");
+        assert!(!line.contains("other x5"), "concise: {line}");
+        assert!(!line.contains("maps-snapshot"), "concise: {line}");
+        let line = coverage_line(&ev, true);
+        assert!(
+            line.contains("discovery retries: other x5, process-ended x5"),
+            "verbose: {line}"
+        );
+        assert!(!line.contains("maps-snapshot"), "verbose: {line}");
         // All six labels list alphabetically with user words.
         ev.discovery_retry_classes = BTreeMap::from([
             ("maps-snapshot".to_string(), 7),

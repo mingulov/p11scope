@@ -495,12 +495,14 @@ note, including object-level skips and transient watch-scan races that
 file no `skipped` row, so they do not reconcile one-to-one with
 `skipped` rows. Labels and counts are finite — the stderr first samples
 that may name target paths never reach this key. The object never feeds
-verdicts by itself. Both texts name every nonzero class with its count
-as one coverage fragment (`discovery retries: <words> x<count>, ...`,
-alphabetical by label, with user words for the `process-view` label),
-so a folded row count no longer hides its multiplicity; the concise
-coverage line stays one line with it. This is a v3-additive disclosure
-that introduces no new schema revision.
+verdicts by itself. The verbose text names every nonzero class with
+its count as one coverage fragment (`discovery retries: <words>
+x<count>, ...`, alphabetical by label, with user words for the
+`process-view` label); the concise text names one total
+(`discovery retries: <count>`), so a folded row count no longer
+hides its multiplicity either way; the concise coverage line stays
+one line with it. This is a v3-additive disclosure that introduces
+no new schema revision.
 
 `pid_descendant_gaps` and `multi_rebuild_gaps` are saturating u64 counts.
 `pid_descendant_gaps` is zero for exact PID scope because process-creation

@@ -10,8 +10,8 @@
 # The observer keeps no /etc config or /var/lib state (docs/install.md):
 # "old config and state" here means the operator's own files the upgrade
 # must never touch: a canary in the per-user recovery dir
-# (/var/tmp/p11scope-recovered-<euid>/) and a saved -o report plus its
-# --event-log. The cell hashes them before the upgrade and requires
+# (/var/tmp/p11scope-recovered-<euid>/) and a saved report-shaped JSON
+# file. The cell hashes them before the upgrade and requires
 # byte-identical bytes after.
 #
 # Usage (as root):
@@ -26,166 +26,360 @@
 #
 # Exit 0 on pass, 1 on fail. Writes typed JSON to $WORKDIR/gate5-result.json
 # and the same to stdout.
-set -u
-FORMAT=""; OLD=""; NEW=""; WORKDIR=""
+set -eu
+FORMAT=""; OLD=""; NEW=""; WORKDIR=""; SELF_TEST_DIR=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --format) FORMAT="$2"; shift 2;;
     --old) OLD="$2"; shift 2;;
     --new) NEW="$2"; shift 2;;
     --workdir) WORKDIR="$2"; shift 2;;
+    --self-test) SELF_TEST_DIR="$2"; shift 2;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
 done
-[ "$FORMAT" = deb ] || [ "$FORMAT" = rpm ] || { echo "--format deb|rpm required" >&2; exit 2; }
-[ -n "$OLD" ] && [ -n "$NEW" ] && [ -n "$WORKDIR" ] || { echo "--old/--new/--workdir required" >&2; exit 2; }
-[ -f "$OLD" ] || { echo "old package missing: $OLD" >&2; exit 2; }
-[ -f "$NEW" ] || { echo "new package missing: $NEW" >&2; exit 2; }
-[ "$(id -u)" = 0 ] || { echo "must run as root (installs system packages)" >&2; exit 2; }
-mkdir -p "$WORKDIR"
-RESULT="$WORKDIR/gate5-result.json"
 
-# Typed result fields; filled as the cell runs.
+# Typed result fields; filled as the cell runs.  The binary path is absolute
+# so a PATH shadow cannot make the cell attest a different executable.
+P11SCOPE_BIN="/usr/bin/p11scope"
 OLD_VERSION=""; NEW_VERSION=""
+OLD_PACKAGE_VERSION=""; NEW_PACKAGE_VERSION=""
 DOCTOR_OLD_RC=-1; DOCTOR_NEW_RC=-1
 CAPTURE_OLD_RC=-1; CAPTURE_NEW_RC=-1
 CANARY_RECOVERY_SHA_BEFORE=""; CANARY_RECOVERY_SHA_AFTER=""
 CANARY_REPORT_SHA_BEFORE=""; CANARY_REPORT_SHA_AFTER=""
 FAIL_REASON=""
+RESULT=""
+
+emit_result() {
+  status="$1"
+  output="$2"
+  GATE5_FORMAT="$FORMAT" \
+  GATE5_OLD="$OLD" \
+  GATE5_NEW="$NEW" \
+  GATE5_BINARY="$P11SCOPE_BIN" \
+  GATE5_OLD_VERSION="$OLD_VERSION" \
+  GATE5_NEW_VERSION="$NEW_VERSION" \
+  GATE5_OLD_PACKAGE_VERSION="$OLD_PACKAGE_VERSION" \
+  GATE5_NEW_PACKAGE_VERSION="$NEW_PACKAGE_VERSION" \
+  GATE5_DOCTOR_OLD_RC="$DOCTOR_OLD_RC" \
+  GATE5_DOCTOR_NEW_RC="$DOCTOR_NEW_RC" \
+  GATE5_CAPTURE_OLD_RC="$CAPTURE_OLD_RC" \
+  GATE5_CAPTURE_NEW_RC="$CAPTURE_NEW_RC" \
+  GATE5_CANARY_RECOVERY_SHA_BEFORE="$CANARY_RECOVERY_SHA_BEFORE" \
+  GATE5_CANARY_RECOVERY_SHA_AFTER="$CANARY_RECOVERY_SHA_AFTER" \
+  GATE5_CANARY_REPORT_SHA_BEFORE="$CANARY_REPORT_SHA_BEFORE" \
+  GATE5_CANARY_REPORT_SHA_AFTER="$CANARY_REPORT_SHA_AFTER" \
+  GATE5_FAIL_REASON="$FAIL_REASON" \
+  python3 - "$output" "$status" <<'PY'
+import json
+import os
+import sys
+
+
+def text(name):
+    return os.environ.get(name, "")
+
+
+def integer(name):
+    try:
+        return int(text(name))
+    except ValueError:
+        return -1
+
+
+doctor_old = integer("GATE5_DOCTOR_OLD_RC")
+doctor_new = integer("GATE5_DOCTOR_NEW_RC")
+recovery_before = text("GATE5_CANARY_RECOVERY_SHA_BEFORE")
+recovery_after = text("GATE5_CANARY_RECOVERY_SHA_AFTER")
+report_before = text("GATE5_CANARY_REPORT_SHA_BEFORE")
+report_after = text("GATE5_CANARY_REPORT_SHA_AFTER")
+result = {
+    "gate": 5,
+    "format": text("GATE5_FORMAT"),
+    "status": sys.argv[2],
+    "old_package": text("GATE5_OLD"),
+    "new_package": text("GATE5_NEW"),
+    "binary": text("GATE5_BINARY"),
+    "old_version": text("GATE5_OLD_VERSION"),
+    "new_version": text("GATE5_NEW_VERSION"),
+    "old_package_version": text("GATE5_OLD_PACKAGE_VERSION"),
+    "new_package_version": text("GATE5_NEW_PACKAGE_VERSION"),
+    "doctor_old_rc": doctor_old,
+    "doctor_new_rc": doctor_new,
+    "doctor_rcs_equal": doctor_old in (0, 1) and doctor_old == doctor_new,
+    "capture_old_rc": integer("GATE5_CAPTURE_OLD_RC"),
+    "capture_new_rc": integer("GATE5_CAPTURE_NEW_RC"),
+    "canary_recovery_sha_before": recovery_before,
+    "canary_recovery_sha_after": recovery_after,
+    "canary_report_sha_before": report_before,
+    "canary_report_sha_after": report_after,
+    "canary_survived": bool(recovery_before)
+    and recovery_before == recovery_after
+    and bool(report_before)
+    and report_before == report_after,
+    "fail_reason": text("GATE5_FAIL_REASON"),
+}
+encoded = json.dumps(result, indent=2, sort_keys=True) + "\n"
+with open(sys.argv[1], "w", encoding="utf-8") as out:
+    out.write(encoded)
+print(encoded, end="")
+PY
+}
 
 fail() {
   FAIL_REASON="$1"
-  emit_result "fail"
+  if [ -n "$RESULT" ]; then
+    emit_result "fail" "$RESULT"
+  fi
   echo "GATE5 FAIL: $1" >&2
   exit 1
 }
 
-emit_result() {
-  status="$1"
-  python3 - "$RESULT" "$status" <<PY
-import json, sys
-result = {
-  "gate": 5,
-  "format": "$FORMAT",
-  "status": sys.argv[2],
-  "old_package": "$OLD",
-  "new_package": "$NEW",
-  "old_version": "$OLD_VERSION",
-  "new_version": "$NEW_VERSION",
-  "doctor_old_rc": $DOCTOR_OLD_RC,
-  "doctor_new_rc": $DOCTOR_NEW_RC,
-  "capture_old_rc": $CAPTURE_OLD_RC,
-  "capture_new_rc": $CAPTURE_NEW_RC,
-  "canary_recovery_sha_before": "$CANARY_RECOVERY_SHA_BEFORE",
-  "canary_recovery_sha_after": "$CANARY_RECOVERY_SHA_AFTER",
-  "canary_report_sha_before": "$CANARY_REPORT_SHA_BEFORE",
-  "canary_report_sha_after": "$CANARY_REPORT_SHA_AFTER",
-  "canary_survived": "$CANARY_RECOVERY_SHA_BEFORE" != "" and "$CANARY_RECOVERY_SHA_BEFORE" == "$CANARY_RECOVERY_SHA_AFTER" and "$CANARY_REPORT_SHA_BEFORE" == "$CANARY_REPORT_SHA_AFTER",
-  "fail_reason": "$FAIL_REASON",
+run_self_test() {
+  dir="$1"
+  mkdir -p "$dir" 2>/dev/null || { echo "self-test directory unavailable: $dir" >&2; exit 2; }
+  FORMAT="selftest"
+  OLD="old-package"
+  NEW="new-package"
+  OLD_VERSION="0.7.1"
+  NEW_VERSION="0.7.2"
+  OLD_PACKAGE_VERSION="0.7.1"
+  NEW_PACKAGE_VERSION="0.7.2"
+  DOCTOR_OLD_RC=0
+  DOCTOR_NEW_RC=0
+  CAPTURE_OLD_RC=0
+  CAPTURE_NEW_RC=0
+  CANARY_RECOVERY_SHA_BEFORE="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  CANARY_RECOVERY_SHA_AFTER="$CANARY_RECOVERY_SHA_BEFORE"
+  CANARY_REPORT_SHA_BEFORE="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  CANARY_REPORT_SHA_AFTER="$CANARY_REPORT_SHA_BEFORE"
+  emit_result "pass" "$dir/gate5-result.json"
+  CANARY_REPORT_SHA_AFTER="cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  FAIL_REASON="self-test mismatch"
+  emit_result "fail" "$dir/gate5-result-mismatch.json"
+  CANARY_REPORT_SHA_AFTER="$CANARY_REPORT_SHA_BEFORE"
+  DOCTOR_NEW_RC=1
+  FAIL_REASON="self-test doctor mismatch"
+  emit_result "fail" "$dir/gate5-result-doctor-mismatch.json"
+  DOCTOR_NEW_RC=0
+  CANARY_RECOVERY_SHA_BEFORE=""
+  CANARY_RECOVERY_SHA_AFTER=""
+  FAIL_REASON="self-test empty hash"
+  emit_result "fail" "$dir/gate5-result-empty-hash.json"
 }
-open(sys.argv[1], "w").write(json.dumps(result, indent=2, sort_keys=True) + "\n")
-print(json.dumps(result, indent=2, sort_keys=True))
+
+if [ -n "$SELF_TEST_DIR" ]; then
+  [ -z "$FORMAT" ] && [ -z "$OLD" ] && [ -z "$NEW" ] && [ -z "$WORKDIR" ] || {
+    echo "--self-test cannot be combined with gate arguments" >&2
+    exit 2
+  }
+  run_self_test "$SELF_TEST_DIR"
+  exit 0
+fi
+
+[ "$FORMAT" = deb ] || [ "$FORMAT" = rpm ] || { echo "--format deb|rpm required" >&2; exit 2; }
+[ -n "$OLD" ] && [ -n "$NEW" ] && [ -n "$WORKDIR" ] || { echo "--old/--new/--workdir required" >&2; exit 2; }
+[ -f "$OLD" ] || { echo "old package missing: $OLD" >&2; exit 2; }
+[ -f "$NEW" ] || { echo "new package missing: $NEW" >&2; exit 2; }
+[ "$(id -u)" = 0 ] || { echo "must run as root (installs system packages)" >&2; exit 2; }
+if ! mkdir -p "$WORKDIR" 2>/dev/null; then
+  echo "workdir unavailable: $WORKDIR" >&2
+  exit 2
+fi
+RESULT="$WORKDIR/gate5-result.json"
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+if ! EXPECTED_NEW="$(python3 - "$REPO_ROOT/Cargo.toml" <<'PY'
+import re
+import sys
+
+try:
+    text = open(sys.argv[1], encoding="utf-8").read()
+    package = text.split("[package]", 1)[1].split("\n[", 1)[0]
+    found = re.search(r'^version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"\s*$', package, re.M)
+except (OSError, IndexError) as exc:
+    print(f"cannot read tree version: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+if not found:
+    print("cannot parse strict tree version", file=sys.stderr)
+    raise SystemExit(1)
+print(found[1])
 PY
+)"; then
+  fail "cannot read repo version"
+fi
+
+package_version() {
+  if [ "$FORMAT" = deb ]; then
+    dpkg-deb -f "$1" Version 2>/dev/null
+  else
+    rpm -qp --queryformat '%{VERSION}' "$1" 2>/dev/null
+  fi
 }
+
+OLD_PACKAGE_VERSION="$(package_version "$OLD")" || fail "cannot read old package metadata"
+NEW_PACKAGE_VERSION="$(package_version "$NEW")" || fail "cannot read new package metadata"
+[ -n "$OLD_PACKAGE_VERSION" ] || fail "old package metadata version empty"
+[ -n "$NEW_PACKAGE_VERSION" ] || fail "new package metadata version empty"
+[ "$OLD_PACKAGE_VERSION" = "0.7.1" ] || fail "old package is version '$OLD_PACKAGE_VERSION', expected 0.7.1"
+[ "$NEW_PACKAGE_VERSION" = "$EXPECTED_NEW" ] || fail "new package is version '$NEW_PACKAGE_VERSION', expected '$EXPECTED_NEW'"
 
 # Canary state: recovery dir + saved report. Created before the old install
 # so even the old install must preserve them; hashed before upgrade.
 EUID_VAL="$(id -u)"
-# When running as root with a WORKDIR owned by another user (docker mount,
-# fedora TASKDIR via sudo), inventory -o needs --output-owner to trust it.
-WORKDIR_UID="$(stat -c %u "$WORKDIR")"
+WORKDIR_UID="$(stat -c %u "$WORKDIR")" || fail "cannot stat workdir"
 OUTPUT_OWNER_ARGS=""
 if [ "$EUID_VAL" = 0 ] && [ "$WORKDIR_UID" != 0 ]; then
   OUTPUT_OWNER_ARGS="--output-owner $WORKDIR_UID"
 fi
 RECOVERY_DIR="/var/tmp/p11scope-recovered-$EUID_VAL"
-mkdir -p "$RECOVERY_DIR"
-chmod 700 "$RECOVERY_DIR"
+mkdir -p "$RECOVERY_DIR" || fail "cannot create recovery canary dir"
+chmod 700 "$RECOVERY_DIR" || fail "cannot secure recovery canary dir"
 CANARY_RECOVERY="$RECOVERY_DIR/gate5-canary-$FORMAT"
-printf 'gate5-canary %s old-state must survive\n' "$FORMAT" > "$CANARY_RECOVERY"
-chmod 600 "$CANARY_RECOVERY"
+printf 'gate5-canary %s old-state must survive\n' "$FORMAT" > "$CANARY_RECOVERY" || fail "cannot create recovery canary"
+chmod 600 "$CANARY_RECOVERY" || fail "cannot secure recovery canary"
 CANARY_REPORT="$WORKDIR/operator-report-$FORMAT.json"
-printf '{"gate":5,"format":"%s","operator":"saved report must survive"}\n' "$FORMAT" > "$CANARY_REPORT"
+printf '{"gate":5,"format":"%s","operator":"saved report must survive"}\n' "$FORMAT" > "$CANARY_REPORT" || fail "cannot create saved-report canary"
+
+hash_file() {
+  output="$(sha256sum "$1")" || return 1
+  [ -n "$output" ] || return 1
+  printf '%s' "${output%% *}"
+}
+
+installed_version() {
+  version_output="$("$P11SCOPE_BIN" --version 2>/dev/null)" || return 1
+  IFS= read -r first_line <<< "$version_output"
+  # shellcheck disable=SC2086
+  set -- $first_line
+  [ "${1:-}" = "p11scope" ] && [ -n "${2:-}" ] || return 1
+  printf '%s' "$2"
+}
+
+validate_inventory_schema() {
+  python3 - "$1" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        document = json.load(handle)
+except (OSError, json.JSONDecodeError) as exc:
+    print(f"invalid inventory report: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+if document.get("schema") != "p11scope/inventory/v1":
+    print(f"wrong inventory schema: {document.get('schema')}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
 
 install_old() {
   if [ "$FORMAT" = deb ]; then
-    dpkg -i "$OLD" > "$WORKDIR/install-old.log" 2>&1 || return $?
+    dpkg -i "$OLD" > "$WORKDIR/install-old.log" 2>&1
   else
-    rpm -i --force "$OLD" > "$WORKDIR/install-old.log" 2>&1 || return $?
+    rpm -i --force "$OLD" > "$WORKDIR/install-old.log" 2>&1
   fi
 }
 
 upgrade_new() {
   if [ "$FORMAT" = deb ]; then
-    dpkg -i "$NEW" > "$WORKDIR/install-new.log" 2>&1 || return $?
+    dpkg -i "$NEW" > "$WORKDIR/install-new.log" 2>&1
   else
-    rpm -U "$NEW" > "$WORKDIR/install-new.log" 2>&1 || return $?
+    rpm -U "$NEW" > "$WORKDIR/install-new.log" 2>&1
+  fi
+}
+
+run_doctor() {
+  log="$1"
+  if "$P11SCOPE_BIN" doctor > "$log" 2>&1; then
+    return 0
+  else
+    return $?
+  fi
+}
+
+run_capture() {
+  output="$1"
+  log="$2"
+  # OUTPUT_OWNER_ARGS is either empty or a numeric uid pair constructed above.
+  # shellcheck disable=SC2086
+  if "$P11SCOPE_BIN" inventory --system --capture scan --identity-backend userspace --json -o "$output" $OUTPUT_OWNER_ARGS > "$log" 2>&1; then
+    return 0
+  else
+    return $?
   fi
 }
 
 # 1. Install old.
 install_old || fail "old install failed (see install-old.log)"
-# 2. Old version must be 0.7.1.
-OLD_VERSION="$(p11scope --version 2>/dev/null | head -n 1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)"
+[ -x "$P11SCOPE_BIN" ] || fail "installed old binary missing at $P11SCOPE_BIN"
+# 2. Old installed version must be 0.7.1.
+OLD_VERSION="$(installed_version)" || fail "cannot run installed old binary"
 [ "$OLD_VERSION" = "0.7.1" ] || fail "old version is '$OLD_VERSION', expected 0.7.1"
 # 3. Old doctor (no scope). rc 0 (all requested lanes passed) or 1 (a
 # requested lane unavailable, e.g. no CAP_BPF in a container) both prove
 # the binary runs and reports; only 2+ (usage/crash) or a missing Doctor
 # line fails.
-set +e
-p11scope doctor > "$WORKDIR/doctor-old.out" 2>&1
-DOCTOR_OLD_RC=$?
-set -e
+if run_doctor "$WORKDIR/doctor-old.out"; then
+  DOCTOR_OLD_RC=0
+else
+  DOCTOR_OLD_RC=$?
+fi
 [ "$DOCTOR_OLD_RC" = 0 ] || [ "$DOCTOR_OLD_RC" = 1 ] || fail "old doctor rc=$DOCTOR_OLD_RC"
 grep -q '^Doctor:' "$WORKDIR/doctor-old.out" || fail "old doctor output has no Doctor line"
 # 4. Old short capture: system scan with userspace identity (no BPF, no
 # PID-namespace dependence, so it works on hosts and in containers).
-set +e
-# shellcheck disable=SC2086
-p11scope inventory --system --capture scan --identity-backend userspace --json -o "$WORKDIR/pre-upgrade.json" $OUTPUT_OWNER_ARGS > "$WORKDIR/capture-old.out" 2>&1
-CAPTURE_OLD_RC=$?
-set -e
+if run_capture "$WORKDIR/pre-upgrade.json" "$WORKDIR/capture-old.out"; then
+  CAPTURE_OLD_RC=0
+else
+  CAPTURE_OLD_RC=$?
+fi
 [ "$CAPTURE_OLD_RC" = 0 ] || fail "old capture rc=$CAPTURE_OLD_RC"
-python3 -c "import json; d=json.load(open('$WORKDIR/pre-upgrade.json')); assert d.get('schema')=='p11scope/inventory/v1', d.get('schema')" \
-  || fail "old capture report has wrong schema"
-# Hash canaries before upgrade.
-CANARY_RECOVERY_SHA_BEFORE="$(sha256sum "$CANARY_RECOVERY" | cut -d' ' -f1)"
-CANARY_REPORT_SHA_BEFORE="$(sha256sum "$CANARY_REPORT" | cut -d' ' -f1)"
+validate_inventory_schema "$WORKDIR/pre-upgrade.json" || fail "old capture report has wrong schema"
+# Hash canaries before upgrade; an empty hash is a failure, never equality.
+CANARY_RECOVERY_SHA_BEFORE="$(hash_file "$CANARY_RECOVERY")" || fail "cannot hash recovery canary before upgrade"
+CANARY_REPORT_SHA_BEFORE="$(hash_file "$CANARY_REPORT")" || fail "cannot hash saved-report canary before upgrade"
+[ -n "$CANARY_RECOVERY_SHA_BEFORE" ] || fail "recovery canary hash empty before upgrade"
+[ -n "$CANARY_REPORT_SHA_BEFORE" ] || fail "saved-report canary hash empty before upgrade"
 # 5. Upgrade to new.
 upgrade_new || fail "upgrade to new failed (see install-new.log)"
-# 6. New version must match the tree (Cargo.toml next to this script's repo).
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-EXPECTED_NEW="$(python3 -c "import re,sys; t=open(sys.argv[1]).read(); p=t.split('[package]',1)[1].split('\n[',1)[0]; print(re.search(r'^version\s*=\s*\"([0-9.]+)\"', p, re.M).group(1))" "$REPO_ROOT/Cargo.toml")"
-NEW_VERSION="$(p11scope --version 2>/dev/null | head -n 1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)"
+[ -x "$P11SCOPE_BIN" ] || fail "installed new binary missing at $P11SCOPE_BIN"
+# 6. New installed version must match the tree.
+NEW_VERSION="$(installed_version)" || fail "cannot run installed new binary"
 [ "$NEW_VERSION" = "$EXPECTED_NEW" ] || fail "new version is '$NEW_VERSION', expected '$EXPECTED_NEW'"
-# 7. New doctor (same 0/1 acceptance as old).
-set +e
-p11scope doctor > "$WORKDIR/doctor-new.out" 2>&1
-DOCTOR_NEW_RC=$?
-set -e
+# 7. New doctor (same 0/1 acceptance as old) and no doctor-result regression.
+if run_doctor "$WORKDIR/doctor-new.out"; then
+  DOCTOR_NEW_RC=0
+else
+  DOCTOR_NEW_RC=$?
+fi
 [ "$DOCTOR_NEW_RC" = 0 ] || [ "$DOCTOR_NEW_RC" = 1 ] || fail "new doctor rc=$DOCTOR_NEW_RC"
 grep -q '^Doctor:' "$WORKDIR/doctor-new.out" || fail "new doctor output has no Doctor line"
+[ "$DOCTOR_NEW_RC" = "$DOCTOR_OLD_RC" ] || fail "doctor rc flipped $DOCTOR_OLD_RC->$DOCTOR_NEW_RC"
 # 8. New short capture (same system scan as old).
-set +e
-# shellcheck disable=SC2086
-p11scope inventory --system --capture scan --identity-backend userspace --json -o "$WORKDIR/post-upgrade.json" $OUTPUT_OWNER_ARGS > "$WORKDIR/capture-new.out" 2>&1
-CAPTURE_NEW_RC=$?
-set -e
+if run_capture "$WORKDIR/post-upgrade.json" "$WORKDIR/capture-new.out"; then
+  CAPTURE_NEW_RC=0
+else
+  CAPTURE_NEW_RC=$?
+fi
 [ "$CAPTURE_NEW_RC" = 0 ] || fail "new capture rc=$CAPTURE_NEW_RC"
-python3 -c "import json; d=json.load(open('$WORKDIR/post-upgrade.json')); assert d.get('schema')=='p11scope/inventory/v1', d.get('schema')" \
-  || fail "new capture report has wrong schema"
-# 9. Canaries byte-identical.
-CANARY_RECOVERY_SHA_AFTER="$(sha256sum "$CANARY_RECOVERY" | cut -d' ' -f1)"
-CANARY_REPORT_SHA_AFTER="$(sha256sum "$CANARY_REPORT" | cut -d' ' -f1)"
+validate_inventory_schema "$WORKDIR/post-upgrade.json" || fail "new capture report has wrong schema"
+# 9. Canaries byte-identical, with non-empty hashes on both sides.
+CANARY_RECOVERY_SHA_AFTER="$(hash_file "$CANARY_RECOVERY")" || fail "cannot hash recovery canary after upgrade"
+CANARY_REPORT_SHA_AFTER="$(hash_file "$CANARY_REPORT")" || fail "cannot hash saved-report canary after upgrade"
+[ -n "$CANARY_RECOVERY_SHA_AFTER" ] || fail "recovery canary hash empty after upgrade"
+[ -n "$CANARY_REPORT_SHA_AFTER" ] || fail "saved-report canary hash empty after upgrade"
 [ "$CANARY_RECOVERY_SHA_BEFORE" = "$CANARY_RECOVERY_SHA_AFTER" ] || fail "recovery canary changed across upgrade"
 [ "$CANARY_REPORT_SHA_BEFORE" = "$CANARY_REPORT_SHA_AFTER" ] || fail "saved-report canary changed across upgrade"
 # 10. Package manager agrees the new version is installed.
 if [ "$FORMAT" = deb ]; then
-  dpkg -l p11scope 2>/dev/null | grep -q "$NEW_VERSION" || fail "dpkg does not list $NEW_VERSION"
+  INSTALLED_PACKAGE_VERSION="$(dpkg-query -W -f='${Version}' p11scope 2>/dev/null)" || fail "dpkg does not list p11scope"
 else
-  rpm -q p11scope 2>/dev/null | grep -q "$NEW_VERSION" || fail "rpm does not list $NEW_VERSION"
+  INSTALLED_PACKAGE_VERSION="$(rpm -q --queryformat '%{VERSION}' p11scope 2>/dev/null)" || fail "rpm does not list p11scope"
 fi
+[ "$INSTALLED_PACKAGE_VERSION" = "$NEW_VERSION" ] || fail "package manager version is '$INSTALLED_PACKAGE_VERSION', expected '$NEW_VERSION'"
 
-emit_result "pass"
+emit_result "pass" "$RESULT"
 echo "GATE5 PASS ($FORMAT): 0.7.1 -> $NEW_VERSION, doctor+capture ok, canaries survived" >&2

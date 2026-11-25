@@ -23,19 +23,17 @@ The three breaking items (docs/releases/v0.8.0.md upgrade notes):
 Typed checks (exit 0 only if all pass):
   1. Old inventory scan report generates with the v0.7.1 binary (rc 0,
      schema p11scope/inventory/v1).
-  2. New binary reads old via cbom (rc 0, CycloneDX JSON) and via diff
-     old-vs-old (rc 0, 0 changes) and old-vs-new (rc 0).
-  3. B1: old has no departed_use anywhere; new has modules[].departed_use
-     (null when no fold) and the exact budgets set; the new-vs-old key
-     delta is exactly the B1 set plus a pinned additive set (all optional,
-     all ignored by readers).
+  2. New binary reads old via cbom (rc 0, CycloneDX JSON), via diff
+     old-vs-old (rc 0 and typed zero changes) and old-vs-new (rc 0).
+  3. B1: old has no departed_use key; new has every pinned B1 key; the
+     new-vs-old key delta is exactly the B1 set plus a pinned additive set
+     (all optional, all ignored by readers), with no removed keys.
   4. B2: v0.7.1 object-observations schemas v1-v5 (from tag v0.7.1) do not
-     list live_joint_feed_absent; this tree's do; new cbom accepts a report
-     carrying that reason.
+     list live_joint_feed_absent in their reason enums; this tree's do;
+     new cbom accepts a report carrying that reason and renders it through.
   5. B3: v0.7.1 observed-profile-v3 schema (from tag) does not require the
      three fields; this tree's does; new cbom still reads an old-shaped
-     profile (lenient reader) while schema validation fails only on those
-     three.
+     profile and renders its typed profile markers.
 
 Usage:
   python3 -I scripts/upgrade-gate6.py \
@@ -46,11 +44,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import ctypes
 import json
+import os
+import select
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 sys.dont_write_bytecode = True
@@ -92,29 +90,172 @@ B3_FIELDS = (
     "member_stop_attached",
     "member_stop_unattached",
 )
+BREAKING = ["departed_use", "live_joint_feed_absent", "profile_evidence_fields"]
+LIVE_JOINT_REASON = "live_joint_feed_absent"
+PROFILE_TEST_WINDOW = "2026-01-01T00:00:00Z..2026-01-01T00:00:01Z (capture wall clock)"
+PROFILE_INPUT_NOTE = (
+    "profile input: mechanisms are capture-global, without caller, usage-edge or key linkage"
+)
 
 
-def run(args, **kw):
-    return subprocess.run(args, capture_output=True, text=True, timeout=120, **kw)
+class GateFailure(Exception):
+    """One typed gate check failed; the result has already been recorded."""
+
+
+def initial_result() -> dict:
+    return {
+        "gate": 6,
+        "status": "fail",
+        "checks": {},
+        "breaking": list(BREAKING),
+        "notes": {},
+        "fail_reason": "",
+    }
+
+
+def check(result: dict, name: str, ok: bool, detail: str = "") -> None:
+    result["checks"][name] = {"pass": bool(ok), "detail": detail}
+    if not ok:
+        result["fail_reason"] = f"{name}: {detail}"
+        raise GateFailure(result["fail_reason"])
+
+
+def run(args, timeout=120, **kw):
+    """Run a command, converting timeout/exec failure into a typed result."""
+    try:
+        return subprocess.run(
+            args, capture_output=True, text=True, timeout=timeout, **kw
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            args, 124, stdout="", stderr=f"timeout after {timeout} seconds"
+        )
+    except OSError as exc:
+        return subprocess.CompletedProcess(
+            args, 127, stdout="", stderr=f"exec failed: {exc}"
+        )
 
 
 def flatten_keys(value, path=""):
-    """First-element key paths, matching the gate's pinned sets."""
+    """Yield key paths, uniting keys from every dict element of a list.
+
+    List positions are normalized to ``[0]`` because the pinned key sets
+    describe the shape of homogeneous rows, not row identities. Looking at
+    every element matters: a key appearing first in modules[1] is still a
+    schema-shape delta.
+    """
     if isinstance(value, dict):
         for key, child in value.items():
             here = f"{path}.{key}" if path else key
             yield here
             yield from flatten_keys(child, here)
-    elif isinstance(value, list) and value and isinstance(value[0], dict):
-        for key in value[0].keys():
-            here = f"{path}[0].{key}"
-            yield here
-            yield from flatten_keys(value[0][key], here)
+    elif isinstance(value, list):
+        for row in value:
+            if not isinstance(row, dict):
+                continue
+            for key, child in row.items():
+                here = f"{path}[0].{key}" if path else f"[0].{key}"
+                yield here
+                yield from flatten_keys(child, here)
+
+
+def evaluate_b1_delta(old_keys, new_keys) -> dict:
+    """Evaluate the typed B1 key delta in both directions."""
+    old_keys = set(old_keys)
+    new_keys = set(new_keys)
+    new_only = new_keys - old_keys
+    allowed = set(B1_KEYS) | set(ADDITIVE_KEYS)
+    return {
+        "removed": old_keys - new_keys,
+        "unexpected": new_only - allowed,
+        "missing_b1": set(B1_KEYS) - new_keys,
+    }
+
+
+def key_exists(value, wanted: str) -> bool:
+    """True when typed JSON contains a key exactly named ``wanted``."""
+    if isinstance(value, dict):
+        return any(
+            key == wanted or key_exists(child, wanted)
+            for key, child in value.items()
+        )
+    if isinstance(value, list):
+        return any(key_exists(child, wanted) for child in value)
+    return False
+
+
+def schema_reason_has(schema: dict, reason: str) -> bool:
+    enum = schema.get("properties", {}).get("reason", {}).get("enum", [])
+    return reason in enum
+
+
+def cbom_properties(document: dict) -> dict:
+    """Metadata properties as one typed name -> value mapping."""
+    props = {}
+    for row in document.get("metadata", {}).get("properties", []):
+        if not isinstance(row, dict):
+            continue
+        name = row.get("name")
+        value = row.get("value")
+        if isinstance(name, str) and isinstance(value, str):
+            props[name] = value
+    return props
+
+
+def diff_zero_same(document: dict) -> bool:
+    """True only for the typed diff schema with both change lists empty."""
+    return (
+        document.get("schema") == "p11scope/inventory-diff/v1"
+        and document.get("application_changes") == []
+        and document.get("module_path_changes") == []
+    )
+
+
+def cbom_live_joint_rendered(document: dict) -> bool:
+    """True when cbom renders the exact injected object-observation reason."""
+    return (
+        cbom_properties(document).get("p11scope:object_observations")
+        == f"partial ({LIVE_JOINT_REASON})"
+    )
+
+
+def cbom_profile_markers_present(document: dict) -> bool:
+    """True when the old-shaped profile's typed conversion markers flow through."""
+    props = cbom_properties(document)
+    return (
+        props.get("p11scope:source_schema") == "p11scope/observed-profile/v3"
+        and props.get("p11scope:window") == PROFILE_TEST_WINDOW
+        and props.get("p11scope:profile_note") == PROFILE_INPUT_NOTE
+    )
+
+
+def required_evidence(schema):
+    req = set()
+    evidence = schema.get("properties", {}).get("evidence", {})
+    req.update(evidence.get("required", []))
+    for clause in schema.get("allOf", []):
+        # allOf entries nest required under then.properties.evidence
+        # (profile lane) or properties.evidence.
+        for container in (clause, clause.get("then", {})):
+            props = container.get("properties", {}).get("evidence", {})
+            req.update(props.get("required", []))
+        for sub in clause.get("allOf", []):
+            sub_props = sub.get("properties", {}).get("evidence", {})
+            req.update(sub_props.get("required", []))
+    return req
+
+
+def then_required(schema):
+    """The profile-lane then.required list (where the three live)."""
+    for clause in schema.get("allOf", []):
+        then = clause.get("then", {})
+        props = then.get("properties", {}).get("evidence", {})
+        if props.get("required"):
+            return set(props["required"])
+    return set()
 
 
 def git_show(rev: str, path: str) -> bytes:
-    import os
-
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
     out = subprocess.run(
@@ -128,26 +269,90 @@ def git_show(rev: str, path: str) -> bytes:
     return out.stdout
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--old-binary", required=True, type=Path)
-    parser.add_argument("--new-binary", required=True, type=Path)
-    parser.add_argument("--workdir", required=True, type=Path)
-    args = parser.parse_args()
-    workdir = args.workdir
-    workdir.mkdir(parents=True, exist_ok=True)
-    result = {
-        "gate": 6,
-        "status": "fail",
-        "checks": {},
-        "breaking": ["departed_use", "live_joint_feed_absent", "profile_evidence_fields"],
-    }
+def load_json_file(path: Path):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{path}: {exc}") from exc
 
-    def check(name, ok, detail=""):
-        result["checks"][name] = {"pass": bool(ok), "detail": detail}
-        if not ok:
-            result["fail_reason"] = f"{name}: {detail}"
-        return ok
+
+def terminate_target(target: subprocess.Popen) -> None:
+    target.terminate()
+    try:
+        target.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        target.kill()
+        target.wait(timeout=5)
+
+
+def generate_scan_report(binary: Path, output: Path, module: str) -> str:
+    """Generate one inventory scan; return an empty string or failure detail."""
+    try:
+        target = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import ctypes, sys, time; ctypes.CDLL(sys.argv[1]); "
+                "print('ready', flush=True); time.sleep(30)",
+                module,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    except OSError as exc:
+        return f"target exec failed for {binary}: {exc}"
+    try:
+        if target.stdout is None:
+            return f"target stdout unavailable for {binary}"
+        ready, _, _ = select.select([target.stdout], [], [], 10)
+        if not ready:
+            return f"target readiness timeout for {binary}"
+        line = target.stdout.readline()
+        if "ready" not in line:
+            return f"target did not start for {binary}: {line[:200]}"
+        completed = run(
+            [
+                str(binary),
+                "inventory",
+                "--pid",
+                str(target.pid),
+                "--capture",
+                "scan",
+                "--json",
+                "-o",
+                str(output),
+            ]
+        )
+        if completed.returncode != 0 or not output.exists():
+            return (
+                f"{binary} inventory rc={completed.returncode} "
+                f"stderr={completed.stderr[:300]}"
+            )
+        try:
+            document = load_json_file(output)
+        except ValueError as exc:
+            return f"{binary} report unreadable: {exc}"
+        if document.get("schema") != "p11scope/inventory/v1":
+            return f"{binary} schema={document.get('schema')}"
+        return ""
+    finally:
+        try:
+            terminate_target(target)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+
+def run_gate(args, workdir: Path, result: dict) -> int:
+    check(
+        result,
+        "inputs_present",
+        args.old_binary.is_file()
+        and os.access(args.old_binary, os.X_OK)
+        and args.new_binary.is_file()
+        and os.access(args.new_binary, os.X_OK),
+        f"old={args.old_binary} new={args.new_binary}",
+    )
 
     # 1. Generate old + new inventory scan reports from live targets.
     module = None
@@ -159,85 +364,64 @@ def main() -> int:
         if Path(candidate).exists():
             module = candidate
             break
-    if module is None:
-        check("reports_generated", False, "no SoftHSM provider found")
-        return emit(workdir, result, 1)
+    check(result, "reports_generated", module is not None, "no SoftHSM provider found")
     old_report = workdir / "v071-inventory.json"
     new_report = workdir / "v072-inventory.json"
-    ok = True
-    for binary, out in ((args.old_binary, old_report), (args.new_binary, new_report)):
-        target = subprocess.Popen(
-            [
-                sys.executable,
-                "-c",
-                f"import ctypes, time; ctypes.CDLL('{module}'); "
-                "print('ready', flush=True); time.sleep(30)",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-        try:
-            line = target.stdout.readline()
-            if "ready" not in line:
-                ok = check(
-                    "reports_generated", False, f"target did not start for {binary}"
-                )
-                break
-            r = run(
-                [
-                    str(binary),
-                    "inventory",
-                    "--pid",
-                    str(target.pid),
-                    "--capture",
-                    "scan",
-                    "--json",
-                    "-o",
-                    str(out),
-                ]
-            )
-            if r.returncode != 0 or not out.exists():
-                ok = check(
-                    "reports_generated",
-                    False,
-                    f"{binary} inventory rc={r.returncode} stderr={r.stderr[:300]}",
-                )
-                break
-            doc = json.loads(out.read_text())
-            if doc.get("schema") != "p11scope/inventory/v1":
-                ok = check(
-                    "reports_generated", False, f"{binary} schema={doc.get('schema')}"
-                )
-                break
-        finally:
-            target.terminate()
-            try:
-                target.wait(timeout=5)
-            except Exception:
-                target.kill()
-    if not ok:
-        return emit(workdir, result, 1)
-    check("reports_generated", True, f"old={old_report} new={new_report}")
+    for binary, output in ((args.old_binary, old_report), (args.new_binary, new_report)):
+        detail = generate_scan_report(binary, output, module)
+        if detail:
+            check(result, "reports_generated", False, detail)
+    check(
+        result,
+        "reports_generated",
+        True,
+        f"old={old_report} new={new_report}",
+    )
 
     # 2. New binary reads old via cbom and diff.
-    r = run([str(args.new_binary), "inventory", "cbom", str(old_report), "--json"])
-    if not check("cbom_reads_old", r.returncode == 0, f"rc={r.returncode}"):
-        return emit(workdir, result, 1)
-    try:
-        cbom = json.loads(r.stdout)
-        bom_ok = cbom.get("bomFormat") == "CycloneDX"
-    except Exception as exc:
-        bom_ok = False
-        r = f"cbom JSON parse: {exc}"
-    if not check("cbom_old_typed", bom_ok, "bomFormat=CycloneDX"):
-        return emit(workdir, result, 1)
-    r = run(
-        [str(args.new_binary), "inventory", "diff", str(old_report), str(old_report)]
+    completed = run([str(args.new_binary), "inventory", "cbom", str(old_report), "--json"])
+    check(
+        result,
+        "cbom_reads_old",
+        completed.returncode == 0,
+        f"rc={completed.returncode}",
     )
-    if not check("diff_old_old", r.returncode == 0, f"rc={r.returncode}"):
-        return emit(workdir, result, 1)
-    r = run(
+    try:
+        cbom = json.loads(completed.stdout)
+        cbom_typed_ok = cbom.get("bomFormat") == "CycloneDX"
+        cbom_typed_detail = f"bomFormat={cbom.get('bomFormat')}"
+    except json.JSONDecodeError as exc:
+        cbom_typed_ok = False
+        cbom_typed_detail = f"cbom JSON parse: {exc}"
+    check(result, "cbom_old_typed", cbom_typed_ok, cbom_typed_detail)
+
+    completed = run(
+        [
+            str(args.new_binary),
+            "inventory",
+            "diff",
+            str(old_report),
+            str(old_report),
+            "--json",
+        ]
+    )
+    zero_detail = f"rc={completed.returncode}"
+    zero_ok = completed.returncode == 0
+    if zero_ok:
+        try:
+            same_diff = json.loads(completed.stdout)
+            zero_ok = diff_zero_same(same_diff)
+            zero_detail = (
+                "schema=inventory-diff/v1 "
+                f"application_changes={len(same_diff.get('application_changes', []))} "
+                f"module_path_changes={len(same_diff.get('module_path_changes', []))}"
+            )
+        except json.JSONDecodeError as exc:
+            zero_ok = False
+            zero_detail = f"diff JSON parse: {exc}"
+    check(result, "diff_old_old_zero", zero_ok, zero_detail)
+
+    completed = run(
         [
             str(args.new_binary),
             "inventory",
@@ -247,103 +431,141 @@ def main() -> int:
             "--json",
         ]
     )
-    if not check("diff_old_new", r.returncode == 0, f"rc={r.returncode}"):
-        return emit(workdir, result, 1)
+    check(result, "diff_old_new", completed.returncode == 0, f"rc={completed.returncode}")
     try:
-        diff_doc = json.loads(r.stdout)
+        diff_doc = json.loads(completed.stdout)
+        diff_detail = f"schema={diff_doc.get('schema')}"
         diff_ok = diff_doc.get("schema") == "p11scope/inventory-diff/v1"
-    except Exception as exc:
+    except json.JSONDecodeError as exc:
+        diff_doc = {}
+        diff_detail = f"diff JSON parse: {exc}"
         diff_ok = False
-    if not check("diff_typed", diff_ok, "schema=inventory-diff/v1"):
-        return emit(workdir, result, 1)
+    check(result, "diff_typed", diff_ok, diff_detail)
 
-    # 3. B1: departed_use delta is exactly B1+additive, nothing else.
-    old = json.loads(old_report.read_text())
-    new = json.loads(new_report.read_text())
+    # 3. B1: departed_use delta is exactly B1+additive, nothing else, and
+    # every pinned B1 key is present in the new typed report.
+    try:
+        old = load_json_file(old_report)
+        new = load_json_file(new_report)
+    except ValueError as exc:
+        check(result, "b1_exact", False, f"report load: {exc}")
     old_keys = set(flatten_keys(old))
     new_keys = set(flatten_keys(new))
-    new_only = new_keys - old_keys
-    old_only = old_keys - new_keys
-    if not check("b1_no_removed", len(old_only) == 0, f"removed={sorted(old_only)}"):
-        return emit(workdir, result, 1)
-    allowed = set(B1_KEYS) | set(ADDITIVE_KEYS)
-    # modules[0].departed_use appears as null in new scan reports; flatten
-    # yields the key itself (no children for null). Budgets children of
-    # departed_use/native_departed appear as listed.
-    unexpected = new_only - allowed
-    missing_b1 = set(B1_KEYS) - new_only - old_keys
-    # B1 keys that are null/absent in this shape still count if the code
-    # emits them elsewhere; require at least the top-level markers.
-    for marker in ("budgets.departed_use", "modules[0].departed_use"):
-        if marker not in new_keys:
-            if not check("b1_present", False, f"missing {marker}"):
-                return emit(workdir, result, 1)
-    if not check(
+    delta = evaluate_b1_delta(old_keys, new_keys)
+    check(
+        result,
+        "b1_no_removed",
+        len(delta["removed"]) == 0,
+        f"removed={sorted(delta['removed'])}",
+    )
+    check(
+        result,
+        "b1_all_present",
+        len(delta["missing_b1"]) == 0,
+        f"missing B1={sorted(delta['missing_b1'])}",
+    )
+    check(
+        result,
         "b1_exact",
-        len(unexpected) == 0,
-        f"unexpected new keys={sorted(unexpected)}",
-    ):
-        return emit(workdir, result, 1)
-    # Old must carry no departed_use anywhere in its bytes.
-    if not check(
+        len(delta["unexpected"]) == 0,
+        f"unexpected new keys={sorted(delta['unexpected'])}",
+    )
+    old_has_departed = key_exists(old, "departed_use")
+    check(
+        result,
         "b1_old_absent",
-        "departed_use" not in old_report.read_text(),
-        "old report mentions departed_use",
-    ):
-        return emit(workdir, result, 1)
+        not old_has_departed,
+        "departed_use key present in old report"
+        if old_has_departed
+        else "no departed_use key in old report",
+    )
 
-    # 4. B2: live_joint_feed_absent in v1-v5 schemas, new reader accepts it.
+    # 4. B2: live_joint_feed_absent in the v1-v5 reason enums, and the new
+    # reader renders it through rather than merely exiting zero.
+    schema_names = [
+        "docs/schema/inventory-v1-object-observations.schema.json",
+        *(
+            f"docs/schema/inventory-v1-object-observations-{version}.schema.json"
+            for version in ("v2", "v3", "v4", "v5")
+        ),
+    ]
     try:
-        b2_old_has = []
-        b2_new_has = []
-        for ver in ("v2", "v3", "v4", "v5"):
-            name = f"docs/schema/inventory-v1-object-observations-{ver}.schema.json"
-            old_schema = git_show("v0.7.1", name).decode()
-            new_schema = (ROOT / name).read_text()
-            b2_old_has.append("live_joint_feed_absent" in old_schema)
-            b2_new_has.append("live_joint_feed_absent" in new_schema)
-        # v1 is the unversioned base file.
-        old_base = git_show(
-            "v0.7.1", "docs/schema/inventory-v1-object-observations.schema.json"
-        ).decode()
-        new_base = (
-            ROOT / "docs/schema/inventory-v1-object-observations.schema.json"
-        ).read_text()
-        b2_old_has.append("live_joint_feed_absent" in old_base)
-        b2_new_has.append("live_joint_feed_absent" in new_base)
-    except subprocess.CalledProcessError as exc:
-        return emit(workdir, result, 1) if not check(
-            "b2_schemas", False, f"git show: {exc}"
-        ) else 1
-    if not check(
-        "b2_old_absent", not any(b2_old_has), f"old schemas carry the reason: {b2_old_has}"
-    ):
-        return emit(workdir, result, 1)
-    if not check(
-        "b2_new_present", all(b2_new_has), f"new schemas missing it: {b2_new_has}"
-    ):
-        return emit(workdir, result, 1)
-    # New cbom must accept a report carrying the new reason.
-    injected = json.loads(old_report.read_text())
-    injected["object_observations"] = {
-        "version": 1,
-        "revision": 1,
-        "status": "partial",
-        "reason": "live_joint_feed_absent",
-        "budgets": injected["object_observations"]["budgets"],
-        "gaps": {"rows": [], "suppressed": 0},
-        "key_operations": [],
-        "objects": [],
-        "sessions": [],
-        "unknown_key_operations": [],
-    }
+        old_schemas = {
+            name: json.loads(git_show("v0.7.1", name).decode()) for name in schema_names
+        }
+        new_schemas = {name: json.loads((ROOT / name).read_text()) for name in schema_names}
+    except (subprocess.CalledProcessError, OSError, json.JSONDecodeError) as exc:
+        check(result, "b2_schemas", False, f"schema load: {exc}")
+    old_carrying = [
+        name
+        for name, schema in old_schemas.items()
+        if schema_reason_has(schema, LIVE_JOINT_REASON)
+    ]
+    check(
+        result,
+        "b2_old_absent",
+        not old_carrying,
+        f"old schemas carrying the reason={old_carrying}",
+    )
+    new_missing = [
+        name
+        for name, schema in new_schemas.items()
+        if not schema_reason_has(schema, LIVE_JOINT_REASON)
+    ]
+    check(
+        result,
+        "b2_new_present",
+        not new_missing,
+        f"new schemas missing the reason={new_missing}",
+    )
+
+    try:
+        injected = load_json_file(old_report)
+        budgets = injected["object_observations"]["budgets"]
+        if not isinstance(budgets, dict):
+            raise TypeError("object_observations.budgets is not an object")
+        injected["object_observations"] = {
+            "version": 1,
+            "revision": 1,
+            "status": "partial",
+            "reason": LIVE_JOINT_REASON,
+            "budgets": budgets,
+            "gaps": {"rows": [], "suppressed": 0},
+            "key_operations": [],
+            "objects": [],
+            "sessions": [],
+            "unknown_key_operations": [],
+        }
+    except (ValueError, KeyError, TypeError) as exc:
+        check(result, "b2_reader_accepts", False, f"cannot build injection: {exc}")
     injected_path = workdir / "injected-live-joint.json"
     injected_path.write_text(json.dumps(injected))
-    r = run([str(args.new_binary), "inventory", "cbom", str(injected_path), "--json"])
-    if not check("b2_reader_accepts", r.returncode == 0, f"rc={r.returncode}"):
-        return emit(workdir, result, 1)
+    completed = run([str(args.new_binary), "inventory", "cbom", str(injected_path), "--json"])
+    rendered = None
+    cbom = {}
+    reader_detail = f"rc={completed.returncode}"
+    if completed.returncode == 0:
+        try:
+            cbom = json.loads(completed.stdout)
+            if cbom.get("bomFormat") != "CycloneDX":
+                reader_detail = f"bomFormat={cbom.get('bomFormat')}"
+            else:
+                rendered = cbom_properties(cbom).get("p11scope:object_observations")
+                reader_detail = f"object_observations={rendered!r}"
+        except json.JSONDecodeError as exc:
+            reader_detail = f"cbom JSON parse: {exc}"
+    expected_render = f"partial ({LIVE_JOINT_REASON})"
+    rendered_ok = cbom_live_joint_rendered(cbom)
+    check(
+        result,
+        "b2_reader_accepts",
+        rendered_ok,
+        f"{reader_detail}, expected {expected_render!r}",
+    )
 
-    # 5. B3: profile schema requires exactly the three new evidence fields.
+    # 5. B3: profile schema requires exactly the three new evidence fields
+    # in the profile-lane then.required and exactly those plus
+    # coverage_retired_slots in the full evidence-required delta.
     try:
         old_prof = json.loads(
             git_show("v0.7.1", "docs/schema/observed-profile-v3.schema.json").decode()
@@ -351,35 +573,8 @@ def main() -> int:
         new_prof = json.loads(
             (ROOT / "docs/schema/observed-profile-v3.schema.json").read_text()
         )
-    except subprocess.CalledProcessError as exc:
-        return emit(workdir, result, 1) if not check(
-            "b3_schemas", False, f"git show: {exc}"
-        ) else 1
-    # The three fields live under evidence.properties and in an allOf
-    # required list. Compare required sets.
-    def required_evidence(schema):
-        req = set()
-        ev = schema.get("properties", {}).get("evidence", {})
-        req.update(ev.get("required", []))
-        for clause in schema.get("allOf", []):
-            # allOf entries nest required under then.properties.evidence
-            # (profile lane) or properties.evidence.
-            for container in (clause, clause.get("then", {})):
-                props = container.get("properties", {}).get("evidence", {})
-                req.update(props.get("required", []))
-            for sub in clause.get("allOf", []):
-                sub_props = sub.get("properties", {}).get("evidence", {})
-                req.update(sub_props.get("required", []))
-        return req
-
-    def then_required(schema):
-        # The profile-lane then.required list (where the three live).
-        for clause in schema.get("allOf", []):
-            then = clause.get("then", {})
-            props = then.get("properties", {}).get("evidence", {})
-            if props.get("required"):
-                return set(props["required"])
-        return set()
+    except (subprocess.CalledProcessError, OSError, json.JSONDecodeError) as exc:
+        check(result, "b3_schemas", False, f"schema load: {exc}")
 
     old_req = required_evidence(old_prof)
     new_req = required_evidence(new_prof)
@@ -388,33 +583,27 @@ def main() -> int:
     old_then = then_required(old_prof)
     new_then = then_required(new_prof)
     then_added = new_then - old_then
-    # Upgrade notes list exactly the three in the profile-lane then.required.
-    if not check(
+    then_removed = old_then - new_then
+    check(
+        result,
         "b3_then_exact",
-        then_added == set(B3_FIELDS) and len(old_then - new_then) == 0,
-        f"then_added={sorted(then_added)}",
-    ):
-        return emit(workdir, result, 1)
-    # Full required delta must be exactly the three plus the documented
-    # coverage_retired_slots (see below); nothing else.
+        then_added == set(B3_FIELDS) and not then_removed,
+        f"then_added={sorted(then_added)} then_removed={sorted(then_removed)}",
+    )
     expected_added = set(B3_FIELDS) | {"coverage_retired_slots"}
-    if not check(
+    check(
+        result,
         "b3_exact",
-        added == expected_added and len(removed) == 0,
+        added == expected_added and not removed,
         f"added={sorted(added)} removed={sorted(removed)}",
-    ):
-        return emit(workdir, result, 1)
-    # coverage_retired_slots is a fourth new required evidence field but the
-    # upgrade notes' B3 line lists only the three run-gap fields. The gate
-    # passes on the exact typed set (three + coverage, nothing else); the
-    # notes gap is recorded here for the docs lane, not hidden.
-    if not check(
-        "b3_coverage_noted",
-        "coverage_retired_slots" in added,
-        "coverage_retired_slots present but undocumented in upgrade notes B3",
-    ):
-        return emit(workdir, result, 1)
-    # New cbom still reads an old-shaped profile (lenient reader).
+    )
+    result["notes"]["b3_coverage"] = (
+        "coverage_retired_slots is part of the exact full required delta but is "
+        "not one of the three upgrade-note run-gap fields; docs lane owns that note"
+    )
+
+    # New cbom still reads an old-shaped profile (lenient reader) and the
+    # typed profile markers flow through, so this is not an rc-only check.
     minimal_profile = {
         "schema": "p11scope/observed-profile/v3",
         "lane": "profile",
@@ -425,9 +614,28 @@ def main() -> int:
     }
     prof_path = workdir / "v071-shaped-profile.json"
     prof_path.write_text(json.dumps(minimal_profile))
-    r = run([str(args.new_binary), "inventory", "cbom", str(prof_path), "--json"])
-    if not check("b3_reader_accepts_old", r.returncode == 0, f"rc={r.returncode}"):
-        return emit(workdir, result, 1)
+    completed = run([str(args.new_binary), "inventory", "cbom", str(prof_path), "--json"])
+    props = {}
+    cbom = {}
+    profile_detail = f"rc={completed.returncode}"
+    if completed.returncode == 0:
+        try:
+            cbom = json.loads(completed.stdout)
+            if cbom.get("bomFormat") != "CycloneDX":
+                profile_detail = f"bomFormat={cbom.get('bomFormat')}"
+            else:
+                props = cbom_properties(cbom)
+                profile_detail = "typed profile markers present"
+        except json.JSONDecodeError as exc:
+            profile_detail = f"cbom JSON parse: {exc}"
+    profile_ok = completed.returncode == 0 and cbom_profile_markers_present(cbom)
+    if not profile_ok and props:
+        profile_detail = (
+            f"source_schema={props.get('p11scope:source_schema')!r} "
+            f"window={props.get('p11scope:window')!r} "
+            f"profile_note={props.get('p11scope:profile_note')!r}"
+        )
+    check(result, "b3_reader_accepts_old", profile_ok, profile_detail)
 
     result["status"] = "pass"
     return emit(workdir, result, 0)
@@ -438,6 +646,31 @@ def emit(workdir: Path, result: dict, code: int) -> int:
     out.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
     print(json.dumps(result, indent=2, sort_keys=True))
     return code
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--old-binary", required=True, type=Path)
+    parser.add_argument("--new-binary", required=True, type=Path)
+    parser.add_argument("--workdir", required=True, type=Path)
+    args = parser.parse_args()
+    workdir = args.workdir
+    result = initial_result()
+    try:
+        workdir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        result["checks"]["internal"] = {"pass": False, "detail": repr(exc)}
+        result["fail_reason"] = f"internal: {exc!r}"
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 1
+    try:
+        return run_gate(args, workdir, result)
+    except GateFailure:
+        return emit(workdir, result, 1)
+    except Exception as exc:  # typed failure record even for an unexpected checker bug
+        result["checks"]["internal"] = {"pass": False, "detail": repr(exc)}
+        result["fail_reason"] = f"internal: {exc!r}"
+        return emit(workdir, result, 1)
 
 
 if __name__ == "__main__":

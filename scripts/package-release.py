@@ -344,10 +344,21 @@ def commit_epoch(root: Path) -> int:
     return value
 
 
-def system_package_description(capture_mode: str, version: str) -> str:
-    variant = ("FULL official build with object-attribute capture enabled"
+def system_package_variant(capture_mode: str, test_build: bool = False) -> str:
+    capture = ("object-attribute capture enabled"
                if capture_mode == "full" else
-               "P0 official build with object-attribute capture disabled")
+               "object-attribute capture disabled")
+    if test_build:
+        return (f"TEST build for upgrade mechanics with {capture}; "
+                "not an official release")
+    return (f"FULL official build with {capture}"
+            if capture_mode == "full" else
+            f"P0 official build with {capture}")
+
+
+def system_package_description(capture_mode: str, version: str,
+                               test_build: bool = False) -> str:
+    variant = system_package_variant(capture_mode, test_build)
     return (f"{SYSTEM_PACKAGE_SUMMARY}.\n"
             f" This is the {variant} ({version}).\n"
             " .\n"
@@ -388,15 +399,18 @@ def run_tool(arguments, epoch: int, what: str):
 
 
 def build_deb(staging: Path, observer: bytes, helper: bytes, docs,
-              version: str, capture_mode: str, epoch: int) -> bytes:
+              version: str, capture_mode: str, epoch: int,
+              test_build: bool = False) -> bytes:
     dpkg_deb = shutil.which("dpkg-deb")
     if not dpkg_deb:
         raise ValueError("dpkg-deb is required to build the DEB package")
     root = staging / "deb"
+    description = system_package_description(capture_mode, version,
+                                             test_build=test_build)
     control = (f"Package: p11scope\nVersion: {version}\nSection: utils\n"
                f"Priority: optional\nArchitecture: amd64\n"
                f"Maintainer: {SYSTEM_PACKAGE_MAINTAINER}\n"
-               f"Description: {system_package_description(capture_mode, version)}\n")
+               f"Description: {description}\n")
     files = {"DEBIAN/control": (control.encode(), 0o644),
              "usr/bin/p11scope": (observer, 0o755),
              "usr/bin/p11scope-discover": (helper, 0o755)}
@@ -410,7 +424,8 @@ def build_deb(staging: Path, observer: bytes, helper: bytes, docs,
 
 
 def build_rpm(staging: Path, observer: bytes, helper: bytes, docs,
-              version: str, capture_mode: str, epoch: int) -> bytes:
+              version: str, capture_mode: str, epoch: int,
+              test_build: bool = False) -> bytes:
     rpmbuild = shutil.which("rpmbuild")
     if not rpmbuild:
         raise ValueError("rpmbuild is required to build the RPM package")
@@ -425,9 +440,7 @@ def build_rpm(staging: Path, observer: bytes, helper: bytes, docs,
     for name, (data, mode) in docs.items():
         files[f"usr/share/doc/p11scope/{name}"] = (data, mode)
     write_tree(buildroot, files, epoch)
-    variant = ("FULL official build with object-attribute capture enabled"
-               if capture_mode == "full" else
-               "P0 official build with object-attribute capture disabled")
+    variant = system_package_variant(capture_mode, test_build)
     doc_entries = "\n".join(f"/usr/share/doc/p11scope/{name}"
                             for name in sorted(docs))
     spec = (f"Name: p11scope\nVersion: {version}\nRelease: 1\n"

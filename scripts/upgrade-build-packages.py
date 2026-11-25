@@ -90,10 +90,12 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="p11scope-upgrade-") as staging_name:
         staging = Path(staging_name)
         deb_data = PACKAGE.build_deb(
-            staging, observer, helper, docs, version, args.capture_mode, epoch
+            staging, observer, helper, docs, version, args.capture_mode, epoch,
+            test_build=True
         )
         rpm_data = PACKAGE.build_rpm(
-            staging, observer, helper, docs, version, args.capture_mode, epoch
+            staging, observer, helper, docs, version, args.capture_mode, epoch,
+            test_build=True
         )
     deb_name = f"p11scope_{version}_amd64.deb"
     rpm_name = f"p11scope-{version}-1.x86_64.rpm"

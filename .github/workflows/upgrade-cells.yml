@@ -104,7 +104,7 @@ jobs:
           set -euo pipefail
           # Ubuntu runners have no rpm db; init it so rpm -i/-U works.
           sudo mkdir -p /var/lib/rpm
-          sudo rpm --initdb 2>/dev/null || true
+          sudo rpm --initdb
           sudo scripts/upgrade-gate5.sh --format rpm \
             --old "$RUNNER_TEMP/old-pkgs/p11scope-0.7.1-1.x86_64.rpm" \
             --new "$RUNNER_TEMP/new-pkgs/p11scope-"*"-1.x86_64.rpm" \

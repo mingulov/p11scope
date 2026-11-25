@@ -46419,8 +46419,6 @@ int main(void) {
             "the converged scan shows no live in-progress gap"
         );
     }
-        );
-    }
 }
 
 #[cfg(test)]

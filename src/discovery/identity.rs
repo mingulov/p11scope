@@ -18644,6 +18644,89 @@ mod tests {
         );
     }
 
+    /// Twin (B1 discriminator, controller ruling 17:27): an
+    /// UNAVAILABLE observation and a REFUSED observation on one key
+    /// stay distinct. The unavailable one files its named skip
+    /// without refusing, so the lone refusal pairs with nothing —
+    /// no ambiguity, no rejection — and a proven peer filed after
+    /// still binds.
+    #[test]
+    fn unavailable_and_refused_observations_on_one_key_stay_distinct() {
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let mut source = image_pins(&[(key, "aaaaaaaa", 1)]);
+        let entry = source.by_id.pop_first().unwrap().1;
+        let raw = entry.raw.clone();
+        let mut pins = PinnedObjects::empty();
+        let mut skipped = Vec::new();
+        record_scanned_candidate(
+            &mut pins,
+            ProcessViewId(1),
+            raw.clone(),
+            Err(PinOutcome::Unproven {
+                cause: UnprovenCause::IdentityUnreadable,
+                reason: "mapping identity unavailable: mount table unreadable".to_string(),
+            }),
+            &mut skipped,
+            true,
+        );
+        record_scanned_candidate(
+            &mut pins,
+            ProcessViewId(2),
+            raw.clone(),
+            Err(PinOutcome::Unproven {
+                cause: UnprovenCause::OpenFailed,
+                reason: "TEST refused".to_string(),
+            }),
+            &mut skipped,
+            true,
+        );
+        assert_eq!(
+            pins.refused_keys,
+            BTreeSet::from([(ProcessViewId(2), key)]),
+            "only the refused observation refuses: {:?}",
+            pins.refused_keys
+        );
+        assert!(
+            pins.ambiguous_keys.is_empty(),
+            "a lone refusal pairs with nothing: {:?}",
+            pins.ambiguous_keys
+        );
+        assert!(
+            !pins.rejects(key),
+            "the key stays admitted without a proven collision"
+        );
+        assert!(
+            skipped
+                .iter()
+                .any(|skip| skip.reason.contains("mount table unreadable")),
+            "the unavailable observation keeps its named skip: {skipped:?}"
+        );
+        assert!(
+            skipped.iter().any(|skip| skip.reason.contains("TEST refused")),
+            "the refused observation keeps its named skip: {skipped:?}"
+        );
+        record_scanned_candidate(
+            &mut pins,
+            ProcessViewId(3),
+            raw,
+            Ok(entry),
+            &mut skipped,
+            true,
+        );
+        assert_eq!(
+            pins.pinned().count(),
+            1,
+            "a proven peer filed after still binds"
+        );
+        assert!(
+            !pins.rejects(key),
+            "the proven peer stays admitted: {skipped:?}"
+        );
+    }
+
     /// Re-exec channel for the self-chrooting pin fixture below. The parent
     /// half respawns this same test binary with these variables set; the child
     /// half enters a fresh mount namespace (via the `unshare(1)` launch),

@@ -24043,6 +24043,9 @@ int main(int argc, char **argv) {
             reads > 0,
             "scan 3 re-opens (hinted group) instead of hitting: {reads}"
         );
+        // Proved by the narrowed-only mutant (fails here with this
+        // message): broader guard mutants trip the reads assert
+        // above first, so they prove nothing about this line.
         assert_eq!(
             budget.preopen_hits_for_test(),
             hits,

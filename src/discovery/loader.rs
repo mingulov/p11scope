@@ -989,6 +989,11 @@ mod tests {
         assert_eq!(registry.allocated_contexts(), MAX_LOADER_CONTEXTS);
         let truncated = registry.discovery_truncated();
         let error = registry.preflight(spec(None)).unwrap_err();
+        assert_eq!(
+            registry.allocated_contexts(),
+            MAX_LOADER_CONTEXTS,
+            "a failed preflight allocates nothing"
+        );
         assert_eq!(registry.discovery_truncated(), truncated);
         registry.record_preflight_failure();
         assert!(error.contains("capacity 256"), "{error}");

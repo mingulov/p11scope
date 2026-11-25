@@ -3346,6 +3346,24 @@ impl PinnedObjects {
         self.ownership.keys().copied().collect()
     }
 
+    /// Test-only read of every view holding a scan-record set, so
+    /// retirement twins pin that no stale custody survives.
+    #[cfg(test)]
+    pub(crate) fn raw_ownership_views_for_test(&self) -> Vec<ProcessViewId> {
+        self.raw_ownership.keys().copied().collect()
+    }
+
+    /// Test-only read of every view holding a refusal mark, so
+    /// retirement twins pin that marks never outlive their view.
+    #[cfg(test)]
+    pub(crate) fn refused_views_for_test(&self) -> Vec<ProcessViewId> {
+        let mut views: Vec<ProcessViewId> =
+            self.refused_keys.iter().map(|(view, _)| *view).collect();
+        views.sort();
+        views.dedup();
+        views
+    }
+
     /// Ids that stay resolvable without ownership claims anywhere: the
     /// except-carry shape. Global purges spare them (one view's replace
     /// or prune must not drop another view's carried coverage); fully
@@ -12865,6 +12883,31 @@ pub(crate) mod test_fixture {
         pins.raw_ownership.entry(view).or_default().insert(raw);
     }
 
+    /// Files a refused observation for `view`: the
+    /// `record_scanned_candidate` refusal arm through a refusing
+    /// cause. The view's own raw stays unfiled (a refusal proves
+    /// nothing), so the key's other raws and pins are untouched.
+    pub(crate) fn record_refusal(
+        pins: &mut PinnedObjects,
+        view: ProcessViewId,
+        raw: RawObjectInstance,
+        reason: &str,
+    ) -> Vec<Skipped> {
+        let mut skipped = Vec::new();
+        super::record_scanned_candidate(
+            pins,
+            view,
+            raw,
+            Err(PinOutcome::Unproven {
+                cause: UnprovenCause::OpenFailed,
+                reason: reason.to_string(),
+            }),
+            &mut skipped,
+            false,
+        );
+        skipped
+    }
+
     /// Owns every pinned raw under its key-derived view (fixture keys
     /// encode their view in device.minor, see `module()`): the
     /// `raw_ownership` rows `record_scanned_candidate` would have
@@ -20308,6 +20351,194 @@ mod tests {
             ambiguity_count(&all_skips),
             1,
             "exactly one bounded ambiguity row: {all_skips:?}"
+        );
+    }
+
+    /// Twin (V3/B4 killing test): retiring a view drops its scan
+    /// records with its claims — a reused numeric view ID resolves
+    /// nothing through the previous generation's custody, even while
+    /// a live peer owns the identical raw.
+    #[test]
+    fn reused_view_id_resolves_nothing_through_retired_scan_records() {
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let r = ProcessViewId(41);
+        let l = ProcessViewId(42);
+        let w = ProcessViewId(43);
+        let module_for = |view| {
+            let mut m = module(key);
+            m.view = view;
+            m
+        };
+        // R and L share one pin.
+        let mut pins = PinnedObjects::empty();
+        let mut skipped = Vec::new();
+        for view in [r, l] {
+            let filed = view_pin(&module_for(view), 1, SHA, 1, false);
+            let entry = filed.by_id.values().next().unwrap().clone();
+            let raw = entry.raw.clone();
+            record_scanned_candidate(&mut pins, view, raw, Ok(entry), &mut skipped, true);
+        }
+        assert_eq!(pins.pinned().count(), 1, "R and L share one pin");
+        let id = pins
+            .id_for_scanned(&module_for(r), key, PATH)
+            .expect("R resolves through its live records");
+        // Retire R with carry, then L.
+        pins.retire_view_except_proven(r, RetirementProof::Exited, &BTreeSet::from([id]));
+        pins.retire_view_only_if_proven_gone(l, RetirementProof::Exited);
+        // W pins the same raw again.
+        let filed = view_pin(&module_for(w), 1, SHA, 1, false);
+        let entry = filed.by_id.values().next().unwrap().clone();
+        let raw = entry.raw.clone();
+        record_scanned_candidate(&mut pins, w, raw.clone(), Ok(entry), &mut skipped, true);
+        // The new generation under the reused ID R proves nothing:
+        // its own pin stays unreadable, so it files a skip. (The
+        // unavailable cause is the non-scrubbing failure here: a
+        // scrubbing refusal would remove W's routing too.)
+        record_scanned_candidate(
+            &mut pins,
+            r,
+            raw,
+            Err(PinOutcome::Unproven {
+                cause: UnprovenCause::IdentityUnreadable,
+                reason: "mapping identity unavailable: mount table unreadable".to_string(),
+            }),
+            &mut skipped,
+            true,
+        );
+        assert!(
+            pins.id_for_scanned(&module_for(r), key, PATH).is_none(),
+            "the reused ID resolves nothing through retired records"
+        );
+    }
+
+    /// Twin (V4 killing test): refusal marks belong to one process
+    /// generation — retiring a view prunes its marks, so a reused
+    /// numeric ID files cleanly and never contradiction-nukes a live
+    /// peer's pin.
+    #[test]
+    fn reused_view_id_after_a_refusal_files_without_contradiction() {
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let v = ProcessViewId(51);
+        let w = ProcessViewId(52);
+        let mut module_w = module(key);
+        module_w.view = w;
+        let mut pins = PinnedObjects::empty();
+        let mut skipped = Vec::new();
+        // W holds a proven pin for K...
+        let filed = view_pin(&module_w, 1, SHA, 1, false);
+        let entry_w = filed.by_id.values().next().unwrap().clone();
+        record_scanned_candidate(
+            &mut pins,
+            w,
+            entry_w.raw.clone(),
+            Ok(entry_w.clone()),
+            &mut skipped,
+            true,
+        );
+        // ...while V refuses K from its own unfiled raw, then retires
+        // without ever filing (the early-return path).
+        let mut module_v = module(key);
+        module_v.view = v;
+        module_v.mount_namespace = MountNamespaceId { device: 1, inode: 100 };
+        let raw_v = RawObjectInstance::scanned(&module_v, key, "/v/lib.so").unwrap();
+        record_scanned_candidate(
+            &mut pins,
+            v,
+            raw_v,
+            Err(PinOutcome::Unproven {
+                cause: UnprovenCause::OpenFailed,
+                reason: "TEST refused".to_string(),
+            }),
+            &mut skipped,
+            true,
+        );
+        assert_eq!(
+            pins.refused_keys,
+            BTreeSet::from([(v, key)]),
+            "V's refusal is marked"
+        );
+        pins.retire_view_only_if_proven_gone(v, RetirementProof::Exited);
+        // The successor generation under V files K for the same file.
+        record_scanned_candidate(
+            &mut pins,
+            v,
+            entry_w.raw.clone(),
+            Ok(entry_w),
+            &mut skipped,
+            true,
+        );
+        assert!(
+            skipped
+                .iter()
+                .all(|skip| !skip.reason.contains("contradicts filed")),
+            "no contradiction gap: {skipped:?}"
+        );
+        assert!(
+            pins.id_for_scanned(&module_w, key, PATH).is_some(),
+            "W's pin survives the successor's filing"
+        );
+        assert_eq!(
+            pins.pinned().count(),
+            1,
+            "the identical proof merges onto W's pin"
+        );
+
+        // Second leg: a view that filed (ownership present) and
+        // refused another key prunes its marks on that path too.
+        let key2 = ObjectKey {
+            device: Device { major: 8, minor: 2 },
+            inode: INODE + 1,
+        };
+        let key3 = ObjectKey {
+            device: Device { major: 8, minor: 3 },
+            inode: INODE + 2,
+        };
+        let mut pins = PinnedObjects::empty();
+        let mut skipped = Vec::new();
+        let mut module2 = module(key2);
+        module2.view = v;
+        let filed = view_pin(&module2, 1, SHA, 1, false);
+        let entry2 = filed.by_id.values().next().unwrap().clone();
+        record_scanned_candidate(
+            &mut pins,
+            v,
+            entry2.raw.clone(),
+            Ok(entry2),
+            &mut skipped,
+            true,
+        );
+        let mut module3 = module(key3);
+        module3.view = v;
+        module3.mount_namespace = MountNamespaceId { device: 1, inode: 100 };
+        let raw3 = RawObjectInstance::scanned(&module3, key3, "/v/other.so").unwrap();
+        record_scanned_candidate(
+            &mut pins,
+            v,
+            raw3,
+            Err(PinOutcome::Unproven {
+                cause: UnprovenCause::OpenFailed,
+                reason: "TEST refused".to_string(),
+            }),
+            &mut skipped,
+            true,
+        );
+        assert!(pins.ownership.contains_key(&v), "V holds ownership");
+        assert_eq!(
+            pins.refused_keys,
+            BTreeSet::from([(v, key3)]),
+            "V's refusal is marked"
+        );
+        pins.retire_view_only_if_proven_gone(v, RetirementProof::Exited);
+        assert!(
+            pins.refused_keys.is_empty(),
+            "retirement prunes the marks: {:?}",
+            pins.refused_keys
         );
     }
 

@@ -8926,6 +8926,57 @@ fn a_reused_id_keeps_each_process_judged_on_its_own_proof() {
     second.wait().unwrap();
 }
 
+/// Twin (V3/V4 release path): releasing a view ID clears both pin
+/// records for the ID — scan custody and refusal marks — so a later
+/// reuse starts clean even on paths that release without retiring
+/// the committed pins first.
+#[test]
+fn release_view_id_clears_the_released_views_pin_records() {
+    use crate::discovery::identity::test_fixture;
+    let mut engine = Engine::empty();
+    let view = ProcessViewId(7);
+    let key = ObjectKey {
+        device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+        inode: 56_317_450,
+    };
+    let mut module_v = test_fixture::module(key);
+    module_v.view = view;
+    // Committed live pins for the view, plus a refused mark under a
+    // second key from the view's own unfiled raw.
+    let filed = test_fixture::view_pin(&module_v, 1, test_fixture::SHA, 1, false);
+    assert!(engine.pinned.absorb(filed).is_empty());
+    test_fixture::record_scan_ownership(&mut engine.pinned, view, key, test_fixture::PATH);
+    let key2 = ObjectKey {
+        device: p11scope_manifest::maps::Device { major: 8, minor: 2 },
+        inode: 56_317_451,
+    };
+    let mut module2 = test_fixture::module(key2);
+    module2.view = view;
+    let raw2 =
+        RawObjectInstance::scanned(&module2, key2, "/v/other.so").expect("test raw builds");
+    test_fixture::record_refusal(&mut engine.pinned, view, raw2, "TEST refused");
+    assert!(
+        engine.pinned.raw_ownership_views_for_test().contains(&view),
+        "scan custody is staged"
+    );
+    assert!(
+        engine.pinned.refused_views_for_test().contains(&view),
+        "the refusal mark is staged"
+    );
+    engine.release_view_id(view);
+    assert!(
+        !engine
+            .pinned
+            .raw_ownership_views_for_test()
+            .contains(&view),
+        "release clears scan custody"
+    );
+    assert!(
+        !engine.pinned.refused_views_for_test().contains(&view),
+        "release clears refusal marks"
+    );
+}
+
 #[test]
 fn a_pending_assessment_is_written_off_when_its_id_is_released() {
     // An unanswerable assessment must not be inherited by the next

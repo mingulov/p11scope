@@ -2631,11 +2631,13 @@ impl PinnedObjects {
                 return false;
             }
         }
+        // Generations already match for every view `self` holds (the
+        // loop above), so only row membership is left to check here.
         candidate.raw_ownership.iter().all(|(view, raws)| {
             raws.iter().all(|raw| {
                 self.raw_ownership
                     .get(view)
-                    .is_some_and(|old| old.generation() == raws.generation() && old.contains(raw))
+                    .is_some_and(|old| old.contains(raw))
                     || (raw.mount_namespace.is_some()
                         && candidate.raw_to_id.get(raw) == Some(&loader))
             })

@@ -2231,7 +2231,7 @@ impl PinnedObjects {
         // cross-partition collision takes, and the proven marker
         // propagates only for proven collisions.
         for key in other.rejected_keys.iter().copied() {
-            self.reject_key(key);
+            self.reject_observation(key);
         }
         self.proven_collision_keys
             .extend(other.proven_collision_keys.iter().copied());
@@ -3450,6 +3450,22 @@ impl PinnedObjects {
             !unowned.contains(id)
                 && (!removed_raws.contains(raw) || retained_raws.contains(raw) || keep.contains(id))
         });
+        // Scan custody is evidence only while the object it proved is
+        // still carried. The purge above can drop a carried raw (the
+        // last owner leaves, or a re-pin replaces it); prune those
+        // observations instead of letting them prove a later reused
+        // view. Ownerless rows may remain only for live carry raws.
+        for raws in self.raw_ownership.values_mut() {
+            raws.retain(|raw| self.raw_to_id.contains_key(raw));
+        }
+        self.raw_ownership.retain(|_, raws| !raws.is_empty());
+        let carried_keys: BTreeSet<_> = self
+            .raw_to_id
+            .iter()
+            .filter_map(|(raw, id)| keep.contains(id).then_some(raw.key))
+            .collect();
+        self.refused_keys
+            .retain(|(refused_view, key)| *refused_view != view || carried_keys.contains(key));
         Some(removed)
     }
 
@@ -15032,6 +15048,13 @@ mod tests {
             "a rejected key is content"
         );
 
+        let mut refused = pin_set(&[(overlay(102), SHA, 7), (overlay(104), SHA, 9)], false);
+        refused.refused_keys.insert((ProcessViewId(77), overlay(102)));
+        assert!(
+            !one.same_pin_content(&refused),
+            "a refused view/key pair is content"
+        );
+
         let mut flagged = pin_set(&[(overlay(102), SHA, 7), (overlay(104), SHA, 9)], false);
         {
             let entry = flagged.by_id.values_mut().next().unwrap();
@@ -15202,7 +15225,7 @@ mod tests {
                 "round {round}: identical content must match in any order"
             );
 
-            let mutated = match xorshift(&mut state) % 5 {
+            let mutated = match xorshift(&mut state) % 6 {
                 0 => {
                     let mut m = pin_set(&refs, false);
                     m.by_id.values_mut().next().unwrap().sha256.push('x');
@@ -15221,6 +15244,11 @@ mod tests {
                 3 => {
                     let mut m = pin_set(&refs, false);
                     m.reject_key(refs[0].0);
+                    m
+                }
+                4 => {
+                    let mut m = pin_set(&refs, false);
+                    m.refused_keys.insert((ProcessViewId(90), refs[0].0));
                     m
                 }
                 _ => {

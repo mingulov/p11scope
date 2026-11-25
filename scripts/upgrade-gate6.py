@@ -85,6 +85,21 @@ B1_KEYS = frozenset(
 # Pinned: any new key outside B1+ADDITIVE fails the "nothing else" proof.
 ADDITIVE_KEYS = frozenset(
     [
+        "instance_reload_not_excluded",
+        "instance_reload_not_excluded.continued_across_global",
+        "instance_reload_not_excluded.identities",
+        "instance_reload_not_excluded.identities[0].instances",
+        "instance_reload_not_excluded.identities[0].module",
+        "instance_reload_not_excluded.joined_across_global",
+        "object_observations.gaps.rows[0].reason",
+        "object_observations.gaps.rows[0].repeats",
+        "object_observations.gaps.rows[0].subject",
+        "object_observations.unattributed",
+        "object_observations.unattributed[0].count",
+        "object_observations.unattributed[0].reason",
+        "object_observations.unknown_key_operations[0].mechanisms",
+        "object_observations.unknown_key_operations[0].mechanisms[0].mechanism",
+        "object_observations.unknown_key_operations[0].mechanisms[0].terminals",
         "observation.semantic_capture.length_insert_failures",
         "observation.semantic_capture.length_stash_mismatches",
     ]

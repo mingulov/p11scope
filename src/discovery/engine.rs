@@ -12572,7 +12572,15 @@ struct MergeOverflow {
 /// `MAX_LIVE_TABLES_PER_MODULE`: the capture reads PARTIAL with this
 /// gap instead of silently losing the observed return's calls.
 const MERGE_LIVE_OVERFLOW_SUBJECT: &str = "live table merge";
-const MERGE_LIVE_OVERFLOW_REASON: &str = "a live-returned table past the 64-live-tables per-module allowance was dropped; its calls are not counted";
+
+/// The overflow reason, built from the live allowance so a future
+/// ceiling change cannot lie in output.
+fn merge_live_overflow_reason() -> String {
+    format!(
+        "a live-returned table past the {}-live-tables per-module allowance was dropped; its calls are not counted",
+        MAX_LIVE_TABLES_PER_MODULE
+    )
+}
 
 /// Truncate an over-cap module before it enters the store: proven
 /// (live-returned) tables sort first so the tail that drops and counts
@@ -15819,7 +15827,10 @@ impl Engine {
             self.merge_live_tables_dropped = self
                 .merge_live_tables_dropped
                 .saturating_add(overflow.live_dropped);
-            self.mark_live_loss(MERGE_LIVE_OVERFLOW_SUBJECT, MERGE_LIVE_OVERFLOW_REASON);
+            self.mark_live_loss(
+                MERGE_LIVE_OVERFLOW_SUBJECT,
+                &merge_live_overflow_reason(),
+            );
             if crate::run::capture_diagnostics_on() {
                 eprintln!(
                     "p11scope: live table merge dropped {} live tables past the per-module live allowance ({} total)",

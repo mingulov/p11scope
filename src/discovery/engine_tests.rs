@@ -41046,11 +41046,36 @@ fn merge_tables_marked_counts_live_overflow_with_a_named_gap() {
     assert!(
         engine.counters.object_skips.contains(&Skipped {
             subject: MERGE_LIVE_OVERFLOW_SUBJECT.into(),
-            reason: MERGE_LIVE_OVERFLOW_REASON.into(),
+            reason: merge_live_overflow_reason(),
         }),
         "live overflow marks its named gap: {:?}",
         engine.counters.object_skips
     );
+}
+
+#[test]
+fn live_overflow_reason_is_built_from_the_live_allowance() {
+    assert_eq!(
+        merge_live_overflow_reason(),
+        format!(
+            "a live-returned table past the {}-live-tables per-module allowance was dropped; its calls are not counted",
+            MAX_LIVE_TABLES_PER_MODULE
+        )
+    );
+}
+
+#[test]
+fn live_table_merge_gap_folds_to_the_generic_discovery_row() {
+    // The outer judge matches this exact folded row for the
+    // live-overflow class: if rendering ever preserves the subject
+    // instead, this pin fails first and the leg must be re-pointed,
+    // never silently blinded.
+    let projected = crate::render::capture_skipped_out(&Skipped {
+        subject: MERGE_LIVE_OVERFLOW_SUBJECT.into(),
+        reason: merge_live_overflow_reason(),
+    });
+    assert_eq!(projected.name, "discovery subject");
+    assert_eq!(projected.reason, "discovery unavailable");
 }
 
 #[test]

@@ -801,6 +801,26 @@ class JudgeTwins(unittest.TestCase):
         self.assertIn("want 4", summary)
         self.assertIn("mechanism 99", summary)
 
+    def test_no_semantic_edges_fails(self):
+        inv = copy.deepcopy(inventory(True))
+        inv["semantic_edges"] = []
+        rc, summary = run_judge(inv, verbose(True),
+                                inventory(False), verbose(False))
+        self.assertEqual(rc, 1, summary)
+        self.assertIn("pqc-sizes-rows: FAIL", summary)
+        self.assertIn("no semantic_edges", summary)
+
+    def test_mechanism_listed_twice_fails(self):
+        inv = copy.deepcopy(inventory(True))
+        mechs = inv["semantic_edges"][0]["mechanisms"]
+        mechs.append(dict(next(row for row in mechs
+                               if row["mechanism"] == 23)))
+        rc, summary = run_judge(inv, verbose(True),
+                                inventory(False), verbose(False))
+        self.assertEqual(rc, 1, summary)
+        self.assertIn("pqc-sizes-rows: FAIL", summary)
+        self.assertIn("listed twice", summary)
+
     def test_mechanism_missing_fails(self):
         inv = copy.deepcopy(inventory(True))
         mechs = inv["semantic_edges"][0]["mechanisms"]

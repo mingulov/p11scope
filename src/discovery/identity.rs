@@ -10442,6 +10442,7 @@ pub fn pin_scanned_view_objects(
         &self_mapped_file,
         None,
         Filing::Acquire(&mut table, DeferredReason::Live),
+        &mut Vec::new(),
     )
 }
 
@@ -10467,20 +10468,32 @@ pub(crate) fn pin_scanned_view_objects_with_reserve(
         &self_mapped_file,
         reserve,
         Filing::Untracked,
+        &mut Vec::new(),
     )
 }
 
 /// [`pin_scanned_view_objects`] with the filing destination for each
 /// proven pin: every site files `Acquire` (refusing) into its lane's
-/// table.
+/// table. `waits` collects the typed cause of every pin wait the
+/// loop files, in scan order (N1: the defer-whole tail reads these,
+/// never the gap text).
 pub(crate) fn pin_scanned_view_objects_with_filing(
     view: &ProcessView,
     modules: &[ScannedModule],
     budget: &mut CaptureWorkBudget,
     reserve: Option<&crate::fd_budget::FdReserveTick>,
     filing: Filing<'_>,
+    waits: &mut Vec<WaitCause>,
 ) -> Result<(PinnedObjects, Vec<Skipped>), String> {
-    pin_scanned_view_objects_with(view, modules, budget, &self_mapped_file, reserve, filing)
+    pin_scanned_view_objects_with(
+        view,
+        modules,
+        budget,
+        &self_mapped_file,
+        reserve,
+        filing,
+        waits,
+    )
 }
 
 /// [`pin_scanned_view_objects_with_filing`] for single-module pins
@@ -10504,6 +10517,7 @@ pub(crate) fn pin_scanned_view_objects_with_table(
         &self_mapped_file,
         reserve,
         Filing::Acquire(table, reason),
+        &mut Vec::new(),
     )
 }
 
@@ -10516,6 +10530,9 @@ type ReadPinnedIdentity<'a> = &'a dyn Fn(&std::fs::File) -> Result<MappedFile, S
 /// snapshot (fix7 F1, see the bridge above); `None` pins unbounded on
 /// that axis. `filing` is where each proven pin files: a refusing
 /// table row, no row, or a probe-local scratch dropped at return.
+/// `waits` collects the typed cause of every pin wait the loop
+/// files, in scan order — one entry per wait gap, so it aligns with
+/// the filed [`PIN_WAIT_SUBJECT`] gaps.
 fn pin_scanned_view_objects_with(
     view: &ProcessView,
     modules: &[ScannedModule],
@@ -10523,6 +10540,7 @@ fn pin_scanned_view_objects_with(
     pinned_identity: ReadPinnedIdentity<'_>,
     reserve: Option<&crate::fd_budget::FdReserveTick>,
     mut filing: Filing<'_>,
+    waits: &mut Vec<WaitCause>,
 ) -> Result<(PinnedObjects, Vec<Skipped>), String> {
     // Both the table-owning modules and every object a table entry points into: an
     // entry may land in a dependency the module itself only forwards to.
@@ -10617,6 +10635,7 @@ fn pin_scanned_view_objects_with(
                 WaitCause::ReserveStop,
                 PIN_RESERVE_STOP_DETAIL,
                 retries,
+                waits,
             );
             break;
         }
@@ -10638,6 +10657,7 @@ fn pin_scanned_view_objects_with(
                 WaitCause::BudgetStop,
                 PIN_BUDGET_STOP_DETAIL,
                 retries,
+                waits,
             );
             break;
         }
@@ -10673,6 +10693,7 @@ fn pin_scanned_view_objects_with(
                                     WaitCause::BudgetStop,
                                     PIN_BUDGET_STOP_DETAIL,
                                     retries,
+                                    waits,
                                 );
                                 break;
                             }
@@ -10692,6 +10713,9 @@ fn pin_scanned_view_objects_with(
             }
             Err(failure) => Err(failure),
         };
+        if let Err(PinOutcome::Wait { cause, .. }) = &candidate {
+            waits.push(*cause);
+        }
         record_scanned_candidate(
             &mut pinned,
             view.id(),
@@ -11030,6 +11054,27 @@ impl UnprovenCause {
     }
 }
 
+impl WaitCause {
+    /// Whether this wait names a capture-budget stop: the typed
+    /// counterpart of the `BUDGET_EXHAUSTION_REASONS` vocabulary
+    /// behind `scan::is_capture_budget_stop_reason`. Handle-class
+    /// waits (`HandleExhaustion`, `ReserveStop`, `BudgetStop`) are
+    /// not capture-budget stops: the defer-whole tail and the
+    /// pass-cursor member outcome treat them on the handles path,
+    /// as before.
+    pub(crate) fn is_capture_budget_stop(self) -> bool {
+        matches!(
+            self,
+            Self::IoCeiling
+                | Self::WorkCeiling
+                | Self::Deadline
+                | Self::ClockUnavailable
+                | Self::TableWindowCeiling
+                | Self::InterfaceWindowCeiling
+        )
+    }
+}
+
 /// Files one pre-emptive pin-loop stop (fix7 F1's reserve stop,
 /// fix8 F2's budget stop): this object plus every remaining one waits
 /// under the named `detail` gap — never attempted (or closed back out
@@ -11044,11 +11089,14 @@ fn record_pin_stop(
     cause: WaitCause,
     detail: &str,
     retries: bool,
+    waits: &mut Vec<WaitCause>,
 ) {
     let stop = || PinOutcome::wait(cause, detail.to_string());
     record_scanned_candidate(pinned, view, raw, Err(stop()), skipped, retries);
+    waits.push(cause);
     for raw in remaining {
         record_scanned_candidate(pinned, view, raw, Err(stop()), skipped, retries);
+        waits.push(cause);
     }
 }
 
@@ -20856,6 +20904,7 @@ mod tests {
             &|_| Ok(calibrated),
             None,
             Filing::Untracked,
+            &mut Vec::new(),
         )
         .unwrap();
         assert!(skipped.is_empty(), "{skipped:?}");
@@ -20876,6 +20925,7 @@ mod tests {
             &probe,
             None,
             Filing::Untracked,
+            &mut Vec::new(),
         )
         .unwrap();
         assert!(skipped.is_empty(), "{skipped:?}");
@@ -20895,6 +20945,7 @@ mod tests {
             &probe,
             None,
             Filing::Untracked,
+            &mut Vec::new(),
         )
         .unwrap();
         assert_eq!(probes.get(), 2 * usize::from(!reusable));
@@ -20952,6 +21003,7 @@ mod tests {
                 },
                 None,
                 Filing::Untracked,
+                &mut Vec::new(),
             )
             .unwrap();
             (objects.pinned().count(), skipped)

@@ -27,7 +27,7 @@ use crate::discovery::identity::{
     ManifestStaleReason, Pin, PinnedConservativeCursor, PinnedObjectId, PinnedObjects,
     PinnedTimingKey, PrearmPinnedInput, ReconciledModule, RetainedScannedInputs,
     RetiredFileHandoff, ScannedInputMeasure, ScannedRebindCursor, SelfMappingProbe,
-    StaleManifestObject, bind_scanned_modules, bind_scanned_modules_strict,
+    StaleManifestObject, WaitCause, bind_scanned_modules, bind_scanned_modules_strict,
     bind_scanned_modules_strict_gated, canonicalize_scanned_overlays, open_view_executable_cached,
     open_view_rooted_object_cached, opened_file_matches_maps,
     pin_manifest_objects_deferred_in_views_with_budget_and_filing,
@@ -6946,6 +6946,14 @@ struct DiscoveryCounters {
     /// that ended early. Whole modules, not entries — the module they belong to
     /// publishes no table, so nothing else in the plan records the loss.
     object_skips: Vec<Skipped>,
+    /// The typed cause of every pin wait this scan filed, in scan order
+    /// (N1): the defer-whole tail names these instead of guessing from
+    /// the fd-exhaustion text. One entry per [`PIN_WAIT_SUBJECT`]
+    /// gap the pin loop filed; waits are never excused as
+    /// ending-refusals, so the two stay aligned.
+    ///
+    /// [`PIN_WAIT_SUBJECT`]: crate::discovery::identity::PIN_WAIT_SUBJECT
+    pin_wait_causes: Vec<WaitCause>,
     /// Which §4.12 outcome each corroborated module got, so `discovery[]` can
     /// tell an agreement from a conflict instead of publishing a counter with
     /// nothing to explain it.
@@ -8099,7 +8107,9 @@ fn scan_and_pin_with_proof(
     // pending instead of opening into `EMFILE`. Every site files
     // through the single `acquire()`, so one scan can no longer retain
     // past the cap.
-    let pinned = pin_scanned_view_objects_with_filing(view, &modules, budget, reserve, filing);
+    let mut pin_wait_causes = Vec::new();
+    let pinned =
+        pin_scanned_view_objects_with_filing(view, &modules, budget, reserve, filing, &mut pin_wait_causes);
     stage.span(
         crate::timing::StageKind::Pin,
         "pin_view_objects",
@@ -8116,6 +8126,9 @@ fn scan_and_pin_with_proof(
     }
     let (pinned, pin_skips) =
         pinned.map_err(|error| anyhow!("pinning process view {:?}: {error}", view.id()))?;
+    // N1: the typed wait causes ride beside the gaps (waits are never
+    // excused below, so the two stay aligned one cause per wait gap).
+    counters.pin_wait_causes.extend(pin_wait_causes);
     for skipped in pin_skips {
         if excuse && skip_is_ending_refusal(&skipped) {
             counters.ending_suppressed_skips += 1;
@@ -8669,6 +8682,103 @@ fn scan_pins_waited_only_for_budget(skips: &[Skipped]) -> bool {
         waited = true;
     }
     waited
+}
+
+/// Which defer-whole tail a waited scan files (N1, controller 17:27,
+/// I3 scope): unanimous pre-emptive stops keep their tails, any
+/// real handle-exhaustion wait keeps the fd tail, and any other
+/// waited scan names its typed wait cause instead of guessing
+/// fd-exhaustion from the gap text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeferWholeTail {
+    /// Every wait is a reserve stop: nothing filled, the guard
+    /// tripped first.
+    Reserve,
+    /// Every wait is a library-handle budget stop.
+    Budget,
+    /// A handle-exhaustion wait (or no typed cause at all): the
+    /// legacy fd-table-exhausted tail.
+    Handles,
+    /// Name this capture-budget cause.
+    Cause(WaitCause),
+}
+
+/// Selects the defer-whole tail from the typed wait causes a scan
+/// recorded, in scan order. Pre-emptive stops break the pin loop,
+/// so they sort last; mixed capture-budget waits name the first
+/// cause. Empty causes fall back to the legacy text decision at the
+/// call site.
+fn defer_whole_tail(causes: &[WaitCause]) -> DeferWholeTail {
+    if causes.is_empty() {
+        return DeferWholeTail::Handles;
+    }
+    if causes
+        .iter()
+        .all(|cause| matches!(cause, WaitCause::ReserveStop))
+    {
+        return DeferWholeTail::Reserve;
+    }
+    if causes
+        .iter()
+        .all(|cause| matches!(cause, WaitCause::BudgetStop))
+    {
+        return DeferWholeTail::Budget;
+    }
+    if causes
+        .iter()
+        .any(|cause| matches!(cause, WaitCause::HandleExhaustion))
+    {
+        return DeferWholeTail::Handles;
+    }
+    match causes.iter().find(|cause| {
+        !matches!(
+            cause,
+            WaitCause::HandleExhaustion | WaitCause::ReserveStop | WaitCause::BudgetStop
+        )
+    }) {
+        Some(cause) => DeferWholeTail::Cause(*cause),
+        // Mixed pre-emptive stops only: the legacy fd text, as today.
+        None => DeferWholeTail::Handles,
+    }
+}
+
+/// The defer-whole head text naming one wait cause. Handle-class
+/// causes keep their dedicated tails and never reach here through
+/// [`defer_whole_tail`]; their arms stay as the defensive mapping.
+fn defer_whole_cause_head(cause: WaitCause) -> &'static str {
+    match cause {
+        WaitCause::IoCeiling => "capture attempted-I/O ceiling reached while reading a library",
+        WaitCause::WorkCeiling => "capture discovery work ceiling reached while scanning a library",
+        WaitCause::Deadline => "capture discovery deadline reached while scanning a library",
+        WaitCause::ClockUnavailable => "monotonic clock read failed while scanning a library",
+        WaitCause::TableWindowCeiling => {
+            "discovery window table decode allowance reached while scanning a library"
+        }
+        WaitCause::InterfaceWindowCeiling => {
+            "discovery window interface decode allowance reached while scanning a library"
+        }
+        WaitCause::HandleExhaustion => "fd table exhausted while opening a library",
+        WaitCause::ReserveStop => "capture file-descriptor reserve exhausted",
+        WaitCause::BudgetStop => "capture library-handle budget exhausted",
+    }
+}
+
+/// The pass-cursor member outcome a waited scan owes (N1): a scan
+/// cut short by a capture-budget stop files `CutShortBudgetStop`
+/// even though it defers whole. Handle-class waits record nothing
+/// (as before), and a scan that ran under an already-stopped
+/// budget never got a working turn.
+fn waited_member_outcome(
+    stop_before: Option<&str>,
+    causes: &[WaitCause],
+) -> Option<crate::discovery::scan_pass::MemberOutcome> {
+    if stop_before.is_some() {
+        return None;
+    }
+    causes
+        .iter()
+        .any(|cause| cause.is_capture_budget_stop())
+        .then_some(crate::discovery::scan_pass::MemberOutcome::CutShortBudgetStop)
 }
 
 /// Pids in `sweep` that are kernel threads with no user address space, to
@@ -9881,6 +9991,15 @@ fn discover_plan(
                 // pending (its ID too), so startup reaches a session
                 // and the retry tick rescans the same generation.
                 if scan_pins_waited(&counters.object_skips) {
+                    // N1: a scan cut short by a capture-budget stop
+                    // still owes the pass cursor its member outcome —
+                    // the break below used to skip the record.
+                    let task = (*pid, view.start_time());
+                    if let Some(outcome) =
+                        waited_member_outcome(stop_before, &counters.pin_wait_causes)
+                    {
+                        member_outcomes.push((task, outcome, 0));
+                    }
                     if named {
                         let pid = view.pid();
                         discovered.views.push(view);
@@ -9915,16 +10034,39 @@ fn discover_plan(
                         .object_skips
                         .extend(counters.object_skips);
                     discovered.base_counters.noise.merge(&counters.noise);
-                    let reason = if reserve_stop {
+                    // N1: the typed wait causes name the tail; the
+                    // text classifiers below stay for scans that
+                    // recorded no typed causes.
+                    let reason: String = if !counters.pin_wait_causes.is_empty() {
+                        match defer_whole_tail(&counters.pin_wait_causes) {
+                            DeferWholeTail::Reserve => {
+                                "capture file-descriptor reserve exhausted; remaining processes deferred to the next tick"
+                                    .into()
+                            }
+                            DeferWholeTail::Budget => {
+                                crate::fd_budget::LIBRARY_HANDLE_BUDGET_REASON_INITIAL.into()
+                            }
+                            DeferWholeTail::Handles => {
+                                "fd table exhausted while opening a library; remaining processes deferred to the next tick"
+                                    .into()
+                            }
+                            DeferWholeTail::Cause(cause) => format!(
+                                "{}; remaining processes deferred to the next tick",
+                                defer_whole_cause_head(cause)
+                            ),
+                        }
+                    } else if reserve_stop {
                         "capture file-descriptor reserve exhausted; remaining processes deferred to the next tick"
+                            .into()
                     } else if budget_stop {
-                        crate::fd_budget::LIBRARY_HANDLE_BUDGET_REASON_INITIAL
+                        crate::fd_budget::LIBRARY_HANDLE_BUDGET_REASON_INITIAL.into()
                     } else {
                         "fd table exhausted while opening a library; remaining processes deferred to the next tick"
+                            .into()
                     };
                     let skipped = Skipped {
                         subject: "process view".into(),
-                        reason: reason.into(),
+                        reason,
                     };
                     attribution::note(&skipped);
                     discovered.base_counters.object_skips.push(skipped);
@@ -33554,7 +33696,7 @@ impl Engine {
             // new row.
             let admits_before = self.handle_table.stats().admits;
             let cancel = self.cancel_flag.as_deref();
-            let (scan_result, counters) = Self::scan_retained_view(
+            let (scan_result, mut counters) = Self::scan_retained_view(
                 &view,
                 &self.module_hints,
                 &self.hooks,
@@ -33576,6 +33718,9 @@ impl Engine {
             let pins_waited = scan_pins_waited(&counters.object_skips);
             let reserve_stop = scan_pins_waited_only_for_reserve(&counters.object_skips);
             let budget_stop = scan_pins_waited_only_for_budget(&counters.object_skips);
+            // N1: the typed wait causes name the defer-whole tail;
+            // taken before the counters move into the absorb below.
+            let wait_causes = std::mem::take(&mut counters.pin_wait_causes);
             skipped.extend(self.absorb_scan_counters(counters));
             match scan_result {
                 // A new view has no retained modules, so a partial first
@@ -33609,17 +33754,39 @@ impl Engine {
                         // the guard tripped first. Fix8 F2: a scan that
                         // stopped BEFORE the handle cap files the budget
                         // tail. Any real open-exhaustion wait keeps the
-                        // fd-table-exhausted tail.
-                        let reason = if reserve_stop {
+                        // fd-table-exhausted tail. N1: the typed wait
+                        // causes name the tail; the text classifiers stay
+                        // for scans that recorded no typed causes.
+                        let reason: String = if !wait_causes.is_empty() {
+                            match defer_whole_tail(&wait_causes) {
+                                DeferWholeTail::Reserve => {
+                                    "capture file-descriptor reserve exhausted; remaining new processes deferred to the next tick"
+                                        .into()
+                                }
+                                DeferWholeTail::Budget => {
+                                    crate::fd_budget::LIBRARY_HANDLE_BUDGET_REASON_LIVE.into()
+                                }
+                                DeferWholeTail::Handles => {
+                                    "fd table exhausted while opening a library; remaining new processes deferred to the next tick"
+                                        .into()
+                                }
+                                DeferWholeTail::Cause(cause) => format!(
+                                    "{}; remaining new processes deferred to the next tick",
+                                    defer_whole_cause_head(cause)
+                                ),
+                            }
+                        } else if reserve_stop {
                             "capture file-descriptor reserve exhausted; remaining new processes deferred to the next tick"
+                                .into()
                         } else if budget_stop {
-                            crate::fd_budget::LIBRARY_HANDLE_BUDGET_REASON_LIVE
+                            crate::fd_budget::LIBRARY_HANDLE_BUDGET_REASON_LIVE.into()
                         } else {
                             "fd table exhausted while opening a library; remaining new processes deferred to the next tick"
+                                .into()
                         };
                         skipped.push(Skipped {
                             subject: "live discovery tick".into(),
-                            reason: reason.into(),
+                            reason,
                         });
                         break;
                     }

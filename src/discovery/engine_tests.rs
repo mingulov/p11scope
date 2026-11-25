@@ -58635,6 +58635,8 @@ fn scan_channels_typed_pin_wait_causes() {
     let mut module = crate::discovery::identity::test_fixture::module(key);
     module.path = "/bin/sh".into();
     module.tables = Vec::new();
+    module.view = view.id();
+    module.mount_namespace = view.mount_namespace();
     // Healable exhaustion: the work allowance is spent before the
     // first pin, so the pin waits instead of proving.
     let mut budget = CaptureWorkBudget::with_work_ceiling(1);
@@ -58667,6 +58669,50 @@ fn scan_channels_typed_pin_wait_causes() {
         "the wait still files its gap: {:?}",
         counters.object_skips
     );
+}
+
+/// N1: every wait cause owns its defer-whole head text, including
+/// the handle-class defensive mapping.
+#[test]
+fn defer_whole_cause_head_names_each_cause() {
+    use crate::discovery::identity::WaitCause::*;
+    for (cause, head) in [
+        (
+            IoCeiling,
+            "capture attempted-I/O ceiling reached while reading a library",
+        ),
+        (
+            WorkCeiling,
+            "capture discovery work ceiling reached while scanning a library",
+        ),
+        (
+            Deadline,
+            "capture discovery deadline reached while scanning a library",
+        ),
+        (
+            ClockUnavailable,
+            "monotonic clock read failed while scanning a library",
+        ),
+        (
+            TableWindowCeiling,
+            "discovery window table decode allowance reached while scanning a library",
+        ),
+        (
+            InterfaceWindowCeiling,
+            "discovery window interface decode allowance reached while scanning a library",
+        ),
+        (
+            HandleExhaustion,
+            "fd table exhausted while opening a library",
+        ),
+        (
+            ReserveStop,
+            "capture file-descriptor reserve exhausted",
+        ),
+        (BudgetStop, "capture library-handle budget exhausted"),
+    ] {
+        assert_eq!(defer_whole_cause_head(cause), head, "{cause:?}");
+    }
 }
 
 /// View-collapse fix7 F1 at the admission seam (codex blocking): a live

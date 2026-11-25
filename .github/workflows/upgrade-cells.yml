@@ -73,7 +73,7 @@ jobs:
       - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
       - run: rustup target add --toolchain "$(cat .release-rust-version)" x86_64-unknown-linux-musl
       - run: cargo +"$(cat .release-rust-version)" install bpf-linker --version "$CI_TOOL_BPF_LINKER" --locked
-      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc jq llvm musl-tools python3 rpm softhsm2
+      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc jq llvm musl-tools python3 softhsm2
       - run: python3 -I scripts/prepare-dependencies.py
       - run: cargo +"$(cat .release-rust-version)" fetch --locked --manifest-path Cargo.toml
       - run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml

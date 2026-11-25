@@ -1467,6 +1467,38 @@ class UpgradeArtifactValidationTests(unittest.TestCase):
             self.validation.diff_errors(inconsistent, before, after),
         )
 
+    def test_inventory_validator_rejects_wrong_nested_types(self):
+        document = substantive_inventory()
+        document["observation"]["passes"] = "2"
+        self.assertIn(
+            "inventory observation.passes is string, expected a positive integer",
+            self.validation.inventory_errors(document),
+        )
+
+        document = substantive_inventory()
+        document["modules"][0]["paths"] = None
+        self.assertIn(
+            "inventory modules[0].paths is null, expected an array of nonempty strings",
+            self.validation.inventory_errors(document),
+        )
+
+        document = substantive_inventory()
+        document["gaps_suppressed"] = True
+        self.assertIn(
+            "inventory field 'gaps_suppressed' is bool, expected a nonnegative integer",
+            self.validation.inventory_errors(document),
+        )
+
+    def test_diff_validator_rejects_snapshot_inconsistent_with_source(self):
+        before = substantive_inventory()
+        after = substantive_inventory()
+        document = valid_diff_document(before, after)
+        document["before"]["observation"]["started_ns"] += 1
+        self.assertIn(
+            "diff before.observation.started_ns is 101, expected 100",
+            self.validation.diff_errors(document, before, after),
+        )
+
 
 class UpgradeGate6PureTests(unittest.TestCase):
     @classmethod

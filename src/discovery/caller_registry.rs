@@ -7302,7 +7302,7 @@ impl CallerRegistry {
         let (reason, budget, retained_index) = {
             let aggregate = self
                 .exhaustion_aggregate
-                .get_or_insert_with(|| ExhaustionAggregate {
+                .get_or_insert(ExhaustionAggregate {
                     deferrals: 0,
                     max_attempted: 0,
                     limit: 0,
@@ -7326,7 +7326,7 @@ impl CallerRegistry {
             && retained.subject == subject
         {
             let old = std::mem::replace(&mut retained.reason, reason.clone());
-            let old_budget = std::mem::replace(&mut retained.budget, budget.clone());
+            let old_budget = std::mem::replace(&mut retained.budget, budget);
             self.gap_index.remove(&RegistryGap {
                 caller: None,
                 module: None,

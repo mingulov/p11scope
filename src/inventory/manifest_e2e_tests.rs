@@ -3227,9 +3227,11 @@ fn keysize_canary_json_dump_sized_array(
 /// bytes (the map's `bytes_key`/`bytes_value` from `bpftool map list
 /// -j`); a short or long row fails the caller. A `value` may also be
 /// the exact refusal blob `{"error": "<glibc strerror>"}` bpftool
-/// emits when the kernel refuses a cell lookup (`cgroup_array`: no
-/// userspace lookup at all — see `probe_refused_lookup` in
-/// `scripts/dump-owned-bpf-maps.py`); a refused cell holds no bytes
+/// emits when the kernel refuses a cell lookup (`cgroup_array`: its
+/// kernel lookup returns -EOPNOTSUPP, and userspace receives -ENOTSUPP
+/// because the map ops define no `map_fd_sys_lookup_elem` — see
+/// `probe_refused_lookup` in `scripts/dump-owned-bpf-maps.py`); a
+/// refused cell holds no bytes
 /// for the decoder, so it skips the value-length check — but it still
 /// counts, and its key still scans and must be exactly `key_len`
 /// bytes. The caller gates the count on the map kind (only
@@ -3242,18 +3244,32 @@ fn keysize_canary_json_dump_sized_array(
 /// possible-CPU metadata). Strict shape otherwise (mirrors
 /// `normalize_map_dump`): an unknown field fails the caller, so a
 /// dump the cell cannot decode fails closed instead of passing thin.
+///
+/// The typed decode result: every decoded byte, the number of map cells
+/// (entries) decoded, and the refused-cell count with the lookup error
+/// strings bpftool reported. The strings stay diagnostic text; the shape
+/// check above remains the strict gate.
+struct KeysizeCanaryJsonDump {
+    bytes: Vec<u8>,
+    cells: usize,
+    refused: usize,
+    refusal_errors: Vec<String>,
+}
+
 fn keysize_canary_json_dump_cells(
     dump: &[u8],
     key_len: usize,
     value_len: usize,
-) -> Result<(Vec<u8>, usize)> {
+) -> Result<KeysizeCanaryJsonDump> {
     let parsed: serde_json::Value =
         serde_json::from_slice(dump).context("KEYCANARY: map dump is not JSON")?;
     let entries = parsed
         .as_array()
         .context("KEYCANARY: map dump is not an array")?;
     let mut out = Vec::new();
+    let mut cells = 0usize;
     let mut refused = 0usize;
+    let mut refusal_errors = Vec::new();
     for entry in entries {
         let object = entry
             .as_object()
@@ -3274,11 +3290,17 @@ fn keysize_canary_json_dump_cells(
                     "key",
                 )?);
                 if let Some(blob) = object["value"].as_object() {
-                    ensure!(
-                        blob.len() == 1 && blob.get("error").is_some_and(|error| error.is_string()),
-                        "KEYCANARY: map dump refused cell is not {{\"error\": str}}"
-                    );
+                    let error_text = match (
+                        blob.len(),
+                        blob.get("error").and_then(serde_json::Value::as_str),
+                    ) {
+                        (1, Some(error)) => error,
+                        _ => anyhow::bail!(
+                            "KEYCANARY: map dump refused cell is not {{\"error\": str}}"
+                        ),
+                    };
                     refused += 1;
+                    refusal_errors.push(error_text.to_string());
                 } else {
                     out.extend(keysize_canary_json_dump_sized_array(
                         &object["value"],
@@ -3323,8 +3345,14 @@ fn keysize_canary_json_dump_cells(
             }
             _ => anyhow::bail!("KEYCANARY: map dump entry has unexpected fields: {keys:?}"),
         }
+        cells += 1;
     }
-    Ok((out, refused))
+    Ok(KeysizeCanaryJsonDump {
+        bytes: out,
+        cells,
+        refused,
+        refusal_errors,
+    })
 }
 
 /// Whether the marker appears in any decoded key/value cell of one
@@ -3338,20 +3366,96 @@ fn keysize_canary_json_dump_marked(
     key_len: usize,
     value_len: usize,
 ) -> Result<(bool, usize)> {
-    let (bytes, refused) = keysize_canary_json_dump_cells(dump, key_len, value_len)?;
-    Ok((keysize_canary_scan(&bytes), refused))
+    let decoded = keysize_canary_json_dump_cells(dump, key_len, value_len)?;
+    Ok((keysize_canary_scan(&decoded.bytes), decoded.refused))
 }
 
 /// The refused-cell gate: refused cells are legitimate on exactly one
-/// map kind. `cgroup_array` answers every userspace lookup with
-/// -ENOTSUPP (`cgroup_array_map_ops` defines no lookup), so its dumps
-/// carry per-cell refusal blobs by kernel design; any other kind with
-/// a refused cell is unscanned surface hiding behind a "dumped" label
+/// map kind. `cgroup_array` has a kernel lookup that returns
+/// -EOPNOTSUPP, while userspace receives -ENOTSUPP because the map ops
+/// define no `map_fd_sys_lookup_elem`; its dumps therefore carry
+/// per-cell refusal blobs by kernel design. Any other kind with a
+/// refused cell is unscanned surface hiding behind a "dumped" label
 /// and fails the caller.
 fn keysize_canary_refused_gate(kind: &str, refused: usize) -> Result<()> {
     ensure!(
         refused == 0 || kind == "cgroup_array",
         "KEYCANARY: {refused} refused cells on a {kind} map: only cgroup_array may refuse lookups"
+    );
+    Ok(())
+}
+
+/// The distinct refusal texts in stable order, for the failure context.
+/// They are bpftool/glibc diagnostic strings, never asserted as kernel
+/// facts; carrying them through only makes a refusal cause visible.
+fn keysize_canary_refusal_errors_text(errors: &[String]) -> String {
+    let unique: std::collections::BTreeSet<&str> = errors.iter().map(String::as_str).collect();
+    unique.into_iter().collect::<Vec<_>>().join("; ")
+}
+
+/// Whether an empty dump can be the true state of this map kind. Hash
+/// family maps legitimately drain to zero entries (for example PAUSE_PIDS
+/// after its authorization is removed); arrays enumerate every index and
+/// therefore cannot validly dump zero cells. The scan-level aggregate
+/// still requires at least one decoded cell across every owned map.
+fn keysize_canary_kind_may_dump_empty(kind: &str) -> bool {
+    matches!(
+        kind,
+        "hash" | "percpu_hash" | "lru_hash" | "lru_percpu_hash"
+    )
+}
+
+/// Verify one raw `bpftool -j` map dump against everything the live cell
+/// needs from it, without command or process I/O: the map must have both
+/// widths in the same `map list` snapshot, its text and decoded cells must
+/// not carry the marker, every row must decode at those widths, refusals
+/// must pass the kind gate, and a kind that cannot validly be empty must
+/// decode at least one map cell. Returns the decoded cell count. A refused
+/// non-`cgroup_array` cell fails once — no retry — with bpftool's refusal
+/// text in the message so a lookup-time churn race is distinguishable from
+/// an unexplained refusal.
+fn keysize_canary_verify_map_dump(
+    name: &str,
+    id: u32,
+    kind: &str,
+    dump: &[u8],
+    widths: Option<(usize, usize)>,
+) -> Result<usize> {
+    let (key_len, value_len) = widths.with_context(|| {
+        format!("KEYCANARY: owned map {name} ({id}/{kind}) has no key/value widths in the map list")
+    })?;
+    ensure!(
+        !keysize_canary_scan_map_dump(dump),
+        "KEYCANARY: canary marker leaked into BPF map {name} ({id}/{kind})"
+    );
+    let decoded = keysize_canary_json_dump_cells(dump, key_len, value_len).with_context(|| {
+        format!("KEYCANARY: cannot decode the BPF map {name} ({id}/{kind}) dump")
+    })?;
+    keysize_canary_refused_gate(kind, decoded.refused).with_context(|| {
+        format!(
+            "KEYCANARY: BPF map {name} ({id}/{kind}) refused {} cell lookups (lookup errors: {})",
+            decoded.refused,
+            keysize_canary_refusal_errors_text(&decoded.refusal_errors)
+        )
+    })?;
+    ensure!(
+        decoded.cells > 0 || keysize_canary_kind_may_dump_empty(kind),
+        "KEYCANARY: BPF map {name} ({id}/{kind}) decoded zero cells on a kind that cannot validly be empty"
+    );
+    ensure!(
+        !keysize_canary_scan(&decoded.bytes),
+        "KEYCANARY: canary marker leaked into BPF map {name} ({id}/{kind}) cells"
+    );
+    Ok(decoded.cells)
+}
+
+/// The scan-level non-vacuity gate. Individual hash-family maps may be
+/// empty as their true state, but a scan that decoded zero cells in total
+/// scanned nothing and must not pass.
+fn keysize_canary_cells_gate(cells: u64) -> Result<()> {
+    ensure!(
+        cells > 0,
+        "KEYCANARY: decoded zero cells across all owned BPF maps: refusing a vacuous scan"
     );
     Ok(())
 }
@@ -3687,6 +3791,105 @@ fn keysize_canary_refused_gate_admits_only_cgroup_array_refusals() {
     assert!(keysize_canary_refused_gate("CGROUP_ARRAY", 1).is_err());
     assert!(keysize_canary_refused_gate("cgroup_array ", 1).is_err());
     assert!(keysize_canary_refused_gate("", 1).is_err());
+}
+
+/// The pure per-dump verifier wires the kind gate into the live path:
+/// a refused hash cell fails once (no retry), with the map identity and
+/// bpftool's refusal text in the error so a lookup-time churn race is
+/// diagnosable. The same refusal shape remains legitimate on exactly
+/// `cgroup_array` and counts as one decoded cell.
+#[test]
+fn keysize_canary_verify_map_dump_rejects_refused_cells_off_cgroup_array() {
+    let dump = br#"[{"key": ["0x00", "0x00", "0x00", "0x00"], "value": {"error": "No such file or directory"}}]"#;
+    let error = keysize_canary_verify_map_dump("EVIDENCE_START", 9, "hash", dump, Some((4, 4)))
+        .unwrap_err();
+    let error = format!("{error:#}");
+    assert!(
+        error.contains("EVIDENCE_START (9/hash)"),
+        "the map identity is missing: {error}"
+    );
+    assert!(
+        error.contains("1 refused cells on a hash map"),
+        "the kind gate is missing: {error}"
+    );
+    assert!(
+        error.contains("No such file or directory"),
+        "the refusal text is missing: {error}"
+    );
+    assert_eq!(
+        keysize_canary_verify_map_dump("CGROUP_FILTER", 7, "cgroup_array", dump, Some((4, 4)))
+            .unwrap(),
+        1,
+        "a cgroup_array refusal is admitted and counts as its one decoded cell"
+    );
+}
+
+/// The pure verifier owns the live width lookup: a map absent from the
+/// width table cannot have its rows length-checked, so it errors before
+/// decoding instead of passing thin.
+#[test]
+fn keysize_canary_verify_map_dump_rejects_absent_widths() {
+    let dump = br#"[{"key": ["0x00"], "value": ["0x00"]}]"#;
+    let error =
+        keysize_canary_verify_map_dump("EVIDENCE_START", 9, "hash", dump, None).unwrap_err();
+    let error = format!("{error:#}");
+    assert!(
+        error.contains("EVIDENCE_START (9/hash) has no key/value widths"),
+        "unexpected error: {error}"
+    );
+}
+
+/// The pure verifier returns the number of decoded map cells. It refuses
+/// an all-empty array dump (arrays enumerate every index) while accepting
+/// an all-empty hash dump as a true empty map; the scan-level cells gate
+/// refuses zero decoded cells in total, so every map dumping `[]` still
+/// fails the live cell.
+#[test]
+fn keysize_canary_verify_map_dump_counts_cells_and_checks_empty_dumps() {
+    let dump =
+        br#"[{"key": ["0x00"], "value": ["0x00", "0x01"]}, {"key": ["0x01"], "value": [2, 3]}]"#;
+    assert_eq!(
+        keysize_canary_verify_map_dump("EVIDENCE_START", 9, "hash", dump, Some((1, 2))).unwrap(),
+        2,
+        "two decoded entries count as two cells"
+    );
+    let error =
+        keysize_canary_verify_map_dump("COUNTERS", 9, "array", b"[]", Some((1, 1))).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("decoded zero cells"),
+        "unexpected error: {error:#}"
+    );
+    assert_eq!(
+        keysize_canary_verify_map_dump("PAUSE_PIDS", 10, "hash", b"[]", Some((1, 1))).unwrap(),
+        0,
+        "an empty hash-family dump is a true empty map, not a malformed dump"
+    );
+    assert!(keysize_canary_cells_gate(0).is_err());
+    assert!(keysize_canary_cells_gate(1).is_ok());
+}
+
+/// The verifier wires both marker scans into the live per-dump path: the
+/// text scan covers BTF `formatted` ASCII, while the decoded-cell scan
+/// covers hex byte cells the text scan cannot read.
+#[test]
+fn keysize_canary_verify_map_dump_rejects_marked_text_and_cells() {
+    let formatted = br#"[{"key": ["0x00"], "value": ["0x00"], "formatted": {"key": 0, "value": "K3YS1Z3CANARY!"}}]"#;
+    assert!(
+        keysize_canary_verify_map_dump("EVIDENCE_START", 9, "hash", formatted, Some((1, 1)))
+            .is_err(),
+        "a marker in formatted text fails the dump"
+    );
+    assert!(
+        keysize_canary_verify_map_dump(
+            "EVIDENCE_START",
+            9,
+            "hash",
+            KEYSIZE_CANARY_JSON_HEX_CONTROL,
+            Some((1, 14))
+        )
+        .is_err(),
+        "a marker in decoded hex cells fails the dump"
+    );
 }
 
 /// The `-j` decoder enforces exact key/value lengths (the map's
@@ -4681,14 +4884,15 @@ fn keysize_canary_listed_lengths(listed: &[u8]) -> Result<Vec<(u32, usize, usize
 
 /// The owned-map scan result: dumped (and scanned) maps, ringbufs the
 /// kernel cannot dump, identity task storage the kernel cannot dump,
-/// the scanned dump bytes, and the refused-cell count with the maps
-/// that refused. Only names and counts ever print; dump contents stay
-/// in 0600 scratch files.
+/// the scanned dump bytes, the decoded cell count, and the refused-cell
+/// count with the maps that refused. Only names and counts ever print;
+/// dump contents stay in 0600 scratch files.
 struct KeysizeCanaryMapScan {
     dumped: Vec<String>,
     rings: Vec<String>,
     task_storage: Vec<String>,
     bytes: u64,
+    cells: u64,
     refused: u64,
     refused_maps: Vec<String>,
 }
@@ -4746,9 +4950,10 @@ fn keysize_canary_dumped_covers_evidence_start(dumped: &[String]) -> bool {
 /// minted identity and epoch words only (no byte buffers). Per-cell
 /// lookup refusals are counted and gated on the map kind (only
 /// `cgroup_array` may refuse); a bpftool dump refusal, an unaudited
-/// task-storage name, an empty dump list, a missing `EVIDENCE_START`,
-/// or a failed positive control fails the cell: an unscanned map is a
-/// hole, not a pass.
+/// task-storage name, an empty dump of a kind that cannot validly be
+/// empty, zero decoded cells in total, an empty dump list, a missing
+/// `EVIDENCE_START`, or a failed positive control fails the cell: an
+/// unscanned map is a hole, not a pass.
 fn keysize_canary_scan_owned_maps(pid: u32, dump_dir: &Path) -> Result<KeysizeCanaryMapScan> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -4764,6 +4969,7 @@ fn keysize_canary_scan_owned_maps(pid: u32, dump_dir: &Path) -> Result<KeysizeCa
     let mut rings = Vec::new();
     let mut task_storage = Vec::new();
     let mut bytes = 0u64;
+    let mut cells = 0u64;
     let mut refused = 0u64;
     let mut refused_maps = Vec::new();
     let mut combined = Vec::new();
@@ -4824,31 +5030,35 @@ fn keysize_canary_scan_owned_maps(pid: u32, dump_dir: &Path) -> Result<KeysizeCa
             .open(dump_dir.join(format!("map-{id}.txt")))?
             .write_all(&dump.stdout)?;
         bytes += dump.stdout.len() as u64;
-        ensure!(
-            !keysize_canary_scan_map_dump(&dump.stdout),
-            "{TAG}: canary marker leaked into BPF map {name} ({id}/{kind})"
-        );
-        let (key_len, value_len) = lengths.get(&id).with_context(|| {
-            format!("{TAG}: owned map {name} ({id}/{kind}) has no key/value widths in the map list")
-        })?;
-        let (marked, map_refused) =
-            keysize_canary_json_dump_marked(&dump.stdout, *key_len, *value_len).with_context(
-                || format!("{TAG}: cannot decode the BPF map {name} ({id}/{kind}) dump"),
-            )?;
-        keysize_canary_refused_gate(kind, map_refused).with_context(|| {
-            format!("{TAG}: BPF map {name} ({id}/{kind}) refused {map_refused} cell lookups")
-        })?;
+        let widths = lengths.get(&id).copied();
+        let map_cells = keysize_canary_verify_map_dump(name, id, kind, &dump.stdout, widths)?;
+        cells += map_cells as u64;
+        // A successful verify proves a non-cgroup_array map had zero
+        // refusals. Decode only the small cgroup_array dumps a second
+        // time to report their admitted refusal count; the pure verifier
+        // intentionally returns just the decoded-cell count.
+        let map_refused = if kind == "cgroup_array" {
+            let (key_len, value_len) = widths.with_context(|| {
+                format!(
+                    "{TAG}: owned map {name} ({id}/{kind}) has no key/value widths in the map list"
+                )
+            })?;
+            keysize_canary_json_dump_cells(&dump.stdout, key_len, value_len)
+                .with_context(|| {
+                    format!("{TAG}: cannot recount the verified BPF map {name} ({id}/{kind}) dump")
+                })?
+                .refused
+        } else {
+            0
+        };
         if map_refused > 0 {
             refused += map_refused as u64;
             refused_maps.push(format!("{name} ({id}/{kind}): {map_refused}"));
         }
-        ensure!(
-            !marked,
-            "{TAG}: canary marker leaked into BPF map {name} ({id}/{kind}) cells"
-        );
         combined.extend_from_slice(&dump.stdout);
         dumped.push(format!("{name} ({id})"));
     }
+    keysize_canary_cells_gate(cells)?;
     ensure!(
         !dumped.is_empty(),
         "{TAG}: no BPF maps dumped for the observer (pid {pid}): refusing a vacuous scan"
@@ -4873,6 +5083,7 @@ fn keysize_canary_scan_owned_maps(pid: u32, dump_dir: &Path) -> Result<KeysizeCa
         rings,
         task_storage,
         bytes,
+        cells,
         refused,
         refused_maps,
     })
@@ -5127,10 +5338,11 @@ fn keysize_canary_inner(workload: &E2eWorkload, module: &str, observer: &Path) -
     let scan_started = Instant::now();
     let map_scan = keysize_canary_scan_owned_maps(child.id(), &workload.path("mapdumps"))?;
     println!(
-        "{TAG} maps dumped={} rings={} taskstorage={} refused={} bytes={} secs={} rings=[{}] taskstorage=[{}] refusedmaps=[{}]",
+        "{TAG} maps dumped={} rings={} taskstorage={} cells={} refused={} bytes={} secs={} rings=[{}] taskstorage=[{}] refusedmaps=[{}]",
         map_scan.dumped.len(),
         map_scan.rings.len(),
         map_scan.task_storage.len(),
+        map_scan.cells,
         map_scan.refused,
         map_scan.bytes,
         scan_started.elapsed().as_secs(),

@@ -173,6 +173,44 @@ fn explicit_always_refuses_rather_than_completing_unpaused() {
     }
 }
 
+/// `always` on an available capture lane pauses for real: the
+/// root-integration host cell requires the positive branch (the
+/// confirmed sigstop lattice, never a refusal). Without capture the
+/// test keeps the historical refused branch (ordinary unprivileged
+/// CI), which `P11SCOPE_REQUIRE_CAPTURE=1` turns into a named
+/// failure instead of a pass.
+#[test]
+fn explicit_always_pauses_on_an_available_capture_lane() {
+    let dir = work_dir("always-positive");
+    let marker = dir.join("ran");
+    let args = paused_run(PausePolicy::Always, &marker);
+
+    match (capture_available(), run_owned(&args)) {
+        (true, Ok(outcome)) => {
+            eprintln!("P11SCOPE_TEST_BRANCH=positive");
+            // A successful `always` run must be exactly the confirmed
+            // lattice — never `none`, never `partial` — and the
+            // paused child still runs to completion.
+            assert_eq!(outcome.evidence.pause, "sigstop");
+            assert!(outcome.evidence.pause_attempts > 0);
+            assert_eq!(outcome.evidence.pause_partial, 0);
+            assert_eq!(
+                outcome.evidence.pause_confirmed,
+                outcome.evidence.pause_attempts
+            );
+            assert_pause_lattice(&outcome.evidence);
+            assert!(marker.exists(), "a paused run still runs the child");
+        }
+        (false, Err(_)) => {
+            eprintln!("P11SCOPE_TEST_BRANCH=unavailable");
+            require_capture_positive("explicit_always_pauses_on_an_available_capture_lane");
+            assert!(!marker.exists(), "a refused run released the child");
+        }
+        (true, Err(error)) => panic!("capture lane available but always run failed: {error:#}"),
+        (false, Ok(_)) => panic!("capture lane unavailable but run reported success"),
+    }
+}
+
 /// `auto` is explicit best effort: an attempt that cannot be confirmed falls
 /// back to attach/resume and renders `pause: partial`, which is sticky and
 /// forces `PARTIAL` — it is never silently upgraded to `none`.

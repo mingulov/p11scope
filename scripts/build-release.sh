@@ -509,10 +509,40 @@ release_body_cleanup() {
     return "$release_cleanup_status"
 }
 
+# On a failed body the workflow log would otherwise carry only the
+# finalize-time symptom ("release artifact ledger was not recorded"):
+# the body's real error sits in the receipt logs, which no step
+# prints or uploads. Name the furthest reached stage and dump the
+# tails so the log carries the cause. Best effort and read-only:
+# every read is guarded, grep/tail are sealed-inventory tools, and
+# the dump never changes the terminal status.
+receipt_dump_body_logs() {
+    [ -n "${RECEIPT_ROOT-}" ] || return 0
+    [ -s "$RECEIPT_ROOT/stderr.log" ] || [ -s "$RECEIPT_ROOT/stdout.log" ] || return 0
+    echo "build-release: the release body failed; furthest stage and log tails follow" >&2
+    if [ -s "$RECEIPT_ROOT/stdout.log" ]; then
+        t4_stage=$(grep '^=== ' "$RECEIPT_ROOT/stdout.log" 2>/dev/null | tail -n 1) || t4_stage=
+        if [ -n "$t4_stage" ]; then
+            echo "build-release: furthest stage: $t4_stage" >&2
+        else
+            echo "build-release: furthest stage: (no stage header in stdout.log)" >&2
+        fi
+    fi
+    for t4_log in stderr.log stdout.log; do
+        [ -s "$RECEIPT_ROOT/$t4_log" ] || continue
+        echo "--- tail: $t4_log ---" >&2
+        tail -n 60 "$RECEIPT_ROOT/$t4_log" >&2 || true
+    done
+}
+
 receipt_finalize() {
     t4_result=$?
     trap - EXIT INT TERM HUP
     set +e
+    t4_entry=$t4_result
+    if [ "$t4_entry" -ne 0 ] && [ "$t4_entry" -ne 77 ]; then
+        receipt_dump_body_logs
+    fi
     release_body_cleanup || [ "$t4_result" -ne 0 ] || t4_result=1
     [ "$(stat -Lc %d:%i "$RECEIPT_ROOT" 2>/dev/null)" = "$RECEIPT_ROOT_ID" ] || t4_result=1
     [ "$(stat -Lc %d:%i "$RECEIPT_ROOT/artifacts" 2>/dev/null)" = "$RECEIPT_ARTIFACTS_ID" ] || t4_result=1

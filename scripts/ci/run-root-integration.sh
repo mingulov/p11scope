@@ -19,6 +19,7 @@
 #   pause::explicit_never_publishes_the_neutral_lattice
 #   pause::explicit_auto_falls_back_to_a_partial_attempt_instead_of_failing
 #   pause::explicit_always_refuses_rather_than_completing_unpaused
+#   pause::explicit_always_pauses_on_an_available_capture_lane
 #   t2_cold_start::cold_start_profile_lane_is_honest_without_ambient_state
 #   t2_cold_start::cold_start_run_lane_is_honest_without_ambient_state
 #   ux_journeys::b6_doctor_reports_rows_and_verdict
@@ -367,6 +368,7 @@ CELLS=(
     pause:explicit_never_publishes_the_neutral_lattice
     pause:explicit_auto_falls_back_to_a_partial_attempt_instead_of_failing
     pause:explicit_always_refuses_rather_than_completing_unpaused
+    pause:explicit_always_pauses_on_an_available_capture_lane
     t2_cold_start:cold_start_profile_lane_is_honest_without_ambient_state
     t2_cold_start:cold_start_run_lane_is_honest_without_ambient_state
     ux_journeys:b6_doctor_reports_rows_and_verdict

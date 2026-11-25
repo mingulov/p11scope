@@ -9,19 +9,23 @@ command-contract, owned-provider-counts,
 owned-provider-counts-with-runner-noise,
 owned-provider-counts-with-66-discovery-gap,
 owned-provider-counts-with-ambient-gap, owned-edge-usage-counts,
-prearm-exactness, verdict-consistency, semantic-names and failed are
-qualified and every qualified row must pass (with owned-edge-usage-counts
-requiring its proof fields in detail); nonqualifying smoke may pass or
+provider-info-exact, prearm-exactness, verdict-consistency,
+semantic-names and failed are qualified and every qualified row must
+pass (with owned-edge-usage-counts and provider-info-exact requiring
+their proof fields in detail); nonqualifying smoke may pass or
 fail but every nonqualifying row must be allow-listed and the allow-list
 must equal the nonqualifying set; expected-failure must equal its
 declared list and an expected failure that passes is a failure. An
 --intermittent-failure cell fails only sometimes with a known signature:
 its row must appear and may be a passing qualified row or a non-passing
 expected-failure row, never a failed row or an unexpected pass. Every
+intermittent cell names its owning lane (CELL=LANE, repeatable when two
+lanes share a cell); a bare cell without a lane is refused, so no
+intermittent declaration is anonymous. Every
 --require cell must appear, so a dropped row fails.
 
 Usage:
-  python3 -I scripts/ci/check-cell-results.py RESULTS.JSONL [--expected-failure CELL ...] [--intermittent-failure CELL ...] [--allow-nonqualifying CELL ...] [--require CELL ...]
+  python3 -I scripts/ci/check-cell-results.py RESULTS.JSONL [--expected-failure CELL ...] [--intermittent-failure CELL=LANE ...] [--allow-nonqualifying CELL ...] [--require CELL ...]
 """
 
 import json
@@ -39,13 +43,19 @@ QUALIFIED = {"qualified", "command-contract", "owned-provider-counts",
              "owned-provider-counts-with-runner-noise",
              "owned-provider-counts-with-66-discovery-gap",
              "owned-provider-counts-with-ambient-gap",
-             "owned-edge-usage-counts", "prearm-exactness",
+             "owned-edge-usage-counts", "provider-info-exact",
+             "prearm-exactness",
              "verdict-consistency", "semantic-names", "failed"}
 VALID_QUALIFICATIONS = QUALIFIED | {"nonqualifying", "expected-failure"}
 OWNED_EDGE_USAGE_DETAIL = re.compile(
     r"owned per-edge usage and streamed edge totals match the independent ledger "
     r"total ([0-9]+) over ([0-9]+) workload callers; "
     r"per-caller attribution is by caller pid"
+)
+PROVIDER_INFO_DETAIL = re.compile(
+    r"provider (.+) library ([0-9]+)\.([0-9]+): ([0-9]+) token rows and "
+    r"([0-9]+) mechanism rows match the ledger over ([0-9]+) slots; "
+    r"serial/label absent"
 )
 
 
@@ -54,9 +64,27 @@ def has_owned_edge_usage_proof(detail):
     return match is not None and int(match.group(1)) > 0 and int(match.group(2)) > 0
 
 
+def has_provider_info_proof(detail):
+    match = PROVIDER_INFO_DETAIL.search(detail)
+    return (match is not None and int(match.group(4)) > 0 and
+            int(match.group(5)) > 0 and int(match.group(6)) > 0)
+
+
+LANE_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*")
+
+
+def split_intermittent(value):
+    cell, sep, lane = value.partition("=")
+    if not sep or not cell or LANE_PATTERN.fullmatch(lane) is None:
+        return None, None
+    return cell, lane
+
+
 def main(argv):
     expected = []
     intermittent = []
+    intermittent_lanes = {}
+    intermittent_declarations = []
     allowed_smoke = []
     required = []
     positional = []
@@ -69,9 +97,20 @@ def main(argv):
                 return fail("--expected-failure needs a cell name")
         elif token == "--intermittent-failure":
             try:
-                intermittent.append(next(iterator))
+                value = next(iterator)
             except StopIteration:
-                return fail("--intermittent-failure needs a cell name")
+                return fail("--intermittent-failure needs CELL=LANE")
+            cell, lane = split_intermittent(value)
+            if cell is None:
+                return fail(
+                    f"intermittent cell needs a named lane: {value} (want CELL=LANE)")
+            if value in intermittent_declarations:
+                return fail(f"duplicate --intermittent-failure declaration: {value}")
+            intermittent_declarations.append(value)
+            if cell not in intermittent_lanes:
+                intermittent_lanes[cell] = []
+                intermittent.append(cell)
+            intermittent_lanes[cell].append(lane)
         elif token == "--allow-nonqualifying":
             try:
                 allowed_smoke.append(next(iterator))
@@ -154,10 +193,12 @@ def main(argv):
             if cell not in set(allowed_smoke):
                 problems.append(f"nonqualifying cell not in allow list: {cell}")
         else:
-            missing_proof = (
-                qualification == "owned-edge-usage-counts"
-                and not has_owned_edge_usage_proof(row["detail"])
-            )
+            if qualification == "owned-edge-usage-counts":
+                missing_proof = not has_owned_edge_usage_proof(row["detail"])
+            elif qualification == "provider-info-exact":
+                missing_proof = not has_provider_info_proof(row["detail"])
+            else:
+                missing_proof = False
             status = "PASS" if (passed and not missing_proof) else "FAIL"
             print(f"{status} {cell} {detail}")
             if not passed:
@@ -165,13 +206,13 @@ def main(argv):
             if qualification == "failed" and passed:
                 problems.append(f"inconsistent row for {cell}: pass with failed qualification")
             if missing_proof:
-                problems.append(f"missing owned-edge-usage-counts proof fields for {cell}")
+                problems.append(f"missing {qualification} proof fields for {cell}")
     actual = sorted(row["cell"] for row in rows if row["qualification"] == "expected-failure")
     wanted = sorted(set(expected))
     if len(wanted) != len(expected):
         problems.append("duplicate --expected-failure names")
-    if len(set(intermittent)) != len(intermittent):
-        problems.append("duplicate --intermittent-failure names")
+    # Exact-duplicate CELL=LANE declarations are refused at parse time;
+    # the same cell with two lanes stays one intermittent cell here.
     both = sorted(set(intermittent) & set(expected))
     if both:
         problems.append("cells declared both expected and intermittent: " + ", ".join(both))
@@ -208,8 +249,11 @@ def main(argv):
         if row["cell"] in set(intermittent) and row["qualification"] == "expected-failure"
     )
     if intermittent:
+        lanes = ", ".join(
+            f"{cell}={'+'.join(intermittent_lanes[cell])}"
+            for cell in sorted(set(intermittent)))
         print(f"check-cell-results: {len(rows)} rows ok ({len(actual)} expected failures, "
-              f"{landed} of {len(set(intermittent))} intermittent failures)")
+              f"{landed} of {len(set(intermittent))} intermittent failures: {lanes})")
     else:
         print(f"check-cell-results: {len(rows)} rows ok ({len(actual)} expected failures)")
     return 0

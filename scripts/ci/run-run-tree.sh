@@ -74,9 +74,12 @@ privileged_run_tree_non_member_provider_is_never_staged
 # is an ERE the cell log must contain. Keep this list, the workflow's
 # --intermittent-failure flags and run-tree-vng.sh in step.
 #
-# Revert note: when the named lane lands, delete its entries here; when
-# a cell has no entry left, turn the workflow's --intermittent-failure
-# for it back into --require.
+# Revert note: the owning lanes are named on the workflow's
+# --intermittent-failure flags (PLAN-REPLACE-GAP by
+# task/v080-replace-inplace, SLOT-RECLAIM by task/v080-slot-reclaim).
+# When a lane lands, delete its entries here; when a cell has no
+# entry left, turn the workflow's --intermittent-failure for it back
+# into --require.
 #
 # The cells judge exact accounting (owner ruling 2026-11-15): every call
 # that entered after its function's first attach must be observed, so any

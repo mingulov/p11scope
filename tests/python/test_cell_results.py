@@ -92,6 +92,39 @@ class CheckCellResultsTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("missing owned-edge-usage-counts proof fields", result.stderr)
 
+    def test_provider_info_exact_accepted_with_proof_fields(self):
+        result = run_checker([
+            row("inventory-provider-info-pid", True, "provider-info-exact",
+                "provider SoftHSM library 2.6: 2 token rows and 140 mechanism rows "
+                "match the ledger over 2 slots; serial/label absent"),
+        ])
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_provider_info_exact_rejects_missing_proof_fields(self):
+        cases = [
+            "ok",
+            "",
+            "provider SoftHSM library 2.6: 2 token rows and 140 mechanism rows match the ledger over 2 slots",
+            "provider SoftHSM library 2.6: 0 token rows and 140 mechanism rows match the ledger over 2 slots; serial/label absent",
+            "provider SoftHSM library 2.6: 2 token rows and 0 mechanism rows match the ledger over 2 slots; serial/label absent",
+            "provider SoftHSM library 2.6: 2 token rows and 140 mechanism rows match the ledger over 0 slots; serial/label absent",
+        ]
+        for detail in cases:
+            with self.subTest(detail=detail):
+                result = run_checker([row("inventory-provider-info-pid", True,
+                                          "provider-info-exact", detail)])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("missing provider-info-exact proof fields", result.stderr)
+
+    def test_provider_info_exact_failure_rejected(self):
+        result = run_checker([
+            row("inventory-provider-info-pid", False, "provider-info-exact",
+                "provider SoftHSM library 2.6: 2 token rows and 140 mechanism rows "
+                "match the ledger over 2 slots; serial/label absent"),
+        ])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("failed qualified cell inventory-provider-info-pid", result.stderr)
+
     def test_owned_edge_usage_counts_failure_rejected(self):
         result = run_checker([
             row("inventory-mt-pid", False, "owned-edge-usage-counts",
@@ -204,7 +237,8 @@ class CheckCellResultsTests(unittest.TestCase):
         for outcome in (row("flaky", True),
                         row("flaky", False, "expected-failure", "bug 1: signature")):
             result = run_checker([row("a", True), outcome],
-                                 "--intermittent-failure", "flaky", "--require", "a")
+                                 "--intermittent-failure", "flaky=task/fix",
+                                 "--require", "a")
             self.assertEqual(result.returncode, 0, (outcome, result.stderr))
 
     def test_intermittent_failure_never_masks_a_failure(self):
@@ -212,25 +246,43 @@ class CheckCellResultsTests(unittest.TestCase):
                 (row("flaky", False, "failed", "rc=101 other"), "failed qualified cell flaky"),
                 (row("flaky", True, "expected-failure", "UNEXPECTED PASS"),
                  "unexpected pass for expected failure flaky")):
-            result = run_checker([outcome], "--intermittent-failure", "flaky")
+            result = run_checker([outcome], "--intermittent-failure", "flaky=task/fix")
             self.assertNotEqual(result.returncode, 0, outcome)
             self.assertIn(message, result.stderr)
 
     def test_intermittent_failure_row_must_appear(self):
-        result = run_checker([row("a", True)], "--intermittent-failure", "flaky")
+        result = run_checker([row("a", True)], "--intermittent-failure", "flaky=task/fix")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("missing intermittent cells: flaky", result.stderr)
 
     def test_intermittent_failure_names_are_exclusive(self):
         rows = [row("flaky", False, "expected-failure", "bug")]
-        result = run_checker(rows, "--intermittent-failure", "flaky",
+        result = run_checker(rows, "--intermittent-failure", "flaky=task/fix",
                              "--expected-failure", "flaky")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("cells declared both expected and intermittent: flaky", result.stderr)
-        result = run_checker(rows, "--intermittent-failure", "flaky",
-                             "--intermittent-failure", "flaky")
+        result = run_checker(rows, "--intermittent-failure", "flaky=task/fix",
+                             "--intermittent-failure", "flaky=task/fix")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("duplicate --intermittent-failure names", result.stderr)
+        self.assertIn("duplicate --intermittent-failure declaration: flaky=task/fix",
+                      result.stderr)
+
+    def test_intermittent_failure_needs_a_named_lane(self):
+        for value in ("flaky", "flaky=", "=task/fix", "flaky=bad lane",
+                      "flaky=../escape"):
+            result = run_checker([row("flaky", True)],
+                                 "--intermittent-failure", value)
+            with self.subTest(value=value):
+                self.assertNotEqual(result.returncode, 0, value)
+                self.assertIn("intermittent cell needs a named lane", result.stderr)
+
+    def test_intermittent_failure_accepts_two_lanes_for_one_cell(self):
+        outcome = row("flaky", False, "expected-failure", "bug 1: signature")
+        result = run_checker([row("a", True), outcome],
+                             "--intermittent-failure", "flaky=task/one",
+                             "--intermittent-failure", "flaky=task/two")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("flaky=task/one+task/two", result.stdout)
 
     def test_malformed_rows_fail(self):
         cases = [

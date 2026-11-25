@@ -53,8 +53,8 @@ fi
 # shellcheck disable=SC2086
 for _cell in ${P11SCOPE_PUBLIC_CLI_CELLS:-}; do
   case $_cell in
-    profile-pid|metrics-pid|trace-pid|mt-exact|system|mt-metrics|mt-errors|mt-shared|mt-churn|mt-trace|mt-system|mt-system-metrics|mt-system-trace|counter-latency-mt|inventory-mt-pid|inventory-mt-system) ;;
-    *) echo "unsupported subset cell: $_cell (supported: profile-pid metrics-pid trace-pid mt-exact system mt-metrics mt-errors mt-shared mt-churn mt-trace mt-system mt-system-metrics mt-system-trace counter-latency-mt inventory-mt-pid inventory-mt-system)" >&2; exit 64 ;;
+    profile-pid|metrics-pid|trace-pid|mt-exact|system|mt-metrics|mt-errors|mt-shared|mt-churn|mt-trace|mt-system|mt-system-metrics|mt-system-trace|counter-latency-mt|inventory-mt-pid|inventory-mt-system|inventory-provider-info-pid) ;;
+    *) echo "unsupported subset cell: $_cell (supported: profile-pid metrics-pid trace-pid mt-exact system mt-metrics mt-errors mt-shared mt-churn mt-trace mt-system mt-system-metrics mt-system-trace counter-latency-mt inventory-mt-pid inventory-mt-system inventory-provider-info-pid)" >&2; exit 64 ;;
   esac
 done
 unset _cell
@@ -351,6 +351,8 @@ judge() {
   case "${4:-}" in
     inventory-mt-*)
       out=$(python3 -I "$HERE/inventory-mt-oracle.py" --report "$1" --ledger "$2" --receipt "$3" --cell "$4" --event-log "$4.eventlog.jsonl" "${extra[@]}"); rc=$? ;;
+    inventory-provider-info-pid)
+      out=$(python3 -I "$HERE/inventory-provider-info-oracle.py" --report "$1" --ledger "$2" --receipt "$3" --cell "$4" --event-log "$4.eventlog.jsonl" "${extra[@]}"); rc=$? ;;
     *)
       out=$(python3 -I "$ORACLE" --report "$1" --ledger "$2" --receipt "$3" --cell "$4" "${extra[@]}"); rc=$? ;;
   esac
@@ -381,6 +383,7 @@ gated() {
     mt-system|mt-system-metrics|mt-system-trace) asuser "$fixture" "$MODULE" 4 8 250 "$gate" 0 > "$cell.wl" 2>&1 & ;;
     inventory-mt-pid) asuser "$fixture" "$MODULE" 8 1000 "$gate" sessions 0 > "$cell.wl" 2>&1 & ;;
     inventory-mt-system) asuser "$fixture" "$MODULE" 4 8 250 "$gate" 0 > "$cell.wl" 2>&1 & ;;
+    inventory-provider-info-pid) asuser "$fixture" "$MODULE" "$gate" > "$cell.wl" 2>&1 & ;;
     *) asuser "$fixture" "$MODULE" "$ITERS" 200 "$gate" > "$cell.wl" 2>&1 & ;;
   esac
   wl=$!; register "$wl" && gen=${CHILDREN[$wl]}
@@ -416,10 +419,10 @@ gated() {
     # precedent): reset an inherited SIGINT ignore so the observer's own
     # stop handler deterministically installs.
     local sigint_env=()
-    case "$cell" in inventory-mt-*) sigint_env=(env --default-signal=INT);; esac
+    case "$cell" in inventory-mt-*|inventory-provider-info-pid) sigint_env=(env --default-signal=INT);; esac
     "${sigint_env[@]}" "$P" "${args[@]}" > "$cell.stdout" 2> "$cell.stderr" & pp=$!; register "$pp" || true
     local ready_needle='p11scope: capturing:'
-    case "$cell" in inventory-mt-*) ready_needle='native usage lane active';; esac
+    case "$cell" in inventory-mt-*|inventory-provider-info-pid) ready_needle='native usage lane active';; esac
     if "$poll" "$cell.stderr" "$ready_needle" "$pp" "$READY_TICKS" && alive "$wl" && alive "$pp"; then
       capturing=1
       # Capture window opens here (shell builtin only: every fork during
@@ -436,7 +439,7 @@ gated() {
       # gate window from lane-active is strictly inside those spans).
       local match_ok=1 match_stall=0 match_overall=0
       case "$cell" in
-        inventory-mt-pid) match_stall=10; match_overall=60 ;;
+        inventory-mt-pid|inventory-provider-info-pid) match_stall=10; match_overall=60 ;;
         inventory-mt-system) match_stall=20; match_overall=90 ;;
       esac
       if [ "$match_stall" != 0 ]; then
@@ -450,7 +453,7 @@ gated() {
         released=1
         if "$poll" "$cell.wl" '^LEDGER ' "$wl" "$LEDGER_TICKS" 1; then
           case "$cell" in
-            inventory-mt-*)
+            inventory-mt-*|inventory-provider-info-pid)
               # The workload is done (LEDGER holds its exact totals); let
               # the product count on its own cadence (two further passes
               # surely collected after the ledger, since pass collections
@@ -498,7 +501,7 @@ gated() {
   after=$(pin) || after='null'
   receipt || { result "$cell" 0 'receipt publication failed' failed; return 1; }
   publish_output "$cell.$ext" || { result "$cell" 0 'output copy failed' failed; return 1; }
-  case "$cell" in inventory-mt-*) publish_output "$cell.eventlog.jsonl" || { result "$cell" 0 'event-log copy failed' failed; return 1; };; esac
+  case "$cell" in inventory-mt-*|inventory-provider-info-pid) publish_output "$cell.eventlog.jsonl" || { result "$cell" 0 'event-log copy failed' failed; return 1; };; esac
   judge "$cell.$ext" "$cell.wl" "$cell.receipt.json" "$cell"
 }
 # Counter-build probe, once per campaign (CONTROL modes skip it: they run
@@ -940,10 +943,11 @@ else
 fi
 gcc -O2 -Wall -Wextra -Werror -o "$FIX/mt_mixed" "$SRC/mt_mixed.c" -ldl -lpthread || exit 65
 gcc -O2 -Wall -Wextra -Werror -o "$FIX/mt_fork" "$SRC/mt_fork.c" -ldl -lpthread || exit 65
+gcc -O2 -Wall -Wextra -Werror -o "$FIX/provider_info" "$SRC/provider_info.c" -ldl || exit 65
 GATED=$FIX/gated; MT=$FIX/mt; PREARM_LOADER=$FIX/prearm-first-use; CFORK=$FIX/cgroup-fork
 CHAIN_PARENT=$FIX/chain-parent
-MTM=$FIX/mt_mixed; MTF=$FIX/mt_fork
-chmod 755 "$FIX" "$GATED" "$MT" "$CFORK" "$CHAIN_PARENT" "$MTM" "$MTF"
+MTM=$FIX/mt_mixed; MTF=$FIX/mt_fork; PINFO=$FIX/provider_info
+chmod 755 "$FIX" "$GATED" "$MT" "$CFORK" "$CHAIN_PARENT" "$MTM" "$MTF" "$PINFO"
 export SOFTHSM2_CONF=$OUT/softhsm2.conf
 mkdir -p tokens
 printf 'directories.tokendir = %s/tokens\nobjectstore.backend = file\nlog.level = ERROR\n' "$OUT" > softhsm2.conf
@@ -988,6 +992,7 @@ if [ -n "${P11SCOPE_PUBLIC_CLI_CELLS:-}" ]; then
       mt-system-trace) gated mt-system-trace system "$MTF" trace --system --module "$MODULE" --duration 25 -o "$OUT/mt-system-trace.txt" ;;
       inventory-mt-pid) MT_MIXED_HOLD=1 gated inventory-mt-pid pid "$MTM" inventory --pid @PID@ --capture native --duration 120 --event-log "$OUT/inventory-mt-pid.eventlog.jsonl" -o "$OUT/inventory-mt-pid.json" ;;
       inventory-mt-system) MT_MIXED_HOLD=1 gated inventory-mt-system system "$MTF" inventory --system --module "$MODULE" --capture native --duration 120 --event-log "$OUT/inventory-mt-system.eventlog.jsonl" -o "$OUT/inventory-mt-system.json" ;;
+      inventory-provider-info-pid) gated inventory-provider-info-pid pid "$PINFO" inventory --pid @PID@ --capture native --provider-info --duration 120 --event-log "$OUT/inventory-provider-info-pid.eventlog.jsonl" -o "$OUT/inventory-provider-info-pid.json" ;;
     esac
   done
   summary "$@"; exit $?
@@ -1056,6 +1061,11 @@ gated mt-system-metrics system "$MTF" profile --mode metrics --system --module "
 # (sigint_exact shape); --duration is only the backstop behind that stop.
 MT_MIXED_HOLD=1 gated inventory-mt-pid pid "$MTM" inventory --pid @PID@ --capture native --duration 120 --event-log "$OUT/inventory-mt-pid.eventlog.jsonl" -o "$OUT/inventory-mt-pid.json"
 MT_MIXED_HOLD=1 gated inventory-mt-system system "$MTF" inventory --system --module "$MODULE" --capture native --duration 120 --event-log "$OUT/inventory-mt-system.eventlog.jsonl" -o "$OUT/inventory-mt-system.json"
+# Provider-info exact cell: the single-process info workload above runs under
+# `inventory --pid --capture native --provider-info`; the oracle asserts the
+# C_GetInfo record, token/mechanism row counts and values, and serial/label
+# absence exactly against the fixture ledger.
+gated inventory-provider-info-pid pid "$PINFO" inventory --pid @PID@ --capture native --provider-info --duration 120 --event-log "$OUT/inventory-provider-info-pid.eventlog.jsonl" -o "$OUT/inventory-provider-info-pid.json"
 # SIGINT exact: the workload does exactly K calls, emits LEDGER, then holds.
 # SIGINT arrives after the ledger is complete; require exact counts, a proven
 # drain and exact observation via the oracle.
@@ -1166,5 +1176,5 @@ startup_cell() {
   result "$cell" 1 "$detail"
 }
 startup_cell
-summary doctor profile-pid names-pid verdict-pid metrics-pid trace-pid run-short run-cover run-prearm parent-chain mt-exact system mt-metrics mt-errors mt-shared mt-churn mt-trace counter-latency-mt mt-system mt-system-metrics inventory-mt-pid inventory-mt-system sigint second-sigint fifo-refused inventory-event-stdout profile-cgroup metrics-cgroup trace-cgroup inventory-cgroup counter-counts-pid counter-timestamps-pid counter-latency-pid counter-counts-system counter-timestamps-system counter-latency-system select-endpoint-pid select-endpoint-system profile-pid-ia32 run-ia32 startup-to-capturing
+summary doctor profile-pid names-pid verdict-pid metrics-pid trace-pid run-short run-cover run-prearm parent-chain mt-exact system mt-metrics mt-errors mt-shared mt-churn mt-trace counter-latency-mt mt-system mt-system-metrics inventory-mt-pid inventory-mt-system inventory-provider-info-pid sigint second-sigint fifo-refused inventory-event-stdout profile-cgroup metrics-cgroup trace-cgroup inventory-cgroup counter-counts-pid counter-timestamps-pid counter-latency-pid counter-counts-system counter-timestamps-system counter-latency-system select-endpoint-pid select-endpoint-system profile-pid-ia32 run-ia32 startup-to-capturing
 exit $?

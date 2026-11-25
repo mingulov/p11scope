@@ -2032,8 +2032,9 @@ fn scale4097_inner(
 /// reason must be a known MT race bucket, and at least one sign
 /// must land in a row (an all-unknown run would be vacuous). A
 /// build without the journal pins the `journal_unavailable`
-/// refusal instead of exact rows. Anything else fails as silently
-/// wrong. Returns a one-line summary.
+/// refusal instead of exact rows; on a journal-carrying build the
+/// same refusal is a journal regression and fails. Anything else
+/// fails as silently wrong. Returns a one-line summary.
 fn judge_mt_key_observations(
     observations: &serde_json::Value,
     ledger_signs: u64,
@@ -2050,6 +2051,10 @@ fn judge_mt_key_observations(
         ensure!(
             reason == "journal_unavailable",
             "key rows refused with {reason}, want the pinned journal_unavailable refusal"
+        );
+        ensure!(
+            env!("P11SCOPE_JOURNAL_ENABLED") != "1",
+            "journal build refused key rows with journal_unavailable: a journal regression, not the pinned journal-less refusal"
         );
         return Ok(format!("refused={reason}"));
     }
@@ -2404,12 +2409,21 @@ fn mt_key_judge_rejects_all_unknown_rows() {
 
 #[test]
 fn mt_key_judge_pins_the_journal_refusal() {
+    // The pinned refusal is only valid on a journal-less build; on a
+    // journal-carrying build the same observation is a journal
+    // regression and must fail (the mutant this twin carries).
     let observations =
         serde_json::json!({"status": "unavailable", "reason": "journal_unavailable"});
-    assert_eq!(
-        judge_mt_key_observations(&observations, 400).unwrap(),
-        "refused=journal_unavailable"
-    );
+    let outcome = judge_mt_key_observations(&observations, 400);
+    if env!("P11SCOPE_JOURNAL_ENABLED") == "1" {
+        let error = outcome.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("a journal regression"),
+            "unexpected error: {error:#}"
+        );
+    } else {
+        assert_eq!(outcome.unwrap(), "refused=journal_unavailable");
+    }
 }
 
 #[test]

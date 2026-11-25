@@ -196,6 +196,70 @@ def _stall_outcomes(server) -> str:
 #: keeps the self-skipping hosted default.
 STRICT = os.environ.get("P11SCOPE_BROWSER_STRICT") == "1"
 
+#: Doctor's journal-pair availability row and the one build-limit detail
+#: a journal-less build reports (src/doctor.rs JOURNAL_PAIR_ROW /
+#: BUILD_LIMIT_NOT_IN_BUILD): the key-operations refusal branch is only
+#: valid when the binary under test reports exactly this token.
+_JOURNAL_PAIR_ROW = "journal pair preflight"
+_JOURNAL_NOT_IN_BUILD = "not in this build"
+
+
+def observer_omits_journal():
+    """Whether the binary under test omits the production journal.
+
+    Asks the binary itself (`doctor -v` names the journal-pair
+    availability): only a `not in this build` row means a
+    journal-less build. Any other shape (available, unavailable for
+    a host reason) means the build carries the journal. A missing
+    row fails closed: an unprovable flavor never takes the refusal
+    branch.
+    """
+    binary = cells.p11scope_bin()
+    proc = subprocess.run(
+        [str(binary), "doctor", "-v"],
+        capture_output=True, text=True, timeout=180, check=False)
+    for line in proc.stdout.splitlines():
+        if line.startswith(_JOURNAL_PAIR_ROW):
+            return _JOURNAL_NOT_IN_BUILD in line
+    raise AssertionError(
+        "doctor names no journal-pair row?! cannot prove the build flavor")
+
+
+def judge_key_observations_journal_branch(observations, report, *,
+                                          journal_omitted):
+    """Judge a `journal_unavailable` key-operations observation.
+
+    Returns "refusal" when the observation is the pinned
+    journal-less-build refusal (status unavailable, zero rows, the
+    named build cause, no lost events). Raises AssertionError when a
+    journal-carrying build refused (a journal regression, which must
+    fail instead of passing as a refusal) or when the refusal shape
+    itself is wrong.
+    """
+    if not journal_omitted:
+        raise AssertionError(
+            "journal build refused key rows with journal_unavailable: "
+            "a journal regression, not the pinned journal-less refusal")
+    if observations.get("status") != "unavailable":
+        raise AssertionError("journal refusal must stay unavailable")
+    rows = observations.get("key_operations") or []
+    if len(rows) != 0:
+        raise AssertionError("journal refusal must carry zero rows")
+    refusal_gaps = [
+        gap.get("reason") or ""
+        for gap in report.get("gaps") or []
+        if isinstance(gap, dict)
+        and gap.get("subject") == "key operations unavailable"
+    ]
+    if not any("journal-pair-unavailable-in-build" in reason
+               for reason in refusal_gaps):
+        raise AssertionError("journal refusal must name its build cause")
+    capture = (report.get("observation") or {}).get("semantic_capture") or {}
+    if capture.get("events_lost") != 0:
+        raise AssertionError(
+            "semantic events lost: %r" % (capture.get("events_lost"),))
+    return "refusal"
+
 
 def gate(browser):
     """Skip unless every gate prerequisite for the ``browser`` cell holds.
@@ -901,31 +965,18 @@ class BrowserCells(unittest.TestCase):
             self.assertGreater(
                 len(folded_browser_idents), 0,
                 "browser softokn instance missing (neither live nor folded)")
-        # Wide-default build (v0.7.0): the production journal is omitted
-        # (docs/known-limitations.md "Counter and journal companions at
-        # the wide profile"), so `inventory --key-operations` refuses
-        # with `journal-pair-unavailable-in-build` and reports zero rows
-        # under `journal_unavailable`. Pin that documented refusal
-        # instead of key rows; the journal build (FULL-512) still must
-        # populate rows below. (N2; restoring the companions is 0.7.x.)
+        # The shipped build carries the production journal, so a
+        # `journal_unavailable` refusal is only valid when the binary
+        # under test proves it omits the journal (doctor's
+        # `journal pair preflight` row reads `not in this build`); on
+        # a journal-carrying build the same observation is a journal
+        # regression and fails. The pinned refusal shape (status
+        # unavailable, zero rows, the named build cause, no lost
+        # events) is judged by the shared helper, with twins below.
         if observations.get("reason") == "journal_unavailable":
-            self.assertEqual(
-                observations.get("status"), "unavailable",
-                "journal refusal must stay unavailable")
-            rows = observations.get("key_operations") or []
-            self.assertEqual(len(rows), 0, "journal refusal must carry zero rows")
-            refusal_gaps = [
-                gap.get("reason") or ""
-                for gap in report.get("gaps") or []
-                if isinstance(gap, dict)
-                and gap.get("subject") == "key operations unavailable"
-            ]
-            self.assertTrue(
-                any("journal-pair-unavailable-in-build" in reason
-                    for reason in refusal_gaps),
-                "journal refusal must name its build cause")
-            capture = (report.get("observation") or {}).get("semantic_capture") or {}
-            self.assertEqual(capture.get("events_lost"), 0, "semantic events lost")
+            judge_key_observations_journal_branch(
+                observations, report,
+                journal_omitted=observer_omits_journal())
             return
         # Name the cause on failure: every Joint birth refusal (caller,
         # reason, repeats) and the observation gaps, so a CI miss says
@@ -3474,6 +3525,88 @@ class BrowserFoldedLeg(unittest.TestCase):
             with self.subTest(reason=reason):
                 rows = self._folded_sign_rows(["i-folded-1", "i-folded-2"])
                 self._ff_first_bg_rig(status, reason, rows, False)
+
+    def _journal_refusal_rig(self, **overrides):
+        observations = {"status": "unavailable",
+                        "reason": "journal_unavailable",
+                        "key_operations": []}
+        report = {
+            "gaps": [{"subject": "key operations unavailable",
+                      "reason": "journal-pair-unavailable-in-build"}],
+            "observation": {"semantic_capture": {"events_lost": 0}},
+        }
+        observations.update(overrides.pop("observations", {}))
+        report.update(overrides.pop("report", {}))
+        assert not overrides, overrides
+        return observations, report
+
+    def test_journal_refusal_fails_on_a_journal_build(self):
+        # Mutant twin: the shipped build carries the journal, so a
+        # journal_unavailable refusal on it is a journal regression
+        # and must fail. Dropping the flavor gate would let this
+        # pass as the pinned refusal.
+        observations, report = self._journal_refusal_rig()
+        with self.assertRaisesRegex(AssertionError, "a journal regression"):
+            judge_key_observations_journal_branch(
+                observations, report, journal_omitted=False)
+
+    def test_journal_refusal_passes_on_a_journal_less_build(self):
+        # The pinned refusal stays valid where the binary proves it
+        # omits the journal.
+        observations, report = self._journal_refusal_rig()
+        self.assertEqual(
+            judge_key_observations_journal_branch(
+                observations, report, journal_omitted=True),
+            "refusal")
+
+    def test_journal_refusal_with_rows_fails(self):
+        # The pinned refusal carries zero rows, even journal-less.
+        observations, report = self._journal_refusal_rig(
+            observations={"key_operations": [{"category": "sign"}]})
+        with self.assertRaisesRegex(AssertionError, "zero rows"):
+            judge_key_observations_journal_branch(
+                observations, report, journal_omitted=True)
+
+    def test_journal_refusal_without_build_cause_fails(self):
+        # The pinned refusal names its build cause, even journal-less.
+        observations, report = self._journal_refusal_rig(
+            report={"gaps": []})
+        with self.assertRaisesRegex(AssertionError, "build cause"):
+            judge_key_observations_journal_branch(
+                observations, report, journal_omitted=True)
+
+    def test_journal_refusal_with_lost_events_fails(self):
+        # The pinned refusal loses no semantic events, even journal-less.
+        observations, report = self._journal_refusal_rig(
+            report={"observation": {"semantic_capture": {"events_lost": 2}}})
+        with self.assertRaisesRegex(AssertionError, "semantic events lost"):
+            judge_key_observations_journal_branch(
+                observations, report, journal_omitted=True)
+
+    def test_observer_omits_journal_reads_the_doctor_row(self):
+        # The flavor probe parses doctor -v: only the exact
+        # `not in this build` token means journal-less; a missing
+        # row fails closed.
+        for doctor_out, want in [
+                ("journal pair preflight .... not-applicable  not in this build\n",
+                 True),
+                ("journal pair preflight .... ok              available\n",
+                 False),
+                ("journal pair preflight .... warn            unavailable: pair missing (x)\n",
+                 False),
+        ]:
+            with self.subTest(doctor_out=doctor_out):
+                with patch.object(cells, "p11scope_bin",
+                                  return_value=Path("/bin/true")), patch(
+                        "subprocess.run",
+                        return_value=SimpleNamespace(stdout=doctor_out)):
+                    self.assertIs(observer_omits_journal(), want)
+        with patch.object(cells, "p11scope_bin",
+                          return_value=Path("/bin/true")), patch(
+                "subprocess.run",
+                return_value=SimpleNamespace(stdout="Doctor: ok.\n")):
+            with self.assertRaisesRegex(AssertionError, "no journal-pair row"):
+                observer_omits_journal()
 
     def test_bootstrap_with_live_browser_instances_fails(self):
         # Folded-leg-only allowance: bootstrap with S1 rows is

@@ -208,6 +208,114 @@ before calling a rerun green.
   split admitted jointly stay both-Fresh and converge next pass via
   the changed mark.
 
+## Privileged-CI signatures
+
+These failures come from the hosted privileged lanes (browser cells
+and package builds), not from the Cargo suites or the Docker live
+cells, so they carry no quarantine entry. The triage protocol above
+still applies: preserve the failed run, rerun the exact cell, and
+match the mechanism before calling a rerun green.
+
+### `browser-ff-nomod-mid-flight-skip` (FF-NOMOD; dev run 45433813497)
+
+- Selector: `tests/python/test_browser_cells.py`
+  `BrowserCells.test_ff_nomod_observes_nothing` (privileged-tests
+  `browser-cells`, strict). Seen once on dev `477055927`
+  (2026-11-24); green on 45511168818 (`d2c527f84`, dev plus a
+  CI-only repin) and 45626348152 (`ae9081058`).
+- Signature (the cell's only failure line):
+  `skipped record 'discovery subject' reason 'process exited
+  mid-flight': possible coverage gap, want structural only`. The
+  asserted never-mapped property held: counts `{}`, open entries
+  `{}`, `attached_probes` 0, and observation causes exactly
+  `discovery, slots, skipped, pause_partial, loader_discovery,
+  pid_descendant_gaps` (all allowed for never-mapped-run). Only
+  the structural-skips check (`STRUCTURAL_SKIPPED_REASONS`, which
+  admits `null pointer` and `discovery unavailable`) tripped.
+- Mechanism: Firefox multiprocess teardown trails the main-process
+  exit, so capture ends while descendants are mid-teardown; a
+  descendant exited while discovery was mid-read, folding one of
+  the six mid-flight generation pairs (`is_mid_flight_pair` in
+  `src/render.rs`) to the public `discovery subject / process
+  exited mid-flight` skip. The folded record does not identify
+  which pair fired; diagnostics would.
+- Cause (controller ruling 2026-11-25 17:02): a dead run member's
+  pending stop is recorded as a gap instead of withdrawn as a
+  proven-dead member. The fix is parked for v0.7.2 in
+  `task/v080-ff-flake-nomod` (`member_died_with_row_pending`
+  withdrawal `23c1b22a9` plus `6eec85591`, `5f371f4e4`,
+  `676316901`; codex has 3 blocking) and merges after the tag.
+  The link-loss half of that lane (the `task_uprobe_link_losses`
+  qualification) is already in dev and passed on this run.
+- Disposition: intermittent known-failing row owned by the
+  `v072-known-failing` lane (target 0.7.3; the lane assigns the
+  KI id once the typed known-issues block lands):
+  path `tests/python/test_browser_cells.py`,
+  test `BrowserCells.test_ff_nomod_observes_nothing`, cell
+  `FF-NOMOD`, runner `python-suite`, lane
+  `task/v080-ff-flake-nomod`, mode `intermittent`, signature
+  `{"cell": "FF-NOMOD", "branch": "mid_flight_skip"}`,
+  reason `dead run member's pending stop recorded as a gap
+  instead of withdrawn (mid-flight discovery skip trips the
+  structural-skips check while zero rows/probes hold)`,
+  last_green_sha
+  `ae9081058e59cc14ccf46c676ea0be309faf2fd2`
+  (run 45626348152, 2026-11-25).
+
+### `browser-cr-run-sign-softokn-undiscovered` (CR-RUN-SIGN; branch run 45548719334)
+
+- Selector: `test_cr_run_sign_observes_client_cert_signs` on
+  `test/v080-integrate-9` at `df42a0b25` (2026-11-25). The cell
+  does not exist in dev, so no dev gate impact. Seen once.
+- Signature: `AssertionError: 0 not greater than 0 : softokn never
+  discovered (browser never mapped it, or discovery missed it)`
+  at the discovery-resolution assert. The TLS ground truth held
+  (client cert presented, handshake ok), so the browser used a
+  key the report's `discovery[]` list lacks: no row with basename
+  `libsoftokn3.so`.
+- Likely cause (unproven; needs tip-run confirmation): the
+  report's discovery list lost the softokn row to a proven-view
+  retirement that purged carried modules' pins. The branch fixed
+  exactly that shape next (`ea473c249`, "keep carried pins
+  resolvable across proven view retirement", plus `9aa7ea20c`),
+  and `browser-cells` passed on the following branch run
+  45631943550 (`ea473c249`).
+- Next step if it recurs: the failing assert fires before
+  `check_report`, so the log carries no report detail — upload
+  the cell report plus observer diagnostics and check whether
+  discovery lost a mapped softokn (product miss) or the browser
+  mapped a non-system softokn the exact-basename match excludes.
+- Disposition: branch-cell failure with a named likely cause, no
+  ledger row (not a dev test; recurs belong to the owning lane).
+
+### `package-full-silent-ledger` (package-preview `package-full`; runs 45598444284, 45604903557)
+
+- Signature: `package-full` ends after 35-38 minutes with only
+  `release artifact ledger was not recorded` and zero body
+  output in the log. Seen twice on `cadacde91`
+  (`test/v072-k8s-runtime`, 2026-11-25 10:48 and 11:29), with a
+  pass on the same SHA at 12:19 (45612670901). The lane did not
+  touch the release scripts (dev-identical code).
+- Mechanism (named): `release_body` redirects stdout/stderr to
+  `$RECEIPT_ROOT/{stdout,stderr}.log`, which no step prints or
+  uploads; any pre-ledger failure (before the `record` step in
+  `scripts/build-release.sh`) surfaces only as the finalize-time
+  `receipt_verify_artifacts` symptom. The body's real error is
+  unrecoverable from those two runs.
+- Timing: both failures spent 35-38 minutes inside
+  `build-release.sh`, longer than the entire successful
+  build-plus-assemble-plus-upload (28 minutes or less), so the
+  failing pre-ledger stage stalled or retried before failing.
+  Prime suspect (unproven): the docker discover-container stage
+  (`scripts/verify-discover-containers.sh`) — the only
+  network-dependent pre-ledger stage, with 30s/60s docker
+  timeouts that trip on a stalled daemon or registry.
+- Fix: `build-release.sh` now names the furthest reached `===`
+  stage and dumps the last 60 lines of both body logs on any
+  failed body (`receipt_dump_body_logs`, pinned by
+  `test_package_preview.py`). The next occurrence will name the
+  real error; re-diagnose from that log instead of this entry.
+
 ### `D1-after-5-in-place-truncation` (counted known issue; 1/20 in the R7 after-campaign)
 
 - Signature: the oracle's single-module assert finds TWO records with

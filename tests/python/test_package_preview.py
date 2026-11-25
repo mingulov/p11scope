@@ -513,6 +513,47 @@ else:
                 self.assertEqual(result.returncode, status, result.stdout + result.stderr)
                 self.assertFalse(public.exists())
 
+    def test_failed_body_logs_name_the_furthest_stage_and_dump_the_tails(self):
+        # The release body redirects into the receipt logs, which no
+        # step prints or uploads; finalize must surface the real error
+        # instead of only the "ledger was not recorded" symptom.
+        script = (ROOT / "scripts/build-release.sh").read_text()
+        start = script.index("receipt_dump_body_logs() {")
+        end = script.index("\n}\n", start) + len("\n}\n")
+        harness = self.base / "dump.sh"
+        harness.write_text(script[start:end] + 'receipt_dump_body_logs; echo "dump_rc=$?"\n')
+        root = self.base / "receipt"
+        root.mkdir()
+        (root / "stdout.log").write_text(
+            "=== release privacy gate ===\n"
+            "=== p11scope-discover: dynamic glibc + dynamic musl builds ===\n")
+        (root / "stderr.log").write_text("docker: error pulling image\n")
+        env = {**self.env, "RECEIPT_ROOT": str(root)}
+        result = subprocess.run(["sh", str(harness)], env=env, text=True,
+                                capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("dump_rc=0", result.stdout)
+        self.assertIn("furthest stage and log tails follow", result.stderr)
+        self.assertIn("furthest stage: === p11scope-discover: dynamic glibc + dynamic musl builds ===",
+                      result.stderr)
+        self.assertIn("--- tail: stderr.log ---", result.stderr)
+        self.assertIn("docker: error pulling image", result.stderr)
+        self.assertIn("--- tail: stdout.log ---", result.stderr)
+        # Guarded reads: missing logs stay silent, never a new failure.
+        (root / "stdout.log").unlink()
+        (root / "stderr.log").unlink()
+        result = subprocess.run(["sh", str(harness)], env=env, text=True,
+                                capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        # Finalize dumps only on a failed body, never on success (0)
+        # or a sealed-environment refusal (77, which already explains
+        # itself).
+        finalize = script[script.index("receipt_finalize() {"):]
+        self.assertIn('t4_entry=$t4_result', finalize)
+        self.assertIn('[ "$t4_entry" -ne 0 ] && [ "$t4_entry" -ne 77 ]', finalize)
+        self.assertIn("receipt_dump_body_logs", finalize)
+
     def test_full_package_is_uploadable_while_p0_fails(self):
         self.prepare_package_children()
         full_result, full_public = self.assemble("full", fail_mode="p0")

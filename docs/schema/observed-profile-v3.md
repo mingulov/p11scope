@@ -527,8 +527,8 @@ pre-admission life is still unobserved. Never above the total; the
 remainder (exits, prune and finish sweeps, sentinels, removal-boundary
 gaps, and the lifecycle floor) was never observed — members sighted in
 a walk but never scanned land in the remainder too. The text row splits
-the count (`<total> short-lived process gaps (<admitted>
-admitted/scanned, <rest> never observed)`); the total still gates the
+the count (`<total> short-lived process gaps (<admitted> seen after
+start, <rest> never seen)`); the total still gates the
 verdict, and the split never feeds shares, verdicts, or completeness.
 
 `member_stop_attached` counts run-tree provider mappers the member-stop

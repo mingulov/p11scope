@@ -4749,11 +4749,22 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
     // holds, so single rows never touch it.
     let backstop_fold = pause_loader_backstop_fold(ev);
     let mut backstop_fold_fragment: Option<String> = backstop_fold.then(|| {
-        let plain = count(
-            ev.pause_partial,
-            "load held only by the member-stop backstop",
-            "loads held only by the member-stop backstop",
-        );
+        // The fold's proof is per capture, not per load: claim only the
+        // holds `member_stop_attached` proves, out of the partial loads
+        // ("1 of 3"), never all N on one proven hold (run-path R5).
+        let held = ev.member_stop_attached.min(ev.pause_partial);
+        let plain = if held == ev.pause_partial {
+            count(
+                ev.pause_partial,
+                "load held only by the member-stop backstop",
+                "loads held only by the member-stop backstop",
+            )
+        } else {
+            format!(
+                "{held} of {} loads held only by the member-stop backstop",
+                ev.pause_partial
+            )
+        };
         if verbose {
             format!("{plain} (pause_partial, loader_discovery)")
         } else {
@@ -5126,7 +5137,7 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
                 let admitted = ev.pid_descendant_gaps_admitted.min(total);
                 let never = total.saturating_sub(admitted);
                 format!(
-                    "{} ({} admitted/scanned, {} never observed)",
+                    "{} ({} seen after start, {} never seen)",
                     count(total, "short-lived process gap", "short-lived process gaps"),
                     admitted,
                     never
@@ -11361,17 +11372,60 @@ pub(crate) mod tests {
             ),
             "{verbose}"
         );
-        // Plural: the count rides the folded row.
+        // Plural with one proven hold (run-path R5): the row claims only
+        // the proven hold out of the partial loads, never all of them.
+        let mut ev = evidence();
+        backstopped(&mut ev);
+        ev.pause_partial = 3;
+        ev.pause_attempts = 6;
+        ev.verdict();
+        let out = concise(&ev);
+        assert!(
+            out.contains("1 of 3 loads held only by the member-stop backstop"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("(3 loads held only by the member-stop backstop"),
+            "{out}"
+        );
+        let verbose = scope_summary_with_verbosity(
+            "pid",
+            &reports_fixture(),
+            &ev,
+            crate::cli::TextVerbosity::Verbose,
+        );
+        assert!(
+            verbose.contains(
+                "1 of 3 loads held only by the member-stop backstop (pause_partial, loader_discovery)"
+            ),
+            "{verbose}"
+        );
+        // Plural with every hold proven: the count rides the folded row.
         let mut ev = evidence();
         backstopped(&mut ev);
         ev.pause_partial = 2;
         ev.pause_attempts = 5;
+        ev.member_stop_attached = 2;
         ev.verdict();
         let out = concise(&ev);
         assert!(
             out.contains("2 loads held only by the member-stop backstop"),
             "{out}"
         );
+        assert!(!out.contains(" of 2 loads"), "{out}");
+        // More proven holds than partial loads still claim only the loads.
+        let mut ev = evidence();
+        backstopped(&mut ev);
+        ev.pause_partial = 2;
+        ev.pause_attempts = 5;
+        ev.member_stop_attached = 7;
+        ev.verdict();
+        let out = concise(&ev);
+        assert!(
+            out.contains("2 loads held only by the member-stop backstop"),
+            "{out}"
+        );
+        assert!(!out.contains(" of 2 loads"), "{out}");
         // Each violated condition unfolds back to the two rows.
         for label in [
             "unbound loader context",
@@ -11538,8 +11592,9 @@ pub(crate) mod tests {
         }
     }
 
-    /// CLI text: the descendant-gap row splits into admitted/scanned
-    /// versus never observed. The total still gates the verdict, and
+    /// CLI text: the descendant-gap row splits, in plain words, into
+    /// members seen after start versus never seen (run-path R6: no
+    /// internal "admitted/scanned" wording). The total still gates the verdict, and
     /// a corrupt split (admitted above the total) clamps instead of
     /// rendering a negative remainder.
     #[test]
@@ -11555,9 +11610,10 @@ pub(crate) mod tests {
         ] {
             let out = scope_summary_with_verbosity("pid", &reports_fixture(), &ev, verbosity);
             assert!(
-                out.contains("32 short-lived process gaps (5 admitted/scanned, 27 never observed)"),
+                out.contains("32 short-lived process gaps (5 seen after start, 27 never seen)"),
                 "{verbosity:?}: {out}"
             );
+            assert!(!out.contains("admitted/scanned"), "{verbosity:?}: {out}");
         }
         // Nothing admitted: the whole count was never observed.
         let mut ev = evidence();
@@ -11566,7 +11622,7 @@ pub(crate) mod tests {
         ev.verdict();
         let out = scope_summary("pid", &reports_fixture(), &ev);
         assert!(
-            out.contains("19 short-lived process gaps (0 admitted/scanned, 19 never observed)"),
+            out.contains("19 short-lived process gaps (0 seen after start, 19 never seen)"),
             "{out}"
         );
         // Singular stays singular.
@@ -11576,7 +11632,7 @@ pub(crate) mod tests {
         ev.verdict();
         let out = scope_summary("pid", &reports_fixture(), &ev);
         assert!(
-            out.contains("1 short-lived process gap (1 admitted/scanned, 0 never observed)"),
+            out.contains("1 short-lived process gap (1 seen after start, 0 never seen)"),
             "{out}"
         );
         // A corrupt split clamps: admitted never renders above total.
@@ -11586,7 +11642,7 @@ pub(crate) mod tests {
         ev.verdict();
         let out = scope_summary("pid", &reports_fixture(), &ev);
         assert!(
-            out.contains("2 short-lived process gaps (2 admitted/scanned, 0 never observed)"),
+            out.contains("2 short-lived process gaps (2 seen after start, 0 never seen)"),
             "{out}"
         );
     }

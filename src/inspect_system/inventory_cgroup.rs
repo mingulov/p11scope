@@ -364,6 +364,13 @@ impl CgroupCollection {
     pub(crate) fn member_pids(&self) -> impl Iterator<Item = u32> + '_ {
         self.originals.keys().copied()
     }
+    /// Each pinned member's pid with its recorded start time (`None`
+    /// when unreadable): the walk's member generations.
+    pub(crate) fn member_generations(&self) -> impl Iterator<Item = (u32, Option<u64>)> + '_ {
+        self.originals
+            .iter()
+            .map(|(pid, member)| (*pid, member.generation.start_time))
+    }
     pub(crate) fn outcome(&self) -> ScopedCollectionOutcome {
         let stopped = self.work.stopped();
         if let Some(CollectionOutcome::Cancelled(stop)) = stopped {

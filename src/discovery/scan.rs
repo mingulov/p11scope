@@ -1587,6 +1587,13 @@ impl RetainedFileFacts {
         }
     }
 
+    /// Test-only: the `(pid, start_time)` of every remembered resume
+    /// history pair.
+    #[cfg(test)]
+    pub(crate) fn resume_history_pairs_for_test(&self) -> Vec<(u32, u64)> {
+        self.decode_cursors.history_generations_for_test()
+    }
+
     /// Test-only: every carried decode cursor with its key, so twins can
     /// assert frontiers, cached rows and completeness pass by pass.
     #[cfg(test)]
@@ -1644,6 +1651,29 @@ impl RetainedFileFacts {
         budget.drop_decode_cursors_for_pid(4_000_000);
         assert!(budget.record_decode_cursor(key(4_100_000), cursor()));
         budget.take_retained_file_facts()
+    }
+
+    /// Size of a departed-generation prune over this bundle (cursors
+    /// plus resume-history pairs): what the caller charges for it.
+    pub(crate) fn decode_prune_extent(&self) -> usize {
+        self.decode_cursors.prune_extent()
+    }
+
+    /// Unfinished carried cursors' `(pid, start_time)` generations.
+    pub(crate) fn unfinished_decode_generations(&self) -> BTreeSet<(u32, u64)> {
+        self.decode_cursors.unfinished_generations()
+    }
+
+    /// Drop every decode cursor and resume-history pair of a generation
+    /// `departed` proves gone, keeping the shared retained-byte account
+    /// exact. Returns `(cursors dropped, history pairs forgotten)`.
+    pub(crate) fn drop_departed_decode_generations(
+        &mut self,
+        departed: &mut dyn FnMut(u32, u64) -> bool,
+    ) -> (usize, usize) {
+        let (freed, cursors, pairs) = self.decode_cursors.drop_departed_generations(departed);
+        self.retained_cache_bytes = self.retained_cache_bytes.saturating_sub(freed);
+        (cursors, pairs)
     }
 
     /// Whether the carried bundle holds any decode cursor: a bundle

@@ -1782,6 +1782,38 @@ report and `--json` stdout carry the same value). Runs without
 
 Counts only: no event content, paths or payload bytes.
 
+## Notes (additive within v1)
+
+Top-level `notes` lists typed rows that record no loss, beside `gaps`; it is
+omitted when there are none. A note never counts toward PARTIAL: the coverage
+verdict reads only `gaps`, `gaps_suppressed` and the budget refusals. Each
+note has the gap fields (`caller`, `module`, `pid`, `subject`, `reason`,
+`repeats`) plus `kind`:
+
+- `activation_deferred` / `activation_unsettled`: a scoped native owner
+  activation the one-commit-per-transaction gate deferred, or refused for want
+  of a settled expected image. While it is pending it is a `gaps` row; once the
+  same caller incarnation commits its native owner, the row becomes this note
+  (the caller stayed scan-pinned meanwhile, so nothing was missed). A caller
+  that never recovers keeps the gap. A later recurrence returns it to `gaps`.
+- `member_demoted`: a member that scans after newcomers after repeated budget
+  stops. The budget stops keep their own gaps; the note clears once a scan of
+  the member completes.
+- `fold_deferred_oversized`: a departed caller too costly to fold in one
+  window stays in inventory, unfolded, with its evidence.
+
+`notes_suppressed` (present with `notes`) counts distinct notes dropped past
+the `--max-gaps` bound, which notes share with gaps; it is not a loss.
+
+A gap's or note's `caller` names a `callers[]` row or is `null`: a caller that
+folded out of `callers[]` keeps its `pid`, never a dangling id. Under the
+cgroup scope, membership walks that stop on the shared work limit while decode
+cursors are still resuming are counted in one `cgroup membership walk
+incomplete` gap until a complete walk follows. Resume cursors and resume
+history of member generations a complete walk no longer sees (or a metered
+generation proof shows gone) are dropped after each accepted pass, so a member
+that exits mid-decode never leaves a lasting `scan_in_progress` gap.
+
 ## Example (abridged)
 
 ```json

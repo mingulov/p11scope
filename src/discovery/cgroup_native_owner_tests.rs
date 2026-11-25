@@ -1633,6 +1633,39 @@ impl ScopedNativeScene {
             "the second member starts scan-pinned"
         );
         assert_eq!(self.coordinator.owner_of(second_caller), None);
+        self.settle_second_member(second_caller, second_pid, ticket, count)
+    }
+
+    /// Admit an already spawned second member sharing the scene's
+    /// provider, without settling its native witness: it stays
+    /// scan-pinned with no settled expected image.
+    fn admit_second_member_unsettled(&mut self, child: OwnedStoppedChild) -> (CallerId, u32) {
+        let second_pid = child.id();
+        self.extra_children.push(child);
+        let first_pid = self.child_id();
+        assert_ne!(first_pid, second_pid);
+        self.rewrite_membership(&[first_pid, second_pid]);
+        let (completion, _, _) = self.commit_observed_pass(None, second_pid, PassAction::Stable);
+        assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+        assert_eq!(completion.admitted, 1, "the second member is admitted");
+        let second_caller = self
+            .coordinator
+            .adapter()
+            .live_id(second_pid)
+            .expect("the second member is admitted");
+        assert_ne!(second_caller, self.caller);
+        (second_caller, second_pid)
+    }
+
+    /// Settle an admitted second member's native witness under `ticket`
+    /// with `count` physical uses on the shared provider.
+    fn settle_second_member(
+        &mut self,
+        second_caller: CallerId,
+        second_pid: u32,
+        ticket: u64,
+        count: u64,
+    ) -> (CallerId, u32, (AttachObjectId, EndpointId)) {
         let second_pin = self
             .coordinator
             .adapter()
@@ -4643,5 +4676,272 @@ fn cgroup_native_owner_cancellation_after_gate_suspends_nobody() {
         staged_counts(&scene),
         (2, 0, 0),
         "both owners retain their capacity"
+    );
+}
+
+// --- Recovered activation delays (v0.7.2 I1) -------------------------------
+// A retry-by-design activation refusal is a loss row while it is pending
+// and a typed note once the same caller incarnation commits its native
+// owner. A caller that never recovers keeps the loss row (PARTIAL).
+
+use crate::discovery::caller_registry::{GapClass, NoteKind};
+
+/// The scoped activation refusal rows with their verdict classes: the
+/// typed record these twins compare exactly.
+fn activation_rows(
+    scene: &ScopedNativeScene,
+) -> Vec<(Option<CallerId>, Option<u32>, String, GapClass)> {
+    let registry = scene.coordinator.registry();
+    registry
+        .gaps()
+        .iter()
+        .zip(registry.gap_classes())
+        .filter(|(gap, _)| gap.subject == ACTIVATION_REFUSED_SUBJECT)
+        .map(|(gap, class)| (gap.caller, gap.pid, gap.reason.clone(), *class))
+        .collect()
+}
+
+fn scene_presentation(scene: &ScopedNativeScene) -> crate::inventory_present::Presentation {
+    crate::inventory_present::Presentation::capture(&*scene.coordinator, "cgroup", 0, 1, 1)
+}
+
+fn delay_note(
+    delay: ActivationDelay,
+    caller: CallerId,
+    pid: u32,
+) -> crate::inventory_present::NoteView {
+    crate::inventory_present::NoteView {
+        kind: delay.note(),
+        caller: Some(caller),
+        module: None,
+        pid: Some(pid),
+        subject: ACTIVATION_REFUSED_SUBJECT.into(),
+        reason: delay.reason().into(),
+        repeats: 1,
+    }
+}
+
+fn activation_gaps(
+    presentation: &crate::inventory_present::Presentation,
+) -> Vec<(Option<CallerId>, Option<u32>, String)> {
+    presentation
+        .gaps
+        .iter()
+        .filter(|gap| gap.subject == ACTIVATION_REFUSED_SUBJECT)
+        .map(|gap| (gap.caller, gap.pid, gap.reason.clone()))
+        .collect()
+}
+
+#[test]
+fn cgroup_native_owner_recovered_deferral_resolves_to_a_typed_note() {
+    // The fork-cell shape: two members settle in one pass, the
+    // one-commit gate activates one and defers the other by name, and
+    // the deferred member activates on the next pass. Pending, the
+    // deferral is a loss row; recovered, it is a typed note, the gaps
+    // carry no activation row and JSON lists the note. RED before
+    // the fix: the row stayed a loss gap after recovery.
+    let mut scene = ScopedNativeScene::new();
+    let second_child = scene.spawn_second_child("ready-b");
+    let (second_caller, second_pid, _) = scene.admit_and_settle_second_member(second_child, 42, 11);
+    let first_pid = scene.child_id();
+    let first_caller = scene.caller;
+    let first_member_first = first_pid < second_pid;
+    let (early_caller, early_pid, early_ticket) = if first_member_first {
+        (first_caller, first_pid, 41)
+    } else {
+        (second_caller, second_pid, 42)
+    };
+    let (late_caller, late_pid, late_ticket) = if first_member_first {
+        (second_caller, second_pid, 42)
+    } else {
+        (first_caller, first_pid, 41)
+    };
+    let mut script = Vec::new();
+    for (ticket, first_gen) in [(early_ticket, 1), (late_ticket, 6), (late_ticket, 11)] {
+        for generation in first_gen..first_gen + 5 {
+            script.push((generation, ticket, 1));
+        }
+    }
+    let _acquired = scene.set_scripted_acquisition(&script);
+    let deferred = ActivationDelay::Deferred.reason().to_string();
+
+    scene.commit_observed_pass(Some(early_caller), early_pid, PassAction::Stable);
+    assert!(scene.coordinator.owner_of(early_caller).is_some());
+    assert_eq!(scene.coordinator.owner_of(late_caller), None);
+    assert_eq!(
+        activation_rows(&scene),
+        vec![(
+            Some(late_caller),
+            Some(late_pid),
+            deferred.clone(),
+            GapClass::Loss
+        )],
+        "a pending deferral is a loss row"
+    );
+    let pending = scene_presentation(&scene);
+    assert_eq!(
+        activation_gaps(&pending),
+        vec![(Some(late_caller), Some(late_pid), deferred.clone())],
+        "the pending deferral renders as a gap (PARTIAL)"
+    );
+    assert!(pending.notes.is_empty(), "{:?}", pending.notes);
+
+    scene.commit_observed_pass(Some(late_caller), late_pid, PassAction::Stable);
+    assert!(
+        scene.coordinator.owner_of(late_caller).is_some(),
+        "the deferred member activates on the next pass"
+    );
+    assert_eq!(
+        activation_rows(&scene),
+        vec![(
+            Some(late_caller),
+            Some(late_pid),
+            deferred,
+            GapClass::Note(NoteKind::ActivationDeferred)
+        )],
+        "the recovered deferral is a typed note"
+    );
+    let recovered = scene_presentation(&scene);
+    assert_eq!(
+        activation_gaps(&recovered),
+        Vec::new(),
+        "no activation gap after recovery"
+    );
+    assert_eq!(
+        recovered.notes,
+        vec![delay_note(ActivationDelay::Deferred, late_caller, late_pid)]
+    );
+    let json = crate::inventory::render_json_from_presentation(&recovered);
+    assert_eq!(
+        json["notes"],
+        serde_json::json!([{
+            "kind": "activation_deferred",
+            "caller": late_caller.label(),
+            "module": null,
+            "pid": late_pid,
+            "subject": ACTIVATION_REFUSED_SUBJECT,
+            "reason": ActivationDelay::Deferred.reason(),
+            "repeats": 1,
+        }])
+    );
+    assert_eq!(json["notes_suppressed"], serde_json::json!(0));
+    assert!(
+        json["gaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|gap| gap["subject"] != ACTIVATION_REFUSED_SUBJECT),
+        "{}",
+        json["gaps"]
+    );
+}
+
+#[test]
+fn cgroup_native_owner_recovered_unsettled_activation_resolves_to_a_typed_note() {
+    // A member admitted before its native witness settles refuses
+    // by name (no settled expected image) and stays scan-pinned; once
+    // the witness settles, the same caller incarnation activates and
+    // the refusal is a typed note. RED before the fix.
+    let mut scene = ScopedNativeScene::new();
+    let second_child = scene.spawn_second_child("ready-b");
+    let (second_caller, second_pid) = scene.admit_second_member_unsettled(second_child);
+    let first_caller = scene.caller;
+    let first_pid = scene.child_id();
+    let mut script = Vec::new();
+    for (ticket, first_gen) in [(41, 1), (42, 6)] {
+        for generation in first_gen..first_gen + 5 {
+            script.push((generation, ticket, 1));
+        }
+    }
+    let _acquired = scene.set_scripted_acquisition(&script);
+    let unsettled = ActivationDelay::Unsettled.reason().to_string();
+
+    scene.commit_observed_pass(Some(second_caller), second_pid, PassAction::Stable);
+    assert!(
+        scene.coordinator.owner_of(first_caller).is_some(),
+        "the settled member activates"
+    );
+    assert_eq!(scene.coordinator.owner_of(second_caller), None);
+    assert_eq!(
+        activation_rows(&scene),
+        vec![(
+            Some(second_caller),
+            Some(second_pid),
+            unsettled.clone(),
+            GapClass::Loss
+        )],
+        "the unsettled member refuses by name: a loss row while pending"
+    );
+    assert_ne!(first_pid, second_pid);
+
+    scene.settle_second_member(second_caller, second_pid, 42, 11);
+    scene.commit_observed_pass(Some(second_caller), second_pid, PassAction::Stable);
+    assert!(
+        scene.coordinator.owner_of(second_caller).is_some(),
+        "the settled member activates"
+    );
+    assert_eq!(
+        activation_rows(&scene),
+        vec![(
+            Some(second_caller),
+            Some(second_pid),
+            unsettled,
+            GapClass::Note(NoteKind::ActivationUnsettled)
+        )],
+    );
+    let recovered = scene_presentation(&scene);
+    assert_eq!(activation_gaps(&recovered), Vec::new());
+    assert_eq!(
+        recovered.notes,
+        vec![delay_note(
+            ActivationDelay::Unsettled,
+            second_caller,
+            second_pid
+        )]
+    );
+}
+
+#[test]
+fn cgroup_native_owner_unrecovered_activation_stays_a_loss_row() {
+    // Twin: a member whose witness never settles never activates. Its
+    // refusal stays a loss row on every pass (PARTIAL) and no note is
+    // minted, while the other member's activation resolves nothing of
+    // it.
+    let mut scene = ScopedNativeScene::new();
+    let second_child = scene.spawn_second_child("ready-b");
+    let (second_caller, second_pid) = scene.admit_second_member_unsettled(second_child);
+    let first_caller = scene.caller;
+    let script: Vec<_> = (1..=16).map(|generation| (generation, 41, 1)).collect();
+    let _acquired = scene.set_scripted_acquisition(&script);
+    let unsettled = ActivationDelay::Unsettled.reason().to_string();
+    for _ in 0..2 {
+        scene.commit_observed_pass(Some(second_caller), second_pid, PassAction::Stable);
+    }
+    assert!(scene.coordinator.owner_of(first_caller).is_some());
+    assert_eq!(scene.coordinator.owner_of(second_caller), None);
+    assert_eq!(
+        activation_rows(&scene),
+        vec![(
+            Some(second_caller),
+            Some(second_pid),
+            unsettled.clone(),
+            GapClass::Loss
+        )],
+    );
+    let presentation = scene_presentation(&scene);
+    assert_eq!(
+        activation_gaps(&presentation),
+        vec![(Some(second_caller), Some(second_pid), unsettled)],
+        "an activation that never recovers stays a gap"
+    );
+    assert!(presentation.notes.is_empty(), "{:?}", presentation.notes);
+    assert_eq!(
+        presentation
+            .gaps
+            .iter()
+            .find(|gap| gap.subject == ACTIVATION_REFUSED_SUBJECT)
+            .unwrap()
+            .repeats,
+        2
     );
 }

@@ -1304,6 +1304,8 @@ pub(crate) fn scripted_promotion_view_for_test() -> std::sync::Arc<super::Promot
         render_index: Default::default(),
         gaps: Vec::new(),
         gaps_suppressed: 0,
+        notes: Vec::new(),
+        notes_suppressed: 0,
         excluded_modules: Vec::new(),
         unmatched_excludes: Vec::new(),
         unmatched_forwarding: Vec::new(),

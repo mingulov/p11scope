@@ -701,13 +701,24 @@ GAP = Record("gap", {
     "caller": (Nullable(STR), "gap caller"), "pid": (Nullable(PID), "gap pid"),
     "module": (Nullable(STR), "gap module"), "subject": (STR, "gap subject"),
     "reason": (Nullable(STR), "gap reason")}, closed=False)
+# A typed non-loss row (src/inventory/mod.rs `notes`): never counted
+# toward PARTIAL. Strict: every key, exact types.
+NOTE_KINDS = ("activation_deferred", "activation_unsettled", "member_demoted", "fold_deferred_oversized")
+NOTE = Record("note", {
+    "kind": (OneOf(*NOTE_KINDS), "note kind"),
+    "caller": (Nullable(STR), "note caller"), "pid": (Nullable(PID), "note pid"),
+    "module": (Nullable(STR), "note module"), "subject": (STR, "note subject"),
+    "reason": (STR, "note reason"), "repeats": (Unsigned(1), "note repeats")})
 CGROUP_REPORT = Record("cgroup-report", {
     "schema": (OneOf("p11scope/inventory/v1"), "inventory schema"),
     "scope": (STR, "inventory scope"),
     "callers": (ListOf(CALLER, item="caller"), "callers", N),
     "modules": (ListOf(MODULE, item="module"), "modules", N),
     "edges": (ListOf(EDGE, item="edge"), "edges", N),
-    "gaps": (ListOf(GAP, item="gap"), "gaps", N)}, closed=False)
+    "gaps": (ListOf(GAP, item="gap"), "gaps", N)},
+    optional={"notes": (ListOf(NOTE, item="note"), "notes"),
+              "notes_suppressed": (U64, "notes_suppressed")},
+    closed=False)
 PIN = Record("provider-pin", {"dev": (Decided(ListOf(U64, 2, 2), "record.provider-pin",
                                                "pin dev is not [major, minor]: {value!r}"), "pin dev"),
                               "ino": (U64, "pin ino"),
@@ -733,7 +744,9 @@ CG_NO_EXTRA = declare("cgroup.no-extra-caller", "every caller is an inside membe
 CG_ONCE = declare("cgroup.member-once", "each inside member is exactly one caller incarnation")
 CG_NO_ORPHAN = declare("cgroup.no-orphan-edge", "every edge belongs to an inside member")
 GAP_UNCLASSIFIED = declare("gap.unclassified", "every gap is one named allowance")
-GAP_ACTIVATION = declare("gap.activation", "an activation refusal binds a workload caller that recovered native_exact")
+GAP_ACTIVATION = declare("gap.activation", "an activation delay is a typed note of a workload caller that recovered "
+                         "native_exact; as a gap it never recovered")
+NOTE_UNCLASSIFIED = declare("note.unclassified", "every note is a recovered activation delay of the workload, none suppressed")
 GAP_RETAINED = declare("gap.retained", "a retained-refresh refusal binds a workload caller, at most once, with a run deadline")
 GAP_DEADLINE = declare("gap.deadline", "the collection deadline gap is unattributed")
 GAP_ADMISSION = declare("gap.admission-note", "an admission note binds a workload caller and names an upward transition")
@@ -755,6 +768,10 @@ SETTLE_REASON = ("no settled expected native image for this caller in the acquis
                  "scan-pinned fallback retained")
 ACTIVATION_REFUSALS = {DEFERRED_REASON: "deferred activation never recovered",
                        SETTLE_REASON: "native activation never recovered"}
+# The producer's typed resolution (src/discovery/inventory_coordinator.rs
+# ActivationDelay): once the same caller incarnation commits its native
+# owner, its delay row is a note of this kind with this exact reason.
+NOTE_REASONS = {"activation_deferred": DEFERRED_REASON, "activation_unsettled": SETTLE_REASON}
 PREP_SUBJECT = "cgroup provider preparation incomplete"
 # The producer files eight reasons under this subject and shape
 # (src/discovery/inventory_attach_set.rs prepare_absorption). A ninth
@@ -957,9 +974,10 @@ def judge_cgroup_inventory(args):
             unnamed = "overlay published extra gap: %r" if degraded else "witness-available published extra gap: %r"
         require(kind is not None, GAP_UNCLASSIFIED, unnamed % (g,))
         if kind == "activation":
+            # A recovered delay is a typed note; one still in gaps is
+            # the producer's own verdict that it never recovered.
             require(g["subject"] == ACTIVATION, GAP_ACTIVATION, "activation refusal under another subject: %r" % (g,))
-            require(at_workload(g) and workload[g["caller"]]["authority"] == "native_exact", GAP_ACTIVATION,
-                    "%s: %r" % (ACTIVATION_REFUSALS[g["reason"]], g))
+            require(False, GAP_ACTIVATION, "%s: %r" % (ACTIVATION_REFUSALS[g["reason"]], g))
         require(kind != "unexpected-activation", GAP_ACTIVATION, "unexpected activation refusal: %r" % (g,))
         if kind == "retained":
             require(g["subject"] == "native owner refresh refused" and at_workload(g), GAP_RETAINED,
@@ -978,6 +996,16 @@ def judge_cgroup_inventory(args):
                          "malformed interrupted preparation budget: %r" % (g,))
             require_type("repeats" in g and type(g["repeats"]) is int and g["repeats"] >= 1, GAP_PREP,
                          "malformed interrupted preparation count: %r" % (g,))
+    notes = report.get("notes", [])
+    require(report.get("notes_suppressed", 0) == 0, NOTE_UNCLASSIFIED,
+            "notes suppressed: %r" % (report.get("notes_suppressed"),))
+    for n in notes:
+        require(n["kind"] in NOTE_REASONS, NOTE_UNCLASSIFIED, "unrecognized cgroup note: %r" % (n,))
+        require(n["subject"] == ACTIVATION, GAP_ACTIVATION, "activation refusal under another subject: %r" % (n,))
+        require(n["reason"] == NOTE_REASONS[n["kind"]], GAP_ACTIVATION,
+                "activation note reason is not its kind's: %r" % (n,))
+        require(at_workload(n) and workload[n["caller"]]["authority"] == "native_exact", GAP_ACTIVATION,
+                "%s: %r" % (ACTIVATION_REFUSALS[n["reason"]], n))
     retained = [g for k, g in kinds if k == "retained"]
     if retained:
         require(any(k == "deadline" for k, _ in kinds), GAP_RETAINED,
@@ -1029,8 +1057,8 @@ def judge_cgroup_inventory(args):
             require(g["subject"] == modpath, GAP_UNPROVEN, "overlay unproven subject")
             require(g["module"] is None, GAP_UNPROVEN, "overlay unproven module")
             require(g["pid"] == workload[g["caller"]]["pid"], GAP_UNPROVEN, "overlay unproven pid")
-    return ("inventory cgroup: inside=%d child=%d outside=%d excluded module=%s admission=%s unproven=%d gaps=%d"
-            % (inside_pid, child_pid, outside_pid, owned_id, state, len(unproven), len(report["gaps"])))
+    return ("inventory cgroup: inside=%d child=%d outside=%d excluded module=%s admission=%s unproven=%d gaps=%d notes=%d"
+            % (inside_pid, child_pid, outside_pid, owned_id, state, len(unproven), len(report["gaps"]), len(notes)))
 
 
 # -- run pre-arm --------------------------------------------------------------

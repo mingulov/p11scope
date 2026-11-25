@@ -2029,6 +2029,8 @@ impl CallerRegistry {
             | Mutation::NoteModuleAbsent { .. }
             | Mutation::NoteMemberUnscanned { .. }
             | Mutation::RecordGap { .. }
+            | Mutation::RecordNote { .. }
+            | Mutation::ClassifyGap { .. }
             | Mutation::RecordKeyedGap { .. }
             | Mutation::RecordAggregatedUnrouted { .. } => {
                 unreachable!("only original registration/call rows enter this index")

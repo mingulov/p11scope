@@ -552,6 +552,35 @@ impl ResumeHistory {
     pub(crate) fn len(&self) -> usize {
         self.covered.len()
     }
+
+    #[cfg(test)]
+    fn generations_for_test(&self) -> Vec<(u32, u64)> {
+        self.covered
+            .keys()
+            .chain(self.completed.iter())
+            .map(|(key, _)| (key.pid, key.start_time))
+            .collect()
+    }
+
+    /// Remembered pairs over both records (covered plus completed).
+    pub(crate) fn pairs(&self) -> usize {
+        self.covered.len().saturating_add(self.completed.len())
+    }
+
+    /// Forget every pair whose `(pid, start_time)` generation `departed`
+    /// proves gone. The key carries the start time, so such a pair can
+    /// never be recorded again: dropping it changes no decision for any
+    /// live generation (no rise is earned or lost, no live ground is
+    /// uncovered) and frees its slot for live work. Returns the pairs
+    /// forgotten.
+    fn forget_generations(&mut self, departed: &mut dyn FnMut(u32, u64) -> bool) -> usize {
+        let before = self.pairs();
+        let mut gone = |key: &DecodeCursorKey| departed(key.pid, key.start_time);
+        self.covered.retain(|(key, _), _| !gone(key));
+        self.evictable.retain(|_, (key, _)| !gone(key));
+        self.completed.retain(|(key, _)| !gone(key));
+        before.saturating_sub(self.pairs())
+    }
 }
 
 /// One accepted pass's resume summary, read in `O(1)` at publication:
@@ -613,6 +642,56 @@ impl DecodeCursorStore {
 
     fn begin_pass(&mut self) {
         self.history.begin_pass();
+    }
+
+    /// Test-only: the generation of every remembered history pair.
+    #[cfg(test)]
+    pub(crate) fn history_generations_for_test(&self) -> Vec<(u32, u64)> {
+        self.history.generations_for_test()
+    }
+
+    /// Carried cursors plus remembered history pairs: the size a
+    /// departed-generation prune walks.
+    pub(crate) fn prune_extent(&self) -> usize {
+        self.cursors.len().saturating_add(self.history.pairs())
+    }
+
+    /// Unfinished carried cursors' generations, for the liveness probe
+    /// of members an incomplete walk did not see.
+    pub(crate) fn unfinished_generations(&self) -> BTreeSet<(u32, u64)> {
+        self.cursors
+            .iter()
+            .filter(|(_, cursor)| !cursor.complete)
+            .map(|(key, _)| (key.pid, key.start_time))
+            .collect()
+    }
+
+    /// Drop every unfinished cursor and every history pair of a
+    /// generation `departed` proves gone (`(pid, start_time)`),
+    /// returning the cursors' freed bytes, the cursors dropped and the
+    /// history pairs forgotten. A departed member's unfinished cursor
+    /// would otherwise keep the run "in progress" for good, and its
+    /// history pairs would fill the bounded record. Completed cursors
+    /// count as done (no progress row) and are already the first
+    /// reclamation victims under pressure, so they stay.
+    pub(crate) fn drop_departed_generations(
+        &mut self,
+        departed: &mut dyn FnMut(u32, u64) -> bool,
+    ) -> (u64, usize, usize) {
+        let stale: Vec<DecodeCursorKey> = self
+            .cursors
+            .iter()
+            .filter(|(key, cursor)| !cursor.complete && departed(key.pid, key.start_time))
+            .map(|(key, _)| key.clone())
+            .collect();
+        let mut freed = 0u64;
+        for key in &stale {
+            if let Some(old) = self.remove(key) {
+                freed = freed.saturating_add(decode_cursor_bytes(key, &old));
+            }
+        }
+        let forgotten = self.history.forget_generations(departed);
+        (freed, stale.len(), forgotten)
     }
 
     /// `(done, total, tables)` over the store; `None` when no cursor is
@@ -815,6 +894,14 @@ impl ResumeCursor {
     #[cfg(test)]
     pub(crate) fn own_spend_for_test(&self) -> BTreeMap<MemberTask, u64> {
         self.own_spend.clone()
+    }
+
+    /// Whether `task` is demoted (budget-stopped
+    /// [`BUDGET_STOP_DEMOTE_AFTER`] passes without completing).
+    pub(crate) fn is_demoted(&self, task: &MemberTask) -> bool {
+        self.streaks
+            .get(task)
+            .is_some_and(|streak| *streak >= BUDGET_STOP_DEMOTE_AFTER)
     }
 
     /// Examined tasks held, for memory telemetry.
@@ -3230,6 +3317,119 @@ mod tests {
                 .own_spend_for_test()
                 .contains_key(&(10, Some(100))),
             "the old incarnation's spend never transfers"
+        );
+    }
+}
+
+#[cfg(test)]
+mod departed_history_tests {
+    use super::{
+        CommittedCursorProgress, DecodeCursorKey, MAX_DECODE_CURSORS, ResumeHistory, SweepFrontier,
+    };
+
+    fn key(pid: u32, start_time: u64) -> DecodeCursorKey {
+        let file = std::fs::File::open("/bin/sh").unwrap();
+        DecodeCursorKey {
+            pid,
+            start_time,
+            file: crate::discovery::scan::InspectedFileKey {
+                device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+                inode: 11,
+                pin: crate::discovery::identity::pin_of(&file).unwrap(),
+                fd_dev: 7,
+            },
+            exec: None,
+        }
+    }
+
+    fn progress(complete: bool) -> CommittedCursorProgress {
+        CommittedCursorProgress {
+            layout: 1,
+            tables: SweepFrontier {
+                snapshot: 0,
+                word: 1,
+            },
+            interfaces: SweepFrontier {
+                snapshot: 0,
+                word: 0,
+            },
+            tables_decoded: 0,
+            complete,
+        }
+    }
+
+    /// Records `count` dead pairs (unfinished and completed alternating)
+    /// of generation `start_time` from `first` pid on, forgetting each
+    /// generation once it is proven dead when `prune` is set.
+    fn churn(history: &mut ResumeHistory, prune: bool) {
+        for round in 0..4u64 {
+            for index in 0..5_000u32 {
+                history.record(
+                    &key(1_000_000 + index, 100 + round),
+                    &progress(index % 2 == 0),
+                );
+            }
+            if prune {
+                let dead = 100 + round;
+                history.forget_generations(&mut |_, start_time| start_time == dead);
+            }
+        }
+    }
+
+    /// v0.7.2 I3: 20,000 pairs of proven-dead generations (start time
+    /// in the key: they can never return), then a newcomer that stops
+    /// mid-decode on the budget. With the dead pairs forgotten the
+    /// newcomer is admitted and nothing is refused; the twin without
+    /// forgetting fills the bounded record and refuses it (the named
+    /// `scan resume history full` gap). The 16k bound is unchanged.
+    #[test]
+    fn forgotten_dead_pairs_admit_a_budget_stopped_newcomer() {
+        let mut pruned = ResumeHistory::default();
+        churn(&mut pruned, true);
+        assert_eq!(pruned.pairs(), 0, "every dead pair is forgotten");
+        pruned.record(&key(42, 7), &progress(false));
+        assert_eq!(
+            (pruned.len(), pruned.refused()),
+            (1, 0),
+            "the newcomer is admitted"
+        );
+
+        let mut kept = ResumeHistory::default();
+        churn(&mut kept, false);
+        assert!(
+            kept.pairs() <= 2 * MAX_DECODE_CURSORS,
+            "the record stays bounded"
+        );
+        let refused_before = kept.refused();
+        kept.record(&key(42, 7), &progress(false));
+        assert_eq!(
+            kept.refused(),
+            refused_before + 1,
+            "control: dead pairs fill the record and refuse the newcomer"
+        );
+    }
+
+    /// Forgetting is exact: only pairs of generations the predicate
+    /// proves gone go; a live generation's covered, protected and
+    /// completed ground is untouched, and it still never earns a pass
+    /// on a restart behind its frontier.
+    #[test]
+    fn forgetting_keeps_live_ground_exactly() {
+        let mut history = ResumeHistory::default();
+        history.record(&key(5, 50), &progress(false));
+        history.record(&key(6, 60), &progress(true));
+        history.record(&key(7, 70), &progress(false));
+        let forgotten =
+            history.forget_generations(&mut |pid, start_time| (pid, start_time) == (7, 70));
+        assert_eq!(forgotten, 1);
+        let mut generations = history.generations_for_test();
+        generations.sort_unstable();
+        assert_eq!(generations, vec![(5, 50), (6, 60)]);
+        history.begin_pass();
+        history.record(&key(5, 50), &progress(false));
+        assert!(
+            !history.raised(),
+            "no new ground: the live frontier is kept"
         );
     }
 }

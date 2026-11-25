@@ -2885,6 +2885,7 @@ fn canary_presentation() -> crate::inventory_present::Presentation {
         prearm: Vec::new(),
         key_operations_requested: false,
         key_sizes_requested: false,
+        provider_info_requested: false,
         manifests_present: false,
         joint_audit_subjects: None,
         provider_observations: None,

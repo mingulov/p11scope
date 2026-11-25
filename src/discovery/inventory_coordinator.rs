@@ -609,6 +609,11 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// at run setup beside `key_operations_requested`; harnesses
     /// leave it false.
     key_sizes_requested: bool,
+    /// Whether `--provider-info` was requested for this run (text
+    /// only: the snapshot distinguishes "requested but none
+    /// observed" from "off"). Set once at run setup beside
+    /// `key_operations_requested`; harnesses leave it false.
+    provider_info_requested: bool,
     /// Retained `--prearm-module` pins (packet 6.13 round-2, F5): startup
     /// validation, pin and held-FD custody for supported auto/native
     /// Inventory capture. Proved offsets lower into the run's attach set
@@ -2368,6 +2373,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             count_manifests: Vec::new(),
             key_operations_requested: false,
             key_sizes_requested: false,
+            provider_info_requested: false,
             prearm: None,
             prearm_prior: (0, 0),
             prearm_state: crate::prearm_module::PrearmState::empty(),
@@ -2588,6 +2594,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// Whether `--key-sizes` was requested for this run.
     pub(crate) fn key_sizes_requested(&self) -> bool {
         self.key_sizes_requested
+    }
+
+    /// Record the run's `--provider-info` request for snapshot text.
+    pub(crate) fn set_provider_info_requested(&mut self, requested: bool) {
+        self.provider_info_requested = requested;
+    }
+
+    /// Whether `--provider-info` was requested for this run.
+    pub(crate) fn provider_info_requested(&self) -> bool {
+        self.provider_info_requested
     }
 
     /// Record the run's `--provider-info` request on the attach set

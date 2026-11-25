@@ -2288,6 +2288,7 @@ fn run_with_terminal_budget(
     coordinator.set_forwarding(forwarding_modules.to_vec());
     coordinator.set_key_sizes_requested(key_sizes);
     coordinator.set_key_operations_requested(key_operations);
+    coordinator.set_provider_info_requested(provider_info);
     coordinator.set_info_capture(provider_info);
     // The departed-caller fold paces its planning strides against
     // the operator's live signal counter (when the run has one), so

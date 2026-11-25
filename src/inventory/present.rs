@@ -768,6 +768,10 @@ pub(crate) struct Presentation {
     /// only: distinguishes "requested but unavailable" from "off";
     /// JSON keeps the observations and gaps).
     pub key_operations_requested: bool,
+    /// Whether `--provider-info` was requested for this run (text
+    /// only: distinguishes "requested but none observed" from "off";
+    /// JSON keeps the observations and gaps).
+    pub provider_info_requested: bool,
     /// Whether `--key-sizes` was requested for this run (text only:
     /// without it `-v` prints the one-line size hint; JSON keeps the
     /// observations). Sizes render from row states, never this flag.
@@ -1285,6 +1289,7 @@ impl Presentation {
             },
             key_operations_requested: coordinator.key_operations_requested(),
             key_sizes_requested: coordinator.key_sizes_requested(),
+            provider_info_requested: coordinator.provider_info_requested(),
             manifests_present: coordinator.has_manifests(),
             joint_audit_subjects: {
                 let diagnosis = coordinator.joint_audit_subject_diagnosis();
@@ -4764,12 +4769,30 @@ fn render_concise_caller_scope_lines(out: &mut String, presentation: &Presentati
     }
 }
 
+/// Why requested provider info went unobserved: the auto-to-scan
+/// fallback leaves the named scope gap (the scan lane has no info
+/// feed); otherwise no module finished `C_GetInfo`.
+fn provider_info_absence_cause(presentation: &Presentation) -> &'static str {
+    let fell_back_to_scan = presentation
+        .gaps
+        .iter()
+        .any(|gap| gap.subject == "native usage feed unavailable");
+    if fell_back_to_scan {
+        "auto capture fell back to scan"
+    } else {
+        "no provider completed C_GetInfo"
+    }
+}
+
 /// Task 7 (§17.5) provider/token/mechanism text: one concise
 /// provider line per module with completed `C_GetInfo` facts, plus
-/// verbose-only token, mechanism and gap lines. Provider-controlled
-/// strings pass through [`escape_controls`]; refused (non-UTF8)
-/// strings read `?`. Slot numbers are per-process, so rows sharing
-/// a slot within a module name their caller.
+/// verbose-only token, mechanism and gap lines — or, when the run
+/// requested provider info but observed none, one concise
+/// `requested, but none observed` line naming the cause.
+/// Provider-controlled strings pass through [`escape_controls`];
+/// refused (non-UTF8) strings read `?`. Slot numbers are
+/// per-process, so rows sharing a slot within a module name their
+/// caller.
 fn render_provider_info_lines(out: &mut String, presentation: &Presentation, verbose: bool) {
     use std::fmt::Write as _;
     let observations = presentation.provider_observations.as_ref();
@@ -4827,6 +4850,24 @@ fn render_provider_info_lines(out: &mut String, presentation: &Presentation, ver
         if verbose {
             render_provider_info_rows(out, tokens, mechanisms);
         }
+    }
+    // Requested but nothing observed — no completed C_GetInfo, no
+    // token or mechanism rows (gaps alone are not observations):
+    // name the request and the cause, as the key-operations text
+    // does. The gaps block below carries the detail.
+    let any_observed = presentation
+        .modules
+        .iter()
+        .any(|module| module.provider_info.is_some())
+        || observations.is_some_and(|observations| {
+            !observations.tokens.is_empty() || !observations.mechanisms.is_empty()
+        });
+    if presentation.provider_info_requested && !any_observed {
+        let _ = writeln!(
+            out,
+            "provider info: requested, but none observed ({})",
+            provider_info_absence_cause(presentation),
+        );
     }
     if verbose && let Some(observations) = observations {
         let gaps = &observations.gaps;
@@ -5499,8 +5540,10 @@ fn render_snapshot_inner(
     }
     // Task 7 (§17.5): one concise provider line per module with
     // completed `C_GetInfo` facts, verbose-only per-slot token and
-    // per-mechanism limit lines. Absent without Task 7 content, and
-    // never in the quiet head.
+    // per-mechanism limit lines — or one `requested, but none
+    // observed` line when the run asked but saw nothing. Absent
+    // without Task 7 content or a request, and never in the quiet
+    // head.
     if !summary_only {
         render_provider_info_lines(&mut out, presentation, verbose);
     }

@@ -1235,6 +1235,83 @@ fn coverage_provider_segment_matches_json_gap_total() {
     assert_eq!(segment, total, "{line}");
 }
 
+/// Audit test 3: `--provider-info` requested but nothing observed reads
+/// `provider info: requested, but none observed (<cause>)` in the
+/// concise text — naming the scan fallback or the missing C_GetInfo.
+/// Unrequested runs stay silent.
+#[test]
+fn requested_provider_info_without_observations_names_its_cause() {
+    use crate::inventory_provider_info::{ProviderGaps, ProviderObservations};
+    let render_with = |requested: bool, fallback: bool, gaps_only: bool| {
+        let harness = varied_harness();
+        let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+        presentation.provider_info_requested = requested;
+        presentation.gaps.clear();
+        presentation.budgets.callers_refused = 0;
+        presentation.budgets.modules_refused = 0;
+        presentation.budgets.edges_refused = 0;
+        presentation.budgets.endpoints_refused = 0;
+        presentation.gaps_suppressed = 0;
+        assert!(presentation.provider_observations.is_none());
+        assert!(
+            presentation
+                .modules
+                .iter()
+                .all(|module| module.provider_info.is_none())
+        );
+        if gaps_only {
+            presentation.provider_observations = Some(ProviderObservations {
+                tokens: Vec::new(),
+                mechanisms: Vec::new(),
+                gaps: ProviderGaps {
+                    return_refused_hazard: 2,
+                    ..Default::default()
+                },
+            });
+        }
+        if fallback {
+            presentation.gaps.push(GapView {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: "native usage feed unavailable".into(),
+                reason: "live capture refused (no BPF)".into(),
+                budget: None,
+                repeats: 1,
+            });
+        }
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise)
+    };
+    let scan = render_with(true, true, false);
+    assert!(
+        scan.contains(
+            "provider info: requested, but none observed (auto capture fell back to scan)"
+        ),
+        "{scan}"
+    );
+    let native = render_with(true, false, false);
+    assert!(
+        native.contains(
+            "provider info: requested, but none observed (no provider completed C_GetInfo)"
+        ),
+        "{native}"
+    );
+    // Gaps without rows are still none observed — and force PARTIAL.
+    let refused = render_with(true, false, true);
+    assert!(
+        refused.contains(
+            "provider info: requested, but none observed (no provider completed C_GetInfo)"
+        ),
+        "{refused}"
+    );
+    assert!(
+        refused.contains("coverage: partial - provider info: 2 refused"),
+        "{refused}"
+    );
+    let quiet = render_with(false, true, false);
+    assert!(!quiet.contains("provider info: requested"), "{quiet}");
+}
+
 #[test]
 fn retained_labels_preserve_unknown_deleted_and_incarnation() {
     // A live-PID lookup would overwrite a retired incarnation's name; an

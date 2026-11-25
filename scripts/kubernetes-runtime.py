@@ -128,7 +128,8 @@ def validate_results(cell, work):
     gated = [row for row in rows if row.get("ok") is True and "record_only" not in row]
     recorded = [row for row in rows if row.get("record_only") is True and "ok" not in row]
     expected = Counter({"profile-exact": 3, "posture": 1, "doctor": 1, "isolation": 1,
-                        "trace-exact": 1, "negative": 1, "inventory": 1, "pid-refusal": 1}) if cell == "K1" \
+                        "trace-exact": 1, "copy-up-neg": 1, "negative": 1, "inventory": 1,
+                        "pid-refusal": 1}) if cell == "K1" \
         else Counter({"profile-exact": 1, "negative": 1, "scan-limit": 1})
     records = Counter({"trace-pid-namespace": 1, "observer-memory": 1}) if cell == "K1" else Counter()
     if (len(gated) + len(recorded) != len(rows)
@@ -139,11 +140,13 @@ def validate_results(cell, work):
     if sorted(row.get("calls", -1) for row in profiles) != ([1500, 1800, 2400] if cell == "K1" else [2400]):
         raise ValueError("original exact profile counts are missing")
     for row in gated:
-        if row["check"] in {"profile-exact", "trace-exact"}:
+        if row["check"] in {"profile-exact", "trace-exact", "copy-up-neg"}:
             if row.get("pid_namespace_causes") != ["pid_namespace"]:
                 raise ValueError("nested PID namespace disclosure is missing")
         if row["check"] == "trace-exact" and row.get("calls") != 1200:
             raise ValueError("original exact trace count is missing")
+        if row["check"] == "copy-up-neg" and row.get("calls") != 3900:
+            raise ValueError("original exact copy-up count is missing")
         if row["check"] == "scan-limit":
             if "pid_namespace" not in row.get("causes", []):
                 raise ValueError("scan-limit nested PID namespace disclosure is missing")
@@ -152,10 +155,14 @@ def validate_results(cell, work):
             if row["leg"] != "counted-exact" and not row.get("disclosure"):
                 raise ValueError("late provider zero has no disclosure")
     log = (work / "runtime.log").read_text()
-    marker = r"^=== kind e2e: ALL OK \(10 gated checks passed; 2 record-only lines; summary .+\) ===$" \
-        if cell == "K1" else r"^SUMMARY cell=K2 verdict=PASS reason=.+$"
-    if len(re.findall(marker, log, re.M)) != 1:
-        raise ValueError("original harness completion summary is missing or duplicated")
+    if cell == "K1":
+        marker = r"^=== kind e2e: ALL OK \((\d+) gated checks passed; (\d+) record-only lines; summary .+\) ===$"
+        matches = re.findall(marker, log, re.M)
+        valid = len(matches) == 1 and (int(matches[0][0]), int(matches[0][1])) == (len(gated), len(recorded))
+    else:
+        valid = len(re.findall(r"^SUMMARY cell=K2 verdict=PASS reason=.+$", log, re.M)) == 1
+    if not valid:
+        raise ValueError("original harness completion summary is missing, duplicated or inconsistent")
 
 
 def bpf_ids():

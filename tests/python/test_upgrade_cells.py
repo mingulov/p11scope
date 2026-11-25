@@ -473,6 +473,7 @@ class UpgradeGate6Harness:
         object_old_live=False,
         object_new_live=True,
         profile_schema_mutator=None,
+        profile_fixture_shape_valid=True,
     ):
         gate6 = self.gate6
         old_doc = copy.deepcopy(old_doc) if old_doc is not None else self.good_old_doc()
@@ -503,6 +504,13 @@ class UpgradeGate6Harness:
                 output.write_text(json.dumps(document))
                 return ""
 
+            fixture_path = gate6.PROFILE_FIXTURE
+            if not profile_fixture_shape_valid:
+                fixture_doc = json.loads(gate6.PROFILE_FIXTURE.read_text())
+                fixture_doc["capture"]["modules"] = []
+                fixture_path = base / "v071-observed-profile.json"
+                fixture_path.write_text(json.dumps(fixture_doc))
+
             def fake_run(command, timeout=120, **kwargs):
                 if fault:
                     return self.run_faulted(fault, command, timeout=timeout, **kwargs)
@@ -526,6 +534,7 @@ class UpgradeGate6Harness:
                     "load_profile_schemas",
                     return_value=(old_profile, new_profile),
                 ),
+                mock.patch.object(gate6, "PROFILE_FIXTURE", fixture_path),
             ]
             with contextlib.ExitStack() as stack:
                 for patcher in patches:
@@ -1104,6 +1113,7 @@ class UpgradeGate6ActivationTests(unittest.TestCase):
             ("b2_reader_accepts", {"fault": "b2-wrong-render"}),
             ("b3_then_exact", {"profile_schema_mutator": then_missing}),
             ("b3_exact", {"profile_schema_mutator": full_missing}),
+            ("b3_fixture_old_shape", {"profile_fixture_shape_valid": False}),
             ("b3_reader_accepts_old", {"fault": "b3-wrong-render"}),
         ]
         for check_name, kwargs in scenarios:

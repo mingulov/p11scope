@@ -232,23 +232,9 @@ def run_oracle(report, *, modfs, pin=None, modpath=MODPATH, ledger=None,
 
 
 def run_oracle_optimized(report, *, modfs, pin=None, modpath=MODPATH):
-    """Run the extracted oracle with assertions stripped (python3 -O)."""
-    block = extract_inventory_oracle()
-    if pin is None:
-        pin = PIN
-    inside_wl = "READY pid=100\nCHILD pid=101\nLEDGER x\n"
-    outside_wl = "READY pid=102\nLEDGER y\n"
-    with tempfile.TemporaryDirectory() as raw:
-        tmp = Path(raw)
-        (tmp / "r.json").write_text(json.dumps(report))
-        (tmp / "in.wl").write_text(inside_wl)
-        (tmp / "out.wl").write_text(outside_wl)
-        proc = subprocess.run(
-            [sys.executable, "-I", "-O", "-", "r.json", "in.wl",
-             "out.wl", json.dumps(pin), modpath, modfs],
-            input=block, capture_output=True, text=True, timeout=30,
-            cwd=str(tmp))
-    return proc.returncode, proc.stdout + proc.stderr
+    """Run the module judge with assertions stripped (python3 -O)."""
+    return run_oracle(report, modfs=modfs, pin=pin, modpath=modpath,
+                      interpreter=OPTIMIZED)
 
 
 def decided_report():
@@ -1304,7 +1290,7 @@ class ExplicitRefusalTests(unittest.TestCase):
     # (transaction gate, validated deadline collection, retained
     # presence, prep shape, degraded reason list, empty view).
     def test_block_has_no_bare_asserts(self):
-        tree = ast.parse(extract_inventory_oracle())
+        tree = ast.parse(RECORDS.read_text())
         found = sorted(node.lineno for node in ast.walk(tree)
                        if isinstance(node, ast.Assert))
         self.assertEqual(found, [])

@@ -30,7 +30,7 @@ _WRAP = ("tests/fixtures/operator-output/prepare-diagnostics-wrap.py",
          "tests/fixtures/operator-output/diagnostics-wrap-ledger.c",
          "tests/fixtures/public-cli/demotion-ledger.c", _PIN)
 _CI = ("scripts/ci/build-counter-fixtures.sh", "scripts/ci/build-wrap-fixtures.sh",
-       "scripts/ci/prepare-btrfs-tmpdir.sh")
+       "scripts/ci/prepare-btrfs-tmpdir.sh", "scripts/ci/joint_stop_verdict.py")
 _LIB = _CI + _COUNTER + _WRAP
 _PUBLIC = ("scripts/public-cli-oracle.py", "scripts/check-capture-evidence.py", "scripts/system-scope-measure.py",
            "scripts/qualify_records.py", "scripts/release-matrix-contract.py", _PIN,

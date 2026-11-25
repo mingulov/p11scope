@@ -58517,6 +58517,158 @@ fn scan_pins_waited_only_for_budget_names_the_preemptive_stop() {
     assert!(!scan_pins_waited_only_for_budget(&[]));
 }
 
+/// N1 (controller 17:27, I3 scope): the defer-whole tail names the
+/// typed wait cause behind the scan's waits, never the
+/// fd-exhaustion text — except a real handle-exhaustion wait, which
+/// keeps the fd tail, and the unanimous pre-emptive stops, which
+/// keep their tails.
+#[test]
+fn defer_whole_tail_names_the_typed_wait_cause() {
+    use crate::discovery::identity::WaitCause::*;
+    // Unanimous pre-emptive stops keep their tails.
+    assert_eq!(
+        defer_whole_tail(&[ReserveStop, ReserveStop]),
+        DeferWholeTail::Reserve
+    );
+    assert_eq!(defer_whole_tail(&[BudgetStop]), DeferWholeTail::Budget);
+    // Any handle-exhaustion wait keeps the fd tail, as do mixed
+    // pre-emptive stops with no other cause (the legacy text).
+    assert_eq!(
+        defer_whole_tail(&[HandleExhaustion]),
+        DeferWholeTail::Handles
+    );
+    assert_eq!(
+        defer_whole_tail(&[IoCeiling, HandleExhaustion]),
+        DeferWholeTail::Handles
+    );
+    assert_eq!(
+        defer_whole_tail(&[ReserveStop, BudgetStop]),
+        DeferWholeTail::Handles
+    );
+    assert_eq!(defer_whole_tail(&[]), DeferWholeTail::Handles);
+    // Every capture-budget cause names itself.
+    for cause in [
+        IoCeiling,
+        WorkCeiling,
+        Deadline,
+        ClockUnavailable,
+        TableWindowCeiling,
+        InterfaceWindowCeiling,
+    ] {
+        assert_eq!(
+            defer_whole_tail(&[cause]),
+            DeferWholeTail::Cause(cause),
+            "{cause:?} names its own tail"
+        );
+    }
+    // Mixed capture-budget waits name the first cause in scan order
+    // (pre-emptive stops break the loop, so they sort last).
+    assert_eq!(
+        defer_whole_tail(&[Deadline, IoCeiling]),
+        DeferWholeTail::Cause(Deadline)
+    );
+    assert_eq!(
+        defer_whole_tail(&[IoCeiling, ReserveStop]),
+        DeferWholeTail::Cause(IoCeiling)
+    );
+    assert_eq!(
+        defer_whole_tail(&[WorkCeiling, BudgetStop]),
+        DeferWholeTail::Cause(WorkCeiling)
+    );
+}
+
+/// N1: a scan cut short by a capture-budget wait still owes the pass
+/// cursor its CutShortBudgetStop member outcome; handle-class waits,
+/// scans that never got a working turn, and empty waits record
+/// nothing.
+#[test]
+fn waited_member_outcome_keeps_the_budget_stop_record() {
+    use crate::discovery::identity::WaitCause::*;
+    use crate::discovery::scan_pass::MemberOutcome;
+    for cause in [
+        IoCeiling,
+        WorkCeiling,
+        Deadline,
+        ClockUnavailable,
+        TableWindowCeiling,
+        InterfaceWindowCeiling,
+    ] {
+        assert_eq!(
+            waited_member_outcome(None, &[cause]),
+            Some(MemberOutcome::CutShortBudgetStop),
+            "{cause:?} cuts the scan short"
+        );
+        assert_eq!(
+            waited_member_outcome(Some("already stopped"), &[cause]),
+            None,
+            "{cause:?} under an already-stopped budget never got a turn"
+        );
+    }
+    for cause in [HandleExhaustion, ReserveStop, BudgetStop] {
+        assert_eq!(
+            waited_member_outcome(None, &[cause]),
+            None,
+            "{cause:?} records nothing"
+        );
+    }
+    assert_eq!(
+        waited_member_outcome(None, &[HandleExhaustion, IoCeiling]),
+        Some(MemberOutcome::CutShortBudgetStop),
+        "one budget stop among handle waits still cuts short"
+    );
+    assert_eq!(waited_member_outcome(None, &[]), None);
+}
+
+/// N1: the scan funnel channels the typed pin-wait causes beside the
+/// gaps, in scan order — the defer-whole tail reads these, never the
+/// gap text.
+#[test]
+fn scan_channels_typed_pin_wait_causes() {
+    use crate::discovery::identity::WaitCause;
+    let pid = std::process::id();
+    let view = ProcessView::open(ProcessViewId(0), pid).unwrap();
+    let hooks = HookRegistry::builtin();
+    let key = ObjectKey {
+        device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+        inode: 56_317_450,
+    };
+    let mut module = crate::discovery::identity::test_fixture::module(key);
+    module.path = "/bin/sh".into();
+    module.tables = Vec::new();
+    // Healable exhaustion: the work allowance is spent before the
+    // first pin, so the pin waits instead of proving.
+    let mut budget = CaptureWorkBudget::with_work_ceiling(1);
+    assert!(budget.charge(1));
+    let mut counters = DiscoveryCounters::default();
+    scan_and_pin_with(
+        &view,
+        &[],
+        &hooks,
+        &mut budget,
+        &mut counters,
+        false,
+        &mut crate::timing::StageTimings::default(),
+        &mut TeardownDeferralBudget::new(),
+        None,
+        |_: &ScanRequest<'_>, _: &ProcessView, _: &mut CaptureWorkBudget| {
+            Ok::<_, String>(ScanOutcome::Scanned {
+                modules: vec![module],
+                skipped: vec![],
+                scan_ms: 0,
+            })
+        },
+        None,
+        crate::discovery::handle_table::Filing::Untracked,
+    )
+    .unwrap();
+    assert_eq!(counters.pin_wait_causes, vec![WaitCause::WorkCeiling]);
+    assert!(
+        scan_pins_waited(&counters.object_skips),
+        "the wait still files its gap: {:?}",
+        counters.object_skips
+    );
+}
+
 /// View-collapse fix7 F1 at the admission seam (codex blocking): a live
 /// admission whose scan wants more pins than the reserve covers stops
 /// mid-scan — the view defers whole under the RESERVE tail (not the

@@ -2987,6 +2987,67 @@ fn discovery_row_marks_only_the_pre_copy_up_object() {
     );
 }
 
+/// A planned module whose pin vanished before evidence rendered
+/// (file churn between planning and publication) files a named,
+/// counted gap instead of panicking the live render path.
+#[test]
+fn discovery_evidence_without_a_pin_for_a_planned_object_files_a_gap() {
+    let mut plan = plan_with(2, 0);
+    // Distinct pinless objects per slot, so each dropped row files.
+    plan.slots[1].object = crate::discovery::identity::PinnedObjectId(43);
+    let pins = crate::discovery::identity::PinnedObjects::empty();
+    let evidence = discovery_evidence(
+        &plan,
+        &pins,
+        &DiscoveryCounters::default(),
+        &crate::prearm_module::PrearmState::empty(),
+        &BTreeMap::new(),
+    );
+    assert!(
+        evidence.modules.is_empty(),
+        "an unrenderable module leaves no row: {:?}",
+        evidence.modules
+    );
+}
+
+/// A planned slot whose object lost its pin drops from its module's
+/// objects with a gap, while the module row itself still renders.
+#[test]
+fn discovery_evidence_without_a_pin_for_a_planned_slot_files_a_gap() {
+    use crate::discovery::identity::test_fixture::pin_set;
+    let key = ObjectKey {
+        device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+        inode: 42,
+    };
+    let pins = pin_set(&[(key, "sha-module", 7)], false);
+    let module_id = pins.pinned().next().unwrap().id;
+    let mut plan = plan_with(2, 0);
+    plan.modules[0].object = module_id;
+    plan.modules[0].key = key;
+    plan.modules[0].path = "/opt/p11.so".to_string();
+    // Slot 0 keeps a pin; slot 1 names an object the pin set lost.
+    plan.slots[0].object = module_id;
+    plan.slots[0].object_path = "/opt/p11.so".to_string();
+    plan.slots[1].object = crate::discovery::identity::PinnedObjectId(424242);
+    plan.slots[1].object_path = "/opt/p11-gone.so".to_string();
+    let evidence = discovery_evidence(
+        &plan,
+        &pins,
+        &DiscoveryCounters::default(),
+        &crate::prearm_module::PrearmState::empty(),
+        &BTreeMap::new(),
+    );
+    assert_eq!(evidence.modules.len(), 1, "the module row renders");
+    assert!(
+        evidence.modules[0]
+            .objects
+            .iter()
+            .all(|object| object.path != "/opt/p11-gone.so"),
+        "the pinless slot object leaves the row: {:?}",
+        evidence.modules[0].objects
+    );
+}
+
 #[test]
 fn discovery_pair_rows_share_the_merge_view_key() {
     // Both rows of a witness-proven copy-up pair publish the merge

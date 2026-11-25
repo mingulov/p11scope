@@ -2584,6 +2584,47 @@ mod tests {
         );
     }
 
+    /// The §4.5 type-only fallback for the three PQC key types (the
+    /// combined label governs when present; the raw type fills in
+    /// only when no label exists): 0x49/0x4a/0x4b name ML-KEM/ML-DSA/
+    /// SLH-DSA, and unlisted codes stay `None` so the inference
+    /// stands alone, never conflicting.
+    #[test]
+    fn established_type_kind_mapping() {
+        assert_eq!(
+            established_type_kind(0x49),
+            Some(EstablishedKind::MlKem { set: "" })
+        );
+        assert_eq!(
+            established_type_kind(0x4a),
+            Some(EstablishedKind::MlDsa { set: "" })
+        );
+        assert_eq!(
+            established_type_kind(0x4b),
+            Some(EstablishedKind::SlhDsa { set: "" })
+        );
+        assert_eq!(established_type_kind(0xff), None);
+    }
+
+    /// PQC parameter-set displays: all six ML sets plus SLH-DSA
+    /// short-form spots render exactly (unknown spellings pass
+    /// through, never hidden).
+    #[test]
+    fn pqc_set_displays() {
+        for (set, display) in [
+            ("ml_kem_512", "ML-KEM-512"),
+            ("ml_kem_768", "ML-KEM-768"),
+            ("ml_kem_1024", "ML-KEM-1024"),
+            ("ml_dsa_44", "ML-DSA-44"),
+            ("ml_dsa_65", "ML-DSA-65"),
+            ("ml_dsa_87", "ML-DSA-87"),
+            ("slh_dsa_128s", "SLH-DSA-128s"),
+            ("slh_dsa_256f", "SLH-DSA-256f"),
+        ] {
+            assert_eq!(pqc_set_display(set), display, "{set}");
+        }
+    }
+
     /// Every §4.5 row, both directions of the qualifiers, plus the
     /// cross-name default (everything else conflicts) and the inert
     /// des2/des3 pair.

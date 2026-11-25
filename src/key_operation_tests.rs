@@ -34088,3 +34088,34 @@ fn key_operation_schema_v7_detail_accepts_mathematical_integers() {
         );
     }
 }
+
+/// The v7+ size-detail JSON for one PQC set: kind, parameter set,
+/// octets and the first evidence tag render exactly.
+#[test]
+fn key_operation_pqc_size_detail_json_pins() {
+    use crate::key_operation_projection::inferred_size_json;
+    use crate::semantics_key_use::{InferredStatus, SizeState};
+    let mut size = SizeState::default();
+    size.status = InferredStatus::Inferred;
+    size.detail = Some((
+        crate::keymeta::SizeDetail::PqcSet {
+            parameter_set: "ml_kem_768",
+            octets: 1088,
+        },
+        crate::keymeta::EvidenceTag::EncapsulateOutput,
+    ));
+    size.completions = 1;
+    assert_eq!(
+        inferred_size_json(&size),
+        serde_json::json!({
+            "status": "inferred",
+            "detail": {
+                "kind": "pqc_set",
+                "parameter_set": "ml_kem_768",
+                "octets": 1088,
+                "evidence": "encapsulate_output",
+            },
+            "completions": 1,
+        })
+    );
+}

@@ -53,6 +53,11 @@ from pathlib import Path
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+import upgrade_artifact_validation as artifact_validation
 
 # B1: exact new-only inventory keys introduced by the departed_use fold.
 # From the v0.7.1-vs-current scan comparison (budgets + per-module).
@@ -204,9 +209,9 @@ def cbom_properties(document: dict) -> dict:
 
 
 def diff_zero_same(document: dict) -> bool:
-    """True only for the typed diff schema with both change lists empty."""
+    """True only for a typed diff document with both change lists empty."""
     return (
-        document.get("schema") == "p11scope/inventory-diff/v1"
+        not artifact_validation.diff_errors(document)
         and document.get("application_changes") == []
         and document.get("module_path_changes") == []
     )
@@ -409,8 +414,9 @@ def generate_scan_report(binary: Path, output: Path, module: str) -> str:
             document = load_json_file(output)
         except ValueError as exc:
             return f"{binary} report unreadable: {exc}"
-        if document.get("schema") != "p11scope/inventory/v1":
-            return f"{binary} schema={document.get('schema')}"
+        errors = artifact_validation.inventory_errors(document)
+        if errors:
+            return f"{binary} invalid inventory report: {errors[0]}"
         return ""
     finally:
         try:
@@ -445,6 +451,26 @@ def run_gate(args, workdir: Path, result: dict) -> int:
         True,
         f"old={old_report} new={new_report}",
     )
+    try:
+        old = load_json_file(old_report)
+        new = load_json_file(new_report)
+    except ValueError as exc:
+        check(result, "inventory_reports_typed", False, f"report load: {exc}")
+    inventory_errors = []
+    old_errors = artifact_validation.inventory_errors(old)
+    new_errors = artifact_validation.inventory_errors(new)
+    if old_errors:
+        inventory_errors.append(f"old: {old_errors[0]}")
+    if new_errors:
+        inventory_errors.append(f"new: {new_errors[0]}")
+    check(
+        result,
+        "inventory_reports_typed",
+        not inventory_errors,
+        "; ".join(inventory_errors)
+        if inventory_errors
+        else "old/new inventory reports carry typed root, observation, budget, row and gap content",
+    )
 
     # 2. New binary reads old via cbom and diff.
     completed = run([str(args.new_binary), "inventory", "cbom", str(old_report), "--json"])
@@ -456,8 +482,13 @@ def run_gate(args, workdir: Path, result: dict) -> int:
     )
     try:
         cbom = json.loads(completed.stdout)
-        cbom_typed_ok = cbom.get("bomFormat") == "CycloneDX"
-        cbom_typed_detail = f"bomFormat={cbom.get('bomFormat')}"
+        cbom_errors = artifact_validation.cbom_inventory_errors(cbom, old)
+        cbom_typed_ok = not cbom_errors
+        cbom_typed_detail = (
+            cbom_errors[0]
+            if cbom_errors
+            else "typed inventory cbom flow-through matches scope/window/passes/gaps/provider/application counts"
+        )
     except json.JSONDecodeError as exc:
         cbom_typed_ok = False
         cbom_typed_detail = f"cbom JSON parse: {exc}"
@@ -478,11 +509,14 @@ def run_gate(args, workdir: Path, result: dict) -> int:
     if zero_ok:
         try:
             same_diff = json.loads(completed.stdout)
-            zero_ok = diff_zero_same(same_diff)
+            zero_errors = artifact_validation.diff_errors(same_diff, old, old)
+            if same_diff.get("application_changes") != [] or same_diff.get("module_path_changes") != []:
+                zero_errors.append("same-input diff has nonempty application/module-path changes")
+            zero_ok = not zero_errors
             zero_detail = (
-                f"schema={same_diff.get('schema')} "
-                f"application_changes={len(same_diff.get('application_changes', []))} "
-                f"module_path_changes={len(same_diff.get('module_path_changes', []))}"
+                zero_errors[0]
+                if zero_errors
+                else "typed ten-field diff, consistent before/after snapshots and zero changes"
             )
         except json.JSONDecodeError as exc:
             zero_ok = False
@@ -502,8 +536,13 @@ def run_gate(args, workdir: Path, result: dict) -> int:
     check(result, "diff_old_new", completed.returncode == 0, f"rc={completed.returncode}")
     try:
         diff_doc = json.loads(completed.stdout)
-        diff_detail = f"schema={diff_doc.get('schema')}"
-        diff_ok = diff_doc.get("schema") == "p11scope/inventory-diff/v1"
+        diff_errors = artifact_validation.diff_errors(diff_doc, old, new)
+        diff_ok = not diff_errors
+        diff_detail = (
+            diff_errors[0]
+            if diff_errors
+            else "typed ten-field diff with consistent before/after snapshots, comparison and summary"
+        )
     except json.JSONDecodeError as exc:
         diff_doc = {}
         diff_detail = f"diff JSON parse: {exc}"
@@ -512,11 +551,6 @@ def run_gate(args, workdir: Path, result: dict) -> int:
 
     # 3. B1: departed_use delta is exactly B1+additive, nothing else, and
     # every pinned B1 key is present in the new typed report.
-    try:
-        old = load_json_file(old_report)
-        new = load_json_file(new_report)
-    except ValueError as exc:
-        check(result, "b1_exact", False, f"report load: {exc}")
     old_keys = set(flatten_keys(old))
     new_keys = set(flatten_keys(new))
     delta = evaluate_b1_delta(old_keys, new_keys)
@@ -601,19 +635,23 @@ def run_gate(args, workdir: Path, result: dict) -> int:
     completed = run([str(args.new_binary), "inventory", "cbom", str(injected_path), "--json"])
     rendered = None
     cbom = {}
+    cbom_errors = ["cbom command failed"]
     reader_detail = f"rc={completed.returncode}"
     if completed.returncode == 0:
         try:
             cbom = json.loads(completed.stdout)
-            if cbom.get("bomFormat") != "CycloneDX":
-                reader_detail = f"bomFormat={cbom.get('bomFormat')}"
-            else:
-                rendered = cbom_properties(cbom).get("p11scope:object_observations")
-                reader_detail = f"object_observations={rendered!r}"
+            cbom_errors = artifact_validation.cbom_inventory_errors(cbom, injected)
+            rendered = cbom_properties(cbom).get("p11scope:object_observations")
+            reader_detail = (
+                cbom_errors[0]
+                if cbom_errors
+                else f"object_observations={rendered!r}"
+            )
         except json.JSONDecodeError as exc:
-            reader_detail = f"cbom JSON parse: {exc}"
+            cbom_errors = [f"cbom JSON parse: {exc}"]
+            reader_detail = cbom_errors[0]
     expected_render = f"partial ({LIVE_JOINT_REASON})"
-    rendered_ok = cbom_live_joint_rendered(cbom)
+    rendered_ok = not cbom_errors and cbom_live_joint_rendered(cbom)
     check(
         result,
         "b2_reader_accepts",
@@ -673,33 +711,25 @@ def run_gate(args, workdir: Path, result: dict) -> int:
         if fixture_ok
         else "fixture is not a substantive old-shaped v0.7.1 profile",
     )
-    window = profile_window(profile_doc)
     completed = run(
         [str(args.new_binary), "inventory", "cbom", str(PROFILE_FIXTURE), "--json"]
     )
-    props = {}
     cbom = {}
+    profile_errors = ["cbom command failed"]
     profile_detail = f"rc={completed.returncode}"
     if completed.returncode == 0:
         try:
             cbom = json.loads(completed.stdout)
-            if cbom.get("bomFormat") != "CycloneDX":
-                profile_detail = f"bomFormat={cbom.get('bomFormat')}"
-            else:
-                props = cbom_properties(cbom)
-                profile_detail = "typed profile markers and substantive rows present"
+            profile_errors = artifact_validation.cbom_profile_errors(cbom, profile_doc)
+            profile_detail = (
+                profile_errors[0]
+                if profile_errors
+                else "typed profile markers and substantive rows present"
+            )
         except json.JSONDecodeError as exc:
-            profile_detail = f"cbom JSON parse: {exc}"
-    profile_ok = completed.returncode == 0 and cbom_profile_fixture_flow(cbom, window)
-    if not profile_ok and props:
-        profile_detail = (
-            f"source_schema={props.get('p11scope:source_schema')!r} "
-            f"window={props.get('p11scope:window')!r} "
-            f"profile_note={props.get('p11scope:profile_note')!r} "
-            f"completeness={props.get('p11scope:completeness')!r} "
-            f"providers={props.get('p11scope:providers')!r} "
-            f"algorithms={props.get('p11scope:algorithms')!r}"
-        )
+            profile_errors = [f"cbom JSON parse: {exc}"]
+            profile_detail = profile_errors[0]
+    profile_ok = completed.returncode == 0 and not profile_errors
     check(result, "b3_reader_accepts_old", profile_ok, profile_detail)
 
     result["status"] = "pass"

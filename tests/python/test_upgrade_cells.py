@@ -273,11 +273,11 @@ def diff_snapshot(source):
             "ended_ns": source["observation"]["ended_ns"],
             "passes": source["observation"]["passes"],
             "usage_feed": source["observation"]["usage_feed"],
-            "lane": "scan",
-            "settlement": "settled",
-            "retirement": "closed",
+            "lane": None,
+            "settlement": None,
+            "retirement": None,
             "attach": None,
-            "lifecycle": {},
+            "lifecycle": None,
             "native_witnesses": dict(source["observation"]["native_witnesses"]),
         },
         "pid_namespace": dict(source["pid_namespace"]),
@@ -286,7 +286,7 @@ def diff_snapshot(source):
         "suppressed_gaps": source["gaps_suppressed"],
         "refusals": {"reported_budget_gaps": 0, "budget_counters": {}},
         "budgets": dict(source["budgets"]),
-        "loss_evidence": {"lifecycle": {}, "native_witnesses": dict(source["observation"]["native_witnesses"])},
+        "loss_evidence": {"lifecycle": None, "native_witnesses": dict(source["observation"]["native_witnesses"])},
         "gaps": copy.deepcopy(source["gaps"]),
         "evidence": {
             "callers": copy.deepcopy(source["callers"]),
@@ -804,11 +804,14 @@ class UpgradeGate6Harness:
     def cbom(properties, bom_format="CycloneDX"):
         return {
             "bomFormat": bom_format,
+            "specVersion": "1.6",
             "metadata": {
                 "properties": [
                     {"name": name, "value": value} for name, value in properties.items()
                 ]
             },
+            "components": [{"type": "library", "name": "provider.so"}],
+            "dependencies": [{"ref": "p11scope:module:0", "dependsOn": []}],
         }
 
     def fake_completed(self, command, rc=0, stdout="", stderr=""):
@@ -843,6 +846,17 @@ class UpgradeGate6Harness:
                         "p11scope:completeness": "COMPLETE",
                         "p11scope:providers": "1",
                         "p11scope:algorithms": "1",
+                        "p11scope:applications": "0",
+                        "p11scope:keys": "0",
+                        "p11scope:object_observations": "absent",
+                        "p11scope:established_source_query": "0",
+                        "p11scope:established_source_creation_success": "0",
+                        "p11scope:established_source_unrecorded": "0",
+                        "p11scope:callers_unknown_exe": "0",
+                        "p11scope:mechanisms_unnamed": "0",
+                        "p11scope:mechanisms_unknown_primitive": "0",
+                        "p11scope:keys_unknown_size": "0",
+                        "p11scope:keys_unknown_type": "0",
                     }
                 )
             return self.fake_completed(
@@ -1579,15 +1593,19 @@ class UpgradeGate6PureTests(unittest.TestCase):
         self.assertFalse(self.gate6.key_exists({"a": [{"other": "departed_use"}]}, "departed_use"))
 
     def test_diff_zero_requires_typed_empty_changes(self):
-        good = {
-            "schema": "p11scope/inventory-diff/v1",
-            "application_changes": [],
-            "module_path_changes": [],
-        }
+        source = substantive_inventory()
+        good = valid_diff_document(source, source)
         self.assertTrue(self.gate6.diff_zero_same(good))
-        self.assertFalse(self.gate6.diff_zero_same({**good, "application_changes": [{"x": 1}]}))
-        self.assertFalse(self.gate6.diff_zero_same({**good, "module_path_changes": [{"x": 1}]}))
-        self.assertFalse(self.gate6.diff_zero_same({**good, "schema": "other"}))
+        changed = copy.deepcopy(good)
+        changed["application_changes"] = [{"x": 1}]
+        self.assertFalse(self.gate6.diff_zero_same(changed))
+        changed = copy.deepcopy(good)
+        changed["module_path_changes"] = [{"x": 1}]
+        self.assertFalse(self.gate6.diff_zero_same(changed))
+        changed = copy.deepcopy(good)
+        changed["schema"] = "other"
+        self.assertFalse(self.gate6.diff_zero_same(changed))
+        self.assertFalse(self.gate6.diff_zero_same({"schema": "p11scope/inventory-diff/v1"}))
 
     def test_live_joint_render_requires_exact_reason(self):
         doc = {
@@ -1683,7 +1701,7 @@ class UpgradeGate6ActivationTests(unittest.TestCase):
         unexpected = self.harness.good_new_doc()
         unexpected["modules"][0]["surprise"] = 1
         removed = self.harness.good_new_doc()
-        del removed["modules"][0]["paths"]
+        del removed["callers"][0]["incarnation"]
         old_departed = self.harness.good_old_doc()
         new_departed = self.harness.good_new_doc()
         old_departed["departed_use"] = {}
@@ -1735,7 +1753,7 @@ class UpgradeGate6ActivationTests(unittest.TestCase):
         result = self.assert_gate_failure(
             "diff_old_old_zero", fault="diff-zero-wrong-schema"
         )
-        self.assertIn("schema=other", result["checks"]["diff_old_old_zero"]["detail"])
+        self.assertIn("diff schema is 'other'", result["checks"]["diff_old_old_zero"]["detail"])
 
     def test_v071_profile_fixture_is_real_old_shaped_and_substantive(self):
         path = ROOT / "tests/fixtures/upgrade/v071-observed-profile.json"

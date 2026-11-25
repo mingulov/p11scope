@@ -213,21 +213,9 @@ installed_version() {
   printf '%s' "$2"
 }
 
-validate_inventory_schema() {
-  python3 - "$1" <<'PY'
-import json
-import sys
-
-try:
-    with open(sys.argv[1], encoding="utf-8") as handle:
-        document = json.load(handle)
-except (OSError, json.JSONDecodeError) as exc:
-    print(f"invalid inventory report: {exc}", file=sys.stderr)
-    raise SystemExit(1)
-if document.get("schema") != "p11scope/inventory/v1":
-    print(f"wrong inventory schema: {document.get('schema')}", file=sys.stderr)
-    raise SystemExit(1)
-PY
+validate_inventory_report() {
+  validator="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/upgrade_artifact_validation.py" || return 1
+  python3 "$validator" inventory "$1" 2>&1
 }
 
 install_old() {
@@ -331,7 +319,7 @@ run_gate_body() {
     CAPTURE_OLD_RC=$?
   fi
   [ "$CAPTURE_OLD_RC" = 0 ] || fail "old capture rc=$CAPTURE_OLD_RC"
-  validate_inventory_schema "$WORKDIR/pre-upgrade.json" || fail "old capture report has wrong schema"
+  validation_detail="$(validate_inventory_report "$WORKDIR/pre-upgrade.json")" || fail "old capture report failed typed validation: $validation_detail"
   # Hash canaries before upgrade; an empty hash is a failure, never equality.
   CANARY_RECOVERY_SHA_BEFORE="$(hash_file "$CANARY_RECOVERY")" || fail "cannot hash recovery canary before upgrade"
   CANARY_REPORT_SHA_BEFORE="$(hash_file "$CANARY_REPORT")" || fail "cannot hash saved-report canary before upgrade"
@@ -359,7 +347,7 @@ run_gate_body() {
     CAPTURE_NEW_RC=$?
   fi
   [ "$CAPTURE_NEW_RC" = 0 ] || fail "new capture rc=$CAPTURE_NEW_RC"
-  validate_inventory_schema "$WORKDIR/post-upgrade.json" || fail "new capture report has wrong schema"
+  validation_detail="$(validate_inventory_report "$WORKDIR/post-upgrade.json")" || fail "new capture report failed typed validation: $validation_detail"
   # 9. Canaries byte-identical, with non-empty hashes on both sides.
   CANARY_RECOVERY_SHA_AFTER="$(hash_file "$CANARY_RECOVERY")" || fail "cannot hash recovery canary after upgrade"
   CANARY_REPORT_SHA_AFTER="$(hash_file "$CANARY_REPORT")" || fail "cannot hash saved-report canary after upgrade"

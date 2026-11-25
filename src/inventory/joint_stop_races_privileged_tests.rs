@@ -4771,16 +4771,19 @@ fn stop_reconciliation_refuses_a_shed_row_with_an_unknown_drop_word() {
     );
 }
 
-/// Seal pending across stop, live (stop-time seal stall): q2 holds
-/// its seal take with the test seam (partition contention, pending),
-/// the capture stops directly while the seal is pending, then the
-/// hold clears and the take hits its final Stopped refusal (no retry).
-/// The feed falls back at once, and its calls land in one named
-/// capture-ended gap with their exact count. q2 publishes, then the
-/// Finish publishes, winds down, and hands off with no latch, no trip,
-/// no abandon and no semantic_unavailable. Before the fix the stopped
-/// take read as partition contention and every delivery retried
-/// forever (the live s12b/s12c finish stall).
+/// Seal pending across stop, live (stop-time seal stall): the Finish
+/// holds its seal take with the test seam (partition contention,
+/// pending) across the production stop. The Finish is the single
+/// stop (FinishStop runs the H0 stop inside the Finish drive; no
+/// direct capture stop, no q2 Running quantum): its quantum collects
+/// the complete return, stops H0, then its seal holds while the hold
+/// masks the Stopped latch. Clearing the hold lets the take hit its
+/// final Stopped refusal (no retry). The feed falls back at once, and
+/// its calls land in one named capture-ended gap with their exact
+/// count. The Finish then publishes, winds down, and hands off with
+/// no latch, no trip, no abandon and no semantic_unavailable. Before
+/// the fix the stopped take read as partition contention and every
+/// delivery retried forever (the live s12b/s12c finish stall).
 #[test]
 #[ignore = "privileged: live Joint seal pending across stop falls back with named loss"]
 fn privileged_joint_seal_pending_across_stop_falls_back_live_lp64() -> Result<()> {
@@ -4868,6 +4871,7 @@ fn privileged_joint_seal_pending_across_stop_falls_back_live_lp64() -> Result<()
     // back. Each retry is another Running transaction, still before any
     // release, so the held entry stays in flight.
     let mut q1_polls = 0u64;
+    let mut q1_feeds = 0;
     for attempt in 0..4 {
         q1_polls += service_to_published(
             &mut lane,
@@ -4876,14 +4880,86 @@ fn privileged_joint_seal_pending_across_stop_falls_back_live_lp64() -> Result<()
             &format!("{tag}-q1a{attempt}"),
         )?;
         let feeds = coordinator.registry().joint_feeds();
-        eprintln!("JOINT_STOP {tag}: q1 attempt {attempt} feeds={feeds}");
+        let seal = coordinator.joint_seal_bootstrap_diagnosis();
+        eprintln!(
+            "JOINT_STOP {tag}: q1 attempt {attempt} feeds={feeds} takes={:?} gaps={} shed={} \
+             reverify={:?} covers={} pin={} other={}",
+            seal.take_failed,
+            coordinator.registry().gaps().len(),
+            lane.shed_calls_disclosed(),
+            seal.reverify_failed,
+            seal.covers_failed,
+            seal.pin_failed,
+            seal.other_failed,
+        );
+        q1_feeds = feeds;
         if feeds == 2 {
             break;
         }
-        ensure!(
-            attempt < 3,
-            "{tag}: q1 never installed both Joint feeds (got {feeds} after 4 attempts)"
+    }
+    // Shed branch (busy host): q1 never installed both feeds. Dump every
+    // typed record the verdict will pin (temporary: the exact shed-gap
+    // verdict lands once this dump names the record).
+    if q1_feeds != 2 {
+        let seal = coordinator.joint_seal_bootstrap_diagnosis();
+        eprintln!(
+            "JOINT_STOP {tag}: SHED feeds={q1_feeds} linked={} takes={:?} reverify={:?} \
+             covers={} pin={} other={} shed={} merge_refused={}",
+            coordinator.registry().journal_linked(),
+            seal.take_failed,
+            seal.reverify_failed,
+            seal.covers_failed,
+            seal.pin_failed,
+            seal.other_failed,
+            lane.shed_calls_disclosed(),
+            lane.merge_refused_births(),
         );
+        for gap in coordinator.registry().gaps().iter() {
+            eprintln!(
+                "JOINT_STOP {tag}: SHED gap {:?} {:?} caller={:?} module={:?} pid={:?} \
+                 budget={:?}",
+                gap.subject, gap.reason, gap.caller, gap.module, gap.pid, gap.budget,
+            );
+        }
+        for gap in coordinator.registry().staged_gaps_for_test() {
+            eprintln!(
+                "JOINT_STOP {tag}: SHED staged {:?} {:?} caller={:?}",
+                gap.subject, gap.reason, gap.caller,
+            );
+        }
+        for (name, pid, module) in [
+            ("a", process_a.pid(), "live-joint-held.so"),
+            ("b", process_b.pid(), "soft-copy.so"),
+        ] {
+            match joint_edge_snapshot(&coordinator, pid, module) {
+                Ok(edge) => eprintln!(
+                    "JOINT_STOP {tag}: SHED edge_{name} joint={} reduced={} api={:?} \
+                     started={:?} completed={:?} mechanisms={:?}",
+                    edge.joint,
+                    edge.reduced,
+                    edge.api_returns,
+                    edge.started,
+                    edge.completed,
+                    edge.mechanisms,
+                ),
+                Err(error) => eprintln!("JOINT_STOP {tag}: SHED edge_{name} missing: {error:#}"),
+            }
+            let out = if name == "a" {
+                &process_a.out
+            } else {
+                &process_b.out
+            };
+            match ledger_calls(out) {
+                Ok((per_function, total, bad)) => eprintln!(
+                    "JOINT_STOP {tag}: SHED ledger_{name} total={total} bad={bad} \
+                     per_function={per_function:?}",
+                ),
+                Err(error) => {
+                    eprintln!("JOINT_STOP {tag}: SHED ledger_{name} unreadable: {error:#}")
+                }
+            }
+        }
+        anyhow::bail!("{tag}: SHED: q1 installed {q1_feeds} feeds (verdict TBD)");
     }
     let q1_end_ns = monotonic_ns();
     let t_enter = ledger_stamp(&process_a.out, "HELD ")?;
@@ -4891,25 +4967,29 @@ fn privileged_joint_seal_pending_across_stop_falls_back_live_lp64() -> Result<()
         t_enter < q1_end_ns,
         "{tag}: the held call entered before q1 ended: {t_enter} < {q1_end_ns}"
     );
-    eprintln!("JOINT_STOP {tag}: q1 published in {q1_polls} polls; releasing for q2");
+    eprintln!("JOINT_STOP {tag}: q1 published in {q1_polls} polls; releasing for the finish");
     {
         let _release = std::fs::File::create(&release)?;
     }
     process_a.wait_for("RETURNED ", Duration::from_secs(60))?;
     eprintln!(
-        "JOINT_STOP {tag}: pre-q2 baseline: drive={:?} stash={:?} stuck={:?}",
+        "JOINT_STOP {tag}: pre-finish baseline: drive={:?} stash={:?} stuck={:?}",
         lane.joint_drive_state_for_test(),
         lane.stash_pending_floor(),
         lane.joint_stuck_diagnostic_for_test(),
     );
-    // Hold the seal take across the stop with the test seam, then stop.
-    // q2 collects the complete return, stages it, then its seal holds as
-    // partition contention (retry, pending). The direct stop then lands
-    // while the seal is pending; clearing the hold lets the take hit its
-    // final Stopped refusal (no retry), falling back with counted loss.
-    // Deterministic: the hold flag pins the seal pending by construction,
-    // the direct stop lands before the release below. Only an S1 build
-    // precludes the cell here (no journal feed at all).
+    // Hold the seal take across the stop with the test seam, then stop
+    // through the PRODUCTION sequencing: the Finish is the single stop
+    // (no direct capture stop, no q2 Running quantum). The Finish
+    // quantum collects the complete return, runs the H0 stop inside
+    // FinishStop, then its seal holds as partition contention (retry,
+    // pending) while the hold masks the Stopped latch; clearing the
+    // hold lets the take hit its final Stopped refusal (no retry),
+    // falling back with counted loss. Deterministic: the hold flag
+    // pins the seal pending by construction, and the phase order
+    // (FinishStop before the seal) puts the production stop before
+    // the first take. Only an S1 build precludes the cell here (no
+    // journal feed at all).
     if matches!(joint_branch(&coordinator), JointBranch::S1) {
         eprintln!("P11SCOPE_CELL_BRANCH={tag}:s1-precluded");
         anyhow::bail!(
@@ -4930,116 +5010,8 @@ fn privileged_joint_seal_pending_across_stop_falls_back_live_lp64() -> Result<()
     lane.live_capture_mut()
         .expect("live capture")
         .set_hold_takes_for_test(true);
-    lane.begin_joint_commit(false)
-        .map_err(|refusal| anyhow::anyhow!("{tag}: q2 begin refused: {refusal:?}"))?;
-    {
-        use crate::inventory_semantics::{JointServiceMode, JointWorkBudget};
-        let mut budget = JointWorkBudget {
-            remaining_actions: 1024,
-            deadline: Instant::now() + Duration::from_millis(10),
-        };
-        let service = lane
-            .service_joint(&mut coordinator, JointServiceMode::Running, &mut budget)
-            .map_err(|reason| anyhow::anyhow!("{tag}: q2 held service refused: {reason}"))?;
-        ensure!(
-            matches!(
-                service,
-                crate::inventory_semantics::JointServiceProgress::Pending
-            ),
-            "{tag}: the held q2 service stays pending (got {service:?})"
-        );
-        let mut budget = JointWorkBudget {
-            remaining_actions: 1024,
-            deadline: Instant::now() + Duration::from_millis(10),
-        };
-        let commit = lane
-            .poll_joint_commit(&mut coordinator, &mut budget)
-            .map_err(|reason| anyhow::anyhow!("{tag}: q2 held poll refused: {reason}"))?;
-        ensure!(
-            matches!(
-                commit,
-                crate::discovery::engine::inventory_coordinator::JointCommitProgress::Pending
-            ),
-            "{tag}: the held q2 poll stays pending (got {commit:?})"
-        );
-    }
-    {
-        use crate::semantics_objects::journal::SealBootstrapCounts as Counts;
-        let counts = coordinator.joint_seal_bootstrap_diagnosis();
-        let current = Counts::take_index(crate::attach::BirthObservationRefusal::CurrentPartition);
-        let stopped = Counts::take_index(crate::attach::BirthObservationRefusal::Stopped);
-        eprintln!(
-            "JOINT_STOP {tag}: held takes current={} stopped={} all={:?}",
-            counts.take_failed[current], counts.take_failed[stopped], counts.take_failed,
-        );
-        ensure!(
-            counts.take_failed[current] >= 1,
-            "{tag}: the hold pins at least one contention take (got {:?})",
-            counts.take_failed,
-        );
-        ensure!(
-            counts.take_failed[stopped] == 0,
-            "{tag}: no Stopped before the stop (got {:?})",
-            counts.take_failed,
-        );
-    }
-    lane.live_capture_mut().expect("live capture").stop();
-    eprintln!("JOINT_STOP {tag}: capture stopped with the seal pending");
-    lane.live_capture_mut()
-        .expect("live capture")
-        .set_hold_takes_for_test(false);
-    // Drive the already-begun q2 to Published (no second begin): its
-    // pending seal now hits Stopped, falls back at once, and publishes
-    // with its capture-ended gap.
-    {
-        use crate::inventory_semantics::{JointServiceMode, JointWorkBudget};
-        let revision_before = coordinator.registry().published_revision();
-        let started = Instant::now();
-        let mut q2_polls = 0u64;
-        loop {
-            let mut budget = JointWorkBudget {
-                remaining_actions: 1024,
-                deadline: Instant::now() + Duration::from_millis(10),
-            };
-            lane.service_joint(&mut coordinator, JointServiceMode::Running, &mut budget)
-                .map_err(|reason| anyhow::anyhow!("{tag}: q2 service refused: {reason}"))?;
-            let mut budget = JointWorkBudget {
-                remaining_actions: 1024,
-                deadline: Instant::now() + Duration::from_millis(10),
-            };
-            let commit = lane
-                .poll_joint_commit(&mut coordinator, &mut budget)
-                .map_err(|reason| anyhow::anyhow!("{tag}: q2 poll refused: {reason}"))?;
-            q2_polls += 1;
-            if matches!(
-                commit,
-                crate::discovery::engine::inventory_coordinator::JointCommitProgress::Published(_)
-            ) {
-                let revision_after = coordinator.registry().published_revision();
-                ensure!(
-                    revision_after == revision_before + 1,
-                    "{tag}: q2 publishes one revision: {revision_before} -> {revision_after}"
-                );
-                break;
-            }
-            ensure!(
-                started.elapsed() < Duration::from_secs(120),
-                "{tag}: q2 unpublished after {q2_polls} polls"
-            );
-        }
-        eprintln!("JOINT_STOP {tag}: q2 published in {q2_polls} polls after the stop");
-    }
-    eprintln!(
-        "JOINT_STOP {tag}: pre-finish branch={:?} feeds={} journal_linked={}",
-        match joint_branch(&coordinator) {
-            JointBranch::Linked => "linked",
-            JointBranch::S1 => "s1",
-            JointBranch::Unattributed => "unattributed",
-        },
-        coordinator.registry().joint_feeds(),
-        coordinator.registry().journal_linked(),
-    );
-    // Stop through the production finish driver; every loop is bounded.
+    // The production stop: begin the Finish (it owns the H0 stop via
+    // FinishStop). Every loop below is bounded.
     let mut driver = joint_finish_driver(&mut coordinator, lane);
     driver.begin_final_joint_finish();
     let begin = match &driver.joint_finish {
@@ -5049,6 +5021,78 @@ fn privileged_joint_seal_pending_across_stop_falls_back_live_lp64() -> Result<()
         JointFinishDriver::NotBegun => "not-begun",
     }
     .to_string();
+    ensure!(
+        begin == "polling",
+        "{tag}: the seal-pending finish begins polling (got {begin}; \
+         first_error={:?})",
+        driver.joint_first_error,
+    );
+    // Held Finish polls: drive the begun Finish until its seal holds
+    // (the first contention take), proving the seal is pending across
+    // the production stop. The hold clears at once, so no trip can
+    // arm on the held stall.
+    let held_polls = {
+        use crate::semantics_objects::journal::SealBootstrapCounts as Counts;
+        let current = Counts::take_index(crate::attach::BirthObservationRefusal::CurrentPartition);
+        let stopped = Counts::take_index(crate::attach::BirthObservationRefusal::Stopped);
+        let started = Instant::now();
+        let mut held_polls = 0u64;
+        loop {
+            {
+                let (coordinator, semantic, joint_finish, first_error) = (
+                    &mut *driver.coordinator,
+                    &mut driver.semantic,
+                    &mut driver.joint_finish,
+                    &mut driver.joint_first_error,
+                );
+                let _step = ClassicDriver::step_begun_joint_finish(
+                    semantic,
+                    joint_finish,
+                    coordinator,
+                    first_error,
+                );
+            }
+            held_polls += 1;
+            ensure!(
+                matches!(driver.joint_finish, JointFinishDriver::Polling),
+                "{tag}: the held finish stays polling (got {:?} after {held_polls} polls; \
+                 first_error={:?})",
+                driver.joint_finish,
+                driver.joint_first_error,
+            );
+            let counts = driver.coordinator.joint_seal_bootstrap_diagnosis();
+            if counts.take_failed[current] >= 1 {
+                eprintln!(
+                    "JOINT_STOP {tag}: seal held after {held_polls} polls: current={} stopped={} \
+                     all={:?}",
+                    counts.take_failed[current], counts.take_failed[stopped], counts.take_failed,
+                );
+                break;
+            }
+            ensure!(
+                held_polls < 1000 && started.elapsed() < Duration::from_secs(120),
+                "{tag}: the seal never held after {held_polls} polls"
+            );
+        }
+        let counts = driver.coordinator.joint_seal_bootstrap_diagnosis();
+        ensure!(
+            counts.take_failed[stopped] == 0,
+            "{tag}: the hold masks the stop (got {:?})",
+            counts.take_failed,
+        );
+        held_polls
+    };
+    driver
+        .semantic
+        .as_mut()
+        .expect("lane")
+        .live_capture_mut()
+        .expect("live capture")
+        .set_hold_takes_for_test(false);
+    eprintln!(
+        "JOINT_STOP {tag}: hold cleared after {held_polls} polls; \
+         the pending seal now hits Stopped"
+    );
     let mut finish_polls = 0u64;
     let finish = if !matches!(driver.joint_finish, JointFinishDriver::Polling) {
         match &driver.joint_finish {
@@ -5179,8 +5223,8 @@ fn privileged_joint_seal_pending_across_stop_falls_back_live_lp64() -> Result<()
     }
     // Typed records: the final Stopped refusal, the named stop-loss gap
     // with its exact count, exit 0, no semantic_unavailable. The holds
-    // above already counted as contention; the final Stopped is q2's
-    // only new take (the empty Finish takes nothing).
+    // above already counted as contention; the final Stopped is the
+    // Finish's only new take after the hold clears.
     let counts = driver.coordinator.joint_seal_bootstrap_diagnosis();
     let stopped_index =
         SealBootstrapCounts::take_index(crate::attach::BirthObservationRefusal::Stopped);
@@ -5249,9 +5293,10 @@ fn privileged_joint_seal_pending_across_stop_falls_back_live_lp64() -> Result<()
         begin == "polling",
         "{tag}: the finish begins polling (got {begin})"
     );
-    // The final Stopped refusal: exactly one seal take hits it (q2's
-    // held-then-stopped call). The holds above counted as contention
-    // (at least one, budget-dependent); nothing else fails a take.
+    // The final Stopped refusal: exactly one seal take hits it (the
+    // Finish's held-then-stopped call). The holds above counted as
+    // contention (at least one, budget-dependent); nothing else fails
+    // a take.
     ensure!(
         stopped_takes == 1,
         "{tag}: exactly one seal take hits Stopped (got {stopped_takes}, total {total_takes})"

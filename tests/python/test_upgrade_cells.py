@@ -5,13 +5,14 @@
 
 Gate 5 is a root-only cell (installs DEB/RPM); this suite pins its script
 contract without installing: argument parsing, the non-root refusal, typed
-emitter behaviour through the script's self-test mode, and the schema/key
-pins gate 6 consumes. The live upgrade runs in the upgrade-cells workflow
-and on the fedora host via scripts/upgrade-gate5.sh.
+emitter behaviour through the script's self-test mode, and the full gate
+body through a typed fake package root. The live upgrade runs in the
+upgrade-cells workflow and on the fedora host via scripts/upgrade-gate5.sh.
 
 Gate 6's end-to-end leg lives in .github/workflows/upgrade-cells.yml and in
-the release-candidate host runs. This suite pins its pure typed checks and
-the exact B1/B2/B3 schema deltas from the tree alone.
+the release-candidate host runs. This suite pins its pure typed checks, its
+run_gate activation wiring through typed doubles, sparse-artifact refusals,
+and the exact B1/B2/B3 schema deltas from the tree alone.
 """
 
 import contextlib
@@ -41,6 +42,16 @@ def load_gate6():
     return module
 
 
+def load_artifact_validation():
+    spec = importlib.util.spec_from_file_location(
+        "upgrade_artifact_validation_under_test",
+        ROOT / "scripts/upgrade_artifact_validation.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def load_package_release():
     spec = importlib.util.spec_from_file_location(
         "package_release_under_test", ROOT / "scripts/package-release.py"
@@ -55,17 +66,318 @@ def write_executable(path: Path, content: str) -> None:
     path.chmod(0o755)
 
 
+def substantive_inventory(schema="p11scope/inventory/v1"):
+    """One small but fully typed inventory document used by typed doubles."""
+    return {
+        "schema": schema,
+        "scope": "system",
+        "clock": {"basis": "CLOCK_MONOTONIC", "unit": "ns"},
+        "observation": {
+            "started_ns": 100,
+            "ended_ns": 200,
+            "passes": 1,
+            "usage_feed": False,
+            "semantic_capture": {},
+            "native_witnesses": {
+                "rows": 0,
+                "bound": 0,
+                "unbound": 0,
+                "pending": 0,
+                "integrity": 0,
+                "unbound_reasons": {},
+                "placement": {"edge": 0, "module": 0, "ambiguous": 0, "unresolved": 0},
+            },
+        },
+        "pid_namespace": {"observer": "initial", "kernel_pids": "initial", "proc_pids": "observer"},
+        "budgets": {
+            "callers": {"limit": 4096, "occupied": 1, "refused": 0},
+            "modules": {"limit": 4096, "occupied": 1, "refused": 0},
+            "edges": {"limit": 32768, "occupied": 1, "refused": 0},
+            "instances": {"limit": 4096, "occupied": 0, "refused": 0},
+            "endpoints": {"limit": 1048576, "occupied": 1, "refused": 0},
+            "inventory_endpoints": {"limit": 32768, "occupied": 1, "refused": 0},
+            "inventory_attach_modules": {"limit": 32768, "occupied": 1, "refused": 0},
+            "counters": {
+                "cap": 18446744073709551615,
+                "observed_edges": 1,
+                "saturated_edges": 0,
+            },
+            "semantic_state": {
+                "limit": 32768,
+                "occupied": 0,
+                "status": "withheld",
+                "unknown_edges": 1,
+                "refused": 0,
+            },
+            "retained_history": {"limit": 8192, "retained": 1, "suppressed": 0},
+            "native_preadmission": None,
+        },
+        "callers": [
+            {
+                "id": "c0",
+                "pid": 4242,
+                "start_time": 987654,
+                "start_time_unit": "clock_ticks_since_boot",
+                "incarnation": 0,
+                "image": {
+                    "authority": "scan_pinned",
+                    "task_cookie": None,
+                    "exec_id": None,
+                    "exe": {
+                        "dev": 8,
+                        "ino": 12345,
+                        "mtime_secs": 1700000000,
+                        "mtime_nanos": 0,
+                        "path": "/driver",
+                    },
+                    "exec_observed": True,
+                },
+                "lifecycle": "mapped",
+                "lifecycle_reason": None,
+                "first_seen_ns": 110,
+                "last_seen_ns": 190,
+                "retired": False,
+            }
+        ],
+        "modules": [
+            {
+                "id": "m0",
+                "paths": ["/provider.so"],
+                "identity": {
+                    "device": {"major": 8, "minor": 1},
+                    "inode": 23456,
+                    "sha256": "a" * 64,
+                    "build_id": None,
+                    "source": "mountinfo",
+                },
+                "admission": {
+                    "state": "admitted",
+                    "class": "exact",
+                    "endpoints": 1,
+                    "reasons": [],
+                    "note": "scan-only admission: manifest corroboration was not consulted",
+                    "history": [],
+                },
+                "lifecycle": "mapped",
+                "unloaded_observed": False,
+                "unbound_use": None,
+            }
+        ],
+        "edges": [
+            {
+                "caller": "c0",
+                "module": "m0",
+                "mapping": {
+                    "state": "mapped",
+                    "evidence": "deep_scan",
+                    "reason": None,
+                    "first_seen_ns": 110,
+                    "last_seen_ns": 190,
+                    "interruptions": 0,
+                },
+                "entries": {
+                    "count": 0,
+                    "saturated": False,
+                    "cap": 18446744073709551615,
+                    "first_seen_ns": None,
+                    "last_seen_ns": None,
+                    "in_flight": False,
+                    "observation": "unknown (usage observation unavailable)",
+                    "coverage": {
+                        "state": "unknown",
+                        "since_ns": None,
+                        "until_ns": None,
+                        "first_ns": None,
+                        "lossy": None,
+                        "reason": "scan_only",
+                        "detail": None,
+                    },
+                },
+                "semantics": "unknown (semantic capture withheld)",
+                "mechanisms": None,
+                "operations": None,
+            }
+        ],
+        "object_observations": {
+            "version": 1,
+            "revision": 1,
+            "status": "unavailable",
+            "reason": "journal_unavailable",
+            "budgets": {},
+            "gaps": {"rows": [], "suppressed": 0},
+            "key_operations": [],
+            "objects": [],
+            "sessions": [],
+            "unknown_key_operations": [],
+        },
+        "gaps": [
+            {
+                "caller": None,
+                "module": None,
+                "pid": None,
+                "subject": "exact image authority unavailable",
+                "reason": "no BPF image identity; scan-lane incarnation pinning",
+                "budget": None,
+                "repeats": 1,
+            }
+        ],
+        "gaps_suppressed": 0,
+    }
+
+
+def inventory_cbom_properties(document):
+    """The inventory flow-through properties a non-vacuous cbom must carry."""
+    observation = document["observation"]
+    object_observations = document.get("object_observations")
+    if object_observations is None:
+        object_render = "absent"
+    elif object_observations.get("status") == "populated":
+        object_render = "populated"
+    else:
+        object_render = f"{object_observations.get('status')} ({object_observations.get('reason')})"
+    properties = {
+        "p11scope:source_schema": "p11scope/inventory/v1",
+        "p11scope:scope": document["scope"],
+        "p11scope:window": (
+            f"{observation['started_ns']}..{observation['ended_ns']} (CLOCK_MONOTONIC ns)"
+        ),
+        "p11scope:passes": str(observation["passes"]),
+        "p11scope:source_gaps": str(len(document["gaps"])),
+        "p11scope:established_source_query": "0",
+        "p11scope:established_source_creation_success": "0",
+        "p11scope:established_source_unrecorded": "0",
+        "p11scope:object_observations": object_render,
+        "p11scope:applications": "1",
+        "p11scope:providers": str(len(document["modules"])),
+        "p11scope:algorithms": "0",
+        "p11scope:keys": "0",
+        "p11scope:callers_unknown_exe": "0",
+        "p11scope:mechanisms_unnamed": "0",
+        "p11scope:mechanisms_unknown_primitive": "0",
+        "p11scope:keys_unknown_size": "0",
+        "p11scope:keys_unknown_type": "0",
+    }
+    subjects = sorted({row["subject"] for row in document["gaps"]})
+    if subjects:
+        properties["p11scope:gap_subjects"] = ",".join(subjects)
+    return properties
+
+
+def diff_snapshot(source):
+    """One substantive typed diff snapshot projection for harness documents."""
+    return {
+        "scope": source["scope"],
+        "clock": dict(source["clock"]),
+        "observation": {
+            "started_ns": source["observation"]["started_ns"],
+            "ended_ns": source["observation"]["ended_ns"],
+            "passes": source["observation"]["passes"],
+            "usage_feed": source["observation"]["usage_feed"],
+            "lane": "scan",
+            "settlement": "settled",
+            "retirement": "closed",
+            "attach": None,
+            "lifecycle": {},
+            "native_witnesses": dict(source["observation"]["native_witnesses"]),
+        },
+        "pid_namespace": dict(source["pid_namespace"]),
+        "scope_completeness": "unknown",
+        "reported_gaps": len(source["gaps"]),
+        "suppressed_gaps": source["gaps_suppressed"],
+        "refusals": {"reported_budget_gaps": 0, "budget_counters": {}},
+        "budgets": dict(source["budgets"]),
+        "loss_evidence": {"lifecycle": {}, "native_witnesses": dict(source["observation"]["native_witnesses"])},
+        "gaps": copy.deepcopy(source["gaps"]),
+        "evidence": {
+            "callers": copy.deepcopy(source["callers"]),
+            "modules": copy.deepcopy(source["modules"]),
+            "edges": copy.deepcopy(source["edges"]),
+            "caller_occurrences": [0],
+            "module_occurrences": [0],
+            "edge_occurrences": [0],
+        },
+    }
+
+
+def valid_diff_document(before_source, after_source):
+    """One typed nonzero-projection diff consistent with the two inputs."""
+    same = before_source == after_source
+    application_path = before_source["callers"][0]["image"]["exe"]["path"]
+    digest = before_source["modules"][0]["identity"]["sha256"]
+    changes = [] if same else ["caller_population"]
+    application_changes = [] if same else [
+        {
+            "key": {"exe_path_ref": 0, "sha256": digest},
+            "presence": "both",
+            "changes": changes,
+            "before": [0],
+            "after": [0],
+            "before_population": {"callers": [0], "modules": [0]},
+            "after_population": {"callers": [0], "modules": [0]},
+        }
+    ]
+    return {
+        "schema": "p11scope/inventory-diff/v1",
+        "before": diff_snapshot(before_source),
+        "after": diff_snapshot(after_source),
+        "comparison": {
+            "host_relation": "unknown",
+            "boot_relation": "unknown",
+            "process_continuity": "unknown",
+            "physical_continuity": "unknown",
+            "counter_relation": "independent_windows",
+            "scope_relation": (
+                "same_recorded_label"
+                if before_source["scope"] == after_source["scope"]
+                else "different_recorded_labels"
+            ),
+            "application_paths": [application_path],
+        },
+        "summary": {
+            "application_groups_compared": 1,
+            "application_groups_changed": 0 if same else 1,
+            "content_both": 1,
+            "content_before_only": 0,
+            "content_after_only": 0,
+            "module_paths_changed": 0,
+            "unresolved_observations": 0,
+        },
+        "module_contents": [
+            {"key": {"sha256": digest}, "presence": "both", "changes": [], "before": [0], "after": [0]}
+        ],
+        "application_changes": application_changes,
+        "module_path_changes": [],
+        "unresolved": [],
+        "limitations": [
+            "absence_is_not_removal",
+            "application_groups_use_recorded_paths",
+            "counts_are_independent_windows",
+            "host_boot_continuity_unknown",
+            "physical_continuity_unknown",
+            "process_continuity_unknown",
+            "scope_completeness_unknown",
+            "semantic_details_not_compared",
+        ],
+    }
+
+
 MOCK_PACKAGE_TOOL = r'''#!/usr/bin/env python3
+import json
 import os
 import sys
 from pathlib import Path
 
 
 def package_version(path):
+    version = ""
     for line in Path(path).read_text().splitlines():
         if line.startswith("version="):
-            return line.split("=", 1)[1]
-    return ""
+            version = line.split("=", 1)[1]
+            break
+    side = "old" if version == "0.7.1" else "new"
+    if control(f"metadata-{side}-empty"):
+        return ""
+    return version
 
 
 def state_dir():
@@ -89,10 +401,130 @@ def install_package(package):
     if control(f"fail-{side}-install"):
         return 1
     (state / "installed-version").write_text(version)
-    if not control(f"skip-binary-{side}"):
-        binary = Path(os.environ["SIM_P11SCOPE_BIN"])
+    binary = Path(os.environ["SIM_P11SCOPE_BIN"])
+    if control(f"skip-binary-{side}"):
+        binary.unlink(missing_ok=True)
+    else:
         binary.parent.mkdir(parents=True, exist_ok=True)
-        binary.write_text("""#!/bin/sh
+        inventory = {
+            "schema": "p11scope/inventory/v1",
+            "scope": "system",
+            "clock": {"basis": "CLOCK_MONOTONIC", "unit": "ns"},
+            "observation": {
+                "started_ns": 100,
+                "ended_ns": 200,
+                "passes": 1,
+                "usage_feed": False,
+                "semantic_capture": {},
+                "native_witnesses": {
+                    "rows": 0,
+                    "bound": 0,
+                    "unbound": 0,
+                    "pending": 0,
+                    "integrity": 0,
+                    "unbound_reasons": {},
+                    "placement": {"edge": 0, "module": 0, "ambiguous": 0, "unresolved": 0},
+                },
+            },
+            "pid_namespace": {"observer": "initial", "kernel_pids": "initial", "proc_pids": "observer"},
+            "budgets": {
+                "callers": {"limit": 4096, "occupied": 1, "refused": 0},
+                "modules": {"limit": 4096, "occupied": 1, "refused": 0},
+                "edges": {"limit": 32768, "occupied": 1, "refused": 0},
+                "instances": {"limit": 4096, "occupied": 0, "refused": 0},
+                "endpoints": {"limit": 1048576, "occupied": 1, "refused": 0},
+                "inventory_endpoints": {"limit": 32768, "occupied": 1, "refused": 0},
+                "inventory_attach_modules": {"limit": 32768, "occupied": 1, "refused": 0},
+                "counters": {"cap": 18446744073709551615, "observed_edges": 1, "saturated_edges": 0},
+                "semantic_state": {"limit": 32768, "occupied": 0, "status": "withheld", "unknown_edges": 1, "refused": 0},
+                "retained_history": {"limit": 8192, "retained": 1, "suppressed": 0},
+                "native_preadmission": None,
+            },
+            "callers": [{
+                "id": "c0",
+                "pid": 4242,
+                "start_time": 987654,
+                "start_time_unit": "clock_ticks_since_boot",
+                "incarnation": 0,
+                "image": {
+                    "authority": "scan_pinned",
+                    "task_cookie": None,
+                    "exec_id": None,
+                    "exe": {"dev": 8, "ino": 12345, "mtime_secs": 1700000000, "mtime_nanos": 0, "path": "/driver"},
+                    "exec_observed": True,
+                },
+                "lifecycle": "mapped",
+                "lifecycle_reason": None,
+                "first_seen_ns": 110,
+                "last_seen_ns": 190,
+                "retired": False,
+            }],
+            "modules": [{
+                "id": "m0",
+                "paths": ["/provider.so"],
+                "identity": {
+                    "device": {"major": 8, "minor": 1},
+                    "inode": 23456,
+                    "sha256": "a" * 64,
+                    "build_id": None,
+                    "source": "mountinfo",
+                },
+                "admission": {
+                    "state": "admitted",
+                    "class": "exact",
+                    "endpoints": 1,
+                    "reasons": [],
+                    "note": "scan-only admission: manifest corroboration was not consulted",
+                    "history": [],
+                },
+                "lifecycle": "mapped",
+                "unloaded_observed": False,
+                "unbound_use": None,
+            }],
+            "edges": [{
+                "caller": "c0",
+                "module": "m0",
+                "mapping": {"state": "mapped", "evidence": "deep_scan", "reason": None, "first_seen_ns": 110, "last_seen_ns": 190, "interruptions": 0},
+                "entries": {
+                    "count": 0,
+                    "saturated": False,
+                    "cap": 18446744073709551615,
+                    "first_seen_ns": None,
+                    "last_seen_ns": None,
+                    "in_flight": False,
+                    "observation": "unknown (usage observation unavailable)",
+                    "coverage": {"state": "unknown", "since_ns": None, "until_ns": None, "first_ns": None, "lossy": None, "reason": "scan_only", "detail": None},
+                },
+                "semantics": "unknown (semantic capture withheld)",
+                "mechanisms": None,
+                "operations": None,
+            }],
+            "object_observations": {
+                "version": 1,
+                "revision": 1,
+                "status": "unavailable",
+                "reason": "journal_unavailable",
+                "budgets": {},
+                "gaps": {"rows": [], "suppressed": 0},
+                "key_operations": [],
+                "objects": [],
+                "sessions": [],
+                "unknown_key_operations": [],
+            },
+            "gaps": [{
+                "caller": None,
+                "module": None,
+                "pid": None,
+                "subject": "exact image authority unavailable",
+                "reason": "no BPF image identity; scan-lane incarnation pinning",
+                "budget": None,
+                "repeats": 1,
+            }],
+            "gaps_suppressed": 0,
+        }
+        correct_inventory = json.dumps(inventory, separators=(",", ":"))
+        wrong_inventory = json.dumps({**inventory, "schema": "wrong/schema"}, separators=(",", ":"))
+        script = """#!/bin/sh
 state=${SIM_STATE_DIR:?}
 version="$(cat "$state/installed-version" 2>/dev/null || printf unknown)"
 case "$version" in
@@ -124,15 +556,20 @@ if [ "${1:-}" = "inventory" ]; then
     esac
   done
   [ -n "$out" ] || exit 2
-  schema='p11scope/inventory/v1'
-  [ -f "$state/capture-$side-wrong-schema" ] && schema='wrong/schema'
-  printf '{"schema":"%s"}\n' "$schema" >"$out"
+  if [ -f "$state/capture-$side-sparse" ]; then
+    printf '{"schema":"p11scope/inventory/v1"}\n' >"$out"
+  elif [ -f "$state/capture-$side-wrong-schema" ]; then
+    printf '%s\n' '__WRONG_INVENTORY__' >"$out"
+  else
+    printf '%s\n' '__CORRECT_INVENTORY__' >"$out"
+  fi
   rc=0
   [ -f "$state/capture-$side-rc" ] && rc="$(cat "$state/capture-$side-rc")"
   exit "$rc"
 fi
 exit 2
-""")
+""".replace("__CORRECT_INVENTORY__", correct_inventory).replace("__WRONG_INVENTORY__", wrong_inventory)
+        binary.write_text(script)
         binary.chmod(0o755)
     if version != "0.7.1":
         fmt = os.environ["SIM_FORMAT"]
@@ -153,6 +590,8 @@ def query_version():
     except OSError:
         return 1
     side = "old" if version == "0.7.1" else "new"
+    if control(f"query-{side}-missing"):
+        return 1
     version = control_text(f"query-{side}-version") or version
     sys.stdout.write(version)
     return 0
@@ -287,13 +726,7 @@ class UpgradeGate6Harness:
 
     @staticmethod
     def base_inventory():
-        return {
-            "schema": "p11scope/inventory/v1",
-            "budgets": {"callers": {}, "edges": {}, "instances": {}},
-            "modules": [{"path": "/provider.so"}],
-            "object_observations": {"budgets": {}},
-            "observation": {"semantic_capture": {}},
-        }
+        return substantive_inventory()
 
     @classmethod
     def good_old_doc(cls):
@@ -389,8 +822,13 @@ class UpgradeGate6Harness:
             properties = {}
             if source.name == "injected-live-joint.json":
                 injected = json.loads(source.read_text())
+                properties = inventory_cbom_properties(injected)
                 reason = injected["object_observations"]["reason"]
                 properties["p11scope:object_observations"] = f"partial ({reason})"
+            elif source.name == "v071-inventory.json":
+                source_document = json.loads(source.read_text())
+                if "observation" in source_document:
+                    properties = inventory_cbom_properties(source_document)
             elif source.name == "v071-observed-profile.json":
                 profile = json.loads(source.read_text())
                 window = self.gate6.profile_window(profile)
@@ -412,12 +850,16 @@ class UpgradeGate6Harness:
             )
         if "diff" in text_command:
             index = text_command.index("diff")
-            same = text_command[index + 1] == text_command[index + 2]
-            document = {
-                "schema": "p11scope/inventory-diff/v1",
-                "application_changes": [] if same else [{"change": "expected"}],
-                "module_path_changes": [],
-            }
+            before = json.loads(Path(text_command[index + 1]).read_text())
+            after = json.loads(Path(text_command[index + 2]).read_text())
+            if "scope" in before and "scope" in after:
+                document = valid_diff_document(before, after)
+            else:
+                document = {
+                    "schema": "p11scope/inventory-diff/v1",
+                    "application_changes": [],
+                    "module_path_changes": [],
+                }
             return self.fake_completed(command, stdout=json.dumps(document))
         return self.fake_completed(command, rc=2, stderr="unexpected command")
 
@@ -441,7 +883,40 @@ class UpgradeGate6Harness:
                 document = None
         if document is None:
             return completed
-        if fault == "cbom-old-bad-format" and cbom_source == "v071-inventory.json":
+        if fault == "cbom-old-sparse" and cbom_source == "v071-inventory.json":
+            document = {"bomFormat": "CycloneDX", "metadata": {"properties": []}}
+        elif fault == "diff-zero-sparse" and "diff" in text_command:
+            index = text_command.index("diff")
+            if text_command[index + 1] == text_command[index + 2]:
+                document = {
+                    "schema": "p11scope/inventory-diff/v1",
+                    "application_changes": [],
+                    "module_path_changes": [],
+                }
+        elif fault == "diff-new-sparse" and "diff" in text_command:
+            index = text_command.index("diff")
+            if text_command[index + 1] != text_command[index + 2]:
+                document = {
+                    "schema": "p11scope/inventory-diff/v1",
+                    "application_changes": [{"change": "expected"}],
+                    "module_path_changes": [],
+                }
+        elif fault == "b2-sparse-cbom" and cbom_source == "injected-live-joint.json":
+            document = {
+                "bomFormat": "CycloneDX",
+                "metadata": {
+                    "properties": [
+                        {
+                            "name": "p11scope:object_observations",
+                            "value": "partial (live_joint_feed_absent)",
+                        }
+                    ]
+                },
+            }
+        elif fault == "b3-sparse-cbom" and cbom_source == "v071-observed-profile.json":
+            properties = document["metadata"]["properties"]
+            document = {"bomFormat": "CycloneDX", "metadata": {"properties": properties}}
+        elif fault == "cbom-old-bad-format" and cbom_source == "v071-inventory.json":
             document["bomFormat"] = "wrong"
         elif fault == "diff-zero-wrong-schema" and "diff" in text_command:
             index = text_command.index("diff")
@@ -571,6 +1046,17 @@ class UpgradeGate5ContractTests(unittest.TestCase):
                 r = self.run_gate5(option)
                 self.assertEqual(r.returncode, 2)
                 self.assertIn(f"{option} requires a value", r.stderr)
+
+    def test_gate5_self_test_cannot_combine_with_gate_arguments(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            r = self.run_gate5("--self-test", tmp, "--format", "deb")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("--self-test cannot be combined with gate arguments", r.stderr)
+
+    def test_gate5_requires_gate_arguments(self):
+        r = self.run_gate5("--format", "deb")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("--old/--new/--workdir required", r.stderr)
 
     def test_gate5_source_only_environment_cannot_bypass_normal_execution(self):
         env = dict(os.environ, P11SCOPE_GATE5_SOURCE_ONLY="1")
@@ -708,6 +1194,42 @@ class UpgradeGate5SimulationTests(unittest.TestCase):
     def test_simulated_negative_controls_fail_with_exact_typed_reasons(self):
         scenarios = [
             (
+                "old metadata empty",
+                {},
+                {"metadata-old-empty": ""},
+                "old package metadata version empty",
+            ),
+            (
+                "new metadata empty",
+                {},
+                {"metadata-new-empty": ""},
+                "new package metadata version empty",
+            ),
+            (
+                "missing old installed binary",
+                {},
+                {"skip-binary-old": ""},
+                "installed old binary missing at {binary}",
+            ),
+            (
+                "missing new installed binary",
+                {},
+                {"skip-binary-new": ""},
+                "installed new binary missing at {binary}",
+            ),
+            (
+                "old package manager missing",
+                {},
+                {"query-old-missing": ""},
+                "package manager does not list old p11scope",
+            ),
+            (
+                "new package manager missing",
+                {},
+                {"query-new-missing": ""},
+                "package manager does not list new p11scope",
+            ),
+            (
                 "wrong_old_metadata",
                 {"old_version": "0.7.2"},
                 {},
@@ -753,7 +1275,13 @@ class UpgradeGate5SimulationTests(unittest.TestCase):
                 "old capture schema",
                 {},
                 {"capture-old-wrong-schema": ""},
-                "old capture report has wrong schema",
+                "old capture report failed typed validation: schema is 'wrong/schema', expected 'p11scope/inventory/v1'",
+            ),
+            (
+                "old capture sparse",
+                {},
+                {"capture-old-sparse": ""},
+                "old capture report failed typed validation: missing inventory root field 'scope'",
             ),
             (
                 "empty recovery hash before",
@@ -807,7 +1335,13 @@ class UpgradeGate5SimulationTests(unittest.TestCase):
                 "new capture schema",
                 {},
                 {"capture-new-wrong-schema": ""},
-                "new capture report has wrong schema",
+                "new capture report failed typed validation: schema is 'wrong/schema', expected 'p11scope/inventory/v1'",
+            ),
+            (
+                "new capture sparse",
+                {},
+                {"capture-new-sparse": ""},
+                "new capture report failed typed validation: missing inventory root field 'scope'",
             ),
             (
                 "empty recovery hash after",
@@ -848,7 +1382,76 @@ class UpgradeGate5SimulationTests(unittest.TestCase):
                 self.assertEqual(rc, 1, stderr)
                 self.assertIsNotNone(result, stderr)
                 self.assertEqual(result["status"], "fail")
-                self.assertEqual(result["fail_reason"], expected_reason)
+                self.assertEqual(
+                    result["fail_reason"],
+                    expected_reason.format(binary=result["binary"]),
+                )
+
+
+class UpgradeArtifactValidationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.validation = load_artifact_validation()
+
+    def test_inventory_validator_accepts_substantive_typed_document(self):
+        self.assertEqual(self.validation.inventory_errors(substantive_inventory()), [])
+
+    def test_inventory_validator_rejects_schema_only_document_typed_exactly(self):
+        errors = self.validation.inventory_errors({"schema": "p11scope/inventory/v1"})
+        self.assertEqual(errors[0], "missing inventory root field 'scope'")
+        self.assertIn("missing inventory root field 'gaps_suppressed'", errors)
+
+    def test_inventory_validator_rejects_each_required_root_field(self):
+        for key in (
+            "scope",
+            "clock",
+            "observation",
+            "budgets",
+            "callers",
+            "modules",
+            "edges",
+            "gaps",
+            "gaps_suppressed",
+        ):
+            with self.subTest(key=key):
+                document = substantive_inventory()
+                del document[key]
+                self.assertEqual(
+                    self.validation.inventory_errors(document)[0],
+                    f"missing inventory root field '{key}'",
+                )
+
+    def test_cbom_inventory_validator_requires_source_flow_through(self):
+        source = substantive_inventory()
+        cbom = UpgradeGate6Harness.cbom(inventory_cbom_properties(source))
+        cbom.update({"specVersion": "1.6", "components": [{}], "dependencies": []})
+        self.assertEqual(self.validation.cbom_inventory_errors(cbom, source), [])
+        sparse = {"bomFormat": "CycloneDX", "metadata": {"properties": []}}
+        self.assertEqual(
+            self.validation.cbom_inventory_errors(sparse, source)[0],
+            "missing cbom root field 'specVersion'",
+        )
+
+    def test_diff_validator_requires_ten_field_typed_document_and_consistency(self):
+        before = substantive_inventory()
+        after = substantive_inventory()
+        document = valid_diff_document(before, after)
+        self.assertEqual(self.validation.diff_errors(document, before, after), [])
+        sparse = {
+            "schema": "p11scope/inventory-diff/v1",
+            "application_changes": [],
+            "module_path_changes": [],
+        }
+        self.assertEqual(
+            self.validation.diff_errors(sparse, before, after)[0],
+            "missing diff root field 'before'",
+        )
+        inconsistent = copy.deepcopy(document)
+        inconsistent["summary"]["module_paths_changed"] = 1
+        self.assertIn(
+            "diff summary module_paths_changed is 1, expected 0",
+            self.validation.diff_errors(inconsistent, before, after),
+        )
 
 
 class UpgradeGate6PureTests(unittest.TestCase):
@@ -1053,6 +1656,7 @@ class UpgradeGate6ActivationTests(unittest.TestCase):
             {
                 "inputs_present",
                 "reports_generated",
+                "inventory_reports_typed",
                 "cbom_reads_old",
                 "cbom_old_typed",
                 "diff_old_old_zero",
@@ -1079,7 +1683,7 @@ class UpgradeGate6ActivationTests(unittest.TestCase):
         unexpected = self.harness.good_new_doc()
         unexpected["modules"][0]["surprise"] = 1
         removed = self.harness.good_new_doc()
-        del removed["modules"][0]["path"]
+        del removed["modules"][0]["paths"]
         old_departed = self.harness.good_old_doc()
         new_departed = self.harness.good_new_doc()
         old_departed["departed_use"] = {}
@@ -1099,11 +1703,16 @@ class UpgradeGate6ActivationTests(unittest.TestCase):
             ("inputs_present", {"missing_old_binary": True}),
             ("reports_generated", {"generate_error": "injected generation failure"}),
             ("reports_generated", {"module_present": False}),
+            ("inventory_reports_typed", {"old_doc": {"schema": "p11scope/inventory/v1"}}),
+            ("inventory_reports_typed", {"new_doc": {"schema": "p11scope/inventory/v1"}}),
             ("cbom_reads_old", {"fault": "cbom-old-rc"}),
             ("cbom_old_typed", {"fault": "cbom-old-bad-format"}),
+            ("cbom_old_typed", {"fault": "cbom-old-sparse"}),
             ("diff_old_old_zero", {"fault": "diff-zero-wrong-schema"}),
+            ("diff_old_old_zero", {"fault": "diff-zero-sparse"}),
             ("diff_old_new", {"fault": "diff-old-new-rc"}),
             ("diff_typed", {"fault": "diff-new-wrong-schema"}),
+            ("diff_typed", {"fault": "diff-new-sparse"}),
             ("b1_no_removed", {"new_doc": removed}),
             ("b1_all_present", {"new_doc": missing_b1}),
             ("b1_exact", {"new_doc": unexpected}),
@@ -1111,10 +1720,12 @@ class UpgradeGate6ActivationTests(unittest.TestCase):
             ("b2_old_absent", {"object_old_live": True}),
             ("b2_new_present", {"object_new_live": False}),
             ("b2_reader_accepts", {"fault": "b2-wrong-render"}),
+            ("b2_reader_accepts", {"fault": "b2-sparse-cbom"}),
             ("b3_then_exact", {"profile_schema_mutator": then_missing}),
             ("b3_exact", {"profile_schema_mutator": full_missing}),
             ("b3_fixture_old_shape", {"profile_fixture_shape_valid": False}),
             ("b3_reader_accepts_old", {"fault": "b3-wrong-render"}),
+            ("b3_reader_accepts_old", {"fault": "b3-sparse-cbom"}),
         ]
         for check_name, kwargs in scenarios:
             with self.subTest(check=check_name):

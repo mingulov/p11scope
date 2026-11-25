@@ -743,10 +743,10 @@ omits the length programs); when the sizes start fails — for
 example a length program the verifier refuses — the journal retries
 without sizes behind a `key sizes unavailable` gap and key rows
 continue without operation-length sizes. The Task 4 privacy canary
-for `--key-sizes` passed on 2026-11-25 (Fedora kernel 7.2.9): the
-committed cell passed 3/3 at rev 0c39778f3, after 3/3 at 727c1b302,
-3/3 at c6f684673 and 6/6 across earlier verdict revisions with a
-manual map supplement.
+for `--key-sizes` passed on 2026-11-25: the committed cell passed
+1/1 at rev 9bb09cc4e on Fedora kernel 7.3.4-200.fc44 with
+cells=106695, after 1/1 at 16e255cb9 on the same kernel and 3/3 at
+0c39778f3 on kernel 7.2.9.
 A live `inventory --pid --capture native --key-operations --key-sizes
 --verbose` capture over a sentinel-guarded sign+verify workload (pure
 repeated 64-byte `K3YS1Z3CANARY!` guards around the S length cell and

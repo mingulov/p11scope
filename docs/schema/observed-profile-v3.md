@@ -1307,7 +1307,7 @@ Owned-pause arm failures file under their own subject. Each record is
 `{name: "owned pause", reason}` with `reason` exactly:
 
 - `the pause arm failed before the first epoch; the owned child ran
-  without pause protection`: the pause coordinator refused a re-arm
+  without pause protection`: the pause coordinator refused an arm
   (the owned generation changed before the arm) and the run
   continued unpaused. Arm-write and ARMED-readback failures disclose
   via `evidence.pause_partial` and `pause_diag` without this row.
@@ -1318,10 +1318,14 @@ Owned-pause arm failures file under their own subject. Each record is
   owned child may have waited stopped`: a release signal after a
   failed pause arm failed while the owned child was alive or its
   liveness was unreadable, so the child may have waited stopped
-  until a later retry released it. The debt retries on every later
-  pass while the child lives; a release against an already-gone
-  child is moot and files nothing. Repeat filings dedupe to this
-  one row.
+  until a later retry released it. The debt retries on later
+  passes while the child lives, up to three consecutive failures,
+  then ends the capture with a lifecycle error instead of leaving
+  the child stopped; if the child exits first the debt settles
+  silently and the row stands as the record of the unproven window.
+  The final cleanup probes liveness and resumes once for any debt
+  still owed. A release against an already-gone child is moot and
+  files nothing. Repeat filings dedupe to this one row.
 
 Run first-map stop gaps file under their own subject. Each record is
 `{name: "run first-map stop", reason}` with `reason` exactly:

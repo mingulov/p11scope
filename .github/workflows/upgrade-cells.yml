@@ -1,0 +1,156 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
+name: upgrade-cells
+# Gates 5 (package upgrade 0.7.1 -> this tree) and 6 (saved 0.7.1 reports
+# read by this tree). Runs on every branch push; tag pushes trigger nothing
+# (a release tag rides the commit the branch push already ran).
+on:
+  push:
+    branches:
+      - '**'
+    tags-ignore:
+      - '**'
+  pull_request:
+permissions:
+  contents: read
+env:
+  CI_TOOL_BPF_LINKER: 0.10.4
+jobs:
+  upgrade-deb:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal
+      - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
+      - run: rustup target add --toolchain "$(cat .release-rust-version)" x86_64-unknown-linux-musl
+      - run: cargo +"$(cat .release-rust-version)" install bpf-linker --version "$CI_TOOL_BPF_LINKER" --locked
+      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc jq llvm musl-tools python3 softhsm2
+      - run: python3 -I scripts/prepare-dependencies.py
+      - run: cargo +"$(cat .release-rust-version)" fetch --locked --manifest-path Cargo.toml
+      - run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
+      - name: Build observer and helper
+        run: |
+          set -euo pipefail
+          ./scripts/cargo.sh +"$(cat .release-rust-version)" build --locked --bin p11scope -p p11scope --bin p11scope-discover -p p11scope-discover
+      - name: Build test packages from this tree
+        run: |
+          set -euo pipefail
+          python3 -I scripts/upgrade-build-packages.py \
+            --observer target/debug/p11scope \
+            --helper target/debug/p11scope-discover \
+            --output-dir "$RUNNER_TEMP/new-pkgs"
+          ls -l "$RUNNER_TEMP/new-pkgs"
+      - name: Download v0.7.1 DEB
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/old-pkgs"
+          gh release download v0.7.1 --repo "${{ github.repository }}" \
+            --pattern 'p11scope_0.7.1_amd64.deb' --pattern 'SHA256SUMS' \
+            --dir "$RUNNER_TEMP/old-pkgs" --clobber
+          (cd "$RUNNER_TEMP/old-pkgs" && sha256sum --check --ignore-missing SHA256SUMS)
+      - name: Gate 5 DEB upgrade
+        run: |
+          set -euo pipefail
+          sudo scripts/upgrade-gate5.sh --format deb \
+            --old "$RUNNER_TEMP/old-pkgs/p11scope_0.7.1_amd64.deb" \
+            --new "$RUNNER_TEMP/new-pkgs/p11scope_"*"_amd64.deb" \
+            --workdir "$RUNNER_TEMP/gate5-deb"
+      - name: Show DEB result
+        if: always()
+        run: cat "$RUNNER_TEMP/gate5-deb/gate5-result.json"
+
+  upgrade-rpm:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal
+      - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
+      - run: rustup target add --toolchain "$(cat .release-rust-version)" x86_64-unknown-linux-musl
+      - run: cargo +"$(cat .release-rust-version)" install bpf-linker --version "$CI_TOOL_BPF_LINKER" --locked
+      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc jq llvm musl-tools python3 rpm softhsm2
+      - run: python3 -I scripts/prepare-dependencies.py
+      - run: cargo +"$(cat .release-rust-version)" fetch --locked --manifest-path Cargo.toml
+      - run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
+      - name: Build observer and helper
+        run: |
+          set -euo pipefail
+          ./scripts/cargo.sh +"$(cat .release-rust-version)" build --locked --bin p11scope -p p11scope --bin p11scope-discover -p p11scope-discover
+      - name: Build test packages from this tree
+        run: |
+          set -euo pipefail
+          python3 -I scripts/upgrade-build-packages.py \
+            --observer target/debug/p11scope \
+            --helper target/debug/p11scope-discover \
+            --output-dir "$RUNNER_TEMP/new-pkgs"
+          ls -l "$RUNNER_TEMP/new-pkgs"
+      - name: Download v0.7.1 RPM
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/old-pkgs"
+          gh release download v0.7.1 --repo "${{ github.repository }}" \
+            --pattern 'p11scope-0.7.1-1.x86_64.rpm' --pattern 'SHA256SUMS' \
+            --dir "$RUNNER_TEMP/old-pkgs" --clobber
+          (cd "$RUNNER_TEMP/old-pkgs" && sha256sum --check --ignore-missing SHA256SUMS)
+      - name: Gate 5 RPM upgrade
+        run: |
+          set -euo pipefail
+          # Ubuntu runners have no rpm db; init it so rpm -i/-U works.
+          sudo mkdir -p /var/lib/rpm
+          sudo rpm --initdb 2>/dev/null || true
+          sudo scripts/upgrade-gate5.sh --format rpm \
+            --old "$RUNNER_TEMP/old-pkgs/p11scope-0.7.1-1.x86_64.rpm" \
+            --new "$RUNNER_TEMP/new-pkgs/p11scope-"*"-1.x86_64.rpm" \
+            --workdir "$RUNNER_TEMP/gate5-rpm"
+      - name: Show RPM result
+        if: always()
+        run: cat "$RUNNER_TEMP/gate5-rpm/gate5-result.json"
+
+  report-compat:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal
+      - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
+      - run: rustup target add --toolchain "$(cat .release-rust-version)" x86_64-unknown-linux-musl
+      - run: cargo +"$(cat .release-rust-version)" install bpf-linker --version "$CI_TOOL_BPF_LINKER" --locked
+      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc jq llvm musl-tools python3 softhsm2
+      - run: python3 -I scripts/prepare-dependencies.py
+      - run: cargo +"$(cat .release-rust-version)" fetch --locked --manifest-path Cargo.toml
+      - run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
+      - name: Build observer
+        run: |
+          set -euo pipefail
+          ./scripts/cargo.sh +"$(cat .release-rust-version)" build --locked --bin p11scope
+      - name: Download v0.7.1 binary
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/old-bin"
+          gh release download v0.7.1 --repo "${{ github.repository }}" \
+            --pattern 'p11scope-0.7.1-x86_64-linux-musl.tar.gz' --pattern 'SHA256SUMS' \
+            --dir "$RUNNER_TEMP/old-bin" --clobber
+          (cd "$RUNNER_TEMP/old-bin" && sha256sum --check --ignore-missing SHA256SUMS)
+          tar xzf "$RUNNER_TEMP/old-bin/p11scope-0.7.1-x86_64-linux-musl.tar.gz" \
+            -C "$RUNNER_TEMP/old-bin" --strip-components=1
+          "$RUNNER_TEMP/old-bin/p11scope" --version
+      - name: Gate 6 report compat
+        run: |
+          set -euo pipefail
+          python3 -I scripts/upgrade-gate6.py \
+            --old-binary "$RUNNER_TEMP/old-bin/p11scope" \
+            --new-binary target/debug/p11scope \
+            --workdir "$RUNNER_TEMP/gate6"
+      - name: Show Gate 6 result
+        if: always()
+        run: cat "$RUNNER_TEMP/gate6/gate6-result.json"

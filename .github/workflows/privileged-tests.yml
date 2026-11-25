@@ -1870,8 +1870,9 @@ jobs:
           # they are --require again (their old PLAN-REPLACE-GAP /
           # SLOT-RECLAIM entries were dropped, not because those lanes
           # landed — restore them if another leg fails). Any other miss
-          # fails. When those lanes land, delete their entries there and
-          # turn these back into --require.
+          # fails. When PLAN-REPLACE-GAP lands, delete the two remaining
+          # EXPECTED_FAILURES entries and turn the arming_exhaustion and
+          # descendants cells into --require.
           python3 -I scripts/ci/check-cell-results.py "$out/cells/results.jsonl" \
             --require privileged_run_tree_shell_wrapper_shows_grandchild_calls \
             --require privileged_run_tree_double_fork_shows_reparented_calls \

@@ -1097,9 +1097,11 @@ returned error.
 In every case the error names every failed step.
 
 A stop that arrives during `profile` or `trace` startup, before anything is
-attached (discovery can take seconds), is honoured once discovery returns:
-exit 1 with `interrupted by SIGINT during startup`, no report, no temporary file left behind, and a previous trace
-`-o` file left as it was. Under `run`, a child the pause holds
+attached (discovery can take seconds), is honoured at the next startup
+check — a stop during discovery itself is honoured once discovery
+returns: exit 1 with `interrupted by SIGINT during startup`, no
+report, no temporary file left behind, and a previous trace `-o` file
+left as it was. Under `run`, a child the pause holds
 stopped is resumed before the observer signals it or hands it back. The stop
 signal is forwarded to the child's process group; a child still alive gets
 SIGTERM 5 s later and SIGKILL 5 s after that, so settling it takes at most

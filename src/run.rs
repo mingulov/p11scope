@@ -3573,6 +3573,20 @@ fn should_stop(interrupted: &SignalState, elapsed: Duration, duration: Option<Du
     interrupted.interrupted() || duration.is_some_and(|d| elapsed >= d)
 }
 
+/// The slow `capture` startup stages before attach. The stop flag is
+/// installed before the first one and each stage checks it: a signal
+/// in any of them ends startup with the named error (exit 1), never
+/// the default disposition's silent 130/143.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupStage {
+    Policy,
+    Pidns,
+    NamedView,
+    HostProbe,
+    UretprobePreflight,
+    Discovery,
+}
+
 /// `profile` and `trace` against an external target: install the stop
 /// flag first, then decide the policy, run the preflights, discover
 /// and pin what is in scope, and run the same loop `run` runs — with
@@ -3619,6 +3633,7 @@ fn capture_with_host(
     // an error that drops the sink.
     let stop = install_stop_flag()?;
     let kind = a.kind;
+    refuse_if_interrupted_at_stage(&stop, StartupStage::Policy)?;
     let policy = capture_policy(
         kind,
         a.metrics,
@@ -3627,12 +3642,14 @@ fn capture_with_host(
         a.track_short_lived,
         a.select_endpoint.as_deref(),
     )?;
+    refuse_if_interrupted_at_stage(&stop, StartupStage::Pidns)?;
     if let Some(warning) = pid_namespace_preflight(&a.scope, crate::pidns::numbering())? {
         emit_capture_diagnostic(&warning);
     }
     if let Some(line) = crate::pidns::container_only_warning_live(crate::pidns::numbering()) {
         emit_capture_diagnostic(&line);
     }
+    refuse_if_interrupted_at_stage(&stop, StartupStage::NamedView)?;
     let (scope, named_view) = match &a.scope {
         ScopeArg::Pid(p) => {
             // Never-stop: a named pid that exits before the view opens
@@ -3655,6 +3672,7 @@ fn capture_with_host(
         // No named view and no cgroup path: discovery sweeps /proc itself.
         ScopeArg::System => (Scope::System, None),
     };
+    refuse_if_interrupted_at_stage(&stop, StartupStage::HostProbe)?;
     let _host = host()?;
     match (kind, a.duration) {
         (Kind::Trace, None) => emit_capture_diagnostic(&no_duration_notice()),
@@ -3662,6 +3680,7 @@ fn capture_with_host(
         _ => {}
     }
     warn_unsafe_policy(policy);
+    refuse_if_interrupted_at_stage(&stop, StartupStage::UretprobePreflight)?;
     let return_admission = preflight_uretprobe_hazard(
         match &a.scope {
             ScopeArg::Pid(pid) => Some(*pid),
@@ -3698,6 +3717,7 @@ fn capture_with_host(
     // fail-fast checks above, before the first slow step.
     emit_capture_diagnostic(&capture_starting_line());
     let cancel = stop.cancel_flag();
+    refuse_if_interrupted_at_stage(&stop, StartupStage::Discovery)?;
     let discovered = Engine::discover_with_cancel(a, &scope, named_view, &cancel);
     refuse_if_interrupted_before_attach(&stop)?;
     let mut engine = discovered?;
@@ -3830,6 +3850,21 @@ fn refuse_if_interrupted_before_attach(stop: &SignalState) -> Result<()> {
     match stop.first_signal() {
         None => Ok(()),
         Some(signal) => Err(StartupInterrupted { signal }.into()),
+    }
+}
+
+/// A stop observed at a named slow startup stage ends startup with
+/// the same named error: nothing was captured, so there is no report
+/// to write. The match is exhaustive so a new stage cannot slip in
+/// unchecked; the operator line stays uniform across stages.
+fn refuse_if_interrupted_at_stage(stop: &SignalState, stage: StartupStage) -> Result<()> {
+    match stage {
+        StartupStage::Policy
+        | StartupStage::Pidns
+        | StartupStage::NamedView
+        | StartupStage::HostProbe
+        | StartupStage::UretprobePreflight
+        | StartupStage::Discovery => refuse_if_interrupted_before_attach(stop),
     }
 }
 
@@ -30833,6 +30868,44 @@ int main(int argc, char **argv) {
         assert!(text.contains("no report was written"), "{text}");
     }
 
+    /// Audit test 6: a stop at any slow startup stage before attach
+    /// ends with the named line and exit 1 — never a silent 130/143.
+    /// The error is not already-reported (so `main` prints the line)
+    /// and maps to exit 1 (so no signal code leaks).
+    #[test]
+    fn interruption_at_any_startup_stage_is_the_named_exit_1() {
+        for stage in [
+            StartupStage::Policy,
+            StartupStage::Pidns,
+            StartupStage::NamedView,
+            StartupStage::HostProbe,
+            StartupStage::UretprobePreflight,
+            StartupStage::Discovery,
+        ] {
+            for (signal, name) in [(libc::SIGINT, "SIGINT"), (libc::SIGTERM, "SIGTERM")] {
+                let stop = SignalState::new();
+                assert!(
+                    refuse_if_interrupted_at_stage(&stop, stage).is_ok(),
+                    "{stage:?} without a stop"
+                );
+                stop.observe(signal);
+                let error = refuse_if_interrupted_at_stage(&stop, stage).unwrap_err();
+                let text = format!("{error:#}");
+                assert!(
+                    text.contains(&format!("interrupted by {name}")),
+                    "{stage:?}: {text}"
+                );
+                assert!(text.contains("during startup"), "{stage:?}: {text}");
+                assert!(text.contains("no report was written"), "{stage:?}: {text}");
+                assert_eq!(failure_exit_code(&error), 1, "{stage:?}: {text}");
+                assert!(
+                    !failure_already_reported(&error),
+                    "{stage:?}: the named line must print: {text}"
+                );
+            }
+        }
+    }
+
     /// M-1: `capture` must own Ctrl-C/SIGTERM/SIGHUP on its first
     /// line, before the policy checks, the host probe, the `-o` temp
     /// file, and discovery (a default disposition there kills the
@@ -31010,6 +31083,47 @@ int main(int argc, char **argv) {
             "child seam check failed: {} {detail}",
             output.status
         );
+    }
+
+    /// The stop flag is installed before the first slow startup step
+    /// and every stage checks it before attach: a signal in the
+    /// policy/pidns/view/host/preflight/discovery window ends startup
+    /// with the named error, never the default disposition.
+    #[test]
+    fn capture_checks_each_startup_stage_before_attach() {
+        let source = include_str!("run.rs");
+        let body = source
+            .split_once("pub fn capture(a: &CaptureArgs)")
+            .unwrap()
+            .1
+            .split_once("\nfn no_duration_notice")
+            .unwrap()
+            .0;
+        let at = |needle: &str| {
+            assert_eq!(body.matches(needle).count(), 1, "{needle}");
+            body.find(needle).unwrap()
+        };
+        let install = at("install_stop_flag()");
+        let policy = at("capture_policy(");
+        assert!(
+            install < policy,
+            "stop flag installed after the first startup step"
+        );
+        let attach = at("start_session(");
+        for stage in [
+            "Policy",
+            "Pidns",
+            "NamedView",
+            "HostProbe",
+            "UretprobePreflight",
+            "Discovery",
+        ] {
+            let check = at(&format!(
+                "refuse_if_interrupted_at_stage(&stop, StartupStage::{stage})"
+            ));
+            assert!(install < check, "{stage} checked before the flag exists");
+            assert!(check < attach, "{stage} checked only after attach");
+        }
     }
 
     /// Exercises the interrupt path directly, with no real signal sent:

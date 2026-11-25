@@ -909,7 +909,6 @@ class MatrixContract(unittest.TestCase):
         unreadable = os.geteuid() != 0  # root reads any mode bits
         inner = stage / "inner.sh"
         def check(runner, mode, root, remove_root):
-            where = INPUTS["RUNNERS"][runner][mode][0]
             names = list(INPUTS["required"](runner, mode))
             if mode != "stage" and (runner, mode) not in self.INPUT_FREE:
                 names.append(INPUTS["SELF"])

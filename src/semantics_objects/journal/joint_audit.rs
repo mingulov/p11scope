@@ -363,6 +363,27 @@ pub(crate) fn capture_ended_reason(
     )
 }
 
+/// Gap subject for stop-loss the stopped capture could not attribute
+/// to one consumer (B2: several keys bound to the image, or a BEGIN
+/// past the frame frontier): caller-less, counted per image, never
+/// under a consumer.
+#[allow(dead_code)] // RED-first scaffolding: the r4 twins pin it; the fix wires it.
+pub(crate) const STOP_LOSS_UNATTRIBUTED_SUBJECT: &str = "joint seal stop-loss unattributed";
+
+/// Reason text of one unattributed stop-loss gap: the stopping
+/// refusal, the image the lost calls share, and their exact count.
+#[allow(dead_code)] // RED-first scaffolding: the r4 twins pin it; the fix wires it.
+pub(crate) fn stop_loss_unattributed_reason(
+    refusal: crate::attach::BirthObservationRefusal,
+    image: (u64, u64),
+    units: usize,
+) -> String {
+    format!(
+        "the stopped capture could not attribute these calls to one consumer ({refusal:?}); image cookie {} exec {} counted loss ({units} calls)",
+        image.0, image.1,
+    )
+}
+
 /// Gap subject for a parked stuck consumer's forced-fallback
 /// degrade: the watchdog parked the consumer past its retry stall
 /// with counted loss instead of tripping the lane.

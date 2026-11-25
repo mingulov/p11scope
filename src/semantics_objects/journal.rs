@@ -3775,6 +3775,467 @@ impl JournalAdapter {
         true
     }
 
+    /// Tests-only post-frontier END: move one open original's staged END
+    /// ordinal past the frame frontier, keeping its bytes. Only the
+    /// END-ordinal check changes, so the stop-loss twin isolates it.
+    #[cfg(test)]
+    pub(crate) fn shift_open_end_past_frontier_for_test(
+        &mut self,
+        native: JournalNativeKey,
+        frontier: u64,
+    ) -> bool {
+        let Some(mut entry) = self.open.get_mut(&native) else {
+            return false;
+        };
+        let Some(end) = entry.end.as_mut() else {
+            return false;
+        };
+        end.ordinal = frontier.saturating_add(1);
+        true
+    }
+
+    /// Tests-only post-frontier BEGIN: move one open original's BEGIN
+    /// ordinal past the frame frontier. The H8Open ledger charge stays
+    /// keyed at the original ordinal (production ordinals never shift),
+    /// so the twin's release misses by construction; only the
+    /// BEGIN-ordinal check changes on the fallback path.
+    #[cfg(test)]
+    pub(crate) fn shift_open_begin_past_frontier_for_test(
+        &mut self,
+        native: JournalNativeKey,
+        frontier: u64,
+    ) -> bool {
+        let Some(mut entry) = self.open.get_mut(&native) else {
+            return false;
+        };
+        entry.begin_ordinal = frontier.saturating_add(1);
+        true
+    }
+
+    /// Tests-only staged abandon: attach a forged (but validator-clean)
+    /// ABANDON terminal to one open original, so the stop-loss twin
+    /// exercises the abandon arm with every other check passing.
+    #[cfg(test)]
+    pub(crate) fn pose_open_abandon_for_test(
+        &mut self,
+        native: JournalNativeKey,
+        ordinal: u64,
+    ) -> bool {
+        use p11scope_ebpf_common::object_journal::{
+            JOURNAL_ABANDON_BYTES, JOURNAL_KIND_ABANDON, JOURNAL_REASON_STOP_CLEANUP,
+            JOURNAL_VERSION,
+        };
+        let Some(entry) = self.open.get(&native) else {
+            return false;
+        };
+        let mut bytes = [0u8; JOURNAL_ABANDON_BYTES];
+        bytes[0..2].copy_from_slice(&JOURNAL_VERSION.to_le_bytes());
+        bytes[2..4].copy_from_slice(&(JOURNAL_ABANDON_BYTES as u16).to_le_bytes());
+        bytes[4] = JOURNAL_KIND_ABANDON;
+        bytes[8..16].copy_from_slice(&native.0.to_le_bytes());
+        bytes[16..24].copy_from_slice(&native.1.to_le_bytes());
+        bytes[24..32].copy_from_slice(&entry.begin.pid_tgid().to_le_bytes());
+        bytes[32..40].copy_from_slice(&entry.image.0.to_le_bytes());
+        bytes[40..48].copy_from_slice(&entry.image.1.to_le_bytes());
+        bytes[48..52].copy_from_slice(&entry.begin.slot().to_le_bytes());
+        bytes[52..56].copy_from_slice(&JOURNAL_REASON_STOP_CLEANUP.to_le_bytes());
+        let Some(abandon) = p11scope_ebpf_common::object_journal::validate_abandon(&bytes) else {
+            return false;
+        };
+        let Some(mut entry) = self.open.get_mut(&native) else {
+            return false;
+        };
+        entry.abandon = Some(StagedAbandon { ordinal, abandon });
+        true
+    }
+
+    /// Tests-only corroborated return: mark one open original's return
+    /// corroborated, so the stop-loss twin isolates that predicate.
+    #[cfg(test)]
+    pub(crate) fn pose_open_corroborated_for_test(
+        &mut self,
+        native: JournalNativeKey,
+        value: u64,
+    ) -> bool {
+        let Some(mut entry) = self.open.get_mut(&native) else {
+            return false;
+        };
+        entry.corroborated_return = Some(value);
+        true
+    }
+
+    /// Tests-only dropped lineage: clear one open original's resource
+    /// reservation, so the stop-loss twin isolates that predicate.
+    #[cfg(test)]
+    pub(crate) fn clear_open_raw_resource_for_test(&mut self, native: JournalNativeKey) -> bool {
+        let Some(mut entry) = self.open.get_mut(&native) else {
+            return false;
+        };
+        entry.raw_resource = None;
+        true
+    }
+
+    /// Tests-only image disagreement: change one open original's image
+    /// link without touching its BEGIN bytes (so its identity and every
+    /// claim lookup still resolve), isolating the image checks.
+    #[cfg(test)]
+    pub(crate) fn replace_open_image_for_test(
+        &mut self,
+        native: JournalNativeKey,
+        image: (u64, u64),
+    ) -> bool {
+        let Some(mut entry) = self.open.get_mut(&native) else {
+            return false;
+        };
+        entry.image = image;
+        true
+    }
+
+    /// Tests-only S1-only mark: flag one open original as S1-owned
+    /// under its sole claimant (else its sole bound key), so the
+    /// stop-loss twin exercises the other-owner skip arm.
+    #[cfg(test)]
+    pub(crate) fn pose_open_s1only_for_test(&mut self, native: JournalNativeKey) -> bool {
+        let Some(entry) = self.open.get(&native) else {
+            return false;
+        };
+        let identity = identity_of_begin(&entry.begin);
+        let image = entry.image;
+        let soles: Vec<JournalDomainKey> = self
+            .claims
+            .get(&identity)
+            .map(|claimants| claimants.keys().copied().collect())
+            .unwrap_or_default();
+        let key = if let [key] = soles.as_slice() {
+            *key
+        } else {
+            let bound = self.image_keys.get(&image).cloned().unwrap_or_default();
+            let [key] = bound.as_slice() else {
+                return false;
+            };
+            *key
+        };
+        let Some(mut entry) = self.open.get_mut(&native) else {
+            return false;
+        };
+        entry.s1only_subject = Some(key);
+        true
+    }
+
+    /// Tests-only broken ledger link: release one open original's H8Open
+    /// charge, so the completed-staging ledger check fails while every
+    /// other predicate passes.
+    #[cfg(test)]
+    pub(crate) fn release_open_ledger_for_test(&mut self, native: JournalNativeKey) -> bool {
+        let Some(entry) = self.open.get(&native) else {
+            return false;
+        };
+        self.ledger.release_h8open(entry.begin_ordinal);
+        true
+    }
+
+    /// Tests-only dropped return floor: forget one open original's
+    /// physical-return namespace floor, so the custody twin exercises
+    /// the floor invariant without consuming any claim.
+    #[cfg(test)]
+    pub(crate) fn drop_open_return_floor_for_test(&mut self, native: JournalNativeKey) -> bool {
+        let Some(entry) = self.open.get(&native) else {
+            return false;
+        };
+        self.physical_return_floors.remove(&entry.begin.pid_tgid());
+        true
+    }
+
+    /// Tests-only claim corruption: flip the sole claimant's return
+    /// value for one open original, so the claim-shape check fails
+    /// while identity, fingerprint and every END-derived predicate
+    /// still pass. Refuses ambiguous shapes.
+    #[cfg(test)]
+    pub(crate) fn corrupt_claim_rv_for_test(&mut self, native: JournalNativeKey) -> bool {
+        let Some(entry) = self.open.get(&native) else {
+            return false;
+        };
+        let identity = identity_of_begin(&entry.begin);
+        let soles: Vec<JournalDomainKey> = self
+            .claims
+            .get(&identity)
+            .map(|claimants| claimants.keys().copied().collect())
+            .unwrap_or_default();
+        let [key] = soles.as_slice() else {
+            return false;
+        };
+        let Some(claim) = self
+            .claims
+            .edit()
+            .get_mut(&identity)
+            .and_then(|claimants| claimants.get_mut(key))
+            .and_then(|mine| mine.front_mut())
+        else {
+            return false;
+        };
+        claim.rv ^= 0x00ff_00ff_00ff_00ff;
+        true
+    }
+
+    /// Tests-only ambiguity: queue one more claim under the identity's
+    /// sole claimant for one open original, cloning the front claim at
+    /// `admission`. Unlike production admission this poses no image
+    /// taint: the twin drives the ambiguity into the stop classifier
+    /// instead. Refuses ambiguous shapes (use the keyed form to add a
+    /// second key's claim).
+    #[cfg(test)]
+    pub(crate) fn pose_extra_claim_for_test(
+        &mut self,
+        native: JournalNativeKey,
+        admission: u64,
+    ) -> bool {
+        let Some(entry) = self.open.get(&native) else {
+            return false;
+        };
+        let identity = identity_of_begin(&entry.begin);
+        let soles: Vec<JournalDomainKey> = self
+            .claims
+            .get(&identity)
+            .map(|claimants| claimants.keys().copied().collect())
+            .unwrap_or_default();
+        let [key] = soles.as_slice() else {
+            return false;
+        };
+        self.pose_extra_claim_for_key_for_test(native, *key, admission)
+    }
+
+    /// Tests-only keyed ambiguity: queue one more claim under `key`
+    /// for one open original's identity, cloning the front claim at
+    /// `admission` (taint-free, like the sole form).
+    #[cfg(test)]
+    fn pose_extra_claim_for_key_for_test(
+        &mut self,
+        native: JournalNativeKey,
+        key: JournalDomainKey,
+        admission: u64,
+    ) -> bool {
+        let Some(entry) = self.open.get(&native) else {
+            return false;
+        };
+        let identity = identity_of_begin(&entry.begin);
+        let Some(front) = self
+            .claims
+            .get(&identity)
+            .and_then(|claimants| claimants.values().next())
+            .and_then(|mine| mine.front().copied())
+        else {
+            return false;
+        };
+        self.claims
+            .edit()
+            .entry(identity)
+            .or_default()
+            .entry(key)
+            .or_default()
+            .push_back(AdmittedJournalClaim { admission, ..front });
+        self.claim_counts += 1;
+        true
+    }
+
+    /// Tests-only sibling key: bind one more live key to one open
+    /// original's image (the p11-kit/two-instance shape), mirroring the
+    /// production mint without any birth.
+    #[cfg(test)]
+    pub(crate) fn pose_sibling_key_for_test(&mut self, native: JournalNativeKey) -> bool {
+        self.sibling_key_for_test(native).is_some()
+    }
+
+    /// Tests-only two-key claim: bind the sibling key (like
+    /// [`Self::pose_sibling_key_for_test`]) and queue one claim under
+    /// it for the open original's identity at `admission`.
+    #[cfg(test)]
+    pub(crate) fn pose_sibling_claim_for_test(
+        &mut self,
+        native: JournalNativeKey,
+        admission: u64,
+    ) -> bool {
+        let Some(sibling) = self.sibling_key_for_test(native) else {
+            return false;
+        };
+        self.pose_extra_claim_for_key_for_test(native, sibling, admission)
+    }
+
+    #[cfg(test)]
+    fn sibling_key_for_test(&mut self, native: JournalNativeKey) -> Option<JournalDomainKey> {
+        let Some(entry) = self.open.get(&native) else {
+            return None;
+        };
+        let image = entry.image;
+        let sibling = JournalDomainKey {
+            domain_tag: u64::MAX,
+            caller: u32::MAX,
+            cookie: image.0,
+            exec: image.1,
+            router: u64::MAX,
+            incarnation: u32::MAX,
+        };
+        if self.keys.contains_key(&sibling) {
+            return None;
+        }
+        self.keys
+            .edit()
+            .insert(sibling, JournalDomainState::default());
+        self.image_keys
+            .edit()
+            .entry(image)
+            .or_default()
+            .push(sibling);
+        Some(sibling)
+    }
+
+    /// Tests-only END clock surgery: rewrite one open original's staged
+    /// END event clock (timestamp and duration independently) through
+    /// the real record validator, so the twin isolates the fingerprint
+    /// (duration-only shift), timestamp (joint shift) and END-agreement
+    /// (rewound timestamp) predicates. Full-form ENDs only.
+    #[cfg(test)]
+    pub(crate) fn shift_open_end_clock_for_test(
+        &mut self,
+        native: JournalNativeKey,
+        ts_ns: u64,
+        duration_ns: u64,
+    ) -> bool {
+        use p11scope_ebpf_common::object_journal::{
+            JOURNAL_COMMON_BYTES, JOURNAL_END_FULL_BYTES, decode_journal_record,
+        };
+        use p11scope_ebpf_common::object_wire::publish_object_descriptors;
+        let Some(entry) = self.open.get(&native) else {
+            return false;
+        };
+        let Some(staged) = entry.end else {
+            return false;
+        };
+        let raw = staged.end.raw_bytes();
+        if raw.len() != JOURNAL_END_FULL_BYTES {
+            return false;
+        }
+        let mut patched = [0u8; JOURNAL_END_FULL_BYTES];
+        patched.copy_from_slice(raw);
+        patched[JOURNAL_COMMON_BYTES..JOURNAL_COMMON_BYTES + 8]
+            .copy_from_slice(&ts_ns.to_le_bytes());
+        patched[JOURNAL_COMMON_BYTES + 8..JOURNAL_COMMON_BYTES + 16]
+            .copy_from_slice(&duration_ns.to_le_bytes());
+        let rows = publish_object_descriptors();
+        let Some(p11scope_ebpf_common::object_journal::JournalRecord::End(end)) =
+            decode_journal_record(&patched, &rows)
+        else {
+            return false;
+        };
+        let Some(mut entry) = self.open.get_mut(&native) else {
+            return false;
+        };
+        entry.end = Some(StagedEnd {
+            ordinal: staged.ordinal,
+            end,
+        });
+        true
+    }
+
+    /// Tests-only END clock read: one open original's staged END
+    /// (ordinal, event timestamp, event duration).
+    #[cfg(test)]
+    pub(crate) fn open_end_clock_for_test(
+        &self,
+        native: JournalNativeKey,
+    ) -> Option<(u64, u64, u64)> {
+        let entry = self.open.get(&native)?;
+        let staged = entry.end?;
+        let event = staged.end.payload_base().event;
+        Some((staged.ordinal, event.ts_ns, event.duration_ns))
+    }
+
+    /// Tests-only vanished open: drop one open original's retained entry
+    /// (with its ledger charge and census member) while keeping its
+    /// claims, so the twin drives a staged head with no open entry.
+    #[cfg(test)]
+    pub(crate) fn drop_open_for_test(&mut self, native: JournalNativeKey) -> bool {
+        let Some(entry) = self.take_open(native) else {
+            return false;
+        };
+        self.retained_member_dec(
+            identity_of_begin(&entry.begin),
+            RetainedMember::Open(native),
+        );
+        self.ledger.release_h8open(entry.begin_ordinal);
+        true
+    }
+
+    /// Tests-only slot read: one open original's attested slot, so the
+    /// twin pins which call each counted loss consumed.
+    #[cfg(test)]
+    pub(crate) fn retained_start_slot_for_test(&self, native: JournalNativeKey) -> Option<u32> {
+        self.open.get(&native).map(|entry| entry.begin.slot())
+    }
+
+    /// Tests-only image read: one open original's linked image, so the
+    /// twin pins unattributed rows to their exact image.
+    #[cfg(test)]
+    pub(crate) fn retained_start_image_for_test(
+        &self,
+        native: JournalNativeKey,
+    ) -> Option<(u64, u64)> {
+        self.open.get(&native).map(|entry| entry.image)
+    }
+
+    /// Tests-only stale claim: file one unstaged claim under the
+    /// image's sole bound key for one open original's identity,
+    /// cloning the shape's front claim when one exists, else the
+    /// adapter's first claim. The twin builds deterministic
+    /// claimed-but-unstaged opens from unclaimed ones. Refuses
+    /// multi-bound images and already-claimed shapes.
+    #[cfg(test)]
+    pub(crate) fn forge_stale_claim_for_test(
+        &mut self,
+        native: JournalNativeKey,
+        admission: u64,
+    ) -> bool {
+        let Some(entry) = self.open.get(&native) else {
+            return false;
+        };
+        let identity = identity_of_begin(&entry.begin);
+        let image = entry.image;
+        if self.claims.get(&identity).is_some() {
+            return false;
+        }
+        let bound = self.image_keys.get(&image).cloned().unwrap_or_default();
+        let [key] = bound.as_slice() else {
+            return false;
+        };
+        let key = *key;
+        let template = self
+            .claims
+            .get(&identity)
+            .and_then(|claimants| claimants.values().next())
+            .and_then(|mine| mine.front().copied())
+            .or_else(|| {
+                self.claims
+                    .values()
+                    .flat_map(|claimants| claimants.values())
+                    .flat_map(|mine| mine.front().copied())
+                    .next()
+            });
+        let Some(template) = template else {
+            return false;
+        };
+        self.claims
+            .edit()
+            .entry(identity)
+            .or_default()
+            .entry(key)
+            .or_default()
+            .push_back(AdmittedJournalClaim {
+                admission,
+                ..template
+            });
+        self.claim_counts += 1;
+        true
+    }
+
     /// Images with unconverted staging (open or refused) that no bound
     /// key accounts for: the input `has_unbound_staging` refuses on.
     #[cfg(test)]

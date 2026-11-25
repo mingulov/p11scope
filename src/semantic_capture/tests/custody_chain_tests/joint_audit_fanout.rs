@@ -29331,6 +29331,20 @@ impl CanonicalFanoutScene {
         }
     }
 
+    /// One BEGIN record with no END at all (never admitted, never
+    /// claimed): the deterministic unclaimed-open shape.
+    fn push_begin_only(&mut self, pid: u32, name: &str, sequence: u64) {
+        let (begin, _) = self.scene.encoded(pid, 0, name, sequence);
+        self.scene.drain.source_mut().push_record(begin.to_vec());
+    }
+
+    /// [`Self::push_begin_only`] on both feeds.
+    fn push_two_begin_only(&mut self, name: &str, sequence: u64) {
+        for pid in [std::process::id(), self._child.id()] {
+            self.push_begin_only(pid, name, sequence);
+        }
+    }
+
     fn push_distinct_create(&mut self, pid: u32, sequence: u64, result: u64) {
         let (begin, _) = self.scene.encoded(pid, 0, "C_CreateObject", sequence);
         let end = crate::semantics_objects::journal::tests::end_bytes_result(
@@ -30846,140 +30860,10 @@ fn seal_pending_across_stop_incomplete(mixed: bool) {
     );
 }
 
-/// Round r3 (D1 siblings): the capture-ended gate covers every
-/// final refusal, not just Stopped. Scripted AuthorityExhausted
-/// takes (no stop) route the same fallback: no retry, the frame
-/// completes, and each gap names its own refusal with its exact
-/// count. Incomplete heads dispose (never replay).
-#[test]
-fn joint_seal_exhausted_take_falls_back_incomplete_entries() {
-    let mut fixture = CanonicalFanoutScene::prior_sealed();
-    fixture.push_two_without_end("C_SignInit", 2);
-    let fault = FrameFault::clean();
-    let mut frame = fixture.audited(2, 2, &fault);
-    let before = fixture.feeds();
-    let mut takes = FailTakesAlways {
-        refusal: BirthObservationRefusal::AuthorityExhausted,
-    };
-    let mut steps = Vec::new();
-    {
-        let mut ports = fixture
-            .scene
-            .real
-            .scene
-            .coordinator
-            .joint_frame_ports(&fixture.scene.producers)
-            .unwrap();
-        frame.bind_targets(&ports).unwrap();
-        for _ in 0..16 {
-            let sealed = frame.seal_next(&mut ports, &mut takes, &fault);
-            let delivered = frame.deliver_next(&mut ports);
-            let done = delivered == Ok(QuantumSealProgress::Complete);
-            steps.push((sealed, delivered));
-            if done {
-                break;
-            }
-        }
-    }
-    assert_eq!(
-        steps,
-        vec![
-            (
-                Ok(QuantumSealProgress::DeliveryReady),
-                Ok(QuantumSealProgress::LocalPending)
-            ),
-            (
-                Ok(QuantumSealProgress::DeliveryReady),
-                Ok(QuantumSealProgress::Complete)
-            ),
-        ],
-        "each consumer falls back on its first visit; nothing retries"
-    );
-    {
-        // No stop ran, so keys stay live and the fallback releases
-        // every stranded open, including prior-sealed history (all
-        // already counted): the tables end empty, not pristine.
-        let owner = fixture.scene.real.scene.coordinator.joint_capture();
-        assert_eq!(
-            owner.adapter().invocation_claims_for_test(),
-            (0, Vec::new()),
-            "stop-loss consumes every claim it verifies"
-        );
-        assert!(
-            owner.adapter().retained_starts_for_test().is_empty(),
-            "stop-loss consumes every open entry it verifies"
-        );
-    }
-    let feeds = fixture.feeds();
-    assert_eq!(feeds.len(), 2);
-    assert!(
-        feeds
-            .iter()
-            .all(|feed| feed.staged == 0 && feed.fallback && !feed.degraded),
-        "both feeds fall back with nothing left staged"
-    );
-    for feed in &feeds {
-        let was = before
-            .iter()
-            .find(|old| old.id == feed.id)
-            .expect("feed persists across the stop frame");
-        assert_eq!(
-            feed.reduced - was.reduced,
-            0,
-            "incomplete heads never replay"
-        );
-        assert_eq!(
-            feed.disposed - was.disposed,
-            1,
-            "each incomplete head disposes once"
-        );
-    }
-    use crate::semantics_objects::journal::joint_audit::{
-        CAPTURE_ENDED_SUBJECT, FALLBACK_FENCED_SUBJECT, capture_ended_reason,
-    };
-    let expected_reason = capture_ended_reason(BirthObservationRefusal::AuthorityExhausted, 1);
-    assert_eq!(
-        expected_reason,
-        "the capture ended before the seal could take its birth evidence \
-         (AuthorityExhausted); fell back with counted loss (1 calls)",
-        "control: the reason renders the refusal and the count"
-    );
-    let registry = fixture.scene.real.scene.coordinator.registry();
-    let mut ended = registry
-        .gaps()
-        .iter()
-        .cloned()
-        .chain(registry.staged_gaps_for_test())
-        .filter(|gap| gap.subject == CAPTURE_ENDED_SUBJECT)
-        .collect::<Vec<_>>();
-    ended.sort_by_key(|gap| gap.caller);
-    let mut expected = feeds
-        .iter()
-        .map(|feed| crate::discovery::caller_registry::RegistryGap {
-            caller: Some(feed.caller),
-            module: None,
-            pid: None,
-            subject: CAPTURE_ENDED_SUBJECT.to_string(),
-            reason: expected_reason.clone(),
-            budget: None,
-            units: Some(1),
-        })
-        .collect::<Vec<_>>();
-    expected.sort_by_key(|gap| gap.caller);
-    assert_eq!(
-        ended, expected,
-        "one capture-ended gap per feed, each naming its own refusal"
-    );
-    assert!(
-        registry
-            .gaps()
-            .iter()
-            .cloned()
-            .chain(registry.staged_gaps_for_test())
-            .all(|gap| gap.subject != FALLBACK_FENCED_SUBJECT),
-        "a capture-ended close never names its calls twice"
-    );
-}
+/// Round r4 (B3): `joint_stop_loss_non_stop_refusals_keep_pre_r3_path`
+/// replaces the r3 exhausted twin below this line's history: only a
+/// Stopped take runs the stop-loss arms, so AuthorityExhausted and
+/// CoverageFailed refuse incomplete entries with nothing disposed.
 
 /// Round r3 (D1 interaction): a replay-resource failure striking an
 /// incomplete fallback disposes exactly once (single pop, single
@@ -31167,6 +31051,1357 @@ fn joint_seal_pending_across_stop_falls_back_incomplete_bounded_slices() {
             "each gap counts its five lost calls"
         );
     }
+}
+
+/// Round r4 (B1): one table row per stop-loss predicate of the
+/// `completed_fallback_original` family (S0, S0a, S0b) and the
+/// incomplete twin. Loss rows publish the frame with exact
+/// (slot, instance, count); custody rows refuse with no state change.
+/// Each row's mutant flips its predicate arm back and must fail.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum R4Push {
+    Complete,
+    Endless,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum R4Takes {
+    /// Stop the capture; native takes hit Stopped (keys die at stop).
+    StoppedCapture,
+    /// Scripted Stopped takes without stopping (keys stay live).
+    ScriptedStopped,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum R4Corrupt {
+    None,
+    EndPastFrontier,
+    BeginPastFrontier,
+    Abandon,
+    Corroborated,
+    RawNone,
+    MultiClaim,
+    TwoKeys,
+    OriginWrong,
+    EndDisagree,
+    TsShift,
+    DurationShift,
+    LedgerBreak,
+    FloorDrop,
+    ClaimRv,
+    ImageForeign,
+    S1Only,
+    HeadNoNative,
+    OpenDropped,
+    OpenDroppedHeadless,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum R4Unclaimed {
+    None,
+    ForgeStale,
+    ForgeStaleForeign,
+    SiblingKey,
+    ShiftBegin,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum R4Expect {
+    Loss { replayed: u64, disposed: u64 },
+    Refuse,
+}
+
+struct R4Row {
+    name: &'static str,
+    push: R4Push,
+    begin_only: bool,
+    takes: R4Takes,
+    corrupt: R4Corrupt,
+    unclaimed: R4Unclaimed,
+    expect: R4Expect,
+    leftover_claims: usize,
+    unattributed_rows: usize,
+}
+
+fn drive_r4_stop_row(row: &R4Row) {
+    use crate::semantics_objects::journal::joint_audit::{
+        CAPTURE_ENDED_SUBJECT, FALLBACK_FENCED_SUBJECT, STOP_LOSS_UNATTRIBUTED_SUBJECT,
+        capture_ended_reason, stop_loss_unattributed_reason,
+    };
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    match row.push {
+        R4Push::Complete => fixture.push_two("C_SignInit", 2),
+        R4Push::Endless => fixture.push_two_without_end("C_SignInit", 2),
+    }
+    if row.begin_only {
+        fixture.push_two_begin_only("C_SignInit", 3);
+    }
+    let fault = FrameFault::clean();
+    let mut frame = fixture.audited(2, 2, &fault);
+    // New natives, oldest first: staged (lower ordinals, admitted at
+    // the tick) then begin-only (higher ordinals, ingested after).
+    // Every seam below returns false on a miss, so a mis-partition
+    // fails loudly instead of corrupting the wrong entry.
+    let mut opens: Vec<(u64, u64, u64)> = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .retained_starts_for_test();
+    opens.sort_by_key(|open| (open.2, open.0, open.1));
+    let staged_count = 2;
+    let unclaimed_count = usize::from(row.begin_only) * 2;
+    assert_eq!(
+        opens.len(),
+        staged_count + unclaimed_count,
+        "{}: control: the pushed calls are all retained",
+        row.name,
+    );
+    let staged: Vec<(u64, u64)> = opens
+        .iter()
+        .take(staged_count)
+        .map(|open| (open.0, open.1))
+        .collect();
+    let unclaimed: Vec<(u64, u64)> = opens
+        .iter()
+        .skip(staged_count)
+        .map(|open| (open.0, open.1))
+        .collect();
+    if row.begin_only {
+        for native in &staged {
+            assert!(
+                fixture
+                    .scene
+                    .real
+                    .scene
+                    .coordinator
+                    .joint_capture()
+                    .adapter()
+                    .open_end_clock_for_test(*native)
+                    .is_some()
+                    == (row.push == R4Push::Complete),
+                "{}: control: staged natives carry the pushed shape",
+                row.name,
+            );
+        }
+        for native in &unclaimed {
+            assert!(
+                fixture
+                    .scene
+                    .real
+                    .scene
+                    .coordinator
+                    .joint_capture()
+                    .adapter()
+                    .open_end_clock_for_test(*native)
+                    .is_none(),
+                "{}: control: begin-only natives never grew an END",
+                row.name,
+            );
+        }
+    }
+    // Exact slot: every pushed call shares the fixture slot for
+    // (file 0, C_SignInit); the loss must consume exactly these.
+    let expected_slot = fixture.scene.real.h0.0.borrow().io.slot(0, "C_SignInit");
+    for native in staged.iter().chain(unclaimed.iter()) {
+        assert_eq!(
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture()
+                .adapter()
+                .retained_start_slot_for_test(*native),
+            Some(expected_slot),
+            "{}: control: the pushed call's exact slot",
+            row.name,
+        );
+    }
+    let wrong_far = u64::MAX - 1;
+    for native in &staged {
+        let adapter = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture_mut()
+            .adapter_mut();
+        let posed = match row.corrupt {
+            R4Corrupt::None => true,
+            R4Corrupt::EndPastFrontier => {
+                adapter.shift_open_end_past_frontier_for_test(*native, wrong_far)
+            }
+            R4Corrupt::BeginPastFrontier => {
+                adapter.shift_open_begin_past_frontier_for_test(*native, wrong_far)
+            }
+            R4Corrupt::Abandon => adapter.pose_open_abandon_for_test(*native, 0),
+            R4Corrupt::Corroborated => adapter.pose_open_corroborated_for_test(*native, 1),
+            R4Corrupt::RawNone => adapter.clear_open_raw_resource_for_test(*native),
+            R4Corrupt::MultiClaim => adapter.pose_extra_claim_for_test(*native, u64::MAX),
+            R4Corrupt::TwoKeys => adapter.pose_sibling_claim_for_test(*native, u64::MAX),
+            R4Corrupt::OriginWrong => adapter.replace_collected_origin_for_test(
+                *native,
+                Some(
+                    crate::semantics_objects::journal::joint_driver::CollectedCallOrigin::scripted(
+                        u64::MAX,
+                    ),
+                ),
+            ),
+            R4Corrupt::EndDisagree => {
+                let clock = adapter.open_end_clock_for_test(*native);
+                clock.is_some_and(|(_, _, duration)| {
+                    adapter.shift_open_end_clock_for_test(*native, 1, duration)
+                })
+            }
+            R4Corrupt::TsShift => {
+                let clock = adapter.open_end_clock_for_test(*native);
+                clock.is_some_and(|(_, ts, duration)| {
+                    adapter.shift_open_end_clock_for_test(
+                        *native,
+                        ts.saturating_add(1000),
+                        duration.saturating_add(1000),
+                    )
+                })
+            }
+            R4Corrupt::DurationShift => {
+                let clock = adapter.open_end_clock_for_test(*native);
+                clock.is_some_and(|(_, ts, duration)| {
+                    adapter.shift_open_end_clock_for_test(*native, ts, duration.saturating_add(1))
+                })
+            }
+            R4Corrupt::LedgerBreak => adapter.release_open_ledger_for_test(*native),
+            R4Corrupt::FloorDrop => adapter.drop_open_return_floor_for_test(*native),
+            R4Corrupt::ClaimRv => adapter.corrupt_claim_rv_for_test(*native),
+            R4Corrupt::ImageForeign => {
+                adapter.replace_open_image_for_test(*native, (wrong_far, wrong_far - 1))
+            }
+            R4Corrupt::S1Only => adapter.pose_open_s1only_for_test(*native),
+            R4Corrupt::HeadNoNative => true,
+            R4Corrupt::OpenDropped | R4Corrupt::OpenDroppedHeadless => {
+                adapter.drop_open_for_test(*native)
+            }
+        };
+        assert!(posed, "{}: control: the corruption poses", row.name);
+    }
+    if matches!(
+        row.corrupt,
+        R4Corrupt::HeadNoNative | R4Corrupt::OpenDroppedHeadless
+    ) {
+        let targets: Vec<_> = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .joint_feed_targets()
+            .collect();
+        assert_eq!(targets.len(), 2, "{}: control: two feeds", row.name);
+        for target in &targets {
+            assert!(
+                fixture
+                    .scene
+                    .real
+                    .scene
+                    .coordinator
+                    .registry_mut()
+                    .clear_joint_staged_head_invocation_for_test(target),
+                "{}: control: the head invocation clears",
+                row.name,
+            );
+        }
+    }
+    let unclaimed_images: Vec<(u64, u64)> = unclaimed
+        .iter()
+        .map(|native| {
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture()
+                .adapter()
+                .retained_start_image_for_test(*native)
+                .expect("unclaimed image")
+        })
+        .collect();
+    for native in &unclaimed {
+        let adapter = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture_mut()
+            .adapter_mut();
+        let posed = match row.unclaimed {
+            R4Unclaimed::None => true,
+            R4Unclaimed::ForgeStale => adapter.forge_stale_claim_for_test(*native, u64::MAX),
+            R4Unclaimed::ForgeStaleForeign => {
+                adapter.forge_stale_claim_for_test(*native, u64::MAX)
+                    && adapter.replace_open_image_for_test(*native, (wrong_far, wrong_far - 1))
+            }
+            R4Unclaimed::SiblingKey => adapter.pose_sibling_key_for_test(*native),
+            R4Unclaimed::ShiftBegin => {
+                adapter.shift_open_begin_past_frontier_for_test(*native, wrong_far)
+            }
+        };
+        assert!(posed, "{}: control: the unclaimed setup poses", row.name);
+    }
+    let before = fixture.feeds();
+    let seal_opens = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .retained_starts_for_test();
+    let seal_claims = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .invocation_claims_for_test();
+    let h0 = fixture.scene.real.h0.clone();
+    enum Takes<'a> {
+        Native(NativeFrameBirths<'a>),
+        Scripted(FailTakesAlways),
+    }
+    let mut takes = match row.takes {
+        R4Takes::StoppedCapture => {
+            let _ = h0.0.borrow_mut().capture.stop();
+            assert!(
+                h0.0.borrow().capture.stopped,
+                "{}: control: the capture is stopped",
+                row.name,
+            );
+            Takes::Native(NativeFrameBirths {
+                h0: &h0,
+                attached: &fixture.attached,
+                retained: &mut fixture.births,
+                seen: Vec::new(),
+                unreadable: false,
+            })
+        }
+        R4Takes::ScriptedStopped => Takes::Scripted(FailTakesAlways {
+            refusal: BirthObservationRefusal::Stopped,
+        }),
+    };
+    let mut steps = Vec::new();
+    let mut first_err = None;
+    let mut completed = false;
+    {
+        let mut ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        frame.bind_targets(&ports).unwrap();
+        for _ in 0..16 {
+            let sealed = match &mut takes {
+                Takes::Native(takes) => frame.seal_next(&mut ports, takes, &fault),
+                Takes::Scripted(takes) => frame.seal_next(&mut ports, takes, &fault),
+            };
+            if let Err(refusal) = sealed {
+                first_err = Some(refusal);
+                break;
+            }
+            let delivered = frame.deliver_next(&mut ports);
+            match delivered {
+                Err(refusal) => {
+                    first_err = Some(refusal);
+                    break;
+                }
+                Ok(progress) => {
+                    let done = progress == QuantumSealProgress::Complete;
+                    steps.push(progress);
+                    if done {
+                        completed = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    drop(takes);
+    let feeds = fixture.feeds();
+    let registry = fixture.scene.real.scene.coordinator.registry();
+    let mut ended: Vec<_> = registry
+        .gaps()
+        .iter()
+        .cloned()
+        .chain(registry.staged_gaps_for_test())
+        .filter(|gap| gap.subject == CAPTURE_ENDED_SUBJECT)
+        .collect();
+    ended.sort_by_key(|gap| gap.caller);
+    let mut unattributed: Vec<_> = registry
+        .gaps()
+        .iter()
+        .cloned()
+        .chain(registry.staged_gaps_for_test())
+        .filter(|gap| gap.subject == STOP_LOSS_UNATTRIBUTED_SUBJECT)
+        .collect();
+    unattributed.sort_by_key(|gap| gap.reason.clone());
+    match row.expect {
+        R4Expect::Loss { replayed, disposed } => {
+            assert_eq!(
+                first_err, None,
+                "{}: the fallback publishes (got {first_err:?})",
+                row.name,
+            );
+            assert!(completed, "{}: the frame completes", row.name);
+            assert_eq!(
+                steps,
+                vec![
+                    QuantumSealProgress::LocalPending,
+                    QuantumSealProgress::Complete,
+                ],
+                "{}: each consumer falls back on its first visit; nothing retries",
+                row.name,
+            );
+            assert_eq!(feeds.len(), 2, "{}: two feeds", row.name);
+            assert!(
+                feeds
+                    .iter()
+                    .all(|feed| feed.staged == 0 && feed.fallback && !feed.degraded),
+                "{}: both feeds fall back with nothing left staged",
+                row.name,
+            );
+            for feed in &feeds {
+                let was = before
+                    .iter()
+                    .find(|old| old.id == feed.id)
+                    .expect("feed persists");
+                assert_eq!(
+                    feed.reduced - was.reduced,
+                    replayed,
+                    "{}: exact replayed delta",
+                    row.name,
+                );
+                assert_eq!(
+                    feed.disposed - was.disposed,
+                    disposed,
+                    "{}: exact disposed delta",
+                    row.name,
+                );
+            }
+            let units = replayed + disposed;
+            let mut expected: Vec<_> = feeds
+                .iter()
+                .map(|feed| crate::discovery::caller_registry::RegistryGap {
+                    caller: Some(feed.caller),
+                    module: None,
+                    pid: None,
+                    subject: CAPTURE_ENDED_SUBJECT.to_string(),
+                    reason: capture_ended_reason(BirthObservationRefusal::Stopped, units as usize),
+                    budget: None,
+                    units: Some(units),
+                })
+                .collect();
+            expected.sort_by_key(|gap| gap.caller);
+            assert_eq!(
+                ended, expected,
+                "{}: one capture-ended gap per feed with exact (instance, count)",
+                row.name,
+            );
+            assert!(
+                registry
+                    .gaps()
+                    .iter()
+                    .cloned()
+                    .chain(registry.staged_gaps_for_test())
+                    .all(|gap| gap.subject != FALLBACK_FENCED_SUBJECT),
+                "{}: a capture-ended close never names its calls twice",
+                row.name,
+            );
+            // N1 consistency: the feed's typed disposed counter and the
+            // gap's typed units agree on every feed.
+            for feed in &feeds {
+                let was = before
+                    .iter()
+                    .find(|old| old.id == feed.id)
+                    .expect("feed persists");
+                let gap = ended
+                    .iter()
+                    .find(|gap| gap.caller == Some(feed.caller))
+                    .expect("per-feed gap");
+                assert_eq!(
+                    feed.disposed - was.disposed + (feed.reduced - was.reduced),
+                    gap.units.expect("typed units"),
+                    "{}: N1: disposed+replayed deltas equal the typed gap units",
+                    row.name,
+                );
+            }
+            let mut expected_unattributed: Vec<_> = unclaimed_images
+                .iter()
+                .take(row.unattributed_rows)
+                .map(|image| crate::discovery::caller_registry::RegistryGap {
+                    caller: None,
+                    module: None,
+                    pid: None,
+                    subject: STOP_LOSS_UNATTRIBUTED_SUBJECT.to_string(),
+                    reason: stop_loss_unattributed_reason(
+                        BirthObservationRefusal::Stopped,
+                        *image,
+                        1,
+                    ),
+                    budget: None,
+                    units: Some(1),
+                })
+                .collect();
+            expected_unattributed.sort_by_key(|gap| gap.reason.clone());
+            assert_eq!(
+                unattributed, expected_unattributed,
+                "{}: exact caller-less per-image rows",
+                row.name,
+            );
+            let owner = fixture.scene.real.scene.coordinator.joint_capture();
+            assert!(
+                owner.adapter().retained_starts_for_test().is_empty(),
+                "{}: the loss consumes every open entry",
+                row.name,
+            );
+            assert_eq!(
+                owner.adapter().invocation_claims_for_test().0,
+                row.leftover_claims,
+                "{}: exact leftover claims",
+                row.name,
+            );
+        }
+        R4Expect::Refuse => {
+            assert_eq!(
+                first_err,
+                Some(RawQuantumRefusal::DispositionMismatch),
+                "{}: the custody check refuses the delivery",
+                row.name,
+            );
+            let owner = fixture.scene.real.scene.coordinator.joint_capture();
+            assert_eq!(
+                owner.adapter().retained_starts_for_test(),
+                seal_opens,
+                "{}: B4: a refusal changes no open entry",
+                row.name,
+            );
+            assert_eq!(
+                owner.adapter().invocation_claims_for_test(),
+                seal_claims,
+                "{}: B4: a refusal changes no claim",
+                row.name,
+            );
+            for feed in &feeds {
+                let was = before
+                    .iter()
+                    .find(|old| old.id == feed.id)
+                    .expect("feed persists");
+                assert_eq!(feed.staged, was.staged, "{}: staged intact", row.name);
+                assert_eq!(feed.reduced, was.reduced, "{}: reduced intact", row.name);
+                assert_eq!(feed.disposed, was.disposed, "{}: disposed intact", row.name);
+            }
+            assert!(
+                ended.is_empty(),
+                "{}: B4: a refusal counts no per-consumer loss (got {ended:?})",
+                row.name,
+            );
+            assert!(
+                unattributed.is_empty(),
+                "{}: B4: a refusal counts no unattributed loss",
+                row.name,
+            );
+        }
+    }
+}
+
+#[test]
+fn joint_stop_loss_predicate_table_publishes_counted_loss() {
+    use R4Corrupt as C;
+    use R4Expect as E;
+    use R4Push as P;
+    use R4Takes as T;
+    use R4Unclaimed as U;
+    let loss = E::Loss {
+        replayed: 0,
+        disposed: 1,
+    };
+    let rows = [
+        // Control: a complete entry still replays at stop.
+        R4Row {
+            name: "complete_replays",
+            push: P::Complete,
+            begin_only: false,
+            takes: T::StoppedCapture,
+            corrupt: C::None,
+            unclaimed: U::None,
+            expect: E::Loss {
+                replayed: 1,
+                disposed: 0,
+            },
+            leftover_claims: 0,
+            unattributed_rows: 0,
+        },
+        // S0: END missing.
+        R4Row {
+            name: "end_none",
+            push: P::Endless,
+            begin_only: false,
+            takes: T::StoppedCapture,
+            corrupt: C::None,
+            unclaimed: U::None,
+            expect: loss,
+            leftover_claims: 0,
+            unattributed_rows: 0,
+        },
+        // S0a: END past the frontier.
+        R4Row {
+            name: "end_past_frontier",
+            push: P::Complete,
+            begin_only: false,
+            takes: T::StoppedCapture,
+            corrupt: C::EndPastFrontier,
+            unclaimed: U::None,
+            expect: loss,
+            leftover_claims: 0,
+            unattributed_rows: 0,
+        },
+        // S0a: BEGIN past the frontier (END present and END-less).
+        R4Row {
+            name: "begin_past_frontier_end",
+            push: P::Complete,
+            begin_only: false,
+            takes: T::StoppedCapture,
+            corrupt: C::BeginPastFrontier,
+            unclaimed: U::None,
+            expect: loss,
+            leftover_claims: 0,
+            unattributed_rows: 0,
+        },
+        R4Row {
+            name: "begin_past_frontier_endless",
+            push: P::Endless,
+            begin_only: false,
+            takes: T::StoppedCapture,
+            corrupt: C::BeginPastFrontier,
+            unclaimed: U::None,
+            expect: loss,
+            leftover_claims: 0,
+            unattributed_rows: 0,
+        },
+        // S0a: abandon staged (END present and END-less).
+        R4Row {
+            name: "abandon_end",
+            push: P::Complete,
+            begin_only: false,
+            takes: T::StoppedCapture,
+            corrupt: C::Abandon,
+            unclaimed: U::None,
+            expect: loss,
+            leftover_claims: 0,
+            unattributed_rows: 0,
+        },
+        R4Row {
+            name: "abandon_endless",
+            push: P::Endless,
+            begin_only: false,
+            takes: T::StoppedCapture,
+            corrupt: C::Abandon,
+            unclaimed: U::None,
+            expect: loss,
+            leftover_claims: 0,
+            unattributed_rows: 0,
+        },
+        // S0a: corroborated return.
+        R4Row {
+            name: "corroborated",
+            push: P::Complete,
+            begin_only: false,
+            takes: T::StoppedCapture,
+            corrupt: C::Corroborated,
+            unclaimed: U::None,
+            expect: loss,
+            leftover_claims: 0,
+            unattributed_rows: 0,
+        },
+        // S0a: no resource lineage (END present and END-less).
+        R4Row {
+            name: "raw_none_end",
+            push: P::Complete,
+            begin_only: false,
+            takes: T::StoppedCapture,
+            corrupt: C::RawNone,
+            unclaimed: U::None,
+            expect: loss,
+            leftover_claims: 0,
+            unattributed_rows: 0,
+        },
+        R4Row {
+            name: "raw_none_endless",
+            push: P::Endless,
+            begin_only: false,
+            takes: T::StoppedCapture,
+            corrupt: C::RawNone,
+            unclaimed: U::None,
+            expect: loss,
+            leftover_claims: 0,
+            unattributed_rows: 0,
+        },
+        // S0a: several claims under one key (one staged).
+        R4Row {
+            name: "multi_claim",
+            push: P::Complete,
+            begin_only: false,
+            takes: T::StoppedCapture,
+            corrupt: C::MultiClaim,
+            unclaimed: U::None,
+            expect: loss,
+            leftover_claims: 0,
+            unattributed_rows: 0,
+        },
+        // S0a: a claim under two keys (the sibling claim survives).
+        R4Row {
+            name: "two_keys",
+            push: P::Complete,
+            begin_only: false,
+            takes: T::StoppedCapture,
+            corrupt: C::TwoKeys,
+            unclaimed: U::None,
+            expect: loss,
+            leftover_claims: 2,
+            unattributed_rows: 0,
+        },
+        // Collected origin names another admission (END present and
+        // END-less).
+        R4Row {
+            name: "origin_wrong_end",
+            push: P::Complete,
+            begin_only: false,
+            takes: T::StoppedCapture,
+            corrupt: C::OriginWrong,
+            unclaimed: U::None,
+            expect: loss,
+            leftover_claims: 0,
+            unattributed_rows: 0,
+        },
+        R4Row {
+            name: "origin_wrong_endless",
+            push: P::Endless,
+            begin_only: false,
+            takes: T::StoppedCapture,
+            corrupt: C::OriginWrong,
+            unclaimed: U::None,
+            expect: loss,
+            leftover_claims: 0,
+            unattributed_rows: 0,
+        },
+        // END disagrees with BEGIN (rewound clock).
+        R4Row {
+            name: "end_disagree",
+            push: P::Complete,
+            begin_only: false,
+            takes: T::StoppedCapture,
+            corrupt: C::EndDisagree,
+            unclaimed: U::None,
+            expect: loss,
+            leftover_claims: 0,
+            unattributed_rows: 0,
+        },
+        // END timestamp disagrees with the admitted return.
+        R4Row {
+            name: "ts_shift",
+            push: P::Complete,
+            begin_only: false,
+            takes: T::StoppedCapture,
+            corrupt: C::TsShift,
+            unclaimed: U::None,
+            expect: loss,
+            leftover_claims: 0,
+            unattributed_rows: 0,
+        },
+        // Other-owner entries skip into the counted difference.
+        R4Row {
+            name: "s1only_skip",
+            push: P::Complete,
+            begin_only: false,
+            takes: T::StoppedCapture,
+            corrupt: C::S1Only,
+            unclaimed: U::None,
+            expect: loss,
+            leftover_claims: 0,
+            unattributed_rows: 0,
+        },
+        // S0b: staged head with no native original.
+        R4Row {
+            name: "head_no_native",
+            push: P::Endless,
+            begin_only: false,
+            takes: T::StoppedCapture,
+            corrupt: C::HeadNoNative,
+            unclaimed: U::None,
+            expect: loss,
+            leftover_claims: 0,
+            unattributed_rows: 0,
+        },
+        // S0b: staged head whose open entry is gone (its claims stay).
+        R4Row {
+            name: "open_dropped",
+            push: P::Endless,
+            begin_only: false,
+            takes: T::StoppedCapture,
+            corrupt: C::OpenDropped,
+            unclaimed: U::None,
+            expect: loss,
+            leftover_claims: 2,
+            unattributed_rows: 0,
+        },
+        R4Row {
+            name: "open_dropped_headless",
+            push: P::Endless,
+            begin_only: false,
+            takes: T::StoppedCapture,
+            corrupt: C::OpenDroppedHeadless,
+            unclaimed: U::None,
+            expect: loss,
+            leftover_claims: 2,
+            unattributed_rows: 0,
+        },
+        // N2: live keys at stop. Stale claimed-but-unstaged opens
+        // release silently (the gap counts only the staged call).
+        R4Row {
+            name: "stale_silent_live_keys",
+            push: P::Endless,
+            begin_only: true,
+            takes: T::ScriptedStopped,
+            corrupt: C::None,
+            unclaimed: U::ForgeStale,
+            expect: loss,
+            leftover_claims: 0,
+            unattributed_rows: 0,
+        },
+        // N2: live keys at stop. Unclaimed sole-image opens count
+        // under their consumer (staged 1 + unclaimed 1 per feed).
+        R4Row {
+            name: "unclaimed_live_keys",
+            push: P::Endless,
+            begin_only: true,
+            takes: T::ScriptedStopped,
+            corrupt: C::None,
+            unclaimed: U::None,
+            expect: E::Loss {
+                replayed: 0,
+                disposed: 2,
+            },
+            leftover_claims: 0,
+            unattributed_rows: 0,
+        },
+        // B2: two keys on one image -> caller-less per-image row; the
+        // per-consumer gap counts only the staged call.
+        R4Row {
+            name: "two_keys_one_image_unattributed",
+            push: P::Endless,
+            begin_only: true,
+            takes: T::ScriptedStopped,
+            corrupt: C::None,
+            unclaimed: U::SiblingKey,
+            expect: loss,
+            leftover_claims: 0,
+            unattributed_rows: 2,
+        },
+        // B2: post-frontier open -> caller-less per-image row.
+        R4Row {
+            name: "post_frontier_unattributed",
+            push: P::Endless,
+            begin_only: true,
+            takes: T::ScriptedStopped,
+            corrupt: C::None,
+            unclaimed: U::ShiftBegin,
+            expect: loss,
+            leftover_claims: 0,
+            unattributed_rows: 2,
+        },
+    ];
+    for row in &rows {
+        eprintln!("stop-loss loss row: {}", row.name);
+        drive_r4_stop_row(row);
+    }
+}
+
+#[test]
+fn joint_stop_loss_custody_table_refuses_without_change() {
+    use R4Corrupt as C;
+    use R4Expect as E;
+    use R4Push as P;
+    use R4Takes as T;
+    use R4Unclaimed as U;
+    let rows = [
+        // Custody: ledger staging link broken.
+        R4Row {
+            name: "ledger_break",
+            push: P::Complete,
+            begin_only: false,
+            takes: T::StoppedCapture,
+            corrupt: C::LedgerBreak,
+            unclaimed: U::None,
+            expect: E::Refuse,
+            leftover_claims: 0,
+            unattributed_rows: 0,
+        },
+        // Custody: return fingerprint disagrees with the END event.
+        R4Row {
+            name: "fingerprint_break",
+            push: P::Complete,
+            begin_only: false,
+            takes: T::StoppedCapture,
+            corrupt: C::DurationShift,
+            unclaimed: U::None,
+            expect: E::Refuse,
+            leftover_claims: 0,
+            unattributed_rows: 0,
+        },
+        // Custody: open image disagrees with the key (staged entry).
+        R4Row {
+            name: "image_foreign",
+            push: P::Complete,
+            begin_only: false,
+            takes: T::StoppedCapture,
+            corrupt: C::ImageForeign,
+            unclaimed: U::None,
+            expect: E::Refuse,
+            leftover_claims: 0,
+            unattributed_rows: 0,
+        },
+        // Custody: claim names another shape.
+        R4Row {
+            name: "claim_rv",
+            push: P::Complete,
+            begin_only: false,
+            takes: T::StoppedCapture,
+            corrupt: C::ClaimRv,
+            unclaimed: U::None,
+            expect: E::Refuse,
+            leftover_claims: 0,
+            unattributed_rows: 0,
+        },
+        // Custody: physical-return floor missing (consumption needs it).
+        R4Row {
+            name: "floor_drop",
+            push: P::Complete,
+            begin_only: false,
+            takes: T::StoppedCapture,
+            corrupt: C::FloorDrop,
+            unclaimed: U::None,
+            expect: E::Refuse,
+            leftover_claims: 0,
+            unattributed_rows: 0,
+        },
+        // N3: stale claimed-but-unstaged open with a foreign image.
+        R4Row {
+            name: "stale_image_foreign",
+            push: P::Complete,
+            begin_only: true,
+            takes: T::StoppedCapture,
+            corrupt: C::None,
+            unclaimed: U::ForgeStaleForeign,
+            expect: E::Refuse,
+            leftover_claims: 0,
+            unattributed_rows: 0,
+        },
+    ];
+    for row in &rows {
+        eprintln!("stop-loss custody row: {}", row.name);
+        drive_r4_stop_row(row);
+    }
+}
+
+/// Round r4 (B4): plan, then apply. Each image holds an unclaimed
+/// open (lower native, planned for disposal) followed by a stale
+/// foreign-image open (higher native, refusing). The walk must only
+/// classify: when the refusal lands, no state changes and no count
+/// is lost. Before the fix the walk disposed the planned open
+/// before validation finished.
+#[test]
+fn joint_stop_loss_refusal_applies_no_planned_disposal() {
+    use crate::semantics_objects::journal::joint_audit::{
+        CAPTURE_ENDED_SUBJECT, STOP_LOSS_UNATTRIBUTED_SUBJECT,
+    };
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    fixture.push_two("C_SignInit", 2);
+    fixture.push_two_begin_only("C_SignInit", 3);
+    fixture.push_two_begin_only("C_SignInit", 4);
+    let fault = FrameFault::clean();
+    let mut frame = fixture.audited(2, 2, &fault);
+    let mut opens: Vec<(u64, u64, u64)> = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .retained_starts_for_test();
+    opens.sort_by_key(|open| (open.2, open.0, open.1));
+    assert_eq!(
+        opens.len(),
+        6,
+        "control: staged plus two begin-only per feed"
+    );
+    let unclaimed: Vec<(u64, u64)> = opens.iter().skip(2).map(|open| (open.0, open.1)).collect();
+    assert_eq!(unclaimed.len(), 4, "control: four begin-only opens");
+    // Per image (per ticket): the lower native stays clean (planned),
+    // the higher native forges stale with a foreign image (refusing).
+    use std::collections::BTreeMap;
+    let mut by_ticket: BTreeMap<u64, Vec<(u64, u64)>> = BTreeMap::new();
+    for native in &unclaimed {
+        by_ticket.entry(native.0).or_default().push(*native);
+    }
+    assert_eq!(by_ticket.len(), 2, "control: two images");
+    let wrong_far = u64::MAX - 1;
+    for natives in by_ticket.values() {
+        assert_eq!(natives.len(), 2, "control: a pair per image");
+        let mut pair = natives.clone();
+        pair.sort();
+        let adapter = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture_mut()
+            .adapter_mut();
+        assert!(
+            adapter.open_end_clock_for_test(pair[0]).is_none()
+                && adapter.open_end_clock_for_test(pair[1]).is_none(),
+            "control: the pair is begin-only",
+        );
+        assert!(
+            adapter.forge_stale_claim_for_test(pair[1], u64::MAX)
+                && adapter.replace_open_image_for_test(pair[1], (wrong_far, wrong_far - 1)),
+            "control: the higher native refuses",
+        );
+    }
+    let before = fixture.feeds();
+    let seal_opens = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .retained_starts_for_test();
+    let seal_claims = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .invocation_claims_for_test();
+    // Live keys: scripted Stopped takes without stopping, so the
+    // unclaimed arm would dispose before the fix.
+    let mut takes = FailTakesAlways {
+        refusal: BirthObservationRefusal::Stopped,
+    };
+    let mut first_err = None;
+    {
+        let mut ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        frame.bind_targets(&ports).unwrap();
+        for _ in 0..16 {
+            match frame.seal_next(&mut ports, &mut takes, &fault) {
+                Err(refusal) => {
+                    first_err = Some(refusal);
+                    break;
+                }
+                Ok(_) => {}
+            }
+            match frame.deliver_next(&mut ports) {
+                Err(refusal) => {
+                    first_err = Some(refusal);
+                    break;
+                }
+                Ok(progress) => {
+                    if progress == QuantumSealProgress::Complete {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(
+        first_err,
+        Some(RawQuantumRefusal::DispositionMismatch),
+        "the custody check refuses the delivery",
+    );
+    let owner = fixture.scene.real.scene.coordinator.joint_capture();
+    assert_eq!(
+        owner.adapter().retained_starts_for_test(),
+        seal_opens,
+        "B4: a refusal changes no open entry (the planned disposal never applies)",
+    );
+    assert_eq!(
+        owner.adapter().invocation_claims_for_test(),
+        seal_claims,
+        "B4: a refusal changes no claim",
+    );
+    let feeds = fixture.feeds();
+    for feed in &feeds {
+        let was = before
+            .iter()
+            .find(|old| old.id == feed.id)
+            .expect("feed persists");
+        assert_eq!(feed.staged, was.staged, "staged intact");
+        assert_eq!(feed.disposed, was.disposed, "disposed intact");
+    }
+    let registry = fixture.scene.real.scene.coordinator.registry();
+    assert!(
+        registry
+            .gaps()
+            .iter()
+            .cloned()
+            .chain(registry.staged_gaps_for_test())
+            .all(|gap| gap.subject != CAPTURE_ENDED_SUBJECT
+                && gap.subject != STOP_LOSS_UNATTRIBUTED_SUBJECT),
+        "B4: a refusal counts no loss",
+    );
+}
+
+/// Round r4 (B3): only a Stopped take runs the stop-loss
+/// disposal/release arms. AuthorityExhausted and CoverageFailed keep
+/// the pre-r3 completed-only path: incomplete entries refuse with
+/// nothing disposed mid-run, while complete entries still fall back
+/// and replay exactly as before.
+#[test]
+fn joint_stop_loss_non_stop_refusals_keep_pre_r3_path() {
+    use crate::semantics_objects::journal::joint_audit::{
+        CAPTURE_ENDED_SUBJECT, capture_ended_reason,
+    };
+    for refusal in [
+        BirthObservationRefusal::AuthorityExhausted,
+        BirthObservationRefusal::CoverageFailed,
+    ] {
+        for endless in [false, true] {
+            let mut fixture = CanonicalFanoutScene::prior_sealed();
+            if endless {
+                fixture.push_two_without_end("C_SignInit", 2);
+            } else {
+                fixture.push_two("C_SignInit", 2);
+            }
+            let fault = FrameFault::clean();
+            let mut frame = fixture.audited(2, 2, &fault);
+            let before = fixture.feeds();
+            let seal_opens = fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture()
+                .adapter()
+                .retained_starts_for_test();
+            let seal_claims = fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture()
+                .adapter()
+                .invocation_claims_for_test();
+            // No stop: keys stay live, proving mid-run behavior.
+            let mut takes = FailTakesAlways { refusal };
+            let mut steps = Vec::new();
+            let mut first_err = None;
+            let mut completed = false;
+            {
+                let mut ports = fixture
+                    .scene
+                    .real
+                    .scene
+                    .coordinator
+                    .joint_frame_ports(&fixture.scene.producers)
+                    .unwrap();
+                frame.bind_targets(&ports).unwrap();
+                for _ in 0..16 {
+                    match frame.seal_next(&mut ports, &mut takes, &fault) {
+                        Err(refusal) => {
+                            first_err = Some(refusal);
+                            break;
+                        }
+                        Ok(_) => {}
+                    }
+                    match frame.deliver_next(&mut ports) {
+                        Err(refusal) => {
+                            first_err = Some(refusal);
+                            break;
+                        }
+                        Ok(progress) => {
+                            let done = progress == QuantumSealProgress::Complete;
+                            steps.push(progress);
+                            if done {
+                                completed = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            let feeds = fixture.feeds();
+            let registry = fixture.scene.real.scene.coordinator.registry();
+            let mut ended: Vec<_> = registry
+                .gaps()
+                .iter()
+                .cloned()
+                .chain(registry.staged_gaps_for_test())
+                .filter(|gap| gap.subject == CAPTURE_ENDED_SUBJECT)
+                .collect();
+            ended.sort_by_key(|gap| gap.caller);
+            if endless {
+                assert_eq!(
+                    first_err,
+                    Some(RawQuantumRefusal::DispositionMismatch),
+                    "{refusal:?}: incomplete entries refuse without a stop",
+                );
+                let owner = fixture.scene.real.scene.coordinator.joint_capture();
+                assert_eq!(
+                    owner.adapter().retained_starts_for_test(),
+                    seal_opens,
+                    "{refusal:?}: B3: nothing is disposed mid-run (opens)",
+                );
+                assert_eq!(
+                    owner.adapter().invocation_claims_for_test(),
+                    seal_claims,
+                    "{refusal:?}: B3: nothing is disposed mid-run (claims)",
+                );
+                for feed in &feeds {
+                    let was = before
+                        .iter()
+                        .find(|old| old.id == feed.id)
+                        .expect("feed persists");
+                    assert_eq!(feed.staged, was.staged, "{refusal:?}: staged intact");
+                    assert_eq!(feed.disposed, was.disposed, "{refusal:?}: disposed intact");
+                }
+                assert!(
+                    ended.is_empty(),
+                    "{refusal:?}: B3: a refusal counts no loss (got {ended:?})",
+                );
+            } else {
+                assert_eq!(
+                    first_err, None,
+                    "{refusal:?}: complete entries fall back (got {first_err:?})",
+                );
+                assert!(completed, "{refusal:?}: the frame completes");
+                assert_eq!(
+                    steps,
+                    vec![
+                        QuantumSealProgress::LocalPending,
+                        QuantumSealProgress::Complete,
+                    ],
+                    "{refusal:?}: each consumer falls back on its first visit",
+                );
+                for feed in &feeds {
+                    let was = before
+                        .iter()
+                        .find(|old| old.id == feed.id)
+                        .expect("feed persists");
+                    assert_eq!(
+                        feed.reduced - was.reduced,
+                        1,
+                        "{refusal:?}: the complete head replays",
+                    );
+                    assert_eq!(
+                        feed.disposed - was.disposed,
+                        0,
+                        "{refusal:?}: nothing disposes",
+                    );
+                }
+                let mut expected: Vec<_> = feeds
+                    .iter()
+                    .map(|feed| crate::discovery::caller_registry::RegistryGap {
+                        caller: Some(feed.caller),
+                        module: None,
+                        pid: None,
+                        subject: CAPTURE_ENDED_SUBJECT.to_string(),
+                        reason: capture_ended_reason(refusal, 1),
+                        budget: None,
+                        units: Some(1),
+                    })
+                    .collect();
+                expected.sort_by_key(|gap| gap.caller);
+                assert_eq!(
+                    ended, expected,
+                    "{refusal:?}: the pre-r3 gap names its refusal and count",
+                );
+            }
+        }
+    }
+}
+
+/// Round r4 (N5, frame twin): a consumer that loses nothing gets no
+/// capture-ended row. Only feed A stages a call; B falls back empty
+/// and stays silent.
+#[test]
+fn joint_stop_loss_empty_consumer_gets_no_row() {
+    use crate::semantics_objects::journal::joint_audit::{
+        CAPTURE_ENDED_SUBJECT, capture_ended_reason,
+    };
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 2);
+    let fault = FrameFault::clean();
+    let mut frame = fixture.audited(1, 1, &fault);
+    let h0 = fixture.scene.real.h0.clone();
+    let _ = h0.0.borrow_mut().capture.stop();
+    let mut takes = NativeFrameBirths {
+        h0: &h0,
+        attached: &fixture.attached,
+        retained: &mut fixture.births,
+        seen: Vec::new(),
+        unreadable: false,
+    };
+    let mut completed = false;
+    {
+        let mut ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        frame.bind_targets(&ports).unwrap();
+        for _ in 0..16 {
+            frame.seal_next(&mut ports, &mut takes, &fault).unwrap();
+            if frame.deliver_next(&mut ports) == Ok(QuantumSealProgress::Complete) {
+                completed = true;
+                break;
+            }
+        }
+    }
+    drop(takes);
+    assert!(completed, "the frame completes");
+    let feeds = fixture.feeds();
+    assert_eq!(feeds.len(), 2, "two feeds");
+    let registry = fixture.scene.real.scene.coordinator.registry();
+    let ended: Vec<_> = registry
+        .gaps()
+        .iter()
+        .cloned()
+        .chain(registry.staged_gaps_for_test())
+        .filter(|gap| gap.subject == CAPTURE_ENDED_SUBJECT)
+        .collect();
+    assert_eq!(ended.len(), 1, "only the losing consumer gets a row");
+    assert_eq!(
+        ended[0].reason,
+        capture_ended_reason(BirthObservationRefusal::Stopped, 1),
+        "the row counts its single call",
+    );
+    assert_eq!(ended[0].units, Some(1), "N1: the typed count");
+    assert!(
+        feeds.iter().all(|feed| feed.fallback),
+        "both consumers fell back (the empty one silently)"
+    );
 }
 
 #[test]

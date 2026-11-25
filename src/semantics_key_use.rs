@@ -1276,6 +1276,16 @@ impl JointStaging {
         self.staged.front().map(|head| head.charged_bytes())
     }
 
+    /// Tests-only native-less head: clear the staged head invocation.
+    #[cfg(test)]
+    pub(crate) fn clear_staged_head_invocation_for_test(&mut self) -> bool {
+        let Some(head) = self.staged.front_mut() else {
+            return false;
+        };
+        head.original_invocation = None;
+        true
+    }
+
     /// Borrow the existing FIFO by index during one continuation preflight;
     /// no copied queue or scalar admission can create this native identity.
     pub(crate) fn staged_original_at(&self, index: usize) -> Option<(u64, (u64, u64))> {

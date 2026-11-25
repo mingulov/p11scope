@@ -342,6 +342,34 @@ fn departed_use_absent_for_old_captures() {
 }
 
 #[test]
+fn pre_fold_detection_needs_both_markers_absent() {
+    // Marker-less, the v0.7.1 shape: pre-fold.
+    let v = fixture();
+    assert!(v.pointer("/modules/0/departed_use").is_none());
+    assert!(v.pointer("/budgets/callers/retired_with_calls").is_none());
+    assert!(parse_snapshot(&bytes(&v)).unwrap().pre_fold_input);
+    // Either marker alone declares a current writer: a null
+    // `departed_use` key counts as present, and so does a zero
+    // `retired_with_calls` counter.
+    let mut nulled = v.clone();
+    nulled["modules"][0]["departed_use"] = json!(null);
+    assert!(!parse_snapshot(&bytes(&nulled)).unwrap().pre_fold_input);
+    let mut retired = v.clone();
+    retired["budgets"]["callers"]["retired_with_calls"] = json!(0);
+    assert!(!parse_snapshot(&bytes(&retired)).unwrap().pre_fold_input);
+    let mut both = nulled.clone();
+    both["budgets"]["callers"]["retired_with_calls"] = json!(0);
+    assert!(!parse_snapshot(&bytes(&both)).unwrap().pre_fold_input);
+    // An empty module list alone is not pre-fold while the writer
+    // marker survives.
+    let mut emptied = both.clone();
+    emptied["modules"] = json!([]);
+    emptied["edges"] = json!([]);
+    emptied["gaps"] = json!([]);
+    assert!(!parse_snapshot(&bytes(&emptied)).unwrap().pre_fold_input);
+}
+
+#[test]
 fn unbound_use_entries_are_carried_when_present() {
     let mut v = fixture();
     v["modules"][0]["unbound_use"] = json!({

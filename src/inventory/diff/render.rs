@@ -161,11 +161,25 @@ fn render_caveats(human: &mut Human) -> io::Result<()> {
     Ok(())
 }
 
+/// The mixed-version fold caveat: one side predates the fold, so
+/// its exited callers are live rows where the other side holds
+/// folded aggregates.
+const PRE_FOLD_INPUT_NOTE: &str = "one input predates the departed-caller fold (v0.7.1 or older): exited callers are live rows there and folded here; `departed_use`/`lifecycle` changes on shared modules may be format only.";
+
+fn pre_fold_note(limitation: &str) -> Option<&'static str> {
+    (limitation == "pre_fold_input").then_some(PRE_FOLD_INPUT_NOTE)
+}
+
 /// Snapshot-specific limitations in plain words: the fixed codes stay out
-/// (the caveats above already state them), anything else prints verbatim.
+/// (the caveats above already state them), the fold caveat prints its
+/// sentence, anything else prints verbatim.
 fn render_plain_limitations(human: &mut Human, limitations: &[String]) -> io::Result<()> {
     for limitation in limitations {
         if FIXED_LIMITATION_CODES.contains(&limitation.as_str()) {
+            continue;
+        }
+        if let Some(note) = pre_fold_note(limitation) {
+            human.line(2, &format!("Note: {note}"))?;
             continue;
         }
         human.line(2, &format!("Note: {limitation}"))?;

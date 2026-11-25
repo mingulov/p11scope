@@ -36,6 +36,11 @@ pub(super) struct Snapshot {
     pub gaps: Vec<Gap>,
     pub gaps_suppressed: u64,
     pub limitations: Vec<String>,
+    /// True when the file predates the departed-caller fold (v0.7.1 or
+    /// older): exited callers are live rows here, folded aggregates in
+    /// current files. Key presence, never content: a current file with
+    /// nothing folded still carries the markers.
+    pub pre_fold_input: bool,
 }
 
 /// Unknown enum labels remain available for diagnostics without becoming an
@@ -976,11 +981,12 @@ fn convert_snapshot(value: &Value, limits: InputLimits) -> Result<Snapshot> {
             })
         })
         .transpose()?;
+    let budgets_object = root.object("budgets")?;
     Ok(Snapshot {
         scope: root.text("scope")?,
         clock,
         observation: parse_observation(&root.object("observation")?)?,
-        budgets: parse_budgets(&root.object("budgets")?)?,
+        budgets: parse_budgets(&budgets_object)?,
         pid_namespace,
         callers,
         modules,
@@ -988,7 +994,26 @@ fn convert_snapshot(value: &Value, limits: InputLimits) -> Result<Snapshot> {
         gaps,
         gaps_suppressed: root.uint("gaps_suppressed")?,
         limitations,
+        pre_fold_input: is_pre_fold_input(&root, &budgets_object)?,
     })
+}
+
+/// A pre-fold inventory predates the departed-caller fold: no module
+/// carries the `departed_use` key (a current writer always emits it,
+/// null when nothing folded) and `budgets.callers` carries no
+/// `retired_with_calls` counter. Both markers must be absent together:
+/// an empty module list alone never makes a current file pre-fold.
+fn is_pre_fold_input(root: &Object<'_>, budgets: &Object<'_>) -> Result<bool> {
+    let folded = root
+        .array("modules")?
+        .iter()
+        .filter_map(|module| module.as_object())
+        .any(|module| module.contains_key("departed_use"));
+    let retired = budgets
+        .object("callers")?
+        .fields
+        .contains_key("retired_with_calls");
+    Ok(!folded && !retired)
 }
 fn resolve(o: &Object<'_>, key: &str, ids: &BTreeMap<String, usize>) -> Result<usize> {
     ids.get(&o.text(key)?)

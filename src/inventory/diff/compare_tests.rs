@@ -5,6 +5,7 @@ use super::{
     compare::compare,
     input::{self, Snapshot},
     model::{self, Presence, Side, UnresolvedKind},
+    render::{render_concise, render_text},
 };
 use serde_json::{Value, json};
 
@@ -22,7 +23,23 @@ fn app_path<'a>(r: &'a model::DiffReport, a: &model::ApplicationChange) -> &'a s
 }
 
 const FIXTURE: &[u8] = include_bytes!("../../../tests/fixtures/inventory-diff/scan-current.json");
+/// The fixture content declared as a current inventory: a current
+/// writer always emits the `departed_use` key (null when nothing
+/// folded) and `budgets.callers.retired_with_calls`, so without
+/// these markers every same-version test below would read as
+/// mixed-version. Mixed-version tests use [`legacy_document`].
 fn document() -> Value {
+    let mut v: Value = serde_json::from_slice(FIXTURE).unwrap();
+    v["budgets"]["callers"]["retired_with_calls"] = json!(0);
+    for module in v["modules"].as_array_mut().unwrap() {
+        module["departed_use"] = Value::Null;
+    }
+    v
+}
+/// The same content in its pre-fold shape: no `departed_use` key on
+/// any module and no `budgets.callers.retired_with_calls`, like a
+/// v0.7.1 inventory.
+fn legacy_document() -> Value {
     serde_json::from_slice(FIXTURE).unwrap()
 }
 fn snapshot(v: &Value) -> Snapshot {
@@ -2207,6 +2224,116 @@ fn native_semantic_resource_budgets_do_not_change_physical_diff() {
                 report
                     .limitations
                     .contains(&"semantic_details_not_compared".into())
+            );
+        }
+    }
+}
+
+/// A pre-fold inventory: the steady caller and the exited churn
+/// caller are both live rows on the shared module, with no fold
+/// markers anywhere.
+fn mixed_version_before() -> Value {
+    let mut v = legacy_document();
+    assert!(v.pointer("/modules/0/departed_use").is_none());
+    assert!(v.pointer("/budgets/callers/retired_with_calls").is_none());
+    let mut churn = v["callers"][0].clone();
+    churn["id"] = json!("c1");
+    churn["pid"] = json!(4300);
+    churn["image"]["exe"]["ino"] = json!(101);
+    churn["image"]["exe"]["path"] = json!("/bin/churn");
+    churn["lifecycle"] = json!("exited");
+    churn["lifecycle_reason"] = json!("process exited (pid names no live process)");
+    v["callers"].as_array_mut().unwrap().push(churn);
+    let mut edge = v["edges"][0].clone();
+    edge["caller"] = json!("c1");
+    v["edges"].as_array_mut().unwrap().push(edge);
+    v["gaps"] = json!([]);
+    v
+}
+
+/// The same workload folded by a current inventory: the churn caller
+/// left live rows for `departed_use`, with the fold markers a
+/// current writer always emits.
+fn mixed_version_after() -> Value {
+    let mut v = mixed_version_before();
+    v["callers"] = json!([v["callers"][0].clone()]);
+    v["edges"] = json!([v["edges"][0].clone()]);
+    v["budgets"]["callers"]["retired_with_calls"] = json!(1);
+    v["modules"][0]["departed_use"] = departed_use_json(
+        1,
+        1,
+        vec![departed_identity_json("c1", Some("/bin/churn"), "exited")],
+    );
+    v
+}
+
+fn rendered(report: &model::DiffReport) -> Vec<String> {
+    let mut verbose = Vec::new();
+    render_text(report, &mut verbose).unwrap();
+    let mut concise = Vec::new();
+    render_concise(report, &mut concise).unwrap();
+    vec![
+        String::from_utf8(verbose).unwrap(),
+        String::from_utf8(concise).unwrap(),
+    ]
+}
+
+/// A pre-fold input compared against a folded current input names
+/// the `pre_fold_input` limitation, keeps the folded group present
+/// on both sides, and leaves the other group on the shared module
+/// unchanged — in both directions.
+#[test]
+fn mixed_version_fold_marks_only_the_folded_group() {
+    let before = mixed_version_before();
+    let after = mixed_version_after();
+    for (left, right) in [(&before, &after), (&after, &before)] {
+        let report = compare(&snapshot(left), &snapshot(right));
+        assert!(
+            report.limitations.contains(&"pre_fold_input".to_owned()),
+            "mixed versions name the fold limitation: {:?}",
+            report.limitations
+        );
+        assert_eq!(report.summary.application_groups_compared, 2);
+        assert_eq!(
+            report.application_changes.len(),
+            1,
+            "only the folded group reads changed: {:?}",
+            report
+                .application_changes
+                .iter()
+                .map(|row| (
+                    &report.comparison.application_paths[row.key.exe_path_ref.0],
+                    &row.changes
+                ))
+                .collect::<Vec<_>>()
+        );
+        let change = &report.application_changes[0];
+        assert_eq!(app_path(&report, change), "/bin/churn");
+        assert_eq!(change.presence, Presence::Both);
+        assert_eq!(
+            change.changes,
+            vec!["caller_population", "content_presence", "departed_use"]
+        );
+        assert!(
+            !report
+                .application_changes
+                .iter()
+                .any(|row| row.presence != Presence::Both),
+            "no group reads added or removed"
+        );
+        assert_eq!(report.module_contents.len(), 1);
+        assert!(
+            report.module_contents[0].changes.is_empty(),
+            "the module facet ignores the format-only fold: {:?}",
+            report.module_contents[0].changes
+        );
+        for output in rendered(&report) {
+            let words = output.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(
+                words.contains(
+                    "Note: one input predates the departed-caller fold (v0.7.1 or older)"
+                ),
+                "both renderings carry the fold note: {output}"
             );
         }
     }

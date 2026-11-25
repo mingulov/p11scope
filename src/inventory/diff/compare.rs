@@ -163,7 +163,14 @@ pub(super) fn compare(before: &Snapshot, after: &Snapshot) -> DiffReport {
         .enumerate()
         .map(|(i, p)| (p.as_str(), i))
         .collect();
-    let (br, ar) = ranks(before, after);
+    // Mixed-version comparison: one side predates the departed-caller
+    // fold, so its exited callers are live rows where the other side
+    // holds folded aggregates. The module facet then ignores
+    // `departed_use` (a format difference, not an observation one) and
+    // the report carries the `pre_fold_input` limitation; the folded
+    // group itself still reports its `departed_use` row change below.
+    let mixed_fold = before.pre_fold_input != after.pre_fold_input;
+    let (br, ar) = ranks(before, after, mixed_fold);
     let b = prepare(before, &br);
     let a = prepare(after, &ar);
     let bp = project(before, &path_indexes);
@@ -306,6 +313,12 @@ pub(super) fn compare(before: &Snapshot, after: &Snapshot) -> DiffReport {
             .into_iter()
             .map(str::to_owned),
         )
+        .chain(
+            mixed_fold
+                .then_some("pre_fold_input")
+                .into_iter()
+                .map(str::to_owned),
+        )
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
@@ -428,7 +441,7 @@ fn caller_keys(c: &input::Caller) -> Vec<Vec<u8>> {
         encoded(&full),
     ]
 }
-fn module_keys(m: &input::Module) -> Vec<Vec<u8>> {
+fn module_keys(m: &input::Module, ignore_departed_use: bool) -> Vec<Vec<u8>> {
     let mut full = module_evidence(m);
     if let Some(h) = &mut full.admission.history {
         for a in h {
@@ -437,6 +450,13 @@ fn module_keys(m: &input::Module) -> Vec<Vec<u8>> {
     }
     if let Some(u) = &mut full.unbound_use {
         u.first_ns = 0;
+    }
+    if ignore_departed_use {
+        // Mixed-version comparison only: the pre-fold side cannot
+        // carry this aggregate, so its presence is format, not
+        // observation. Rendered evidence keeps the parsed value;
+        // only the compared ranks drop it.
+        full.departed_use = None;
     }
     vec![
         encoded(&full.identity),
@@ -479,14 +499,18 @@ fn edge_keys(e: &input::Edge) -> Vec<Vec<u8>> {
         encoded(&e.semantics),
     ]
 }
-fn ranks(before: &Snapshot, after: &Snapshot) -> (Ranks, Ranks) {
+fn ranks(before: &Snapshot, after: &Snapshot, ignore_departed_use: bool) -> (Ranks, Ranks) {
     let keys: Vec<_> = [before, after]
         .into_iter()
         .map(|s| {
             s.callers
                 .iter()
                 .map(caller_keys)
-                .chain(s.modules.iter().map(module_keys))
+                .chain(
+                    s.modules
+                        .iter()
+                        .map(|m| module_keys(m, ignore_departed_use)),
+                )
                 .chain(s.edges.iter().map(edge_keys))
                 .collect::<Vec<_>>()
         })

@@ -50533,8 +50533,10 @@ fn select_excluding_kernel_threads_counts_absences_on_the_budget() {
     ];
     let unavailable: BTreeSet<u32> = [12].into_iter().collect();
     let mut budget = CaptureWorkBudget::default();
-    let mut tiers = crate::discovery::scan_pass::MemberTiers::default();
-    tiers.identity_checks = 7;
+    let tiers = crate::discovery::scan_pass::MemberTiers {
+        identity_checks: 7,
+        ..Default::default()
+    };
     let selected =
         select_excluding_kernel_threads(&sweep, &unavailable, &proc_root, 4, &mut budget, &tiers);
     // Only pid 10 is a flagged thread with an empty available snapshot;

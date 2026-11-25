@@ -1812,6 +1812,144 @@ pub struct ReconciledModule {
 /// One target under its complete opened-file identity plus offset.
 type TargetKey = (MappingFileKey, u64, Pin, String, u64);
 
+/// Which process generation proved one view's scan custody. The single
+/// owner of the fresh-versus-carried distinction: resolution and the
+/// per-view proof fence read this tag, never ownership-claim presence
+/// (synthetic and replace-preserved custody legitimately exists without
+/// claims, while a carried view's custody outlives its claims).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum CustodyGeneration {
+    /// Proven by the view's current, live generation (or filed as proof
+    /// by a fixture): fresh proof for that view, and a fence that keeps
+    /// every other view from riding it.
+    #[default]
+    Fresh,
+    /// Kept only as carry evidence for pins that outlive their view's
+    /// generation. Never fresh proof and never a fence: only a carried
+    /// (unauthorized) bind of the same view may resolve through it.
+    Carried(CarryCause),
+}
+
+/// Why a view's scan custody stopped being fresh proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CarryCause {
+    /// The generation retired with carried pins (the proof it retired on).
+    Retired(RetirementProof),
+    /// The candidate rebuild denied the view claims (carried, dropped or
+    /// unknown views): its rows ride as carry, not as a live generation.
+    ClaimsDenied,
+}
+
+/// One view's scan custody: the raws its scans proved plus the generation
+/// that proved them. Reads go through `Deref`; every mutation is a named
+/// operation, so a carried set can never silently gain fresh rows (filing
+/// fresh proof into a carried set starts a new generation) and a fresh set
+/// becomes carried only through [`Self::carry`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ScanCustody {
+    raws: BTreeSet<RawObjectInstance>,
+    generation: CustodyGeneration,
+}
+
+impl std::ops::Deref for ScanCustody {
+    type Target = BTreeSet<RawObjectInstance>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.raws
+    }
+}
+
+impl<'a> IntoIterator for &'a ScanCustody {
+    type Item = &'a RawObjectInstance;
+    type IntoIter = std::collections::btree_set::Iter<'a, RawObjectInstance>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.raws.iter()
+    }
+}
+
+impl ScanCustody {
+    /// An empty custody of `generation` (the conservative copy's output
+    /// slot: rows copy one at a time under the same tag).
+    fn empty(generation: CustodyGeneration) -> Self {
+        Self {
+            raws: BTreeSet::new(),
+            generation,
+        }
+    }
+
+    pub(crate) fn generation(&self) -> CustodyGeneration {
+        self.generation
+    }
+
+    pub(crate) fn is_fresh(&self) -> bool {
+        self.generation == CustodyGeneration::Fresh
+    }
+
+    /// Files one freshly proven raw. A carried set belongs to a previous
+    /// generation of this numeric ID: its rows are discarded first, so
+    /// carry evidence never becomes fresh proof by sharing a set.
+    fn file_fresh(&mut self, raw: RawObjectInstance) {
+        if !self.is_fresh() {
+            self.raws.clear();
+            self.generation = CustodyGeneration::Fresh;
+        }
+        self.raws.insert(raw);
+    }
+
+    /// Restores rows this same set held before (replace keeps a view's
+    /// preserved rows): they rejoin under the set's current generation
+    /// only when that generation is the one they came from.
+    fn restore(&mut self, generation: CustodyGeneration, raws: BTreeSet<RawObjectInstance>) {
+        self.merge(ScanCustody { raws, generation });
+    }
+
+    /// Merges another set of the same view. Same generation: union. Mixed
+    /// generations: the fresh rows win and the carried rows (a superseded
+    /// generation of the numeric ID) are dropped, so carry never promotes.
+    fn merge(&mut self, other: ScanCustody) {
+        if other.raws.is_empty() {
+            return;
+        }
+        if self.raws.is_empty() {
+            *self = other;
+            return;
+        }
+        match (self.is_fresh(), other.is_fresh()) {
+            (true, false) => {}
+            (false, true) => *self = other,
+            _ => self.raws.extend(other.raws),
+        }
+    }
+
+    /// Ends this set's fresh standing: the rows stay only as carry
+    /// evidence for `cause`. An already carried set keeps its first cause.
+    fn carry(&mut self, cause: CarryCause) {
+        if self.is_fresh() {
+            self.generation = CustodyGeneration::Carried(cause);
+        }
+    }
+
+    fn retain(&mut self, keep: impl FnMut(&RawObjectInstance) -> bool) {
+        self.raws.retain(keep);
+    }
+
+    fn remove(&mut self, raw: &RawObjectInstance) -> bool {
+        self.raws.remove(raw)
+    }
+
+    /// Reclaims one row (the conservative copy's bounded teardown).
+    fn pop_first(&mut self) -> Option<RawObjectInstance> {
+        self.raws.pop_first()
+    }
+
+    /// Copies one row into the conservative copy's output slot, which was
+    /// created with the source set's generation.
+    fn copy_row(&mut self, raw: RawObjectInstance) {
+        self.raws.insert(raw);
+    }
+}
+
 /// Every object opened, identity-matched, hashed, and pinned by a capture-local ID.
 /// Raw mapping keys remain lookup inputs until reconciliation, never attach identity.
 /// No read leases are held:
@@ -1837,7 +1975,7 @@ pub struct PinnedObjects {
     ambiguous_keys: BTreeSet<ObjectKey>,
     ambiguity_published: BTreeSet<ObjectKey>,
     ownership: BTreeMap<ProcessViewId, ViewClaims>,
-    raw_ownership: BTreeMap<ProcessViewId, BTreeSet<RawObjectInstance>>,
+    raw_ownership: BTreeMap<ProcessViewId, ScanCustody>,
     /// Every `(target object, file offset)` the strict bind proved is a
     /// function entry: export agreement or a proven function start for
     /// an uncorroborated entry (see `bind_scanned_modules_strict`).
@@ -2280,11 +2418,11 @@ impl PinnedObjects {
                     .filter(|id| self.by_id.contains_key(id)),
             );
         }
-        for (view, raws) in other_raw_ownership {
-            self.raw_ownership.entry(view).or_default().extend(
-                raws.into_iter()
-                    .filter(|raw| self.raw_to_id.contains_key(raw)),
-            );
+        // Custody merges under its generation tag: incoming carry rows stay
+        // carry (never promoted by a fresh set of the same numeric ID).
+        for (view, mut custody) in other_raw_ownership {
+            custody.retain(|raw| self.raw_to_id.contains_key(raw));
+            self.raw_ownership.entry(view).or_default().merge(custody);
         }
         self.changed.set(self.changed.get() || other.changed.get());
         self.overlay_uncertain |= other_overlay_uncertain;
@@ -2488,7 +2626,7 @@ impl PinnedObjects {
             if candidate
                 .raw_ownership
                 .get(view)
-                .is_none_or(|new| !old.is_subset(new))
+                .is_none_or(|new| new.generation() != old.generation() || !old.is_subset(new))
             {
                 return false;
             }
@@ -2497,7 +2635,7 @@ impl PinnedObjects {
             raws.iter().all(|raw| {
                 self.raw_ownership
                     .get(view)
-                    .is_some_and(|old| old.contains(raw))
+                    .is_some_and(|old| old.generation() == raws.generation() && old.contains(raw))
                     || (raw.mount_namespace.is_some()
                         && candidate.raw_to_id.get(raw) == Some(&loader))
             })
@@ -2796,6 +2934,8 @@ impl PinnedObjects {
         let resolve: BTreeSet<_> = preserve_resolve.iter().copied().collect();
         let claim_ids: BTreeSet<_> = preserve_claims.iter().copied().collect();
         let view_raws = self.raw_ownership.remove(&view).unwrap_or_default();
+        // Preserved rows rejoin under the generation that proved them.
+        let view_generation = view_raws.generation();
         let resolve_raws: BTreeSet<_> = view_raws
             .iter()
             .filter(|raw| {
@@ -2806,12 +2946,13 @@ impl PinnedObjects {
             .cloned()
             .collect();
         let claim_raws: BTreeSet<_> = view_raws
-            .into_iter()
+            .iter()
             .filter(|raw| {
                 self.raw_to_id
                     .get(raw)
                     .is_some_and(|id| claim_ids.contains(id))
             })
+            .cloned()
             .collect();
         let skipped = self.absorb(incoming);
         let resolve_raws: BTreeSet<_> = resolve_raws
@@ -2848,7 +2989,7 @@ impl PinnedObjects {
             self.raw_ownership
                 .entry(view)
                 .or_default()
-                .extend(resolve_raws);
+                .restore(view_generation, resolve_raws);
         }
         if restore_ownership {
             self.ownership
@@ -3372,6 +3513,34 @@ impl PinnedObjects {
     /// Clears one released view's scan-only provenance: custody rows and
     /// refusal marks name process generations, so numeric view-ID reuse
     /// must never inherit them. Committed object custody is unchanged.
+    /// Ends one retiring view's custody generation (the single custody
+    /// retirement site): rows whose pin is in `keep` stay under the view as
+    /// [`CustodyGeneration::Carried`] by `proof`; the other rows are taken
+    /// out and returned for the caller's routing purge. The post-purge
+    /// pruning drops every carried row whose object did not survive, and
+    /// `release_view_id` clears the rest before the numeric ID is reused.
+    fn retire_view_custody(
+        &mut self,
+        view: ProcessViewId,
+        keep: &BTreeSet<PinnedObjectId>,
+        proof: RetirementProof,
+    ) -> BTreeSet<RawObjectInstance> {
+        let Some(mut custody) = self.raw_ownership.remove(&view) else {
+            return BTreeSet::new();
+        };
+        let removed: BTreeSet<RawObjectInstance> = custody
+            .iter()
+            .filter(|raw| !self.raw_to_id.get(raw).is_some_and(|id| keep.contains(id)))
+            .cloned()
+            .collect();
+        custody.retain(|raw| !removed.contains(raw));
+        if !custody.is_empty() {
+            custody.carry(CarryCause::Retired(proof));
+            self.raw_ownership.insert(view, custody);
+        }
+        removed
+    }
+
     pub(crate) fn clear_view_scan_records(&mut self, view: ProcessViewId) {
         let had_raws = self.raw_ownership.remove(&view).is_some();
         let refused_before = self.refused_keys.len();
@@ -3425,6 +3594,7 @@ impl PinnedObjects {
         &mut self,
         view: ProcessViewId,
         keep: &BTreeSet<PinnedObjectId>,
+        proof: RetirementProof,
     ) -> Option<ViewClaims> {
         // Refusal marks belong to one process generation: prune the
         // retiring view's marks first, even when it owns nothing (a
@@ -3433,30 +3603,19 @@ impl PinnedObjects {
         let refused_before = self.refused_keys.len();
         self.refused_keys.retain(|(retired, _)| *retired != view);
         let pruned_refused = self.refused_keys.len() != refused_before;
+        // The generation's scan custody ends here, claims or not: rows
+        // proving a carried pin stay as typed carry evidence (never
+        // fresh proof, never a fence); every other row retires with the
+        // view. A claimless view (synthetic or replace-preserved custody)
+        // gets the same treatment as one with claims.
+        let removed_raws = self.retire_view_custody(view, keep, proof);
         let Some(removed) = self.ownership.remove(&view) else {
-            if pruned_refused {
+            if pruned_refused || !removed_raws.is_empty() {
                 self.bump_revision();
             }
             return None;
         };
         self.bump_revision();
-        // Carried pins keep the scan custody that proves them while
-        // the carry lives; custody for pins outside `keep` retires
-        // with the view. The post-purge pruning below drops every
-        // carried row whose object did not survive, so the record
-        // never outlives the carry, and `release_view_id` clears the
-        // rest before the numeric ID can be reused.
-        let removed_raws = self.raw_ownership.remove(&view).unwrap_or_default();
-        let (kept_raws, removed_raws): (BTreeSet<RawObjectInstance>, BTreeSet<RawObjectInstance>) =
-            removed_raws
-                .into_iter()
-                .partition(|raw| self.raw_to_id.get(raw).is_some_and(|id| keep.contains(id)));
-        if !kept_raws.is_empty() {
-            self.raw_ownership
-                .entry(view)
-                .or_default()
-                .extend(kept_raws);
-        }
         let retained_raws: BTreeSet<_> = self
             .raw_ownership
             .values()
@@ -3546,14 +3705,15 @@ impl PinnedObjects {
             RetirementProof::IdentityChanged => &no_carry,
             RetirementProof::Exited | RetirementProof::OperatorRemoval => keep,
         };
-        self.remove_view_except(view, keep)
+        self.remove_view_except(view, keep, proof)
     }
 
     /// Pure scratch filter: a clone without one view's pins. Query
     /// helpers and comparison fixtures use this instead of mutating
     /// committed custody; it retires nothing.
     pub fn without_view(mut self, view: ProcessViewId) -> Self {
-        self.remove_view_except(view, &BTreeSet::new());
+        // An empty keep carries nothing, so the proof names no row.
+        self.remove_view_except(view, &BTreeSet::new(), RetirementProof::OperatorRemoval);
         self
     }
 
@@ -3619,7 +3779,7 @@ impl PinnedObjects {
             if !self.by_id.contains_key(&id) {
                 continue;
             }
-            self.raw_ownership.entry(view).or_default().insert(raw);
+            self.raw_ownership.entry(view).or_default().file_fresh(raw);
             let claims = self.ownership.entry(view).or_default();
             if !claims.pins.contains(&id) {
                 claims.pins.push(id);
@@ -3634,10 +3794,22 @@ impl PinnedObjects {
     /// (tests shape carried fixtures with it directly) — a retained
     /// table supplies exact attached targets without filing claims under
     /// a retired process. Carried ids (resolvable, claimless) stay spared
-    /// by every later purge; dropping an already claimless view is a
-    /// no-op. Never removes pins, raw mappings, or another view's claims.
+    /// by every later purge. The view's scan custody stays (raw mappings
+    /// are never removed here) but is retagged as carry
+    /// ([`CarryCause::ClaimsDenied`]): a denied view is not a live
+    /// generation. Never removes pins, raw mappings, or another view's
+    /// claims.
     pub(crate) fn drop_view_claims(&mut self, view: ProcessViewId) {
-        if self.ownership.remove(&view).is_some() {
+        let mut changed = self.ownership.remove(&view).is_some();
+        // A denied view's custody rides as carry evidence for its carried
+        // modules, never as a live generation's fresh proof or fence.
+        if let Some(custody) = self.raw_ownership.get_mut(&view)
+            && custody.is_fresh()
+        {
+            custody.carry(CarryCause::ClaimsDenied);
+            changed = true;
+        }
+        if changed {
             self.bump_revision();
         }
     }
@@ -4076,40 +4248,42 @@ impl PinnedObjects {
         self.id_for_scanned_with_carry(module, key, path, false)
     }
 
-    /// Scan resolution, optionally trusting ownerless retirement custody
-    /// for a module the candidate rebuild is carrying rather than filing
-    /// as a fresh scan. Fresh/reused views never pass `allow_retired`:
-    /// their numeric ID must not inherit a previous generation's proof.
+    /// Scan resolution with the custody generation read from its typed
+    /// tag ([`CustodyGeneration`]). Fresh custody of the resolving view is
+    /// proof; carried custody of the resolving view is proof only for a
+    /// carried bind (`allow_carried`: the view is outside the rebuild's
+    /// claim authority). Fresh/reused views never pass it, so their
+    /// numeric ID never inherits a previous generation's proof.
     fn id_for_scanned_with_carry(
         &self,
         module: &ScannedModule,
         key: ObjectKey,
         path: &str,
-        allow_retired: bool,
+        allow_carried: bool,
     ) -> Option<PinnedObjectId> {
         let raw = RawObjectInstance::scanned(module, key, path)?;
-        if (self.ownership.contains_key(&module.view) || allow_retired)
-            && self
-                .raw_ownership
-                .get(&module.view)
-                .is_some_and(|owned| owned.contains(&raw))
+        if self
+            .raw_ownership
+            .get(&module.view)
+            .is_some_and(|owned| (owned.is_fresh() || allow_carried) && owned.contains(&raw))
         {
             return self.raw_to_id.get(&raw).copied();
         }
         let id = self.raw_to_id.get(&raw).copied()?;
-        // A raw alias that survives without live scan custody is
+        // A raw alias that survives without fresh scan custody is
         // retained carry evidence: the alias itself was filed only after
-        // the pin proved this exact namespace/key/path. Ownerless rows
-        // are retirement metadata, not a live fence. Do not let a live
-        // view ride a peer's proof, though: while a view with claims
-        // owns the identical raw, the proof belongs to someone else and
-        // the fence stays closed. Once every proven owner has retired,
-        // the claimless carried pin (including proof-variant pre-copy-up
-        // rows) must remain resolvable.
+        // the pin proved this exact namespace/key/path. Carried rows are
+        // retirement metadata, not a live fence. Do not let a live view
+        // ride a peer's proof, though: while any view's fresh custody
+        // holds the identical raw, the proof belongs to someone else and
+        // the fence stays closed (claims are not required: synthetic and
+        // replace-preserved custody is fresh without them). Once every
+        // fresh owner has retired, the claimless carried pin (including
+        // proof-variant pre-copy-up rows) must remain resolvable.
         if self
             .raw_ownership
-            .iter()
-            .any(|(owner, owned)| self.ownership.contains_key(owner) && owned.contains(&raw))
+            .values()
+            .any(|owned| owned.is_fresh() && owned.contains(&raw))
         {
             return None;
         }
@@ -5300,7 +5474,7 @@ mod conservative_copy {
             )?;
             add(
                 &mut total,
-                tree::<ProcessViewId, BTreeSet<RawObjectInstance>>(source.raw_ownership.len())?,
+                tree::<ProcessViewId, ScanCustody>(source.raw_ownership.len())?,
             )?;
             let keys = source
                 .ambiguous_keys
@@ -5511,14 +5685,23 @@ mod conservative_copy {
             owned: bool,
         ) -> Result<(), GraphRefusal> {
             if owned && self.active_view.is_none() {
-                if let Some((view, _)) = next_map(&source.raw_ownership, self.last_view.as_ref()) {
-                    if selection.retires(source, *view) {
+                if let Some((view, custody)) =
+                    next_map(&source.raw_ownership, self.last_view.as_ref())
+                {
+                    // Every retired view's custody ends, claims or not (the
+                    // copy carries nothing: `remove_view_except` with an
+                    // empty keep), so a claimless retired set never rides
+                    // into the replay as fresh proof.
+                    if selection.retired().contains(view) {
                         self.last_view = Some(*view);
                     } else {
                         self.active_view = Some(*view);
+                        // The copy keeps the source set's generation tag:
+                        // carry never becomes fresh through a copy.
+                        let generation = custody.generation();
                         self.output_mut()?
                             .raw_ownership
-                            .insert(*view, BTreeSet::new());
+                            .insert(*view, ScanCustody::empty(generation));
                     }
                 } else {
                     // Refusal history replays before rejections: the
@@ -5539,7 +5722,7 @@ mod conservative_copy {
                             .raw_ownership
                             .get_mut(&view)
                             .ok_or(GraphRefusal::Identity)?
-                            .insert(copy);
+                            .copy_row(copy);
                     } else {
                         let id = *source
                             .raw_to_id
@@ -11217,7 +11400,11 @@ fn record_scanned_candidate(
                 });
             } else if let Some(id) = pinned.insert_entry(entry, skipped) {
                 pinned.ownership.entry(view).or_default().pins.push(id);
-                pinned.raw_ownership.entry(view).or_default().insert(raw);
+                pinned
+                    .raw_ownership
+                    .entry(view)
+                    .or_default()
+                    .file_fresh(raw);
             }
         }
         // Retryable waits keep the wait arm exactly as before: the pin
@@ -11258,10 +11445,11 @@ fn record_scanned_candidate(
             // group-reject the key by itself. Refusal pairs publish
             // ambiguity; a later filing by the same view contradicts it.
             if !raw.pre_copy_up {
-                let view_filed = pinned
-                    .raw_ownership
-                    .get(&view)
-                    .is_some_and(|raws| raws.iter().any(|filed| filed.key == raw.key));
+                // Only this generation's fresh filing contradicts: carried
+                // rows of a previous generation prove nothing about it.
+                let view_filed = pinned.raw_ownership.get(&view).is_some_and(|raws| {
+                    raws.is_fresh() && raws.iter().any(|filed| filed.key == raw.key)
+                });
                 pinned.scrub_raw(&raw);
                 if !pinned.has_pre_copy_up_for_key(raw.key) {
                     let pair = pinned
@@ -12944,7 +13132,7 @@ pub(crate) mod test_fixture {
             .map(|(raw, id)| (raw.clone(), *id))
             .expect("test key/path names a pinned raw");
         pins.ownership.entry(view).or_default().pins.push(id);
-        pins.raw_ownership.entry(view).or_default().insert(raw);
+        pins.raw_ownership.entry(view).or_default().file_fresh(raw);
     }
 
     /// Files a refused observation for `view` under `key`: the
@@ -12986,7 +13174,7 @@ pub(crate) mod test_fixture {
         let raws: Vec<_> = pins.raw_to_id.keys().cloned().collect();
         for raw in raws {
             let view = ProcessViewId(raw.key.device.minor as u32);
-            pins.raw_ownership.entry(view).or_default().insert(raw);
+            pins.raw_ownership.entry(view).or_default().file_fresh(raw);
         }
     }
 
@@ -12996,7 +13184,7 @@ pub(crate) mod test_fixture {
     pub(crate) fn own_all_raws_under(pins: &mut PinnedObjects, view: ProcessViewId) {
         let raws: Vec<_> = pins.raw_to_id.keys().cloned().collect();
         for raw in raws {
-            pins.raw_ownership.entry(view).or_default().insert(raw);
+            pins.raw_ownership.entry(view).or_default().file_fresh(raw);
         }
     }
 
@@ -15195,7 +15383,7 @@ mod tests {
                 .raw_ownership
                 .entry(ProcessViewId(77))
                 .or_default()
-                .insert(raw);
+                .file_fresh(raw);
         }
         assert!(
             !one.same_pin_content(&raw_owned),
@@ -28018,6 +28206,398 @@ mod tests {
                 reason: "file changed while it was being identified - retry".into(),
             },
             "mid-read change is missing evidence"
+        );
+    }
+
+    // ---- Scan-custody generation class: every custody mutation and copy
+    // site decides from the typed `CustodyGeneration` tag, never from
+    // ownership-claim presence. One killing test per site (see the site
+    // table in the lane report).
+
+    fn custody_key(minor: u64) -> ObjectKey {
+        ObjectKey {
+            device: Device { major: 8, minor },
+            inode: INODE,
+        }
+    }
+
+    fn custody_module(key: ObjectKey, view: ProcessViewId) -> ScannedModule {
+        let mut m = module(key);
+        m.view = view;
+        m
+    }
+
+    /// Files `view`'s own proven pin for `key` through the production
+    /// filing arm; returns the raw it filed.
+    fn custody_file(
+        pins: &mut PinnedObjects,
+        view: ProcessViewId,
+        key: ObjectKey,
+    ) -> RawObjectInstance {
+        let filed = view_pin(&custody_module(key, view), 1, SHA, 1, false);
+        let entry = filed.by_id.values().next().unwrap().clone();
+        let raw = entry.raw.clone();
+        let mut skipped = Vec::new();
+        record_scanned_candidate(pins, view, raw.clone(), Ok(entry), &mut skipped, true);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        raw
+    }
+
+    /// The typed custody record for one view: its generation tag plus rows.
+    fn custody_of(
+        pins: &PinnedObjects,
+        view: ProcessViewId,
+    ) -> Option<(CustodyGeneration, Vec<RawObjectInstance>)> {
+        pins.raw_ownership
+            .get(&view)
+            .map(|custody| (custody.generation(), custody.iter().cloned().collect()))
+    }
+
+    fn strict(pins: &PinnedObjects, key: ObjectKey, view: ProcessViewId) -> Option<PinnedObjectId> {
+        pins.id_for_scanned(&custody_module(key, view), key, PATH)
+    }
+
+    fn carried(
+        pins: &PinnedObjects,
+        key: ObjectKey,
+        view: ProcessViewId,
+    ) -> Option<PinnedObjectId> {
+        pins.id_for_scanned_with_carry(&custody_module(key, view), key, PATH, true)
+    }
+
+    const RETIRED_EXITED: CustodyGeneration =
+        CustodyGeneration::Carried(CarryCause::Retired(RetirementProof::Exited));
+
+    /// Sites: `retire_view_custody` (claims path) + strict/carry resolution.
+    /// A retiring view's kept rows become typed carry by its proof; the
+    /// strict resolver refuses them while a live peer's fresh custody holds
+    /// the raw, and only a carried bind resolves through them.
+    #[test]
+    fn custody_retirement_tags_kept_rows_as_carry_by_their_proof() {
+        let key = custody_key(31);
+        let (r, l) = (ProcessViewId(31), ProcessViewId(32));
+        let mut pins = PinnedObjects::empty();
+        let raw = custody_file(&mut pins, r, key);
+        custody_file(&mut pins, l, key);
+        let id = strict(&pins, key, r).expect("R resolves through its fresh custody");
+        assert_eq!(
+            custody_of(&pins, r),
+            Some((CustodyGeneration::Fresh, vec![raw.clone()]))
+        );
+        pins.retire_view_except_proven(r, RetirementProof::Exited, &BTreeSet::from([id]));
+        assert_eq!(
+            custody_of(&pins, r),
+            Some((RETIRED_EXITED, vec![raw.clone()]))
+        );
+        assert_eq!(strict(&pins, key, r), None, "carry is never fresh proof");
+        assert_eq!(
+            carried(&pins, key, r),
+            Some(id),
+            "a carried bind rides its own carry"
+        );
+        assert_eq!(
+            strict(&pins, key, l),
+            Some(id),
+            "the live peer keeps its proof"
+        );
+
+        // IdentityChanged never carries: no custody survives.
+        let mut pins = PinnedObjects::empty();
+        custody_file(&mut pins, r, key);
+        custody_file(&mut pins, l, key);
+        let id = strict(&pins, key, r).unwrap();
+        pins.retire_view_except_proven(r, RetirementProof::IdentityChanged, &BTreeSet::from([id]));
+        assert_eq!(custody_of(&pins, r), None);
+    }
+
+    /// Site: `retire_view_custody` (claimless path). Synthetic or
+    /// replace-preserved custody without claims is fresh proof while its
+    /// view lives, and retiring that view ends it exactly like a view
+    /// with claims: kept rows carry, the rest go.
+    #[test]
+    fn claimless_custody_is_fresh_until_its_view_retires() {
+        let key = custody_key(33);
+        let (v, w) = (ProcessViewId(33), ProcessViewId(34));
+        let filed = view_pin(&custody_module(key, v), 1, SHA, 1, false);
+        let mut pins = filed.clone();
+        own_all_raws_under(&mut pins, v);
+        assert!(pins.view_claims(v).is_none(), "the fixture files no claims");
+        let raw = pins.raw_to_id.keys().next().unwrap().clone();
+        let id = strict(&pins, key, v).expect("claimless fresh custody is proof");
+        assert_eq!(
+            strict(&pins, key, w),
+            None,
+            "claimless fresh custody fences a peer"
+        );
+
+        let mut gone = pins.clone();
+        gone.retire_view_only_if_proven_gone(v, RetirementProof::Exited);
+        assert_eq!(custody_of(&gone, v), None, "no carry: every row retires");
+
+        pins.retire_view_except_proven(v, RetirementProof::Exited, &BTreeSet::from([id]));
+        assert_eq!(custody_of(&pins, v), Some((RETIRED_EXITED, vec![raw])));
+        assert_eq!(
+            strict(&pins, key, w),
+            Some(id),
+            "carry does not fence: the claimless carried pin stays resolvable"
+        );
+    }
+
+    /// Site: `drop_view_claims`. A denied view's custody rides as typed
+    /// carry; a first cause is never overwritten.
+    #[test]
+    fn denied_view_custody_rides_as_typed_carry() {
+        let key = custody_key(35);
+        let (v, w) = (ProcessViewId(35), ProcessViewId(36));
+        let mut pins = PinnedObjects::empty();
+        let raw = custody_file(&mut pins, v, key);
+        custody_file(&mut pins, w, key);
+        let id = strict(&pins, key, v).unwrap();
+        pins.drop_view_claims(v);
+        assert_eq!(
+            custody_of(&pins, v),
+            Some((
+                CustodyGeneration::Carried(CarryCause::ClaimsDenied),
+                vec![raw.clone()]
+            ))
+        );
+        assert_eq!(strict(&pins, key, v), None, "W's fresh custody fences V");
+        assert_eq!(carried(&pins, key, v), Some(id));
+
+        let mut retired = PinnedObjects::empty();
+        custody_file(&mut retired, v, key);
+        custody_file(&mut retired, w, key);
+        let id = strict(&retired, key, v).unwrap();
+        retired.retire_view_except_proven(v, RetirementProof::Exited, &BTreeSet::from([id]));
+        retired.drop_view_claims(v);
+        assert_eq!(custody_of(&retired, v), Some((RETIRED_EXITED, vec![raw])));
+    }
+
+    /// Site: the per-view proof fence. Only fresh custody fences: a peer
+    /// rides the alias once its only custodian is carried, and is fenced
+    /// while any fresh custodian holds the raw.
+    #[test]
+    fn only_fresh_custody_fences_a_peer() {
+        let key = custody_key(37);
+        let (v, w, x) = (ProcessViewId(37), ProcessViewId(38), ProcessViewId(39));
+        let mut pins = PinnedObjects::empty();
+        custody_file(&mut pins, v, key);
+        let id = strict(&pins, key, v).unwrap();
+        assert_eq!(strict(&pins, key, w), None, "fresh V fences W");
+        pins.drop_view_claims(v);
+        assert_eq!(
+            strict(&pins, key, w),
+            Some(id),
+            "carried V does not fence W"
+        );
+        custody_file(&mut pins, x, key);
+        assert_eq!(strict(&pins, key, w), None, "fresh X fences W again");
+    }
+
+    /// Sites: `ScanCustody::file_fresh` via the filing arm and
+    /// `alias_scanned_module_under`. Fresh proof filed into a carried set
+    /// starts a new generation: the old carry rows are discarded, never
+    /// promoted.
+    #[test]
+    fn fresh_filing_into_carried_custody_starts_a_new_generation() {
+        let (k1, k2) = (custody_key(41), custody_key(42));
+        let (v, l) = (ProcessViewId(41), ProcessViewId(43));
+        let mut pins = PinnedObjects::empty();
+        custody_file(&mut pins, v, k1);
+        custody_file(&mut pins, l, k1);
+        let id = strict(&pins, k1, v).unwrap();
+        pins.retire_view_except_proven(v, RetirementProof::Exited, &BTreeSet::from([id]));
+        assert_eq!(custody_of(&pins, v).map(|(g, _)| g), Some(RETIRED_EXITED));
+        let raw2 = custody_file(&mut pins, v, k2);
+        assert_eq!(
+            custody_of(&pins, v),
+            Some((CustodyGeneration::Fresh, vec![raw2]))
+        );
+        assert_eq!(
+            carried(&pins, k1, v),
+            None,
+            "the discarded carry resolves nothing"
+        );
+
+        let mut learned = PinnedObjects::empty();
+        custody_file(&mut learned, l, k1);
+        let raw1 = custody_file(&mut learned, v, k1);
+        learned.drop_view_claims(v);
+        learned.alias_scanned_module_under(&custody_module(k1, v), v);
+        assert_eq!(
+            custody_of(&learned, v),
+            Some((CustodyGeneration::Fresh, vec![raw1]))
+        );
+    }
+
+    /// Sites: `absorb` and `ScanCustody::merge`. Incoming custody keeps its
+    /// tag; mixed generations keep only the fresh rows.
+    #[test]
+    fn absorb_merges_custody_under_its_generation_tag() {
+        let (k1, k2) = (custody_key(44), custody_key(45));
+        let (v, l) = (ProcessViewId(44), ProcessViewId(46));
+        let carried_set = |key: ObjectKey| {
+            let mut pins = PinnedObjects::empty();
+            custody_file(&mut pins, v, key);
+            custody_file(&mut pins, l, key);
+            let id = strict(&pins, key, v).unwrap();
+            pins.retire_view_except_proven(v, RetirementProof::Exited, &BTreeSet::from([id]));
+            pins
+        };
+        // Into a set without V: the carry arrives as carry.
+        let mut empty = PinnedObjects::empty();
+        assert!(empty.absorb(carried_set(k1)).is_empty());
+        assert_eq!(custody_of(&empty, v).map(|(g, _)| g), Some(RETIRED_EXITED));
+        // Fresh ours, carried theirs: the fresh rows win.
+        let mut fresh = PinnedObjects::empty();
+        let raw2 = custody_file(&mut fresh, v, k2);
+        assert!(fresh.absorb(carried_set(k1)).is_empty());
+        assert_eq!(
+            custody_of(&fresh, v),
+            Some((CustodyGeneration::Fresh, vec![raw2.clone()]))
+        );
+        // Carried ours, fresh theirs: the fresh rows win.
+        let mut ours = carried_set(k1);
+        let mut theirs = PinnedObjects::empty();
+        custody_file(&mut theirs, v, k2);
+        assert!(ours.absorb(theirs).is_empty());
+        assert_eq!(
+            custody_of(&ours, v),
+            Some((CustodyGeneration::Fresh, vec![raw2]))
+        );
+    }
+
+    /// Site: `replace_view_pins_inner`. Preserved rows rejoin under the
+    /// generation that proved them; a rescan's fresh rows win over carry.
+    #[test]
+    fn replace_restores_preserved_rows_under_their_generation() {
+        let key = custody_key(47);
+        let (v, l) = (ProcessViewId(47), ProcessViewId(48));
+        let mut pins = PinnedObjects::empty();
+        let raw = custody_file(&mut pins, v, key);
+        custody_file(&mut pins, l, key);
+        let id = strict(&pins, key, v).unwrap();
+        pins.drop_view_claims(v);
+        let mut replaced = pins.clone();
+        replaced.replace_view_pins(v, PinnedObjects::empty(), &[id]);
+        assert_eq!(
+            custody_of(&replaced, v),
+            Some((
+                CustodyGeneration::Carried(CarryCause::ClaimsDenied),
+                vec![raw.clone()]
+            )),
+            "a preserved carried row stays carry"
+        );
+        let mut rescanned = pins.clone();
+        let mut incoming = PinnedObjects::empty();
+        let fresh_raw = custody_file(&mut incoming, v, key);
+        rescanned.replace_view_pins(v, incoming, &[id]);
+        assert_eq!(
+            custody_of(&rescanned, v),
+            Some((CustodyGeneration::Fresh, vec![fresh_raw])),
+            "the rescan's fresh proof wins"
+        );
+    }
+
+    /// Site: the refusal arm's `view_filed`. A carried row from a previous
+    /// generation does not make the view's refusal contradict a filing.
+    #[test]
+    fn carried_custody_does_not_count_as_this_generations_filing() {
+        let key = custody_key(49);
+        let (v, l) = (ProcessViewId(49), ProcessViewId(50));
+        let mut pins = PinnedObjects::empty();
+        custody_file(&mut pins, v, key);
+        custody_file(&mut pins, l, key);
+        let mut fresh = pins.clone();
+        super::test_fixture::record_refusal(
+            &mut fresh,
+            v,
+            &custody_module(key, v),
+            key,
+            PATH,
+            "TEST refused",
+        );
+        assert!(
+            fresh.ambiguous_keys.contains(&key),
+            "control: a fresh filing contradicts"
+        );
+        pins.drop_view_claims(v);
+        super::test_fixture::record_refusal(
+            &mut pins,
+            v,
+            &custody_module(key, v),
+            key,
+            PATH,
+            "TEST refused",
+        );
+        assert!(
+            !pins.ambiguous_keys.contains(&key),
+            "a carried row proves nothing about this generation"
+        );
+    }
+
+    /// Sites: content equality and the loader fast path. The tag is
+    /// content: a fresh-to-carry change is never "nothing moved".
+    #[test]
+    fn custody_generation_is_content() {
+        let key = custody_key(51);
+        let (v, l) = (ProcessViewId(51), ProcessViewId(52));
+        let mut pins = PinnedObjects::empty();
+        custody_file(&mut pins, v, key);
+        custody_file(&mut pins, l, key);
+        let mut denied = pins.clone();
+        denied.drop_view_claims(v);
+        denied.ownership = pins.ownership.clone();
+        assert!(!pins.same_pin_content(&denied), "the tag is pin content");
+        assert!(!pins.ownership_matches(&denied), "the tag is ownership");
+        let loader = strict(&pins, key, v).unwrap();
+        assert!(
+            pins.preserves_provider_inputs_for_loader(&pins.clone(), loader),
+            "control: an identical candidate preserves the inputs"
+        );
+        assert!(
+            !pins.preserves_provider_inputs_for_loader(&denied, loader),
+            "a retagged custody is not the same provider input"
+        );
+        assert!(
+            !denied.preserves_provider_inputs_for_loader(&pins, loader),
+            "nor in reverse"
+        );
+    }
+
+    /// Sites: the conservative copy's custody output. The copy keeps a
+    /// surviving view's tag and ends every retired view's custody, claims
+    /// or not.
+    #[test]
+    fn conservative_copy_keeps_custody_tags_and_ends_retired_claimless_custody() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        let (k1, k2) = (custody_key(53), custody_key(54));
+        let (v, l, c) = (ProcessViewId(53), ProcessViewId(55), ProcessViewId(56));
+        let mut pins = PinnedObjects::empty();
+        let raw = custody_file(&mut pins, v, k1);
+        custody_file(&mut pins, l, k1);
+        pins.drop_view_claims(v);
+        let mut claimless = view_pin(&custody_module(k2, c), 1, SHA, 1, false);
+        own_all_raws_under(&mut claimless, c);
+        assert!(pins.absorb(claimless).is_empty());
+        assert!(pins.view_claims(c).is_none() && custody_of(&pins, c).is_some());
+        let pool = SemanticResourcePool::default();
+        let selection = conservative_selection(&pool, BTreeSet::from([c]), BTreeSet::new());
+        let reserve = pool.reserver();
+        let mut cursor = PinnedConservativeCursor::new();
+        finish_conservative_copy(&pins, &mut cursor, &selection, &reserve);
+        let copy = cursor.pinned().expect("the copy reaches Ready");
+        assert_eq!(
+            custody_of(copy, v),
+            Some((
+                CustodyGeneration::Carried(CarryCause::ClaimsDenied),
+                vec![raw]
+            ))
+        );
+        assert_eq!(
+            custody_of(copy, c),
+            None,
+            "the retired claimless view's custody ends"
         );
     }
 }

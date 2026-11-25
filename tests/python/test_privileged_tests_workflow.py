@@ -19,10 +19,16 @@ Run: python3 -I tests/python/test_privileged_tests_workflow.py -v
 
 import importlib.util
 import json
+import os
 import re
+import shlex
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+
+import yaml
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[2]
@@ -30,6 +36,235 @@ CI_YML = ROOT / ".github" / "workflows" / "ci.yml"
 PRIV_YML = ROOT / ".github" / "workflows" / "privileged-tests.yml"
 RELEASE_RUST_VERSION = ROOT / ".release-rust-version"
 CAMPAIGN = ROOT / "tests" / "privileged-campaign.json"
+CHECKER = ROOT / "scripts" / "check-known-failing.py"
+CELL_CHECKER = ROOT / "scripts" / "ci" / "check-cell-results.py"
+PRIVILEGED_RUNNER = ROOT / "scripts" / "run-privileged-lib-tests.sh"
+
+
+def load_checker_module():
+    spec = importlib.util.spec_from_file_location("known_failing_checker_workflow_test", CHECKER)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def shell_array(source, name):
+    match = re.search(rf"(?ms)^{re.escape(name)}=\(\n(.*?)^\)", source)
+    if match is None:
+        raise AssertionError(f"shell array {name} not found")
+    return [line.strip() for line in match.group(1).splitlines()
+            if line.strip() and not line.strip().startswith("#")]
+
+
+def shell_function(source, name):
+    match = re.search(rf"(?ms)^{re.escape(name)}\(\) \{{\n(.*?)^\}}", source)
+    if match is None:
+        raise AssertionError(f"shell function {name} not found")
+    return match.group(0)
+
+
+def selector_validation_block(source):
+    start_token = '    for arg in ${SELECTORS[@]+"${SELECTORS[@]}"}; do\n        local matched=0 candidate\n'
+    start = source.index(start_token)
+    end = source.index('\n\n    tmpdir=$outdir/tmp', start)
+    return source[start:end]
+
+
+def run_selector_validation(source, selector):
+    block = selector_validation_block(source)
+    harness = f"""set -u
+DEFAULT_TESTS=(default-a)
+ALTERNATIVE_TESTS=()
+LONG_TESTS=()
+BTRFS_TESTS=()
+OVERLAY_TESTS=()
+EXPECTED_FAILURE_TESTS=()
+SKIP_TESTS=()
+KNOWN_FAILING_TYPED_TESTS=(typed-known-a)
+WIDE_DETAILED_2112_TESTS=()
+PROG=run-privileged-lib-tests.sh
+selector_matches() {{ [ "$1" = "$2" ]; }}
+SELECTORS=({shlex.quote(selector)})
+wide=0
+include_long=0
+include_btrfs=0
+include_overlay=0
+include_xfail=0
+validate_selectors() {{
+{block}
+}}
+validate_selectors
+"""
+    return subprocess.run(["bash", "-c", harness], capture_output=True, text=True, timeout=30)
+
+
+def run_record_typed_verdict(source, verdict_dir, *arguments):
+    function = shell_function(source, "record_typed_verdict")
+    verdicts = verdict_dir / "verdicts.tsv"
+    command = " ".join(shlex.quote(str(argument)) for argument in arguments)
+    harness = f"""set -u
+PROG=run-privileged-lib-tests.sh
+TYPED_VERDICTS={shlex.quote(str(verdicts))}
+{function}
+record_typed_verdict {command}
+"""
+    result = subprocess.run(["bash", "-c", harness], capture_output=True, text=True, timeout=30)
+    return result, verdicts.read_bytes() if verdicts.exists() else b""
+
+
+def write_fake_privileged_libtest(path, runner_source):
+    names = []
+    for array in ("DEFAULT_TESTS", "ALTERNATIVE_TESTS", "LONG_TESTS", "BTRFS_TESTS",
+                  "OVERLAY_TESTS", "EXPECTED_FAILURE_TESTS", "KNOWN_FAILING_TYPED_TESTS", "SKIP_TESTS"):
+        names.extend(shell_array(runner_source, array))
+    names = list(dict.fromkeys(names))
+    script = f"""#!/usr/bin/env python3
+import json
+import os
+import sys
+NAMES = json.loads({json.dumps(json.dumps(names))})
+if sys.argv[1:] == ["--list", "--ignored", "--format", "terse"]:
+    print("\\n".join(name + ": test" for name in NAMES))
+    raise SystemExit(0)
+if len(sys.argv) >= 3 and sys.argv[1] == "--exact":
+    if os.environ.get("FAKE_LIBTEST_MODE") == "fail-typed":
+        sidecar = os.environ.get("P11SCOPE_TYPED_FAILURE_PATH")
+        if not sidecar:
+            raise SystemExit(65)
+        with open(sidecar, "w", encoding="utf-8") as output:
+            json.dump({{"cell": "X", "branch": "exact_branch"}}, output)
+            output.write("\\n")
+        print("test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s")
+        raise SystemExit(101)
+    print("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 123 filtered out; finished in 0.01s")
+    raise SystemExit(0)
+raise SystemExit(64)
+"""
+    path.write_text(script, encoding="utf-8")
+    path.chmod(0o755)
+
+
+def privileged_runner_mirror(temp, runner_source):
+    root = temp / "mirror-root"
+    script = root / "scripts/run-privileged-lib-tests.sh"
+    script.parent.mkdir(parents=True)
+    script.write_text(runner_source, encoding="utf-8")
+    script.chmod(0o755)
+    for relative in ("scripts/check-known-failing.py", "scripts/ci/privileged-lib-results.py",
+                     "tests/ignored-tests.json", "tests/known-failing.json"):
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text((ROOT / relative).read_text(encoding="utf-8"), encoding="utf-8")
+    workflow_target = root / ".github/workflows"
+    workflow_target.mkdir(parents=True)
+    for workflow in (ROOT / ".github/workflows").glob("*.yml"):
+        (workflow_target / workflow.name).write_text(workflow.read_text(encoding="utf-8"), encoding="utf-8")
+    fakebin = temp / "fakebin"
+    fakebin.mkdir()
+    id_script = fakebin / "id"
+    id_script.write_text("#!/bin/sh\nif [ \"$1\" = -u ]; then echo 0; exit 0; fi\nexec /usr/bin/id \"$@\"\n", encoding="utf-8")
+    id_script.chmod(0o755)
+    return root, script, fakebin
+
+
+def run_privileged_runner_with_fake_binary(temp, runner_source, selector, mode):
+    root, script, fakebin = privileged_runner_mirror(temp, runner_source)
+    libtest = temp / "libtest-fake"
+    write_fake_privileged_libtest(libtest, runner_source)
+    outdir = temp / "runner-out"
+    typed_output = temp / "typed-results.json"
+    env = dict(os.environ)
+    env.update({
+        "PATH": str(fakebin) + os.pathsep + env.get("PATH", ""),
+        "FAKE_LIBTEST_MODE": mode,
+        "P11SCOPE_KNOWN_FAILING_RESULTS": str(typed_output),
+        "P11SCOPE_KNOWN_FAILING_HOST": "github",
+    })
+    result = subprocess.run(
+        ["bash", str(script), str(libtest), str(outdir), "--exact-selectors", selector],
+        cwd=root, env=env, capture_output=True, text=True, timeout=60)
+    verdicts = outdir / "known-failing-verdicts.tsv"
+    selection = outdir / "known-failing-selection.txt"
+    return {
+        "run": result,
+        "outdir": outdir,
+        "typed_output": typed_output,
+        "verdicts": verdicts.read_bytes() if verdicts.exists() else b"",
+        "selection": selection.read_text(encoding="utf-8") if selection.exists() else "",
+    }
+
+
+def matrix_substitute(value, matrix):
+    def replace(match):
+        key = match.group(1)
+        if key not in matrix:
+            raise AssertionError(f"workflow matrix has no key {key}")
+        return str(matrix[key])
+    resolved = re.sub(r"\$\{\{\s*matrix\.([A-Za-z0-9_]+)\s*\}\}", replace, value)
+    if "${{" in resolved:
+        raise AssertionError(f"unresolved workflow expression in {value!r}")
+    return resolved
+
+
+def expanded_option_sequence(invocation, matrix, conditional_nonqualifying):
+    expanded = []
+    for name, value in invocation.get("option_sequence", []):
+        if name == "array-expansion":
+            if value != "allow_extra":
+                raise AssertionError(f"unmodelled shell array expansion {value}")
+            expanded.extend(("--allow-nonqualifying", cell) for cell in conditional_nonqualifying)
+        else:
+            expanded.append((name, matrix_substitute(value, matrix)))
+    return expanded
+
+
+def run_real_cell_invocation(invocation, matrix, temp, host, conditional_nonqualifying=()):
+    rows_path = temp / "results.jsonl"
+    typed_output = temp / "known-failing-results.json"
+    options = expanded_option_sequence(invocation, matrix, conditional_nonqualifying)
+    selected = []
+    declarations = {}
+    for name, value in options:
+        if name in ("--require", "--expected-failure", "--intermittent-failure", "--allow-nonqualifying"):
+            if value not in selected:
+                selected.append(value)
+            if name != "--require":
+                declarations[value] = name
+        elif name == "--known-failing-results":
+            value = str(typed_output)
+        elif name == "--known-failing-host":
+            value = host
+    rows = []
+    for cell in selected:
+        declaration = declarations.get(cell)
+        if declaration == "--allow-nonqualifying":
+            rows.append({"cell": cell, "pass": False, "qualification": "nonqualifying", "detail": "synthetic smoke"})
+        elif declaration in ("--expected-failure", "--intermittent-failure"):
+            qualification = "expected-failure" if declaration == "--expected-failure" else "qualified"
+            rows.append({"cell": cell, "pass": declaration == "--intermittent-failure",
+                         "qualification": qualification, "detail": "synthetic declared outcome"})
+        else:
+            rows.append({"cell": cell, "pass": True, "qualification": "qualified", "detail": "synthetic pass"})
+    rows_path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    args = [sys.executable, "-I", str(CELL_CHECKER), str(rows_path)]
+    for name, value in options:
+        if name == "--known-failing-results":
+            value = str(typed_output)
+        elif name == "--known-failing-host":
+            value = host
+        args.extend((name, value))
+    result = subprocess.run(args, capture_output=True, text=True, timeout=45)
+    document = json.loads(typed_output.read_text(encoding="utf-8")) if typed_output.exists() else None
+    return result, document, selected
+
+
+def provider_matrix_entries(document, job):
+    matrix = document["jobs"][job]["strategy"]["matrix"]
+    entries = matrix.get("include")
+    if not isinstance(entries, list) or not entries:
+        raise AssertionError(f"{job} has no matrix include entries")
+    return entries
+
 
 _SPEC = importlib.util.spec_from_file_location(
     "bpf_kernels_contract", Path(__file__).with_name("test_bpf_kernels_contract.py"))
@@ -1095,6 +1330,188 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
         release = job_body(self.yml, "release-build")
         self.assertNotIn("github.event_name", release,
                          "release-build must run on schedule for FULL")
+
+
+class RealTypedWorkflowInvocationTests(unittest.TestCase):
+    def setUp(self):
+        self.document = yaml.safe_load(PRIV_YML.read_text(encoding="utf-8"))
+        checker = load_checker_module()
+        self.invocations, problems = checker.workflow_invocations(ROOT)
+        self.assertEqual([], problems)
+
+    def typed_invocations(self, job):
+        return [invocation for invocation in self.invocations
+                if invocation["job"] == job and invocation["known_results"]]
+
+    def test_every_public_cli_typed_invocation_runs_through_the_real_checker(self):
+        invocations = self.typed_invocations("public-cli")
+        self.assertGreaterEqual(len(invocations), 4)
+        self.assertEqual(
+            {"cell:scripts/qualify-public-cli.sh", "cell:scripts/ci/minimal-setcap.sh"},
+            {invocation["runner"] for invocation in invocations})
+        for invocation in invocations:
+            for host in ("github", "vng"):
+                with self.subTest(runner=invocation["runner"], kind=invocation["kind"], host=host):
+                    with tempfile.TemporaryDirectory() as temporary:
+                        result, document, selected = run_real_cell_invocation(
+                            invocation, {}, Path(temporary), host)
+                    self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+                    self.assertIsNotNone(document)
+                    self.assertTrue(document["complete"])
+                    self.assertEqual(host, document["host"])
+                    self.assertEqual(selected, [item["test"] for item in document["selection"]])
+                    self.assertEqual(len(selected), len(document["results"]))
+
+    def test_every_provider_matrix_typed_invocation_runs_through_the_real_checker(self):
+        for job in ("pkcs11-check-providers", "pkcs11-check-providers-full"):
+            invocations = self.typed_invocations(job)
+            self.assertEqual(1, len(invocations), job)
+            invocation = invocations[0]
+            for matrix in provider_matrix_entries(self.document, job):
+                conditional = []
+                if job == "pkcs11-check-providers":
+                    scripts = [step.get("run", "") for step in self.document["jobs"][job]["steps"]
+                               if isinstance(step, dict)]
+                    run_script = next(script for script in scripts if "allow_extra" in script)
+                    self.assertIn('if [ "${{ matrix.suite }}" = "no" ]; then', run_script)
+                    self.assertIn('allow_extra=(--allow-nonqualifying "${{ matrix.provider }}-identical-results")',
+                                  run_script)
+                    if matrix["suite"] == "no":
+                        conditional = [matrix["provider"] + "-identical-results"]
+                with self.subTest(job=job, provider=matrix["provider"]):
+                    with tempfile.TemporaryDirectory() as temporary:
+                        result, document, selected = run_real_cell_invocation(
+                            invocation, matrix, Path(temporary), "github", conditional)
+                    self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+                    self.assertIsNotNone(document)
+                    self.assertTrue(document["complete"])
+                    self.assertEqual(selected, [item["test"] for item in document["selection"]])
+                    states = {item["test"]: item["state"] for item in document["results"]}
+                    identical = matrix["provider"] + "-identical-results"
+                    if conditional:
+                        self.assertEqual("not_applicable", states[identical])
+                    else:
+                        self.assertEqual("passed", states[identical])
+                    coverage = matrix["provider"] + "-default-run-coverage"
+                    self.assertEqual("not_applicable", states[coverage])
+
+
+class PrivilegedLibTypedRunnerBoundaryTests(unittest.TestCase):
+    def setUp(self):
+        self.source = PRIVILEGED_RUNNER.read_text(encoding="utf-8")
+
+    def test_record_typed_verdict_emits_one_row_with_the_optional_sidecar_field(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            temp = Path(temporary)
+            sidecar = temp / "typed-failure.json"
+            result, payload = run_record_typed_verdict(
+                self.source, temp, "inventory::privileged_tests::example", "FAIL", sidecar)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                ("inventory::privileged_tests::example\tFAIL\t" + str(sidecar) + "\n").encode(),
+                payload)
+            result, payload = run_record_typed_verdict(
+                self.source, temp, "inventory::privileged_tests::example", "PASS")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(b"inventory::privileged_tests::example\tPASS\n", payload)
+
+    def test_typed_known_tests_are_curated_selector_vocabulary(self):
+        accepted = run_selector_validation(self.source, "typed-known-a")
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        unknown = run_selector_validation(self.source, "unknown-selector")
+        self.assertNotEqual(unknown.returncode, 0)
+        self.assertIn("selector matches no curated test", unknown.stderr)
+
+    def test_real_runner_pipeline_preserves_the_sidecar_to_the_tsv_converter(self):
+        selector = "attach::identity_iter::tests::anchor_maps_validate_real_handles"
+        with tempfile.TemporaryDirectory() as temporary:
+            outcome = run_privileged_runner_with_fake_binary(
+                Path(temporary), self.source, selector, "fail-typed")
+        expected_tsv = selector.encode() + b"\tFAIL\t" + str(
+            outcome["outdir"] / "evidence/0-anchor_maps_validate_real_handles/typed-failure.json").encode() + b"\n"
+        self.assertEqual(expected_tsv, outcome["verdicts"])
+        self.assertTrue(outcome["typed_output"].is_file(),
+                        outcome["run"].stdout + outcome["run"].stderr)
+        document = json.loads(outcome["typed_output"].read_text(encoding="utf-8"))
+        self.assertEqual(document["results"][0]["signature"], {"cell": "X", "branch": "exact_branch"})
+        self.assertNotIn("selector matches no curated test", outcome["run"].stderr)
+
+    def test_real_runner_pipeline_positive_passes_the_checker(self):
+        selector = "attach::identity_iter::tests::anchor_maps_validate_real_handles"
+        with tempfile.TemporaryDirectory() as temporary:
+            outcome = run_privileged_runner_with_fake_binary(
+                Path(temporary), self.source, selector, "pass")
+        self.assertEqual(outcome["run"].returncode, 0,
+                         outcome["run"].stdout + outcome["run"].stderr)
+        document = json.loads(outcome["typed_output"].read_text(encoding="utf-8"))
+        self.assertEqual(document["results"][0]["state"], "passed")
+        self.assertIsNone(document["results"][0]["signature"])
+
+    def test_a_typed_row_selector_reaches_execution_instead_of_selector_refusal(self):
+        typed_name = "attach::tests::sealed_session_drain_linkage_is_behavioral"
+        for array in ("DEFAULT_TESTS", "ALTERNATIVE_TESTS", "LONG_TESTS", "BTRFS_TESTS",
+                      "OVERLAY_TESTS", "EXPECTED_FAILURE_TESTS", "SKIP_TESTS"):
+            self.assertNotIn(typed_name, shell_array(self.source, array))
+        injected = self.source.replace(
+            "KNOWN_FAILING_TYPED_TESTS=(\n)",
+            "KNOWN_FAILING_TYPED_TESTS=(\n" + typed_name + "\n)", 1)
+        self.assertNotEqual(injected, self.source)
+        with tempfile.TemporaryDirectory() as temporary:
+            outcome = run_privileged_runner_with_fake_binary(
+                Path(temporary), injected, typed_name, "fail-typed")
+        self.assertNotIn("selector matches no curated test", outcome["run"].stderr)
+        self.assertEqual(typed_name + "\n", outcome["selection"])
+        rows = outcome["verdicts"].splitlines()
+        self.assertEqual(1, len(rows))
+        self.assertEqual(3, len(rows[0].split(b"\t")))
+        self.assertEqual((typed_name + "\tXFAIL").encode(), rows[0].split(b"\t")[0] + b"\t" + rows[0].split(b"\t")[1])
+
+    def test_typed_privileged_records_are_uploaded_for_ci_evidence(self):
+        shard = job_body(self.yml, "privileged-shard")
+        upload = shard.split("name: Upload the shard results and logs", 1)[1]
+        for artifact in ("known-failing-results.json", "known-failing-selection.txt", "known-failing-verdicts.tsv"):
+            self.assertIn(artifact, upload)
+
+
+class PrivilegedShellMutationSweepTests(unittest.TestCase):
+    def test_shell_boundary_mutation_sweep(self):
+        source = PRIVILEGED_RUNNER.read_text(encoding="utf-8")
+        failures = []
+        killed = 0
+
+        sidecar_mutant = source.replace('if [ "$#" -eq 3 ]; then', 'if false; then', 1)
+        outcomes = {}
+        for label, candidate in (("original", source), ("mutant", sidecar_mutant)):
+            with tempfile.TemporaryDirectory() as temporary:
+                result, payload = run_record_typed_verdict(
+                    candidate, Path(temporary), "inventory::privileged_tests::example", "FAIL", "/sidecar.json")
+            outcomes[label] = (result.returncode == 0 and payload ==
+                               b"inventory::privileged_tests::example\tFAIL\t/sidecar.json\n")
+        if outcomes["original"] and not outcomes["mutant"]:
+            killed += 1
+        else:
+            failures.append(f"shell-sidecar-forwarding{outcomes}")
+
+        selector_mutant = source.replace(
+            ' "${EXPECTED_FAILURE_TESTS[@]}" "${SKIP_TESTS[@]}" "${KNOWN_FAILING_TYPED_TESTS[@]}";',
+            ' "${EXPECTED_FAILURE_TESTS[@]}" "${SKIP_TESTS[@]}";', 1)
+        outcomes = {}
+        for label, candidate in (("original", source), ("mutant", selector_mutant)):
+            if candidate == source:
+                outcomes[label] = False
+                continue
+            accepted = run_selector_validation(candidate, "typed-known-a")
+            outcomes[label] = accepted.returncode == 0
+        original_accepted = run_selector_validation(source, "typed-known-a")
+        outcomes["original"] = original_accepted.returncode == 0
+        if outcomes["original"] and not outcomes["mutant"]:
+            killed += 1
+        else:
+            failures.append(f"shell-typed-selector-validation{outcomes}")
+
+        total = 2
+        self.assertEqual([], failures, f"surviving shell mutants: {failures}; killed {killed}/{total}")
+        print(f"privileged shell mutation sweep: {killed}/{total} killed")
 
 
 if __name__ == "__main__":

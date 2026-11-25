@@ -560,12 +560,23 @@ class TypedCellResultsTests(unittest.TestCase):
         self.assertEqual(document["results"][0]["signature"],
                          {"cell": "smoke", "qualification": "nonqualifying"})
 
-    def test_selection_categories_must_not_overlap(self):
-        result, _document = run_typed_checker(
+    def test_require_is_orthogonal_to_outcome_declarations(self):
+        result, document = run_typed_checker(
             [row("smoke", False, "nonqualifying", "smoke")],
             "--allow-nonqualifying", "smoke", "--require", "smoke")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("typed selection overlap", result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([item["test"] for item in document["selection"]], ["smoke"])
+        self.assertEqual(document["results"][0]["state"], "not_applicable")
+
+    def test_conflicting_outcome_declarations_must_not_overlap(self):
+        for options in (
+                ("--allow-nonqualifying", "cell", "--expected-failure", "cell"),
+                ("--allow-nonqualifying", "cell", "--intermittent-failure", "cell")):
+            with self.subTest(options=options):
+                result, _document = run_typed_checker(
+                    [row("cell", False, "nonqualifying", "smoke")], *options)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("typed outcome overlap", result.stderr)
 
 
     def test_failed_cell_can_carry_exact_typed_branch_sidecar(self):

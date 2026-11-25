@@ -682,6 +682,22 @@ class NeutralTerminalStateTests(unittest.TestCase):
 
 
 class PrivilegedTypedBranchTests(unittest.TestCase):
+    def test_converter_maps_promoted_curated_test_outside_ignored_registry(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            temp = Path(temporary)
+            test_name = "attach::inventory::activation::privileged_tests::privileged_task4_inventory_n2048_lp64"
+            selection = temp / "selection.txt"
+            verdicts = temp / "verdicts.tsv"
+            output = temp / "out.json"
+            selection.write_text(test_name + "\n")
+            verdicts.write_text(test_name + "\tPASS\n")
+            converter = ROOT / "scripts/ci/privileged-lib-results.py"
+            result = subprocess.run([sys.executable, "-I", str(converter), str(selection), str(verdicts), str(output), "github"],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads(output.read_text())
+            self.assertEqual(data["selection"][0]["path"], "src/attach/inventory/activation/privileged_tests.rs")
+
     def test_converter_uses_sidecar_typed_signature_for_failed_rows(self):
         with tempfile.TemporaryDirectory() as temporary:
             temp = Path(temporary)
@@ -903,6 +919,30 @@ class ProducerMutationSweepTests(unittest.TestCase):
         mutant_ok = mutant_run.returncode != 0 or mutant_doc is None
         self.record(results, "privileged-invalid-sidecar-accepted", original_ok, mutant_ok)
 
+        # Promoted curated tests outside the ignored registry are mapped by
+        # the Rust-source fallback; disabling it recreates the shard failure.
+        fallback_mutant = privileged_source.replace("if len(candidates) == 1:", "if False:", 1)
+        outcomes = {}
+        for label, source in (("original", privileged_source), ("mutant", fallback_mutant)):
+            with tempfile.TemporaryDirectory() as temporary:
+                temp = Path(temporary)
+                (temp / "scripts/ci").mkdir(parents=True)
+                (temp / "tests").mkdir()
+                (temp / "scripts/check-known-failing.py").write_text(CHECKER.read_text(encoding="utf-8"), encoding="utf-8")
+                shutil.copy2(ROOT / "scripts/check-ignored-tests.py", temp / "scripts/check-ignored-tests.py")
+                shutil.copy2(ROOT / "tests/ignored-tests.json", temp / "tests/ignored-tests.json")
+                os.symlink(ROOT / "src", temp / "src")
+                script = temp / "scripts/ci/privileged-lib-results.py"
+                script.write_text(source, encoding="utf-8")
+                name = "attach::inventory::activation::privileged_tests::privileged_task4_inventory_n2048_lp64"
+                selection = temp / "selection.txt"; verdicts = temp / "verdicts.tsv"; output = temp / "out.json"
+                selection.write_text(name + "\n", encoding="utf-8")
+                verdicts.write_text(name + "\tPASS\n", encoding="utf-8")
+                run = subprocess.run([sys.executable, "-I", str(script), str(selection), str(verdicts), str(output), "github"],
+                                     capture_output=True, text=True)
+                outcomes[label] = run.returncode == 0
+        self.record(results, "privileged-promoted-source-fallback", outcomes["original"], outcomes["mutant"])
+
         # Rust terse-list parsing and the pinned cargo wrapper are executable
         # discovery controls, not incidental implementation details.
         checker_source = CHECKER.read_text(encoding="utf-8")
@@ -1093,7 +1133,7 @@ class ProducerMutationSweepTests(unittest.TestCase):
                     artifact_flag in workflow_text and "cli-out/minimal-cells/dynamic-selection.txt" in workflow_text,
                     artifact_flag in artifact_mutant and "cli-out/minimal-cells/dynamic-selection.txt" in artifact_mutant)
 
-        total = 16
+        total = 17
         self.assertEqual(results["failures"], [],
                          f"surviving producer mutants: {results['failures']}; killed {results['killed']}/{total}")
         print(f"known-failing producer mutation sweep: {results['killed']}/{total} killed")

@@ -11,6 +11,7 @@ tests/ignored-tests.json, and emits p11scope/known-failing-results/v1.
 """
 import importlib.util
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -33,6 +34,35 @@ def checker_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def ignored_scanner_module():
+    path = ROOT / "scripts/check-ignored-tests.py"
+    spec = importlib.util.spec_from_file_location("ignored_test_scanner", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def rust_token_index():
+    """Map Rust identifier tokens to source files, ignoring comments/strings."""
+    scanner = ignored_scanner_module()
+    index = {}
+    for base_name in ("src", "tests", "crates"):
+        base = ROOT / base_name
+        if not base.is_dir():
+            continue
+        for path in base.rglob("*.rs"):
+            if any(segment in scanner.EXCLUDED_SEGMENTS for segment in path.parts):
+                continue
+            try:
+                stripped = scanner.strip_code(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError):
+                continue
+            relative = path.relative_to(ROOT).as_posix()
+            for token in set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", stripped)):
+                index.setdefault(token, set()).add(relative)
+    return index
 
 
 def typed_sidecar_signature(path_text):
@@ -91,6 +121,15 @@ def main(argv):
             files.setdefault(site["path"], site["file"])
     for name in ambiguous:
         files.pop(name, None)
+    missing = [name for _path, name in
+               ((files.get(name), name) for name in verdict_names) if _path is None]
+    if missing:
+        index = rust_token_index()
+        for name in missing:
+            leaf = name.rsplit("::", 1)[-1]
+            candidates = index.get(leaf, set())
+            if len(candidates) == 1:
+                files[name] = next(iter(candidates))
     selection = []
     results = []
     for parts in verdict_rows:
@@ -100,7 +139,7 @@ def main(argv):
             return 1
         path = files.get(name)
         if path is None:
-            print(f"privileged-lib-results: no unambiguous ignored-test source path for {name}", file=sys.stderr)
+            print(f"privileged-lib-results: no unambiguous Rust source path for {name}", file=sys.stderr)
             return 1
         state, signature = VERDICT_STATE[verdict]
         if len(parts) == 3:

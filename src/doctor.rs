@@ -2031,6 +2031,18 @@ pub fn summary(checks: &[Check], extra_strict: bool) -> String {
     summary_with_host(checks, extra_strict, None)
 }
 
+/// The running binary's own path and version. Doctor is the installed
+/// troubleshooting surface, so it names which `p11scope` actually answered
+/// (an old `/usr/local/bin` shadow is otherwise invisible next to a package
+/// in `/usr/bin`). The path is render-escaped like every other path.
+fn binary_line() -> String {
+    format!(
+        "Binary: {} (p11scope {}).",
+        crate::render::escape_controls(&crate::caps::current_binary()),
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
 /// The summary with the typed host verdict: the Next step for the
 /// uprobe-multi row comes from the typed probe refusal, never from
 /// re-parsing the rendered row text. Without a typed verdict (callers
@@ -2041,6 +2053,7 @@ fn summary_with_host(
     host: Option<crate::attach::MultiHostVerdict>,
 ) -> String {
     let mut out = format!("Doctor: {}.\n", doctor_conclusion(checks, extra_strict));
+    let _ = writeln!(out, "{}", binary_line());
     let _ = writeln!(out, "{}", capability_tier_line(capability_tier(checks)));
     let target = lane_assessment(checks, "target readability");
     let scope = scope_assessment(checks);
@@ -2314,6 +2327,7 @@ fn render_concise_with_host(
     host: Option<crate::attach::MultiHostVerdict>,
 ) -> String {
     let mut out = format!("Doctor: {}.\n", doctor_conclusion(checks, false));
+    let _ = writeln!(out, "{}", binary_line());
     let _ = writeln!(out, "{}", verdict_line_concise(checks));
     if userns_cause_proven(checks) {
         // The proven userns cause, stated once: the user-namespace row

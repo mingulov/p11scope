@@ -1022,6 +1022,51 @@ fn sum_unrouted_disclosed(
     Ok(total)
 }
 
+/// A parsed unrouted-shed gap: (total calls, per-cause counts, bindings).
+type UnroutedShedCounts = (u64, Vec<(String, u64)>, usize);
+
+/// Parse an aggregated unrouted reason (`{total} calls shed without a
+/// route ({label}={count} ...) with {bindings} bindings`) into
+/// (total, labels, bindings). Strict: any shape mismatch errors
+/// loudly, so a template change updates the verdict instead of
+/// slipping past it. The seal cell's shed branch pins the counts
+/// exactly (total against the lane shed counter, bindings against
+/// the two fixture callers, label counts summing to the total) while
+/// the label names stay diagnostic (they name the load's fault mode,
+/// which the test does not control).
+fn parse_unrouted_reason(reason: &str) -> Result<UnroutedShedCounts> {
+    let (head, bindings) = reason
+        .rsplit_once(" with ")
+        .context("an unrouted reason ends with ' with {N} bindings'")?;
+    let bindings = bindings
+        .strip_suffix(" bindings")
+        .context("an unrouted reason ends with ' bindings'")?
+        .parse::<usize>()
+        .context("unrouted bindings parse")?;
+    let (total, labels) = head
+        .split_once(" calls shed without a route (")
+        .context("an unrouted reason starts with '{total} calls shed without a route ('")?;
+    let total = total.parse::<u64>().context("unrouted total parses")?;
+    let labels = labels
+        .strip_suffix(')')
+        .context("an unrouted reason closes its label list")?;
+    let mut parsed = Vec::new();
+    for pair in labels.split_whitespace() {
+        let (label, count) = pair
+            .split_once('=')
+            .with_context(|| format!("unrouted label pair {pair:?}"))?;
+        ensure!(!label.is_empty(), "unrouted label {pair:?} names its cause");
+        parsed.push((
+            label.to_string(),
+            count
+                .parse::<u64>()
+                .context("unrouted label count parses")?,
+        ));
+    }
+    ensure!(!parsed.is_empty(), "an unrouted shed names its causes");
+    Ok((total, parsed, bindings))
+}
+
 /// Trusted Joint-branch selector. `journal_linked` latches from the
 /// drain producers on the birth path, so it still reads the test
 /// default (true) when zero births flowed (total shed). Joint
@@ -4897,9 +4942,19 @@ fn privileged_joint_seal_pending_across_stop_falls_back_live_lp64() -> Result<()
             break;
         }
     }
-    // Shed branch (busy host): q1 never installed both feeds. Dump every
-    // typed record the verdict will pin (temporary: the exact shed-gap
-    // verdict lands once this dump names the record).
+    let q1_end_ns = monotonic_ns();
+    let t_enter = ledger_stamp(&process_a.out, "HELD ")?;
+    ensure!(
+        t_enter < q1_end_ns,
+        "{tag}: the held call entered before q1 ended: {t_enter} < {q1_end_ns}"
+    );
+    // Shed branch (busy host): q1 never installed both feeds. The shed
+    // is acceptable only as a counted, named gap (partial, never
+    // stop): the held call stays in flight across the production
+    // Finish (same skeleton as the full branch, minus the hold: with
+    // no feeds there is no seal to hold), the Finish publishes, and
+    // the verdict pins the exact shed records plus the end-state
+    // equation. Silent shedding, or a Finish that abandons, is red.
     if q1_feeds != 2 {
         let seal = coordinator.joint_seal_bootstrap_diagnosis();
         eprintln!(
@@ -4959,14 +5014,474 @@ fn privileged_joint_seal_pending_across_stop_falls_back_live_lp64() -> Result<()
                 }
             }
         }
-        anyhow::bail!("{tag}: SHED: q1 installed {q1_feeds} feeds (verdict TBD)");
+        if matches!(joint_branch(&coordinator), JointBranch::S1) {
+            eprintln!("P11SCOPE_CELL_BRANCH={tag}:s1-precluded");
+            anyhow::bail!(
+                "{tag}: SHED: no journal feed: the cell needs a journal-build libtest \
+                 (P11SCOPE_JOURNAL=1 P11SCOPE_BIRTH_MARKER=1); not attempted"
+            );
+        }
+        ensure!(
+            q1_feeds == 0,
+            "{tag}: SHED: a partial install (1 feed) needs its own verdict, \
+             not the 0-feed shed verdict (got {q1_feeds} feeds)"
+        );
+        {
+            use crate::semantics_objects::journal::SealBootstrapCounts as Counts;
+            let seal = coordinator.joint_seal_bootstrap_diagnosis();
+            ensure!(
+                seal.take_failed_total() == 0
+                    && seal.reverify_failed.iter().all(|count| *count == 0)
+                    && seal.covers_failed == 0
+                    && seal.pin_failed == 0
+                    && seal.other_failed == 0,
+                "{tag}: SHED: control: the shed runs no seal (got takes={:?} \
+                 reverify={:?} covers={} pin={} other={})",
+                seal.take_failed,
+                seal.reverify_failed,
+                seal.covers_failed,
+                seal.pin_failed,
+                seal.other_failed,
+            );
+            let _ = Counts::take_index(crate::attach::BirthObservationRefusal::Stopped);
+        }
+        eprintln!(
+            "JOINT_STOP {tag}: SHED: q1 shed in {q1_polls} polls; \
+             the held call stays in flight across the stop"
+        );
+        // The production stop (no hold: no feeds, no seal to hold).
+        // Every loop below is bounded.
+        let mut driver = joint_finish_driver(&mut coordinator, lane);
+        driver.begin_final_joint_finish();
+        let begin = match &driver.joint_finish {
+            JointFinishDriver::Polling => "polling",
+            JointFinishDriver::Published => "published-at-begin",
+            JointFinishDriver::Abandoned => "abandoned-at-begin",
+            JointFinishDriver::NotBegun => "not-begun",
+        }
+        .to_string();
+        ensure!(
+            begin == "polling",
+            "{tag}: SHED: the shed finish begins polling (got {begin}; \
+             first_error={:?})",
+            driver.joint_first_error,
+        );
+        let mut finish_polls = 0u64;
+        let finish = {
+            let started = Instant::now();
+            loop {
+                if finish_polls >= 1000 || started.elapsed() > Duration::from_secs(120) {
+                    break "unpublished".to_string();
+                }
+                {
+                    let (coordinator, semantic, joint_finish, first_error) = (
+                        &mut *driver.coordinator,
+                        &mut driver.semantic,
+                        &mut driver.joint_finish,
+                        &mut driver.joint_first_error,
+                    );
+                    let _step = ClassicDriver::step_begun_joint_finish(
+                        semantic,
+                        joint_finish,
+                        coordinator,
+                        first_error,
+                    );
+                }
+                finish_polls += 1;
+                {
+                    let seal = driver.coordinator.joint_seal_bootstrap_diagnosis();
+                    let drive = driver
+                        .semantic
+                        .as_ref()
+                        .map(|lane| format!("{:?}", lane.joint_drive_state_for_test()));
+                    eprintln!(
+                        "JOINT_STOP {tag}: SHED finish poll {finish_polls}: state={:?} \
+                         drive={:?} takes_total={} shed={}",
+                        driver.joint_finish,
+                        drive,
+                        seal.take_failed_total(),
+                        driver
+                            .semantic
+                            .as_ref()
+                            .map_or(u64::MAX, |lane| lane.shed_calls_disclosed()),
+                    );
+                }
+                match &driver.joint_finish {
+                    JointFinishDriver::Published => break "published".to_string(),
+                    JointFinishDriver::Abandoned => break "abandoned".to_string(),
+                    JointFinishDriver::Polling | JointFinishDriver::NotBegun => {}
+                }
+            }
+        };
+        let first_error = driver.joint_first_error.clone();
+        ensure!(
+            finish == "published",
+            "{tag}: SHED: partial, never stop: the shed finish publishes \
+             (got {finish} after {finish_polls} polls; first_error={first_error:?})"
+        );
+        let lane_ref = driver.semantic.as_ref().expect("lane");
+        let latched = lane_ref.joint_finish_disposition_required();
+        let latch_code = lane_ref
+            .joint_disposition_reason()
+            .map(|reason| reason.code().to_string());
+        let finish_trip = lane_ref
+            .joint_finish_no_progress_trip()
+            .map(|trip| (trip.polls, trip.stalled.as_secs()));
+        let audit_trip = lane_ref
+            .joint_audit_no_progress_trip()
+            .map(|trip| (trip.polls, trip.stalled.as_secs()));
+        eprintln!(
+            "JOINT_STOP {tag}: SHED finish={finish} after {finish_polls} polls; \
+             first_error={first_error:?} latched={latched} latch={latch_code:?} \
+             finish_trip={finish_trip:?} audit_trip={audit_trip:?}"
+        );
+        let h0_stop = {
+            let (coordinator, semantic) = (&mut *driver.coordinator, &mut driver.semantic);
+            let lane = semantic.as_mut().expect("lane");
+            match lane.finish_semantic_stop() {
+                Some(batch) => {
+                    coordinator.stage_semantic_batch(batch);
+                    lane.note_semantic_staged();
+                    match commit_semantic_finish(coordinator, lane) {
+                        Ok(()) => {
+                            lane.note_semantic_published();
+                            if lane.is_finished() {
+                                "committed".to_string()
+                            } else {
+                                "committed-unfinished".to_string()
+                            }
+                        }
+                        Err(error) => format!("commit-refused:{error}"),
+                    }
+                }
+                None => {
+                    if lane.is_finished() {
+                        "no-batch-finished".to_string()
+                    } else {
+                        "no-batch-unfinished".to_string()
+                    }
+                }
+            }
+        };
+        let mut wound_polls = 0u64;
+        let wound = loop {
+            if wound_polls >= 600 {
+                break "unwound".to_string();
+            }
+            let (coordinator, semantic) = (&mut *driver.coordinator, &mut driver.semantic);
+            let lane = semantic.as_mut().expect("lane");
+            match lane.poll_wound_down(coordinator, &mut std::io::sink()) {
+                Ok(true) => break "joined".to_string(),
+                Ok(false) => {}
+                Err(refusal) => break format!("wound-refused:{refusal}"),
+            }
+            wound_polls += 1;
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let domain = driver.semantic.as_ref().expect("lane").domain();
+        let take = driver
+            .semantic
+            .as_mut()
+            .expect("lane")
+            .take_joined_session();
+        let taken = matches!(&take, Ok(Some(_)));
+        let mut minted = false;
+        if let Ok(Some(session)) = take {
+            let mut minter = crate::attach::NativeCompletionMinter::new();
+            minter.note_wound_down(domain, session);
+            let started = Instant::now();
+            loop {
+                if let Some(completion) = minter.poll_completion(domain) {
+                    if completion.domain() == domain && minter.take_first_failure().is_none() {
+                        minted = true;
+                    }
+                    break;
+                }
+                if started.elapsed() >= Duration::from_secs(30) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        // The held call stayed in flight across the stop; release it now
+        // so it exits cleanly and flushes its ledger (its post-stop
+        // return is never collected: the call itself was already counted
+        // at entry).
+        {
+            let _release = std::fs::File::create(&release)?;
+        }
+        process_a.wait_for("DONE ", Duration::from_secs(60))?;
+        // Shed verdict: the exact shed records plus the end-state
+        // equation. Every entered call is attributed, slot-refused,
+        // instance-refused, disclosed-shed, or pregrant-history-lost;
+        // a silent drop breaks the equation.
+        let seal = driver.coordinator.joint_seal_bootstrap_diagnosis();
+        let lane_shed = driver
+            .semantic
+            .as_ref()
+            .expect("lane")
+            .shed_calls_disclosed();
+        eprintln!(
+            "JOINT_STOP {tag}: SHED end: takes={:?} reverify={:?} covers={} pin={} other={} \
+             shed={lane_shed}",
+            seal.take_failed,
+            seal.reverify_failed,
+            seal.covers_failed,
+            seal.pin_failed,
+            seal.other_failed,
+        );
+        let caller_a = caller_of(driver.coordinator, process_a.pid())?;
+        let caller_b = caller_of(driver.coordinator, process_b.pid())?;
+        let edge_a =
+            joint_edge_snapshot(driver.coordinator, process_a.pid(), "live-joint-held.so")?;
+        let edge_b = joint_edge_snapshot(driver.coordinator, process_b.pid(), "soft-copy.so")?;
+        let (per_function_a, total_a, bad_a) = ledger_calls(&process_a.out)?;
+        let (per_function_b, total_b, bad_b) = ledger_calls(&process_b.out)?;
+        let (a_semantic, a_count_only) = ledger_semantic_split(&per_function_a);
+        let (b_semantic, b_count_only) = ledger_semantic_split(&per_function_b);
+        eprintln!(
+            "JOINT_STOP {tag}: SHED end: ledger_a total={total_a} bad={bad_a} sem={a_semantic} \
+             co={a_count_only} api={:?} | ledger_b total={total_b} bad={bad_b} sem={b_semantic} \
+             co={b_count_only} api={:?}",
+            edge_a.api_returns, edge_b.api_returns,
+        );
+        for gap in driver.coordinator.registry().gaps().iter() {
+            eprintln!(
+                "JOINT_STOP {tag}: SHED end gap {:?} {:?} caller={:?}",
+                gap.subject, gap.reason, gap.caller
+            );
+        }
+        let unrouted = driver
+            .coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .cloned()
+            .chain(driver.coordinator.registry().staged_gaps_for_test())
+            .filter(|gap| gap.subject == "semantic calls unrouted")
+            .collect::<Vec<_>>();
+        let history_subject = crate::inventory_present::JOINT_RETAINED_S1_SUBJECT.to_string();
+        let history = driver
+            .coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .cloned()
+            .chain(driver.coordinator.registry().staged_gaps_for_test())
+            .filter(|gap| gap.subject == history_subject)
+            .collect::<Vec<_>>();
+        ensure!(
+            matches!(joint_branch(driver.coordinator), JointBranch::Unattributed),
+            "{tag}: SHED: zero installs with the default link latch \
+             (feeds={} journal_linked={})",
+            driver.coordinator.registry().joint_feeds(),
+            driver.coordinator.registry().journal_linked(),
+        );
+        ensure!(
+            finish == "published",
+            "{tag}: SHED: the shed finish publishes (got {finish} after {finish_polls} polls)"
+        );
+        ensure!(
+            wound == "joined",
+            "{tag}: SHED: the published lane winds down (got {wound} after {wound_polls} polls)"
+        );
+        ensure!(
+            taken,
+            "{tag}: SHED: the wound-down lane hands off its session"
+        );
+        ensure!(
+            first_error.is_none(),
+            "{tag}: SHED: no first error (got {first_error:?})"
+        );
+        ensure!(
+            !latched,
+            "{tag}: SHED: no latched disposition (got {latch_code:?})"
+        );
+        ensure!(
+            finish_trip.is_none(),
+            "{tag}: SHED: no finish no-progress trip (got {finish_trip:?})"
+        );
+        ensure!(
+            audit_trip.is_none(),
+            "{tag}: SHED: no audit no-progress trip (got {audit_trip:?})"
+        );
+        ensure!(
+            begin == "polling",
+            "{tag}: SHED: the finish begins polling (got {begin})"
+        );
+        ensure!(
+            seal.take_failed_total() == 0
+                && seal.reverify_failed.iter().all(|count| *count == 0)
+                && seal.covers_failed == 0
+                && seal.pin_failed == 0
+                && seal.other_failed == 0,
+            "{tag}: SHED: the shed still runs no seal (got takes={:?} reverify={:?} \
+             covers={} pin={} other={})",
+            seal.take_failed,
+            seal.reverify_failed,
+            seal.covers_failed,
+            seal.pin_failed,
+            seal.other_failed,
+        );
+        ensure!(
+            unrouted.len() == 1,
+            "{tag}: SHED: exactly one unrouted-shed gap (got {unrouted:?})"
+        );
+        let gap = &unrouted[0];
+        ensure!(
+            gap.caller.is_none()
+                && gap.module.is_none()
+                && gap.pid.is_none()
+                && gap.budget.is_none(),
+            "{tag}: SHED: the unrouted gap is caller-less (got {gap:?})"
+        );
+        let (total, labels, bindings) = parse_unrouted_reason(&gap.reason)?;
+        ensure!(
+            total == lane_shed,
+            "{tag}: SHED: the gap counts the lane shed exactly \
+             (gap {total} vs lane {lane_shed})"
+        );
+        ensure!(
+            bindings == 2,
+            "{tag}: SHED: the shed binds exactly the two fixture callers (got {bindings})"
+        );
+        let labelled: u64 = labels.iter().map(|(_, count)| count).sum();
+        ensure!(
+            labelled == total,
+            "{tag}: SHED: every shed call names its cause exactly once \
+             (labels {labels:?} sum {labelled} vs total {total})"
+        );
+        ensure!(
+            history.len() == 1,
+            "{tag}: SHED: exactly one pregrant history-loss gap (got {history:?})"
+        );
+        let expected_history = crate::discovery::caller_registry::RegistryGap {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: history_subject,
+            reason: "joint_pregrant_nonadmission_history_loss calls=1".to_string(),
+            budget: None,
+        };
+        ensure!(
+            history[0] == expected_history,
+            "{tag}: SHED: the history-loss gap is exact (got {:?})",
+            history[0],
+        );
+        let slot_a = count_disclosed_gaps(
+            driver.coordinator,
+            "semantic input refused",
+            "slot",
+            Some(caller_a),
+        );
+        let slot_b = count_disclosed_gaps(
+            driver.coordinator,
+            "semantic input refused",
+            "slot",
+            Some(caller_b),
+        );
+        let inst_a = driver
+            .coordinator
+            .registry()
+            .instance_calls_refused(caller_a);
+        let inst_b = driver
+            .coordinator
+            .registry()
+            .instance_calls_refused(caller_b);
+        let api_a = edge_a.api_returns.unwrap_or(0);
+        let api_b = edge_b.api_returns.unwrap_or(0);
+        ensure!(
+            api_a <= a_semantic,
+            "{tag}: SHED: a never over-attributes: api {api_a} <= sem {a_semantic}"
+        );
+        ensure!(
+            api_b <= b_semantic,
+            "{tag}: SHED: b never over-attributes: api {api_b} <= sem {b_semantic}"
+        );
+        ensure!(
+            slot_a <= a_count_only,
+            "{tag}: SHED: a never over-refuses: slot {slot_a} <= count-only {a_count_only}"
+        );
+        ensure!(
+            slot_b <= b_count_only,
+            "{tag}: SHED: b never over-refuses: slot {slot_b} <= count-only {b_count_only}"
+        );
+        let unrouted_entries =
+            count_callerless_gap_entries(driver.coordinator, "semantic calls unrouted");
+        let capacity_entries =
+            count_callerless_gap_entries(driver.coordinator, "semantic call outcome capacity");
+        let suppressed = driver.coordinator.registry().gaps_suppressed();
+        ensure!(
+            capacity_entries == 0,
+            "{tag}: SHED: no capacity shed without a counter: {capacity_entries} entries"
+        );
+        ensure!(
+            lane_shed == 0 || (unrouted_entries > 0 && suppressed == 0),
+            "{tag}: SHED: shed calls are disclosed in a printed named gap: shed {lane_shed}, \
+             entries {unrouted_entries}, suppressed {suppressed}"
+        );
+        let entered = total_a + total_b;
+        ensure!(
+            entered == api_a + api_b + lane_shed + slot_a + slot_b + inst_a + inst_b + 1,
+            "{tag}: SHED: every entered call is attributed, slot-refused, instance-refused, \
+             disclosed-shed or pregrant-history-lost: entered {entered} (a {total_a} + b \
+             {total_b}) vs api {} + shed {lane_shed} + slot {} + inst {} + history 1",
+            api_a + api_b,
+            slot_a + slot_b,
+            inst_a + inst_b,
+        );
+        let ended = driver
+            .coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .cloned()
+            .chain(driver.coordinator.registry().staged_gaps_for_test())
+            .filter(|gap| gap.subject == CAPTURE_ENDED_SUBJECT)
+            .collect::<Vec<_>>();
+        ensure!(
+            ended.is_empty(),
+            "{tag}: SHED: no capture-ended gap without a seal (got {ended:?})"
+        );
+        let unavailable = driver
+            .coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .cloned()
+            .chain(driver.coordinator.registry().staged_gaps_for_test())
+            .filter(|gap| gap.reason.contains("semantic_unavailable"))
+            .collect::<Vec<_>>();
+        ensure!(
+            unavailable.is_empty(),
+            "{tag}: SHED: no semantic_unavailable (got {unavailable:?})"
+        );
+        let abandon_gap = driver
+            .coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .find(|gap| {
+                gap.subject == "unfinished joint publication abandoned"
+                    || gap.subject == "for exit"
+                    || gap.subject == "for lane stop"
+            })
+            .map(|gap| format!("{}: {}", gap.subject, gap.reason));
+        ensure!(
+            abandon_gap.is_none(),
+            "{tag}: SHED: no abandon gap without abandonment (got {abandon_gap:?})"
+        );
+        eprintln!(
+            "P11SCOPE_CELL_BRANCH={tag}:shed:published:{finish_polls}:{wound_polls}:{}:{}",
+            u8::from(taken),
+            u8::from(minted),
+        );
+        eprintln!(
+            "JOINT_STOP {tag}: SHED h0={h0_stop} taken={taken} minted={minted} \
+             shed={lane_shed} entered={entered}"
+        );
+        return Ok(());
     }
-    let q1_end_ns = monotonic_ns();
-    let t_enter = ledger_stamp(&process_a.out, "HELD ")?;
-    ensure!(
-        t_enter < q1_end_ns,
-        "{tag}: the held call entered before q1 ended: {t_enter} < {q1_end_ns}"
-    );
     eprintln!("JOINT_STOP {tag}: q1 published in {q1_polls} polls; releasing for the finish");
     {
         let _release = std::fs::File::create(&release)?;
@@ -4980,16 +5495,17 @@ fn privileged_joint_seal_pending_across_stop_falls_back_live_lp64() -> Result<()
     );
     // Hold the seal take across the stop with the test seam, then stop
     // through the PRODUCTION sequencing: the Finish is the single stop
-    // (no direct capture stop, no q2 Running quantum). The Finish
-    // quantum collects the complete return, runs the H0 stop inside
-    // FinishStop, then its seal holds as partition contention (retry,
-    // pending) while the hold masks the Stopped latch; clearing the
-    // hold lets the take hit its final Stopped refusal (no retry),
-    // falling back with counted loss. Deterministic: the hold flag
-    // pins the seal pending by construction, and the phase order
-    // (FinishStop before the seal) puts the production stop before
-    // the first take. Only an S1 build precludes the cell here (no
-    // journal feed at all).
+    // (no direct capture stop, no q2 Running quantum). The held call
+    // was released above, so its entry is complete; the Finish
+    // quantum collects it, runs the H0 stop inside FinishStop, then
+    // its seal takes for the staged entry hold as partition
+    // contention (retry, pending) while the hold masks the Stopped
+    // latch; clearing the hold lets the take hit its final Stopped
+    // refusal (no retry), falling back with counted loss.
+    // Deterministic: the hold flag pins the seal pending by
+    // construction, and the phase order (FinishStop before the seal)
+    // puts the production stop before the first take. Only an S1
+    // build precludes the cell here (no journal feed at all).
     if matches!(joint_branch(&coordinator), JointBranch::S1) {
         eprintln!("P11SCOPE_CELL_BRANCH={tag}:s1-precluded");
         anyhow::bail!(
@@ -5130,12 +5646,94 @@ fn privileged_joint_seal_pending_across_stop_falls_back_live_lp64() -> Result<()
         }
     };
     let first_error = driver.joint_first_error.clone();
+    // Abandon forensics, printed on every run so a red finish stays
+    // diagnosable (the lane holds the lane shell for exit, hiding it).
+    {
+        let seal = driver.coordinator.joint_seal_bootstrap_diagnosis();
+        eprintln!(
+            "JOINT_STOP {tag}: FORENSIC finish={finish} polls={finish_polls} \
+             first_error={first_error:?} takes={:?} reverify={:?} covers={} pin={} other={} \
+             shed={} merge_refused={}",
+            seal.take_failed,
+            seal.reverify_failed,
+            seal.covers_failed,
+            seal.pin_failed,
+            seal.other_failed,
+            driver
+                .semantic
+                .as_ref()
+                .map_or(u64::MAX, |lane| lane.shed_calls_disclosed()),
+            driver
+                .semantic
+                .as_ref()
+                .map_or(u64::MAX, |lane| lane.merge_refused_births()),
+        );
+        if let Some(lane) = driver.semantic.as_ref() {
+            eprintln!(
+                "JOINT_STOP {tag}: FORENSIC latched={} latch={:?} audit={:?} stuck={:?} \
+                 drive={:?} branch feeds={} linked={}",
+                lane.joint_finish_disposition_required(),
+                lane.joint_disposition_reason().map(|reason| reason.code()),
+                lane.joint_audit_diagnostic_for_test(),
+                lane.joint_stuck_diagnostic_for_test(),
+                lane.joint_drive_state_for_test(),
+                driver.coordinator.registry().joint_feeds(),
+                driver.coordinator.registry().journal_linked(),
+            );
+        }
+        // Map the forensic caller ids to the fixture processes, so
+        // the finish's gap owners resolve.
+        match (
+            caller_of(driver.coordinator, process_a.pid()),
+            caller_of(driver.coordinator, process_b.pid()),
+        ) {
+            (Ok(caller_a), Ok(caller_b)) => {
+                let edge_a =
+                    joint_edge_snapshot(driver.coordinator, process_a.pid(), "live-joint-held.so")
+                        .map(|edge| (edge.joint, edge.reduced, edge.api_returns, edge.mechanisms));
+                let edge_b =
+                    joint_edge_snapshot(driver.coordinator, process_b.pid(), "soft-copy.so")
+                        .map(|edge| (edge.joint, edge.reduced, edge.api_returns, edge.mechanisms));
+                eprintln!(
+                    "JOINT_STOP {tag}: FORENSIC callers a={caller_a:?} b={caller_b:?} \
+                     edge_a={edge_a:?} edge_b={edge_b:?}"
+                );
+            }
+            (caller_a, caller_b) => eprintln!(
+                "JOINT_STOP {tag}: FORENSIC callers unresolved: {caller_a:?} {caller_b:?}"
+            ),
+        }
+        for gap in driver.coordinator.registry().gaps().iter() {
+            eprintln!(
+                "JOINT_STOP {tag}: FORENSIC gap {:?} {:?} caller={:?}",
+                gap.subject, gap.reason, gap.caller
+            );
+        }
+        for gap in driver.coordinator.registry().staged_gaps_for_test() {
+            eprintln!(
+                "JOINT_STOP {tag}: FORENSIC staged {:?} {:?} caller={:?}",
+                gap.subject, gap.reason, gap.caller
+            );
+        }
+    }
     // Fail gracefully (not panic) when the finish abandons and holds
     // the lane for exit: the ensures below report the red state.
     ensure!(
         finish == "published",
         "{tag}: the seal-pending finish publishes (got {finish} after {finish_polls} polls; \
          first_error={first_error:?})"
+    );
+    // The production stop ran inside the finish (a publish without
+    // it would mean the stop never sequenced).
+    ensure!(
+        driver
+            .semantic
+            .as_mut()
+            .expect("lane")
+            .live_capture_mut()
+            .expect("live capture")
+            .capture_stopped_for_test(),
+        "{tag}: the finish ran the production stop"
     );
     let lane_ref = driver.semantic.as_ref().expect("lane");
     let latched = lane_ref.joint_finish_disposition_required();
@@ -5221,6 +5819,10 @@ fn privileged_joint_seal_pending_across_stop_falls_back_live_lp64() -> Result<()
             std::thread::sleep(Duration::from_millis(10));
         }
     }
+    // The held call was released before the finish; it exits
+    // cleanly on its own. Wait for its clean exit (already done
+    // returns at once).
+    process_a.wait_for("DONE ", Duration::from_secs(60))?;
     // Typed records: the final Stopped refusal, the named stop-loss gap
     // with its exact count, exit 0, no semantic_unavailable. The holds
     // above already counted as contention; the final Stopped is the

@@ -4423,6 +4423,14 @@ impl SemanticCapture {
         self.hold_takes_for_test = on;
     }
 
+    /// Tests-only stop-latch read: whether the capture already
+    /// stopped. The seal cell asserts through this that its
+    /// published finish ran the production stop, read-only.
+    #[cfg(test)]
+    pub(crate) fn capture_stopped_for_test(&self) -> bool {
+        self.stopped
+    }
+
     /// Coverage-failure state for the stuck-transaction diagnostic only:
     /// (capture image_failed, pending discovery complete, router
     /// image_failed, faulted key count, faulted-overflow latch, router

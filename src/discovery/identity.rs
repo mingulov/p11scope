@@ -21961,6 +21961,86 @@ mod tests {
         panic!("the tiny real-file copy must finish over bounded credits");
     }
 
+    /// Twin (V2/B2 killing test): the conservative copy carries
+    /// refusal history — a source with refused pairs replays them,
+    /// so filing the key for the refusing view afterwards still
+    /// contradicts.
+    #[test]
+    fn conservative_copy_carries_refused_pairs_into_the_replay() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let mut source = image_pins(&[(key, "aaaaaaaa", 1)]);
+        let entry = source.by_id.pop_first().unwrap().1;
+        let raw = entry.raw.clone();
+        let mut pins = PinnedObjects::empty();
+        let mut skipped = Vec::new();
+        // The refusing view's observation, then a peer view's proof.
+        record_scanned_candidate(
+            &mut pins,
+            ProcessViewId(1),
+            raw.clone(),
+            Err(PinOutcome::Unproven {
+                cause: UnprovenCause::OpenFailed,
+                reason: "TEST refused".to_string(),
+            }),
+            &mut skipped,
+            false,
+        );
+        record_scanned_candidate(
+            &mut pins,
+            ProcessViewId(2),
+            raw.clone(),
+            Ok(entry),
+            &mut skipped,
+            false,
+        );
+        assert_eq!(pins.pinned().count(), 1);
+        assert_eq!(
+            pins.refused_keys,
+            BTreeSet::from([(ProcessViewId(1), key)]),
+            "the source carries one refused pair"
+        );
+        let pool = SemanticResourcePool::default();
+        let selection = conservative_selection(&pool, BTreeSet::new(), BTreeSet::new());
+        let reserve = pool.reserver();
+        let mut cursor = PinnedConservativeCursor::new();
+        finish_conservative_copy(&pins, &mut cursor, &selection, &reserve);
+        let copy = cursor.pinned().expect("the copy reaches Ready").clone();
+        assert_eq!(
+            copy.refused_keys, pins.refused_keys,
+            "refusal history survives the copy"
+        );
+        assert!(
+            !copy.refused_keys.is_empty(),
+            "non-vacuous: the source refused"
+        );
+        // A later filing by the refusing view still contradicts.
+        let entry = copy.by_id.values().next().unwrap().clone();
+        let mut replayed = copy;
+        let mut filed = Vec::new();
+        record_scanned_candidate(
+            &mut replayed,
+            ProcessViewId(1),
+            raw,
+            Ok(entry),
+            &mut filed,
+            false,
+        );
+        assert!(
+            replayed.rejects(key),
+            "filing after the copied refusal group-rejects"
+        );
+        assert!(
+            filed
+                .iter()
+                .any(|skip| skip.reason.contains("contradicts filed")),
+            "the contradiction leaves a named gap: {filed:?}"
+        );
+    }
+
     #[test]
     fn conservative_copy_cursor_preserves_originals_and_peak() {
         use crate::semantics_edge::resources::SemanticResourcePool;

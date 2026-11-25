@@ -495,11 +495,17 @@ fn read_view_mountinfo_resumable(
             Ok((table, text))
         }
         MountinfoStep::LegReached => {
+            // Count the parked work: the gap names the bytes read so far,
+            // and the remainder after them is the next pass's.
+            let parked_bytes = progress.bytes_read();
             *slot = Some(ParkedMountTable {
                 file: table,
                 progress,
             });
-            Err(reason(crate::discovery::scan::MOUNTINFO_RESUME_REASON))
+            Err(reason(&format!(
+                "{} ({parked_bytes} bytes read so far)",
+                crate::discovery::scan::MOUNTINFO_RESUME_REASON
+            )))
         }
     }
 }
@@ -4133,7 +4139,12 @@ int main(int argc, char **argv) {
                         error.contains(crate::discovery::scan::MOUNTINFO_RESUME_REASON),
                         "{error}"
                     );
-                    parked.push(view.parked_mount_table_bytes_for_test().unwrap());
+                    let bytes = view.parked_mount_table_bytes_for_test().unwrap();
+                    assert!(
+                        error.ends_with(&format!("({bytes} bytes read so far)")),
+                        "the gap counts the parked bytes: {error}"
+                    );
+                    parked.push(bytes);
                 }
             }
         }

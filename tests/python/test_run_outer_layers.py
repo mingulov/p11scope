@@ -315,6 +315,21 @@ def check_hygiene(report, unattributed, unknown, failures, notes):
             f"phantoms (KI-v072-proxy-phantom-inflight): evidence={in_flight_end} rows={stuck!r}")
     else:
         notes.append("phantoms=0")
+    # The live-table-merge class folds to this exact generic row in
+    # evidence.skipped[] (the subject never reaches the document; the
+    # fold is pinned by
+    # live_table_merge_gap_folds_to_the_generic_discovery_row). A
+    # tightly-scoped outer run must never file one: any live overflow
+    # is a bug signal, and any other discovery gap here is equally
+    # unexpected. The message cannot name the subject — the fold hides
+    # it — so it names the fold instead.
+    folded = [row for row in (evidence.get("skipped") or [])
+              if row.get("name") == "discovery subject"
+              and row.get("reason") == "discovery unavailable"]
+    if folded:
+        failures.append(f"folded discovery gap rows (live-overflow class folds here): {folded!r}")
+    else:
+        notes.append("folded-gaps=0")
 
 
 def check_gfl_gi(report, ledger, backend, spyview, backend_indexes, failures, notes):
@@ -1142,6 +1157,46 @@ class ProxyLiveSignalTwins(unittest.TestCase):
         verdict = judge_proxy_outer_prefix_gap(report, ledger, 0, 2, 2)
         self.assertTrue(verdict, verdict.detail)
         self.assertIn("tables incl 1 live", verdict.detail)
+
+
+FOLDED_GAP_ROW = {"name": "discovery subject", "reason": "discovery unavailable"}
+
+
+class FoldedGapTwins(unittest.TestCase):
+    def test_folded_discovery_gap_fails(self):
+        def gap(report, _ledger):
+            report["evidence"]["skipped"] = [dict(FOLDED_GAP_ROW)]
+        ledger, report = proxy_fixture(gap)
+        verdict = judge_proxy_outer(report, ledger, 0, 2, 2)
+        self.assertFalse(verdict, verdict.detail)
+        self.assertIn("folded discovery gap", verdict.detail)
+
+    def test_zero_proxy_with_folded_gap_fails(self):
+        # The 0/109 MF-1 signature with its gap: the live leg notes
+        # P1, the gap leg fails.
+        ledger, report = proxy_live_fixture(live=False, counted=False)
+        report["evidence"]["skipped"] = [dict(FOLDED_GAP_ROW)]
+        verdict = judge_proxy_outer(report, ledger, 0, 2, 2)
+        self.assertFalse(verdict, verdict.detail)
+        self.assertIn("folded discovery gap", verdict.detail)
+
+    def test_folded_discovery_gap_fails_opensc(self):
+        ledger, report = opensc_fixture()
+        report["evidence"]["skipped"] = [dict(FOLDED_GAP_ROW)]
+        verdict = judge_opensc_outer(report, ledger, 1, "Available slots:\n")
+        self.assertFalse(verdict, verdict.detail)
+        self.assertIn("folded discovery gap", verdict.detail)
+
+    def test_unrelated_skip_rows_still_pass(self):
+        # Null-pointer function rows (present in every real run) are
+        # not folded discovery gaps.
+        def gap(report, _ledger):
+            report["evidence"]["skipped"] = [
+                {"name": "C_AsyncComplete", "reason": "null pointer"}]
+        ledger, report = proxy_fixture(gap)
+        verdict = judge_proxy_outer(report, ledger, 0, 2, 2)
+        self.assertTrue(verdict, verdict.detail)
+        self.assertIn("folded-gaps=0", verdict.detail)
 
 
 class ProxyPrefixGapTwins(unittest.TestCase):

@@ -843,6 +843,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--old-binary", required=True, type=Path)
     parser.add_argument("--new-binary", required=True, type=Path)
+    parser.add_argument("--helper-binary", type=Path)
     parser.add_argument("--workdir", required=True, type=Path)
     args = parser.parse_args()
     workdir = args.workdir

@@ -29027,6 +29027,98 @@ mod tests {
     }
 
     #[test]
+    fn extract_proof_pins_collects_every_wanted_id() {
+        // Several wanted ids (the own file plus two table-entry
+        // dependencies) extract together: every wanted entry and raw
+        // mapping lands, foreign entries stay behind. Guards the
+        // one-pass rewrite: a dropped wanted id loses an entry here.
+        use std::collections::BTreeSet;
+        let key = overlay(890);
+        let dep_a = overlay(891);
+        let dep_b = overlay(892);
+        let mut main = module(key);
+        main.tables[0].entries.push(ScannedEntry {
+            name: "C_Dependency_A",
+            object: dep_a,
+            object_path: PATH.into(),
+            file_offset: 0x2200,
+        });
+        main.tables[0].entries.push(ScannedEntry {
+            name: "C_Dependency_B",
+            object: dep_b,
+            object_path: PATH.into(),
+            file_offset: 0x2300,
+        });
+        let mut store = PinnedObjects::empty();
+        assert!(
+            store
+                .absorb(view_pin(&main, 8900, SHA, 1, false))
+                .is_empty()
+        );
+        // One scan, one mount namespace: each dependency pin files
+        // under the proving main's namespace, as production scans
+        // do, so the entry raws resolve to them.
+        let mut dep_module_a = module(dep_a);
+        dep_module_a.mount_namespace = main.mount_namespace;
+        assert!(
+            store
+                .absorb(view_pin(&dep_module_a, 8901, SHA, 1, false))
+                .is_empty()
+        );
+        let mut dep_module_b = module(dep_b);
+        dep_module_b.mount_namespace = main.mount_namespace;
+        assert!(
+            store
+                .absorb(view_pin(&dep_module_b, 8902, SHA, 1, false))
+                .is_empty()
+        );
+        let foreign = overlay(893);
+        assert!(
+            store
+                .absorb(view_pin(&module(foreign), 8903, SHA, 1, false))
+                .is_empty()
+        );
+        let own_id = store
+            .id_for_scanned(&main, main.key, &main.path)
+            .expect("the own file resolves");
+        let dep_a_id = store
+            .id_for_scanned(&main, dep_a, PATH)
+            .expect("dependency A resolves");
+        let dep_b_id = store
+            .id_for_scanned(&main, dep_b, PATH)
+            .expect("dependency B resolves");
+        let foreign_id = store
+            .id_for_scanned(&module(foreign), foreign, PATH)
+            .expect("the foreign file resolves in the source");
+        let extracted = store
+            .extract_proof_pins(own_id, &main)
+            .expect("the own file extracts");
+        let wanted = BTreeSet::from([own_id, dep_a_id, dep_b_id]);
+        let extracted_ids: BTreeSet<PinnedObjectId> =
+            extracted.by_id.keys().copied().collect();
+        assert_eq!(
+            extracted_ids, wanted,
+            "the extraction carries exactly the wanted entries"
+        );
+        let mapped_ids: BTreeSet<PinnedObjectId> =
+            extracted.raw_to_id.values().copied().collect();
+        assert_eq!(
+            mapped_ids, wanted,
+            "the extraction maps exactly the wanted raws"
+        );
+        assert!(
+            extracted.summary(foreign_id).is_none(),
+            "the extraction carries no foreign entry"
+        );
+        assert!(
+            extracted
+                .id_for_scanned(&module(foreign), foreign, PATH)
+                .is_none(),
+            "the foreign raw resolves nowhere in the extraction"
+        );
+    }
+
+    #[test]
     fn raw_aliased_ids_covers_owned_and_global_aliases_only() {
         // The prebuilt reclaim set: view-owned raws and global
         // (mount-namespace-less) raws name their objects; a raw

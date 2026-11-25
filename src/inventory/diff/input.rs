@@ -872,9 +872,11 @@ const SEMANTICS: &[&str] = &[
 
 fn convert_snapshot(value: &Value, limits: InputLimits) -> Result<Snapshot> {
     let root = Object::new(value, "root")?;
+    let schema = root.text("schema")?;
     ensure!(
-        root.text("schema")? == "p11scope/inventory/v1",
-        "root.schema: unsupported schema"
+        schema == "p11scope/inventory/v1",
+        "root.schema: unsupported schema {}; inventory diff compares inventories; use `inventory cbom` for profiles",
+        render_found_schema(&schema)
     );
     let mut rows = 0usize;
     for key in ["callers", "modules", "edges", "gaps"] {
@@ -996,6 +998,20 @@ fn convert_snapshot(value: &Value, limits: InputLimits) -> Result<Snapshot> {
         limitations,
         pre_fold_input: is_pre_fold_input(&root, &budgets_object)?,
     })
+}
+
+/// A found `schema` value for a refusal: control-escaped and
+/// length-bounded, so a hostile 16 KiB string cannot flood stderr.
+/// Genuine schema ids are short and render in full.
+fn render_found_schema(schema: &str) -> String {
+    const MAX_SCHEMA_HINT_CHARS: usize = 120;
+    let escaped = crate::render::escape_controls(schema);
+    let truncated: String = escaped.chars().take(MAX_SCHEMA_HINT_CHARS).collect();
+    if truncated.len() < escaped.len() {
+        format!("{truncated:?} (truncated)")
+    } else {
+        format!("{truncated:?}")
+    }
 }
 
 /// A pre-fold inventory predates the departed-caller fold: no module

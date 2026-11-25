@@ -22,6 +22,7 @@ use crate::mechanism_names::mechanism_name;
 pub(super) const SCHEMA_INVENTORY_V1: &str = "p11scope/inventory/v1";
 pub(super) const SCHEMA_PROFILE_V3: &str = "p11scope/observed-profile/v3";
 pub(super) const SCHEMA_PROFILE_V2: &str = "p11scope/observed-profile/v2";
+pub(super) const SCHEMA_PROFILE_V3_METRICS: &str = "p11scope/observed-profile/v3-metrics";
 
 /// Joined display lists keep this many entries before a `+N more` tail;
 /// counts stay exact either way.
@@ -404,6 +405,9 @@ fn convert_value(value: &Value, limits: InputLimits) -> Result<Projection> {
     match schema {
         SCHEMA_INVENTORY_V1 => convert_inventory(value),
         SCHEMA_PROFILE_V3 | SCHEMA_PROFILE_V2 => convert_profile(value, schema),
+        SCHEMA_PROFILE_V3_METRICS => anyhow::bail!(
+            "unsupported CBOM input schema: {SCHEMA_PROFILE_V3_METRICS}: metrics output has no mechanism rows; save `profile -o`"
+        ),
         other => anyhow::bail!("unsupported CBOM input schema: {other}"),
     }
 }

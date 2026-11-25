@@ -567,6 +567,23 @@ fn projection_refuses_unsupported_schemas() {
     assert!(error.contains("no schema string"), "{error}");
 }
 
+#[test]
+fn metrics_refusal_names_the_profile_command() {
+    let error = parse_input(
+        serde_json::to_vec(&json!({"schema": "p11scope/observed-profile/v3-metrics"}))
+            .unwrap()
+            .as_slice(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("p11scope/observed-profile/v3-metrics"),
+        "{error}"
+    );
+    assert!(error.contains("no mechanism rows"), "{error}");
+    assert!(error.contains("profile -o"), "{error}");
+}
+
 // Task 7 (spec §17.5) CBOM twins: supplier/version on the library,
 // device token components, per-reporter mechanism limit properties,
 // and the serial-absence proof.

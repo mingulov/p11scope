@@ -697,6 +697,25 @@ fn numeric_types_and_overflow_are_errors() {
 }
 
 #[test]
+fn wrong_schema_refusal_names_the_found_schema_and_the_cbom_command() {
+    for schema in ["p11scope/observed-profile/v3", "p11scope/inventory/v9"] {
+        let mut v = fixture();
+        v["schema"] = json!(schema);
+        let error = parse_snapshot(&bytes(&v)).unwrap_err().to_string();
+        assert!(error.contains("unsupported schema"), "{error}");
+        assert!(error.contains(schema), "{error}");
+        assert!(error.contains("inventory cbom"), "{error}");
+    }
+    // A hostile-length schema id is named briefly, never in full.
+    let mut v = fixture();
+    v["schema"] = json!("p11scope/".to_string() + &"x".repeat(16_000));
+    let error = parse_snapshot(&bytes(&v)).unwrap_err().to_string();
+    assert!(error.contains("unsupported schema"), "{error}");
+    assert!(error.contains("truncated"), "{error}");
+    assert!(error.len() < 1024, "{error}");
+}
+
+#[test]
 fn dispatch_and_json_syntax_are_strict() {
     rejected(&json!([]), "root");
     let mut v = fixture();

@@ -44663,6 +44663,194 @@ int main(void) {
     /// A gone task's tombstone still keeps its full window: a pass
     /// before the keep window ends drains nothing and counts nothing.
     #[test]
+    /// N4: the age drain shares the pass liveness memo: one pid read
+    /// by the EXEC stash and the drain costs a single source read.
+    #[test]
+    fn drain_shares_the_pass_liveness_memo() {
+        let (mut native, _caller) = NativeScene::new();
+        let at = native.stamps.tick();
+        let pid = 777_777u32;
+        native.scene.coordinator.exec_exe.insert(
+            DomainCookie::new(native.domain, 99),
+            StashedExec {
+                dev: 8,
+                ino: 99,
+                hook_ts_ns: at,
+                pid_host: pid,
+                gone_since: None,
+            },
+        );
+        for object in 0..2u32 {
+            native.scene.coordinator.pair_dropped_tombstones.insert(
+                PairKey {
+                    image: DomainCookie::scripted(native.domain, 41),
+                    exec: 1,
+                    object,
+                },
+                PrunedPairBase {
+                    base: 1,
+                    base_since: at,
+                    pruned_since: at,
+                    pid,
+                },
+            );
+        }
+        let before = native.scene.source.gone_calls();
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(at + PAIR_TOMBSTONE_KEEP_NS + 1);
+        assert_eq!(
+            native.scene.source.gone_calls() - before,
+            1,
+            "exec stash plus two drain tombstones read the shared pid once"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .dropped_pair_tombstones_for_test(),
+            0,
+            "the gone pid drains both tombstones"
+        );
+    }
+
+    /// N4: the age drain visits at most one sweep bound of expired
+    /// tombstones per pass and resumes where it stopped: oldest
+    /// first, then the remainder on later passes.
+    #[test]
+    fn drain_bounds_visits_per_pass_and_resumes() {
+        let (mut native, _caller) = NativeScene::new();
+        let at = native.stamps.tick();
+        const EXTRA: usize = 904;
+        let total = EVER_ENUMERATED_SWEEP + EXTRA;
+        for i in 0..total {
+            native.scene.coordinator.pair_dropped_tombstones.insert(
+                PairKey {
+                    image: DomainCookie::scripted(native.domain, 41),
+                    exec: 1,
+                    object: i as u32,
+                },
+                PrunedPairBase {
+                    base: 1,
+                    base_since: at + i as u64,
+                    pruned_since: at + i as u64,
+                    pid: 100_000 + i as u32,
+                },
+            );
+        }
+        // Unspawned pids are gone by construction; every tombstone is
+        // past both window checks at `now`.
+        let now = at + total as u64 + PAIR_TOMBSTONE_KEEP_NS + 1;
+        native.scene.coordinator.prune_departed_native_state(now);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .dropped_pair_tombstones_for_test(),
+            EXTRA,
+            "one pass drains exactly one sweep bound"
+        );
+        let survivor = PairKey {
+            image: DomainCookie::scripted(native.domain, 41),
+            exec: 1,
+            object: (total - 1) as u32,
+        };
+        let drained = PairKey {
+            image: DomainCookie::scripted(native.domain, 41),
+            exec: 1,
+            object: 0,
+        };
+        assert!(
+            native
+                .scene
+                .coordinator
+                .pair_dropped_tombstones
+                .contains_key(&survivor),
+            "the newest tombstone waits for the resume"
+        );
+        assert!(
+            !native
+                .scene
+                .coordinator
+                .pair_dropped_tombstones
+                .contains_key(&drained),
+            "the oldest tombstone drains first"
+        );
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(now + 1);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .dropped_pair_tombstones_for_test(),
+            0,
+            "the resume pass drains the remainder"
+        );
+    }
+
+    /// N4: tombstones sharing one drain-order position rotate too: a
+    /// tie group larger than the sweep bound advances across passes
+    /// instead of reprocessing its head forever.
+    #[test]
+    fn drain_rotates_within_a_tied_drain_position() {
+        let (mut native, _caller) = NativeScene::new();
+        let at = native.stamps.tick();
+        const EXTRA: usize = 904;
+        let total = EVER_ENUMERATED_SWEEP + EXTRA;
+        let pid = 300_000u32;
+        native.scene.source.spawn(pid, 500);
+        for i in 0..total {
+            native.scene.coordinator.pair_dropped_tombstones.insert(
+                PairKey {
+                    image: DomainCookie::scripted(native.domain, 41),
+                    exec: 1,
+                    object: i as u32,
+                },
+                PrunedPairBase {
+                    base: 1,
+                    base_since: at,
+                    pruned_since: at,
+                    pid,
+                },
+            );
+        }
+        let now = at + PAIR_TOMBSTONE_KEEP_NS + 1;
+        native.scene.coordinator.prune_departed_native_state(now);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .dropped_pair_tombstones_for_test(),
+            total,
+            "live tombstones are all kept past the first sweep"
+        );
+        native.scene.source.kill(pid);
+        native.scene.coordinator.prune_departed_native_state(now + 1);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .dropped_pair_tombstones_for_test(),
+            EVER_ENUMERATED_SWEEP,
+            "the resume pass drains the tie tail it had not reached"
+        );
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(now + 2);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .dropped_pair_tombstones_for_test(),
+            0,
+            "the rotation wraps and drains the tie head"
+        );
+    }
+
     fn gone_task_tombstone_keeps_its_full_window() {
         let (mut native, _caller) = NativeScene::new();
         let at = native.stamps.tick();

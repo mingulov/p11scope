@@ -9363,6 +9363,7 @@ pub(crate) mod tests {
         reopen_poisoned: bool,
         reopen_attempts: usize,
         leader_exit_queries: usize,
+        gone_calls: u64,
     }
 
     /// Scripted source: the pid/exit/reuse/exec sequence is programmed,
@@ -9446,6 +9447,10 @@ pub(crate) mod tests {
             if let Some(process) = self.state.borrow_mut().processes.get_mut(&pid) {
                 process.alive = false;
             }
+        }
+
+        pub(crate) fn gone_calls(&self) -> u64 {
+            self.state.borrow().gone_calls
         }
 
         pub(crate) fn set_leader_exit_observation(
@@ -9628,9 +9633,9 @@ pub(crate) mod tests {
         }
 
         fn gone(&self, pid: u32) -> bool {
-            !self
-                .state
-                .borrow()
+            let mut state = self.state.borrow_mut();
+            state.gone_calls = state.gone_calls.saturating_add(1);
+            !state
                 .processes
                 .get(&pid)
                 .is_some_and(|process| process.alive)

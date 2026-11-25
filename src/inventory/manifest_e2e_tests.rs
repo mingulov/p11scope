@@ -3395,13 +3395,15 @@ fn keysize_canary_refusal_errors_text(errors: &[String]) -> String {
 
 /// Whether an empty dump can be the true state of this map kind. Hash
 /// family maps legitimately drain to zero entries (for example PAUSE_PIDS
-/// after its authorization is removed); arrays enumerate every index and
-/// therefore cannot validly dump zero cells. The scan-level aggregate
-/// still requires at least one decoded cell across every owned map.
+/// after its authorization is removed), and program arrays are sparse
+/// slots (STACK_GUARD is deliberately never populated). Plain and
+/// per-CPU arrays enumerate every index and therefore cannot validly
+/// dump zero cells. The scan-level aggregate still requires at least one
+/// decoded cell across every owned map.
 fn keysize_canary_kind_may_dump_empty(kind: &str) -> bool {
     matches!(
         kind,
-        "hash" | "percpu_hash" | "lru_hash" | "lru_percpu_hash"
+        "hash" | "percpu_hash" | "lru_hash" | "lru_percpu_hash" | "prog_array"
     )
 }
 
@@ -3840,10 +3842,10 @@ fn keysize_canary_verify_map_dump_rejects_absent_widths() {
 }
 
 /// The pure verifier returns the number of decoded map cells. It refuses
-/// an all-empty array dump (arrays enumerate every index) while accepting
-/// an all-empty hash dump as a true empty map; the scan-level cells gate
-/// refuses zero decoded cells in total, so every map dumping `[]` still
-/// fails the live cell.
+/// an all-empty plain-array dump (arrays enumerate every index) while
+/// accepting an all-empty hash or program-array dump as a true empty or
+/// sparse map; the scan-level cells gate refuses zero decoded cells in
+/// total, so every map dumping `[]` still fails the live cell.
 #[test]
 fn keysize_canary_verify_map_dump_counts_cells_and_checks_empty_dumps() {
     let dump =
@@ -3863,6 +3865,12 @@ fn keysize_canary_verify_map_dump_counts_cells_and_checks_empty_dumps() {
         keysize_canary_verify_map_dump("PAUSE_PIDS", 10, "hash", b"[]", Some((1, 1))).unwrap(),
         0,
         "an empty hash-family dump is a true empty map, not a malformed dump"
+    );
+    assert_eq!(
+        keysize_canary_verify_map_dump("STACK_GUARD", 11, "prog_array", b"[]", Some((4, 4)))
+            .unwrap(),
+        0,
+        "an empty program array is sparse empty state, not a malformed dump"
     );
     assert!(keysize_canary_cells_gate(0).is_err());
     assert!(keysize_canary_cells_gate(1).is_ok());

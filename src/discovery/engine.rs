@@ -25504,21 +25504,6 @@ impl Engine {
         if proof.module.tables.is_empty() && proof.module.interfaces.is_empty() {
             return None;
         }
-        // Charge the harvest below (filter, absorb, union and compare
-        // ride on the proof's decoded size): one unit per table, entry
-        // and interface plus one for the call, so run learning debits
-        // the capture work budget instead of absorbing proofs
-        // uncharged. Advisory: the verdicts below never change on a
-        // trip.
-        let units = proof
-            .module
-            .tables
-            .iter()
-            .map(|table| table.entries.len() as u64)
-            .fold(1u64, |total, entries| total.saturating_add(entries))
-            .saturating_add(proof.module.tables.len() as u64)
-            .saturating_add(proof.module.interfaces.len() as u64);
-        self.budget.charge(units);
         // File-generation check: the union below keys on
         // (mount namespace, key, path) with no digest, so a proof
         // from a NEW generation of the file (same key after an
@@ -25677,6 +25662,22 @@ impl Engine {
             }
             return None;
         }
+        // Charge the harvest below (absorb, alias, union and compare
+        // ride on the proof's decoded size): one unit per table,
+        // entry and interface plus one for the call, so run learning
+        // debits the capture work budget instead of absorbing proofs
+        // uncharged. Only a harvest that reaches this point pays:
+        // the loud refusals above debit nothing. Advisory: the
+        // verdicts below never change on a trip.
+        let units = proof
+            .module
+            .tables
+            .iter()
+            .map(|table| table.entries.len() as u64)
+            .fold(1u64, |total, entries| total.saturating_add(entries))
+            .saturating_add(proof.module.tables.len() as u64)
+            .saturating_add(proof.module.interfaces.len() as u64);
+        self.budget.charge(units);
         // Absorb the proving scan's pins while the module has a pin
         // gap under the reserved owner, then alias its raws there:
         // the candidate bind below resolves module and entry objects

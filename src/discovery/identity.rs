@@ -7436,15 +7436,13 @@ mod conservative_copy {
                         // the longer subject either way.
                         add(
                             &mut self.extra,
-                            text_bytes(&source.path)?.max(text_bytes(
-                                crate::render::LEARNED_SKIP_SUBJECT,
-                            )?),
+                            text_bytes(&source.path)?
+                                .max(text_bytes(crate::render::LEARNED_SKIP_SUBJECT)?),
                         )?;
                         add(
                             &mut self.extra,
-                            text_bytes(MODULE_ABI)?.max(text_bytes(
-                                crate::render::LEARNED_TABLE_UNBOUND_REASON,
-                            )?),
+                            text_bytes(MODULE_ABI)?
+                                .max(text_bytes(crate::render::LEARNED_TABLE_UNBOUND_REASON)?),
                         )?;
                         self.max_skips = self
                             .max_skips
@@ -7552,9 +7550,8 @@ mod conservative_copy {
                             // A learned entry's lost copy names the finite
                             // learned-tables row instead of the per-entry
                             // detail; cover the longer text either way.
-                            let subject = text_bytes(entry.name)?.max(text_bytes(
-                                crate::render::LEARNED_SKIP_SUBJECT,
-                            )?);
+                            let subject = text_bytes(entry.name)?
+                                .max(text_bytes(crate::render::LEARNED_SKIP_SUBJECT)?);
                             let reason = text_bytes(&entry.object_path)?
                                 .checked_add(
                                     ENTRY_MISSING
@@ -7565,12 +7562,9 @@ mod conservative_copy {
                                         .max(UNVERIFIED_INTERFACE_LIST_FORWARD_REFUSAL.len()),
                                 )
                                 .ok_or(GraphRefusal::Overflow)?
-                                .max(text_bytes(
-                                    crate::render::LEARNED_TABLE_UNBOUND_REASON,
-                                )?);
-                            let strings = subject
-                                .checked_add(reason)
-                                .ok_or(GraphRefusal::Overflow)?;
+                                .max(text_bytes(crate::render::LEARNED_TABLE_UNBOUND_REASON)?);
+                            let strings =
+                                subject.checked_add(reason).ok_or(GraphRefusal::Overflow)?;
                             add(
                                 &mut self.extra,
                                 strings.checked_mul(2).ok_or(GraphRefusal::Overflow)?,
@@ -8201,8 +8195,7 @@ mod conservative_copy {
                             // input lost its tables. Same row as
                             // `learned_table_unbound_skip`, copied bounded.
                             let learned = self.module.as_ref().is_some_and(|module| {
-                                module.view
-                                    == crate::discovery::engine::Engine::RUN_LEARNED_VIEW_ID
+                                module.view == crate::discovery::engine::Engine::RUN_LEARNED_VIEW_ID
                             });
                             let done = if learned {
                                 self.skip_copy
@@ -8301,8 +8294,7 @@ mod conservative_copy {
                     }
                     BindPhase::EntryResolve => {
                         let key = self.entry.as_ref().ok_or(GraphRefusal::Identity)?.object;
-                        let module_key =
-                            self.module.as_ref().ok_or(GraphRefusal::Identity)?.key;
+                        let module_key = self.module.as_ref().ok_or(GraphRefusal::Identity)?.key;
                         // A rejected dependency key never binds, even when
                         // its plain raw still resolves to the witness-kept
                         // pre-copy-up file: binding it would credit calls at
@@ -8387,8 +8379,7 @@ mod conservative_copy {
                             // learned module, exactly like
                             // `bind_scanned_modules`.
                             let learned = self.module.as_ref().is_some_and(|module| {
-                                module.view
-                                    == crate::discovery::engine::Engine::RUN_LEARNED_VIEW_ID
+                                module.view == crate::discovery::engine::Engine::RUN_LEARNED_VIEW_ID
                             });
                             let done = if learned {
                                 self.skip_copy
@@ -16156,11 +16147,7 @@ mod tests {
         let modules = rebind.modules().expect("the rebind is ready");
         assert_eq!(modules.len(), 1, "the wrapper module binds");
         let entries = &modules[0].scanned.tables[0].entries;
-        assert_eq!(
-            entries.len(),
-            1,
-            "only the valid entry binds: {entries:?}"
-        );
+        assert_eq!(entries.len(), 1, "only the valid entry binds: {entries:?}");
         assert_eq!(entries[0].name, "C_Initialize");
         assert_eq!(
             modules[0].entry_objects[0].len(),
@@ -16254,7 +16241,10 @@ mod tests {
             file_offset: 0x2000,
         });
         let skipped = pins.absorb(view_pin(&scanned, 1, SHA, 1, false));
-        assert!(skipped.is_empty(), "the learned module pins cleanly: {skipped:?}");
+        assert!(
+            skipped.is_empty(),
+            "the learned module pins cleanly: {skipped:?}"
+        );
         let mut rejected_module = module(dependency);
         rejected_module.view = Engine::RUN_LEARNED_VIEW_ID;
         rejected_module.path = lower_path.into();
@@ -16270,11 +16260,7 @@ mod tests {
         let modules = rebind.modules().expect("the rebind is ready");
         assert_eq!(modules.len(), 1, "the learned module binds");
         let entries = &modules[0].scanned.tables[0].entries;
-        assert_eq!(
-            entries.len(),
-            1,
-            "only the valid entry binds: {entries:?}"
-        );
+        assert_eq!(entries.len(), 1, "only the valid entry binds: {entries:?}");
         assert_eq!(entries[0].name, "C_Initialize");
         let unpinned = &modules[0].scanned.tables[0].unpinned;
         assert_eq!(

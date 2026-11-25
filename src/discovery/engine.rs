@@ -13075,9 +13075,15 @@ const MERGE_LIVE_OVERFLOW_SUBJECT: &str = "live table merge";
 /// The overflow reason, built from the live allowance so a future
 /// ceiling change cannot lie in output.
 fn merge_live_overflow_reason() -> String {
+    merge_live_overflow_reason_for(MAX_LIVE_TABLES_PER_MODULE)
+}
+
+/// The overflow reason for an explicit allowance: the production
+/// caller passes `MAX_LIVE_TABLES_PER_MODULE`; tests pass other
+/// values to prove the number is rendered, not a literal.
+fn merge_live_overflow_reason_for(limit: usize) -> String {
     format!(
-        "a live-returned table past the {}-live-tables per-module allowance was dropped; its calls are not counted",
-        MAX_LIVE_TABLES_PER_MODULE
+        "a live-returned table past the {limit}-live-tables per-module allowance was dropped; its calls are not counted"
     )
 }
 

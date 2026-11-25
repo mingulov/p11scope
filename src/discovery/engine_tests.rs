@@ -42195,11 +42195,24 @@ fn live_overflow_reason_is_built_from_the_live_allowance() {
 }
 
 #[test]
+fn live_overflow_reason_renders_any_allowance() {
+    // A literal "64" in production still passes the pin above, so
+    // this twin renders a non-production allowance (7, not 64)
+    // through the parameterized helper and pins the exact text.
+    assert_eq!(
+        merge_live_overflow_reason_for(7),
+        "a live-returned table past the 7-live-tables per-module allowance was dropped; its calls are not counted"
+    );
+}
+
+#[test]
 fn live_table_merge_gap_folds_to_the_generic_discovery_row() {
-    // The outer judge matches this exact folded row for the
-    // live-overflow class: if rendering ever preserves the subject
-    // instead, this pin fails first and the leg must be re-pointed,
-    // never silently blinded.
+    // The outer judge only COUNTS this exact folded row
+    // (folded-gaps=N, never a failure: the fold is the catch-all
+    // for every unclassified discovery gap, and healthy runs carry
+    // some). If rendering ever preserves the subject instead, this
+    // pin fails first and the note must be re-pointed, never
+    // silently blinded.
     let projected = crate::render::capture_skipped_out(&Skipped {
         subject: MERGE_LIVE_OVERFLOW_SUBJECT.into(),
         reason: merge_live_overflow_reason(),

@@ -669,6 +669,42 @@ fn numeric_types_and_overflow_are_errors() {
 }
 
 #[test]
+fn dangling_gap_links_drop_while_edges_stay_strict() {
+    // A gap may name a caller or module id whose live row folded
+    // away; the gap (with its pid, subject and reason) survives and
+    // only the link drops.
+    for (pointer, key, label) in [
+        ("/gaps/0/caller", "caller", "c99"),
+        ("/gaps/0/module", "module", "m99"),
+    ] {
+        let mut v = fixture();
+        *v.pointer_mut(pointer).unwrap() = json!(label);
+        let snapshot = parse_snapshot(&bytes(&v)).unwrap();
+        let gap = &snapshot.gaps[0];
+        if key == "caller" {
+            assert!(gap.caller.is_none());
+        } else {
+            assert!(gap.module.is_none());
+        }
+        assert_eq!(
+            gap.subject,
+            v.pointer("/gaps/0/subject").unwrap().as_str().unwrap()
+        );
+    }
+    // Malformed links still refuse, and so do dangling edge links:
+    // edges define the compared groups.
+    let mut v = fixture();
+    v["gaps"][0]["caller"] = json!(42);
+    rejected(&v, "caller");
+    let mut v = fixture();
+    v["edges"][0]["caller"] = json!("c99");
+    rejected(&v, "caller");
+    let mut v = fixture();
+    v["edges"][0]["module"] = json!("m99");
+    rejected(&v, "module");
+}
+
+#[test]
 fn dispatch_and_json_syntax_are_strict() {
     rejected(&json!([]), "root");
     let mut v = fixture();

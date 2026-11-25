@@ -939,8 +939,8 @@ fn convert_snapshot(value: &Value, limits: InputLimits) -> Result<Snapshot> {
             .transpose()
             .with_context(|| format!("gaps[{i}].pid: u32 overflow"))?;
         gaps.push(Gap {
-            caller: resolve_null(&o, "caller", &caller_ids)?,
-            module: resolve_null(&o, "module", &module_ids)?,
+            caller: resolve_gap_link(&o, "caller", &caller_ids)?,
+            module: resolve_gap_link(&o, "module", &module_ids)?,
             pid,
             subject: o.text("subject")?,
             reason: o.text("reason")?,
@@ -995,11 +995,29 @@ fn resolve(o: &Object<'_>, key: &str, ids: &BTreeMap<String, usize>) -> Result<u
         .copied()
         .with_context(|| format!("{}: dangling reference", o.field(key)))
 }
-fn resolve_null(o: &Object<'_>, key: &str, ids: &BTreeMap<String, usize>) -> Result<Option<usize>> {
+/// Gap subject links are best-effort across the fold: the contract
+/// keeps gaps naming a folded caller by label after its live row is
+/// gone, so a dangling gap id in label shape (`c`/`m` plus digits)
+/// drops its link instead of refusing the file (the gap keeps its
+/// pid, subject and reason). Anything else still refuses, and edges
+/// keep strict resolution (they define the compared groups).
+fn resolve_gap_link(
+    o: &Object<'_>,
+    key: &str,
+    ids: &BTreeMap<String, usize>,
+) -> Result<Option<usize>> {
     if o.value(key)?.is_null() {
         Ok(None)
     } else {
-        resolve(o, key, ids).map(Some)
+        let id = o.text(key)?;
+        let folded = id.len() > 1
+            && matches!(id.as_bytes()[0], b'c' | b'm')
+            && id.as_bytes()[1..].iter().all(u8::is_ascii_digit);
+        if folded {
+            Ok(ids.get(&id).copied())
+        } else {
+            resolve(o, key, ids).map(Some)
+        }
     }
 }
 fn parse_caller(o: &Object<'_>) -> Result<Caller> {

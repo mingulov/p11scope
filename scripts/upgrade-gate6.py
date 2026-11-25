@@ -557,6 +557,27 @@ def run_gate(args, workdir: Path, result: dict) -> int:
         diff_ok = False
     check(result, "diff_typed", diff_ok, diff_detail)
 
+    # The churn workload keeps one caller alive while short-lived children
+    # enter and leave over several passes.  A lifecycle claim for that group
+    # is only acceptable when the reader names the pre-fold input limitation
+    # (lane v072-compat-071); otherwise independent windows must not invent
+    # a lifecycle transition.
+    lifecycle_rows = []
+    if isinstance(diff_doc, dict):
+        for row in diff_doc.get("application_changes", []):
+            if isinstance(row, dict) and any("lifecycle" in str(change) for change in row.get("changes", [])):
+                lifecycle_rows.append(row)
+    pre_fold_present = (
+        isinstance(diff_doc, dict)
+        and "pre_fold_input" in diff_doc.get("limitations", [])
+    )
+    check(
+        result,
+        "diff_churn_lifecycle",
+        not lifecycle_rows or pre_fold_present,
+        f"lifecycle_rows={len(lifecycle_rows)} pre_fold_input={pre_fold_present}",
+    )
+
     # 3. B1: departed_use delta is exactly B1+additive, nothing else, and
     # every pinned B1 key is present in the new typed report.
     old_keys = set(flatten_keys(old))

@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 name: upgrade-cells
-# Gates 5 (package upgrade 0.7.1 -> this tree) and 6 (saved 0.7.1 reports
-# read by this tree). Runs on every branch push; tag pushes trigger nothing
-# (a release tag rides the commit the branch push already ran).
+# Gates 5 (official package upgrade 0.7.1 -> this tree) and 6 (saved 0.7.1
+# reports read by this tree). The new side is built only through the official
+# release path, never by packaging a local debug binary.
 on:
   push:
     branches:
@@ -11,42 +11,118 @@ on:
     tags-ignore:
       - '**'
   pull_request:
+  workflow_dispatch:
 permissions:
   contents: read
 env:
   CI_TOOL_BPF_LINKER: 0.10.4
+  BUILD_JOBS: '2'
 jobs:
+  package-v072:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify package checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${{ github.sha }}"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+      - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal --component rustfmt,clippy
+      - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
+      - run: rustup target add --toolchain "$(cat .release-rust-version)" x86_64-unknown-linux-musl
+      - run: cargo +"$(cat .release-rust-version)" install bpf-linker --version "$CI_TOOL_BPF_LINKER" --locked --jobs "$BUILD_JOBS"
+      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm musl-tools python3 python3-yaml rpm softhsm2
+      - name: Install packaged bpftool
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y linux-tools-generic
+          if bpftool_files=$(dpkg-query -L bpftool 2>/dev/null); then
+            bpftool_source=$(printf '%s\n' "$bpftool_files" | grep -Ex '/usr/(sbin|bin)/bpftool')
+          else
+            status=$?
+            [[ "$status" -eq 1 ]]
+            tools_package=$(dpkg-query -W -f='${Depends}' linux-tools-generic)
+            [[ "$tools_package" =~ ^linux-tools-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-generic$ ]]
+            bpftool_source="/usr/lib/linux-tools/${tools_package#linux-tools-}/bpftool"
+            bpftool_files=$(dpkg-query -L "$tools_package")
+            grep -Fxq -- "$bpftool_source" <<< "$bpftool_files"
+          fi
+          test -f "$bpftool_source"
+          test -x "$bpftool_source"
+          sudo install -m 0755 "$bpftool_source" /usr/local/bin/bpftool
+          bpftool version
+          sudo bpftool version
+      - name: Reconstruct pinned dependency sources
+        run: python3 -I scripts/prepare-dependencies.py
+      - run: cargo +"$(cat .release-rust-version)" fetch --locked --manifest-path Cargo.toml
+      - run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
+      - name: Download verified package tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          tools="$RUNNER_TEMP/release-tools"
+          mkdir -m 700 "$tools"
+          curl -fsSL --retry 3 -o "$tools/cargo-about.tar.gz" \
+            https://github.com/EmbarkStudios/cargo-about/releases/download/0.9.2/cargo-about-0.9.2-x86_64-unknown-linux-musl.tar.gz
+          echo "9099a59e820c38a68b9d65f300662a567d56562f9a10f6aa4c7e86c17c2566af  $tools/cargo-about.tar.gz" | sha256sum --check
+          tar -xzf "$tools/cargo-about.tar.gz" -C "$tools" \
+            cargo-about-0.9.2-x86_64-unknown-linux-musl/cargo-about
+          install -m 0755 "$tools/cargo-about-0.9.2-x86_64-unknown-linux-musl/cargo-about" "$tools/cargo-about"
+          curl -fsSL --retry 3 -o "$tools/musl-1.2.5.tar.gz" \
+            https://musl.libc.org/releases/musl-1.2.5.tar.gz
+          echo "a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4  $tools/musl-1.2.5.tar.gz" | sha256sum --check
+      - name: Build and assemble the official release package
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+          evidence="$RUNNER_TEMP/release-evidence"
+          mkdir -m 700 "$evidence"
+          TMPDIR="$evidence" scripts/build-release.sh \
+            --capture-mode full --jobs "$BUILD_JOBS" "$evidence/receipt"
+          python3 -I scripts/export-source.py --output "$evidence/source.tar.gz"
+          python3 -I scripts/release-notices.py \
+            --cargo-about "$RUNNER_TEMP/release-tools/cargo-about" \
+            --musl-archive "$RUNNER_TEMP/release-tools/musl-1.2.5.tar.gz" \
+            --output "$evidence/notices"
+          python3 -I scripts/package-release.py \
+            --capture-mode full --receipt "$evidence/receipt" \
+            --notices "$evidence/notices" --source "$evidence/source.tar.gz" \
+            --output "$evidence/public"
+          cp "$evidence/public/SHA256SUMS" "$RUNNER_TEMP/official-package-sha256sums.txt"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: upgrade-v072-official-package
+          path: ${{ runner.temp }}/release-evidence/public/
+          if-no-files-found: error
+          retention-days: 14
+
   upgrade-deb:
+    needs: package-v072
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal
-      - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
-      - run: rustup target add --toolchain "$(cat .release-rust-version)" x86_64-unknown-linux-musl
-      - run: cargo +"$(cat .release-rust-version)" install bpf-linker --version "$CI_TOOL_BPF_LINKER" --locked
-      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc jq llvm musl-tools python3 softhsm2
-      - run: python3 -I scripts/prepare-dependencies.py
-      - run: cargo +"$(cat .release-rust-version)" fetch --locked --manifest-path Cargo.toml
-      - run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
-      - name: Build observer and helper
-        run: |
-          set -euo pipefail
-          ./scripts/cargo.sh +"$(cat .release-rust-version)" build --locked --bin p11scope -p p11scope --bin p11scope-discover -p p11scope-discover
-      - name: Build test packages from this tree
-        run: |
-          set -euo pipefail
-          python3 -I scripts/upgrade-build-packages.py \
-            --observer target/debug/p11scope \
-            --helper target/debug/p11scope-discover \
-            --output-dir "$RUNNER_TEMP/new-pkgs"
-          ls -l "$RUNNER_TEMP/new-pkgs"
-      - name: Download v0.7.1 DEB
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: upgrade-v072-official-package
+          path: ${{ runner.temp }}/new-pkgs
+      - run: sudo apt-get update && sudo apt-get install -y python3 softhsm2
+      - name: Verify and download packages
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          (cd "$RUNNER_TEMP/new-pkgs" && sha256sum --check SHA256SUMS)
           mkdir -p "$RUNNER_TEMP/old-pkgs"
           gh release download v0.7.1 --repo "${{ github.repository }}" \
             --pattern 'p11scope_0.7.1_amd64.deb' --pattern 'SHA256SUMS' \
@@ -57,44 +133,31 @@ jobs:
           set -euo pipefail
           sudo scripts/upgrade-gate5.sh --format deb \
             --old "$RUNNER_TEMP/old-pkgs/p11scope_0.7.1_amd64.deb" \
-            --new "$RUNNER_TEMP/new-pkgs/p11scope_"*"_amd64.deb" \
+            --new "$RUNNER_TEMP/new-pkgs/p11scope_0.7.2_amd64.deb" \
             --workdir "$RUNNER_TEMP/gate5-deb"
       - name: Show DEB result
         if: always()
         run: cat "$RUNNER_TEMP/gate5-deb/gate5-result.json"
 
   upgrade-rpm:
+    needs: package-v072
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal
-      - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
-      - run: rustup target add --toolchain "$(cat .release-rust-version)" x86_64-unknown-linux-musl
-      - run: cargo +"$(cat .release-rust-version)" install bpf-linker --version "$CI_TOOL_BPF_LINKER" --locked
-      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc jq llvm musl-tools python3 softhsm2
-      - run: python3 -I scripts/prepare-dependencies.py
-      - run: cargo +"$(cat .release-rust-version)" fetch --locked --manifest-path Cargo.toml
-      - run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
-      - name: Build observer and helper
-        run: |
-          set -euo pipefail
-          ./scripts/cargo.sh +"$(cat .release-rust-version)" build --locked --bin p11scope -p p11scope --bin p11scope-discover -p p11scope-discover
-      - name: Build test packages from this tree
-        run: |
-          set -euo pipefail
-          python3 -I scripts/upgrade-build-packages.py \
-            --observer target/debug/p11scope \
-            --helper target/debug/p11scope-discover \
-            --output-dir "$RUNNER_TEMP/new-pkgs"
-          ls -l "$RUNNER_TEMP/new-pkgs"
-      - name: Download v0.7.1 RPM
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: upgrade-v072-official-package
+          path: ${{ runner.temp }}/new-pkgs
+      - name: Verify and download packages
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/old-pkgs"
+          (cd "$RUNNER_TEMP/new-pkgs" && sha256sum --check SHA256SUMS)
+          mkdir -p "$RUNNER_TEMP/old-pkgs" "$RUNNER_TEMP/gate5-rpm"
           gh release download v0.7.1 --repo "${{ github.repository }}" \
             --pattern 'p11scope-0.7.1-1.x86_64.rpm' --pattern 'SHA256SUMS' \
             --dir "$RUNNER_TEMP/old-pkgs" --clobber
@@ -102,13 +165,6 @@ jobs:
       - name: Gate 5 RPM upgrade
         run: |
           set -euo pipefail
-          # RPM dependencies must resolve against a real RPM-native database.
-          # An Ubuntu runner's empty rpmdb has no glibc/libgcc providers, so
-          # run only the install/upgrade leg in the pinned Fedora image also
-          # used by the packaging preview. The Fedora base image has rpm/dnf
-          # but no python3; install that one gate-script dependency inside
-          # the disposable container.
-          mkdir -p "$RUNNER_TEMP/gate5-rpm"
           docker run --rm \
             -v "$GITHUB_WORKSPACE:/src:ro" \
             -v "$RUNNER_TEMP/old-pkgs:/old-pkgs:ro" \
@@ -117,10 +173,10 @@ jobs:
             fedora:44@sha256:15da97ed9aa94dd3d92c3925eb89520f6c80e07ea7ee24cba848d1f8b6912b3e \
             bash -c '
               set -euo pipefail
-              dnf install -y python3
+              dnf install -y python3 softhsm
               /src/scripts/upgrade-gate5.sh --format rpm \
                 --old /old-pkgs/p11scope-0.7.1-1.x86_64.rpm \
-                --new /new-pkgs/p11scope-*-1.x86_64.rpm \
+                --new /new-pkgs/p11scope-0.7.2-1.x86_64.rpm \
                 --workdir /gate5-rpm
             '
       - name: Show RPM result
@@ -128,43 +184,93 @@ jobs:
         run: cat "$RUNNER_TEMP/gate5-rpm/gate5-result.json"
 
   report-compat:
+    needs: package-v072
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal
-      - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
-      - run: rustup target add --toolchain "$(cat .release-rust-version)" x86_64-unknown-linux-musl
-      - run: cargo +"$(cat .release-rust-version)" install bpf-linker --version "$CI_TOOL_BPF_LINKER" --locked
-      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc jq llvm musl-tools python3 softhsm2
-      - run: python3 -I scripts/prepare-dependencies.py
-      - run: cargo +"$(cat .release-rust-version)" fetch --locked --manifest-path Cargo.toml
-      - run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
-      - name: Build observer
-        run: |
-          set -euo pipefail
-          ./scripts/cargo.sh +"$(cat .release-rust-version)" build --locked --bin p11scope
-      - name: Download v0.7.1 binary
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: upgrade-v072-official-package
+          path: ${{ runner.temp }}/new-pkgs
+      - run: sudo apt-get update && sudo apt-get install -y python3 softhsm2
+      - name: Extract official binaries and record hashes
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/old-bin"
+          (cd "$RUNNER_TEMP/new-pkgs" && sha256sum --check SHA256SUMS)
+          mkdir -p "$RUNNER_TEMP/new-bin" "$RUNNER_TEMP/old-bin"
+          tar xzf "$RUNNER_TEMP/new-pkgs/p11scope-0.7.2-x86_64-linux-musl.tar.gz" \
+            -C "$RUNNER_TEMP/new-bin" --strip-components=1
+          sha256sum "$RUNNER_TEMP/new-bin/p11scope" | tee "$RUNNER_TEMP/new-bin/official-v072.sha256"
           gh release download v0.7.1 --repo "${{ github.repository }}" \
             --pattern 'p11scope-0.7.1-x86_64-linux-musl.tar.gz' --pattern 'SHA256SUMS' \
             --dir "$RUNNER_TEMP/old-bin" --clobber
           (cd "$RUNNER_TEMP/old-bin" && sha256sum --check --ignore-missing SHA256SUMS)
           tar xzf "$RUNNER_TEMP/old-bin/p11scope-0.7.1-x86_64-linux-musl.tar.gz" \
             -C "$RUNNER_TEMP/old-bin" --strip-components=1
+          sha256sum "$RUNNER_TEMP/old-bin/p11scope" | tee "$RUNNER_TEMP/old-bin/official-v071.sha256"
           "$RUNNER_TEMP/old-bin/p11scope" --version
+          "$RUNNER_TEMP/new-bin/p11scope" --version
       - name: Gate 6 report compat
         run: |
           set -euo pipefail
-          python3 -I scripts/upgrade-gate6.py \
+          sudo git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          sudo TMPDIR="$RUNNER_TEMP" python3 -I scripts/upgrade-gate6.py \
             --old-binary "$RUNNER_TEMP/old-bin/p11scope" \
-            --new-binary target/debug/p11scope \
+            --new-binary "$RUNNER_TEMP/new-bin/p11scope" \
             --workdir "$RUNNER_TEMP/gate6"
       - name: Show Gate 6 result
         if: always()
         run: cat "$RUNNER_TEMP/gate6/gate6-result.json"
+
+  usr-local-shadow-deb:
+    needs: package-v072
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: upgrade-v072-official-package
+          path: ${{ runner.temp }}/new-pkgs
+      - name: Install the shadow then the package and identify what runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          (cd "$RUNNER_TEMP/new-pkgs" && sha256sum --check SHA256SUMS)
+          mkdir -p "$RUNNER_TEMP/old-tarball"
+          gh release download v0.7.1 --repo "${{ github.repository }}" \
+            --pattern 'p11scope-0.7.1-x86_64-linux-musl.tar.gz' --pattern 'SHA256SUMS' \
+            --dir "$RUNNER_TEMP/old-tarball" --clobber
+          (cd "$RUNNER_TEMP/old-tarball" && sha256sum --check --ignore-missing SHA256SUMS)
+          tar xzf "$RUNNER_TEMP/old-tarball/p11scope-0.7.1-x86_64-linux-musl.tar.gz" \
+            -C "$RUNNER_TEMP/old-tarball" --strip-components=1
+          sudo install -m 0755 "$RUNNER_TEMP/old-tarball/p11scope" /usr/local/bin/p11scope
+          sudo apt-get install -y "$RUNNER_TEMP/new-pkgs/p11scope_0.7.2_amd64.deb"
+          resolved="$(command -v p11scope)"
+          echo "resolved=$resolved"
+          echo "usr-local-version=$(/usr/local/bin/p11scope --version)"
+          echo "usr-bin-version=$(/usr/bin/p11scope --version)"
+          test "$resolved" = /usr/local/bin/p11scope
+          /usr/local/bin/p11scope --version | grep -F '0.7.1'
+          /usr/bin/p11scope --version | grep -F '0.7.2'
+          set +e
+          sudo p11scope doctor >"$RUNNER_TEMP/shadow-doctor.txt" 2>&1
+          doctor_rc=$?
+          set -e
+          cat "$RUNNER_TEMP/shadow-doctor.txt"
+          test "$doctor_rc" -eq 0 -o "$doctor_rc" -eq 1
+          grep -q '^Doctor:' "$RUNNER_TEMP/shadow-doctor.txt"
+          printf 'shadow resolution: PATH executable %s; /usr/bin package executable %s\n' \
+            "$(readlink -f "$resolved")" "$(readlink -f /usr/bin/p11scope)" | \
+            tee "$RUNNER_TEMP/shadow-resolution.txt"
+      - name: Clean the shadow binary
+        if: always()
+        run: sudo rm -f /usr/local/bin/p11scope

@@ -1784,6 +1784,7 @@ class UpgradeGate6ActivationTests(unittest.TestCase):
                 "diff_old_old_zero",
                 "diff_old_new",
                 "diff_typed",
+                "diff_churn_lifecycle",
                 "b1_no_removed",
                 "b1_all_present",
                 "b1_exact",

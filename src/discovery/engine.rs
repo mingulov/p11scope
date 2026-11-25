@@ -506,6 +506,10 @@ pub struct Engine {
     /// never silent). Drops are only possible past 64 distinct tables
     /// for one module, far above any legitimate provider surface.
     merge_tables_dropped: u64,
+    /// Fresh live tables the per-module live allowance dropped
+    /// (counted overflow with a named live-loss gap, never silent).
+    /// Realistic runs never touch it (~1 live table per module).
+    merge_live_tables_dropped: u64,
     /// A learned staging, or an owned member's bounded rescan after an
     /// incomplete scan, owes an expedited discovery frame so attach lands
     /// promptly instead of at the next cadence boundary.
@@ -12539,9 +12543,36 @@ fn refreshed_scans_equal(
 /// run-learned store already caps modules, not tables per module).
 /// Past it, fresh heuristic tables drop and count instead of appending;
 /// live-returned tables are proof (an observed export return), never
-/// speculation, so they always admit: entry truncation sorts them first
-/// and the union appends them past the cap.
+/// speculation, so they admit past this cap — up to
+/// `MAX_LIVE_TABLES_PER_MODULE` live tables per module, past which
+/// fresh live tables drop counted with live loss (never silent).
 const MAX_MERGED_TABLES_PER_MODULE: usize = 64;
+
+/// Live-returned tables kept per module by `merge_scanned_module`,
+/// the proof allowance beside the speculative cap above. Realistic
+/// runs carry ~1 live table per module (the observed export return);
+/// 64 mirrors the speculative cap so no realistic run ever touches
+/// it, while a provider returning a fresh heap table per call (or an
+/// ASLR-churned address per observation, which dedup never folds)
+/// still stays bounded: 64 live tables of ~10 KiB each worst case
+/// per module, with counted, named overflow past it.
+const MAX_LIVE_TABLES_PER_MODULE: usize = 64;
+
+/// Counted overflow from one `merge_scanned_module` union: heuristic
+/// tables the speculative cap dropped, and live tables the live
+/// allowance dropped. Callers accumulate both on the engine; live
+/// drops additionally mark live loss (fail-visible, never silent).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct MergeOverflow {
+    dropped: u64,
+    live_dropped: u64,
+}
+
+/// Named overflow for live tables dropped past
+/// `MAX_LIVE_TABLES_PER_MODULE`: the capture reads PARTIAL with this
+/// gap instead of silently losing the observed return's calls.
+const MERGE_LIVE_OVERFLOW_SUBJECT: &str = "live table merge";
+const MERGE_LIVE_OVERFLOW_REASON: &str = "a live-returned table past the 64-live-tables per-module allowance was dropped; its calls are not counted";
 
 /// Truncate an over-cap module before it enters the store: proven
 /// (live-returned) tables sort first so the tail that drops and counts
@@ -12549,9 +12580,11 @@ const MAX_MERGED_TABLES_PER_MODULE: usize = 64;
 /// their row with no table link, and the finished claim clears (a
 /// truncating skip, like any other: the stored module no longer spans
 /// the whole surface, so the sole-complete grant must not fire on it).
-fn truncate_module_tables_to_cap(module: &mut ScannedModule) -> u64 {
+/// Live tables among the dropped tail (only past 64 live in one fresh
+/// module) count as live overflow, like the union arm below.
+fn truncate_module_tables_to_cap(module: &mut ScannedModule) -> MergeOverflow {
     if module.tables.len() <= MAX_MERGED_TABLES_PER_MODULE {
-        return 0;
+        return MergeOverflow::default();
     }
     if module.tables.iter().any(|table| table.live_return) {
         // Stable partition, live first: an observed return proves the
@@ -12575,6 +12608,10 @@ fn truncate_module_tables_to_cap(module: &mut ScannedModule) -> u64 {
         }
     }
     let dropped = module.tables.len() - MAX_MERGED_TABLES_PER_MODULE;
+    let dropped_live = module.tables[MAX_MERGED_TABLES_PER_MODULE..]
+        .iter()
+        .filter(|table| table.live_return)
+        .count();
     module.tables.truncate(MAX_MERGED_TABLES_PER_MODULE);
     for interface in &mut module.interfaces {
         if interface
@@ -12585,7 +12622,10 @@ fn truncate_module_tables_to_cap(module: &mut ScannedModule) -> u64 {
         }
     }
     module.tables_scan_finished = false;
-    u64::try_from(dropped).unwrap_or(u64::MAX)
+    MergeOverflow {
+        dropped: u64::try_from(dropped - dropped_live).unwrap_or(u64::MAX),
+        live_dropped: u64::try_from(dropped_live).unwrap_or(u64::MAX),
+    }
 }
 
 /// Same-table re-decode across scans: two static instances with the
@@ -12658,12 +12698,17 @@ fn unlink_table_interfaces(
 }
 
 /// Union `incoming` into its same-file module, or file it beside its
-/// ABI-mismatched twin. Returns how many fresh tables the per-module
-/// cap dropped (counted overflow, never silent): callers accumulate it
-/// on the engine. Identical tables dedup free and never count, and
-/// live-returned tables always admit (proof, never speculation), even
-/// past the speculative cap.
-fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedModule) -> u64 {
+/// ABI-mismatched twin. Returns the fresh tables the per-module caps
+/// dropped (counted overflow, never silent): callers accumulate both
+/// counters on the engine and mark live loss for live overflow.
+/// Identical tables dedup free and never count, and live-returned
+/// tables admit past the speculative cap (proof, never speculation) —
+/// up to the live allowance per module, past which fresh live tables
+/// drop counted like heuristics.
+fn merge_scanned_module(
+    modules: &mut Vec<ScannedModule>,
+    mut incoming: ScannedModule,
+) -> MergeOverflow {
     let Some(position) = modules.iter().position(|module| {
         module.view == incoming.view
             && module.mount_namespace == incoming.mount_namespace
@@ -12734,7 +12779,7 @@ fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedM
     }
     let mut table_indices: Vec<Option<LoweredTable>> = Vec::new();
     let mut typed_live_tables = BTreeSet::new();
-    let mut dropped = 0u64;
+    let mut overflow = MergeOverflow::default();
     for (incoming_index, table) in incoming.tables.drain(..).enumerate() {
         let incoming_address = table.address;
         let typed_live = table.live_return
@@ -12812,19 +12857,48 @@ fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedM
                 })
             }
             None => {
-                if existing.tables.len() >= MAX_MERGED_TABLES_PER_MODULE && incoming_is_static {
-                    // Past the cap a fresh speculative table drops and
-                    // counts; a dropped static table still re-opens
-                    // finished-ness (the union no longer spans the whole
-                    // surface). A live table is proof, not speculation,
-                    // so it appends past the cap: dropping an observed
-                    // return would lose real calls, and the observation
-                    // already passed and can never be re-taken.
-                    dropped = dropped.saturating_add(1);
-                    appended_static |= incoming_is_static;
+                if incoming_is_static {
+                    if existing.tables.len() >= MAX_MERGED_TABLES_PER_MODULE {
+                        // Past the cap a fresh speculative table drops and
+                        // counts; a dropped static table still re-opens
+                        // finished-ness (the union no longer spans the
+                        // whole surface).
+                        overflow.dropped = overflow.dropped.saturating_add(1);
+                        appended_static = true;
+                        None
+                    } else {
+                        appended_static = true;
+                        existing.tables.push(table);
+                        let index = existing.tables.len() - 1;
+                        if typed_live {
+                            typed_live_tables.insert(index);
+                        }
+                        Some(LoweredTable {
+                            index,
+                            address: incoming_address,
+                        })
+                    }
+                } else if existing
+                    .tables
+                    .iter()
+                    .filter(|known| known.live_return)
+                    .count()
+                    >= MAX_LIVE_TABLES_PER_MODULE
+                {
+                    // Past the live allowance a fresh live table drops
+                    // and counts as live overflow (the caller marks live
+                    // loss): proof admits past the speculative cap, but
+                    // run-long live growth stays bounded too. A dropped
+                    // live table is an observation, not a scan finding,
+                    // so finished-ness stays as the live-only rule left it.
+                    overflow.live_dropped = overflow.live_dropped.saturating_add(1);
                     None
                 } else {
-                    appended_static |= incoming_is_static;
+                    // A live table is proof, not speculation, so it
+                    // appends past the speculative cap while the live
+                    // allowance holds: dropping an observed return would
+                    // lose real calls, and the observation already
+                    // passed and can never be re-taken.
                     existing.tables.push(table);
                     let index = existing.tables.len() - 1;
                     if typed_live {
@@ -12881,19 +12955,7 @@ fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedM
             existing.interfaces.push(interface);
         }
     }
-    dropped
-}
-
-/// Union one module and accumulate the per-module cap's counted
-/// overflow into `dropped`: every rebuild and harvest path counts
-/// through this one line, so a refused table is never silent.
-fn merge_scanned_module_counted(
-    modules: &mut Vec<ScannedModule>,
-    incoming: ScannedModule,
-    dropped: &mut u64,
-) {
-    let fresh = merge_scanned_module(modules, incoming);
-    *dropped = dropped.saturating_add(fresh);
+    overflow
 }
 
 fn usable_path(maps: &MapIndex<'_>, mapping: &MapEntry) -> Option<PathBuf> {
@@ -14189,6 +14251,7 @@ impl Engine {
             learned_event_loss: 0,
             learned_cap_skipped: 0,
             merge_tables_dropped: 0,
+            merge_live_tables_dropped: 0,
             learned_frame_owed: false,
             owned_watch_unproven: BTreeMap::new(),
             owned_incomplete_scans: BTreeMap::new(),
@@ -15727,6 +15790,43 @@ impl Engine {
     #[cfg(test)]
     pub(crate) fn merge_tables_dropped(&self) -> u64 {
         self.merge_tables_dropped
+    }
+
+    /// Fresh live tables the per-module live allowance dropped.
+    #[cfg(test)]
+    pub(crate) fn merge_live_tables_dropped(&self) -> u64 {
+        self.merge_live_tables_dropped
+    }
+
+    /// Union one module and accumulate the per-module caps' counted
+    /// overflow: every rebuild and publication path merges through this
+    /// one line, so a refused table is never silent. (The run-learned
+    /// harvest merges its own store field directly and absorbs through
+    /// `absorb_merge_overflow` below — same choke, split for the borrow.)
+    /// Heuristic overflow counts; live overflow counts and marks live
+    /// loss with its named gap (a dropped observation fails visible).
+    fn merge_tables_marked(&mut self, modules: &mut Vec<ScannedModule>, incoming: ScannedModule) {
+        let overflow = merge_scanned_module(modules, incoming);
+        self.absorb_merge_overflow(overflow);
+    }
+
+    /// Accumulate one union's counted overflow, marking live loss for
+    /// live overflow. The single counting choke behind
+    /// `merge_tables_marked` and the run-learned harvest.
+    fn absorb_merge_overflow(&mut self, overflow: MergeOverflow) {
+        self.merge_tables_dropped = self.merge_tables_dropped.saturating_add(overflow.dropped);
+        if overflow.live_dropped > 0 {
+            self.merge_live_tables_dropped = self
+                .merge_live_tables_dropped
+                .saturating_add(overflow.live_dropped);
+            self.mark_live_loss(MERGE_LIVE_OVERFLOW_SUBJECT, MERGE_LIVE_OVERFLOW_REASON);
+            if crate::run::capture_diagnostics_on() {
+                eprintln!(
+                    "p11scope: live table merge dropped {} live tables past the per-module live allowance ({} total)",
+                    overflow.live_dropped, self.merge_live_tables_dropped,
+                );
+            }
+        }
     }
 
     /// Consume the learned-staging (or owned incomplete-rescan)
@@ -22147,7 +22247,7 @@ impl Engine {
             self.views[position].view_admission(),
             std::slice::from_ref(&lowered),
         );
-        merge_scanned_module_counted(&mut raw_modules, lowered, &mut self.merge_tables_dropped);
+        self.merge_tables_marked(&mut raw_modules, lowered);
         // The observed view is this rebuild's fresh view; committed
         // carried views ride through it. The choke authorizes the former
         // and denies the latter (spec §3).
@@ -22925,20 +23025,12 @@ impl Engine {
                 // counts and finished flags the scan disproved retire
                 // instead of lingering in the union.
                 for module in found {
-                    merge_scanned_module_counted(
-                        &mut raw_modules,
-                        module,
-                        &mut self.merge_tables_dropped,
-                    );
+                    self.merge_tables_marked(&mut raw_modules, module);
                 }
             } else {
                 let mut retained = retained;
                 for module in found {
-                    merge_scanned_module_counted(
-                        &mut retained,
-                        module,
-                        &mut self.merge_tables_dropped,
-                    );
+                    self.merge_tables_marked(&mut retained, module);
                 }
                 raw_modules.extend(retained);
             }
@@ -23016,11 +23108,7 @@ impl Engine {
                 .collect();
             if found_complete {
                 for module in kept_found {
-                    merge_scanned_module_counted(
-                        &mut raw_modules,
-                        module,
-                        &mut self.merge_tables_dropped,
-                    );
+                    self.merge_tables_marked(&mut raw_modules, module);
                 }
             } else {
                 let mut kept_retained: Vec<_> = retained
@@ -23031,11 +23119,7 @@ impl Engine {
                     })
                     .collect();
                 for module in kept_found {
-                    merge_scanned_module_counted(
-                        &mut kept_retained,
-                        module,
-                        &mut self.merge_tables_dropped,
-                    );
+                    self.merge_tables_marked(&mut kept_retained, module);
                 }
                 raw_modules.extend(kept_retained);
             }
@@ -23067,11 +23151,7 @@ impl Engine {
                 .map(|module| module.scanned.clone())
                 .collect();
             for module in found {
-                merge_scanned_module_counted(
-                    &mut raw_modules,
-                    module,
-                    &mut self.merge_tables_dropped,
-                );
+                self.merge_tables_marked(&mut raw_modules, module);
             }
             (candidate_pins, raw_modules)
         };
@@ -24099,11 +24179,11 @@ impl Engine {
         }
         let before = self.run_learned_modules.clone();
         let drops_before = self.merge_tables_dropped;
-        merge_scanned_module_counted(
-            &mut self.run_learned_modules,
-            module,
-            &mut self.merge_tables_dropped,
-        );
+        // The harvest merges its own store field directly (a method
+        // call would borrow all of `self` twice); the absorb below is
+        // the same counting choke as `merge_tables_marked`.
+        let overflow = merge_scanned_module(&mut self.run_learned_modules, module);
+        self.absorb_merge_overflow(overflow);
         if crate::run::capture_diagnostics_on() {
             eprintln!(
                 "p11scope: run-learned tables for {}: {} tables {} interfaces (store {} modules)",
@@ -32036,21 +32116,13 @@ impl Engine {
                 &preserve_refreshed,
             ));
             for module in modules {
-                merge_scanned_module_counted(
-                    &mut raw_modules,
-                    module.clone(),
-                    &mut self.merge_tables_dropped,
-                );
+                self.merge_tables_marked(&mut raw_modules, module.clone());
             }
         }
         for (_, modules, pins) in new_views {
             skipped.extend(candidate_pins.absorb(pins.clone()));
             for module in modules {
-                merge_scanned_module_counted(
-                    &mut raw_modules,
-                    module.clone(),
-                    &mut self.merge_tables_dropped,
-                );
+                self.merge_tables_marked(&mut raw_modules, module.clone());
             }
         }
         self.stage_timings.span(

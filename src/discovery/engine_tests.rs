@@ -40568,7 +40568,7 @@ fn merge_scanned_module_caps_tables_per_module_with_counted_overflow() {
     // A fresh module past the cap truncates on entry and counts the
     // dropped tables; the interface to a dropped table detaches.
     let mut entered = Vec::new();
-    let dropped = merge_scanned_module(
+    let overflow = merge_scanned_module(
         &mut entered,
         module(
             (0..cap + 3).map(table).collect(),
@@ -40578,7 +40578,8 @@ fn merge_scanned_module_caps_tables_per_module_with_counted_overflow() {
             ],
         ),
     );
-    assert_eq!(dropped, 3);
+    assert_eq!(overflow.dropped, 3);
+    assert_eq!(overflow.live_dropped, 0);
     assert_eq!(entered.len(), 1);
     assert_eq!(entered[0].tables.len(), MAX_MERGED_TABLES_PER_MODULE);
     assert_eq!(entered[0].interfaces.len(), 2);
@@ -40591,11 +40592,12 @@ fn merge_scanned_module_caps_tables_per_module_with_counted_overflow() {
     // A union past the cap drops and counts the fresh tables without
     // growing, and re-opens finished-ness like any new static table.
     let mut merged = vec![module((0..cap).map(table).collect(), vec![])];
-    let dropped = merge_scanned_module(
+    let overflow = merge_scanned_module(
         &mut merged,
         module(vec![table(10_000), table(10_001)], vec![]),
     );
-    assert_eq!(dropped, 2);
+    assert_eq!(overflow.dropped, 2);
+    assert_eq!(overflow.live_dropped, 0);
     assert_eq!(merged.len(), 1);
     assert_eq!(merged[0].tables.len(), MAX_MERGED_TABLES_PER_MODULE);
     assert!(
@@ -40603,13 +40605,15 @@ fn merge_scanned_module_caps_tables_per_module_with_counted_overflow() {
         "a dropped static table re-opens finished-ness"
     );
     // Identical tables re-merge free: nothing appends, nothing drops.
-    let dropped = merge_scanned_module(&mut merged, module((0..cap).map(table).collect(), vec![]));
-    assert_eq!(dropped, 0);
+    let overflow = merge_scanned_module(&mut merged, module((0..cap).map(table).collect(), vec![]));
+    assert_eq!(overflow.dropped, 0);
+    assert_eq!(overflow.live_dropped, 0);
     assert_eq!(merged[0].tables.len(), MAX_MERGED_TABLES_PER_MODULE);
     // Under the cap nothing changes: fresh tables still append free.
     let mut small = vec![module(vec![table(0)], vec![])];
-    let dropped = merge_scanned_module(&mut small, module(vec![table(1)], vec![]));
-    assert_eq!(dropped, 0);
+    let overflow = merge_scanned_module(&mut small, module(vec![table(1)], vec![]));
+    assert_eq!(overflow.dropped, 0);
+    assert_eq!(overflow.live_dropped, 0);
     assert_eq!(small[0].tables.len(), 2);
 }
 
@@ -40682,9 +40686,10 @@ fn merge_scanned_module_keeps_live_tables_past_the_merge_cap() {
     let mut tables: Vec<ScannedTable> = (0..cap as u64 + 3).map(table).collect();
     tables.push(live_table(0));
     let mut entered = Vec::new();
-    let dropped =
+    let overflow =
         merge_scanned_module(&mut entered, module(tables, vec![interface(Some(cap + 3))]));
-    assert_eq!(dropped, 4);
+    assert_eq!(overflow.dropped, 4);
+    assert_eq!(overflow.live_dropped, 0);
     assert_eq!(entered.len(), 1);
     assert_eq!(entered[0].tables.len(), cap);
     assert!(
@@ -40716,8 +40721,9 @@ fn merge_scanned_module_keeps_live_tables_past_the_merge_cap() {
     // live-only union preserves the finished scan.
     let mut merged = vec![module((0..cap as u64).map(table).collect(), vec![])];
     assert!(merged[0].tables_scan_finished);
-    let dropped = merge_scanned_module(&mut merged, module(vec![live_table(1)], vec![]));
-    assert_eq!(dropped, 0);
+    let overflow = merge_scanned_module(&mut merged, module(vec![live_table(1)], vec![]));
+    assert_eq!(overflow.dropped, 0);
+    assert_eq!(overflow.live_dropped, 0);
     assert_eq!(merged[0].tables.len(), cap + 1);
     assert!(merged[0].tables[cap].live_return);
     assert!(
@@ -40726,8 +40732,9 @@ fn merge_scanned_module_keeps_live_tables_past_the_merge_cap() {
     );
     // The cap still binds speculation: a fresh heuristic past a full
     // module drops and counts, even beside a proven table.
-    let dropped = merge_scanned_module(&mut merged, module(vec![table(10_000)], vec![]));
-    assert_eq!(dropped, 1);
+    let overflow = merge_scanned_module(&mut merged, module(vec![table(10_000)], vec![]));
+    assert_eq!(overflow.dropped, 1);
+    assert_eq!(overflow.live_dropped, 0);
     assert_eq!(merged[0].tables.len(), cap + 1);
     assert!(
         !merged[0].tables_scan_finished,
@@ -40790,16 +40797,26 @@ fn merge_scanned_module_bounds_live_tables_past_the_live_allowance() {
         interfaces: vec![],
     };
     let cap = MAX_MERGED_TABLES_PER_MODULE;
+    let live_cap = MAX_LIVE_TABLES_PER_MODULE;
+    assert_eq!(
+        (cap, live_cap),
+        (64, 64),
+        "the speculative cap and the live allowance mirror at 64; raise neither silently"
+    );
     let mut merged = vec![module((0..cap as u64).map(table).collect())];
-    let live: Vec<ScannedTable> = (0..cap as u64 + 6).map(live_table).collect();
-    let dropped = merge_scanned_module(&mut merged, module(live));
+    let live: Vec<ScannedTable> = (0..live_cap as u64 + 6).map(live_table).collect();
+    let overflow = merge_scanned_module(&mut merged, module(live));
     let live_kept = merged[0].tables.iter().filter(|t| t.live_return).count();
     assert!(
-        live_kept <= cap,
+        live_kept <= live_cap,
         "unbounded live returns stay bounded: kept {live_kept} live tables past a full module"
     );
-    assert_eq!(dropped, 6, "live overflow past the allowance drops and counts");
-    assert_eq!(merged[0].tables.len(), cap + cap);
+    assert_eq!(overflow.dropped, 0);
+    assert_eq!(
+        overflow.live_dropped, 6,
+        "live overflow past the allowance drops and counts"
+    );
+    assert_eq!(merged[0].tables.len(), cap + live_cap);
     assert!(
         merged[0].tables_scan_finished,
         "a live-only union preserves the finished scan even when live tables drop"
@@ -40850,11 +40867,15 @@ fn merge_scanned_module_entry_bounds_live_tables_with_counted_overflow() {
     };
     let cap = MAX_MERGED_TABLES_PER_MODULE;
     let mut entered = Vec::new();
-    let dropped = merge_scanned_module(
+    let overflow = merge_scanned_module(
         &mut entered,
         module((0..cap as u64 + 6).map(live_table).collect()),
     );
-    assert_eq!(dropped, 6, "entry live overflow drops and counts");
+    assert_eq!(overflow.dropped, 0);
+    assert_eq!(
+        overflow.live_dropped, 6,
+        "entry live overflow drops and counts"
+    );
     assert_eq!(entered.len(), 1);
     assert_eq!(entered[0].tables.len(), cap);
     assert!(
@@ -40923,19 +40944,112 @@ fn merge_scanned_module_keeps_the_proxy_live_table_in_arrival_order() {
     };
     let cap = MAX_MERGED_TABLES_PER_MODULE;
     let mut merged = Vec::new();
-    let dropped = merge_scanned_module(
+    let overflow = merge_scanned_module(
         &mut merged,
         module((0..cap as u64 + 3).map(table).collect()),
     );
-    assert_eq!(dropped, 3);
+    assert_eq!(overflow.dropped, 3);
+    assert_eq!(overflow.live_dropped, 0);
     assert_eq!(merged[0].tables.len(), cap);
-    let dropped = merge_scanned_module(&mut merged, module(vec![live_table(1)]));
-    assert_eq!(dropped, 0, "the one proven table admits with zero overflow");
+    let overflow = merge_scanned_module(&mut merged, module(vec![live_table(1)]));
+    assert_eq!(
+        overflow.dropped, 0,
+        "the one proven table admits with zero overflow"
+    );
+    assert_eq!(overflow.live_dropped, 0);
     assert_eq!(merged[0].tables.len(), cap + 1);
     assert_eq!(
         merged[0].tables.iter().filter(|t| t.live_return).count(),
         1,
         "the proxy's proven live table survives the merge"
+    );
+}
+
+#[test]
+fn merge_tables_marked_counts_live_overflow_with_a_named_gap() {
+    // The engine choke behind every merge path: live overflow counts
+    // on its own counter and marks live loss with the named gap, so a
+    // dropped observation fails visible (PARTIAL) instead of silent.
+    // Heuristic overflow beside it counts without the live gap.
+    let table = |slot: u64| ScannedTable {
+        version: (3, 0),
+        walk: "full",
+        entries: vec![],
+        null_entries: vec![],
+        unpinned: vec![],
+        address: 0x1000 + slot,
+        file_offset: Some(slot),
+        live_return: false,
+        manifest_supported: false,
+        extension_impossible: false,
+    };
+    let live_table = |slot: u64| ScannedTable {
+        version: (3, 2),
+        walk: "full",
+        entries: vec![],
+        null_entries: vec![],
+        unpinned: vec![],
+        address: 0x7f00_0000 + slot,
+        file_offset: None,
+        live_return: true,
+        manifest_supported: false,
+        extension_impossible: false,
+    };
+    let module = |tables: Vec<ScannedTable>| ScannedModule {
+        key_is_identity: false,
+        module_hint: None,
+        mapped_identity: None,
+        double_loaded: false,
+        same_file_loads: 1,
+        pre_copy_up: None,
+        view: ProcessViewId(0),
+        mount_namespace: crate::process::MountNamespaceId {
+            device: 1,
+            inode: 2,
+        },
+        key: ObjectKey {
+            device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+            inode: 42,
+        },
+        path: "/opt/p.so".into(),
+        tables_scan_finished: true,
+        decoder_abi: None,
+        exports: vec![],
+        tables,
+        interfaces: vec![],
+    };
+    let cap = MAX_MERGED_TABLES_PER_MODULE;
+    let live_cap = MAX_LIVE_TABLES_PER_MODULE;
+    let mut engine = Engine::empty();
+    assert_eq!(engine.merge_live_tables_dropped(), 0);
+    // A heuristic-only overflow counts without the live gap.
+    let mut modules = vec![module((0..cap as u64).map(table).collect())];
+    engine.merge_tables_marked(&mut modules, module(vec![table(10_000)]));
+    assert_eq!(engine.merge_tables_dropped(), 1);
+    assert_eq!(engine.merge_live_tables_dropped(), 0);
+    assert!(
+        !engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.subject == MERGE_LIVE_OVERFLOW_SUBJECT),
+        "heuristic overflow marks no live gap: {:?}",
+        engine.counters.object_skips
+    );
+    // A live overflow counts on its own counter with the named gap.
+    let mut full: Vec<ScannedTable> = (0..cap as u64).map(table).collect();
+    full.extend((0..live_cap as u64).map(live_table));
+    let mut modules = vec![module(full)];
+    engine.merge_tables_marked(&mut modules, module(vec![live_table(10_000)]));
+    assert_eq!(engine.merge_tables_dropped(), 1);
+    assert_eq!(engine.merge_live_tables_dropped(), 1);
+    assert!(
+        engine.counters.object_skips.contains(&Skipped {
+            subject: MERGE_LIVE_OVERFLOW_SUBJECT.into(),
+            reason: MERGE_LIVE_OVERFLOW_REASON.into(),
+        }),
+        "live overflow marks its named gap: {:?}",
+        engine.counters.object_skips
     );
 }
 

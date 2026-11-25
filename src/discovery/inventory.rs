@@ -1113,7 +1113,7 @@ impl Engine {
             .map(|module| module.scanned.clone())
             .collect();
         for module in facts.modules {
-            merge_scanned_module_counted(&mut modules, module, &mut self.merge_tables_dropped);
+            self.merge_tables_marked(&mut modules, module);
         }
         pins.reset_scan_pin_claims();
         // The reconciled owner is this rebuild's fresh view; retained

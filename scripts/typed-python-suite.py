@@ -8,7 +8,9 @@ stdlib unittest runner before running the suite as ``__main__``. The outer
 runner's suite object is the executable selection proof; terminal outcomes
 are recorded by unittest's own result callbacks. Nested unittest runners
 (commonly used by mutation-test assertions inside a test) are deliberately
-not part of the outer selection.
+not part of the outer selection. A setUpClass/setUpModule SkipTest marks
+its scope's selected tests skipped (branch class_skip/module_skip); a
+setUpClass error leaves them not_run and the fragment incomplete.
 
 Usage:
   typed-python-suite.py SUITE FRAGMENT.json [suite-arg ...]
@@ -21,6 +23,7 @@ than parsing Python source.
 """
 
 import json
+import re
 import runpy
 import sys
 import traceback
@@ -51,6 +54,21 @@ def test_identity(test):
 
 def suite_event_name(test):
     return raw_test_id(test).split(".")[-1].split(" ", 1)[0]
+
+
+def scope_skip(ident):
+    """Parse a unittest placeholder skip id into a scope mark, or None.
+
+    Only setUpClass/setUpModule skips mark a scope: their tests never
+    ran. tearDown* skips arrive after real outcomes and must not
+    override them; unparseable ids fail closed (no marking).
+    """
+    match = re.fullmatch(r"setUpClass \((?:[A-Za-z_][\w.]*\.)?([A-Za-z_]\w*)\)", ident)
+    if match is not None:
+        return ("class", match.group(1))
+    if re.fullmatch(r"setUpModule \([A-Za-z_][\w.]*\)", ident) is not None:
+        return ("module", None)
+    return None
 
 
 def json_copy_typed_signature(value):
@@ -87,6 +105,7 @@ class Recorder:
         self.selection = []
         self.events = []
         self.suite_events = []
+        self.scope_skips = []
         self.depth = 0
         self.discover_only = False
 
@@ -102,6 +121,10 @@ class Recorder:
         signature = None if state == "passed" else outcome_signature(state, err)
         if not isinstance(test, unittest.TestCase):
             self.suite_events.append({"event": suite_event_name(test), "state": state, "signature": signature})
+            if state == "skipped":
+                mark = scope_skip(raw_test_id(test))
+                if mark is not None:
+                    self.scope_skips.append(mark)
             return
         self.events.append({"test": test_identity(test), "state": state, "signature": signature})
 
@@ -230,17 +253,32 @@ def execute_suite(suite, arguments, discover_only):
 
 def fragment(path, invocation, process_exit):
     outcomes = RECORDER.outcomes()
+    module_skipped = any(scope == "module" for scope, _name in RECORDER.scope_skips)
+    class_skipped = {name for scope, name in RECORDER.scope_skips if scope == "class"}
     rows = []
     complete = True
     for test in RECORDER.selection:
         event = outcomes.get(test)
         if event is None:
-            complete = False
-            event = {
-                "test": test,
-                "state": "not_run",
-                "signature": {"branch": "not_run", "oracle": "unittest"},
-            }
+            if module_skipped:
+                event = {
+                    "test": test,
+                    "state": "skipped",
+                    "signature": {"branch": "module_skip", "oracle": "unittest"},
+                }
+            elif any(test.startswith(name + ".") for name in class_skipped):
+                event = {
+                    "test": test,
+                    "state": "skipped",
+                    "signature": {"branch": "class_skip", "oracle": "unittest"},
+                }
+            else:
+                complete = False
+                event = {
+                    "test": test,
+                    "state": "not_run",
+                    "signature": {"branch": "not_run", "oracle": "unittest"},
+                }
         rows.append(event)
     if not RECORDER.selection:
         complete = False

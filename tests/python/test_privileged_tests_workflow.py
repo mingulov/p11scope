@@ -116,9 +116,12 @@ record_typed_verdict {command}
 
 
 def static_skip_print_block(source):
-    start_token = '    for i in ${selected_skipped[@]+"${selected_skipped[@]}"}; do\n'
-    start = source.index(start_token)
-    end = source.index('\n    done\n\n    for name in ${selected_runnable', start)
+    # Two loops iterate selected_skipped; the print loop is the one
+    # whose body echoes SKIP lines into the results file.
+    echo = '        echo "SKIP ${SKIP_TESTS[$i]} :: ${SKIP_REASONS[$i]}" | tee -a "$results"\n'
+    at = source.index(echo)
+    start = source.rindex('    for i in ${selected_skipped[@]+"${selected_skipped[@]}"}; do\n', 0, at)
+    end = source.index('\n    done', at)
     return source[start:end + len('\n    done')]
 
 
@@ -1643,7 +1646,8 @@ write_dynamic_selection
         # The static-skip print guard must see the pipeline status, not
         # the verdict call's: reverting the order silences the failure.
         order_mutant = source.replace(
-            '        if [ "${PIPESTATUS[0]}" -ne 0 ] || [ "${PIPESTATUS[1]}" -ne 0 ]; then\n'
+            '        print_rc=("${PIPESTATUS[@]}")\n'
+            '        if [ "${print_rc[0]}" -ne 0 ] || [ "${print_rc[1]}" -ne 0 ]; then\n'
             '            echo "$PROG: static skip print failed for index $i" >&2\n'
             '            return 1\n'
             '        fi\n'

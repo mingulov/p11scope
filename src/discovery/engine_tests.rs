@@ -98002,6 +98002,134 @@ fn member_stop_refused_provider_is_no_attached_resume() {
     }
 }
 
+/// Sets `path`'s mtime to a deterministic value (the ctime follows): a
+/// metadata-only churn step whose bytes never change.
+fn touch_for_test(path: &std::path::Path, secs: u64) {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+        .unwrap();
+}
+
+/// A stop-staged provider whose key a later observation rejects (the file
+/// changed between the learned pin and the next absorb: same bytes, new
+/// ctime) can never attach: the hold ends refused in the next pass, before
+/// its bound, with the first-use row filed. Without the refusal the hold
+/// burns to the bound waiting for an impossible attach (the churn shape).
+#[test]
+fn member_stop_rejected_staging_key_refuses_the_hold() {
+    let (fixture, _view, _module, _pins) = loaded_seed_provider();
+    let pid = fixture.child.id();
+    let library = fixture._dir.path().join("seed-provider.so");
+    // Generation 1.
+    touch_for_test(&library, 1_000_000);
+    let pin1 = crate::discovery::identity::pin_of(
+        &std::fs::File::open(&library).unwrap(),
+    )
+    .unwrap();
+    stop_member_for_test(pid);
+    let key = member_exec_key_for_test(pid, &library);
+    let mut io = ScriptedMemberStops::default();
+    io.rows.insert(pid, member_stop_row(pid, &library, key));
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    assert!(engine.member_stops_held(), "intake holds the mapper");
+    // The drain stages generation 1 through the real path.
+    engine.service_learned_files();
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        1,
+        "generation 1 stages"
+    );
+    let staged_key = engine
+        .prearm_input
+        .as_ref()
+        .and_then(|prearm| prearm.inputs.first().map(|input| input.key));
+    // Generation 2: metadata only (bytes identical, ctime stepped).
+    touch_for_test(&library, 2_000_000);
+    let pin2 = crate::discovery::identity::pin_of(
+        &std::fs::File::open(&library).unwrap(),
+    )
+    .unwrap();
+    assert_ne!(pin1, pin2, "the churn step moves the pin");
+    // A second observation (the scan's, live) absorbs and conflicts: the
+    // drain would skip the settled identity, so the twin drives the real
+    // staging path directly for the new generation.
+    let file = std::fs::File::open(&library).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    engine.stage_learned_candidate(crate::fanotify::LearnedCandidate {
+        file,
+        dev,
+        ino,
+        display_path: library.to_string_lossy().into_owned(),
+        loader_exe: None,
+        loader_unknown_reason: None,
+        run_learned: false,
+        proving_retained: false,
+    });
+    // Sanity (passes with and without the fix): the key is rejected and
+    // its pin scrubbed, so no slot can ever build for it.
+    let staged_key = staged_key.expect("round 1 records its key");
+    assert!(
+        engine.pinned.rejects(staged_key),
+        "the conflicting absorb rejects the key"
+    );
+    assert!(
+        !engine.pinned.sweep_match_keys().contains_key(&staged_key),
+        "a rejected key routes no pin"
+    );
+    // Resolve BEFORE the bound (10 ms after an intake at ~0).
+    engine.service_member_stops(&mut io, &mut session, Some(10_000_000));
+    assert!(
+        !engine.member_stops_held(),
+        "a rejected staging key refuses the hold"
+    );
+    let stats = engine.member_stop_stats_for_test();
+    assert_eq!(stats.refused_resumes, 1, "{stats:?}");
+    assert_eq!(stats.timed_out, 0, "{stats:?}");
+    assert!(member_resumed_for_test(pid), "the member runs again");
+    assert!(
+        files_the_first_use_row(&engine),
+        "the refused hold files the first-use row"
+    );
+}
+
+/// A staged hold whose key is never rejected stays held: rejection alone
+/// refuses, never the staging itself.
+#[test]
+fn member_stop_staged_unrejected_hold_stays_held() {
+    let (fixture, _view, _module, _pins) = loaded_seed_provider();
+    let pid = fixture.child.id();
+    let library = fixture._dir.path().join("seed-provider.so");
+    stop_member_for_test(pid);
+    let key = member_exec_key_for_test(pid, &library);
+    let mut io = ScriptedMemberStops::default();
+    io.rows.insert(pid, member_stop_row(pid, &library, key));
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    assert!(engine.member_stops_held(), "intake holds the mapper");
+    engine.service_learned_files();
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        1,
+        "the staging lands"
+    );
+    engine.service_member_stops(&mut io, &mut session, Some(10_000_000));
+    assert!(
+        engine.member_stops_held(),
+        "no rejection: the hold waits for its attach"
+    );
+    let stats = engine.member_stop_stats_for_test();
+    assert_eq!(stats.refused_resumes, 0, "{stats:?}");
+    assert_eq!(stats.timed_out, 0, "{stats:?}");
+    assert_eq!(stats.attached_resumes, 0, "{stats:?}");
+}
+
 /// The watchdog gone, the observer alone must not keep anyone stopped:
 /// the next pass deactivates (and detaches) the stops and resumes every
 /// held and pending member, and later passes resume any row that is

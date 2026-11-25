@@ -822,6 +822,12 @@ impl ResumeCursor {
         self.streaks.clone()
     }
 
+    /// Fresh retry tasks, for tests.
+    #[cfg(test)]
+    pub(crate) fn fresh_for_test(&self) -> BTreeSet<MemberTask> {
+        self.fresh.clone()
+    }
+
     /// Per-member own-spend totals, for tests.
     #[cfg(test)]
     pub(crate) fn own_spend_for_test(&self) -> BTreeMap<MemberTask, u64> {
@@ -3198,6 +3204,30 @@ mod tests {
                 .order_members(&[(10, Some(100)), (500, Some(5000)), (501, Some(5010))]),
             vec![501, 500, 10],
             "the least-spent retry scans first, regardless of pid"
+        );
+    }
+
+    /// Pruning drops departed pids from every cursor tier while live
+    /// members keep their exact tier and spend state.
+    #[test]
+    fn owner2_cursor_prune_to_live_drops_departed_members_everywhere() {
+        let mut pass = detailed(u64::MAX, u64::MAX);
+        pass.cursor_mut().note_member_outcomes(&[
+            ((10, Some(100)), MemberOutcome::Examined, 500),
+            ((11, Some(110)), MemberOutcome::CutShortBudgetStop, 100),
+            ((12, Some(120)), MemberOutcome::Examined, 700),
+            ((13, Some(130)), MemberOutcome::CutShortOther, 50),
+        ]);
+        pass.cursor_mut().prune_to_live(&BTreeSet::from([10, 11]));
+        assert_eq!(pass.cursor().examined_for_test(), BTreeSet::from([(10, Some(100))]));
+        assert_eq!(pass.cursor().fresh_for_test(), BTreeSet::from([(11, Some(110))]));
+        assert_eq!(
+            pass.cursor().streaks_for_test(),
+            BTreeMap::from([((11, Some(110)), 1)])
+        );
+        assert_eq!(
+            pass.cursor().own_spend_for_test(),
+            BTreeMap::from([((10, Some(100)), 500), ((11, Some(110)), 100)])
         );
     }
 

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://p11scope/observed-profile/v3.schema.json",
   "title": "p11scope observed-profile v3 document",
-  "description": "Consumer aid for live v3 profile and v3-metrics documents (SYSPLAN residual F-50). The evidence object is closed per lane; the release oracle (scripts/check-capture-evidence.py) is the enforcement behind this file, and tests/python/test_schema_json.py keeps the two in agreement. Terminal trace EVIDENCE objects are not documents and are out of scope, as are historical v2 shapes.",
+  "description": "Consumer aid for live v3 profile and v3-metrics documents (SYSPLAN residual F-50). The evidence object is closed per lane; the release oracle (scripts/check-capture-evidence.py) is the enforcement behind this file, and tests/python/test_schema_json.py keeps the two in agreement. Four fields the product always emits stay optional here so v0.7.1 documents validate: coverage_retired_slots, member_stop_attached, member_stop_unattached and pid_descendant_gaps_admitted. Terminal trace EVIDENCE objects are not documents and are out of scope, as are historical v2 shapes.",
   "type": "object",
   "required": ["schema", "lane", "capture", "evidence", "functions"],
   "properties": {
@@ -39,7 +39,7 @@
         "aliased", "async_duplicates", "async_evictions",
         "async_orphans", "async_target_failures", "attach_backend", "attach_failures",
         "attach_gap_ms", "attached_probes", "auth_state_ambiguities",
-        "authority", "cgroup_scope_failures", "completeness", "coverage_retired_slots", "discovery",
+        "authority", "cgroup_scope_failures", "completeness", "discovery",
         "discovery_conflicts", "discovery_read_failures", "discovery_ring_loss",
         "discovery_state_failures", "discovery_truncated",
         "discovery_uncorroborated", "discovery_uncorroborated_candidates",
@@ -1188,7 +1188,7 @@
         "properties": {
           "schema": {"const": "p11scope/observed-profile/v3"},
           "evidence": {
-            "required": ["interface_selection", "attach_mechanisms", "pid_descendant_gaps", "multi_rebuild_gaps", "pid_descendant_gaps_admitted", "member_stop_attached", "member_stop_unattached", "learned_staged_files", "learned_event_loss", "learned_cap_skipped"]
+            "required": ["interface_selection", "attach_mechanisms", "pid_descendant_gaps", "multi_rebuild_gaps", "learned_staged_files", "learned_event_loss", "learned_cap_skipped"]
           }
         },
         "required": ["mechanisms", "sessions", "logins", "templates", "cgroups"]

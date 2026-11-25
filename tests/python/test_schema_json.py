@@ -31,6 +31,17 @@ def evidence_schema():
     return SCHEMA["properties"]["evidence"]
 
 
+# Evidence fields the product always emits but the machine schema
+# leaves optional, so v0.7.1 documents (which predate them) validate
+# against it: one base counter plus three profile-lane-only fields.
+# The release oracle still requires them on current output.
+VERSION_TOLERANT_BASE_FIELDS = frozenset({"coverage_retired_slots"})
+VERSION_TOLERANT_PROFILE_FIELDS = frozenset({
+    "member_stop_attached", "member_stop_unattached",
+    "pid_descendant_gaps_admitted",
+})
+
+
 class SchemaOracleAgreement(unittest.TestCase):
     def metrics_document(self):
         return CHECKER["document_fixture"](
@@ -1224,10 +1235,41 @@ class SchemaOracleAgreement(unittest.TestCase):
                     CHECKER["exact_metrics_schema"](invalid)
 
     def test_metrics_required_is_oracle_base(self):
-        """Metrics requires exactly the oracle base key set."""
+        """Metrics requires the oracle base key set minus the
+        version-tolerant fields the schema leaves optional for old
+        files; the oracle still requires them on current output."""
         self.assertEqual(
-            set(evidence_schema()["required"]), set(CHECKER["BASE_EVIDENCE_KEYS"])
+            set(evidence_schema()["required"]),
+            set(CHECKER["BASE_EVIDENCE_KEYS"]) - VERSION_TOLERANT_BASE_FIELDS,
         )
+
+    def test_version_tolerant_fields_are_optional_but_shaped(self):
+        """The four fields v0.7.1 documents predate stay shaped but
+        leave `required`, so old documents validate against this
+        schema while current documents (which the oracle still
+        requires to carry them) are unchanged."""
+        base_required = set(evidence_schema()["required"])
+        properties = evidence_schema()["properties"]
+        for field in sorted(VERSION_TOLERANT_BASE_FIELDS):
+            with self.subTest(field=field):
+                self.assertNotIn(field, base_required)
+                self.assertEqual(
+                    properties[field], {"type": "integer", "minimum": 0})
+                self.assertIn(field, CHECKER["BASE_EVIDENCE_KEYS"])
+        branches = SCHEMA["allOf"]
+        profile = next(
+            b
+            for b in branches
+            if b["if"] == {"properties": {"lane": {"const": "profile"}}}
+        )
+        lane_required = set(
+            profile["then"]["properties"]["evidence"]["required"])
+        for field in sorted(VERSION_TOLERANT_PROFILE_FIELDS):
+            with self.subTest(field=field):
+                self.assertNotIn(field, lane_required)
+                self.assertEqual(
+                    properties[field], {"type": "integer", "minimum": 0})
+                self.assertIn(field, CHECKER["PROFILE_V3_FIELDS"])
 
     def test_unregistered_standard_layout_mechanisms_registered(self):
         """The producer's always-emitted withheld-count field is a
@@ -1268,9 +1310,10 @@ class SchemaOracleAgreement(unittest.TestCase):
             {"type": "integer", "minimum": 0})
 
     def test_profile_branch_requires_versioned_only_fields(self):
-        """The lane==profile branch requires exactly the 4 versioned-only
-        fields; the metrics branch forbids them plus the profile-only
-        exit-mapping split (no instance hooks under metrics)."""
+        """The lane==profile branch requires the versioned-only fields
+        minus the version-tolerant ones old files predate; the metrics
+        branch forbids them plus the profile-only exit-mapping split
+        (no instance hooks under metrics)."""
         branches = SCHEMA["allOf"]
         profile = next(
             b
@@ -1279,7 +1322,7 @@ class SchemaOracleAgreement(unittest.TestCase):
         )
         self.assertEqual(
             set(profile["then"]["properties"]["evidence"]["required"]),
-            set(CHECKER["PROFILE_V3_FIELDS"]),
+            set(CHECKER["PROFILE_V3_FIELDS"]) - VERSION_TOLERANT_PROFILE_FIELDS,
         )
         metrics = next(
             b

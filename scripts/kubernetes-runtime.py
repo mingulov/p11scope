@@ -145,8 +145,13 @@ def validate_results(cell, work):
                 raise ValueError("nested PID namespace disclosure is missing")
         if row["check"] == "trace-exact" and row.get("calls") != 1200:
             raise ValueError("original exact trace count is missing")
-        if row["check"] == "copy-up-neg" and row.get("calls") != 3900:
-            raise ValueError("original exact copy-up count is missing")
+        if row["check"] == "copy-up-neg":
+            if row.get("calls") != 3900:
+                raise ValueError("original exact copy-up count is missing")
+            if row.get("modules") != ["/tmp/copyup/libsofthsm2.so"]:
+                raise ValueError("original copy-up module inventory is missing")
+            if row.get("skipped_rows") != 3:
+                raise ValueError("original copy-up skipped-row count is missing")
         if row["check"] == "scan-limit":
             if "pid_namespace" not in row.get("causes", []):
                 raise ValueError("scan-limit nested PID namespace disclosure is missing")

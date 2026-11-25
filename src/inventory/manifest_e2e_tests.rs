@@ -3399,7 +3399,7 @@ fn keysize_canary_refusal_errors_text(errors: &[String]) -> String {
 /// slots (STACK_GUARD is deliberately never populated). Plain and
 /// per-CPU arrays enumerate every index and therefore cannot validly
 /// dump zero cells. The scan-level aggregate still requires at least one
-/// decoded cell across every owned map.
+/// scanned cell across every owned map.
 fn keysize_canary_kind_may_dump_empty(kind: &str) -> bool {
     matches!(
         kind,
@@ -3911,6 +3911,13 @@ fn keysize_canary_scan_verdict_exact_table() {
         (
             no_evidence(),
             0,
+            0,
+            Err("KEYCANARY: EVIDENCE_START is missing from the dumped maps: [\"PAUSE_PIDS (10)\"]"
+                .to_string()),
+        ),
+        (
+            no_evidence(),
+            1,
             0,
             Err("KEYCANARY: EVIDENCE_START is missing from the dumped maps: [\"PAUSE_PIDS (10)\"]"
                 .to_string()),

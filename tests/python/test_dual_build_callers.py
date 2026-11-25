@@ -187,7 +187,8 @@ class DualBuildCallerTests(unittest.TestCase):
         (self.repo / "scripts").mkdir(parents=True)
         for source in CHILDREN:
             shutil.copy2(source, self.repo / "scripts" / source.name)
-        for name in ("product-build.sh", "cargo.sh", "lib.sh", "cleanup-traps.sh", "release-matrix-contract.py"):
+        for name in ("product-build.sh", "cargo.sh", "lib.sh", "cleanup-traps.sh", "release-matrix-contract.py",
+                     "runner_inputs.py"):
             shutil.copy2(ROOT / "scripts" / name, self.repo / "scripts" / name)
         shutil.copy2(FIXTURES / "record-preparer.py", self.repo / "scripts/prepare-dependencies.py")
         shutil.copy2(ROOT / ".release-rust-version", self.repo / ".release-rust-version")
@@ -383,6 +384,7 @@ class DualBuildCallerTests(unittest.TestCase):
         for name in ("scripts/build-task-storage-reader.sh", "scripts/native/dump-task-storage.c",
                      "scripts/native/dump-task-storage.bpf.c", "scripts/fixtures/canary_workload.c",
                      "crates/discover/tests/fixture/version_matrix.c", "scripts/release-matrix-contract.py",
+                     "scripts/runner_inputs.py",
                      "build.rs", "src/lib.rs"):
             destination = self.repo / name
             destination.parent.mkdir(parents=True, exist_ok=True)

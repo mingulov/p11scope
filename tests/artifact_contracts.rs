@@ -10725,6 +10725,14 @@ fn is_self_test_capable(path: &str) -> bool {
         // detector demands a hosted `run-python-suites.py --self-test` step
         // that would fail on the runner, which has no such flag.
         "scripts/run-python-suites.py",
+        // Strict-runner documentation is not capability: the docstring
+        // names the strict runners' `--self-test` modes, but the
+        // loader's own argv parsing implements only
+        // `ROOT RUNNER MODE SUITE [TEST...]`. Without this exclusion
+        // the detector demands a hosted `strict-selftest.py
+        // --self-test` step that would fail on the runner, which has
+        // no such flag.
+        "scripts/strict-selftest.py",
     ]
     .contains(&path)
     {

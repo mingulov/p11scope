@@ -127,7 +127,7 @@ class CanaryObserverVerbosityTests(unittest.TestCase):
         scripts.mkdir(parents=True)
         for name in ("verify-canaries.sh", "product-build.sh", "cargo.sh",
                      "lib.sh", "cleanup-traps.sh", "release-matrix-contract.py",
-                     "lane-lib-oracle-1.py"):
+                     "runner_inputs.py", "lane-lib-oracle-1.py"):
             shutil.copy2(ROOT / "scripts" / name, scripts / name)
         shutil.copy2(DUAL_FIXTURES / "record-preparer.py",
                      scripts / "prepare-dependencies.py")

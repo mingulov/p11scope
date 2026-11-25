@@ -43,6 +43,15 @@ pub(crate) const MAX_SUCCESSORS_PER_ARM: u8 = 16;
 /// counted named gap. The run continues (never-stop); only the pause chain
 /// ends, loudly, instead of re-arming once per loader hit without bound.
 const MAX_CONSECUTIVE_ENGINE_INCOMPLETE: u32 = 3;
+/// Consecutive live-child release failures before the arm-failure retry
+/// debt escalates to a lifecycle error: the capture ends and settles
+/// instead of leaving a possibly-stopped child with no bound in time.
+/// The parent-death `SIGCONT` arm resumes the child when the observer
+/// exits. Matches the engine-incomplete cap: small, fixed, and counted
+/// from the first unproven release (initial attempt plus retries).
+const MAX_RELEASE_FAILURES: u32 = 3;
+const MSG_RELEASE_FAILED_REPEATEDLY: &str =
+    "owned child release failed repeatedly; ending the capture so the child is not left stopped";
 const MSG_UNPAUSED_PUBLICATION: &str = "the owned pause chain ended while a provider's function table was still unpublished; calls before its probes attach may be unobserved";
 const MAX_FAILURE_ITEMS: usize = 128;
 const MSG_ARM_FAILED: &str = "owned child generation changed before pause arm";
@@ -553,6 +562,11 @@ pub(crate) struct PauseCoordinator {
     /// while the child lives. A release the child never needed (it
     /// was already gone) owes nothing and files nothing.
     release_owed: bool,
+    /// Consecutive live-or-doubted release failures, from the first
+    /// unproven release (initial attempt plus disabled-pass retries).
+    /// A proven release or a proven-gone child resets it; reaching
+    /// `MAX_RELEASE_FAILURES` escalates to a lifecycle error.
+    release_failures: u32,
     /// A pause key was issued to the kernel at least once (an `arm`
     /// write succeeded, even if its readback failed). Before the first
     /// issuance the session's map holds no key by construction, so a
@@ -726,6 +740,7 @@ impl PauseCoordinator {
             cleaned: false,
             disarm_owed: false,
             release_owed: false,
+            release_failures: 0,
             key_issued: false,
         }
     }
@@ -9212,6 +9227,142 @@ mod tests {
         assert_eq!(io.events, ["resume"]);
         assert!(io.resumed);
         assert!(!coordinator.release_owed);
+    }
+
+    #[test]
+    fn auto_arm_failure_with_failing_release_and_unreadable_liveness_owes_release() {
+        let mut io = FakeIo {
+            same_generation: false,
+            authorization: Some(PAUSE_ARMED),
+            fail_resume: true,
+            fail_original_exited: true,
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.key_issued = true;
+
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Disabled);
+
+        // Doubt at the first attempt owes exactly like a live child: the
+        // liveness read failed, so the release cannot be moot.
+        assert_eq!(io.events, ["read", "remove", "resume"]);
+        assert!(!coordinator.disarm_owed);
+        assert!(coordinator.release_owed);
+        assert_eq!(io.arm_failed_notes, 1);
+        assert_eq!(io.release_unproven_notes, 1);
+        // A later proven release clears the debt.
+        io.fail_resume = false;
+        io.fail_original_exited = false;
+        io.events.clear();
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Disabled);
+        assert_eq!(io.events, ["resume"]);
+        assert!(io.resumed);
+        assert!(!coordinator.release_owed);
+        assert_eq!(io.release_unproven_notes, 1);
+    }
+
+    #[test]
+    fn disarm_backlog_release_failures_escalate_to_lifecycle_after_bound() {
+        let mut io = FakeIo {
+            same_generation: false,
+            authorization: Some(PAUSE_ARMED),
+            fail_resume: true,
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.key_issued = true;
+
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Disabled);
+        assert!(coordinator.release_owed);
+        assert_eq!(coordinator.release_failures, 1);
+        assert_eq!(io.release_unproven_notes, 1);
+
+        io.events.clear();
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Disabled);
+        assert!(coordinator.release_owed);
+        assert_eq!(coordinator.release_failures, 2);
+        assert_eq!(io.release_unproven_notes, 2);
+
+        // The third consecutive live failure ends the capture with a
+        // lifecycle error instead of leaving the child stopped forever.
+        io.events.clear();
+        let error = coordinator.arm(&mut io).unwrap_err();
+        assert!(error.lifecycle());
+        assert!(
+            error.to_string().contains(MSG_RELEASE_FAILED_REPEATEDLY),
+            "escalation names its cause: {error}"
+        );
+        assert!(coordinator.release_owed);
+        assert_eq!(coordinator.release_failures, MAX_RELEASE_FAILURES);
+        assert_eq!(io.release_unproven_notes, 3);
+        assert!(io.events.contains(&"resume"));
+    }
+
+    #[test]
+    fn terminal_cleanup_honours_release_debt_with_a_final_resume() {
+        let mut io = FakeIo {
+            same_generation: false,
+            authorization: Some(PAUSE_ARMED),
+            fail_resume: true,
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.key_issued = true;
+
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Disabled);
+        assert!(coordinator.release_owed);
+
+        io.fail_resume = false;
+        io.events.clear();
+        io.resumed = false;
+        coordinator.cleanup(&mut io).unwrap();
+        assert!(io.events.contains(&"resume"));
+        assert!(io.resumed);
+        assert!(!coordinator.release_owed);
+        assert_eq!(coordinator.release_failures, 0);
+    }
+
+    #[test]
+    fn terminal_cleanup_settles_release_debt_silently_when_the_child_is_gone() {
+        let mut io = FakeIo {
+            same_generation: false,
+            authorization: Some(PAUSE_ARMED),
+            fail_resume: true,
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.key_issued = true;
+
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Disabled);
+        assert!(coordinator.release_owed);
+
+        io.original_exited = true;
+        io.events.clear();
+        coordinator.cleanup(&mut io).unwrap();
+        assert!(!io.events.contains(&"resume"));
+        assert!(!coordinator.release_owed);
+        assert_eq!(coordinator.release_failures, 0);
+    }
+
+    #[test]
+    fn terminal_cleanup_collects_a_failing_final_release_and_keeps_the_debt() {
+        let mut io = FakeIo {
+            same_generation: false,
+            authorization: Some(PAUSE_ARMED),
+            fail_resume: true,
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.key_issued = true;
+
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Disabled);
+        assert!(coordinator.release_owed);
+
+        io.events.clear();
+        let error = coordinator.cleanup(&mut io).unwrap_err();
+        assert!(error.lifecycle());
+        assert!(io.events.contains(&"resume"));
+        assert!(coordinator.release_owed);
     }
 
     #[test]

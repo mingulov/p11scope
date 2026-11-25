@@ -366,6 +366,17 @@ def load_profile_schemas() -> tuple[dict, dict]:
     return old_prof, new_prof
 
 
+def generate_manifest(helper: Path, module: str, output: Path) -> str:
+    """Generate the provider manifest needed for attested semantic capture."""
+    completed = run(
+        [str(helper), "--module", module, "-o", str(output)],
+        timeout=30,
+    )
+    if completed.returncode != 0 or not output.exists():
+        return f"manifest generation rc={completed.returncode} stderr={completed.stderr[:300]}"
+    return ""
+
+
 def output_owner_arguments(output: Path) -> list[str]:
     """Root handover arguments when the output directory belongs to a user."""
     if hasattr(os, "geteuid") and os.geteuid() == 0:
@@ -406,6 +417,9 @@ def generate_scan_report(binary: Path, output: Path, module: str) -> str:
                 "native",
                 "--duration",
                 "5s",
+                "--key-operations",
+                "--manifest",
+                str(output.parent / "softhsm-manifest.json"),
                 "--json",
                 "-o",
                 str(output),
@@ -449,6 +463,11 @@ def run_gate(args, workdir: Path, result: dict) -> int:
     check(result, "reports_generated", module is not None, "no SoftHSM provider found")
     old_report = workdir / "v071-inventory.json"
     new_report = workdir / "v072-inventory.json"
+    helper = getattr(args, "helper_binary", None) or args.new_binary.parent / "p11scope-discover"
+    manifest = workdir / "softhsm-manifest.json"
+    manifest_detail = generate_manifest(helper, module, manifest)
+    if manifest_detail:
+        check(result, "reports_generated", False, manifest_detail)
     for binary, output in ((args.old_binary, old_report), (args.new_binary, new_report)):
         detail = generate_scan_report(binary, output, module)
         if detail:

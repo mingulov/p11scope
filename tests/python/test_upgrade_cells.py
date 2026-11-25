@@ -1055,6 +1055,7 @@ class UpgradeGate6Harness:
                     return_value="/fake/libsofthsm2.so" if module_present else None,
                 ),
                 mock.patch.object(gate6, "generate_scan_report", side_effect=fake_generate),
+                mock.patch.object(gate6, "generate_manifest", return_value=""),
                 mock.patch.object(gate6, "run", side_effect=fake_run),
                 mock.patch.object(
                     gate6,
@@ -1512,6 +1513,15 @@ class UpgradeArtifactValidationTests(unittest.TestCase):
         hollow_errors = self.validation.cbom_inventory_errors(hollow, source)
         self.assertIn("cbom positive payload: fewer than one typed applications component", hollow_errors)
         self.assertIn("cbom positive payload: fewer than one typed providers component", hollow_errors)
+        mismatched = copy.deepcopy(cbom)
+        for prop in mismatched["metadata"]["properties"]:
+            if prop["name"] == "p11scope:applications":
+                prop["value"] = "2"
+        mismatch_errors = self.validation.cbom_inventory_errors(mismatched, source)
+        self.assertIn(
+            "cbom positive payload: 'p11scope:applications' is 2, but 1 typed component(s) are present",
+            mismatch_errors,
+        )
         sparse = {"bomFormat": "CycloneDX", "metadata": {"properties": []}}
         self.assertEqual(
             self.validation.cbom_inventory_errors(sparse, source)[0],

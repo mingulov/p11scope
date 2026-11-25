@@ -1415,6 +1415,13 @@ class DeferredActivationTests(unittest.TestCase):
         self.assertNotEqual(rc, 0, out)
         self.assertIn("caller image has type NoneType", out)
 
+    def test_deferral_with_zero_observed_rows_fails(self):
+        report = deferred_recovered_report()
+        report["edges"][1]["entries"]["count"] = 0
+        rc, out = run_oracle(report, modfs="overlayfs")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("deferred activation recovered without observed witness rows", out)
+
     def test_callerless_deferral_fails(self):
         report = deferred_recovered_report()
         report["gaps"][-1]["caller"] = None
@@ -1453,7 +1460,7 @@ class CountReconciliationTests(unittest.TestCase):
                 report["edges"][1]["entries"] = witnessed_zero()
                 rc, out = run_oracle(report, modfs=modfs)
                 self.assertNotEqual(rc, 0, out)
-                self.assertIn("fork child calls not counted", out)
+                self.assertIn("deferred activation recovered without observed witness rows", out)
 
     def test_missing_child_edge_fails(self):
         for modfs, witness in self.SHAPES:

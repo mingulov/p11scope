@@ -960,6 +960,12 @@ def judge_cgroup_inventory(args):
             require(g["subject"] == ACTIVATION, GAP_ACTIVATION, "activation refusal under another subject: %r" % (g,))
             require(at_workload(g) and workload[g["caller"]]["authority"] == "native_exact", GAP_ACTIVATION,
                     "%s: %r" % (ACTIVATION_REFUSALS[g["reason"]], g))
+            if g["reason"] == DEFERRED_REASON and at_workload(g):
+                caller = workload[g["caller"]]
+                owned = [x for m, x in caller["edges"] if m == owned_id]
+                observed = [x for x in owned if x["count"] > 0]
+                require(not owned or observed, GAP_ACTIVATION,
+                        "deferred activation recovered without observed witness rows: %r" % (g,))
         require(kind != "unexpected-activation", GAP_ACTIVATION, "unexpected activation refusal: %r" % (g,))
         if kind == "retained":
             require(g["subject"] == "native owner refresh refused" and at_workload(g), GAP_RETAINED,

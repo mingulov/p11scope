@@ -20217,6 +20217,72 @@ mod tests {
         );
     }
 
+    /// Twin (V1/B3 killing test): a contradiction rejection survives
+    /// absorb into the committed set — the committed key rejects, the
+    /// peer pin stops resolving, and exactly one bounded ambiguity
+    /// row publishes.
+    #[test]
+    fn contradiction_rejection_survives_absorb_into_the_committed_set() {
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let module_w = module(key);
+        // Committed: W holds a proven pin for K.
+        let mut committed = view_pin(&module_w, 1, SHA, 1, false);
+        test_fixture::record_scan_ownership(&mut committed, module_w.view, key, PATH);
+        assert!(
+            committed
+                .id_for_scanned(&module_w, key, PATH)
+                .is_some(),
+            "W's pin resolves before the merge"
+        );
+        // Scratch: V refuses K, then contradicts itself by filing it.
+        let mut source = image_pins(&[(key, "aaaaaaaa", 1)]);
+        let entry = source.by_id.pop_first().unwrap().1;
+        let raw = entry.raw.clone();
+        let mut scratch = PinnedObjects::empty();
+        let mut scratch_skips = Vec::new();
+        record_scanned_candidate(
+            &mut scratch,
+            ProcessViewId(211),
+            raw.clone(),
+            Err(PinOutcome::Unproven {
+                cause: UnprovenCause::OpenFailed,
+                reason: "TEST refused".to_string(),
+            }),
+            &mut scratch_skips,
+            false,
+        );
+        record_scanned_candidate(
+            &mut scratch,
+            ProcessViewId(211),
+            raw,
+            Ok(entry),
+            &mut scratch_skips,
+            false,
+        );
+        assert!(
+            scratch.rejects(key),
+            "the scratch store contradicts itself before the merge"
+        );
+        let mut all_skips = scratch_skips;
+        all_skips.extend(committed.absorb(scratch));
+        assert!(
+            committed.rejects(key),
+            "the contradiction rejects the committed key"
+        );
+        assert!(
+            committed.id_for_scanned(&module_w, key, PATH).is_none(),
+            "W's pin stops resolving after the merge"
+        );
+        assert_eq!(
+            ambiguity_count(&all_skips),
+            1,
+            "exactly one bounded ambiguity row: {all_skips:?}"
+        );
+    }
+
     /// A proven collision — two proven entries contradicting under one
     /// raw key — still rejects the key globally with exactly one
     /// bounded ambiguity row, even across a retained plain pin, and

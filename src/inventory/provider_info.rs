@@ -405,6 +405,22 @@ pub(crate) struct ProviderGaps {
     pub mechanisms_departed: u64,
 }
 
+impl ProviderGaps {
+    /// Every named gap counted once: the concise coverage segment's
+    /// total, equal to the JSON `gaps[].count` sum.
+    pub(crate) fn total(&self) -> u64 {
+        self.aliased
+            .saturating_add(self.return_deferred)
+            .saturating_add(self.return_refused_hazard)
+            .saturating_add(self.caller_unavailable)
+            .saturating_add(self.mechanism_refused)
+            .saturating_add(self.tokens_refused)
+            .saturating_add(self.mechanisms_refused)
+            .saturating_add(self.tokens_departed)
+            .saturating_add(self.mechanisms_departed)
+    }
+}
+
 /// The joined Task 7 projection (top-level section content).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ProviderObservations {

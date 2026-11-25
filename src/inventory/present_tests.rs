@@ -1108,6 +1108,133 @@ fn coverage_line_uses_lowercase_verdict_and_omits_zero_counts() {
     );
 }
 
+/// Audit test 2: nonzero `provider_observations.gaps` force PARTIAL and
+/// are named in the concise coverage line — never `coverage: complete`
+/// while the JSON gaps hold counts.
+#[test]
+fn coverage_line_counts_provider_info_gaps() {
+    use crate::inventory_provider_info::{ProviderGaps, ProviderObservations};
+    let coverage_with = |gaps: ProviderGaps| {
+        let harness = varied_harness();
+        let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+        presentation.gaps.clear();
+        presentation.budgets.callers_refused = 0;
+        presentation.budgets.modules_refused = 0;
+        presentation.budgets.edges_refused = 0;
+        presentation.budgets.endpoints_refused = 0;
+        presentation.gaps_suppressed = 0;
+        presentation.provider_observations = Some(ProviderObservations {
+            tokens: Vec::new(),
+            mechanisms: Vec::new(),
+            gaps,
+        });
+        let snapshot =
+            render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+        snapshot.lines().nth(1).unwrap().to_string()
+    };
+    // Every info endpoint downgraded by the uretprobe safety check.
+    assert_eq!(
+        coverage_with(ProviderGaps {
+            return_refused_hazard: 4,
+            ..Default::default()
+        }),
+        "coverage: partial - provider info: 4 refused"
+    );
+    // Token and mechanism rows refused at the row caps.
+    assert_eq!(
+        coverage_with(ProviderGaps {
+            mechanism_refused: 1,
+            tokens_refused: 2,
+            mechanisms_refused: 3,
+            ..Default::default()
+        }),
+        "coverage: partial - provider info: 6 refused"
+    );
+    // Beside registry loss both read, provider after refused.
+    let harness = varied_harness();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    presentation.gaps.clear();
+    presentation.gaps.push(GapView {
+        caller: None,
+        module: None,
+        pid: None,
+        subject: "scope-0".into(),
+        reason: "reason".into(),
+        budget: None,
+        repeats: 1,
+    });
+    presentation.budgets.callers_refused = 0;
+    presentation.budgets.modules_refused = 0;
+    presentation.budgets.edges_refused = 0;
+    presentation.budgets.endpoints_refused = 1;
+    presentation.gaps_suppressed = 0;
+    presentation.provider_observations = Some(ProviderObservations {
+        tokens: Vec::new(),
+        mechanisms: Vec::new(),
+        gaps: ProviderGaps {
+            caller_unavailable: 2,
+            ..Default::default()
+        },
+    });
+    let snapshot =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert_eq!(
+        snapshot.lines().nth(1).unwrap(),
+        "coverage: partial - 1 gap, 1 refused, provider info: 2 refused"
+    );
+}
+
+/// The class check: the concise provider segment counts every JSON gap
+/// exactly once — the segment total equals the `gaps[].count` sum.
+#[test]
+fn coverage_provider_segment_matches_json_gap_total() {
+    use crate::inventory_provider_info::{ProviderGaps, ProviderObservations};
+    let gaps = ProviderGaps {
+        aliased: 1,
+        return_deferred: 2,
+        return_refused_hazard: 3,
+        caller_unavailable: 4,
+        mechanism_refused: 5,
+        tokens_refused: 6,
+        mechanisms_refused: 7,
+        tokens_departed: 8,
+        mechanisms_departed: 9,
+    };
+    let harness = varied_harness();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    presentation.gaps.clear();
+    presentation.budgets.callers_refused = 0;
+    presentation.budgets.modules_refused = 0;
+    presentation.budgets.edges_refused = 0;
+    presentation.budgets.endpoints_refused = 0;
+    presentation.gaps_suppressed = 0;
+    let observations = ProviderObservations {
+        tokens: Vec::new(),
+        mechanisms: Vec::new(),
+        gaps,
+    };
+    presentation.provider_observations = Some(observations.clone());
+    let snapshot =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    let line = snapshot.lines().nth(1).unwrap();
+    let segment: u64 = line
+        .strip_prefix("coverage: partial - provider info: ")
+        .expect("provider-only partial line")
+        .strip_suffix(" refused")
+        .expect("refused suffix")
+        .parse()
+        .unwrap();
+    let json = crate::inventory_provider_info::provider_observations_json(&observations);
+    let total: u64 = json["gaps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|gap| gap["count"].as_u64().unwrap())
+        .sum();
+    assert_eq!(total, 45);
+    assert_eq!(segment, total, "{line}");
+}
+
 #[test]
 fn retained_labels_preserve_unknown_deleted_and_incarnation() {
     // A live-PID lookup would overwrite a retired incarnation's name; an

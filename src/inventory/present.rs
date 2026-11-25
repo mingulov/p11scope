@@ -4976,10 +4976,21 @@ fn render_snapshot_inner(
     }
     // One coverage format everywhere (profile, inspect, inventory):
     // `coverage: complete`, or `coverage: partial` with the nonzero
-    // segments — loss gaps, refusals, suppressed-but-unretained.
-    // Zero counts stay out; the gaps block below names the reasons.
+    // segments — loss gaps, refusals, provider-info gaps,
+    // suppressed-but-unretained. Zero counts stay out; the gaps block
+    // below names the reasons. Never `complete` while the JSON
+    // `provider_observations.gaps` hold counts.
     let gaps = loss_gap_count(&presentation.gaps);
-    if gaps == 0 && budgets.refusals() == 0 && presentation.gaps_suppressed == 0 {
+    let provider_gaps = presentation
+        .provider_observations
+        .as_ref()
+        .map(|observations| observations.gaps.total())
+        .unwrap_or(0);
+    if gaps == 0
+        && budgets.refusals() == 0
+        && presentation.gaps_suppressed == 0
+        && provider_gaps == 0
+    {
         let _ = writeln!(out, "coverage: complete");
     } else {
         let mut segments = Vec::new();
@@ -4988,6 +4999,9 @@ fn render_snapshot_inner(
         }
         if budgets.refusals() > 0 {
             segments.push(format!("{} refused", budgets.refusals()));
+        }
+        if provider_gaps > 0 {
+            segments.push(format!("provider info: {provider_gaps} refused"));
         }
         if presentation.gaps_suppressed > 0 {
             segments.push(format!("{} more not shown", presentation.gaps_suppressed));

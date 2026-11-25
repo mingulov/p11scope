@@ -20606,6 +20606,13 @@ mod tests {
             public.reason,
             "physical identity is ambiguous; the collision group was not attached"
         );
+        let rendered = serde_json::to_string(&public).unwrap();
+        for private in ["first.so", "second.so", "retained.so", dir.path().to_str().unwrap()] {
+            assert!(
+                !rendered.contains(private),
+                "the public ambiguity row leaks {private}: {rendered}"
+            );
+        }
 
         // A second merge publishes nothing again.
         let again = retained.absorb(PinnedObjects::empty());
@@ -20614,6 +20621,37 @@ mod tests {
                 .iter()
                 .all(|skip| !skip.reason.contains("physical identity is ambiguous")),
             "no second ambiguity row: {again:?}"
+        );
+    }
+
+    /// Proven collisions publish per key: two independent collision
+    /// groups produce exactly two bounded ambiguity rows, never one
+    /// merged row that hides a key.
+    #[test]
+    fn distinct_proven_collision_keys_each_publish_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut aggregate = PinnedObjects::empty();
+        let mut skipped = Vec::new();
+        for (inode, first_name, second_name) in [
+            (INODE, "first-a.so", "second-a.so"),
+            (INODE + 1, "first-b.so", "second-b.so"),
+        ] {
+            let key = ObjectKey {
+                device: Device { major: 8, minor: 1 },
+                inode,
+            };
+            let mut first = image_pins(&[(key, "aaaaaaaa", 1)]);
+            reback(&mut first, &backing_file(&dir, first_name));
+            let mut second = image_pins(&[(key, "aaaaaaaa", 1)]);
+            reback(&mut second, &backing_file(&dir, second_name));
+            second.by_id.values_mut().next().unwrap().mapping.mount_id += 1;
+            skipped.extend(first.absorb(second));
+            skipped.extend(aggregate.absorb(first));
+        }
+        assert_eq!(
+            ambiguity_count(&skipped),
+            2,
+            "each proven collision key publishes once: {skipped:?}"
         );
     }
 

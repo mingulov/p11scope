@@ -8952,8 +8952,8 @@ fn release_view_id_clears_the_released_views_pin_records() {
     };
     let mut module2 = test_fixture::module(key2);
     module2.view = view;
-    let raw2 =
-        RawObjectInstance::scanned(&module2, key2, "/v/other.so").expect("test raw builds");
+    let raw2 = crate::discovery::identity::RawObjectInstance::scanned(&module2, key2, "/v/other.so")
+        .expect("test raw builds");
     test_fixture::record_refusal(&mut engine.pinned, view, raw2, "TEST refused");
     assert!(
         engine.pinned.raw_ownership_views_for_test().contains(&view),

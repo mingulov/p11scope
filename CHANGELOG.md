@@ -43,10 +43,11 @@ versioned separately and are opaque, exact dispatch keys.
 - Inferred key families and sizes on `--key-operations` rows
   (section version 7): families infer from operation mechanisms in
   both modes, sizes infer from operation lengths with the new
-  `--key-sizes` opt-in (needs `--key-operations` and a FULL build,
-  off by default; without it operation-length sizes read unknown
-  and no length word is acquired, while families and
-  creation/token-reported sizes still show). A refused sizes start
+  `--key-sizes` opt-in (needs `--key-operations` and a build with
+  key-size capture, off by default; without it operation-length
+  sizes read unknown and no length word is acquired, while families
+  and creation/token-reported sizes still show). A refused sizes
+  start
   retries the journal without sizes behind a `key sizes unavailable`
   gap instead of voiding key rows, and ECDSA lengths publish the
   size class unless the curve is established. Text gains
@@ -55,7 +56,8 @@ versioned separately and are opaque, exact dispatch keys.
   1–6 stay frozen and byte-stable.
 - Provider, token and mechanism facts on inventory runs with the new
   `--provider-info` opt-in (section version 8; standalone, off by
-  default; needs `--capture auto` or `native` and a FULL build).
+  default; needs `--capture auto` or `native` and a build with
+  provider-info capture).
   Observed content decides the output: modules with completed
   `C_GetInfo` evidence gain per-module `provider_info` records and
   one concise provider text line each, `--json` gains the optional
@@ -121,7 +123,10 @@ versioned separately and are opaque, exact dispatch keys.
   saturation and overflow as named unknowns) already consume the
   aggregate. Inventory text names folded departed callers per module:
   a `departed use:` summary row counts the folded callers, entries
-  and edges (plus any identities or mechanisms past the row bound).
+  and edges (plus any identities or mechanisms past the row bound),
+  and the concise head counts the retired rows behind it (`N exited
+  without attributed calls`, `N departed callers folded with N
+  calls`).
 - Mixed-version inventory diffs are explicit: diffing a pre-fold
   (v0.7.1 or older) inventory against a current one carries a
   `pre_fold_before`/`pre_fold_after` limitation naming the older side
@@ -182,6 +187,9 @@ versioned separately and are opaque, exact dispatch keys.
 
 ### Fixed
 
+- The observer caps glibc allocator arenas at startup, so long quiet
+  runs no longer grow RSS through unbounded arena creation; the cap
+  does nothing on the shipped musl build, which has no arenas.
 - A capture under a flood of short-lived processes no longer stops
   counting partway: a scan bracket starved of discovery work drops
   its decoded modules with the failure named (the v0.7.0 contract)

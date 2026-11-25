@@ -3188,7 +3188,7 @@ fn privileged_native_lane_sigint_during_extend_lp64() -> Result<()> {
     let mut coordinator = pid_coordinator(target.pid(), Path::new(softhsm()))?;
     let mut probe = pid_probe(target.pid(), &coordinator)?;
     probe.raise_sigint_on_activation = true;
-    let flag = StopFlag::install();
+    let flag = StopFlag::install()?;
     let lane = NativeLane::start(probe, &mut coordinator, LaneWindows::PROVISIONAL, None)
         .map_err(|(_, reason)| anyhow::anyhow!("{reason}"))?;
     ensure!(

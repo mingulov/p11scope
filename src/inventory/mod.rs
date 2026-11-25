@@ -946,13 +946,15 @@ pub fn run(
     // The opt-in gates before any load, mirroring the parse refusals
     // for programmatic callers (spec §10.5).
     if key_sizes && cfg!(feature = "stub-object-attributes") {
-        anyhow::bail!("--key-sizes requires a FULL build (P0 omits length capture)");
+        anyhow::bail!("--key-sizes requires key-size capture (this build was made without it)");
     }
     if key_sizes && !key_operations {
         anyhow::bail!("--key-sizes requires --key-operations");
     }
     if provider_info && cfg!(feature = "stub-object-attributes") {
-        anyhow::bail!("--provider-info requires a FULL build (P0 omits info capture)");
+        anyhow::bail!(
+            "--provider-info requires provider-info capture (this build was made without it)"
+        );
     }
     if provider_info && capture == CaptureMode::Scan {
         anyhow::bail!("--provider-info requires --capture auto or native");
@@ -977,7 +979,7 @@ pub fn run(
     let stdout_tty = crate::inventory_dashboard::fd_is_tty(1);
     // SIGINT/SIGTERM/SIGHUP end the loop, classic or dashboard, through
     // its stop path (the final sinks are still written).
-    let stop = StopFlag::install();
+    let stop = StopFlag::install()?;
     let signals = || stop.signal_count();
     let mut stdout = FdStdout::new(1, &signals);
     let identity = matches!(scope, crate::cli::ScopeArg::System).then_some(identity_backend);

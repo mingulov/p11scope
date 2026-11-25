@@ -1712,7 +1712,9 @@ Limits that matter in pods:
   `--key-operations` (default off) opts in to per-key tracking through a linked
   journal session; it requires `--capture auto` or `native`. `--key-sizes`
   (default off) additionally infers key sizes from operation lengths; it needs
-  `--key-operations` and a FULL build (P0 omits length capture). On a kernel
+  `--key-operations` and a build with key-size capture (check
+  `p11scope --version`: a limited build was made without it). On a
+  kernel
   that refuses only the length programs, the run keeps key operations and
   records a `key sizes unavailable` gap instead. Without it,
   token-reported and creation-template sizes and inferred families are still
@@ -1879,8 +1881,9 @@ Limits that matter in pods:
   `--provider-info` (standalone, off by default) additionally captures
   provider, token and mechanism facts from observed application
   `C_GetInfo`, `C_GetTokenInfo` and `C_GetMechanismInfo` calls. It
-  needs `--capture auto` or `native` and a FULL build (P0 omits info
-  capture), and refuses under `--capture scan`; it needs no other
+  needs `--capture auto` or `native` and a build with provider-info
+  capture (check `p11scope --version`: a limited build was made
+  without it), and refuses under `--capture scan`; it needs no other
   flag, so info appears in default inventory as well as under
   `--key-operations`, and identically with `--key-sizes` on or off.
   Observation needs the native lane: an `auto` run that stays

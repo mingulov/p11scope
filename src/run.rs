@@ -31426,7 +31426,7 @@ int main(int argc, char **argv) {
         let _signal_guard = ACTUAL_SIGNAL_TEST.lock().unwrap();
         let _restore = RestoreDisposition::save(libc::SIGHUP);
         set_disposition(libc::SIGHUP, libc::SIG_IGN);
-        let flag = crate::inventory_dashboard::StopFlag::install();
+        let flag = crate::inventory_dashboard::StopFlag::install().unwrap();
         assert_eq!(
             signal_disposition(libc::SIGHUP),
             libc::SIG_IGN,

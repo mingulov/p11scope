@@ -348,6 +348,19 @@ fn next_frame_still_shows_an_exited_callers_calls() {
     );
 }
 
+/// A failed stop-handler registration fails startup with a named
+/// error — never a silent drop that would leave the signal killing
+/// the run with no report.
+#[test]
+fn stop_flag_install_names_a_failed_handler_registration() {
+    let error = match StopFlag::install_for(&[-1]) {
+        Ok(_) => panic!("installing a handler for an invalid signal must fail"),
+        Err(error) => error,
+    };
+    let text = format!("{error:#}");
+    assert!(text.contains("installing handler for signal -1"), "{text}");
+}
+
 /// Capture the harness's current registry state as a presentation
 /// (same extraction the JSON path uses for its observation block).
 fn capture_from_harness(harness: &Harness) -> Presentation {

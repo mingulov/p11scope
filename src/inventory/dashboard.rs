@@ -35,6 +35,7 @@ use crate::inventory_promotion::{
     ViewRevision,
 };
 use crate::render::escape_controls;
+use anyhow::Context as _;
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::Write as _;
@@ -2341,11 +2342,19 @@ pub(crate) struct StopFlag {
 // `signal_hook::low_level::register` is process-global; the dashboard
 // runs once per process, so the hooks live for the run.
 impl StopFlag {
-    pub(crate) fn install() -> Self {
-        let signals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    pub(crate) fn install() -> anyhow::Result<Self> {
+        Self::install_for(&[libc::SIGINT, libc::SIGTERM, libc::SIGHUP])
+    }
+
+    /// Install the stop handlers for exactly `signals`. A failed
+    /// registration fails startup with a named error, like
+    /// `install_stop_flag` — never a silent drop, which would leave
+    /// that signal killing the run with no report.
+    fn install_for(signals: &[libc::c_int]) -> anyhow::Result<Self> {
+        let counts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let outputs_attempted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut hooks = Vec::new();
-        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+        for signal in signals.iter().copied() {
             // An inherited hangup ignore (`nohup p11scope inventory
             // ...`) survives, like profile/trace/run: the run keeps
             // going after logout.
@@ -2356,12 +2365,14 @@ impl StopFlag {
             {
                 continue;
             }
-            let count = Arc::clone(&signals);
+            let count = Arc::clone(&counts);
             let phase = Arc::clone(&outputs_attempted);
             // The callback uses lock-free atomics on supported x86-64, or
             // `_exit` (async-signal-safe); no allocation, no
             // I/O, no locks.
-            let hook = unsafe {
+            // SAFETY: the callback performs only atomic operations and
+            // `_exit`, which is async-signal-safe.
+            let id = unsafe {
                 signal_hook::low_level::register(signal, move || {
                     // After the outputs a further stop ends the wait at
                     // once — but only once a stop was already counted,
@@ -2374,16 +2385,15 @@ impl StopFlag {
                         (seen < 2).then_some(seen + 1)
                     });
                 })
-            };
-            if let Ok(id) = hook {
-                hooks.push(id);
             }
+            .with_context(|| format!("installing handler for signal {signal}"))?;
+            hooks.push(id);
         }
-        Self {
-            signals,
+        Ok(Self {
+            signals: counts,
             outputs_attempted,
             _hooks: hooks,
-        }
+        })
     }
 
     pub(crate) fn stopped(&self) -> bool {

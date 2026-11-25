@@ -1421,7 +1421,7 @@ mod tests {
             .unwrap();
         let healthy = std::env::var_os("P11SCOPE_CGROUP_RELEASE_TEST").is_some();
         let (_fixture, root) = fixture(pid);
-        let stop = crate::inventory_dashboard::StopFlag::install();
+        let stop = crate::inventory_dashboard::StopFlag::install().unwrap();
         let mut request = request(root);
         request.control =
             CollectionControl::new(None).with_operator_stop_source(stop.signal_source());

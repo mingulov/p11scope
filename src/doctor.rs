@@ -1455,7 +1455,7 @@ fn live_discovery_checks(pid: Option<u32>, capture_lane: bool) -> Vec<Check> {
         Check {
             name: "pause".into(),
             status: Status::Ok(format!(
-                "never default; explicit auto|always {} arm here",
+                "auto default; never|always explicit; {} arm here",
                 if capture_lane { "can" } else { "cannot" }
             )),
         },
@@ -4445,15 +4445,25 @@ mod tests {
             );
         }
         // Pause: the default is stated, and an explicit policy's armability is
-        // what an operator actually needs before asking for one.
+        // what an operator actually needs before asking for one. The
+        // stated default is typed: it equals the CLI pause default,
+        // so a default change fails here instead of lying in -v.
         let pause = checks
             .iter()
             .find(|c| c.name == "pause")
             .expect("pause row is missing");
         let detail = status_detail(&pause.status);
-        assert!(detail.starts_with("never default"), "{detail:?}");
+        let default = format!("{:?}", crate::cli::PausePolicy::default()).to_lowercase();
         assert!(
-            detail.contains("auto") && detail.contains("always"),
+            detail.starts_with(&format!("{default} default")),
+            "the pause row must state the CLI pause default: {detail:?}"
+        );
+        assert!(
+            detail.contains("never|always explicit"),
+            "the pause row must name the explicit policies: {detail:?}"
+        );
+        assert!(
+            detail.contains("can arm here") || detail.contains("cannot arm here"),
             "the pause row must say whether an explicit policy can arm: {detail:?}"
         );
         // The memory scan lane keeps its existing row and its existing rules.

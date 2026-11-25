@@ -5307,7 +5307,7 @@ fn stop_flag_child_exits_on_the_armed_signal() {
     if std::env::var_os("P11SCOPE_STOPFLAG_CHILD").is_none() {
         return;
     }
-    let flag = crate::inventory_dashboard::StopFlag::install();
+    let flag = crate::inventory_dashboard::StopFlag::install().unwrap();
     // SAFETY: raising a signal whose handler is installed.
     unsafe { libc::raise(libc::SIGINT) };
     // Positive control: before arming, a signal only requests the stop.
@@ -5353,7 +5353,7 @@ fn stop_flag_child_first_signal_after_duration_end_keeps_report_code() {
     if std::env::var_os("P11SCOPE_STOPFLAG_FIRST_SURVIVES").is_none() {
         return;
     }
-    let flag = crate::inventory_dashboard::StopFlag::install();
+    let flag = crate::inventory_dashboard::StopFlag::install().unwrap();
     flag.note_outputs_attempted();
     // SAFETY: raising a signal whose handler is installed.
     unsafe { libc::raise(libc::SIGTERM) };
@@ -5390,7 +5390,7 @@ fn stop_flag_child_second_signal_during_detach_exits() {
     if std::env::var_os("P11SCOPE_STOPFLAG_TWO_DURING_DETACH").is_none() {
         return;
     }
-    let flag = crate::inventory_dashboard::StopFlag::install();
+    let flag = crate::inventory_dashboard::StopFlag::install().unwrap();
     flag.note_outputs_attempted();
     // SAFETY: raising a signal whose handler is installed.
     unsafe { libc::raise(libc::SIGTERM) };
@@ -5654,7 +5654,7 @@ fn stop_flag_counts_distinct_deliveries_child() {
     if std::env::var_os("P11SCOPE_COUNT_CHILD").is_none() {
         return;
     }
-    let flag = crate::inventory_dashboard::StopFlag::install();
+    let flag = crate::inventory_dashboard::StopFlag::install().unwrap();
     assert_eq!(flag.signal_count(), 0);
     for (signal, expected) in [(libc::SIGINT, 1), (libc::SIGTERM, 2), (libc::SIGHUP, 2)] {
         unsafe {

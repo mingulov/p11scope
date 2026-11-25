@@ -715,7 +715,7 @@ Live capture needs root and usable uprobe_multi host capability (normally Linux 
 Ctrl-C or SIGTERM ends capture cleanly and writes the final -o report.
 --output-owner UID[:GID] trusts -o directories owned by UID and hands the report to UID:GID (GID defaults to UID); root only, for a container bind mount owned by the host user. Needs -o.
 Default text output is concise: totals, coverage, and the function and mechanism tables. -v, --verbose adds every gap and reason, Evidence, and timing plus informational stderr notes. --quiet prints only the totals and coverage. Evidence counts probes: one entry and one return probe per watched function, so probes run at twice functions.
-exit codes: 0 ok (partial results still exit 0); 1 capture failed; 2 wrong arguments.
+exit codes: 0 ok (partial results still exit 0); 1 capture failed; 2 wrong arguments; 130 a second Ctrl-C abandoned cleanup.
 ";
 
 /// `p11scope trace --help`: scoped syntax, examples and evidence limits.
@@ -766,7 +766,7 @@ const TRACE_HELP_TAIL: &str = "-o copies the trace to a file; -o - uses stdout o
 --output-owner UID[:GID] trusts -o directories owned by UID and hands the report to UID:GID (GID defaults to UID); root only, for a container bind mount owned by the host user. Needs -o.
 Ctrl-C or SIGTERM ends capture cleanly.
 Trace events print the same at every verbosity; -v, --verbose additionally shows informational stderr notes (discovery, timing) and restores the EVIDENCE record on stdout.
-exit codes: 0 ok (partial results still exit 0); 1 capture failed; 2 wrong arguments.
+exit codes: 0 ok (partial results still exit 0); 1 capture failed; 2 wrong arguments; 130 a second Ctrl-C abandoned cleanup.
 ";
 
 /// `p11scope run --help`: scoped syntax, examples and evidence limits.
@@ -937,7 +937,7 @@ A missing observation or incomplete retained history does not establish zero act
 Compare saved files offline with inventory diff, and export one saved file as CycloneDX CBOM with inventory cbom; see docs/usage.md.
 --attach-backend auto (default) uses one multi-uprobe link per attach group where one links, else safe per-offset fallback; multi forces multi, singles forces per-offset.
 Live capture (auto/native) needs root and usable uprobe_multi host capability (normally Linux 6.6+); --capture scan does not.
-exit codes: 0 ok (partial results still exit 0); 1 nothing could be observed; 2 wrong arguments.
+exit codes: 0 ok (partial results still exit 0); 1 nothing could be observed; 2 wrong arguments; 128+signal a further stop during the detach.
 ";
 
 /// The assembled inventory help: head, the live `--max-endpoints` line,
@@ -2353,7 +2353,7 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
     // any other sizes check (a P0 run cannot do sizes at all).
     if key_sizes && cfg!(feature = "stub-object-attributes") {
         return Err(usage_err(
-            "--key-sizes requires a FULL build (P0 omits length capture)",
+            "--key-sizes requires key-size capture (this build was made without it)",
         ));
     }
     if key_sizes && !key_operations {
@@ -2363,7 +2363,7 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
     // any other provider-info check (a P0 run cannot do info at all).
     if provider_info && cfg!(feature = "stub-object-attributes") {
         return Err(usage_err(
-            "--provider-info requires a FULL build (P0 omits info capture)",
+            "--provider-info requires provider-info capture (this build was made without it)",
         ));
     }
     if provider_info && capture == Some(CaptureMode::Scan) {
@@ -7676,6 +7676,33 @@ mod tests {
         }
     }
 
+    /// Audit test 7: every `exit codes:` line lists 130 where a second
+    /// signal can abandon the run — profile/trace link cleanup (130)
+    /// and the inventory detach (128 + signal).
+    #[test]
+    fn exit_code_lines_list_130_where_a_second_signal_abandons() {
+        for topic in [HelpTopic::Profile, HelpTopic::Trace] {
+            let help = topic.text();
+            let line = help
+                .lines()
+                .find(|line| line.starts_with("exit codes:"))
+                .unwrap();
+            assert!(
+                line.contains("130"),
+                "{topic:?} can exit 130 on a second Ctrl-C: {line}"
+            );
+        }
+        let help = HelpTopic::Inventory.text();
+        let line = help
+            .lines()
+            .find(|line| line.starts_with("exit codes:"))
+            .unwrap();
+        assert!(
+            line.contains("128"),
+            "inventory can exit 128+signal during the detach: {line}"
+        );
+    }
+
     #[test]
     fn capture_examples_show_sudo_and_parse() {
         let run = HelpTopic::Run.text();
@@ -7903,11 +7930,24 @@ mod tests {
         }
     }
 
+    /// The `--version` flavor names exactly what a limited build
+    /// cannot do, matching the `--key-sizes`/`--provider-info`
+    /// refusals: `full`, or the limited capability note.
+    #[test]
+    fn build_flavor_names_exactly_what_a_limited_build_lacks() {
+        let flavor = crate::build_flavor();
+        if cfg!(feature = "stub-object-attributes") {
+            assert_eq!(flavor, "limited: no key-size or provider-info capture");
+        } else {
+            assert_eq!(flavor, "full");
+        }
+    }
+
     #[test]
     #[cfg(feature = "stub-object-attributes")]
     fn inventory_key_sizes_refused_under_p0() {
         // P0 builds omit the length programs, so the flag refuses with
-        // the named FULL-only reason — alone (precedence over the
+        // the named plain-words reason — alone (precedence over the
         // requires-key-operations refusal) and beside --key-operations.
         for argv in [
             vec!["inventory", "--pid", "7", "--key-sizes"],
@@ -7915,7 +7955,7 @@ mod tests {
         ] {
             assert!(
                 matches!(parse(args(&argv)), Err(CliError::Usage { message, topic: HelpTopic::Inventory })
-                    if message.contains("--key-sizes requires a FULL build (P0 omits length capture)")),
+                    if message.contains("--key-sizes requires key-size capture (this build was made without it)")),
                 "{argv:?} should refuse --key-sizes under P0"
             );
         }
@@ -8032,7 +8072,7 @@ mod tests {
     #[cfg(feature = "stub-object-attributes")]
     fn inventory_provider_info_refused_under_p0() {
         // P0 builds omit the info programs, so the flag refuses with
-        // the named FULL-only reason — alone (precedence over the
+        // the named plain-words reason — alone (precedence over the
         // scan refusal) and beside --key-operations.
         for argv in [
             vec!["inventory", "--pid", "7", "--provider-info"],
@@ -8046,7 +8086,7 @@ mod tests {
         ] {
             assert!(
                 matches!(parse(args(&argv)), Err(CliError::Usage { message, topic: HelpTopic::Inventory })
-                    if message.contains("--provider-info requires a FULL build (P0 omits info capture)")),
+                    if message.contains("--provider-info requires provider-info capture (this build was made without it)")),
                 "{argv:?} should refuse --provider-info under P0"
             );
         }

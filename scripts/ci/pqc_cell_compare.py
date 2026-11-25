@@ -86,8 +86,6 @@ OP_EVIDENCE = {
     "encapsulate": "encapsulate_output", "decapsulate": "decapsulate_input",
 }
 FAMILY_DISPLAY = {"ml_kem": "ML-KEM", "ml_dsa": "ML-DSA"}
-WANT_SPOTLIGHT = ("ML-DSA-44", "ML-DSA-65", "ML-DSA-87",
-                  "ML-KEM-512", "ML-KEM-768", "ML-KEM-1024")
 
 # Attribution: the exact role each operation carries, and the
 # established class of the object it must join (2 public, 3 private).

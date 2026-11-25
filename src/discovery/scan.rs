@@ -202,6 +202,14 @@ pub(crate) const MOUNTINFO_CEILING_REASON: &str =
     "capture mountinfo byte ceiling reached; the incomplete mount table was refused";
 pub(crate) const MOUNTINFO_ENTRY_CEILING_REASON: &str =
     "capture mountinfo entry ceiling reached; the incomplete mount table was refused";
+/// A resumable mount-table read met this pass's per-object leg: the bytes
+/// read so far stay parked with their open table fd, and the next pass
+/// continues from there (INV-2: bounded per pass, resumed next pass).
+pub(crate) const MOUNTINFO_RESUME_REASON: &str = "capture mountinfo byte ceiling reached for this pass; the incomplete mount table resumes next pass";
+/// A parked mount-table read whose mount namespace changed before it
+/// completed: the partial bytes were discarded (never spliced with the
+/// new generation) and the read restarts.
+pub(crate) const MOUNTINFO_GENERATION_CHANGED_REASON: &str = "mount table changed while its read was parked; the partial table was discarded and the read restarts";
 
 pub(crate) fn target_layout(abi: ElfAbi) -> LinuxLayout {
     match abi {
@@ -432,24 +440,121 @@ pub(crate) fn read_mountinfo<R: Read>(
 }
 
 pub(crate) fn read_mountinfo_with<R: Read>(
+    reader: R,
+    budget: &mut CaptureWorkBudget,
+    chunk_size: usize,
+    deadline: impl FnMut(&mut CaptureWorkBudget) -> Option<&'static str>,
+) -> Result<String, String> {
+    let mut progress = MountinfoProgress::default();
+    match read_mountinfo_pass(
+        reader,
+        budget,
+        chunk_size,
+        deadline,
+        &mut progress,
+        MountinfoBound::OneShot,
+    )? {
+        MountinfoStep::Complete(text) => Ok(text),
+        // A one-shot read refuses at its leg inside the pass loop.
+        MountinfoStep::LegReached => Err(MOUNTINFO_CEILING_REASON.into()),
+    }
+}
+
+/// One pass of a resumable mount-table read: continues `progress` and
+/// stops at this pass's per-object leg ([`MountinfoStep::LegReached`])
+/// instead of refusing, so the caller can park the read and resume it next
+/// pass. The 64 MiB absolute cap and the entry cap still refuse.
+pub(crate) fn read_mountinfo_resumable<R: Read>(
+    reader: R,
+    budget: &mut CaptureWorkBudget,
+    progress: &mut MountinfoProgress,
+) -> Result<MountinfoStep, String> {
+    read_mountinfo_resumable_with(
+        reader,
+        budget,
+        READ_CHUNK,
+        CaptureWorkBudget::check_deadline_now,
+        progress,
+    )
+}
+
+pub(crate) fn read_mountinfo_resumable_with<R: Read>(
+    reader: R,
+    budget: &mut CaptureWorkBudget,
+    chunk_size: usize,
+    deadline: impl FnMut(&mut CaptureWorkBudget) -> Option<&'static str>,
+    progress: &mut MountinfoProgress,
+) -> Result<MountinfoStep, String> {
+    read_mountinfo_pass(
+        reader,
+        budget,
+        chunk_size,
+        deadline,
+        progress,
+        MountinfoBound::Resumable,
+    )
+}
+
+/// The bytes and line counters of one mount-table read so far. A one-shot
+/// read starts and ends empty-handed within one call; a resumable read
+/// keeps this across passes beside its open table fd.
+#[derive(Debug, Default)]
+pub(crate) struct MountinfoProgress {
+    table: Vec<u8>,
+    observed_lines: usize,
+    newline_count: usize,
+}
+
+impl MountinfoProgress {
+    /// Bytes read so far (the parked remainder starts after them).
+    pub(crate) fn bytes_read(&self) -> u64 {
+        u64::try_from(self.table.len()).unwrap_or(u64::MAX)
+    }
+}
+
+/// How one mount-table read pass ended without an error.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum MountinfoStep {
+    /// EOF proved the table complete.
+    Complete(String),
+    /// A resumable read met this pass's per-object leg before EOF.
+    LegReached,
+}
+
+/// The bound a mount-table read pass applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MountinfoBound {
+    /// The whole table within `min(per_object, 64 MiB)` in one call; one
+    /// byte past it refuses with the excess byte charged.
+    OneShot,
+    /// At most the per-object leg (plus the one-byte EOF probe) per call,
+    /// the whole table within 64 MiB across calls; the leg parks.
+    Resumable,
+}
+
+fn read_mountinfo_pass<R: Read>(
     mut reader: R,
     budget: &mut CaptureWorkBudget,
     chunk_size: usize,
     mut deadline: impl FnMut(&mut CaptureWorkBudget) -> Option<&'static str>,
-) -> Result<String, String> {
+    progress: &mut MountinfoProgress,
+    bound: MountinfoBound,
+) -> Result<MountinfoStep, String> {
     // The mount table is bounded by the per-object leg and the
     // absolute byte cap together (controller ruling 18:58, A): the
-    // bound is min(per_object, 64 MiB), never raised. If resumable
-    // scans need more of the table, the read must resume across
-    // passes, never take a bigger single bound.
-    let table_cap = budget.limits().per_object_bytes.min(MAX_MOUNTINFO_BYTES);
-    if table_cap == 0 {
+    // bound is min(per_object, 64 MiB) per pass, never raised. A table
+    // larger than the leg resumes across passes (resumable reads), never
+    // takes a bigger single bound. A zero leg admits nothing.
+    let leg = budget.limits().per_object_bytes;
+    if leg.min(MAX_MOUNTINFO_BYTES) == 0 {
         return Err(MOUNTINFO_CEILING_REASON.into());
     }
+    let table_cap = match bound {
+        MountinfoBound::OneShot => leg.min(MAX_MOUNTINFO_BYTES),
+        MountinfoBound::Resumable => MAX_MOUNTINFO_BYTES,
+    };
+    let pass_start = progress.table.len();
 
-    let mut table = Vec::new();
-    let mut observed_lines = 0usize;
-    let mut newline_count = 0usize;
     let mut chunk = vec![0; chunk_size.max(1)];
     loop {
         if let Some(reason) = budget.stopped_reason() {
@@ -466,12 +571,16 @@ pub(crate) fn read_mountinfo_with<R: Read>(
             }
             return Err(IO_CEILING_REASON.into());
         }
-        let table_bytes = u64::try_from(table.len()).unwrap_or(u64::MAX);
+        let table_bytes = u64::try_from(progress.table.len()).unwrap_or(u64::MAX);
         let table_left = table_cap.saturating_sub(table_bytes);
-        let wanted = u64::try_from(chunk.len())
+        let mut wanted = u64::try_from(chunk.len())
             .unwrap_or(u64::MAX)
             .min(capture_left)
             .min(table_left.saturating_add(1));
+        if bound == MountinfoBound::Resumable {
+            let pass_bytes = u64::try_from(progress.table.len() - pass_start).unwrap_or(u64::MAX);
+            wanted = wanted.min(leg.saturating_sub(pass_bytes).saturating_add(1));
+        }
         let wanted = usize::try_from(wanted).unwrap_or(chunk.len());
         if wanted == 0 {
             return Err(MOUNTINFO_CEILING_REASON.into());
@@ -488,22 +597,25 @@ pub(crate) fn read_mountinfo_with<R: Read>(
             if let Some(reason) = deadline(budget) {
                 return Err(reason.into());
             }
-            return String::from_utf8(table)
+            return String::from_utf8(std::mem::take(&mut progress.table))
+                .map(MountinfoStep::Complete)
                 .map_err(|error| format!("mount table is not valid UTF-8: {error}"));
         }
 
-        let next_len = table
+        let next_len = progress
+            .table
             .len()
             .checked_add(read)
             .ok_or_else(|| MOUNTINFO_CEILING_REASON.to_string())?;
         let newlines = chunk[..read].iter().filter(|byte| **byte == b'\n').count();
-        let next_newline_count = newline_count
+        let next_newline_count = progress
+            .newline_count
             .checked_add(newlines)
             .ok_or_else(|| MOUNTINFO_ENTRY_CEILING_REASON.to_string())?;
         let next_lines = next_newline_count
             .checked_add(usize::from(chunk[read - 1] != b'\n'))
             .ok_or_else(|| MOUNTINFO_ENTRY_CEILING_REASON.to_string())?;
-        let added_lines = next_lines.saturating_sub(observed_lines);
+        let added_lines = next_lines.saturating_sub(progress.observed_lines);
         budget
             .spend(u64::try_from(added_lines).unwrap_or(u64::MAX))
             .map_err(str::to_string)?;
@@ -513,9 +625,16 @@ pub(crate) fn read_mountinfo_with<R: Read>(
         if next_lines > MAX_MOUNTINFO_ENTRIES {
             return Err(MOUNTINFO_ENTRY_CEILING_REASON.into());
         }
-        table.extend_from_slice(&chunk[..read]);
-        newline_count = next_newline_count;
-        observed_lines = next_lines;
+        progress.table.extend_from_slice(&chunk[..read]);
+        progress.newline_count = next_newline_count;
+        progress.observed_lines = next_lines;
+        if bound == MountinfoBound::Resumable
+            && u64::try_from(progress.table.len() - pass_start).unwrap_or(u64::MAX) > leg
+        {
+            // The probe byte past the leg proved more table: keep every
+            // byte read (the fd position moved past them) and park.
+            return Ok(MountinfoStep::LegReached);
+        }
     }
 }
 
@@ -20903,6 +21022,145 @@ int main(int argc, char **argv) {
 
     /// Twin (A): a zero per-object leg admits nothing — the mountinfo
     /// read refuses with the ceiling reason without reading.
+    /// Serves a byte stream in whatever request sizes the reader asks
+    /// for, recording each request (a file position that persists across
+    /// passes, like a parked table fd).
+    struct StreamReader {
+        data: Vec<u8>,
+        at: usize,
+        requests: Vec<usize>,
+    }
+
+    impl Read for &mut StreamReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.requests.push(buffer.len());
+            let read = buffer.len().min(self.data.len() - self.at);
+            buffer[..read].copy_from_slice(&self.data[self.at..self.at + read]);
+            self.at += read;
+            Ok(read)
+        }
+    }
+
+    /// Resumable twin of the per-object leg (INV-2): a table larger than
+    /// the leg parks after the leg plus its probe byte, resumes from the
+    /// parked bytes each pass, and converges to the one-shot table. Each
+    /// pass's typed record is (requests, attempted bytes, parked bytes,
+    /// line work) and the whole table is exact.
+    #[test]
+    fn mountinfo_resumable_reader_parks_each_pass_and_converges_to_the_one_shot_table() {
+        let table: Vec<u8> = (0..5)
+            .flat_map(|line| format!("{line:02} 1 8:1 / /m rw\n").into_bytes())
+            .collect();
+        assert_eq!(table.len(), 85, "five 17-byte rows");
+        let roomy = ScanLimits {
+            per_object_bytes: u64::MAX,
+            total_bytes: u64::MAX,
+        };
+        let mut reference = StreamReader {
+            data: table.clone(),
+            at: 0,
+            requests: Vec::new(),
+        };
+        let one_shot = read_mountinfo_with(
+            &mut reference,
+            &mut CaptureWorkBudget::new(roomy),
+            8,
+            |_| None,
+        )
+        .unwrap();
+        let mut reader = StreamReader {
+            data: table,
+            at: 0,
+            requests: Vec::new(),
+        };
+        let mut progress = MountinfoProgress::default();
+        let mut passes = Vec::new();
+        let text = loop {
+            assert!(passes.len() < 8, "the read converges: {passes:?}");
+            let mut budget = CaptureWorkBudget::new(ScanLimits {
+                per_object_bytes: 16,
+                total_bytes: u64::MAX,
+            });
+            reader.requests.clear();
+            let step =
+                read_mountinfo_resumable_with(&mut reader, &mut budget, 8, |_| None, &mut progress)
+                    .unwrap();
+            let line_work = budget.work_units_count() - reader.requests.len() as u64;
+            passes.push((
+                reader.requests.clone(),
+                budget.attempted_io_bytes(),
+                progress.bytes_read(),
+                line_work,
+            ));
+            match step {
+                MountinfoStep::Complete(text) => break text,
+                MountinfoStep::LegReached => {}
+            }
+        };
+        assert_eq!(
+            text, one_shot,
+            "the resumed table equals the one-shot table"
+        );
+        assert_eq!(
+            passes,
+            vec![
+                (vec![8, 8, 1], 17, 17, 1),
+                (vec![8, 8, 1], 17, 34, 1),
+                (vec![8, 8, 1], 17, 51, 1),
+                (vec![8, 8, 1], 17, 68, 1),
+                (vec![8, 8, 1], 17, 85, 1),
+                (vec![8], 0, 0, 0),
+            ],
+            "each pass reads its leg plus one probe byte and parks"
+        );
+    }
+
+    /// The absolute 64 MiB cap still refuses a resumable read (only the
+    /// per-object leg parks): the same nine-read shape as the one-shot.
+    #[test]
+    fn mountinfo_resumable_reader_refuses_past_the_absolute_cap() {
+        let mut steps: Vec<_> = (0..8)
+            .map(|_| ReaderStep::Bytes(vec![b'x'; 8 << 20]))
+            .collect();
+        steps.push(ReaderStep::Bytes(vec![b'x'; 1]));
+        let mut excess = RecordingReader::new(steps);
+        let mut budget = CaptureWorkBudget::new(ScanLimits {
+            per_object_bytes: u64::MAX,
+            total_bytes: u64::MAX,
+        });
+        let mut progress = MountinfoProgress::default();
+        assert_eq!(
+            read_mountinfo_resumable_with(
+                &mut excess,
+                &mut budget,
+                8 << 20,
+                |_| None,
+                &mut progress
+            )
+            .unwrap_err(),
+            MOUNTINFO_CEILING_REASON
+        );
+        assert_eq!(excess.requests, [vec![8 << 20; 8], vec![1]].concat());
+    }
+
+    /// A zero leg admits nothing on the resumable path too: it refuses
+    /// without reading (parking would never progress).
+    #[test]
+    fn mountinfo_resumable_reader_refuses_a_zero_leg() {
+        let mut reader = RecordingReader::new([ReaderStep::Bytes(b"abc\n".to_vec())]);
+        let mut budget = CaptureWorkBudget::new(ScanLimits {
+            per_object_bytes: 0,
+            total_bytes: u64::MAX,
+        });
+        let mut progress = MountinfoProgress::default();
+        assert_eq!(
+            read_mountinfo_resumable_with(&mut reader, &mut budget, 8, |_| None, &mut progress)
+                .unwrap_err(),
+            MOUNTINFO_CEILING_REASON
+        );
+        assert!(reader.requests.is_empty());
+    }
+
     #[test]
     fn mountinfo_reader_refuses_a_zero_per_object_leg() {
         let mut reader =
@@ -27467,6 +27725,55 @@ int main(int argc, char **argv) {
         );
     }
 
+    /// Pins this thread's view mount-table reads to the rows of the host
+    /// table that the fixture's own files live on (their fdinfo mount ids)
+    /// plus the root mount. The split cells size their per-object leg to
+    /// the fixture's mappings, and the leg also bounds the mount table
+    /// (controller ruling 18:58, A): a host table larger than the leg
+    /// would otherwise move every pass boundary by one. Hold the returned
+    /// pair for the fixture's lifetime.
+    fn pin_compact_mountinfo(
+        paths: &[&Path],
+    ) -> (
+        tempfile::NamedTempFile,
+        crate::process::PinnedMountinfoGuard,
+    ) {
+        let mut ids = BTreeSet::new();
+        for path in paths {
+            let file = File::open(path).unwrap();
+            let fdinfo = std::fs::read_to_string(format!(
+                "/proc/self/fdinfo/{}",
+                std::os::fd::AsRawFd::as_raw_fd(&file)
+            ))
+            .unwrap();
+            let id = fdinfo
+                .lines()
+                .find_map(|line| line.strip_prefix("mnt_id:"))
+                .map(|id| id.trim().to_string())
+                .expect("fdinfo names the mount id");
+            ids.insert(id);
+        }
+        let host = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+        let rows: String = host
+            .lines()
+            .filter(|line| {
+                let mut fields = line.split(' ');
+                let id = fields.next().unwrap_or_default();
+                let mount_point = fields.nth(3).unwrap_or_default();
+                ids.contains(id) || mount_point == "/"
+            })
+            .map(|line| format!("{line}\n"))
+            .collect();
+        assert!(
+            rows.lines().count() >= ids.len(),
+            "every fixture mount has its row"
+        );
+        let mut table = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut table, rows.as_bytes()).unwrap();
+        let guard = crate::process::pin_mountinfo_for_test(table.path());
+        (table, guard)
+    }
+
     /// Drive one scan pass with an armed budget: `limits` plus the carried
     /// bundle (empty for pass one). Returns the outcome and the bundle the
     /// pass takes back, so twins can thread real resume state across passes.
@@ -27501,6 +27808,7 @@ int main(int argc, char **argv) {
     #[test]
     fn truncated_mapping_snapshot_resumes_and_never_completes() {
         let mut fixture = BracketFixture::new(8, true);
+        let _mounts = pin_compact_mountinfo(&[&fixture.path]);
         let limits = ScanLimits {
             per_object_bytes: 0x2000 + 0x80,
             total_bytes: u64::MAX,

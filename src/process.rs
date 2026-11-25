@@ -2,7 +2,9 @@
 //! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Bounded Linux process identity tracking for node-wide captures.
 
-use crate::discovery::scan::{CaptureWorkBudget, read_mountinfo};
+use crate::discovery::scan::{
+    CaptureWorkBudget, MountinfoProgress, MountinfoStep, read_mountinfo, read_mountinfo_resumable,
+};
 use crate::semantics::ProcessKey;
 use crate::semantics_edge::resources::{
     OWNED_ALLOCATION_PADDING, ResourceLease, SemanticResourceRefusal, SemanticResourceReserver,
@@ -19,12 +21,12 @@ pub(crate) mod leader_exit;
 pub(crate) mod metered_io;
 mod view_filesystem;
 use std::sync::{Arc, Weak};
-#[cfg(test)]
-pub(crate) use view_filesystem::pin_mountinfo_for_test;
 pub(crate) use view_filesystem::{
     MappedOpenError, ViewFilesystem, cold_filesystem_deadline, observer_mount_namespace,
     snapshot_leader_is_zombie, with_cold_snapshot_filesystem,
 };
+#[cfg(test)]
+pub(crate) use view_filesystem::{PinnedMountinfoGuard, pin_mountinfo_for_test};
 
 pub(crate) const MAX_TRACKED: usize = 16_384;
 /// Producer history bound: one registry slot per lifetime identity ticket,
@@ -424,6 +426,82 @@ fn ensure_same_mount_namespace(
 #[cfg(test)]
 thread_local! {
     static MOUNTINFO_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static MOUNTINFO_DISCARDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many parked mount-table reads this thread discarded because the
+/// mount namespace changed before they completed (resume seam).
+#[cfg(test)]
+pub(crate) fn mountinfo_discards_for_test() -> u64 {
+    MOUNTINFO_DISCARDS.with(std::cell::Cell::get)
+}
+
+/// A resumable mount-table read parked at a pass's per-object leg (INV-2:
+/// bounded per pass, resumed next pass). The open table fd is the resume
+/// point (its file position) and the generation witness (`POLLPRI` once the
+/// namespace's mount table changed after the open); `progress` holds the
+/// bytes read so far. A changed generation discards the bytes: two
+/// generations are never spliced into one table.
+pub(crate) struct ParkedMountTable {
+    file: std::fs::File,
+    progress: MountinfoProgress,
+}
+
+/// Reads one retained view's mount table through its parked slot: resumes a
+/// parked read when its generation is unchanged (discarding and restarting
+/// it otherwise), parks again at this pass's per-object leg, and returns the
+/// open fd with the complete table once EOF proves it.
+fn read_view_mountinfo_resumable(
+    pid: u32,
+    parked: &std::sync::Mutex<Option<ParkedMountTable>>,
+    changed: fn(&std::fs::File) -> bool,
+    budget: &mut CaptureWorkBudget,
+    open: impl FnOnce() -> io::Result<std::fs::File>,
+) -> Result<(std::fs::File, String), String> {
+    let reason = |detail: &str| crate::discovery::scan::mount_table_read_reason(pid, detail);
+    let mut slot = parked
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let resumed = match slot.take() {
+        Some(parked) if !changed(&parked.file) => Some(parked),
+        Some(_) => {
+            #[cfg(test)]
+            MOUNTINFO_DISCARDS.with(|discards| discards.set(discards.get() + 1));
+            None
+        }
+        None => None,
+    };
+    let (table, mut progress, was_resumed) = match resumed {
+        Some(parked) => (parked.file, parked.progress, true),
+        None => {
+            let table =
+                open().map_err(|error| format!("cannot open pid {pid}'s mount table: {error}"))?;
+            #[cfg(test)]
+            MOUNTINFO_READS.with(|reads| reads.set(reads.get() + 1));
+            (table, MountinfoProgress::default(), false)
+        }
+    };
+    match read_mountinfo_resumable(&table, budget, &mut progress).map_err(|error| reason(&error))? {
+        MountinfoStep::Complete(text) => {
+            // A resumed table spans passes: prove its generation held up to
+            // EOF, or discard it rather than splice two generations.
+            if was_resumed && changed(&table) {
+                #[cfg(test)]
+                MOUNTINFO_DISCARDS.with(|discards| discards.set(discards.get() + 1));
+                return Err(reason(
+                    crate::discovery::scan::MOUNTINFO_GENERATION_CHANGED_REASON,
+                ));
+            }
+            Ok((table, text))
+        }
+        MountinfoStep::LegReached => {
+            *slot = Some(ParkedMountTable {
+                file: table,
+                progress,
+            });
+            Err(reason(crate::discovery::scan::MOUNTINFO_RESUME_REASON))
+        }
+    }
 }
 
 /// How many `/proc/<pid>/mountinfo` tables this thread has read through a
@@ -531,6 +609,7 @@ impl MountTableCache {
     fn refresh(
         &mut self,
         owner: (ProcessViewId, u32),
+        parked: &std::sync::Mutex<Option<ParkedMountTable>>,
         budget: &mut CaptureWorkBudget,
         open: impl FnOnce() -> io::Result<std::fs::File>,
     ) -> Result<(), String> {
@@ -541,7 +620,8 @@ impl MountTableCache {
             return Ok(());
         }
         self.table = None;
-        let (file, text) = read_view_mountinfo(owner.1, budget, open)?;
+        let (file, text) =
+            read_view_mountinfo_resumable(owner.1, parked, self.changed, budget, open)?;
         self.table = Some(CachedMountTable { owner, file, text });
         Ok(())
     }
@@ -601,6 +681,9 @@ pub struct ProcessView {
     pin: Arc<PidPin>,
     admitted_ns: u64,
     cold_filesystem_observed: std::sync::atomic::AtomicBool,
+    /// This view's mount-table read parked at a pass's per-object leg, if
+    /// any: the next pass's cached read resumes it (one slot per view).
+    parked_mount_table: std::sync::Mutex<Option<ParkedMountTable>>,
 }
 
 #[cfg(test)]
@@ -682,7 +765,18 @@ impl ProcessView {
             pin: Arc::new(pin),
             admitted_ns,
             cold_filesystem_observed: std::sync::atomic::AtomicBool::new(cold_filesystem),
+            parked_mount_table: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Bytes of this view's parked mount-table read, if one is parked.
+    #[cfg(test)]
+    pub(crate) fn parked_mount_table_bytes_for_test(&self) -> Option<u64> {
+        self.parked_mount_table
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|parked| parked.progress.bytes_read())
     }
 
     pub(crate) fn retained_pin(&self) -> &PidPin {
@@ -924,9 +1018,12 @@ impl ProcessView {
             || self.ensure_filesystem(&filesystem, &mut work.borrow_mut()),
             || open(&filesystem),
             || {
-                mounts.refresh(owner, &mut work.borrow_mut(), || {
-                    filesystem.open_mountinfo()
-                })
+                mounts.refresh(
+                    owner,
+                    &self.parked_mount_table,
+                    &mut work.borrow_mut(),
+                    || filesystem.open_mountinfo(),
+                )
             },
         )?;
         Ok((opened, mounts.text()))
@@ -3981,5 +4078,136 @@ int main(int argc, char **argv) {
                 run_pidfd_denial_case(errno);
             }
         }
+    }
+
+    // ---- Resumable mount-table reads (INV-2): a table larger than the
+    // per-object leg parks per view and resumes next pass; a changed
+    // generation discards the partial bytes and restarts, never splices.
+
+    fn leg_budget(leg: u64) -> CaptureWorkBudget {
+        CaptureWorkBudget::new(crate::discovery::scan::ScanLimits {
+            per_object_bytes: leg,
+            total_bytes: u64::MAX,
+        })
+    }
+
+    /// One pass of the cached production read: a fresh per-scan cache, the
+    /// view's parked slot, and `detector` as the generation witness.
+    fn mount_pass(
+        view: &ProcessView,
+        leg: u64,
+        detector: fn(&std::fs::File) -> bool,
+    ) -> Result<String, String> {
+        let mut mounts = MountTableCache::with_change_detector_for_test(detector);
+        let mut budget = leg_budget(leg);
+        let text = view
+            .open_then_cached_mountinfo(|_| Ok(()), &mut mounts, &mut budget)
+            .map(|((), text)| text.to_string())?;
+        assert!(
+            budget.attempted_io_bytes() <= leg + 1,
+            "one pass reads at most its leg plus the EOF probe"
+        );
+        Ok(text)
+    }
+
+    const MOUNT_LEG: u64 = 1024;
+
+    #[test]
+    fn mount_table_larger_than_the_leg_parks_and_resumes_to_the_whole_table() {
+        let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+        let expected = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+        assert!(
+            expected.len() as u64 > 2 * (MOUNT_LEG + 1),
+            "non-vacuous: the host table spans several legs"
+        );
+        let mut parked = Vec::new();
+        let mut text = None;
+        for _ in 0..(expected.len() as u64 / MOUNT_LEG + 2) {
+            match mount_pass(&view, MOUNT_LEG, |_| false) {
+                Ok(done) => {
+                    text = Some(done);
+                    break;
+                }
+                Err(error) => {
+                    assert!(
+                        error.contains(crate::discovery::scan::MOUNTINFO_RESUME_REASON),
+                        "{error}"
+                    );
+                    parked.push(view.parked_mount_table_bytes_for_test().unwrap());
+                }
+            }
+        }
+        let text = text.expect("the parked read completes");
+        assert_eq!(view.parked_mount_table_bytes_for_test(), None);
+        // Each pass parks exactly one leg plus its probe byte further on.
+        let want: Vec<u64> = (1..=parked.len() as u64)
+            .map(|pass| pass * (MOUNT_LEG + 1))
+            .collect();
+        assert_eq!(parked, want);
+        let witness = MountChangeWitness::new();
+        if !witness.changed() {
+            assert_eq!(text, expected, "the resumed table is the whole table");
+        }
+    }
+
+    #[test]
+    fn changed_generation_discards_the_parked_table_and_never_splices() {
+        let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+        let reads = mountinfo_reads_for_test();
+        let discards = mountinfo_discards_for_test();
+        for _ in 0..3 {
+            let error = mount_pass(&view, MOUNT_LEG, |_| true).unwrap_err();
+            assert!(
+                error.contains(crate::discovery::scan::MOUNTINFO_RESUME_REASON),
+                "{error}"
+            );
+            assert_eq!(
+                view.parked_mount_table_bytes_for_test(),
+                Some(MOUNT_LEG + 1),
+                "a discarded read restarts from byte zero"
+            );
+        }
+        assert_eq!(
+            mountinfo_discards_for_test() - discards,
+            2,
+            "passes 2 and 3 discard"
+        );
+        assert_eq!(
+            mountinfo_reads_for_test() - reads,
+            3,
+            "each restart opens a fresh table"
+        );
+    }
+
+    thread_local! {
+        static DETECTOR_CALLS: Cell<u32> = const { Cell::new(0) };
+    }
+
+    /// Unchanged at the resume check, changed at the post-EOF check.
+    fn changed_on_second_call(_: &std::fs::File) -> bool {
+        DETECTOR_CALLS.with(|calls| {
+            calls.set(calls.get() + 1);
+            calls.get() == 2
+        })
+    }
+
+    #[test]
+    fn a_change_during_the_final_pass_discards_the_resumed_table() {
+        let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+        let size = std::fs::read("/proc/self/mountinfo").unwrap().len() as u64;
+        // Pass one parks at a leg just under the table; pass two finishes.
+        let leg = size - 2;
+        assert!(mount_pass(&view, leg, |_| false).is_err());
+        assert!(view.parked_mount_table_bytes_for_test().is_some());
+        DETECTOR_CALLS.with(|calls| calls.set(0));
+        let discards = mountinfo_discards_for_test();
+        let error = mount_pass(&view, leg, changed_on_second_call).unwrap_err();
+        assert!(
+            error.contains(crate::discovery::scan::MOUNTINFO_GENERATION_CHANGED_REASON),
+            "{error}"
+        );
+        assert_eq!(DETECTOR_CALLS.with(Cell::get), 2);
+        assert_eq!(mountinfo_discards_for_test() - discards, 1);
+        assert_eq!(view.parked_mount_table_bytes_for_test(), None);
     }
 }

@@ -106,6 +106,7 @@ const ROOMY_LIMITS: ScanLimits = ScanLimits {
 /// bytes into the second, before its interface triple.
 fn cell_short_read() -> CellResult {
     let mut fixture = BracketFixture::new(8, true);
+    let _mounts = pin_compact_mountinfo(&[&fixture.path]);
     let limits = ScanLimits {
         per_object_bytes: 0x2000 + 0x80,
         total_bytes: u64::MAX,
@@ -250,6 +251,7 @@ fn write_table_at(mem: &File, at: u64) {
 /// truncation control.)
 fn cell_header_before_cursor() -> CellResult {
     let mut fixture = BracketFixture::new(8, false);
+    let _mounts = pin_compact_mountinfo(&[&fixture.path]);
     write_table_at(&fixture.mem, 0x7000);
     // Non-vacuity first: the roomy reference must see the table.
     let mut roomy_probe = BracketFixture::new(8, false);

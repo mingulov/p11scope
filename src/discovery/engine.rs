@@ -26735,12 +26735,10 @@ impl Engine {
             attribution::note_all(&joined);
             self.counters.object_skips.extend(joined);
             for input in &pinning.inputs {
-                // A stop-staged identity's key, so a later key rejection
-                // refuses its holds (attach impossible, never at the bound).
-                // Recorded for every proved input (fresh, duplicate or
-                // scan-covered): the recorder keeps stop-queued identities
-                // only.
-                self.member_stops.note_stop_staged_key(identity, input.key);
+                // The staged identity's key, so a later key rejection
+                // refuses the holds on it (attach impossible, never at the
+                // bound). Recorded for every proved input, held or not.
+                self.member_stops.note_staged_key(identity, input.key);
                 // Dedupe by file identity (key), never by path spelling
                 // for run-learned proofs: the operator's `--prearm-module`
                 // spelling may differ lexically from the scan's display

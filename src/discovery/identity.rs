@@ -2430,6 +2430,17 @@ impl PinnedObjects {
         skipped
     }
 
+    /// Whether this store files ownership claims (tables, targets or
+    /// pins for any view). Deferred harvest remap sources must be
+    /// claim-free: [`Self::absorb`] extends claims without dedup, so
+    /// absorbing a claim-carrying source stacks its claims every
+    /// time. `harvest_commit` debug-asserts this on its remap source.
+    pub(crate) fn carries_ownership_claims(&self) -> bool {
+        self.ownership.values().any(|claims| {
+            !claims.tables.is_empty() || !claims.targets.is_empty() || !claims.pins.is_empty()
+        })
+    }
+
     /// Whether fresh pins for `modules` reprove the retained identities
     /// they name: every observed raw is freshly pinned, and absorbing
     /// the fresh set adds no skip and no rejection while resolving

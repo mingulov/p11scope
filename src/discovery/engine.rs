@@ -25480,6 +25480,15 @@ impl Engine {
             // commit wipes the harvest while the union below keeps
             // unbindable tables.
             Some(source) => {
+                // Remap sources are proof-pin stashes, never live
+                // stores: absorbing a claim-carrying source stacks its
+                // claims on every harvest (absorb extends without
+                // dedup; a whole-store self-absorb doubles them). The
+                // fresh path passes `None` above.
+                debug_assert!(
+                    !source.carries_ownership_claims(),
+                    "deferred harvest remap source carries ownership claims"
+                );
                 if !target.module_aliased_under(&module, Self::RUN_LEARNED_VIEW_ID) {
                     let absorbed = target.absorb(source.clone());
                     attribution::note_all(&absorbed);

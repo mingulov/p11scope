@@ -392,6 +392,26 @@ PY
 paranoid_values() { # current, 3, 4 deduplicated
   printf "%s\n%s\n%s\n" "$SAVED_PARANOID" 3 4 | awk '!seen[$0]++'
 }
+write_dynamic_selection() {
+  # Parametric rows outside the always-required 3/4 inventory. The file is
+  # written before the rows run so check-cell-results can require the exact
+  # dynamic inventory instead of rejecting the current-paranoid bonus rows.
+  local file=$OUT/dynamic-selection.txt paranoid
+  : >"$file" || exit 2
+  for paranoid in $(paranoid_values); do
+    case "$paranoid" in
+      3|4) continue ;;
+    esac
+    printf '%s\n' \
+      "doctor-minimal-p$paranoid" \
+      "profile-pid-p$paranoid" \
+      "missing-cap-cap_bpf-p$paranoid" \
+      "missing-cap-cap_perfmon-p$paranoid" \
+      "missing-cap-cap_checkpoint_restore-p$paranoid" \
+      "missing-cap-cap_dac_read_search-p$paranoid" \
+      "missing-cap-cap_sys_ptrace-p$paranoid" >>"$file" || exit 2
+  done
+}
 run_doctor() { # PARANOID — doctor-minimal cell as nobody with the full set
   paranoid=$1
   sysctl -w kernel.perf_event_paranoid="$paranoid" >/dev/null || return 1
@@ -513,6 +533,7 @@ run_missing() { # PARANOID CAPNAME — one missing-capability line cell
   detail="$detail $(grep -o "needs ${cap}[^;]*" "$err" | head -1 | head -c 200)"
   row "missing-cap-$lower-p$paranoid" "$pass" qualified "$detail"
 }
+write_dynamic_selection
 for paranoid in $(paranoid_values); do
   run_doctor "$paranoid" || FAILED=1
   run_profile "$paranoid" || FAILED=1

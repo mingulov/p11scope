@@ -29002,7 +29002,7 @@ exit 0
             .coordinator
             .prune_dropped_pair_targets(EXEC_STATE_GRACE_NS + 1000);
         assert!(
-            native.scene.coordinator.pair_targets.get(&key).is_none(),
+            !native.scene.coordinator.pair_targets.contains_key(&key),
             "the due Dropped row leaves the live map"
         );
         let tomb = native

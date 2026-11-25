@@ -8970,10 +8970,7 @@ fn release_view_id_clears_the_released_views_pin_records() {
     );
     engine.release_view_id(view);
     assert!(
-        !engine
-            .pinned
-            .raw_ownership_views_for_test()
-            .contains(&view),
+        !engine.pinned.raw_ownership_views_for_test().contains(&view),
         "release clears scan custody"
     );
     assert!(
@@ -58767,10 +58764,7 @@ fn defer_whole_cause_head_names_each_cause() {
             HandleExhaustion,
             "fd table exhausted while opening a library",
         ),
-        (
-            ReserveStop,
-            "capture file-descriptor reserve exhausted",
-        ),
+        (ReserveStop, "capture file-descriptor reserve exhausted"),
         (BudgetStop, "capture library-handle budget exhausted"),
     ] {
         assert_eq!(defer_whole_cause_head(cause), head, "{cause:?}");

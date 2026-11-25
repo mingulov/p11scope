@@ -8108,8 +8108,14 @@ fn scan_and_pin_with_proof(
     // through the single `acquire()`, so one scan can no longer retain
     // past the cap.
     let mut pin_wait_causes = Vec::new();
-    let pinned =
-        pin_scanned_view_objects_with_filing(view, &modules, budget, reserve, filing, &mut pin_wait_causes);
+    let pinned = pin_scanned_view_objects_with_filing(
+        view,
+        &modules,
+        budget,
+        reserve,
+        filing,
+        &mut pin_wait_causes,
+    );
     stage.span(
         crate::timing::StageKind::Pin,
         "pin_view_objects",

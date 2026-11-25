@@ -3290,8 +3290,14 @@ mod tests {
             ((13, Some(130)), MemberOutcome::CutShortOther, 50),
         ]);
         pass.cursor_mut().prune_to_live(&BTreeSet::from([10, 11]));
-        assert_eq!(pass.cursor().examined_for_test(), BTreeSet::from([(10, Some(100))]));
-        assert_eq!(pass.cursor().fresh_for_test(), BTreeSet::from([(11, Some(110))]));
+        assert_eq!(
+            pass.cursor().examined_for_test(),
+            BTreeSet::from([(10, Some(100))])
+        );
+        assert_eq!(
+            pass.cursor().fresh_for_test(),
+            BTreeSet::from([(11, Some(110))])
+        );
         assert_eq!(
             pass.cursor().streaks_for_test(),
             BTreeMap::from([((11, Some(110)), 1)])

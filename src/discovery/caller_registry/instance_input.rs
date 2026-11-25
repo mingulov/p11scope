@@ -1860,6 +1860,16 @@ pub(crate) const STAGED_DISPOSAL_INSTANCE_LOST_SUBJECT: &str =
 /// any) disposed synchronously at removal.
 pub(crate) const STAGED_DISPOSAL_INSTANCE_LOST_REASON: &str = "the instance under disposal was removed before its staged calls disposed; its preserved unknown-key rows are lost";
 
+/// Gap subject for a staged disposal abandoned for exit: the exit
+/// hold's bounded drain could not finish it, so the remainder is
+/// dropped with a counted gap instead of deferring folds forever.
+pub(crate) const STAGED_DISPOSAL_ABANDONED_SUBJECT: &str = "staged disposal abandoned for exit";
+
+/// Gap reason for an exit-abandoned disposal: constant, so every
+/// abandon folds into repeats. The undisposed calls' completions
+/// are lost; the void's own history loss discloses beside it.
+pub(crate) const STAGED_DISPOSAL_ABANDONED_REASON: &str = "the exit hold stopped a void disposal before it disposed every staged call; the remaining calls' preserved completions are lost";
+
 impl CallerRegistry {
     /// Census at immutable publication, never on the semantic ingress path.
     /// The byte pool and these counts cover both legacy and instance reducers.
@@ -3428,7 +3438,9 @@ impl CallerRegistry {
     /// leaf credit: no credited poll pays table-construction work.
     /// A pool-full prepare fails silently and the disposal's mints
     /// refuse Full without a table (honest refusals, never
-    /// misbehavior).
+    /// misbehavior). Marks the fallback's disposal ownership, so
+    /// synchronous charges and releases fail fast in debug while the
+    /// budgeted cursors own the table.
     pub(crate) fn start_staged_disposal(&mut self) {
         if self.staged_disposal.is_some() {
             return;
@@ -3441,6 +3453,7 @@ impl CallerRegistry {
             done_upto: None,
             current: None,
         });
+        self.assoc_fallback.set_staged_disposal_in_flight(true);
     }
 
     /// Whether a stranded staged disposal still owns work: while set,
@@ -3652,6 +3665,7 @@ impl CallerRegistry {
                 }
             };
             let Some((next_id, staged_len, mode)) = next else {
+                self.assoc_fallback.set_staged_disposal_in_flight(false);
                 let spent = gate.spent();
                 debug_assert!(spent <= budget);
                 return (true, spent);
@@ -3667,6 +3681,26 @@ impl CallerRegistry {
             ));
             continue;
         }
+    }
+
+    /// Abandon a pending stranded staged disposal for exit: the exit
+    /// hold's bounded drain could not finish it. The undisposed
+    /// calls' completions are lost with a counted named gap, never
+    /// silently; the table ownership clears so terminal commits and
+    /// folds proceed. A quiet no-op without a disposal.
+    pub(crate) fn abandon_staged_disposal(&mut self) {
+        if self.staged_disposal.take().is_none() {
+            return;
+        }
+        self.assoc_fallback.set_staged_disposal_in_flight(false);
+        self.record_gap(RegistryGap {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: STAGED_DISPOSAL_ABANDONED_SUBJECT.into(),
+            reason: STAGED_DISPOSAL_ABANDONED_REASON.into(),
+            budget: None,
+        });
     }
     pub(crate) fn observe_instance_semantic(&mut self, input: AdmittedInstanceCall) {
         self.staged.push(Mutation::ObserveInstanceSemantic(input));
@@ -8596,5 +8630,74 @@ mod staged_disposal_gate_tests {
             .mint_keyassoc(16)
             .expect("a mint past a drained disposal succeeds");
         registry.assoc_fallback.release_keyassoc(ticket);
+    }
+
+    /// Abandoning the disposal clears the table ownership and counts
+    /// the loss: one staged head abandoned mid-disposal stages the
+    /// named gap exactly once, and a mint past the abandon succeeds.
+    #[test]
+    fn staged_disposal_abandon_clears_sync_ownership() {
+        let mut registry = CallerRegistry::new(RegistryLimits::default_limits());
+        let pool = SemanticResourcePool::default();
+        let mut ledger = StagingLedger::with_resources(pool.reserver());
+        ledger.prepare_capacity().unwrap();
+        let id = RegistryInstanceId::from_raw(27);
+        let mut record = empty_record(id);
+        record.feed = crate::semantics_key_use::JointStaging::select_joint_for_test();
+        let facts = SemanticCall {
+            function: "C_SignInit".into(),
+            session: 6201,
+            mechanism: 0x000d,
+            capture: p11scope_ebpf_common::capture::MECHANISM_VALUE
+                | p11scope_ebpf_common::capture::OUTPUT_NON_NULL,
+            ts_ns: 100,
+            ..SemanticCall::default()
+        };
+        let origin = EffectOrigin {
+            function: "C_SignInit".into(),
+            session: 6201,
+            ts_ns: 100,
+        };
+        record.feed.stage(facts, origin, 1, &mut ledger).unwrap();
+        registry.instance_state.semantics.insert(id, record);
+        registry.start_staged_disposal();
+        assert!(registry.staged_disposal_pending());
+        registry.abandon_staged_disposal();
+        assert!(!registry.staged_disposal_pending());
+        let abandoned = registry
+            .staged_scope_gaps_for_test()
+            .into_iter()
+            .filter(|(subject, reason)| {
+                subject == "staged disposal abandoned for exit"
+                    && reason
+                        == "the exit hold stopped a void disposal before it disposed every staged call; the remaining calls' preserved completions are lost"
+            })
+            .count();
+        assert_eq!(
+            abandoned, 1,
+            "the abandon stages its named gap exactly once"
+        );
+        let ticket = registry
+            .assoc_fallback
+            .mint_keyassoc(16)
+            .expect("a mint past an abandoned disposal succeeds");
+        registry.assoc_fallback.release_keyassoc(ticket);
+    }
+
+    /// Abandoning without a disposal is a quiet no-op: no gap stages
+    /// and the table stays unowned.
+    #[test]
+    fn staged_disposal_abandon_without_disposal_is_quiet() {
+        let mut registry = CallerRegistry::new(RegistryLimits::default_limits());
+        assert!(!registry.staged_disposal_pending());
+        registry.abandon_staged_disposal();
+        assert!(
+            registry.staged_scope_gaps_for_test().is_empty(),
+            "no disposal means no abandon gap"
+        );
+        registry
+            .assoc_fallback
+            .mint_keyassoc(16)
+            .expect("the table stays unowned without a disposal");
     }
 }

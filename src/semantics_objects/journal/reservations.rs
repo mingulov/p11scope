@@ -1661,6 +1661,14 @@ impl<C> ReservationTable<C> {
     /// from its own index (the caller resets `resume` to it).
     /// Production tables are indexed; the linear arm keeps larger
     /// tables honest.
+    ///
+    /// Retention: the linear scan never revisits indices below
+    /// `resume` within one cursor, so a slot freed behind the cursor
+    /// waits for a fresh cursor — which every new mint starts with
+    /// (`free_scan` zero) — rather than being lost. The one
+    /// in-cursor exception is the link-grant restore protocol above.
+    /// Indexed tables pop from their free list and never read
+    /// `resume`, so the rule touches unindexed tables only.
     pub(super) fn budgeted_free_pop(
         &mut self,
         resume: &mut usize,

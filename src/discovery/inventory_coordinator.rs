@@ -317,6 +317,15 @@ pub(crate) const FOLD_DEFERRED_OVERSIZED_SUBJECT: &str =
 /// verbatim by the admission-table test below.
 pub(crate) const FOLD_DEFERRED_OVERSIZED_REASON: &str = "the retired caller and its evidence remain in inventory as unfolded rows; the fold retries next pass";
 
+/// Exit-settle credits for one stranded staged disposal: the exit
+/// hold and the wound-down release drain at most this many 64-leaf
+/// polls before abandoning the remainder with a counted gap. The
+/// same bound the staged-disposal suites prove sufficient for
+/// multi-head disposals, so realistic voids drain and only a
+/// pathological remainder abandons; the exit never hangs in either
+/// case.
+pub(crate) const EXIT_STAGED_DISPOSAL_SETTLE_POLLS: usize = 4096;
+
 /// Terminal wording for the short-lived never-scanned count: `confirmed`
 /// programs were never enumerated twice in a row or were listed only as
 /// exited before their scan, so no scan ever examined them; `untracked`
@@ -14034,6 +14043,45 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let members = self.registry.stuck_session_identities(stuck);
         self.joint_capture
             .break_scoped_after_running_abandon(&members);
+    }
+
+    /// Settle a stranded staged disposal for exit: drain it with at
+    /// most `max_polls` 64-leaf polls, then abandon the remainder
+    /// with a counted gap. A drained void discloses its history loss
+    /// exactly like a machine completion (the machine emits only on
+    /// completion, so this is exactly once); an abandoned remainder
+    /// discloses the same history loss plus its named abandon gap. A
+    /// quiet no-op without a disposal. The exit hold and the
+    /// wound-down release call this before their terminal commits and
+    /// the lane release, so no fold defers and no synchronous
+    /// fallback mutation trips past the settle.
+    pub(crate) fn settle_staged_disposal_for_exit(&mut self, max_polls: usize) {
+        if !self.registry.staged_disposal_pending() {
+            return;
+        }
+        for _ in 0..max_polls {
+            let (done, _) = self.poll_staged_disposal(64);
+            if done {
+                self.note_staged_disposal_history_loss();
+                return;
+            }
+        }
+        if self.registry.staged_disposal_pending() {
+            self.note_staged_disposal_history_loss();
+            self.registry.abandon_staged_disposal();
+        }
+    }
+
+    /// Disclose one settled void disposal's fenced history loss: the
+    /// same subject and reason the machine emits on completion.
+    fn note_staged_disposal_history_loss(&mut self) {
+        self.note_scope_gap(
+            crate::inventory_present::JOINT_RETAINED_S1_SUBJECT.to_string(),
+            format!(
+                "joint_void_{}_history_loss",
+                crate::semantics_objects::journal::joint_driver::INGEST_BREAK_VOID_GAP.label()
+            ),
+        );
     }
 
     /// Test-only pose of a pending staged disposal over one Joint

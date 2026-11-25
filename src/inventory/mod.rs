@@ -24,7 +24,8 @@ use crate::discovery::caller_registry::{CallerId, MappingState, ModuleKey};
 use crate::discovery::engine::inventory::UnavailableImageGuard;
 use crate::discovery::engine::inventory::image_guard::ImageAcquisition;
 use crate::discovery::engine::inventory_coordinator::{
-    InventoryCoordinator, InventoryScope, JointCommitProgress, PassReport,
+    EXIT_STAGED_DISPOSAL_SETTLE_POLLS, InventoryCoordinator, InventoryScope, JointCommitProgress,
+    PassReport,
 };
 use crate::discovery::hooks::HookRegistry;
 use crate::discovery::native_binding::NativeIdentity;
@@ -4441,6 +4442,14 @@ impl ClassicDriver<'_> {
         // even when the lane never publishes again.
         coordinator.poll_and_disclose_events_ring_loss(&mut lane);
         coordinator.poll_and_disclose_length_stash_loss(&mut lane);
+        // Settle a stranded staged disposal before anything below can
+        // stage-and-apply instance work: the void machine never steps
+        // again past the hold, so a pending disposal would defer
+        // folds forever and trip the sync-fallback sentinels in the
+        // terminal commits. The bounded drain preserves what it can;
+        // the remainder abandons with a counted gap. A quiet no-op
+        // without a disposal.
+        coordinator.settle_staged_disposal_for_exit(EXIT_STAGED_DISPOSAL_SETTLE_POLLS);
         // A recorded terminal graph refusal predates any later
         // verdict, so it wins as the abandon reason (§1.9, §6.4).
         // Next the machine's latched disposition refusal, so the
@@ -4812,6 +4821,12 @@ impl ClassicDriver<'_> {
             Err(_) => return,
         };
         if handed_off {
+            // Defense in depth beside the exit hold: settle a stranded
+            // staged disposal before releasing the lane shell (the
+            // machine publishes only past a drained disposal, so this
+            // is a no-op on every genuine path).
+            self.coordinator
+                .settle_staged_disposal_for_exit(EXIT_STAGED_DISPOSAL_SETTLE_POLLS);
             self.coordinator.note_joint_decoder_malformed(decoder);
             let mut warn = WarnSink {
                 display: &mut self.display,
@@ -24020,8 +24035,8 @@ mod tests {
             "a drained disposal stages no abandon gap: {gaps:?}"
         );
         assert!(
-            gaps.iter().all(|(subject, _)| subject
-                != "staged disposal instance retired mid-disposal"),
+            gaps.iter()
+                .all(|(subject, _)| subject != "staged disposal instance retired mid-disposal"),
             "no instance is lost across the exit drain: {gaps:?}"
         );
         assert!(
@@ -24075,6 +24090,68 @@ mod tests {
                 .take_instance_for_fold(id)
                 .is_some(),
             "the departed fold proceeds past the settled disposal"
+        );
+    }
+
+    #[test]
+    fn exit_disposal_settle_abandons_past_its_poll_bound() {
+        // The exit settle abandons what its poll bound cannot drain:
+        // with zero polls the posed disposal abandons at once. The
+        // void's history loss still discloses exactly once (the
+        // machine never completed) beside the named abandon gap, and
+        // the departed fold proceeds past the abandon.
+        let mut coordinator = coordinator();
+        let id = coordinator.pose_staged_disposal_for_test();
+        coordinator.settle_staged_disposal_for_exit(0);
+        assert!(
+            !coordinator.registry().staged_disposal_pending(),
+            "the zero-bound settle abandons the disposal"
+        );
+        let gaps = coordinator.registry().staged_scope_gaps_for_test();
+        assert_eq!(
+            gaps.iter()
+                .filter(|(subject, reason)| subject
+                    == "Joint key operations unavailable; retained S1"
+                    && reason == "joint_void_ingest_break_loss_history_loss")
+                .count(),
+            1,
+            "the abandoned void still discloses its history loss once: {gaps:?}"
+        );
+        assert_eq!(
+            gaps.iter()
+                .filter(|(subject, reason)| subject == "staged disposal abandoned for exit"
+                    && reason
+                        == "the exit hold stopped a void disposal before it disposed every staged call; the remaining calls' preserved completions are lost")
+                .count(),
+            1,
+            "the abandon stages its named gap exactly once: {gaps:?}"
+        );
+        assert!(
+            coordinator
+                .registry_mut()
+                .take_instance_for_fold(id)
+                .is_some(),
+            "the departed fold proceeds past the abandoned disposal"
+        );
+    }
+
+    #[test]
+    fn exit_disposal_settle_without_disposal_is_quiet() {
+        // The exit settle without a disposal stages nothing: no
+        // history-loss gap for a void that never happened.
+        let mut coordinator = coordinator();
+        assert!(!coordinator.registry().staged_disposal_pending());
+        coordinator.settle_staged_disposal_for_exit(EXIT_STAGED_DISPOSAL_SETTLE_POLLS);
+        assert!(
+            !coordinator.registry().staged_disposal_pending(),
+            "no disposal appears from the settle"
+        );
+        assert!(
+            coordinator
+                .registry()
+                .staged_scope_gaps_for_test()
+                .is_empty(),
+            "a quiet settle stages no gap"
         );
     }
 

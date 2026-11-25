@@ -77,6 +77,12 @@ pub(crate) struct StagingLedger {
     // slot/link work. No insert, merge or transfer may run until the
     // sweep completes (the machine defers collection meanwhile).
     h8_void: Option<ReleaseRoleCursor>,
+    // Resumable stranded staged disposal in flight (association
+    // fallback only): set by `start_staged_disposal`, cleared on
+    // completion or abandon. While set, no synchronous charge or
+    // release may run (its table mutations would break the
+    // disposal's budgeted cursors); folds defer meanwhile.
+    staged_disposal_in_flight: bool,
 }
 
 /// Opaque cursor for one budgeted staged release: the disposal holds
@@ -168,6 +174,7 @@ impl StagingLedger {
                 .map(|last| LedgerGeneration(last + 1)),
             byte_limit: SEMANTIC_RESOURCE_LIMIT as u64,
             h8_void: None,
+            staged_disposal_in_flight: false,
         }
     }
 
@@ -395,6 +402,13 @@ impl StagingLedger {
             self.h8_void.is_none(),
             "no sync charge while a budgeted void owns the table"
         );
+        // No stranded staged disposal in flight: a synchronous insert
+        // under its budgeted cursors would corrupt the fallback table
+        // (stale splices). Folds defer while the disposal drains.
+        debug_assert!(
+            !self.staged_disposal_in_flight,
+            "no sync charge while a staged disposal owns the table"
+        );
         let total = self
             .charged_bytes()
             .saturating_sub(credit)
@@ -567,6 +581,12 @@ impl StagingLedger {
         debug_assert!(
             self.h8_void.is_none(),
             "no sync release while a budgeted void owns the table"
+        );
+        // No stranded staged disposal in flight: a synchronous unlink
+        // under its budgeted cursors would corrupt the fallback table.
+        debug_assert!(
+            !self.staged_disposal_in_flight,
+            "no sync release while a staged disposal owns the table"
         );
         if let Some(table) = self.table.as_mut() {
             drop(table.release(role, key));
@@ -885,6 +905,12 @@ impl StagingLedger {
             self.h8_void.is_none(),
             "no sync release while a budgeted void owns the table"
         );
+        // Same disposal guard as the single-release funnel: no
+        // stranded staged disposal in flight either.
+        debug_assert!(
+            !self.staged_disposal_in_flight,
+            "no sync release while a staged disposal owns the table"
+        );
         if let Some(table) = self.table.as_mut() {
             table.release_role(Role::H8Open);
         }
@@ -927,6 +953,13 @@ impl StagingLedger {
     /// Whether a budgeted H8 void sweep still owns work.
     pub(crate) fn h8_void_pending(&self) -> bool {
         self.h8_void.is_some()
+    }
+
+    /// Mark or clear the stranded staged disposal ownership
+    /// (association fallback only): set when the disposal starts,
+    /// cleared when it completes or is abandoned for exit.
+    pub(crate) fn set_staged_disposal_in_flight(&mut self, in_flight: bool) {
+        self.staged_disposal_in_flight = in_flight;
     }
 
     pub(crate) fn charge_model(&mut self, token: u64, bytes: u64) -> Result<(), LedgerRefusal> {

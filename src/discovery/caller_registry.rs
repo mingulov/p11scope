@@ -10948,8 +10948,8 @@ pub(crate) mod tests {
     #[test]
     fn staged_instance_invalidations_counts_one_retire_caller() {
         // Positive control for the void-entry proof twins' zero pin:
-        // one staged caller retirement counts exactly one, and an
-        // empty staging counts zero.
+        // one staged caller retirement counts exactly one, a staged
+        // gap counts nothing, and an empty staging counts zero.
         let mut registry = registry();
         assert_eq!(
             registry.staged_instance_invalidations_for_test(),
@@ -10961,6 +10961,19 @@ pub(crate) mod tests {
             registry.staged_instance_invalidations_for_test(),
             1,
             "one staged caller retirement counts one"
+        );
+        registry.record_gap(RegistryGap {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: "test gap".to_string(),
+            reason: "test reason".to_string(),
+            budget: None,
+        });
+        assert_eq!(
+            registry.staged_instance_invalidations_for_test(),
+            1,
+            "a staged gap is not an instance invalidation"
         );
     }
 

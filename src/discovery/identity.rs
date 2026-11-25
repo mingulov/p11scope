@@ -12896,16 +12896,20 @@ pub(crate) mod test_fixture {
         pins.raw_ownership.entry(view).or_default().insert(raw);
     }
 
-    /// Files a refused observation for `view`: the
+    /// Files a refused observation for `view` under `key`: the
     /// `record_scanned_candidate` refusal arm through a refusing
     /// cause. The view's own raw stays unfiled (a refusal proves
     /// nothing), so the key's other raws and pins are untouched.
     pub(crate) fn record_refusal(
         pins: &mut PinnedObjects,
         view: ProcessViewId,
-        raw: RawObjectInstance,
+        module: &ScannedModule,
+        key: ObjectKey,
+        path: &str,
         reason: &str,
     ) -> Vec<Skipped> {
+        let raw =
+            super::RawObjectInstance::scanned(module, key, path).expect("test refusal raw builds");
         let mut skipped = Vec::new();
         super::record_scanned_candidate(
             pins,

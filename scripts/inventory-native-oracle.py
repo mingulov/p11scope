@@ -2991,7 +2991,8 @@ def demotion_public_health(inventory):
                   retained_history={"limit", "retained", "suppressed"},
                   native_preadmission={"limit", "occupied", "refused", "pruned"},
                   native_departed={"pair_dropped_rows", "pair_dropped_base",
-                                   "pair_prune_overflow", "exec_prune_overflow"})
+                                   "pair_prune_overflow", "pair_fold_memory_overflow",
+                                   "exec_prune_overflow"})
     for name, shape in shapes.items():
         table = budgets[name]
         if name == "native_preadmission" and table is None:
@@ -3780,12 +3781,14 @@ def demotion_self_test():
             retained_history={"limit": 64, "retained": 2, "suppressed": 0},
             native_preadmission={"limit": 64, "occupied": 0, "refused": 0, "pruned": 0},
             native_departed={"pair_dropped_rows": 0, "pair_dropped_base": 0,
-                             "pair_prune_overflow": 0, "exec_prune_overflow": 0})
+                             "pair_prune_overflow": 0, "pair_fold_memory_overflow": 0,
+                             "exec_prune_overflow": 0})
     def public_health_counts(inventory, retired=0, late_refused=0, native_departed=None):
         inventory["budgets"]["callers"].update(retired=retired, late_refused=late_refused)
         inventory["budgets"]["native_departed"] = native_departed or {
             "pair_dropped_rows": 0, "pair_dropped_base": 0,
-            "pair_prune_overflow": 0, "exec_prune_overflow": 0}
+            "pair_prune_overflow": 0, "pair_fold_memory_overflow": 0,
+            "exec_prune_overflow": 0}
 
     public_health(receipt, inventory, ledger, manifest)
     public_health_counts(inventory)
@@ -3865,7 +3868,8 @@ def demotion_self_test():
         case("public-native-departed", "pass", "qualified",
              lambda r, i, l, m: public_health_counts(i, native_departed={
                  "pair_dropped_rows": 4, "pair_dropped_base": 9,
-                 "pair_prune_overflow": 1, "exec_prune_overflow": 2}))
+                 "pair_prune_overflow": 1, "pair_fold_memory_overflow": 3,
+                 "exec_prune_overflow": 2}))
         case("public-native-departed-shape", "fail", "invalid_schema",
              lambda r, i, l, m: i["budgets"]["native_departed"].pop("exec_prune_overflow"))
 

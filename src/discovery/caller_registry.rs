@@ -3577,6 +3577,7 @@ const WITNESS_WITHOUT_MAPPING: &str = "native witness without mapping evidence";
 const WITNESS_UNKNOWN_MODULE: &str = "native witness for an unknown module";
 pub(crate) const WITNESS_SHARED_ENDPOINT: &str = "ambiguous shared endpoint";
 pub(crate) const DEMOTED_COUNT_REJECTED: &str = "rejected demoted count";
+pub(crate) const REVIVED_FOLDED_COUNT: &str = "revived folded count";
 pub(crate) const DEMOTED_COUNT_PLACED: &str = "demoted count placed";
 
 /// Where every decided native witness row went, each row exactly once
@@ -8038,6 +8039,26 @@ impl CallerRegistry {
             reason: format!("the current physical owner is not proven for absolute count range ({base}, {absolute}] ({} unattributed calls); historical counts remain and no witness or module-level use is recorded", absolute - base),
             budget: None,
             units: None,
+        });
+    }
+
+    /// A revival past a counted fold is uncertainty, never a witness
+    /// or a count: the folded base lives only in the class
+    /// aggregate, so the current absolute cannot rebase past it.
+    pub(crate) fn note_fold_revival_count_gap(
+        &mut self,
+        caller: CallerId,
+        base: u64,
+        absolute: u64,
+    ) {
+        if absolute <= base {
+            return;
+        }
+        self.record_gap(RegistryGap {
+            caller: Some(caller), module: None, pid: None,
+            subject: REVIVED_FOLDED_COUNT.into(),
+            reason: format!("the pair revived past a counted fold for absolute count range ({base}, {absolute}] ({} unattributed calls); the folded base stays in the class aggregate and no pre-revival use is recorded", absolute - base),
+            budget: None,
         });
     }
 

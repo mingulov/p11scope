@@ -1362,6 +1362,7 @@ pub(crate) fn scripted_promotion_view_for_test() -> std::sync::Arc<super::Promot
             native_pair_dropped_rows: 0,
             native_pair_dropped_base: 0,
             native_pair_prune_overflow: 0,
+            native_pair_fold_memory_overflow: 0,
             native_exec_prune_overflow: 0,
         },
         semantic_capture: crate::inventory_semantics::SemanticCaptureSummary::default(),

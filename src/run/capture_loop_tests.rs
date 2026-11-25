@@ -2940,6 +2940,7 @@ fn canary_presentation() -> crate::inventory_present::Presentation {
             native_pair_dropped_rows: 0,
             native_pair_dropped_base: 0,
             native_pair_prune_overflow: 0,
+            native_pair_fold_memory_overflow: 0,
             native_exec_prune_overflow: 0,
         },
     }

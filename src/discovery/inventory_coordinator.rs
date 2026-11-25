@@ -845,6 +845,17 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// late revival, and the stop-time domain finish stays as the
     /// backstop.
     pair_dropped_tombstones: HashMap<PairKey, PrunedPairBase>,
+    /// Cap-folded dropped pairs awaiting a possible revival, bounded
+    /// by the tombstone bound: a revival past one of these files a
+    /// disclosed gap instead of re-crediting. Gone-task folds evict
+    /// first (a gone task cannot revive); a live eviction counts in
+    /// `pair_fold_memory_overflow` and names the limit.
+    pair_folded: HashMap<PairKey, FoldedPair>,
+    /// Folded-key memory evictions of live tasks past the bound
+    /// (sticky, saturating; counted once). A revival past an
+    /// evicted fold re-credits silently: the counter discloses the
+    /// limit instead of claiming exactness.
+    pair_fold_memory_overflow: u64,
     /// Exact aggregate of pruned dropped-pair bases per key class
     /// (domain and object): rows and saturating base total. Counts stay
     /// exact when the per-pair rows leave the map.
@@ -1882,6 +1893,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             pair_targets: HashMap::new(),
             pair_dropped_tombstones: HashMap::new(),
             pair_drain_cursor: None,
+            pair_folded: HashMap::new(),
+            pair_fold_memory_overflow: 0,
             pair_dropped_totals: HashMap::new(),
             pair_prune_overflow: 0,
             pair_prune_cap: MAX_PRUNED_PAIR_TOMBSTONES,
@@ -6433,6 +6446,20 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
     }
 
+    /// Whether a tombstone-owning pid is gone, through the pass
+    /// memo: pid 0 (the record was already gone when the pair
+    /// dropped) reads like gone without a source read. Always
+    /// memoizes, so memo readers and return-value readers agree.
+    /// The single rule for the age drain, the gone-first eviction
+    /// sweep, and folded-memory eviction alike.
+    fn tombstone_owner_gone(memo: &mut HashMap<u32, bool>, source: &Source, pid: u32) -> bool {
+        if pid == 0 {
+            memo.insert(0, true);
+            return true;
+        }
+        *memo.entry(pid).or_insert_with(|| source.gone(pid))
+    }
+
     /// Prune dropped pair targets whose base is older than the grace
     /// into the exact per-class aggregate. A tombstone keeps the base
     /// so a late revival rebases past it; past the tombstone bound the
@@ -6447,6 +6474,28 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// instead of living until domain stop, while a live task's
     /// tombstone stays for its late revival.
     fn prune_dropped_pair_targets(&mut self, now_ns: u64, gone_memo: &mut HashMap<u32, bool>) {
+        // Gone-first room: when the tombstone map is full, evict
+        // gone-task tombstones (a gone task cannot revive) so due
+        // rows keep exact tombstones instead of folding. Bounded
+        // probes per pass; each eviction counts like any fold.
+        if self.pair_dropped_tombstones.len() >= self.pair_prune_cap {
+            let source = self.adapter.source();
+            let mut probes = 0usize;
+            let mut victims = Vec::new();
+            for (key, tomb) in self.pair_dropped_tombstones.iter() {
+                if probes >= EVER_ENUMERATED_SWEEP {
+                    break;
+                }
+                probes += 1;
+                if Self::tombstone_owner_gone(gone_memo, source, tomb.pid) {
+                    victims.push(*key);
+                }
+            }
+            for key in victims {
+                self.pair_dropped_tombstones.remove(&key);
+                self.pair_prune_overflow = self.pair_prune_overflow.saturating_add(1);
+            }
+        }
         let due: Vec<PairKey> = self
             .pair_targets
             .iter()
@@ -6479,8 +6528,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             total.base = total.base.saturating_add(base);
             // One due row leaves the map here exactly once: the
             // tombstone keeps the exact base while the bound has room,
-            // otherwise the row is aggregate-only and counted.
+            // otherwise the row is aggregate-only and counted, and its
+            // key is remembered so a later revival files a disclosed
+            // gap instead of re-crediting.
             if self.pair_dropped_tombstones.len() < self.pair_prune_cap {
+                self.pair_folded.remove(&key);
                 self.pair_dropped_tombstones.insert(
                     key,
                     PrunedPairBase {
@@ -6492,6 +6544,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 );
             } else {
                 self.pair_prune_overflow = self.pair_prune_overflow.saturating_add(1);
+                self.remember_folded_pair(key, pid, now_ns, gone_memo);
             }
         }
         // Age drain: a tombstone past the keep window leaves the map
@@ -6539,9 +6592,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let end = (start + EVER_ENUMERATED_SWEEP).min(expired.len());
         let source = self.adapter.source();
         for (_, _, pid) in &expired[start..end] {
-            gone_memo
-                .entry(*pid)
-                .or_insert_with(|| *pid == 0 || source.gone(*pid));
+            Self::tombstone_owner_gone(gone_memo, source, *pid);
         }
         let mut drained = 0u64;
         for (key, _, pid) in &expired[start..end] {
@@ -6965,12 +7016,59 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         );
     }
 
+    /// Remember one cap-folded dropped pair for its revival, bounded
+    /// by the tombstone bound: a gone-task fold evicts first and
+    /// silently (a gone task cannot revive, and its fold is already
+    /// counted), otherwise the oldest scanned live fold drops with a
+    /// counted overflow that names the limit. One bounded scan.
+    fn remember_folded_pair(
+        &mut self,
+        key: PairKey,
+        pid: u32,
+        now_ns: u64,
+        gone_memo: &mut HashMap<u32, bool>,
+    ) {
+        if self.pair_folded.len() >= self.pair_prune_cap {
+            let source = self.adapter.source();
+            let mut oldest: Option<(PairKey, u64)> = None;
+            let mut gone_victim = None;
+            for (candidate, folded) in self.pair_folded.iter().take(EVER_ENUMERATED_SWEEP) {
+                if Self::tombstone_owner_gone(gone_memo, source, folded.pid) {
+                    gone_victim = Some(*candidate);
+                    break;
+                }
+                let older = oldest.is_none_or(|(_, since)| folded.folded_since < since);
+                if older {
+                    oldest = Some((*candidate, folded.folded_since));
+                }
+            }
+            if let Some(victim) = gone_victim {
+                self.pair_folded.remove(&victim);
+            } else if let Some((victim, _)) = oldest {
+                self.pair_folded.remove(&victim);
+                self.pair_fold_memory_overflow = self.pair_fold_memory_overflow.saturating_add(1);
+            }
+        }
+        self.pair_folded.insert(
+            key,
+            FoldedPair {
+                pid,
+                folded_since: now_ns,
+            },
+        );
+    }
+
     /// Take one pruned dropped-pair tombstone back into the live map
     /// (revival or re-drop): the base is about to be represented by the
     /// target row again, so folding it out of the class aggregate here
     /// keeps `sum(live targets) + aggregate` exact and lets a later
     /// re-prune count the base exactly once.
     fn take_pruned_pair_base(&mut self, key: &PairKey) -> Option<PrunedPairBase> {
+        // No fold-memory touch here: tombstone and fold memory are
+        // mutually exclusive (tombstone insert clears the memory, a
+        // fold inserts only without a tombstone), so a taken
+        // tombstone implies absent memory, and an absent tombstone
+        // must leave the memory for the revival staging to consume.
         let pruned = self.pair_dropped_tombstones.remove(key)?;
         let class = PairKeyClass {
             domain: key.image.domain(),
@@ -7007,6 +7105,18 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// task (each counted once, when it leaves the map).
     pub(crate) fn pair_prune_overflow(&self) -> u64 {
         self.pair_prune_overflow
+    }
+
+    /// Folded-key memory evictions of live tasks past the bound
+    /// (each counted once, when the memory leaves the map).
+    pub(crate) fn pair_fold_memory_overflow(&self) -> u64 {
+        self.pair_fold_memory_overflow
+    }
+
+    /// Test-only: folded-key memory evictions of live tasks.
+    #[cfg(test)]
+    pub(crate) fn pair_fold_memory_overflow_for_test(&self) -> u64 {
+        self.pair_fold_memory_overflow
     }
 
     /// Pruned EXEC stashes discarded past the tombstone bound (each
@@ -11614,7 +11724,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 | PairTarget::Suspended {
                     base, base_since, ..
                 },
-            ) => (*base, *base, *base_since, *base_since),
+            ) => {
+                // A re-dropped pair rebases past its exact live base;
+                // any stale fold memory from an earlier fold-and-revive
+                // cycle no longer describes this incarnation.
+                self.pair_folded.remove(&key);
+                (*base, *base, *base_since, *base_since)
+            }
             // A pruned dropped pair keeps its exact base as a tombstone:
             // the revival rebases past it exactly like an unpruned drop.
             // A late-bound row (recorded before its caller's admission)
@@ -11741,6 +11857,37 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         since_ns: u64,
         base: u64,
     ) -> bool {
+        // A revival past a counted fold cannot rebase past the folded
+        // base (it lives only in the class aggregate): disclose the
+        // unattributed window and rebase the live target past the
+        // current absolute so only post-revival growth stages. Zero
+        // observations leave the memory for the first nonzero staging.
+        if observation.count > 0 && self.pair_folded.remove(&key).is_some() {
+            self.registry
+                .note_fold_revival_count_gap(caller, 0, observation.count);
+            if let Some(target) = self.pair_targets.get_mut(&key) {
+                match target {
+                    PairTarget::Pending {
+                        base: target_base,
+                        base_since: target_since,
+                        ..
+                    }
+                    | PairTarget::Bound {
+                        base: target_base,
+                        base_since: target_since,
+                        ..
+                    } => {
+                        *target_base = observation.count;
+                        *target_since = observation.anchor_ns;
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(recovery) = self.recoveries.get_mut(&key) {
+                recovery.watermark = recovery.watermark.max(observation.count);
+            }
+            return false;
+        }
         let count = rebased_count(observation, base);
         if count.count == 0 {
             return false;
@@ -15550,6 +15697,16 @@ struct PrunedPairBase {
     base_since: u64,
     pruned_since: u64,
     pid: u32,
+}
+
+/// A cap-folded dropped pair remembered for its revival: the owning
+/// host tgid at fold time plus when it folded. A revival past this
+/// entry files a disclosed gap instead of re-crediting the absolute
+/// the class aggregate already holds.
+#[derive(Debug, Clone, Copy)]
+struct FoldedPair {
+    pid: u32,
+    folded_since: u64,
 }
 
 /// Exact aggregate of pruned dropped-pair bases for one class.
@@ -45138,11 +45295,15 @@ int main(void) {
             staged.is_empty(),
             "refresh 7 past the fold stages nothing: {staged:?}"
         );
+        native.scene.coordinator.registry.publish();
         assert!(
-            native.scene.coordinator.registry.gaps().iter().any(|gap| gap
-                .subject
-                == "revived folded count"
-                && gap.reason.contains("(0, 7]")),
+            native
+                .scene
+                .coordinator
+                .registry
+                .gaps()
+                .iter()
+                .any(|gap| gap.subject == "revived folded count" && gap.reason.contains("(0, 7]")),
             "the revival files a disclosed gap: {:?}",
             native.scene.coordinator.registry.gaps()
         );
@@ -45194,24 +45355,37 @@ int main(void) {
                     pid: 7,
                 },
             );
-            native.scene.coordinator.prune_departed_native_state(
-                at + EXEC_STATE_GRACE_NS + pass as u64,
-            );
+            native
+                .scene
+                .coordinator
+                .prune_departed_native_state(at + EXEC_STATE_GRACE_NS + pass as u64);
         }
         assert_eq!(
             native.scene.coordinator.pair_prune_overflow_for_test(),
             3,
             "three folds past the live-blocked bound"
         );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .pair_fold_memory_overflow_for_test(),
+            1,
+            "the oldest live fold drops with a counted overflow"
+        );
         for ticket in [42u64, 43] {
             let row = native.row(ticket, 1, 7, at, 0);
             native.scene.coordinator.bind_pair_count(&row, caller, &[]);
-            native
-                .counts_read(Vec::new(), vec![(ticket, 1, 0, 7)]);
+            native.counts_read(Vec::new(), vec![(ticket, 1, 0, 7)]);
+            native.scene.coordinator.registry.publish();
             assert!(
-                native.scene.coordinator.registry.gaps().iter().any(|gap| gap
-                    .subject
-                    == "revived folded count"),
+                native
+                    .scene
+                    .coordinator
+                    .registry
+                    .gaps()
+                    .iter()
+                    .any(|gap| gap.subject == "revived folded count"),
                 "remembered fold {ticket} gaps on revival: {:?}",
                 native.scene.coordinator.registry.gaps()
             );
@@ -45241,9 +45415,7 @@ int main(void) {
                 },
             );
         }
-        for (pass, (ticket, pid)) in
-            [(41u64, 401_001u32), (42, 401_002)].iter().enumerate()
-        {
+        for (pass, (ticket, pid)) in [(41u64, 401_001u32), (42, 401_002)].iter().enumerate() {
             native.scene.source.spawn(*pid, 500);
             let key = PairKey {
                 image: DomainCookie::scripted(native.domain, *ticket),
@@ -45258,9 +45430,10 @@ int main(void) {
                     pid: *pid,
                 },
             );
-            native.scene.coordinator.prune_departed_native_state(
-                at + EXEC_STATE_GRACE_NS + pass as u64,
-            );
+            native
+                .scene
+                .coordinator
+                .prune_departed_native_state(at + EXEC_STATE_GRACE_NS + pass as u64);
         }
         native.scene.source.kill(401_002);
         let key = PairKey {
@@ -45280,19 +45453,198 @@ int main(void) {
             .scene
             .coordinator
             .prune_departed_native_state(at + EXEC_STATE_GRACE_NS + 2);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .pair_fold_memory_overflow_for_test(),
+            0,
+            "evicting the gone fold counts nothing"
+        );
         for ticket in [41u64, 43] {
             let row = native.row(ticket, 1, 7, at, 0);
             native.scene.coordinator.bind_pair_count(&row, caller, &[]);
-            native
-                .counts_read(Vec::new(), vec![(ticket, 1, 0, 7)]);
+            native.counts_read(Vec::new(), vec![(ticket, 1, 0, 7)]);
+            native.scene.coordinator.registry.publish();
             assert!(
-                native.scene.coordinator.registry.gaps().iter().any(|gap| gap
-                    .subject
-                    == "revived folded count"),
+                native
+                    .scene
+                    .coordinator
+                    .registry
+                    .gaps()
+                    .iter()
+                    .any(|gap| gap.subject == "revived folded count"),
                 "remembered fold {ticket} gaps on revival: {:?}",
                 native.scene.coordinator.registry.gaps()
             );
         }
+    }
+
+    /// N2: a re-drop after a fold-and-bind clears the stale fold
+    /// memory at rebind: the refresh rebases past the exact live
+    /// base with no spurious gap.
+    #[test]
+    fn stale_fold_memory_clears_on_rebind_to_a_live_base() {
+        let (mut native, caller) = NativeScene::new();
+        let at = native.stamps.tick();
+        native.scene.coordinator.set_pair_prune_cap_for_test(1);
+        native.scene.coordinator.pair_dropped_tombstones.insert(
+            PairKey {
+                image: DomainCookie::scripted(native.domain, 99),
+                exec: 1,
+                object: 0,
+            },
+            PrunedPairBase {
+                base: 9,
+                base_since: at,
+                pruned_since: at,
+                pid: 7,
+            },
+        );
+        let key = PairKey {
+            image: DomainCookie::scripted(native.domain, 41),
+            exec: 1,
+            object: 0,
+        };
+        native.scene.coordinator.pair_targets.insert(
+            key,
+            PairTarget::Dropped {
+                base: 3,
+                base_since: at,
+                pid: 7,
+            },
+        );
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(at + EXEC_STATE_GRACE_NS);
+        let row = native.row(41, 1, 7, at, 0);
+        native.scene.coordinator.bind_pair_count(&row, caller, &[]);
+        native.scene.coordinator.pair_targets.insert(
+            key,
+            PairTarget::Dropped {
+                base: 5,
+                base_since: at,
+                pid: 7,
+            },
+        );
+        native.scene.coordinator.bind_pair_count(&row, caller, &[]);
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 7)]);
+        let staged = native
+            .scene
+            .coordinator
+            .registry
+            .staged_pending_counts_for_test();
+        assert_eq!(staged.len(), 1, "one exact staging: {staged:?}");
+        assert_eq!(staged[0].1, 2, "refresh 7 past base 5 stages +2");
+        assert_eq!(staged[0].2, 5, "the staging rebases past 5");
+        native.scene.coordinator.registry.publish();
+        assert!(
+            native
+                .scene
+                .coordinator
+                .registry
+                .gaps()
+                .iter()
+                .all(|gap| gap.subject != "revived folded count"),
+            "no spurious fold gap: {:?}",
+            native.scene.coordinator.registry.gaps()
+        );
+    }
+
+    /// N2: a re-drop pruned to an exact tombstone clears the stale
+    /// fold memory at insert: the revival rebases past the tombstone
+    /// with no spurious gap.
+    #[test]
+    fn stale_fold_memory_clears_on_tombstone_insert() {
+        let (mut native, caller) = NativeScene::new();
+        let at = native.stamps.tick();
+        native.scene.coordinator.set_pair_prune_cap_for_test(2);
+        native.scene.coordinator.pair_dropped_tombstones.insert(
+            PairKey {
+                image: DomainCookie::scripted(native.domain, 99),
+                exec: 1,
+                object: 0,
+            },
+            PrunedPairBase {
+                base: 9,
+                base_since: at,
+                pruned_since: at,
+                pid: 7,
+            },
+        );
+        let key = PairKey {
+            image: DomainCookie::scripted(native.domain, 41),
+            exec: 1,
+            object: 0,
+        };
+        native.scene.coordinator.pair_targets.insert(
+            key,
+            PairTarget::Dropped {
+                base: 3,
+                base_since: at,
+                pid: 7,
+            },
+        );
+        // Two tombstones fill the bound; the due row folds.
+        let other = PairKey {
+            image: DomainCookie::scripted(native.domain, 98),
+            exec: 1,
+            object: 0,
+        };
+        native.scene.coordinator.pair_dropped_tombstones.insert(
+            other,
+            PrunedPairBase {
+                base: 8,
+                base_since: at,
+                pruned_since: at,
+                pid: 7,
+            },
+        );
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(at + EXEC_STATE_GRACE_NS);
+        let row = native.row(41, 1, 7, at, 0);
+        native.scene.coordinator.bind_pair_count(&row, caller, &[]);
+        native.scene.coordinator.pair_targets.insert(
+            key,
+            PairTarget::Dropped {
+                base: 5,
+                base_since: at,
+                pid: 7,
+            },
+        );
+        native
+            .scene
+            .coordinator
+            .pair_dropped_tombstones
+            .remove(&other);
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(at + EXEC_STATE_GRACE_NS + 1);
+        native.scene.coordinator.bind_pair_count(&row, caller, &[]);
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 7)]);
+        let staged = native
+            .scene
+            .coordinator
+            .registry
+            .staged_pending_counts_for_test();
+        assert_eq!(staged.len(), 1, "one exact staging: {staged:?}");
+        assert_eq!(staged[0].1, 2, "refresh 7 past base 5 stages +2");
+        native.scene.coordinator.registry.publish();
+        assert!(
+            native
+                .scene
+                .coordinator
+                .registry
+                .gaps()
+                .iter()
+                .all(|gap| gap.subject != "revived folded count"),
+            "no spurious fold gap: {:?}",
+            native.scene.coordinator.registry.gaps()
+        );
     }
 
     /// A gone task's tombstone still keeps its full window: a pass

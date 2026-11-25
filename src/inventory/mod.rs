@@ -11406,10 +11406,13 @@ fn budgets_json(budgets: &crate::inventory_present::BudgetView) -> serde_json::V
         // `pair_dropped_*` is the exact aggregate of pruned dropped-pair
         // rows (bases folded per key class, never forgotten silently);
         // `pair_prune_overflow` counts the rows folded past the exact
-        // per-pair tombstone bound or past its keep window: a later revival starts from zero,
-        // so it stages its new absolute as growth instead of rebasing
-        // past the folded base, which the class aggregate still holds
-        // exactly once. `exec_prune_overflow` counts pruned EXEC stashes
+        // per-pair tombstone bound or past its keep window, which the
+        // class aggregate still holds exactly once. A revival past a
+        // remembered fold files a disclosed gap and rebases past the
+        // current absolute instead of re-crediting; `pair_fold_memory_overflow`
+        // counts remembered folds dropped past their own bound (a
+        // revival past one of those re-credits, disclosed by this
+        // count). `exec_prune_overflow` counts pruned EXEC stashes
         // discarded past their bound (the domain latches
         // `exec_record_lost`). Every overflow row is counted once, when
         // it leaves the map.
@@ -11417,6 +11420,7 @@ fn budgets_json(budgets: &crate::inventory_present::BudgetView) -> serde_json::V
             "pair_dropped_rows": budgets.native_pair_dropped_rows,
             "pair_dropped_base": budgets.native_pair_dropped_base,
             "pair_prune_overflow": budgets.native_pair_prune_overflow,
+            "pair_fold_memory_overflow": budgets.native_pair_fold_memory_overflow,
             "exec_prune_overflow": budgets.native_exec_prune_overflow,
         },
         // Additive (v1, v0.8.0): run-wide departed-fold overflow
@@ -11481,6 +11485,7 @@ mod tests {
             native_pair_dropped_rows: 11,
             native_pair_dropped_base: 42,
             native_pair_prune_overflow: 2,
+            native_pair_fold_memory_overflow: 3,
             native_exec_prune_overflow: 1,
             ..Default::default()
         };
@@ -11496,6 +11501,7 @@ mod tests {
         assert_eq!(json["native_departed"]["pair_dropped_rows"], 11);
         assert_eq!(json["native_departed"]["pair_dropped_base"], 42);
         assert_eq!(json["native_departed"]["pair_prune_overflow"], 2);
+        assert_eq!(json["native_departed"]["pair_fold_memory_overflow"], 3);
         assert_eq!(json["native_departed"]["exec_prune_overflow"], 1);
         // Additive: the existing budget rows are untouched.
         assert_eq!(json["callers"]["limit"], 0);

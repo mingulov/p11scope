@@ -1179,17 +1179,19 @@ Additive budgets are:
   run-wide departed-fold overflow totals (the per-module rows carry
   the detail).
 - `native_departed`: `{pair_dropped_rows, pair_dropped_base,
-  pair_prune_overflow, exec_prune_overflow}` — departed native retention
-  accounting. `pair_dropped_rows`/`pair_dropped_base` are the exact
-  aggregate of dropped witness-pair rows whose base passed the 180 s grace
-  and left `pair_targets`, and of their absolute counted bases (folded per
-  domain and object class). `pair_prune_overflow` counts the rows folded
-  into that aggregate past the exact per-pair revival-tombstone bound or
+  pair_prune_overflow, pair_fold_memory_overflow, exec_prune_overflow}` —
+  departed native retention accounting. `pair_dropped_rows`/`pair_dropped_base`
+  are the exact aggregate of dropped witness-pair rows whose base passed the
+  180 s grace and left `pair_targets`, and of their absolute counted bases
+  (folded per domain and object class). `pair_prune_overflow` counts the rows
+  folded into that aggregate past the exact per-pair revival-tombstone bound or
   past its keep window (two prune graces past pruning); each
-  row is counted once, its base is still in the aggregate, and only exact
-  per-pair revival is lost: a later revival starts from zero, so its new
-  absolute is staged as growth rather than rebased past the folded base
-  (the class aggregate keeps that base counted exactly once).
+  row is counted once and its base is still in the aggregate. A revival past
+  a remembered bound-fold files a disclosed gap and rebases past the current
+  absolute instead of re-crediting; a revival past an age-folded gone task
+  still restarts from zero. `pair_fold_memory_overflow` counts remembered
+  folds dropped past their own bound (a revival past one of those
+  re-credits, disclosed by this count).
   `exec_prune_overflow` counts
   pruned EXEC stashes discarded past their tombstone bound; the domain
   latches EXEC loss and late rows there read `exec_record_lost`. EXEC
@@ -1843,7 +1845,8 @@ converged — only its lasting `scan_in_progress` row is gone.
     "semantic_state": {"limit": 32768, "occupied": 0, "status": "withheld", "unknown_edges": 1, "refused": 0},
     "retained_history": {"limit": 1024, "retained": 1, "suppressed": 0},
     "native_departed": {"pair_dropped_rows": 0, "pair_dropped_base": 0,
-                        "pair_prune_overflow": 0, "exec_prune_overflow": 0}
+                        "pair_prune_overflow": 0, "pair_fold_memory_overflow": 0,
+                        "exec_prune_overflow": 0}
   },
   "callers": [
     {

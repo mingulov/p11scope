@@ -623,6 +623,7 @@ pub(crate) struct BudgetView {
     pub native_pair_dropped_rows: u64,
     pub native_pair_dropped_base: u64,
     pub native_pair_prune_overflow: u64,
+    pub native_pair_fold_memory_overflow: u64,
     pub native_exec_prune_overflow: u64,
 }
 
@@ -1279,6 +1280,7 @@ impl Presentation {
                 native_pair_dropped_rows: dropped_pairs.0,
                 native_pair_dropped_base: dropped_pairs.1,
                 native_pair_prune_overflow: coordinator.pair_prune_overflow(),
+                native_pair_fold_memory_overflow: coordinator.pair_fold_memory_overflow(),
                 native_exec_prune_overflow: coordinator.exec_prune_overflow(),
             },
             key_operations_requested: coordinator.key_operations_requested(),

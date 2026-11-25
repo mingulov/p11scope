@@ -2960,13 +2960,16 @@ The old bounds are measurements, not a product startup SLA.
   targets older than the grace move their exact base into a bounded
   revival tombstone and the exact per-class aggregate, so `pair_targets`
   stays bounded without double-counting a late revival. Past 65,536
-  tombstones the row is folded into the same aggregate and counted once
-  in `budgets.native_departed.pair_prune_overflow`: no base is forgotten
-  silently and the map does not grow; only exact per-pair revival is
-  lost, and the published overflow count says so. Tombstones past the
-  keep window (two prune graces past pruning) drain by age on the same
-  pass with the same counting, so the tombstone map stays flat under
-  churn instead of living until domain stop. `pair_dropped_rows`
+  tombstones a gone-task tombstone evicts first so the incoming row
+  keeps its exact tombstone; otherwise the row is folded into the same
+  aggregate and counted once in `budgets.native_departed.pair_prune_overflow`:
+  no base is forgotten silently and the map does not grow. A revival past
+  a remembered fold files a disclosed gap and rebases past the current
+  absolute instead of re-crediting; remembered folds past their own bound
+  drop oldest-first with a counted `pair_fold_memory_overflow` naming the
+  limit. Tombstones past the keep window (two prune graces past pruning)
+  drain by age on the same pass with the same counting, so the tombstone map
+  stays flat under churn instead of living until domain stop. `pair_dropped_rows`
   and `pair_dropped_base` publish the exact aggregate. Every other
   per-pid or per-image structure is hard-capped and its saturation is
   published: the run-wide unidentified caller-image set (16,384;

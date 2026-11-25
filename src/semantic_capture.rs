@@ -1959,6 +1959,13 @@ pub(crate) struct SemanticCapture {
     /// retained. Keep failures until the next collection audits its real prefix.
     pending_discovery_status: CollectionStatus,
     stopped: bool,
+    /// Tests-only seal-take hold: while set, every birth-health check
+    /// refuses with partition contention (retry), even after the
+    /// capture stopped. The live stop cell holds a seal pending across
+    /// the stop with this, then clears it so the take hits its final
+    /// Stopped refusal. Memory-only flag, no budget impact.
+    #[cfg(test)]
+    hold_takes_for_test: bool,
     continuity_cuts: u64,
     /// Diagnostic-only birth-funnel formation: sighting receipts minted
     /// carrying a birth, and New/AdmittedFirst births withheld by the
@@ -2110,6 +2117,8 @@ impl SemanticCapture {
             batch_failed: false,
             pending_discovery_status: CollectionStatus::Complete,
             stopped: false,
+            #[cfg(test)]
+            hold_takes_for_test: false,
             continuity_cuts: 0,
             birth_offers_formed: 0,
             birth_cooled_withheld: 0,
@@ -3238,6 +3247,10 @@ impl SemanticCapture {
         io: &mut impl CaptureIo,
     ) -> Result<(), crate::attach::BirthObservationRefusal> {
         use crate::attach::BirthObservationRefusal as Refusal;
+        #[cfg(test)]
+        if self.hold_takes_for_test {
+            return Err(Refusal::CurrentPartition);
+        }
         self.capture_ended_refusal()?;
         if io.domain() != Some(self.router.domain()) {
             return Err(Refusal::CurrentPartition);
@@ -4401,6 +4414,13 @@ impl SemanticCapture {
         &self,
     ) -> Option<crate::semantics_objects::journal::JournalCollection> {
         self.first_failed_quantum_audit_for_test
+    }
+
+    /// Tests-only seal-take hold (see the field): while set, takes
+    /// hold as partition contention across the stop.
+    #[cfg(test)]
+    pub(crate) fn set_hold_takes_for_test(&mut self, on: bool) {
+        self.hold_takes_for_test = on;
     }
 
     /// Coverage-failure state for the stuck-transaction diagnostic only:

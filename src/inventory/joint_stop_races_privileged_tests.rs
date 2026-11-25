@@ -487,6 +487,46 @@ fn start_joint_lane(
     Ok(lane)
 }
 
+/// Flag-on variant of [`start_joint_lane`], duplicated from
+/// `privileged_tests.rs` (`start_joint_lane_with_journal`): the lane
+/// starts with a journal request, so on a journal build the session
+/// seals linked. The seal-pending cell needs linked births; the
+/// stop-after-last-waiter matrix above keeps its S1 starter.
+fn start_joint_lane_with_journal(
+    coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    manifests: Vec<PathBuf>,
+) -> Result<crate::inventory_semantics::AttestedSemanticLane> {
+    ensure!(
+        env!("P11SCOPE_JOURNAL_ENABLED") == "1",
+        "a linked lane requires P11SCOPE_JOURNAL=1"
+    );
+    coordinator.set_semantic_manifests(manifests);
+    let attach_subset = coordinator
+        .prepare_semantic_subset()
+        .subset
+        .context("the attach subset prepares")?;
+    let convert_subset = coordinator
+        .prepare_semantic_subset()
+        .subset
+        .context("the conversion subset prepares")?;
+    let scope = Scope::System;
+    let spec = crate::attach::journal::JournalSpec;
+    let mut lane = crate::inventory_semantics::AttestedSemanticLane::start_live(
+        attach_subset,
+        convert_subset,
+        &scope,
+        crate::attach::BackendSelection::Auto,
+        Some(&spec),
+    )
+    .map_err(|refusal| anyhow::anyhow!("linked live lane attaches: {refusal}"))?;
+    ensure!(lane.is_live(), "the lane owns its live session");
+    lane.initialize_joint(coordinator)
+        .map_err(|refusal| anyhow::anyhow!("the joint machine initializes: {refusal}"))?;
+    ensure!(lane.has_joint_machine(), "the machine initializes live");
+    joint_drive_line(&lane, coordinator, "r16-lane", "started-linked");
+    Ok(lane)
+}
+
 /// One JOINT_R16 drive-state line: the lane gates plus the machine's
 /// retained phase/demand, before every driven step (and after a
 /// refusal, where the retained phase names the exact failing step).
@@ -4729,4 +4769,563 @@ fn stop_reconciliation_refuses_a_shed_row_with_an_unknown_drop_word() {
         text.contains("counted total"),
         "the failure names the unparsable row: {text}"
     );
+}
+
+/// Seal pending across stop, live (stop-time seal stall): q2 holds
+/// its seal take with the test seam (partition contention, pending),
+/// the capture stops directly while the seal is pending, then the
+/// hold clears and the take hits its final Stopped refusal (no retry).
+/// The feed falls back at once, and its calls land in one named
+/// capture-ended gap with their exact count. q2 publishes, then the
+/// Finish publishes, winds down, and hands off with no latch, no trip,
+/// no abandon and no semantic_unavailable. Before the fix the stopped
+/// take read as partition contention and every delivery retried
+/// forever (the live s12b/s12c finish stall).
+#[test]
+#[ignore = "privileged: live Joint seal pending across stop falls back with named loss"]
+fn privileged_joint_seal_pending_across_stop_falls_back_live_lp64() -> Result<()> {
+    use crate::inventory_promotion::lifecycle::NativeCompletionSource as _;
+    use crate::semantics_objects::journal::SealBootstrapCounts;
+    use crate::semantics_objects::journal::joint_audit::{
+        CAPTURE_ENDED_SUBJECT, capture_ended_reason,
+    };
+
+    const INDEX: usize = 100;
+    let tag = format!("wp7-seal-stop{INDEX}");
+    let workload = JointWorkload::build()?;
+    let soft_manifest = provider_joint_manifest(
+        workload.workload.dir.path(),
+        &workload.soft_copy,
+        JOINT_SOFT_FUNCTIONS,
+        "wp7-seal-soft.dr37.json",
+    )?;
+    let held_manifest = provider_joint_manifest(
+        workload.workload.dir.path(),
+        &workload.held,
+        &["C_SignInit", "C_Sign"],
+        "wp7-seal-held.dr37.json",
+    )?;
+    let release = workload.path(&format!("release{INDEX}"));
+    let go = workload.path(&format!("go{INDEX}"));
+    let _ = std::fs::remove_file(&release);
+    let release_c = std::ffi::CString::new(release.to_str().context("release path")?)
+        .context("release path holds NUL")?;
+    let mkfifo_rc = unsafe { libc::mkfifo(release_c.as_ptr(), 0o600) };
+    ensure!(
+        mkfifo_rc == 0,
+        "mkfifo {}: {}",
+        release.display(),
+        std::io::Error::last_os_error()
+    );
+    let go_arg = go.to_str().context("go path")?.to_string();
+    let release_arg = release.to_str().context("release path")?.to_string();
+    let held_path = workload.held.to_str().context("held path")?.to_string();
+    let mut coordinator =
+        system_joint_coordinator(&[workload.soft_copy.clone(), workload.held.clone()])?;
+    if env!("P11SCOPE_JOURNAL_ENABLED") != "1" {
+        eprintln!("P11SCOPE_CELL_BRANCH={tag}:s1-precluded");
+        anyhow::bail!("{tag}: no journal build: the seal needs P11SCOPE_JOURNAL=1; not attempted");
+    }
+    let mut lane = start_joint_lane_with_journal(
+        &mut coordinator,
+        vec![soft_manifest.to_path_buf(), held_manifest.to_path_buf()],
+    )?;
+    let process_a = workload.spawn(
+        &format!("A{INDEX}"),
+        &[
+            "a",
+            "--cell",
+            "A",
+            "--module",
+            &held_path,
+            "--go",
+            &go_arg,
+            "--release",
+            &release_arg,
+            "--hold",
+        ],
+        &[],
+    )?;
+    let soft_path = workload
+        .soft_copy
+        .to_str()
+        .context("soft-copy path")?
+        .to_string();
+    let process_b = workload.spawn(
+        &format!("B{INDEX}"),
+        &[
+            "b", "--cell", "B", "--module", &soft_path, "--go", &go_arg, "--iters", "2", "--hold",
+        ],
+        &[],
+    )?;
+    drive_until_mapped(&mut coordinator, &[process_a.pid(), process_b.pid()])?;
+    std::fs::write(&go, "go\n").context("releasing the live-joint gate")?;
+    process_a.wait_for("HELD ", Duration::from_secs(60))?;
+    process_b.wait_for("DONE ", Duration::from_secs(120))?;
+    // q1 installs both Joint feeds (A held, B done). On a loaded host a
+    // first quantum can shed and publish with 0 feeds; retry boundedly
+    // until both install, so the seal below has staged history to fall
+    // back. Each retry is another Running transaction, still before any
+    // release, so the held entry stays in flight.
+    let mut q1_polls = 0u64;
+    for attempt in 0..4 {
+        q1_polls += service_to_published(
+            &mut lane,
+            &mut coordinator,
+            attempt == 0,
+            &format!("{tag}-q1a{attempt}"),
+        )?;
+        let feeds = coordinator.registry().joint_feeds();
+        eprintln!("JOINT_STOP {tag}: q1 attempt {attempt} feeds={feeds}");
+        if feeds == 2 {
+            break;
+        }
+        ensure!(
+            attempt < 3,
+            "{tag}: q1 never installed both Joint feeds (got {feeds} after 4 attempts)"
+        );
+    }
+    let q1_end_ns = monotonic_ns();
+    let t_enter = ledger_stamp(&process_a.out, "HELD ")?;
+    ensure!(
+        t_enter < q1_end_ns,
+        "{tag}: the held call entered before q1 ended: {t_enter} < {q1_end_ns}"
+    );
+    eprintln!("JOINT_STOP {tag}: q1 published in {q1_polls} polls; releasing for q2");
+    {
+        let _release = std::fs::File::create(&release)?;
+    }
+    process_a.wait_for("RETURNED ", Duration::from_secs(60))?;
+    eprintln!(
+        "JOINT_STOP {tag}: pre-q2 baseline: drive={:?} stash={:?} stuck={:?}",
+        lane.joint_drive_state_for_test(),
+        lane.stash_pending_floor(),
+        lane.joint_stuck_diagnostic_for_test(),
+    );
+    // Hold the seal take across the stop with the test seam, then stop.
+    // q2 collects the complete return, stages it, then its seal holds as
+    // partition contention (retry, pending). The direct stop then lands
+    // while the seal is pending; clearing the hold lets the take hit its
+    // final Stopped refusal (no retry), falling back with counted loss.
+    // Deterministic: the hold flag pins the seal pending by construction,
+    // the direct stop lands before the release below. Only an S1 build
+    // precludes the cell here (no journal feed at all).
+    if matches!(joint_branch(&coordinator), JointBranch::S1) {
+        eprintln!("P11SCOPE_CELL_BRANCH={tag}:s1-precluded");
+        anyhow::bail!(
+            "{tag}: no journal feed: the seal needs a journal-build libtest \
+             (P11SCOPE_JOURNAL=1 P11SCOPE_BIRTH_MARKER=1); not attempted"
+        );
+    }
+    {
+        use crate::semantics_objects::journal::SealBootstrapCounts as Counts;
+        let counts_q1 = coordinator.joint_seal_bootstrap_diagnosis();
+        ensure!(
+            counts_q1.take_failed_total() == 0,
+            "{tag}: control: q1 took nothing (got {:?})",
+            counts_q1.take_failed,
+        );
+        let _ = Counts::take_index(crate::attach::BirthObservationRefusal::Stopped);
+    }
+    lane.live_capture_mut()
+        .expect("live capture")
+        .set_hold_takes_for_test(true);
+    lane.begin_joint_commit(false)
+        .map_err(|refusal| anyhow::anyhow!("{tag}: q2 begin refused: {refusal:?}"))?;
+    {
+        use crate::inventory_semantics::{JointServiceMode, JointWorkBudget};
+        let mut budget = JointWorkBudget {
+            remaining_actions: 1024,
+            deadline: Instant::now() + Duration::from_millis(10),
+        };
+        let service = lane
+            .service_joint(&mut coordinator, JointServiceMode::Running, &mut budget)
+            .map_err(|reason| anyhow::anyhow!("{tag}: q2 held service refused: {reason}"))?;
+        ensure!(
+            matches!(
+                service,
+                crate::inventory_semantics::JointServiceProgress::Pending
+            ),
+            "{tag}: the held q2 service stays pending (got {service:?})"
+        );
+        let mut budget = JointWorkBudget {
+            remaining_actions: 1024,
+            deadline: Instant::now() + Duration::from_millis(10),
+        };
+        let commit = lane
+            .poll_joint_commit(&mut coordinator, &mut budget)
+            .map_err(|reason| anyhow::anyhow!("{tag}: q2 held poll refused: {reason}"))?;
+        ensure!(
+            matches!(
+                commit,
+                crate::discovery::engine::inventory_coordinator::JointCommitProgress::Pending
+            ),
+            "{tag}: the held q2 poll stays pending (got {commit:?})"
+        );
+    }
+    {
+        use crate::semantics_objects::journal::SealBootstrapCounts as Counts;
+        let counts = coordinator.joint_seal_bootstrap_diagnosis();
+        let current = Counts::take_index(crate::attach::BirthObservationRefusal::CurrentPartition);
+        let stopped = Counts::take_index(crate::attach::BirthObservationRefusal::Stopped);
+        eprintln!(
+            "JOINT_STOP {tag}: held takes current={} stopped={} all={:?}",
+            counts.take_failed[current], counts.take_failed[stopped], counts.take_failed,
+        );
+        ensure!(
+            counts.take_failed[current] >= 1,
+            "{tag}: the hold pins at least one contention take (got {:?})",
+            counts.take_failed,
+        );
+        ensure!(
+            counts.take_failed[stopped] == 0,
+            "{tag}: no Stopped before the stop (got {:?})",
+            counts.take_failed,
+        );
+    }
+    lane.live_capture_mut().expect("live capture").stop();
+    eprintln!("JOINT_STOP {tag}: capture stopped with the seal pending");
+    lane.live_capture_mut()
+        .expect("live capture")
+        .set_hold_takes_for_test(false);
+    // Drive the already-begun q2 to Published (no second begin): its
+    // pending seal now hits Stopped, falls back at once, and publishes
+    // with its capture-ended gap.
+    {
+        use crate::inventory_semantics::{JointServiceMode, JointWorkBudget};
+        let revision_before = coordinator.registry().published_revision();
+        let started = Instant::now();
+        let mut q2_polls = 0u64;
+        loop {
+            let mut budget = JointWorkBudget {
+                remaining_actions: 1024,
+                deadline: Instant::now() + Duration::from_millis(10),
+            };
+            lane.service_joint(&mut coordinator, JointServiceMode::Running, &mut budget)
+                .map_err(|reason| anyhow::anyhow!("{tag}: q2 service refused: {reason}"))?;
+            let mut budget = JointWorkBudget {
+                remaining_actions: 1024,
+                deadline: Instant::now() + Duration::from_millis(10),
+            };
+            let commit = lane
+                .poll_joint_commit(&mut coordinator, &mut budget)
+                .map_err(|reason| anyhow::anyhow!("{tag}: q2 poll refused: {reason}"))?;
+            q2_polls += 1;
+            if matches!(
+                commit,
+                crate::discovery::engine::inventory_coordinator::JointCommitProgress::Published(_)
+            ) {
+                let revision_after = coordinator.registry().published_revision();
+                ensure!(
+                    revision_after == revision_before + 1,
+                    "{tag}: q2 publishes one revision: {revision_before} -> {revision_after}"
+                );
+                break;
+            }
+            ensure!(
+                started.elapsed() < Duration::from_secs(120),
+                "{tag}: q2 unpublished after {q2_polls} polls"
+            );
+        }
+        eprintln!("JOINT_STOP {tag}: q2 published in {q2_polls} polls after the stop");
+    }
+    eprintln!(
+        "JOINT_STOP {tag}: pre-finish branch={:?} feeds={} journal_linked={}",
+        match joint_branch(&coordinator) {
+            JointBranch::Linked => "linked",
+            JointBranch::S1 => "s1",
+            JointBranch::Unattributed => "unattributed",
+        },
+        coordinator.registry().joint_feeds(),
+        coordinator.registry().journal_linked(),
+    );
+    // Stop through the production finish driver; every loop is bounded.
+    let mut driver = joint_finish_driver(&mut coordinator, lane);
+    driver.begin_final_joint_finish();
+    let begin = match &driver.joint_finish {
+        JointFinishDriver::Polling => "polling",
+        JointFinishDriver::Published => "published-at-begin",
+        JointFinishDriver::Abandoned => "abandoned-at-begin",
+        JointFinishDriver::NotBegun => "not-begun",
+    }
+    .to_string();
+    let mut finish_polls = 0u64;
+    let finish = if !matches!(driver.joint_finish, JointFinishDriver::Polling) {
+        match &driver.joint_finish {
+            JointFinishDriver::Published => "published".to_string(),
+            JointFinishDriver::Abandoned => "abandoned".to_string(),
+            JointFinishDriver::NotBegun => "not-begun".to_string(),
+            JointFinishDriver::Polling => unreachable!(),
+        }
+    } else {
+        let started = Instant::now();
+        loop {
+            if finish_polls >= 1000 || started.elapsed() > Duration::from_secs(120) {
+                break "unpublished".to_string();
+            }
+            {
+                let (coordinator, semantic, joint_finish, first_error) = (
+                    &mut *driver.coordinator,
+                    &mut driver.semantic,
+                    &mut driver.joint_finish,
+                    &mut driver.joint_first_error,
+                );
+                let _step = ClassicDriver::step_begun_joint_finish(
+                    semantic,
+                    joint_finish,
+                    coordinator,
+                    first_error,
+                );
+            }
+            finish_polls += 1;
+            match &driver.joint_finish {
+                JointFinishDriver::Published => break "published".to_string(),
+                JointFinishDriver::Abandoned => break "abandoned".to_string(),
+                JointFinishDriver::Polling | JointFinishDriver::NotBegun => {}
+            }
+        }
+    };
+    let first_error = driver.joint_first_error.clone();
+    // Fail gracefully (not panic) when the finish abandons and holds
+    // the lane for exit: the ensures below report the red state.
+    ensure!(
+        finish == "published",
+        "{tag}: the seal-pending finish publishes (got {finish} after {finish_polls} polls; \
+         first_error={first_error:?})"
+    );
+    let lane_ref = driver.semantic.as_ref().expect("lane");
+    let latched = lane_ref.joint_finish_disposition_required();
+    let latch_code = lane_ref
+        .joint_disposition_reason()
+        .map(|reason| reason.code().to_string());
+    let finish_trip = lane_ref
+        .joint_finish_no_progress_trip()
+        .map(|trip| (trip.polls, trip.stalled.as_secs()));
+    let audit_trip = lane_ref
+        .joint_audit_no_progress_trip()
+        .map(|trip| (trip.polls, trip.stalled.as_secs()));
+    eprintln!(
+        "JOINT_STOP {tag}: finish={finish} after {finish_polls} polls; \
+         first_error={first_error:?} latched={latched} latch={latch_code:?} \
+         finish_trip={finish_trip:?} audit_trip={audit_trip:?}"
+    );
+    let h0_stop = {
+        let (coordinator, semantic) = (&mut *driver.coordinator, &mut driver.semantic);
+        let lane = semantic.as_mut().expect("lane");
+        match lane.finish_semantic_stop() {
+            Some(batch) => {
+                coordinator.stage_semantic_batch(batch);
+                lane.note_semantic_staged();
+                match commit_semantic_finish(coordinator, lane) {
+                    Ok(()) => {
+                        lane.note_semantic_published();
+                        if lane.is_finished() {
+                            "committed".to_string()
+                        } else {
+                            "committed-unfinished".to_string()
+                        }
+                    }
+                    Err(error) => format!("commit-refused:{error}"),
+                }
+            }
+            None => {
+                if lane.is_finished() {
+                    "no-batch-finished".to_string()
+                } else {
+                    "no-batch-unfinished".to_string()
+                }
+            }
+        }
+    };
+    let mut wound_polls = 0u64;
+    let wound = loop {
+        if wound_polls >= 600 {
+            break "unwound".to_string();
+        }
+        let (coordinator, semantic) = (&mut *driver.coordinator, &mut driver.semantic);
+        let lane = semantic.as_mut().expect("lane");
+        match lane.poll_wound_down(coordinator, &mut std::io::sink()) {
+            Ok(true) => break "joined".to_string(),
+            Ok(false) => {}
+            Err(refusal) => break format!("wound-refused:{refusal}"),
+        }
+        wound_polls += 1;
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let domain = driver.semantic.as_ref().expect("lane").domain();
+    let take = driver
+        .semantic
+        .as_mut()
+        .expect("lane")
+        .take_joined_session();
+    let taken = matches!(&take, Ok(Some(_)));
+    let mut minted = false;
+    if let Ok(Some(session)) = take {
+        let mut minter = crate::attach::NativeCompletionMinter::new();
+        minter.note_wound_down(domain, session);
+        let started = Instant::now();
+        loop {
+            if let Some(completion) = minter.poll_completion(domain) {
+                if completion.domain() == domain && minter.take_first_failure().is_none() {
+                    minted = true;
+                }
+                break;
+            }
+            if started.elapsed() >= Duration::from_secs(30) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    // Typed records: the final Stopped refusal, the named stop-loss gap
+    // with its exact count, exit 0, no semantic_unavailable. The holds
+    // above already counted as contention; the final Stopped is q2's
+    // only new take (the empty Finish takes nothing).
+    let counts = driver.coordinator.joint_seal_bootstrap_diagnosis();
+    let stopped_index =
+        SealBootstrapCounts::take_index(crate::attach::BirthObservationRefusal::Stopped);
+    let current_index =
+        SealBootstrapCounts::take_index(crate::attach::BirthObservationRefusal::CurrentPartition);
+    let stopped_takes = counts.take_failed[stopped_index];
+    let current_takes = counts.take_failed[current_index];
+    let total_takes = counts.take_failed_total();
+    eprintln!(
+        "JOINT_STOP {tag}: take_failed stopped={stopped_takes} current={current_takes} \
+         total={total_takes} all={:?}",
+        counts.take_failed,
+    );
+    let caller_a = caller_of(driver.coordinator, process_a.pid())?;
+    let mut ended = driver
+        .coordinator
+        .registry()
+        .gaps()
+        .iter()
+        .cloned()
+        .chain(driver.coordinator.registry().staged_gaps_for_test())
+        .filter(|gap| gap.subject == CAPTURE_ENDED_SUBJECT)
+        .collect::<Vec<_>>();
+    ended.sort_by_key(|gap| gap.caller);
+    for gap in driver.coordinator.registry().gaps().iter() {
+        eprintln!(
+            "JOINT_STOP {tag}: gap {:?} {:?} caller={:?}",
+            gap.subject, gap.reason, gap.caller
+        );
+    }
+    // Exit 0: the finish publishes, winds down and hands off with no
+    // latch, no trip and no first error. The post-finish branch is
+    // linked (the Finish installed the feeds it sealed).
+    ensure!(
+        matches!(joint_branch(driver.coordinator), JointBranch::Linked),
+        "{tag}: the seal ran linked (feeds={} journal_linked={})",
+        driver.coordinator.registry().joint_feeds(),
+        driver.coordinator.registry().journal_linked(),
+    );
+    ensure!(
+        finish == "published",
+        "{tag}: the seal-pending finish publishes (got {finish} after {finish_polls} polls)"
+    );
+    ensure!(
+        wound == "joined",
+        "{tag}: the published lane winds down (got {wound} after {wound_polls} polls)"
+    );
+    ensure!(taken, "{tag}: the wound-down lane hands off its session");
+    ensure!(
+        first_error.is_none(),
+        "{tag}: no first error (got {first_error:?})"
+    );
+    ensure!(
+        !latched,
+        "{tag}: no latched disposition (got {latch_code:?})"
+    );
+    ensure!(
+        finish_trip.is_none(),
+        "{tag}: no finish no-progress trip (got {finish_trip:?})"
+    );
+    ensure!(
+        audit_trip.is_none(),
+        "{tag}: no audit no-progress trip (got {audit_trip:?})"
+    );
+    ensure!(
+        begin == "polling",
+        "{tag}: the finish begins polling (got {begin})"
+    );
+    // The final Stopped refusal: exactly one seal take hits it (q2's
+    // held-then-stopped call). The holds above counted as contention
+    // (at least one, budget-dependent); nothing else fails a take.
+    ensure!(
+        stopped_takes == 1,
+        "{tag}: exactly one seal take hits Stopped (got {stopped_takes}, total {total_takes})"
+    );
+    ensure!(
+        current_takes >= 1,
+        "{tag}: the hold pinned contention takes (got {current_takes}: {:?})",
+        counts.take_failed,
+    );
+    ensure!(
+        total_takes == stopped_takes + current_takes,
+        "{tag}: no take failure besides the holds and the final Stopped \
+         (got total {total_takes}: {:?})",
+        counts.take_failed,
+    );
+    // The named stop-loss gap with its exact count: one gap for A's
+    // caller, one call, pinned text.
+    let expected_reason = capture_ended_reason(crate::attach::BirthObservationRefusal::Stopped, 1);
+    ensure!(
+        expected_reason
+            == "the capture ended before the seal could take its birth evidence \
+                 (Stopped); fell back with counted loss (1 calls)",
+        "{tag}: control: the reason renders the refusal and the count"
+    );
+    let expected = vec![crate::discovery::caller_registry::RegistryGap {
+        caller: Some(caller_a),
+        module: None,
+        pid: None,
+        subject: CAPTURE_ENDED_SUBJECT.to_string(),
+        reason: expected_reason,
+        budget: None,
+    }];
+    ensure!(
+        ended == expected,
+        "{tag}: one capture-ended gap for A's caller with 1 call (got {ended:?})"
+    );
+    // No semantic_unavailable: the lane never stops with loss, and no
+    // abandon gap appears without an abandonment.
+    let unavailable = driver
+        .coordinator
+        .registry()
+        .gaps()
+        .iter()
+        .cloned()
+        .chain(driver.coordinator.registry().staged_gaps_for_test())
+        .filter(|gap| gap.reason.contains("semantic_unavailable"))
+        .collect::<Vec<_>>();
+    ensure!(
+        unavailable.is_empty(),
+        "{tag}: no semantic_unavailable (got {unavailable:?})"
+    );
+    let abandon_gap = driver
+        .coordinator
+        .registry()
+        .gaps()
+        .iter()
+        .find(|gap| {
+            gap.subject == "unfinished joint publication abandoned"
+                || gap.subject == "for exit"
+                || gap.subject == "for lane stop"
+        })
+        .map(|gap| format!("{}: {}", gap.subject, gap.reason));
+    ensure!(
+        abandon_gap.is_none(),
+        "{tag}: no abandon gap without abandonment (got {abandon_gap:?})"
+    );
+    eprintln!(
+        "P11SCOPE_CELL_BRANCH={tag}:linked:published:{finish_polls}:{wound_polls}:{}:{}",
+        u8::from(taken),
+        u8::from(minted),
+    );
+    eprintln!(
+        "JOINT_STOP {tag}: h0={h0_stop} taken={taken} minted={minted} \
+         stopped={stopped_takes} ended={ended:?}"
+    );
+    Ok(())
 }

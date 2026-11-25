@@ -1068,6 +1068,12 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// bundle at every take and accepted return (see
     /// `stash_history_refusals`).
     history_refusals: u64,
+    /// Accepted cgroup passes whose membership walk stopped on the
+    /// shared work limit while decode cursors were unfinished (the
+    /// "translated" passes that record no per-pass transaction row),
+    /// counted since the last complete walk. A complete walk resets
+    /// it; while it is nonzero the terminal view names it.
+    walk_incomplete_passes: u64,
     /// Last valid scan-progress summary while the carried bundle is out
     /// with the worker: the completed pass stashes it as it takes the
     /// bundle back, and collecting the next job stashes the same
@@ -1323,6 +1329,101 @@ const SCOPED_OWNER_PREPARATION_ATTEMPTS: usize = 4;
 /// pass with their staged state released. Activations and refreshes
 /// share this budget, activations first.
 const SCOPED_OWNER_COMMITS_PER_TRANSACTION: usize = 1;
+
+/// The typed scheduling note for one member demoted behind newcomers
+/// after repeated budget stops (exact identity: recorded once per
+/// episode, cleared when a scan completes).
+fn member_demotion_row(pid: u32) -> RegistryGap {
+    RegistryGap {
+        caller: None,
+        module: None,
+        pid: Some(pid),
+        subject: crate::discovery::scan_pass::demotion_gap_subject(),
+        reason: format!(
+            "pid {pid} had its scan stopped by a capture budget stop on {} passes \
+             without an intervening completed scan or maps match; it now scans after \
+             never-scanned members until one of its scans completes, so it cannot stall \
+             later newcomers",
+            crate::discovery::scan_pass::BUDGET_STOP_DEMOTE_AFTER
+        ),
+        budget: None,
+        units: None,
+    }
+}
+
+/// Whether a walk that saw `seen` (pid -> recorded start time) proves
+/// the `(pid, start_time)` generation departed: the pid was not seen, or
+/// was seen at another start time. An unreadable start time proves
+/// nothing. Only meaningful for a complete walk.
+fn walk_generation_departed(seen: &BTreeMap<u32, Option<u64>>, pid: u32, start_time: u64) -> bool {
+    match seen.get(&pid) {
+        Some(Some(seen_start)) => *seen_start != start_time,
+        Some(None) => false,
+        None => true,
+    }
+}
+
+/// Terminal row subject for membership walks cut short by the shared
+/// work limit with no complete walk after them.
+pub(crate) const CGROUP_WALK_INCOMPLETE_SUBJECT: &str = "cgroup membership walk incomplete";
+
+pub(crate) fn cgroup_walk_incomplete_reason(passes: u64) -> String {
+    format!(
+        "the membership walk stopped on the shared work limit on {passes} pass(es) with no \
+         complete walk since; a member only an unwalked part of the scope holds may be missing"
+    )
+}
+
+/// The scoped native activation refusal subject.
+pub(crate) const ACTIVATION_REFUSED_SUBJECT: &str = "native owner activation refused";
+
+/// The retry-by-design scoped activation refusals: the caller stays
+/// scan-pinned (counts keep running) and stages again from fresh proof
+/// on a later pass. Each is a loss row while it is pending; once the
+/// same caller incarnation commits its native owner, the row becomes a
+/// typed note — a delay, nothing missed. A caller that never recovers
+/// keeps the loss row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ActivationDelay {
+    /// The one-commit-per-transaction gate deferred this member.
+    Deferred,
+    /// No settled expected native image for the caller yet.
+    Unsettled,
+}
+
+impl ActivationDelay {
+    pub(crate) const ALL: [Self; 2] = [Self::Deferred, Self::Unsettled];
+
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            Self::Deferred => {
+                "only one native owner activation per transaction; the staged owner is deferred to a later pass; scan-pinned fallback retained"
+            }
+            Self::Unsettled => {
+                "no settled expected native image for this caller in the acquisition domain; scan-pinned fallback retained"
+            }
+        }
+    }
+
+    pub(crate) fn note(self) -> crate::discovery::caller_registry::NoteKind {
+        match self {
+            Self::Deferred => crate::discovery::caller_registry::NoteKind::ActivationDeferred,
+            Self::Unsettled => crate::discovery::caller_registry::NoteKind::ActivationUnsettled,
+        }
+    }
+
+    /// The exact loss row this delay records for one caller.
+    fn row(self, caller: CallerId, pid: u32) -> RegistryGap {
+        RegistryGap {
+            caller: Some(caller),
+            module: None,
+            pid: Some(pid),
+            subject: ACTIVATION_REFUSED_SUBJECT.into(),
+            reason: self.reason().into(),
+            budget: None,
+        }
+    }
+}
 
 /// Standing handle-less disclosure: emitted on every cgroup pass
 /// committed without an active image-acquisition handle, with no
@@ -1823,6 +1924,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             completed_cgroup: None,
             cgroup_file_facts: crate::discovery::scan::RetainedFileFacts::default(),
             history_refusals: 0,
+            walk_incomplete_passes: 0,
             last_scan_progress: None,
             scanned_owners: BTreeSet::new(),
             churned_owners: BTreeSet::new(),
@@ -5701,6 +5803,91 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         })
     }
 
+    /// Drop the carried decode cursors and resume-history pairs of
+    /// member generations this accepted pass proves gone, so a member
+    /// that exited mid-decode never leaves the run "in progress" for
+    /// good and dead pairs never fill the bounded history. A complete
+    /// membership walk proves every generation it did not see gone
+    /// (start times are in the keys, so a gone generation never
+    /// returns). A walk that did not complete proves nothing by
+    /// absence: only unfinished cursors' generations it did not see are
+    /// probed, each through the metered generation proof, and only a
+    /// proven change drops. Charged from the collection's own work
+    /// (one unit per 64 entries walked, one per probe unit); a refused
+    /// charge leaves everything for the next pass. A pid whose start
+    /// time the walk could not read keeps all its generations.
+    fn drop_departed_decode_generations(
+        &mut self,
+        collection: &CgroupCollection,
+        work: &crate::inspect_system::inventory_cgroup::SharedCollectionWork,
+    ) {
+        let extent = self.cgroup_file_facts.decode_prune_extent();
+        if extent == 0 {
+            return;
+        }
+        let mut seen: BTreeMap<u32, Option<u64>> = BTreeMap::new();
+        for (pid, start_time) in collection.member_generations() {
+            seen.insert(pid, start_time);
+        }
+        let live = |seen: &BTreeMap<u32, Option<u64>>, pid: u32, start_time: u64| {
+            !walk_generation_departed(seen, pid, start_time)
+        };
+        match collection.outcome() {
+            ScopedCollectionOutcome::Complete => {
+                if !work.charge(extent.div_ceil(64).saturating_add(1)) {
+                    return;
+                }
+                self.cgroup_file_facts
+                    .drop_departed_decode_generations(&mut |pid, start_time| {
+                        !live(&seen, pid, start_time)
+                    });
+            }
+            ScopedCollectionOutcome::Cancelled(_) => {}
+            ScopedCollectionOutcome::Incomplete(_) => {
+                let mut gone = BTreeSet::new();
+                for (pid, start_time) in self.cgroup_file_facts.unfinished_decode_generations() {
+                    if live(&seen, pid, start_time) {
+                        continue;
+                    }
+                    match crate::process::metered_pid_generation(pid, start_time, &mut || {
+                        work.charge(1)
+                    }) {
+                        Some(crate::process::GenerationProof::Changed) => {
+                            gone.insert((pid, start_time));
+                        }
+                        Some(_) => {}
+                        None => break,
+                    }
+                }
+                if gone.is_empty() || !work.charge(extent.div_ceil(64).saturating_add(1)) {
+                    return;
+                }
+                self.cgroup_file_facts
+                    .drop_departed_decode_generations(&mut |pid, start_time| {
+                        gone.contains(&(pid, start_time))
+                    });
+            }
+        }
+    }
+
+    /// The counted membership-walk row for the terminal view: passes
+    /// whose walk stopped on the shared work limit while decode cursors
+    /// were unfinished record no per-pass transaction row, so the run
+    /// names them here until a complete walk follows. `None` when the
+    /// latest walks were complete.
+    pub(crate) fn live_walk_incomplete_gap(&self) -> Option<crate::inventory_present::GapView> {
+        let passes = self.walk_incomplete_passes;
+        (passes > 0).then(|| crate::inventory_present::GapView {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: CGROUP_WALK_INCOMPLETE_SUBJECT.to_string(),
+            reason: cgroup_walk_incomplete_reason(passes),
+            budget: None,
+            repeats: 1,
+        })
+    }
+
     pub(crate) fn cgroup_collector_observed(
         &mut self,
         state: CgroupWalkState,
@@ -5793,8 +5980,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // outright (an empty bundle clears it); only worker custody or a
         // discarded return keeps the older summary.
         self.cgroup_file_facts = collection.take_retained_file_facts();
-        self.replace_scan_progress_stash();
         let work = collection.work();
+        self.drop_departed_decode_generations(&collection, &work);
+        self.replace_scan_progress_stash();
         let events = self
             .adapter
             .reconcile_scoped(now_ns, &mut || work.charge(5));
@@ -7141,15 +7329,20 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 // kept, under a counted named gap, and retries every
                 // pass. The row stays carried (nothing here removes
                 // it) and siblings still fold around it.
-                self.registry.record_gap(RegistryGap {
-                    caller: Some(id),
-                    module: None,
-                    pid: None,
-                    subject: FOLD_DEFERRED_OVERSIZED_SUBJECT.into(),
-                    reason: FOLD_DEFERRED_OVERSIZED_REASON.into(),
-                    budget: None,
-                    units: None,
-                });
+                // Evidence kept, nothing missed: a typed note, never
+                // a loss row.
+                self.registry.record_note(
+                    RegistryGap {
+                        caller: Some(id),
+                        module: None,
+                        pid: None,
+                        subject: FOLD_DEFERRED_OVERSIZED_SUBJECT.into(),
+                        reason: FOLD_DEFERRED_OVERSIZED_REASON.into(),
+                        budget: None,
+                        units: None,
+                    },
+                    crate::discovery::caller_registry::NoteKind::FoldDeferredOversized,
+                );
                 continue;
             }
             if cost > credits {
@@ -8001,8 +8194,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         {
             Some(expected) => expected,
             None => {
-                self.refuse_scoped_native_owner(caller, pid,
-                        "no settled expected native image for this caller in the acquisition domain; scan-pinned fallback retained");
+                self.refuse_scoped_native_owner(caller, pid, ActivationDelay::Unsettled.reason());
                 return None;
             }
         };
@@ -8737,6 +8929,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         {
             Ok(commit) => {
                 self.owners.insert(caller, owner);
+                // The same caller incarnation now holds its native
+                // owner: its pending retry-by-design delays resolve to
+                // typed notes (a non-retained row stays as it is).
+                for delay in ActivationDelay::ALL {
+                    self.registry.classify_gap(
+                        delay.row(caller, pid),
+                        crate::discovery::caller_registry::GapClass::Note(delay.note()),
+                    );
+                }
                 self.project_native_commit(caller, owner, &commit, verdicts, now_ns);
                 if commit.complete {
                     self.complete_scanned.insert(caller);
@@ -8853,7 +9054,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             caller: Some(caller),
             module: None,
             pid: Some(pid),
-            subject: "native owner activation refused".into(),
+            subject: ACTIVATION_REFUSED_SUBJECT.into(),
             reason: reason.into(),
             budget: None,
             units: None,
@@ -13397,6 +13598,19 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .iter()
             .map(|process| process.pid)
             .collect();
+        // Demoted tasks whose scan completes this pass: their
+        // scheduling note clears (the demotion ended).
+        let completed_demoted: Vec<u32> = {
+            let cursor = self.engine.budget.pass_owner().cursor_mut();
+            outcomes
+                .iter()
+                .filter(|(task, outcome, _)| {
+                    *outcome == crate::discovery::scan_pass::MemberOutcome::Examined
+                        && cursor.is_demoted(task)
+                })
+                .map(|(task, _, _)| task.0)
+                .collect()
+        };
         let newly_demoted = self
             .engine
             .budget
@@ -13408,22 +13622,20 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .pass_owner()
             .cursor_mut()
             .prune_to_live(&live_pids);
+        // The demotion row is scheduling, never a loss: the budget
+        // stops that caused it keep their own rows. A typed note while
+        // the member stays demoted; it clears once a scan completes.
+        for pid in completed_demoted {
+            self.registry.classify_gap(
+                member_demotion_row(pid),
+                crate::discovery::caller_registry::GapClass::Cleared,
+            );
+        }
         for (pid, _) in newly_demoted {
-            self.registry.record_gap(RegistryGap {
-                caller: None,
-                module: None,
-                pid: Some(pid),
-                subject: crate::discovery::scan_pass::demotion_gap_subject(),
-                reason: format!(
-                    "pid {pid} had its scan stopped by a capture budget stop on {} passes \
-                     without an intervening completed scan or maps match; it now scans after \
-                     never-scanned members until one of its scans completes, so it cannot stall \
-                     later newcomers",
-                    crate::discovery::scan_pass::BUDGET_STOP_DEMOTE_AFTER
-                ),
-                budget: None,
-                units: None,
-            });
+            self.registry.record_note(
+                member_demotion_row(pid),
+                crate::discovery::caller_registry::NoteKind::MemberDemoted,
+            );
         }
         self.evict_enumerated_overflow();
     }
@@ -14762,7 +14974,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                                 staged.pid,
                                 staged.owner,
                                 Some(&staged.lease),
-                                "only one native owner activation per transaction; the staged owner is deferred to a later pass; scan-pinned fallback retained",
+                                ActivationDelay::Deferred.reason(),
                             );
                         } else {
                             commits_used += 1;
@@ -14908,7 +15120,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         )
                     )
                 ) && self.cgroup_file_facts.scan_progress_totals().is_some();
-                if !translated {
+                if translated {
+                    // Not silent: counted until a complete walk follows.
+                    self.walk_incomplete_passes = self.walk_incomplete_passes.saturating_add(1);
+                } else {
                     self.registry.record_gap(RegistryGap {
                         caller: None,
                         module: None,
@@ -14921,6 +15136,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 }
             } else {
                 cgroup_proof_complete = true;
+                // A complete walk saw the whole scope again: earlier
+                // cut-short walks are covered from here on.
+                self.walk_incomplete_passes = 0;
             }
             // A prior binding is not current membership. Suspend failed
             // members and cut their live operations before any queued owner
@@ -31310,6 +31528,67 @@ exit 0
     /// nothing of the oversized row: every row and its evidence stay
     /// live, repeats count the run's deferrals, and only the
     /// sibling's members aggregate.
+    /// v0.7.2 I5: the oversized-fold deferral keeps the caller and its
+    /// evidence in inventory, so it records no loss: it is a typed
+    /// note, and the presentation carries it under `notes`, never under
+    /// `gaps`. RED before the fix: the row was a loss gap (PARTIAL).
+    #[test]
+    fn fold_oversized_deferral_is_a_typed_note() {
+        use crate::discovery::caller_registry::{GapClass, NoteKind};
+        let (mut native, _live) = NativeScene::new();
+        let heavy = stage_cutoff_caller(&mut native, 5030, 70_000, 3, 2, 4, 3, 2);
+        native.scene.coordinator.registry_mut().publish();
+        native.scene.coordinator.note_rendered_callers(&[heavy]);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(300, None)
+                .retired,
+            0
+        );
+        native.scene.coordinator.registry_mut().publish();
+        let registry = native.scene.coordinator.registry();
+        let rows: Vec<_> = registry
+            .gaps()
+            .iter()
+            .zip(registry.gap_classes())
+            .filter(|(gap, _)| gap.subject == FOLD_DEFERRED_OVERSIZED_SUBJECT)
+            .map(|(gap, class)| (gap.caller, *class))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![(Some(heavy), GapClass::Note(NoteKind::FoldDeferredOversized))]
+        );
+        let presentation = crate::inventory_present::Presentation::capture(
+            &native.scene.coordinator,
+            "system",
+            0,
+            1,
+            1,
+        );
+        assert!(
+            presentation
+                .gaps
+                .iter()
+                .all(|gap| gap.subject != FOLD_DEFERRED_OVERSIZED_SUBJECT),
+            "{:?}",
+            presentation.gaps
+        );
+        assert_eq!(
+            presentation
+                .notes
+                .iter()
+                .map(|note| (note.kind, note.subject.as_str(), note.reason.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(
+                NoteKind::FoldDeferredOversized,
+                FOLD_DEFERRED_OVERSIZED_SUBJECT,
+                FOLD_DEFERRED_OVERSIZED_REASON
+            )]
+        );
+    }
+
     #[test]
     fn fold_oversized_mixed_members_defer_around_fitting_sibling() {
         let (mut native, _live) = NativeScene::new();
@@ -47260,6 +47539,404 @@ int main(void) {
         );
     }
 
+    /// One test decode cursor key for `pid`/`start_time` on object
+    /// `inode`.
+    fn departed_test_key(
+        pid: u32,
+        start_time: u64,
+        inode: u64,
+    ) -> crate::discovery::scan_pass::DecodeCursorKey {
+        let file = std::fs::File::open("/bin/sh").unwrap();
+        crate::discovery::scan_pass::DecodeCursorKey {
+            pid,
+            start_time,
+            file: crate::discovery::scan::InspectedFileKey {
+                device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+                inode,
+                pin: crate::discovery::identity::pin_of(&file).unwrap(),
+                fd_dev: 7,
+            },
+            exec: None,
+        }
+    }
+
+    fn departed_test_cursor(complete: bool) -> crate::discovery::scan_pass::DecodeCursor {
+        crate::discovery::scan_pass::DecodeCursor {
+            fingerprint: Vec::new(),
+            tables: crate::discovery::scan_pass::SweepFrontier {
+                snapshot: 0,
+                word: u64::from(complete),
+            },
+            interfaces: crate::discovery::scan_pass::SweepFrontier {
+                snapshot: 0,
+                word: 0,
+            },
+            anchors: None,
+            cached_tables: Vec::new(),
+            cached_interfaces: Vec::new(),
+            unlinked: Vec::new(),
+            targets: Vec::new(),
+            complete,
+            validated: complete,
+            seq: 0,
+        }
+    }
+
+    /// A pid no process holds (above the kernel's pid ceiling), and a
+    /// live non-member generation (this test process).
+    // Above PID_MAX_LIMIT (4_194_304): no real process can hold it, so
+    // a busy host's own pids never collide with the fixture.
+    const DEPARTED_TEST_PID: u32 = 4_250_000;
+
+    fn carried_cursor_table(
+        coordinator: &InventoryCoordinator<OsProcessSource>,
+        pids: &[u32],
+    ) -> Vec<(u32, u64, u64, bool)> {
+        coordinator
+            .cgroup_file_facts
+            .decode_cursors_for_test()
+            .into_iter()
+            .filter(|(key, _)| pids.contains(&key.pid))
+            .map(|(key, cursor)| (key.pid, key.start_time, key.file.inode, cursor.complete))
+            .collect()
+    }
+
+    fn one_cgroup_pass(
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        incomplete: bool,
+    ) -> CgroupCompletion {
+        let mut collection = coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap()();
+        if incomplete {
+            collection.preparation_incomplete();
+        }
+        coordinator
+            .apply_cgroup_collection(collection, crate::discovery::caller_registry::now_ns())
+            .unwrap();
+        coordinator.commit_batch(false).unwrap();
+        coordinator.take_cgroup_completion().unwrap()
+    }
+
+    /// v0.7.2 I2: a member that exits mid-decode leaves an unfinished
+    /// cursor; after the next accepted pass whose complete walk no
+    /// longer sees its generation, the cursor is gone and the run
+    /// shows no live in-progress row. The departed member's completed
+    /// cursor stays (it is done; reclamation already takes it first),
+    /// and so does nothing else. RED before the fix: the dead cursor
+    /// kept the run in progress for good.
+    #[test]
+    fn complete_walk_drops_a_departed_members_unfinished_cursor() {
+        let (_dir, _child, mut coordinator) = cgroup_provider_scene();
+        let mut budget = crate::discovery::scan::CaptureWorkBudget::default()
+            .with_retained_file_facts(crate::discovery::scan::RetainedFileFacts::default());
+        assert!(budget.record_decode_cursor(
+            departed_test_key(DEPARTED_TEST_PID, 9, 11),
+            departed_test_cursor(false)
+        ));
+        assert!(budget.record_decode_cursor(
+            departed_test_key(DEPARTED_TEST_PID, 9, 12),
+            departed_test_cursor(true)
+        ));
+        coordinator.cgroup_file_facts = budget.take_retained_file_facts();
+        assert!(
+            coordinator.live_scan_progress_gap().is_some(),
+            "setup: in progress"
+        );
+        let completion = one_cgroup_pass(&mut coordinator, false);
+        assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+        assert_eq!(
+            carried_cursor_table(&coordinator, &[DEPARTED_TEST_PID]),
+            vec![(DEPARTED_TEST_PID, 9, 12, true)],
+            "the departed member's unfinished cursor is dropped, its completed one kept"
+        );
+        assert!(
+            coordinator.live_scan_progress_gap().is_none(),
+            "every live member converged: no live in-progress row"
+        );
+        let presentation =
+            crate::inventory_present::Presentation::capture(&coordinator, "cgroup", 0, 1, 1);
+        assert!(
+            presentation
+                .gaps
+                .iter()
+                .all(|gap| gap.subject != crate::discovery::scan_pass::SCAN_IN_PROGRESS_SUBJECT),
+            "{:?}",
+            presentation.gaps
+        );
+    }
+
+    /// v0.7.2 I2, incomplete-walk leg: absence from a walk that did not
+    /// complete proves nothing, so only a metered generation proof
+    /// drops: a dead generation's unfinished cursor drops, a live
+    /// non-member generation's unfinished cursor (this test process)
+    /// stays. Twin of the complete-walk leg.
+    #[test]
+    fn incomplete_walk_drops_only_proven_dead_unfinished_cursors() {
+        let (_dir, _child, mut coordinator) = cgroup_provider_scene();
+        let me = std::process::id();
+        let my_start = crate::process::process_start_time(me).unwrap();
+        let mut budget = crate::discovery::scan::CaptureWorkBudget::default()
+            .with_retained_file_facts(crate::discovery::scan::RetainedFileFacts::default());
+        assert!(budget.record_decode_cursor(
+            departed_test_key(DEPARTED_TEST_PID, 9, 11),
+            departed_test_cursor(false)
+        ));
+        assert!(budget.record_decode_cursor(
+            departed_test_key(me, my_start, 11),
+            departed_test_cursor(false)
+        ));
+        coordinator.cgroup_file_facts = budget.take_retained_file_facts();
+        let completion = one_cgroup_pass(&mut coordinator, true);
+        assert_ne!(
+            completion.outcome,
+            ScopedCollectionOutcome::Complete,
+            "setup: incomplete"
+        );
+        assert_eq!(
+            carried_cursor_table(&coordinator, &[DEPARTED_TEST_PID, me]),
+            vec![(me, my_start, 11, false)],
+            "the proven-dead generation drops; the live one stays"
+        );
+        assert!(
+            coordinator.live_scan_progress_gap().is_some(),
+            "the live unfinished cursor still names its progress"
+        );
+    }
+
+    /// v0.7.2 I2: the walk-generation rule, as a typed table. A
+    /// generation the walk saw at the same start time is live; at a
+    /// different start time, or a pid the walk never saw, it departed;
+    /// a pid whose start time the walk could not read proves nothing.
+    #[test]
+    fn walk_generation_departure_table() {
+        let seen = BTreeMap::from([(10u32, Some(100u64)), (11, None)]);
+        let table: Vec<(u32, u64, bool)> = [(10, 100), (10, 101), (11, 7), (12, 100)]
+            .into_iter()
+            .map(|(pid, start)| (pid, start, walk_generation_departed(&seen, pid, start)))
+            .collect();
+        assert_eq!(
+            table,
+            vec![
+                (10, 100, false),
+                (10, 101, true),
+                (11, 7, false),
+                (12, 100, true)
+            ]
+        );
+    }
+
+    /// v0.7.2 I3 wiring: an accepted pass with a complete walk forgets
+    /// the resume-history pairs of generations it no longer sees (the
+    /// saturated bundle's fake members), so dead pairs never hold the
+    /// bounded record full. RED before the fix: the pairs stayed.
+    #[test]
+    fn complete_walk_forgets_departed_resume_history_pairs() {
+        let (_dir, _child, mut coordinator) = cgroup_provider_scene();
+        coordinator.cgroup_file_facts =
+            crate::discovery::scan::RetainedFileFacts::saturated_resume_history_for_test();
+        let before = coordinator.cgroup_file_facts.decode_prune_extent();
+        assert!(
+            before > crate::discovery::scan_pass::MAX_DECODE_CURSORS,
+            "setup: {before}"
+        );
+        let completion = one_cgroup_pass(&mut coordinator, false);
+        assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+        let fake: Vec<_> = coordinator
+            .cgroup_file_facts
+            .decode_cursors_for_test()
+            .into_iter()
+            // The fixture's fake generations all start at 9; a real
+            // member (the scene's child, any pid) never does.
+            .filter(|(key, _)| key.pid >= 4_000_000 && key.start_time == 9)
+            .collect();
+        assert!(
+            fake.is_empty(),
+            "no dead unfinished cursor stays: {}",
+            fake.len()
+        );
+        assert!(
+            coordinator
+                .cgroup_file_facts
+                .resume_history_pairs_for_test()
+                .iter()
+                .all(|(pid, start_time)| *pid < 4_000_000 || *start_time != 9),
+            "no dead generation's history pair stays"
+        );
+    }
+
+    /// v0.7.2 R1: a walk that stops on the shared work limit while
+    /// decode cursors resume records no per-pass transaction row, so
+    /// the run counts it in one live row until a complete walk
+    /// follows; the complete walk clears it. RED before the fix: the
+    /// cut-short walk left no row at all.
+    #[test]
+    fn walk_cut_short_while_resuming_is_counted_until_a_complete_walk() {
+        let (_dir, _child, mut coordinator) = cgroup_provider_scene();
+        let limits = CgroupWalkLimits {
+            work_units: 8000,
+            ..CgroupWalkLimits::default()
+        };
+        let collection = coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                limits,
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap()();
+        coordinator
+            .apply_cgroup_collection(collection, crate::discovery::caller_registry::now_ns())
+            .unwrap();
+        coordinator.commit_batch(false).unwrap();
+        let completion = coordinator.take_cgroup_completion().unwrap();
+        assert!(
+            completion.progress.is_some(),
+            "setup: the pass stopped with resumable progress"
+        );
+        assert_eq!(
+            completion.outcome,
+            ScopedCollectionOutcome::Incomplete(
+                crate::inspect_system::inventory_cgroup::ScopedCollectionGap::Membership(
+                    crate::scope::inventory_cgroup::CgroupIncomplete::WorkLimit
+                )
+            ),
+            "setup: the translated walk-limit shape"
+        );
+        let row = coordinator
+            .live_walk_incomplete_gap()
+            .map(|gap| (gap.subject, gap.reason, gap.caller, gap.pid));
+        assert_eq!(
+            row,
+            Some((
+                CGROUP_WALK_INCOMPLETE_SUBJECT.to_string(),
+                cgroup_walk_incomplete_reason(1),
+                None,
+                None
+            )),
+        );
+        let presentation =
+            crate::inventory_present::Presentation::capture(&coordinator, "cgroup", 0, 1, 1);
+        assert_eq!(
+            presentation
+                .gaps
+                .iter()
+                .filter(|gap| gap.subject == CGROUP_WALK_INCOMPLETE_SUBJECT)
+                .count(),
+            1,
+            "the presentation counts the cut-short walk"
+        );
+        let mut state = completion.state;
+        let mut complete = false;
+        for _ in 0..12 {
+            let collection = coordinator
+                .cgroup_collector(
+                    std::mem::take(&mut state),
+                    CgroupWalkLimits::default(),
+                    CollectionControl::new(None),
+                    None,
+                )
+                .unwrap()();
+            coordinator
+                .apply_cgroup_collection(collection, crate::discovery::caller_registry::now_ns())
+                .unwrap();
+            coordinator.commit_batch(false).unwrap();
+            let completion = coordinator.take_cgroup_completion().unwrap();
+            state = completion.state;
+            if completion.outcome == ScopedCollectionOutcome::Complete {
+                complete = true;
+                break;
+            }
+        }
+        assert!(complete, "a default-allowance walk completes");
+        assert!(
+            coordinator.live_walk_incomplete_gap().is_none(),
+            "a complete walk covers the earlier cut-short walk"
+        );
+    }
+
+    /// v0.7.2 C1: a row's caller names a `callers[]` row or nothing. A
+    /// caller id the inventory no longer lists (a folded caller) is
+    /// nulled in both the gap and the note projection, with its pid
+    /// kept; a listed caller keeps its id.
+    #[test]
+    fn rows_never_name_a_caller_outside_callers() {
+        let (_dir, child, mut coordinator) = cgroup_provider_scene();
+        let completion = one_cgroup_pass(&mut coordinator, false);
+        assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+        let listed = coordinator
+            .adapter()
+            .live_id(child.id())
+            .expect("the member is a caller");
+        let folded = CallerId(999_999);
+        for (caller, subject) in [(listed, "listed row"), (folded, "folded row")] {
+            coordinator.registry.record_gap(RegistryGap {
+                caller: Some(caller),
+                module: None,
+                pid: Some(77),
+                subject: subject.into(),
+                reason: "r".into(),
+                budget: None,
+            });
+            coordinator.registry.record_note(
+                RegistryGap {
+                    caller: Some(caller),
+                    module: None,
+                    pid: Some(77),
+                    subject: format!("{subject} note"),
+                    reason: "r".into(),
+                    budget: None,
+                },
+                crate::discovery::caller_registry::NoteKind::FoldDeferredOversized,
+            );
+        }
+        coordinator.registry.publish();
+        let presentation =
+            crate::inventory_present::Presentation::capture(&coordinator, "cgroup", 0, 1, 1);
+        assert!(
+            presentation
+                .callers
+                .iter()
+                .any(|caller| caller.id == listed)
+        );
+        assert!(
+            presentation
+                .callers
+                .iter()
+                .all(|caller| caller.id != folded)
+        );
+        let gaps: Vec<_> = presentation
+            .gaps
+            .iter()
+            .filter(|gap| gap.subject.ends_with(" row"))
+            .map(|gap| (gap.subject.as_str(), gap.caller, gap.pid))
+            .collect();
+        assert_eq!(
+            gaps,
+            vec![
+                ("listed row", Some(listed), Some(77)),
+                ("folded row", None, Some(77))
+            ]
+        );
+        let notes: Vec<_> = presentation
+            .notes
+            .iter()
+            .map(|note| (note.subject.as_str(), note.caller, note.pid))
+            .collect();
+        assert_eq!(
+            notes,
+            vec![
+                ("listed row note", Some(listed), Some(77)),
+                ("folded row note", None, Some(77))
+            ]
+        );
+    }
+
     /// A counted resume-history refusal survives every custody path: it
     /// names while the bundle is home, while the next worker owns the
     /// bundle, after that worker's collection is discarded, and after an
@@ -47939,6 +48616,90 @@ mod scan_freshness_tests {
                 .count(),
             1,
             "the completed scan keeps the episode's gap row"
+        );
+    }
+
+    /// v0.7.2 I4: the demotion row is a scheduling note, never a loss.
+    /// While the member stays demoted it is a typed note (no gap in the
+    /// presentation); once a scan completes it clears; a new stuck
+    /// episode raises the same note again. The record compared is the
+    /// typed `(pid, class)` table, exactly.
+    #[test]
+    fn demotion_row_is_a_note_that_clears_on_completion() {
+        use crate::discovery::caller_registry::{GapClass, NoteKind};
+        let classes = |coordinator: &InventoryCoordinator<_>| -> Vec<(Option<u32>, GapClass)> {
+            let registry = coordinator.registry();
+            registry
+                .gaps()
+                .iter()
+                .zip(registry.gap_classes())
+                .filter(|(gap, _)| {
+                    gap.subject == crate::discovery::scan_pass::demotion_gap_subject()
+                })
+                .map(|(gap, class)| (gap.pid, *class))
+                .collect()
+        };
+        let mut coordinator = freshness_coordinator();
+        let stuck = |catalog: &mut crate::inspect_system::Catalog| {
+            catalog.processes[0].work_disposition =
+                crate::inspect_system::MemberWorkDisposition::StoppedDuringScan {
+                    full_allowance: true,
+                };
+            catalog.skipped = vec![crate::inspect_system::PidGap {
+                pid: Some(11),
+                subject: "libcopy.so".into(),
+                reason: crate::discovery::scan::WORK_CEILING_REASON.into(),
+                generic: false,
+            }];
+        };
+        let mut catalog = super::tests::capture_catalog(
+            &crate::discovery::identity::PinnedObjects::empty(),
+            &[],
+            11,
+            Some(crate::inspect_system::MemberGeneration {
+                start_time: Some(110),
+                exe: None,
+            }),
+        );
+        stuck(&mut catalog);
+        for _ in 0..BUDGET_STOP_DEMOTE_AFTER - 1 {
+            coordinator.note_applied_scan_tasks(&catalog);
+        }
+        coordinator.registry.publish();
+        assert_eq!(classes(&coordinator), Vec::new(), "not yet demoted");
+        coordinator.note_applied_scan_tasks(&catalog);
+        coordinator.registry.publish();
+        assert_eq!(
+            classes(&coordinator),
+            vec![(Some(11), GapClass::Note(NoteKind::MemberDemoted))],
+            "the demotion is a typed note"
+        );
+        coordinator.note_applied_scan_tasks(&catalog);
+        coordinator.registry.publish();
+        assert_eq!(
+            classes(&coordinator),
+            vec![(Some(11), GapClass::Note(NoteKind::MemberDemoted))],
+            "a still-stuck pass changes nothing"
+        );
+        catalog.skipped.clear();
+        catalog.processes[0].work_disposition =
+            crate::inspect_system::MemberWorkDisposition::NoBudgetStop;
+        coordinator.note_applied_scan_tasks(&catalog);
+        coordinator.registry.publish();
+        assert_eq!(
+            classes(&coordinator),
+            vec![(Some(11), GapClass::Cleared)],
+            "a completed scan clears the note"
+        );
+        stuck(&mut catalog);
+        for _ in 0..BUDGET_STOP_DEMOTE_AFTER {
+            coordinator.note_applied_scan_tasks(&catalog);
+        }
+        coordinator.registry.publish();
+        assert_eq!(
+            classes(&coordinator),
+            vec![(Some(11), GapClass::Note(NoteKind::MemberDemoted))],
+            "a new stuck episode raises the note again"
         );
     }
 

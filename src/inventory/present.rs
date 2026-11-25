@@ -450,6 +450,20 @@ pub(crate) struct InstanceSemanticView {
     pub reasons: Vec<&'static str>,
 }
 
+/// One typed non-loss row, owned for rendering: never counted toward
+/// PARTIAL (see [`crate::discovery::caller_registry::NoteKind`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NoteView {
+    pub kind: crate::discovery::caller_registry::NoteKind,
+    pub caller: Option<CallerId>,
+    pub module: Option<ModuleId>,
+    pub pid: Option<u32>,
+    pub subject: String,
+    pub reason: String,
+    /// How many times this identical row was recorded this run (>= 1).
+    pub repeats: u64,
+}
+
 /// One coverage gap, owned for rendering.
 #[derive(Debug, Clone)]
 pub(crate) struct GapView {
@@ -717,6 +731,11 @@ pub(crate) struct Presentation {
     pub(crate) render_index: PresentationRenderIndex,
     pub gaps: Vec<GapView>,
     pub gaps_suppressed: u64,
+    /// Typed non-loss rows (additive within v1): never counted toward
+    /// PARTIAL. Empty on most runs.
+    pub notes: Vec<NoteView>,
+    /// Distinct notes dropped past the gap bound (no loss).
+    pub notes_suppressed: u64,
     /// Files skipped by `--exclude-module` (a declared operator choice,
     /// never a loss), plus the inputs that matched nothing. Empty unless
     /// the operator passed `--exclude-module`.
@@ -1061,29 +1080,53 @@ impl Presentation {
                 }
             })
             .collect();
-        let mut gaps: Vec<GapView> = registry
+        // A row's caller names a `callers[]` row or nothing: a caller
+        // folded out of the inventory (departed fold) keeps its pid
+        // and its row, never a dangling caller id.
+        let listed: std::collections::BTreeSet<CallerId> =
+            callers.iter().map(|caller| caller.id).collect();
+        let listed_caller = |caller: Option<CallerId>| caller.filter(|id| listed.contains(id));
+        let mut gaps: Vec<GapView> = Vec::new();
+        let mut notes: Vec<NoteView> = Vec::new();
+        for ((gap, &repeats), &class) in registry
             .gaps()
             .iter()
             .zip(registry.gap_repeats())
-            .map(|(gap, &repeats)| {
-                // Repeated-noise families project to their finite
-                // public reason here, so text, JSON and the dashboard
-                // agree; every record keeps its row, attribution and
-                // repeats — folding renames rows, never drops them.
-                let reason = fold_scan_ceiling_reason(&gap.reason)
-                    .map(str::to_string)
-                    .unwrap_or_else(|| gap.reason.clone());
-                GapView {
-                    caller: gap.caller,
-                    module: gap.module,
-                    pid: gap.pid,
-                    subject: gap.subject.clone(),
-                    reason,
-                    budget: gap.budget,
-                    repeats,
+            .zip(registry.gap_classes())
+        {
+            match class {
+                crate::discovery::caller_registry::GapClass::Loss => {
+                    // Repeated-noise families project to their finite
+                    // public reason here, so text, JSON and the dashboard
+                    // agree; every record keeps its row, attribution and
+                    // repeats — folding renames rows, never drops them.
+                    let reason = fold_scan_ceiling_reason(&gap.reason)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| gap.reason.clone());
+                    gaps.push(GapView {
+                        caller: listed_caller(gap.caller),
+                        module: gap.module,
+                        pid: gap.pid,
+                        subject: gap.subject.clone(),
+                        reason,
+                        budget: gap.budget,
+                        repeats,
+                    });
                 }
-            })
-            .collect();
+                crate::discovery::caller_registry::GapClass::Note(kind) => {
+                    notes.push(NoteView {
+                        kind,
+                        caller: listed_caller(gap.caller),
+                        module: gap.module,
+                        pid: gap.pid,
+                        subject: gap.subject.clone(),
+                        reason: gap.reason.clone(),
+                        repeats,
+                    });
+                }
+                crate::discovery::caller_registry::GapClass::Cleared => {}
+            }
+        }
         let object_observations = coordinator.registry().joint_observations(passes);
         if let Some(gap) = silent_bootstrap_gap(&object_observations, semantic_edges.len(), &gaps) {
             gaps.push(gap);
@@ -1098,6 +1141,11 @@ impl Presentation {
         // Unfinished work the snapshot resume history could not admit
         // is named with its count (run-wide, protected in concise text).
         if let Some(gap) = coordinator.live_scan_history_gap() {
+            gaps.push(gap);
+        }
+        // Membership walks cut short while decode cursors resumed record
+        // no per-pass row; the run counts them until a complete walk.
+        if let Some(gap) = coordinator.live_walk_incomplete_gap() {
             gaps.push(gap);
         }
         let limits = registry.limits();
@@ -1157,6 +1205,8 @@ impl Presentation {
             render_index,
             gaps,
             gaps_suppressed: registry.gaps_suppressed(),
+            notes,
+            notes_suppressed: registry.notes_suppressed(),
             excluded_modules,
             unmatched_excludes,
             unmatched_forwarding,
@@ -5951,6 +6001,23 @@ fn render_snapshot_inner(
     }
     if presentation.gaps_suppressed > 0 {
         let _ = writeln!(out, "more gaps not shown: {}", presentation.gaps_suppressed);
+    }
+    // Typed non-loss rows: listed for the record, never counted in the
+    // coverage line.
+    for note in &presentation.notes {
+        let _ = writeln!(
+            out,
+            "note [{}] {} (no data lost)",
+            escape_controls(&note.subject),
+            escape_controls(&note.reason),
+        );
+    }
+    if presentation.notes_suppressed > 0 {
+        let _ = writeln!(
+            out,
+            "more notes not shown: {}",
+            presentation.notes_suppressed
+        );
     }
     out
 }

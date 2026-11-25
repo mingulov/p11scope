@@ -161,14 +161,17 @@ def overlay_published_report():
         "gaps": [
             {"caller": "c0", "module": None, "pid": 100,
              "reason": UNPROVEN_DIAGNOSED, "subject": MODPATH, "repeats": 12},
-            {"caller": "c0", "module": None, "pid": 100,
-             "reason": NATIVE, "subject": "native owner activation refused",
-             "repeats": 11},
             {"caller": "c1", "module": None, "pid": 101,
              "reason": UNPROVEN, "subject": MODPATH, "repeats": 10},
-            {"caller": "c1", "module": None, "pid": 101,
-             "reason": NATIVE, "subject": "native owner activation refused",
-             "repeats": 9},
+        ],
+        # The recovered settle refusals are typed notes (v0.7.2 I1).
+        "notes": [
+            {"kind": "activation_unsettled", "caller": "c0", "module": None,
+             "pid": 100, "reason": NATIVE,
+             "subject": "native owner activation refused", "repeats": 11},
+            {"kind": "activation_unsettled", "caller": "c1", "module": None,
+             "pid": 101, "reason": NATIVE,
+             "subject": "native owner activation refused", "repeats": 9},
         ],
     }
 
@@ -639,14 +642,14 @@ class InventoryOverlayTests(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertIn("inventory cgroup: inside=100 child=101 "
                       "outside=102 excluded module=m0 admission=admitted "
-                      "unproven=2 gaps=4", out)
+                      "unproven=2 gaps=2 notes=2", out)
 
     def test_overlay_published_shape_passes_unresolved(self):
         report = overlay_published_report()
         report["modules"][0]["admission"] = {"state": "unresolved"}
         rc, out = run_oracle(report, pin=PUBLISHED_PIN)
         self.assertEqual(rc, 0, out)
-        self.assertIn("admission=unresolved unproven=2 gaps=4", out)
+        self.assertIn("admission=unresolved unproven=2 gaps=2 notes=2", out)
 
     def test_overlay_empty_view_fails_loudly(self):
         # The regressed 0-module shape: no signature, no
@@ -670,7 +673,7 @@ class InventoryOverlayTests(unittest.TestCase):
              "repeats": 2})
         rc, out = run_oracle(report, pin=PUBLISHED_PIN)
         self.assertEqual(rc, 0, out)
-        self.assertIn("unproven=2 gaps=5", out)
+        self.assertIn("unproven=2 gaps=3 notes=2", out)
 
     def test_overlay_branch_rejects(self):
         cases = []

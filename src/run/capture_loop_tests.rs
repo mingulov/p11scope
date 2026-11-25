@@ -2872,6 +2872,8 @@ fn canary_presentation() -> crate::inventory_present::Presentation {
         instance_reload_not_excluded: None,
         render_index: Default::default(),
         gaps_suppressed: 0,
+        notes: Vec::new(),
+        notes_suppressed: 0,
         excluded_modules: Vec::new(),
         unmatched_excludes: Vec::new(),
         unmatched_forwarding: Vec::new(),

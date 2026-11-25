@@ -169,6 +169,17 @@ def unbound_reason(first=UNBOUND_FIRST):
             "attributed by pid" % (MODPATH, first))
 
 
+def activation_note(caller, pid, *, kind="activation_unsettled", reason=None,
+                    repeats=1):
+    """A recovered activation delay as the producer publishes it: a
+    typed note (`notes[]`), never a loss gap (v0.7.2 I1)."""
+    if reason is None:
+        reason = NATIVE if kind == "activation_unsettled" else DEFERRED
+    return {"kind": kind, "caller": caller, "module": None, "pid": pid,
+            "reason": reason, "subject": "native owner activation refused",
+            "repeats": repeats}
+
+
 RECORDS = ROOT / "scripts/qualify_records.py"
 RUN_ID = "test-run"
 
@@ -268,18 +279,16 @@ def decided_report():
         "gaps": [
             {"caller": "c0", "module": None, "pid": 100,
              "reason": UNPROVEN, "subject": MODPATH, "repeats": 10},
-            {"caller": "c0", "module": None, "pid": 100,
-             "reason": NATIVE, "subject": "native owner activation refused",
-             "repeats": 1},
             {"caller": "c1", "module": None, "pid": 101,
              "reason": UNPROVEN, "subject": MODPATH, "repeats": 9},
             {"caller": None, "module": "m0", "pid": None,
              "reason": unbound_reason(), "subject": UNBOUND_SUBJECT,
              "repeats": 1},
-            {"caller": "c1", "module": None, "pid": 101,
-             "reason": NATIVE, "subject": "native owner activation refused",
-             "repeats": 8},
         ],
+        # Each recovered settle refusal is a typed note, not a gap.
+        "notes": [activation_note("c0", 100),
+                  activation_note("c1", 101, repeats=8)],
+        "notes_suppressed": 0,
     }
 
 
@@ -304,24 +313,24 @@ class AcceptTests(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertIn("inventory cgroup: inside=100 child=101 "
                       "outside=102 excluded module=m0 admission=admitted "
-                      "unproven=2 gaps=5", out)
+                      "unproven=2 gaps=3 notes=2", out)
 
     def test_decided_shape_passes_with_another_binder_cause(self):
         # The unbound reason frames a diagnosed binder first-cause;
         # any diagnosed cause keeps the gap named (same precedent as
         # the unproven prefix).
         report = decided_report()
-        report["gaps"][3]["reason"] = unbound_reason(UNBOUND_FIRST_EXITED)
+        report["gaps"][2]["reason"] = unbound_reason(UNBOUND_FIRST_EXITED)
         rc, out = run_oracle(report, modfs="overlayfs")
         self.assertEqual(rc, 0, out)
-        self.assertIn("unproven=2 gaps=5", out)
+        self.assertIn("unproven=2 gaps=3 notes=2", out)
 
     def test_decided_no_witness_shape_passes_off_overlay(self):
         # No kernel witness on a non-overlay filesystem degrades the
         # same way: the named shape qualifies, the module stays admitted.
         rc, out = run_oracle(decided_report(), modfs="ext4")
         self.assertEqual(rc, 0, out)
-        self.assertIn("unproven=2 gaps=5", out)
+        self.assertIn("unproven=2 gaps=3 notes=2", out)
 
     def test_deadline_straddle_with_retained_refresh_passes(self):
         # CI run 43309778622, v6.6.157 leg: twelve passes, two of
@@ -344,7 +353,7 @@ class AcceptTests(unittest.TestCase):
              "repeats": 1})
         rc, out = run_oracle(report, modfs="overlayfs")
         self.assertEqual(rc, 0, out)
-        self.assertIn("unproven=2 gaps=7", out)
+        self.assertIn("unproven=2 gaps=5 notes=2", out)
 
     def test_deadline_straddle_with_retained_refresh_passes_witness_available(self):
         # F1 control: the N3 retained-refresh invariant applies
@@ -363,20 +372,21 @@ class AcceptTests(unittest.TestCase):
              "repeats": 1})
         rc, out = run_oracle(report, modfs="ext4")
         self.assertEqual(rc, 0, out)
-        self.assertIn("unproven=0 gaps=5", out)
+        self.assertIn("unproven=0 gaps=3 notes=2", out)
 
     def test_witness_available_unbound_positive_passes_off_overlay(self):
         # Host leg (7.0.0-azure): the witness ran, so no unproven gaps
         # exist; the named counted positive on the owned module is
-        # PARTIAL coverage, not a failure. Gap order mirrors the CI
-        # row exactly (per-caller fallback, owned positive, fallback).
+        # PARTIAL coverage, not a failure. The recovered per-caller
+        # fallbacks are typed notes beside the one owned positive.
         report = witness_available_report()
         self.assertEqual(
             [(g.get("caller"), g.get("module")) for g in report["gaps"]],
-            [("c0", None), (None, "m0"), ("c1", None)])
+            [(None, "m0")])
+        self.assertEqual([n.get("caller") for n in report["notes"]], ["c0", "c1"])
         rc, out = run_oracle(report, modfs="ext4")
         self.assertEqual(rc, 0, out)
-        self.assertIn("unproven=0 gaps=3", out)
+        self.assertIn("unproven=0 gaps=1 notes=2", out)
 
     def test_deadline_straddle_with_preparation_interrupted_passes(self):
         # CI run 44960926490, v7.3.1 leg: twelve passes, two of them
@@ -403,7 +413,7 @@ class AcceptTests(unittest.TestCase):
              "repeats": 1})
         rc, out = run_oracle(report, modfs="overlayfs")
         self.assertEqual(rc, 0, out)
-        self.assertIn("unproven=2 gaps=8", out)
+        self.assertIn("unproven=2 gaps=6 notes=2", out)
 
     def test_deadline_straddle_with_preparation_interrupted_passes_witness_available(self):
         # The preparation-interrupted guard is substrate-independent
@@ -423,7 +433,7 @@ class AcceptTests(unittest.TestCase):
              "repeats": 2})
         rc, out = run_oracle(report, modfs="ext4")
         self.assertEqual(rc, 0, out)
-        self.assertIn("unproven=0 gaps=5", out)
+        self.assertIn("unproven=0 gaps=3 notes=2", out)
 
 
 def healthy_report_with_unbound():
@@ -522,7 +532,7 @@ class RefuseTests(unittest.TestCase):
         # The subject alone does not name the gap: the reason must
         # carry the producer framing, or the owned-module check fails.
         report = decided_report()
-        report["gaps"][3]["reason"] = "native witness rows, truncated"
+        report["gaps"][2]["reason"] = "native witness rows, truncated"
         rc, out = run_oracle(report, modfs="overlayfs")
         self.assertNotEqual(rc, 0, out)
         self.assertIn("inventory gaps about owned module", out)
@@ -531,7 +541,7 @@ class RefuseTests(unittest.TestCase):
         # The named positive belongs to the owned module; the same
         # shape detached from it is an unexpected extra gap.
         report = decided_report()
-        report["gaps"][3]["module"] = None
+        report["gaps"][2]["module"] = None
         rc, out = run_oracle(report, modfs="overlayfs")
         self.assertNotEqual(rc, 0, out)
         self.assertIn("overlay published extra gap", out)
@@ -1267,7 +1277,7 @@ class CrossPairTests(unittest.TestCase):
         # witness-available branch too; the same shape detached
         # from it is unclassified there.
         report = witness_available_report()
-        report["gaps"][1]["module"] = None
+        report["gaps"][0]["module"] = None
         for optimized in (False, True):
             with self.subTest(optimized=optimized):
                 self.assert_cross_pair_refusal(
@@ -1371,12 +1381,12 @@ def deferred_recovered_report(*, modfs_witness=False):
     report["callers"] = workload_callers()
     report["gaps"] = [
         g for g in report["gaps"]
-        if g.get("subject") != UNBOUND_SUBJECT
-        and not (g.get("caller") == "c1" and g.get("reason") == NATIVE)]
-    report["gaps"].append(
-        {"caller": "c1", "module": None, "pid": 101,
-         "reason": DEFERRED, "subject": "native owner activation refused",
-         "repeats": 1})
+        if g.get("subject") != UNBOUND_SUBJECT]
+    report["notes"] = [
+        n for n in report["notes"]
+        if not (n.get("caller") == "c1" and n.get("reason") == NATIVE)]
+    # The recovered deferral: a typed note (v0.7.2 I1), never a gap.
+    report["notes"].append(activation_note("c1", 101, kind="activation_deferred"))
     return report
 
 
@@ -1384,13 +1394,13 @@ class DeferredActivationTests(unittest.TestCase):
     def test_deferred_then_activated_member_passes_degraded(self):
         rc, out = run_oracle(deferred_recovered_report(), modfs="overlayfs")
         self.assertEqual(rc, 0, out)
-        self.assertIn("unproven=2 gaps=4", out)
+        self.assertIn("unproven=2 gaps=2 notes=2", out)
 
     def test_deferred_then_activated_member_passes_witness_available(self):
         rc, out = run_oracle(deferred_recovered_report(modfs_witness=True),
                              modfs="ext4")
         self.assertEqual(rc, 0, out)
-        self.assertIn("unproven=0 gaps=2", out)
+        self.assertIn("unproven=0 gaps=0 notes=2", out)
 
     def test_deferred_member_that_stays_scan_pinned_fails(self):
         # Recover and continue: a deferral is a disclosure of one
@@ -1424,17 +1434,108 @@ class DeferredActivationTests(unittest.TestCase):
 
     def test_callerless_deferral_fails(self):
         report = deferred_recovered_report()
-        report["gaps"][-1]["caller"] = None
+        report["notes"][-1]["caller"] = None
         rc, out = run_oracle(report, modfs="overlayfs")
         self.assertNotEqual(rc, 0, out)
         self.assertIn("deferred activation never recovered", out)
 
     def test_deferral_under_another_subject_fails(self):
         report = deferred_recovered_report()
-        report["gaps"][-1]["subject"] = "native owner refresh refused"
+        report["notes"][-1]["subject"] = "native owner refresh refused"
         rc, out = run_oracle(report, modfs="overlayfs")
         self.assertNotEqual(rc, 0, out)
         self.assertIn("activation refusal under another subject", out)
+
+
+class RestoredActivationArmTests(unittest.TestCase):
+    """v0.7.2 I1: the relaxed arms of 6d6cdefc3/b126200cd/18d95edb7 are
+    restored. The producer resolves a recovered activation delay to a
+    typed note, so an activation delay in `gaps` is the producer's own
+    verdict that it never recovered and fails the cell on every
+    substrate, even when the caller ended native_exact. Notes are typed
+    strictly: kind, reason and attribution must agree."""
+
+    SHAPES = (("overlayfs", False), ("ext4", True))
+
+    def test_recovered_deferral_published_as_a_gap_fails(self):
+        for modfs, witness in self.SHAPES:
+            with self.subTest(modfs=modfs):
+                report = deferred_recovered_report(modfs_witness=witness)
+                note = report["notes"].pop()
+                del note["kind"]
+                report["gaps"].append(note)
+                rc, out = run_oracle(report, modfs=modfs)
+                self.assertNotEqual(rc, 0, out)
+                self.assertIn("deferred activation never recovered", out)
+
+    def test_recovered_settle_refusal_published_as_a_gap_fails(self):
+        for modfs, witness in self.SHAPES:
+            with self.subTest(modfs=modfs):
+                report = (witness_available_report() if witness
+                          else decided_report())
+                note = report["notes"].pop(0)
+                del note["kind"]
+                report["gaps"].append(note)
+                rc, out = run_oracle(report, modfs=modfs)
+                self.assertNotEqual(rc, 0, out)
+                self.assertIn("native activation never recovered", out)
+
+    def test_note_kind_must_match_its_reason(self):
+        report = deferred_recovered_report(modfs_witness=True)
+        report["notes"][-1]["kind"] = "activation_unsettled"
+        rc, out = run_oracle(report, modfs="ext4")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("activation note reason is not its kind's", out)
+
+    def test_other_note_kinds_fail_the_cell(self):
+        for kind in ("member_demoted", "fold_deferred_oversized"):
+            with self.subTest(kind=kind):
+                report = deferred_recovered_report(modfs_witness=True)
+                report["notes"][-1]["kind"] = kind
+                rc, out = run_oracle(report, modfs="ext4")
+                self.assertNotEqual(rc, 0, out)
+                self.assertIn("unrecognized cgroup note", out)
+
+    def test_unknown_note_kind_fails_typing(self):
+        report = deferred_recovered_report(modfs_witness=True)
+        report["notes"][-1]["kind"] = "activation_maybe"
+        rc, out = run_oracle(report, modfs="ext4")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("note kind 'activation_maybe' is not one of", out)
+
+    def test_suppressed_notes_fail(self):
+        report = deferred_recovered_report(modfs_witness=True)
+        report["notes_suppressed"] = 1
+        rc, out = run_oracle(report, modfs="ext4")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("notes suppressed", out)
+
+    def test_note_records_are_strict(self):
+        for key in ("kind", "caller", "pid", "module", "subject", "reason", "repeats"):
+            with self.subTest(missing=key):
+                report = deferred_recovered_report(modfs_witness=True)
+                del report["notes"][-1][key]
+                rc, out = run_oracle(report, modfs="ext4")
+                self.assertNotEqual(rc, 0, out)
+                self.assertIn("missing", out)
+        report = deferred_recovered_report(modfs_witness=True)
+        report["notes"][-1]["extra"] = 1
+        rc, out = run_oracle(report, modfs="ext4")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("unknown keys ['extra']", out)
+        report = deferred_recovered_report(modfs_witness=True)
+        report["notes"][-1]["repeats"] = 0
+        rc, out = run_oracle(report, modfs="ext4")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("note repeats out of range", out)
+
+    def test_fork_shape_without_notes_passes_complete(self):
+        # The healthy fork cell with no delay at all: no gap, no note.
+        report = deferred_recovered_report(modfs_witness=True)
+        report["notes"] = []
+        rc, out = run_oracle(report, modfs="ext4")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("unproven=0 gaps=0 notes=0", out)
 
 
 class CountReconciliationTests(unittest.TestCase):
@@ -1544,7 +1645,7 @@ class RefusalIdentityTests(unittest.TestCase):
                 report = (witness_available_report() if witness
                           else decided_report())
                 report["callers"][1]["image"]["authority"] = "scan_pinned"
-                for g in report["gaps"]:
+                for g in report["notes"]:
                     if g.get("caller") == "c1" and g.get("reason") == NATIVE:
                         g["subject"] = "native owner refresh refused"
                 rc, out = run_oracle(report, modfs=modfs)
@@ -1556,7 +1657,7 @@ class RefusalIdentityTests(unittest.TestCase):
             with self.subTest(modfs=modfs):
                 report = (witness_available_report() if witness
                           else decided_report())
-                for g in report["gaps"]:
+                for g in report["notes"]:
                     if g.get("caller") == "c1" and g.get("reason") == NATIVE:
                         g["subject"] = "native owner refresh refused"
                 rc, out = run_oracle(report, modfs=modfs)
@@ -1568,7 +1669,7 @@ class RefusalIdentityTests(unittest.TestCase):
             with self.subTest(modfs=modfs):
                 report = deferred_recovered_report(modfs_witness=witness)
                 report["callers"][1]["image"]["authority"] = "scan_pinned"
-                report["gaps"][-1]["subject"] = "native owner refresh refused"
+                report["notes"][-1]["subject"] = "native owner refresh refused"
                 rc, out = run_oracle(report, modfs=modfs)
                 self.assertNotEqual(rc, 0, out)
                 self.assertIn("activation refusal under another subject", out)
@@ -1583,7 +1684,7 @@ class RefusalIdentityTests(unittest.TestCase):
                 second = workload_caller("c2", 101, authority="scan_pinned")
                 second["start_time"] = 9000
                 report["callers"].append(second)
-                report["gaps"][-1]["caller"] = "c2"
+                report["notes"][-1]["caller"] = "c2"
                 rc, out = run_oracle(report, modfs=modfs)
                 self.assertNotEqual(rc, 0, out)
                 self.assertIn("fork child has 2 caller incarnations", out)
@@ -1592,7 +1693,7 @@ class RefusalIdentityTests(unittest.TestCase):
         for modfs, witness in self.SHAPES:
             with self.subTest(modfs=modfs):
                 report = deferred_recovered_report(modfs_witness=witness)
-                report["gaps"][-1]["caller"] = "c7"
+                report["notes"][-1]["caller"] = "c7"
                 rc, out = run_oracle(report, modfs=modfs)
                 self.assertNotEqual(rc, 0, out)
                 self.assertIn("deferred activation never recovered", out)
@@ -1617,8 +1718,8 @@ def _provision_failed_child(report):
     # Codex r3 F2: another activation reason under the canonical
     # subject, the child still scan-pinned, both edges exactly counted.
     report["callers"][1]["image"]["authority"] = "scan_pinned"
-    report["gaps"] = [g for g in report["gaps"]
-                      if g.get("reason") != DEFERRED]
+    report["notes"] = [n for n in report["notes"]
+                       if n.get("reason") != DEFERRED]
     report["gaps"].append({"caller": "c1", "module": None, "pid": 101,
                            "reason": "staged owner provision failed: scripted error",
                            "subject": ACTIVATION, "repeats": 1})
@@ -1626,8 +1727,8 @@ def _provision_failed_child(report):
 
 def _scan_pinned_child_without_gap(report):
     report["callers"][1]["image"]["authority"] = "scan_pinned"
-    report["gaps"] = [g for g in report["gaps"]
-                      if g.get("reason") != DEFERRED]
+    report["notes"] = [n for n in report["notes"]
+                       if n.get("reason") != DEFERRED]
 
 
 def _retired_child(report):
@@ -1668,9 +1769,7 @@ def _third_pid_caller(report):
     third = workload_caller("c3", 100)
     third["pid"] = 103
     report["callers"].append(third)
-    report["gaps"].append({"caller": "c3", "module": None, "pid": 103,
-                           "reason": NATIVE, "subject": ACTIVATION,
-                           "repeats": 1})
+    report["notes"].append(activation_note("c3", 103))
 
 
 def _unknown_gap(report):
@@ -1710,7 +1809,7 @@ def _add_gaps(*gaps):
 
 def _deferral_on(**override):
     def mutate(report):
-        report["gaps"][-1].update(override)
+        report["notes"][-1].update(override)
     return mutate
 
 
@@ -1726,7 +1825,7 @@ def _null_child_identity(report):
     # Codex r5 F1: a null id with matching null references.
     report["callers"][1]["id"] = None
     report["edges"][1]["caller"] = None
-    report["gaps"][-1]["caller"] = None
+    report["notes"][-1]["caller"] = None
 
 
 def _set(path, value):
@@ -1743,6 +1842,17 @@ def _set(path, value):
 
 
 _DELETE = object()
+
+
+def _typed_gap(field, value):
+    """Mutation adding one gap row with `field` mistyped. The recovered
+    activation delays are notes now (v0.7.2 I1), so the witness-available
+    fork report may publish no gap; the typing rows carry their own."""
+    def mutate(report):
+        gap = _deadline()
+        gap[field] = value
+        report["gaps"].append(gap)
+    return mutate
 
 
 def _duplicate_module_id(report):
@@ -1840,11 +1950,11 @@ class ExpectedTableTests(unittest.TestCase):
          "edge count has type str"),
         ("edge-coverage-missing", _set(["edges", 1, "entries", "coverage"], _DELETE),
          "edge coverage has type NoneType"),
-        ("gap-pid-string", _set(["gaps", -1, "pid"], "101"),
+        ("gap-pid-string", _typed_gap("pid", "101"),
          "gap pid has type str"),
-        ("gap-caller-int", _set(["gaps", -1, "caller"], 1),
+        ("gap-caller-int", _typed_gap("caller", 1),
          "gap caller has type int"),
-        ("gap-subject-null", _set(["gaps", -1, "subject"], None),
+        ("gap-subject-null", _typed_gap("subject", None),
          "gap subject has type NoneType"),
         # Codex r5 N2: only the producer's upward transitions.
         ("admission-note-empty-transition",
@@ -2020,8 +2130,8 @@ class CheckCoverageTests(unittest.TestCase):
         ("gaps-not-a-list", _set(["gaps"], None), "gaps has type NoneType"),
         ("gap-not-an-object", lambda r: r["gaps"].append("gap"),
          "gap has type str"),
-        ("gap-module-int", _set(["gaps", -1, "module"], 0), "gap module has type int"),
-        ("gap-reason-int", _set(["gaps", -1, "reason"], 7), "gap reason has type int"),
+        ("gap-module-int", _typed_gap("module", 0), "gap module has type int"),
+        ("gap-reason-int", _typed_gap("reason", 7), "gap reason has type int"),
     ]
 
     LEDGER_ROWS = [
@@ -2478,7 +2588,7 @@ class NeverSettledTests(unittest.TestCase):
 
     def test_settle_refusal_at_another_pid_fails(self):
         report = decided_report()
-        report["gaps"][1]["pid"] = 999
+        report["notes"][0]["pid"] = 999
         rc, out = run_oracle(report, modfs="overlayfs")
         self.assertNotEqual(rc, 0, out)
         self.assertIn("native activation never recovered", out)

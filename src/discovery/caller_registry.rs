@@ -3717,6 +3717,51 @@ pub(crate) struct BudgetRefusal {
     pub requested: usize,
 }
 
+/// Why a retained row records no loss: the typed non-loss classes. A
+/// row in one of these classes renders under `notes`, never under
+/// `gaps`, and never counts toward a PARTIAL verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum NoteKind {
+    /// A scoped native activation the one-commit-per-transaction gate
+    /// deferred, after which the same caller incarnation committed its
+    /// native owner: a delay, nothing missed.
+    ActivationDeferred,
+    /// A scoped native activation refused for want of a settled
+    /// expected image, after which the same caller incarnation
+    /// committed its native owner: a delay, nothing missed.
+    ActivationUnsettled,
+    /// A member demoted behind newcomers after repeated budget stops:
+    /// scheduling only (the budget stops keep their own loss rows).
+    MemberDemoted,
+    /// A departed caller too costly to fold in one window stays in
+    /// inventory, unfolded, with its evidence kept.
+    FoldDeferredOversized,
+}
+
+impl NoteKind {
+    /// The stable public label (`notes[].kind`).
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::ActivationDeferred => "activation_deferred",
+            Self::ActivationUnsettled => "activation_unsettled",
+            Self::MemberDemoted => "member_demoted",
+            Self::FoldDeferredOversized => "fold_deferred_oversized",
+        }
+    }
+}
+
+/// The verdict class of one retained row. `Loss` rows are gaps;
+/// `Note` rows render as notes; `Cleared` rows were notes whose
+/// condition ended (a demoted member completed a scan) and render
+/// nowhere. A later recording of the same row as a loss returns it to
+/// `Loss`: a resolved delay that recurs is pending again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GapClass {
+    Loss,
+    Note(NoteKind),
+    Cleared,
+}
+
 /// One explicit coverage gap: what is unknown and why. Never silent
 /// absence.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -4032,6 +4077,18 @@ enum Mutation {
         /// shared stop-time reserve, never crowded out by it.
         aggregate: bool,
     },
+    /// One typed non-loss row, retained under the ordinary gap bound.
+    RecordNote {
+        gap: RegistryGap,
+        kind: NoteKind,
+        terminal: bool,
+    },
+    /// Reclassify one retained row (exact identity); a row that is not
+    /// retained (never recorded, or suppressed) is left as it is.
+    ClassifyGap {
+        gap: RegistryGap,
+        class: GapClass,
+    },
     RecordKeyedGap {
         /// The module key, resolved to an ID at apply time — after the
         /// publication's mappings commit (F3-04).
@@ -4300,6 +4357,11 @@ pub(crate) struct CallerRegistry {
     /// Parallel to `gaps`: how many times each retained gap was recorded
     /// this run (>= 1).
     gap_repeats: Vec<u64>,
+    /// Parallel to `gaps`: each retained row's verdict class.
+    gap_classes: Vec<GapClass>,
+    /// Distinct typed notes past the gap bound: counted apart from
+    /// `gaps_suppressed`, because a suppressed note records no loss.
+    notes_suppressed: u64,
     /// Retained gap -> its index in `gaps`: the run-wide dedupe key.
     gap_index: HashMap<RegistryGap, usize>,
     /// Distinct gaps already counted as suppressed (bounded by
@@ -4724,6 +4786,8 @@ impl CallerRegistry {
             edges: BTreeMap::new(),
             gaps: Vec::new(),
             gap_repeats: Vec::new(),
+            gap_classes: Vec::new(),
+            notes_suppressed: 0,
             gap_index: HashMap::new(),
             suppressed_seen: HashSet::new(),
             suppressed_hasher: std::hash::RandomState::new(),
@@ -5499,6 +5563,16 @@ impl CallerRegistry {
 
     pub(crate) fn gaps_suppressed(&self) -> u64 {
         self.gaps_suppressed
+    }
+
+    /// Per-row verdict classes, parallel to [`Self::gaps`].
+    pub(crate) fn gap_classes(&self) -> &[GapClass] {
+        &self.gap_classes
+    }
+
+    /// Distinct typed notes dropped past the gap bound (no loss).
+    pub(crate) fn notes_suppressed(&self) -> u64 {
+        self.notes_suppressed
     }
 
     /// The enforced budgets (limits, occupancy, and loss counters render
@@ -6277,6 +6351,24 @@ impl CallerRegistry {
         });
     }
 
+    /// Stage one typed non-loss row: it shares the gap bound and the
+    /// run-wide dedupe, but renders as a note and never counts toward
+    /// PARTIAL.
+    pub(crate) fn record_note(&mut self, gap: RegistryGap, kind: NoteKind) {
+        let terminal = self.terminal_phase;
+        self.staged.push(Mutation::RecordNote {
+            gap,
+            kind,
+            terminal,
+        });
+    }
+
+    /// Stage one reclassification of a retained row (exact identity),
+    /// applied in staging order after the rows staged before it.
+    pub(crate) fn classify_gap(&mut self, gap: RegistryGap, class: GapClass) {
+        self.staged.push(Mutation::ClassifyGap { gap, class });
+    }
+
     /// Stage one terminal INFO aggregate (spec §17.4): the cut, a run
     /// total, or the deferred-fold disclosure. Aggregates carry
     /// explicit terminal retention — they retain from the dedicated
@@ -6826,8 +6918,31 @@ impl CallerRegistry {
     /// [`TERMINAL_AGGREGATE_HEADROOM`] count above the shared reserve,
     /// so either stage order preserves both budgets.
     fn push_gap_as(&mut self, gap: RegistryGap, terminal: bool, aggregate: bool) {
+        self.push_gap_classified(gap, terminal, aggregate, GapClass::Loss);
+    }
+
+    /// [`Self::push_gap_as`] with the row's verdict class. A repeat
+    /// re-raises the class: a loss recording of a row that resolved to a
+    /// note (or a note recording of a cleared row) returns it to the
+    /// incoming class, so a recurring condition is never hidden by an
+    /// earlier resolution. A note never lowers a loss row. A distinct
+    /// note past the bound counts in `notes_suppressed`, never in
+    /// `gaps_suppressed`.
+    fn push_gap_classified(
+        &mut self,
+        gap: RegistryGap,
+        terminal: bool,
+        aggregate: bool,
+        class: GapClass,
+    ) {
         if let Some(&index) = self.gap_index.get(&gap) {
             self.gap_repeats[index] = self.gap_repeats[index].saturating_add(1);
+            let held = self.gap_classes[index];
+            self.gap_classes[index] = match (held, class) {
+                (_, GapClass::Loss) => GapClass::Loss,
+                (GapClass::Cleared, note) => note,
+                (held, _) => held,
+            };
             return;
         }
         // Separate budgets: aggregates use only the dedicated
@@ -6851,7 +6966,11 @@ impl CallerRegistry {
             if self.suppressed_seen.contains(&fingerprint) {
                 return;
             }
-            self.gaps_suppressed = self.gaps_suppressed.saturating_add(1);
+            if class == GapClass::Loss {
+                self.gaps_suppressed = self.gaps_suppressed.saturating_add(1);
+            } else {
+                self.notes_suppressed = self.notes_suppressed.saturating_add(1);
+            }
             if self.suppressed_seen.len() < MAX_SUPPRESSED_GAP_MEMORY {
                 self.suppressed_seen.insert(fingerprint);
             }
@@ -6860,6 +6979,7 @@ impl CallerRegistry {
         self.gap_index.insert(gap.clone(), self.gaps.len());
         self.gaps.push(gap);
         self.gap_repeats.push(1);
+        self.gap_classes.push(class);
         if aggregate && terminal {
             self.terminal_aggregate_retained = self.terminal_aggregate_retained.saturating_add(1);
         }
@@ -7332,6 +7452,16 @@ impl CallerRegistry {
                 terminal,
                 aggregate,
             } => self.push_gap_as(gap, terminal, aggregate),
+            Mutation::RecordNote {
+                gap,
+                kind,
+                terminal,
+            } => self.push_gap_classified(gap, terminal, false, GapClass::Note(kind)),
+            Mutation::ClassifyGap { gap, class } => {
+                if let Some(&index) = self.gap_index.get(&gap) {
+                    self.gap_classes[index] = class;
+                }
+            }
             Mutation::RecordAggregatedUnrouted {
                 subject,
                 total,
@@ -11312,6 +11442,113 @@ pub(crate) mod tests {
         registry.publish();
         assert_eq!(registry.gaps().len(), 8192);
         assert_eq!(registry.gaps_suppressed(), 1);
+    }
+
+    /// Verdict classes of retained rows (v0.7.2 I1/I4/I5): a pending
+    /// loss row resolves to a typed note by exact identity, a later loss
+    /// recording returns it to `Loss`, a note never lowers a loss row,
+    /// a cleared note re-raises on recurrence, and a classification of
+    /// a non-retained row changes nothing. The record compared is the
+    /// typed `(gap, repeats, class)` table, exactly.
+    #[test]
+    fn gap_classes_resolve_recur_and_never_lower_a_loss() {
+        use super::{GapClass, NoteKind};
+        let table = |registry: &CallerRegistry| -> Vec<(String, u64, GapClass)> {
+            registry
+                .gaps()
+                .iter()
+                .zip(registry.gap_repeats())
+                .zip(registry.gap_classes())
+                .map(|((gap, repeats), class)| (gap.subject.clone(), *repeats, *class))
+                .collect()
+        };
+        let row = |subject: &str| RegistryGap {
+            caller: Some(CallerId(3)),
+            module: None,
+            pid: Some(30),
+            subject: subject.into(),
+            reason: "r".into(),
+            budget: None,
+        };
+        let mut registry = registry();
+        registry.record_gap(row("delay"));
+        registry.classify_gap(
+            row("never-recorded"),
+            GapClass::Note(NoteKind::ActivationDeferred),
+        );
+        registry.publish();
+        assert_eq!(table(&registry), vec![("delay".into(), 1, GapClass::Loss)]);
+        registry.classify_gap(row("delay"), GapClass::Note(NoteKind::ActivationDeferred));
+        registry.publish();
+        assert_eq!(
+            table(&registry),
+            vec![(
+                "delay".into(),
+                1,
+                GapClass::Note(NoteKind::ActivationDeferred)
+            )],
+            "a resolved delay is a note"
+        );
+        registry.record_gap(row("delay"));
+        registry.publish();
+        assert_eq!(
+            table(&registry),
+            vec![("delay".into(), 2, GapClass::Loss)],
+            "a recurring delay is pending again"
+        );
+        registry.record_note(row("delay"), NoteKind::ActivationDeferred);
+        registry.publish();
+        assert_eq!(
+            table(&registry),
+            vec![("delay".into(), 3, GapClass::Loss)],
+            "a note recording never lowers a loss row"
+        );
+        registry.record_note(row("demoted"), NoteKind::MemberDemoted);
+        registry.classify_gap(row("demoted"), GapClass::Cleared);
+        registry.publish();
+        assert_eq!(
+            table(&registry)[1],
+            ("demoted".into(), 1, GapClass::Cleared)
+        );
+        registry.record_note(row("demoted"), NoteKind::MemberDemoted);
+        registry.publish();
+        assert_eq!(
+            table(&registry)[1],
+            ("demoted".into(), 2, GapClass::Note(NoteKind::MemberDemoted)),
+            "a cleared note re-raises when it recurs"
+        );
+        assert_eq!(
+            (registry.gaps_suppressed(), registry.notes_suppressed()),
+            (0, 0)
+        );
+    }
+
+    /// A distinct note past the gap bound counts in `notes_suppressed`,
+    /// never in `gaps_suppressed` (it records no loss); a distinct loss
+    /// past the bound still counts in `gaps_suppressed`.
+    #[test]
+    fn suppressed_notes_count_apart_from_suppressed_gaps() {
+        use super::NoteKind;
+        let mut registry =
+            CallerRegistry::new(RegistryLimits::new(64, 64, 64, 1, 1 << 20, 64).unwrap());
+        let row = |n: u32| RegistryGap {
+            caller: None,
+            module: None,
+            pid: Some(n),
+            subject: format!("s{n}"),
+            reason: "r".into(),
+            budget: None,
+        };
+        registry.record_gap(row(0));
+        registry.record_note(row(1), NoteKind::FoldDeferredOversized);
+        registry.record_note(row(1), NoteKind::FoldDeferredOversized);
+        registry.record_gap(row(2));
+        registry.publish();
+        assert_eq!(registry.gaps().len(), 1);
+        assert_eq!(
+            (registry.gaps_suppressed(), registry.notes_suppressed()),
+            (1, 1)
+        );
     }
 
     fn collapse_gap() -> RegistryGap {

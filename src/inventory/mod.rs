@@ -11153,6 +11153,28 @@ pub(crate) fn render_json_from_presentation(presentation: &Presentation) -> serd
         document["provider_observations"] =
             crate::inventory_provider_info::provider_observations_json(observations);
     }
+    // Additive (v1, v0.7.2): typed non-loss rows (a recovered activation
+    // delay, a scheduling demotion, an oversized fold kept unfolded).
+    // They never count toward PARTIAL; `gaps` keeps every loss row.
+    // Omitted when there are none.
+    if !presentation.notes.is_empty() || presentation.notes_suppressed > 0 {
+        document["notes"] = presentation
+            .notes
+            .iter()
+            .map(|note| {
+                serde_json::json!({
+                    "kind": note.kind.label(),
+                    "caller": note.caller.map(|caller| caller.label()),
+                    "module": note.module.map(|module| module.label()),
+                    "pid": note.pid,
+                    "subject": note.subject,
+                    "reason": note.reason,
+                    "repeats": note.repeats,
+                })
+            })
+            .collect::<serde_json::Value>();
+        document["notes_suppressed"] = presentation.notes_suppressed.into();
+    }
     // Additive (v0.6.0): files skipped by `--exclude-module`, a declared
     // operator choice, never a loss. Omitted when empty.
     if !presentation.excluded_modules.is_empty() {

@@ -3728,6 +3728,10 @@ pub(crate) struct RegistryGap {
     pub reason: String,
     /// `Some` exactly when the gap records a budget refusal.
     pub budget: Option<BudgetRefusal>,
+    /// Exact call count this gap names, when it names one. Only the
+    /// stop-loss family sets it (one typed count per row, never
+    /// text-only); every other gap leaves it `None`.
+    pub units: Option<u64>,
 }
 
 /// Named cap for cumulative per-edge entry counts. Addition saturates
@@ -6787,6 +6791,8 @@ impl CallerRegistry {
                     .label()
                     .into(),
                 budget: None,
+
+                units: None,
             };
             // Reconciliation is not a new occurrence each pass. Suppressed
             // identities retain the existing bounded fingerprint policy.
@@ -6908,6 +6914,8 @@ impl CallerRegistry {
                 subject: subject.clone(),
                 reason: old,
                 budget: None,
+
+                units: None,
             });
             self.gap_index.insert(
                 RegistryGap {
@@ -6917,6 +6925,8 @@ impl CallerRegistry {
                     subject,
                     reason,
                     budget: None,
+
+                    units: None,
                 },
                 index,
             );
@@ -6935,6 +6945,8 @@ impl CallerRegistry {
             subject: subject.clone(),
             reason,
             budget: None,
+
+            units: None,
         };
         let before = self.gaps.len();
         self.push_gap_as(gap.clone(), terminal, false);
@@ -7022,6 +7034,8 @@ impl CallerRegistry {
                     subject: "semantic capture loss".into(),
                     reason,
                     budget: None,
+
+                    units: None,
                 });
             }
             Mutation::NoteRefreshLoss { reason } => {
@@ -7045,6 +7059,8 @@ impl CallerRegistry {
                     subject: "native count refresh loss".into(),
                     reason,
                     budget: None,
+
+                    units: None,
                 });
             }
             Mutation::NoteCountedLoss => {
@@ -7208,7 +7224,8 @@ impl CallerRegistry {
                         if demoted == 1 { "edge" } else { "edges" },
                     ),
                     budget: None,
-                });
+
+                    units: None,});
             }
             Mutation::EndWatches { reason, at_ns } => {
                 if self.watches_ended_ns.is_none() {
@@ -7271,7 +7288,8 @@ impl CallerRegistry {
                         }
                     ),
                     budget: None,
-                });
+
+                    units: None,});
             }
             Mutation::RetireCaller {
                 caller,
@@ -7345,6 +7363,8 @@ impl CallerRegistry {
                         subject,
                         reason,
                         budget,
+
+                        units: None,
                     },
                     terminal,
                     false,
@@ -7372,6 +7392,8 @@ impl CallerRegistry {
                     "the caller incarnation retired; late mapping evidence was dropped, not merged"
                         .into(),
                 budget: None,
+
+                units: None,
             });
             return;
         }
@@ -7393,7 +7415,8 @@ impl CallerRegistry {
                         refusal.limit, refusal.requested,
                     ),
                     budget: Some(refusal),
-                });
+
+                    units: None,});
                 return;
             }
             self.callers.insert(caller);
@@ -7409,7 +7432,8 @@ impl CallerRegistry {
                     info.path
                 ),
                 budget: None,
-            });
+
+                units: None,});
         }
         let module = match self.modules_by_key.get(&info.key).copied() {
             Some(id) => {
@@ -7440,7 +7464,8 @@ impl CallerRegistry {
                             refusal.limit, refusal.requested,
                         ),
                         budget: Some(refusal),
-                    });
+
+                        units: None,});
                     return;
                 }
                 // The endpoint census charges only admitted modules with a
@@ -7467,7 +7492,8 @@ impl CallerRegistry {
                             refusal.limit, refusal.requested,
                         ),
                         budget: Some(refusal),
-                    });
+
+                        units: None,});
                     return;
                 }
                 let id = ModuleId(self.next_module);
@@ -7525,7 +7551,8 @@ impl CallerRegistry {
                             refusal.limit, refusal.requested,
                         ),
                         budget: Some(refusal),
-                    });
+
+                        units: None,});
                     return;
                 }
                 self.edges.insert(
@@ -7601,7 +7628,8 @@ impl CallerRegistry {
             reason: "this object is mapped twice with duplicate executable file offsets; observed calls cannot attribute to one instance and establish no claim"
                 .into(),
             budget: None,
-        };
+
+            units: None,};
         self.push_gap(gap);
     }
 
@@ -7800,7 +7828,8 @@ impl CallerRegistry {
                             key,
                         ),
                         budget: None,
-                    });
+
+                        units: None,});
                 }
             }
             (PendingRejection::NoEdge, [key]) => {
@@ -7821,7 +7850,8 @@ impl CallerRegistry {
                         key,
                     ),
                     budget: None,
-                });
+
+                    units: None,});
             }
             (PendingRejection::NoEdge, []) => {
                 self.push_gap(RegistryGap {
@@ -7835,7 +7865,8 @@ impl CallerRegistry {
                          stale edge"
                     ),
                     budget: None,
-                });
+
+                    units: None,});
             }
             // Multi-candidate placements reject ambiguous, never NoEdge.
             (PendingRejection::NoEdge, _) => {}
@@ -7853,7 +7884,8 @@ impl CallerRegistry {
             subject: DEMOTED_COUNT_REJECTED.into(),
             reason: format!("the current physical owner is not proven for absolute count range ({base}, {absolute}] ({} unattributed calls); historical counts remain and no witness or module-level use is recorded", absolute - base),
             budget: None,
-        });
+
+            units: None,});
     }
 
     /// One row whose endpoint several admitted modules share, with no
@@ -8277,6 +8309,8 @@ impl CallerRegistry {
             subject: subject.into(),
             reason: with_key(reason, module, key),
             budget: None,
+
+            units: None,
         });
     }
 
@@ -8491,6 +8525,8 @@ impl CallerRegistry {
             subject: subject.into(),
             reason: with_key(reason, module, key),
             budget: None,
+
+            units: None,
         });
     }
 
@@ -8673,6 +8709,8 @@ impl CallerRegistry {
             subject: "module admission changed".into(),
             reason,
             budget: None,
+
+            units: None,
         });
     }
 
@@ -8694,6 +8732,8 @@ impl CallerRegistry {
                 subject: "entry without mapping evidence".into(),
                 reason: "observed entries never invent mappings; the batch was dropped".into(),
                 budget: None,
+
+                units: None,
             });
             return EntryOutcome::UnknownEdge;
         };
@@ -8707,6 +8747,8 @@ impl CallerRegistry {
                 subject: "entry without mapping evidence".into(),
                 reason: "observed entries never invent mappings; the batch was dropped".into(),
                 budget: None,
+
+                units: None,
             });
             return EntryOutcome::UnknownEdge;
         };
@@ -8752,6 +8794,8 @@ impl CallerRegistry {
                 subject: "semantic call without mapping evidence".into(),
                 reason: "observed calls never invent mappings; the call was dropped".into(),
                 budget: None,
+
+                units: None,
             });
             return;
         };
@@ -8763,6 +8807,8 @@ impl CallerRegistry {
                 subject: "semantic call without mapping evidence".into(),
                 reason: "observed calls never invent mappings; the call was dropped".into(),
                 budget: None,
+
+                units: None,
             });
             return;
         }
@@ -8790,7 +8836,8 @@ impl CallerRegistry {
                         refusal.limit, refusal.requested,
                     ),
                     budget: Some(refusal),
-                });
+
+                    units: None,});
                 return;
             }
             let reducer = match EdgeSemantics::with_resources(&self.semantic_resources) {
@@ -8851,6 +8898,8 @@ impl CallerRegistry {
                 limit: refusal.limit_bytes,
                 requested: refusal.requested_bytes,
             }),
+
+            units: None,
         });
     }
 
@@ -9691,6 +9740,8 @@ pub(crate) mod tests {
                 subject: "lens".to_string(),
                 reason: "gap-index movement".to_string(),
                 budget: None,
+
+                units: None,
             },
             false,
             false,
@@ -11226,6 +11277,8 @@ pub(crate) mod tests {
                 subject: format!("subject-{n}"),
                 reason: format!("reason-{n}"),
                 budget: None,
+
+                units: None,
             });
         }
         registry.publish();
@@ -11255,6 +11308,8 @@ pub(crate) mod tests {
                 subject: format!("subject-{n}"),
                 reason: format!("reason-{n}"),
                 budget: None,
+
+                units: None,
             });
         }
         registry.publish();
@@ -11267,6 +11322,8 @@ pub(crate) mod tests {
             subject: "subject-8192".into(),
             reason: "reason-8192".into(),
             budget: None,
+
+            units: None,
         });
         registry.publish();
         assert_eq!(registry.gaps().len(), 8192);
@@ -11281,6 +11338,7 @@ pub(crate) mod tests {
             subject: "overlay collapse".into(),
             reason: "two overlay instances map one inode".into(),
             budget: None,
+            units: None,
         }
     }
 
@@ -11619,6 +11677,8 @@ pub(crate) mod tests {
                 subject: format!("flood-{n}"),
                 reason: "x".into(),
                 budget: None,
+
+                units: None,
             });
         }
         registry.publish();
@@ -11641,6 +11701,8 @@ pub(crate) mod tests {
                 subject: format!("terminal-{n}"),
                 reason: "y".into(),
                 budget: None,
+
+                units: None,
             });
         }
         registry.publish();
@@ -11685,6 +11747,8 @@ pub(crate) mod tests {
                 subject: format!("flood-{n}"),
                 reason: "x".into(),
                 budget: None,
+
+                units: None,
             });
         }
         registry.enter_terminal_phase();
@@ -11696,6 +11760,8 @@ pub(crate) mod tests {
                 subject: format!("terminal-{n}"),
                 reason: "y".into(),
                 budget: None,
+
+                units: None,
             });
         }
         registry.publish();

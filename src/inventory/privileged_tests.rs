@@ -7301,6 +7301,7 @@ fn r16_q1_coverage_fault_gap_matches_only_the_disclosed_shape() {
             subject: subject.into(),
             reason: reason.into(),
             budget: None,
+            units: None,
         }
     }
     // Exact producer shape (the `record_gap` call in
@@ -9026,6 +9027,8 @@ mod joint_ledger_parse_tests {
                 subject: "semantic input refused".into(),
                 reason: "slot".into(),
                 budget: None,
+
+                units: None,
             });
         }
         coordinator.registry_mut().record_gap(RegistryGap {
@@ -9035,6 +9038,8 @@ mod joint_ledger_parse_tests {
             subject: "semantic input refused".into(),
             reason: "slot".into(),
             budget: None,
+
+            units: None,
         });
         // Gaps stage until publication; the two identical rows share
         // one published row with two repeats.
@@ -9089,6 +9094,8 @@ mod joint_ledger_parse_tests {
                 subject: "semantic input refused".into(),
                 reason: "slot".into(),
                 budget: None,
+
+                units: None,
             });
         }
         coordinator.registry_mut().publish();
@@ -9127,6 +9134,8 @@ mod joint_ledger_parse_tests {
                 subject: "semantic input refused".into(),
                 reason: "slot".into(),
                 budget: None,
+
+                units: None,
             });
         }
         coordinator.registry_mut().publish();
@@ -9145,6 +9154,8 @@ mod joint_ledger_parse_tests {
             subject: "semantic calls unrouted".into(),
             reason: "1 calls shed without a route (pending=1)".into(),
             budget: None,
+
+            units: None,
         });
         coordinator.registry_mut().publish();
         let exemption = QuietExemption {
@@ -9162,6 +9173,8 @@ mod joint_ledger_parse_tests {
             subject: "semantic calls lost".into(),
             reason: "loss".into(),
             budget: None,
+
+            units: None,
         });
         coordinator.registry_mut().publish();
         let exemption = QuietExemption {
@@ -9313,6 +9326,8 @@ mod joint_ledger_parse_tests {
                 subject: subject.into(),
                 reason: reason.into(),
                 budget: None,
+
+                units: None,
             });
             coordinator.registry_mut().publish();
             assert_quiet_twins_except_stopped(&coordinator, "t", &[], &[], &[])
@@ -9361,6 +9376,8 @@ mod joint_ledger_parse_tests {
             subject: "semantic input refused".into(),
             reason: "slot".into(),
             budget: None,
+
+            units: None,
         });
         coordinator.registry_mut().publish();
         let ledger = script_ledger(&[("C_Initialize", 1), ("C_Sign", 2)]);
@@ -9391,6 +9408,8 @@ mod joint_ledger_parse_tests {
             subject: "selected promotion refused".into(),
             reason: "view expired".into(),
             budget: None,
+
+            units: None,
         });
         coordinator.registry_mut().publish();
         assert_eq!(
@@ -9404,6 +9423,8 @@ mod joint_ledger_parse_tests {
             subject: "selected promotion refused".into(),
             reason: "manifest unavailable".into(),
             budget: None,
+
+            units: None,
         });
         coordinator.registry_mut().publish();
         assert!(disclosed_scope_reason(&coordinator, "selected promotion refused").is_err());
@@ -9432,6 +9453,8 @@ mod joint_ledger_parse_tests {
             subject: "selected promotion refused".into(),
             reason: "view expired".into(),
             budget: None,
+
+            units: None,
         });
         coordinator.registry_mut().publish();
         let exemption = QuietExemption {

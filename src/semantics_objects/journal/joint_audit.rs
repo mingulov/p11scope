@@ -2834,6 +2834,8 @@ impl IngestedJointQuantum {
                         subject: FALLBACK_FENCED_SUBJECT.to_string(),
                         reason: decision.gap_reason(units as u64),
                         budget: None,
+
+                        units: None,
                     });
                 }
                 // A take refused because the capture ended (stop at
@@ -2849,6 +2851,7 @@ impl IngestedJointQuantum {
                         subject: CAPTURE_ENDED_SUBJECT.to_string(),
                         reason: capture_ended_reason(refusal, units),
                         budget: None,
+                        units: Some(units as u64),
                     });
                 }
                 // A parked consumer's forced fallback lands its named
@@ -2870,7 +2873,8 @@ impl IngestedJointQuantum {
                             units,
                         ),
                         budget: None,
-                    });
+
+                        units: None,});
                 }
                 // Diagnostic-only (scope round): the void above ended a
                 // Joint feed. One void fanning out to many feeds counts

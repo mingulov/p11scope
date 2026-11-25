@@ -4122,6 +4122,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             subject,
             reason,
             budget: None,
+
+            units: None,
         });
     }
 
@@ -4495,6 +4497,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                      (sticky, never retried); counted uses are lower bounds"
                 ),
                 budget: None,
+
+                units: None,
             });
         }
         if !unclaimed_deferred.is_empty() {
@@ -4509,6 +4513,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                      when the receipt closed; counted uses are lower bounds"
                 ),
                 budget: None,
+
+                units: None,
             });
             let fold = self.deferral_folds.entry(None).or_default();
             fold.passes += 1;
@@ -4615,6 +4621,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     subject: DEFERRED_ATTACH_SUBJECT.into(),
                     reason,
                     budget: None,
+
+                    units: None,
                 }),
             }
             staged = true;
@@ -4685,7 +4693,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                             "{later}; the earlier clean-exit claim is withdrawn (counted columns stay lower bounds)"
                         ),
                         budget: None,
-                    });
+
+                        units: None,});
                 }
             }
             return;
@@ -4729,7 +4738,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 "{reason}; every watched no-use interval ends at the earlier of the custody instant and the last clean read; a watch starting at or after that instant reads unknown, and no watch starts again"
             ),
             budget: None,
-        });
+
+            units: None,});
     }
 
     /// Absorbs one witness batch's health and custody: a counter rise
@@ -5411,6 +5421,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                  successor admission, or retry"
             ),
             budget: None,
+
+            units: None,
         });
         PassReport {
             pass: self.passes,
@@ -5987,6 +5999,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         subject: "native inventory scan failed".into(),
                         reason: format!("{error:#}"),
                         budget: None,
+
+                        units: None,
                     });
                 }
             }
@@ -6017,7 +6031,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         reason: "only partial receipts committed for this owner; absences for its caller are uncertain"
                             .into(),
                         budget: None,
-                    });
+
+                        units: None,});
                 }
                 Err(error) => {
                     self.registry.record_gap(RegistryGap {
@@ -6027,6 +6042,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         subject: "native owner lost".into(),
                         reason: format!("{error:#}"),
                         budget: None,
+
+                        units: None,
                     });
                 }
             }
@@ -7751,6 +7768,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             subject: "scan pass produced no observation".into(),
             reason: reason.to_string(),
             budget: None,
+
+            units: None,
         });
         self.reconcile_count_eligibility(identity, &mut RecoveryWorkBudget::new());
         let native_callers = live
@@ -7817,7 +7836,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                                 "the native owner opened but caller admission failed ({reason}); the owner stays retained"
                             ),
                             budget: None,
-                        });
+
+                            units: None,});
                     }
                     failed.push((*pid, reason.as_str(), *budget));
                     continue;
@@ -7855,6 +7875,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     subject: "caller admission failed".into(),
                     reason: (*reason).to_string(),
                     budget: *budget,
+
+                    units: None,
                 }),
                 [(first_pid, first_reason, _), ..] => {
                     let budget = group
@@ -7881,6 +7903,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         subject: "caller admission failed".into(),
                         reason,
                         budget,
+
+                        units: None,
                     });
                 }
             }
@@ -7918,6 +7942,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 subject: "native inventory owner unavailable".into(),
                 reason: format!("{reason}; scan-lane incarnation by pidfd/start-time"),
                 budget: None,
+
+                units: None,
             });
         }
         if scan_pinned > 0 && !self.authority_gap_recorded {
@@ -7930,7 +7956,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 reason: "no BPF image identity; scan-lane incarnations by pidfd/start-time with exe-identity exec detection"
                     .into(),
                 budget: None,
-            });
+
+                units: None,});
         }
     }
 
@@ -8455,6 +8482,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             subject: "native owner refresh refused".into(),
             reason: reason.into(),
             budget: None,
+
+            units: None,
         });
     }
 
@@ -8642,6 +8671,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     subject: "native owner suspended".into(),
                     reason,
                     budget: None,
+
+                    units: None,
                 });
             }
             Err(error) => {
@@ -8786,7 +8817,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     "scoped owner work could not revise the engine tail: {error:#}; the previous publication stands"
                 ),
                 budget: None,
-            });
+
+                units: None,});
         }
     }
 
@@ -8834,6 +8866,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             subject: "native owner activation refused".into(),
             reason: reason.into(),
             budget: None,
+
+            units: None,
         });
     }
     /// One native owner through the core: refresh request, lease, I4a
@@ -9066,6 +9100,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         limit,
                         requested,
                     }),
+
+                units: None,
             });
         }
         absorbed.verdicts
@@ -9281,7 +9317,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 complete_scan,
                 self.registry.published_revision(),
             ) {
-                self.registry.record_gap(RegistryGap { caller: Some(caller), module: None, pid: Some(process.pid), subject: "current count ownership storage refused".into(), reason: "the bounded ownership observation could not be retained; historical evidence remains, current count eligibility is unknown".into(), budget: Some(BudgetRefusal { resource: "inventory_count_observations", limit: self.registry.limits().max_edges, requested: self.registry.limits().max_edges.saturating_add(1) }) });
+                self.registry.record_gap(RegistryGap { caller: Some(caller), module: None, pid: Some(process.pid), subject: "current count ownership storage refused".into(), reason: "the bounded ownership observation could not be retained; historical evidence remains, current count eligibility is unknown".into(), budget: Some(BudgetRefusal { resource: "inventory_count_observations", limit: self.registry.limits().max_edges, requested: self.registry.limits().max_edges.saturating_add(1) }) , units: None, });
             }
             if absent && let Some(owner) = self.owners.get(&caller).copied() {
                 self.churned_owners.insert(owner);
@@ -9303,6 +9339,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     parts.join(", ")
                 ),
                 budget: None,
+
+                units: None,
             });
         }
         let examining: BTreeSet<u32> = catalog
@@ -9331,6 +9369,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     retained_edges,
                 ),
                 budget: None,
+
+                units: None,
             });
         }
         let notes = collapse_hint_misses(&examining, &object_paths, &catalog.notes);
@@ -9374,6 +9414,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 subject: gap.subject.clone(),
                 reason: gap.reason.clone(),
                 budget: None,
+
+                units: None,
             });
         }
     }
@@ -9680,6 +9722,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                              stale-exit guard is disabled and exits record unfiltered"
                             .into(),
                         budget: None,
+
+                        units: None,
                     });
                 }
             } else if self
@@ -9775,6 +9819,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                      caller for a stale hook, so no successor is minted"
                     .into(),
                 budget: None,
+
+                units: None,
             });
             return Vec::new();
         }
@@ -9806,6 +9852,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                          incarnation is neither retired nor replaced"
                         .into(),
                     budget: None,
+
+                    units: None,
                 });
                 return Vec::new();
             }
@@ -9831,6 +9879,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                      its admission; the proved old incarnation retires without a successor"
                     .into(),
                 budget: None,
+
+                units: None,
             });
             return self.adapter.exec_transition_scoped(caller, now_ns);
         }
@@ -9875,6 +9925,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 subject: "successor admission refused without a live image".into(),
                 reason: reason.into(),
                 budget: None,
+
+                units: None,
             });
             return self.adapter.exec_transition_scoped(caller, now_ns);
         }
@@ -9890,6 +9942,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                  images"
                 .into(),
             budget: None,
+
+            units: None,
         });
         if self.stopped {
             // Stop wins before successor admission: the old incarnation
@@ -9904,6 +9958,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                      without a successor and no retry is scheduled"
                     .into(),
                 budget: None,
+
+                units: None,
             });
             return self.adapter.exec_transition_scoped(caller, now_ns);
         }
@@ -10347,6 +10403,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     unresolved.len()
                 ),
                 budget: None,
+
+                units: None,
             });
         }
         let mut events = Vec::new();
@@ -10387,6 +10445,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 batch.integrity_total
             ),
             budget: None,
+
+            units: None,
         });
     }
 
@@ -10893,7 +10953,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 caller: Some(recovery.caller), module: None, pid: None,
                 subject: "count retirement earlier read invariant refused".into(),
                 reason: "a late earlier equivalent read contradicts a finalized boundary; history remains immutable and future retirement attribution is refused".into(), budget: None,
-            });
+
+                units: None,});
         }
         if recovery.receipt_refused || ordinary {
             return;
@@ -10949,7 +11010,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 subject: "count retirement receipt invariant refused".into(),
                 reason: "a fourth unresolved current receipt remained after fixed-slot normalization; future retirement attribution is refused".into(),
                 budget: Some(BudgetRefusal { resource: "inventory_count_retirements", limit: 3, requested: 4 }),
-            });
+
+                units: None,});
         }
     }
 
@@ -10975,7 +11037,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 limit,
                 requested: limit.saturating_add(1),
             }),
-        });
+
+            units: None,});
     }
 
     /// The admitted modules a count update's endpoint resolves to (F7):
@@ -11918,7 +11981,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     caller: Some(recovery.caller), module: None, pid: None,
                     subject: "count retirement earlier read invariant refused".into(),
                     reason: "a late earlier equivalent read contradicts a finalized boundary; history remains immutable and future retirement attribution is refused".into(), budget: None,
-                });
+
+                    units: None,});
             }
             let live = self
                 .adapter
@@ -12274,7 +12338,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         subject: "count retirement candidate revoked".into(),
                         reason: "independently unknown historical coverage crosses the retained candidate after genuine revocation; future recovery needs a new actual advancing read".into(),
                         budget: None,
-                    });
+
+                        units: None,});
                 }
             } else {
                 // All conditional tags are detached from this new current
@@ -12662,6 +12727,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         stash.limit
                     ),
                     budget: None,
+
+                    units: None,
                 });
                 let callers: Vec<CallerId> =
                     self.adapter.records().map(|record| record.id).collect();
@@ -12858,6 +12925,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 subject: "native exec proof not applied".into(),
                 reason: format!("{error:#}; the caller incarnation still retires"),
                 budget: None,
+
+                units: None,
             });
             // A stale owner refuses the handoff: the image end is fact (the
             // old incarnation retires) but no successor is minted for it.
@@ -12876,6 +12945,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                      without a successor and no retry is scheduled"
                     .into(),
                 budget: None,
+
+                units: None,
             });
             return self.adapter.exec_transition_scoped(caller, now_ns);
         }
@@ -12922,6 +12993,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                      at most one successor commits per ended caller"
                     .into(),
                 budget: None,
+
+                units: None,
             });
             return None;
         }
@@ -12963,6 +13036,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                      the successor is never reopened by scalar PID"
                     .into(),
                 budget: None,
+
+                units: None,
             });
             return None;
         };
@@ -13174,6 +13249,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                          no successor commits and the pin is released"
                         .into(),
                     budget: None,
+
+                    units: None,
                 });
             }
         }
@@ -13228,6 +13305,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                      no successor commits and no retry is scheduled"
                 ),
                 budget: None,
+
+                units: None,
             });
         }
     }
@@ -14463,6 +14542,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                             subject: "cgroup provider preparation incomplete".into(),
                             reason,
                             budget: None,
+
+                            units: None,
                         });
                         None
                     }
@@ -14623,6 +14704,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                                 subject: "cgroup provider consumption incomplete".into(),
                                 reason,
                                 budget: None,
+
+                                units: None,
                             });
                             None
                         }
@@ -14672,6 +14755,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     subject: NATIVE_OWNER_UNAVAILABLE_SUBJECT.into(),
                     reason: NATIVE_OWNER_UNAVAILABLE_REASON.into(),
                     budget: None,
+
+                    units: None,
                 });
             }
             // Native owner activation and refresh: commit staged
@@ -14831,6 +14916,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         scoped_scan_callers,
                     ),
                     budget: None,
+
+                    units: None,
                 });
             } else if outcome != ScopedCollectionOutcome::Complete {
                 allowed_callers.clear();
@@ -14855,6 +14942,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         subject: "cgroup scope transaction incomplete".into(),
                         reason: outcome.reason().into(),
                         budget: None,
+
+                        units: None,
                     });
                 }
             } else {
@@ -44515,6 +44604,8 @@ int main(void) {
                     subject: format!("filler gap {i}"),
                     reason: format!("filler reason {i}"),
                     budget: None,
+
+                    units: None,
                 });
         }
         native.scene.coordinator.commit_batch(false).unwrap();

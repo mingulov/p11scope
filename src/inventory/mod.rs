@@ -18126,6 +18126,8 @@ mod tests {
                 subject: "overlay collapse".into(),
                 reason: "two overlay instances map one inode".into(),
                 budget: None,
+
+                units: None,
             });
             if pass == 2 {
                 coordinator.registry_mut().record_gap(RegistryGap {
@@ -18135,6 +18137,8 @@ mod tests {
                     subject: "once".into(),
                     reason: "only on pass 2".into(),
                     budget: None,
+
+                    units: None,
                 });
             }
             coordinator.commit_batch(false).unwrap();
@@ -18229,6 +18233,8 @@ mod tests {
                 subject: "steady".into(),
                 reason: "every pass".into(),
                 budget: None,
+
+                units: None,
             });
             coordinator.commit_batch(false).unwrap();
             let report = PassReport {
@@ -34858,6 +34864,8 @@ mod module_init_render_tests {
                 subject: subject.into(),
                 reason: "test loss".into(),
                 budget: None,
+
+                units: None,
             });
             coordinator.registry_mut().publish();
             let document = render_json(&coordinator, "pid:7", 90, 120, 1);

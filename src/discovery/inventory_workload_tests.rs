@@ -2411,6 +2411,8 @@ fn retention_overflow_marks_eviction_never_silent_completeness() {
                 subject: format!("retention probe {index}"),
                 reason: "the retention test overflows the gap bound on purpose".into(),
                 budget: None,
+
+                units: None,
             });
     }
     harness.commit();

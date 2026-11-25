@@ -851,6 +851,8 @@ fn disclose_s1_birth_refusal(
         subject: crate::inventory_present::JOINT_BIRTH_UNAVAILABLE_SUBJECT.into(),
         reason,
         budget: None,
+
+        units: None,
     });
 }
 
@@ -869,6 +871,8 @@ fn disclose_s1_birth_deferred(
         subject: crate::inventory_present::JOINT_BIRTH_DEFERRED_SUBJECT.into(),
         reason,
         budget: None,
+
+        units: None,
     });
 }
 
@@ -1371,6 +1375,8 @@ impl PreparedSemanticBatch {
                     subject: "semantic input refused".into(),
                     reason: reason.code().into(),
                     budget: None,
+
+                    units: None,
                 });
             }
         }
@@ -2069,6 +2075,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 subject: "semantic handoff storage refused".into(),
                 reason: "semantic_resource_capacity".into(),
                 budget: None,
+
+                units: None,
             });
             self.drain_prepared_s1(&mut prepared, BirthDisposeCause::StorageRefused);
             self.finish_semantic_preparation(prepared, lane.stash_pending_floor());

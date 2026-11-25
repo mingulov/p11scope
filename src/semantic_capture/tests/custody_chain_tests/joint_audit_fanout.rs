@@ -22126,6 +22126,8 @@ fn watchdog_rearm_loss_under_a_full_gap_cap_is_counted_not_named() {
                 subject: format!("gap-pressure-filler-{n}"),
                 reason: format!("filler row {n}"),
                 budget: None,
+
+                units: None,
             });
         }
         (cap, retained, suppressed)
@@ -22282,6 +22284,8 @@ fn watchdog_park_loss_under_a_full_gap_cap_is_counted_not_named() {
                 subject: format!("gap-pressure-filler-{n}"),
                 reason: format!("filler row {n}"),
                 budget: None,
+
+                units: None,
             });
         }
     }
@@ -30627,6 +30631,7 @@ fn seal_pending_across_stop(inject_resource_failure: bool) {
                      evidence (Stopped); fell back with counted loss (1 calls)"
                 .to_string(),
             budget: None,
+            units: Some(1),
         })
         .collect::<Vec<_>>();
     expected.sort_by_key(|gap| gap.caller);
@@ -30821,6 +30826,7 @@ fn seal_pending_across_stop_incomplete(mixed: bool) {
                      evidence (Stopped); fell back with counted loss (1 calls)"
                 .to_string(),
             budget: None,
+            units: Some(1),
         })
         .collect::<Vec<_>>();
     expected.sort_by_key(|gap| gap.caller);
@@ -30956,6 +30962,7 @@ fn joint_seal_exhausted_take_falls_back_incomplete_entries() {
             subject: CAPTURE_ENDED_SUBJECT.to_string(),
             reason: expected_reason.clone(),
             budget: None,
+            units: Some(1),
         })
         .collect::<Vec<_>>();
     expected.sort_by_key(|gap| gap.caller);

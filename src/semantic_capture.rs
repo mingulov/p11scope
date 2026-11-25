@@ -1968,10 +1968,12 @@ pub(crate) struct SemanticCapture {
     hold_takes_for_test: bool,
     /// Tests-only batch-shed pose: while set, every tick's batch
     /// routes shed with the real CoverageFault label and counting,
-    /// exactly as a scoped quantum failure would, but without
-    /// invalidating coverage or clearing jobs. The shed cell forces
-    /// its q1 shed deterministically with this. Memory-only flag,
-    /// no budget impact.
+    /// approximating (not reproducing) a scoped quantum failure: it
+    /// skips the coverage invalidation and job clearing the natural
+    /// shed performs, so posed records match the natural shed's
+    /// labels and counts but not its full side effects. The shed
+    /// cell forces its q1 shed deterministically with this.
+    /// Memory-only flag, no budget impact.
     #[cfg(test)]
     fail_batches_for_test: bool,
     continuity_cuts: u64,
@@ -5578,7 +5580,8 @@ impl SemanticCapture {
             // A scoped quantum failure routes this tick's batch exactly
             // as latched coverage would; the flag clears below, so the
             // next tick routes normally again. The posed test seam
-            // routes identically but stays until cleared.
+            // routes with the same label but stays until cleared and
+            // skips the invalidation/job clearing (see the field).
             let route = if self.fail_batch_routing() {
                 Route::Unknown(UnknownReason::CoverageFault)
             } else {

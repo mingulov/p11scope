@@ -5398,6 +5398,8 @@ fn seal_cell_across_stop(force_shed: bool) -> Result<()> {
             subject: history_subject,
             reason: "joint_pregrant_nonadmission_history_loss calls=1".to_string(),
             budget: None,
+
+            units: None,
         };
         ensure!(
             history[0] == expected_history,
@@ -6014,6 +6016,7 @@ fn seal_cell_across_stop(force_shed: bool) -> Result<()> {
             subject: CAPTURE_ENDED_SUBJECT.to_string(),
             reason: expected_reason_a,
             budget: None,
+            units: Some(1),
         },
         crate::discovery::caller_registry::RegistryGap {
             caller: Some(caller_b),
@@ -6022,6 +6025,7 @@ fn seal_cell_across_stop(force_shed: bool) -> Result<()> {
             subject: CAPTURE_ENDED_SUBJECT.to_string(),
             reason: expected_reason_b,
             budget: None,
+            units: Some(0),
         },
     ];
     let mut expected_sorted = expected;
@@ -6042,6 +6046,8 @@ fn seal_cell_across_stop(force_shed: bool) -> Result<()> {
                 subject: history_subject.clone(),
                 reason: "joint_seal_bootstrap_mismatch_fallback".to_string(),
                 budget: None,
+
+                units: None,
             })
             .collect();
     let mut expected_endings_sorted = expected_endings;

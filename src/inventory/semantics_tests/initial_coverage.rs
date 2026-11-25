@@ -267,6 +267,8 @@ fn native_semantic_initial_coverage_suppression_stays_bounded() {
         subject: "existing gap".into(),
         reason: "existing".into(),
         budget: None,
+
+        units: None,
     });
     registry.note_counted_use(conv.caller, &module, 7, 100, 300, 0);
     registry.note_instance(instance::registration(key.clone(), conv.caller, 200, None));

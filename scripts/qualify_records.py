@@ -993,6 +993,19 @@ def judge_cgroup_inventory(args):
         require(len(prep) == 1, GAP_PREP, "duplicate interrupted preparation rows: %r" % (prep,))
         require(any(k == "deadline" for k, _ in kinds), GAP_PREP,
                 "interrupted preparation without a run deadline: %r" % (prep,))
+    # The run-deadline row carries its exact producer shape: an
+    # explicitly present null budget (the row records no budget
+    # refusal) and a positive integer recording count. The producer
+    # dedupes identical rows, so duplicates are malformed.
+    deadline_rows = [g for k, g in kinds if k == "deadline"]
+    if deadline_rows:
+        for g in deadline_rows:
+            require_type("budget" in g and g["budget"] is None, GAP_DEADLINE,
+                         "malformed run deadline budget: %r" % (g,))
+            require_type("repeats" in g and type(g["repeats"]) is int and g["repeats"] >= 1,
+                         GAP_DEADLINE, "malformed run deadline count: %r" % (g,))
+        require(len(deadline_rows) == 1, GAP_DEADLINE,
+                "duplicate run deadline rows: %r" % (deadline_rows,))
     for label, _pid in expected:
         r = row[label]
         require(r["start_time_unit"] == "clock_ticks_since_boot", CG_GENERATION,

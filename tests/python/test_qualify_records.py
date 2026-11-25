@@ -404,7 +404,8 @@ def add_gaps(*gaps):
 
 UNBOUND_REASON = (MODPATH + ": native witness rows of this module were not bound to a caller incarnation "
                   "(first: no live caller); module-level positive use only, never attributed by pid")
-DEADLINE_GAP = gap(subject="cgroup scope transaction incomplete", reason=Q.DEADLINE)
+DEADLINE_GAP = gap(subject="cgroup scope transaction incomplete", reason=Q.DEADLINE,
+                   budget=None, repeats=1)
 RETAINED_GAP = gap(caller="c0", pid=100, subject="native owner refresh refused", reason=Q.RETAINED)
 ACTIVATION_GAP = gap(caller="c0", pid=100, subject=Q.ACTIVATION, reason=Q.SETTLE_REASON)
 ADMISSION_GAP = gap(caller="c0", pid=100, module="m0", subject="module admission changed",

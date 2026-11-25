@@ -90348,6 +90348,213 @@ fn learned_pin_failure_files_after_bounded_retries() {
     );
 }
 
+/// Serializes the learned-pin line tests below: both redirect
+/// process-stderr and flip the process-global verbosity, so they must
+/// never overlap each other.
+static LEARNED_PIN_LINES_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Redirects process stderr to `path` until dropped (restores even on
+/// panic), mirroring the prearm sentinel capture.
+struct LearnedPinStderrCapture {
+    saved: std::os::fd::OwnedFd,
+}
+
+impl LearnedPinStderrCapture {
+    fn start(path: &std::path::Path) -> (Self, std::fs::File) {
+        use std::os::unix::io::{AsRawFd as _, FromRawFd as _};
+        let file = std::fs::File::create(path).expect("stderr capture file");
+        // SAFETY: dup of the stderr fd; checked return.
+        let saved_raw = unsafe { libc::dup(2) };
+        assert!(saved_raw >= 0, "dup stderr");
+        // SAFETY: owned dup from the checked call above.
+        let saved = unsafe { std::os::fd::OwnedFd::from_raw_fd(saved_raw) };
+        // SAFETY: flush C streams before swapping the fd.
+        unsafe {
+            libc::fflush(std::ptr::null_mut());
+        }
+        // SAFETY: stderr (fd 2) redirected to the capture file; checked.
+        let redirected = unsafe { libc::dup2(file.as_raw_fd(), 2) };
+        assert_eq!(redirected, 2, "redirect stderr");
+        (Self { saved }, file)
+    }
+}
+
+impl Drop for LearnedPinStderrCapture {
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd as _;
+        // SAFETY: restore stderr from the saved dup; best effort.
+        unsafe {
+            libc::fflush(std::ptr::null_mut());
+            libc::dup2(self.saved.as_raw_fd(), 2);
+        }
+    }
+}
+
+/// Restores the run-scoped text verbosity on drop, so a failing
+/// assertion cannot leak a level into unrelated tests.
+struct VerbosityRestore {
+    previous: crate::cli::TextVerbosity,
+}
+
+impl Drop for VerbosityRestore {
+    fn drop(&mut self) {
+        crate::cli::set_text_verbosity(self.previous);
+    }
+}
+
+/// One learned-pin candidate engine: the seed provider's file plus a
+/// live sender, like the retry twins above. Returns the fixture (it
+/// owns the library file), the engine, the (dev, ino) identity, and
+/// the sender (it must outlive the services).
+fn learned_pin_lines_engine() -> (
+    LoadedSeedProvider,
+    Engine,
+    (u64, u64),
+    std::sync::mpsc::SyncSender<crate::fanotify::LearnMsg>,
+) {
+    let (fixture, _view, _module, _pins) = loaded_seed_provider();
+    let library = fixture._dir.path().join("seed-provider.so");
+    let file = std::fs::File::open(&library).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    tx.send(crate::fanotify::LearnMsg::Candidate(
+        crate::fanotify::LearnedCandidate {
+            file,
+            dev,
+            ino,
+            display_path: library.to_string_lossy().into_owned(),
+            loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+            loader_unknown_reason: None,
+            run_learned: false,
+            proving_retained: false,
+        },
+    ))
+    .unwrap();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.set_learned_rx_for_test(rx);
+    (fixture, engine, (dev, ino), tx)
+}
+
+/// Drives one candidate through requeue into filing at `verbosity`,
+/// capturing stderr, and returns the captured text. Asserts the path
+/// ran (requeued, then settled with its structured skip row), so an
+/// absence assertion on the returned text is non-vacuous.
+fn drive_learned_pin_lines(
+    verbosity: crate::cli::TextVerbosity,
+    stderr_path: &std::path::Path,
+) -> String {
+    let _restore = VerbosityRestore {
+        previous: crate::cli::set_text_verbosity(verbosity),
+    };
+    let (_fixture, mut engine, (dev, ino), _alive) = learned_pin_lines_engine();
+    let (capture, _file) = LearnedPinStderrCapture::start(stderr_path);
+    crate::discovery::identity::prearm_pin_test::inject_file_change_once();
+    engine.service_learned_files();
+    assert!(
+        !engine.pending_learned.is_empty(),
+        "the pin requeues at {verbosity:?}"
+    );
+    for _ in 0..10 {
+        crate::discovery::identity::prearm_pin_test::inject_file_change_once();
+        engine.service_learned_files();
+    }
+    assert!(
+        engine.learned_settled.contains(&(dev, ino)),
+        "exhausted retries settle the candidate at {verbosity:?}"
+    );
+    let public: Vec<_> = engine
+        .counters
+        .object_skips
+        .iter()
+        .map(render::capture_skipped_out)
+        .collect();
+    assert!(
+        public
+            .iter()
+            .any(|skip| skip.reason == "prearm object unavailable"),
+        "exhausted retries file the structured row at {verbosity:?}: {public:?}"
+    );
+    drop(capture);
+    std::fs::read_to_string(stderr_path).expect("read captured stderr")
+}
+
+/// The learned-pin operator lines print only under `-v`: concise,
+/// quiet and JSON-shaped runs stay silent while the structured skip
+/// row still files. (`--json` never arms verbose, so the concise
+/// phase covers it.)
+#[test]
+fn learned_pin_operator_lines_print_only_under_verbose() {
+    let _serial = LEARNED_PIN_LINES_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let dir = tempfile::tempdir().expect("stderr dir");
+    for verbosity in [
+        crate::cli::TextVerbosity::Concise,
+        crate::cli::TextVerbosity::Quiet,
+    ] {
+        let path = dir.path().join(format!("{verbosity:?}.log"));
+        let text = drive_learned_pin_lines(verbosity, &path);
+        assert!(
+            !text.contains("learned pin"),
+            "{verbosity:?} prints no learned-pin line: {text:?}"
+        );
+    }
+    let path = dir.path().join("Verbose.log");
+    let text = drive_learned_pin_lines(crate::cli::TextVerbosity::Verbose, &path);
+    assert!(
+        text.contains("learned pin requeued"),
+        "verbose names the requeue: {text:?}"
+    );
+    assert!(
+        text.contains("learned pin filed"),
+        "verbose names the filing: {text:?}"
+    );
+}
+
+/// The learned-pin line helper prints only under verbose: concise and
+/// quiet return false with no bytes, verbose returns true with the
+/// line verbatim on the channel.
+#[test]
+fn learned_pin_line_helper_prints_only_under_verbose() {
+    let _serial = LEARNED_PIN_LINES_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let dir = tempfile::tempdir().expect("stderr dir");
+    for verbosity in [
+        crate::cli::TextVerbosity::Concise,
+        crate::cli::TextVerbosity::Quiet,
+    ] {
+        let _restore = VerbosityRestore {
+            previous: crate::cli::set_text_verbosity(verbosity),
+        };
+        let path = dir.path().join(format!("{verbosity:?}.log"));
+        let (capture, _file) = LearnedPinStderrCapture::start(&path);
+        let printed =
+            Engine::note_learned_pin_line("p11scope: learned pin filed (x): y".to_string());
+        drop(capture);
+        assert!(!printed, "{verbosity:?} prints nothing");
+        let text = std::fs::read_to_string(&path).expect("read captured stderr");
+        assert!(
+            !text.contains("learned pin"),
+            "{verbosity:?} writes no learned-pin line: {text:?}"
+        );
+    }
+    let _restore = VerbosityRestore {
+        previous: crate::cli::set_text_verbosity(crate::cli::TextVerbosity::Verbose),
+    };
+    let path = dir.path().join("Verbose.log");
+    let (capture, _file) = LearnedPinStderrCapture::start(&path);
+    let printed = Engine::note_learned_pin_line("p11scope: learned pin filed (x): y".to_string());
+    drop(capture);
+    assert!(printed, "verbose prints the line");
+    let text = std::fs::read_to_string(&path).expect("read captured stderr");
+    assert!(
+        text.contains("p11scope: learned pin filed (x): y"),
+        "verbose writes the line verbatim: {text:?}"
+    );
+}
+
 /// The end-of-capture flush files a file-changed learned pin
 /// immediately instead of requeueing: past the boundary there is no
 /// later tick, so a retry would vanish silently.

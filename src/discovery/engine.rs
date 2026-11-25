@@ -26095,6 +26095,18 @@ impl Engine {
         }
     }
 
+    /// One learned-pin operator line on the verbose channel, through
+    /// the non-blocking diagnostic sink: silent under concise, quiet
+    /// and JSON-shaped runs. Returns whether it printed, so tests
+    /// assert the gate decision through the production drives.
+    fn note_learned_pin_line(line: String) -> bool {
+        if !crate::cli::text_is_verbose() {
+            return false;
+        }
+        let _ = crate::sink::try_stderr_line(&line);
+        true
+    }
+
     /// Records one settled learned identity under a hard bound: past
     /// the cap the identity is not retained (a re-sent candidate then
     /// dedupes by pinned identity at staging, and a re-refused one
@@ -26319,16 +26331,17 @@ impl Engine {
                     reason: format!("prearm object unavailable: {}", error.problems().join("; ")),
                 };
                 attribution::note(&skip);
-                // Name the stage on the operator channel: the public
-                // skip folds every internal detail into one label, so
-                // without this line a host-cell cause is unverifiable
-                // from its artifacts. No subject: the path stays out of
-                // the channel, the stage plus reason names the class.
-                eprintln!(
+                // Name the stage on the verbose operator channel: the
+                // public skip folds every internal detail into one
+                // label, so without this line a host-cell cause is
+                // unverifiable from its artifacts. No subject: the path
+                // stays out of the channel, the stage plus reason names
+                // the class.
+                Self::note_learned_pin_line(format!(
                     "p11scope: learned pin filed ({}): {}",
                     crate::discovery::identity::learned_pin_stage(&skip.reason),
                     crate::render::escape_controls(&skip.reason)
-                );
+                ));
                 self.counters.object_skips.push(skip);
                 self.note_learned_settled(identity);
                 self.member_stops.note_refused(identity);
@@ -26422,11 +26435,11 @@ impl Engine {
                     .iter()
                     .find(|skip| skip.reason.contains(LEARNED_PIN_RETRY_REASON))
                 {
-                    eprintln!(
+                    Self::note_learned_pin_line(format!(
                         "p11scope: learned pin requeued ({}): {}",
                         crate::discovery::identity::learned_pin_stage(&trigger.reason),
                         crate::render::escape_controls(&trigger.reason)
-                    );
+                    ));
                 }
                 drop(std::mem::take(&mut pinning.skipped));
                 self.requeue_learned_candidate(candidate);
@@ -26437,11 +26450,11 @@ impl Engine {
             // above; rows from other families keep their own channels.
             for skip in &pinning.skipped {
                 if crate::discovery::identity::is_prearm_unavailable_reason(&skip.reason) {
-                    eprintln!(
+                    Self::note_learned_pin_line(format!(
                         "p11scope: learned pin filed ({}): {}",
                         crate::discovery::identity::learned_pin_stage(&skip.reason),
                         crate::render::escape_controls(&skip.reason)
-                    );
+                    ));
                 }
             }
             self.note_object_skips(std::mem::take(&mut pinning.skipped));

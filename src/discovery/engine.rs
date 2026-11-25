@@ -14987,6 +14987,7 @@ impl Engine {
                 // A stale/reused ID or vanished association is only a discarded
                 // hint. Pruning progresses even if this ticket later expires.
                 self.trace_provider_views.remove(&id);
+        self.pinned.clear_view_scan_records(id);
                 cursor = Some(id);
                 remaining -= 1;
             }

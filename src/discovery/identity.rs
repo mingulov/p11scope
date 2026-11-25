@@ -3364,6 +3364,19 @@ impl PinnedObjects {
         views
     }
 
+    /// Clears one released view's scan-only provenance: custody rows and
+    /// refusal marks name process generations, so numeric view-ID reuse
+    /// must never inherit them. Committed object custody is unchanged.
+    pub(crate) fn clear_view_scan_records(&mut self, view: ProcessViewId) {
+        let had_raws = self.raw_ownership.remove(&view).is_some();
+        let refused_before = self.refused_keys.len();
+        self.refused_keys
+            .retain(|(refused_view, _)| *refused_view != view);
+        if had_raws || self.refused_keys.len() != refused_before {
+            self.bump_revision();
+        }
+    }
+
     /// Ids that stay resolvable without ownership claims anywhere: the
     /// except-carry shape. Global purges spare them (one view's replace
     /// or prune must not drop another view's carried coverage); fully

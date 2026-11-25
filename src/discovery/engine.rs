@@ -17849,10 +17849,11 @@ impl Engine {
         &mut self,
         pins: &mut crate::discovery::identity::PinnedObjects,
         view: ProcessViewId,
+        keep: &BTreeSet<PinnedObjectId>,
     ) {
         match self.retirement_proof_for(view) {
             Some(proof) => {
-                pins.retire_view_only_if_proven_gone(view, proof);
+                pins.retire_view_only_if_proven_gone_with_keep(view, proof, keep);
             }
             None => {
                 self.mark_partial(
@@ -19352,7 +19353,7 @@ impl Engine {
         };
         let mut pinned = self.pinned.clone();
         for view in retirements {
-            self.retire_view_or_keep_with_gap(&mut pinned, *view);
+            self.retire_view_or_keep_with_gap(&mut pinned, *view, &carry_objects);
         }
         let skipped = pinned.reapply_rejected_keys(keys);
         let raw_modules = self
@@ -21678,7 +21679,7 @@ impl Engine {
         let carried = candidate.pinned.carried_ids();
         let mut cleaned_pins = candidate.pinned.clone();
         for view in stale_views {
-            self.retire_view_or_keep_with_gap(&mut cleaned_pins, *view);
+            self.retire_view_or_keep_with_gap(&mut cleaned_pins, *view, &carried);
         }
         let cleaned_modules: Vec<_> = candidate
             .modules
@@ -32146,7 +32147,7 @@ impl Engine {
         {
             let mut candidate_pins = self.pinned.clone();
             for view in removed {
-                self.retire_view_or_keep_with_gap(&mut candidate_pins, *view);
+                self.retire_view_or_keep_with_gap(&mut candidate_pins, *view, &carry_objects);
             }
             let mut pin_skipped = Vec::new();
             for (view, _, pins) in refreshed {
@@ -32189,7 +32190,7 @@ impl Engine {
         // removed views' modules below.
         let mut candidate_pins = self.pinned.clone();
         for view in removed {
-            self.retire_view_or_keep_with_gap(&mut candidate_pins, *view);
+            self.retire_view_or_keep_with_gap(&mut candidate_pins, *view, &carry_objects);
         }
         let mut raw_modules: Vec<_> = self
             .modules

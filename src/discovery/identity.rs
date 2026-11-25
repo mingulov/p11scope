@@ -3338,9 +3338,33 @@ impl PinnedObjects {
     /// never this raw custody op. Pure scratch filtering uses
     /// [`without_view`](Self::without_view) instead.
     fn remove_view(&mut self, view: ProcessViewId) -> Option<ViewClaims> {
+        self.remove_view_except(view, &BTreeSet::new())
+    }
+
+    /// [`remove_view`](Self::remove_view), except ids in `keep` survive
+    /// the by-id/raw purge with their ownership rows: their view claims
+    /// still drop, but the pins stay resolvable. Generational carry uses
+    /// this: a retired view's carried modules still bind through the
+    /// proof fence (their proof is intact; only the view retired) while
+    /// the choke denies them fresh claims.
+    fn remove_view_except(
+        &mut self,
+        view: ProcessViewId,
+        keep: &BTreeSet<PinnedObjectId>,
+    ) -> Option<ViewClaims> {
         let removed = self.ownership.remove(&view)?;
         self.bump_revision();
         let removed_raws = self.raw_ownership.remove(&view).unwrap_or_default();
+        let (kept_raws, removed_raws): (BTreeSet<RawObjectInstance>, BTreeSet<RawObjectInstance>) =
+            removed_raws
+                .into_iter()
+                .partition(|raw| self.raw_to_id.get(raw).is_some_and(|id| keep.contains(id)));
+        if !kept_raws.is_empty() {
+            self.raw_ownership
+                .entry(view)
+                .or_default()
+                .extend(kept_raws);
+        }
         let retained_raws: BTreeSet<_> = self
             .raw_ownership
             .values()
@@ -3377,11 +3401,16 @@ impl PinnedObjects {
                     .filter_map(|(raw, id)| raw.mount_namespace.is_none().then_some(*id)),
             )
             .collect();
-        let unowned: BTreeSet<_> = candidates.difference(&retained).copied().collect();
+        let unowned: BTreeSet<_> = candidates
+            .difference(&retained)
+            .copied()
+            .filter(|id| !keep.contains(id))
+            .collect();
         self.scrub_proven_targets(unowned.iter().copied());
         self.by_id.retain(|id, _| !unowned.contains(id));
         self.raw_to_id.retain(|raw, id| {
-            !unowned.contains(id) && (!removed_raws.contains(raw) || retained_raws.contains(raw))
+            !unowned.contains(id)
+                && (!removed_raws.contains(raw) || retained_raws.contains(raw) || keep.contains(id))
         });
         Some(removed)
     }
@@ -3395,8 +3424,21 @@ impl PinnedObjects {
         view: ProcessViewId,
         proof: RetirementProof,
     ) -> Option<ViewClaims> {
+        self.retire_view_only_if_proven_gone_with_keep(view, proof, &BTreeSet::new())
+    }
+
+    /// [`retire_view_only_if_proven_gone`](Self::retire_view_only_if_proven_gone),
+    /// except ids in `keep` stay resolvable with their ownership rows
+    /// (see [`remove_view_except`](Self::remove_view_except)): generational
+    /// carry retires the view while its carried modules keep binding.
+    pub fn retire_view_only_if_proven_gone_with_keep(
+        &mut self,
+        view: ProcessViewId,
+        proof: RetirementProof,
+        keep: &BTreeSet<PinnedObjectId>,
+    ) -> Option<ViewClaims> {
         let _ = proof;
-        self.remove_view(view)
+        self.remove_view_except(view, keep)
     }
 
     /// Pure scratch filter: a clone without one view's pins. Query

@@ -30614,7 +30614,7 @@ fn unprovable_generation_keeps_pins_with_a_named_gap() {
         crate::process::unprovable_process_view_for_test(ProcessViewId(7), std::process::id())
             .unwrap();
     assert_eq!(engine.retirement_proof_for(ProcessViewId(7)), None);
-    engine.retire_view_or_keep_with_gap(&mut pins, ProcessViewId(7));
+    engine.retire_view_or_keep_with_gap(&mut pins, ProcessViewId(7), &BTreeSet::new());
     assert!(
         pins.view_claims(ProcessViewId(7)).is_some(),
         "unproven keeps its committed pins"

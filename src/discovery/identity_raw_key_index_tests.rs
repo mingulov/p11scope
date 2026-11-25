@@ -340,7 +340,11 @@ fn prune_view_pins_to_modules_preserve_survives_global_purge() {
     record_scan_ownership(&mut pins, ProcessViewId(1), entries[0].0, PATH);
     record_scan_ownership(&mut pins, ProcessViewId(2), entries[1].0, PATH);
     // View 1 retires carried: resolvable, claimless.
-    pins.retire_view_only_if_proven_gone(ProcessViewId(1), RetirementProof::Exited);
+    pins.retire_view_except_proven(
+        ProcessViewId(1),
+        RetirementProof::Exited,
+        &BTreeSet::from([kept]),
+    );
     assert!(pins.summary(kept).is_some(), "carried stays resolvable");
     assert!(pins.summary(dropped).is_some(), "fixture pins resolve");
     pins.prune_view_pins_to_modules_proven(ProcessViewId(2), &[], &[kept], RetirementProof::Exited);
@@ -368,7 +372,11 @@ fn global_purge_spares_resolvable_but_claimless_ids() {
     record_scan_ownership(&mut pins, ProcessViewId(2), entries[1].0, PATH);
     record_scan_ownership(&mut pins, ProcessViewId(3), entries[2].0, PATH);
     // View 1 retires carried: resolvable, claimless.
-    pins.retire_view_only_if_proven_gone(ProcessViewId(1), RetirementProof::Exited);
+    pins.retire_view_except_proven(
+        ProcessViewId(1),
+        RetirementProof::Exited,
+        &BTreeSet::from([kept]),
+    );
     assert!(pins.summary(kept).is_some(), "carried stays resolvable");
     assert!(
         pins.view_claims(ProcessViewId(1)).is_none(),

@@ -1731,9 +1731,11 @@ fn generational_stale_retirement_keeps_carried_coverage() {
         candidate.modules = engine.modules.clone();
         let view = engine.modules[0].scanned.view;
         // Except-carry shape: resolvable, claimless.
-        candidate
-            .pinned
-            .retire_view_only_if_proven_gone(view, RetirementProof::Exited);
+        candidate.pinned.retire_view_except_proven(
+            view,
+            RetirementProof::Exited,
+            &BTreeSet::from([object]),
+        );
         assert!(
             candidate.pinned.view_claims(view).is_none(),
             "the fixture stages carried coverage ({scope:?})"
@@ -30614,7 +30616,7 @@ fn unprovable_generation_keeps_pins_with_a_named_gap() {
         crate::process::unprovable_process_view_for_test(ProcessViewId(7), std::process::id())
             .unwrap();
     assert_eq!(engine.retirement_proof_for(ProcessViewId(7)), None);
-    engine.retire_view_or_keep_with_gap(&mut pins, ProcessViewId(7));
+    engine.retire_view_or_keep_with_gap(&mut pins, ProcessViewId(7), &BTreeSet::new());
     assert!(
         pins.view_claims(ProcessViewId(7)).is_some(),
         "unproven keeps its committed pins"

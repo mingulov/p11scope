@@ -1822,6 +1822,11 @@ pub struct PinnedObjects {
     by_id: BTreeMap<PinnedObjectId, Entry>,
     raw_to_id: RawToId,
     rejected_keys: BTreeSet<ObjectKey>,
+    /// Transient pin-failure marks per viewing process: refused
+    /// observations never reject by themselves, but two views refusing
+    /// one key publish ambiguity, and a view filing a key it previously
+    /// refused contradicts itself and group-rejects fail-closed.
+    refused_keys: BTreeSet<(ProcessViewId, ObjectKey)>,
     /// The proven-collision subset of `rejected_keys`: keys under which
     /// two proven entries contradicted (forgery or group rejection at
     /// insert). Only these replay across `absorb`: an unproven
@@ -1871,6 +1876,7 @@ impl Clone for PinnedObjects {
             by_id: self.by_id.clone(),
             raw_to_id: self.raw_to_id.clone(),
             rejected_keys: self.rejected_keys.clone(),
+            refused_keys: self.refused_keys.clone(),
             proven_collision_keys: self.proven_collision_keys.clone(),
             ambiguous_keys: self.ambiguous_keys.clone(),
             ambiguity_published: self.ambiguity_published.clone(),
@@ -2008,6 +2014,7 @@ impl PinnedObjects {
             by_id: BTreeMap::new(),
             raw_to_id: RawToId::default(),
             rejected_keys: BTreeSet::new(),
+            refused_keys: BTreeSet::new(),
             proven_collision_keys: BTreeSet::new(),
             ambiguous_keys: BTreeSet::new(),
             ambiguity_published: BTreeSet::new(),
@@ -2045,6 +2052,7 @@ impl PinnedObjects {
     /// only ever move later under `check_unchanged`.
     pub(crate) fn same_pin_content(&self, other: &Self) -> bool {
         if self.rejected_keys != other.rejected_keys
+            || self.refused_keys != other.refused_keys
             || self.proven_collision_keys != other.proven_collision_keys
             || self.ambiguous_keys != other.ambiguous_keys
             || self.ambiguity_published != other.ambiguity_published
@@ -2226,13 +2234,21 @@ impl PinnedObjects {
         }
         self.proven_collision_keys
             .extend(other.proven_collision_keys.iter().copied());
-        self.ambiguous_keys.extend(
-            other
-                .ambiguous_keys
+        for (view, key) in &other.refused_keys {
+            if self
+                .refused_keys
                 .iter()
-                .copied()
-                .filter(|key| other.proven_collision_keys.contains(key)),
-        );
+                .any(|(other_view, other_key)| *other_view != *view && *other_key == *key)
+            {
+                self.ambiguous_keys.insert(*key);
+            }
+        }
+        self.refused_keys.extend(other.refused_keys.iter().copied());
+        self.ambiguous_keys
+            .extend(other.ambiguous_keys.iter().copied().filter(|key| {
+                other.proven_collision_keys.contains(key)
+                    || other.refused_keys.iter().any(|(_, refused)| refused == key)
+            }));
         self.ambiguity_published.extend(
             other
                 .ambiguity_published
@@ -3125,6 +3141,37 @@ impl PinnedObjects {
         filesystem_without_unique_inodes(entry.file.as_raw_fd())
     }
 
+    /// Scrubs one unproven raw observation and every entry left without a
+    /// filed raw. Refusal provenance lives in `refused_keys`; the object
+    /// itself stays fail-closed absent unless another alias still proves it.
+    pub(crate) fn scrub_raw(&mut self, raw: &RawObjectInstance) {
+        if self.raw_to_id.remove(raw).is_none() {
+            return;
+        }
+        self.bump_revision();
+        let live: BTreeSet<PinnedObjectId> = self.raw_to_id.values().copied().collect();
+        let dropped: BTreeSet<PinnedObjectId> = self
+            .by_id
+            .keys()
+            .copied()
+            .filter(|id| !live.contains(id))
+            .collect();
+        if dropped.is_empty() {
+            return;
+        }
+        self.scrub_proven_targets(dropped.iter().copied());
+        self.by_id.retain(|id, _| !dropped.contains(id));
+        for claims in self.ownership.values_mut() {
+            claims.remove(&dropped);
+        }
+        self.ownership.retain(|_, claims| {
+            !(claims.tables.is_empty() && claims.targets.is_empty() && claims.pins.is_empty())
+        });
+        for raws in self.raw_ownership.values_mut() {
+            raws.retain(|raw| self.raw_to_id.contains_key(raw));
+        }
+    }
+
     /// Entries this set retains: before cross-view sharing each entry
     /// holds its own fd, so this was the fd-reserve debit; sharing now
     /// debits only the rows an admission newly files instead.
@@ -3337,7 +3384,11 @@ impl PinnedObjects {
     /// [`retire_view_only_if_proven_gone`](Self::retire_view_only_if_proven_gone),
     /// never this raw custody op. Pure scratch filtering uses
     /// [`without_view`](Self::without_view) instead.
-    fn remove_view(&mut self, view: ProcessViewId) -> Option<ViewClaims> {
+    fn remove_view_except(
+        &mut self,
+        view: ProcessViewId,
+        keep: &BTreeSet<PinnedObjectId>,
+    ) -> Option<ViewClaims> {
         let removed = self.ownership.remove(&view)?;
         self.bump_revision();
         let removed_raws = self.raw_ownership.remove(&view).unwrap_or_default();
@@ -3377,11 +3428,16 @@ impl PinnedObjects {
                     .filter_map(|(raw, id)| raw.mount_namespace.is_none().then_some(*id)),
             )
             .collect();
-        let unowned: BTreeSet<_> = candidates.difference(&retained).copied().collect();
+        let unowned: BTreeSet<_> = candidates
+            .difference(&retained)
+            .copied()
+            .filter(|id| !keep.contains(id))
+            .collect();
         self.scrub_proven_targets(unowned.iter().copied());
         self.by_id.retain(|id, _| !unowned.contains(id));
         self.raw_to_id.retain(|raw, id| {
-            !unowned.contains(id) && (!removed_raws.contains(raw) || retained_raws.contains(raw))
+            !unowned.contains(id)
+                && (!removed_raws.contains(raw) || retained_raws.contains(raw) || keep.contains(id))
         });
         Some(removed)
     }
@@ -3395,15 +3451,32 @@ impl PinnedObjects {
         view: ProcessViewId,
         proof: RetirementProof,
     ) -> Option<ViewClaims> {
-        let _ = proof;
-        self.remove_view(view)
+        self.retire_view_except_proven(view, proof, &BTreeSet::new())
+    }
+
+    /// [`retire_view_only_if_proven_gone`](Self::retire_view_only_if_proven_gone),
+    /// except ids in `keep` survive the by-id/raw purge as claimless carried
+    /// pins. `IdentityChanged` never carries: the proof itself says the old
+    /// generation's pins were superseded.
+    pub fn retire_view_except_proven(
+        &mut self,
+        view: ProcessViewId,
+        proof: RetirementProof,
+        keep: &BTreeSet<PinnedObjectId>,
+    ) -> Option<ViewClaims> {
+        let no_carry = BTreeSet::new();
+        let keep = match proof {
+            RetirementProof::IdentityChanged => &no_carry,
+            RetirementProof::Exited | RetirementProof::OperatorRemoval => keep,
+        };
+        self.remove_view_except(view, keep)
     }
 
     /// Pure scratch filter: a clone without one view's pins. Query
     /// helpers and comparison fixtures use this instead of mutating
     /// committed custody; it retires nothing.
     pub fn without_view(mut self, view: ProcessViewId) -> Self {
-        self.remove_view(view);
+        self.remove_view_except(view, &BTreeSet::new());
         self
     }
 
@@ -3924,14 +3997,30 @@ impl PinnedObjects {
         path: &str,
     ) -> Option<PinnedObjectId> {
         let raw = RawObjectInstance::scanned(module, key, path)?;
-        if !self
+        if self
             .raw_ownership
             .get(&module.view)
             .is_some_and(|owned| owned.contains(&raw))
         {
+            return self.raw_to_id.get(&raw).copied();
+        }
+        let id = self.raw_to_id.get(&raw).copied()?;
+        // A raw alias that survives without its view's scan custody is
+        // retained carry evidence: the alias itself was filed only after
+        // the pin proved this exact namespace/key/path. Do not let a live
+        // view ride a peer's proof, though: while live scan custody owns
+        // the identical raw, the proof belongs to someone else and the
+        // fence stays closed. Once every proven owner has retired, the
+        // claimless carried pin (including proof-variant pre-copy-up rows)
+        // must remain resolvable.
+        if self
+            .raw_ownership
+            .values()
+            .any(|owned| owned.contains(&raw))
+        {
             return None;
         }
-        self.raw_to_id.get(&raw).copied()
+        Some(id)
     }
 
     pub fn summary(&self, id: PinnedObjectId) -> Option<PinnedSummary<'_>> {
@@ -4289,6 +4378,14 @@ impl PinnedObjects {
             && aliases.all(|raw| raw.mount_namespace.is_some())
     }
 
+    /// Whether a witness-proven pre-copy-up observation is kept under
+    /// `key`: a proven side is never nuked by a sibling's pin failure.
+    fn has_pre_copy_up_for_key(&self, key: ObjectKey) -> bool {
+        self.by_id
+            .values()
+            .any(|entry| entry.raw.key == key && entry.pre_copy_up)
+    }
+
     fn reject_key(&mut self, key: ObjectKey) {
         self.bump_revision();
         self.rejected_keys.insert(key);
@@ -4324,6 +4421,17 @@ impl PinnedObjects {
             claims.remove(&ids);
         }
         if !ids.is_empty() {
+            self.ambiguous_keys.insert(key);
+        }
+    }
+
+    /// Records another member of a group that is already known only as rejected.
+    /// The first contradiction establishes fail-closed state; the second
+    /// establishes the finite collision-group ambiguity, once per raw key.
+    fn reject_observation(&mut self, key: ObjectKey) {
+        let repeated = self.rejected_keys.contains(&key);
+        self.reject_key(key);
+        if repeated {
             self.ambiguous_keys.insert(key);
         }
     }
@@ -4841,6 +4949,7 @@ mod conservative_copy {
         RawMap,
         Ownership,
         RawOwnership,
+        Refused,
         Rejected,
         ProvenCollision,
         Ambiguous,
@@ -4937,6 +5046,7 @@ mod conservative_copy {
         last_view: Option<ProcessViewId>,
         active_view: Option<ProcessViewId>,
         last_key: Option<ObjectKey>,
+        last_refused: Option<(ProcessViewId, ObjectKey)>,
         bucket: u8,
         index: usize,
         retired_count: u64,
@@ -4978,6 +5088,7 @@ mod conservative_copy {
                 last_view: None,
                 active_view: None,
                 last_key: None,
+                last_refused: None,
                 bucket: 0,
                 index: 0,
                 retired_count: 0,
@@ -5072,6 +5183,7 @@ mod conservative_copy {
             self.last_view = None;
             self.active_view = None;
             self.last_key = None;
+            self.last_refused = None;
             self.index = 0;
             self.bucket = 0;
         }
@@ -5102,6 +5214,10 @@ mod conservative_copy {
                 .len()
                 .checked_add(selection.rejected.len())
                 .ok_or(GraphRefusal::Overflow)?;
+            add(
+                &mut total,
+                tree::<(ProcessViewId, ObjectKey), ()>(source.refused_keys.len())?,
+            )?;
             add(
                 &mut total,
                 tree::<ObjectKey, ()>(
@@ -5431,6 +5547,17 @@ mod conservative_copy {
             Ok(())
         }
 
+        fn advance_refused(&mut self, source: &PinnedObjects) -> Result<(), GraphRefusal> {
+            if let Some(pair) = next_set(&source.refused_keys, self.last_refused.as_ref()).copied()
+            {
+                self.last_refused = Some(pair);
+                self.output_mut()?.refused_keys.insert(pair);
+            } else {
+                self.next_phase(Phase::Rejected);
+            }
+            Ok(())
+        }
+
         fn advance_sets(
             &mut self,
             source: &PinnedObjects,
@@ -5683,6 +5810,7 @@ mod conservative_copy {
                 Phase::RawMap => self.advance_raw_output(source, selection, reserve, false)?,
                 Phase::Ownership => self.advance_ownership(source, selection)?,
                 Phase::RawOwnership => self.advance_raw_output(source, selection, reserve, true)?,
+                Phase::Refused => self.advance_refused(source)?,
                 Phase::Rejected
                 | Phase::ProvenCollision
                 | Phase::Ambiguous
@@ -10909,24 +11037,26 @@ fn record_scanned_candidate(
 ) {
     match candidate {
         Ok(entry) => {
-            // An earlier unproven observation by this view left no mark
-            // (only proven collisions reject), so a proven filing now is
-            // no contradiction: it binds through the proof fence in
-            // `id_for_scanned` like any peer's.
-            if let Some(id) = pinned.insert_entry(entry, skipped) {
+            // A view that already refused this key contradicts itself by
+            // filing it now: group-reject like the reverse order, so the
+            // pairing is order-free. Other views' refusals never poison
+            // this filing.
+            if pinned.refused_keys.contains(&(view, entry.raw.key)) {
+                pinned.reject_observation(entry.raw.key);
+                pinned.ambiguous_keys.insert(entry.raw.key);
+                skipped.push(Skipped {
+                    subject: entry.raw.path.clone(),
+                    reason: "refused observation contradicts filed observation".to_string(),
+                });
+            } else if let Some(id) = pinned.insert_entry(entry, skipped) {
                 pinned.ownership.entry(view).or_default().pins.push(id);
                 pinned.raw_ownership.entry(view).or_default().insert(raw);
             }
         }
-        // Handle-class waits keep the wait arm exactly as before:
-        // the open waits for the next tick with the whole view. Every
-        // other outcome files its own named skip below; no outcome
-        // here rejects the key.
-        Err(PinOutcome::Wait {
-            cause: WaitCause::HandleExhaustion | WaitCause::ReserveStop | WaitCause::BudgetStop,
-            reason,
-            ..
-        }) => {
+        // Retryable waits keep the wait arm exactly as before: the pin
+        // waits for the next tick with the whole view. No outcome here
+        // rejects the key.
+        Err(PinOutcome::Wait { reason, .. }) => {
             // Out of handles: the open waits for the next tick — or
             // names the terminal wait when the lane never retries
             // (one-shot inspect). No key rejection — nothing was
@@ -10943,17 +11073,37 @@ fn record_scanned_candidate(
                 reason: format!("{}: {reason}; {tail}", raw.path),
             });
         }
-        Err(outcome) => {
-            // An unproven observation files a named skip for its view
-            // and never rejects the key: only a proven collision (two
-            // proven entries contradicting at insert) fails a key
-            // closed. The failed view binds nothing — the proof fence
-            // in `id_for_scanned` refuses it — while proven peers keep
-            // counting. Skip shapes stay exactly as before. A gone
-            // view's loss files here too: the gap names the loss, the
-            // key (and every live view's pins on it) is left alone,
-            // and unlike a wait this never defers for a retry that
-            // cannot help.
+        Err(PinOutcome::Unproven { reason, .. }) => {
+            // A missing identity fails this observation only: scrub its
+            // possibly-partial filing and mark the refusal, but never
+            // group-reject the key by itself. Refusal pairs publish
+            // ambiguity; a later filing by the same view contradicts it.
+            if !raw.pre_copy_up {
+                let view_filed = pinned
+                    .raw_ownership
+                    .get(&view)
+                    .is_some_and(|raws| raws.iter().any(|filed| filed.key == raw.key));
+                pinned.scrub_raw(&raw);
+                if !pinned.has_pre_copy_up_for_key(raw.key) {
+                    let pair = pinned
+                        .refused_keys
+                        .iter()
+                        .any(|(other, key)| *other != view && *key == raw.key);
+                    pinned.refused_keys.insert((view, raw.key));
+                    if view_filed || pair {
+                        pinned.ambiguous_keys.insert(raw.key);
+                    }
+                }
+            }
+            skipped.push(Skipped {
+                subject: raw.path,
+                reason,
+            });
+        }
+        Err(outcome @ PinOutcome::Gone { .. }) => {
+            // The view died mid-pin: loss, not forgery evidence. File the
+            // gap like a refusal but leave the key (and every live view's
+            // pins on it) alone; unlike a wait, this never defers.
             skipped.push(Skipped {
                 subject: raw.path,
                 reason: outcome.reason().to_string(),
@@ -14549,7 +14699,11 @@ mod tests {
             "the fixture files claims under view 1"
         );
 
-        let removed = pins.retire_view_only_if_proven_gone(m1.view, RetirementProof::Exited);
+        let removed = pins.retire_view_except_proven(
+            m1.view,
+            RetirementProof::Exited,
+            &BTreeSet::from([id1]),
+        );
         assert!(
             removed.is_some(),
             "the except call retires view 1 (not the empty early return)"
@@ -18370,16 +18524,12 @@ mod tests {
         );
     }
 
-    /// The wait-subject split: only the handle-class waits
-    /// (`HandleExhaustion`, `ReserveStop`, `BudgetStop`) file under
-    /// the fixed wait subject the defer-whole classifiers recognise;
-    /// every other `Wait` cause files under its own path subject, so
-    /// a work-ceiling (or I/O, deadline, clock, table/interface
-    /// window) wait never defers a scan whole. A future `Wait`
-    /// cause that should defer whole must file under the wait
-    /// subject too — this table fails until it does.
+    /// Every typed retryable wait files under the fixed wait subject the
+    /// defer-whole classifiers recognise. Deadline and I/O-ceiling stops
+    /// are transient exactly like handle exhaustion: filing them under the
+    /// object path would turn a fresh-pass retry into a terminal refusal.
     #[test]
-    fn wait_causes_split_the_wait_subject_by_handle_class() {
+    fn wait_causes_share_the_wait_subject() {
         let key = ObjectKey {
             device: Device { major: 8, minor: 1 },
             inode: INODE,
@@ -18416,21 +18566,10 @@ mod tests {
                 true,
             );
             assert_eq!(skipped.len(), 1, "{cause:?} files exactly one skip");
-            let handle_class = matches!(
-                cause,
-                WaitCause::HandleExhaustion | WaitCause::ReserveStop | WaitCause::BudgetStop
+            assert_eq!(
+                skipped[0].subject, PIN_WAIT_SUBJECT,
+                "{cause:?} must file the defer-whole wait subject"
             );
-            if handle_class {
-                assert_eq!(
-                    skipped[0].subject, PIN_WAIT_SUBJECT,
-                    "{cause:?} must file the defer-whole wait subject"
-                );
-            } else {
-                assert_eq!(
-                    skipped[0].subject, raw.path,
-                    "{cause:?} must not file the defer-whole wait subject"
-                );
-            }
             assert!(!pinned.rejects(key), "{cause:?} never rejects the key");
         }
     }
@@ -21600,6 +21739,7 @@ mod tests {
 
     fn assert_conservative_value(expected: &PinnedObjects, actual: &PinnedObjects) {
         assert_eq!(actual.raw_to_id, expected.raw_to_id);
+        assert_eq!(actual.refused_keys, expected.refused_keys);
         assert_eq!(actual.rejected_keys, expected.rejected_keys);
         assert_eq!(actual.proven_collision_keys, expected.proven_collision_keys);
         assert_eq!(actual.ambiguous_keys, expected.ambiguous_keys);

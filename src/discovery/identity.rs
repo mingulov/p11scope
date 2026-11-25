@@ -3298,41 +3298,6 @@ impl PinnedObjects {
         self.ownership.keys().copied().collect()
     }
 
-    /// Scrubs one possibly-partially-filed raw observation (pin-failure
-    /// path): drops its raw filing and any by-id entries left with no
-    /// raws at all, plus their ownership claims. Never touches
-    /// rejected_keys: a failed observation is skipped, not a group
-    /// rejection, so one view's refused pin cannot nuke committed
-    /// coverage for the same key.
-    pub(crate) fn scrub_raw(&mut self, raw: &RawObjectInstance) {
-        if self.raw_to_id.remove(raw).is_none() {
-            return;
-        }
-        self.bump_revision();
-        let live: BTreeSet<PinnedObjectId> = self.raw_to_id.values().copied().collect();
-        let dropped: BTreeSet<PinnedObjectId> = self
-            .by_id
-            .keys()
-            .copied()
-            .filter(|id| !live.contains(id))
-            .collect();
-        if dropped.is_empty() {
-            return;
-        }
-        self.by_id.retain(|id, _| !dropped.contains(id));
-        for claims in self.ownership.values_mut() {
-            claims.tables.retain(|id| !dropped.contains(id));
-            claims.targets.retain(|(id, _)| !dropped.contains(id));
-            claims.pins.retain(|id| !dropped.contains(id));
-        }
-        self.ownership.retain(|_, claims| {
-            !(claims.tables.is_empty() && claims.targets.is_empty() && claims.pins.is_empty())
-        });
-        for raws in self.raw_ownership.values_mut() {
-            raws.retain(|raw| self.raw_to_id.contains_key(raw));
-        }
-    }
-
     /// Ids that stay resolvable without ownership claims anywhere: the
     /// except-carry shape. Global purges spare them (one view's replace
     /// or prune must not drop another view's carried coverage); fully

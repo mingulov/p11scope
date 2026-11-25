@@ -1,0 +1,2203 @@
+{
+ "source": {
+  "report": "/home/user/src/m/p11scope-ws/tmp/muse-jobs/evidence/spark-v072-proxy-parity-cut/live/A03/report.json",
+  "report_sha256": "b5c953946725a7e191ddc97c612e7abcad4ebf09c26c8580a59b380a3280f0c8",
+  "spy_log": "/home/user/src/m/p11scope-ws/tmp/muse-jobs/evidence/spark-v072-proxy-parity-cut/live/A03/spy.log",
+  "spy_sha256": "d2a74168f55ce38b58eebe30b9e669108ce5901cfab64eeafe29d7490d9e4a16",
+  "workload": "pkcs11-tool --list-objects via pkcs11-spy -> p11-kit-proxy -> softhsm (RPO-PROXY)"
+ },
+ "tool": {
+  "rc": 0,
+  "rc_citation": "rc=0 per parity-cut report (all 20 runs rc=0 priv=2 pub=2)",
+  "priv": 2,
+  "pub": 2
+ },
+ "spy_loaded": "/usr/lib64/p11-kit-proxy.so",
+ "spy_entries": [
+  [
+   "C_GetInterface",
+   0
+  ],
+  [
+   "C_Initialize",
+   0
+  ],
+  [
+   "C_GetSlotList",
+   0
+  ],
+  [
+   "C_GetSlotList",
+   0
+  ],
+  [
+   "C_GetTokenInfo",
+   0
+  ],
+  [
+   "C_OpenSession",
+   0
+  ],
+  [
+   "C_GetTokenInfo",
+   0
+  ],
+  [
+   "C_Login",
+   0
+  ],
+  [
+   "C_FindObjectsInit",
+   0
+  ],
+  [
+   "C_FindObjects",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   18
+  ],
+  [
+   "C_GetTokenInfo",
+   0
+  ],
+  [
+   "C_FindObjects",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   18
+  ],
+  [
+   "C_GetTokenInfo",
+   0
+  ],
+  [
+   "C_FindObjects",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   18
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   18
+  ],
+  [
+   "C_GetTokenInfo",
+   0
+  ],
+  [
+   "C_FindObjects",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   18
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   0
+  ],
+  [
+   "C_GetAttributeValue",
+   18
+  ],
+  [
+   "C_GetTokenInfo",
+   0
+  ],
+  [
+   "C_FindObjects",
+   0
+  ],
+  [
+   "C_FindObjectsFinal",
+   0
+  ],
+  [
+   "C_CloseSession",
+   0
+  ],
+  [
+   "C_Finalize",
+   0
+  ]
+ ],
+ "report": {
+  "schema": "p11scope/observed-profile/v3",
+  "capture": {
+   "modules": [
+    {
+     "build_id": "2ad9da77286941ccaeba526b82329cd6bd301d73",
+     "dev": [
+      0,
+      37
+     ],
+     "ino": 148391,
+     "path": "/usr/lib64/pkcs11-spy.so",
+     "sha256": "6c951fd25fed2b728da297394acc898c2ee39481a8b6dcbea5288f448e0ad7c2"
+    },
+    {
+     "build_id": "14b34a794619258f06ce7a3648deb8c220894424",
+     "dev": [
+      0,
+      37
+     ],
+     "ino": 15319,
+     "path": "/usr/lib64/libp11-kit.so.0.4.11",
+     "sha256": "8a966951d57b06a71bfd450e774c18e3a5a5e1d029eb23582a865d2102f0d8ae"
+    },
+    {
+     "build_id": "a65c5cd98723ce758b734aed2e7b20b742fd11ac",
+     "dev": [
+      0,
+      37
+     ],
+     "ino": 150603,
+     "path": "/usr/lib64/pkcs11/libsofthsm2.so",
+     "sha256": "611254bf118e3c4ef0f3ef3dd25667d984202ef10055b7d6d5da20d60898c5a5"
+    },
+    {
+     "build_id": "166143083ba0fcab24b132ba16def67a8d1d2ac8",
+     "dev": [
+      0,
+      37
+     ],
+     "ino": 16792,
+     "path": "/usr/lib64/pkcs11/p11-kit-trust.so",
+     "sha256": "17140c65bbf100c3c0c74d41cc4de1d8e355cb2d993b8100b6c247b992c9d409"
+    },
+    {
+     "build_id": "1f090b9f32478f921fc8fe3a704bd5dd3c212425",
+     "dev": [
+      0,
+      37
+     ],
+     "ino": 148390,
+     "path": "/usr/lib64/opensc-pkcs11.so",
+     "sha256": "aa6d580ef30c693c7a00f5bd5ed3a88c6d72da3d1fc7913a8a18c56f2875cff4"
+    }
+   ]
+  },
+  "functions": [
+   {
+    "aliased": false,
+    "calls": 1,
+    "errors": 0,
+    "forwarding_layer": false,
+    "in_flight": 0,
+    "latency_ns": {
+     "approximate": true,
+     "max": 249723,
+     "p50": 131072,
+     "p95": 131072,
+     "p99": 131072,
+     "total": 249723
+    },
+    "module": {
+     "dev": [
+      0,
+      37
+     ],
+     "ino": 150603,
+     "sha256": "611254bf118e3c4ef0f3ef3dd25667d984202ef10055b7d6d5da20d60898c5a5"
+    },
+    "module_ambiguous": false,
+    "module_unresolved": false,
+    "names": [
+     "C_GetFunctionList"
+    ],
+    "ordinals": [
+     {
+      "ordinal": 3,
+      "table_file_offset": 942080
+     }
+    ],
+    "pending_returns": 0,
+    "rv_counts": {
+     "0x0000000000000000": 1
+    },
+    "rv_names": {
+     "0x0000000000000000": "CKR_OK"
+    },
+    "target": {
+     "file_offset": 78320,
+     "object": {
+      "dev": [
+       0,
+       37
+      ],
+      "ino": 150603,
+      "sha256": "611254bf118e3c4ef0f3ef3dd25667d984202ef10055b7d6d5da20d60898c5a5"
+     }
+    }
+   },
+   {
+    "aliased": false,
+    "calls": 1,
+    "errors": 0,
+    "forwarding_layer": false,
+    "in_flight": 0,
+    "initialization": {
+     "outcome": "ok",
+     "potential_provider": true
+    },
+    "latency_ns": {
+     "approximate": true,
+     "max": 3007230,
+     "p50": 2097152,
+     "p95": 2097152,
+     "p99": 2097152,
+     "total": 3007230
+    },
+    "module": {
+     "dev": [
+      0,
+      37
+     ],
+     "ino": 150603,
+     "sha256": "611254bf118e3c4ef0f3ef3dd25667d984202ef10055b7d6d5da20d60898c5a5"
+    },
+    "module_ambiguous": false,
+    "module_unresolved": false,
+    "names": [
+     "C_Initialize"
+    ],
+    "ordinals": [
+     {
+      "ordinal": 0,
+      "table_file_offset": 942080
+     }
+    ],
+    "pending_returns": 0,
+    "rv_counts": {
+     "0x0000000000000000": 1
+    },
+    "rv_names": {
+     "0x0000000000000000": "CKR_OK"
+    },
+    "target": {
+     "file_offset": 78368,
+     "object": {
+      "dev": [
+       0,
+       37
+      ],
+      "ino": 150603,
+      "sha256": "611254bf118e3c4ef0f3ef3dd25667d984202ef10055b7d6d5da20d60898c5a5"
+     }
+    }
+   },
+   {
+    "aliased": false,
+    "calls": 1,
+    "errors": 0,
+    "forwarding_layer": false,
+    "in_flight": 0,
+    "latency_ns": {
+     "approximate": true,
+     "max": 80603,
+     "p50": 65536,
+     "p95": 65536,
+     "p99": 65536,
+     "total": 80603
+    },
+    "module": {
+     "dev": [
+      0,
+      37
+     ],
+     "ino": 150603,
+     "sha256": "611254bf118e3c4ef0f3ef3dd25667d984202ef10055b7d6d5da20d60898c5a5"
+    },
+    "module_ambiguous": false,
+    "module_unresolved": false,
+    "names": [
+     "C_Finalize"
+    ],
+    "ordinals": [
+     {
+      "ordinal": 1,
+      "table_file_offset": 942080
+     }
+    ],
+    "pending_returns": 0,
+    "rv_counts": {
+     "0x0000000000000000": 1
+    },
+    "rv_names": {
+     "0x0000000000000000": "CKR_OK"
+    },
+    "target": {
+     "file_offset": 78416,
+     "object": {
+      "dev": [
+       0,
+       37
+      ],
+      "ino": 150603,
+      "sha256": "611254bf118e3c4ef0f3ef3dd25667d984202ef10055b7d6d5da20d60898c5a5"
+     }
+    }
+   },
+   {
+    "aliased": false,
+    "calls": 6,
+    "errors": 0,
+    "forwarding_layer": false,
+    "in_flight": 0,
+    "latency_ns": {
+     "approximate": true,
+     "max": 64010,
+     "p50": 4096,
+     "p95": 32768,
+     "p99": 32768,
+     "total": 154861
+    },
+    "module": {
+     "dev": [
+      0,
+      37
+     ],
+     "ino": 150603,
+     "sha256": "611254bf118e3c4ef0f3ef3dd25667d984202ef10055b7d6d5da20d60898c5a5"
+    },
+    "module_ambiguous": false,
+    "module_unresolved": false,
+    "names": [
+     "C_GetSlotList"
+    ],
+    "ordinals": [
+     {
+      "ordinal": 4,
+      "table_file_offset": 942080
+     }
+    ],
+    "pending_returns": 0,
+    "rv_counts": {
+     "0x0000000000000000": 6
+    },
+    "rv_names": {
+     "0x0000000000000000": "CKR_OK"
+    },
+    "target": {
+     "file_offset": 78512,
+     "object": {
+      "dev": [
+       0,
+       37
+      ],
+      "ino": 150603,
+      "sha256": "611254bf118e3c4ef0f3ef3dd25667d984202ef10055b7d6d5da20d60898c5a5"
+     }
+    }
+   },
+   {
+    "aliased": false,
+    "calls": 6,
+    "errors": 0,
+    "forwarding_layer": false,
+    "in_flight": 0,
+    "latency_ns": {
+     "approximate": true,
+     "max": 490418,
+     "p50": 65536,
+     "p95": 262144,
+     "p99": 262144,
+     "total": 1430556
+    },
+    "module": {
+     "dev": [
+      0,
+      37
+     ],
+     "ino": 150603,
+     "sha256": "611254bf118e3c4ef0f3ef3dd25667d984202ef10055b7d6d5da20d60898c5a5"
+    },
+    "module_ambiguous": false,
+    "module_unresolved": false,
+    "names": [
+     "C_GetTokenInfo"
+    ],
+    "ordinals": [
+     {
+      "ordinal": 6,
+      "table_file_offset": 942080
+     }
+    ],
+    "pending_returns": 0,
+    "rv_counts": {
+     "0x0000000000000000": 6
+    },
+    "rv_names": {
+     "0x0000000000000000": "CKR_OK"
+    },
+    "target": {
+     "file_offset": 78656,
+     "object": {
+      "dev": [
+       0,
+       37
+      ],
+      "ino": 150603,
+      "sha256": "611254bf118e3c4ef0f3ef3dd25667d984202ef10055b7d6d5da20d60898c5a5"
+     }
+    }
+   },
+   {
+    "aliased": false,
+    "calls": 1,
+    "errors": 0,
+    "forwarding_layer": false,
+    "in_flight": 0,
+    "latency_ns": {
+     "approximate": true,
+     "max": 26681,
+     "p50": 16384,
+     "p95": 16384,
+     "p99": 16384,
+     "total": 26681
+    },
+    "module": {
+     "dev": [
+      0,
+      37
+     ],
+     "ino": 150603,
+     "sha256": "611254bf118e3c4ef0f3ef3dd25667d984202ef10055b7d6d5da20d60898c5a5"
+    },
+    "module_ambiguous": false,
+    "module_unresolved": false,
+    "names": [
+     "C_OpenSession"
+    ],
+    "ordinals": [
+     {
+      "ordinal": 12,
+      "table_file_offset": 942080
+     }
+    ],
+    "pending_returns": 0,
+    "rv_counts": {
+     "0x0000000000000000": 1
+    },
+    "rv_names": {
+     "0x0000000000000000": "CKR_OK"
+    },
+    "target": {
+     "file_offset": 79136,
+     "object": {
+      "dev": [
+       0,
+       37
+      ],
+      "ino": 150603,
+      "sha256": "611254bf118e3c4ef0f3ef3dd25667d984202ef10055b7d6d5da20d60898c5a5"
+     }
+    }
+   },
+   {
+    "aliased": false,
+    "calls": 1,
+    "errors": 0,
+    "forwarding_layer": false,
+    "in_flight": 0,
+    "latency_ns": {
+     "approximate": true,
+     "max": 10420,
+     "p50": 8192,
+     "p95": 8192,
+     "p99": 8192,
+     "total": 10420
+    },
+    "module": {
+     "dev": [
+      0,
+      37
+     ],
+     "ino": 150603,
+     "sha256": "611254bf118e3c4ef0f3ef3dd25667d984202ef10055b7d6d5da20d60898c5a5"
+    },
+    "module_ambiguous": false,
+    "module_unresolved": false,
+    "names": [
+     "C_CloseSession"
+    ],
+    "ordinals": [
+     {
+      "ordinal": 13,
+      "table_file_offset": 942080
+     }
+    ],
+    "pending_returns": 0,
+    "rv_counts": {
+     "0x0000000000000000": 1
+    },
+    "rv_names": {
+     "0x0000000000000000": "CKR_OK"
+    },
+    "target": {
+     "file_offset": 79232,
+     "object": {
+      "dev": [
+       0,
+       37
+      ],
+      "ino": 150603,
+      "sha256": "611254bf118e3c4ef0f3ef3dd25667d984202ef10055b7d6d5da20d60898c5a5"
+     }
+    }
+   },
+   {
+    "aliased": false,
+    "calls": 1,
+    "errors": 0,
+    "forwarding_layer": false,
+    "in_flight": 0,
+    "latency_ns": {
+     "approximate": true,
+     "max": 1963496,
+     "p50": 1048576,
+     "p95": 1048576,
+     "p99": 1048576,
+     "total": 1963496
+    },
+    "module": {
+     "dev": [
+      0,
+      37
+     ],
+     "ino": 150603,
+     "sha256": "611254bf118e3c4ef0f3ef3dd25667d984202ef10055b7d6d5da20d60898c5a5"
+    },
+    "module_ambiguous": false,
+    "module_unresolved": false,
+    "names": [
+     "C_Login"
+    ],
+    "ordinals": [
+     {
+      "ordinal": 18,
+      "table_file_offset": 942080
+     }
+    ],
+    "pending_returns": 0,
+    "rv_counts": {
+     "0x0000000000000000": 1
+    },
+    "rv_names": {
+     "0x0000000000000000": "CKR_OK"
+    },
+    "target": {
+     "file_offset": 79568,
+     "object": {
+      "dev": [
+       0,
+       37
+      ],
+      "ino": 150603,
+      "sha256": "611254bf118e3c4ef0f3ef3dd25667d984202ef10055b7d6d5da20d60898c5a5"
+     }
+    }
+   },
+   {
+    "aliased": false,
+    "calls": 89,
+    "errors": 6,
+    "forwarding_layer": false,
+    "in_flight": 0,
+    "latency_ns": {
+     "approximate": true,
+     "max": 739279,
+     "p50": 32768,
+     "p95": 131072,
+     "p99": 524288,
+     "total": 7080532
+    },
+    "module": {
+     "dev": [
+      0,
+      37
+     ],
+     "ino": 150603,
+     "sha256": "611254bf118e3c4ef0f3ef3dd25667d984202ef10055b7d6d5da20d60898c5a5"
+    },
+    "module_ambiguous": false,
+    "module_unresolved": false,
+    "names": [
+     "C_GetAttributeValue"
+    ],
+    "ordinals": [
+     {
+      "ordinal": 24,
+      "table_file_offset": 942080
+     }
+    ],
+    "pending_returns": 0,
+    "rv_counts": {
+     "0x0000000000000000": 83,
+     "0x0000000000000012": 6
+    },
+    "rv_names": {
+     "0x0000000000000000": "CKR_OK",
+     "0x0000000000000012": "CKR_ATTRIBUTE_TYPE_INVALID"
+    },
+    "target": {
+     "file_offset": 80016,
+     "object": {
+      "dev": [
+       0,
+       37
+      ],
+      "ino": 150603,
+      "sha256": "611254bf118e3c4ef0f3ef3dd25667d984202ef10055b7d6d5da20d60898c5a5"
+     }
+    }
+   },
+   {
+    "aliased": false,
+    "calls": 1,
+    "errors": 0,
+    "forwarding_layer": false,
+    "in_flight": 0,
+    "latency_ns": {
+     "approximate": true,
+     "max": 372998,
+     "p50": 262144,
+     "p95": 262144,
+     "p99": 262144,
+     "total": 372998
+    },
+    "module": {
+     "dev": [
+      0,
+      37
+     ],
+     "ino": 150603,
+     "sha256": "611254bf118e3c4ef0f3ef3dd25667d984202ef10055b7d6d5da20d60898c5a5"
+    },
+    "module_ambiguous": false,
+    "module_unresolved": false,
+    "names": [
+     "C_FindObjectsInit"
+    ],
+    "ordinals": [
+     {
+      "ordinal": 26,
+      "table_file_offset": 942080
+     }
+    ],
+    "pending_returns": 0,
+    "rv_counts": {
+     "0x0000000000000000": 1
+    },
+    "rv_names": {
+     "0x0000000000000000": "CKR_OK"
+    },
+    "target": {
+     "file_offset": 80176,
+     "object": {
+      "dev": [
+       0,
+       37
+      ],
+      "ino": 150603,
+      "sha256": "611254bf118e3c4ef0f3ef3dd25667d984202ef10055b7d6d5da20d60898c5a5"
+     }
+    }
+   },
+   {
+    "aliased": false,
+    "calls": 5,
+    "errors": 0,
+    "forwarding_layer": false,
+    "in_flight": 0,
+    "latency_ns": {
+     "approximate": true,
+     "max": 38814,
+     "p50": 16384,
+     "p95": 32768,
+     "p99": 32768,
+     "total": 109848
+    },
+    "module": {
+     "dev": [
+      0,
+      37
+     ],
+     "ino": 150603,
+     "sha256": "611254bf118e3c4ef0f3ef3dd25667d984202ef10055b7d6d5da20d60898c5a5"
+    },
+    "module_ambiguous": false,
+    "module_unresolved": false,
+    "names": [
+     "C_FindObjects"
+    ],
+    "ordinals": [
+     {
+      "ordinal": 27,
+      "table_file_offset": 942080
+     }
+    ],
+    "pending_returns": 0,
+    "rv_counts": {
+     "0x0000000000000000": 5
+    },
+    "rv_names": {
+     "0x0000000000000000": "CKR_OK"
+    },
+    "target": {
+     "file_offset": 80256,
+     "object": {
+      "dev": [
+       0,
+       37
+      ],
+      "ino": 150603,
+      "sha256": "611254bf118e3c4ef0f3ef3dd25667d984202ef10055b7d6d5da20d60898c5a5"
+     }
+    }
+   },
+   {
+    "aliased": false,
+    "calls": 1,
+    "errors": 0,
+    "forwarding_layer": false,
+    "in_flight": 0,
+    "latency_ns": {
+     "approximate": true,
+     "max": 6041,
+     "p50": 4096,
+     "p95": 4096,
+     "p99": 4096,
+     "total": 6041
+    },
+    "module": {
+     "dev": [
+      0,
+      37
+     ],
+     "ino": 150603,
+     "sha256": "611254bf118e3c4ef0f3ef3dd25667d984202ef10055b7d6d5da20d60898c5a5"
+    },
+    "module_ambiguous": false,
+    "module_unresolved": false,
+    "names": [
+     "C_FindObjectsFinal"
+    ],
+    "ordinals": [
+     {
+      "ordinal": 28,
+      "table_file_offset": 942080
+     }
+    ],
+    "pending_returns": 0,
+    "rv_counts": {
+     "0x0000000000000000": 1
+    },
+    "rv_names": {
+     "0x0000000000000000": "CKR_OK"
+    },
+    "target": {
+     "file_offset": 80336,
+     "object": {
+      "dev": [
+       0,
+       37
+      ],
+      "ino": 150603,
+      "sha256": "611254bf118e3c4ef0f3ef3dd25667d984202ef10055b7d6d5da20d60898c5a5"
+     }
+    }
+   },
+   {
+    "aliased": false,
+    "calls": 1,
+    "errors": 0,
+    "forwarding_layer": false,
+    "in_flight": 0,
+    "latency_ns": {
+     "approximate": true,
+     "max": 95441,
+     "p50": 65536,
+     "p95": 65536,
+     "p99": 65536,
+     "total": 95441
+    },
+    "module": {
+     "dev": [
+      0,
+      37
+     ],
+     "ino": 16792,
+     "sha256": "17140c65bbf100c3c0c74d41cc4de1d8e355cb2d993b8100b6c247b992c9d409"
+    },
+    "module_ambiguous": false,
+    "module_unresolved": false,
+    "names": [
+     "C_GetFunctionList"
+    ],
+    "ordinals": [],
+    "pending_returns": 0,
+    "rv_counts": {
+     "0x0000000000000000": 1
+    },
+    "rv_names": {
+     "0x0000000000000000": "CKR_OK"
+    },
+    "target": {
+     "file_offset": 70976,
+     "object": {
+      "dev": [
+       0,
+       37
+      ],
+      "ino": 16792,
+      "sha256": "17140c65bbf100c3c0c74d41cc4de1d8e355cb2d993b8100b6c247b992c9d409"
+     }
+    }
+   },
+   {
+    "aliased": false,
+    "calls": 1,
+    "errors": 0,
+    "forwarding_layer": false,
+    "in_flight": 0,
+    "initialization": {
+     "outcome": "ok",
+     "potential_provider": true
+    },
+    "latency_ns": {
+     "approximate": true,
+     "max": 47116572,
+     "p50": 33554432,
+     "p95": 33554432,
+     "p99": 33554432,
+     "total": 47116572
+    },
+    "module": {
+     "dev": [
+      0,
+      37
+     ],
+     "ino": 148390,
+     "sha256": "aa6d580ef30c693c7a00f5bd5ed3a88c6d72da3d1fc7913a8a18c56f2875cff4"
+    },
+    "module_ambiguous": false,
+    "module_unresolved": false,
+    "names": [
+     "C_Initialize"
+    ],
+    "ordinals": [
+     {
+      "ordinal": 0,
+      "table_file_offset": 271776
+     },
+     {
+      "ordinal": 0,
+      "table_file_offset": 272544
+     },
+     {
+      "ordinal": 0,
+      "table_file_offset": 273408
+     }
+    ],
+    "pending_returns": 0,
+    "rv_counts": {
+     "0x0000000000000000": 1
+    },
+    "rv_names": {
+     "0x0000000000000000": "CKR_OK"
+    },
+    "target": {
+     "file_offset": 58368,
+     "object": {
+      "dev": [
+       0,
+       37
+      ],
+      "ino": 148390,
+      "sha256": "aa6d580ef30c693c7a00f5bd5ed3a88c6d72da3d1fc7913a8a18c56f2875cff4"
+     }
+    }
+   },
+   {
+    "aliased": false,
+    "calls": 2,
+    "errors": 1,
+    "forwarding_layer": false,
+    "in_flight": 0,
+    "latency_ns": {
+     "approximate": true,
+     "max": 181253,
+     "p50": 4096,
+     "p95": 131072,
+     "p99": 131072,
+     "total": 189228
+    },
+    "module": {
+     "dev": [
+      0,
+      37
+     ],
+     "ino": 148390,
+     "sha256": "aa6d580ef30c693c7a00f5bd5ed3a88c6d72da3d1fc7913a8a18c56f2875cff4"
+    },
+    "module_ambiguous": false,
+    "module_unresolved": false,
+    "names": [
+     "C_Finalize"
+    ],
+    "ordinals": [
+     {
+      "ordinal": 1,
+      "table_file_offset": 271776
+     },
+     {
+      "ordinal": 1,
+      "table_file_offset": 272544
+     },
+     {
+      "ordinal": 1,
+      "table_file_offset": 273408
+     }
+    ],
+    "pending_returns": 0,
+    "rv_counts": {
+     "0x0000000000000000": 1,
+     "0x0000000000000190": 1
+    },
+    "rv_names": {
+     "0x0000000000000000": "CKR_OK",
+     "0x0000000000000190": "CKR_CRYPTOKI_NOT_INITIALIZED"
+    },
+    "target": {
+     "file_offset": 51136,
+     "object": {
+      "dev": [
+       0,
+       37
+      ],
+      "ino": 148390,
+      "sha256": "aa6d580ef30c693c7a00f5bd5ed3a88c6d72da3d1fc7913a8a18c56f2875cff4"
+     }
+    }
+   },
+   {
+    "aliased": false,
+    "calls": 3,
+    "errors": 0,
+    "forwarding_layer": false,
+    "in_flight": 0,
+    "latency_ns": {
+     "approximate": true,
+     "max": 45451403,
+     "p50": 33554432,
+     "p95": 33554432,
+     "p99": 33554432,
+     "total": 127782836
+    },
+    "module": {
+     "dev": [
+      0,
+      37
+     ],
+     "ino": 148390,
+     "sha256": "aa6d580ef30c693c7a00f5bd5ed3a88c6d72da3d1fc7913a8a18c56f2875cff4"
+    },
+    "module_ambiguous": false,
+    "module_unresolved": false,
+    "names": [
+     "C_GetSlotList"
+    ],
+    "ordinals": [
+     {
+      "ordinal": 4,
+      "table_file_offset": 271776
+     },
+     {
+      "ordinal": 4,
+      "table_file_offset": 272544
+     },
+     {
+      "ordinal": 4,
+      "table_file_offset": 273408
+     }
+    ],
+    "pending_returns": 0,
+    "rv_counts": {
+     "0x0000000000000000": 3
+    },
+    "rv_names": {
+     "0x0000000000000000": "CKR_OK"
+    },
+    "target": {
+     "file_offset": 60688,
+     "object": {
+      "dev": [
+       0,
+       37
+      ],
+      "ino": 148390,
+      "sha256": "aa6d580ef30c693c7a00f5bd5ed3a88c6d72da3d1fc7913a8a18c56f2875cff4"
+     }
+    }
+   },
+   {
+    "aliased": false,
+    "calls": 1,
+    "errors": 0,
+    "forwarding_layer": false,
+    "in_flight": 0,
+    "latency_ns": {
+     "approximate": true,
+     "max": 46628,
+     "p50": 32768,
+     "p95": 32768,
+     "p99": 32768,
+     "total": 46628
+    },
+    "module": {
+     "dev": [
+      0,
+      37
+     ],
+     "ino": 148390,
+     "sha256": "aa6d580ef30c693c7a00f5bd5ed3a88c6d72da3d1fc7913a8a18c56f2875cff4"
+    },
+    "module_ambiguous": false,
+    "module_unresolved": false,
+    "names": [
+     "C_GetInterface"
+    ],
+    "ordinals": [
+     {
+      "ordinal": 69,
+      "table_file_offset": 271776
+     },
+     {
+      "ordinal": 69,
+      "table_file_offset": 272544
+     }
+    ],
+    "pending_returns": 0,
+    "rv_counts": {
+     "0x0000000000000000": 1
+    },
+    "rv_names": {
+     "0x0000000000000000": "CKR_OK"
+    },
+    "target": {
+     "file_offset": 9184,
+     "object": {
+      "dev": [
+       0,
+       37
+      ],
+      "ino": 148390,
+      "sha256": "aa6d580ef30c693c7a00f5bd5ed3a88c6d72da3d1fc7913a8a18c56f2875cff4"
+     }
+    }
+   }
+  ],
+  "evidence": {
+   "completeness": "PARTIAL",
+   "event_loss": 0,
+   "in_flight_at_end": 0,
+   "discovery": [
+    {
+     "path": "/usr/lib64/pkcs11-spy.so",
+     "tables": [],
+     "unobserved_windows": [
+      {
+       "end_ns": 16979864604089,
+       "reason": "late_discovery",
+       "start_ns": 16975290844062
+      }
+     ]
+    },
+    {
+     "path": "/usr/lib64/libp11-kit.so.0.4.11",
+     "tables": [
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      },
+      {
+       "linkage": "heuristic"
+      }
+     ],
+     "unobserved_windows": [
+      {
+       "end_ns": 16981564964618,
+       "reason": "late_discovery",
+       "start_ns": 16975290844062
+      },
+      {
+       "end_ns": 16982300917115,
+       "reason": "coverage_retired",
+       "start_ns": 16980029844672
+      }
+     ]
+    },
+    {
+     "path": "/usr/lib64/pkcs11/libsofthsm2.so",
+     "tables": [
+      {
+       "linkage": "exports"
+      },
+      {
+       "linkage": "live_return"
+      }
+     ],
+     "unobserved_windows": [
+      {
+       "end_ns": 16980374536421,
+       "reason": "late_discovery",
+       "start_ns": 16975290844062
+      }
+     ]
+    },
+    {
+     "path": "/usr/lib64/pkcs11/p11-kit-trust.so",
+     "tables": [
+      {
+       "linkage": "live_return"
+      }
+     ],
+     "unobserved_windows": [
+      {
+       "end_ns": 16980879976257,
+       "reason": "late_discovery",
+       "start_ns": 16975290844062
+      }
+     ]
+    },
+    {
+     "path": "/usr/lib64/opensc-pkcs11.so",
+     "tables": [
+      {
+       "linkage": "interface"
+      },
+      {
+       "linkage": "interface"
+      },
+      {
+       "linkage": "interface"
+      }
+     ],
+     "unobserved_windows": [
+      {
+       "end_ns": 16981341412080,
+       "reason": "late_discovery",
+       "start_ns": 16975290844062
+      }
+     ]
+    }
+   ],
+   "modules_skipped": [
+    {
+     "name": "/usr/lib64/libp11-kit.so.0.4.11",
+     "reason": "a proxy closure array in a detailed capture attaches only its published tables, and none of its 64 lookalike function tables is published yet, so calls through it are not counted (a proxy closure array is admitted whole, as a prefix when named by the operator, or as published tables; an unnamed layer in a detailed capture attaches only its published tables); the providers it forwards to attach when they load"
+    }
+   ],
+   "interface_selection": {
+    "inventory_surfaces": [
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 0
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 1
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 2
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 3
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 4
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 5
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 6
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 7
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 8
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 9
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 10
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 11
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 12
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 13
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 14
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 15
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 16
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 17
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 18
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 19
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 20
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 21
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 22
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 23
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 24
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 25
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 26
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 27
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 28
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 29
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 30
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 31
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 32
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 33
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 34
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 35
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 36
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 37
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 38
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 39
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 40
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 41
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 42
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 43
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 44
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 45
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 46
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 47
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 48
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 49
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 50
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 51
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 52
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 53
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 54
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 55
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 56
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 57
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 58
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 59
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 60
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 61
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 62
+     },
+     {
+      "kind": "legacy",
+      "module": 1,
+      "ordinal": 63
+     },
+     {
+      "kind": "legacy",
+      "module": 2,
+      "ordinal": 0
+     },
+     {
+      "kind": "legacy",
+      "module": 3,
+      "ordinal": 0
+     },
+     {
+      "kind": "legacy",
+      "module": 4,
+      "ordinal": 0
+     },
+     {
+      "kind": "interface",
+      "module": 4,
+      "ordinal": 1
+     },
+     {
+      "kind": "legacy",
+      "module": 4,
+      "ordinal": 2
+     },
+     {
+      "kind": "interface",
+      "module": 4,
+      "ordinal": 3
+     },
+     {
+      "kind": "legacy",
+      "module": 4,
+      "ordinal": 4
+     },
+     {
+      "kind": "interface",
+      "module": 4,
+      "ordinal": 5
+     }
+    ],
+    "providers": [
+     {
+      "coverage": "absent_uncovered",
+      "module": 0
+     },
+     {
+      "coverage": "observed",
+      "module": 1
+     },
+     {
+      "coverage": "observed",
+      "module": 4
+     }
+    ],
+    "selection_truncated": false,
+    "standard_exports": [
+     {
+      "module": 0,
+      "status": "present"
+     },
+     {
+      "module": 1,
+      "status": "present"
+     },
+     {
+      "module": 2,
+      "status": "legacy_absent"
+     },
+     {
+      "module": 3,
+      "status": "legacy_absent"
+     },
+     {
+      "module": 4,
+      "status": "present"
+     }
+    ],
+    "tuples": [
+     {
+      "authority": "none",
+      "count": 1,
+      "inventory_matches": [],
+      "module": 1,
+      "request": {
+       "flags": 0,
+       "name": "exact_standard",
+       "version": "null"
+      },
+      "result": {
+       "flags": "zero",
+       "name": "exact_standard",
+       "version": "v3_2"
+      },
+      "rv": 0,
+      "table_match": false
+     },
+     {
+      "authority": "inventory",
+      "count": 1,
+      "inventory_matches": [
+       {
+        "name_agrees": false,
+        "surface": 68,
+        "version_agrees": true
+       },
+       {
+        "name_agrees": true,
+        "surface": 69,
+        "version_agrees": true
+       }
+      ],
+      "module": 4,
+      "request": {
+       "flags": 0,
+       "name": "exact_standard",
+       "version": "null"
+      },
+      "result": {
+       "flags": "zero",
+       "name": "exact_standard",
+       "version": "v3_2"
+      },
+      "rv": 0,
+      "table_match": true
+     }
+    ]
+   },
+   "skipped": [
+    {
+     "name": "discovery subject",
+     "reason": "function table unavailable in file-backed data"
+    },
+    {
+     "name": "counting coverage",
+     "reason": "counting probes were retired mid-capture; calls in the retire window were not observed"
+    },
+    {
+     "name": "discovery subject",
+     "reason": "discovery unavailable"
+    },
+    {
+     "name": "discovery subject",
+     "reason": "discovery unavailable"
+    },
+    {
+     "name": "discovery subject",
+     "reason": "discovery unavailable"
+    },
+    {
+     "name": "discovery subject",
+     "reason": "discovery unavailable"
+    },
+    {
+     "name": "discovery subject",
+     "reason": "static probes detached and exact pairs reattached"
+    }
+   ]
+  }
+ }
+}

@@ -10,23 +10,36 @@ spy log (one entry per forwarded call, every entry closed by a
 objects). The report's typed records (`functions[]`, `evidence.*`)
 are judged against that ledger; log text never scores.
 
-- RPO-PROXY (`test_rpo_proxy_outer`): exact-or-prefix-gap. The spy
-  layer (the tool's own calls) is either counted 1:1 or missed exactly
-  on a ledger-ordered prefix of at most the first two calls
-  (`C_Initialize`, then `C_GetSlotList`): the spy's table is
-  heap-published at the tool's `C_GetInterface` return and attaches
-  ~150-250 ms later, while `C_Initialize` fires microseconds after the
-  return, so the first call is physically uncatchable without a
-  synchronous hold. The gap branch is exact, never tolerant: the
-  missed set must equal the ledger prefix exactly, books must balance
-  per function, and it still forbids surplus, missing windows, and
-  exact claims (one twin per prong); phantoms are a named known issue
-  instead (see below). The backend legs and the proxy closure skip
-  stay strict-exact as below.
+- RPO-PROXY (`test_rpo_proxy_outer`): exact-or-prefix-gap on TWO
+  counted layers. The spy layer (the tool's own calls) and the proxy
+  layer (the forwarded calls counted on libp11-kit) are each either
+  counted 1:1 per function (calls and errors) or missed exactly on a
+  ledger-ordered prefix of at most the first three calls
+  (`C_Initialize`, then `C_GetSlotList` twice: the real workload
+  issues two, so the pin is three, not two): each layer's table
+  attaches after the burst starts, so leading calls are physically
+  uncatchable without a synchronous hold. Each gap branch is exact,
+  never tolerant: the missed multiset must equal the ledger prefix
+  exactly (Counter(order[:K]) with K pinned), books must balance per
+  function, and it still forbids surplus, missing windows, and
+  completeness claims (one twin per prong); phantoms are a named
+  known issue instead (see below). A zero-count proxy layer fails
+  its count leg (0 != ledger): the P1 arrival race stays NAMED in
+  notes, but it no longer passes the counts. The backend legs and
+  the proxy closure skip stay strict-exact as below.
 - RPO-OPENSC (`test_rpo_opensc_outer`): exact-or-prefix-gap with the
-  same ledger-prefix rule (at most the first two calls). The backend
-  legs are exact in both branches, including the adjudicated double
-  `C_Finalize`.
+  same ledger-prefix rule (at most the first three calls; the
+  opensc ledger only ever misses two). The backend legs are exact
+  in both branches, including the adjudicated double `C_Finalize`.
+
+Folded discovery-gap rows (`discovery subject` / `discovery
+unavailable` in `evidence.skipped[]`) are COUNTED in notes
+(`folded-gaps=N`), never failed: the fold is the catch-all for
+every unclassified discovery gap, and every real run — v0.7.1
+included — carries some. Failing on it fails healthy runs. A
+typed live-overflow record that distinguishes live-merge loss
+from other folded loss is v0.7.3 work; until then the engine
+seam tests guard the mechanism.
 
 Both cells count phantoms under KI-v072-proxy-phantom-inflight
 instead of forbidding them: without the in-flight gate (cut from
@@ -315,21 +328,19 @@ def check_hygiene(report, unattributed, unknown, failures, notes):
             f"phantoms (KI-v072-proxy-phantom-inflight): evidence={in_flight_end} rows={stuck!r}")
     else:
         notes.append("phantoms=0")
-    # The live-table-merge class folds to this exact generic row in
-    # evidence.skipped[] (the subject never reaches the document; the
-    # fold is pinned by
-    # live_table_merge_gap_folds_to_the_generic_discovery_row). A
-    # tightly-scoped outer run must never file one: any live overflow
-    # is a bug signal, and any other discovery gap here is equally
-    # unexpected. The message cannot name the subject — the fold hides
-    # it — so it names the fold instead.
+    # Folded discovery-gap rows are COUNTED here, never failed. The
+    # live-table-merge class folds to this exact generic row (the
+    # subject never reaches the document; the fold is pinned by
+    # live_table_merge_gap_folds_to_the_generic_discovery_row), but
+    # so does every other unclassified discovery gap — and every
+    # real run carries some (3-16 per report on both revisions, the
+    # healthy r4-r2 included). Failing on the fold fails healthy
+    # runs; the count stays so a typed live-overflow record (v0.7.3)
+    # can later separate merge loss from the other folded loss.
     folded = [row for row in (evidence.get("skipped") or [])
               if row.get("name") == "discovery subject"
               and row.get("reason") == "discovery unavailable"]
-    if folded:
-        failures.append(f"folded discovery gap rows (live-overflow class folds here): {folded!r}")
-    else:
-        notes.append("folded-gaps=0")
+    notes.append(f"folded-gaps={len(folded)}")
 
 
 def check_gfl_gi(report, ledger, backend, spyview, backend_indexes, failures, notes):
@@ -359,11 +370,19 @@ def check_gfl_gi(report, ledger, backend, spyview, backend_indexes, failures, no
         notes.append(f"gi: backend={gi_back} spy-ledger={gi_spy} tuples={isel}")
 
 
-#: Table calls the gap may miss, in ledger order. The spy's table is
-#: heap-published at the tool's interface return and attaches after it,
-#: so only a leading prefix can precede attach; anything past the first
-#: two calls is mid-burst and fails like any other miss.
+#: Table calls the gap may miss, in ledger order. Each layer's
+#: table attaches after the burst starts, so only a leading prefix
+#: can precede attach; anything past the pinned depth below is
+#: mid-burst and fails like any other miss.
 PREFIX_ALLOW = ("C_Initialize", "C_GetSlotList")
+
+#: Pinned prefix depth: a gap may miss at most the first three table
+#: calls — `C_Initialize` then `C_GetSlotList` twice, the real
+#: workload's leading run (the 106-shape misses exactly these three).
+#: The depth is a literal, never derived from the miss: a workload
+#: drift that needs a deeper (or differently-shaped) prefix fails
+#: loudly instead of silently widening the gap.
+PREFIX_MAX_MISSED_CALLS = 3
 
 
 def table_order(ledger):
@@ -371,15 +390,67 @@ def table_order(ledger):
             if fn not in ("C_GetFunctionList", "C_GetInterface")]
 
 
+def layer_books(ledger, observed_calls, observed_errors, layer, failures,
+                strict=False):
+    """Per-function books for one counted layer against the spy ledger.
+
+    Returns (exact, deficits). In strict mode every mismatch fails
+    immediately with a `layer`-named per-function message (deficits
+    included: a strict layer tolerates no miss). Otherwise surplus
+    and error mismatches fail immediately, while deficit-only
+    functions accumulate into the returned deficit multiset (want -
+    got) for the pinned-prefix analysis.
+    """
+    exact, deficits = True, Counter()
+    for fn in sorted(set(ledger.counts) | set(observed_calls)):
+        if fn in ("C_GetFunctionList", "C_GetInterface"):
+            continue
+        want, got = ledger.counts.get(fn, 0), observed_calls.get(fn, 0)
+        wanterr, goterr = ledger.errors.get(fn, 0), observed_errors.get(fn, 0)
+        if want == got and wanterr == goterr:
+            continue
+        exact = False
+        if not strict and got < want and goterr == wanterr:
+            deficits[fn] = want - got
+        else:
+            failures.append(
+                f"{layer} {fn}: obs calls={got} errs={goterr}, "
+                f"spy calls={want} errs={wanterr}")
+    return exact, deficits
+
+
+def pinned_prefix_failure(ledger, deficits, layer):
+    """The pinned-prefix verdict on a deficit multiset, one site.
+
+    Returns None when the miss is exactly the ledger's leading
+    prefix within the pinned depth, else the `layer`-named failure
+    message. The comparison is a multiset over ledger positions
+    (Counter(order[:K])), so a mid-burst occurrence of an allowed
+    function name still fails, as does any miss past the pinned
+    depth (workload drift fails loudly).
+    """
+    order = table_order(ledger)
+    if not set(deficits) <= set(PREFIX_ALLOW):
+        return f"{layer} miss is not the ledger prefix: {sorted(deficits)!r}"
+    missed = sum(deficits.values())
+    if (missed == 0 or missed > PREFIX_MAX_MISSED_CALLS
+            or deficits != Counter(order[:missed])):
+        return (f"{layer} miss is not the ledger prefix: {dict(deficits)!r} "
+                f"is not the leading {missed} {order[:missed]!r}")
+    return None
+
+
 def check_spy_prefix_gap(report, ledger, spyview, failures, notes):
     """Exact-or-prefix-gap verdict core for one spy layer.
 
     Returns "exact" or "prefix-gap". Exact needs every table function
     1:1 with exact errors. Otherwise the miss must be exactly the
-    ledger's leading prefix (at most `C_Initialize` then
-    `C_GetSlotList`), books must balance per function, and the full
-    honest disclosure must hold (window, PARTIAL, zero in-flight, zero
-    loss, no surplus, no unattributed rows). Anything else fails.
+    ledger's leading prefix (at most the first three table calls:
+    `C_Initialize` then `C_GetSlotList` twice), books must balance
+    per function, and the full honest disclosure must hold (window,
+    PARTIAL, zero loss, no surplus, no unattributed rows; in-flight
+    rows are counted under KI-v072-proxy-phantom-inflight, never
+    failed). Anything else fails.
     """
     order = table_order(ledger)
     mark = len(failures)
@@ -387,26 +458,14 @@ def check_spy_prefix_gap(report, ledger, spyview, failures, notes):
         failures.append(f"ledger shape drifted: table order starts {order[:2]!r}")
         return "exact"
     notes.append(f"ledger: total={ledger.total} prefix-ok")
-    exact, missed = True, []
-    for fn in sorted(set(ledger.counts) | set(spyview.calls)):
-        if fn in ("C_GetFunctionList", "C_GetInterface"):
-            continue
-        want, got = ledger.counts.get(fn, 0), spyview.calls.get(fn, 0)
-        wanterr, goterr = ledger.errors.get(fn, 0), spyview.errors.get(fn, 0)
-        if want != got or wanterr != goterr:
-            exact = False
-            if got < want and goterr == wanterr:
-                missed.append(fn)
-            else:
-                failures.append(
-                    f"spy {fn}: obs calls={got} errs={goterr}, "
-                    f"spy calls={want} errs={wanterr}")
+    exact, deficits = layer_books(ledger, spyview.calls, spyview.errors,
+                                  "spy", failures)
     if exact:
         notes.append("spy: exact")
         return "exact"
-    allowed = {frozenset(PREFIX_ALLOW[:1]), frozenset(PREFIX_ALLOW[:2])}
-    if frozenset(missed) not in allowed:
-        failures.append(f"spy miss is not the ledger prefix: {sorted(missed)!r}")
+    miss = pinned_prefix_failure(ledger, deficits, "spy")
+    if miss is not None:
+        failures.append(miss)
         return "exact"
     surplus = [fn for fn in sorted(set(ledger.counts) | set(spyview.calls))
                if fn not in ("C_GetFunctionList", "C_GetInterface")
@@ -427,25 +486,89 @@ def check_spy_prefix_gap(report, ledger, spyview, failures, notes):
     return "exact"
 
 
-def proxy_layer_counts(report):
-    """Counted proxy-layer calls, keyed by single function name.
+def proxy_layer_view(report):
+    """Counted proxy-layer view (calls and errors), keyed by single
+    function name.
 
     The MUST-FIX signal lives here: `split_layers` drops proxy rows
     (neither backend nor spy), so the outer judges cannot see the
-    proxy leg without this count.
+    proxy leg without this count. Unknown-name and multi-name proxy
+    rows are not folded in: unknown counted rows fail in hygiene and
+    aliased counted rows refuse in `split_layers`, so neither can
+    hide a miscount here.
     """
     modules = report.get("capture", {}).get("modules", [])
     sha = {m["sha256"] for m in modules
            if "libp11-kit" in (m.get("path") or "") and m.get("sha256")}
-    calls = Counter()
+    view = LayerView()
     for row in report.get("functions", []):
         if row.get("calls", 0) <= 0:
             continue
         mod = row.get("module") or {}
         names = row.get("names") or ["unknown"]
         if mod.get("sha256") in sha and names != ["unknown"] and len(names) == 1:
-            calls[names[0]] += row.get("calls", 0)
-    return calls
+            view.calls[names[0]] += row.get("calls", 0)
+            view.errors[names[0]] += row.get("errors", 0)
+    return view
+
+
+def proxy_layer_counts(report):
+    """Counted proxy-layer calls, keyed by single function name."""
+    return proxy_layer_view(report).calls
+
+
+def check_proxy_counts(report, ledger, failures, notes, allow_prefix_gap):
+    """Exact-or-prefix-gap verdict core for the proxy layer.
+
+    The typed proxy-layer counts must equal the spy ledger multiset
+    per function (calls and errors), or miss exactly the ledger's
+    leading prefix within the pinned depth (same rule as the spy
+    layer, own window). Any surplus — a duplicate count, a double
+    attachment, a wrong attribution — fails immediately in both
+    branches, and a zero-count proxy layer fails (0 != ledger): the
+    P1 arrival shape is named by the live-signal leg, but it no
+    longer passes the counts. `C_GetFunctionList`/`C_GetInterface`
+    are excluded like in every other table comparison (the proxy
+    never counts them; see the GFL/GI leg for the interface pair).
+    """
+    order = table_order(ledger)
+    mark = len(failures)
+    if order[:2] != list(PREFIX_ALLOW):
+        failures.append(f"proxy ledger shape drifted: table order starts {order[:2]!r}")
+        return
+    notes.append(f"proxy ledger: total={ledger.total} prefix-ok")
+    view = proxy_layer_view(report)
+    exact, deficits = layer_books(ledger, view.calls, view.errors,
+                                  "proxy", failures,
+                                  strict=not allow_prefix_gap)
+    if exact:
+        notes.append(f"proxy: exact {sum(view.calls.values())}/"
+                     f"{ledger.total - ledger.counts.get('C_GetInterface', 0)
+                      - ledger.counts.get('C_GetFunctionList', 0)}")
+        return
+    if not allow_prefix_gap:
+        return
+    miss = pinned_prefix_failure(ledger, deficits, "proxy")
+    if miss is not None:
+        failures.append(miss)
+        return
+    surplus = [fn for fn in sorted(set(ledger.counts) | set(view.calls))
+               if fn not in ("C_GetFunctionList", "C_GetInterface")
+               and view.calls.get(fn, 0) > ledger.counts.get(fn, 0)]
+    if surplus:
+        failures.append(f"proxy gap branch with phantom surplus: {surplus!r}")
+    record = discovery_record(report, "libp11-kit")
+    window = late_window(record) if record is not None else None
+    if window is None:
+        failures.append("proxy gap branch without a late_discovery window naming the proxy")
+    else:
+        notes.append(f"proxy gap window: [{window['start_ns']},{window['end_ns']}]")
+    if report.get("evidence", {}).get("completeness") != "PARTIAL":
+        failures.append("proxy gap branch while the report claims completeness="
+                        f"{report.get('evidence', {}).get('completeness')!r}")
+    if len(failures) == mark:
+        missed = sorted(deficits)
+        notes.append(f"proxy missed-before-attach (ledger-exact): {missed!r}")
 
 
 def check_proxy_live_table(report, failures, notes):
@@ -455,10 +578,11 @@ def check_proxy_live_table(report, failures, notes):
     "live_return" on its discovery record); the merge-cap regression
     dropped exactly that table. With zero counted proxy calls no live
     table can exist (the pre-existing P1 arrival race is the known
-    zero-count cause), so the signal is unobservable and the leg only
-    names that in notes: failing here would conflate the MUST-FIX
-    signal with the arrival race. Judging a zero-count proxy leg stays
-    future work (SR-F5); this leg only asserts on counting runs.
+    zero-count cause), so the signal is unobservable and this leg
+    only names that in notes: failing here would conflate the
+    MUST-FIX signal with the arrival race. The zero itself is judged
+    by the proxy count leg (`check_proxy_counts`, 0 != ledger); this
+    leg only asserts the mechanism signal on counting runs.
     """
     proxy = proxy_layer_counts(report)
     if sum(proxy.values()) == 0:
@@ -476,12 +600,16 @@ def check_proxy_live_table(report, failures, notes):
         notes.append(f"proxy: {len(tables)} tables incl {len(live)} live")
 
 
-def judge_proxy_common_legs(report, ledger, tool_rc, priv_objects, pub_objects):
-    """Tool, backend, and interface legs shared by both proxy judges.
+def judge_proxy_common_legs(report, ledger, tool_rc, priv_objects, pub_objects,
+                            allow_prefix_gap):
+    """Tool, backend, proxy-count, and interface legs shared by both
+    proxy judges.
 
     Returns (failures, notes, backend, spyview, backend_indexes,
     unattributed, unknown). The spy layer itself is judged separately
-    (strict-exact vs prefix-gap); everything else is identical.
+    (strict-exact vs prefix-gap); the proxy count leg takes the same
+    branch discipline via `allow_prefix_gap`; everything else is
+    identical.
     """
     failures, notes = [], []
     if tool_rc != 0 or priv_objects != 2 or pub_objects != 2:
@@ -491,6 +619,7 @@ def judge_proxy_common_legs(report, ledger, tool_rc, priv_objects, pub_objects):
         notes.append("tool: rc=0 objects=2+2")
     notes.append(f"ledger: total={ledger.total}")
     check_proxy_live_table(report, failures, notes)
+    check_proxy_counts(report, ledger, failures, notes, allow_prefix_gap)
     _, _, backend, spyview, unattributed, unknown = split_layers(report, "libsofthsm2.so")
     modules = report.get("capture", {}).get("modules", [])
     backend_indexes = {i for i, m in enumerate(modules) if "libsofthsm2.so" in (m.get("path") or "")}
@@ -528,18 +657,12 @@ def judge_proxy_tail(report, failures, notes):
 def judge_proxy_outer(report, ledger, tool_rc, priv_objects, pub_objects):
     """Strict-exact verdict for RPO-PROXY (no miss-tolerant branch)."""
     failures, notes, _, spyview, _, unattributed, unknown = judge_proxy_common_legs(
-        report, ledger, tool_rc, priv_objects, pub_objects)
-    for fn in sorted(set(ledger.counts) | set(spyview.calls)):
-        if fn in ("C_GetFunctionList", "C_GetInterface"):
-            continue
-        want, got = ledger.counts.get(fn, 0), spyview.calls.get(fn, 0)
-        wanterr, goterr = ledger.errors.get(fn, 0), spyview.errors.get(fn, 0)
-        # The spy forwards 1:1: any miss fails, and any surplus is a
-        # phantom count, never proxy traffic (the proxy sits behind it).
-        if want != got or wanterr != goterr:
-            failures.append(
-                f"spy {fn}: obs calls={got} errs={goterr}, spy calls={want} errs={wanterr}")
-    if not failures:
+        report, ledger, tool_rc, priv_objects, pub_objects, False)
+    # The spy forwards 1:1: any miss fails, and any surplus is a
+    # phantom count, never proxy traffic (the proxy sits behind it).
+    exact, _ = layer_books(ledger, spyview.calls, spyview.errors,
+                           "spy", failures, strict=True)
+    if exact and not failures:
         notes.append(f"spy: exact {sum(spyview.calls.values())}/{ledger.total - ledger.counts.get('C_GetInterface', 0) - ledger.counts.get('C_GetFunctionList', 0)}")
     judge_proxy_tail(report, failures, notes)
     check_hygiene(report, unattributed, unknown, failures, notes)
@@ -550,14 +673,16 @@ def judge_proxy_outer(report, ledger, tool_rc, priv_objects, pub_objects):
 def judge_proxy_outer_prefix_gap(report, ledger, tool_rc, priv_objects, pub_objects):
     """Exact-or-prefix-gap verdict for RPO-PROXY.
 
-    Same legs as the strict judge, except the spy layer uses the
-    prefix-gap core: exact when every forwarded call is counted,
-    otherwise green only for exactly the ledger's leading prefix with
-    its full typed disclosure (books balanced, window, PARTIAL, zero
-    in-flight, zero loss, no surplus).
+    Same legs as the strict judge, except the spy and proxy layers
+    use the prefix-gap core: exact when every forwarded call is
+    counted, otherwise green only for exactly the ledger's leading
+    prefix with its full typed disclosure (books balanced, window,
+    PARTIAL, zero loss, no surplus; in-flight rows are counted
+    under KI-v072-proxy-phantom-inflight). The returned branch
+    tracks the spy layer (pre-existing semantics).
     """
     failures, notes, _, spyview, _, unattributed, unknown = judge_proxy_common_legs(
-        report, ledger, tool_rc, priv_objects, pub_objects)
+        report, ledger, tool_rc, priv_objects, pub_objects, True)
     branch = check_spy_prefix_gap(report, ledger, spyview, failures, notes)
     judge_proxy_tail(report, failures, notes)
     check_hygiene(report, unattributed, unknown, failures, notes)
@@ -815,7 +940,13 @@ def twin_discovery(path, tables=1, window=True):
 
 
 def proxy_fixture(mutate=None):
-    """A passing RPO-PROXY (ledger, report): `mutate` breaks one prong."""
+    """A passing RPO-PROXY (ledger, report): `mutate` breaks one prong.
+
+    The proxy layer mirrors the ledger table counts exactly (the
+    proxy count leg judges them 1:1), and the proxy discovery record
+    carries a live table plus a late window (the mechanism signal
+    and the gap disclosure).
+    """
     ledger = parse_spy_log(spy_text([("C_GetInterface", 0), ("C_Initialize", 0),
                                      ("C_GetSlotList", 0), ("C_Login", 0),
                                      ("C_GetAttributeValue", 0), ("C_GetAttributeValue", 6)]))
@@ -835,6 +966,20 @@ def proxy_fixture(mutate=None):
               "through it are not counted (a proxy closure array is admitted whole)"}]
     report = twin_report(backend_rows, spy_rows, discovery, skips=skips,
                          tuples=[{"module": 0, "count": 1, "table_match": False}])
+    report["capture"]["modules"].append({"path": "/m/libp11-kit.so.0", "sha256": PROXY_SHA})
+    report["functions"].extend([
+        function_row("C_Initialize", PROXY_SHA, 1),
+        function_row("C_GetSlotList", PROXY_SHA, 1),
+        function_row("C_Login", PROXY_SHA, 1),
+        function_row("C_GetAttributeValue", PROXY_SHA, 2, errors=1),
+    ])
+    report["evidence"]["discovery"].append({
+        "path": "/m/libp11-kit.so.0",
+        "tables": [{"linkage": "heuristic", "version": "3.1"},
+                   {"linkage": "live_return", "version": "3.1"}],
+        "unobserved_windows": [{"reason": "late_discovery",
+                                "start_ns": 100, "end_ns": 500}],
+    })
     if mutate:
         mutate(report, ledger)
     return ledger, report
@@ -857,6 +1002,77 @@ def opensc_fixture(mutate=None):
     report = twin_report(backend_rows, spy_rows, discovery,
                          tuples=[{"module": 0, "count": 1, "table_match": True}],
                          backend_path="/m/opensc-pkcs11.so")
+    if mutate:
+        mutate(report, ledger)
+    return ledger, report
+
+
+REAL_FIXTURES = Path(__file__).parent / "fixtures" / "outer-layers"
+
+
+def load_real_fixture(name):
+    """A real run's trimmed report plus its real spy ledger.
+
+    The fixture file carries the trimmed report.json (every
+    judge-read key with real values), the real spy entries in
+    ledger order, and the tool effect. The entries render through
+    the strict-format helper, so the ledger parses through the
+    same strict parser as the live cells.
+    """
+    blob = json.loads((REAL_FIXTURES / f"{name}.json").read_text())
+    ledger = parse_spy_log(spy_text([(entry[0], entry[1])
+                                     for entry in blob["spy_entries"]],
+                                    loaded=blob["spy_loaded"]))
+    tool = blob["tool"]
+    return ledger, blob["report"], tool["rc"], tool["priv"], tool["pub"]
+
+
+def gsl_fixture(count=2, drift_pos=None, mutate=None):
+    """A passing RPO-PROXY whose ledger issues C_GetSlotList `count` times.
+
+    The GSLs lead the table order (the real workload's shape);
+    `drift_pos` moves the last GSL to that table-order position to
+    model workload drift (a mid-burst GSL the prefix must not
+    cover). Proxy rows mirror the ledger exactly, like
+    `proxy_fixture`.
+    """
+    table = ["C_Initialize"] + ["C_GetSlotList"] * count + [
+        "C_Login", "C_GetAttributeValue", "C_GetAttributeValue"]
+    if drift_pos is not None:
+        table.pop(count)
+        table.insert(drift_pos, "C_GetSlotList")
+    entries = [("C_GetInterface", 0)] + [(fn, 0) for fn in table]
+    entries[-1] = ("C_GetAttributeValue", 6)
+    ledger = parse_spy_log(spy_text(entries))
+    backend_rows = [function_row("C_Initialize", BACKEND_SHA, 1),
+                    function_row("C_GetSlotList", BACKEND_SHA, 4 + count),
+                    function_row("C_Login", BACKEND_SHA, 1),
+                    function_row("C_GetAttributeValue", BACKEND_SHA, 2, errors=1),
+                    function_row("C_GetFunctionList", BACKEND_SHA, 1)]
+    spy_rows = [function_row("C_Initialize", SPY_SHA, 1),
+                function_row("C_GetSlotList", SPY_SHA, count),
+                function_row("C_Login", SPY_SHA, 1),
+                function_row("C_GetAttributeValue", SPY_SHA, 2, errors=1)]
+    proxy_rows = [function_row("C_Initialize", PROXY_SHA, 1),
+                  function_row("C_GetSlotList", PROXY_SHA, count),
+                  function_row("C_Login", PROXY_SHA, 1),
+                  function_row("C_GetAttributeValue", PROXY_SHA, 2, errors=1)]
+    discovery = [twin_discovery("/m/libsofthsm2.so"), twin_discovery("/m/pkcs11-spy.so")]
+    skips = [{"name": "/usr/lib64/libp11-kit.so.0", "reason":
+              "a proxy closure array in a detailed capture attaches only its published tables, "
+              "and none of its 64 lookalike function tables is published yet, so calls "
+              "through it are not counted (a proxy closure array is admitted whole)"}]
+    report = twin_report(backend_rows, spy_rows, discovery, skips=skips,
+                         tuples=[{"module": 0, "count": 1, "table_match": False}])
+    report["capture"]["modules"].append({"path": "/m/libp11-kit.so.0", "sha256": PROXY_SHA})
+    report["functions"].extend(proxy_rows)
+    report["evidence"]["discovery"].append({
+        "path": "/m/libp11-kit.so.0",
+        "tables": [{"linkage": "heuristic", "version": "3.1"},
+                   {"linkage": "live_return", "version": "3.1"}],
+        "unobserved_windows": [{"reason": "late_discovery",
+                                "start_ns": 100, "end_ns": 500}],
+    })
     if mutate:
         mutate(report, ledger)
     return ledger, report
@@ -1113,22 +1329,23 @@ class ProxyJudgeTwins(unittest.TestCase):
 
 
 def proxy_live_fixture(live=True, counted=True):
-    """proxy_fixture plus a proxy module, proxy rows, and a proxy record.
+    """proxy_fixture with a tunable proxy mechanism signal.
 
-    `live` controls whether the proxy discovery record carries a
-    live_return table; `counted` controls whether any proxy row counts.
+    The base fixture already carries exact proxy counts plus a live
+    table; `live` strips the live_return table when False, `counted`
+    strips the proxy rows when False. Note the stripped-counts shape
+    is NOT a passing shape: it fails the proxy count leg (0 !=
+    ledger) while the live-signal leg still names P1.
     """
     ledger, report = proxy_fixture()
-    report["capture"]["modules"].append({"path": "/m/libp11-kit.so.0", "sha256": PROXY_SHA})
-    if counted:
-        report["functions"].extend([
-            function_row("C_Initialize", PROXY_SHA, 1),
-            function_row("C_GetSlotList", PROXY_SHA, 1),
-        ])
-    tables = [{"linkage": "heuristic", "version": "3.1"}]
-    if live:
-        tables.append({"linkage": "live_return", "version": "3.1"})
-    report["evidence"]["discovery"].append({"path": "/m/libp11-kit.so.0", "tables": tables})
+    if not live:
+        for record in report["evidence"]["discovery"]:
+            if "libp11-kit" in (record.get("path") or ""):
+                record["tables"] = [table for table in record.get("tables", [])
+                                    if table.get("linkage") != "live_return"]
+    if not counted:
+        report["functions"] = [row for row in report["functions"]
+                               if (row.get("module") or {}).get("sha256") != PROXY_SHA]
     return ledger, report
 
 
@@ -1145,12 +1362,24 @@ class ProxyLiveSignalTwins(unittest.TestCase):
         self.assertFalse(verdict, verdict.detail)
         self.assertIn("MUST-FIX signal absent", verdict.detail)
 
-    def test_zero_proxy_p1_shape_names_unobservable_signal(self):
-        ledger, report = proxy_live_fixture(live=False, counted=False)
-        verdict = judge_proxy_outer(report, ledger, 0, 2, 2)
-        self.assertTrue(verdict, verdict.detail)
-        self.assertIn("P1 arrival shape", verdict.detail)
-        self.assertNotIn("MUST-FIX signal absent", verdict.detail)
+    def test_zero_proxy_fails_on_typed_count_equality(self):
+        # The 0/109 shape fails the proxy count leg (0 != ledger) on
+        # both judges; the live-signal leg still names P1 in notes
+        # (the arrival race is the known zero-count cause), but the
+        # name is not a pass. Recorded honestly: without a typed
+        # live-overflow record the judge cannot separate a P1 zero
+        # from a silent re-break — the engine seam tests guard the
+        # mechanism, and the typed field is v0.7.3 work.
+        for judge, marker in ((judge_proxy_outer, "proxy C_GetAttributeValue"),
+                              (judge_proxy_outer_prefix_gap,
+                               "proxy miss is not the ledger prefix")):
+            ledger, report = proxy_live_fixture(live=False, counted=False)
+            verdict = judge(report, ledger, 0, 2, 2)
+            self.assertFalse(verdict, verdict.detail)
+            self.assertIn(marker, verdict.detail)
+            self.assertIn("P1 arrival shape", verdict.detail)
+            self.assertIn("folded-gaps=0", verdict.detail)
+            self.assertNotIn("MUST-FIX signal absent", verdict.detail)
 
     def test_prefix_gap_judge_sees_the_live_signal_too(self):
         ledger, report = proxy_live_fixture(live=True, counted=True)
@@ -1163,29 +1392,50 @@ FOLDED_GAP_ROW = {"name": "discovery subject", "reason": "discovery unavailable"
 
 
 class FoldedGapTwins(unittest.TestCase):
-    def test_folded_discovery_gap_fails(self):
+    def test_folded_discovery_gap_is_a_counted_note(self):
+        # The catch-all fold fires on every real run (the healthy
+        # r4-r2 carries 3, v0.7.1 runs carry 3-5): failing on it
+        # fails healthy runs. The judge counts it and passes.
         def gap(report, _ledger):
             report["evidence"]["skipped"] = [dict(FOLDED_GAP_ROW)]
         ledger, report = proxy_fixture(gap)
         verdict = judge_proxy_outer(report, ledger, 0, 2, 2)
-        self.assertFalse(verdict, verdict.detail)
-        self.assertIn("folded discovery gap", verdict.detail)
+        self.assertTrue(verdict, verdict.detail)
+        self.assertIn("folded-gaps=1", verdict.detail)
+        self.assertNotIn("folded discovery gap", verdict.detail)
 
-    def test_zero_proxy_with_folded_gap_fails(self):
-        # The 0/109 MF-1 signature with its gap: the live leg notes
-        # P1, the gap leg fails.
-        ledger, report = proxy_live_fixture(live=False, counted=False)
-        report["evidence"]["skipped"] = [dict(FOLDED_GAP_ROW)]
-        verdict = judge_proxy_outer(report, ledger, 0, 2, 2)
-        self.assertFalse(verdict, verdict.detail)
-        self.assertIn("folded discovery gap", verdict.detail)
+    def test_folded_discovery_gap_is_a_counted_note_prefix_gap(self):
+        def gap(report, _ledger):
+            report["evidence"]["skipped"] = [dict(FOLDED_GAP_ROW)] * 3
+        ledger, report = proxy_fixture(gap)
+        verdict = judge_proxy_outer_prefix_gap(report, ledger, 0, 2, 2)
+        self.assertTrue(verdict, verdict.detail)
+        self.assertEqual(verdict.branch, "exact")
+        self.assertIn("folded-gaps=3", verdict.detail)
 
-    def test_folded_discovery_gap_fails_opensc(self):
+    def test_zero_proxy_with_folded_gap_fails_on_counts_not_the_fold(self):
+        # The 0/109 shape with a folded row: the live leg names P1,
+        # the fold is a counted note, and the COUNT leg fails. This
+        # pins the reconciliation: zeros fail through typed count
+        # equality (0 != ledger), never through the fold.
+        for judge, marker in ((judge_proxy_outer, "proxy C_GetAttributeValue"),
+                              (judge_proxy_outer_prefix_gap,
+                               "proxy miss is not the ledger prefix")):
+            ledger, report = proxy_live_fixture(live=False, counted=False)
+            report["evidence"]["skipped"] = [dict(FOLDED_GAP_ROW)]
+            verdict = judge(report, ledger, 0, 2, 2)
+            self.assertFalse(verdict, verdict.detail)
+            self.assertIn(marker, verdict.detail)
+            self.assertIn("folded-gaps=1", verdict.detail)
+            self.assertIn("P1 arrival shape", verdict.detail)
+            self.assertNotIn("folded discovery gap", verdict.detail)
+
+    def test_folded_discovery_gap_is_a_counted_note_opensc(self):
         ledger, report = opensc_fixture()
-        report["evidence"]["skipped"] = [dict(FOLDED_GAP_ROW)]
+        report["evidence"]["skipped"] = [dict(FOLDED_GAP_ROW)] * 4
         verdict = judge_opensc_outer(report, ledger, 1, "Available slots:\n")
-        self.assertFalse(verdict, verdict.detail)
-        self.assertIn("folded discovery gap", verdict.detail)
+        self.assertTrue(verdict, verdict.detail)
+        self.assertIn("folded-gaps=4", verdict.detail)
 
     def test_unrelated_skip_rows_still_pass(self):
         # Null-pointer function rows (present in every real run) are
@@ -1449,6 +1699,231 @@ class OpenscJudgeTwins(unittest.TestCase):
     def test_tool_effect_mismatch_fails(self):
         verdict = self.verdict(rc=0)
         self.assertFalse(verdict, verdict.detail)
+
+
+class PrefixMultisetTwins(unittest.TestCase):
+    """The multiset prefix rule (Counter(order[:K]), K pinned)."""
+
+    def test_prefix_depth_pins_three_calls(self):
+        # The gap's depth lives in PREFIX_MAX_MISSED_CALLS and the
+        # judge derives its accepted multisets from it: widening the
+        # constant must fail here, not silently widen the gap.
+        self.assertEqual(PREFIX_MAX_MISSED_CALLS, 3)
+
+    def test_gsl_double_miss_passes_prefix_gap(self):
+        # The real 106-shape: C_Initialize plus both leading
+        # C_GetSlotLists missed, everything else exact.
+        def drop_prefix(report, _ledger):
+            report["functions"] = [r for r in report["functions"]
+                                   if not (r["names"] in (["C_Initialize"], ["C_GetSlotList"])
+                                           and (r["module"] or {}).get("sha256") == SPY_SHA)]
+        ledger, report = gsl_fixture(mutate=drop_prefix)
+        verdict = judge_proxy_outer_prefix_gap(report, ledger, 0, 2, 2)
+        self.assertTrue(verdict, verdict.detail)
+        self.assertEqual(verdict.branch, "prefix-gap")
+
+    def test_mid_burst_gsl_miss_rejected(self):
+        # Workload drift: the second GSL fires mid-burst (table
+        # position 4), and the miss covers it. Every missed name is
+        # allowed, but the multiset is not the leading prefix — the
+        # old name-only rule passed this; the multiset rule fails it.
+        def drop_prefix(report, _ledger):
+            report["functions"] = [r for r in report["functions"]
+                                   if not (r["names"] in (["C_Initialize"], ["C_GetSlotList"])
+                                           and (r["module"] or {}).get("sha256") == SPY_SHA)]
+        ledger, report = gsl_fixture(drift_pos=4, mutate=drop_prefix)
+        verdict = judge_proxy_outer_prefix_gap(report, ledger, 0, 2, 2)
+        self.assertFalse(verdict, verdict.detail)
+        self.assertIn("spy miss is not the ledger prefix", verdict.detail)
+
+    def test_four_deep_prefix_rejected(self):
+        # Three leading GSLs plus Initialize is four calls: past the
+        # pinned depth, even though every name is allowed and the
+        # multiset IS a leading prefix. The old name-only rule
+        # passed this too.
+        def drop_prefix(report, _ledger):
+            report["functions"] = [r for r in report["functions"]
+                                   if not (r["names"] in (["C_Initialize"], ["C_GetSlotList"])
+                                           and (r["module"] or {}).get("sha256") == SPY_SHA)]
+        ledger, report = gsl_fixture(count=3, mutate=drop_prefix)
+        verdict = judge_proxy_outer_prefix_gap(report, ledger, 0, 2, 2)
+        self.assertFalse(verdict, verdict.detail)
+        self.assertIn("spy miss is not the ledger prefix", verdict.detail)
+
+
+class ProxyCountTwins(unittest.TestCase):
+    """The proxy count leg: typed counts equal the ledger multiset."""
+
+    def test_proxy_duplicate_count_fails_both_judges(self):
+        # A closure-array duplicate (or double attachment) counts
+        # C_Login 20 extra times on the proxy layer while backend
+        # and spy stay exact: both judges fail on the surplus.
+        def double(report, _ledger):
+            report["functions"].append(function_row("C_Login", PROXY_SHA, 20))
+        for judge in (judge_proxy_outer, judge_proxy_outer_prefix_gap):
+            ledger, report = proxy_fixture(double)
+            verdict = judge(report, ledger, 0, 2, 2)
+            self.assertFalse(verdict, verdict.detail)
+            self.assertIn("proxy C_Login", verdict.detail)
+
+    def test_proxy_wrong_function_fails_both_judges(self):
+        # Wrong attribution: the proxy counts a call the ledger
+        # never issued at all.
+        def wrong(report, _ledger):
+            report["functions"].append(function_row("C_SignInit", PROXY_SHA, 1))
+        for judge in (judge_proxy_outer, judge_proxy_outer_prefix_gap):
+            ledger, report = proxy_fixture(wrong)
+            verdict = judge(report, ledger, 0, 2, 2)
+            self.assertFalse(verdict, verdict.detail)
+            self.assertIn("proxy C_SignInit", verdict.detail)
+
+    def test_proxy_mid_burst_deficit_fails_both_judges(self):
+        # A mid-burst proxy deficit (Login missed, prefix intact)
+        # is not a prefix gap on either judge.
+        def drop_login(report, _ledger):
+            report["functions"] = [r for r in report["functions"]
+                                   if not (r["names"] == ["C_Login"]
+                                           and (r["module"] or {}).get("sha256") == PROXY_SHA)]
+        ledger, report = proxy_fixture(drop_login)
+        verdict = judge_proxy_outer(report, ledger, 0, 2, 2)
+        self.assertFalse(verdict, verdict.detail)
+        self.assertIn("proxy C_Login", verdict.detail)
+        ledger, report = proxy_fixture(drop_login)
+        verdict = judge_proxy_outer_prefix_gap(report, ledger, 0, 2, 2)
+        self.assertFalse(verdict, verdict.detail)
+        self.assertIn("proxy miss is not the ledger prefix", verdict.detail)
+
+    def test_proxy_error_mismatch_fails_both_judges(self):
+        # Calls exact but an error mismatches on the proxy layer.
+        def err(report, _ledger):
+            for row in report["functions"]:
+                if row["names"] == ["C_Login"] and (row["module"] or {}).get("sha256") == PROXY_SHA:
+                    row["errors"] += 1
+        for judge in (judge_proxy_outer, judge_proxy_outer_prefix_gap):
+            ledger, report = proxy_fixture(err)
+            verdict = judge(report, ledger, 0, 2, 2)
+            self.assertFalse(verdict, verdict.detail)
+            self.assertIn("proxy C_Login", verdict.detail)
+
+    def test_proxy_prefix_miss_passes_prefix_fails_strict(self):
+        # The 108-shape on the proxy layer (Initialize missed
+        # before attach, disclosed): the prefix judge passes with
+        # the proxy gap note, the strict judge fails.
+        def drop_init(report, _ledger):
+            report["functions"] = [r for r in report["functions"]
+                                   if not (r["names"] == ["C_Initialize"]
+                                           and (r["module"] or {}).get("sha256") == PROXY_SHA)]
+        ledger, report = proxy_fixture(drop_init)
+        verdict = judge_proxy_outer_prefix_gap(report, ledger, 0, 2, 2)
+        self.assertTrue(verdict, verdict.detail)
+        self.assertIn("proxy missed-before-attach (ledger-exact): ['C_Initialize']",
+                      verdict.detail)
+        ledger, report = proxy_fixture(drop_init)
+        verdict = judge_proxy_outer(report, ledger, 0, 2, 2)
+        self.assertFalse(verdict, verdict.detail)
+        self.assertIn("proxy C_Initialize", verdict.detail)
+
+    def test_proxy_gap_without_window_fails(self):
+        def drop_both(report, _ledger):
+            report["functions"] = [r for r in report["functions"]
+                                   if not (r["names"] == ["C_Initialize"]
+                                           and (r["module"] or {}).get("sha256") == PROXY_SHA)]
+            for record in report["evidence"]["discovery"]:
+                if "libp11-kit" in (record.get("path") or ""):
+                    record.pop("unobserved_windows", None)
+        ledger, report = proxy_fixture(drop_both)
+        verdict = judge_proxy_outer_prefix_gap(report, ledger, 0, 2, 2)
+        self.assertFalse(verdict, verdict.detail)
+        self.assertIn("window naming the proxy", verdict.detail)
+
+    def test_proxy_gap_with_complete_claim_fails(self):
+        def drop_and_claim(report, _ledger):
+            report["functions"] = [r for r in report["functions"]
+                                   if not (r["names"] == ["C_Initialize"]
+                                           and (r["module"] or {}).get("sha256") == PROXY_SHA)]
+            report["evidence"]["completeness"] = "COMPLETE"
+        ledger, report = proxy_fixture(drop_and_claim)
+        verdict = judge_proxy_outer_prefix_gap(report, ledger, 0, 2, 2)
+        self.assertFalse(verdict, verdict.detail)
+        self.assertIn("proxy gap branch while the report claims", verdict.detail)
+
+    def test_proxy_gap_with_surplus_fails(self):
+        def drop_and_bump(report, _ledger):
+            report["functions"] = [r for r in report["functions"]
+                                   if not (r["names"] == ["C_Initialize"]
+                                           and (r["module"] or {}).get("sha256") == PROXY_SHA)]
+            for row in report["functions"]:
+                if row["names"] == ["C_Login"] and (row["module"] or {}).get("sha256") == PROXY_SHA:
+                    row["calls"] += 1
+        ledger, report = proxy_fixture(drop_and_bump)
+        verdict = judge_proxy_outer_prefix_gap(report, ledger, 0, 2, 2)
+        self.assertFalse(verdict, verdict.detail)
+        self.assertIn("proxy gap branch with phantom surplus", verdict.detail)
+
+    def test_proxy_ledger_drift_names_proxy(self):
+        # Ledger puts SlotList before Initialize (tool drift): the
+        # proxy leg pins its shape independently of the spy leg.
+        ledger = parse_spy_log(spy_text([("C_GetInterface", 0), ("C_GetSlotList", 0),
+                                         ("C_Initialize", 0), ("C_Login", 0),
+                                         ("C_GetAttributeValue", 0),
+                                         ("C_GetAttributeValue", 6)]))
+        _, report = proxy_fixture()
+        verdict = judge_proxy_outer_prefix_gap(report, ledger, 0, 2, 2)
+        self.assertFalse(verdict, verdict.detail)
+        self.assertIn("proxy ledger shape drifted", verdict.detail)
+
+
+class RealReportTwins(unittest.TestCase):
+    """Twins built from real runs, not synthetic fixtures.
+
+    The synthetic fixtures cannot drift from reality without these
+    noticing: the healthy r4-r2 report must pass the exact branch,
+    the real 0/109 A03 report must fail on typed counts, and the
+    real 106-prefix A02 report must pass the proxy prefix leg
+    while failing the (P2) spy leg.
+    """
+
+    def test_real_healthy_r4_r2_passes_exact(self):
+        ledger, report, rc, priv, pub = load_real_fixture("outer-r4-r2-healthy")
+        verdict = judge_proxy_outer_prefix_gap(report, ledger, rc, priv, pub)
+        self.assertTrue(verdict, verdict.detail)
+        self.assertEqual(verdict.branch, "exact")
+        self.assertIn("proxy: exact 109/109", verdict.detail)
+        self.assertIn("folded-gaps=3", verdict.detail)
+        strict = judge_proxy_outer(report, ledger, rc, priv, pub)
+        self.assertTrue(strict, strict.detail)
+
+    def test_real_zero_a03_fails_on_typed_counts(self):
+        ledger, report, rc, priv, pub = load_real_fixture("outer-parity-a03-zero")
+        markers = ((judge_proxy_outer,
+                    "proxy C_GetAttributeValue", "spy C_GetAttributeValue"),
+                   (judge_proxy_outer_prefix_gap,
+                    "proxy miss is not the ledger prefix",
+                    "spy miss is not the ledger prefix"))
+        for judge, proxy_marker, spy_marker in markers:
+            verdict = judge(report, ledger, rc, priv, pub)
+            self.assertFalse(verdict, verdict.detail)
+            self.assertIn(proxy_marker, verdict.detail)
+            self.assertIn(spy_marker, verdict.detail)
+            self.assertIn("folded-gaps=4", verdict.detail)
+            self.assertNotIn("folded discovery gap", verdict.detail)
+
+    def test_real_prefix_a02_passes_proxy_prefix_fails_spy(self):
+        # The real 106-shape: the proxy missed exactly the leading
+        # Init+GSLx2 before attach (its own window discloses it),
+        # while the spy missed the whole burst (the P2 race). The
+        # proxy leg passes its prefix branch; the run still fails
+        # on the spy leg.
+        ledger, report, rc, priv, pub = load_real_fixture("outer-parity-a02-prefix106")
+        failures, notes = [], []
+        check_proxy_counts(report, ledger, failures, notes, True)
+        self.assertEqual(failures, [])
+        self.assertTrue(any("proxy missed-before-attach" in note for note in notes),
+                        "; ".join(notes))
+        verdict = judge_proxy_outer_prefix_gap(report, ledger, rc, priv, pub)
+        self.assertFalse(verdict, verdict.detail)
+        self.assertIn("spy miss is not the ledger prefix", verdict.detail)
+        self.assertIn("proxy missed-before-attach (ledger-exact)", verdict.detail)
 
 
 if __name__ == "__main__":

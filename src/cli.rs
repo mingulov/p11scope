@@ -2828,14 +2828,30 @@ mod tests {
 
     /// The shared test guard restores the previous level on drop, so
     /// a failing assertion cannot leak a level into unrelated tests.
+    /// Compares against the level the guard recorded (not a racy
+    /// pre-read), and polls boundedly: between the drop and the
+    /// observation another verbosity test may briefly hold the lock.
     #[test]
     fn verbosity_test_guard_restores_on_drop() {
-        let before = text_verbosity();
-        {
-            let _guard = VerbosityTestGuard::set(TextVerbosity::Verbose);
-            assert_eq!(text_verbosity(), TextVerbosity::Verbose);
+        let guard = VerbosityTestGuard::set(TextVerbosity::Verbose);
+        let previous = guard.previous.clone();
+        assert_eq!(text_verbosity(), TextVerbosity::Verbose);
+        drop(guard);
+        let start = std::time::Instant::now();
+        loop {
+            let serial = TEXT_VERBOSITY_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if text_verbosity() == previous {
+                break;
+            }
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(30),
+                "drop restores the level"
+            );
+            drop(serial);
+            std::thread::yield_now();
         }
-        assert_eq!(text_verbosity(), before, "drop restores the level");
     }
 
     /// The shared test lock is one lock: a second thread cannot take

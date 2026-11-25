@@ -1246,6 +1246,7 @@ jobs:
               --require inventory-sudo-stderr-fifo \
               --require daemonset-doctor --require daemonset-profile \
               --require daemonset-inventory \
+              --require-file "$out/minimal-cells/dynamic-selection.txt" \
               --known-failing-results "$out/minimal-cells/known-failing-results.json" \
               --known-failing-runner cell:scripts/ci/minimal-setcap.sh \
               --known-failing-host "$kf_host" \
@@ -1297,7 +1298,8 @@ jobs:
             --require inventory-diff-sudo-fifo-out \
             --require inventory-sudo-stderr-fifo \
             --require daemonset-doctor --require daemonset-profile \
-            --require daemonset-inventory
+            --require daemonset-inventory \
+            --require-file "$out/minimal-cells/dynamic-selection.txt"
           # Closed-set qualification and proof check uniformly over every
           # host and guest public CLI run before the full 41-cell gate.
           python3 -I scripts/ci/check-cell-results.py "$out/cells/results.jsonl" \
@@ -1426,6 +1428,8 @@ jobs:
             ${{ github.workspace }}/cli-out/qual.log
             ${{ github.workspace }}/cli-out/minimal.log
             ${{ github.workspace }}/cli-out/minimal-cells/results.jsonl
+            ${{ github.workspace }}/cli-out/minimal-cells/known-failing-results.json
+            ${{ github.workspace }}/cli-out/minimal-cells/dynamic-selection.txt
             ${{ github.workspace }}/cli-out/minimal-cells/logs/*.out
             ${{ github.workspace }}/cli-out/minimal-cells/logs/*.err
             ${{ github.workspace }}/cli-out/minimal-cells/logs/*.json

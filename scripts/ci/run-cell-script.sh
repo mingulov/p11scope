@@ -1,7 +1,7 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-3.0-or-later
 # SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
-# run-cell-script.sh NAME P11SCOPE OUTDIR [--expected-failure CELL ...] [--intermittent-failure CELL ...] [--allow-nonqualifying CELL ...] [--require CELL ...] [--known-failing-results PATH --known-failing-runner RUNNER --known-failing-host HOST]
+# run-cell-script.sh NAME P11SCOPE OUTDIR [--expected-failure CELL ...] [--intermittent-failure CELL ...] [--allow-nonqualifying CELL ...] [--require CELL ...] [--require-file PATH ...] [--known-failing-results PATH --known-failing-runner RUNNER --known-failing-host HOST]
 # Generic cell-script template: runs scripts/ci/<NAME>.sh P11SCOPE OUTDIR,
 # then validates OUTDIR/results.jsonl with check-cell-results.py.
 # Must run as root; the workflow invokes this wrapper through privilege
@@ -27,6 +27,7 @@ while [ $# -gt 0 ]; do
     --intermittent-failure) shift; [ $# -gt 0 ] || { echo "run-cell-script: --intermittent-failure needs a cell name" >&2; exit 2; }; EXPECTED+=(--intermittent-failure "$1"); shift ;;
     --known-failing-results|--known-failing-runner|--known-failing-host) option=$1; shift; [ $# -gt 0 ] || { echo "run-cell-script: $option needs a value" >&2; exit 2; }; EXPECTED+=("$option" "$1"); shift ;;
     --require) shift; [ $# -gt 0 ] || { echo "run-cell-script: --require needs a cell name" >&2; exit 2; }; EXPECTED+=(--require "$1"); shift ;;
+    --require-file) shift; [ $# -gt 0 ] || { echo "run-cell-script: --require-file needs a path" >&2; exit 2; }; EXPECTED+=(--require-file "$1"); shift ;;
     *) echo "run-cell-script: unknown option: $1" >&2; exit 2 ;;
   esac
 done

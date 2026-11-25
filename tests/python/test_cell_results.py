@@ -560,6 +560,36 @@ class TypedCellResultsTests(unittest.TestCase):
         self.assertEqual(document["results"][0]["signature"],
                          {"cell": "smoke", "qualification": "nonqualifying"})
 
+    def test_require_file_adds_dynamic_inventory_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            require_file = Path(tmp) / "dynamic-selection.txt"
+            require_file.write_text("doctor-minimal-p2\nmissing-cap-cap_bpf-p2\n", encoding="utf-8")
+            result, document = run_typed_checker(
+                [row("base", True), row("doctor-minimal-p2", True), row("missing-cap-cap_bpf-p2", True)],
+                "--require", "base", "--require-file", str(require_file))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual([item["test"] for item in document["selection"]],
+                             ["base", "doctor-minimal-p2", "missing-cap-cap_bpf-p2"])
+
+    def test_require_file_rows_are_required_and_malformed_files_fail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            require_file = Path(tmp) / "dynamic-selection.txt"
+            require_file.write_text("bonus\n", encoding="utf-8")
+            result, document = run_typed_checker(
+                [row("base", True)], "--require", "base", "--require-file", str(require_file))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("missing required cells: bonus", result.stderr)
+            self.assertFalse(document["complete"])
+            require_file.write_text("bad cell\n", encoding="utf-8")
+            result, _document = run_typed_checker(
+                [row("base", True)], "--require", "base", "--require-file", str(require_file))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("require file", result.stderr)
+            result, _document = run_typed_checker(
+                [row("base", True)], "--require", "base", "--require-file", str(Path(tmp) / "missing"))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("require file", result.stderr)
+
     def test_require_is_orthogonal_to_outcome_declarations(self):
         result, document = run_typed_checker(
             [row("smoke", False, "nonqualifying", "smoke")],

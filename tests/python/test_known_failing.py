@@ -1047,7 +1047,53 @@ class ProducerMutationSweepTests(unittest.TestCase):
                                    ("array-expansion", "allow_extra") in provider[0]["option_sequence"])
         self.record(results, "workflow-array-expansion-loss", outcomes["original"], outcomes["mutant"])
 
-        total = 13
+        # Dynamic require-file inventory is consumed into the typed
+        # selection; dropping it recreates the vng paranoid-bonus failure.
+        require_file_mutant = cell_source.replace(
+            "                required.append(line)\n                selection_order.append(line)\n",
+            "                pass\n", 1)
+        outcomes = {}
+        for label, source in (("original", cell_source), ("mutant", require_file_mutant)):
+            with tempfile.TemporaryDirectory() as temporary:
+                temp = Path(temporary)
+                (temp / "scripts/ci").mkdir(parents=True)
+                (temp / "scripts/check-known-failing.py").write_text(CHECKER.read_text(encoding="utf-8"), encoding="utf-8")
+                (temp / "scripts/qualify-public-cli.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+                (temp / "tests").mkdir()
+                (temp / "tests/known-failing.json").write_text('{"schema":"p11scope/known-failing/v1","rows":[]}\n', encoding="utf-8")
+                (temp / ".github/workflows").mkdir(parents=True)
+                (temp / ".github/workflows/main.yml").write_text("jobs: {}\n", encoding="utf-8")
+                script = temp / "scripts/ci/check-cell-results.py"
+                script.write_text(source, encoding="utf-8")
+                rows_path = temp / "results.jsonl"
+                rows_path.write_text(json.dumps({"cell": "bonus", "pass": True, "detail": "ok",
+                                                 "qualification": "qualified"}) + "\n", encoding="utf-8")
+                require_file = temp / "dynamic.txt"
+                require_file.write_text("bonus\n", encoding="utf-8")
+                output = temp / "typed.json"
+                run = subprocess.run([sys.executable, "-I", str(script), str(rows_path),
+                                      "--require-file", str(require_file),
+                                      "--known-failing-results", str(output),
+                                      "--known-failing-runner", "cell:scripts/qualify-public-cli.sh",
+                                      "--known-failing-host", "github"], capture_output=True, text=True)
+                outcomes[label] = run.returncode == 0
+        self.record(results, "cell-require-file-consumption", outcomes["original"], outcomes["mutant"])
+
+        # Both public-cli minimal checker sites must consume the dynamic
+        # inventory file; dropping either one is caught by the workflow contract.
+        workflow_text = (ROOT / ".github/workflows/privileged-tests.yml").read_text(encoding="utf-8")
+        flag = '--require-file "$out/minimal-cells/dynamic-selection.txt"'
+        workflow_mutant = workflow_text.replace(flag, "", 1)
+        self.record(results, "workflow-dynamic-require-file",
+                    workflow_text.count(flag) == 2, workflow_mutant.count(flag) == 2)
+
+        artifact_flag = "cli-out/minimal-cells/known-failing-results.json"
+        artifact_mutant = workflow_text.replace(artifact_flag, "", 1)
+        self.record(results, "workflow-minimal-typed-artifact",
+                    artifact_flag in workflow_text and "cli-out/minimal-cells/dynamic-selection.txt" in workflow_text,
+                    artifact_flag in artifact_mutant and "cli-out/minimal-cells/dynamic-selection.txt" in artifact_mutant)
+
+        total = 16
         self.assertEqual(results["failures"], [],
                          f"surviving producer mutants: {results['failures']}; killed {results['killed']}/{total}")
         print(f"known-failing producer mutation sweep: {results['killed']}/{total} killed")

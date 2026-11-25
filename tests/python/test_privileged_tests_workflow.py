@@ -39,6 +39,7 @@ CAMPAIGN = ROOT / "tests" / "privileged-campaign.json"
 CHECKER = ROOT / "scripts" / "check-known-failing.py"
 CELL_CHECKER = ROOT / "scripts" / "ci" / "check-cell-results.py"
 PRIVILEGED_RUNNER = ROOT / "scripts" / "run-privileged-lib-tests.sh"
+MINIMAL_SETCAP = ROOT / "scripts" / "ci" / "minimal-setcap.sh"
 
 
 def load_checker_module():
@@ -226,12 +227,25 @@ def run_real_cell_invocation(invocation, matrix, temp, host, conditional_nonqual
     options = expanded_option_sequence(invocation, matrix, conditional_nonqualifying)
     selected = []
     declarations = {}
+    dynamic_file = temp / "dynamic-selection.txt"
+    dynamic_cells = []
+    if any(name == "--require-file" for name, _value in options):
+        dynamic_cells = [] if host == "github" else [
+            "doctor-minimal-p2", "profile-pid-p2",
+            "missing-cap-cap_bpf-p2", "missing-cap-cap_perfmon-p2",
+            "missing-cap-cap_checkpoint_restore-p2", "missing-cap-cap_dac_read_search-p2",
+            "missing-cap-cap_sys_ptrace-p2"]
+        dynamic_file.write_text("".join(cell + "\n" for cell in dynamic_cells), encoding="utf-8")
     for name, value in options:
         if name in ("--require", "--expected-failure", "--intermittent-failure", "--allow-nonqualifying"):
             if value not in selected:
                 selected.append(value)
             if name != "--require":
                 declarations[value] = name
+        elif name == "--require-file":
+            for cell in dynamic_cells:
+                if cell not in selected:
+                    selected.append(cell)
         elif name == "--known-failing-results":
             value = str(typed_output)
         elif name == "--known-failing-host":
@@ -254,6 +268,8 @@ def run_real_cell_invocation(invocation, matrix, temp, host, conditional_nonqual
             value = str(typed_output)
         elif name == "--known-failing-host":
             value = host
+        elif name == "--require-file":
+            value = str(dynamic_file)
         args.extend((name, value))
     result = subprocess.run(args, capture_output=True, text=True, timeout=45)
     document = json.loads(typed_output.read_text(encoding="utf-8")) if typed_output.exists() else None
@@ -1079,10 +1095,41 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
                      "daemonset-inventory"):
             with self.subTest(cell=cell):
                 self.assertIn(f"--require {cell}", job)
+        self.assertEqual(2, job.count('--require-file "$out/minimal-cells/dynamic-selection.txt"'),
+                         "both the host wrapper and uniform guest gate must consume the dynamic inventory")
         # Artifacts carry the minimal evidence.
+        self.assertIn("minimal-cells/known-failing-results.json", job)
+        self.assertIn("minimal-cells/dynamic-selection.txt", job)
         self.assertIn("minimal-cells/logs/*.out", job)
         self.assertIn("minimal.log", job)
 
+    def test_minimal_setcap_dynamic_selection_covers_the_current_paranoid_bonus_rows(self):
+        source = MINIMAL_SETCAP.read_text(encoding="utf-8")
+        self.assertIn("write_dynamic_selection", source)
+        function = shell_function(source, "write_dynamic_selection")
+        harness_template = """set -u
+OUT=$1
+SAVED_PARANOID=$2
+paranoid_values() { printf "%s\n%s\n%s\n" "$SAVED_PARANOID" 3 4 | awk '!seen[$0]++'; }
+@FUNCTION@
+write_dynamic_selection
+"""
+        for paranoid, expected_count in (("2", 7), ("3", 0), ("4", 0)):
+            with self.subTest(paranoid=paranoid):
+                with tempfile.TemporaryDirectory() as temporary:
+                    output = Path(temporary) / "dynamic-selection.txt"
+                    script = harness_template.replace("@FUNCTION@", function)
+                    run = subprocess.run(["bash", "-c", script, "harness", temporary, paranoid],
+                                         capture_output=True, text=True)
+                    self.assertEqual(run.returncode, 0, run.stderr)
+                    lines = output.read_text(encoding="utf-8").splitlines()
+                    self.assertEqual(expected_count, len(lines), lines)
+                    if paranoid == "2":
+                        self.assertIn("doctor-minimal-p2", lines)
+                        self.assertIn("profile-pid-p2", lines)
+                        for cap in ("cap_bpf", "cap_perfmon", "cap_checkpoint_restore",
+                                    "cap_dac_read_search", "cap_sys_ptrace"):
+                            self.assertIn(f"missing-cap-{cap}-p2", lines)
     def test_witness_cli_matrix_runs_host_and_the_five_pinned_guests(self):
         job = job_body(self.yml, "witness-cli")
         match = re.search(r"kernel:\s*\[(.*?)\]", job)
@@ -1509,7 +1556,36 @@ class PrivilegedShellMutationSweepTests(unittest.TestCase):
         else:
             failures.append(f"shell-typed-selector-validation{outcomes}")
 
-        total = 2
+        # The dynamic paranoid inventory must include every parametrized
+        # row family; dropping one recreates an outside-selection failure.
+        minimal_source = MINIMAL_SETCAP.read_text(encoding="utf-8")
+        dynamic_mutant = minimal_source.replace(
+            "missing-cap-cap_sys_ptrace-p$paranoid",
+            "missing-cap-cap_sys_admin-p$paranoid", 1)
+        outcomes = {}
+        for label, candidate in (("original", minimal_source), ("mutant", dynamic_mutant)):
+            function = shell_function(candidate, "write_dynamic_selection")
+            harness = """set -u
+OUT=$1
+SAVED_PARANOID=2
+paranoid_values() { printf "%s\n%s\n%s\n" "$SAVED_PARANOID" 3 4 | awk '!seen[$0]++'; }
+@FUNCTION@
+write_dynamic_selection
+""".replace("@FUNCTION@", function)
+            with tempfile.TemporaryDirectory() as temporary:
+                run = subprocess.run(["bash", "-c", harness, "harness", temporary], capture_output=True, text=True)
+                lines = []
+                output = Path(temporary) / "dynamic-selection.txt"
+                if output.exists():
+                    lines = output.read_text(encoding="utf-8").splitlines()
+                outcomes[label] = (run.returncode == 0 and len(lines) == 7 and
+                                   "missing-cap-cap_sys_ptrace-p2" in lines)
+        if outcomes["original"] and not outcomes["mutant"]:
+            killed += 1
+        else:
+            failures.append(f"shell-dynamic-selection-inventory{outcomes}")
+
+        total = 3
         self.assertEqual([], failures, f"surviving shell mutants: {failures}; killed {killed}/{total}")
         print(f"privileged shell mutation sweep: {killed}/{total} killed")
 

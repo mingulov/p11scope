@@ -28,7 +28,7 @@ intermittent declaration is anonymous. Every
 --require cell must appear, so a dropped row fails.
 
 Usage:
-  python3 -I scripts/ci/check-cell-results.py RESULTS.JSONL [--expected-failure CELL ...] [--intermittent-failure CELL=LANE ...] [--allow-nonqualifying CELL ...] [--require CELL ...]
+  python3 -I scripts/ci/check-cell-results.py RESULTS.JSONL [--expected-failure CELL ...] [--intermittent-failure CELL=LANE ...] [--allow-nonqualifying CELL ...] [--require CELL ...] [--require-file PATH ...]
 """
 
 import importlib.util
@@ -127,6 +127,21 @@ def main(argv):
                 selection_order.append(value)
             except StopIteration:
                 return fail("--require needs a cell name")
+        elif token == "--require-file":
+            try:
+                require_file = next(iterator)
+            except StopIteration:
+                return fail("--require-file needs a path")
+            require_path = Path(require_file)
+            try:
+                require_text = require_path.read_text(encoding="utf-8")
+            except OSError as error:
+                return fail(f"require file {require_path}: cannot read: {error}")
+            for number, line in enumerate(require_text.splitlines(), 1):
+                if not line or line.strip() != line or any(character.isspace() for character in line):
+                    return fail(f"require file {require_path} line {number}: not one exact cell name")
+                required.append(line)
+                selection_order.append(line)
         elif token.startswith("-"):
             return fail(f"unknown option: {token}")
         else:
@@ -134,7 +149,7 @@ def main(argv):
     if len(known_results) != len(known_runner) or len(known_results) != len(known_host) or len(known_results) > 1:
         return fail("--known-failing-results, --known-failing-runner and --known-failing-host must appear together at most once")
     if len(positional) != 1:
-        return fail("usage: check-cell-results.py RESULTS.JSONL [--expected-failure CELL ...] [--intermittent-failure CELL ...] [--allow-nonqualifying CELL ...] [--require CELL ...] [--known-failing-results PATH --known-failing-runner RUNNER --known-failing-host HOST]")
+        return fail("usage: check-cell-results.py RESULTS.JSONL [--expected-failure CELL ...] [--intermittent-failure CELL ...] [--allow-nonqualifying CELL ...] [--require CELL ...] [--require-file PATH ...] [--known-failing-results PATH --known-failing-runner RUNNER --known-failing-host HOST]")
     path = Path(positional[0])
     try:
         text = path.read_text(encoding="utf-8")

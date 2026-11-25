@@ -533,6 +533,7 @@ OPTION_ARITY = {
     "--intermittent-failure": 1,
     "--allow-nonqualifying": 1,
     "--require": 1,
+    "--require-file": 1,
     "--known-failing-runner": 1,
     "--known-failing-results": 1,
     "--known-failing-host": 1,

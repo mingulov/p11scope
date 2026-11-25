@@ -2583,6 +2583,23 @@ fn pause_release_unproven_gap_projects_named_and_redacts_cross_subject() {
     }
 }
 
+#[test]
+fn pause_release_unproven_gap_histogram_names_the_row_with_its_count() {
+    let mut ev = tests::evidence();
+    ev.skipped = vec![SkippedOut {
+        name: PAUSE_SKIP_SUBJECT.into(),
+        reason: (*PAUSE_RELEASE_UNPROVEN_REASON).into(),
+    }];
+    ev.verdict();
+    let fragments = cause_fragments(&ev, &["skipped"], false);
+    assert!(
+        fragments
+            .iter()
+            .any(|fragment| fragment == &format!("{PAUSE_RELEASE_UNPROVEN_REASON}: 1")),
+        "{fragments:?}"
+    );
+}
+
 /// Counting-coverage retirements project under their own subject with
 /// their finite reason intact; anything else under the subject fails
 /// closed to the generic discovery skip instead of breaking the closed

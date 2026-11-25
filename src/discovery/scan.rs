@@ -20882,6 +20882,11 @@ int main(int argc, char **argv) {
             MAX_MOUNTINFO_BYTES + 1,
             "the excess byte is charged"
         );
+        assert_eq!(
+            excess.requests,
+            [vec![8 << 20; 8], vec![1]].concat(),
+            "eight full reads fill the absolute cap and the ninth probes one byte"
+        );
     }
 
     #[test]
@@ -20938,18 +20943,27 @@ int main(int argc, char **argv) {
 
     #[test]
     fn mountinfo_reader_never_reads_after_exhaustion_and_rechecks_deadline_before_publish() {
-        for mut budget in [
-            CaptureWorkBudget::new(ScanLimits {
-                per_object_bytes: 0,
-                total_bytes: 8,
-            }),
-            CaptureWorkBudget::new(ScanLimits {
-                per_object_bytes: 8,
-                total_bytes: 0,
-            }),
+        for (mut budget, reason) in [
+            (
+                CaptureWorkBudget::new(ScanLimits {
+                    per_object_bytes: 0,
+                    total_bytes: 8,
+                }),
+                MOUNTINFO_CEILING_REASON,
+            ),
+            (
+                CaptureWorkBudget::new(ScanLimits {
+                    per_object_bytes: 8,
+                    total_bytes: 0,
+                }),
+                IO_CEILING_REASON,
+            ),
         ] {
             let mut reader = RecordingReader::new([ReaderStep::Bytes(b"x".to_vec())]);
-            assert!(read_mountinfo_with(&mut reader, &mut budget, 8, |_| None).is_err());
+            assert_eq!(
+                read_mountinfo_with(&mut reader, &mut budget, 8, |_| None).unwrap_err(),
+                reason
+            );
             assert!(reader.requests.is_empty());
         }
 

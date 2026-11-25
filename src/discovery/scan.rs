@@ -20842,11 +20842,7 @@ int main(int argc, char **argv) {
     }
 
     #[test]
-    fn mountinfo_reader_ignores_small_per_object_legs_and_refuses_past_the_absolute_cap() {
-        // Small per-object legs still read small tables: the mount table
-        // is per-scan overhead (read once, cached, window-charged), so
-        // gating it on the per-object leg would make small-but-legitimate
-        // legs unusable on mount-heavy hosts.
+    fn mountinfo_reader_proves_eof_at_the_exact_byte_cap_and_refuses_excess() {
         let mut exact =
             RecordingReader::new([ReaderStep::Bytes(b"abc\n".to_vec()), ReaderStep::Eof]);
         let mut budget = CaptureWorkBudget::new(ScanLimits {
@@ -20860,6 +20856,21 @@ int main(int argc, char **argv) {
         assert_eq!(exact.requests, [5, 1], "the final request is EOF lookahead");
         assert_eq!(budget.attempted_io_bytes(), 4);
 
+        // The per-object leg binds the table: one byte past it refuses
+        // with the excess byte charged (controller ruling 18:58, A —
+        // the bound is min(per_object, 64 MiB), never raised).
+        let mut excess = RecordingReader::new([ReaderStep::Bytes(b"abc\nx".to_vec())]);
+        let mut budget = CaptureWorkBudget::new(ScanLimits {
+            per_object_bytes: 4,
+            total_bytes: 5,
+        });
+        assert_eq!(
+            read_mountinfo_with(&mut excess, &mut budget, 8, |_| None).unwrap_err(),
+            MOUNTINFO_CEILING_REASON
+        );
+        assert_eq!(excess.requests, [5]);
+        assert_eq!(budget.attempted_io_bytes(), 5, "the excess byte is charged");
+
         // Past the absolute byte cap, the read refuses with the excess
         // byte charged. Eight full 8 MiB reads fill the cap; the ninth
         // single byte trips it.
@@ -20870,13 +20881,16 @@ int main(int argc, char **argv) {
         steps.push(ReaderStep::Bytes(vec![b'x'; 1]));
         let mut excess = RecordingReader::new(steps);
         let mut budget = CaptureWorkBudget::new(ScanLimits {
-            per_object_bytes: 4,
+            per_object_bytes: u64::MAX,
             total_bytes: u64::MAX,
         });
         assert_eq!(
             read_mountinfo_with(&mut excess, &mut budget, 8 << 20, |_| None).unwrap_err(),
             MOUNTINFO_CEILING_REASON
         );
+        let mut want_requests = vec![8 << 20; 8];
+        want_requests.push(1);
+        assert_eq!(excess.requests, want_requests, "the 9-read shape is exact");
         assert_eq!(
             budget.attempted_io_bytes(),
             MAX_MOUNTINFO_BYTES + 1,
@@ -20887,6 +20901,24 @@ int main(int argc, char **argv) {
             [vec![8 << 20; 8], vec![1]].concat(),
             "eight full reads fill the absolute cap and the ninth probes one byte"
         );
+    }
+
+    /// Twin (A): a zero per-object leg admits nothing — the mountinfo
+    /// read refuses with the ceiling reason without reading.
+    #[test]
+    fn mountinfo_reader_refuses_a_zero_per_object_leg() {
+        let mut reader =
+            RecordingReader::new([ReaderStep::Bytes(b"abc\n".to_vec()), ReaderStep::Eof]);
+        let mut budget = CaptureWorkBudget::new(ScanLimits {
+            per_object_bytes: 0,
+            total_bytes: u64::MAX,
+        });
+        assert_eq!(
+            read_mountinfo_with(&mut reader, &mut budget, 8, |_| None).unwrap_err(),
+            MOUNTINFO_CEILING_REASON
+        );
+        assert!(reader.requests.is_empty(), "nothing is read");
+        assert_eq!(budget.attempted_io_bytes(), 0);
     }
 
     #[test]

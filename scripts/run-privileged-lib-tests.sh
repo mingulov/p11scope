@@ -2098,14 +2098,18 @@ main() {
     # Static skips among the selection are recorded, never silently dropped.
     # The `| tee` pipeline forks the expansion into a subshell where `set -u`
     # cannot stop the loop, so a failed print must fail loudly here instead
-    # of counting phantoms toward a lying SUMMARY.
+    # of counting phantoms toward a lying SUMMARY. Both pipeline elements
+    # are captured before the verdict call, which resets PIPESTATUS (a
+    # second [ ] test would only see the first one's status); echo's
+    # status alone cannot see a failed tee.
     for i in ${selected_skipped[@]+"${selected_skipped[@]}"}; do
         echo "SKIP ${SKIP_TESTS[$i]} :: ${SKIP_REASONS[$i]}" | tee -a "$results"
-        record_typed_verdict "${SKIP_TESTS[$i]}" SKIP
-        if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+        print_rc=("${PIPESTATUS[@]}")
+        if [ "${print_rc[0]}" -ne 0 ] || [ "${print_rc[1]}" -ne 0 ]; then
             echo "$PROG: static skip print failed for index $i" >&2
             return 1
         fi
+        record_typed_verdict "${SKIP_TESTS[$i]}" SKIP
         skipped=$((skipped + 1))
     done
 

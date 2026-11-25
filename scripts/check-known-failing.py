@@ -16,13 +16,17 @@ a textual pattern.
 
 Known-issue authority is the typed `p11scope/known-issues/v1` block in the
 `## Known limitations in 0.7.2` section of docs/known-limitations.md. Until
-that section lands, only an empty list is valid.
+that section lands, only an empty list is valid; once
+docs/releases/v0.7.2.md exists the empty list is refused.
 
 Static validation checks row shape, executable test/cell discovery, suite
-registration, issue/row exact equality, runner declarations per invocation
-stream (never a workflow-wide union), and exact `cell: known-failing`
+registration, issue/row exact equality, reverse runner declarations per
+invocation stream (no undeclared workflow cells; row-to-declaration
+unification is deferred to 0.7.3), and exact `cell: known-failing`
 ignored-test entries. The eleven pre-existing inverted declarations are a
-closed legacy baseline until their 0.7.3 migration.
+closed legacy baseline until their 0.7.3 migration. Host-limited rows for
+hosts without a CI judge (fedora, fedora-sm1) and privileged-lib rows
+(the summary job does not count XFAIL yet) are refused.
 
 With `--results`, the checker judges schema
 `p11scope/known-failing-results/v1`:
@@ -221,6 +225,8 @@ def validate_row(raw, index):
         problems.append(f"{label}: test must be a nonempty exact test or cell id")
     if not typed_string(raw["cell"]):
         problems.append(f"{label}: cell must be a stable typed cell token")
+    if isinstance(raw["runner"], str) and raw["runner"].startswith("cell:") and raw["cell"] != raw["test"]:
+        problems.append(f"{label}: cell must equal the cell id in test for cell runners")
     issues = raw["issues"]
     if (not isinstance(issues, list) or not issues
             or any(not isinstance(issue, str) or not ISSUE_RE.fullmatch(issue) for issue in issues)
@@ -230,9 +236,13 @@ def validate_row(raw, index):
         problems.append(f"{label}: target must be one of {', '.join(sorted(TARGETS))}")
     if not valid_runner(raw["runner"]):
         problems.append(f"{label}: runner is not in the closed runner vocabulary")
+    if raw["runner"] == "privileged-lib":
+        problems.append(f"{label}: privileged-lib rows are refused until Prove full coverage counts XFAIL rows")
     problems.extend(f"{label}: {problem}" for problem in signature_problems(raw["signature"]))
     if isinstance(raw["signature"], dict) and "branch" not in raw["signature"]:
         problems.append(f"{label}: signature lacks a typed branch")
+    if isinstance(raw["signature"], dict) and "cell" in raw["signature"] and raw["signature"]["cell"] != raw["cell"]:
+        problems.append(f"{label}: signature cell must equal the row cell")
     if not isinstance(raw["lane"], str) or not raw["lane"].strip():
         problems.append(f"{label}: lane must name the lane that owns the fix")
     if not isinstance(raw["mode"], str) or raw["mode"] not in MODES:
@@ -248,6 +258,10 @@ def validate_row(raw, index):
                 or any(not isinstance(host, str) or host not in HOSTS for host in hosts)
                 or len(set(hosts)) != len(hosts)):
             problems.append(f"{label}: hosts must be a unique nonempty subset of {', '.join(sorted(HOSTS))}")
+    if "hosts" in raw and isinstance(raw["hosts"], list):
+        limited = [host for host in raw["hosts"] if host in ("fedora", "fedora-sm1")]
+        if limited:
+            problems.append(f"{label}: hosts {', '.join(limited)} have no CI judge: host-limited rows are refused until one exists")
     if "invocation" in raw and not valid_invocation(raw["invocation"]):
         problems.append(f"{label}: invocation must be a list of nonempty argument strings")
     for key in ("since", "evidence"):
@@ -596,6 +610,7 @@ def parse_invocation(tokens, start, kind):
         "intermittent": options["--intermittent-failure"],
         "required": options["--require"],
         "nonqualifying": options["--allow-nonqualifying"],
+        "require_file": options["--require-file"],
         "known_results": (options["--known-failing-results"] or [None])[-1],
         "known_host": (options["--known-failing-host"] or [None])[-1],
         "explicit_runner": bool(options["--known-failing-runner"]),
@@ -678,6 +693,7 @@ def validate_cell_runner_declarations(root, rows):
             problems.append(f"{where}: check-cell-results invocation lacks a typed host")
         if invocation["known_results"] and not (
             invocation["required"] or invocation["expected"] or invocation["intermittent"] or invocation["nonqualifying"]
+            or invocation["require_file"]
         ):
             problems.append(f"{where}: typed cell result selection is empty")
 
@@ -696,7 +712,7 @@ def validate_cell_runner_declarations(root, rows):
         first = sites[0]
         for site in sites[1:]:
             if any(sorted(site[key]) != sorted(first[key])
-                   for key in ("expected", "intermittent", "required", "nonqualifying")):
+                   for key in ("expected", "intermittent", "required", "nonqualifying", "require_file")):
                 problems.append(
                     f"{workflow}:{job}:{results}: repeated declarations for one runner/results stream differ")
                 break
@@ -712,16 +728,8 @@ def validate_cell_runner_declarations(root, rows):
         if extra_intermittent:
             problems.append(f"{runner} declarations have undeclared intermittent cells: " + ", ".join(extra_intermittent))
 
-    for row in cell_rows:
-        matching = []
-        for (runner, _workflow, _job, _results), sites in groups.items():
-            if runner != row["runner"]:
-                continue
-            declared = set(sites[0]["expected"]) if row["mode"] == "always" else set(sites[0]["intermittent"])
-            if row["test"] in declared:
-                matching.append(sites[0])
-        if not matching:
-            problems.append(f"{row['runner']} has no per-runner declaration for {row['test']}")
+    # Row-to-workflow declaration unification (plan rule 3) is deferred
+    # to 0.7.3: only the reverse direction is enforced here.
     overlap = sorted({row["test"] for row in cell_rows if row["mode"] == "always"}
                      & {row["test"] for row in cell_rows if row["mode"] == "intermittent"})
     if overlap:
@@ -773,10 +781,13 @@ def validate_ignored_known_failing(root, rows):
     return problems
 
 
-def validate_static(root, list_path):
+def validate_static(root, list_path, discover_executables=True):
     rows, problems = load_list(list_path)
     registry_present, registry, registry_problems = load_issue_registry(root)
     problems.extend(registry_problems)
+    if not rows and (root / "docs/releases/v0.7.2.md").is_file():
+        problems.append("empty known-failing list is refused once docs/releases/v0.7.2.md exists: "
+                        "the 0.7.2 release carries its rows")
     if rows and not registry_present:
         problems.append("no typed known-issue registry: rows cannot name a known issue before the 0.7.2 section lands")
     elif registry_present and not registry_problems:
@@ -810,7 +821,7 @@ def validate_static(root, list_path):
         except (OSError, ValueError):
             problems.append(f"{row['path']}: path escapes the repository root")
             continue
-        if not test_exists(root, row):
+        if discover_executables and not test_exists(root, row):
             problems.append(f"{row['path']}: executable discovery did not find exact test id: {row['test']}")
         if not python_suite_registered(root, row):
             problems.append(f"{row['path']}: suite invocation is not registered in scripts/run-python-suites.py")
@@ -972,7 +983,9 @@ def evaluate_results(rows, document):
         if legacy_exempt(runner, key[1]):
             continue
         problems.append(f"failing test not listed: {key[1]} at {key[0]} ({result['state']})")
-    return problems, expected_failures, intermittent_passes, len(applicable), len(results_by_key)
+    skipped = sum(1 for result in results_by_key.values() if result["state"] == "skipped")
+    not_applicable = sum(1 for result in results_by_key.values() if result["state"] == "not_applicable")
+    return problems, expected_failures, intermittent_passes, len(applicable), len(results_by_key), skipped, not_applicable
 
 
 def parse_args(argv):
@@ -989,7 +1002,7 @@ def main(argv):
     list_path = Path(args.list_path) if args.list_path else root / "tests/known-failing.json"
     if not list_path.is_absolute():
         list_path = root / list_path
-    rows, problems, registry_present = validate_static(root, list_path)
+    rows, problems, registry_present = validate_static(root, list_path, discover_executables=args.results is None)
     if problems:
         for problem in problems:
             print(f"check-known-failing: {problem}", file=sys.stderr)
@@ -1003,14 +1016,15 @@ def main(argv):
         for problem in result_problems:
             print(f"check-known-failing: {problem}", file=sys.stderr)
         return 1
-    problems, expected, intermittent, applicable, observed = evaluate_results(rows, document)
+    problems, expected, intermittent, applicable, observed, skipped, not_applicable = evaluate_results(rows, document)
     if problems:
         for problem in problems:
             print(f"check-known-failing: {problem}", file=sys.stderr)
         return 1
     print(
         f"check-known-failing: results ok ({expected} expected failures, "
-        f"{intermittent} intermittent passes, {applicable} applicable rows, {observed} observations)")
+        f"{intermittent} intermittent passes, {applicable} applicable rows, {observed} observations, "
+        f"{skipped} skipped, {not_applicable} not_applicable)")
     return 0
 
 

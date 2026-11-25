@@ -437,17 +437,15 @@ pub(crate) fn read_mountinfo_with<R: Read>(
     chunk_size: usize,
     mut deadline: impl FnMut(&mut CaptureWorkBudget) -> Option<&'static str>,
 ) -> Result<String, String> {
-    // The mount table is per-scan overhead (read once, cached, window-charged):
-    // gating it on the per-object leg would make small-but-legitimate legs
-    // unusable on mount-heavy hosts, so only the absolute byte cap and the
-    // entry cap below bound the read. Worst case is the 64M absolute cap
-    // plus the pass window (the 8M per-operation leg no longer applies to
-    // this read); realistic tables (kilobytes) are unaffected.
-    // A zero per-object leg still refuses: a degenerate leg admits nothing.
-    if budget.limits().per_object_bytes == 0 {
+    // The mount table is bounded by the per-object leg and the
+    // absolute byte cap together (controller ruling 18:58, A): the
+    // bound is min(per_object, 64 MiB), never raised. If resumable
+    // scans need more of the table, the read must resume across
+    // passes, never take a bigger single bound.
+    let table_cap = budget.limits().per_object_bytes.min(MAX_MOUNTINFO_BYTES);
+    if table_cap == 0 {
         return Err(MOUNTINFO_CEILING_REASON.into());
     }
-    let table_cap = MAX_MOUNTINFO_BYTES;
 
     let mut table = Vec::new();
     let mut observed_lines = 0usize;

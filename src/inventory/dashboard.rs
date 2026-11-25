@@ -566,6 +566,23 @@ pub(crate) fn render_frame(
     out
 }
 
+/// The folded-departed accounting line for both dashboard headers:
+/// `departed: N callers, M calls (folded)`. Present exactly while the
+/// run has retired caller rows — one pass after a caller exits its row
+/// leaves the live list, but its calls stay on screen here and in the
+/// folded header totals. Nouns stay invariant, like the totals lines.
+fn departed_line(budgets: &crate::inventory_present::BudgetView, width: usize) -> Option<String> {
+    (budgets.callers_retired > 0).then(|| {
+        truncate_cell(
+            &format!(
+                "departed: {} callers, {} calls (folded)",
+                budgets.callers_retired, budgets.edges_folded_entries,
+            ),
+            width,
+        )
+    })
+}
+
 /// Compact terminals prioritize identifiable associations over observer logs.
 /// Below the useful window size, only bounded totals and coverage remain.
 fn render_minimal(
@@ -610,14 +627,27 @@ fn render_minimal(
         truncate_cell(
             &format!(
                 "totals: {} callers {} modules {} edges",
-                presentation.callers.len(),
+                presentation
+                    .callers
+                    .len()
+                    .saturating_add(budgets.callers_retired as usize),
                 presentation.modules.len(),
-                presentation.edges.len()
+                presentation
+                    .edges
+                    .len()
+                    .saturating_add(budgets.edges_folded as usize)
             ),
             width,
         ),
         truncate_cell(&coverage, width),
     ];
+    // The departed line takes its row from the association window,
+    // like the promotion line does.
+    let departed = departed_line(budgets, width);
+    let departed_room = usize::from(departed.is_some());
+    if let Some(line) = departed {
+        lines.push(line);
+    }
     if width >= 30 && height >= 8 {
         let total = state.items_total(presentation);
         let scroll = state.scroll.min(total.saturating_sub(1));
@@ -629,7 +659,10 @@ fn render_minimal(
             .status_line()
             .map(|line| truncate_cell(&line, width));
         let promo_room = usize::from(promo_line.is_some());
-        let room = height.saturating_sub(4).saturating_sub(promo_room);
+        let room = height
+            .saturating_sub(4)
+            .saturating_sub(departed_room)
+            .saturating_sub(promo_room);
         // Disabled never marks: only an enabled control holds a cursor.
         let selected = state
             .promotion
@@ -841,9 +874,15 @@ fn render_full(
                 "p11scope inventory {} | {} passes | {} callers {} modules {} edges",
                 presentation.scope_label,
                 presentation.passes,
-                presentation.callers.len(),
+                presentation
+                    .callers
+                    .len()
+                    .saturating_add(budgets.callers_retired as usize),
                 presentation.modules.len(),
-                presentation.edges.len(),
+                presentation
+                    .edges
+                    .len()
+                    .saturating_add(budgets.edges_folded as usize),
             ),
             width,
         ),
@@ -888,6 +927,13 @@ fn render_full(
             width,
         ),
     ];
+    // The departed line takes its row from the edge window, like the
+    // projection and promotion lines do.
+    let departed = departed_line(budgets, width);
+    let extra_departed = usize::from(departed.is_some());
+    if let Some(line) = departed {
+        lines.push(line);
+    }
     if let Some(line) = object_line {
         lines.push(line);
     }
@@ -895,6 +941,7 @@ fn render_full(
         lines.push(line);
     }
     let edge_room = detail_room(height)
+        .saturating_sub(extra_departed)
         .saturating_sub(extra)
         .saturating_sub(extra_promo);
     let log_rows = detail_log_rows(height);
@@ -927,9 +974,9 @@ fn render_full(
     lines.append(&mut edge_lines);
     // Pad a short window so the log tail + footer stay pinned to the
     // bottom rows regardless of content. The target counts the
-    // projection and promotion lines when shown, against the shrunken
-    // window.
-    while lines.len() < 3 + extra + extra_promo + 1 + edge_room {
+    // departed, projection and promotion lines when shown, against
+    // the shrunken window.
+    while lines.len() < 3 + extra_departed + extra + extra_promo + 1 + edge_room {
         lines.push(String::new());
     }
     let log_header = if frame.log.dropped_lines > 0 || frame.log.dropped_bytes > 0 {

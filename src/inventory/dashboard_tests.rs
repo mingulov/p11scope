@@ -191,6 +191,163 @@ fn coverage_stays_prominent_and_totals_ignore_the_scroll() {
     assert!(bottom_text.contains("scroll "), "{bottom_text}");
 }
 
+/// G2 render contract: a post-fold presentation shows one departed
+/// line and folded totals in both dashboard headers — an exited
+/// caller's calls stay on screen instead of dropping one pass after
+/// the exit.
+#[test]
+fn departed_callers_and_calls_stay_in_both_dashboard_headers() {
+    let mut presentation = varied_presentation();
+    assert_eq!(presentation.budgets.callers_retired, 0);
+    let live_callers = presentation.callers.len();
+    let live_edges = presentation.edges.len();
+    presentation.budgets.callers_retired = 2;
+    presentation.budgets.callers_retired_with_calls = 2;
+    presentation.budgets.edges_folded = 4;
+    presentation.budgets.edges_folded_entries = 27;
+    let frame = frame_for(&presentation);
+    let full = frame_text(&render_frame(
+        &frame,
+        Viewport {
+            width: 80,
+            height: 24,
+        },
+        &DashboardState::new(),
+    ));
+    let full_lines: Vec<&str> = full.split('\n').collect();
+    assert!(
+        full_lines[0].contains(&format!("{} callers", live_callers + 2)),
+        "folded callers join the title total: {}",
+        full_lines[0]
+    );
+    assert!(
+        full_lines[0].contains(&format!("{} edges", live_edges + 4)),
+        "folded edges join the title total: {}",
+        full_lines[0]
+    );
+    assert!(
+        full.contains("departed: 2 callers, 27 calls (folded)"),
+        "{full}"
+    );
+    let minimal = frame_text(&render_frame(
+        &frame,
+        Viewport {
+            width: 40,
+            height: 10,
+        },
+        &DashboardState::new(),
+    ));
+    let minimal_lines: Vec<&str> = minimal.split('\n').collect();
+    assert!(
+        minimal_lines[1].contains(&format!("{} callers", live_callers + 2)),
+        "folded callers join the minimal total: {}",
+        minimal_lines[1]
+    );
+    assert!(
+        minimal_lines[1].contains(&format!("{} edges", live_edges + 4)),
+        "folded edges join the minimal total: {}",
+        minimal_lines[1]
+    );
+    assert!(
+        minimal.contains("departed: 2 callers, 27 calls (folded)"),
+        "{minimal}"
+    );
+}
+
+/// G2 end to end: a caller exits, the retire path folds it, and the
+/// next frame still shows its calls — the departed line and the
+/// folded totals carry the real fold counts.
+#[test]
+fn next_frame_still_shows_an_exited_callers_calls() {
+    let mut harness = harness();
+    let spec = ScaleSpec {
+        name: "dash-fold",
+        callers: 6,
+        modules: 3,
+        edges_per_caller: 2,
+        endpoints_per_module: 4,
+        first_pid: 80_000,
+    };
+    harness.stage_scale(&spec);
+    harness.commit();
+    harness.advance(10);
+    let first = capture_from_harness(&harness);
+    let live_callers = first.callers.len();
+    let live_edges = first.edges.len();
+    let before = frame_text(&render_frame(
+        &frame_for(&first),
+        Viewport {
+            width: 80,
+            height: 24,
+        },
+        &DashboardState::new(),
+    ));
+    assert!(!before.contains("departed:"), "{before}");
+    let ids: Vec<CallerId> = first.callers.iter().map(|caller| caller.id).collect();
+    harness.source().kill(80_001);
+    let observed: BTreeSet<u32> = (80_000..80_006).filter(|pid| *pid != 80_001).collect();
+    let now = harness.now_ns();
+    let events = harness.coordinator_mut().adapter_mut().reconcile(
+        &observed,
+        &mut |_| ImageAuthority::ScanPinned,
+        now,
+    );
+    harness
+        .coordinator_mut()
+        .apply_reconcile_events(&events, now);
+    harness.commit();
+    harness.coordinator_mut().note_rendered_callers(&ids);
+    let retire_at = harness.now_ns();
+    let receipt = harness
+        .coordinator_mut()
+        .retire_rendered_callers(retire_at, None);
+    assert_eq!(receipt.retired, 1, "the exited caller retires");
+    let second = capture_from_harness(&harness);
+    let retired = second.budgets.callers_retired;
+    let folded_edges = second.budgets.edges_folded;
+    let folded_entries = second.budgets.edges_folded_entries;
+    assert_eq!(retired, 1);
+    assert!(
+        second.callers.len() < live_callers,
+        "the row left the live list"
+    );
+    let after = frame_text(&render_frame(
+        &frame_for(&second),
+        Viewport {
+            width: 80,
+            height: 24,
+        },
+        &DashboardState::new(),
+    ));
+    let expected = format!("departed: {retired} callers, {folded_entries} calls (folded)");
+    assert!(after.contains(&expected), "{after}");
+    let title = after.split('\n').next().unwrap();
+    assert!(
+        title.contains(&format!(
+            "{} callers",
+            second.callers.len() + retired as usize
+        )),
+        "title keeps the folded caller in its total: {title}"
+    );
+    assert!(
+        title.contains(&format!(
+            "{} edges",
+            second.edges.len() + folded_edges as usize
+        )),
+        "title keeps the folded edges in its total: {title}"
+    );
+    assert_eq!(
+        second.callers.len() + retired as usize,
+        live_callers,
+        "live plus folded callers still sum to the pre-exit total"
+    );
+    assert_eq!(
+        second.edges.len() + folded_edges as usize,
+        live_edges,
+        "live plus folded edges still sum to the pre-exit total"
+    );
+}
+
 /// Capture the harness's current registry state as a presentation
 /// (same extraction the JSON path uses for its observation block).
 fn capture_from_harness(harness: &Harness) -> Presentation {

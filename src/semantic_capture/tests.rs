@@ -3535,12 +3535,69 @@ fn production_absence_acquisition_preflights_final_latches_first() {
         gate < first_session && gate < commit,
         "the latch preflight precedes every session read and the commit"
     );
+    assert_eq!(
+        body.matches("self.absence_acquire_gate()?;").count(),
+        1,
+        "the acquisition carries exactly one latch preflight"
+    );
+    // Every fallible mapping in the acquisition body runs after the
+    // preflight, so no drain, cut or proof failure can mask a final
+    // latch refusal as retryable contention.
+    for marker in [
+        "Refusal::StreamCut",
+        "Refusal::CurrentPartition",
+        "Refusal::AttachmentMismatch",
+    ] {
+        for (at, _) in body.match_indices(marker) {
+            assert!(
+                gate < at,
+                "the latch preflight precedes every {marker} mapping"
+            );
+        }
+    }
     let gate_body = &source[start + end..];
     let gate_end = gate_body.find("\n    }\n").expect("gate body ends");
     assert!(
         gate_body[..gate_end].contains("self.capture_ended_refusal()?;"),
         "the preflight checks the three final latches"
     );
+}
+
+/// The live birth path validates the candidate (final latches first)
+/// before any native row read, and the production recheck twin keeps
+/// the same order: the behavioural latch tests run against the
+/// substituted-I/O twin, so this pins the production order against
+/// drift. Both production ports take a live `Session` (privileged).
+#[test]
+fn production_consume_birth_validates_before_row_reads() {
+    let source = include_str!("../semantic_capture.rs");
+    for (name, end_marker) in [
+        (
+            "pub(crate) fn consume_birth(",
+            "pub(crate) fn validate_current(",
+        ),
+        ("pub(crate) fn fresh_evidence(", "fn fresh_evidence_with("),
+    ] {
+        let start = source
+            .find(name)
+            .unwrap_or_else(|| panic!("{name} present"));
+        let end = source[start..]
+            .find(end_marker)
+            .expect("the next item follows the production port");
+        let body = &source[start..start + end];
+        let validate = body
+            .find("validate_birth_candidate(")
+            .expect("the production port validates");
+        let rows = body
+            .find("LiveBirthRows")
+            .expect("the production port reads rows");
+        assert!(validate < rows, "{name} validates before any row read");
+        assert_eq!(
+            body.matches("LiveBirthRows").count(),
+            1,
+            "{name} reads rows once"
+        );
+    }
 }
 
 #[test]
@@ -3628,6 +3685,419 @@ fn joint_birth_witness_capture_latches_refuse_finally() {
         "contention is never a capture end"
     );
     assert!(!Refusal::RetainedWitnessMismatch.capture_ended());
+}
+
+/// The absence gate refuses a busy H0 owner (an awaited record or a
+/// queued scan job) as contention, but the three final latches
+/// outrank busyness: an ended capture refuses finally even with
+/// queued work, and an idle healthy capture admits.
+#[test]
+fn joint_birth_absence_gate_busy_refuses_current_partition() {
+    use crate::attach::BirthObservationRefusal as Refusal;
+    let mut harness = JointBirthHarness::new();
+    let mut outcomes = Vec::new();
+    // busy: 0 = idle, 1 = a queued scan job, 2 = an awaited record.
+    for (busy, stopped, exhausted, image_failed) in [
+        (0, false, false, false),
+        (1, false, false, false),
+        (2, false, false, false),
+        (1, true, false, false),
+        (2, true, false, false),
+        (1, false, true, false),
+        (2, false, true, false),
+        (1, false, false, true),
+        (2, false, false, true),
+        (1, true, true, true),
+    ] {
+        harness.capture.stopped = stopped;
+        harness.capture.exhausted = exhausted;
+        harness.capture.image_failed = image_failed;
+        harness.capture.jobs.clear();
+        harness.capture.awaiting.clear();
+        // The gate only tests emptiness, never the queued content.
+        if busy == 1 {
+            harness.capture.jobs.push_back(ScanJob {
+                image: harness.io.current_image,
+                endpoint: Endpoint {
+                    object: PinnedObjectId(0),
+                    file_slot: 0,
+                    offset: 0,
+                },
+                slot: 0,
+                pin: harness.io.pin.clone(),
+                deadline: harness.io.now,
+                birth_cut: None,
+            });
+        }
+        if busy == 2 {
+            harness.io.call(1, 0);
+            let record = harness.io.records.pop_front().expect("scripted record");
+            harness.capture.awaiting.insert(
+                7,
+                Awaiting {
+                    record,
+                    endpoint: None,
+                    collected_origin: None,
+                },
+            );
+        }
+        outcomes.push((
+            (busy, stopped, exhausted, image_failed),
+            harness.capture.absence_acquire_gate().map(|_| ()),
+        ));
+    }
+    assert_eq!(
+        outcomes,
+        vec![
+            ((0, false, false, false), Ok(())),
+            ((1, false, false, false), Err(Refusal::CurrentPartition)),
+            ((2, false, false, false), Err(Refusal::CurrentPartition)),
+            ((1, true, false, false), Err(Refusal::Stopped)),
+            ((2, true, false, false), Err(Refusal::Stopped)),
+            ((1, false, true, false), Err(Refusal::AuthorityExhausted)),
+            ((2, false, true, false), Err(Refusal::AuthorityExhausted)),
+            ((1, false, false, true), Err(Refusal::CoverageFailed)),
+            ((2, false, false, true), Err(Refusal::CoverageFailed)),
+            ((1, true, true, true), Err(Refusal::Stopped)),
+        ],
+        "busyness contends; an ended capture refuses finally even when busy"
+    );
+}
+
+/// The birth validation checks the three final latches before any
+/// fallible read: a refused receipt read or a failed health read
+/// must not mask Stopped/AuthorityExhausted/CoverageFailed as
+/// contention. Every native row read is a proof-side operation, so a
+/// latch refusal reads none while a healthy take reads both rows; on
+/// a healthy capture the original fault surfaces.
+#[test]
+fn joint_birth_validate_checks_final_latches_before_fallible_reads() {
+    use crate::attach::BirthObservationRefusal as Refusal;
+    use crate::semantics_objects::journal::tests::{NativeBirthRows, NativePublisher};
+    use std::cell::Cell;
+    struct CountedRows<'a> {
+        inner: &'a mut NativeBirthRows,
+        reads: &'a Cell<usize>,
+        fail_control: bool,
+    }
+    impl crate::attach::BirthRowReader for CountedRows<'_> {
+        fn read_marker_row(
+            &mut self,
+        ) -> Result<p11scope_ebpf_common::InstanceRecord, crate::attach::BirthRowError> {
+            self.reads.set(self.reads.get() + 1);
+            crate::attach::BirthRowReader::read_marker_row(self.inner)
+        }
+        fn read_admission_control(
+            &mut self,
+        ) -> Result<p11scope_ebpf_common::JournalAdmissionControl, crate::attach::BirthRowError>
+        {
+            self.reads.set(self.reads.get() + 1);
+            if self.fail_control {
+                return Err(crate::attach::BirthRowError::Unreadable);
+            }
+            crate::attach::BirthRowReader::read_admission_control(self.inner)
+        }
+    }
+    let mut harness = JointBirthHarness::new();
+    harness.push_create(1);
+    let mut raw = harness.collect();
+    let (report, admitted) = harness.route(&mut raw);
+    let (_, proof) = harness.ingest(raw, &admitted);
+    let publisher = NativePublisher::build();
+    let closure = harness.fixture.attachment().generation();
+    let (row, control, _) = publisher.publish_stamped(&["0", "0"], closure);
+    let mut rows = NativeBirthRows { row, control };
+    let witness = harness.birth(report, &admitted, &proof, None, &mut rows);
+    let reads = Cell::new(0usize);
+    let mut outcomes = Vec::new();
+    // fault: 0 = healthy io, 1 = the receipt read is refused,
+    // 2 = the health read fails.
+    for (stopped, exhausted, image_failed, fault) in [
+        (true, false, false, 1),
+        (false, true, false, 1),
+        (false, false, true, 1),
+        (true, false, false, 2),
+        (false, true, false, 2),
+        (false, false, true, 2),
+        (false, false, false, 1),
+        (false, false, false, 2),
+        (false, false, false, 0),
+    ] {
+        harness.capture.stopped = stopped;
+        harness.capture.exhausted = exhausted;
+        harness.capture.image_failed = image_failed;
+        harness.io.receipt_refusal = None;
+        harness.io.health.clear();
+        harness.io.last_health = Health {
+            fault: 0,
+            sticky: 0,
+        };
+        match fault {
+            1 => harness.io.receipt_refusal = Some(CurrentReceiptRefusal::Partition),
+            2 => harness.io.health.push_back(Err(())),
+            _ => {}
+        }
+        reads.set(0);
+        let taken = witness
+            .fresh_evidence_with(
+                &mut harness.io,
+                &mut CountedRows {
+                    inner: &mut rows,
+                    reads: &reads,
+                    fail_control: false,
+                },
+                &harness.capture,
+                harness.fixture.attachment(),
+                harness.fixture.binding(),
+            )
+            .map(|_| ());
+        outcomes.push((
+            (stopped, exhausted, image_failed, fault),
+            taken,
+            reads.get(),
+        ));
+    }
+    assert_eq!(
+        outcomes,
+        vec![
+            ((true, false, false, 1), Err(Refusal::Stopped), 0),
+            ((false, true, false, 1), Err(Refusal::AuthorityExhausted), 0),
+            ((false, false, true, 1), Err(Refusal::CoverageFailed), 0),
+            ((true, false, false, 2), Err(Refusal::Stopped), 0),
+            ((false, true, false, 2), Err(Refusal::AuthorityExhausted), 0),
+            ((false, false, true, 2), Err(Refusal::CoverageFailed), 0),
+            ((false, false, false, 1), Err(Refusal::CurrentPartition), 0),
+            ((false, false, false, 2), Err(Refusal::CurrentPartition), 0),
+            ((false, false, false, 0), Ok(()), 2),
+        ],
+        "a latch refusal precedes every fallible read and reads no row"
+    );
+    // A healthy take with an unreadable control row surfaces the
+    // original row error after reading both rows.
+    harness.capture.stopped = false;
+    harness.capture.exhausted = false;
+    harness.capture.image_failed = false;
+    harness.io.receipt_refusal = None;
+    harness.io.health.clear();
+    harness.io.last_health = Health {
+        fault: 0,
+        sticky: 0,
+    };
+    reads.set(0);
+    let failed_rows = witness
+        .fresh_evidence_with(
+            &mut harness.io,
+            &mut CountedRows {
+                inner: &mut rows,
+                reads: &reads,
+                fail_control: true,
+            },
+            &harness.capture,
+            harness.fixture.attachment(),
+            harness.fixture.binding(),
+        )
+        .map(|_| ());
+    assert_eq!(
+        (failed_rows, reads.get()),
+        (Err(Refusal::RowUnreadable), 2),
+        "the original row error surfaces after both rows are read"
+    );
+}
+
+/// The validation re-verifies capture health after the receipt read:
+/// a health drift between the two checks refuses as contention. The
+/// scripted queue pops once per check (first validation, recheck,
+/// second validation), so the drift lands on the last check; the
+/// steady queue is the control.
+#[test]
+fn joint_birth_recheck_after_reads_catches_health_drift() {
+    use crate::attach::BirthObservationRefusal as Refusal;
+    use crate::semantics_objects::journal::tests::{NativeBirthRows, NativePublisher};
+    let mut harness = JointBirthHarness::new();
+    harness.push_create(1);
+    let mut raw = harness.collect();
+    let (report, admitted) = harness.route(&mut raw);
+    let (_, proof) = harness.ingest(raw, &admitted);
+    let publisher = NativePublisher::build();
+    let closure = harness.fixture.attachment().generation();
+    let (row, control, _) = publisher.publish_stamped(&["0", "0"], closure);
+    let mut rows = NativeBirthRows { row, control };
+    let witness = harness.birth(report, &admitted, &proof, None, &mut rows);
+    let mut outcomes = Vec::new();
+    for script in [
+        [
+            Ok(Health {
+                fault: 0,
+                sticky: 0,
+            }),
+            Ok(Health {
+                fault: 0,
+                sticky: 0,
+            }),
+            Err(()),
+        ],
+        [
+            Ok(Health {
+                fault: 0,
+                sticky: 0,
+            }),
+            Ok(Health {
+                fault: 0,
+                sticky: 0,
+            }),
+            Ok(Health {
+                fault: 0,
+                sticky: 0,
+            }),
+        ],
+    ] {
+        harness.io.health.clear();
+        harness.io.last_health = Health {
+            fault: 0,
+            sticky: 0,
+        };
+        harness.io.health.extend(script);
+        let taken = witness
+            .fresh_evidence_with(
+                &mut harness.io,
+                &mut rows,
+                &harness.capture,
+                harness.fixture.attachment(),
+                harness.fixture.binding(),
+            )
+            .map(|_| ());
+        outcomes.push(taken);
+    }
+    assert_eq!(
+        outcomes,
+        vec![Err(Refusal::CurrentPartition), Ok(())],
+        "a health drift after the reads refuses; steady health takes"
+    );
+}
+
+/// The production commit with scripted fixtures, returning the
+/// refusal instead of unwrapping: the same arguments
+/// `JointBirthHarness::absence` commits.
+fn try_commit_absence(
+    harness: &mut JointBirthHarness,
+) -> Result<CommittedAbsenceBirth, crate::attach::BirthObservationRefusal> {
+    use crate::attach::image_query::acquire_test_absence;
+    let (slot, endpoint) = harness.fixture.endpoint_for("C_GetSessionInfo");
+    let proof = acquire_test_absence(
+        harness.io.domain,
+        harness.io.current_image,
+        endpoint.file_slot,
+        CompleteEpochs {
+            local: u64::from(harness.io.local),
+            global: 0,
+            fault: 0,
+            sticky: 0,
+            record_flags: 0,
+        },
+        vec![p11scope_manifest::maps::MapEntry {
+            start: 0x4000,
+            end: 0x5000,
+            file_offset: 0,
+            permissions: *b"r-xp",
+            device: p11scope_manifest::maps::Device { major: 8, minor: 2 },
+            inode: 1001,
+            raw_path: None,
+        }],
+        harness.fixture.attachment().generation(),
+        vec![harness.io.watched[0].object_key()],
+        crate::discovery::instances::MappedFileIdentity {
+            dev: 0x801,
+            ino: 999,
+        },
+        |_, _| panic!("no watched-provider mapping"),
+        harness.capture.router.fence(),
+    )
+    .expect("genuine provider-free acquisition before appearance");
+    let before = harness.drain.consumption_cut().unwrap();
+    let after = harness.drain.consumption_cut().unwrap();
+    harness.capture.commit_absence_with(
+        &mut harness.io,
+        proof,
+        before,
+        after,
+        harness.fixture.binding_for_collected(harness.caller),
+        harness.fixture.attachment(),
+        slot,
+        &mut harness.adapter,
+        &harness.producers,
+    )
+}
+
+/// The absence commit checks the three final latches before any
+/// attachment read: a refused attachment read or a failed health
+/// read must not mask Stopped/AuthorityExhausted/CoverageFailed as
+/// contention. On a healthy capture the original fault surfaces,
+/// and the quiet fixture commits.
+#[test]
+fn joint_birth_commit_checks_final_latches_before_attachment_reads() {
+    use crate::attach::BirthObservationRefusal as Refusal;
+    let mut harness = JointBirthHarness::new();
+    harness.push_ordinary(ImageIdentity::default());
+    let mut quiet = harness.collect();
+    let (quiet_report, admitted) = harness.route(&mut quiet);
+    assert!(quiet_report.observations.contains(&ObserveOutcome::New));
+    quiet
+        .classify_ordinary(&admitted)
+        .expect("only real canonical C_GetSessionInfo admission narrows history");
+    harness.ingest(quiet, &admitted);
+    harness.io.local = 2;
+    let mut outcomes = Vec::new();
+    // fault: 0 = healthy io, 1 = the attachment read is refused,
+    // 2 = the health read fails.
+    for (stopped, exhausted, image_failed, fault) in [
+        (true, false, false, 0),
+        (false, true, false, 0),
+        (false, false, true, 0),
+        (true, false, false, 1),
+        (false, true, false, 1),
+        (false, false, true, 1),
+        (true, false, false, 2),
+        (false, true, false, 2),
+        (false, false, true, 2),
+        (false, false, false, 0),
+        (false, false, false, 1),
+        (false, false, false, 2),
+    ] {
+        harness.capture.stopped = stopped;
+        harness.capture.exhausted = exhausted;
+        harness.capture.image_failed = image_failed;
+        harness.io.attachment_refusal = None;
+        harness.io.health.clear();
+        harness.io.last_health = Health {
+            fault: 0,
+            sticky: 0,
+        };
+        match fault {
+            1 => harness.io.attachment_refusal = Some(CurrentReceiptRefusal::Attachment),
+            2 => harness.io.health.push_back(Err(())),
+            _ => {}
+        }
+        let taken = try_commit_absence(&mut harness).map(|_| ());
+        outcomes.push(((stopped, exhausted, image_failed, fault), taken));
+    }
+    assert_eq!(
+        outcomes,
+        vec![
+            ((true, false, false, 0), Err(Refusal::Stopped)),
+            ((false, true, false, 0), Err(Refusal::AuthorityExhausted)),
+            ((false, false, true, 0), Err(Refusal::CoverageFailed)),
+            ((true, false, false, 1), Err(Refusal::Stopped)),
+            ((false, true, false, 1), Err(Refusal::AuthorityExhausted)),
+            ((false, false, true, 1), Err(Refusal::CoverageFailed)),
+            ((true, false, false, 2), Err(Refusal::Stopped)),
+            ((false, true, false, 2), Err(Refusal::AuthorityExhausted)),
+            ((false, false, true, 2), Err(Refusal::CoverageFailed)),
+            ((false, false, false, 0), Ok(())),
+            ((false, false, false, 1), Err(Refusal::AttachmentMismatch)),
+            ((false, false, false, 2), Err(Refusal::CurrentPartition)),
+        ],
+        "the commit refuses finally before any attachment read"
+    );
 }
 
 #[test]

@@ -683,7 +683,7 @@ class JudgeTwins(unittest.TestCase):
                                 inventory(False), verbose(False))
         self.assertEqual(rc, 1, summary)
         self.assertIn("pqc-sizes-rows: FAIL", summary)
-        self.assertIn("instance", summary)
+        self.assertIn("want one shared instance", summary)
 
     def test_family_label_mismatch_fails(self):
         inv = copy.deepcopy(inventory(True))
@@ -793,12 +793,13 @@ class JudgeTwins(unittest.TestCase):
         inv = copy.deepcopy(inventory(True))
         inv["semantic_edges"][0]["mechanisms"].append(
             {"mechanism": 99, "name": "CKM_NOISE",
-             "calls": 1, "errors": 0})
+             "calls": 1, "errors": 1})
         rc, summary = run_judge(inv, verbose(True),
                                 inventory(False), verbose(False))
         self.assertEqual(rc, 1, summary)
         self.assertIn("pqc-sizes-rows: FAIL", summary)
-        self.assertIn("mechanism", summary)
+        self.assertIn("want 4", summary)
+        self.assertIn("mechanism 99", summary)
 
     def test_mechanism_missing_fails(self):
         inv = copy.deepcopy(inventory(True))
@@ -852,7 +853,19 @@ class JudgeTwins(unittest.TestCase):
                                 inventory(False), verbose(False))
         self.assertEqual(rc, 1, summary)
         self.assertIn("pqc-sizes-rows: FAIL", summary)
-        self.assertIn("spotlight", summary)
+        self.assertIn("spotlight lacks", summary)
+
+    def test_spotlight_extra_segment_fails(self):
+        lines = verbose(True).splitlines()
+        for index, line in enumerate(lines):
+            if line.startswith("  pqc keys: "):
+                lines[index] = line + ", FOO bar: 9"
+        rc, summary = run_judge(inventory(True),
+                                "\n".join(lines) + "\n",
+                                inventory(False), verbose(False))
+        self.assertEqual(rc, 1, summary)
+        self.assertIn("pqc-sizes-rows: FAIL", summary)
+        self.assertIn("spotlight has extra", summary)
 
     def test_wrong_section_version_fails(self):
         inv = copy.deepcopy(inventory(True))
@@ -871,7 +884,7 @@ class JudgeTwins(unittest.TestCase):
                                 inventory(False), verbose(False))
         self.assertEqual(rc, 1, summary)
         self.assertIn("pqc-sizes-rows: FAIL", summary)
-        self.assertIn("instance", summary)
+        self.assertIn("want iN like", summary)
 
     def test_invalid_label_fails(self):
         inv = copy.deepcopy(inventory(True))
@@ -982,6 +995,35 @@ class JudgeTwins(unittest.TestCase):
         self.assertEqual(rc, 1, summary)
         self.assertIn("pqc-sizes-rows: FAIL", summary)
         self.assertIn("keys", summary)
+
+    def test_malformed_object_extra_key_fails(self):
+        inv = copy.deepcopy(inventory(True))
+        find_object(inv, 1)["bogus"] = 1
+        rc, summary = run_judge(inv, verbose(True),
+                                inventory(False), verbose(False))
+        self.assertEqual(rc, 1, summary)
+        self.assertIn("pqc-sizes-rows: FAIL", summary)
+        self.assertIn("keys extra", summary)
+
+    def test_unknown_extra_row_fails(self):
+        inv = copy.deepcopy(inventory(True))
+        rows = inv["object_observations"]["unknown_key_operations"]
+        rows.append(copy.deepcopy(rows[0]))
+        rc, summary = run_judge(inv, verbose(True),
+                                inventory(False), verbose(False))
+        self.assertEqual(rc, 1, summary)
+        self.assertIn("pqc-sizes-rows: FAIL", summary)
+        self.assertIn("unknown rows", summary)
+
+    def test_unknown_row_extra_key_fails(self):
+        inv = copy.deepcopy(inventory(True))
+        inv["object_observations"]["unknown_key_operations"][0][
+            "bogus"] = 1
+        rc, summary = run_judge(inv, verbose(True),
+                                inventory(False), verbose(False))
+        self.assertEqual(rc, 1, summary)
+        self.assertIn("pqc-sizes-rows: FAIL", summary)
+        self.assertIn("keys extra", summary)
 
     def test_object_provenance_mismatch_fails(self):
         inv = copy.deepcopy(inventory(True))

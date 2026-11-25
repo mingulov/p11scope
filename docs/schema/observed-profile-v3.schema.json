@@ -632,6 +632,7 @@
                   "the reaped child's tail drain reached its deadline; its events are unproven",
                   "counting probes were retired mid-capture; calls in the retire window were not observed",
                   "the pause arm failed before the first epoch; the owned child ran without pause protection",
+                  "the release after a failed pause arm could not be proven; the owned child may have waited stopped",
                   "the run first-map stop was unavailable; descendants ran without first-map protection"
                 ]
               }

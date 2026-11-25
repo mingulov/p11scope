@@ -700,13 +700,18 @@ COVERAGE_RETIRED_REASONS = {COVERAGE_RETIRED_REASON}
 # Owned-pause arm failures: a run whose pause arm failed before the first
 # epoch files one fixed gap row under its own subject (render.rs
 # `capture_skipped_out` pause arm). The failed arm's count rides in
-# `evidence.pause_partial`, never in the reason.
+# `evidence.pause_partial`, never in the reason. A release the failed arm
+# could not prove files the second fixed row under the same subject.
 PAUSE_SKIP_SUBJECT = "owned pause"
 PAUSE_ARM_FAILED_REASON = (
     "the pause arm failed before the first epoch; "
     "the owned child ran without pause protection"
 )
-PAUSE_ARM_FAILED_REASONS = {PAUSE_ARM_FAILED_REASON}
+PAUSE_RELEASE_UNPROVEN_REASON = (
+    "the release after a failed pause arm could not be proven; "
+    "the owned child may have waited stopped"
+)
+PAUSE_ARM_FAILED_REASONS = {PAUSE_ARM_FAILED_REASON, PAUSE_RELEASE_UNPROVEN_REASON}
 # Run first-map stop gaps: a run whose member-stop object (or watchdog)
 # could not start files one fixed gap row under its own subject
 # (render.rs `capture_skipped_out` member-stop arm). No call count is

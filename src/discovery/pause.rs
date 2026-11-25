@@ -866,19 +866,26 @@ impl PauseCoordinator {
                 // holds no key by construction, so a failed first arm
                 // owes no disarm read. After it, an absent key owes
                 // nothing; any other read — a live key or an unreadable
-                // map — removes the key and releases the child, best
-                // effort, and owes a disarm retry while the removal is
-                // unproven. Removal runs before the resume: a stop that
-                // landed just before the removal is released by the
-                // resume, and none can land after it (the key is gone
-                // and nothing re-arms).
+                // map — removes the key and releases the child, and
+                // owes a disarm retry while the removal is unproven
+                // plus a release retry while the release is unproven.
+                // Removal runs before the resume: a stop that landed
+                // just before the removal is released by the resume,
+                // and none can land after it (the key is gone and
+                // nothing re-arms).
                 if self.key_issued {
                     match io.authorization() {
                         Ok(None) => {}
                         _ => {
                             let removed = io.remove_authorization().is_ok();
-                            let _ = io.resume();
+                            let released = io.resume().is_ok();
                             self.disarm_owed = !removed;
+                            // The release attempt always runs here; only a
+                            // failure consults liveness, to tell debt (live
+                            // or doubted: owe the retry and file the row)
+                            // from moot (already gone: nothing was owed).
+                            let gone = !released && matches!(io.original_exited(), Ok(true));
+                            self.settle_release_attempt(io, released, gone);
                         }
                     }
                 }
@@ -894,19 +901,41 @@ impl PauseCoordinator {
         }
     }
 
-    /// Retries an arm-failure disarm the earlier pass could not prove:
-    /// the kernel may still hold the key, and a stop may have landed on
-    /// it since. Removal first (nothing can stop after an acknowledged
-    /// delete: only an arm creates the key, and re-arming is disabled),
-    /// then the release for any stop that landed before it. Doubt keeps
-    /// the debt: a failed removal retries on the next pass.
+    /// Settles one arm-failure release attempt into the retry debt: a
+    /// proven release clears it, a failure against a live-or-doubted
+    /// child files the named gap and owes the retry, and a failure
+    /// against a proven-gone child is moot (nothing was owed).
+    fn settle_release_attempt(&mut self, io: &mut impl PauseIo, released: bool, gone: bool) {
+        if released || gone {
+            self.release_owed = false;
+        } else {
+            io.note_release_unproven();
+            self.release_owed = true;
+        }
+    }
+
+    /// Retries an arm-failure disarm or release the earlier pass could
+    /// not prove: the kernel may still hold the key, and a stop may
+    /// have landed on it since. Removal first (nothing can stop after
+    /// an acknowledged delete: only an arm creates the key, and
+    /// re-arming is disabled), then the release for any stop that
+    /// landed before it — owed, or protective while the key is
+    /// doubted. A gone child settles the release silently (no further
+    /// signal is attempted); doubt retries. At most three bounded
+    /// calls per pass (removal, liveness, release).
     fn service_disarm_backlog(&mut self, io: &mut impl PauseIo) {
-        if !self.disarm_owed {
+        if !self.disarm_owed && !self.release_owed {
             return;
         }
-        let removed = io.remove_authorization().is_ok();
-        let _ = io.resume();
-        self.disarm_owed = !removed;
+        if self.disarm_owed {
+            self.disarm_owed = io.remove_authorization().is_err();
+        }
+        if matches!(io.original_exited(), Ok(true)) {
+            self.release_owed = false;
+            return;
+        }
+        let released = io.resume().is_ok();
+        self.settle_release_attempt(io, released, false);
     }
 
     fn arm_cleanup_failed(
@@ -3029,6 +3058,11 @@ impl PauseIo for SessionPauseIo<'_> {
     fn note_arm_failed(&mut self) {
         self.engine
             .note_owned_pause_gap(crate::render::PAUSE_ARM_FAILED_REASON);
+    }
+
+    fn note_release_unproven(&mut self) {
+        self.engine
+            .note_owned_pause_gap(crate::render::PAUSE_RELEASE_UNPROVEN_REASON);
     }
 }
 

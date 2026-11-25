@@ -2012,7 +2012,7 @@ pub(crate) const RUN_TREE_SUBJECT: &str = "run process tree";
 pub(crate) const RUN_TREE_SURVIVORS: &str = "process-tree members were still present when the command exited; their calls after the run end are out of scope";
 pub(crate) const RUN_TREE_DEGRADED: &str = "only the started command is observed";
 pub(crate) const RUN_TREE_MEMBERSHIP_UNKNOWN: &str = "handed-back descendants are unknown";
-/// Owned-pause gaps file under this subject with one finite reason
+/// Owned-pause gaps file under this subject with finite reasons
 /// (schema v3): the failed arm's count rides in
 /// `evidence.pause_partial`, never in the reason.
 pub(crate) const PAUSE_SKIP_SUBJECT: &str = "owned pause";
@@ -2298,10 +2298,16 @@ pub fn capture_skipped_out(s: &Skipped) -> SkippedOut {
             reason: s.reason.clone(),
         };
     }
-    // Owned-pause arm failures keep their subject and their one finite
-    // reason; anything else under the subject falls through to the
+    // Owned-pause arm failures keep their subject and their finite
+    // reasons; anything else under the subject falls through to the
     // fail-closed generic below instead of breaking the closed vocabulary.
     if s.subject == PAUSE_SKIP_SUBJECT && s.reason.as_str() == PAUSE_ARM_FAILED_REASON {
+        return SkippedOut {
+            name: s.subject.clone(),
+            reason: s.reason.clone(),
+        };
+    }
+    if s.subject == PAUSE_SKIP_SUBJECT && s.reason.as_str() == PAUSE_RELEASE_UNPROVEN_REASON {
         return SkippedOut {
             name: s.subject.clone(),
             reason: s.reason.clone(),
@@ -5007,6 +5013,7 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
                     LEARNED_UNMARKED_REASON,
                     COVERAGE_RETIRED_REASON,
                     PAUSE_ARM_FAILED_REASON,
+                    PAUSE_RELEASE_UNPROVEN_REASON,
                     MEMBER_STOP_UNAVAILABLE_REASON,
                 ] {
                     let hits = ev

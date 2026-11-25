@@ -137,7 +137,7 @@ cleanup() {
     CLEANUP_STATUS=$?
     trap - EXIT INT TERM
     set +e
-    for pid in "${HPID_H-}" "${HPID_FIVE-}" "${WPID-}" "${HPID_R-}" "${OPID-}"; do
+    for pid in "${HPID_H-}" "${HPID_FIVE-}" "${HPID_REC-}" "${WPID-}" "${HPID_R-}" "${OPID-}"; do
         if [ -n "$pid" ]; then
             kill "$pid" 2>/dev/null || true
             wait "$pid" 2>/dev/null || true
@@ -146,7 +146,7 @@ cleanup() {
     for name in "$VICTIM_NAME" \
         "p11scope-container-obs1-$RUN_ID" "p11scope-container-obs2-$RUN_ID" \
         "p11scope-container-obs3-$RUN_ID" "p11scope-container-obs4-$RUN_ID" \
-        "p11scope-container-obs5-$RUN_ID"; do
+        "p11scope-container-obs5-$RUN_ID" "p11scope-container-obs6-$RUN_ID"; do
         docker rm -f "$name" >/dev/null 2>&1 || true
     done
     docker image rm "$VICTIM_IMAGE" >/dev/null 2>&1 || true
@@ -682,6 +682,101 @@ stop_refusal_target() {
     fi
 }
 
+leg_recovery_image() {
+    echo "=== leg: recovery-var-tmp ==="
+    local name log hlog inner rc table_class recovered_dir recovered_report
+    name="p11scope-container-obs6-$RUN_ID"
+    log="$OUT/recovery-observer.log"
+    hlog="$OUT/recovery-harness.log"
+    rm -f "$WORK/shared/go-rec" "$WORK/shared/fin-rec" || return 1
+    SOFTHSM2_CONF="$SOFTHSM2_CONF" "$WORK/harness" "$MODULE" \
+        "$WORK/shared/go-rec" "$WORK/shared/fin-rec" >"$hlog" 2>&1 &
+    HPID_REC=$!
+    local attempt
+    attempt=0
+    while [ "$attempt" -lt 200 ]; do
+        grep -Fq libsofthsm2.so "/proc/$HPID_REC/maps" 2>/dev/null && break
+        attempt=$((attempt + 1))
+        sleep 0.05
+    done
+    grep -Fq libsofthsm2.so "/proc/$HPID_REC/maps" 2>/dev/null || return 1
+    # Fill a small /tmp tmpfs almost completely before exec'ing the observer.
+    # The output write then fails with ENOSPC while /var/tmp stays writable,
+    # which is the shipped-image recovery case item 4 qualifies.
+    inner="/bin/busybox dd if=/dev/zero of=/tmp/fill bs=1024 count=120 2>/dev/null || true; exec /usr/local/bin/p11scope profile --pid $HPID_REC --mode metrics --duration $DURATION -o /tmp/full.json"
+    timeout --signal=TERM --kill-after=10s 90s docker run --name "$name" \
+        --entrypoint /bin/sh --tmpfs /tmp:rw,nosuid,nodev,size=128k \
+        "${OBS_FLAGS[@]}" "$OBS_IMAGE" -c "$inner" >"$log" 2>&1 &
+    OPID=$!
+    SPID=$OPID
+    wait_for_capture_ready "$log" aggregate-only metrics || {
+        kill_obs
+        docker rm -f "$name" >/dev/null 2>&1 || true
+        return 1
+    }
+    SPID=
+    touch "$WORK/shared/go-rec" || return 1
+    rc=0
+    wait "$OPID" || rc=$?
+    OPID=
+    touch "$WORK/shared/fin-rec" || return 1
+    wait "$HPID_REC" || return 1
+    HPID_REC=
+    [ "$rc" -eq 1 ] || {
+        echo "full-/tmp capture exited $rc, not the output failure's 1" >&2
+        docker rm -f "$name" >/dev/null 2>&1 || true
+        return 1
+    }
+    [ "$(grep -c 'capture saved to' "$log" || true)" -eq 1 ] || {
+        echo "recovery fact is not exactly one stderr line" >&2
+        docker rm -f "$name" >/dev/null 2>&1 || true
+        return 1
+    }
+    ! grep -Fq 'the JSON report follows on stdout' "$log" || {
+        echo "a recovered capture was duplicated to stdout" >&2
+        docker rm -f "$name" >/dev/null 2>&1 || true
+        return 1
+    }
+    if docker cp "$name:/tmp/full.json" "$OUT/recovery-primary.json" >/dev/null 2>&1; then
+        echo "the full-/tmp primary unexpectedly exists" >&2
+        docker rm -f "$name" >/dev/null 2>&1 || true
+        return 1
+    fi
+    rm -rf "$OUT/recovered-image" || return 1
+    docker cp "$name:/var/tmp/p11scope-recovered-0" "$OUT/recovered-image" >/dev/null 2>&1 || {
+        echo "no recovery dir in the image's /var/tmp" >&2
+        docker rm -f "$name" >/dev/null 2>&1 || true
+        return 1
+    }
+    docker rm -f "$name" >/dev/null 2>&1 || return 1
+    recovered_dir="$OUT/recovered-image"
+    recovered_report=$(python3 -I - "$recovered_dir" <<'PY' || return 1
+import pathlib, sys
+files = sorted(path for path in pathlib.Path(sys.argv[1]).iterdir() if path.is_file())
+assert len(files) == 1, files
+print(files[0])
+PY
+)
+    [ -n "$recovered_report" ] || return 1
+    reclaim_root_output "$recovered_report" || return 1
+    python3 -I scripts/matrix/check-count-multiset.py "$recovered_report" spike/expected.txt \
+        >>"$OUT/recovery-oracle.log" 2>&1 || return 1
+    table_class=$(classify_provider_tables "$recovered_report" 2>>"$OUT/recovery-oracle.log") || return 1
+    echo "provider table class: $table_class" >>"$OUT/recovery-oracle.log"
+    case $table_class in
+        26)
+            python3 -I scripts/check-capture-evidence.py clean-metrics "$recovered_report" spike/expected.txt \
+                >>"$OUT/recovery-oracle.log" 2>&1 || return 1
+            ;;
+        27) ;;
+        *)
+            echo "unknown provider table shape: $table_class" >&2
+            return 1
+            ;;
+    esac
+    return 0
+}
+
 leg_refusal_pidns() {
     echo "=== leg: refusal-pidns ==="
     local name log flag
@@ -795,6 +890,12 @@ if leg_host_five; then
     fi
 else
     record five-cap-exact 0 failed "see host-five-observer.log and host-five-oracle.log"
+    FAILED=1
+fi
+if leg_recovery_image; then
+    record recovery-var-tmp 1 qualified "full /tmp output fails once and recovers a complete report under /var/tmp"
+else
+    record recovery-var-tmp 0 failed "see recovery-observer.log and recovery-oracle.log"
     FAILED=1
 fi
 if start_refusal_target; then

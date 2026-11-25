@@ -117,8 +117,8 @@ readable memory)` before every capture.
 goes to `p11scope` verbatim. Which processes on the node map a provider:
 `kubectl -n p11scope exec "$OBS" -- p11scope inventory --system -o
 /tmp/inventory.json` (scan-only in this release: callers and mappings, no
-usage counts). `/tmp` is the only writable path; copy results out before the
-pod is replaced, because the emptyDir does not survive a rollout.
+usage counts). `/tmp` is the output path and `/var/tmp` holds recovery copies; copy results
+out before the pod is replaced, because the emptyDirs do not survive a rollout.
 
 ## Privileges and why
 
@@ -287,11 +287,12 @@ Where an admission policy engine or audit pipeline exists, alert on any
 Scale the DaemonSet down (or delete it) when no capture is planned: nothing
 it holds needs to persist.
 
-**Read-only root**: the root filesystem is read-only; the only writable path
-is the `scratch` emptyDir at `/tmp` (capped at 256 Mi by `sizeLimit`; the
-kubelet evicts the pod past it), so captures write `-o /tmp/<name>`.
-Kubelet creates that mount 0777 without the sticky bit, which the observer's
-output trust check refuses; `k8s-profile-entry.sh` restores 1777 first.
+**Read-only root**: the root filesystem is read-only. Captures write `-o
+/tmp/<name>` on the `scratch` emptyDir, and a failed `-o` save recovers under
+`/var/tmp` on the separate `recovery` emptyDir (each capped at 256 Mi by
+`sizeLimit`; the kubelet evicts the pod past it). Kubelet creates those mounts
+0777 without the sticky bit, which the observer's output trust check refuses;
+`k8s-profile-entry.sh` restores 1777 first.
 
 Resources: requests 50m CPU / 128 Mi, limits 1 CPU / 768 Mi. Every capture
 runs through `kubectl exec` in this one pod, so concurrent captures share the

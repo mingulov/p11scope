@@ -9456,7 +9456,9 @@ pub(crate) fn finish_output(
     };
     if let Some(mut sink) = sink {
         let result = match sink.write_document(&document_bytes) {
-            Ok(()) => sink.commit(),
+            Ok(()) => sink
+                .commit_with_outcome()
+                .map_err(|failure| failure.into_message()),
             Err(error) => Err(sink
                 .fail_write_with_recovery(
                     &document_bytes,

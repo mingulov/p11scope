@@ -227,7 +227,9 @@ class ContainerImageCellTests(unittest.TestCase):
     def test_lane_keeps_its_oracle_and_refusal_markers(self):
         text = ENTRY.read_text()
         for marker in ("--network=none", "--network none", "host-exact", "container-exact",
-                       "refusal-pidns", "refusal-cap",
+                       "refusal-pidns", "refusal-cap", "recovery-var-tmp",
+                       "--tmpfs /tmp:rw,nosuid,nodev,size=128k",
+                       "/var/tmp/p11scope-recovered-0",
                        "pid-namespace-mismatch: refusing --pid",
                        "cannot identify process mount namespace: Permission denied",
                        "check-capture-evidence.py clean-metrics",

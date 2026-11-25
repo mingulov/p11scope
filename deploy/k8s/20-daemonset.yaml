@@ -121,7 +121,7 @@ spec:
         - name: observer
           image: ghcr.io/mingulov/p11scope:0.7.2
           imagePullPolicy: IfNotPresent
-          command: ["/bin/sh", "-c", "chmod 1777 /tmp && exec sleep infinity"]
+          command: ["/bin/sh", "-c", "chmod 1777 /tmp /var/tmp && exec sleep infinity"]
           securityContext:
             readOnlyRootFilesystem: true
             allowPrivilegeEscalation: false
@@ -140,6 +140,8 @@ spec:
               readOnly: true
             - name: scratch
               mountPath: /tmp
+            - name: recovery
+              mountPath: /var/tmp
           resources:
             requests:
               cpu: 50m
@@ -153,6 +155,9 @@ spec:
             path: /sys/fs/cgroup
             type: Directory
         - name: scratch
+          emptyDir:
+            sizeLimit: 256Mi
+        - name: recovery
           emptyDir:
             sizeLimit: 256Mi
       tolerations:

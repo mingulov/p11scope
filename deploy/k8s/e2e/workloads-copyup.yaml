@@ -26,6 +26,9 @@ spec:
       imagePullPolicy: Never
       args: ["copy-up", "400", "250", "8"]
       resources:
+        requests:
+          cpu: 50m
+          memory: 32Mi
         limits:
           cpu: 500m
           memory: 128Mi

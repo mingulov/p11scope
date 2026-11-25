@@ -39,6 +39,9 @@ spec:
       imagePullPolicy: Never
       args: ["ledger", "400"]
       resources:
+        requests:
+          cpu: 50m
+          memory: 32Mi
         limits:
           cpu: 500m
           memory: 128Mi
@@ -61,6 +64,9 @@ spec:
       imagePullPolicy: Never
       args: ["ledger", "250"]
       resources:
+        requests:
+          cpu: 50m
+          memory: 32Mi
         limits:
           cpu: 500m
           memory: 128Mi
@@ -87,6 +93,9 @@ spec:
       imagePullPolicy: Never
       args: ["ledger-private", "300"]
       resources:
+        requests:
+          cpu: 50m
+          memory: 32Mi
         limits:
           cpu: 500m
           memory: 128Mi
@@ -109,6 +118,9 @@ spec:
       imagePullPolicy: Never
       args: ["ledger", "100"]
       resources:
+        requests:
+          cpu: 50m
+          memory: 32Mi
         limits:
           cpu: 500m
           memory: 128Mi
@@ -131,6 +143,9 @@ spec:
       imagePullPolicy: Never
       args: ["ledger", "200"]
       resources:
+        requests:
+          cpu: 50m
+          memory: 32Mi
         limits:
           cpu: 500m
           memory: 128Mi
@@ -153,6 +168,9 @@ spec:
       imagePullPolicy: Never
       args: ["idle"]
       resources:
+        requests:
+          cpu: 10m
+          memory: 16Mi
         limits:
           cpu: 100m
           memory: 32Mi

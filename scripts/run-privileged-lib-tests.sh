@@ -1642,6 +1642,14 @@ cleanup_btrfs_mount() {
     BTRFS_TEARDOWN_MNT=
 }
 
+record_typed_verdict() {
+    # Closed runner token only; never copy a log line or free-text reason here.
+    printf '%s\t%s\n' "$1" "$2" >>"$TYPED_VERDICTS" || {
+        echo "$PROG: cannot append typed verdict for $1" >&2
+        exit 1
+    }
+}
+
 main() {
     local bin outdir include_long=0 include_btrfs=0 include_overlay=0 include_xfail=0 wide=0 full512=0
     local selected_runnable=() selected_skipped=()
@@ -1783,6 +1791,15 @@ main() {
         done
     fi
     dedup_preserving_order selected_runnable
+    TYPED_SELECTION=$outdir/known-failing-selection.txt
+    TYPED_VERDICTS=$outdir/known-failing-verdicts.tsv
+    {
+        printf '%s\n' ${selected_runnable[@]+"${selected_runnable[@]}"}
+        for i in ${selected_skipped[@]+"${selected_skipped[@]}"}; do
+            printf '%s\n' "${SKIP_TESTS[$i]}"
+        done
+    } >"$TYPED_SELECTION" || return 1
+    : >"$TYPED_VERDICTS" || return 1
     # Every SELECTOR must match at least one curated test.
     for arg in ${SELECTORS[@]+"${SELECTORS[@]}"}; do
         local matched=0 candidate
@@ -2052,6 +2069,7 @@ main() {
     # of counting phantoms toward a lying SUMMARY.
     for i in ${selected_skipped[@]+"${selected_skipped[@]}"}; do
         echo "SKIP ${SKIP_TESTS[$i]} :: ${SKIP_REASONS[$i]}" | tee -a "$results"
+        record_typed_verdict "${SKIP_TESTS[$i]}" SKIP
         if [ "${PIPESTATUS[0]}" -ne 0 ]; then
             echo "$PROG: static skip print failed for index $i" >&2
             return 1
@@ -2064,6 +2082,7 @@ main() {
             *_ia32)
                 if [ "$m32_ok" -eq 0 ]; then
                     echo "SKIP $name :: host cc -m32 probe failed (ia32 multilib unavailable)" | tee -a "$results"
+                    record_typed_verdict "$name" SKIP
                     skipped=$((skipped + 1))
                     continue
                 fi
@@ -2071,6 +2090,7 @@ main() {
             *broad_p11kit_admission_arithmetic)
                 if [ "$p11kit_ok" -eq 0 ]; then
                     echo "SKIP $name :: host python3 cannot load libp11-kit.so.0" | tee -a "$results"
+                    record_typed_verdict "$name" SKIP
                     skipped=$((skipped + 1))
                     continue
                 fi
@@ -2078,6 +2098,7 @@ main() {
             *_never_attributed_on_ext4)
                 if [ -n "$ext4loop_skip" ]; then
                     echo "SKIP $name :: $ext4loop_skip" | tee -a "$results"
+                    record_typed_verdict "$name" SKIP
                     skipped=$((skipped + 1))
                     continue
                 fi
@@ -2088,6 +2109,7 @@ main() {
         if [ -n "${counter_fixture_set[$name]+present}" ]; then
             if [ -n "$counter_skip" ]; then
                 echo "SKIP $name :: $counter_skip" | tee -a "$results"
+                record_typed_verdict "$name" SKIP
                 skipped=$((skipped + 1))
                 continue
             fi
@@ -2099,6 +2121,7 @@ main() {
         if [ -n "${wrap_fixture_set[$name]+present}" ]; then
             if [ -n "$wrap_skip" ]; then
                 echo "SKIP $name :: $wrap_skip" | tee -a "$results"
+                record_typed_verdict "$name" SKIP
                 skipped=$((skipped + 1))
                 continue
             fi
@@ -2109,6 +2132,7 @@ main() {
         if [ -n "${btrfs_set[$name]+present}" ]; then
             if [ -n "$btrfs_skip" ]; then
                 echo "SKIP $name :: $btrfs_skip" | tee -a "$results"
+                record_typed_verdict "$name" SKIP
                 skipped=$((skipped + 1))
                 continue
             fi
@@ -2185,13 +2209,16 @@ main() {
             if [ "$verdict" = "PASS" ]; then
                 xpass=$((xpass + 1))
                 echo "XPASS $name rc=$rc seconds=$seconds :: $result_line$branch_suffix (UNEXPECTED PASS; expected: ${xfail_reason[$name]})" | tee -a "$results"
+                record_typed_verdict "$name" XPASS
             elif xfail_log_matches "${xfail_sig[$name]}" "$log"; then
                 xfail=$((xfail + 1))
                 sig_line=$(command grep -F -m 1 -- "${xfail_sig[$name]}" "$log" | head -c 300 || true)
                 echo "XFAIL $name rc=$rc seconds=$seconds :: $result_line$branch_suffix (expected: ${xfail_reason[$name]}; sig: $sig_line)" | tee -a "$results"
+                record_typed_verdict "$name" XFAIL
             else
                 fail=$((fail + 1))
                 echo "FAIL $name rc=$rc seconds=$seconds :: $result_line$branch_suffix (EXPECTED-FAILURE SIGNATURE MISMATCH; want sig: ${xfail_sig[$name]}; expected: ${xfail_reason[$name]})" | tee -a "$results"
+                record_typed_verdict "$name" FAIL
             fi
         else
             if [ "$verdict" = "PASS" ]; then
@@ -2200,11 +2227,22 @@ main() {
                 fail=$((fail + 1))
             fi
             echo "$verdict $name rc=$rc seconds=$seconds :: $result_line$branch_suffix" | tee -a "$results"
+            record_typed_verdict "$name" "$verdict"
         fi
     done
 
     echo "SUMMARY pass=$pass fail=$fail skipped=$skipped xfail=$xfail xpass=$xpass" | tee -a "$results"
-    [ "$fail" -eq 0 ] && [ "$xpass" -eq 0 ]
+    ledger_ok=0
+    if [ -n "${P11SCOPE_KNOWN_FAILING_RESULTS:-}" ] || [ -n "${P11SCOPE_KNOWN_FAILING_HOST:-}" ]; then
+        if [ -z "${P11SCOPE_KNOWN_FAILING_RESULTS:-}" ] || [ -z "${P11SCOPE_KNOWN_FAILING_HOST:-}" ]; then
+            echo "$PROG: typed known-failing results need both P11SCOPE_KNOWN_FAILING_RESULTS and P11SCOPE_KNOWN_FAILING_HOST" >&2
+        elif python3 -I "$REPO_ROOT/scripts/ci/privileged-lib-results.py"             "$TYPED_SELECTION" "$TYPED_VERDICTS" "$P11SCOPE_KNOWN_FAILING_RESULTS" "$P11SCOPE_KNOWN_FAILING_HOST"             && python3 -I "$REPO_ROOT/scripts/check-known-failing.py" --results "$P11SCOPE_KNOWN_FAILING_RESULTS"; then
+            ledger_ok=1
+        fi
+    else
+        ledger_ok=1
+    fi
+    [ "$fail" -eq 0 ] && [ "$xpass" -eq 0 ] && [ "$ledger_ok" -eq 1 ]
 }
 
 main "$@"

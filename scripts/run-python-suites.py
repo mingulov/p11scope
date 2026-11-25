@@ -29,9 +29,11 @@ Usage:
   python3 -I scripts/run-python-suites.py SUITE...   # check, run only these
 """
 
+import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -425,24 +427,97 @@ def print_registry():
         print(f"EXCLUDED  {name}: {reason}")
 
 
+def merge_typed_fragments(fragments, output, host):
+    selection = []
+    results = []
+    complete = True
+    valid = True
+    for path in fragments:
+        try:
+            fragment = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            valid = False
+            continue
+        if (not isinstance(fragment, dict)
+                or fragment.get("schema") != "p11scope/python-suite-fragment/v1"
+                or not isinstance(fragment.get("selection"), list)
+                or not isinstance(fragment.get("results"), list)):
+            valid = False
+            continue
+        complete = complete and fragment.get("complete") is True
+        invocation = fragment.get("invocation")
+        suite_path = fragment.get("path")
+        for item in fragment["selection"]:
+            if isinstance(item, dict) and isinstance(item.get("test"), str):
+                selection.append({"path": suite_path, "test": item["test"], "invocation": invocation})
+        for item in fragment["results"]:
+            if isinstance(item, dict) and isinstance(item.get("test"), str):
+                results.append({
+                    "path": suite_path,
+                    "test": item["test"],
+                    "invocation": invocation,
+                    "state": item.get("state"),
+                    "signature": item.get("signature"),
+                })
+    if not valid:
+        complete = False
+    document = {
+        "schema": "p11scope/known-failing-results/v1",
+        "runner": "python-suite",
+        "host": host,
+        "complete": complete,
+        "selection": selection,
+        "results": results,
+    }
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_suffix(output.suffix + ".tmp")
+    temporary.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.replace(output)
+
+
 def run_suites(selected):
     failed = []
-    for name, args in RUN:
-        if selected and name not in selected:
-            continue
-        label = " ".join([name, *args])
-        start = time.monotonic()
-        print(f"=== {label}", flush=True)
-        result = subprocess.run(
-            [sys.executable, "-I", f"{SUITE_DIR}/{name}", *args, "-v"],
-            cwd=ROOT,
-            env=os.environ.copy(),
-        )
-        seconds = time.monotonic() - start
-        verdict = "PASS" if result.returncode == 0 else f"FAIL rc={result.returncode}"
-        print(f"=== {verdict} {label} ({seconds:.0f}s)", flush=True)
-        if result.returncode != 0:
-            failed.append(label)
+    typed_output = os.environ.get("P11SCOPE_KNOWN_FAILING_RESULTS")
+    typed_host = os.environ.get("P11SCOPE_KNOWN_FAILING_HOST")
+    typed = bool(typed_output or typed_host)
+    fragments = []
+    with tempfile.TemporaryDirectory(prefix="python-suite-fragments-") as temporary:
+        for index, (name, args) in enumerate(RUN):
+            if selected and name not in selected:
+                continue
+            label = " ".join([name, *args])
+            start = time.monotonic()
+            print(f"=== {label}", flush=True)
+            if typed:
+                fragment = Path(temporary) / f"fragment-{index}.json"
+                command = [
+                    sys.executable, "-I", "scripts/typed-python-suite.py",
+                    f"{SUITE_DIR}/{name}", str(fragment), *args, "-v",
+                ]
+                fragments.append(fragment)
+            else:
+                command = [sys.executable, "-I", f"{SUITE_DIR}/{name}", *args, "-v"]
+            result = subprocess.run(command, cwd=ROOT, env=os.environ.copy())
+            seconds = time.monotonic() - start
+            verdict = "PASS" if result.returncode == 0 else f"FAIL rc={result.returncode}"
+            print(f"=== {verdict} {label} ({seconds:.0f}s)", flush=True)
+            if result.returncode != 0:
+                failed.append(label)
+        if typed:
+            if not typed_output or not typed_host:
+                print("run-python-suites: typed results need both P11SCOPE_KNOWN_FAILING_RESULTS and P11SCOPE_KNOWN_FAILING_HOST", file=sys.stderr)
+                return [*failed, "typed-result configuration"]
+            output = Path(typed_output)
+            merge_typed_fragments(fragments, output, typed_host)
+            checker = subprocess.run(
+                [sys.executable, "-I", "scripts/check-known-failing.py", "--results", str(output)],
+                cwd=ROOT,
+            )
+            if checker.returncode != 0:
+                return [*failed, "known-failing ledger judgment"]
+            if failed:
+                print("run-python-suites: nonzero suite outcomes are exactly covered by the typed known-failing ledger")
+                return []
     return failed
 
 

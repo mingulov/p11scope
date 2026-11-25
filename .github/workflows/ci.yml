@@ -1115,7 +1115,12 @@ jobs:
       # (test_help_usage_drift.py), schema, release-notice, packaging and
       # residual-gate suites. `--list` prints the registry.
       - name: tests/python suites (help-drift, schema, residual gates, every standalone suite)
-        run: python3 -I scripts/run-python-suites.py
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/known-failing-results"
+          python3 -I scripts/run-python-suites.py
+        env:
+          P11SCOPE_KNOWN_FAILING_RESULTS: ${{ github.workspace }}/known-failing-results/python.json
+          P11SCOPE_KNOWN_FAILING_HOST: github
   # A step cannot read its own job's log, so a second job fetches each finished
   # check job's log through the Actions API and keeps them as one run artifact
   # (90 days requested; repo and org settings can cap that). CHECK_JOBS names

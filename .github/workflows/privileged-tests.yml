@@ -382,6 +382,8 @@ jobs:
           sudo -n env PKCS11_HEADER_DIR="$header" \
             P11SCOPE_E2E_OBSERVER="$in/bin/p11scope" \
             P11SCOPE_DISCOVER_BIN="$in/bin/p11scope-discover" \
+            P11SCOPE_KNOWN_FAILING_RESULTS="$out/run/known-failing-results.json" \
+            P11SCOPE_KNOWN_FAILING_HOST=github \
             scripts/run-privileged-lib-tests.sh "$in/lib-tests" "$out/run" --exact-selectors "${extra[@]}" "${cells[@]}" || rc=$?
           sudo -n chown -R "$(id -un):$(id -gn)" "$out"
           cat "$out/run/results.txt"
@@ -564,6 +566,8 @@ jobs:
           header=/usr/include/p11-kit-1/p11-kit
           sudo -n env PKCS11_HEADER_DIR="$header" \
             P11SCOPE_E2E_OBSERVER="$in/bin/p11scope" \
+            P11SCOPE_KNOWN_FAILING_RESULTS="$out/run/known-failing-results.json" \
+            P11SCOPE_KNOWN_FAILING_HOST=github \
             scripts/run-privileged-lib-tests.sh "$in/lib-tests" "$out/run" --full-512 --exact-selectors "${cells[@]}" || rc=$?
           sudo -n chown -R "$(id -un):$(id -gn)" "$out"
           cat "$out/run/results.txt"
@@ -656,6 +660,8 @@ jobs:
           header=/usr/include/p11-kit-1/p11-kit
           sudo -n env PKCS11_HEADER_DIR="$header" \
             P11SCOPE_E2E_OBSERVER="$in/bin/p11scope" \
+            P11SCOPE_KNOWN_FAILING_RESULTS="$out/run/known-failing-results.json" \
+            P11SCOPE_KNOWN_FAILING_HOST=github \
             scripts/run-privileged-lib-tests.sh "$in/lib-tests" "$out/run" --full-512 --exact-selectors "${cells[@]}" || rc=$?
           sudo -n chown -R "$(id -un):$(id -gn)" "$out"
           cat "$out/run/results.txt"
@@ -732,7 +738,9 @@ jobs:
           mkdir -m 700 "$out"
           rc=0
           mapfile -t cells <"$RUNNER_TEMP/btrfs-cells.txt"
-          sudo -n scripts/run-privileged-lib-tests.sh "$in/lib-tests" "$out/run" --include-btrfs --exact-selectors "${cells[@]}" || rc=$?
+          sudo -n env P11SCOPE_KNOWN_FAILING_RESULTS="$out/run/known-failing-results.json" \
+            P11SCOPE_KNOWN_FAILING_HOST=github \
+            scripts/run-privileged-lib-tests.sh "$in/lib-tests" "$out/run" --include-btrfs --exact-selectors "${cells[@]}" || rc=$?
           sudo -n chown -R "$(id -un):$(id -gn)" "$out"
           cat "$out/run/results.txt"
           echo "runner rc=$rc"
@@ -764,7 +772,10 @@ jobs:
           sub="$mnt/sub"
           sudo -n install -d -m 700 -o "$(id -u)" -g "$(id -g)" "$sub"
           scripts/ci/discover-btrfs-subvol.sh "$in/bin/p11scope-discover" "$sub" "$cell_out"
-          python3 -I scripts/ci/check-cell-results.py "$cell_out/results.jsonl" --require discover-btrfs-subvol
+          python3 -I scripts/ci/check-cell-results.py "$cell_out/results.jsonl" --require discover-btrfs-subvol \
+            --known-failing-results "$cell_out/known-failing-results.json" \
+            --known-failing-runner cell:scripts/ci/discover-btrfs-subvol.sh \
+            --known-failing-host github
           trap - EXIT
           cleanup
       - name: Upload the btrfs results and logs
@@ -836,7 +847,9 @@ jobs:
           mkdir -m 700 "$out"
           rc=0
           mapfile -t cells <"$RUNNER_TEMP/overlay-cells.txt"
-          sudo -n scripts/run-privileged-lib-tests.sh "$in/lib-tests" "$out/run" --include-overlay --exact-selectors "${cells[@]}" || rc=$?
+          sudo -n env P11SCOPE_KNOWN_FAILING_RESULTS="$out/run/known-failing-results.json" \
+            P11SCOPE_KNOWN_FAILING_HOST=github \
+            scripts/run-privileged-lib-tests.sh "$in/lib-tests" "$out/run" --include-overlay --exact-selectors "${cells[@]}" || rc=$?
           sudo -n chown -R "$(id -un):$(id -gn)" "$out"
           cat "$out/run/results.txt"
           echo "runner rc=$rc"
@@ -1167,6 +1180,8 @@ jobs:
           (cd "$in" && sha256sum --check SHA256SUMS)
           chmod +x "$in/p11scope" "$in/p11scope-discover"
           out="$GITHUB_WORKSPACE/cli-out"
+          kf_host=github
+          if [ "${{ matrix.kernel }}" != host ]; then kf_host=vng; fi
           rc=0
           if [ "${{ matrix.kernel }}" = host ]; then
             uname -a
@@ -1189,6 +1204,9 @@ jobs:
               --require mt-trace --require counter-latency-mt --require mt-system \
               --require inventory-mt-pid --require inventory-mt-system \
               --require fifo-refused --require inventory-event-stdout \
+              --known-failing-results "$out/cells/known-failing-results.json" \
+              --known-failing-runner cell:scripts/qualify-public-cli.sh \
+              --known-failing-host "$kf_host" \
               >"$RUNNER_TEMP/qual.log" 2>&1 || qual_rc=$?
             sudo -n chown -R "$(id -un):$(id -gn)" "$out"
             tail -40 "$RUNNER_TEMP/qual.log"
@@ -1197,6 +1215,9 @@ jobs:
             # the same leg inside qualify-public-cli-vng.sh.
             minimal_rc=0
             sudo -n env RUNUID="$(id -u)" RUNGID="$(id -g)" scripts/ci/run-cell-script.sh minimal-setcap "$in/p11scope" "$out/minimal-cells" \
+              --known-failing-results "$out/minimal-cells/known-failing-results.json" \
+              --known-failing-runner cell:scripts/ci/minimal-setcap.sh \
+              --known-failing-host "$kf_host" \
               >"$RUNNER_TEMP/minimal.log" 2>&1 || minimal_rc=$?
             sudo -n chown -R "$(id -un):$(id -gn)" "$out"
             tail -20 "$RUNNER_TEMP/minimal.log"
@@ -1235,6 +1256,9 @@ jobs:
             --require run-child-drops-caps --require postsetup-drops-sysadmin \
             --require postsetup-inventory-drops-sysadmin \
             --require run-sudo --require run-user-nobody \
+            --known-failing-results "$out/minimal-cells/known-failing-results.json" \
+            --known-failing-runner cell:scripts/ci/minimal-setcap.sh \
+            --known-failing-host "$kf_host" \
             --require run-kill-on-timeout --require trace-sudo-out \
             --require inventory-sudo-event-log \
             --require inventory-sudo-fifo-out \
@@ -1255,7 +1279,10 @@ jobs:
             --require mt-metrics --require mt-errors --require mt-shared --require mt-churn \
             --require mt-trace --require counter-latency-mt --require mt-system \
             --require inventory-mt-pid --require inventory-mt-system \
-            --require fifo-refused --require inventory-event-stdout
+            --require fifo-refused --require inventory-event-stdout \
+            --known-failing-results "$out/cells/known-failing-results.json" \
+            --known-failing-runner cell:scripts/qualify-public-cli.sh \
+            --known-failing-host "$kf_host"
           # The wrapper translates the documented nonqualifying-smoke exit 2
           # to 0 when results exist; the per-cell checks below still decide.
           python3 -I - "$out/cells/results.jsonl" <<'PY'
@@ -1399,7 +1426,10 @@ jobs:
           # The shared closed-set gate (as the host leg): the ia32 cells
           # route through judge and pass with owned-provider-counts.
           python3 -I scripts/ci/check-cell-results.py "$out/cells/results.jsonl" \
-            --require profile-pid-ia32 --require run-ia32
+            --require profile-pid-ia32 --require run-ia32 \
+            --known-failing-results "$out/cells/known-failing-results.json" \
+            --known-failing-runner cell:scripts/qualify-public-cli.sh \
+            --known-failing-host github
       - name: Upload the ia32 results
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -1714,6 +1744,8 @@ jobs:
           set -euo pipefail
           umask 022
           out="$GITHUB_WORKSPACE/witness-cli-out"
+          kf_host=github
+          if [ "${{ matrix.kernel }}" != host ]; then kf_host=vng; fi
           if [ "${{ matrix.kernel }}" = host ]; then
             uname -a
             sudo -n scripts/ci/run-witness-cli.sh "$WITNESS_TESTBIN" "$out/cells"
@@ -1731,7 +1763,10 @@ jobs:
             --require privileged_profile_pid_prearm_twin_exact_window \
             --require privileged_trace_system_prearm_clean_exact_counts \
             --require privileged_profile_system_learned_provider_second_round_catches_oneshots \
-            --require privileged_trace_system_prearm_shared_provider_honest_accounting
+            --require privileged_trace_system_prearm_shared_provider_honest_accounting \
+            --known-failing-results "$out/cells/known-failing-results.json" \
+            --known-failing-runner cell:scripts/ci/run-witness-cli.sh \
+            --known-failing-host "$kf_host"
       - name: Upload the witness CLI results
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -1847,6 +1882,8 @@ jobs:
           set -euo pipefail
           umask 022
           out="$GITHUB_WORKSPACE/run-tree-out"
+          kf_host=github
+          if [ "${{ matrix.kernel }}" != host ]; then kf_host=vng; fi
           if [ "${{ matrix.kernel }}" = host ]; then
             uname -a
             sudo -n scripts/ci/run-run-tree.sh "$RUNTREE_TESTBIN" "$out/cells"
@@ -1877,7 +1914,10 @@ jobs:
             --intermittent-failure privileged_run_tree_unprearmed_shortlived_never_pause_still_learns \
             --intermittent-failure privileged_run_tree_unprearmed_shortlived_parallel_never_pause_covers_waves \
             --intermittent-failure privileged_run_tree_arming_exhaustion_still_stages_and_counts \
-            --require privileged_run_tree_non_member_provider_is_never_staged
+            --require privileged_run_tree_non_member_provider_is_never_staged \
+            --known-failing-results "$out/cells/known-failing-results.json" \
+            --known-failing-runner cell:scripts/ci/run-run-tree.sh \
+            --known-failing-host "$kf_host"
       - name: Upload the run-tree results
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -2010,7 +2050,10 @@ jobs:
           python3 -I scripts/ci/check-cell-results.py "$GITHUB_WORKSPACE/container-image-out/results.jsonl" \
             --require host-exact --require container-exact \
             --require refusal-pidns --require refusal-cap \
-            --require five-cap-exact
+            --require five-cap-exact \
+            --known-failing-results "$GITHUB_WORKSPACE/container-image-out/known-failing-results.json" \
+            --known-failing-runner cell:scripts/matrix/verify-container-image.sh \
+            --known-failing-host github
       - name: Upload the container-image results
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -2068,7 +2111,10 @@ jobs:
             --require pkcs11-check-identical-results \
             --require pkcs11-check-observer-clean \
             --require pkcs11-check-manifest-exact \
-            --require pkcs11-check-default-coverage
+            --require pkcs11-check-default-coverage \
+            --known-failing-results "$out/cells/known-failing-results.json" \
+            --known-failing-runner cell:scripts/ci/pkcs11-check-cell.sh \
+            --known-failing-host github
           sudo -n chown -R "$(id -un):$(id -gn)" "$out"
           rm -rf "$out/cells/leg-a/tokens" "$out/cells/leg-b/tokens" "$out/cells/leg-c/tokens"
       - name: Upload the smoke results
@@ -2125,7 +2171,10 @@ jobs:
             --require pkcs11-check-identical-results \
             --require pkcs11-check-observer-clean \
             --require pkcs11-check-manifest-exact \
-            --require pkcs11-check-default-coverage
+            --require pkcs11-check-default-coverage \
+            --known-failing-results "$out/cells/known-failing-results.json" \
+            --known-failing-runner cell:scripts/ci/pkcs11-check-cell.sh \
+            --known-failing-host github
           sudo -n chown -R "$(id -un):$(id -gn)" "$out"
           rm -rf "$out/cells/leg-a/tokens" "$out/cells/leg-b/tokens" "$out/cells/leg-c/tokens"
       - name: Upload the full results
@@ -2224,7 +2273,10 @@ jobs:
             --require "${{ matrix.provider }}-run-observed" \
             --require "${{ matrix.provider }}-default-run-coverage" \
             --require "${{ matrix.provider }}-inventory-pid" \
-            --require "${{ matrix.discover_row }}"
+            --require "${{ matrix.discover_row }}" \
+            --known-failing-results "$out/cells/known-failing-results.json" \
+            --known-failing-runner cell:scripts/ci/provider-matrix-cell.sh \
+            --known-failing-host github
           sudo -n chown -R "$(id -un):$(id -gn)" "$out"
       - name: Upload the provider results
         if: ${{ !cancelled() }}
@@ -2296,7 +2348,10 @@ jobs:
             --require "${{ matrix.provider }}-run-observed" \
             --require "${{ matrix.provider }}-default-run-coverage" \
             --require "${{ matrix.provider }}-inventory-pid" \
-            --require "${{ matrix.discover_row }}"
+            --require "${{ matrix.discover_row }}" \
+            --known-failing-results "$out/cells/known-failing-results.json" \
+            --known-failing-runner cell:scripts/ci/provider-matrix-cell.sh \
+            --known-failing-host github
           sudo -n chown -R "$(id -un):$(id -gn)" "$out"
       - name: Upload the provider results
         if: ${{ !cancelled() }}

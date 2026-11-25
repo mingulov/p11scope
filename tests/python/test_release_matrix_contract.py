@@ -582,8 +582,6 @@ class MatrixContract(unittest.TestCase):
         ("scripts/qualify-release-matrix.sh", ".release-rust-version"): "the host's compiler pin; the stage never reads it",
         ("scripts/qualify-release-matrix.sh", "scripts/fixtures/exec_churn.c"):
             "build_bins hashes it in the checkout; the stage carries it as artifacts/lib-source",
-        ("scripts/run-privileged-lib-tests.sh", "scripts/ci/stop-races.sh"):
-            "prose in an unscheduled cell's reason text; this runner never runs it",
     }
     # The contract's own literals are the staging declarations under test.
     DECLARATION = "scripts/release-matrix-contract.py"
@@ -660,7 +658,7 @@ class MatrixContract(unittest.TestCase):
         "scripts/qualify-release-matrix.sh": {"stage", "checkout", "self-test"},
     }
     # Text that names a file without reading it (an unscheduled cell's reason).
-    PROSE = {("scripts/run-privileged-lib-tests.sh", "scripts/ci/stop-races.sh")}
+    PROSE = set()
 
     def closure(self, owner, self_test=False):
         """Every repository file `owner` reads, file by file through the

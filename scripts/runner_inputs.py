@@ -75,12 +75,12 @@ _MATRIX_SELF_TEST = (
     "tests/python/test_qualify_records.py", "tests/python/test_task_storage_canary.py",
     "scripts/build-task-storage-canary.sh", "scripts/build-task-storage-reader.sh",
     "scripts/capture-stopped-canary.py", "scripts/check-bpf-map-defs.py", "scripts/check-canary-evidence.py",
-    "scripts/check-ignored-tests.py", "scripts/ci/stop-races.sh", "scripts/cleanup-traps.sh",
+    "scripts/check-ignored-tests.py", "scripts/cleanup-traps.sh",
     "scripts/dump-owned-bpf-maps.py", "scripts/fixtures/canary_workload.c",
     "scripts/fixtures/privacy-stack-workload.c", "scripts/lane-lib-oracle-1.py", "scripts/lane-lib-oracle-2.py",
     "scripts/lane-lib-oracle-3.py", "scripts/lane-lib-oracle-4.py", "scripts/lane-lib-oracle-5.py",
     "scripts/lane-lib-oracle-6.py", "scripts/lib.sh", "scripts/native/dump-task-storage.bpf.c",
-    "scripts/native/dump-task-storage.c", "scripts/product-build.sh", "scripts/qualify-stop-races.sh",
+    "scripts/native/dump-task-storage.c", "scripts/product-build.sh",
     "scripts/qualify-task-storage-canary.py", "scripts/recorded-process-exec.py", "scripts/verify-canaries.sh")
 
 # runner -> mode -> (where the mode runs, its inputs). A `stage` mode runs

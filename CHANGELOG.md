@@ -143,6 +143,14 @@ versioned separately and are opaque, exact dispatch keys.
   degrades to partial instead of voiding to unavailable: pending
   keys lost to an H3 audit gap record one named `outcome_lost` gap
   each.
+- A function table decoded from memory now binds only when every
+  entry starts a function (an export, a `STT_FUNC` symbol or an
+  `.eh_frame_hdr` entry) or a live getter return or manifest backs it;
+  otherwise the table is refused with a named row instead of probing
+  unproven offsets. This matters for stripped providers without
+  `.eh_frame_hdr`, under `run --pause never` and when attaching to an
+  already-running process (`profile`, `trace` or `inventory` with
+  `--pid` or `--system`), where no getter return is seen.
 
 ### Fixed
 

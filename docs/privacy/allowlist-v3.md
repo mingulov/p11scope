@@ -90,7 +90,7 @@ ours, owner sign-off at 0.9.x; Task 2 reviews `rv-v080-keymeta-t2`
 + `rv-v080-keymeta-t2-sr` + `hy4-rv-v080-keymeta-t2` with 8 fix
 rounds including the codex B1 fetch-mask over-read fix; Task 3
 join/publication landed; the Task 4 `--key-sizes` canary passed on
-2026-11-24, recorded in the keymeta section). The
+2026-11-25, recorded in the keymeta section). The
 [Provider, token and mechanism info (v0.8.0 keymeta Task 7)](#provider-token-and-mechanism-info-v080-keymeta-task-7)
 section is APPROVED and its info capture is IMPLEMENTED behind
 `--provider-info` (owner direction 2026-11-19 via the Task 7 fix8
@@ -2395,18 +2395,20 @@ sign-off at 0.9.x; Task 2 reviews `rv-v080-keymeta-t2` +
 rounds including the codex B1 fetch-mask over-read fix; Task 3
 join/publication landed). The Task 4 `--key-sizes` canary passed on
 2026-11-25 (live sentinel runs, lane v080-keysizes-canary on Fedora
-kernel 7.2.9: the committed cell passed 3/3 at rev 727c1b302 after
-3/3 at c6f684673 and 6/6 across earlier verdict revisions: S/V
-protocols on LP64,
+kernel 7.2.9: the committed cell passed 3/3 at rev 0c39778f3 after
+3/3 at 727c1b302, 3/3 at c6f684673 and 6/6 across earlier verdict
+revisions: S/V protocols on LP64,
 the marker absent from the JSON report, the event log, the verbose
 observer log and all 66 dumpable owned BPF maps including
 `EVIDENCE_START` (`bpftool -j` raw-cell scan of a snapshot after the
-workload; rings drain into the scanned outputs, task-storage identity
-maps are undumpable by bpftool and hold minted identity and epoch
-words only (no byte buffers), and the `CGROUP_FILTER` cgroup_array
-answers verified per-cell lookup refusals), with positive controls on
-every scanner (hex-encoded for the map-cell path) and published
-RSA-2048 sizes; the committed cell
+workload, every row checked against the map's `bytes_key` /
+`bytes_value` widths; rings drain into the scanned outputs,
+task-storage identity maps are undumpable by bpftool and hold minted
+identity and epoch words only (no byte buffers), and the
+`CGROUP_FILTER` cgroup_array answers verified per-cell lookup
+refusals, counted and admitted only on `cgroup_array`, 2 per run),
+with positive controls on every scanner (hex-encoded for the
+map-cell path) and published RSA-2048 sizes; the committed cell
 is `privileged_inventory_pid_key_sizes_canary_no_payload_leak`).
 The Task 5 live matrix remains an explicit outstanding item.**
 This section scopes section version 7 of

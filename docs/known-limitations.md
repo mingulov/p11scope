@@ -744,8 +744,9 @@ example a length program the verifier refuses — the journal retries
 without sizes behind a `key sizes unavailable` gap and key rows
 continue without operation-length sizes. The Task 4 privacy canary
 for `--key-sizes` passed on 2026-11-25 (Fedora kernel 7.2.9): the
-committed cell passed 3/3 at rev 727c1b302, after 3/3 at c6f684673
-and 6/6 across earlier verdict revisions with a manual map supplement.
+committed cell passed 3/3 at rev 0c39778f3, after 3/3 at 727c1b302,
+3/3 at c6f684673 and 6/6 across earlier verdict revisions with a
+manual map supplement.
 A live `inventory --pid --capture native --key-operations --key-sizes
 --verbose` capture over a sentinel-guarded sign+verify workload (pure
 repeated 64-byte `K3YS1Z3CANARY!` guards around the S length cell and
@@ -759,10 +760,13 @@ bpftool-dumpable and are covered via the scanned outputs they drain
 into; the task-storage identity maps are undumpable by bpftool; they
 hold minted identity and epoch words only (no byte buffers). The
 `CGROUP_FILTER` cgroup_array map answers per-cell lookup refusals
-instead of values; the cell verifies the exact refusal shape and scans
-the keys. Positive controls on every scanner (an injected marker copy
-each must find, hex-encoded for the map-cell path) and the mirrored
-size verdict keep the cell non-vacuous; the committed cell is
+instead of values; the cell verifies the exact refusal shape, counts
+the refusals (2 per run, one per filter bank) and admits them only on
+`cgroup_array`, scans the keys, and checks every decoded row against
+the map's `bytes_key`/`bytes_value` widths. Positive controls on
+every scanner (an injected marker copy each must find, hex-encoded
+for the map-cell path) and the mirrored size verdict keep the cell
+non-vacuous; the committed cell is
 `privileged_inventory_pid_key_sizes_canary_no_payload_leak`.
 Live coverage is the S and V protocols on LP64; the remaining nine
 endpoints ride the same adapters with exact read-set twins at the

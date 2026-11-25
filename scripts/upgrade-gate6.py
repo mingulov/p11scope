@@ -96,6 +96,7 @@ PROFILE_TEST_WINDOW = "2026-01-01T00:00:00Z..2026-01-01T00:00:01Z (capture wall 
 PROFILE_INPUT_NOTE = (
     "profile input: mechanisms are capture-global, without caller, usage-edge or key linkage"
 )
+PROFILE_FIXTURE = ROOT / "tests/fixtures/upgrade/v071-observed-profile.json"
 
 
 class GateFailure(Exception):
@@ -219,13 +220,50 @@ def cbom_live_joint_rendered(document: dict) -> bool:
     )
 
 
-def cbom_profile_markers_present(document: dict) -> bool:
+def profile_window(document: dict) -> str:
+    """The typed capture window a cbom conversion must preserve."""
+    capture = document.get("capture", {})
+    start = capture.get("start")
+    end = capture.get("end")
+    if isinstance(start, str) and isinstance(end, str) and start and end:
+        return f"{start}..{end} (capture wall clock)"
+    return ""
+
+
+def cbom_profile_markers_present(document: dict, window: str = PROFILE_TEST_WINDOW) -> bool:
     """True when the old-shaped profile's typed conversion markers flow through."""
     props = cbom_properties(document)
     return (
         props.get("p11scope:source_schema") == "p11scope/observed-profile/v3"
-        and props.get("p11scope:window") == PROFILE_TEST_WINDOW
+        and props.get("p11scope:window") == window
         and props.get("p11scope:profile_note") == PROFILE_INPUT_NOTE
+    )
+
+
+def cbom_profile_fixture_flow(document: dict, window: str) -> bool:
+    """True when substantive v0.7.1 profile rows flow into typed cbom output."""
+    props = cbom_properties(document)
+    return (
+        cbom_profile_markers_present(document, window)
+        and props.get("p11scope:completeness") == "COMPLETE"
+        and props.get("p11scope:providers") == "1"
+        and props.get("p11scope:algorithms") == "1"
+    )
+
+
+def profile_fixture_old_shape(document: dict) -> bool:
+    """True only for a substantive v0.7.1 profile lacking the new evidence keys."""
+    evidence = document.get("evidence", {})
+    capture = document.get("capture", {})
+    return (
+        document.get("schema") == "p11scope/observed-profile/v3"
+        and document.get("lane") == "profile"
+        and capture.get("mode") == "profile"
+        and bool(capture.get("modules"))
+        and bool(document.get("functions"))
+        and bool(document.get("mechanisms"))
+        and evidence.get("completeness") == "COMPLETE"
+        and all(key not in evidence for key in (*B3_FIELDS, "coverage_retired_slots"))
     )
 
 
@@ -283,6 +321,44 @@ def terminate_target(target: subprocess.Popen) -> None:
     except subprocess.TimeoutExpired:
         target.kill()
         target.wait(timeout=5)
+
+
+def find_provider_module() -> str | None:
+    for candidate in (
+        "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so",
+        "/usr/lib64/pkcs11/libsofthsm2.so",
+        "/usr/lib/softhsm/libsofthsm2.so",
+    ):
+        if Path(candidate).exists():
+            return candidate
+    return None
+
+
+def object_observation_schema_names() -> list[str]:
+    return [
+        "docs/schema/inventory-v1-object-observations.schema.json",
+        *(
+            f"docs/schema/inventory-v1-object-observations-{version}.schema.json"
+            for version in ("v2", "v3", "v4", "v5")
+        ),
+    ]
+
+
+def load_object_observation_schemas() -> tuple[dict, dict]:
+    names = object_observation_schema_names()
+    old_schemas = {
+        name: json.loads(git_show("v0.7.1", name).decode()) for name in names
+    }
+    new_schemas = {name: json.loads((ROOT / name).read_text()) for name in names}
+    return old_schemas, new_schemas
+
+
+def load_profile_schemas() -> tuple[dict, dict]:
+    old_prof = json.loads(
+        git_show("v0.7.1", "docs/schema/observed-profile-v3.schema.json").decode()
+    )
+    new_prof = json.loads((ROOT / "docs/schema/observed-profile-v3.schema.json").read_text())
+    return old_prof, new_prof
 
 
 def generate_scan_report(binary: Path, output: Path, module: str) -> str:
@@ -355,15 +431,7 @@ def run_gate(args, workdir: Path, result: dict) -> int:
     )
 
     # 1. Generate old + new inventory scan reports from live targets.
-    module = None
-    for candidate in (
-        "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so",
-        "/usr/lib64/pkcs11/libsofthsm2.so",
-        "/usr/lib/softhsm/libsofthsm2.so",
-    ):
-        if Path(candidate).exists():
-            module = candidate
-            break
+    module = find_provider_module()
     check(result, "reports_generated", module is not None, "no SoftHSM provider found")
     old_report = workdir / "v071-inventory.json"
     new_report = workdir / "v072-inventory.json"
@@ -412,7 +480,7 @@ def run_gate(args, workdir: Path, result: dict) -> int:
             same_diff = json.loads(completed.stdout)
             zero_ok = diff_zero_same(same_diff)
             zero_detail = (
-                "schema=inventory-diff/v1 "
+                f"schema={same_diff.get('schema')} "
                 f"application_changes={len(same_diff.get('application_changes', []))} "
                 f"module_path_changes={len(same_diff.get('module_path_changes', []))}"
             )
@@ -482,18 +550,8 @@ def run_gate(args, workdir: Path, result: dict) -> int:
 
     # 4. B2: live_joint_feed_absent in the v1-v5 reason enums, and the new
     # reader renders it through rather than merely exiting zero.
-    schema_names = [
-        "docs/schema/inventory-v1-object-observations.schema.json",
-        *(
-            f"docs/schema/inventory-v1-object-observations-{version}.schema.json"
-            for version in ("v2", "v3", "v4", "v5")
-        ),
-    ]
     try:
-        old_schemas = {
-            name: json.loads(git_show("v0.7.1", name).decode()) for name in schema_names
-        }
-        new_schemas = {name: json.loads((ROOT / name).read_text()) for name in schema_names}
+        old_schemas, new_schemas = load_object_observation_schemas()
     except (subprocess.CalledProcessError, OSError, json.JSONDecodeError) as exc:
         check(result, "b2_schemas", False, f"schema load: {exc}")
     old_carrying = [
@@ -567,12 +625,7 @@ def run_gate(args, workdir: Path, result: dict) -> int:
     # in the profile-lane then.required and exactly those plus
     # coverage_retired_slots in the full evidence-required delta.
     try:
-        old_prof = json.loads(
-            git_show("v0.7.1", "docs/schema/observed-profile-v3.schema.json").decode()
-        )
-        new_prof = json.loads(
-            (ROOT / "docs/schema/observed-profile-v3.schema.json").read_text()
-        )
+        old_prof, new_prof = load_profile_schemas()
     except (subprocess.CalledProcessError, OSError, json.JSONDecodeError) as exc:
         check(result, "b3_schemas", False, f"schema load: {exc}")
 
@@ -602,19 +655,28 @@ def run_gate(args, workdir: Path, result: dict) -> int:
         "not one of the three upgrade-note run-gap fields; docs lane owns that note"
     )
 
-    # New cbom still reads an old-shaped profile (lenient reader) and the
-    # typed profile markers flow through, so this is not an rc-only check.
-    minimal_profile = {
-        "schema": "p11scope/observed-profile/v3",
-        "lane": "profile",
-        "capture": {"start": "2026-01-01T00:00:00Z", "end": "2026-01-01T00:00:01Z"},
-        "evidence": {"completeness": "complete"},
-        "functions": [],
-        "mechanisms": [],
-    }
-    prof_path = workdir / "v071-shaped-profile.json"
-    prof_path.write_text(json.dumps(minimal_profile))
-    completed = run([str(args.new_binary), "inventory", "cbom", str(prof_path), "--json"])
+    # New cbom still reads a real v0.7.1-generated profile (lenient reader).
+    # The fixture has non-empty capture-module, evidence, function and mechanism
+    # rows; conversion must flow those rows into typed cbom properties rather
+    # than merely exiting zero on a sparse synthetic object.
+    try:
+        profile_doc = load_json_file(PROFILE_FIXTURE)
+    except ValueError as exc:
+        check(result, "b3_fixture_old_shape", False, f"fixture load: {exc}")
+    fixture_ok = profile_fixture_old_shape(profile_doc)
+    check(
+        result,
+        "b3_fixture_old_shape",
+        fixture_ok,
+        "real v0.7.1 profile fixture with modules/evidence/functions/mechanisms "
+        "and without the new required evidence keys"
+        if fixture_ok
+        else "fixture is not a substantive old-shaped v0.7.1 profile",
+    )
+    window = profile_window(profile_doc)
+    completed = run(
+        [str(args.new_binary), "inventory", "cbom", str(PROFILE_FIXTURE), "--json"]
+    )
     props = {}
     cbom = {}
     profile_detail = f"rc={completed.returncode}"
@@ -625,15 +687,18 @@ def run_gate(args, workdir: Path, result: dict) -> int:
                 profile_detail = f"bomFormat={cbom.get('bomFormat')}"
             else:
                 props = cbom_properties(cbom)
-                profile_detail = "typed profile markers present"
+                profile_detail = "typed profile markers and substantive rows present"
         except json.JSONDecodeError as exc:
             profile_detail = f"cbom JSON parse: {exc}"
-    profile_ok = completed.returncode == 0 and cbom_profile_markers_present(cbom)
+    profile_ok = completed.returncode == 0 and cbom_profile_fixture_flow(cbom, window)
     if not profile_ok and props:
         profile_detail = (
             f"source_schema={props.get('p11scope:source_schema')!r} "
             f"window={props.get('p11scope:window')!r} "
-            f"profile_note={props.get('p11scope:profile_note')!r}"
+            f"profile_note={props.get('p11scope:profile_note')!r} "
+            f"completeness={props.get('p11scope:completeness')!r} "
+            f"providers={props.get('p11scope:providers')!r} "
+            f"algorithms={props.get('p11scope:algorithms')!r}"
         )
     check(result, "b3_reader_accepts_old", profile_ok, profile_detail)
 

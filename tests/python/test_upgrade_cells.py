@@ -423,7 +423,10 @@ class UpgradeGate6Harness:
 
     def run_faulted(self, fault, command, timeout=120, **kwargs):
         text_command = [str(part) for part in command]
-        if fault == "cbom-old-rc" and "v071-inventory.json" in text_command:
+        cbom_source = ""
+        if "cbom" in text_command:
+            cbom_source = Path(text_command[text_command.index("cbom") + 1]).name
+        if fault == "cbom-old-rc" and cbom_source == "v071-inventory.json":
             return self.fake_completed(command, rc=1, stderr="injected cbom failure")
         if fault == "diff-old-new-rc" and "diff" in text_command:
             index = text_command.index("diff")
@@ -438,7 +441,7 @@ class UpgradeGate6Harness:
                 document = None
         if document is None:
             return completed
-        if fault == "cbom-old-bad-format" and "v071-inventory.json" in text_command:
+        if fault == "cbom-old-bad-format" and cbom_source == "v071-inventory.json":
             document["bomFormat"] = "wrong"
         elif fault == "diff-zero-wrong-schema" and "diff" in text_command:
             index = text_command.index("diff")
@@ -448,11 +451,11 @@ class UpgradeGate6Harness:
             index = text_command.index("diff")
             if text_command[index + 1] != text_command[index + 2]:
                 document["schema"] = "other"
-        elif fault == "b2-wrong-render" and "injected-live-joint.json" in text_command:
+        elif fault == "b2-wrong-render" and cbom_source == "injected-live-joint.json":
             for prop in document["metadata"]["properties"]:
                 if prop["name"] == "p11scope:object_observations":
                     prop["value"] = "partial (bogus_reason)"
-        elif fault == "b3-wrong-render" and "v071-observed-profile.json" in text_command:
+        elif fault == "b3-wrong-render" and cbom_source == "v071-observed-profile.json":
             for prop in document["metadata"]["properties"]:
                 if prop["name"] == "p11scope:window":
                     prop["value"] = "wrong-window"
@@ -477,6 +480,7 @@ class UpgradeGate6Harness:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             workdir = base / "work"
+            workdir.mkdir()
             old_binary = base / "old-p11scope"
             new_binary = base / "new-p11scope"
             if not missing_old_binary:
@@ -558,6 +562,12 @@ class UpgradeGate5ContractTests(unittest.TestCase):
                 r = self.run_gate5(option)
                 self.assertEqual(r.returncode, 2)
                 self.assertIn(f"{option} requires a value", r.stderr)
+
+    def test_gate5_source_only_environment_cannot_bypass_normal_execution(self):
+        env = dict(os.environ, P11SCOPE_GATE5_SOURCE_ONLY="1")
+        r = self.run_gate5("--format", "bogus", env=env)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("--format", r.stderr)
 
     def test_gate5_refuses_valid_args_without_root(self):
         with tempfile.TemporaryDirectory() as tmp:

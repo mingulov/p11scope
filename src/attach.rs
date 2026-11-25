@@ -6645,13 +6645,13 @@ fn test_flavor_override() -> Option<Result<EmbeddedFlavor, FlavorProbeError>> {
 pub(crate) fn check_flavor_against_build(probed: EmbeddedFlavor) -> Result<EmbeddedFlavor> {
     let expect_stubbed = cfg!(feature = "stub-object-attributes");
     if probed.stubbed != expect_stubbed {
-        let detail = if expect_stubbed {
-            "this limited build (no object-attribute capture) embedded a full object"
+        let (expected, actual) = if expect_stubbed {
+            ("stubbed (P0)", "wired (FULL)")
         } else {
-            "this full build embedded a limited object (no object-attribute capture)"
+            ("FULL", "stubbed (P0)")
         };
         bail!(
-            "embedded BPF object flavor mismatch: {detail} (stale or mismatched embedded object; rebuild p11scope from a clean target directory)"
+            "embedded BPF object flavor mismatch: build expects {expected} object-attribute capture, embedded bytes are {actual} (stale or mismatched embedded object; rebuild p11scope from a clean target directory)"
         );
     }
     let expect_unsafe = cfg!(feature = "unsafe-unvalidated-metadata");

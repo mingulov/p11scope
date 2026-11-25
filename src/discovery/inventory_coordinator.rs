@@ -6480,13 +6480,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // probes per pass; each eviction counts like any fold.
         if self.pair_dropped_tombstones.len() >= self.pair_prune_cap {
             let source = self.adapter.source();
-            let mut probes = 0usize;
             let mut victims = Vec::new();
-            for (key, tomb) in self.pair_dropped_tombstones.iter() {
-                if probes >= EVER_ENUMERATED_SWEEP {
-                    break;
-                }
-                probes += 1;
+            for (key, tomb) in self
+                .pair_dropped_tombstones
+                .iter()
+                .take(EVER_ENUMERATED_SWEEP)
+            {
                 if Self::tombstone_owner_gone(gone_memo, source, tomb.pid) {
                     victims.push(*key);
                 }
@@ -6566,7 +6565,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .map(|(key, tomb)| (*key, tomb.pruned_since, tomb.pid))
             .collect();
         if expired.len() > EVER_ENUMERATED_SWEEP || self.pair_drain_cursor.is_some() {
-            expired.sort_by(|a, b| (a.1, a.2).cmp(&(b.1, b.2)));
+            expired.sort_by_key(|a| (a.1, a.2));
         }
         let start = match self.pair_drain_cursor {
             None => 0,
@@ -11865,23 +11864,21 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         if observation.count > 0 && self.pair_folded.remove(&key).is_some() {
             self.registry
                 .note_fold_revival_count_gap(caller, 0, observation.count);
-            if let Some(target) = self.pair_targets.get_mut(&key) {
-                match target {
-                    PairTarget::Pending {
-                        base: target_base,
-                        base_since: target_since,
-                        ..
-                    }
-                    | PairTarget::Bound {
-                        base: target_base,
-                        base_since: target_since,
-                        ..
-                    } => {
-                        *target_base = observation.count;
-                        *target_since = observation.anchor_ns;
-                    }
-                    _ => {}
+            if let Some(
+                PairTarget::Pending {
+                    base: target_base,
+                    base_since: target_since,
+                    ..
                 }
+                | PairTarget::Bound {
+                    base: target_base,
+                    base_since: target_since,
+                    ..
+                },
+            ) = self.pair_targets.get_mut(&key)
+            {
+                *target_base = observation.count;
+                *target_since = observation.anchor_ns;
             }
             if let Some(recovery) = self.recoveries.get_mut(&key) {
                 recovery.watermark = recovery.watermark.max(observation.count);

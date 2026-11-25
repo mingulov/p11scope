@@ -424,7 +424,8 @@ class TypedCellResultsTests(unittest.TestCase):
     def test_conflicting_outcome_declarations_must_not_overlap(self):
         for options in (
                 ("--allow-nonqualifying", "cell", "--expected-failure", "cell"),
-                ("--allow-nonqualifying", "cell", "--intermittent-failure", "cell")):
+                ("--allow-nonqualifying", "cell", "--intermittent-failure", "cell"),
+                ("--expected-failure", "cell", "--intermittent-failure", "cell")):
             with self.subTest(options=options):
                 result, _document = run_typed_checker(
                     [row("cell", False, "nonqualifying", "smoke")], *options)

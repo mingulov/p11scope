@@ -97,6 +97,11 @@ class Fixture:
             "-->\n" + headings,
             encoding="utf-8")
 
+    def release_doc(self):
+        path = self.root / "docs/releases/v0.7.2.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# p11scope v0.7.2\n", encoding="utf-8")
+
     def python_suite(self):
         suite = self.root / "tests/python/test_sample.py"
         suite.parent.mkdir(parents=True, exist_ok=True)
@@ -167,6 +172,49 @@ class StaticValidationTests(unittest.TestCase):
         f.rows([row()])
         result = f.run_checker()
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_empty_list_is_refused_once_the_release_exists(self):
+        f = fixture(self)
+        f.release_doc()
+        result = f.run_checker()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("docs/releases/v0.7.2.md", result.stderr)
+
+    def test_released_tree_with_rows_and_registry_passes(self):
+        f = fixture(self)
+        f.registry()
+        f.python_suite()
+        f.rows([row()])
+        f.release_doc()
+        result = f.run_checker()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_fedora_host_limited_rows_are_refused_without_a_host_judge(self):
+        for hosts in (["fedora"], ["fedora-sm1"], ["github", "fedora-sm1"]):
+            with self.subTest(hosts=hosts):
+                f = fixture(self)
+                f.registry()
+                f.python_suite()
+                f.rows([row(hosts=hosts)])
+                result = f.run_checker()
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertIn("no CI judge", result.stderr)
+
+    def test_github_and_vng_hosts_are_accepted(self):
+        for hosts in (["github"], ["vng"], ["github", "vng"]):
+            with self.subTest(hosts=hosts):
+                f = fixture(self)
+                f.registry()
+                f.python_suite()
+                f.rows([row(hosts=hosts)])
+                result = f.run_checker()
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_signature_cell_must_equal_the_row_cell(self):
+        self.assert_bad_row(row(signature={"cell": "OTHER", "branch": "B"}), "signature cell must equal")
+
+    def test_privileged_lib_rows_are_refused_until_coverage_counts_xfail(self):
+        self.assert_bad_row(row(runner="privileged-lib"), "refused until")
 
     def test_typed_provenance_is_required(self):
         for field in ("cell", "issues", "reason", "last_green_sha"):
@@ -255,7 +303,8 @@ class StaticValidationTests(unittest.TestCase):
 
 class CellDeclarationTests(unittest.TestCase):
     def cell_row(self, runner="cell:scripts/ci/cells.sh"):
-        return row(path="scripts/ci/cells.sh", test="mt-exact", runner=runner)
+        return row(path="scripts/ci/cells.sh", test="mt-exact", cell="mt-exact", runner=runner,
+                   signature={"cell": "mt-exact", "branch": "B"})
 
     def test_valid_cell_row_matches_per_runner_declaration(self):
         f = fixture(self)
@@ -265,24 +314,61 @@ class CellDeclarationTests(unittest.TestCase):
         result = f.run_checker()
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_wrong_runner_declaration_does_not_satisfy_row(self):
+    def test_row_needs_no_per_runner_declaration(self):
         f = fixture(self)
         f.registry()
-        f.shell_cell()
-        f.rows([self.cell_row(runner="cell:scripts/ci/other.sh")])
-        (f.root / "scripts/ci/other.sh").write_text("#!/bin/sh\nexit 0\n")
+        f.shell_cell(declarations=False)
+        (f.root / ".github/workflows/main.yml").write_text("jobs: {}\n", encoding="utf-8")
+        f.rows([self.cell_row()])
         result = f.run_checker()
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("has no per-runner declaration", result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("has no per-runner declaration", result.stderr)
 
-    def test_missing_row_declaration_fails(self):
+    def test_undeclared_declaration_fails_despite_a_row(self):
         f = fixture(self)
         f.registry()
         f.shell_cell(declared="other-cell")
         f.rows([self.cell_row()])
         result = f.run_checker()
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("has no per-runner declaration", result.stderr)
+        self.assertIn("undeclared expected cells: other-cell", result.stderr)
+
+    def test_cell_must_equal_test_for_cell_runners(self):
+        f = fixture(self)
+        f.registry()
+        f.shell_cell()
+        bad = self.cell_row()
+        bad["cell"] = "OTHER"
+        bad["signature"] = {"cell": "OTHER", "branch": "B"}
+        f.rows([bad])
+        result = f.run_checker()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cell must equal", result.stderr)
+
+    def test_repeated_declarations_compare_require_file_exactly(self):
+        f = fixture(self)
+        f.shell_cell(declarations=False)
+        self.repeated_workflow(f, "--require-file /tmp/inventory-a.txt", "--require-file /tmp/inventory-a.txt")
+        result = f.run_checker()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.repeated_workflow(f, "--require-file /tmp/inventory-a.txt", "--require-file /tmp/inventory-b.txt")
+        result = f.run_checker()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("repeated declarations for one runner/results stream differ", result.stderr)
+
+    def test_require_file_alone_is_a_nonempty_selection(self):
+        f = fixture(self)
+        f.shell_cell(declarations=False)
+        (f.root / ".github/workflows/main.yml").write_text(
+            "jobs:\n  test:\n    steps:\n      - run: |\n"
+            "          python3 -I scripts/ci/check-cell-results.py \"$out/results.jsonl\" "
+            "--require-file /tmp/dynamic-selection.txt"
+            " --known-failing-results \"$out/kf.json\""
+            " --known-failing-runner cell:scripts/ci/cells.sh"
+            " --known-failing-host github\n",
+            encoding="utf-8")
+        result = f.run_checker()
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_undeclared_extra_declaration_fails(self):
         f = fixture(self)
@@ -340,6 +426,35 @@ class CellDeclarationTests(unittest.TestCase):
                 result = f.run_checker()
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("repeated declarations for one runner/results stream differ", result.stderr)
+
+
+class RowActivationTests(unittest.TestCase):
+    def test_hosted_rows_and_registry_pass_static_together(self):
+        # d.3 row 2 shape (python-suite, two issues) plus d.3 row 11
+        # shape (intermittent cell, vng host), written with a KI block
+        # into a temp copy. The real d.3 rows 2 and 11 do not ship:
+        # row 2's test file is absent from the tree and row 11's
+        # legacy intermittent failure carries no branch (see report).
+        f = fixture(self)
+        f.registry((("KI-02", True), ("KI-03", True), ("KI-13", True)))
+        f.python_suite()
+        f.shell_cell(declarations=False)
+        (f.root / ".github/workflows/main.yml").write_text(
+            "jobs:\n  test:\n    steps:\n      - run: |\n"
+            "          python3 -I scripts/ci/check-cell-results.py \"$out/results.jsonl\" "
+            "--intermittent-failure mt-exact"
+            " --known-failing-results \"$out/kf.json\""
+            " --known-failing-runner cell:scripts/ci/cells.sh"
+            " --known-failing-host github\n",
+            encoding="utf-8")
+        python_row = row(test="Sample.test_x", issues=["KI-02", "KI-03"])
+        cell_row = row(path="scripts/ci/cells.sh", test="mt-exact", cell="mt-exact",
+                       issues=["KI-13"], runner="cell:scripts/ci/cells.sh",
+                       mode="intermittent", hosts=["vng"],
+                       signature={"cell": "mt-exact", "branch": "known_gap"})
+        f.rows([python_row, cell_row])
+        result = f.run_checker()
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 class ResultDocumentTests(unittest.TestCase):
@@ -437,7 +552,7 @@ class ResultDocumentTests(unittest.TestCase):
 
     def test_host_filter_selects_exact_hosts(self):
         f = self.make_f()
-        f.rows([row(hosts=["fedora"])])
+        f.rows([row(hosts=["vng"])])
         doc = result_doc([{"path": "tests/python/test_sample.py", "test": "Sample.test_x",
                            "state": "passed", "signature": None}], host="github")
         result = f.run_checker("--results", str(f.results_file(doc)))
@@ -447,6 +562,33 @@ class ResultDocumentTests(unittest.TestCase):
         doc = result_doc([{"path": "tests/python/test_sample.py", "test": "Sample.test_x",
                            "signature": {"detail": "a raw log line"}}])
         self.assert_bad_results(doc, "free-text/log matching")
+
+    def test_results_mode_skips_executable_discovery(self):
+        f = fixture(self)
+        f.registry()
+        f.python_suite()
+        f.rows([row(test="Sample.test_missing")])
+        static = f.run_checker()
+        self.assertNotEqual(static.returncode, 0)
+        self.assertIn("executable discovery did not find exact test id", static.stderr)
+        doc = result_doc([{"path": "tests/python/test_sample.py", "test": "Sample.test_missing"}])
+        judged = f.run_checker("--results", str(f.results_file(doc)))
+        self.assertEqual(judged.returncode, 0, judged.stderr)
+        self.assertIn("1 expected failures", judged.stdout)
+
+    def test_results_summary_prints_neutral_counts(self):
+        f = fixture(self)
+        doc = result_doc([
+            {"path": "tests/python/test_sample.py", "test": "Sample.test_a",
+             "state": "skipped", "signature": {"branch": "host_prerequisite"}},
+            {"path": "tests/python/test_sample.py", "test": "Sample.test_b",
+             "state": "not_applicable", "signature": {"qualification": "nonqualifying"}},
+            {"path": "tests/python/test_sample.py", "test": "Sample.test_c",
+             "state": "passed", "signature": None},
+        ])
+        result = f.run_checker("--results", str(f.results_file(doc)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("1 skipped, 1 not_applicable", result.stdout)
 
 
 class ProducerTests(unittest.TestCase):
@@ -649,6 +791,100 @@ class PythonProducerProcessTests(unittest.TestCase):
             rows = {item["test"]: item for item in data["results"]}
             self.assertEqual(rows["<suite-events>"]["state"], "failed")
             self.assertEqual(rows["<suite-process>"]["state"], "passed")
+
+
+class ScopeSkipTests(unittest.TestCase):
+    CLASS_SKIP_BODY = (
+        "import unittest\n"
+        "class Skipped(unittest.TestCase):\n"
+        "    @classmethod\n"
+        "    def setUpClass(cls): raise unittest.SkipTest('no gcc-m32 on this host')\n"
+        "    def test_a(self): pass\n"
+        "    def test_b(self): pass\n"
+        "class Lively(unittest.TestCase):\n"
+        "    def test_c(self): pass\n"
+        "if __name__ == '__main__': unittest.main()\n")
+    MODULE_SKIP_BODY = (
+        "import unittest\n"
+        "def setUpModule(): raise unittest.SkipTest('no pkcs11.h on this host')\n"
+        "class Probe(unittest.TestCase):\n"
+        "    def test_a(self): pass\n"
+        "    def test_b(self): pass\n"
+        "if __name__ == '__main__': unittest.main()\n")
+    CLASS_ERROR_BODY = (
+        "import unittest\n"
+        "class Probe(unittest.TestCase):\n"
+        "    @classmethod\n"
+        "    def setUpClass(cls): raise RuntimeError('fixture exploded')\n"
+        "    def test_a(self): pass\n"
+        "if __name__ == '__main__': unittest.main()\n")
+
+    def run_scope_suite(self, body):
+        f = fixture(self)
+        suite = f.root / "tests/python/test_sample.py"
+        suite.parent.mkdir(parents=True, exist_ok=True)
+        suite.write_text(body, encoding="utf-8")
+        fragment = f.root / "fragment.json"
+        run = subprocess.run(
+            [sys.executable, "-I", "scripts/typed-python-suite.py",
+             "tests/python/test_sample.py", str(fragment)],
+            cwd=f.root, capture_output=True, text=True, timeout=60)
+        data = json.loads(fragment.read_text(encoding="utf-8"))
+        return f, run, data, fragment
+
+    def merge_and_judge(self, f, fragment, module_name):
+        runner = load_script(ROOT / "scripts/run-python-suites.py", module_name)
+        merged = f.root / "merged.json"
+        runner.merge_typed_fragments([(fragment, "test_sample.py", [])], merged, "github")
+        document = json.loads(merged.read_text(encoding="utf-8"))
+        judged = f.run_checker("--results", str(merged))
+        return document, judged
+
+    def test_setupclass_skip_marks_its_scope_skipped_and_stays_green(self):
+        f, run, data, fragment = self.run_scope_suite(self.CLASS_SKIP_BODY)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertTrue(data["complete"])
+        states = {item["test"]: item for item in data["results"]}
+        self.assertEqual(states["Skipped.test_a"]["state"], "skipped")
+        self.assertEqual(states["Skipped.test_a"]["signature"], {"branch": "class_skip", "oracle": "unittest"})
+        self.assertEqual(states["Skipped.test_b"]["state"], "skipped")
+        self.assertEqual(states["Skipped.test_b"]["signature"], {"branch": "class_skip", "oracle": "unittest"})
+        self.assertEqual(states["Lively.test_c"]["state"], "passed")
+        self.assertNotIn("gcc-m32", json.dumps(data))
+        document, judged = self.merge_and_judge(f, fragment, "python_suite_runner_class_skip")
+        self.assertTrue(document["complete"])
+        rows = {item["test"]: item for item in document["results"]}
+        self.assertEqual(rows["<suite-process>"]["state"], "passed")
+        self.assertEqual(rows["<suite-events>"]["state"], "passed")
+        self.assertEqual(judged.returncode, 0, judged.stderr)
+        self.assertIn("results ok", judged.stdout)
+
+    def test_setupmodule_skip_marks_all_skipped_and_stays_green(self):
+        f, run, data, fragment = self.run_scope_suite(self.MODULE_SKIP_BODY)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertTrue(data["complete"])
+        states = {item["test"]: item for item in data["results"]}
+        self.assertEqual(set(states), {"Probe.test_a", "Probe.test_b"})
+        for item in states.values():
+            self.assertEqual(item["state"], "skipped")
+            self.assertEqual(item["signature"], {"branch": "module_skip", "oracle": "unittest"})
+        self.assertNotIn("pkcs11.h", json.dumps(data))
+        document, judged = self.merge_and_judge(f, fragment, "python_suite_runner_module_skip")
+        self.assertTrue(document["complete"])
+        self.assertEqual(judged.returncode, 0, judged.stderr)
+
+    def test_setupclass_error_stays_red(self):
+        f, run, data, fragment = self.run_scope_suite(self.CLASS_ERROR_BODY)
+        self.assertEqual(run.returncode, 1)
+        self.assertFalse(data["complete"])
+        states = {item["test"]: item for item in data["results"]}
+        self.assertEqual(states["Probe.test_a"]["state"], "not_run")
+        self.assertNotIn("class_skip", json.dumps(data))
+        self.assertEqual(data["suite_events"][0]["state"], "error")
+        document, judged = self.merge_and_judge(f, fragment, "python_suite_runner_class_error")
+        self.assertFalse(document["complete"])
+        self.assertNotEqual(judged.returncode, 0)
+        self.assertIn("complete must be true", judged.stderr)
 
 
 class NeutralTerminalStateTests(unittest.TestCase):
@@ -1041,7 +1277,7 @@ class ProducerMutationSweepTests(unittest.TestCase):
         # Repeated declarations for one runner/results stream compare every
         # selection category, not only the two legacy outcome lists.
         repeated_mutant = checker_source.replace(
-            'for key in ("expected", "intermittent", "required", "nonqualifying")):',
+            'for key in ("expected", "intermittent", "required", "nonqualifying", "require_file")):',
             'for key in ("expected", "intermittent")):', 1)
 
         def repeated_declaration_refused(source):
@@ -1133,7 +1369,108 @@ class ProducerMutationSweepTests(unittest.TestCase):
                     artifact_flag in workflow_text and "cli-out/minimal-cells/dynamic-selection.txt" in workflow_text,
                     artifact_flag in artifact_mutant and "cli-out/minimal-cells/dynamic-selection.txt" in artifact_mutant)
 
-        total = 17
+        # A setUpClass skip marks its scope skipped instead of leaving
+        # not_run gaps; dropping the class branch recreates the red job.
+        class_skip_mutant = self.mutate_source(ROOT / "scripts/typed-python-suite.py",
+            'elif any(test.startswith(name + ".") for name in class_skipped):', 'elif False:')
+        class_skip_body = ("import unittest\nclass Skipped(unittest.TestCase):\n"
+                           " @classmethod\n def setUpClass(cls): raise unittest.SkipTest('x')\n"
+                           " def test_a(self): pass\n"
+                           "class Lively(unittest.TestCase):\n def test_b(self): pass\nunittest.main()\n")
+        outcomes = {}
+        for label, source in (("original", typed_source), ("mutant", class_skip_mutant)):
+            with tempfile.TemporaryDirectory() as temporary:
+                data, _run = self.python_suite_fragment(source, class_skip_body, Path(temporary))
+                outcomes[label] = bool(data and data.get("complete"))
+        self.record(results, "python-class-skip", outcomes["original"], outcomes["mutant"])
+
+        # A setUpModule skip marks every selected test module-skipped;
+        # dropping the module branch leaves the run incomplete.
+        module_skip_mutant = self.mutate_source(ROOT / "scripts/typed-python-suite.py",
+                                                "if module_skipped:", "if False:")
+        module_skip_body = ("import unittest\ndef setUpModule(): raise unittest.SkipTest('x')\n"
+                            "class Probe(unittest.TestCase):\n def test_a(self): pass\nunittest.main()\n")
+        outcomes = {}
+        for label, source in (("original", typed_source), ("mutant", module_skip_mutant)):
+            with tempfile.TemporaryDirectory() as temporary:
+                data, _run = self.python_suite_fragment(source, module_skip_body, Path(temporary))
+                outcomes[label] = bool(data and data.get("complete"))
+        self.record(results, "python-module-skip", outcomes["original"], outcomes["mutant"])
+
+        # Scope marking must never swallow an error: a setUpClass error
+        # stays not_run and incomplete, never scope-skipped.
+        error_swallow_mutant = self.mutate_source(ROOT / "scripts/typed-python-suite.py",
+                                                  'if state == "skipped":', 'if True:')
+        error_body = ("import unittest\nclass Probe(unittest.TestCase):\n"
+                      " @classmethod\n def setUpClass(cls): raise RuntimeError('x')\n"
+                      " def test_a(self): pass\nunittest.main()\n")
+        outcomes = {}
+        for label, source in (("original", typed_source), ("mutant", error_swallow_mutant)):
+            with tempfile.TemporaryDirectory() as temporary:
+                data, _run = self.python_suite_fragment(source, error_body, Path(temporary))
+                outcomes[label] = bool(data) and data.get("complete") is False
+        self.record(results, "python-scope-error-not-swallowed", outcomes["original"], outcomes["mutant"])
+
+        # Repeated declarations for one runner/results stream also
+        # compare the dynamic require-file inventory, not only the four
+        # inline selection categories.
+        require_file_repeated_mutant = checker_source.replace(
+            'for key in ("expected", "intermittent", "required", "nonqualifying", "require_file")):',
+            'for key in ("expected", "intermittent", "required", "nonqualifying")):', 1)
+
+        def require_file_declaration_refused(source):
+            with tempfile.TemporaryDirectory() as temporary:
+                checker = Path(temporary) / "check-known-failing.py"
+                checker.write_text(source, encoding="utf-8")
+                f = fixture(self)
+                f.shell_cell(declarations=False)
+
+                def invocation(option):
+                    return (
+                        "          python3 -I scripts/ci/check-cell-results.py \"$out/results.jsonl\" "
+                        + option
+                        + " --known-failing-results \"$out/kf.json\""
+                        + " --known-failing-runner cell:scripts/ci/cells.sh"
+                        + " --known-failing-host github\n"
+                    )
+
+                (f.root / ".github/workflows/main.yml").write_text(
+                    "jobs:\n  test:\n    steps:\n      - run: |\n"
+                    + invocation("--require-file /tmp/a.txt") + invocation("--require-file /tmp/b.txt"),
+                    encoding="utf-8")
+                run = subprocess.run([sys.executable, "-I", str(checker), "--root", str(f.root)],
+                                     capture_output=True, text=True)
+                return run.returncode != 0
+
+        self.record(results, "workflow-repeated-require-file",
+                    require_file_declaration_refused(checker_source),
+                    require_file_declaration_refused(require_file_repeated_mutant))
+
+        # A dynamic require-file inventory alone is a nonempty typed
+        # selection; ignoring it recreates the false empty-selection
+        # refusal for file-only checker invocations.
+        require_file_empty_mutant = checker_source.replace('or invocation["require_file"]', 'or []', 1)
+        outcomes = {}
+        for label, source in (("original", checker_source), ("mutant", require_file_empty_mutant)):
+            with tempfile.TemporaryDirectory() as temporary:
+                checker = Path(temporary) / "check-known-failing.py"
+                checker.write_text(source, encoding="utf-8")
+                f = fixture(self)
+                f.shell_cell(declarations=False)
+                (f.root / ".github/workflows/main.yml").write_text(
+                    "jobs:\n  test:\n    steps:\n      - run: |\n"
+                    "          python3 -I scripts/ci/check-cell-results.py \"$out/results.jsonl\" "
+                    "--require-file /tmp/dynamic-selection.txt"
+                    " --known-failing-results \"$out/kf.json\""
+                    " --known-failing-runner cell:scripts/ci/cells.sh"
+                    " --known-failing-host github\n",
+                    encoding="utf-8")
+                run = subprocess.run([sys.executable, "-I", str(checker), "--root", str(f.root)],
+                                     capture_output=True, text=True)
+                outcomes[label] = run.returncode == 0
+        self.record(results, "workflow-require-file-empty-selection", outcomes["original"], outcomes["mutant"])
+
+        total = 22
         self.assertEqual(results["failures"], [],
                          f"surviving producer mutants: {results['failures']}; killed {results['killed']}/{total}")
         print(f"known-failing producer mutation sweep: {results['killed']}/{total} killed")
@@ -1156,6 +1493,11 @@ class MutationSweepTests(unittest.TestCase):
             "workflow-runner": ('if invocation["runner"] is None or not valid_runner(invocation["runner"]):', 'if False:'),
             "duplicate-result": ('if key in results:\n            problems.append', 'if False:\n            problems.append'),
             "signature-branch-required": ('if isinstance(raw["signature"], dict) and "branch" not in raw["signature"]:', 'if False:'),
+            "host-limited-refused": ("if limited:\n            problems.append", "if False:\n            problems.append"),
+            "empty-list-release-refused": ('if not rows and (root / "docs/releases/v0.7.2.md").is_file():', 'if False:'),
+            "cell-equality-runner": ('if isinstance(raw["runner"], str) and raw["runner"].startswith("cell:") and raw["cell"] != raw["test"]:', 'if False:'),
+            "cell-equality-signature": ('if isinstance(raw["signature"], dict) and "cell" in raw["signature"] and raw["signature"]["cell"] != raw["cell"]:', 'if False:'),
+            "privileged-lib-refused": ('if raw["runner"] == "privileged-lib":', 'if False:'),
         }
 
         def pass_item(name="Sample.test_control"):
@@ -1221,6 +1563,37 @@ class MutationSweepTests(unittest.TestCase):
                 doc = result_doc([pass_item()])
                 doc["results"].append({**pass_item(), "invocation": []})
                 return doc
+            if name == "host-limited-refused":
+                f.registry()
+                f.python_suite()
+                f.rows([row(hosts=["fedora-sm1"])])
+                return None
+            if name == "empty-list-release-refused":
+                f.release_doc()
+                return None
+            if name == "cell-equality-runner":
+                f.registry()
+                f.shell_cell()
+                f.rows([row(path="scripts/ci/cells.sh", test="mt-exact",
+                            runner="cell:scripts/ci/cells.sh")])
+                return None
+            if name == "cell-equality-signature":
+                f.registry()
+                f.python_suite()
+                f.rows([row(signature={"cell": "OTHER", "branch": "B"})])
+                return None
+            if name == "privileged-lib-refused":
+                f.registry()
+                f.python_suite()
+                (f.root / "scripts/run-privileged-lib-tests.sh").write_text(
+                    "EXPECTED_FAILURE_TESTS=(\n"
+                    "discovery::engine::tests::exit_loader_balanced_benign_transaction_needs_no_terminal_truncation\n"
+                    "inventory::privileged_tests::privileged_identity_kernel_sweep_cell_lp64\n"
+                    "inventory::privileged_tests::privileged_identity_kernel_multipass_reuse_lp64\n"
+                    ")\n"
+                    "KNOWN_FAILING_TYPED_TESTS=(\nSample.test_x\n)\n", encoding="utf-8")
+                f.rows([row(runner="privileged-lib")])
+                return None
             raise AssertionError(name)
 
         killed = 0

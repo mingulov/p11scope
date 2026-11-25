@@ -1222,9 +1222,7 @@ impl Scene {
                         } else if is_straggler && let Some(forced) = self.straggler_status.as_ref()
                         {
                             forced.clone()
-                        } else if is_straggler && self.scans < 2 {
-                            crate::inspect_system::MemberStatus::NotSelected { loss: None }
-                        } else if is_leaver {
+                        } else if (is_straggler && self.scans < 2) || is_leaver {
                             crate::inspect_system::MemberStatus::NotSelected { loss: None }
                         } else {
                             crate::inspect_system::MemberStatus::Scanned

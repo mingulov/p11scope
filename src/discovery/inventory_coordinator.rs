@@ -853,6 +853,12 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// tombstone bound was full (sticky, saturating; counted once).
     pair_prune_overflow: u64,
     pair_prune_cap: usize,
+    /// Resume position of the age-drain rotation: the last drain-order
+    /// position visited (`(pruned_since, pid)`) plus how many entries
+    /// at that position were consumed. `None` starts (or restarts)
+    /// from the oldest. Expired tombstones past the per-pass visit
+    /// bound wait for later passes instead of stalling this one.
+    pair_drain_cursor: Option<((u64, u32), usize)>,
     /// Outstanding publication-time count placements (P3): each staged
     /// pending count's opaque handle back to its pair. Drained with the
     /// publication's decisions; one entry per staged pending count.
@@ -1875,6 +1881,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             pair_counts: HashMap::new(),
             pair_targets: HashMap::new(),
             pair_dropped_tombstones: HashMap::new(),
+            pair_drain_cursor: None,
             pair_dropped_totals: HashMap::new(),
             pair_prune_overflow: 0,
             pair_prune_cap: MAX_PRUNED_PAIR_TOMBSTONES,
@@ -6370,8 +6377,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             // reused by another process) can never matter again.
             capture.preadmission.prune(source);
         }
-        // One `/proc` liveness read per pid per pass, shared by the binder
-        // and the EXEC stash; cheap retained/pending checks run first.
+        // One `/proc` liveness read per pid per pass, shared by the
+        // binder, the EXEC stash and the pair-tombstone age drain;
+        // cheap retained/pending checks run first.
         let mut gone_memo: HashMap<u32, bool> = HashMap::new();
         let mut gone = |pid: u32| *gone_memo.entry(pid).or_insert_with(|| source.gone(pid));
         self.binder.prune_departed(
@@ -6405,7 +6413,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let bindings = &self.semantic_bindings;
         self.proven_images
             .retain(|(domain, cookie), _| bindings.has_ticket(*domain, *cookie));
-        self.prune_dropped_pair_targets(now_ns);
+        self.prune_dropped_pair_targets(now_ns, &mut gone_memo);
     }
 
     /// Remember that one departed image's EXEC stash was pruned: a late
@@ -6438,7 +6446,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// age fold once, so the tombstone map stays flat under churn
     /// instead of living until domain stop, while a live task's
     /// tombstone stays for its late revival.
-    fn prune_dropped_pair_targets(&mut self, now_ns: u64) {
+    fn prune_dropped_pair_targets(&mut self, now_ns: u64, gone_memo: &mut HashMap<u32, bool>) {
         let due: Vec<PairKey> = self
             .pair_targets
             .iter()
@@ -6489,34 +6497,74 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // Age drain: a tombstone past the keep window leaves the map
         // only for a gone task whose base is past the window too; the
         // base stays in the exact aggregate, and the overflow counts
-        // each age fold once, like a bound fold. One liveness read
-        // per distinct pid per pass.
-        let drain_due: Vec<(PairKey, u32)> = self
+        // each age fold once, like a bound fold. Liveness resolves
+        // through the pass memo shared with the binder and EXEC
+        // stash, and each pass visits at most one sweep bound of
+        // expired tombstones, oldest first, resuming past the cursor
+        // (ties advance by consumed count, so no position starves);
+        // the rest wait for later passes instead of stalling this one.
+        let mut expired: Vec<(PairKey, u64, u32)> = self
             .pair_dropped_tombstones
             .iter()
             .filter(|(_, tomb)| {
                 now_ns.saturating_sub(tomb.pruned_since) >= PAIR_TOMBSTONE_KEEP_NS
                     && now_ns.saturating_sub(tomb.base_since) >= PAIR_TOMBSTONE_KEEP_NS
             })
-            .map(|(key, tomb)| (*key, tomb.pid))
+            .map(|(key, tomb)| (*key, tomb.pruned_since, tomb.pid))
             .collect();
-        let mut gone_memo: HashMap<u32, bool> = HashMap::new();
-        {
-            let source = self.adapter.source();
-            for (_, pid) in &drain_due {
-                gone_memo
-                    .entry(*pid)
-                    .or_insert_with(|| *pid == 0 || source.gone(*pid));
+        if expired.len() > EVER_ENUMERATED_SWEEP || self.pair_drain_cursor.is_some() {
+            expired.sort_by(|a, b| (a.1, a.2).cmp(&(b.1, b.2)));
+        }
+        let start = match self.pair_drain_cursor {
+            None => 0,
+            Some(((ts, pid), skipped)) => {
+                let less = expired
+                    .iter()
+                    .take_while(|(_, t, p)| (*t, *p) < (ts, pid))
+                    .count();
+                let tied = expired[less..]
+                    .iter()
+                    .take_while(|(_, t, p)| (*t, *p) == (ts, pid))
+                    .count();
+                (less + skipped.min(tied)).min(expired.len())
+            }
+        };
+        // A cursor past every expired entry restarts from the oldest:
+        // removals since last pass can only shrink the snapshot.
+        let start = if start >= expired.len() && !expired.is_empty() {
+            0
+        } else {
+            start
+        };
+        let end = (start + EVER_ENUMERATED_SWEEP).min(expired.len());
+        let source = self.adapter.source();
+        for (_, _, pid) in &expired[start..end] {
+            gone_memo
+                .entry(*pid)
+                .or_insert_with(|| *pid == 0 || source.gone(*pid));
+        }
+        let mut drained = 0u64;
+        for (key, _, pid) in &expired[start..end] {
+            if gone_memo.get(pid).copied().unwrap_or(false) {
+                self.pair_dropped_tombstones.remove(key);
+                drained = drained.saturating_add(1);
             }
         }
-        let mut expired = 0u64;
-        for (key, pid) in drain_due {
-            if gone_memo.get(&pid).copied().unwrap_or(false) {
-                self.pair_dropped_tombstones.remove(&key);
-                expired = expired.saturating_add(1);
-            }
+        if end >= expired.len() {
+            self.pair_drain_cursor = None;
+        } else if let Some((_, ts, pid)) = expired[start..end].last() {
+            let run = expired[start..end]
+                .iter()
+                .rev()
+                .take_while(|(_, t, p)| (*t, *p) == (*ts, *pid))
+                .count();
+            let carry = match self.pair_drain_cursor {
+                Some(((cts, cpid), k)) if (cts, cpid) == (*ts, *pid) => k,
+                _ => 0,
+            };
+            self.pair_drain_cursor = Some(((*ts, *pid), carry + run));
         }
-        self.pair_prune_overflow = self.pair_prune_overflow.saturating_add(expired);
+        self.pair_prune_overflow = self.pair_prune_overflow.saturating_add(drained);
     }
 
     /// Settle one pair recovery that can never suspend: a Dropped or
@@ -44660,9 +44708,6 @@ int main(void) {
         );
     }
 
-    /// A gone task's tombstone still keeps its full window: a pass
-    /// before the keep window ends drains nothing and counts nothing.
-    #[test]
     /// N4: the age drain shares the pass liveness memo: one pid read
     /// by the EXEC stash and the drain costs a single source read.
     #[test]
@@ -44706,10 +44751,7 @@ int main(void) {
             "exec stash plus two drain tombstones read the shared pid once"
         );
         assert_eq!(
-            native
-                .scene
-                .coordinator
-                .dropped_pair_tombstones_for_test(),
+            native.scene.coordinator.dropped_pair_tombstones_for_test(),
             0,
             "the gone pid drains both tombstones"
         );
@@ -44717,12 +44759,14 @@ int main(void) {
 
     /// N4: the age drain visits at most one sweep bound of expired
     /// tombstones per pass and resumes where it stopped: oldest
-    /// first, then the remainder on later passes.
+    /// first, then the remainder on later passes. Four over the
+    /// bound pins the survivor set exactly, so an unordered visit
+    /// cannot pass by luck.
     #[test]
     fn drain_bounds_visits_per_pass_and_resumes() {
         let (mut native, _caller) = NativeScene::new();
         let at = native.stamps.tick();
-        const EXTRA: usize = 904;
+        const EXTRA: usize = 4;
         let total = EVER_ENUMERATED_SWEEP + EXTRA;
         for i in 0..total {
             native.scene.coordinator.pair_dropped_tombstones.insert(
@@ -44744,31 +44788,30 @@ int main(void) {
         let now = at + total as u64 + PAIR_TOMBSTONE_KEEP_NS + 1;
         native.scene.coordinator.prune_departed_native_state(now);
         assert_eq!(
-            native
-                .scene
-                .coordinator
-                .dropped_pair_tombstones_for_test(),
+            native.scene.coordinator.dropped_pair_tombstones_for_test(),
             EXTRA,
             "one pass drains exactly one sweep bound"
         );
-        let survivor = PairKey {
-            image: DomainCookie::scripted(native.domain, 41),
-            exec: 1,
-            object: (total - 1) as u32,
-        };
+        for object in (total - EXTRA) as u32..total as u32 {
+            let survivor = PairKey {
+                image: DomainCookie::scripted(native.domain, 41),
+                exec: 1,
+                object,
+            };
+            assert!(
+                native
+                    .scene
+                    .coordinator
+                    .pair_dropped_tombstones
+                    .contains_key(&survivor),
+                "the newest tombstones wait for the resume: object {object}"
+            );
+        }
         let drained = PairKey {
             image: DomainCookie::scripted(native.domain, 41),
             exec: 1,
             object: 0,
         };
-        assert!(
-            native
-                .scene
-                .coordinator
-                .pair_dropped_tombstones
-                .contains_key(&survivor),
-            "the newest tombstone waits for the resume"
-        );
         assert!(
             !native
                 .scene
@@ -44782,10 +44825,7 @@ int main(void) {
             .coordinator
             .prune_departed_native_state(now + 1);
         assert_eq!(
-            native
-                .scene
-                .coordinator
-                .dropped_pair_tombstones_for_test(),
+            native.scene.coordinator.dropped_pair_tombstones_for_test(),
             0,
             "the resume pass drains the remainder"
         );
@@ -44820,20 +44860,17 @@ int main(void) {
         let now = at + PAIR_TOMBSTONE_KEEP_NS + 1;
         native.scene.coordinator.prune_departed_native_state(now);
         assert_eq!(
-            native
-                .scene
-                .coordinator
-                .dropped_pair_tombstones_for_test(),
+            native.scene.coordinator.dropped_pair_tombstones_for_test(),
             total,
             "live tombstones are all kept past the first sweep"
         );
         native.scene.source.kill(pid);
-        native.scene.coordinator.prune_departed_native_state(now + 1);
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(now + 1);
         assert_eq!(
-            native
-                .scene
-                .coordinator
-                .dropped_pair_tombstones_for_test(),
+            native.scene.coordinator.dropped_pair_tombstones_for_test(),
             EVER_ENUMERATED_SWEEP,
             "the resume pass drains the tie tail it had not reached"
         );
@@ -44842,15 +44879,64 @@ int main(void) {
             .coordinator
             .prune_departed_native_state(now + 2);
         assert_eq!(
-            native
-                .scene
-                .coordinator
-                .dropped_pair_tombstones_for_test(),
+            native.scene.coordinator.dropped_pair_tombstones_for_test(),
             0,
             "the rotation wraps and drains the tie head"
         );
     }
 
+    /// N4: the tie skip accumulates across passes: a tie group past
+    /// two sweep bounds advances every pass instead of reprocessing
+    /// its head. Killing the shared pid after two live sweeps drains
+    /// the unvisited tail first.
+    #[test]
+    fn drain_accumulates_the_tie_skip_across_passes() {
+        let (mut native, _caller) = NativeScene::new();
+        let at = native.stamps.tick();
+        let total = 2 * EVER_ENUMERATED_SWEEP + 808;
+        let pid = 300_001u32;
+        native.scene.source.spawn(pid, 500);
+        for i in 0..total {
+            native.scene.coordinator.pair_dropped_tombstones.insert(
+                PairKey {
+                    image: DomainCookie::scripted(native.domain, 41),
+                    exec: 1,
+                    object: i as u32,
+                },
+                PrunedPairBase {
+                    base: 1,
+                    base_since: at,
+                    pruned_since: at,
+                    pid,
+                },
+            );
+        }
+        let now = at + PAIR_TOMBSTONE_KEEP_NS + 1;
+        native.scene.coordinator.prune_departed_native_state(now);
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(now + 1);
+        assert_eq!(
+            native.scene.coordinator.dropped_pair_tombstones_for_test(),
+            total,
+            "two live sweeps keep the whole tie group"
+        );
+        native.scene.source.kill(pid);
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(now + 2);
+        assert_eq!(
+            native.scene.coordinator.dropped_pair_tombstones_for_test(),
+            total - 808,
+            "the third sweep drains the tail it had not reached"
+        );
+    }
+
+    /// A gone task's tombstone still keeps its full window: a pass
+    /// before the keep window ends drains nothing and counts nothing.
+    #[test]
     fn gone_task_tombstone_keeps_its_full_window() {
         let (mut native, _caller) = NativeScene::new();
         let at = native.stamps.tick();

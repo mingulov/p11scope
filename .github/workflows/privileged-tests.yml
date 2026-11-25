@@ -1206,6 +1206,13 @@ jobs:
               --require inventory-mt-pid --require inventory-mt-system \
               --require inventory-provider-info-pid \
               --require fifo-refused --require inventory-event-stdout \
+              --require run-prearm --require parent-chain \
+              --require metrics-cgroup --require inventory-cgroup \
+              --require counter-counts-pid --require counter-timestamps-pid \
+              --require counter-latency-pid --require counter-counts-system \
+              --require counter-timestamps-system --require counter-latency-system \
+              --require select-endpoint-pid --require select-endpoint-system \
+              --require startup-to-capturing \
               --known-failing-results "$out/cells/known-failing-results.json" \
               --known-failing-runner cell:scripts/qualify-public-cli.sh \
               --known-failing-host "$kf_host" \
@@ -1217,6 +1224,25 @@ jobs:
             # the same leg inside qualify-public-cli-vng.sh.
             minimal_rc=0
             sudo -n env RUNUID="$(id -u)" RUNGID="$(id -g)" scripts/ci/run-cell-script.sh minimal-setcap "$in/p11scope" "$out/minimal-cells" \
+              --require doctor-minimal-p4 --require doctor-minimal-p3 \
+              --require profile-pid-p4 --require profile-pid-p3 \
+              --require missing-cap-cap_bpf-p4 --require missing-cap-cap_bpf-p3 \
+              --require missing-cap-cap_perfmon-p4 --require missing-cap-cap_perfmon-p3 \
+              --require missing-cap-cap_checkpoint_restore-p4 --require missing-cap-cap_checkpoint_restore-p3 \
+              --require missing-cap-cap_dac_read_search-p4 --require missing-cap-cap_dac_read_search-p3 \
+              --require missing-cap-cap_sys_ptrace-p4 --require missing-cap-cap_sys_ptrace-p3 \
+              --require inventory-system --require run-minimal \
+              --require run-child-drops-caps --require postsetup-drops-sysadmin \
+              --require postsetup-inventory-drops-sysadmin \
+              --require run-sudo --require run-user-nobody \
+              --require run-kill-on-timeout --require trace-sudo-out \
+              --require inventory-sudo-event-log \
+              --require inventory-sudo-fifo-out \
+              --require profile-sudo-fifo-out \
+              --require inventory-diff-sudo-fifo-out \
+              --require inventory-sudo-stderr-fifo \
+              --require daemonset-doctor --require daemonset-profile \
+              --require daemonset-inventory \
               --known-failing-results "$out/minimal-cells/known-failing-results.json" \
               --known-failing-runner cell:scripts/ci/minimal-setcap.sh \
               --known-failing-host "$kf_host" \
@@ -1284,6 +1310,13 @@ jobs:
             --require inventory-mt-pid --require inventory-mt-system \
             --require inventory-provider-info-pid \
             --require fifo-refused --require inventory-event-stdout \
+            --require run-prearm --require parent-chain \
+            --require metrics-cgroup --require inventory-cgroup \
+            --require counter-counts-pid --require counter-timestamps-pid \
+            --require counter-latency-pid --require counter-counts-system \
+            --require counter-timestamps-system --require counter-latency-system \
+            --require select-endpoint-pid --require select-endpoint-system \
+            --require startup-to-capturing \
             --known-failing-results "$out/cells/known-failing-results.json" \
             --known-failing-runner cell:scripts/qualify-public-cli.sh \
             --known-failing-host "$kf_host"

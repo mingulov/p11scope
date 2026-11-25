@@ -433,40 +433,119 @@ def print_registry():
         print(f"EXCLUDED  {name}: {reason}")
 
 
-def merge_typed_fragments(fragments, output, host):
+def merge_typed_fragments(fragment_specs, output, host):
+    """Merge per-suite fragments into the typed result document.
+
+    The outer runner owns the invocation selection. In addition to unittest
+    cases it selects two integrity rows per suite invocation: one for the
+    process-exit/terminal-outcome consistency proof and one for module or
+    class-level terminal events. Those rows are typed executable state, not
+    log text, so a pass-then-nonzero-exit or tearDownModule error cannot be
+    erased after every selected test passed.
+    """
     selection = []
     results = []
     complete = True
-    valid = True
-    for path in fragments:
+    process_problems = []
+    failure_states = {"failed", "error", "unexpected_success", "not_run"}
+    event_failure_states = {"failed", "error", "unexpected_success"}
+    required_keys = {"schema", "path", "invocation", "process_exit", "complete", "selection", "results", "suite_events"}
+
+    for fragment_path, name, outer_invocation in fragment_specs:
+        suite_path = f"{SUITE_DIR}/{name}"
+        invocation = list(outer_invocation)
+        fragment = None
+        invalid = True
         try:
-            fragment = json.loads(path.read_text(encoding="utf-8"))
+            fragment = json.loads(fragment_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            valid = False
-            continue
-        if (not isinstance(fragment, dict)
-                or fragment.get("schema") != "p11scope/python-suite-fragment/v1"
-                or not isinstance(fragment.get("selection"), list)
-                or not isinstance(fragment.get("results"), list)):
-            valid = False
-            continue
-        complete = complete and fragment.get("complete") is True
-        invocation = fragment.get("invocation")
-        suite_path = fragment.get("path")
+            fragment = None
+        if isinstance(fragment, dict) and set(fragment) == required_keys:
+            invalid = not (
+                fragment.get("schema") == "p11scope/python-suite-fragment/v1"
+                and fragment.get("path") == suite_path
+                and fragment.get("invocation") == invocation
+                and isinstance(fragment.get("process_exit"), int)
+                and isinstance(fragment.get("complete"), bool)
+                and isinstance(fragment.get("selection"), list)
+                and isinstance(fragment.get("results"), list)
+                and isinstance(fragment.get("suite_events"), list)
+            )
+        if invalid:
+            complete = False
+            fragment = {
+                "complete": False, "process_exit": None, "selection": [], "results": [], "suite_events": [],
+            }
+
+        selected_tests = []
         for item in fragment["selection"]:
-            if isinstance(item, dict) and isinstance(item.get("test"), str):
+            if isinstance(item, dict) and isinstance(item.get("test"), str) and item["test"]:
+                selected_tests.append(item["test"])
                 selection.append({"path": suite_path, "test": item["test"], "invocation": invocation})
+        outcome_rows = []
+        failure_present = False
         for item in fragment["results"]:
-            if isinstance(item, dict) and isinstance(item.get("test"), str):
-                results.append({
-                    "path": suite_path,
-                    "test": item["test"],
-                    "invocation": invocation,
-                    "state": item.get("state"),
-                    "signature": item.get("signature"),
-                })
-    if not valid:
-        complete = False
+            if not isinstance(item, dict) or not isinstance(item.get("test"), str) or not item["test"]:
+                complete = False
+                continue
+            state = item.get("state")
+            outcome_rows.append(item)
+            if state in failure_states:
+                failure_present = True
+            results.append({
+                "path": suite_path,
+                "test": item["test"],
+                "invocation": invocation,
+                "state": state,
+                "signature": item.get("signature"),
+            })
+        if len(set(selected_tests)) != len(selected_tests) or len({row["test"] for row in outcome_rows}) != len(outcome_rows):
+            complete = False
+        if {row["test"] for row in outcome_rows} != set(selected_tests):
+            complete = False
+        if fragment.get("complete") is not True:
+            complete = False
+
+        suite_events = []
+        for event in fragment["suite_events"]:
+            if (isinstance(event, dict) and isinstance(event.get("event"), str) and event["event"]
+                    and isinstance(event.get("state"), str)):
+                suite_events.append(event)
+                if event["state"] in event_failure_states:
+                    failure_present = True
+            else:
+                complete = False
+
+        process_identity = {"path": suite_path, "test": "<suite-process>", "invocation": invocation}
+        events_identity = {"path": suite_path, "test": "<suite-events>", "invocation": invocation}
+        selection.extend([process_identity, events_identity])
+        process_exit = fragment.get("process_exit")
+        process_consistent = (
+            not invalid
+            and process_exit in (0, 1)
+            and ((process_exit == 1) == failure_present)
+        )
+        if process_consistent:
+            process_state = "passed"
+            process_signature = None
+        else:
+            process_state = "failed"
+            branch = "fragment_invalid" if invalid else "process_exit_inconsistent"
+            process_signature = {"oracle": "python-suite-process", "branch": branch, "exit_code": process_exit}
+            process_problems.append((str(fragment_path), name, list(invocation)))
+        results.append({**process_identity, "state": process_state, "signature": process_signature})
+
+        failing_events = [event for event in suite_events if event["state"] in event_failure_states]
+        if failing_events:
+            event_rows = [
+                {"event": event["event"], "state": event["state"], "signature": event.get("signature")}
+                for event in failing_events
+            ]
+            results.append({**events_identity, "state": "failed",
+                            "signature": {"oracle": "python-suite-events", "events": event_rows}})
+        else:
+            results.append({**events_identity, "state": "passed", "signature": None})
+
     document = {
         "schema": "p11scope/known-failing-results/v1",
         "runner": "python-suite",
@@ -479,6 +558,7 @@ def merge_typed_fragments(fragments, output, host):
     temporary = output.with_suffix(output.suffix + ".tmp")
     temporary.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     temporary.replace(output)
+    return process_problems
 
 
 def run_suites(selected):
@@ -500,7 +580,7 @@ def run_suites(selected):
                     sys.executable, "-I", "scripts/typed-python-suite.py",
                     f"{SUITE_DIR}/{name}", str(fragment), *args, "-v",
                 ]
-                fragments.append(fragment)
+                fragments.append((fragment, name, list(args)))
             else:
                 command = [sys.executable, "-I", f"{SUITE_DIR}/{name}", *args, "-v"]
             result = subprocess.run(command, cwd=ROOT, env=os.environ.copy())
@@ -514,13 +594,15 @@ def run_suites(selected):
                 print("run-python-suites: typed results need both P11SCOPE_KNOWN_FAILING_RESULTS and P11SCOPE_KNOWN_FAILING_HOST", file=sys.stderr)
                 return [*failed, "typed-result configuration"]
             output = Path(typed_output)
-            merge_typed_fragments(fragments, output, typed_host)
+            process_problems = merge_typed_fragments(fragments, output, typed_host)
             checker = subprocess.run(
                 [sys.executable, "-I", "scripts/check-known-failing.py", "--results", str(output)],
                 cwd=ROOT,
             )
             if checker.returncode != 0:
                 return [*failed, "known-failing ledger judgment"]
+            if process_problems:
+                return [*failed, *[f"{name} process-integrity" for _path, name, _args in process_problems]]
             if failed:
                 print("run-python-suites: nonzero suite outcomes are exactly covered by the typed known-failing ledger")
                 return []

@@ -1091,6 +1091,13 @@ XFAIL_OWNERS=(
 "src/inventory/privileged_tests.rs"
 )
 
+# Typed known-failing rows (tests/known-failing.json). They are not part of
+# the legacy fixed-string XFAIL group: a failing row is excused only when its
+# test writes the exact typed signature sidecar pinned by the ledger. The
+# array is empty until the first owner-approved row lands.
+KNOWN_FAILING_TYPED_TESTS=(
+)
+
 # Wide-Detailed campaign: empty since v0.7.0 made 2,112 slots the default
 # profile — the nine load-proof cells run in the default campaign now.
 # Kept (with the --wide-detailed-2112 no-op alias) for one release.
@@ -1379,6 +1386,7 @@ check_curation() {
         printf '%s\n' "${BTRFS_TESTS[@]}"
         printf '%s\n' "${OVERLAY_TESTS[@]}"
         printf '%s\n' "${EXPECTED_FAILURE_TESTS[@]}"
+        printf '%s\n' "${KNOWN_FAILING_TYPED_TESTS[@]}"
         printf '%s\n' "${SKIP_TESTS[@]}"
     } | sort -u >"$cur_list"
     missing_bin=$(comm -13 "$bin_list" "$cur_list" || true)
@@ -1538,6 +1546,9 @@ list_mode() {
         if binary_has_ignored "$bin" "$name"; then
             default_all+=("$name")
         fi
+    done
+    for name in "${KNOWN_FAILING_TYPED_TESTS[@]}"; do
+        default_all+=("$name")
     done
     echo "default (${#default_all[@]})"
     for name in "${default_all[@]}"; do
@@ -1707,7 +1718,7 @@ main() {
     local need_target_tmp=0 target_tmpdir=
     local need_getter_static=0
     local cell_tmpdir
-    local -A counter_fixture_set=() wrap_fixture_set=() btrfs_set=() xfail_reason=() xfail_sig=()
+    local -A counter_fixture_set=() wrap_fixture_set=() btrfs_set=() xfail_reason=() xfail_sig=() typed_known_set=()
     local -A owned_child_tmp_set=() getter_static_set=() btrfs_pair_set=()
     local -A full_matrix_set=()
     local -a cell_env=() matrix_env=()
@@ -1792,6 +1803,11 @@ main() {
             if [ "$full512" -eq 1 ] && [ -n "${wide_only_run[$name]+present}" ]; then
                 continue
             fi
+            if selected "$name"; then
+                selected_runnable+=("$name")
+            fi
+        done
+        for name in "${KNOWN_FAILING_TYPED_TESTS[@]}"; do
             if selected "$name"; then
                 selected_runnable+=("$name")
             fi
@@ -1978,6 +1994,7 @@ main() {
         xfail_reason[${EXPECTED_FAILURE_TESTS[$i]}]=${XFAIL_REASONS[$i]}
         xfail_sig[${EXPECTED_FAILURE_TESTS[$i]}]=${XFAIL_SIGNATURES[$i]}
     done
+    for name in "${KNOWN_FAILING_TYPED_TESTS[@]}"; do typed_known_set[$name]=1; done
     for name in ${selected_runnable[@]+"${selected_runnable[@]}"}; do
         if [ -n "${counter_fixture_set[$name]+present}" ]; then need_counter=1; fi
         if [ -n "${wrap_fixture_set[$name]+present}" ]; then need_wrap=1; fi
@@ -2212,6 +2229,7 @@ main() {
             matrix_env=(-u WP7_STOP_PREPS -u WP7_STOP_OFFSETS)
         fi
         P11SCOPE_TASK4_EVIDENCE_DIR=$evdir P11SCOPE_TASK4_CASE_INDEX=$seq TMPDIR=$cell_tmpdir \
+            P11SCOPE_TYPED_FAILURE_PATH="$evdir/typed-failure.json" \
             env ${matrix_env[@]+"${matrix_env[@]}"} ${cell_env[@]+"${cell_env[@]}"} \
             "$bin" --exact "$name" --ignored --test-threads=1 --nocapture \
             >"$log" 2>&1
@@ -2252,9 +2270,26 @@ main() {
             && printf '%s\n' "$result_line" | command grep -qE '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in [0-9]+\.[0-9]{2}s$'; then
             verdict=PASS
         fi
+        typed_sidecar=
+        if [ -s "$evdir/typed-failure.json" ]; then
+            typed_sidecar=$evdir/typed-failure.json
+            # A passing test that still wrote a failure record is a protocol
+            # violation, never positive evidence.
+            if [ "$verdict" = "PASS" ]; then verdict=FAIL; fi
+        fi
         branch_suffix=$(cell_branch_suffix "$log")
         branch_suffix="$branch_suffix$matrix_note"
-        if [ -n "${xfail_reason[$name]+present}" ]; then
+        if [ -n "${typed_known_set[$name]+present}" ] && [ -n "${P11SCOPE_KNOWN_FAILING_RESULTS:-}" ] && [ -n "${P11SCOPE_KNOWN_FAILING_HOST:-}" ]; then
+            if [ "$verdict" = "PASS" ]; then
+                xpass=$((xpass + 1))
+                echo "XPASS $name rc=$rc seconds=$seconds :: $result_line$branch_suffix (UNEXPECTED PASS; typed known-failing row)" | tee -a "$results"
+                record_typed_verdict "$name" XPASS
+            else
+                xfail=$((xfail + 1))
+                echo "XFAIL $name rc=$rc seconds=$seconds :: $result_line$branch_suffix (typed known-failing row)" | tee -a "$results"
+                record_typed_verdict "$name" XFAIL ${typed_sidecar:+"$typed_sidecar"}
+            fi
+        elif [ -n "${xfail_reason[$name]+present}" ]; then
             if [ "$verdict" = "PASS" ]; then
                 xpass=$((xpass + 1))
                 echo "XPASS $name rc=$rc seconds=$seconds :: $result_line$branch_suffix (UNEXPECTED PASS; expected: ${xfail_reason[$name]})" | tee -a "$results"
@@ -2276,7 +2311,11 @@ main() {
                 fail=$((fail + 1))
             fi
             echo "$verdict $name rc=$rc seconds=$seconds :: $result_line$branch_suffix" | tee -a "$results"
-            record_typed_verdict "$name" "$verdict"
+            if [ "$verdict" = "FAIL" ]; then
+                record_typed_verdict "$name" "$verdict" ${typed_sidecar:+"$typed_sidecar"}
+            else
+                record_typed_verdict "$name" "$verdict"
+            fi
         fi
     done
 

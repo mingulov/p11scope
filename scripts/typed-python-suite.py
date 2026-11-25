@@ -31,15 +31,47 @@ FRAGMENT_SCHEMA = "p11scope/python-suite-fragment/v1"
 FAILURE_STATES = {"failed", "error", "unexpected_success", "skipped", "not_run"}
 
 
+def raw_test_id(test):
+    try:
+        ident = test.id()
+    except Exception:
+        ident = test.__class__.__name__
+    return ident if isinstance(ident, str) and ident else test.__class__.__name__
+
+
 def test_identity(test):
     method = getattr(test, "_testMethodName", None)
     if isinstance(method, str) and method:
         return f"{test.__class__.__name__}.{method}"
-    ident = test.id()
-    parts = ident.split(".")
+    parts = raw_test_id(test).split(".")
     if len(parts) >= 2:
         return ".".join(parts[-2:])
-    return ident
+    return parts[0]
+
+
+def suite_event_name(test):
+    return raw_test_id(test).split(".")[-1].split(" ", 1)[0]
+
+
+def json_copy_typed_signature(value):
+    if not isinstance(value, dict) or not value:
+        return None
+    try:
+        copied = json.loads(json.dumps(value))
+    except (TypeError, ValueError):
+        return None
+    return copied if isinstance(copied, dict) and copied else None
+
+
+def outcome_signature(state, err):
+    exception_value = err[1] if err and len(err) > 1 else None
+    custom = json_copy_typed_signature(getattr(exception_value, "p11scope_signature", None))
+    if custom is not None:
+        return custom
+    signature = {"branch": state, "oracle": "unittest"}
+    if err and err[0]:
+        signature["exception"] = err[0].__name__
+    return signature
 
 
 def flatten_suite(test):
@@ -54,6 +86,7 @@ class Recorder:
     def __init__(self):
         self.selection = []
         self.events = []
+        self.suite_events = []
         self.depth = 0
         self.discover_only = False
 
@@ -63,14 +96,13 @@ class Recorder:
         for test in flatten_suite(suite):
             self.selection.append(test_identity(test))
 
-    def note(self, test, state, exception_type=None):
+    def note(self, test, state, err=None):
         if self.depth != 1:
             return
-        signature = None
-        if state != "passed":
-            signature = {"branch": state, "oracle": "unittest"}
-            if exception_type:
-                signature["exception"] = exception_type
+        signature = None if state == "passed" else outcome_signature(state, err)
+        if not isinstance(test, unittest.TestCase):
+            self.suite_events.append({"event": suite_event_name(test), "state": state, "signature": signature})
+            return
         self.events.append({"test": test_identity(test), "state": state, "signature": signature})
 
     def outcomes(self):
@@ -101,11 +133,11 @@ class RecordingTextTestResult(ORIGINAL_RESULT):
         super().addSuccess(test)
 
     def addFailure(self, test, err):
-        RECORDER.note(test, "failed", err[0].__name__ if err and err[0] else None)
+        RECORDER.note(test, "failed", err)
         super().addFailure(test, err)
 
     def addError(self, test, err):
-        RECORDER.note(test, "error", err[0].__name__ if err and err[0] else None)
+        RECORDER.note(test, "error", err)
         super().addError(test, err)
 
     def addSkip(self, test, reason):
@@ -124,7 +156,7 @@ class RecordingTextTestResult(ORIGINAL_RESULT):
 
     def addSubTest(self, test, subtest, err):
         if err is not None:
-            RECORDER.note(test, "failed", err[0].__name__ if err[0] else None)
+            RECORDER.note(test, "failed", err)
         super().addSubTest(test, subtest, err)
 
 
@@ -220,6 +252,7 @@ def fragment(path, invocation, process_exit):
         "complete": complete,
         "selection": [{"test": test} for test in RECORDER.selection],
         "results": rows,
+        "suite_events": RECORDER.suite_events,
     }
 
 

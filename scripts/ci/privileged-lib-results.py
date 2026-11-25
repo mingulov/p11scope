@@ -9,6 +9,7 @@ verdicts are closed runner tokens. This converter proves the two sets are
 nonempty, unique and exactly one-to-one, maps every id through
 tests/ignored-tests.json, and emits p11scope/known-failing-results/v1.
 """
+import importlib.util
 import json
 import sys
 from pathlib import Path
@@ -24,6 +25,26 @@ VERDICT_STATE = {
     # fails the legacy campaign separately.
     "XPASS": ("passed", None),
 }
+
+
+def checker_module():
+    path = ROOT / "scripts/check-known-failing.py"
+    spec = importlib.util.spec_from_file_location("known_failing_checker", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def typed_sidecar_signature(path_text):
+    path = Path(path_text)
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None, "typed signature sidecar is missing or invalid JSON"
+    problems = checker_module().signature_problems(value)
+    if problems:
+        return None, "typed signature sidecar is not a typed signature: " + "; ".join(problems)
+    return value, None
 
 
 def main(argv):
@@ -42,7 +63,7 @@ def main(argv):
         verdict_rows = []
         for number, line in enumerate(verdicts_path.read_text(encoding="utf-8").splitlines(), 1):
             parts = line.split("\t")
-            if len(parts) != 2:
+            if len(parts) not in (2, 3):
                 print(f"privileged-lib-results: malformed verdict line {number}", file=sys.stderr)
                 return 1
             verdict_rows.append(tuple(parts))
@@ -52,7 +73,7 @@ def main(argv):
     if not selected or len(selected) != len(set(selected)):
         print("privileged-lib-results: selection is empty or duplicated", file=sys.stderr)
         return 1
-    verdict_names = [name for name, _verdict in verdict_rows]
+    verdict_names = [parts[0] for parts in verdict_rows]
     if len(verdict_names) != len(set(verdict_names)) or set(verdict_names) != set(selected):
         print("privileged-lib-results: verdict rows are not exactly one-to-one with the selection", file=sys.stderr)
         return 1
@@ -72,7 +93,8 @@ def main(argv):
         files.pop(name, None)
     selection = []
     results = []
-    for name, verdict in verdict_rows:
+    for parts in verdict_rows:
+        name, verdict = parts[0], parts[1]
         if verdict not in VERDICT_STATE:
             print(f"privileged-lib-results: verdict outside the closed vocabulary for {name}", file=sys.stderr)
             return 1
@@ -81,6 +103,14 @@ def main(argv):
             print(f"privileged-lib-results: no unambiguous ignored-test source path for {name}", file=sys.stderr)
             return 1
         state, signature = VERDICT_STATE[verdict]
+        if len(parts) == 3:
+            if state == "passed":
+                print(f"privileged-lib-results: passing verdict carries a typed failure sidecar for {name}", file=sys.stderr)
+                return 1
+            signature, error = typed_sidecar_signature(parts[2])
+            if error is not None:
+                print(f"privileged-lib-results: {error} for {name}", file=sys.stderr)
+                return 1
         identity = {"path": path, "test": name, "invocation": []}
         selection.append(identity)
         results.append({**identity, "state": state, "signature": signature})

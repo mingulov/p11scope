@@ -58,7 +58,6 @@ import math
 import os
 import re
 import shlex
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -83,7 +82,8 @@ OPTIONAL_ROW_FIELDS = {"hosts", "since", "evidence", "invocation"}
 RESULT_TOP_FIELDS = {"schema", "runner", "host", "complete", "selection", "results"}
 RESULT_SELECTION_FIELDS = {"path", "test", "invocation"}
 RESULT_ROW_FIELDS = {"path", "test", "invocation", "state", "signature"}
-RESULT_STATES = {"passed", "failed", "error", "skipped", "unexpected_success", "not_run"}
+RESULT_STATES = {"passed", "failed", "error", "skipped", "unexpected_success", "not_run", "not_applicable"}
+NEUTRAL_STATES = {"skipped", "not_applicable"}
 ISSUE_RE = re.compile(r"^KI-[0-9]{2}$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SIGNATURE_KEY_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
@@ -231,6 +231,8 @@ def validate_row(raw, index):
     if not valid_runner(raw["runner"]):
         problems.append(f"{label}: runner is not in the closed runner vocabulary")
     problems.extend(f"{label}: {problem}" for problem in signature_problems(raw["signature"]))
+    if isinstance(raw["signature"], dict) and "branch" not in raw["signature"]:
+        problems.append(f"{label}: signature lacks a typed branch")
     if not isinstance(raw["lane"], str) or not raw["lane"].strip():
         problems.append(f"{label}: lane must name the lane that owns the fix")
     if not isinstance(raw["mode"], str) or raw["mode"] not in MODES:
@@ -401,9 +403,6 @@ def cargo_list_probe(root, row):
     closed rather than guessing.
     """
     relative = Path(row["path"])
-    cargo = shutil.which("cargo")
-    if cargo is None:
-        return False
     if len(relative.parts) == 2 and relative.parts[0] == "tests" and relative.suffix == ".rs":
         target_args = ["--test", relative.stem]
     elif relative.parts and relative.parts[0] == "src":
@@ -415,7 +414,10 @@ def cargo_list_probe(root, row):
         toolchain = toolchain_file.read_text(encoding="utf-8").strip()
     except OSError:
         return False
-    command = [cargo, f"+{toolchain}", "test", "--locked", "--offline", "--no-run",
+    cargo_wrapper = root / "scripts/cargo.sh"
+    if not os.access(cargo_wrapper, os.X_OK):
+        return False
+    command = [str(cargo_wrapper), f"+{toolchain}", "test", "--locked", "--offline", "--no-run",
                "--message-format=json", *target_args]
     try:
         built = subprocess.run(command, cwd=root, capture_output=True, text=True, timeout=600)
@@ -445,7 +447,7 @@ def cargo_list_probe(root, row):
         except (OSError, subprocess.TimeoutExpired):
             continue
         if listed.returncode == 0:
-            found.update(line[:-5].strip() for line in listed.stdout.splitlines() if line.endswith(": test"))
+            found.update(line[: -len(": test")].strip() for line in listed.stdout.splitlines() if line.endswith(": test"))
     return row["test"] in found
 
 
@@ -479,6 +481,13 @@ def python_suite_registered(root, row):
     return any(entry == name and list(args) == invocation for entry, args in namespace.get("RUN", []))
 
 
+def shell_string_array(text, name):
+    match = re.search(rf"(?ms)^{re.escape(name)}=\(\n(.*?)^\)", text)
+    if match is None:
+        return None
+    return {line.strip() for line in match.group(1).splitlines() if line.strip() and not line.strip().startswith("#")}
+
+
 def validate_privileged_runner(root, rows):
     runner_path = root / "scripts/run-privileged-lib-tests.sh"
     wanted_new = {row["test"] for row in rows if row["runner"] == "privileged-lib"}
@@ -487,18 +496,28 @@ def validate_privileged_runner(root, rows):
             return ["privileged-lib rows exist but scripts/run-privileged-lib-tests.sh is missing"]
         return []
     text = runner_path.read_text(encoding="utf-8")
-    match = re.search(r"(?ms)^EXPECTED_FAILURE_TESTS=\(\n(.*?)^\)", text)
-    if match is None:
+    legacy_actual = shell_string_array(text, "EXPECTED_FAILURE_TESTS")
+    typed_actual = shell_string_array(text, "KNOWN_FAILING_TYPED_TESTS")
+    if legacy_actual is None:
         return ["privileged-lib runner declaration cannot be read: no EXPECTED_FAILURE_TESTS array"]
-    actual = {line.strip() for line in match.group(1).splitlines() if line.strip() and not line.strip().startswith("#")}
-    expected = set(LEGACY_PRIVILEGED_LIB) | wanted_new
+    if typed_actual is None:
+        return ["privileged-lib runner declaration cannot be read: no KNOWN_FAILING_TYPED_TESTS array"]
     problems = []
-    missing = sorted(expected - actual)
-    extra = sorted(actual - expected)
+    legacy_missing = sorted(set(LEGACY_PRIVILEGED_LIB) - legacy_actual)
+    legacy_extra = sorted(legacy_actual - set(LEGACY_PRIVILEGED_LIB))
+    if legacy_missing:
+        problems.append("privileged-lib legacy declaration is missing cells: " + ", ".join(legacy_missing))
+    if legacy_extra:
+        problems.append("privileged-lib legacy declaration has non-legacy cells: " + ", ".join(legacy_extra))
+    missing = sorted(wanted_new - typed_actual)
+    extra = sorted(typed_actual - wanted_new)
     if missing:
-        problems.append("privileged-lib runner is missing known-failing rows: " + ", ".join(missing))
+        problems.append("privileged-lib typed runner is missing known-failing rows: " + ", ".join(missing))
     if extra:
-        problems.append("privileged-lib runner has undeclared expected failures: " + ", ".join(extra))
+        problems.append("privileged-lib typed runner has undeclared known-failing rows: " + ", ".join(extra))
+    overlap = sorted(legacy_actual & typed_actual)
+    if overlap:
+        problems.append("privileged-lib rows cannot use the legacy fixed-string xfail group: " + ", ".join(overlap))
     return problems
 
 
@@ -566,6 +585,8 @@ def parse_invocation(tokens, start, kind):
         "results": results,
         "expected": options["--expected-failure"],
         "intermittent": options["--intermittent-failure"],
+        "required": options["--require"],
+        "nonqualifying": options["--allow-nonqualifying"],
         "known_results": (options["--known-failing-results"] or [None])[-1],
         "known_host": (options["--known-failing-host"] or [None])[-1],
         "explicit_runner": bool(options["--known-failing-runner"]),
@@ -645,6 +666,10 @@ def validate_cell_runner_declarations(root, rows):
             problems.append(f"{where}: check-cell-results invocation does not emit typed known-failing results")
         if not invocation["known_host"]:
             problems.append(f"{where}: check-cell-results invocation lacks a typed host")
+        if invocation["known_results"] and not (
+            invocation["required"] or invocation["expected"] or invocation["intermittent"] or invocation["nonqualifying"]
+        ):
+            problems.append(f"{where}: typed cell result selection is empty")
 
     groups = {}
     for invocation in invocations:
@@ -665,8 +690,10 @@ def validate_cell_runner_declarations(root, rows):
                     f"{workflow}:{job}:{results}: repeated declarations for one runner/results stream differ")
                 break
         runner_rows = rows_by_runner.get(runner, [])
-        allowed_always = set(LEGACY_CELL_EXPECTED) | {row["test"] for row in runner_rows if row["mode"] == "always"}
-        allowed_intermittent = set(LEGACY_CELL_INTERMITTENT) | {row["test"] for row in runner_rows if row["mode"] == "intermittent"}
+        legacy_always = set(LEGACY_CELL_EXPECTED) if runner == PUBLIC_CLI_RUNNER else set()
+        legacy_intermittent = set(LEGACY_CELL_INTERMITTENT) if runner == RUN_TREE_RUNNER else set()
+        allowed_always = legacy_always | {row["test"] for row in runner_rows if row["mode"] == "always"}
+        allowed_intermittent = legacy_intermittent | {row["test"] for row in runner_rows if row["mode"] == "intermittent"}
         extra_always = sorted(set(first["expected"]) - allowed_always)
         extra_intermittent = sorted(set(first["intermittent"]) - allowed_intermittent)
         if extra_always:
@@ -919,6 +946,8 @@ def evaluate_results(rows, document):
             problems.append(f"stale row: {row['test']} passed but {'/'.join(row['issues'])} is still listed always-failing")
         elif result["state"] == "passed":
             intermittent_passes += 1
+        elif result["state"] in NEUTRAL_STATES or result["state"] == "not_run":
+            problems.append(f"listed row was not executed: {row['test']} ({result['state']})")
         elif not json_exact_equal(result["signature"], row["signature"]):
             problems.append(
                 f"failure signature mismatch for {row['test']} ({'/'.join(row['issues'])}): "
@@ -927,7 +956,7 @@ def evaluate_results(rows, document):
         else:
             expected_failures += 1
     for key, result in results_by_key.items():
-        if key in listed_keys or result["state"] == "passed":
+        if key in listed_keys or result["state"] == "passed" or result["state"] in NEUTRAL_STATES:
             continue
         if legacy_exempt(runner, key[1]):
             continue

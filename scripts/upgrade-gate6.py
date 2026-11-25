@@ -416,7 +416,7 @@ def generate_scan_report(binary: Path, output: Path, module: str) -> str:
                 "--capture",
                 "native",
                 "--duration",
-                "5s",
+                "12s",
                 "--key-operations",
                 "--manifest",
                 str(output.parent / "softhsm-manifest.json"),

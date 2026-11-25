@@ -125,7 +125,7 @@ def parent(module: str, interval: float) -> int:
     temporary = prepare_token()
     library = open_provider(module)
     print("ready", flush=True)
-    deadline = time.monotonic() + 30
+    deadline = time.monotonic() + 60
     next_child = 0.0
     children: list[subprocess.Popen] = []
     try:

@@ -115,6 +115,40 @@ record_typed_verdict {command}
     return result, verdicts.read_bytes() if verdicts.exists() else b""
 
 
+def static_skip_print_block(source):
+    start_token = '    for i in ${selected_skipped[@]+"${selected_skipped[@]}"}; do\n'
+    start = source.index(start_token)
+    end = source.index('\n    done\n\n    for name in ${selected_runnable', start)
+    return source[start:end + len('\n    done')]
+
+
+def run_static_skip_print(source, temp, results_path):
+    block = static_skip_print_block(source)
+    function = shell_function(source, "record_typed_verdict")
+    verdicts = temp / "verdicts.tsv"
+    harness = f"""set -u
+PROG=run-privileged-lib-tests.sh
+TYPED_VERDICTS={shlex.quote(str(verdicts))}
+SKIP_TESTS=(static-cell-a)
+SKIP_REASONS=(preflight-missing)
+selected_skipped=(0)
+results={shlex.quote(str(results_path))}
+skipped=0
+{function}
+print_static_skips() {{
+{block}
+}}
+print_static_skips
+"""
+    return subprocess.run(["bash", "-c", harness], capture_output=True, text=True, timeout=30)
+
+
+def minimal_setcap_call_sites(source):
+    """Production call lines for write_dynamic_selection, never its definition."""
+    return [line for line in source.splitlines()
+            if re.fullmatch(r"[ \t]*write_dynamic_selection([ \t;].*)?", line)]
+
+
 def write_fake_privileged_libtest(path, runner_source):
     names = []
     for array in ("DEFAULT_TESTS", "ALTERNATIVE_TESTS", "LONG_TESTS", "BTRFS_TESTS",
@@ -1105,7 +1139,8 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
 
     def test_minimal_setcap_dynamic_selection_covers_the_current_paranoid_bonus_rows(self):
         source = MINIMAL_SETCAP.read_text(encoding="utf-8")
-        self.assertIn("write_dynamic_selection", source)
+        calls = minimal_setcap_call_sites(source)
+        self.assertTrue(calls, "production call site for write_dynamic_selection is missing")
         function = shell_function(source, "write_dynamic_selection")
         harness_template = """set -u
 OUT=$1
@@ -1464,6 +1499,26 @@ class PrivilegedLibTypedRunnerBoundaryTests(unittest.TestCase):
                 self.source, temp, "inventory::privileged_tests::example", "PASS")
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(b"inventory::privileged_tests::example\tPASS\n", payload)
+            for arguments in (("only-name",),
+                              ("name", "FAIL", "sidecar", "fourth")):
+                with self.subTest(arguments=arguments):
+                    result, _payload = run_record_typed_verdict(self.source, temp, *arguments)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("at most one sidecar", result.stderr)
+
+    def test_static_skip_print_failure_fails_loudly(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            temp = Path(temporary)
+            results = temp / "results.txt"
+            ok = run_static_skip_print(self.source, temp, results)
+            self.assertEqual(ok.returncode, 0, ok.stderr)
+            self.assertIn("SKIP static-cell-a", results.read_text(encoding="utf-8"))
+            self.assertEqual(b"static-cell-a\tSKIP\n", (temp / "verdicts.tsv").read_bytes())
+            blocked = temp / "blocked"
+            blocked.mkdir()
+            failed = run_static_skip_print(self.source, temp, blocked)
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertIn("static skip print failed", failed.stderr)
 
     def test_typed_known_tests_are_curated_selector_vocabulary(self):
         accepted = run_selector_validation(self.source, "typed-known-a")
@@ -1585,7 +1640,58 @@ write_dynamic_selection
         else:
             failures.append(f"shell-dynamic-selection-inventory{outcomes}")
 
-        total = 3
+        # The static-skip print guard must see the pipeline status, not
+        # the verdict call's: reverting the order silences the failure.
+        order_mutant = source.replace(
+            '        if [ "${PIPESTATUS[0]}" -ne 0 ] || [ "${PIPESTATUS[1]}" -ne 0 ]; then\n'
+            '            echo "$PROG: static skip print failed for index $i" >&2\n'
+            '            return 1\n'
+            '        fi\n'
+            '        record_typed_verdict "${SKIP_TESTS[$i]}" SKIP',
+            '        record_typed_verdict "${SKIP_TESTS[$i]}" SKIP\n'
+            '        if [ "${PIPESTATUS[0]}" -ne 0 ]; then\n'
+            '            echo "$PROG: static skip print failed for index $i" >&2\n'
+            '            return 1\n'
+            '        fi', 1)
+        outcomes = {}
+        for label, candidate in (("original", source), ("mutant", order_mutant)):
+            with tempfile.TemporaryDirectory() as temporary:
+                blocked = Path(temporary) / "blocked"
+                blocked.mkdir()
+                run = run_static_skip_print(candidate, Path(temporary), blocked)
+                outcomes[label] = run.returncode != 0
+        if outcomes["original"] and not outcomes["mutant"]:
+            killed += 1
+        else:
+            failures.append(f"shell-skip-print-order{outcomes}")
+
+        # The verdict arity guard rejects anything but 2-3 arguments;
+        # dropping it lets a 4-argument call record a row.
+        arity_mutant = source.replace('if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then', 'if false; then', 1)
+        outcomes = {}
+        for label, candidate in (("original", source), ("mutant", arity_mutant)):
+            with tempfile.TemporaryDirectory() as temporary:
+                result, _payload = run_record_typed_verdict(
+                    candidate, Path(temporary), "name", "FAIL", "sidecar", "fourth")
+                outcomes[label] = result.returncode != 0
+        if outcomes["original"] and not outcomes["mutant"]:
+            killed += 1
+        else:
+            failures.append(f"shell-verdict-arity{outcomes}")
+
+        # The dynamic-selection production call site, not the function
+        # definition, is the load-bearing line: removing the call while
+        # keeping the definition must fail the call-site predicate.
+        call_mutant = minimal_source.replace("\nwrite_dynamic_selection\n", "\n", 1)
+        if (bool(minimal_setcap_call_sites(minimal_source))
+                and not minimal_setcap_call_sites(call_mutant)):
+            killed += 1
+        else:
+            failures.append("shell-dynamic-selection-call-site"
+                            f"(original={bool(minimal_setcap_call_sites(minimal_source))},"
+                            f"mutant={bool(minimal_setcap_call_sites(call_mutant))})")
+
+        total = 6
         self.assertEqual([], failures, f"surviving shell mutants: {failures}; killed {killed}/{total}")
         print(f"privileged shell mutation sweep: {killed}/{total} killed")
 

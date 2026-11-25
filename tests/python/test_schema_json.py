@@ -1489,6 +1489,51 @@ class SchemaOracleAgreement(unittest.TestCase):
             )
         )
 
+    def test_pause_release_unproven_vocabulary_matches_producer(self):
+        """The oracle's unproven-release vocabulary is exactly what
+        `src/render.rs` emits: transcription drift between the producer
+        const and this checker fails closed here."""
+        render_rs = (ROOT / "src" / "render.rs").read_text(encoding="utf-8")
+        match = re.search(
+            r"pub\(crate\) const PAUSE_RELEASE_UNPROVEN_REASON"
+            r': &str =((?:\s*"[^"]*")+);',
+            render_rs,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(
+            match, "PAUSE_RELEASE_UNPROVEN_REASON not found in src/render.rs"
+        )
+        const = "".join(re.findall(r'"([^"]*)"', match.group(1)))
+        self.assertEqual(const, CHECKER["PAUSE_RELEASE_UNPROVEN_REASON"])
+        self.assertIn(
+            CHECKER["PAUSE_RELEASE_UNPROVEN_REASON"],
+            CHECKER["PAUSE_ARM_FAILED_REASONS"],
+        )
+
+    def test_pause_release_unproven_skip_validates_by_subject(self):
+        """The unproven-release row validates under its own subject only."""
+        evidence = {
+            "skipped": [
+                {
+                    "name": CHECKER["PAUSE_SKIP_SUBJECT"],
+                    "reason": CHECKER["PAUSE_RELEASE_UNPROVEN_REASON"],
+                },
+            ]
+        }
+        CHECKER["discovery_skips"](evidence)
+        CHECKER["rejected"](
+            lambda: CHECKER["discovery_skips"](
+                {
+                    "skipped": [
+                        {
+                            "name": CHECKER["MEMBER_STOP_SKIP_SUBJECT"],
+                            "reason": CHECKER["PAUSE_RELEASE_UNPROVEN_REASON"],
+                        }
+                    ]
+                }
+            )
+        )
+
     def test_handoff_vocabulary_matches_producer(self):
         """The oracle's handoff vocabulary is exactly what `src/run.rs`
         emits: transcription drift between the producer consts and this

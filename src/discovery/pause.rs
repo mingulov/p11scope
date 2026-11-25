@@ -397,6 +397,11 @@ pub(crate) trait PauseIo {
     /// The pause arm failed before the first epoch and the run
     /// continues without pause protection: file the named gap.
     fn note_arm_failed(&mut self) {}
+
+    /// A release after a failed pause arm could not be proven while the
+    /// owned child lived (or its liveness was unreadable): file the
+    /// named gap. Repeat filings dedupe downstream to the one row.
+    fn note_release_unproven(&mut self) {}
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -542,6 +547,12 @@ pub(crate) struct PauseCoordinator {
     /// key nobody services, so every disabled pass retries the removal
     /// and releases any stop that landed on it.
     disarm_owed: bool,
+    /// An arm-failure release is still unproven: a `SIGCONT` after a
+    /// failed arm failed while the owned child lived (or its liveness
+    /// was unreadable), so every disabled pass retries the release
+    /// while the child lives. A release the child never needed (it
+    /// was already gone) owes nothing and files nothing.
+    release_owed: bool,
     /// A pause key was issued to the kernel at least once (an `arm`
     /// write succeeded, even if its readback failed). Before the first
     /// issuance the session's map holds no key by construction, so a
@@ -714,6 +725,7 @@ impl PauseCoordinator {
             cleaning: false,
             cleaned: false,
             disarm_owed: false,
+            release_owed: false,
             key_issued: false,
         }
     }
@@ -3676,6 +3688,7 @@ mod tests {
         same_generation: bool,
         same_generation_results: VecDeque<Result<bool, String>>,
         original_exited: bool,
+        fail_original_exited: bool,
         resume_authorization: Option<Option<u64>>,
         resumed: bool,
         post_resume_all_stopped: bool,
@@ -3698,6 +3711,7 @@ mod tests {
         unpaused_publications: u64,
         arm_failed_notes: u64,
         unconfirmed_notes: u64,
+        release_unproven_notes: u64,
     }
 
     impl Default for FakeIo {
@@ -3740,6 +3754,7 @@ mod tests {
                 same_generation: true,
                 same_generation_results: VecDeque::new(),
                 original_exited: false,
+                fail_original_exited: false,
                 resume_authorization: None,
                 resumed: false,
                 post_resume_all_stopped: false,
@@ -3762,6 +3777,7 @@ mod tests {
                 unpaused_publications: 0,
                 arm_failed_notes: 0,
                 unconfirmed_notes: 0,
+                release_unproven_notes: 0,
             }
         }
     }
@@ -4024,6 +4040,9 @@ mod tests {
         }
 
         fn original_exited(&mut self) -> Result<bool, String> {
+            if self.fail_original_exited {
+                return Err("exited".into());
+            }
             Ok(self.original_exited)
         }
 
@@ -4063,6 +4082,10 @@ mod tests {
 
         fn note_arm_failed(&mut self) {
             self.arm_failed_notes += 1;
+        }
+
+        fn note_release_unproven(&mut self) {
+            self.release_unproven_notes += 1;
         }
     }
 
@@ -9004,6 +9027,157 @@ mod tests {
         assert!(io.resumed);
         assert!(coordinator.disarm_owed);
         assert_eq!(io.arm_failed_notes, 1);
+    }
+
+    #[test]
+    fn auto_arm_failure_with_failing_release_owes_release_and_gaps() {
+        let mut io = FakeIo {
+            same_generation: false,
+            authorization: Some(PAUSE_ARMED),
+            fail_resume: true,
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.key_issued = true;
+
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Disabled);
+
+        // The removal proved the kernel clean, but the release failed
+        // with the child alive: only the release debt stays, with the
+        // named gap beside the arm-failure row.
+        assert_eq!(io.events, ["read", "remove", "resume"]);
+        assert!(!io.resumed);
+        assert!(!coordinator.disarm_owed);
+        assert!(coordinator.release_owed);
+        assert_eq!(io.arm_failed_notes, 1);
+        assert_eq!(io.release_unproven_notes, 1);
+        // The next disabled pass retries the release alone (the map is
+        // already proven clean), then clears the debt.
+        io.fail_resume = false;
+        io.events.clear();
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Disabled);
+        assert_eq!(io.events, ["resume"]);
+        assert!(io.resumed);
+        assert!(!coordinator.release_owed);
+        assert_eq!(io.release_unproven_notes, 1);
+        // Proven: further passes are silent.
+        io.events.clear();
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Disabled);
+        assert!(io.events.is_empty());
+    }
+
+    #[test]
+    fn auto_arm_failure_with_failing_release_and_dead_child_owes_no_release() {
+        let mut io = FakeIo {
+            same_generation: false,
+            authorization: Some(PAUSE_ARMED),
+            fail_resume: true,
+            original_exited: true,
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.key_issued = true;
+
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Disabled);
+
+        // The release failed, but the child was already gone: nothing
+        // was owed, so no debt and no release row — only the
+        // arm-failure row names the incident.
+        assert_eq!(io.events, ["read", "remove", "resume"]);
+        assert!(!coordinator.disarm_owed);
+        assert!(!coordinator.release_owed);
+        assert_eq!(io.arm_failed_notes, 1);
+        assert_eq!(io.release_unproven_notes, 0);
+        // Nothing owed: the next pass is silent.
+        io.events.clear();
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Disabled);
+        assert!(io.events.is_empty());
+    }
+
+    #[test]
+    fn disarm_backlog_with_failing_release_retries_until_proven_or_gone() {
+        let mut io = FakeIo {
+            same_generation: false,
+            authorization: Some(PAUSE_ARMED),
+            fail_resume: true,
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.key_issued = true;
+
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Disabled);
+        assert!(coordinator.release_owed);
+
+        // Every pass retries the release while the child lives; each
+        // failure re-files the row (deduped downstream to one).
+        io.events.clear();
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Disabled);
+        assert_eq!(io.events, ["resume"]);
+        assert!(coordinator.release_owed);
+        assert_eq!(io.release_unproven_notes, 2);
+        // A gone child settles the debt silently: the release is moot,
+        // and no further signal is attempted.
+        io.original_exited = true;
+        io.events.clear();
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Disabled);
+        assert!(io.events.is_empty());
+        assert!(!coordinator.release_owed);
+        assert_eq!(io.release_unproven_notes, 2);
+        // Settled: further passes are silent.
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Disabled);
+        assert!(io.events.is_empty());
+    }
+
+    #[test]
+    fn disarm_backlog_protective_resume_failure_owes_release() {
+        let mut io = FakeIo {
+            same_generation: false,
+            authorization: Some(PAUSE_ARMED),
+            fail_remove: true,
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.key_issued = true;
+
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Disabled);
+        assert!(coordinator.disarm_owed);
+        assert!(!coordinator.release_owed);
+        assert_eq!(io.release_unproven_notes, 0);
+
+        // The doubted key earns a protective resume on every pass; when
+        // that fails with the child alive, the release becomes debt too.
+        io.fail_resume = true;
+        io.events.clear();
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Disabled);
+        assert_eq!(io.events, ["remove", "resume"]);
+        assert!(coordinator.disarm_owed);
+        assert!(coordinator.release_owed);
+        assert_eq!(io.release_unproven_notes, 1);
+    }
+
+    #[test]
+    fn disarm_backlog_release_liveness_doubt_still_retries_the_release() {
+        let mut io = FakeIo {
+            same_generation: false,
+            authorization: Some(PAUSE_ARMED),
+            fail_resume: true,
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.key_issued = true;
+
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Disabled);
+        assert!(coordinator.release_owed);
+
+        // An unreadable liveness read is doubt, not a death: the pass
+        // still attempts the release instead of settling the debt.
+        io.fail_resume = false;
+        io.fail_original_exited = true;
+        io.events.clear();
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Disabled);
+        assert_eq!(io.events, ["resume"]);
+        assert!(io.resumed);
+        assert!(!coordinator.release_owed);
     }
 
     #[test]

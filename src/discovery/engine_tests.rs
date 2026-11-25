@@ -24232,6 +24232,22 @@ fn engine_note_owned_pause_gap_files_the_arm_failure_row() {
     assert_eq!(skipped.reason, crate::render::PAUSE_ARM_FAILED_REASON);
 }
 
+#[test]
+fn engine_note_owned_pause_gap_files_the_release_unproven_row_once() {
+    let mut engine = Engine::empty();
+    engine.note_owned_pause_gap(crate::render::PAUSE_RELEASE_UNPROVEN_REASON);
+    assert_eq!(engine.counters.object_skips.len(), 1);
+    let skipped = &engine.counters.object_skips[0];
+    assert_eq!(skipped.subject, crate::render::PAUSE_SKIP_SUBJECT);
+    assert_eq!(skipped.reason, crate::render::PAUSE_RELEASE_UNPROVEN_REASON);
+    engine.note_owned_pause_gap(crate::render::PAUSE_RELEASE_UNPROVEN_REASON);
+    assert_eq!(
+        engine.counters.object_skips.len(),
+        1,
+        "repeat filings dedupe to the one row"
+    );
+}
+
 /// A run cgroup scope missing the held child refuses the prearm by
 /// name, never arming blind.
 #[test]

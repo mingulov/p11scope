@@ -2018,6 +2018,7 @@ pub(crate) const RUN_TREE_MEMBERSHIP_UNKNOWN: &str = "handed-back descendants ar
 pub(crate) const PAUSE_SKIP_SUBJECT: &str = "owned pause";
 pub(crate) const PAUSE_ARM_FAILED_REASON: &str =
     "the pause arm failed before the first epoch; the owned child ran without pause protection";
+pub(crate) const PAUSE_RELEASE_UNPROVEN_REASON: &str = "the release after a failed pause arm could not be proven; the owned child may have waited stopped";
 /// Run first-map stop gaps file under this subject with one finite
 /// reason (schema v3): no call count is claimed, never guessed.
 pub(crate) const MEMBER_STOP_SKIP_SUBJECT: &str = "run first-map stop";
@@ -2534,6 +2535,36 @@ fn pause_arm_and_member_stop_gaps_project_named_without_target_data() {
         assert_eq!(projected.reason, DISCOVERY_UNAVAILABLE, "{reason}");
         let json = serde_json::to_string(&projected).unwrap();
         assert!(!json.contains("os error 1"), "{json}");
+    }
+}
+
+#[test]
+fn pause_release_unproven_gap_projects_named_and_redacts_cross_subject() {
+    let projected = capture_skipped_out(&Skipped {
+        subject: PAUSE_SKIP_SUBJECT.into(),
+        reason: (*PAUSE_RELEASE_UNPROVEN_REASON).into(),
+    });
+    assert_eq!(projected.name, PAUSE_SKIP_SUBJECT);
+    assert_eq!(projected.reason, *PAUSE_RELEASE_UNPROVEN_REASON);
+    let json = serde_json::to_string(&projected).unwrap();
+    assert!(!json.contains("discovery unavailable"), "{json}");
+    // The release row names no target data, and under any other
+    // subject it fails closed to the generic pair.
+    for (subject, reason) in [
+        (
+            PAUSE_SKIP_SUBJECT,
+            "the release failed: pidfd signal 18 for pid 41 failed (os error 3)",
+        ),
+        (MEMBER_STOP_SKIP_SUBJECT, PAUSE_RELEASE_UNPROVEN_REASON),
+    ] {
+        let projected = capture_skipped_out(&Skipped {
+            subject: subject.into(),
+            reason: reason.into(),
+        });
+        assert_eq!(projected.name, "discovery subject", "{reason}");
+        assert_eq!(projected.reason, DISCOVERY_UNAVAILABLE, "{reason}");
+        let json = serde_json::to_string(&projected).unwrap();
+        assert!(!json.contains("os error 3"), "{json}");
     }
 }
 

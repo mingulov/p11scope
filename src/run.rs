@@ -11312,8 +11312,7 @@ fn fallback_streamed_report_to_stdout(
 fn commit_streamed_report(out_file: crate::output::AtomicFile) -> Result<()> {
     match out_file.commit_with_outcome() {
         Ok(()) => Ok(()),
-        Err(failure) if failure.saved_to_recovery().is_some() => Err(anyhow::Error::new(failure)),
-        Err(failure) => Err(anyhow::Error::msg(failure.into_message())),
+        Err(failure) => Err(anyhow::Error::new(failure)),
     }
 }
 

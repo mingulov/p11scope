@@ -111,8 +111,8 @@ enum AttemptFailure {
 }
 
 /// Why an `-o` commit failed: what became of the finished capture. The
-/// message is the operator-facing line (also printed to stderr); the
-/// kind tells callers with another delivery whether one is still needed.
+/// message is the operator-facing line its caller prints exactly once;
+/// the kind tells callers with another delivery whether one is still needed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitFailureKind {
     /// The capture was saved to the recovery dir; the message names
@@ -130,9 +130,8 @@ pub enum CommitFailureKind {
 
 /// A failed `-o` commit: the operator-facing message plus what became
 /// of the finished capture. The streamed profile/metrics publisher
-/// wraps a `SavedToRecovery` failure typed (via `anyhow::Error::new`)
-/// so the stdout rescue suppresses itself; every other failure
-/// travels as its plain message and keeps the rescue.
+/// wraps it typed (via `anyhow::Error::new`) so a `SavedToRecovery`
+/// failure suppresses the stdout rescue while the other kinds keep it.
 #[derive(Debug, Clone)]
 pub struct CommitFailure {
     message: String,
@@ -141,7 +140,7 @@ pub struct CommitFailure {
 }
 
 impl CommitFailure {
-    /// The operator-facing line (also printed to stderr).
+    /// The operator-facing line its caller prints.
     pub fn message(&self) -> &str {
         &self.message
     }
@@ -241,9 +240,11 @@ impl AtomicFile {
                             let statvfs = unsafe { statvfs.assume_init() };
                             let free = statvfs.f_bavail.saturating_mul(statvfs.f_frsize);
                             if free < FREE_SPACE_FLOOR {
-                                eprintln!(
-                                    "p11scope: warning: only {free} bytes free on the filesystem for {}; the report may not fit",
-                                    final_path.display()
+                                let _ = crate::sink::try_stderr_line(
+                                    &crate::render::escape_controls(&format!(
+                                        "p11scope: warning: only {free} bytes free on the filesystem for {}; the report may not fit",
+                                        final_path.display()
+                                    )),
                                 );
                             }
                         }
@@ -348,11 +349,6 @@ impl AtomicFile {
             Ok(saved) => {
                 let euid = unsafe { libc::geteuid() } as u32;
                 let note = recovery_saved_note(euid, account_name(euid).as_deref());
-                eprintln!(
-                    "p11scope: writing {} failed: {write_error}; capture saved to {} {note}",
-                    self.final_path.display(),
-                    saved.display()
-                );
                 CommitFailure {
                     message: format!(
                         "writing {} failed: {write_error}; capture saved to {} {note}",
@@ -363,22 +359,15 @@ impl AtomicFile {
                     saved: Some(saved),
                 }
             }
-            Err(e2) => {
-                eprintln!(
-                    "p11scope: writing {} failed: {write_error}; saving to {} also failed: {e2}; capture lost",
+            Err(e2) => CommitFailure {
+                message: format!(
+                    "writing {} failed: {write_error}; saving to {} also failed: {e2}; capture lost",
                     self.final_path.display(),
                     base.display()
-                );
-                CommitFailure {
-                    message: format!(
-                        "writing {} failed: {write_error}; saving to {} also failed: {e2}; capture lost",
-                        self.final_path.display(),
-                        base.display()
-                    ),
-                    kind: CommitFailureKind::RecoveryFailed,
-                    saved: None,
-                }
-            }
+                ),
+                kind: CommitFailureKind::RecoveryFailed,
+                saved: None,
+            },
         }
     }
 
@@ -402,11 +391,6 @@ impl AtomicFile {
             Ok(saved) => {
                 let euid = unsafe { libc::geteuid() } as u32;
                 let note = recovery_saved_note(euid, account_name(euid).as_deref());
-                eprintln!(
-                    "p11scope: writing {} failed: {write_error}; capture saved to {} {note}",
-                    self.final_path.display(),
-                    saved.display()
-                );
                 CommitFailure {
                     message: format!(
                         "writing {} failed: {write_error}; capture saved to {} {note}",
@@ -417,22 +401,15 @@ impl AtomicFile {
                     saved: Some(saved),
                 }
             }
-            Err(e2) => {
-                eprintln!(
-                    "p11scope: writing {} failed: {write_error}; saving to {} also failed: {e2}; capture lost",
+            Err(e2) => CommitFailure {
+                message: format!(
+                    "writing {} failed: {write_error}; saving to {} also failed: {e2}; capture lost",
                     self.final_path.display(),
                     base.display()
-                );
-                CommitFailure {
-                    message: format!(
-                        "writing {} failed: {write_error}; saving to {} also failed: {e2}; capture lost",
-                        self.final_path.display(),
-                        base.display()
-                    ),
-                    kind: CommitFailureKind::RecoveryFailed,
-                    saved: None,
-                }
-            }
+                ),
+                kind: CommitFailureKind::RecoveryFailed,
+                saved: None,
+            },
         }
     }
 
@@ -511,10 +488,6 @@ impl AtomicFile {
             AttemptFailure::Refused(refusal) => {
                 self.cleanup = false;
                 let temp_path = self.temp_path();
-                eprintln!(
-                    "p11scope: warning: {refusal}; kept {} (report not deleted)",
-                    temp_path.display()
-                );
                 Err(CommitFailure {
                     message: format!(
                         "{refusal}; kept {} (report not deleted)",
@@ -530,11 +503,6 @@ impl AtomicFile {
                     Ok(saved) => {
                         let euid = unsafe { libc::geteuid() } as u32;
                         let note = recovery_saved_note(euid, account_name(euid).as_deref());
-                        eprintln!(
-                            "p11scope: writing {} failed: {e1}; capture saved to {} {note}",
-                            self.final_path.display(),
-                            saved.display()
-                        );
                         Err(CommitFailure {
                             message: format!(
                                 "writing {} failed: {e1}; capture saved to {} {note}",
@@ -545,22 +513,15 @@ impl AtomicFile {
                             saved: Some(saved),
                         })
                     }
-                    Err(e2) => {
-                        eprintln!(
-                            "p11scope: writing {} failed: {e1}; saving to {} also failed: {e2}; capture lost",
+                    Err(e2) => Err(CommitFailure {
+                        message: format!(
+                            "writing {} failed: {e1}; saving to {} also failed: {e2}; capture lost",
                             self.final_path.display(),
                             base.display()
-                        );
-                        Err(CommitFailure {
-                            message: format!(
-                                "writing {} failed: {e1}; saving to {} also failed: {e2}; capture lost",
-                                self.final_path.display(),
-                                base.display()
-                            ),
-                            kind: CommitFailureKind::RecoveryFailed,
-                            saved: None,
-                        })
-                    }
+                        ),
+                        kind: CommitFailureKind::RecoveryFailed,
+                        saved: None,
+                    }),
                 }
                 // cleanup stays true: Drop unlinks the temp only while it
                 // is still this run's private file.
@@ -1857,6 +1818,84 @@ fn recovered_production_base(euid: u32) -> PathBuf {
     PathBuf::from(format!("/var/tmp/p11scope-recovered-{euid}"))
 }
 
+/// The ordered recovery parents production tries for `base`: the fixed
+/// `/var/tmp` location, then the same per-euid leaf under an absolute
+/// `$TMPDIR`, then `/tmp`. Each label names the parent in diagnostics.
+/// A test override or a caller-supplied non-production base stays exact:
+/// refusal twins must not gain a fallback the production chain owns.
+fn recovery_base_chain(base: &Path) -> Vec<(PathBuf, &'static str)> {
+    #[cfg(test)]
+    if std::env::var_os("P11SCOPE_TEST_RECOVERED_DIR").is_some_and(|dir| dir == base.as_os_str()) {
+        return vec![(base.to_path_buf(), "the test recovery parent")];
+    }
+    recovery_base_chain_with_tmpdir(base, std::env::var_os("TMPDIR").as_deref())
+}
+
+/// The pure chain selection behind [`recovery_base_chain`], split so the
+/// order and de-duplication twins need no process-global env mutation.
+fn recovery_base_chain_with_tmpdir(
+    base: &Path,
+    tmpdir: Option<&OsStr>,
+) -> Vec<(PathBuf, &'static str)> {
+    let production = recovered_production_base(unsafe { libc::geteuid() } as u32);
+    if base != production {
+        return vec![(base.to_path_buf(), "the recovery parent")];
+    }
+    let Some(leaf) = base.file_name() else {
+        return vec![(base.to_path_buf(), "the /var/tmp recovery parent")];
+    };
+    let mut chain = vec![(base.to_path_buf(), "/var/tmp")];
+    if let Some(tmpdir) = tmpdir {
+        let root = PathBuf::from(tmpdir);
+        // TMPDIR is meaningful only as an absolute root. A relative one
+        // would make recovery depend on the caller's cwd, so production
+        // ignores it rather than silently writing an unexpected tree.
+        if root.is_absolute() {
+            let candidate = root.join(leaf);
+            if !chain.iter().any(|(path, _)| *path == candidate) {
+                chain.push((candidate, "$TMPDIR"));
+            }
+        }
+    }
+    let candidate = Path::new("/tmp").join(leaf);
+    if !chain.iter().any(|(path, _)| *path == candidate) {
+        chain.push((candidate, "/tmp"));
+    }
+    chain
+}
+
+/// Why a recovery base's parent cannot accept the per-euid directory:
+/// either the parent cannot be opened at all, or the effective caller
+/// lacks write+search on it. This preflight deliberately precedes the
+/// base-name squatter fallback: an absent/unwritable parent selects the
+/// next chain root, while a writable parent keeps recovery on its own
+/// filesystem even when the exact base name is occupied.
+fn recovery_parent_unusable(base: &Path) -> Option<String> {
+    let (parent, parent_path) = match open_recovery_parent(base) {
+        Ok(opened) => opened,
+        Err(error) => return Some(error),
+    };
+    let dot = CString::new(".").expect("a dot path contains no NUL");
+    // SAFETY: the parent fd and NUL-terminated dot outlive the call.
+    // AT_EACCESS checks the effective ids, matching the ids mkdirat uses.
+    if unsafe {
+        libc::faccessat(
+            parent.as_raw_fd(),
+            dot.as_ptr(),
+            libc::W_OK | libc::X_OK,
+            libc::AT_EACCESS,
+        )
+    } == -1
+    {
+        return Some(format!(
+            "recovery parent {} is not writable: {}",
+            parent_path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    None
+}
+
 /// Opens the recovery dir, creating it `0700` when absent, and refuses a
 /// planted impostor: the held dir must be a real directory owned by the
 /// caller with no group/other bits. All descriptor-relative (`mkdirat` /
@@ -1908,7 +1947,7 @@ fn open_recovered_dir(base: &Path) -> Result<std::fs::File, String> {
 /// base; production always falls back, so another user can never
 /// block this caller's recovery, not even by squatting its per-euid
 /// name.
-fn open_recovered_dir_or_fallback(base: &Path) -> Result<(std::fs::File, PathBuf), String> {
+fn open_recovered_dir_or_sibling_fallback(base: &Path) -> Result<(std::fs::File, PathBuf), String> {
     match open_recovered_dir(base) {
         Ok(dir) => Ok((dir, base.to_path_buf())),
         Err(first) => {
@@ -1920,13 +1959,46 @@ fn open_recovered_dir_or_fallback(base: &Path) -> Result<(std::fs::File, PathBuf
             }
             let (dir, fallback) = create_fallback_recovered_dir(base)
                 .map_err(|second| format!("{first}; recovery fallback also failed: {second}"))?;
-            eprintln!(
+            let _ = crate::sink::try_stderr_line(&crate::render::escape_controls(&format!(
                 "p11scope: warning: {first}; using {} instead",
                 fallback.display()
-            );
+            )));
             Ok((dir, fallback))
         }
     }
+}
+
+/// Opens the recovery dir through the production parent chain. Only an
+/// absent or unwritable parent moves to the next root (`$TMPDIR`, then
+/// `/tmp`); once a writable parent is selected, the exact per-euid base
+/// keeps its squatter-resistant sibling fallback on that same parent.
+/// The warning names every parent skipped and its reason before naming
+/// the parent actually used.
+fn open_recovered_dir_or_fallback(base: &Path) -> Result<(std::fs::File, PathBuf), String> {
+    let chain = recovery_base_chain(base);
+    let mut skipped = Vec::new();
+    for (index, (candidate, label)) in chain.iter().enumerate() {
+        if let Some(reason) = recovery_parent_unusable(candidate) {
+            skipped.push(format!("{label} unavailable ({reason})"));
+            continue;
+        }
+        let result = open_recovered_dir_or_sibling_fallback(candidate);
+        if index != 0 && result.is_ok() {
+            let parent = candidate
+                .parent()
+                .unwrap_or_else(|| Path::new("/"))
+                .display();
+            let _ = crate::sink::try_stderr_line(&crate::render::escape_controls(&format!(
+                "p11scope: warning: {}; using {parent} instead",
+                skipped.join("; ")
+            )));
+        }
+        return result;
+    }
+    Err(format!(
+        "no writable recovery parent: {}",
+        skipped.join("; ")
+    ))
 }
 
 /// Opens a recovery base's parent held (no symlink traversal), for
@@ -2684,7 +2756,7 @@ mod tests {
         let path = dir.path().join("trace.log");
         let stream = create_private_stream(&path).unwrap();
         if stream.origin != StreamOrigin::Unnamed {
-            eprintln!("skipped: this filesystem has no O_TMPFILE");
+            let _ = crate::sink::try_stderr_line("skipped: this filesystem has no O_TMPFILE");
             return;
         }
         // Someone else named the same inode (through its descriptor link).
@@ -3440,7 +3512,9 @@ mod tests {
         );
         let invoker = sudo_pair_from_environment();
         if invoker.is_none() {
-            eprintln!("no valid SUDO_UID/SUDO_GID pair: asserting root-owned outputs only");
+            let _ = crate::sink::try_stderr_line(
+                "no valid SUDO_UID/SUDO_GID pair: asserting root-owned outputs only",
+            );
         }
 
         let dir = private_tempdir();
@@ -3589,7 +3663,9 @@ mod tests {
                 "the live report refuses the invoker's write with EACCES"
             );
         } else {
-            eprintln!("fakeroot: skipping the invoker EACCES probe (DAC is real, ownership faked)");
+            let _ = crate::sink::try_stderr_line(
+                "fakeroot: skipping the invoker EACCES probe (DAC is real, ownership faked)",
+            );
         }
         report.commit().unwrap();
         assert_eq!(std::fs::read(&report_path).unwrap(), b"{\"ok\":true}");
@@ -3789,7 +3865,8 @@ mod tests {
     fn commit_handover_failure_falls_back_to_recovered_dir() {
         use std::os::unix::fs::MetadataExt as _;
         if unsafe { libc::geteuid() } == 0 {
-            eprintln!("skipped: needs a non-root caller (fchown must fail)");
+            let _ =
+                crate::sink::try_stderr_line("skipped: needs a non-root caller (fchown must fail)");
             return;
         }
         let dir = private_tempdir();
@@ -3875,7 +3952,9 @@ mod tests {
     #[test]
     fn commit_handover_to_self_publishes_a_private_final() {
         if unsafe { libc::geteuid() } == 0 {
-            eprintln!("skipped: needs a non-root caller (root hands over for real)");
+            let _ = crate::sink::try_stderr_line(
+                "skipped: needs a non-root caller (root hands over for real)",
+            );
             return;
         }
         let dir = private_tempdir();
@@ -3903,7 +3982,8 @@ mod tests {
     #[test]
     fn handover_probe_failure_aborts_before_capture_without_litter() {
         if unsafe { libc::geteuid() } == 0 {
-            eprintln!("skipped: needs a non-root caller (fchown must fail)");
+            let _ =
+                crate::sink::try_stderr_line("skipped: needs a non-root caller (fchown must fail)");
             return;
         }
         let dir = private_tempdir();
@@ -3937,7 +4017,9 @@ mod tests {
     #[test]
     fn handover_probe_to_self_succeeds_and_removes_its_file() {
         if unsafe { libc::geteuid() } == 0 {
-            eprintln!("skipped: needs a non-root caller (root hands over for real)");
+            let _ = crate::sink::try_stderr_line(
+                "skipped: needs a non-root caller (root hands over for real)",
+            );
             return;
         }
         let dir = private_tempdir();
@@ -3997,52 +4079,6 @@ mod tests {
         );
     }
 
-    /// The commit-time handover failure, pinned structurally: a
-    /// handover that fails at commit returns the error naming the path —
-    /// instead of publishing an unhanded report — and `commit` routes it
-    /// to the recovery dir. (The fallback line goes to stderr, which
-    /// libtest captures; the source pin plus the fallback twin above
-    /// prove the path executes.)
-    #[test]
-    fn commit_handover_failure_falls_back_naming_the_path() {
-        let source = include_str!("output.rs");
-        let production = source.split_once("mod tests").unwrap().0;
-        let handover = production
-            .split_once("fn hand_over_at_commit(")
-            .unwrap()
-            .1
-            .split_once("fn verify_temp_identity(")
-            .unwrap()
-            .0;
-        assert!(
-            handover.contains("Err("),
-            "the commit-time handover failure returns an error, not a publish-with-warning"
-        );
-        assert!(
-            handover.contains("final_path.display()"),
-            "the handover error names the report path"
-        );
-        assert!(
-            !handover.contains("Ok(Some"),
-            "no handover failure falls back to publishing the unhanded report"
-        );
-        let commit = production
-            .split_once("pub fn commit(self)")
-            .unwrap()
-            .1
-            .split_once("fn publish(")
-            .unwrap()
-            .0;
-        assert!(
-            commit.contains("hand_over_at_commit"),
-            "commit still hands the finished report over before publishing it"
-        );
-        assert!(
-            commit.contains("eprintln!"),
-            "commit prints the fallback line (bounded in production, captured in tests)"
-        );
-    }
-
     /// A publish failure keeps the finished temp for the operator with a
     /// warning naming it, never deleting the capture. Arranged by
     /// replacing the final with a directory after create, so the
@@ -4087,7 +4123,8 @@ mod tests {
     #[test]
     fn commit_handover_and_publish_failures_fall_back_to_recovered_dir() {
         if unsafe { libc::geteuid() } == 0 {
-            eprintln!("skipped: needs a non-root caller (fchown must fail)");
+            let _ =
+                crate::sink::try_stderr_line("skipped: needs a non-root caller (fchown must fail)");
             return;
         }
         let dir = private_tempdir();
@@ -4124,37 +4161,6 @@ mod tests {
         );
         assert_eq!(temp_litter(dir.path()), Vec::<String>::new());
         std::fs::remove_dir(&path).unwrap();
-    }
-
-    /// The fallback line is emitted only after both commit attempts
-    /// are known, stating what actually happened — `commit` retries
-    /// once, then prints the recovery result. Structural: stderr is
-    /// libtest-captured, so the ordering is pinned on the source.
-    #[test]
-    fn commit_emits_the_fallback_line_only_after_both_attempts() {
-        let source = include_str!("output.rs");
-        let production = source.split_once("mod tests").unwrap().0;
-        let commit = production
-            .split_once("pub fn commit(self)")
-            .unwrap()
-            .1
-            .split_once("fn publish(")
-            .unwrap()
-            .0;
-        let attempt = commit
-            .find("try_commit_once()")
-            .expect("commit must attempt the publish before falling back");
-        let warn = commit
-            .find("eprintln!")
-            .expect("commit must print the fallback line");
-        assert!(
-            attempt < warn,
-            "the fallback line is emitted only after the attempts are known"
-        );
-        assert!(
-            commit.matches("try_commit_once()").count() >= 2,
-            "commit must retry once before falling back"
-        );
     }
 
     /// The whole commit-time handover sequence fails the commit (to
@@ -4596,7 +4602,9 @@ mod tests {
     #[test]
     fn recovered_dir_refuses_a_foreign_owned_dir() {
         if unsafe { libc::geteuid() } == 0 {
-            eprintln!("skipped: needs a non-root caller (the base must be foreign)");
+            let _ = crate::sink::try_stderr_line(
+                "skipped: needs a non-root caller (the base must be foreign)",
+            );
             return;
         }
         let dir = private_tempdir();
@@ -4842,6 +4850,71 @@ mod tests {
         );
     }
 
+    /// Item 4 twin: production tries the fixed `/var/tmp` base first,
+    /// then the same per-euid leaf under an absolute `$TMPDIR`, then
+    /// `/tmp`; duplicate roots collapse and a relative TMPDIR is never
+    /// a cwd-dependent recovery location.
+    #[test]
+    fn recovery_parent_chain_orders_and_deduplicates_roots() {
+        let euid = unsafe { libc::geteuid() } as u32;
+        let base = recovered_production_base(euid);
+        let leaf = base
+            .file_name()
+            .expect("the production base has a leaf")
+            .to_os_string();
+        let chain =
+            recovery_base_chain_with_tmpdir(&base, Some(OsStr::new("/var/tmp/p11scope-test-tmp")));
+        assert_eq!(
+            chain,
+            vec![
+                (base.clone(), "/var/tmp"),
+                (
+                    Path::new("/var/tmp/p11scope-test-tmp").join(&leaf),
+                    "$TMPDIR"
+                ),
+                (Path::new("/tmp").join(&leaf), "/tmp"),
+            ]
+        );
+        let deduped = recovery_base_chain_with_tmpdir(&base, Some(OsStr::new("/tmp")));
+        assert_eq!(
+            deduped,
+            vec![
+                (base.clone(), "/var/tmp"),
+                (Path::new("/tmp").join(&leaf), "/tmp")
+            ]
+        );
+        let relative = recovery_base_chain_with_tmpdir(&base, Some(OsStr::new("relative-tmp")));
+        assert_eq!(
+            relative,
+            vec![
+                (base.clone(), "/var/tmp"),
+                (Path::new("/tmp").join(&leaf), "/tmp")
+            ]
+        );
+    }
+
+    /// Item 4 twin: the parent preflight names an absent parent and an
+    /// unwritable one; either verdict is what moves recovery to the next
+    /// chain root instead of reporting an unexplained mkdir failure.
+    #[test]
+    fn recovery_parent_preflight_names_absent_and_unwritable_parents() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = private_tempdir();
+        let absent = recovery_parent_unusable(&dir.path().join("absent/p11scope-recovered-test"))
+            .expect("an absent parent is unavailable");
+        assert!(absent.contains("opening recovery parent"), "{absent}");
+        assert!(absent.contains("failed"), "{absent}");
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let closed = dir.path().join("closed");
+        std::fs::create_dir(&closed).unwrap();
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let unwritable = recovery_parent_unusable(&closed.join("p11scope-recovered-test"))
+            .expect("a mode-0555 parent is unavailable to an unprivileged caller");
+        assert!(unwritable.contains("is not writable"), "{unwritable}");
+    }
+
     /// Without the test override the recovery base is the production
     /// per-euid name (under the override lock, so no concurrent twin
     /// can set the variable mid-check).
@@ -4899,8 +4972,8 @@ mod tests {
             );
             bases.push(foreign_base);
         } else {
-            eprintln!(
-                "foreign-owned leg skipped: needs root (file, symlink and permissive legs run)"
+            let _ = crate::sink::try_stderr_line(
+                "foreign-owned leg skipped: needs root (file, symlink and permissive legs run)",
             );
         }
         for base in &bases {

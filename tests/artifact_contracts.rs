@@ -10285,6 +10285,7 @@ fn daemonset_posture_is_hardened_and_documented() {
         "emptyDir:",
         "sizeLimit:",
         "mountPath: /tmp",
+        "mountPath: /var/tmp",
         "Least-privilege variant",
         "allowPrivilegeEscalation: false",
         "type: RuntimeDefault",
@@ -10314,8 +10315,8 @@ fn k8s_entry_hardens_the_scratch_mount() {
     // manifest's scratch mount at the same path.
     let entry = read("scripts/k8s-profile-entry.sh");
     assert!(
-        entry.contains("chmod 1777 /tmp"),
-        "k8s-profile-entry.sh must harden /tmp before exec"
+        entry.contains("chmod 1777 /tmp /var/tmp"),
+        "k8s-profile-entry.sh must harden /tmp and /var/tmp before exec"
     );
     let daemonset = read("deploy/k8s/20-daemonset.yaml");
     assert!(
@@ -10326,9 +10327,10 @@ fn k8s_entry_hardens_the_scratch_mount() {
     // -o /tmp/...` (the documented inventory command) runs without the entry
     // script, so the pod itself must harden the mount at start.
     assert!(
-        daemonset
-            .contains(r#"command: ["/bin/sh", "-c", "chmod 1777 /tmp && exec sleep infinity"]"#),
-        "the observer container must harden /tmp at pod start"
+        daemonset.contains(
+            r#"command: ["/bin/sh", "-c", "chmod 1777 /tmp /var/tmp && exec sleep infinity"]"#
+        ),
+        "the observer container must harden /tmp and /var/tmp at pod start"
     );
 }
 
@@ -11937,6 +11939,8 @@ fn observer_images_run_on_scratch_with_pinned_busybox() {
             "notices/BUSYBOX.md",
             "ENV PATH=",
             "BusyBox v1.37.0",
+            "mkdir -p /usr/share/licenses/p11scope/notices /tmp /var/tmp",
+            "chmod 1777 /tmp /var/tmp",
         ] {
             require_contract_marker(&dockerfile, marker, path)
                 .expect("observer scratch runtime contract");

@@ -133,7 +133,7 @@ fn write_report(
     if let Err(error) = sink.write_document(&bytes) {
         let failure =
             sink.fail_write_with_recovery(&bytes, format!("writing JSON report failed: {error}"));
-        return Err(anyhow::Error::msg(failure.into_message()));
+        return Err(anyhow::Error::new(failure));
     }
     before_commit();
     // These descriptors are retained, even if their original names are
@@ -141,7 +141,7 @@ fn write_report(
     // final-name checks. The same-owner check/rename race stays within its
     // documented trusted-directory boundary; this is not a path lock.
     check_output_alias(path, input_paths, sources)?;
-    sink.commit().map_err(anyhow::Error::msg)?;
+    sink.commit_with_outcome().map_err(anyhow::Error::new)?;
     Ok(())
 }
 

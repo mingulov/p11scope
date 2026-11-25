@@ -107,8 +107,8 @@ RUN set -eu; \
     [ "$(/bin/busybox ls /bin | grep -c .)" -eq 17 ] || { echo "unexpected /bin contents:" >&2; /bin/busybox ls -la /bin >&2; exit 1; }; \
     BUSYBOX_LINE=$(/bin/busybox | /bin/busybox sed -n '1p'); \
     case $BUSYBOX_LINE in 'BusyBox v1.37.0 '*) ;; *) echo "busybox version drifted: $BUSYBOX_LINE" >&2; exit 1;; esac; \
-    mkdir -p /usr/share/licenses/p11scope/notices /tmp; \
-    chmod 1777 /tmp; \
+    mkdir -p /usr/share/licenses/p11scope/notices /tmp /var/tmp; \
+    chmod 1777 /tmp /var/tmp; \
     printf '%s\n' "$BUSYBOX_LINE" 'Copyright: many authors 1998-2015, see https://busybox.net' 'License: GNU General Public License version 2 only (GPL-2.0-only).' 'Full text: /usr/share/licenses/p11scope/LICENSES/GPL-2.0-only.txt' 'Upstream: https://busybox.net' 'Installed: /bin/sh plus the applet symlinks the pod needs;' 'no other busybox applets are linked.' > /usr/share/licenses/p11scope/notices/BUSYBOX.md; \
     /usr/local/bin/p11scope --help >/dev/null; \
     /usr/local/bin/k8s-profile-entry --self-test; \

@@ -418,9 +418,9 @@ if [ "$N_READABLE" -lt "$N_VISIBLE" ]; then
     [ "$COMMAND" = doctor ] || exit 1
 fi
 
-# Kubelet creates the scratch emptyDir 0777 without the sticky bit, which the
-# observer's output trust check refuses. Restore classic /tmp mode so `-o
-# /tmp/<name>.json` (the only writable path under the read-only root) works.
-chmod 1777 /tmp || { echo "cannot harden the scratch mount" >&2; exit 1; }
+# Kubelet creates the scratch and recovery emptyDirs 0777 without the sticky
+# bit, which the observer's output trust check refuses. Restore classic tmp
+# modes so `-o /tmp/<name>.json` and the `/var/tmp` recovery fallback work.
+chmod 1777 /tmp /var/tmp || { echo "cannot harden the scratch mounts" >&2; exit 1; }
 
 exec "$OBSERVER" "$COMMAND" --cgroup "$POD_CG" "$@"

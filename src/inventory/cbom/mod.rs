@@ -131,7 +131,7 @@ fn write_sink(
     if let Err(error) = sink.write_document(&bytes) {
         let failure =
             sink.fail_write_with_recovery(&bytes, format!("writing CBOM JSON failed: {error}"));
-        return Err(anyhow::Error::msg(failure.into_message()));
+        return Err(anyhow::Error::new(failure));
     }
     before_commit();
     // The descriptor is retained even if its original name is
@@ -140,7 +140,7 @@ fn write_sink(
     // within its documented trusted-directory boundary; this is not
     // a path lock.
     check_output_alias(path, input_path, source)?;
-    sink.commit().map_err(anyhow::Error::msg)?;
+    sink.commit_with_outcome().map_err(anyhow::Error::new)?;
     Ok(())
 }
 

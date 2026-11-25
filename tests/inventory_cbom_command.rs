@@ -8,9 +8,9 @@ use std::process::{Command, Output, Stdio};
 
 const CRYPTO_FIXTURE: &[u8] = include_bytes!("fixtures/cbom/inventory-with-crypto.json");
 const SCAN_FIXTURE: &[u8] = include_bytes!("fixtures/inventory-diff/scan-current.json");
-const BOM_SCHEMA: &str = include_str!("fixtures/cbom/bom-1.6.schema.json");
-const JSF_SCHEMA: &str = include_str!("fixtures/cbom/jsf-0.82.schema.json");
-const SPDX_SCHEMA: &str = include_str!("fixtures/cbom/spdx.schema.json");
+const BOM_SCHEMA: &str = include_str!("../docs/schema/bom-1.6.schema.json");
+const JSF_SCHEMA: &str = include_str!("../docs/schema/jsf-0.82.schema.json");
+const SPDX_SCHEMA: &str = include_str!("../docs/schema/spdx.schema.json");
 
 fn command(input: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_p11scope"));

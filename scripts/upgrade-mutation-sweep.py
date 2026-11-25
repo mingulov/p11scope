@@ -132,6 +132,55 @@ MUTATIONS = [
         "killer": f"{VALIDATOR_TEST}.test_diff_validator_requires_ten_field_typed_document_and_consistency",
     },
     {
+        "site": "inventory positive caller row",
+        "file": "scripts/upgrade_artifact_validation.py",
+        "old": '    if len(document.get("callers", [])) < 1:',
+        "new": "    if False:",
+        "killer": f"{VALIDATOR_TEST}.test_inventory_positive_payload_rejects_hollow_typed_rows",
+    },
+    {
+        "site": "inventory positive provider row",
+        "file": "scripts/upgrade_artifact_validation.py",
+        "old": '    if len(document.get("modules", [])) < 1:',
+        "new": "    if False:",
+        "killer": f"{VALIDATOR_TEST}.test_inventory_positive_payload_rejects_hollow_typed_rows",
+    },
+    {
+        "site": "inventory positive caller-provider edge",
+        "file": "scripts/upgrade_artifact_validation.py",
+        "old": '    if len(document.get("edges", [])) < 1:',
+        "new": "    if False:",
+        "killer": f"{VALIDATOR_TEST}.test_inventory_positive_payload_rejects_hollow_typed_rows",
+    },
+    {
+        "site": "cbom positive application count equality",
+        "file": "scripts/upgrade_artifact_validation.py",
+        "old": '    for name in ("applications", "providers", "algorithms", "keys"):',
+        "new": '    for name in ("providers", "algorithms", "keys"):',
+        "killer": f"{VALIDATOR_TEST}.test_cbom_inventory_validator_requires_source_flow_through",
+    },
+    {
+        "site": "cbom positive minimum component rule",
+        "file": "scripts/upgrade_artifact_validation.py",
+        "old": '    for name in minimums:\n        if counts[name] < 1:',
+        "new": "    for name in ():\n        if counts[name] < 1:",
+        "killer": f"{VALIDATOR_TEST}.test_cbom_inventory_validator_requires_source_flow_through",
+    },
+    {
+        "site": "diff positive before caller occurrence",
+        "file": "scripts/upgrade_artifact_validation.py",
+        "old": '    for side in ("before", "after"):',
+        "new": '    for side in ("after",):',
+        "killer": f"{VALIDATOR_TEST}.test_diff_positive_payload_rejects_hollow_caller_projections",
+    },
+    {
+        "site": "diff positive after caller occurrence",
+        "file": "scripts/upgrade_artifact_validation.py",
+        "old": '    for side in ("before", "after"):',
+        "new": '    for side in ("before",):',
+        "killer": f"{VALIDATOR_TEST}.test_diff_positive_payload_rejects_hollow_caller_projections",
+    },
+    {
         "site": "diff snapshot/source exact consistency",
         "file": "scripts/upgrade_artifact_validation.py",
         "old": "    if source is None or not isinstance(snapshot, dict) or not isinstance(source, dict):\n        return",
@@ -152,6 +201,8 @@ def copy_cell_tree(destination: Path) -> None:
         "scripts/upgrade-gate5.sh",
         "scripts/upgrade-gate6.py",
         "scripts/upgrade_artifact_validation.py",
+        "scripts/json_schema.py",
+        "scripts/upgrade-softhsm-workload.py",
         "tests/python/test_upgrade_cells.py",
         "tests/fixtures/upgrade/v071-observed-profile.json",
         "Cargo.toml",
@@ -159,6 +210,7 @@ def copy_cell_tree(destination: Path) -> None:
         target = destination / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(ROOT / relative, target)
+    shutil.copytree(ROOT / "docs/schema", destination / "docs/schema")
 
 
 def mutation_line(path: Path, needle: str) -> int:

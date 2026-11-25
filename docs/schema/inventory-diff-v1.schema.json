@@ -1,0 +1,133 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://p11scope/inventory-diff/v1.schema.json",
+  "title": "p11scope inventory diff v1 document",
+  "description": "Structural consumer aid for p11scope/inventory-diff/v1. The prose contract in inventory-diff-v1.md remains authoritative for semantics.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "before", "after", "comparison", "summary", "module_contents", "application_changes", "module_path_changes", "unresolved", "limitations"],
+  "properties": {
+    "schema": {"const": "p11scope/inventory-diff/v1"},
+    "before": {"$ref": "#/$defs/snapshot"},
+    "after": {"$ref": "#/$defs/snapshot"},
+    "comparison": {
+      "type": "object",
+      "required": ["host_relation", "boot_relation", "process_continuity", "physical_continuity", "counter_relation", "scope_relation", "application_paths"],
+      "properties": {
+        "host_relation": {"const": "unknown"},
+        "boot_relation": {"const": "unknown"},
+        "process_continuity": {"const": "unknown"},
+        "physical_continuity": {"const": "unknown"},
+        "counter_relation": {"const": "independent_windows"},
+        "scope_relation": {"enum": ["same_recorded_label", "different_recorded_labels"]},
+        "application_paths": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true}
+      }
+    },
+    "summary": {
+      "type": "object",
+      "required": ["application_groups_compared", "application_groups_changed", "content_both", "content_before_only", "content_after_only", "module_paths_changed", "unresolved_observations"],
+      "properties": {
+        "application_groups_compared": {"type": "integer", "minimum": 0},
+        "application_groups_changed": {"type": "integer", "minimum": 0},
+        "content_both": {"type": "integer", "minimum": 0},
+        "content_before_only": {"type": "integer", "minimum": 0},
+        "content_after_only": {"type": "integer", "minimum": 0},
+        "module_paths_changed": {"type": "integer", "minimum": 0},
+        "unresolved_observations": {"type": "integer", "minimum": 0}
+      }
+    },
+    "module_contents": {"type": "array", "items": {"$ref": "#/$defs/reference_projection"}},
+    "application_changes": {"type": "array", "items": {"$ref": "#/$defs/application_projection"}},
+    "module_path_changes": {"type": "array", "items": {"$ref": "#/$defs/module_path_projection"}},
+    "unresolved": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["side", "kind", "reasons"],
+        "properties": {
+          "side": {"enum": ["before", "after"]},
+          "kind": {"enum": ["caller", "module", "edge"]},
+          "reasons": {"type": "array", "items": {"type": "string", "minLength": 1}}
+        }
+      }
+    },
+    "limitations": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true}
+  },
+  "$defs": {
+    "snapshot": {
+      "type": "object",
+      "required": ["scope", "clock", "observation", "pid_namespace", "scope_completeness", "reported_gaps", "suppressed_gaps", "refusals", "budgets", "loss_evidence", "gaps", "evidence"],
+      "properties": {
+        "scope": {"type": "string", "minLength": 1},
+        "clock": {"type": "object", "required": ["basis", "unit"], "properties": {"basis": {"const": "CLOCK_MONOTONIC"}, "unit": {"const": "ns"}}},
+        "observation": {
+          "type": "object",
+          "required": ["started_ns", "ended_ns", "passes", "usage_feed", "native_witnesses"],
+          "properties": {
+            "started_ns": {"type": "integer", "minimum": 0},
+            "ended_ns": {"type": "integer", "minimum": 0},
+            "passes": {"type": "integer", "minimum": 1},
+            "usage_feed": {"type": "boolean"},
+            "native_witnesses": {"type": "object"}
+          }
+        },
+        "pid_namespace": {"type": ["object", "null"]},
+        "scope_completeness": {"const": "unknown"},
+        "reported_gaps": {"type": "integer", "minimum": 0},
+        "suppressed_gaps": {"type": "integer", "minimum": 0},
+        "refusals": {"type": "object"},
+        "budgets": {"type": "object"},
+        "loss_evidence": {"type": "object"},
+        "gaps": {"type": "array"},
+        "evidence": {
+          "type": "object",
+          "required": ["callers", "modules", "edges", "caller_occurrences", "module_occurrences", "edge_occurrences"],
+          "properties": {
+            "callers": {"type": "array"},
+            "modules": {"type": "array"},
+            "edges": {"type": "array"},
+            "caller_occurrences": {"type": "array", "items": {"type": "integer", "minimum": 0}},
+            "module_occurrences": {"type": "array", "items": {"type": "integer", "minimum": 0}},
+            "edge_occurrences": {"type": "array", "items": {"type": "integer", "minimum": 0}}
+          }
+        }
+      }
+    },
+    "reference_array": {"type": "array", "items": {"type": "integer", "minimum": 0}},
+    "projection": {
+      "type": "object",
+      "required": ["key", "presence", "changes", "before", "after"],
+      "properties": {
+        "key": {"type": "object"},
+        "presence": {"enum": ["both", "before_only", "after_only"]},
+        "changes": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+        "before": {"$ref": "#/$defs/reference_array"},
+        "after": {"$ref": "#/$defs/reference_array"}
+      }
+    },
+    "reference_projection": {
+      "allOf": [
+        {"$ref": "#/$defs/projection"},
+        {"type": "object", "properties": {"key": {"type": "object", "required": ["sha256"], "properties": {"sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}}}}}
+      ]
+    },
+    "application_projection": {
+      "allOf": [
+        {"$ref": "#/$defs/reference_projection"},
+        {"type": "object", "properties": {"key": {"type": "object", "required": ["exe_path_ref", "sha256"], "properties": {"exe_path_ref": {"type": "integer", "minimum": 0}, "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}}}, "before_population": {"type": "object"}, "after_population": {"type": "object"}}}
+      ]
+    },
+    "path_evidence": {"type": "object", "properties": {"sha256": {"type": ["string", "null"], "pattern": "^$|^[a-f0-9]{64}$"}}},
+    "module_path_projection": {
+      "type": "object",
+      "required": ["key", "presence", "changes", "before", "after"],
+      "properties": {
+        "key": {"type": "object", "required": ["path"], "properties": {"path": {"type": "string", "minLength": 1}}},
+        "presence": {"enum": ["both", "before_only", "after_only"]},
+        "changes": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+        "before": {"type": "array", "items": {"$ref": "#/$defs/path_evidence"}},
+        "after": {"type": "array", "items": {"$ref": "#/$defs/path_evidence"}}
+      }
+    }
+  }
+}

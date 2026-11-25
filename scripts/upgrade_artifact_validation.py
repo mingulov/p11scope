@@ -16,6 +16,12 @@ import json
 import sys
 from pathlib import Path
 
+try:
+    import json_schema
+except ModuleNotFoundError:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import json_schema
+
 INVENTORY_SCHEMA = "p11scope/inventory/v1"
 DIFF_SCHEMA = "p11scope/inventory-diff/v1"
 PROFILE_SCHEMA = "p11scope/observed-profile/v3"
@@ -77,6 +83,11 @@ DIFF_BASELINE_LIMITATIONS = {
 }
 
 CBOM_ROOT_FIELDS = ("bomFormat", "specVersion", "metadata", "components", "dependencies")
+SCHEMA_ROOT = Path(__file__).resolve().parent.parent / "docs" / "schema"
+INVENTORY_SCHEMA_FILE = SCHEMA_ROOT / "inventory-v1.schema.json"
+DIFF_SCHEMA_FILE = SCHEMA_ROOT / "inventory-diff-v1.schema.json"
+CBOM_SCHEMA_FILE = SCHEMA_ROOT / "bom-1.6.schema.json"
+
 CBOM_NUMERIC_PROPERTIES = (
     "p11scope:established_source_query",
     "p11scope:established_source_creation_success",
@@ -142,6 +153,88 @@ def missing(errors: list[str], owner: str, field: str) -> None:
 def wrong_type(errors: list[str], field: str, value, expected: str) -> None:
     errors.append(f"{field} is {type_name(value)}, expected {expected}")
 
+
+
+def product_schema_errors(document, schema_file: Path, artifact: str) -> list[str]:
+    """Validate one artifact against the product schema, with offline references."""
+    try:
+        schema = json_schema.load_schema(schema_file)
+        errors = json_schema.validate(document, schema, schema_file)
+    except (json_schema.SchemaError, OSError, ValueError) as exc:
+        return [f"{artifact} schema validation unavailable: {exc}"]
+    return [f"{artifact} schema: {error}" for error in errors]
+
+
+def inventory_positive_errors(document) -> list[str]:
+    """The small positive payload rule for the known SoftHSM workload."""
+    errors: list[str] = []
+    if len(document.get("callers", [])) < 1:
+        errors.append("inventory positive payload: fewer than one typed caller row")
+    if len(document.get("modules", [])) < 1:
+        errors.append("inventory positive payload: fewer than one typed provider row")
+    if len(document.get("edges", [])) < 1:
+        errors.append("inventory positive payload: fewer than one typed caller-provider edge")
+    return errors
+
+
+def cbom_component_counts(document) -> dict[str, int]:
+    counts = {"applications": 0, "providers": 0, "algorithms": 0, "keys": 0}
+    components = document.get("components") if isinstance(document, dict) else None
+    if not isinstance(components, list):
+        return counts
+    for component in components:
+        if not isinstance(component, dict):
+            continue
+        reference = component.get("bom-ref")
+        if component.get("type") == "application":
+            counts["applications"] += 1
+        if component.get("type") == "library" and isinstance(reference, str) and reference.startswith("p11scope:module:"):
+            counts["providers"] += 1
+        if isinstance(reference, str) and reference.startswith("p11scope:mechanism:"):
+            counts["algorithms"] += 1
+        if isinstance(reference, str) and reference.startswith("p11scope:key:"):
+            counts["keys"] += 1
+    return counts
+
+
+def cbom_positive_errors(document, profile_input: bool = False) -> list[str]:
+    """Check the positive metadata-count contract against typed components.
+
+    Profile input cannot link mechanisms to a caller or key, so its
+    application/key counts are legitimately zero by contract.  Inventory
+    input uses the complete provider/application/mechanism rule.
+    """
+    errors: list[str] = []
+    properties = cbom_properties(document)
+    counts = cbom_component_counts(document)
+    for name in ("applications", "providers", "algorithms", "keys"):
+        property_name = f"p11scope:{name}"
+        value = properties.get(property_name)
+        if not decimal_string(value):
+            errors.append(f"cbom positive payload: {property_name!r} is {value!r}, expected a decimal count")
+            continue
+        if int(value) != counts[name]:
+            errors.append(
+                f"cbom positive payload: {property_name!r} is {value}, "
+                f"but {counts[name]} typed component(s) are present"
+            )
+    minimums = ("providers", "algorithms") if profile_input else ("applications", "providers", "algorithms")
+    for name in minimums:
+        if counts[name] < 1:
+            errors.append(f"cbom positive payload: fewer than one typed {name} component")
+    return errors
+
+
+def diff_positive_errors(document) -> list[str]:
+    """The diff positive rule: at least one compared caller row on each side."""
+    errors: list[str] = []
+    for side in ("before", "after"):
+        snapshot = document.get(side) if isinstance(document, dict) else None
+        evidence = snapshot.get("evidence") if isinstance(snapshot, dict) else None
+        occurrences = evidence.get("caller_occurrences") if isinstance(evidence, dict) else None
+        if not isinstance(occurrences, list) or not occurrences:
+            errors.append(f"diff positive payload: fewer than one compared caller row on {side}")
+    return errors
 
 def validate_counter_object(value, field: str, keys, errors: list[str]) -> None:
     if not isinstance(value, dict):
@@ -455,6 +548,9 @@ def inventory_errors(document) -> list[str]:
         validate_object_observations(document["object_observations"], errors)
     if "gaps_suppressed" in document and not nonnegative_int(document["gaps_suppressed"]):
         wrong_type(errors, "inventory field 'gaps_suppressed'", document["gaps_suppressed"], "a nonnegative integer")
+    if not errors:
+        errors.extend(product_schema_errors(document, INVENTORY_SCHEMA_FILE, "inventory"))
+    errors.extend(inventory_positive_errors(document))
     return errors
 
 
@@ -612,6 +708,9 @@ def cbom_inventory_errors(document, source) -> list[str]:
         )
     if not source["gaps_suppressed"] and "p11scope:gaps_suppressed" in props:
         errors.append("cbom property 'p11scope:gaps_suppressed' is present for a zero source count")
+    if not errors:
+        errors.extend(product_schema_errors(document, CBOM_SCHEMA_FILE, "cbom"))
+    errors.extend(cbom_positive_errors(document, profile_input=False))
     return errors
 
 
@@ -647,6 +746,9 @@ def cbom_profile_errors(document, profile) -> list[str]:
     }
     errors = []
     compare_cbom_properties(document, expected, errors)
+    if not errors:
+        errors.extend(product_schema_errors(document, CBOM_SCHEMA_FILE, "cbom"))
+    errors.extend(cbom_positive_errors(document, profile_input=True))
     return errors
 
 
@@ -1023,6 +1125,9 @@ def diff_errors(document, before_source=None, after_source=None) -> list[str]:
                 )
     diff_source_consistency(document.get("before"), before_source, "before", errors)
     diff_source_consistency(document.get("after"), after_source, "after", errors)
+    if not errors:
+        errors.extend(product_schema_errors(document, DIFF_SCHEMA_FILE, "diff"))
+    errors.extend(diff_positive_errors(document))
     return errors
 
 

@@ -249,7 +249,7 @@ def inventory_cbom_properties(document):
         "p11scope:object_observations": object_render,
         "p11scope:applications": "1",
         "p11scope:providers": str(len(document["modules"])),
-        "p11scope:algorithms": "0",
+        "p11scope:algorithms": "1",
         "p11scope:keys": "0",
         "p11scope:callers_unknown_exe": "0",
         "p11scope:mechanisms_unnamed": "0",
@@ -802,6 +802,49 @@ class UpgradeGate6Harness:
 
     @staticmethod
     def cbom(properties, bom_format="CycloneDX"):
+        def count(name):
+            try:
+                return int(properties.get(name, "0"))
+            except ValueError:
+                return 0
+
+        components = []
+        for index in range(count("p11scope:applications")):
+            components.append(
+                {
+                    "type": "application",
+                    "bom-ref": f"p11scope:caller:{index}",
+                    "name": f"application-{index}",
+                }
+            )
+        for index in range(count("p11scope:providers")):
+            components.append(
+                {
+                    "type": "library",
+                    "bom-ref": f"p11scope:module:{index}",
+                    "name": f"provider-{index}.so",
+                }
+            )
+        for index in range(count("p11scope:algorithms")):
+            components.append(
+                {
+                    "type": "cryptographic-asset",
+                    "bom-ref": f"p11scope:mechanism:{index}",
+                    "name": f"mechanism-{index}",
+                }
+            )
+        for index in range(count("p11scope:keys")):
+            components.append(
+                {
+                    "type": "cryptographic-asset",
+                    "bom-ref": f"p11scope:key:{index}",
+                    "name": f"key-{index}",
+                }
+            )
+        dependencies = [
+            {"ref": component["bom-ref"], "dependsOn": []}
+            for component in components
+        ]
         return {
             "bomFormat": bom_format,
             "specVersion": "1.6",
@@ -810,8 +853,8 @@ class UpgradeGate6Harness:
                     {"name": name, "value": value} for name, value in properties.items()
                 ]
             },
-            "components": [{"type": "library", "name": "provider.so"}],
-            "dependencies": [{"ref": "p11scope:module:0", "dependsOn": []}],
+            "components": components,
+            "dependencies": dependencies,
         }
 
     def fake_completed(self, command, rc=0, stdout="", stderr=""):
@@ -1415,6 +1458,30 @@ class UpgradeArtifactValidationTests(unittest.TestCase):
         self.assertEqual(errors[0], "missing inventory root field 'scope'")
         self.assertIn("missing inventory root field 'gaps_suppressed'", errors)
 
+    def test_inventory_positive_payload_rejects_hollow_typed_rows(self):
+        document = substantive_inventory()
+        document["callers"] = []
+        errors = self.validation.inventory_errors(document)
+        self.assertIn("inventory positive payload: fewer than one typed caller row", errors)
+        document = substantive_inventory()
+        document["modules"] = []
+        errors = self.validation.inventory_errors(document)
+        self.assertIn("inventory positive payload: fewer than one typed provider row", errors)
+        document = substantive_inventory()
+        document["edges"] = []
+        errors = self.validation.inventory_errors(document)
+        self.assertIn("inventory positive payload: fewer than one typed caller-provider edge", errors)
+
+    def test_diff_positive_payload_rejects_hollow_caller_projections(self):
+        before = substantive_inventory()
+        after = substantive_inventory()
+        document = valid_diff_document(before, after)
+        for side in ("before", "after"):
+            hollow = copy.deepcopy(document)
+            hollow[side]["evidence"]["caller_occurrences"] = []
+            errors = self.validation.diff_errors(hollow, before, after)
+            self.assertIn(f"diff positive payload: fewer than one compared caller row on {side}", errors)
+
     def test_inventory_validator_rejects_each_required_root_field(self):
         for key in (
             "scope",
@@ -1438,8 +1505,13 @@ class UpgradeArtifactValidationTests(unittest.TestCase):
     def test_cbom_inventory_validator_requires_source_flow_through(self):
         source = substantive_inventory()
         cbom = UpgradeGate6Harness.cbom(inventory_cbom_properties(source))
-        cbom.update({"specVersion": "1.6", "components": [{}], "dependencies": []})
         self.assertEqual(self.validation.cbom_inventory_errors(cbom, source), [])
+        hollow = copy.deepcopy(cbom)
+        hollow["components"] = []
+        hollow["dependencies"] = []
+        hollow_errors = self.validation.cbom_inventory_errors(hollow, source)
+        self.assertIn("cbom positive payload: fewer than one typed applications component", hollow_errors)
+        self.assertIn("cbom positive payload: fewer than one typed providers component", hollow_errors)
         sparse = {"bomFormat": "CycloneDX", "metadata": {"properties": []}}
         self.assertEqual(
             self.validation.cbom_inventory_errors(sparse, source)[0],
@@ -1722,6 +1794,8 @@ class UpgradeGate6ActivationTests(unittest.TestCase):
                 "b3_then_exact",
                 "b3_exact",
                 "b3_fixture_old_shape",
+                "b3_old_schema_passes",
+                "b3_old_against_head_expected_failure",
                 "b3_reader_accepts_old",
             },
         )

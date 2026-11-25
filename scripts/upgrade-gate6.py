@@ -366,17 +366,21 @@ def load_profile_schemas() -> tuple[dict, dict]:
     return old_prof, new_prof
 
 
+def output_owner_arguments(output: Path) -> list[str]:
+    """Root handover arguments when the output directory belongs to a user."""
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        stat = output.parent.stat()
+        if stat.st_uid != 0:
+            return ["--output-owner", f"{stat.st_uid}:{stat.st_gid}"]
+    return []
+
+
 def generate_scan_report(binary: Path, output: Path, module: str) -> str:
-    """Generate one inventory scan; return an empty string or failure detail."""
+    """Generate one churn-workload native inventory; empty string means success."""
+    workload = SCRIPT_DIR / "upgrade-softhsm-workload.py"
     try:
         target = subprocess.Popen(
-            [
-                sys.executable,
-                "-c",
-                "import ctypes, sys, time; ctypes.CDLL(sys.argv[1]); "
-                "print('ready', flush=True); time.sleep(30)",
-                module,
-            ],
+            [sys.executable, str(workload), "--module", module],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -399,15 +403,19 @@ def generate_scan_report(binary: Path, output: Path, module: str) -> str:
                 "--pid",
                 str(target.pid),
                 "--capture",
-                "scan",
+                "native",
+                "--duration",
+                "5s",
                 "--json",
                 "-o",
                 str(output),
-            ]
+                *output_owner_arguments(output),
+            ],
+            timeout=30,
         )
         if completed.returncode != 0 or not output.exists():
             return (
-                f"{binary} inventory rc={completed.returncode} "
+                f"{binary} churn inventory rc={completed.returncode} "
                 f"stderr={completed.stderr[:300]}"
             )
         try:
@@ -416,7 +424,7 @@ def generate_scan_report(binary: Path, output: Path, module: str) -> str:
             return f"{binary} report unreadable: {exc}"
         errors = artifact_validation.inventory_errors(document)
         if errors:
-            return f"{binary} invalid inventory report: {errors[0]}"
+            return f"{binary} invalid churn inventory report: {errors[0]}"
         return ""
     finally:
         try:
@@ -711,6 +719,54 @@ def run_gate(args, workdir: Path, result: dict) -> int:
         if fixture_ok
         else "fixture is not a substantive old-shaped v0.7.1 profile",
     )
+
+    # Versioned-schema matrix: the v0.7.1 artifact is valid against the
+    # schema file shipped at tag v0.7.1.  Until lane v072-compat-071 lands,
+    # validating that same artifact against HEAD is a named expected failure,
+    # never a compatibility pass.
+    old_schema_path = workdir / "observed-profile-v3-v071.schema.json"
+    old_schema_path.write_text(json.dumps(old_prof, indent=2, sort_keys=True) + "\n")
+    new_schema_path = ROOT / "docs/schema/observed-profile-v3.schema.json"
+    try:
+        old_schema_errors = artifact_validation.json_schema.validate(
+            profile_doc, old_prof, old_schema_path
+        )
+        head_schema_errors = artifact_validation.json_schema.validate(
+            profile_doc, new_prof, new_schema_path
+        )
+    except artifact_validation.json_schema.SchemaError as exc:
+        check(result, "b3_schema_matrix", False, f"schema validation error: {exc}")
+    check(
+        result,
+        "b3_old_schema_passes",
+        not old_schema_errors,
+        "v0.7.1 artifact validates against tag v0.7.1 schema"
+        if not old_schema_errors
+        else old_schema_errors[0],
+    )
+    expected_names = sorted(set(B3_FIELDS) | {"coverage_retired_slots"})
+    missing_names = [
+        name
+        for name in expected_names
+        if any(f"required property '{name}' is missing" in error for error in head_schema_errors)
+    ]
+    expected_failure_ok = bool(head_schema_errors) and missing_names == expected_names
+    detail = (
+        "expected failure old-against-HEAD: missing " + ",".join(missing_names)
+        if expected_failure_ok
+        else f"unexpected old-against-HEAD validation outcome: {head_schema_errors[:2]!r}"
+    )
+    check(
+        result,
+        "b3_old_against_head_expected_failure",
+        expected_failure_ok,
+        detail,
+    )
+    result["notes"]["b3_schema_matrix"] = (
+        "old artifact/tag-v0.7.1 schema: valid; old artifact/HEAD schema: "
+        "expected failure until v072-compat-071, never counted as a pass"
+    )
+
     completed = run(
         [str(args.new_binary), "inventory", "cbom", str(PROFILE_FIXTURE), "--json"]
     )

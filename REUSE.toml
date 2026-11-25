@@ -75,9 +75,9 @@ SPDX-License-Identifier = "GPL-3.0-or-later"
 # to upstream only.
 [[annotations]]
 path = [
-    "tests/fixtures/cbom/bom-1.6.schema.json",
-    "tests/fixtures/cbom/jsf-0.82.schema.json",
-    "tests/fixtures/cbom/spdx.schema.json",
+    "docs/schema/bom-1.6.schema.json",
+    "docs/schema/jsf-0.82.schema.json",
+    "docs/schema/spdx.schema.json",
 ]
 precedence = "override"
 SPDX-FileCopyrightText = "OWASP Foundation and the CycloneDX contributors"

@@ -251,16 +251,45 @@ run_doctor() {
   fi
 }
 
+find_provider_module() {
+  for candidate in     /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so     /usr/lib64/pkcs11/libsofthsm2.so     /usr/lib/softhsm/libsofthsm2.so; do
+    if [ -f "$candidate" ]; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
 run_capture() {
   output="$1"
   log="$2"
-  # OUTPUT_OWNER_ARGS is either empty or a numeric uid pair constructed above.
-  # shellcheck disable=SC2086
-  if "$P11SCOPE_BIN" inventory --system --capture scan --identity-backend userspace --json -o "$output" $OUTPUT_OWNER_ARGS > "$log" 2>&1; then
-    return 0
-  else
-    return $?
+  module="$(find_provider_module)" || return 90
+  target_out="$log.target"
+  python3 -c 'import ctypes, sys, time; ctypes.CDLL(sys.argv[1]); print("ready", flush=True); time.sleep(20)' "$module" > "$target_out" 2>&1 &
+  target_pid=$!
+  ready=0
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    if grep -q ready "$target_out" 2>/dev/null; then
+      ready=1
+      break
+    fi
+    sleep 0.1
+  done
+  if [ "$ready" != 1 ]; then
+    kill "$target_pid" 2>/dev/null || true
+    wait "$target_pid" 2>/dev/null || true
+    return 91
   fi
+  # OUTPUT_OWNER_ARGS is either empty or a numeric uid pair constructed above.
+  # The scan target is the known SoftHSM workload: the resulting typed report
+  # must carry at least one caller, provider module and caller-provider edge.
+  # shellcheck disable=SC2086
+  "$P11SCOPE_BIN" inventory --pid "$target_pid" --capture scan --json -o "$output" $OUTPUT_OWNER_ARGS > "$log" 2>&1
+  rc=$?
+  kill "$target_pid" 2>/dev/null || true
+  wait "$target_pid" 2>/dev/null || true
+  return "$rc"
 }
 
 recovery_dir() {
@@ -311,8 +340,8 @@ run_gate_body() {
   fi
   [ "$DOCTOR_OLD_RC" = 0 ] || [ "$DOCTOR_OLD_RC" = 1 ] || fail "old doctor rc=$DOCTOR_OLD_RC"
   grep -q '^Doctor:' "$WORKDIR/doctor-old.out" || fail "old doctor output has no Doctor line"
-  # 4. Old short capture: system scan with userspace identity (no BPF, no
-  # PID-namespace dependence, so it works on hosts and in containers).
+  # 4. Old short capture: a scan of the known SoftHSM target (no BPF, so it
+  # works on hosts and in containers, but with a positive provider payload).
   if run_capture "$WORKDIR/pre-upgrade.json" "$WORKDIR/capture-old.out"; then
     CAPTURE_OLD_RC=0
   else

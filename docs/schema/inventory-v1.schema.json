@@ -1,0 +1,230 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://p11scope/inventory/v1.schema.json",
+  "title": "p11scope inventory v1 document",
+  "description": "Structural consumer aid for p11scope/inventory/v1. The prose contract in inventory-v1.md remains authoritative for semantics; additive fields are allowed by design.",
+  "type": "object",
+  "required": ["schema", "scope", "clock", "observation", "pid_namespace", "budgets", "callers", "modules", "edges", "object_observations", "gaps", "gaps_suppressed"],
+  "properties": {
+    "schema": {"const": "p11scope/inventory/v1"},
+    "scope": {"type": "string", "minLength": 1},
+    "clock": {
+      "type": "object",
+      "required": ["basis", "unit"],
+      "properties": {
+        "basis": {"const": "CLOCK_MONOTONIC"},
+        "unit": {"const": "ns"}
+      }
+    },
+    "observation": {
+      "type": "object",
+      "required": ["started_ns", "ended_ns", "passes", "usage_feed", "native_witnesses"],
+      "properties": {
+        "started_ns": {"type": "integer", "minimum": 0},
+        "ended_ns": {"type": "integer", "minimum": 0},
+        "passes": {"type": "integer", "minimum": 1},
+        "usage_feed": {"type": "boolean"},
+        "native_witnesses": {"$ref": "#/$defs/native_witnesses"}
+      }
+    },
+    "pid_namespace": {
+      "type": ["object", "null"],
+      "properties": {
+        "observer": {"type": "string", "minLength": 1},
+        "kernel_pids": {"type": "string", "minLength": 1},
+        "proc_pids": {"type": "string", "minLength": 1}
+      }
+    },
+    "budgets": {
+      "type": "object",
+      "required": ["callers", "modules", "edges", "endpoints", "inventory_endpoints", "inventory_attach_modules", "counters", "semantic_state", "retained_history", "native_preadmission"],
+      "properties": {
+        "callers": {"$ref": "#/$defs/limit_occupied_refused"},
+        "modules": {"$ref": "#/$defs/limit_occupied_refused"},
+        "edges": {"$ref": "#/$defs/limit_occupied_refused"},
+        "endpoints": {"$ref": "#/$defs/limit_occupied_refused"},
+        "inventory_endpoints": {"$ref": "#/$defs/limit_occupied_refused"},
+        "inventory_attach_modules": {"$ref": "#/$defs/limit_occupied_refused"},
+        "counters": {
+          "type": "object",
+          "required": ["cap", "observed_edges", "saturated_edges"],
+          "properties": {
+            "cap": {"type": "integer", "minimum": 0},
+            "observed_edges": {"type": "integer", "minimum": 0},
+            "saturated_edges": {"type": "integer", "minimum": 0}
+          }
+        },
+        "semantic_state": {
+          "type": "object",
+          "required": ["limit", "occupied", "status", "unknown_edges", "refused"],
+          "properties": {
+            "limit": {"type": "integer", "minimum": 0},
+            "occupied": {"type": "integer", "minimum": 0},
+            "status": {"type": "string", "minLength": 1},
+            "unknown_edges": {"type": "integer", "minimum": 0},
+            "refused": {"type": "integer", "minimum": 0}
+          }
+        },
+        "retained_history": {
+          "type": "object",
+          "required": ["limit", "retained", "suppressed"],
+          "properties": {
+            "limit": {"type": "integer", "minimum": 0},
+            "retained": {"type": "integer", "minimum": 0},
+            "suppressed": {"type": "integer", "minimum": 0}
+          }
+        },
+        "native_preadmission": {
+          "type": ["object", "null"],
+          "required": ["limit", "occupied", "refused", "pruned"],
+          "properties": {
+            "limit": {"type": "integer", "minimum": 0},
+            "occupied": {"type": "integer", "minimum": 0},
+            "refused": {"type": "integer", "minimum": 0},
+            "pruned": {"type": "integer", "minimum": 0}
+          }
+        }
+      }
+    },
+    "callers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "pid", "start_time", "start_time_unit", "image", "lifecycle", "first_seen_ns", "last_seen_ns"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "pid": {"type": "integer", "minimum": 0},
+          "start_time": {"type": ["integer", "null"], "minimum": 0},
+          "start_time_unit": {"type": "string", "minLength": 1},
+          "image": {"type": "object"},
+          "lifecycle": {"type": "string", "minLength": 1},
+          "first_seen_ns": {"type": "integer", "minimum": 0},
+          "last_seen_ns": {"type": "integer", "minimum": 0}
+        }
+      }
+    },
+    "modules": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "paths", "identity", "admission", "lifecycle"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "paths": {"type": "array", "items": {"type": "string", "minLength": 1}},
+          "identity": {
+            "type": "object",
+            "required": ["device", "inode"],
+            "properties": {
+              "device": {
+                "type": "object",
+                "required": ["major", "minor"],
+                "properties": {
+                  "major": {"type": "integer", "minimum": 0},
+                  "minor": {"type": "integer", "minimum": 0}
+                }
+              },
+              "inode": {"type": "integer", "minimum": 0},
+              "sha256": {"type": ["string", "null"], "pattern": "^$|^[a-f0-9]{64}$"}
+            }
+          },
+          "admission": {
+            "type": "object",
+            "required": ["state"],
+            "properties": {"state": {"type": "string", "minLength": 1}}
+          },
+          "lifecycle": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "edges": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["caller", "module", "mapping", "entries"],
+        "properties": {
+          "caller": {"type": "string", "minLength": 1},
+          "module": {"type": "string", "minLength": 1},
+          "mapping": {
+            "type": "object",
+            "required": ["state", "first_seen_ns", "last_seen_ns", "interruptions"],
+            "properties": {
+              "state": {"type": "string", "minLength": 1},
+              "first_seen_ns": {"type": "integer", "minimum": 0},
+              "last_seen_ns": {"type": "integer", "minimum": 0},
+              "interruptions": {"type": "integer", "minimum": 0}
+            }
+          },
+          "entries": {
+            "type": "object",
+            "required": ["count", "saturated", "cap"],
+            "properties": {
+              "count": {"type": "integer", "minimum": 0},
+              "saturated": {"type": "boolean"},
+              "cap": {"type": "integer", "minimum": 0}
+            }
+          }
+        }
+      }
+    },
+    "object_observations": {
+      "type": "object",
+      "required": ["version", "revision", "status", "reason"],
+      "properties": {
+        "version": {"type": "integer", "minimum": 0},
+        "revision": {"type": "integer", "minimum": 0},
+        "status": {"type": "string", "minLength": 1},
+        "reason": {"type": "string", "minLength": 1},
+        "key_operations": {"type": "array"},
+        "objects": {"type": "array"},
+        "sessions": {"type": "array"},
+        "unknown_key_operations": {"type": "array"}
+      }
+    },
+    "gaps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["caller", "module", "pid", "subject", "reason", "budget", "repeats"],
+        "properties": {
+          "subject": {"type": "string", "minLength": 1},
+          "reason": {"type": "string", "minLength": 1},
+          "repeats": {"type": "integer", "minimum": 1}
+        }
+      }
+    },
+    "gaps_suppressed": {"type": "integer", "minimum": 0}
+  },
+  "$defs": {
+    "limit_occupied_refused": {
+      "type": "object",
+      "required": ["limit", "occupied", "refused"],
+      "properties": {
+        "limit": {"type": "integer", "minimum": 0},
+        "occupied": {"type": "integer", "minimum": 0},
+        "refused": {"type": "integer", "minimum": 0}
+      }
+    },
+    "native_witnesses": {
+      "type": "object",
+      "required": ["rows", "bound", "unbound", "pending", "integrity", "unbound_reasons", "placement"],
+      "properties": {
+        "rows": {"type": "integer", "minimum": 0},
+        "bound": {"type": "integer", "minimum": 0},
+        "unbound": {"type": "integer", "minimum": 0},
+        "pending": {"type": "integer", "minimum": 0},
+        "integrity": {"type": "integer", "minimum": 0},
+        "unbound_reasons": {"type": "object"},
+        "placement": {
+          "type": "object",
+          "required": ["edge", "module", "ambiguous", "unresolved"],
+          "properties": {
+            "edge": {"type": "integer", "minimum": 0},
+            "module": {"type": "integer", "minimum": 0},
+            "ambiguous": {"type": "integer", "minimum": 0},
+            "unresolved": {"type": "integer", "minimum": 0}
+          }
+        }
+      }
+    }
+  }
+}

@@ -16042,9 +16042,9 @@ fn license_legal_surface_accepts_only_quoted_upstream_provenance_names() {
 // license but no holder; the upstream LICENSE appendix names
 // "Copyright OWASP Foundation", and the ruling's holder text covers it.
 const LICENSE_CYCLONEDX_SCHEMAS: &[&str] = &[
-    "tests/fixtures/cbom/bom-1.6.schema.json",
-    "tests/fixtures/cbom/jsf-0.82.schema.json",
-    "tests/fixtures/cbom/spdx.schema.json",
+    "docs/schema/bom-1.6.schema.json",
+    "docs/schema/jsf-0.82.schema.json",
+    "docs/schema/spdx.schema.json",
 ];
 const LICENSE_CYCLONEDX_COPYRIGHT: &str = "OWASP Foundation and the CycloneDX contributors";
 

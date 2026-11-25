@@ -2250,7 +2250,9 @@ Limits that matter in pods:
   back before the native stop, so its stderr notices are readable.
   Ctrl-C, SIGTERM or SIGHUP end a classic or dashboard run cleanly: the
   stream's `ended`, the `-o` document and stdout are still attempted
-  independently, with returned sink failures reported as exit 1. Admission
+  independently, with returned sink failures reported as exit 1. An
+  inherited SIGHUP ignore (`nohup p11scope inventory ...`) is
+  preserved, so the run keeps going after logout. Admission
   verdicts come only from the run's attach set; an object it did not
   judge reads `unresolved`, never `admitted`. `--max-gaps <n>` sets the retained gap history bound
   (1..=65536; 8192 when absent); gaps past the bound count in

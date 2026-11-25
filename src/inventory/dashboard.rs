@@ -2297,6 +2297,16 @@ impl StopFlag {
         let exit_on_next = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut hooks = Vec::new();
         for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            // An inherited hangup ignore (`nohup p11scope inventory
+            // ...`) survives, like profile/trace/run: the run keeps
+            // going after logout.
+            if signal == libc::SIGHUP
+                && !crate::run::should_install_hangup_handler(crate::run::current_disposition(
+                    signal,
+                ))
+            {
+                continue;
+            }
             let count = Arc::clone(&signals);
             let armed = Arc::clone(&exit_on_next);
             // The callback uses lock-free atomics on supported x86-64, or

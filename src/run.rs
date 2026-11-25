@@ -3420,7 +3420,7 @@ const DUPLICATE_STOP_WINDOW: Duration = Duration::from_millis(100);
 /// action makes `sigaction` report only. An unreadable disposition (an
 /// invalid signal, which the callers never pass) reports as the default,
 /// which is the install-everything direction.
-fn current_disposition(signal: libc::c_int) -> libc::sighandler_t {
+pub(crate) fn current_disposition(signal: libc::c_int) -> libc::sighandler_t {
     // SAFETY: zeroed sigaction is the documented output buffer, and a null
     // new action reads the current disposition without installing.
     let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
@@ -3437,7 +3437,7 @@ fn current_disposition(signal: libc::c_int) -> libc::sighandler_t {
 /// the capture keeps running after logout, and anything else — the default
 /// in practice — takes the handler. A pure function so the decision is
 /// directly unit-testable without sending a real hangup.
-fn should_install_hangup_handler(disposition: libc::sighandler_t) -> bool {
+pub(crate) fn should_install_hangup_handler(disposition: libc::sighandler_t) -> bool {
     disposition != libc::SIG_IGN
 }
 
@@ -31300,6 +31300,33 @@ int main(int argc, char **argv) {
         assert!(
             sighup_ignored_in_own_status(),
             "SigIgn lost the SIGHUP bit across the stop-flag install"
+        );
+    }
+
+    /// Audit test 4: the inventory twin — an inherited SIGHUP ignore
+    /// survives the inventory stop-flag install, so `nohup p11scope
+    /// inventory ... &` keeps going after logout. A real hangup is
+    /// then ignored by the kernel and the run is not stopped.
+    #[test]
+    fn inventory_stop_flag_preserves_an_inherited_sighup_ignore() {
+        let _signal_guard = ACTUAL_SIGNAL_TEST.lock().unwrap();
+        let _restore = RestoreDisposition::save(libc::SIGHUP);
+        set_disposition(libc::SIGHUP, libc::SIG_IGN);
+        let flag = crate::inventory_dashboard::StopFlag::install();
+        assert_eq!(
+            signal_disposition(libc::SIGHUP),
+            libc::SIG_IGN,
+            "installing the inventory stop flag must not replace an inherited SIGHUP ignore"
+        );
+        assert!(
+            sighup_ignored_in_own_status(),
+            "SigIgn lost the SIGHUP bit across the inventory stop-flag install"
+        );
+        // SAFETY: SIGHUP is ignored; the delivery is a no-op.
+        assert_eq!(unsafe { libc::raise(libc::SIGHUP) }, 0);
+        assert!(
+            !flag.stopped(),
+            "an ignored hangup must not stop the inventory run"
         );
     }
 

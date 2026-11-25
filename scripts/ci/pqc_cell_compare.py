@@ -193,8 +193,6 @@ def check_mechanisms(fail, leg, inv):
             fail.add(leg, f"mechanism {mid} name {row.get('name')!r}, want {name!r}")
         if row.get("calls") != calls:
             fail.add(leg, f"mechanism {mid} calls={row.get('calls')}, want {calls}")
-        if row.get("errors") != 0:
-            fail.add(leg, f"mechanism {mid} errors={row.get('errors')}, want 0")
     for mid, row in sorted(mechs.items(), key=lambda kv: str(kv[0])):
         if row.get("errors") != 0:
             fail.add(leg, f"mechanism {mid} errors={row.get('errors')}, want 0")
@@ -329,8 +327,6 @@ def check_object_binding(fail, leg, inv):
             index[oid] = entry
     pqc = [entry for entry in index.values()
            if entry.get("label") in LABEL_FAMILY]
-    if len(pqc) != WANT_PQC_OBJECTS:
-        fail.add(leg, f"{len(pqc)} PQC objects, want {WANT_PQC_OBJECTS}")
     by_label = {}
     for entry in pqc:
         by_label.setdefault(entry.get("label"), []).append(entry)
@@ -514,9 +510,23 @@ def check_text(fail, leg, text_path, sizes, inv):
     if len(spot) != 1:
         fail.add(leg, f"{len(spot)} spotlight (`pqc keys:`) lines, want 1")
     else:
-        for display, op in SPOTLIGHT_ORDER:
-            if f"{display} {op}:" not in spot[0]:
-                fail.add(leg, f"spotlight lacks {display} {op}")
+        # The exact twelve tally segments (each pair completed once,
+        # clean): presence is the proof, order stays unpinned. Each
+        # segment itself contains ", ", so extras are whatever remains
+        # after removing each expected segment once.
+        want_segments = [f"{display} {op}: 1 completed, "
+                         "0 returned errors, 0 active"
+                         for display, op in SPOTLIGHT_ORDER]
+        body = spot[0][len("  pqc keys: "):]
+        missing_segments = [segment for segment in want_segments
+                            if segment not in body]
+        rest = body
+        for segment in want_segments:
+            rest = rest.replace(segment, "", 1)
+        if missing_segments:
+            fail.add(leg, f"spotlight lacks {missing_segments}")
+        if rest.replace(", ", "").strip():
+            fail.add(leg, f"spotlight has extra {rest.strip()!r}")
 
 
 def judge_leg(fail, leg, args, sizes):

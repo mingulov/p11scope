@@ -1071,6 +1071,11 @@ names the source SHA behind each check the release rounds re-measured.
   parent-death signal, and stopped descendants through the run's
   watchdog. A pause stop a probe queued in the instant the observer
   dies is not ruled out; check the child with `ps` after such a kill.
+  While an arm-failure disarm stays unproven, every disabled pass
+  sends a protective SIGCONT for any stop that may have landed on the
+  doubted key; that signal also resumes a stop the operator meant
+  (job control), until the removal proves the kernel clean (a
+  repeatedly failing release ends the capture instead).
   A descendant that loads an
   already-attached provider file is observed from its first call.
   Without the first-map stop a short-lived descendant that cold-loads

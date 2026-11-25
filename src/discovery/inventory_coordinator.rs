@@ -44295,6 +44295,197 @@ int main(void) {
         );
     }
 
+    /// A live task's tombstone survives the keep window: the age drain
+    /// only drops tombstones of gone tasks, so a pair dropped early
+    /// whose caller binds later still revives past its exact base. A
+    /// refresh of 7 past the kept base 5 stages +2, never +7.
+    #[test]
+    fn live_dropped_pair_tombstone_survives_the_keep_window_and_rebases() {
+        let (mut native, caller) = NativeScene::new();
+        let at = native.stamps.tick();
+        let key = PairKey {
+            image: DomainCookie::scripted(native.domain, 41),
+            exec: 1,
+            object: 0,
+        };
+        native.scene.coordinator.pair_targets.insert(
+            key,
+            PairTarget::Dropped {
+                base: 5,
+                base_since: at,
+            },
+        );
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(at + EXEC_STATE_GRACE_NS);
+        assert_eq!(native.scene.coordinator.pruned_pair_totals(), (1, 5));
+        assert_eq!(
+            native.scene.coordinator.dropped_pair_tombstones_for_test(),
+            1
+        );
+        // Past the keep window pid 7 is still live: the tombstone
+        // stays instead of draining by age.
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(at + EXEC_STATE_GRACE_NS + 2 * EXEC_STATE_GRACE_NS);
+        assert_eq!(
+            native.scene.coordinator.dropped_pair_tombstones_for_test(),
+            1,
+            "a live task's tombstone survives the age drain"
+        );
+        assert_eq!(
+            native.scene.coordinator.pair_prune_overflow_for_test(),
+            0,
+            "no age fold for a kept tombstone"
+        );
+        // Admit after expiry: the revival rebases past the kept base.
+        let row = native.row(41, 1, 7, at, 0);
+        native.scene.coordinator.bind_pair_count(&row, caller, &[]);
+        assert!(
+            matches!(
+                native.scene.coordinator.pair_targets.get(&key),
+                Some(PairTarget::Pending { base: 5, .. })
+            ),
+            "revival past the kept tombstone rebases past 5"
+        );
+        // A refresh of 7 stages only the post-drop growth.
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 7)]);
+        let staged = native
+            .scene
+            .coordinator
+            .registry
+            .staged_pending_counts_for_test();
+        assert_eq!(staged.len(), 1, "one rebased staging: {staged:?}");
+        assert_eq!(
+            staged[0].1, 2,
+            "refresh 7 past base 5 stages +2, not +7: {staged:?}"
+        );
+        assert_eq!(staged[0].2, 5, "the staging rebases past 5: {staged:?}");
+    }
+
+    /// A caller that goes quiet past the prune grace and resumes after
+    /// the keep window loses nothing silently: the drain keeps its
+    /// live tombstone, the resumed row revives past the base, and the
+    /// refresh stages only post-drop growth.
+    #[test]
+    fn quiet_then_resuming_caller_loses_nothing_across_the_drain() {
+        let (mut native, caller) = NativeScene::new();
+        let at = native.stamps.tick();
+        let key = PairKey {
+            image: DomainCookie::scripted(native.domain, 41),
+            exec: 1,
+            object: 0,
+        };
+        // The caller reports 5, then its pair drops through the
+        // production absorb-and-drop path.
+        let mut row = native.row(41, 1, 7, at, 0);
+        row.entry_count = 5;
+        let mut batch = witness_batch();
+        batch.domain = native.domain;
+        batch.rows = vec![row.clone()];
+        batch.health.discovery_counters = Some([0; 5]);
+        batch.health_read_ns = at;
+        batch.rows_anchor_ns = at + 1;
+        batch.rows_read_ns = at + 1;
+        batch.counts_read_ns = at + 1;
+        native.scene.coordinator.absorb_pair_counts(&batch);
+        let dropped = native
+            .scene
+            .coordinator
+            .drop_pair_count(&row, DiagnosticReason::NotAdmitted);
+        assert_eq!(dropped, 5, "the drop remembers the held absolute");
+        assert!(
+            matches!(
+                native.scene.coordinator.pair_targets.get(&key),
+                Some(PairTarget::Dropped { base: 5, .. })
+            ),
+            "the quiet pair drops with its base"
+        );
+        // Quiet past the grace prunes (the absorbed anchor runs one
+        // tick past the row stamp); quiet past the keep window must
+        // not drain a live task's tombstone.
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(at + 1 + EXEC_STATE_GRACE_NS);
+        assert_eq!(
+            native.scene.coordinator.dropped_pair_tombstones_for_test(),
+            1
+        );
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(at + 1 + EXEC_STATE_GRACE_NS + 2 * EXEC_STATE_GRACE_NS);
+        assert_eq!(
+            native.scene.coordinator.dropped_pair_tombstones_for_test(),
+            1,
+            "the quiet-but-live caller's tombstone survives the drain"
+        );
+        // The caller resumes: revival plus a refresh of 7 stages +2.
+        let row = native.row(41, 1, 7, at, 0);
+        native.scene.coordinator.bind_pair_count(&row, caller, &[]);
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 7)]);
+        let staged = native
+            .scene
+            .coordinator
+            .registry
+            .staged_pending_counts_for_test();
+        assert_eq!(staged.len(), 1, "one rebased staging: {staged:?}");
+        assert_eq!(
+            staged[0].1, 2,
+            "the resumed refresh stages +2, not +7: {staged:?}"
+        );
+        assert_eq!(
+            native.scene.coordinator.pair_prune_overflow_for_test(),
+            0,
+            "no fold counted for the kept tombstone"
+        );
+    }
+
+    /// A tombstone whose base grew within the keep window never drains,
+    /// even for a gone task: the drain measures the base's age as well
+    /// as the tombstone's, so post-prune growth is never shed silently.
+    #[test]
+    fn tombstone_grown_within_the_keep_window_never_drains() {
+        let (mut native, _caller) = NativeScene::new();
+        let at = native.stamps.tick();
+        let key = PairKey {
+            image: DomainCookie::scripted(native.domain, 41),
+            exec: 1,
+            object: 0,
+        };
+        native
+            .scene
+            .coordinator
+            .pair_dropped_tombstones
+            .insert(
+                key,
+                PrunedPairBase {
+                    base: 5,
+                    base_since: at,
+                    pruned_since: 1_000,
+                },
+            );
+        // The tombstone is exactly the keep window old, but its base
+        // grew ten ticks short of it: the drain keeps it.
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(1_000 + PAIR_TOMBSTONE_KEEP_NS);
+        assert_eq!(
+            native.scene.coordinator.dropped_pair_tombstones_for_test(),
+            1,
+            "a recently grown tombstone survives the age drain"
+        );
+        assert_eq!(
+            native.scene.coordinator.pair_prune_overflow_for_test(),
+            0,
+            "no age fold for the kept tombstone"
+        );
+    }
+
     /// Resolution source (b): the coordinator exposes the
     /// scan-learned exe identities of admitted callers by their
     /// maps-domain `(dev, ino)`, probing each distinct path once per

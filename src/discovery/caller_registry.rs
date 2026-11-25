@@ -6509,6 +6509,25 @@ impl CallerRegistry {
             .count()
     }
 
+    /// Staged pending counts awaiting the next commit, in stage order,
+    /// as (pending id, rebased count, base): for twins that pin what a
+    /// refresh stages past a revived base.
+    #[cfg(test)]
+    pub(crate) fn staged_pending_counts_for_test(&self) -> Vec<(u64, u64, u64)> {
+        self.staged
+            .iter()
+            .filter_map(|staged| match staged {
+                Mutation::NotePendingCount {
+                    pending_id,
+                    count,
+                    base,
+                    ..
+                } => Some((*pending_id, *count, *base)),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Stage one gap for the module `key` names, resolving the ID at
     /// publication (F3-04): `record_gap` resolves eagerly against the
     /// committed snapshot, which misses a first-discovered module whose

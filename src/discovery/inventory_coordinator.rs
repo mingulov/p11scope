@@ -6298,20 +6298,67 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
 
     /// Drop one pair target for a caller fold: its staged absolute
     /// lands in the dropped-pair machinery (revival intact), so no
-    /// suspended pair pins the exited caller afterwards.
+    /// suspended pair pins the exited caller afterwards. A same-key
+    /// recovery naming the same caller settles first (single owner:
+    /// [`Self::settle_recovery_for_fold`]): suspend names the
+    /// recovery's own caller, so target and recovery share the key by
+    /// construction and the withheld prefix must disclose, never drop
+    /// silently. A stuck recovery naming a different caller (a revival
+    /// past it) stays for its own caller's fold; only its target drops
+    /// here. This never touches `recoveries` or the service order
+    /// directly — the settle owns both.
     fn drop_pair_target_for_fold(&mut self, key: PairKey, pairs: &mut PairFoldWork) {
         #[cfg(test)]
         {
             self.fold_pair_drop_visits = self.fold_pair_drop_visits.saturating_add(1);
+        }
+        let target_caller = match self.pair_targets.get(&key) {
+            Some(
+                PairTarget::Bound { caller, .. }
+                | PairTarget::Pending { caller, .. }
+                | PairTarget::Suspended { caller, .. },
+            ) => Some(*caller),
+            Some(PairTarget::Dropped { .. }) | None => None,
+        };
+        if let Some(caller) = target_caller
+            && self
+                .recoveries
+                .get(&key)
+                .is_some_and(|recovery| recovery.caller == caller)
+        {
+            // The held read belongs to this same caller (its live
+            // target names it), so the settle gaps it with the
+            // withheld prefix instead of dropping it.
+            let held = self.pair_counts.get(&key).map(|held| held.read);
+            self.settle_recovery_for_fold(key, held, pairs);
         }
         let (base, base_since) = self.pair_drop_base(&key);
         let _ = self.take_pruned_pair_base(&key);
         self.pair_targets
             .insert(key, PairTarget::Dropped { base, base_since });
         self.pair_counts.remove(&key);
-        self.recoveries.remove(&key);
         self.placement_generations.remove(&key);
-        self.remove_fold_order_key(pairs, &key);
+    }
+
+    /// The single owner that removes a fold recovery: always settles
+    /// first. Takes the recovery out of the map, discloses any
+    /// withheld prefix through the retirement-count gap, drops a live
+    /// same-caller target into Dropped, and leaves the service order
+    /// exact. `held` is the key's held read exactly when it belongs to
+    /// the recovery's caller (a live same-caller target); otherwise
+    /// `None`, so a revived caller's read is never gapped here. Every
+    /// fold path that ends a recovery calls this — never
+    /// `recoveries.remove` directly.
+    fn settle_recovery_for_fold(
+        &mut self,
+        key: PairKey,
+        held: Option<PairCount>,
+        pairs: &mut PairFoldWork,
+    ) {
+        let Some(recovery) = self.recoveries.remove(&key) else {
+            return;
+        };
+        self.settle_pair_recovery(key, recovery, held, Some(pairs));
     }
 
     /// Settle one stranded recovery for a caller fold, disclosing any
@@ -6321,13 +6368,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         {
             self.fold_pair_settle_visits = self.fold_pair_settle_visits.saturating_add(1);
         }
-        let Some(recovery) = self.recoveries.remove(&key) else {
-            return;
-        };
         // Dropped pairs hold no read (the absorb path skips them);
         // a held read here belongs to a revived live caller for the
         // same key, never to this recovery, so settle does not gap it.
-        self.settle_pair_recovery(key, recovery, None, Some(pairs));
+        self.settle_recovery_for_fold(key, None, pairs);
     }
 
     /// One caller edge's fold facts through the same reads the live

@@ -10665,7 +10665,6 @@ pub(crate) enum PinOutcome {
         reason: String,
     },
 }
-}
 
 /// Why a pin proved nothing (one closed cause per failure class).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14586,8 +14585,7 @@ mod tests {
             "the fixture files claims under view 1"
         );
 
-        let removed =
-            pins.retire_view_only_if_proven_gone(m1.view, RetirementProof::Exited);
+        let removed = pins.retire_view_only_if_proven_gone(m1.view, RetirementProof::Exited);
         assert!(
             removed.is_some(),
             "the except call retires view 1 (not the empty early return)"
@@ -18390,7 +18388,8 @@ mod tests {
             &mut pinned,
             ProcessViewId(1),
             raw,
-            Err(PinOutcome::Gone { evidence: ExitEvidence::ProcessGenerationExited,
+            Err(PinOutcome::Gone {
+                evidence: ExitEvidence::ProcessGenerationExited,
                 reason: "mapping identity unavailable".into(),
             }),
             &mut skipped,

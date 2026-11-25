@@ -1907,7 +1907,7 @@ impl CaptureWorkBudget {
     }
 
     pub fn work_ceiling(&self) -> u64 {
-        self.work_ceiling
+        self.pass.work_ceiling()
     }
 
     pub fn attempted_io_bytes(&self) -> u64 {

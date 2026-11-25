@@ -1376,8 +1376,12 @@ impl NativeBinder {
                 caller,
                 first_seen_ns: 0,
                 query: CookieQuery::NoCookie,
+                late: false,
+                sighted_ns: None,
             }),
             retained: None,
+            resight_due: false,
+            last_attempt: None,
         });
         self.census.pending = self.census.pending.saturating_add(1);
     }
@@ -1414,6 +1418,8 @@ impl NativeBinder {
                 exec_observed: true,
                 lifecycle: CallerLifecycle::Exited,
             }),
+            resight_due: false,
+            last_attempt: None,
         });
         self.census.pending = self.census.pending.saturating_add(1);
     }

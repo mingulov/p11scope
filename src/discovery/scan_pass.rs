@@ -1840,6 +1840,12 @@ impl ScanPassOwner {
         self.work_ceiling = units;
     }
 
+    /// The DetailedLegacy work ceiling (the pin wrapper's futility
+    /// check and the no-capture-credit twin read it back).
+    pub(crate) fn work_ceiling(&self) -> u64 {
+        self.work_ceiling
+    }
+
     /// Set charged work directly (overflow tests). Tests only.
     #[cfg(test)]
     pub(crate) fn set_work_units_for_test(&mut self, units: u64) {

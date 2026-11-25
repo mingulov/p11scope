@@ -8319,7 +8319,7 @@ impl CallerRegistry {
         };
         let before = self.gaps.len();
         let terminal = self.terminal_phase;
-        self.push_gap_as(gap.clone(), terminal);
+        self.push_gap_as(gap.clone(), terminal, true);
         if let Some(&index) = self.gap_index.get(&gap) {
             if let Some(aggregate) = self.demoted_placed_aggregates.get_mut(&memo) {
                 aggregate.gap_index = Some(index);

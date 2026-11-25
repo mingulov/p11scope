@@ -9369,6 +9369,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             NativeBatch::Lifecycle(batch) => Some(batch.domain),
             NativeBatch::Finish { domain } => Some(*domain),
             NativeBatch::Semantic(_) => None,
+            // An INFO quantum stages its drained domain like any
+            // evidence batch: the receipt reports that domain's owed
+            // re-sight work so the stop machine cannot finish past it.
+            NativeBatch::Info(batch) => Some(batch.domain),
         };
         let mut hook_events = Vec::new();
         match batch {
@@ -46570,6 +46574,8 @@ mod scan_freshness_tests {
             complete_scan: None,
             application: unexamined_application(),
             hints_examined: true,
+            own_work: 0,
+            work_disposition: crate::inspect_system::MemberWorkDisposition::NoBudgetStop,
         };
         let mut first = super::tests::capture_catalog(
             &crate::discovery::identity::PinnedObjects::empty(),

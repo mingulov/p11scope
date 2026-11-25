@@ -386,6 +386,10 @@ impl SelfMappingProbe for PaddedOverlayProbe {
         true
     }
 
+    fn fd_is_on_btrfs(&self, _file: &std::fs::File) -> bool {
+        false
+    }
+
     fn kernel_maps_key(
         &self,
         file: &std::fs::File,
@@ -3408,16 +3412,11 @@ impl PinnedObjects {
                     .filter_map(|(raw, id)| raw.mount_namespace.is_none().then_some(*id)),
             )
             .collect();
-        let unowned: BTreeSet<_> = candidates
-            .difference(&retained)
-            .copied()
-            .filter(|id| !keep.contains(id))
-            .collect();
+        let unowned: BTreeSet<_> = candidates.difference(&retained).copied().collect();
         self.scrub_proven_targets(unowned.iter().copied());
         self.by_id.retain(|id, _| !unowned.contains(id));
         self.raw_to_id.retain(|raw, id| {
-            !unowned.contains(id)
-                && (!removed_raws.contains(raw) || retained_raws.contains(raw) || keep.contains(id))
+            !unowned.contains(id) && (!removed_raws.contains(raw) || retained_raws.contains(raw))
         });
         Some(removed)
     }

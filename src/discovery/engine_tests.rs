@@ -1512,6 +1512,99 @@ fn owned_run_conservative_replay_keeps_carried_pins_claimless() {
     );
 }
 
+fn real_mount_provider_engine() -> (Engine, ScannedModule, PinnedObjectId) {
+    let view = ProcessView::open(ProcessViewId(90), std::process::id()).unwrap();
+    let mut module = crate::discovery::identity::test_fixture::small_owned_module(&view);
+    let key = module.key;
+    let path = module.path.clone();
+    module.decoder_abi = Some(if usize::BITS == 64 {
+        ElfAbi::Lp64
+    } else {
+        ElfAbi::Ilp32
+    });
+    module.exports = vec!["C_GetFunctionList".into()];
+    module.tables = vec![ScannedTable {
+        version: (2, 40),
+        walk: "full",
+        entries: vec![ScannedEntry {
+            name: "C_Initialize",
+            object: key,
+            object_path: path,
+            file_offset: 0x1000,
+        }],
+        null_entries: vec![],
+        unpinned: vec![],
+        address: 0x7000,
+        file_offset: Some(0),
+        live_return: false,
+        manifest_supported: false,
+        extension_impossible: false,
+    }];
+    let mut pins = pin_test_modules(&view, std::slice::from_ref(&module));
+    let object = pins
+        .id_for_scanned(&module, module.key, &module.path)
+        .expect("the real-mount fixture resolves");
+    let (modules, skipped) = bind_scanned_modules(std::slice::from_ref(&module), &mut pins);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    assert_eq!(modules.len(), 1, "the real-mount fixture binds");
+    let mut engine = Engine::empty();
+    engine.plan = plan::build_from_reconciled_modules(&modules);
+    engine.pinned = pins;
+    engine.modules = modules;
+    (engine, module, object)
+}
+
+#[test]
+fn owned_run_conservative_replay_keeps_real_mount_scan_custody() {
+    // The overlay twins stage namespace tuples directly. This twin pins a
+    // real file through the production scanner, so its raw proof carries
+    // the host's real mount namespace before retirement. The carried pin
+    // must keep that scan custody (proof) while dropping claims.
+    let dir = tempfile::tempdir().expect("scope dir");
+    std::fs::write(dir.path().join("cgroup.procs"), "").expect("cgroup.procs");
+    let cgroup = crate::scope::cgroup(dir.path()).expect("scope");
+    let (mut engine, module, object) = real_mount_provider_engine();
+    let view = module.view;
+    assert_eq!(
+        module.mount_namespace,
+        current_mount_namespace(),
+        "the fixture is tied to a real mount namespace"
+    );
+    assert!(
+        engine.pinned.module_aliased_under(&module, view),
+        "the production pin files scan custody before retirement"
+    );
+    engine.scope = cgroup;
+    engine.owned_run_pid = Some(424242);
+    engine
+        .capture_facts
+        .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+        .unwrap();
+    assert!(engine.plan.is_active(0), "the fixture starts attached");
+
+    let retirements: BTreeSet<ProcessViewId> = BTreeSet::from([view]);
+    let keys: BTreeSet<ObjectKey> = BTreeSet::new();
+    let carried = engine.conservative_candidate(&retirements, &keys).unwrap();
+
+    assert!(carried.plan.is_active(0), "the real-mount slot rides");
+    assert!(
+        carried.pinned.summary(object).is_some(),
+        "the real-mount pin stays resolvable"
+    );
+    assert!(
+        carried.pinned.module_aliased_under(&module, view),
+        "the carried pin keeps its scan custody"
+    );
+    assert!(
+        carried.pinned.view_claims(view).is_none(),
+        "scan custody is proof, not a derived ownership claim"
+    );
+    assert!(
+        carried.pinned.carried_ids().contains(&object),
+        "the real-mount pin reads as carried coverage"
+    );
+}
+
 #[test]
 fn loader_rebind_keeps_carried_provider_claimless() {
     // A loader scan that rebuilds the candidate after a generational

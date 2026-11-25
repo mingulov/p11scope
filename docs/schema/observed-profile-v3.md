@@ -1326,6 +1326,14 @@ Owned-pause arm failures file under their own subject. Each record is
   arm's count rides in `evidence.pause_partial`; the row names the
   protection that was missing, never a call count. Repeat filings
   dedupe to this one row.
+- `the release after a failed pause arm could not be proven; the
+  owned child may have waited stopped`: a release signal after a
+  failed pause arm failed while the owned child was alive or its
+  liveness was unreadable, so the child may have waited stopped
+  until a later retry released it. The debt retries on every later
+  pass while the child lives; a release against an already-gone
+  child is moot and files nothing. Repeat filings dedupe to this
+  one row.
 
 Run first-map stop gaps file under their own subject. Each record is
 `{name: "run first-map stop", reason}` with `reason` exactly:

@@ -627,12 +627,9 @@ class BrowserCells(unittest.TestCase):
                           "system softokn provider not found")
         missing = cells.missing_nss_seed_tools()
         if missing:
-            if STRICT:
-                raise AssertionError(
-                    "strict installed mode requires this cell: "
-                    f"NSS seed tools missing: {', '.join(missing)}")
-            self.skipTest("browser gate prerequisite missing: "
-                          f"NSS seed tools missing: {', '.join(missing)}")
+            raise AssertionError(
+                "installed browser cell requires NSS seed tools: "
+                f"{', '.join(missing)}")
         cred = softhsm.generate_client_credential(self.work / "cred")
         key, cert = tls_server.make_server_credential(self.work / "srv")
         with tls_server.FlowServer(cert=cert, key=key, require_client_cert=True,

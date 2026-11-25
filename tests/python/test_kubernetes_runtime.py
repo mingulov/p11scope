@@ -28,6 +28,9 @@ def k1_rows():
                  "pid_namespace_causes": ["pid_namespace"]} for calls in (2400, 1500, 1800))
     rows.append({"check": "trace-exact", "ok": True, "calls": 1200,
                  "pid_namespace_causes": ["pid_namespace"]})
+    rows.append({"check": "copy-up-neg", "ok": True, "calls": 3900,
+                 "modules": ["/tmp/copyup/libsofthsm2.so"], "skipped_rows": 3,
+                 "pid_namespace_causes": ["pid_namespace"]})
     rows.extend({"check": check, "record_only": True} for check in
                 ("trace-pid-namespace", "observer-memory"))
     return rows
@@ -39,6 +42,13 @@ def k2_rows():
             {"check": "negative", "ok": True},
             {"check": "scan-limit", "ok": True, "leg": "counted-exact",
              "causes": ["pid_namespace"], "disclosure": []}]
+
+
+def k1_completion_marker(rows):
+    gated = sum(1 for row in rows if row.get("ok") is True and "record_only" not in row)
+    recorded = sum(1 for row in rows if row.get("record_only") is True and "ok" not in row)
+    return (f"=== kind e2e: ALL OK ({gated} gated checks passed; {recorded} record-only lines; "
+            "summary /owned/summary.jsonl) ===\n")
 
 
 def load_helper():
@@ -58,7 +68,7 @@ class SummaryTests(unittest.TestCase):
             (work / "cell").mkdir()
             (work / "cell/summary.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
             (work / "runtime.log").write_text(log or (
-                "=== kind e2e: ALL OK (10 gated checks passed; 2 record-only lines; summary /owned/summary.jsonl) ===\n"
+                k1_completion_marker(rows)
                 if cell == "K1" else "SUMMARY cell=K2 verdict=PASS reason=\"exact and negative and scan\"\n"))
             helper.validate_results(cell, work)
 
@@ -82,11 +92,27 @@ class SummaryTests(unittest.TestCase):
                 next(row for row in rows if row["check"] == "profile-exact")[key] = value
                 with self.assertRaises(ValueError):
                     self.check(cell, rows)
+        rows = k1_rows()
+        next(row for row in rows if row["check"] == "copy-up-neg")["calls"] = 3600
+        with self.assertRaises(ValueError):
+            self.check("K1", rows)
+        rows = k1_rows()
+        next(row for row in rows if row["check"] == "copy-up-neg")["pid_namespace_causes"] = []
+        with self.assertRaises(ValueError):
+            self.check("K1", rows)
         for leg, disclosure in (("attached-zero", []), ("absent", []), ("unknown", ["loader_discovery"])):
             rows = k2_rows()
             rows[-1].update(leg=leg, disclosure=disclosure)
             with self.assertRaises(ValueError):
                 self.check("K2", rows)
+
+    def test_k1_completion_counts_must_match_summary_rows(self):
+        rows = k1_rows()
+        for gated, recorded in ((10, 2), (11, 1), (12, 2)):
+            log = (f"=== kind e2e: ALL OK ({gated} gated checks passed; {recorded} record-only lines; "
+                   "summary /owned/summary.jsonl) ===\n")
+            with self.subTest(gated=gated, recorded=recorded), self.assertRaises(ValueError):
+                self.check("K1", rows, log)
 
     def test_disclosed_late_provider_boundary_remains_accepted(self):
         rows = k2_rows()
@@ -219,7 +245,9 @@ if os.environ.get("STUB_HARNESS_FAIL"):
     raise SystemExit(3)
 rows = json.loads((root / (cell + ".json")).read_text())
 (work / "summary.jsonl").write_text("".join(json.dumps(row) + "\\n" for row in rows))
-print("=== kind e2e: ALL OK (10 gated checks passed; 2 record-only lines; summary x) ===" if cell == "K1" else "SUMMARY cell=K2 verdict=PASS reason=exact-and-twins")
+gated = sum(1 for row in rows if row.get("ok") is True and "record_only" not in row)
+recorded = sum(1 for row in rows if row.get("record_only") is True and "ok" not in row)
+print(("=== kind e2e: ALL OK ({} gated checks passed; {} record-only lines; summary x) ===".format(gated, recorded)) if cell == "K1" else "SUMMARY cell=K2 verdict=PASS reason=exact-and-twins")
 ''')
         for name in ("kind-e2e.sh", "kind-attach-pod-e2e.sh"):
             (self.root / "scripts" / name).write_text(f'#!/bin/sh\nexec {sys.executable} -I "{harness}" "$@"\n')

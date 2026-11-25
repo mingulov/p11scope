@@ -11015,6 +11015,21 @@ impl PinOutcome {
     }
 }
 
+impl UnprovenCause {
+    /// Controller ruling 17:27 (B1): only unreadable identity facts
+    /// are UNAVAILABLE observations — unknown, never contradicting:
+    /// they file a named skip and publish no ambiguity, and never
+    /// disprove a proven peer (ruling 11:38 (1)). Every other cause
+    /// is a REFUSED or contradicting observation and keeps the I4
+    /// fail-closed rules (refusal pairs publish ambiguity; filing
+    /// after a refusal rejects the group). In particular
+    /// `OpenFailed` refuses: the I4 refusal-pairing twins file it
+    /// as a refusal.
+    fn is_unavailable(self) -> bool {
+        matches!(self, Self::IdentityUnreadable)
+    }
+}
+
 /// Files one pre-emptive pin-loop stop (fix7 F1's reserve stop,
 /// fix8 F2's budget stop): this object plus every remaining one waits
 /// under the named `detail` gap — never attempted (or closed back out
@@ -11083,7 +11098,19 @@ fn record_scanned_candidate(
                 reason: format!("{}: {reason}; {tail}", raw.path),
             });
         }
-        Err(PinOutcome::Unproven { reason, .. }) => {
+        Err(PinOutcome::Unproven { cause, reason }) => {
+            // Controller ruling 17:27 (B1): an UNAVAILABLE observation
+            // is unknown, not contradicting — it files its named skip
+            // and publishes no ambiguity, and never disproves a proven
+            // peer (ruling 11:38 (1)). Only REFUSED or contradicting
+            // observations take the I4 fail-closed path below.
+            if cause.is_unavailable() {
+                skipped.push(Skipped {
+                    subject: raw.path,
+                    reason,
+                });
+                return;
+            }
             // A missing identity fails this observation only: scrub its
             // possibly-partial filing and mark the refusal, but never
             // group-reject the key by itself. Refusal pairs publish

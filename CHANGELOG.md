@@ -122,6 +122,25 @@ versioned separately and are opaque, exact dispatch keys.
   aggregate. Inventory text names folded departed callers per module:
   a `departed use:` summary row counts the folded callers, entries
   and edges (plus any identities or mechanisms past the row bound).
+- Mixed-version inventory diffs are explicit: diffing a pre-fold
+  (v0.7.1 or older) inventory against a current one carries a
+  `pre_fold_input` limitation (a Note in text output) and leaves
+  `departed_use` out of the module facet for that comparison, so one
+  exited caller no longer marks every other group on the shared
+  module as changed; the folded group itself keeps presence `both`
+  with its `departed_use` change.
+- Downgrade note: 0.7.1 tools misread 0.7.2 inventories. Its diff
+  refuses folded files whose gaps name folded callers, and where it
+  parses, folded applications read as added or removed; its CBOM
+  omits folded callers. Compare mixed versions with the 0.7.2 diff.
+- A CBOM built from a current inventory links fewer
+  application-to-mechanism pairs than one from a pre-fold file of
+  the same workload: folded pairs are withheld as
+  `p11scope:departed_links_withheld`, not joined.
+- The machine profile schema leaves the four v0.7.2-new evidence
+  fields optional, so v0.7.1 profiles and metrics validate against
+  it; the product still always emits them. The reverse is unchanged:
+  the v0.7.1 schema rejects 0.7.2 profiles.
 - Retired counting coverage is disclosed instead of silently
   narrowing the capture: when an attached counting slot retires
   mid-capture (a `run` member exits, a scope detaches), the
@@ -222,6 +241,9 @@ versioned separately and are opaque, exact dispatch keys.
   their live edge did, so a folded group keeps presence `both`
   with the new `departed_use` change code instead of reading as
   removed against a live snapshot.
+- `inventory diff` reads folded inventories whose gaps name folded
+  callers: the gap keeps its pid, subject and reason with the link
+  dropped, instead of refusing the file as a dangling reference.
 - `inventory cbom` counts a folded caller without an executable
   path once, not once per module it touched.
 - The streaming fold re-certifies carried callers every pass: a

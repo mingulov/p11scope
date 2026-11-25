@@ -2223,13 +2223,14 @@ impl PinnedObjects {
                 }
             }
         }
-        // Only proven collisions replay: an unproven observation in
-        // the incoming set never rejects here, and its ambiguity
-        // markers die with it — no ambiguity without a proven
-        // collision. Proven keys replay unconditionally with the
-        // same entry-removing routing refusal a cross-partition
-        // collision takes, and the marker propagates.
-        for key in other.proven_collision_keys.iter().copied() {
+        // Every incoming rejection replays: proven collisions and
+        // same-view refuse-then-file contradictions are both key-level
+        // fail-closed evidence. An unavailable observation never marks
+        // its key rejected, so it cannot poison the merge. Replayed
+        // keys keep the same entry-removing routing refusal a
+        // cross-partition collision takes, and the proven marker
+        // propagates only for proven collisions.
+        for key in other.rejected_keys.iter().copied() {
             self.reject_key(key);
         }
         self.proven_collision_keys
@@ -5438,7 +5439,12 @@ mod conservative_copy {
                             .insert(*view, BTreeSet::new());
                     }
                 } else {
-                    self.next_phase(Phase::Rejected);
+                    // Refusal history replays before rejections: the
+                    // Refused phase copies every refused pair (retired
+                    // views' included — a refusal is key-level evidence
+                    // that later filings and pairings still consult),
+                    // then hands to Rejected.
+                    self.next_phase(Phase::Refused);
                 }
                 return Ok(());
             }

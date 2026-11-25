@@ -1579,6 +1579,10 @@ const HELD_BACK_REASON: &str =
 /// output keeps one entry however many newcomers wait; pending still counts
 /// them every tick and the end-of-run sweep counts leftovers.
 const CAPACITY_NO_VICTIM_SUBJECT: &str = "live process admission";
+/// The live-loss row for a consumed refresh request refused at a full
+/// queue that no later pass can service (v0.7.1 wording, run-path R2).
+const REFRESH_QUEUE_DROPPED_REASON: &str =
+    "refresh requests exceeded the bounded pending queue; excess requests were dropped";
 const CAPACITY_NO_VICTIM_REASON: &str = "capture process-view capacity was exhausted with no evictable view; a live newcomer waited for admission";
 /// Named gap for the startup initial loader arming (T3): every completion
 /// path — a fatal arm, a stop, a staging/backlog/publish failure, and the
@@ -18864,7 +18868,9 @@ impl Engine {
     }
 
     /// Each consumed record renews pending intent while keeping its first
-    /// arrival mark. Refusing that record preserves explicit loss evidence.
+    /// arrival mark. A refusal at a full queue defers only when a later pass
+    /// services the member; otherwise it files explicit loss evidence
+    /// (`refused_refresh_retryable`).
     fn request_refresh_consumed(&mut self, pid: u32, now_ns: Option<u64>) -> bool {
         self.request_refresh_with(pid, now_ns, true, None)
     }
@@ -18911,10 +18917,24 @@ impl Engine {
                 true
             }
             RefreshIntake::QueueFull { consumed } => {
-                // Overflow defers, never drops: the refused member stays
-                // unexamined, so the pass cursor retries it next pass
-                // (admission owner 2). No truncation count, no dropped
-                // age, no loss mark — the work is unfinished, not lost.
+                // Overflow defers only when a later pass really services
+                // the member: a live retained view keeps its owed refresh,
+                // and a live in-scope pid is re-listed by the pass cursor
+                // (admission owner 2). Those overflows are unfinished, not
+                // lost. A consumed record whose member no later pass can
+                // reach — the pid is gone, or the collected finish runs no
+                // service pass — is dropped work: count it as v0.7.1 did
+                // (truncation, the newcomer's dropped age, the live-loss
+                // row), never as unfinished (run-path audit R2).
+                if consumed && !self.refused_refresh_retryable(pid) {
+                    self.discovery_truncated = self.discovery_truncated.saturating_add(1);
+                    // Diff-first arrivals retain their known dropped age.
+                    let seen = self.newcomer_first_seen.get(&pid).copied().flatten();
+                    self.newcomer_ages
+                        .note_dropped(newcomer_age_ms(seen, now_ns));
+                    self.mark_live_loss("live discovery refresh", REFRESH_QUEUE_DROPPED_REASON);
+                    return false;
+                }
                 // Consumed and retry overflows keep their distinct rows.
                 self.mark_partial(
                     "live discovery refresh",
@@ -18954,6 +18974,17 @@ impl Engine {
                 false
             }
         }
+    }
+
+    /// Whether a refresh refused at a full queue is retried by a later
+    /// pass without a fresh record: some later service pass must run (not
+    /// the collected finish), and the member must still be reachable — a
+    /// retained view (its owed refresh re-requests) or a live pid the pass
+    /// cursor re-lists. Fail-closed: anything else is dropped work.
+    fn refused_refresh_retryable(&self, pid: u32) -> bool {
+        self.collected_finish_actions.is_none()
+            && (self.views.iter().any(|view| view.pid() == pid)
+                || self.proc_root.join(pid.to_string()).exists())
     }
 
     fn clear_refresh_for_view(&mut self, view: ProcessViewId, pid: u32) {

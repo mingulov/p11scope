@@ -2395,9 +2395,9 @@ sign-off at 0.9.x; Task 2 reviews `rv-v080-keymeta-t2` +
 rounds including the codex B1 fetch-mask over-read fix; Task 3
 join/publication landed). The Task 4 `--key-sizes` canary passed on
 2026-11-25 (live sentinel runs, lane v080-keysizes-canary on Fedora
-kernel 7.2.9: the committed cell passed 3/3 at rev 0c39778f3 after
-3/3 at 727c1b302, 3/3 at c6f684673 and 6/6 across earlier verdict
-revisions: S/V protocols on LP64,
+kernel 7.3.4-200.fc44: the committed cell passed 1/1 at rev
+9bb09cc4e with cells=106695, after 1/1 at 16e255cb9 on the same
+kernel and 3/3 at 0c39778f3 on kernel 7.2.9: S/V protocols on LP64,
 the marker absent from the JSON report, the event log, the verbose
 observer log and all 66 dumpable owned BPF maps including
 `EVIDENCE_START` (`bpftool -j` raw-cell scan of a snapshot after the

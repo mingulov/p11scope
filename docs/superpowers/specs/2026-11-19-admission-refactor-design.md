@@ -412,18 +412,20 @@ test ideas live on in the owners' tables (§9).
   tiering → becomes the cursor (§4.2; twins adopted).
 - All `debug:` / `P11SCOPE_FIX1_EVLOG` commits on lane 4 → never ported.
 - Substring classifiers (`scan_pins_waited_only_*` as
-  retry/terminal deciders) → deciders for the handle class only:
-  the typed outcome files the handle-class waits
-  (`HandleExhaustion`/`ReserveStop`/`BudgetStop`) under the fixed
-  wait subject and every other `Wait` cause under its own subject,
-  so the classifiers recognise exactly the defer-whole shape and a
-  future `Wait` cause that should defer whole must file there too
-  (pinned by the wait-subject split twin). The budget-stop
-  classifier (`names_capture_budget_stop`, matching the work,
-  clock, I/O and window causes) is the separate role: it still
-  serves the ending-at-scan-start policy, which keeps capture-wide
-  budget stops instead of excusing them as process exits. (String
-  matching may otherwise survive inside gap rendering only.)
+  retry/terminal deciders) → the typed outcome files EVERY
+  healable `Wait` cause under the fixed wait subject, as on dev
+  (controller ruling 17:27, I3 — this supersedes the draft's
+  handle-class-only split: there is no wait-subject split twin).
+  The defer-whole tail is chosen from the typed `WaitCause` the
+  scan recorded, never from the fd-exhaustion text; a scan cut
+  short by a capture-budget stop still files its
+  `CutShortBudgetStop` member outcome for the pass cursor. The
+  budget-stop classifier (`names_capture_budget_stop`, matching
+  the work, clock, I/O and window causes) is the separate role:
+  it still serves the ending-at-scan-start policy, which keeps
+  capture-wide budget stops instead of excusing them as process
+  exits. (String matching may otherwise survive inside gap
+  rendering only.)
 
 ## 9. Test plan (per owner, RED first on c2a180a71)
 

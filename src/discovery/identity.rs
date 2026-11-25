@@ -27060,8 +27060,16 @@ mod tests {
                 !fresh.rejects(key),
                 "record [{fault}]: an unproven observation must not reject the key"
             );
+            // Controller ruling 17:27 (I3): every healable budget
+            // wait files PIN_WAIT_SUBJECT, as on dev — so the
+            // [budget-io] and [budget-work] rows keep their named
+            // skip under the wait subject, not the object path.
+            let want_subject = match outcome {
+                PinOutcome::Wait { .. } => PIN_WAIT_SUBJECT,
+                _ => PATH,
+            };
             assert!(
-                skipped.iter().any(|skip| skip.subject == PATH),
+                skipped.iter().any(|skip| skip.subject == want_subject),
                 "record [{fault}]: the failed view keeps its named skip: {skipped:?}"
             );
 

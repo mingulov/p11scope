@@ -420,7 +420,8 @@ class JudgeTwins(unittest.TestCase):
         self.assertEqual(rc, 1, summary)
         self.assertIn("pqc-sizes-rows: FAIL", summary)
         self.assertIn("pqc-nosizes-rows: PASS", summary)
-        self.assertIn("matrix pairs", summary)
+        self.assertIn("matrix pairs missing", summary)
+        self.assertIn("matrix pairs duplicated", summary)
 
     def test_relabel_sign_mutation_fails_nosizes_leg(self):
         inv, text = relabel(inventory(False), verbose(False), False,
@@ -430,7 +431,8 @@ class JudgeTwins(unittest.TestCase):
         self.assertEqual(rc, 1, summary)
         self.assertIn("pqc-sizes-rows: PASS", summary)
         self.assertIn("pqc-nosizes-rows: FAIL", summary)
-        self.assertIn("matrix pairs", summary)
+        self.assertIn("matrix pairs missing", summary)
+        self.assertIn("matrix pairs duplicated", summary)
 
     def test_swapped_family_labels_fail(self):
         inv = copy.deepcopy(inventory(True))
@@ -458,7 +460,8 @@ class JudgeTwins(unittest.TestCase):
                                 inventory(False), verbose(False))
         self.assertEqual(rc, 1, summary)
         self.assertIn("pqc-sizes-rows: FAIL", summary)
-        self.assertIn("matrix pairs", summary)
+        self.assertIn("matrix pairs missing", summary)
+        self.assertIn("matrix pairs unexpected", summary)
 
     def test_verbose_row_must_match_its_matrix_pair(self):
         lines = verbose(True).splitlines()
@@ -473,6 +476,7 @@ class JudgeTwins(unittest.TestCase):
                                 inventory(False), verbose(False))
         self.assertEqual(rc, 1, summary)
         self.assertIn("pqc-sizes-rows: FAIL", summary)
+        self.assertIn("text pairs missing", summary)
 
     def test_dropped_row_fails(self):
         inv = copy.deepcopy(inventory(True))
@@ -484,6 +488,8 @@ class JudgeTwins(unittest.TestCase):
                                 inventory(False), verbose(False))
         self.assertEqual(rc, 1, summary)
         self.assertIn("pqc-sizes-rows: FAIL", summary)
+        self.assertIn("want 12", summary)
+        self.assertIn("matrix pairs missing", summary)
 
     def test_wrong_truth_fails(self):
         rc, summary = run_judge(inventory(True), verbose(True),
@@ -491,6 +497,8 @@ class JudgeTwins(unittest.TestCase):
                                 sizes_log="WORKLOAD_EXIT ok=1\n")
         self.assertEqual(rc, 1, summary)
         self.assertIn("pqc-workload-truth: FAIL", summary)
+        self.assertIn("ground-truth line", summary)
+        self.assertIn("lengths line", summary)
 
     def test_workload_exit_nonzero_fails_truth(self):
         rc, summary = run_judge(inventory(True), verbose(True),
@@ -548,7 +556,7 @@ class JudgeTwins(unittest.TestCase):
                                 inventory(False), verbose(False))
         self.assertEqual(rc, 1, summary)
         self.assertIn("pqc-sizes-rows: FAIL", summary)
-        self.assertIn("object", summary)
+        self.assertIn("joins no object", summary)
 
     def test_object_label_mismatch_fails(self):
         inv = copy.deepcopy(inventory(True))
@@ -557,7 +565,7 @@ class JudgeTwins(unittest.TestCase):
                                 inventory(False), verbose(False))
         self.assertEqual(rc, 1, summary)
         self.assertIn("pqc-sizes-rows: FAIL", summary)
-        self.assertIn("label", summary)
+        self.assertIn("object label", summary)
 
     def test_object_key_type_mismatch_fails(self):
         inv = copy.deepcopy(inventory(True))
@@ -596,6 +604,8 @@ class JudgeTwins(unittest.TestCase):
                                 inventory(False), verbose(False))
         self.assertEqual(rc, 1, summary)
         self.assertIn("pqc-sizes-rows: FAIL", summary)
+        self.assertIn("joins no object", summary)
+        self.assertIn("want 2", summary)
 
     def test_extra_object_fails(self):
         inv = copy.deepcopy(inventory(True))
@@ -606,7 +616,8 @@ class JudgeTwins(unittest.TestCase):
                                 inventory(False), verbose(False))
         self.assertEqual(rc, 1, summary)
         self.assertIn("pqc-sizes-rows: FAIL", summary)
-        self.assertIn("18", summary)
+        self.assertIn("want 18", summary)
+        self.assertIn("secret", summary)
 
     def test_malformed_row_missing_key_fails(self):
         inv = copy.deepcopy(inventory(True))
@@ -634,6 +645,8 @@ class JudgeTwins(unittest.TestCase):
                                 inventory(False), verbose(False))
         self.assertEqual(rc, 1, summary)
         self.assertIn("pqc-sizes-rows: FAIL", summary)
+        self.assertIn("want 12", summary)
+        self.assertIn("duplicated", summary)
 
     def test_extra_foreign_category_row_fails(self):
         inv = copy.deepcopy(inventory(True))
@@ -652,6 +665,7 @@ class JudgeTwins(unittest.TestCase):
                                 inventory(False), verbose(False))
         self.assertEqual(rc, 1, summary)
         self.assertIn("pqc-sizes-rows: FAIL", summary)
+        self.assertIn("category", summary)
 
     def test_bad_counters_fail(self):
         inv = copy.deepcopy(inventory(True))
@@ -736,6 +750,7 @@ class JudgeTwins(unittest.TestCase):
                                 inventory(False), verbose(False))
         self.assertEqual(rc, 1, summary)
         self.assertIn("pqc-sizes-rows: FAIL", summary)
+        self.assertIn("want 12", summary)
 
     def test_text_malformed_row_fails(self):
         lines = verbose(True).splitlines()
@@ -747,6 +762,8 @@ class JudgeTwins(unittest.TestCase):
                                 inventory(False), verbose(False))
         self.assertEqual(rc, 1, summary)
         self.assertIn("pqc-sizes-rows: FAIL", summary)
+        self.assertIn("malformed", summary)
+        self.assertIn("text pairs missing", summary)
 
     def test_nosizes_text_without_size_unknown_fails(self):
         lines = verbose(False).splitlines()
@@ -800,7 +817,7 @@ class JudgeTwins(unittest.TestCase):
                                 inventory(False), verbose(False))
         self.assertEqual(rc, 1, summary)
         self.assertIn("pqc-sizes-rows: FAIL", summary)
-        self.assertIn("unknown row", summary)
+        self.assertIn("keys", summary)
 
     def test_unknown_mechanism_order_swap_fails(self):
         inv = copy.deepcopy(inventory(True))
@@ -845,6 +862,172 @@ class JudgeTwins(unittest.TestCase):
         self.assertEqual(rc, 1, summary)
         self.assertIn("pqc-sizes-rows: FAIL", summary)
         self.assertIn("version", summary)
+
+    def test_bad_instance_shape_fails(self):
+        inv = copy.deepcopy(inventory(True))
+        for row in inv["object_observations"]["key_operations"]:
+            row["instance"] = "q0"
+        rc, summary = run_judge(inv, verbose(True),
+                                inventory(False), verbose(False))
+        self.assertEqual(rc, 1, summary)
+        self.assertIn("pqc-sizes-rows: FAIL", summary)
+        self.assertIn("instance", summary)
+
+    def test_invalid_label_fails(self):
+        inv = copy.deepcopy(inventory(True))
+        find_row(inv, "sign", "ml_dsa_44")["metadata_at_use"] = "bogus"
+        rc, summary = run_judge(inv, verbose(True),
+                                inventory(False), verbose(False))
+        self.assertEqual(rc, 1, summary)
+        self.assertIn("pqc-sizes-rows: FAIL", summary)
+        self.assertIn("metadata_at_use", summary)
+
+    def test_unknown_wrong_completed_fails(self):
+        inv = copy.deepcopy(inventory(True))
+        inv["object_observations"]["unknown_key_operations"][0][
+            "completed"] = 5
+        rc, summary = run_judge(inv, verbose(True),
+                                inventory(False), verbose(False))
+        self.assertEqual(rc, 1, summary)
+        self.assertIn("pqc-sizes-rows: FAIL", summary)
+        self.assertIn("unknown row", summary)
+
+    def test_mechanism_wrong_name_fails(self):
+        inv = copy.deepcopy(inventory(True))
+        mechs = inv["semantic_edges"][0]["mechanisms"]
+        next(row for row in mechs
+             if row["mechanism"] == 23)["name"] = "CKM_NOISE"
+        rc, summary = run_judge(inv, verbose(True),
+                                inventory(False), verbose(False))
+        self.assertEqual(rc, 1, summary)
+        self.assertIn("pqc-sizes-rows: FAIL", summary)
+        self.assertIn("mechanism 23", summary)
+
+    def test_mechanism_errors_nonzero_fails(self):
+        inv = copy.deepcopy(inventory(True))
+        mechs = inv["semantic_edges"][0]["mechanisms"]
+        next(row for row in mechs
+             if row["mechanism"] == 29)["errors"] = 1
+        rc, summary = run_judge(inv, verbose(True),
+                                inventory(False), verbose(False))
+        self.assertEqual(rc, 1, summary)
+        self.assertIn("pqc-sizes-rows: FAIL", summary)
+        self.assertIn("mechanism 29", summary)
+
+    def test_inventory_exit_nonzero_fails_leg(self):
+        rc, summary = run_judge(inventory(True), verbose(True),
+                                inventory(False), verbose(False),
+                                sizes_inventory_exit="1")
+        self.assertEqual(rc, 1, summary)
+        self.assertIn("pqc-sizes-rows: FAIL", summary)
+        self.assertIn("inventory exit=1", summary)
+
+    def test_missing_workload_exit_line_fails_truth(self):
+        log = ("GROUND_TRUTH mldsa_gen=3 mldsa_sign=3 mldsa_verify=3 "
+               "mlkem_gen=3 mlkem_enc=3 mlkem_dec=3\n"
+               "LENGTHS mldsa44=2420 mldsa65=3309 mldsa87=4627 "
+               "mlkem512=768 mlkem768=1088 mlkem1024=1568\n")
+        rc, summary = run_judge(inventory(True), verbose(True),
+                                inventory(False), verbose(False),
+                                sizes_log=log)
+        self.assertEqual(rc, 1, summary)
+        self.assertIn("pqc-workload-truth: FAIL", summary)
+        self.assertIn("WORKLOAD_EXIT", summary)
+
+    def test_spotlight_missing_line_fails(self):
+        lines = [line for line in verbose(True).splitlines()
+                 if not line.startswith("  pqc keys: ")]
+        rc, summary = run_judge(inventory(True),
+                                "\n".join(lines) + "\n",
+                                inventory(False), verbose(False))
+        self.assertEqual(rc, 1, summary)
+        self.assertIn("pqc-sizes-rows: FAIL", summary)
+        self.assertIn("spotlight", summary)
+
+    def test_secret_object_mislabeled_fails(self):
+        inv = copy.deepcopy(inventory(True))
+        find_object(inv, 9)["label"] = "foo"
+        rc, summary = run_judge(inv, verbose(True),
+                                inventory(False), verbose(False))
+        self.assertEqual(rc, 1, summary)
+        self.assertIn("pqc-sizes-rows: FAIL", summary)
+        self.assertIn("secret", summary)
+
+    def test_pair_same_class_fails(self):
+        inv = copy.deepcopy(inventory(True))
+        established = find_object(inv, 2)["established"]
+        established["class"]["value"] = 2
+        rc, summary = run_judge(inv, verbose(True),
+                                inventory(False), verbose(False))
+        self.assertEqual(rc, 1, summary)
+        self.assertIn("pqc-sizes-rows: FAIL", summary)
+        self.assertIn("pair classes", summary)
+
+    def test_pair_birth_shared_across_labels_fails(self):
+        inv = copy.deepcopy(inventory(True))
+        first = find_object(inv, 1)["birth"]
+        find_object(inv, 3)["birth"] = dict(first)
+        find_object(inv, 4)["birth"] = dict(first)
+        rc, summary = run_judge(inv, verbose(True),
+                                inventory(False), verbose(False))
+        self.assertEqual(rc, 1, summary)
+        self.assertIn("pqc-sizes-rows: FAIL", summary)
+        self.assertIn("share one birth", summary)
+
+    def test_malformed_object_missing_key_fails(self):
+        inv = copy.deepcopy(inventory(True))
+        del find_object(inv, 1)["session"]
+        rc, summary = run_judge(inv, verbose(True),
+                                inventory(False), verbose(False))
+        self.assertEqual(rc, 1, summary)
+        self.assertIn("pqc-sizes-rows: FAIL", summary)
+        self.assertIn("keys", summary)
+
+    def test_object_provenance_mismatch_fails(self):
+        inv = copy.deepcopy(inventory(True))
+        find_object(inv, 1)["attribution"] = "downgraded"
+        rc, summary = run_judge(inv, verbose(True),
+                                inventory(False), verbose(False))
+        self.assertEqual(rc, 1, summary)
+        self.assertIn("pqc-sizes-rows: FAIL", summary)
+        self.assertIn("provenance", summary)
+
+    def test_duplicate_object_fails(self):
+        inv = copy.deepcopy(inventory(True))
+        extra = copy.deepcopy(find_object(inv, 9))
+        inv["object_observations"]["objects"].append(extra)
+        rc, summary = run_judge(inv, verbose(True),
+                                inventory(False), verbose(False))
+        self.assertEqual(rc, 1, summary)
+        self.assertIn("pqc-sizes-rows: FAIL", summary)
+        self.assertIn("listed twice", summary)
+
+    def test_text_cross_family_pair_fails(self):
+        lines = verbose(True).splitlines()
+        for index, line in enumerate(lines):
+            if " sign " in line and "(ml_dsa_87)" in line:
+                lines[index] = line.replace("(ml_dsa_87)",
+                                            "(ml_kem_512)")
+        rc, summary = run_judge(inventory(True),
+                                "\n".join(lines) + "\n",
+                                inventory(False), verbose(False))
+        self.assertEqual(rc, 1, summary)
+        self.assertIn("pqc-sizes-rows: FAIL", summary)
+        self.assertIn("text pairs missing", summary)
+        self.assertIn("text pairs unexpected", summary)
+
+    def test_text_length_fragment_missing_fails(self):
+        lines = verbose(True).splitlines()
+        for index, line in enumerate(lines):
+            if " sign " in line and "(ml_dsa_44)" in line:
+                lines[index] = line.replace(
+                    " (from signature length)", "")
+        rc, summary = run_judge(inventory(True),
+                                "\n".join(lines) + "\n",
+                                inventory(False), verbose(False))
+        self.assertEqual(rc, 1, summary)
+        self.assertIn("pqc-sizes-rows: FAIL", summary)
+        self.assertIn("length set", summary)
 
 
 if __name__ == "__main__":

@@ -3202,10 +3202,17 @@ fn keysize_canary_json_dump_array(cells: &serde_json::Value) -> Result<Vec<u8>> 
 /// Raw bytes of every key/value cell in one `bpftool -j map dump`
 /// document, in document order: entries carry `key` plus `value` (or
 /// per-CPU `values`), with optional BTF `formatted` the text scan
-/// already covers. Strict shape (mirrors `normalize_map_dump` in
-/// `scripts/dump-owned-bpf-maps.py`): an unknown field fails the
-/// caller, so a dump the cell cannot decode fails closed instead of
-/// passing thin.
+/// already covers. A `value` may also be the exact refusal blob
+/// `{"error": "<glibc strerror>"}` bpftool emits when the kernel
+/// refuses a cell lookup (`cgroup_array`: no userspace lookup at all —
+/// see `probe_refused_lookup` in `scripts/dump-owned-bpf-maps.py`); a
+/// refused cell holds no bytes for the decoder, but its key still
+/// scans and the blob text still scans. The blob shape is exact (one
+/// `error` string key): the strerror text itself is a glibc fact, not
+/// a kernel fact, so it is never asserted. Strict shape otherwise
+/// (mirrors `normalize_map_dump`): an unknown field fails the caller,
+/// so a dump the cell cannot decode fails closed instead of passing
+/// thin.
 fn keysize_canary_json_dump_cells(dump: &[u8]) -> Result<Vec<u8>> {
     let parsed: serde_json::Value =
         serde_json::from_slice(dump).context("KEYCANARY: map dump is not JSON")?;
@@ -3228,7 +3235,14 @@ fn keysize_canary_json_dump_cells(dump: &[u8]) -> Result<Vec<u8>> {
         match keys.as_slice() {
             ["formatted", "key", "value"] | ["key", "value"] => {
                 out.extend(keysize_canary_json_dump_array(&object["key"])?);
-                out.extend(keysize_canary_json_dump_array(&object["value"])?);
+                if let Some(blob) = object["value"].as_object() {
+                    ensure!(
+                        blob.len() == 1 && blob.get("error").is_some_and(|error| error.is_string()),
+                        "KEYCANARY: map dump refused cell is not {{\"error\": str}}"
+                    );
+                } else {
+                    out.extend(keysize_canary_json_dump_array(&object["value"])?);
+                }
             }
             ["formatted", "key", "values"] | ["key", "values"] => {
                 out.extend(keysize_canary_json_dump_array(&object["key"])?);
@@ -3447,6 +3461,44 @@ fn keysize_canary_json_dump_scanner_fails_closed_on_malformed_dumps() {
         assert!(
             keysize_canary_json_dump_marked(bad).is_err(),
             "malformed cell fails closed: {}",
+            String::from_utf8_lossy(bad)
+        );
+    }
+}
+
+/// The `-j` decoder accepts refused cells: a `value` that is exactly
+/// `{"error": "<strerror>"}` carries no bytes (the kernel refused the
+/// lookup), but the entry key still scans and a marked key still fails.
+/// The blob shape is exact; anything else dict-shaped fails closed.
+#[test]
+fn keysize_canary_json_dump_scanner_accepts_refused_cells() {
+    let refused =
+        br#"[{"key": ["0x00", "0x00", "0x00", "0x00"], "value": {"error": "Unknown error 524"}}]"#;
+    assert!(
+        !keysize_canary_json_dump_marked(refused).unwrap(),
+        "a refused cell with a clean key is clean"
+    );
+    let marked_key = br#"[{"key": ["0x4b", "0x33", "0x59", "0x53", "0x31", "0x5a", "0x33", "0x43", "0x41", "0x4e", "0x41", "0x52", "0x59", "0x21"], "value": {"error": "Unknown error 524"}}]"#;
+    assert!(
+        keysize_canary_json_dump_marked(marked_key).unwrap(),
+        "a refused cell with a marked key still fails"
+    );
+    let mixed = br#"[{"key": ["0x00"], "value": {"error": "Unknown error 524"}}, {"key": ["0x01"], "value": ["0x4b", "0x33", "0x59", "0x53", "0x31", "0x5a", "0x33", "0x43", "0x41", "0x4e", "0x41", "0x52", "0x59", "0x21"]}]"#;
+    assert!(
+        keysize_canary_json_dump_marked(mixed).unwrap(),
+        "a marked readable cell beside a refused cell still fails"
+    );
+    // Dict-shaped values that are not exactly {"error": str} fail closed.
+    for bad in [
+        br#"[{"key": ["0x00"], "value": {"error": 524}}]"#.as_slice(),
+        br#"[{"key": ["0x00"], "value": {"error": "x", "extra": 1}}]"#.as_slice(),
+        br#"[{"key": ["0x00"], "value": {"errno": 524}}]"#.as_slice(),
+        br#"[{"key": ["0x00"], "value": {}}]"#.as_slice(),
+        br#"[{"key": ["0x00"], "value": 42}]"#.as_slice(),
+    ] {
+        assert!(
+            keysize_canary_json_dump_marked(bad).is_err(),
+            "a malformed refused cell fails closed: {}",
             String::from_utf8_lossy(bad)
         );
     }
@@ -4461,8 +4513,11 @@ fn keysize_canary_scan_owned_maps(pid: u32, dump_dir: &Path) -> Result<KeysizeCa
             !keysize_canary_scan_map_dump(&dump.stdout),
             "{TAG}: canary marker leaked into BPF map {name} ({id}/{kind})"
         );
+        let marked = keysize_canary_json_dump_marked(&dump.stdout).with_context(|| {
+            format!("{TAG}: cannot decode the BPF map {name} ({id}/{kind}) dump")
+        })?;
         ensure!(
-            !keysize_canary_json_dump_marked(&dump.stdout)?,
+            !marked,
             "{TAG}: canary marker leaked into BPF map {name} ({id}/{kind}) cells"
         );
         combined.extend_from_slice(&dump.stdout);

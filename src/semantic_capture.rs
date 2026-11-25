@@ -1966,6 +1966,14 @@ pub(crate) struct SemanticCapture {
     /// Stopped refusal. Memory-only flag, no budget impact.
     #[cfg(test)]
     hold_takes_for_test: bool,
+    /// Tests-only batch-shed pose: while set, every tick's batch
+    /// routes shed with the real CoverageFault label and counting,
+    /// exactly as a scoped quantum failure would, but without
+    /// invalidating coverage or clearing jobs. The shed cell forces
+    /// its q1 shed deterministically with this. Memory-only flag,
+    /// no budget impact.
+    #[cfg(test)]
+    fail_batches_for_test: bool,
     continuity_cuts: u64,
     /// Diagnostic-only birth-funnel formation: sighting receipts minted
     /// carrying a birth, and New/AdmittedFirst births withheld by the
@@ -2119,6 +2127,8 @@ impl SemanticCapture {
             stopped: false,
             #[cfg(test)]
             hold_takes_for_test: false,
+            #[cfg(test)]
+            fail_batches_for_test: false,
             continuity_cuts: 0,
             birth_offers_formed: 0,
             birth_cooled_withheld: 0,
@@ -4431,6 +4441,27 @@ impl SemanticCapture {
         self.stopped
     }
 
+    /// Tests-only batch-shed pose (see the field): while set, the
+    /// router sheds every tick's batch with real labels/counting.
+    #[cfg(test)]
+    pub(crate) fn pose_fail_batches_for_test(&mut self, on: bool) {
+        self.fail_batches_for_test = on;
+    }
+
+    /// Whether this tick's batch routes shed: the production
+    /// scoped-quantum flag, or the posed test seam (which, unlike
+    /// the flag, stays set until the test clears it).
+    fn fail_batch_routing(&self) -> bool {
+        if self.batch_failed {
+            return true;
+        }
+        #[cfg(test)]
+        if self.fail_batches_for_test {
+            return true;
+        }
+        false
+    }
+
     /// Coverage-failure state for the stuck-transaction diagnostic only:
     /// (capture image_failed, pending discovery complete, router
     /// image_failed, faulted key count, faulted-overflow latch, router
@@ -5546,8 +5577,9 @@ impl SemanticCapture {
             };
             // A scoped quantum failure routes this tick's batch exactly
             // as latched coverage would; the flag clears below, so the
-            // next tick routes normally again.
-            let route = if self.batch_failed {
+            // next tick routes normally again. The posed test seam
+            // routes identically but stays until cleared.
+            let route = if self.fail_batch_routing() {
                 Route::Unknown(UnknownReason::CoverageFault)
             } else {
                 self.router.route(facts)

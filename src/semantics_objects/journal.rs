@@ -9671,7 +9671,12 @@ impl JournalAdapter {
                             // release the stranded open, claim and H8
                             // quietly. Never S1-owned and never
                             // void-owned: those have their own
-                            // disposers.
+                            // disposers. A claimed open whose image
+                            // does not match the key is corruption,
+                            // not staleness, and still refuses.
+                            if entry.image != (key.cookie, key.exec) {
+                                return Err(RawQuantumRefusal::DispositionMismatch);
+                            }
                             let release = entry.s1only_subject.is_none()
                                 && entry.abandon.is_none()
                                 && self.key_is_live(key);

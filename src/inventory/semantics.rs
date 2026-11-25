@@ -3979,6 +3979,11 @@ impl AttestedSemanticLane {
         if !self.collected_finish_requested {
             return None;
         }
+        // The unmatched remainder is enumerable while it still stands:
+        // count every staged call once before H0 finish and the terminal
+        // commit move or drop the lane. The per-feed note is idempotent,
+        // so the generic exit hold's earlier note never double-counts.
+        coordinator.note_joint_stop_unsealed();
         let domain = self.domain;
         #[cfg(test)]
         if let Some(test) = self.test_io.as_mut() {

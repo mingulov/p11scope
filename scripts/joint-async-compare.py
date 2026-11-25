@@ -824,7 +824,8 @@ def _check_row_budget(node, where):
 
 UNATTRIBUTED_REASONS = ("started_before_attach", "record_lost",
                         "foreign_or_unproven_caller", "session_state_lost",
-                        "watchdog_no_progress", "unmodelled_call_shape",
+                        "watchdog_no_progress", "stopped_unsealed",
+                        "unmodelled_call_shape",
                         "proof_refused_fallback")
 
 

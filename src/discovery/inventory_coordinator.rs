@@ -526,6 +526,10 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// hold's two trip arms are pinned through it.
     #[cfg(test)]
     joint_watchdog_notes: u64,
+    /// Calls into `note_joint_stop_unsealed` (test count): the exit
+    /// hold and forced-finish count arms are pinned through it.
+    #[cfg(test)]
+    joint_stop_unsealed_notes: u64,
     /// Semantic preparation remains independent of broad count admission.
     semantic_inputs: semantics::SemanticInputs,
     /// Whether a no-manifest scan seal will be attempted for this
@@ -1604,6 +1608,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             engine_collected_finish_calls: 0,
             #[cfg(test)]
             joint_watchdog_notes: 0,
+            #[cfg(test)]
+            joint_stop_unsealed_notes: 0,
             semantic_inputs: semantics::SemanticInputs::new(Vec::new()),
             scan_mint_requested: false,
             scan_mint_sources: None,
@@ -3334,6 +3340,22 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     #[cfg(test)]
     pub(crate) fn joint_watchdog_notes_for_test(&self) -> u64 {
         self.joint_watchdog_notes
+    }
+
+    /// Note the lane stop/finish on every retained Joint feed, so
+    /// staged calls left unsealed count once as `stopped_unsealed` in
+    /// the next publication.
+    pub(crate) fn note_joint_stop_unsealed(&mut self) {
+        #[cfg(test)]
+        {
+            self.joint_stop_unsealed_notes = self.joint_stop_unsealed_notes.saturating_add(1);
+        }
+        self.registry.note_joint_stop_unsealed();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn joint_stop_unsealed_notes_for_test(&self) -> u64 {
+        self.joint_stop_unsealed_notes
     }
 
     /// Observe the actual engine tail attempts without adding counters or
@@ -13318,8 +13340,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// unapplied phase cancels. The prepared physical work publishes,
     /// the abandon stages its named loss gap, and nothing pending is
     /// a quiet no-op. An applied phase without its frame, without
-    /// bound seal targets, or refusing the finish is left standing:
-    /// the later refusal discloses it exactly as today.
+    /// bound seal targets, or with a refused finish force-closes the
+    /// registry phase instead: the gap names that forced completion
+    /// and carries the exact applied count, so no later plain commit
+    /// stays blocked behind a publication the machine can never resume.
     pub(crate) fn abandon_unfinished_joint_publication(
         &mut self,
         lane: &mut AttestedSemanticLane,
@@ -13332,23 +13356,39 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
         self.abandon_stranded_semantic_batches(lane);
         let mut applied = 0;
+        let mut forced = None;
         if self.registry.publication_pending() {
             if self.registry.joint_publication_applied() {
-                let Some(frame) = frame else {
-                    return;
-                };
-                if !self.registry.joint_publication_targets_bound() {
-                    drop(frame);
-                    return;
+                match frame {
+                    Some(frame) if self.registry.joint_publication_targets_bound() => {
+                        let disposed = frame.abandon_unfinished();
+                        match self
+                            .registry
+                            .finish_joint_publication(&mut self.joint_capture, &disposed)
+                        {
+                            Ok(finished) => applied = finished,
+                            Err(error) => {
+                                forced = Some(format!("completion refused: {error:#}"));
+                                applied = self.registry.force_finish_applied_joint_publication(
+                                    &mut self.joint_capture,
+                                );
+                            }
+                        }
+                    }
+                    Some(frame) => {
+                        drop(frame);
+                        forced = Some("seal targets unbound".to_string());
+                        applied = self
+                            .registry
+                            .force_finish_applied_joint_publication(&mut self.joint_capture);
+                    }
+                    None => {
+                        forced = Some("retained frame missing".to_string());
+                        applied = self
+                            .registry
+                            .force_finish_applied_joint_publication(&mut self.joint_capture);
+                    }
                 }
-                let disposed = frame.abandon_unfinished();
-                let finished = self
-                    .registry
-                    .finish_joint_publication(&mut self.joint_capture, &disposed);
-                let Ok(finished) = finished else {
-                    return;
-                };
-                applied = finished;
             } else {
                 drop(frame);
                 self.registry.cancel_unapplied_joint_publication();
@@ -13360,7 +13400,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             let _ = self.finish_publication_context(pending.completion, applied);
             drop(pending._storage);
         }
-        self.note_scope_gap("unfinished joint publication abandoned".to_string(), reason);
+        let mut detail = format!("{reason}; applied={applied}");
+        if let Some(forced) = forced {
+            detail.push_str(&format!("; forced completion: {forced}"));
+        }
+        self.note_scope_gap("unfinished joint publication abandoned".to_string(), detail);
     }
 
     /// Start the resumable stranded staged disposal after a void sweep:

@@ -109,12 +109,13 @@ pub(crate) const METADATA_UNKNOWN: &str = "unknown";
 /// proved (`started_before_attach`: direct reductions on a feed
 /// registered without a witnessed birth). Counts and reason names
 /// only — never handles, labels, or payloads.
-pub(crate) const UNATTRIBUTED_REASONS: [&str; 7] = [
+pub(crate) const UNATTRIBUTED_REASONS: [&str; 8] = [
     "started_before_attach",
     "record_lost",
     "foreign_or_unproven_caller",
     "session_state_lost",
     "watchdog_no_progress",
+    "stopped_unsealed",
     "unmodelled_call_shape",
     "proof_refused_fallback",
 ];
@@ -1809,6 +1810,7 @@ pub(crate) mod producer {
         let lost = stagings.iter().any(|staging| {
             staging.degraded_loss()
                 || staging.watchdog_tripped()
+                || staging.stop_unsealed_lost()
                 || staging.history_disposed_since_resume() > 0
         }) || folded.lost();
         let fallback = stagings.iter().any(|staging| staging.fell_back()) || folded.fell_back();
@@ -1933,7 +1935,7 @@ pub(crate) mod producer {
                 .iter()
                 .fold(0u64, |total, staging| total.saturating_add(pick(staging)))
         };
-        let counts: [(&str, u64); 5] = [
+        let counts: [(&str, u64); 6] = [
             (
                 "started_before_attach",
                 sum(&|staging| staging.pre_attach_direct()),
@@ -1950,6 +1952,7 @@ pub(crate) mod producer {
                 "watchdog_no_progress",
                 sum(&|staging| staging.watchdog_unsealed()),
             ),
+            ("stopped_unsealed", sum(&|staging| staging.stop_unsealed())),
             (
                 "unmodelled_call_shape",
                 sum(&|staging| staging.unsealable_direct()),

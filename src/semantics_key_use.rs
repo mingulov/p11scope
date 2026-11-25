@@ -73,6 +73,8 @@ enum DegradedWindow {
     /// The no-progress watchdog tripped: the lane is held for exit
     /// and no seal will settle anything again (never resumes).
     Watchdog,
+    /// The lane stopped or finished with staged calls unsealed.
+    Stop,
 }
 
 /// Whether the frozen endpoint table proves `function` irrelevant
@@ -324,6 +326,16 @@ pub(crate) struct JointStaging {
     /// True once the watchdog trip has been noted for this feed:
     /// the take-out above runs exactly once.
     watchdog_tripped: bool,
+    /// Staged calls taken out when the lane stopped or finished
+    /// without their seal, plus later direct key calls in the stop
+    /// window: each counted once as not attributed
+    /// (`stopped_unsealed`). Taken out history-only — never reduced,
+    /// never replayed.
+    stop_unsealed: u64,
+    /// True once the stop/finish take-out has been noted for this
+    /// feed: it runs exactly once even when both the generic exit
+    /// hold and the forced finish pass over the lane.
+    stop_unsealed_noted: bool,
     correlation_refusals: u64,
     /// True while the current segment ended in real loss (not
     /// proof-only refusal): the projection reports `authority_lost`,
@@ -421,6 +433,8 @@ impl JointStaging {
             degraded_window: None,
             watchdog_unsealed: 0,
             watchdog_tripped: false,
+            stop_unsealed: 0,
+            stop_unsealed_noted: false,
             correlation_refusals: 0,
             degraded_loss: false,
             fell_back: false,
@@ -521,6 +535,7 @@ impl JointStaging {
     pub(crate) fn resume_joint(&mut self) -> bool {
         if self.mode == FeedMode::S1Only
             && !self.watchdog_tripped
+            && !self.stop_unsealed_noted
             && self.selected_receipt.is_some()
             && self.segment_resumable
             && self.staged.is_empty()
@@ -591,7 +606,11 @@ impl JointStaging {
             Some("joint_birth_feed_selected")
         } else if !self.staged.is_empty() || self.reduced != 0 || self.pre_attach_direct != 0 {
             Some("joint_birth_after_calls")
-        } else if self.fell_back || self.degraded_loss || self.watchdog_tripped {
+        } else if self.fell_back
+            || self.degraded_loss
+            || self.watchdog_tripped
+            || self.stop_unsealed_noted
+        {
             Some("joint_birth_feed_degraded")
         } else {
             None
@@ -629,6 +648,7 @@ impl JointStaging {
             && self.degraded_window.is_some()
             && self.staged.is_empty()
             && !self.watchdog_tripped
+            && !self.stop_unsealed_noted
     }
 
     /// Reseed a voided feed onto a fresh birth receipt at or above its
@@ -727,6 +747,18 @@ impl JointStaging {
         self.watchdog_unsealed
     }
 
+    /// Staged calls counted under the stop/finish reason.
+    pub(crate) fn stop_unsealed(&self) -> u64 {
+        self.stop_unsealed
+    }
+
+    /// Whether this feed ended its last segment with staged calls
+    /// unsealed at stop/finish. A clean stop with nothing staged is
+    /// exact history, not lost authority.
+    pub(crate) fn stop_unsealed_lost(&self) -> bool {
+        self.stop_unsealed != 0
+    }
+
     /// Note the no-progress watchdog trip for this feed, exactly
     /// once: take every staged call out (history-only, like loss
     /// disposal: never reduced, never replayed, releases pended to
@@ -760,6 +792,36 @@ impl JointStaging {
     /// Whether the no-progress watchdog tripped on this feed.
     pub(crate) fn watchdog_tripped(&self) -> bool {
         self.watchdog_tripped
+    }
+
+    /// Note the lane stop/finish for this feed, exactly once: take
+    /// every staged call out (history-only, like the watchdog trip:
+    /// never reduced, never replayed, releases pended to the next
+    /// ledger contact) and count each once as `stopped_unsealed`.
+    /// The segment closes for good: no later seal, loss or replay can
+    /// count those calls again, nothing new stages, and later direct
+    /// key calls count under the stop reason too. Returns whether
+    /// this call left Joint mode.
+    pub(crate) fn note_stop_unsealed(&mut self) -> bool {
+        if self.stop_unsealed_noted {
+            return false;
+        }
+        self.stop_unsealed_noted = true;
+        while let Some(head) = self.staged.pop_front() {
+            let bytes = head.charged_bytes();
+            let (position, native) = (head.position, head.resource_native);
+            drop(head);
+            self.release_or_pend(None, position, bytes, native);
+            self.frontier = self.frontier.max(position);
+            self.stop_unsealed = self.stop_unsealed.saturating_add(1);
+        }
+        let was_joint = self.mode == FeedMode::Joint;
+        if was_joint || self.selected_receipt.is_some() {
+            self.mode = FeedMode::S1Only;
+            self.segment_resumable = false;
+            self.degraded_window = Some(DegradedWindow::Stop);
+        }
+        was_joint
     }
 
     /// Dispose every staged call without delivery (running-rearm
@@ -831,6 +893,9 @@ impl JointStaging {
             }
             Some(DegradedWindow::Watchdog) => {
                 self.watchdog_unsealed = self.watchdog_unsealed.saturating_add(1);
+            }
+            Some(DegradedWindow::Stop) => {
+                self.stop_unsealed = self.stop_unsealed.saturating_add(1);
             }
             None => {}
         }

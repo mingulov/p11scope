@@ -6539,6 +6539,26 @@ impl CallerRegistry {
 
     /// Completion is supplied only by the actual frame finish, never callback
     /// words, a progress enum, a cut scalar or a second H3 take.
+    /// Force-close an applied Joint publication during the exit-hold
+    /// abandon when its original frame or completion proof is missing.
+    /// This certifies nothing about the audit: the caller names the
+    /// forced completion in its gap. It exists so the registry phase
+    /// cannot stand in front of every later plain commit, and returns
+    /// the exact applied-mutation count that phase carried.
+    pub(crate) fn force_finish_applied_joint_publication(
+        &mut self,
+        owner: &mut JointCaptureOwner,
+    ) -> usize {
+        let applied = self
+            .joint_publication
+            .as_ref()
+            .and_then(|phase| phase.applied)
+            .expect("forced Joint completion needs an applied publication");
+        self.complete_publication(Some(owner.ledger_mut()));
+        self.joint_publication = None;
+        applied
+    }
+
     pub(crate) fn finish_joint_publication(
         &mut self,
         owner: &mut JointCaptureOwner,

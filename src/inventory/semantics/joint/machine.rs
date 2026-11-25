@@ -764,6 +764,7 @@ struct FinishControl {
     #[allow(dead_code)]
     q_storage: Option<ResourceLease>,
     discovery: FinishDiscovery,
+    post_q_discovery_noted: bool,
 }
 
 #[allow(clippy::large_enum_variant)] // The complete bounded original stays inline in the paid machine.
@@ -1706,6 +1707,7 @@ impl LiveJointMachine {
             q: None,
             q_storage: None,
             discovery: FinishDiscovery::Pending,
+            post_q_discovery_noted: false,
         });
     }
 
@@ -2199,6 +2201,7 @@ impl LiveJointMachine {
             q: None,
             q_storage: Some(q_storage),
             discovery: FinishDiscovery::Pending,
+            post_q_discovery_noted: false,
         });
         lane.mark_collected_finish_requested();
         match io.request_finish_stop(lane) {
@@ -2302,9 +2305,31 @@ impl LiveJointMachine {
                         return Err(reason);
                     }
                 };
-                if progress.failed || progress.post_q {
+                if progress.failed {
                     self.state = RunState::DispositionRequired(SemanticRefusal::Unavailable);
                     return Err(SemanticRefusal::Unavailable);
+                }
+                if progress.post_q {
+                    // Match the run path's owner ruling: an ungated
+                    // writer past Q makes the drain unproven, never the
+                    // whole Finish unavailable. The records up to Q were
+                    // serviced and counted through the Engine; the lane
+                    // completes PARTIAL (`final_drain=false`) with the
+                    // detection named once. Records past Q are never
+                    // consumed or guessed, so the honest exact count is
+                    // one detection event, not a fabricated record count.
+                    lane.finish_window_loss = true;
+                    if !finish.post_q_discovery_noted {
+                        finish.post_q_discovery_noted = true;
+                        coordinator.note_scope_gap(
+                            "joint finish discovery post-Q record".to_string(),
+                            format!(
+                                "ungated writer advanced DISCOVERY past the original Q; \
+                                 post_q_detections=1, drained_records_this_credit={}",
+                                progress.records
+                            ),
+                        );
+                    }
                 }
                 if !progress.backlog {
                     finish.discovery = FinishDiscovery::AtQ;
@@ -4599,6 +4624,107 @@ impl LiveJointMachine {
                                 let since = *self.finish_no_progress_since.get_or_insert(now);
                                 let stalled = now.duration_since(since);
                                 if stalled >= JOINT_FINISH_NO_PROGRESS_TIMEOUT {
+                                    // Finish uses the running arm's
+                                    // watchdog park before it trips:
+                                    // delivery-stuck consumers degrade
+                                    // with counted loss and the frame
+                                    // continues past them; only a frame
+                                    // no park can unblock abandons the
+                                    // finish. The barrier scan and the
+                                    // park share the same bounded
+                                    // SCOPED_RECOVERY_SLICE reserve as
+                                    // the running arm (INV-2: no
+                                    // constant grows), either may yield
+                                    // and resume next tick, and a fresh
+                                    // stall clock covers the resumed
+                                    // frame.
+                                    let mut watchdog_budget =
+                                        crate::semantics_objects::journal::SCOPED_RECOVERY_SLICE;
+                                    let frontier =
+                                        coordinator.joint_capture().adapter().consumed_frontier();
+                                    let barrier = match self
+                                        .watchdog_barrier_decision
+                                        .as_ref()
+                                        .and_then(|decision| decision.matches(identity, frontier))
+                                    {
+                                        Some(barrier) => barrier,
+                                        None => {
+                                            let mut scan_budget = watchdog_budget;
+                                            let barrier = match coordinator
+                                                .joint_capture_mut()
+                                                .adapter_mut()
+                                                .has_seal_barrier_bounded(&mut scan_budget)
+                                            {
+                                                crate::semantics_objects::journal::BarrierCheck::Barrier => {
+                                                    true
+                                                }
+                                                crate::semantics_objects::journal::BarrierCheck::Clear => {
+                                                    false
+                                                }
+                                                crate::semantics_objects::journal::BarrierCheck::Yielded => {
+                                                    return (
+                                                        Phase::Audited {
+                                                            frame,
+                                                            identity,
+                                                            base,
+                                                        },
+                                                        Ok(Step::Yield),
+                                                    );
+                                                }
+                                            };
+                                            watchdog_budget = scan_budget;
+                                            self.watchdog_barrier_decision =
+                                                Some(WatchdogBarrierDecision {
+                                                    identity,
+                                                    frontier,
+                                                    barrier,
+                                                });
+                                            barrier
+                                        }
+                                    };
+                                    let parked = if barrier {
+                                        0
+                                    } else {
+                                        match frame.as_mut().map(|frame| {
+                                            frame.park_stuck_consumers_bounded(&mut watchdog_budget)
+                                        }) {
+                                            None | Some(
+                                                crate::semantics_objects::journal::joint_audit::ParkProgress::Done(
+                                                    0,
+                                                ),
+                                            ) => 0,
+                                            Some(
+                                                crate::semantics_objects::journal::joint_audit::ParkProgress::Done(
+                                                    parked,
+                                                ),
+                                            ) => parked,
+                                            Some(
+                                                crate::semantics_objects::journal::joint_audit::ParkProgress::Yielded,
+                                            ) => {
+                                                return (
+                                                    Phase::Audited {
+                                                        frame,
+                                                        identity,
+                                                        base,
+                                                    },
+                                                    Ok(Step::Yield),
+                                                );
+                                            }
+                                        }
+                                    };
+                                    if parked > 0 {
+                                        self.audit_no_progress_polls = 0;
+                                        self.finish_no_progress_polls = 0;
+                                        self.finish_no_progress_since = None;
+                                        return (
+                                            Phase::Audited {
+                                                frame,
+                                                identity,
+                                                base,
+                                            },
+                                            Ok(Step::Yield),
+                                        );
+                                    }
                                     let polls = self.finish_no_progress_polls;
                                     let watermarks = frame
                                         .as_ref()

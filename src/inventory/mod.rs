@@ -4348,7 +4348,8 @@ impl ClassicDriver<'_> {
         // cannot commit while the wedge stands, and this warning is the
         // user-visible name. Outside the counts once-gate: the wedge is
         // new information even past a counts disclosure.
-        if let Some(trip) = lane.joint_finish_no_progress_trip() {
+        let finish_trip = lane.joint_finish_no_progress_trip();
+        if let Some(trip) = finish_trip {
             // Staged calls left unsealed across the trip count
             // once as `watchdog_no_progress` at publication.
             coordinator.note_joint_watchdog_trip();
@@ -4357,6 +4358,13 @@ impl ClassicDriver<'_> {
                 trip.stalled.as_secs(),
                 trip.polls,
             ));
+        }
+        let running_trip = lane.joint_audit_no_progress_trip();
+        if !lane.is_finished() && finish_trip.is_none() && running_trip.is_none() {
+            // A non-watchdog stop/finish abandon is the same enumerable
+            // loss, under its own reason. The per-feed note is
+            // idempotent, so the forced finish below never recounts.
+            coordinator.note_joint_stop_unsealed();
         }
         // Abandon the unfinished Joint publication first: its prepared
         // frame can never resume past the latched machine, and every
@@ -4376,7 +4384,6 @@ impl ClassicDriver<'_> {
         // this never repeats per poll. Outside the counts once-gate,
         // beside the finish wedge above: the wedge is new
         // information even past a counts disclosure.
-        let running_trip = lane.joint_audit_no_progress_trip();
         if running_trip.is_some() {
             // Same watchdog count for a running (audit) trip: the
             // lane stops, so its staged calls never seal.
@@ -28985,6 +28992,11 @@ mod promotion_driver_tests {
             "the gap names the unmatched remainder: {}",
             gaps[0].reason
         );
+        assert_eq!(
+            driver.coordinator.joint_stop_unsealed_notes_for_test(),
+            2,
+            "the hold and the forced finish each pass through the idempotent count note"
+        );
     }
 
     #[test]
@@ -29624,6 +29636,81 @@ mod promotion_driver_tests {
             );
             let _ = take_warned_for_test();
         }
+    }
+
+    /// The generic non-watchdog exit-hold sink notes stop-unsealed
+    /// loss exactly on the untripped arm. A finish or running watchdog
+    /// trip keeps the watchdog reason instead; deleting the hold's
+    /// stop-note call fails the first row.
+    #[test]
+    fn hold_joint_lane_for_exit_notes_stop_unsealed_only_without_a_trip() {
+        use crate::inventory_semantics::AttestedSemanticLane;
+        struct ClearPosedTrips;
+        impl Drop for ClearPosedTrips {
+            fn drop(&mut self) {
+                AttestedSemanticLane::pose_no_progress_trip_for_test(None);
+                AttestedSemanticLane::pose_audit_no_progress_trip_for_test(None);
+            }
+        }
+        let _clear = ClearPosedTrips;
+        let trip = Some((9, std::time::Duration::from_secs(4)));
+        for (finish, audit, want) in [
+            (false, false, 1),
+            (true, false, 0),
+            (false, true, 0),
+            (true, true, 0),
+        ] {
+            AttestedSemanticLane::pose_no_progress_trip_for_test(finish.then_some(trip).flatten());
+            AttestedSemanticLane::pose_audit_no_progress_trip_for_test(
+                audit.then_some(trip).flatten(),
+            );
+            let mut coordinator = coordinator();
+            let mut display = None;
+            let mut warn = WarnSink {
+                display: &mut display,
+            };
+            let _ = ClassicDriver::hold_joint_lane_for_exit(
+                joint_lane(WindDownIo::completing(), false),
+                &mut coordinator,
+                "stop-unsealed arm",
+                "joint finish abandoned for exit",
+                &mut warn,
+                None,
+            );
+            assert_eq!(
+                coordinator.joint_stop_unsealed_notes_for_test(),
+                want,
+                "finish trip {finish}, audit trip {audit}: stop-unsealed notes"
+            );
+            let _ = take_warned_for_test();
+        }
+    }
+
+    /// The forced finish of an unlatched lane notes the same count at
+    /// its own site. The note is a coordinator pass over idempotent
+    /// per-feed latches; the exact typed row equality lives in the
+    /// key-operation registry tests.
+    #[test]
+    fn finish_unfinished_held_lane_notes_stop_unsealed_once() {
+        let mut coordinator = coordinator();
+        let mut lane = joint_lane(WindDownIo::completing(), false);
+        lane.mark_collected_finish_requested();
+        assert!(
+            lane.finish_unfinished_held_lane(&mut coordinator, "second stop during joint finish")
+                .is_some(),
+            "the requested unfinished lane finishes"
+        );
+        assert_eq!(
+            coordinator.joint_stop_unsealed_notes_for_test(),
+            1,
+            "the forced finish passes through the count note exactly once"
+        );
+        assert!(
+            lane.finish_unfinished_held_lane(&mut coordinator, "second stop during joint finish")
+                .is_none(),
+            "an already-finished lane does not repeat the note"
+        );
+        assert_eq!(coordinator.joint_stop_unsealed_notes_for_test(), 1);
     }
 
     #[test]

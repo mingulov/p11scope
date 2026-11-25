@@ -211,7 +211,8 @@ SECTION_KEYS = {"version", "revision", "status", "reason", "sessions", "objects"
 SECTION_KEYS_V3 = SECTION_KEYS | {"unattributed"}
 UNATTRIBUTED_REASONS = ("started_before_attach", "record_lost",
                         "foreign_or_unproven_caller", "session_state_lost",
-                        "watchdog_no_progress", "unmodelled_call_shape",
+                        "watchdog_no_progress", "stopped_unsealed",
+                        "unmodelled_call_shape",
                         "proof_refused_fallback")
 UNATTRIBUTED_ROW_KEYS = {"reason", "count"}
 SESSION_ROW_KEYS = {"session", "origin", "status"}

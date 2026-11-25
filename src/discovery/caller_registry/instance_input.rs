@@ -1641,6 +1641,7 @@ pub(crate) struct FoldedJointEvidence {
     history_disposed: u64,
     degraded_loss_direct: u64,
     watchdog_unsealed: u64,
+    stop_unsealed: u64,
     unsealable_direct: u64,
     fallback_replayed: u64,
     degraded_fallback_direct: u64,
@@ -1667,6 +1668,7 @@ impl FoldedJointEvidence {
         self.watchdog_unsealed = self
             .watchdog_unsealed
             .saturating_add(feed.watchdog_unsealed());
+        self.stop_unsealed = self.stop_unsealed.saturating_add(feed.stop_unsealed());
         self.unsealable_direct = self
             .unsealable_direct
             .saturating_add(feed.unsealable_direct());
@@ -1679,6 +1681,7 @@ impl FoldedJointEvidence {
         self.lost = self.lost
             || feed.degraded_loss()
             || feed.watchdog_tripped()
+            || feed.stop_unsealed_lost()
             || feed.history_disposed_since_resume() > 0;
         self.fallback = self.fallback || feed.fell_back();
         self.joint_history = self.joint_history || feed.mode() == FeedMode::Joint;
@@ -1687,7 +1690,7 @@ impl FoldedJointEvidence {
     /// The folded counters as named unattributed rows, in the frozen
     /// publication order, with the same reason mapping as the live
     /// feed projection. Zero reasons are omitted by the caller.
-    pub(crate) fn rows(&self) -> [(&'static str, u64); 5] {
+    pub(crate) fn rows(&self) -> [(&'static str, u64); 6] {
         [
             ("started_before_attach", self.pre_attach_direct),
             (
@@ -1696,6 +1699,7 @@ impl FoldedJointEvidence {
                     .saturating_add(self.degraded_loss_direct),
             ),
             ("watchdog_no_progress", self.watchdog_unsealed),
+            ("stopped_unsealed", self.stop_unsealed),
             ("unmodelled_call_shape", self.unsealable_direct),
             (
                 "proof_refused_fallback",
@@ -3257,6 +3261,17 @@ impl CallerRegistry {
     pub(crate) fn note_joint_watchdog_trip(&mut self) {
         for record in self.instance_state.semantics.values_mut() {
             if record.feed.note_watchdog_trip() {
+                self.joint_feeds = self.joint_feeds.saturating_sub(1);
+            }
+        }
+    }
+
+    /// Note the lane stop/finish on every retained feed: staged calls
+    /// no seal will now settle count once as `stopped_unsealed` at
+    /// publication. Idempotent per feed.
+    pub(crate) fn note_joint_stop_unsealed(&mut self) {
+        for record in self.instance_state.semantics.values_mut() {
+            if record.feed.note_stop_unsealed() {
                 self.joint_feeds = self.joint_feeds.saturating_sub(1);
             }
         }

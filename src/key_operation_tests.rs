@@ -24371,6 +24371,142 @@ fn key_operation_watchdog_trip_conserves_across_later_loss_seal_and_stage() {
     );
 }
 
+/// Staged calls left unsealed by a non-watchdog stop/finish count
+/// once as `stopped_unsealed` at publication. The note is idempotent;
+/// the healthy twin with no note publishes no row.
+#[test]
+fn key_operation_stop_unsealed_staged_calls_count() {
+    for noted in [false, true] {
+        let mut scene = JointScene::new();
+        let bootstrap = scene.bootstrap();
+        let mut staging = JointStaging::select_joint(Some(&bootstrap));
+        let keyuse = KeyUseReducer::new();
+        for call in sign_flow()[1..3].iter() {
+            prepare_call(&mut scene, &mut staging, call);
+        }
+        assert_eq!(staging.staged_len(), 2, "both calls stay staged");
+        if noted {
+            staging.note_stop_unsealed();
+            staging.note_stop_unsealed();
+        }
+        let observations = commit(73, &[&staging], &scene.model.project(), &keyuse);
+        if noted {
+            assert_eq!(
+                observations.unattributed,
+                vec![crate::key_operation_projection::UnattributedRow {
+                    reason: "stopped_unsealed",
+                    count: 2,
+                }],
+                "unsealed staged calls count under the stop reason: {:?}",
+                observations.unattributed
+            );
+            assert_eq!(staging.staged_len(), 0, "the note takes the staged calls");
+            assert_eq!(staging.stop_unsealed(), 2);
+        } else {
+            assert!(
+                observations
+                    .unattributed
+                    .iter()
+                    .all(|row| row.reason != "stopped_unsealed"),
+                "healthy twin: no stop count without the note: {:?}",
+                observations.unattributed
+            );
+            assert_eq!(staging.stop_unsealed(), 0);
+        }
+    }
+}
+
+/// Stop conservation mirrors the watchdog segment close: nothing
+/// staged before the stop can seal or dispose twice, a later call
+/// cannot stage, and its direct reduction counts once under the same
+/// reason. attributed + unattributed == observed.
+#[test]
+fn key_operation_stop_unsealed_conserves_across_later_loss_seal_and_stage() {
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(4);
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut edge = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    let flow = sign_flow();
+    for call in flow[0..3].iter() {
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut edge,
+            &mut keyuse,
+            &mut sink,
+            call,
+        );
+    }
+    for call in flow[3..5].iter() {
+        prepare_call(&mut scene, &mut staging, call);
+    }
+    staging.note_stop_unsealed();
+    staging.note_stop_unsealed();
+    if let Ok(success) = scene.seal() {
+        let _ = staging.apply_seal(
+            &success,
+            &scene.model,
+            scene.adapter.ledger_mut(),
+            &mut edge,
+            &mut keyuse,
+            instance,
+            &mut sink,
+            None,
+        );
+    }
+    assert_eq!(staging.reduced(), 3, "no post-stop seal replays");
+    assert_eq!(
+        staging.dispose_below_barrier(None, Some(scene.adapter.ledger_mut())),
+        0,
+        "no post-stop loss disposes the same calls"
+    );
+    let admitted = admit_call_input(&mut scene, &flow[5]);
+    let facts = admitted.s1_facts().clone();
+    let origin = EffectOrigin::from(&facts);
+    assert!(
+        staging
+            .stage(
+                facts.clone(),
+                origin,
+                admitted.h0_ordinal(),
+                scene.adapter.ledger_mut()
+            )
+            .is_err(),
+        "no stage after the stop"
+    );
+    staging.note_direct_reduction(&facts.function);
+    assert!(!staging.resume_joint(), "a stopped feed never resumes");
+    let observations = commit(74, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(
+        observations.unattributed,
+        vec![crate::key_operation_projection::UnattributedRow {
+            reason: "stopped_unsealed",
+            count: 3,
+        }],
+        "{:?}",
+        observations.unattributed
+    );
+    assert_eq!(
+        staging.reduced()
+            + observations
+                .unattributed
+                .iter()
+                .map(|row| row.count)
+                .sum::<u64>(),
+        6,
+        "conservation: attributed + unattributed = observed"
+    );
+    assert_eq!(
+        (observations.status, observations.reason),
+        (ObsStatus::Partial, "authority_lost"),
+        "a stop with unsealed calls is partial, its exact rows kept"
+    );
+}
+
 /// v0.7.0 issue 3: a clean resume clears the `authority_lost` latch.
 /// Real loss latches first (partial, reason named, the disposed call
 /// counted); after the feed resumes Joint at a clean point the
@@ -26762,6 +26898,73 @@ fn key_operation_registry_watchdog_trip_counts_staged_joint_calls() {
         }],
         "the two unsealed staged calls count once each: {:?}",
         after.unattributed
+    );
+    let proved_signs: u64 = after
+        .key_operations
+        .iter()
+        .filter(|row| row.category == "sign")
+        .map(|row| row.completed)
+        .sum();
+    assert_eq!(proved_signs, 1, "the sealed sign keeps its row");
+}
+
+/// Registry level of the non-watchdog stop/finish note: calls a
+/// Joint feed staged but never saw sealed count once as
+/// `stopped_unsealed` (noted twice: once), the section degrades with
+/// lost authority, and nothing counts before the note.
+#[test]
+fn key_operation_registry_stop_unsealed_counts_staged_joint_calls() {
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    assert!(
+        guarded
+            .registry
+            .install_joint_receipt(joint_key.clone(), bootstrap)
+    );
+    let (_, joint_id) = guarded.register(1);
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &init),
+        SealApplyOutcome::ReplayedOne
+    );
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &sign),
+        SealApplyOutcome::ReplayedOne
+    );
+    for shape in [&init, &sign] {
+        let (facts, position) = guarded.admit_shape(shape);
+        guarded.observe(&joint_key, position, facts);
+        guarded
+            .registry
+            .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    }
+    let before = guarded.registry.joint_observations(82);
+    assert!(
+        before
+            .unattributed
+            .iter()
+            .all(|row| row.reason != "stopped_unsealed"),
+        "healthy twin: no stop count before the note: {:?}",
+        before.unattributed
+    );
+    guarded.registry.note_joint_stop_unsealed();
+    guarded.registry.note_joint_stop_unsealed();
+    let after = guarded.registry.joint_observations(83);
+    assert_eq!(
+        after.unattributed,
+        vec![crate::key_operation_projection::UnattributedRow {
+            reason: "stopped_unsealed",
+            count: 2,
+        }],
+        "the two unsealed staged calls count once each: {:?}",
+        after.unattributed
+    );
+    assert_eq!(
+        (after.status, after.reason),
+        (ObsStatus::Partial, "authority_lost"),
+        "counted stop loss degrades the section, never voids it"
     );
     let proved_signs: u64 = after
         .key_operations

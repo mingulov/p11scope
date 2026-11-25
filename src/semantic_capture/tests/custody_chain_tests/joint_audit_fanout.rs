@@ -1915,6 +1915,8 @@ impl MachineScene {
                 .discovery_domain(),
             calls: Cell::new(0),
             progressed_for,
+            post_q_once: false,
+            backlog: true,
         };
         let result = self.machine.poll_finish_with_io(
             &mut self.scene.real.lane,
@@ -1923,6 +1925,38 @@ impl MachineScene {
             &mut budget,
         );
         (result, script.calls.get())
+    }
+
+    /// Poll Finish discovery once through the scripted IO, reporting
+    /// one post-Q detection and no backlog. Later polls use the real
+    /// held IO again, so the same machine can complete its Finish.
+    fn poll_finish_discovery_post_q_once(
+        &mut self,
+    ) -> Result<crate::discovery::engine::inventory_coordinator::JointCommitProgress, SemanticRefusal>
+    {
+        let mut budget = crate::inventory_semantics::JointWorkBudget {
+            remaining_actions: 1,
+            deadline: Instant::now() + Duration::from_secs(10),
+        };
+        let mut script = DiscoveryScriptIo {
+            producers: &self.scene.producers,
+            discovery: self
+                .finish
+                .as_ref()
+                .expect("finish fixture enabled")
+                .observer
+                .discovery_domain(),
+            calls: Cell::new(0),
+            progressed_for: 0,
+            post_q_once: true,
+            backlog: false,
+        };
+        self.machine.poll_finish_with_io(
+            &mut self.scene.real.lane,
+            &mut self.scene.real.scene.coordinator,
+            &mut script,
+            &mut budget,
+        )
     }
 
     fn reach_finish_stop_ready(&mut self) {
@@ -3100,17 +3134,20 @@ fn no_progress_gaps(fixture: &MachineScene) -> Vec<(String, String)> {
         .collect()
 }
 
-/// A finish whose Audited polls stop making progress must end
-/// finitely: after the wall-time bound it bails with a named,
-/// disclosed refusal instead of polling Pending forever. The posed
-/// stall stands in for the live-only H3 veto (held scenes always
-/// resolve it): rapid polls alone must never trip (the horizon is
-/// wall time, identical on the retained wait and the winding tick
-/// path), while a stall past the bound trips on its next poll. The
-/// bound, the gap, the recorded trip cause and the kept tags are
-/// what this pins. The unposed control publishes normally.
+/// A finish whose Audited polls stop making progress parks its
+/// delivery-stuck consumers before it may trip: the Finish runs the
+/// same bounded barrier scan and park as the running arm inside the
+/// shared SCOPED_RECOVERY_SLICE reserve, so one stuck consumer degrades
+/// with the counted park gap while the complete consumer publishes and
+/// the Finish completes PARTIAL — never the whole-frame abandon the
+/// pre-park shape pinned. Rapid polls alone and a stall just under the
+/// wall-time bound still neither park nor trip; the over-bound poll
+/// parks the streaked consumer, resets the stall clock and yields, and
+/// once the wedge clears the frame completes past its parked consumer
+/// with no `joint finish made no progress` gap and no recorded trip.
+/// The unposed twin publishes whole with count 0.
 #[test]
-fn joint_machine_finish_no_progress_bound_refuses_with_named_gap() {
+fn joint_machine_finish_no_progress_bound_parks_with_counted_gap() {
     use crate::discovery::engine::inventory_coordinator::JointCommitProgress;
     // The bound is 6 s (the retained 600-poll horizon at the 10 ms
     // retained cadence). One posed poll takes microseconds, so a
@@ -3118,18 +3155,29 @@ fn joint_machine_finish_no_progress_bound_refuses_with_named_gap() {
     let bound = std::time::Duration::from_secs(6);
     let margin = std::time::Duration::from_millis(100);
     for wedged in [true, false] {
-        let mut fixture = MachineScene::new(1);
-        fixture.prime(1);
-        fixture.scene.push(std::process::id(), 0, "C_SignInit", 2);
-        fixture.published_labeled("Finish stall-prefix Init", None);
-        assert_eq!(fixture.reduced(), [2]);
-        fixture.scene.push(std::process::id(), 0, "C_SignFinal", 3);
+        let files = 1usize;
+        let mut fixture = MachineScene::new(files);
+        fixture.prime(files);
+        let pid = std::process::id();
+        // One published prefix call per file establishes its feed;
+        // one final call per file forms the finish quantum, so the
+        // wedged twin's frame holds two independent consumers.
+        for file in 0..files {
+            fixture
+                .scene
+                .push(pid, file as u32, "C_SignInit", 2 + file as u64);
+        }
+        fixture.published_labeled("Finish park-prefix Init", None);
+        for file in 0..files {
+            fixture
+                .scene
+                .push(pid, file as u32, "C_SignFinal", 10 + file as u64);
+        }
         fixture.enable_finish_fixture(Vec::new());
         fixture.begin_finish().unwrap();
-        fixture.machine.pose_no_progress_poll_for_test(wedged);
         if wedged {
             // Drive to Audited first (bounded): discovery and the
-            // advance take a handful of polls, none of them stalls.
+            // advance take a handful of polls.
             for _ in 0..700 {
                 if fixture.machine.diagnostic_snapshot_for_test().0 == "Audited" {
                     break;
@@ -3144,98 +3192,136 @@ fn joint_machine_finish_no_progress_bound_refuses_with_named_gap() {
                 "Audited",
                 "the stall is posed in Audited"
             );
-            let mut audited_polls = 0u64;
-            // Rapid polls alone never trip: 650 posed polls (past
-            // the old 600-poll count) stay Pending with no gap and
-            // no latch, since only milliseconds elapse.
-            for n in 0..650 {
-                assert_eq!(
-                    fixture.machine.diagnostic_snapshot_for_test().0,
-                    "Audited",
-                    "the posed stall stays Audited (rapid poll {n})"
-                );
+            // Delivery-stuck consumer, real-stall shape: drive past
+            // the first Audited poll so the frame's consumers stand,
+            // then pose the persistent delivery failure on one feed.
+            // The stall below is the real one — the stuck consumer is
+            // why the finish stops making progress — never the
+            // all-polls-posed shape, which has nothing to park.
+            for _ in 0..64 {
+                if !fixture.machine.frame_consumer_states_for_test().is_empty() {
+                    break;
+                }
                 match fixture.poll_finish(1) {
-                    Ok(JointCommitProgress::Pending) => audited_polls += 1,
-                    other => panic!("rapid poll {n} must stay Pending: {other:?}"),
+                    Ok(JointCommitProgress::Pending) => {}
+                    other => panic!("consumers must stand before the stall: {other:?}"),
                 }
             }
             assert!(
-                no_progress_gaps(&fixture).is_empty(),
-                "rapid polls disclose no wedge gap"
+                !fixture.machine.frame_consumer_states_for_test().is_empty(),
+                "the finish frame's consumers stand"
             );
-            assert!(
-                !fixture.machine.finish_disposition_required(),
-                "rapid polls latch nothing"
-            );
-            assert_eq!(
-                fixture.machine.finish_no_progress_trip_for_test(),
-                None,
-                "rapid polls record no trip"
-            );
-            // Just under the bound stays Pending.
-            fixture.machine.set_finish_no_progress_since_for_test(Some(
-                std::time::Instant::now() - (bound - margin),
-            ));
-            match fixture.poll_finish(1) {
-                Ok(JointCommitProgress::Pending) => audited_polls += 1,
-                other => panic!("the just-under stall must stay Pending: {other:?}"),
+            let target = fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .registry()
+                .joint_history_targets()
+                .next()
+                .expect("one finish target")
+                .0;
+            let failure = fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture()
+                .adapter()
+                .scripted_failure(
+                    crate::semantics_objects::journal::JournalGap::BoundNotReady,
+                    target.bootstrap(),
+                    crate::semantics_objects::ObjectEffects::default(),
+                );
+            fixture.machine.pose_frame_failure_for_test(failure);
+            let mut streaked = false;
+            for _ in 0..64 {
+                match fixture.poll_finish(1) {
+                    Ok(JointCommitProgress::Pending) => {}
+                    other => panic!("the redelivery failure must pend: {other:?}"),
+                }
+                if fixture
+                    .machine
+                    .frame_consumer_states_for_test()
+                    .iter()
+                    .any(|state| state.2 > 0)
+                {
+                    streaked = true;
+                    break;
+                }
             }
-            assert!(
-                no_progress_gaps(&fixture).is_empty(),
-                "the just-under stall discloses no wedge gap"
-            );
-            assert!(
-                !fixture.machine.finish_disposition_required(),
-                "the just-under stall latches nothing"
-            );
-            // Just over the bound trips on the next poll.
+            assert!(streaked, "the failure streaks one consumer");
+            // The over-bound stall fires the park instead of the
+            // abandon: the streaked consumer parks inside the shared
+            // reserve, the stall clock resets and the poll yields.
             fixture.machine.set_finish_no_progress_since_for_test(Some(
                 std::time::Instant::now() - (bound + margin),
             ));
             match fixture.poll_finish(1) {
-                Err(SemanticRefusal::Unavailable) => audited_polls += 1,
-                other => panic!("the over-bound stall must refuse: {other:?}"),
+                Ok(JointCommitProgress::Pending) => {}
+                other => panic!("the over-bound stall must park, not refuse: {other:?}"),
             }
-            // The wedged publication stands in front of the commit (as
-            // with every mid-publication error), so the gap stages but
-            // cannot commit here; the staged pair is the disclosure the
-            // next commit carries.
-            let gaps = no_progress_gaps(&fixture);
-            assert_eq!(gaps.len(), 1, "the refusal is disclosed exactly once");
+            assert!(
+                fixture
+                    .machine
+                    .frame_consumer_states_for_test()
+                    .iter()
+                    .any(|state| state.3),
+                "the over-bound stall parks the streaked consumer"
+            );
+            assert!(
+                no_progress_gaps(&fixture).is_empty(),
+                "the park discloses no finish abandon gap"
+            );
             assert_eq!(
-                gaps[0].1,
-                format!(
-                    "6s without progress across {audited_polls} consecutive finish polls in \
-                     Audited; abandoning the finish for exit; \
-                     h0_below=Some(4), staged_max=Some(3), floor=None"
-                ),
-                "the gap names the stall in time"
+                fixture.machine.finish_no_progress_trip_for_test(),
+                None,
+                "the park records no trip"
             );
-            let trip = fixture
-                .machine
-                .finish_no_progress_trip_for_test()
-                .expect("the trip records its cause for the exit hold");
+            assert!(
+                !fixture.machine.finish_disposition_required(),
+                "the park latches no refusal"
+            );
+            // The frame completes past its parked consumer and the
+            // Finish publishes PARTIAL with the counted loss instead
+            // of abandoning.
+            let mut published = false;
+            for _ in 0..700 {
+                match fixture.poll_finish(1) {
+                    Ok(JointCommitProgress::Published(_)) => {
+                        published = true;
+                        break;
+                    }
+                    Ok(JointCommitProgress::Pending) => {}
+                    Err(reason) => panic!("the parked finish must publish: {reason:?}"),
+                }
+            }
+            assert!(published, "the frame completes past its parked consumer");
+            assert!(
+                no_progress_gaps(&fixture).is_empty(),
+                "the published finish never abandons"
+            );
             assert_eq!(
-                trip.polls, audited_polls as u32,
-                "the trip counts every consecutive stall poll"
+                fixture.machine.finish_no_progress_trip_for_test(),
+                None,
+                "the published finish records no trip"
+            );
+            // The counted loss is exact: the parked consumer carried
+            // the one final call of its feed; the healthy file's feed
+            // degrades nothing.
+            assert!(
+                watchdog_feed_states(&fixture, 0)
+                    .iter()
+                    .any(|(_, state)| state.4 || state.5 || state.6 > 0),
+                "the parked consumer's feed carries its counted loss"
             );
             assert!(
-                trip.stalled >= bound,
-                "the trip stalls at least the bound: {:?}",
-                trip.stalled
-            );
-            let audit = fixture.machine.diagnostic_audit_for_test();
-            assert!(
-                audit.is_some_and(|(_, h3, _, _, _)| h3 == "Clean"),
-                "the retained audit tags are kept: {audit:?}"
-            );
-            assert!(
-                fixture.machine.finish_disposition_required(),
-                "the refusal latches the finish disposition"
-            );
-            assert!(
-                fixture.machine.finish_begun(),
-                "the finish retains its control past the refusal"
+                watchdog_scope_gaps(&fixture)
+                    .iter()
+                    .any(|(subject, reason)| subject == "joint stuck consumer parked"
+                        && reason.ends_with("(1 calls)")),
+                "the park stages its counted gap exactly: {:?}",
+                watchdog_scope_gaps(&fixture)
             );
         } else {
             let mut published = false;
@@ -3267,9 +3353,119 @@ fn joint_machine_finish_no_progress_bound_refuses_with_named_gap() {
                     .all(|gap| gap.subject != "joint finish made no progress"),
                 "the healthy finish discloses no wedge gap"
             );
+            assert!(
+                watchdog_feed_states(&fixture, 0)
+                    .iter()
+                    .all(|(_, state)| !state.5),
+                "the healthy finish degrades nothing (count 0)"
+            );
             assert!(fixture.scene.real.lane.is_finished());
         }
     }
+}
+
+/// The zero-park control: a wedged finish whose frame holds no
+/// delivery-stuck consumer still trips past the wall-time bound,
+/// because the bounded park has nothing to unblock. The park-first
+/// order is the mutation this pins: delete the park arm and this test
+/// still passes, but the park twin above fails; delete the zero-park
+/// trip and this one fails. The gap names the stall in time with the
+/// exact pinned shape, the trip records its cause for the exit hold,
+/// and the audit tags survive for the abandon.
+#[test]
+fn joint_machine_finish_no_progress_without_parkable_consumers_trips() {
+    use crate::discovery::engine::inventory_coordinator::JointCommitProgress;
+    let bound = std::time::Duration::from_secs(6);
+    let margin = std::time::Duration::from_millis(100);
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 2);
+    fixture.published_labeled("Finish stall-prefix Init", None);
+    assert_eq!(fixture.reduced(), [2]);
+    fixture.scene.push(std::process::id(), 0, "C_SignFinal", 3);
+    fixture.enable_finish_fixture(Vec::new());
+    fixture.begin_finish().unwrap();
+    fixture.machine.pose_no_progress_poll_for_test(true);
+    for _ in 0..700 {
+        if fixture.machine.diagnostic_snapshot_for_test().0 == "Audited" {
+            break;
+        }
+        match fixture.poll_finish(1) {
+            Ok(JointCommitProgress::Pending) => {}
+            other => panic!("must reach Audited before the bound: {other:?}"),
+        }
+    }
+    assert_eq!(
+        fixture.machine.diagnostic_snapshot_for_test().0,
+        "Audited",
+        "the stall is posed in Audited"
+    );
+    let mut audited_polls = 0u64;
+    for n in 0..650 {
+        match fixture.poll_finish(1) {
+            Ok(JointCommitProgress::Pending) => audited_polls += 1,
+            other => panic!("rapid poll {n} must stay Pending: {other:?}"),
+        }
+    }
+    assert!(
+        no_progress_gaps(&fixture).is_empty(),
+        "rapid polls disclose no wedge gap"
+    );
+    fixture
+        .machine
+        .set_finish_no_progress_since_for_test(Some(std::time::Instant::now() - (bound - margin)));
+    match fixture.poll_finish(1) {
+        Ok(JointCommitProgress::Pending) => audited_polls += 1,
+        other => panic!("the just-under stall must stay Pending: {other:?}"),
+    }
+    assert!(
+        no_progress_gaps(&fixture).is_empty(),
+        "the just-under stall discloses no wedge gap"
+    );
+    fixture
+        .machine
+        .set_finish_no_progress_since_for_test(Some(std::time::Instant::now() - (bound + margin)));
+    match fixture.poll_finish(1) {
+        Err(SemanticRefusal::Unavailable) => audited_polls += 1,
+        other => panic!("the zero-park stall must refuse: {other:?}"),
+    }
+    let gaps = no_progress_gaps(&fixture);
+    assert_eq!(gaps.len(), 1, "the refusal is disclosed exactly once");
+    assert_eq!(
+        gaps[0].1,
+        format!(
+            "6s without progress across {audited_polls} consecutive finish polls in \
+             Audited; abandoning the finish for exit; \
+             h0_below=Some(4), staged_max=Some(3), floor=None"
+        ),
+        "the gap names the stall in time"
+    );
+    let trip = fixture
+        .machine
+        .finish_no_progress_trip_for_test()
+        .expect("the trip records its cause for the exit hold");
+    assert_eq!(
+        trip.polls, audited_polls as u32,
+        "the trip counts every consecutive stall poll"
+    );
+    assert!(
+        trip.stalled >= bound,
+        "the trip stalls at least the bound: {:?}",
+        trip.stalled
+    );
+    let audit = fixture.machine.diagnostic_audit_for_test();
+    assert!(
+        audit.is_some_and(|(_, h3, _, _, _)| h3 == "Clean"),
+        "the retained audit tags are kept: {audit:?}"
+    );
+    assert!(
+        fixture.machine.finish_disposition_required(),
+        "the refusal latches the finish disposition"
+    );
+    assert!(
+        fixture.machine.finish_begun(),
+        "the finish retains its control past the refusal"
+    );
 }
 
 /// The staged "joint audit made no progress" gaps on a fixture.
@@ -4662,6 +4858,90 @@ fn joint_machine_abandon_finishes_an_applied_publication() {
         .coordinator
         .commit_batch(false)
         .expect("a later plain commit succeeds past the abandoned publication");
+}
+
+#[test]
+fn joint_machine_abandon_force_finishes_applied_publication_without_frame() {
+    use crate::inventory_semantics::JointServiceProgress;
+    // S6: the exit hold can reach an applied publication after its
+    // frame is already gone (a complete-publication bail). The abandon
+    // must force-close the registry phase instead of leaving it open:
+    // no later plain commit refuses, the gap always lands, and it
+    // carries the exact nonzero applied-mutation count.
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    let pid = std::process::id();
+    fixture.scene.push(pid, 0, "C_SignInit", 2);
+    fixture.scene.push(pid, 0, "C_SignUpdate", 3);
+    fixture.scene.push(pid, 0, "C_SignFinal", 4);
+    fixture.reach_phase("Audited");
+    let mut applied = false;
+    for _ in 0..64 {
+        match fixture.service(1) {
+            Ok(JointServiceProgress::Published) => break,
+            Ok(JointServiceProgress::Pending) => {}
+            Err(reason) => panic!("the healthy commit must not refuse: {reason:?}"),
+        }
+        if fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .joint_publication_applied()
+        {
+            applied = true;
+            break;
+        }
+    }
+    assert!(applied, "the publication applies before the frame is lost");
+    assert!(fixture.scene.real.scene.coordinator.publication_pending());
+    {
+        let scene = &mut fixture.scene.real;
+        scene
+            .scene
+            .coordinator
+            .abandon_unfinished_joint_publication(
+                &mut scene.lane,
+                None,
+                "test abandon without frame".to_string(),
+            );
+    }
+    assert!(
+        !fixture.scene.real.scene.coordinator.publication_pending(),
+        "the forced abandon clears the applied publication"
+    );
+    let gaps = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .staged_scope_gaps_for_test();
+    let gap = gaps
+        .iter()
+        .find(|(subject, _)| subject == "unfinished joint publication abandoned")
+        .expect("the forced abandon stages its named gap");
+    assert!(
+        gap.1.contains("forced completion: retained frame missing"),
+        "the gap names the missing frame: {}",
+        gap.1
+    );
+    let applied_count = gap
+        .1
+        .split("applied=")
+        .nth(1)
+        .and_then(|tail| tail.split([';', ' ', ',']).next())
+        .and_then(|digits| digits.parse::<usize>().ok())
+        .expect("the gap carries its applied count");
+    assert!(applied_count > 0, "an applied publication count is nonzero");
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .commit_batch(false)
+        .expect("a later plain commit succeeds past the forced close");
 }
 
 #[test]
@@ -36504,6 +36784,8 @@ struct DiscoveryScriptIo<'a> {
     discovery: &'a crate::events::DiscoveryDomain,
     calls: Cell<usize>,
     progressed_for: usize,
+    post_q_once: bool,
+    backlog: bool,
 }
 
 impl crate::inventory_semantics::JointMachineIo for DiscoveryScriptIo<'_> {
@@ -36525,8 +36807,8 @@ impl crate::inventory_semantics::JointMachineIo for DiscoveryScriptIo<'_> {
         self.calls.set(self.calls.get() + 1);
         Ok(crate::inventory_semantics::LaneDrainOutcome {
             records: 0,
-            post_q: false,
-            backlog: true,
+            post_q: self.post_q_once && self.calls.get() == 1,
+            backlog: self.backlog,
             failed: false,
         })
     }
@@ -37147,6 +37429,64 @@ fn joint_machine_finish_progress_without_records_is_not_capped() {
     let (result, calls) = idle.poll_finish_discovery_scripted(1024, 0);
     assert!(matches!(result, Ok(JointCommitProgress::Pending)));
     assert_eq!(calls, 64, "idle credits yield after exactly 64");
+}
+
+/// S5: a post-Q discovery record at Finish is terminal evidence, not
+/// a whole-Finish refusal. The machine names one detection, continues
+/// the same Finish to publication, and the lane completes PARTIAL
+/// (`final_drain=false`). The clean twin keeps a proven final drain.
+#[test]
+fn joint_machine_finish_post_q_discovery_degrades_and_publishes() {
+    use crate::discovery::engine::inventory_coordinator::JointCommitProgress;
+    for post_q in [false, true] {
+        let mut fixture = MachineScene::new(1);
+        fixture.prime(1);
+        fixture.scene.push(std::process::id(), 0, "C_SignInit", 2);
+        fixture.enable_finish_fixture(Vec::new());
+        fixture.begin_finish().unwrap();
+        // Observe Q first, then inject exactly the discovery-credit
+        // outcome the live drain reports when its producer crosses Q.
+        match fixture.poll_finish(1) {
+            Ok(JointCommitProgress::Pending) => {}
+            other => panic!("Q observation must pend first: {other:?}"),
+        }
+        if post_q {
+            match fixture.poll_finish_discovery_post_q_once() {
+                Ok(JointCommitProgress::Pending) => {}
+                other => panic!("post-Q must not refuse the Finish: {other:?}"),
+            }
+        }
+        fixture.finish_published();
+        let summary = fixture.scene.real.lane.semantic_summary();
+        assert_eq!(
+            summary.final_drain,
+            Some(!post_q),
+            "post-Q falsifies the drain proof exactly once"
+        );
+        let gaps = watchdog_scope_gaps(&fixture);
+        assert_eq!(
+            gaps.iter()
+                .filter(|(subject, _)| subject == "joint finish discovery post-Q record")
+                .count(),
+            usize::from(post_q),
+            "the detection is named exactly on the post-Q twin: {gaps:?}"
+        );
+        if post_q {
+            let reason = &gaps
+                .iter()
+                .find(|(subject, _)| subject == "joint finish discovery post-Q record")
+                .unwrap()
+                .1;
+            assert!(
+                reason.contains("post_q_detections=1"),
+                "the gap carries the exact detection count: {reason}"
+            );
+        }
+        assert!(
+            !fixture.machine.finish_disposition_required(),
+            "the Finish never latches a refusal"
+        );
+    }
 }
 
 /// With a grant-less Q, the machine's own Raw-minted grant is

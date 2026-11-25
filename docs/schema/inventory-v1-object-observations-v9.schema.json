@@ -1442,6 +1442,7 @@
             "foreign_or_unproven_caller",
             "session_state_lost",
             "watchdog_no_progress",
+            "stopped_unsealed",
             "unmodelled_call_shape",
             "proof_refused_fallback"
           ]

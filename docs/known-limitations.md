@@ -743,23 +743,26 @@ omits the length programs); when the sizes start fails — for
 example a length program the verifier refuses — the journal retries
 without sizes behind a `key sizes unavailable` gap and key rows
 continue without operation-length sizes. The Task 4 privacy canary
-for `--key-sizes` passed on 2026-11-24 (Fedora kernel 7.2.9): the
-committed cell passed 3/3 at rev c6f684673, after 6/6 across earlier
-verdict revisions with a manual map supplement. A live `inventory
---pid --capture native --key-operations --key-sizes --verbose`
-capture over a sentinel-guarded sign+verify workload (pure repeated
-64-byte `K3YS1Z3CANARY!` guards around the S length cell and the V
-buffers, marked message inputs) found the marker in none of the JSON
-report, the event log, the verbose observer log or any of the 66
-dumpable BPF maps owned by the observer (raw+hex scan, including
-`EVIDENCE_START`), while both RSA-2048 sizes published from
-`sign_output`/`verify_input` evidence. The `EVENTS`/`DISCOVERY`/`INFO`
-ringbufs are not bpftool-dumpable and are covered via the scanned
-outputs they drain into; the task-storage identity maps are likewise
-undumpable, hold minted identity words only, and are never read.
-Positive controls on every scanner (an injected marker copy each must
-find) and the mirrored size verdict keep the cell non-vacuous; the
-committed cell is
+for `--key-sizes` passed on 2026-11-25 (Fedora kernel 7.2.9): the
+committed cell passed 3/3 at rev 727c1b302, after 3/3 at c6f684673
+and 6/6 across earlier verdict revisions with a manual map supplement.
+A live `inventory --pid --capture native --key-operations --key-sizes
+--verbose` capture over a sentinel-guarded sign+verify workload (pure
+repeated 64-byte `K3YS1Z3CANARY!` guards around the S length cell and
+the V buffers, marked message inputs) found the marker in none of the
+JSON report, the event log, the verbose observer log or any of the 66
+dumpable BPF maps owned by the observer (`bpftool -j` raw-cell scan
+of a snapshot after the workload, including `EVIDENCE_START`), while
+both RSA-2048 sizes published from `sign_output`/`verify_input`
+evidence. The `EVENTS`/`DISCOVERY`/`INFO` ringbufs are not
+bpftool-dumpable and are covered via the scanned outputs they drain
+into; the task-storage identity maps are undumpable by bpftool; they
+hold minted identity and epoch words only (no byte buffers). The
+`CGROUP_FILTER` cgroup_array map answers per-cell lookup refusals
+instead of values; the cell verifies the exact refusal shape and scans
+the keys. Positive controls on every scanner (an injected marker copy
+each must find, hex-encoded for the map-cell path) and the mirrored
+size verdict keep the cell non-vacuous; the committed cell is
 `privileged_inventory_pid_key_sizes_canary_no_payload_leak`.
 Live coverage is the S and V protocols on LP64; the remaining nine
 endpoints ride the same adapters with exact read-set twins at the

@@ -36,7 +36,7 @@
 #             byte is rewritten in place (same inode: a genuine change,
 #             never a copy-up), and side F maps the changed file after an
 #             8 s settle and ledgers 250. The spanning capture must count
-#             exactly 6 x 400 on the one stale row, never admit F as a
+#             exactly 6 x (400 + 250) on the one stale row, never admit F as a
 #             second object, and disclose provider_changed (the oracle
 #             subcommand is copy-up-neg; the module suffix is the staged
 #             path /tmp/copyup/libsofthsm2.so)
@@ -228,6 +228,24 @@ ledgers2_is() {
         return 1
     }
     rm -f "$ledger_tmp"
+}
+
+# A workload wait failure must carry the scheduler's own evidence into the
+# harness log; the runtime workflow uploads a bounded tail of that log.
+wait_for_workload_pods() {
+    if kc -n "$WL_NS" wait --for=condition=Ready pod --all --timeout=240s; then
+        return 0
+    fi
+    echo "workload pods did not become Ready; scheduling diagnostics follow" >&2
+    echo "--- kubectl get pods -o wide ---" >&2
+    if ! kc -n "$WL_NS" get pods -o wide >&2; then
+        echo "kubectl get pods -o wide failed" >&2
+    fi
+    echo "--- kubectl get events --sort-by=.metadata.creationTimestamp ---" >&2
+    if ! kc -n "$WL_NS" get events --sort-by=.metadata.creationTimestamp >&2; then
+        echo "kubectl get events failed" >&2
+    fi
+    return 1
 }
 
 self_test() {
@@ -603,7 +621,7 @@ sed "s#image: p11scope-holder:1\$#image: $HOLD_IMAGE#" deploy/k8s/e2e/workloads-
     || { echo "workloads-copyup render lost its image anchor" >&2; exit 1; }
 kc apply -f "$MANIFESTS/workloads-copyup.yaml"
 kc -n "$OBS_NS" rollout status daemonset/p11scope-observer --timeout=240s
-kc -n "$WL_NS" wait --for=condition=Ready pod --all --timeout=240s
+wait_for_workload_pods
 
 wait_log() {
     wl_i=0

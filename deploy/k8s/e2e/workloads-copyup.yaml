@@ -5,7 +5,7 @@
 # applies). Side S maps the staged provider and ledgers 400, one unmapped
 # byte is rewritten in place (same inode: a genuine change, never a
 # copy-up), and side F maps the changed file after an 8 s settle and
-# ledgers 250. The spanning capture must count exactly 6 x 400 on the
+# ledgers 250. The spanning capture must count exactly 6 x (400 + 250) on the
 # one stale row, never admit F as a second object, and disclose
 # provider_changed.
 apiVersion: v1

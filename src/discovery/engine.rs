@@ -9170,6 +9170,9 @@ pub(crate) fn select_excluding_given(
     budget: &mut CaptureWorkBudget,
     tiers: &crate::discovery::scan_pass::MemberTiers,
 ) -> Vec<u32> {
+    if tiers.identity_checks != 0 {
+        budget.charge(tiers.identity_checks);
+    }
     for _ in excluded {
         budget.note_kernel_thread_absence();
     }
@@ -9757,6 +9760,7 @@ fn discover_plan(
             let context = Some((sweep, excluded));
             (selected, context)
         } else {
+            discovered.budget.charge(tiers.identity_checks);
             (tiers.order_under_cap(&pids), None)
         };
     if let Some((sweep, excluded)) = &over_cap_sweep {
@@ -14987,7 +14991,6 @@ impl Engine {
                 // A stale/reused ID or vanished association is only a discarded
                 // hint. Pruning progresses even if this ticket later expires.
                 self.trace_provider_views.remove(&id);
-        self.pinned.clear_view_scan_records(id);
                 cursor = Some(id);
                 remaining -= 1;
             }
@@ -16867,6 +16870,11 @@ impl Engine {
         if self.collected_finish_actions.is_some() {
             return;
         }
+        // A released ID's pin records go with it — scan custody and
+        // refusal marks alike — so a reused ID never inherits the
+        // previous generation's proof or refusals. Inventory and
+        // collected paths above never reuse IDs.
+        self.pinned.clear_view_scan_records(id);
         self.detach_leader_exit_state_for_reuse(id);
         // Skip-if-present: a duplicate retired entry would mint one ID to
         // two live views, so a double release is a silent no-op rather than

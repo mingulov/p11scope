@@ -831,6 +831,7 @@ fn collect_members_identity(
             "p11scope: sweep skipped ({} processes fit the {cap} cap)",
             pids.len()
         );
+        budget.charge(tiers.identity_checks);
         tiers.order_under_cap(&pids)
     };
 

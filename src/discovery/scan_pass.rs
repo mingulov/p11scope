@@ -858,12 +858,23 @@ impl ResumeCursor {
     /// each tier least-spent first.
     pub(crate) fn tiers_for_selection(
         &self,
-        live_start_time: impl Fn(u32) -> Option<u64>,
+        mut live_start_time: impl FnMut(u32) -> Option<u64>,
     ) -> MemberTiers {
         let mut tiers = MemberTiers::default();
-        let live = |task: &MemberTask| {
+        let mut identity_checks = 0u64;
+        let mut starts = BTreeMap::new();
+        let mut live_start_once = |pid: u32| {
+            if let Some(start) = starts.get(&pid) {
+                return *start;
+            }
+            let start = live_start_time(pid);
+            identity_checks = identity_checks.saturating_add(1);
+            starts.insert(pid, start);
+            start
+        };
+        let mut live = |task: &MemberTask| {
             task.1
-                .is_none_or(|start| live_start_time(task.0) == Some(start))
+                .is_none_or(|start| live_start_once(task.0) == Some(start))
         };
         for task in self.examined.iter().filter(|task| live(task)) {
             tiers.examined.insert(task.0);
@@ -886,6 +897,7 @@ impl ResumeCursor {
                 .and_modify(|total| *total = total.saturating_add(*spend))
                 .or_insert(*spend);
         }
+        tiers.identity_checks = identity_checks;
         tiers
     }
 }
@@ -900,6 +912,9 @@ pub(crate) struct MemberTiers {
     pub(crate) retry: BTreeSet<u32>,
     pub(crate) demoted: BTreeSet<u32>,
     pub(crate) spend: BTreeMap<u32, u64>,
+    /// `/proc` start-time reads performed while projecting these tiers.
+    /// The caller charges them to the pass budget before selection.
+    pub(crate) identity_checks: u64,
 }
 
 impl MemberTiers {
@@ -2590,6 +2605,7 @@ mod tests {
         COLLECTION_STOP_REASON, CollectionWork, IO_CEILING_REASON, InventoryWindowLimits,
         SCAN_CLOCK_REASON, SCAN_DEADLINE_REASON, WORK_CEILING_REASON, WindowId,
     };
+    use std::collections::{BTreeMap, BTreeSet};
 
     fn detailed(work: u64, io: u64) -> ScanPassOwner {
         ScanPassOwner::detailed(work, io)
@@ -3205,6 +3221,61 @@ mod tests {
             vec![501, 500, 10],
             "the least-spent retry scans first, regardless of pid"
         );
+    }
+
+    /// Cursor debug output never renders the executable bytes it uses
+    /// only as an identity discriminator.
+    #[test]
+    fn decode_cursor_key_debug_redacts_exec_bytes() {
+        use crate::discovery::scan::InspectedFileKey;
+        use p11scope_manifest::maps::Device;
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let pin = crate::discovery::identity::pin_of(file.as_file()).unwrap();
+        let secret = b"/private/secret-image";
+        let key = super::DecodeCursorKey {
+            pid: 7,
+            start_time: 70,
+            file: InspectedFileKey {
+                device: Device { major: 8, minor: 1 },
+                inode: 11,
+                pin,
+                fd_dev: 7,
+            },
+            exec: Some(secret.to_vec()),
+        };
+        let rendered = format!("{key:?}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert!(
+            !rendered.contains(&format!("{secret:?}")),
+            "the raw byte vector must not render: {rendered}"
+        );
+        assert!(
+            !rendered.contains("47, 112"),
+            "even the byte values must not render: {rendered}"
+        );
+    }
+
+    /// Start-time projection memoizes one `/proc` read per distinct
+    /// task even when cursor bookkeeping records that task in every
+    /// tier, and publishes the exact count for the caller to charge.
+    #[test]
+    fn owner2_cursor_selection_reads_each_task_start_once() {
+        let mut pass = detailed(u64::MAX, u64::MAX);
+        for pid in 0..10_000u32 {
+            let task = (pid, Some(u64::from(pid) + 1));
+            let cursor = pass.cursor_mut();
+            cursor.examined.insert(task);
+            cursor.fresh.insert(task);
+            cursor.streaks.insert(task, BUDGET_STOP_DEMOTE_AFTER);
+            cursor.own_spend.insert(task, 1);
+        }
+        let calls = std::cell::Cell::new(0u64);
+        let tiers = pass.cursor().tiers_for_selection(|pid| {
+            calls.set(calls.get() + 1);
+            Some(u64::from(pid) + 1)
+        });
+        assert_eq!(calls.get(), 10_000);
+        assert_eq!(tiers.identity_checks, 10_000);
     }
 
     /// Pruning drops departed pids from every cursor tier while live

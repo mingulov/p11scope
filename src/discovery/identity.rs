@@ -3421,19 +3421,25 @@ impl PinnedObjects {
         view: ProcessViewId,
         keep: &BTreeSet<PinnedObjectId>,
     ) -> Option<ViewClaims> {
-        let removed = self.ownership.remove(&view)?;
+        // Refusal marks belong to one process generation: prune the
+        // retiring view's marks first, even when it owns nothing (a
+        // view that only refused), so a reused numeric ID never
+        // contradicts its successor's filings.
+        let refused_before = self.refused_keys.len();
+        self.refused_keys.retain(|(retired, _)| *retired != view);
+        let pruned_refused = self.refused_keys.len() != refused_before;
+        let Some(removed) = self.ownership.remove(&view) else {
+            if pruned_refused {
+                self.bump_revision();
+            }
+            return None;
+        };
         self.bump_revision();
+        // The retiring view's scan records go with its claims. Kept
+        // custody under a dead ID only closes the carry fence for live
+        // peers and resolves for a reused ID without its own proof; the
+        // carried ids themselves survive through `keep` below.
         let removed_raws = self.raw_ownership.remove(&view).unwrap_or_default();
-        let (kept_raws, removed_raws): (BTreeSet<RawObjectInstance>, BTreeSet<RawObjectInstance>) =
-            removed_raws
-                .into_iter()
-                .partition(|raw| self.raw_to_id.get(raw).is_some_and(|id| keep.contains(id)));
-        if !kept_raws.is_empty() {
-            self.raw_ownership
-                .entry(view)
-                .or_default()
-                .extend(kept_raws);
-        }
         let retained_raws: BTreeSet<_> = self
             .raw_ownership
             .values()
@@ -3481,22 +3487,16 @@ impl PinnedObjects {
             !unowned.contains(id)
                 && (!removed_raws.contains(raw) || retained_raws.contains(raw) || keep.contains(id))
         });
-        // Scan custody is evidence only while the object it proved is
-        // still carried. The purge above can drop a carried raw (the
-        // last owner leaves, or a re-pin replaces it); prune those
-        // observations instead of letting them prove a later reused
-        // view. Ownerless rows may remain only for live carry raws.
+        // Scan records must not outlive their routing: drop every raw
+        // no longer in raw_to_id from every record set. Ownerless
+        // non-empty sets from replace-without-claims carry live resolve
+        // rows and stay; empty ownerless sets drop.
         for raws in self.raw_ownership.values_mut() {
             raws.retain(|raw| self.raw_to_id.contains_key(raw));
         }
-        self.raw_ownership.retain(|_, raws| !raws.is_empty());
-        let carried_keys: BTreeSet<_> = self
-            .raw_to_id
-            .iter()
-            .filter_map(|(raw, id)| keep.contains(id).then_some(raw.key))
-            .collect();
-        self.refused_keys
-            .retain(|(refused_view, key)| *refused_view != view || carried_keys.contains(key));
+        let ownership = &self.ownership;
+        self.raw_ownership
+            .retain(|owner, raws| !raws.is_empty() || ownership.contains_key(owner));
         Some(removed)
     }
 

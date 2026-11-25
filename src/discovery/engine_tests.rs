@@ -50536,13 +50536,19 @@ fn select_excluding_kernel_threads_counts_absences_on_the_budget() {
     ];
     let unavailable: BTreeSet<u32> = [12].into_iter().collect();
     let mut budget = CaptureWorkBudget::default();
-    let tiers = crate::discovery::scan_pass::MemberTiers::default();
+    let mut tiers = crate::discovery::scan_pass::MemberTiers::default();
+    tiers.identity_checks = 7;
     let selected =
         select_excluding_kernel_threads(&sweep, &unavailable, &proc_root, 4, &mut budget, &tiers);
     // Only pid 10 is a flagged thread with an empty available snapshot;
     // the cap then fits every remaining pid.
     assert_eq!(selected, vec![11, 12, 13, 14], "{selected:?}");
     assert_eq!(budget.kernel_thread_absences(), 1);
+    assert_eq!(
+        budget.work_units_count(),
+        7,
+        "selection charges the tier projection's start-time reads"
+    );
     let _ = std::fs::remove_dir_all(&proc_root);
 }
 

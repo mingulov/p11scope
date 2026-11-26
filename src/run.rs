@@ -31358,6 +31358,63 @@ int main(int argc, char **argv) {
         drop(reader);
     }
 
+    /// S5/S9 wiring: every production stdout sink and the discovery
+    /// engine watch the shared stop flag, so an observed stop sheds
+    /// slow flushes promptly (see the twin above for the wired
+    /// behavior) instead of waiting out budgets. One pin per wiring
+    /// owner — the sinks are function locals, so presence here is
+    /// what the mutants remove; each needle names the exact shared
+    /// flag, so wiring a fresh flag fails too.
+    #[test]
+    fn every_production_sink_watches_the_shared_stop_flag() {
+        let source = include_str!("run.rs");
+        for (owner, start, end, needle) in [
+            (
+                "run_loop engine",
+                "fn run_loop(",
+                "\nfn pause_failure(",
+                "engine.set_cancel_flag(interrupted.cancel_flag())",
+            ),
+            (
+                "owned handoff profile seal",
+                "fn seal_owned_handoff_profile(",
+                "\nfn seal_owned_handoff_trace(",
+                "stdout_sink.set_cancel_flag(context.signals.cancel_flag())",
+            ),
+            (
+                "owned handoff trace seal",
+                "fn seal_owned_handoff_trace(",
+                "\nfn finish_capture_loop(",
+                "stdout_sink.set_cancel_flag(context.signals.cancel_flag())",
+            ),
+            (
+                "profile loop",
+                "fn capture_profile(",
+                "\nfn write_json_report(",
+                "stdout_sink.set_cancel_flag(interrupted.cancel_flag())",
+            ),
+            (
+                "trace loop",
+                "fn capture_trace(",
+                "\nfn terminal_trace_count_line(",
+                "stdout_sink.set_cancel_flag(interrupted.cancel_flag())",
+            ),
+        ] {
+            let body = source
+                .split_once(start)
+                .unwrap_or_else(|| panic!("{owner}: region start moved"))
+                .1
+                .split_once(end)
+                .unwrap_or_else(|| panic!("{owner}: region end moved"))
+                .0;
+            assert_eq!(
+                body.matches(needle).count(),
+                1,
+                "{owner}: shared-flag wiring call missing or duplicated"
+            );
+        }
+    }
+
     /// A stop observed on a capture tick ends the loop by signal —
     /// over an already-elapsed duration too — so the terminal path
     /// below seals the report for a signal end. No stop, no end.

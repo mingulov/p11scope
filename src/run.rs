@@ -31124,7 +31124,11 @@ int main(int argc, char **argv) {
     /// `run` owns its stop signals before it forks: the flag install is
     /// the first statement of `run_owned`, so a signal during the owned
     /// startup below is observed at the first poll instead of hitting
-    /// the default disposition.
+    /// the default disposition. Install-before-inner is also enforced
+    /// by construction — `run_owned` is the only caller of
+    /// `run_owned_inner`, which takes the installed flag as a
+    /// parameter — so this tripwire guards only against a slow step
+    /// being added ahead of the install.
     #[test]
     fn run_owns_stop_signals_before_fork() {
         let source = include_str!("run.rs");
@@ -31143,6 +31147,15 @@ int main(int argc, char **argv) {
         assert!(
             first.contains("install_stop_flag()"),
             "run must own stop signals before its first step: {first}"
+        );
+        // Install-before-inner is by construction: the only production
+        // caller passes the installed flag in, so no caller can reach
+        // the fork without it.
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        assert_eq!(
+            production.matches("run_owned_inner(").count(),
+            2,
+            "run_owned must stay the only caller of run_owned_inner (def + call)"
         );
     }
 

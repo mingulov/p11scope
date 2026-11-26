@@ -129,9 +129,8 @@ versioned separately and are opaque, exact dispatch keys.
   and `evidence.coverage_retired_slots` counts the distinct retired
   probe points. Run-tree retire windows attribute to the member that
   actually retired. A retire whose every scanned mapper exited or
-  provably left the scope discloses nothing unless a process is seen
-  mapping the provider before its cover returns; a parked entry whose
-  every endpoint re-attaches without promotion is dropped. Each module
+  provably left the scope discloses nothing unless a process is later
+  seen mapping the provider. Each module
   keeps at most 8 windows; a retire after the module's last window
   closed folds into the last one past the cap and counts in the
   record's `coverage_retired_folded`.

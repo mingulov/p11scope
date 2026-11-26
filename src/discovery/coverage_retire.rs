@@ -11,11 +11,12 @@
 //!   module has live cover again.
 //! - Every scanned mapper exited or provably left the scope, and none
 //!   remains: nothing is lost and nothing is disclosed. The retire is
-//!   parked. If a mapper of that module is seen again before cover
-//!   returns, the parked retire turns into a lossy window from its
-//!   detach instant (calls of the new mapper before the re-attach were
-//!   not observed); otherwise it never surfaces. A parked entry whose
-//!   every endpoint re-attaches without promotion is dropped.
+//!   parked. If a mapper of that module is seen again, the parked
+//!   retire turns into a lossy window from its detach instant (calls
+//!   of the new mapper before the re-attach were not observed); one
+//!   whose module never regains a mapper never surfaces. Promotion
+//!   always preempts: any re-attach a mapper announces promotes
+//!   first, so a parked entry is never dropped for cover returning.
 //!
 //! Bounds: windows are kept per module, at most
 //! [`MAX_COVERAGE_RETIRE_WINDOWS_PER_MODULE`] each; a retire after the
@@ -73,14 +74,6 @@ struct ModuleWindows {
 struct Parked {
     start_ns: u64,
     endpoints: BTreeSet<RetiredEndpoint>,
-    /// Whether the parking apply committed. Stamped at settlement;
-    /// sticky-false across merges: a park filed by a failed apply is
-    /// never dropped (its detach may still have happened), only
-    /// promoted. Accepted residual: after an invisible (scanless)
-    /// re-attach such a park can promote late — over-disclosure in a
-    /// doubly-rare corner, fail-closed, where dropping would risk a
-    /// real partial-detach silence.
-    committed: bool,
 }
 
 /// Test view of one module's window (the projection's shape).
@@ -99,15 +92,11 @@ pub(crate) struct CoverageRetireLedger {
     modules: BTreeMap<ModuleId, ModuleWindows>,
     /// Distinct lossy endpoints across all modules.
     endpoints: BTreeSet<RetiredEndpoint>,
-    /// Parked entries stay until promotion or re-attach on purpose: a
-    /// module that left the plan can return under the same id
-    /// (same-file re-pin), and only then does its parked retire
-    /// disclose. One entry per distinct module ever parked bounds the
-    /// map.
+    /// Parked entries stay until promotion on purpose: a module that
+    /// left the plan can return under the same id (same-file re-pin),
+    /// and only then does its parked retire disclose. One entry per
+    /// distinct module ever parked bounds the map.
     parked: BTreeMap<ModuleId, Parked>,
-    /// Modules parked since the last settlement, awaiting their commit
-    /// stamp (see `settle_fresh_parks`).
-    fresh: BTreeSet<ModuleId>,
 }
 
 impl CoverageRetireLedger {
@@ -149,49 +138,11 @@ impl CoverageRetireLedger {
             let parked = self.parked.entry(*module).or_insert(Parked {
                 start_ns,
                 endpoints: BTreeSet::new(),
-                committed: true,
             });
             parked.start_ns = parked.start_ns.min(start_ns);
             parked.endpoints.insert(endpoint.clone());
-            self.fresh.insert(*module);
         }
         modules.len()
-    }
-
-    /// Stamp the parks filed since the last settlement with whether
-    /// their apply committed, and forget the set. The stamp is
-    /// sticky-false: once an apply fails after parking, the entry is
-    /// never dropped (its detach may still have happened), only
-    /// promoted.
-    pub(crate) fn settle_fresh_parks(&mut self, committed: bool) {
-        if !committed {
-            for module in &self.fresh {
-                if let Some(parked) = self.parked.get_mut(module) {
-                    parked.committed = false;
-                }
-            }
-        }
-        self.fresh.clear();
-    }
-
-    /// Drop parked retires whose every endpoint re-attached without
-    /// promotion: cover returned, so per the module contract they never
-    /// surface (no window, no row, no count). Only committed parks
-    /// drop; a partial re-attach (some endpoint still down) keeps the
-    /// entry for promotion. Parked entries always name at least one
-    /// endpoint (`park` inserts one per module), so the universal
-    /// quantifier below is never vacuous. Returns how many entries
-    /// were dropped.
-    pub(crate) fn drop_reattached(&mut self, active: &BTreeSet<RetiredEndpoint>) -> usize {
-        let before = self.parked.len();
-        self.parked.retain(|_, parked| {
-            !parked.committed
-                || !parked
-                    .endpoints
-                    .iter()
-                    .all(|endpoint| active.contains(endpoint))
-        });
-        before - self.parked.len()
     }
 
     /// Turn every parked module the caller sees mapped again into a lossy
@@ -398,44 +349,14 @@ mod tests {
     }
 
     #[test]
-    fn drop_reattached_needs_every_endpoint_back_and_a_committed_park() {
-        use std::collections::BTreeSet;
+    fn promote_seen_counts_the_whole_parked_endpoint_set() {
         let mut ledger = CoverageRetireLedger::default();
-        // Two endpoints parked for one module: a partial re-attach
-        // (only one back) must keep the entry — `.any()` here would
-        // silently cancel the other endpoint's window.
         ledger.park(&set(&[0]), endpoint(16), 100);
         ledger.park(&set(&[0]), endpoint(32), 100);
-        ledger.settle_fresh_parks(true);
-        assert_eq!(ledger.drop_reattached(&BTreeSet::from([endpoint(16)])), 0);
-        assert_eq!(ledger.parked_modules(), set(&[0]));
-        assert_eq!(ledger.drop_reattached(&BTreeSet::from([endpoint(32)])), 0);
-        assert_eq!(ledger.parked_modules(), set(&[0]));
-        // Every endpoint back without promotion: dropped, never surfaces.
-        assert_eq!(
-            ledger.drop_reattached(&BTreeSet::from([endpoint(16), endpoint(32)])),
-            1
-        );
-        assert!(ledger.parked_modules().is_empty());
-        assert_eq!(ledger.promote_seen(|_| true), 0);
-    }
-
-    #[test]
-    fn drop_reattached_spares_parks_filed_by_a_failed_apply() {
-        use std::collections::BTreeSet;
-        let mut ledger = CoverageRetireLedger::default();
-        ledger.park(&set(&[0]), endpoint(16), 100);
-        ledger.settle_fresh_parks(false);
-        assert_eq!(ledger.drop_reattached(&BTreeSet::from([endpoint(16)])), 0);
-        assert_eq!(ledger.parked_modules(), set(&[0]));
-        // A later committed park of the same module does not clear the
-        // protection: the failed apply's detach may still have happened.
-        ledger.park(&set(&[0]), endpoint(16), 200);
-        ledger.settle_fresh_parks(true);
-        assert_eq!(ledger.drop_reattached(&BTreeSet::from([endpoint(16)])), 0);
-        assert_eq!(ledger.parked_modules(), set(&[0]));
-        // ... but promotion still rescues it when a mapper is seen.
+        // Promotion after a partial re-attach conservatively counts
+        // the whole original parked set, once per distinct endpoint.
         assert_eq!(ledger.promote_seen(|_| true), 1);
+        assert_eq!(ledger.retired_slots(), 2);
     }
 
     #[test]

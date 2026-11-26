@@ -638,12 +638,14 @@ scanned mapper of the object exited or provably left the scope (a ready
 expected removal with no rejected key and no other committed scan of
 the object) is parked: it adds nothing, opens no window and files no
 row. A parked retirement counts, opens its window from its detach
-instant and files its row only when a live process is seen mapping the
-module before its cover returns (the new mapper's calls before the
-re-attach were not observed); a same-tick admit and re-attach closes
-the window at the re-attach. A parked entry whose every endpoint
-re-attaches without promotion is dropped and never surfaces, as is one
-whose module never regains a mapper. A nonzero value
+instant and files its row when a live process is later seen mapping
+the module (the new mapper's calls before the re-attach were not
+observed); a same-tick admit and re-attach closes the window at the
+re-attach. Promotion has no cover check: any re-attach a mapper
+announces promotes first, so a parked entry is never dropped for
+cover returning — one whose module never regains a mapper never
+surfaces, while a mapper seen after an unannounced re-attach opens
+the window late (conservative over-disclosure). A nonzero value
 forces `PARTIAL` through the `coverage_retired_slots` observation cause
 beside the `skipped` cause carried by the paired `counting coverage`
 row, whose intervals ride the affected records' `unobserved_windows`.
@@ -744,8 +746,8 @@ retired module when a mid-capture global retirement detaches live
 attached counting probes with no same-apply reattach, unless the
 retirement is parked (every scanned mapper exited or provably left the
 scope and none remains, see `coverage_retired_slots`); a parked
-retirement opens its window only when a live process is seen mapping
-the module before its cover returns.
+retirement opens its window when a live process is later seen mapping
+the module.
 `start_ns` is the detach decision instant, conservative by the async
 worker latency. Each module's window closes when that module
 re-attaches (a partial revival closes only the revived modules'
@@ -1342,8 +1344,8 @@ is `{name: "counting coverage", reason}` with `reason` exactly:
   live attached counting probes with no same-apply reattach, and a
   mapper of the object may have remained (a parked retirement, whose
   every scanned mapper exited or provably left the scope, files this row
-  only when a live process is seen mapping the module before its cover
-  returns). Repeat retirements dedupe to
+  when a live process is later seen mapping the module). Repeat
+  retirements dedupe to
   this one row; the distinct retired probe-point count rides in
   `evidence.coverage_retired_slots`, and each module's retire intervals
   ride its records' `coverage_retired` unobserved windows: at most 8 per

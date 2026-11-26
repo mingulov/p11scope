@@ -21580,9 +21580,9 @@ int main(int argc, char **argv) {
         .unwrap_err();
         assert_eq!(error, SCAN_DEADLINE_REASON);
         assert_eq!(
-            budget.work_units, 65,
+            budget.work_units_count(), 65,
             "one read plus the first 64-line stride: {}",
-            budget.work_units
+            budget.work_units_count()
         );
     }
 
@@ -21606,9 +21606,9 @@ int main(int argc, char **argv) {
         .unwrap_err();
         assert_eq!(error, SCAN_DEADLINE_REASON);
         assert_eq!(
-            budget.work_units, 65,
+            budget.work_units_count(), 65,
             "one read plus the first 64-line stride: {}",
-            budget.work_units
+            budget.work_units_count()
         );
         assert_eq!(
             reader_newlines_scanned_for_test(),
@@ -21653,9 +21653,9 @@ int main(int argc, char **argv) {
             "no terminator in a newline-free chunk"
         );
         assert_eq!(
-            budget.work_units, 2,
+            budget.work_units_count(), 2,
             "one read plus the first byte stride: {}",
-            budget.work_units
+            budget.work_units_count()
         );
     }
 
@@ -21676,9 +21676,9 @@ int main(int argc, char **argv) {
             "abcd"
         );
         assert_eq!(
-            budget.work_units, 4,
+            budget.work_units_count(), 4,
             "three reads plus the one split line: {}",
-            budget.work_units
+            budget.work_units_count()
         );
         assert_eq!(reader_newlines_scanned_for_test(), 0);
         assert_eq!(reader_bytes_scanned_for_test(), 4);
@@ -21703,7 +21703,7 @@ int main(int argc, char **argv) {
             })
             .expect("the twin chunk must read");
             assert_eq!(polls, polls_want, "rows: {rows}");
-            assert_eq!(budget.work_units, units_want, "rows: {rows}");
+            assert_eq!(budget.work_units_count(), units_want, "rows: {rows}");
             assert_eq!(
                 reader_newlines_scanned_for_test(),
                 rows as u64,
@@ -21735,7 +21735,7 @@ int main(int argc, char **argv) {
             assert_eq!(table.into_bytes(), chunk, "size: {size}");
             assert_eq!(reader_bytes_scanned_for_test(), size as u64, "size: {size}");
             assert_eq!(reader_newlines_scanned_for_test(), 0, "size: {size}");
-            assert_eq!(budget.work_units, units_want, "size: {size}");
+            assert_eq!(budget.work_units_count(), units_want, "size: {size}");
         }
     }
 
@@ -21764,9 +21764,9 @@ int main(int argc, char **argv) {
             "invalid bytes refuse as an encoding error: {error}"
         );
         assert!(
-            budget.work_units < 10,
+            budget.work_units_count() < 10,
             "the encoding refusal precedes the full scan: {}",
-            budget.work_units
+            budget.work_units_count()
         );
     }
 
@@ -21821,10 +21821,10 @@ int main(int argc, char **argv) {
             reader_newlines_scanned_for_test()
         );
         assert_eq!(
-            budget.work_units,
+            budget.work_units_count(),
             (MAX_MOUNTINFO_ENTRIES + 1) as u64,
             "one read plus the ceiling lines: {}",
-            budget.work_units
+            budget.work_units_count()
         );
     }
 

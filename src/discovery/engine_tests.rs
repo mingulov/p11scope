@@ -89105,6 +89105,7 @@ fn learned_pin_failure_retries_before_filing() {
             loader_unknown_reason: None,
             run_learned: false,
             proving_retained: false,
+            loader_pid: None,
         },
     ))
     .unwrap();
@@ -89179,6 +89180,7 @@ fn learned_pin_retry_recovers_on_its_pass_budget() {
             loader_unknown_reason: None,
             run_learned: false,
             proving_retained: false,
+            loader_pid: None,
         },
     ))
     .unwrap();
@@ -89269,6 +89271,7 @@ fn learned_pin_retry_recovers_when_pressure_lands_between_passes() {
             loader_unknown_reason: None,
             run_learned: false,
             proving_retained: false,
+            loader_pid: None,
         },
     ))
     .unwrap();
@@ -89357,6 +89360,7 @@ fn learned_pin_retry_stages_from_large_mount_table() {
             loader_unknown_reason: None,
             run_learned: false,
             proving_retained: false,
+            loader_pid: None,
         },
     ))
     .unwrap();
@@ -89430,6 +89434,7 @@ fn learned_pin_refuses_overlimit_mount_table() {
             loader_unknown_reason: None,
             run_learned: false,
             proving_retained: false,
+            loader_pid: None,
         },
     ))
     .unwrap();
@@ -89509,6 +89514,7 @@ fn learned_pin_initial_completes_padded_overlay_maps_proof() {
             loader_unknown_reason: None,
             run_learned: false,
             proving_retained: false,
+            loader_pid: None,
         },
     ))
     .unwrap();
@@ -89584,6 +89590,7 @@ fn learned_pin_retry_completes_padded_overlay_maps_proof() {
             loader_unknown_reason: None,
             run_learned: false,
             proving_retained: false,
+            loader_pid: None,
         },
     ))
     .unwrap();
@@ -89688,6 +89695,7 @@ fn learned_pin_failure_files_after_bounded_retries() {
             loader_unknown_reason: None,
             run_learned: false,
             proving_retained: false,
+            loader_pid: None,
         },
     ))
     .unwrap();
@@ -89748,6 +89756,7 @@ fn learned_pin_failure_files_immediately_at_flush() {
             loader_unknown_reason: None,
             run_learned: false,
             proving_retained: false,
+            loader_pid: None,
         },
     ))
     .unwrap();
@@ -89802,6 +89811,7 @@ fn learned_pin_failure_files_immediately_when_capture_exhausted() {
             loader_unknown_reason: None,
             run_learned: false,
             proving_retained: false,
+            loader_pid: None,
         },
     ))
     .unwrap();
@@ -89860,6 +89870,7 @@ fn learned_pin_failure_files_immediately_past_retry_map_cap() {
             loader_unknown_reason: None,
             run_learned: false,
             proving_retained: false,
+            loader_pid: None,
         },
     ))
     .unwrap();

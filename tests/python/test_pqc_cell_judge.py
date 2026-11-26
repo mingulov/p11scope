@@ -47,6 +47,83 @@ TRUTH_LOG = (
     "WORKLOAD_EXIT ok=1\n"
 )
 
+# Real loss-disclosure shapes below are verbatim from the fix5 CI
+# artifact (privileged-tests 45677158379 on 38a0f9de6,
+# art5/cells/sizes.json), whose sizes leg the suite mirrors.
+REAL_TOP_GAP_JOINT = {
+    "budget": None, "caller": "c0", "module": None, "pid": None,
+    "reason": "joint_seal_h3_loss_history_loss", "repeats": 1,
+    "subject": "Joint key operations unavailable; retained S1"}
+REAL_EDGE_COVERAGE = {
+    "lossy": True,
+    "reasons": ["capture_stopped", "instance_retired",
+                "semantic_loss", "task_retired"]}
+REAL_TOP_BUDGETS = {
+    "callers": {"late_refused": 0, "limit": 4096, "occupied": 1,
+                "refused": 0, "retired": 0,
+                "retired_with_calls": 0},
+    "counters": {"cap": 18446744073709551615, "observed_edges": 1,
+                 "saturated_edges": 0},
+    "departed_use": {"identities_dropped": 0, "mech_overflow": 0},
+    "edges": {"folded": 0, "folded_entries": 0, "limit": 32768,
+              "occupied": 1, "refused": 0},
+    "endpoints": {"limit": 1048576, "occupied": 92, "refused": 0},
+    "instance_negative_state": {"exhausted": False, "limit": 4096,
+                                "occupied": 2, "refused": 0},
+    "instance_semantic_resources": {
+        "charged_bytes": 2485730, "limit_bytes": 167772160,
+        "occupancy": {"active_machines": 0,
+                      "async_function_bytes": 0,
+                      "async_function_capacity_bytes": 0,
+                      "detached_calls": 0, "mechanisms": 4,
+                      "open_bindings": 0, "operation_categories": 6,
+                      "origin_capacity_elements": 0,
+                      "origin_elements": 0, "origin_vectors": 0,
+                      "pending_calls": 0,
+                      "provenance_function_bytes": 102,
+                      "provenance_function_capacity_bytes": 102,
+                      "provenance_functions": 8,
+                      "provenance_returns": 4},
+        "peak_charged_bytes": 18130996, "refused": 0},
+    "instance_semantic_state": {"limit": 4096, "occupied": 1,
+                                "refused": 0, "shared_limit": 32768,
+                                "shared_occupied": 1,
+                                "unknown_edges": 0},
+    "instances": {"folded": 0, "limit": 4096, "occupied": 1,
+                  "refused": 0},
+    "inventory_attach_modules": {"limit": 32768, "occupied": 1,
+                                 "refused": 0},
+    "inventory_endpoints": {"limit": 32768, "occupied": 92,
+                            "refused": 0},
+    "modules": {"limit": 4096, "occupied": 1, "refused": 0},
+    "native_departed": {"exec_prune_overflow": 0,
+                        "pair_dropped_base": 0,
+                        "pair_dropped_rows": 0,
+                        "pair_prune_overflow": 0},
+    "native_preadmission": {"limit": 4096, "occupied": 0,
+                            "pruned": 0, "refused": 0},
+    "retained_history": {"limit": 8192, "retained": 12,
+                         "suppressed": 0},
+    "semantic_state": {"limit": 32768, "occupied": 0, "refused": 0,
+                       "status": "withheld", "unknown_edges": 1}}
+# The completeness note, transcribed from its single emitter
+# (src/inspect_system.rs:3090-3099): subject "discovery capped"
+# with an "attribution complete: ..." reason. No preserved
+# artifact carries one (real runs have loss instead), so the
+# emitter is the strictest available shape source.
+COMPLETENESS_NOTE = {
+    "budget": None, "caller": None, "module": None, "pid": None,
+    "reason": ("attribution complete: 8 processes in scope; "
+               "every other process maps only shared objects "
+               "a deep scan examined"),
+    "repeats": 1, "subject": "discovery capped"}
+# The producer's real setup-boundary coverage
+# (src/discovery/caller_registry/instance_input.rs:3664-3668:
+# selecting BeforeSemanticBoundary sets lossy).
+SETUP_COVERAGE = {"lossy": True,
+                  "reasons": ["before_semantic_boundary"]}
+CLEAN_COVERAGE = {"lossy": False, "reasons": []}
+
 DSA_SETS = ("ml_dsa_44", "ml_dsa_65", "ml_dsa_87")
 KEM_SETS = ("ml_kem_512", "ml_kem_768", "ml_kem_1024")
 OPERATIONS = (("sign", DSA_SETS), ("verify", DSA_SETS),
@@ -251,17 +328,25 @@ def unknown_row():
 
 def inventory(sizes):
     """One healthy leg inventory: section version 10, eighteen
-    objects, the full twelve-row matrix plus its keygen row."""
+    objects, the full twelve-row matrix plus its keygen row. The
+    loss disclosure mirrors the real artifact: partial status,
+    an outcome gap, one real top-level gap row, real edge
+    coverage and the real (all-clean) top budgets."""
     return {
-        "semantic_edges": [{"mechanisms": [
-            {"mechanism": 15, "name": "CKM_ML_KEM_KEY_PAIR_GEN",
-             "calls": 3, "errors": 0},
-            {"mechanism": 23, "name": "CKM_ML_KEM",
-             "calls": 6, "errors": 0},
-            {"mechanism": 28, "name": "CKM_ML_DSA_KEY_PAIR_GEN",
-             "calls": 3, "errors": 0},
-            {"mechanism": 29, "name": "CKM_ML_DSA",
-             "calls": 12, "errors": 0}]}],
+        "semantic_edges": [{
+            "coverage": copy.deepcopy(REAL_EDGE_COVERAGE),
+            "mechanisms": [
+                {"mechanism": 15, "name": "CKM_ML_KEM_KEY_PAIR_GEN",
+                 "calls": 3, "errors": 0},
+                {"mechanism": 23, "name": "CKM_ML_KEM",
+                 "calls": 6, "errors": 0},
+                {"mechanism": 28, "name": "CKM_ML_DSA_KEY_PAIR_GEN",
+                 "calls": 3, "errors": 0},
+                {"mechanism": 29, "name": "CKM_ML_DSA",
+                 "calls": 12, "errors": 0}]}],
+        "gaps": [copy.deepcopy(REAL_TOP_GAP_JOINT)],
+        "gaps_suppressed": 0,
+        "budgets": copy.deepcopy(REAL_TOP_BUDGETS),
         "object_observations": {
             "version": 10, "revision": 1, "status": "partial",
             "reason": "authority_lost",
@@ -393,8 +478,12 @@ def result_for(rows, cell):
 
 
 def populated_inventory(sizes):
-    """A loss-free leg inventory: populated status, no gaps, clean
-    budgets, the session closed (not lost)."""
+    """A loss-free leg inventory: populated status with reason
+    none, no section gaps, clean section budgets, the session
+    closed (not lost), no top-level gaps, and clean edge
+    coverage. Every field is a producer-possible shape (the
+    registry starts gap-free, coverage always carries both
+    keys); the top budgets are the real all-clean object."""
     inv = inventory(sizes)
     oo = inv["object_observations"]
     oo["status"] = "populated"
@@ -402,6 +491,9 @@ def populated_inventory(sizes):
     oo["sessions"] = [{"session": 1, "origin": "opened",
                        "status": "closed"}]
     oo["gaps"] = {"rows": [], "suppressed": 0}
+    inv["gaps"] = []
+    inv["gaps_suppressed"] = 0
+    inv["semantic_edges"][0]["coverage"] = dict(CLEAN_COVERAGE)
     return inv
 
 
@@ -1181,7 +1273,7 @@ class JudgeTwins(unittest.TestCase):
     def test_partial_leg_reports_partial_qualification(self):
         # The healthy cell discloses partial/authority_lost with an
         # outcome_lost gap: the rows stay exact (PASS) but the run
-        # is partial, with the typed reason.
+        # is partial, with the typed reason in the closed prefix.
         rc, summary, rows = run_judge_full(
             inventory(True), verbose(True),
             inventory(False), verbose(False))
@@ -1192,8 +1284,13 @@ class JudgeTwins(unittest.TestCase):
             self.assertTrue(found["pass"], summary)
             self.assertEqual(found["qualification"], "partial",
                              summary)
-        self.assertIn("authority_lost",
-                      result_for(rows, "pqc-sizes-rows")["detail"])
+        self.assertTrue(
+            result_for(rows, "pqc-sizes-rows")["detail"].startswith(
+                "partial (status/partial/authority_lost): "), summary)
+        self.assertTrue(
+            result_for(rows, "pqc-workload-truth")["detail"].startswith(
+                "partial (sizes/status/partial/authority_lost, "
+                "nosizes/status/partial/authority_lost): "), summary)
 
     def test_populated_leg_reports_qualified(self):
         # A loss-free run (populated status, no gaps, clean
@@ -1223,7 +1320,8 @@ class JudgeTwins(unittest.TestCase):
         found = result_for(rows, "pqc-sizes-rows")
         self.assertTrue(found["pass"], summary)
         self.assertEqual(found["qualification"], "partial", summary)
-        self.assertIn("semantic_loss", found["detail"])
+        self.assertTrue(found["detail"].startswith(
+            "partial (edge/semantic_loss): "), summary)
         self.assertEqual(result_for(
             rows, "pqc-nosizes-rows")["qualification"],
             "qualified", summary)
@@ -1232,12 +1330,12 @@ class JudgeTwins(unittest.TestCase):
             "partial", summary)
 
     def test_setup_coverage_stays_qualified(self):
-        # The expected pre-admission setup calls
-        # (before_semantic_boundary) are harmless disclosure, not
-        # loss: a run carrying only them still qualifies.
+        # Setup-only pre-boundary loss uses the real producer
+        # shape (lossy with exactly the boundary reason) and is
+        # the documented benign case: a run carrying only it
+        # still qualifies.
         inv = populated_inventory(True)
-        inv["semantic_edges"][0]["coverage"] = {
-            "lossy": False, "reasons": ["before_semantic_boundary"]}
+        inv["semantic_edges"][0]["coverage"] = dict(SETUP_COVERAGE)
         rc, summary, rows = run_judge_full(
             inv, verbose(True),
             populated_inventory(False), verbose(False))
@@ -1259,7 +1357,8 @@ class JudgeTwins(unittest.TestCase):
         found = result_for(rows, "pqc-sizes-rows")
         self.assertTrue(found["pass"], summary)
         self.assertEqual(found["qualification"], "partial", summary)
-        self.assertIn("budget/key_rows_refused", found["detail"])
+        self.assertTrue(found["detail"].startswith(
+            "partial (budget/key_rows_refused): "), summary)
 
     def test_suppressed_gaps_report_partial_qualification(self):
         # Suppressed gap rows hide loss detail the judge cannot
@@ -1274,7 +1373,8 @@ class JudgeTwins(unittest.TestCase):
         found = result_for(rows, "pqc-sizes-rows")
         self.assertTrue(found["pass"], summary)
         self.assertEqual(found["qualification"], "partial", summary)
-        self.assertIn("gap/suppressed", found["detail"])
+        self.assertTrue(found["detail"].startswith(
+            "partial (gap/suppressed): "), summary)
 
     def test_gap_row_reports_partial_qualification(self):
         # A model gap row beside a populated status is still
@@ -1291,56 +1391,421 @@ class JudgeTwins(unittest.TestCase):
         found = result_for(rows, "pqc-sizes-rows")
         self.assertTrue(found["pass"], summary)
         self.assertEqual(found["qualification"], "partial", summary)
-        self.assertIn("gap/outcome_lost", found["detail"])
+        self.assertTrue(found["detail"].startswith(
+            "partial (gap/outcome_lost): "), summary)
+
+    def test_top_level_gap_reports_partial_qualification(self):
+        # A top-level inventory gap (here the real Joint-loss row)
+        # is disclosed run coverage loss even beside a clean
+        # section: the leg passes but reports partial.
+        inv = populated_inventory(True)
+        inv["gaps"] = [copy.deepcopy(REAL_TOP_GAP_JOINT)]
+        rc, summary, rows = run_judge_full(
+            inv, verbose(True),
+            populated_inventory(False), verbose(False))
+        self.assertEqual(rc, 0, summary)
+        found = result_for(rows, "pqc-sizes-rows")
+        self.assertTrue(found["pass"], summary)
+        self.assertEqual(found["qualification"], "partial", summary)
+        self.assertTrue(found["detail"].startswith(
+            "partial (root-gap/joint_seal_h3_loss_history_loss): "),
+            summary)
+
+    def test_top_level_suppressed_reports_partial_qualification(self):
+        # Suppressed top-level gap rows hide loss detail the judge
+        # cannot audit: the leg passes but reports partial.
+        inv = populated_inventory(True)
+        inv["gaps_suppressed"] = 2
+        rc, summary, rows = run_judge_full(
+            inv, verbose(True),
+            populated_inventory(False), verbose(False))
+        self.assertEqual(rc, 0, summary)
+        found = result_for(rows, "pqc-sizes-rows")
+        self.assertTrue(found["pass"], summary)
+        self.assertEqual(found["qualification"], "partial", summary)
+        self.assertTrue(found["detail"].startswith(
+            "partial (root-gap/suppressed): "), summary)
+
+    def test_completeness_note_stays_qualified(self):
+        # The producer's explicit completeness note ("attribution
+        # complete", documented as a note, not a loss) is the one
+        # top-level gap row that does not void qualification.
+        inv = populated_inventory(True)
+        inv["gaps"] = [copy.deepcopy(COMPLETENESS_NOTE)]
+        rc, summary, rows = run_judge_full(
+            inv, verbose(True),
+            populated_inventory(False), verbose(False))
+        self.assertEqual(rc, 0, summary)
+        for cell in ("pqc-workload-truth", "pqc-sizes-rows",
+                     "pqc-nosizes-rows"):
+            self.assertEqual(result_for(rows, cell)["qualification"],
+                             "qualified", summary)
+
+    def test_unattributed_reports_partial_qualification(self):
+        # Calls the producer could not attribute to a key (here a
+        # record_lost counter row in the exact emitter shape)
+        # void qualification even beside exact PQC rows.
+        inv = populated_inventory(True)
+        inv["object_observations"]["unattributed"] = [
+            {"reason": "record_lost", "count": 3}]
+        rc, summary, rows = run_judge_full(
+            inv, verbose(True),
+            populated_inventory(False), verbose(False))
+        self.assertEqual(rc, 0, summary)
+        found = result_for(rows, "pqc-sizes-rows")
+        self.assertTrue(found["pass"], summary)
+        self.assertEqual(found["qualification"], "partial", summary)
+        self.assertTrue(found["detail"].startswith(
+            "partial (unattributed/record_lost): "), summary)
+
+    def test_lost_session_reports_partial_qualification(self):
+        # A lost session ended with a model gap (here the real
+        # session row): unaudited loss, so the leg passes but
+        # reports partial.
+        inv = populated_inventory(True)
+        inv["object_observations"]["sessions"] = [
+            {"session": 1, "origin": "opened", "status": "lost"}]
+        rc, summary, rows = run_judge_full(
+            inv, verbose(True),
+            populated_inventory(False), verbose(False))
+        self.assertEqual(rc, 0, summary)
+        found = result_for(rows, "pqc-sizes-rows")
+        self.assertTrue(found["pass"], summary)
+        self.assertEqual(found["qualification"], "partial", summary)
+        self.assertTrue(found["detail"].startswith(
+            "partial (session/1/lost): "), summary)
+
+    def test_populated_reason_mismatch_reports_partial(self):
+        # Reason "none" holds only when populated: a populated
+        # section carrying another reason is contradictory
+        # disclosure, so the leg passes but reports partial.
+        inv = populated_inventory(True)
+        inv["object_observations"]["reason"] = "authority_lost"
+        rc, summary, rows = run_judge_full(
+            inv, verbose(True),
+            populated_inventory(False), verbose(False))
+        self.assertEqual(rc, 0, summary)
+        found = result_for(rows, "pqc-sizes-rows")
+        self.assertTrue(found["pass"], summary)
+        self.assertEqual(found["qualification"], "partial", summary)
+        self.assertTrue(found["detail"].startswith(
+            "partial (status/populated/authority_lost): "), summary)
+
+    def test_top_budget_refusal_reports_partial_qualification(self):
+        # A refused top-level budget (here the real budgets with
+        # two refused edge rows) is omitted coverage: the leg
+        # passes on its exact rows but reports partial.
+        inv = populated_inventory(True)
+        inv["budgets"]["edges"]["refused"] = 2
+        rc, summary, rows = run_judge_full(
+            inv, verbose(True),
+            populated_inventory(False), verbose(False))
+        self.assertEqual(rc, 0, summary)
+        found = result_for(rows, "pqc-sizes-rows")
+        self.assertTrue(found["pass"], summary)
+        self.assertEqual(found["qualification"], "partial", summary)
+        self.assertTrue(found["detail"].startswith(
+            "partial (top-budget/edges/refused): "), summary)
 
     def test_malformed_disclosure_is_partial(self):
-        # Totality: every malformed disclosure shape reports
-        # partial with a typed reason instead of raising (a raise
-        # would skip the results file and void the wrapper's
-        # failure attribution).
+        # Totality with exact reasons: every malformed disclosure
+        # shape — and every CLI-awkward loss shape — reports
+        # partial with its exact typed reason instead of raising
+        # (a raise would skip the results file and void the
+        # wrapper's failure attribution). Pinning the exact
+        # reason (not just "partial") kills dropped-guard
+        # mutants even when a later arm still says partial.
         judge = load_judge_module()
         valid = populated_inventory(True)
-        valid_edge = valid["semantic_edges"][0]
-        cases = [
-            ("none", None),
-            ("scalar", 42),
-            ("empty", {}),
-            ("section_list", {"object_observations": []}),
+        self.assertEqual(valid["semantic_edges"][0]["coverage"],
+                         CLEAN_COVERAGE)
+
+        def apply(mutate):
+            inv = copy.deepcopy(valid)
+            mutate(inv)
+            return inv
+
+        def set_path(*path_and_value):
+            *path, value = path_and_value
+
+            def mutate(inv):
+                target = inv
+                for key in path[:-1]:
+                    target = target[key]
+                target[path[-1]] = value
+            return mutate
+
+        def del_path(*path):
+            def mutate(inv):
+                target = inv
+                for key in path[:-1]:
+                    target = target[key]
+                del target[path[-1]]
+            return mutate
+
+        def str_lost_session(inv):
+            row = inv["object_observations"]["sessions"][0]
+            row["session"] = "1"
+            row["status"] = "lost"
+
+        oo = "object_observations"
+        raw = [
+            ("none", None, ("partial", "inventory_unreadable")),
+            ("scalar", 42, ("partial", "inventory_malformed")),
+            ("inventory_list", [],
+             ("partial", "inventory_malformed")),
+            ("empty", {}, ("partial", "section_malformed")),
+            ("section_list", {"object_observations": []},
+             ("partial", "section_malformed")),
         ]
-        mutated = copy.deepcopy(valid)
-        mutated["object_observations"]["gaps"] = None
-        cases.append(("gaps_none", mutated))
-        mutated = copy.deepcopy(valid)
-        mutated["object_observations"]["gaps"] = {"rows": {},
-                                                 "suppressed": 0}
-        cases.append(("gaps_rows_dict", mutated))
-        mutated = copy.deepcopy(valid)
-        mutated["object_observations"]["budgets"] = None
-        cases.append(("budgets_none", mutated))
-        mutated = copy.deepcopy(valid)
-        mutated["object_observations"]["budgets"]["key_rows"] = None
-        cases.append(("budget_block_none", mutated))
-        mutated = copy.deepcopy(valid)
-        mutated["semantic_edges"] = {}
-        cases.append(("edges_dict", mutated))
-        mutated = copy.deepcopy(valid)
-        mutated["semantic_edges"][0]["coverage"] = 42
-        cases.append(("coverage_scalar", mutated))
-        mutated = copy.deepcopy(valid)
-        mutated["semantic_edges"][0]["coverage"] = {"lossy": False,
-                                                  "reasons": "x"}
-        cases.append(("coverage_reasons_str", mutated))
-        mutated = copy.deepcopy(valid)
-        mutated["semantic_edges"][0]["coverage"] = {"lossy": True,
-                                                  "reasons": []}
-        cases.append(("lossy_without_reasons", mutated))
-        self.assertNotIn("coverage", valid_edge)
-        for name, inv in cases:
-            qual, reason = judge.leg_qualification(inv)
-            self.assertEqual(qual, "partial", name)
-            self.assertIsInstance(reason, str, name)
-        qual, reason = judge.leg_qualification(valid)
-        self.assertEqual((qual, reason), ("qualified", None))
+        table = [
+            ("reason_deleted",
+             ("partial", "status/populated/None"),
+             del_path(oo, "reason")),
+            ("gaps_none", ("partial", "gaps_malformed"),
+             set_path(oo, "gaps", None)),
+            ("gaps_list", ("partial", "gaps_malformed"),
+             set_path(oo, "gaps", [])),
+            ("gaps_rows_dict", ("partial", "gaps_malformed"),
+             set_path(oo, "gaps", {"rows": {}, "suppressed": 0})),
+            ("gaps_row_none", ("partial", "gap/malformed"),
+             set_path(oo, "gaps",
+                      {"rows": [None], "suppressed": 0})),
+            ("gaps_row_noreason", ("partial", "gap/malformed"),
+             set_path(oo, "gaps",
+                      {"rows": [{"repeats": 1, "subject": "model"}],
+                       "suppressed": 0})),
+            ("gaps_suppressed_str", ("partial", "gaps_malformed"),
+             set_path(oo, "gaps", "suppressed", "0")),
+            ("gaps_suppressed_true", ("partial", "gaps_malformed"),
+             set_path(oo, "gaps", "suppressed", True)),
+            ("gaps_suppressed_missing", ("partial", "gaps_malformed"),
+             del_path(oo, "gaps", "suppressed")),
+            ("budgets_none", ("partial", "budgets_malformed"),
+             set_path(oo, "budgets", None)),
+            ("budget_block_none",
+             ("partial", "budget/key_rows_malformed"),
+             set_path(oo, "budgets", "key_rows", None)),
+            ("budget_block_missing",
+             ("partial", "budget/object_rows_malformed"),
+             del_path(oo, "budgets", "object_rows")),
+            ("budget_refused_str",
+             ("partial", "budget/key_rows_malformed"),
+             set_path(oo, "budgets", "key_rows", "refused", "0")),
+            ("budget_refused_true",
+             ("partial", "budget/key_rows_malformed"),
+             set_path(oo, "budgets", "key_rows", "refused", True)),
+            ("budget_refused_missing",
+             ("partial", "budget/key_rows_malformed"),
+             del_path(oo, "budgets", "key_rows", "refused")),
+            ("unattributed_none",
+             ("partial", "unattributed_malformed"),
+             set_path(oo, "unattributed", None)),
+            ("unattributed_dict",
+             ("partial", "unattributed_malformed"),
+             set_path(oo, "unattributed", {})),
+            ("unattributed_row_nondict",
+             ("partial", "unattributed_malformed"),
+             set_path(oo, "unattributed", [42])),
+            ("unattributed_row_noreason",
+             ("partial", "unattributed_malformed"),
+             set_path(oo, "unattributed", [{"count": 1}])),
+            ("unattributed_row_reason_int",
+             ("partial", "unattributed_malformed"),
+             set_path(oo, "unattributed",
+                      [{"reason": 7, "count": 1}])),
+            ("sessions_none", ("partial", "sessions_malformed"),
+             set_path(oo, "sessions", None)),
+            ("sessions_dict", ("partial", "sessions_malformed"),
+             set_path(oo, "sessions", {})),
+            ("session_row_nondict",
+             ("partial", "sessions_malformed"),
+             set_path(oo, "sessions", [7])),
+            ("session_status_other",
+             ("partial", "session/1/malformed"),
+             set_path(oo, "sessions", 0, "status", "bogus")),
+            ("session_status_missing",
+             ("partial", "session/1/malformed"),
+             del_path(oo, "sessions", 0, "status")),
+            ("session_id_str_lost",
+             ("partial", "session/?/lost"),
+             str_lost_session),
+            ("top_gaps_missing", ("partial", "root-gaps_malformed"),
+             del_path("gaps")),
+            ("top_gaps_dict", ("partial", "root-gaps_malformed"),
+             set_path("gaps", {})),
+            ("top_gap_row_none", ("partial", "root-gap/malformed"),
+             set_path("gaps", [None])),
+            ("top_gap_row_bare", ("partial", "root-gap/malformed"),
+             set_path("gaps", [{}])),
+            ("top_gap_row_subject_only",
+             ("partial", "root-gap/PID custody lost"),
+             set_path("gaps", [{"subject": "PID custody lost"}])),
+            ("top_suppressed_str",
+             ("partial", "root-gaps_malformed"),
+             set_path("gaps_suppressed", "0")),
+            ("top_suppressed_true",
+             ("partial", "root-gaps_malformed"),
+             set_path("gaps_suppressed", True)),
+            ("top_suppressed_missing",
+             ("partial", "root-gaps_malformed"),
+             del_path("gaps_suppressed")),
+            ("top_budgets_missing",
+             ("partial", "top-budgets_malformed"),
+             del_path("budgets")),
+            ("top_budgets_list",
+             ("partial", "top-budgets_malformed"),
+             set_path("budgets", [])),
+            ("top_budget_block_missing",
+             ("partial", "top-budget/edges/malformed"),
+             del_path("budgets", "edges")),
+            ("top_budget_block_none",
+             ("partial", "top-budget/edges/malformed"),
+             set_path("budgets", "edges", None)),
+            ("top_budget_counter_missing",
+             ("partial", "top-budget/edges/refused/malformed"),
+             del_path("budgets", "edges", "refused")),
+            ("top_budget_counter_str",
+             ("partial", "top-budget/edges/refused/malformed"),
+             set_path("budgets", "edges", "refused", "0")),
+            ("top_budget_counter_true",
+             ("partial", "top-budget/edges/refused/malformed"),
+             set_path("budgets", "edges", "refused", True)),
+            ("exhausted_true",
+             ("partial",
+              "top-budget/instance_negative_state/exhausted"),
+             set_path("budgets", "instance_negative_state",
+                      "exhausted", True)),
+            ("exhausted_str",
+             ("partial",
+              "top-budget/instance_negative_state/exhausted/"
+              "malformed"),
+             set_path("budgets", "instance_negative_state",
+                      "exhausted", "false")),
+            ("exhausted_missing",
+             ("partial",
+              "top-budget/instance_negative_state/exhausted/"
+              "malformed"),
+             del_path("budgets", "instance_negative_state",
+                      "exhausted")),
+            ("preadmission_pruned",
+             ("partial", "top-budget/native_preadmission/pruned"),
+             set_path("budgets", "native_preadmission",
+                      "pruned", 1)),
+            ("preadmission_str",
+             ("partial",
+              "top-budget/native_preadmission/malformed"),
+             set_path("budgets", "native_preadmission", "x")),
+            ("coverage_absent", ("partial", "edge/coverage_missing"),
+             del_path("semantic_edges", 0, "coverage")),
+            ("coverage_none", ("partial", "edge/coverage_missing"),
+             set_path("semantic_edges", 0, "coverage", None)),
+            ("coverage_empty", ("partial", "edge/lossy_malformed"),
+             set_path("semantic_edges", 0, "coverage", {})),
+            ("coverage_scalar",
+             ("partial", "edge/coverage_malformed"),
+             set_path("semantic_edges", 0, "coverage", 42)),
+            ("lossy_missing", ("partial", "edge/lossy_malformed"),
+             set_path("semantic_edges", 0, "coverage",
+                      {"reasons": []})),
+            ("lossy_int", ("partial", "edge/lossy_malformed"),
+             set_path("semantic_edges", 0, "coverage",
+                      {"lossy": 0, "reasons": []})),
+            ("lossy_str", ("partial", "edge/lossy_malformed"),
+             set_path("semantic_edges", 0, "coverage",
+                      {"lossy": "false", "reasons": []})),
+            ("reasons_missing",
+             ("partial", "edge/reasons_malformed"),
+             set_path("semantic_edges", 0, "coverage",
+                      {"lossy": False})),
+            ("reasons_str", ("partial", "edge/reasons_malformed"),
+             set_path("semantic_edges", 0, "coverage",
+                      {"lossy": False, "reasons": "x"})),
+            ("reasons_none", ("partial", "edge/reasons_malformed"),
+             set_path("semantic_edges", 0, "coverage",
+                      {"lossy": False, "reasons": None})),
+            ("reasons_item_int",
+             ("partial", "edge/reasons_malformed"),
+             set_path("semantic_edges", 0, "coverage",
+                      {"lossy": True, "reasons": [42]})),
+            ("reasons_item_none",
+             ("partial", "edge/reasons_malformed"),
+             set_path("semantic_edges", 0, "coverage",
+                      {"lossy": True, "reasons": [None]})),
+            ("lossy_without_reasons", ("partial", "edge/lossy"),
+             set_path("semantic_edges", 0, "coverage",
+                      {"lossy": True, "reasons": []})),
+            ("contradictory_clean",
+             ("partial", "edge/coverage_contradictory"),
+             set_path("semantic_edges", 0, "coverage",
+                      {"lossy": False,
+                       "reasons": ["before_semantic_boundary"]})),
+            ("contradictory_nocalls",
+             ("partial", "edge/coverage_contradictory"),
+             set_path("semantic_edges", 0, "coverage",
+                      {"lossy": True, "reasons": ["no_calls"]})),
+            ("contradictory_mixed",
+             ("partial", "edge/coverage_contradictory"),
+             set_path("semantic_edges", 0, "coverage",
+                      {"lossy": False,
+                       "reasons": ["before_semantic_boundary",
+                                   "no_calls"]})),
+            ("edge_nondict", ("partial", "edge/edge_malformed"),
+             set_path("semantic_edges", 0, 42)),
+            ("outsider_mixed", ("partial", "edge/semantic_loss"),
+             set_path("semantic_edges", 0, "coverage",
+                      {"lossy": True,
+                       "reasons": ["before_semantic_boundary",
+                                   "semantic_loss"]})),
+            ("fresh_no_calls", ("qualified", None),
+             set_path("semantic_edges", 0, "coverage",
+                      {"lossy": False, "reasons": ["no_calls"]})),
+            ("setup_real_shape", ("qualified", None),
+             set_path("semantic_edges", 0, "coverage",
+                      dict(SETUP_COVERAGE))),
+            ("preadmission_null", ("qualified", None),
+             set_path("budgets", "native_preadmission", None)),
+            ("note_only", ("qualified", None),
+             set_path("gaps", [copy.deepcopy(COMPLETENESS_NOTE)])),
+        ]
+        # Every gated top-budget counter refuses exactly: the
+        # (block, counter) list is an independent copy of the
+        # producer's refused/loss-bearing budget contract, so a
+        # dropped spec entry fails its case.
+        for block, counter in [
+                ("callers", "refused"),
+                ("callers", "late_refused"),
+                ("modules", "refused"),
+                ("edges", "refused"),
+                ("endpoints", "refused"),
+                ("inventory_endpoints", "refused"),
+                ("inventory_attach_modules", "refused"),
+                ("counters", "saturated_edges"),
+                ("semantic_state", "refused"),
+                ("instances", "refused"),
+                ("instance_semantic_state", "refused"),
+                ("instance_negative_state", "refused"),
+                ("instance_semantic_resources", "refused"),
+                ("retained_history", "suppressed"),
+                ("departed_use", "identities_dropped"),
+                ("departed_use", "mech_overflow"),
+                ("native_departed", "pair_prune_overflow"),
+                ("native_departed", "exec_prune_overflow"),
+                ("native_preadmission", "refused"),
+                ("native_preadmission", "pruned")]:
+            table.append(
+                (f"top_budget_{block}_{counter}",
+                 ("partial", f"top-budget/{block}/{counter}"),
+                 set_path("budgets", block, counter, 1)))
+        for name, inv, expected in raw:
+            self.assertEqual(judge.leg_qualification(inv), expected,
+                             name)
+        for name, expected, mutate in table:
+            self.assertEqual(
+                judge.leg_qualification(apply(mutate)), expected,
+                name)
+        self.assertEqual(judge.leg_qualification(valid),
+                         ("qualified", None))
 
 
 if __name__ == "__main__":

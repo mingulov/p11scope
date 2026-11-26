@@ -121,6 +121,35 @@ class CheckCellResultsTests(unittest.TestCase):
         self.assertIn("failed qualified cell pqc-sizes-rows",
                       result.stderr)
 
+    def test_partial_truth_detail_accepted(self):
+        result = run_checker([row(
+            "pqc-workload-truth", True, "partial",
+            "partial (sizes/status/partial/authority_lost, "
+            "nosizes/status/partial/authority_lost): "
+            "both legs ran 3+3 PQC keypairs")])
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_partial_empty_detail_rejected(self):
+        result = run_checker([row("pqc-sizes-rows", True, "partial",
+                                  "")])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("partial row without a typed reason",
+                      result.stderr)
+
+    def test_partial_untyped_detail_rejected(self):
+        result = run_checker([row("pqc-sizes-rows", True, "partial",
+                                  "ok")])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("partial row without a typed reason",
+                      result.stderr)
+
+    def test_partial_bad_reason_rejected(self):
+        result = run_checker([row("pqc-sizes-rows", True, "partial",
+                                  "partial (bogus/x): ok")])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("partial row without a typed reason",
+                      result.stderr)
+
     def test_ambient_burst_qualification_rejected(self):
         # The oracle no longer emits the burst label (evidence-only
         # census since the pdg-harden holdouts): the checker's closed

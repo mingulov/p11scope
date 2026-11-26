@@ -31111,6 +31111,31 @@ int main(int argc, char **argv) {
         );
     }
 
+    /// `run` owns its stop signals before it forks: the flag install is
+    /// the first statement of `run_owned`, so a signal during the owned
+    /// startup below is observed at the first poll instead of hitting
+    /// the default disposition.
+    #[test]
+    fn run_owns_stop_signals_before_fork() {
+        let source = include_str!("run.rs");
+        let body = source
+            .split_once("pub fn run_owned(args: &RunArgs) -> Result<OwnedRunOutcome> {")
+            .unwrap()
+            .1
+            .split_once("\nfn always_wrap(")
+            .unwrap()
+            .0;
+        let first = body
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty() && !line.starts_with("//"))
+            .unwrap();
+        assert!(
+            first.contains("install_stop_flag()"),
+            "run must own stop signals before its first step: {first}"
+        );
+    }
+
     /// The stop flag is installed before the first slow startup step
     /// and every stage checks it before attach: a signal in the
     /// policy/pidns/view/host/preflight/discovery window ends startup

@@ -573,10 +573,7 @@ fn projection_refuses_unsupported_schemas() {
     )
     .unwrap_err()
     .to_string();
-    assert!(
-        error.contains("\"p11scope/inventory/v9\""),
-        "{error}"
-    );
+    assert!(error.contains("\"p11scope/inventory/v9\""), "{error}");
     let error = parse_input(
         serde_json::to_vec(&json!({"schema": "p11scope/".to_string() + &"x".repeat(16_000)}))
             .unwrap()
@@ -601,12 +598,10 @@ fn projection_refuses_unsupported_schemas() {
 /// `tests/fixtures/upgrade/README.md` for provenance.
 const KEYOPS071: &[u8] =
     include_bytes!("../../../tests/fixtures/upgrade/v071-inventory-keyops.json");
-const SCAN071: &[u8] =
-    include_bytes!("../../../tests/fixtures/upgrade/v071-inventory-scan.json");
+const SCAN071: &[u8] = include_bytes!("../../../tests/fixtures/upgrade/v071-inventory-scan.json");
 const NATIVE071: &[u8] =
     include_bytes!("../../../tests/fixtures/upgrade/v071-inventory-native.json");
-const CHURN071: &[u8] =
-    include_bytes!("../../../tests/fixtures/upgrade/v071-inventory-churn.json");
+const CHURN071: &[u8] = include_bytes!("../../../tests/fixtures/upgrade/v071-inventory-churn.json");
 const PROFILE071: &[u8] =
     include_bytes!("../../../tests/fixtures/upgrade/v071-observed-profile-signer.json");
 const METRICS071: &[u8] =
@@ -715,15 +710,7 @@ fn cbom_v071_keyops_inventory_converts() {
 /// with no mechanism, key or token rows.
 #[test]
 fn cbom_v071_scan_native_churn_convert() {
-    for (
-        name,
-        bytes,
-        scope,
-        passes,
-        gap_count,
-        gap_subjects,
-        applications,
-    ) in [
+    for (name, bytes, scope, passes, gap_count, gap_subjects, applications) in [
         (
             "scan",
             SCAN071,
@@ -759,11 +746,7 @@ fn cbom_v071_scan_native_churn_convert() {
             vec![
                 ("/usr/bin/dash".to_string(), 1, vec!["mapped"]),
                 ("/work/f2/bin/catalog-driver".to_string(), 1, vec!["mapped"]),
-                (
-                    "/usr/bin/sleep".to_string(),
-                    9,
-                    vec!["exited", "mapped"],
-                ),
+                ("/usr/bin/sleep".to_string(), 9, vec!["exited", "mapped"]),
                 (
                     "/work/f2/bin/shortlived-sign".to_string(),
                     7,
@@ -790,13 +773,15 @@ fn cbom_v071_scan_native_churn_convert() {
             .collect();
         let expected: Vec<_> = applications
             .into_iter()
-            .map(|(path, incarnations, lifecycles): (String, u64, Vec<&str>)| {
-                (
-                    path,
-                    incarnations,
-                    lifecycles.into_iter().map(str::to_string).collect(),
-                )
-            })
+            .map(
+                |(path, incarnations, lifecycles): (String, u64, Vec<&str>)| {
+                    (
+                        path,
+                        incarnations,
+                        lifecycles.into_iter().map(str::to_string).collect(),
+                    )
+                },
+            )
             .collect();
         assert_eq!(apps, expected, "{name} applications");
         assert_eq!(projection.providers.len(), 1, "{name}");
@@ -850,7 +835,10 @@ fn metrics_refusal_names_the_capture_remedy() {
         "{error}"
     );
     assert!(error.contains("no mechanism rows"), "{error}");
-    assert!(error.contains("capture without `--mode metrics`"), "{error}");
+    assert!(
+        error.contains("capture without `--mode metrics`"),
+        "{error}"
+    );
 }
 
 // Task 7 (spec §17.5) CBOM twins: supplier/version on the library,

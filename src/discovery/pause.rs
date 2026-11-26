@@ -11288,6 +11288,7 @@ mod tests {
     #[test]
     #[ignore = "privileged: run --pause auto through env with a SoftHSM workload (root, BPF, SoftHSM, pkcs11-tool)"]
     fn privileged_pause_auto_env_wrapper_matches_direct_count_lp64() {
+        let _signal_guard = crate::run::ActualSignalTestGuard::hold();
         let dir = wrapper_work_dir("env");
         let conf = wrapper_token(&dir);
         let _env = WrapperEnvGuard::set(&conf);
@@ -11322,6 +11323,7 @@ mod tests {
     #[test]
     #[ignore = "privileged: run --pause auto through sh -c exec with a SoftHSM workload (root, BPF, SoftHSM, pkcs11-tool)"]
     fn privileged_pause_auto_shexec_wrapper_matches_direct_count_lp64() {
+        let _signal_guard = crate::run::ActualSignalTestGuard::hold();
         let dir = wrapper_work_dir("shexec");
         let conf = wrapper_token(&dir);
         let _env = WrapperEnvGuard::set(&conf);
@@ -11369,6 +11371,7 @@ mod tests {
     #[test]
     #[ignore = "privileged: run --pause auto through a forking sh wrapper with a SoftHSM workload (root, BPF, SoftHSM, pkcs11-tool)"]
     fn privileged_pause_auto_shfork_wrapper_reports_honest_gap_lp64() {
+        let _signal_guard = crate::run::ActualSignalTestGuard::hold();
         let dir = wrapper_work_dir("shfork");
         let conf = wrapper_token(&dir);
         let _env = WrapperEnvGuard::set(&conf);
@@ -11439,6 +11442,7 @@ mod tests {
     #[test]
     #[ignore = "privileged: run --pause never through env with a SoftHSM workload (root, BPF, SoftHSM, pkcs11-tool)"]
     fn privileged_pause_never_env_wrapper_publishes_neutral_lattice_lp64() {
+        let _signal_guard = crate::run::ActualSignalTestGuard::hold();
         let dir = wrapper_work_dir("never");
         let conf = wrapper_token(&dir);
         let _env = WrapperEnvGuard::set(&conf);
@@ -11470,6 +11474,7 @@ mod tests {
     #[test]
     #[ignore = "privileged: run with default flags counts a fast SoftHSM child exactly (root, BPF, SoftHSM, pkcs11-tool)"]
     fn privileged_pause_default_flags_count_fast_child_exact_lp64() {
+        let _signal_guard = crate::run::ActualSignalTestGuard::hold();
         let dir = wrapper_work_dir("default");
         let conf = wrapper_token(&dir);
         let _env = WrapperEnvGuard::set(&conf);
@@ -11634,6 +11639,7 @@ mod tests {
     #[test]
     #[ignore = "privileged: SIGINT during a held auto pause still writes the run report (root, BPF, SoftHSM)"]
     fn privileged_pause_sigint_during_hold_still_writes_report_lp64() {
+        let _signal_guard = crate::run::ActualSignalTestGuard::hold();
         let dir = wrapper_work_dir("sigint-hold");
         let conf = wrapper_token(&dir);
         let _env = WrapperEnvGuard::set(&conf);
@@ -11772,6 +11778,7 @@ mod tests {
     #[test]
     #[ignore = "privileged: run --pause auto through a preload-then-exec wrapper with a SoftHSM workload (root, BPF, SoftHSM, pkcs11-tool)"]
     fn privileged_pause_auto_preloaded_exec_matches_direct_count_lp64() {
+        let _signal_guard = crate::run::ActualSignalTestGuard::hold();
         let dir = wrapper_work_dir("preload");
         let conf = wrapper_token(&dir);
         let _env = WrapperEnvGuard::set(&conf);

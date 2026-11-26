@@ -3523,7 +3523,7 @@ fn clear_startup_signal_dispositions_for_test() {
     STARTUP_SIGNAL_DISPOSITIONS.store(0, Ordering::SeqCst);
 }
 
-// B2 class guard (test builds only): set while the current test
+// Class guard (test builds only): set while the current test
 // thread holds `ActualSignalTestGuard`.
 #[cfg(test)]
 thread_local! {
@@ -14788,6 +14788,11 @@ mod capture_loop_tests;
 #[path = "run/cancellation_tests.rs"]
 mod cancellation_tests;
 
+// Test-only, crate-wide: ignored cells in other modules drive owned
+// runs (which install the stop flag), so they hold the same guard.
+#[cfg(test)]
+pub(crate) use tests::ActualSignalTestGuard;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -14802,19 +14807,20 @@ mod tests {
 
     static ACTUAL_SIGNAL_TEST: Mutex<()> = Mutex::new(());
 
-    /// B2 class guard: whoever installs stop handlers (or dances
+    /// Class guard: whoever installs stop handlers (or dances
     /// dispositions) in a test holds this. It locks
     /// `ACTUAL_SIGNAL_TEST` and marks this thread; `install_stop_flag`
     /// debug-asserts the mark, so an unguarded install fails loudly
-    /// instead of racing a fidelity test's dispositions. Visible to
-    /// the whole `run` module: the cancellation child (a re-exec, so
-    /// it cannot inherit the mark) holds it in its own process.
-    pub(super) struct ActualSignalTestGuard {
+    /// instead of racing a fidelity test's dispositions. Shared
+    /// crate-wide for tests: external cells that drive owned runs,
+    /// and re-exec children that cannot inherit the mark, hold it in
+    /// their own process.
+    pub(crate) struct ActualSignalTestGuard {
         _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl ActualSignalTestGuard {
-        pub(super) fn hold() -> Self {
+        pub(crate) fn hold() -> Self {
             let lock = ACTUAL_SIGNAL_TEST.lock().unwrap();
             super::SIGNAL_TEST_HOLDING.with(|held| held.set(true));
             Self { _lock: lock }
@@ -14827,7 +14833,7 @@ mod tests {
         }
     }
 
-    /// B2: installing without the guard panics (the class guard
+    /// Installing without the guard panics (the class guard
     /// fires before any registration, so no handler is installed).
     #[test]
     fn installing_without_the_guard_panics() {

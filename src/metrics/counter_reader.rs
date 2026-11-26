@@ -6861,6 +6861,7 @@ mod tests {
     #[test]
     #[ignore = "requires authorized native Multi staging as root: run --counter-mode counts with an owned child to -o JSON"]
     fn counter_cli_run_counts_with_owned_child_lp64() {
+        let _signal_guard = crate::run::ActualSignalTestGuard::hold();
         if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
             crate::attach::counter_banks::assert_counter_build_omitted_twin(
                 "metrics::counter_reader::tests::counter_cli_run_counts_with_owned_child_lp64",

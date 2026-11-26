@@ -47,6 +47,8 @@ PRODUCER_CONSTANTS = (
     "LOADER_CONTEXT_CHILD_RESERVE",
     "LOADER_SCAN_LEDGER_EXCEEDED",
     "LOADER_ARM_LEDGER_FULL",
+    # The renewing work-ceiling gap projects to its public reason.
+    "DISCOVERY_WORK_CEILING_DEFERRED",
     # Never-stop discovery gaps: one bad manifest object, pre-arm path,
     # or live-ring dequeue gaps without aborting siblings.
     "MANIFEST_OBJECT_UNAVAILABLE",
@@ -97,7 +99,7 @@ def producer_reasons():
 
     Entry granularity (function subjects and the one gated null) renders
     "null pointer" or ENTRY_UNAVAILABLE; discovery scope renders one of the
-    nineteen discovery reasons; the run-tree scope renders one of its three
+    twenty discovery reasons; the run-tree scope renders one of its three
     reasons under its own subject, and the learned-file scope renders one
     of its ten reasons under its own subject. The split mirrors
     `capture_skipped_out`'s branches; the strings themselves come from the
@@ -121,6 +123,7 @@ def producer_reasons():
         const["LOADER_CONTEXT_CHILD_RESERVE"],
         const["LOADER_SCAN_LEDGER_EXCEEDED"],
         const["LOADER_ARM_LEDGER_FULL"],
+        const["DISCOVERY_WORK_CEILING_DEFERRED"],
         const["MANIFEST_OBJECT_UNAVAILABLE"],
         const["PREARM_OBJECT_UNAVAILABLE"],
         const["DISCOVERY_TRANSPORT_UNAVAILABLE"],
@@ -147,7 +150,7 @@ def producer_reasons():
     }
     assert (
         len(entry) == 2
-        and len(discovery) == 19
+        and len(discovery) == 20
         and len(run_tree) == 3
         and len(learned) == 10
     ), const

@@ -13648,8 +13648,8 @@ fn normalize_carried_modules(
     let mut merged: Vec<ScannedModule> = Vec::with_capacity(carriers.len());
     for carrier in carriers.drain(..) {
         let overflow = merge_scanned_module(&mut merged, carrier);
-        *tables_dropped = tables_dropped
-            .saturating_add(overflow.dropped.saturating_add(overflow.live_dropped));
+        *tables_dropped =
+            tables_dropped.saturating_add(overflow.dropped.saturating_add(overflow.live_dropped));
     }
     let mut live_by_object: BTreeMap<PinnedObjectId, Vec<&ScannedModule>> = BTreeMap::new();
     for module in raw_modules

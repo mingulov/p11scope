@@ -9987,6 +9987,13 @@ impl JournalAdapter {
             if evidence.owner_marked || evidence.abandon || !evidence.key_live {
                 return Ok(Outcome::Skip);
             }
+            if ambiguous {
+                // Ambiguous claims never resolve here (the taint path
+                // owns them): taking the shared open would steal a
+                // sibling's staged entry and strand its claims, so
+                // leave it for the sibling's counted loss.
+                return Ok(Outcome::Skip);
+            }
             return Ok(Outcome::Stale);
         }
         if ambiguous {
@@ -14542,6 +14549,26 @@ pub(crate) mod tests {
                 },
                 expect: Ok(O::Skip),
             },
+            Row {
+                name: "stale_multi_claim",
+                evidence: {
+                    let mut ev = healthy_endless();
+                    ev.staged.clear();
+                    ev.my_claims = 2;
+                    ev
+                },
+                expect: Ok(O::Skip),
+            },
+            Row {
+                name: "stale_two_keys",
+                evidence: {
+                    let mut ev = healthy_endless();
+                    ev.staged.clear();
+                    ev.claiming_keys = 2;
+                    ev
+                },
+                expect: Ok(O::Skip),
+            },
             // Binding refusals (all paths with my claims).
             Row {
                 name: "image_refuses",
@@ -14825,7 +14852,7 @@ pub(crate) mod tests {
         }
         // Every row above names its mutand: flipping any single arm of
         // `decide_stop_original` must fail exactly its rows.
-        assert_eq!(rows.len(), 38, "the table covers every predicate arm");
+        assert_eq!(rows.len(), 40, "the table covers every predicate arm");
     }
 
     fn resource_audit(h3: H3DispositionEvidence) -> JournalAuditReceipt {

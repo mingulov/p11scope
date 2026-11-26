@@ -941,7 +941,7 @@ mod tests {
             matches!(&result, Err(error) if error == &expected),
             "expected {expected:?}, got {}",
             match &result {
-                Ok(bytes) => format!("Ok({} bytes)", bytes.len()),
+                Ok(bytes) => format!("Ok({} bytes)", bytes.0.len()),
                 Err(error) => format!("Err({error})"),
             }
         );

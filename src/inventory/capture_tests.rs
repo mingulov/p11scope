@@ -6118,10 +6118,17 @@ fn hold_native_quantum_skips_when_info_holds_the_batch_cap() {
     let mut started = NativeLane::start(lane, &mut scene, windows, None)
         .map_err(|(_, reason)| reason)
         .unwrap();
-    // One INFO shell held (as a collection tick would).
-    started
-        .held_info
-        .push(InfoBatch::empty(started.capture.domain));
+    // One INFO shell held (as a collection tick would): a batch the
+    // content rule actually retains, not an empty shell the tick
+    // would have dropped.
+    let mut held = InfoBatch::empty(started.capture.domain);
+    held.malformed = 1;
+    held.complete = false;
+    assert!(
+        super::NativeLane::<ScriptedLane>::info_quantum_holds(&held),
+        "the test's held batch passes the content rule"
+    );
+    started.held_info.push(held);
     let rows = started.windows.discovery_records;
     let deadline = Instant::now() + Duration::from_secs(60);
     assert!(

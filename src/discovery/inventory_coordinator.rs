@@ -973,10 +973,11 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     rendered_callers: BTreeSet<CallerId>,
     /// Released pidfd custody awaiting its close: folds hand their
     /// pins here instead of dropping them, and the paced drain
-    /// closes them one per stop check. A stop defers the remainder
-    /// under coordinator custody; a quiet pass drains the queue
-    /// whole, so steady state piles nothing up. Bounded by one
-    /// pass's folds times the per-caller pins. The terminal path
+    /// closes them one per stop check, at most one stride per fold
+    /// credit (D5). A stop or a spent budget defers the remainder
+    /// under coordinator custody for the next pass; the drain closes
+    /// at least what each pass's folds release, so steady state piles
+    /// nothing up. The terminal path
     /// moves the queue out before the drop (see
     /// [`Self::drain_pending_closes_for_exit`]), so a latched stop
     /// never leaves it to the teardown batch.
@@ -1695,6 +1696,17 @@ struct FoldStride {
 impl FoldStride {
     fn new() -> Self {
         Self { used: 0 }
+    }
+
+    /// Spend one unit of a bounded budget: true while the spent units
+    /// stay within `budget` (the unit is then counted), false once the
+    /// budget is used up (nothing is counted).
+    fn spend_within(&mut self, budget: u64) -> bool {
+        if self.used >= budget {
+            return false;
+        }
+        self.used = self.used.saturating_add(1);
+        true
     }
 
     /// Count one examined unit; true when the stride lapped and the
@@ -7523,9 +7535,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.info_join
             .fold_step(crate::inventory_provider_info::INFO_FOLD_ROWS_PER_CALL);
         if self.rendered_callers.is_empty() {
-            // No rows wait, but a stopped drain may have left closes
-            // queued: service them while quiet.
-            self.drain_close_queue(stop);
+            // No rows wait, but a stopped or credit-bounded drain may
+            // have left closes queued: service one credit while quiet.
+            self.drain_close_queue(stop, 0);
             return FoldReceipt::default();
         }
         // Released pidfd custody joins the bounded close queue: every
@@ -7533,20 +7545,29 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // last-owner close runs inside a fold credit and no release
         // strands on an abort.
         let mut handoff: Vec<Arc<PidPin>> = Vec::new();
-        let receipt = self.retire_inner(now_ns, subset, stop, &mut handoff);
+        let mut spent = 0;
+        let receipt = self.retire_inner(now_ns, subset, stop, &mut handoff, &mut spent);
         self.pending_close_queue.append(&mut handoff);
-        self.drain_close_queue(stop);
+        self.drain_close_queue(stop, spent);
         receipt
     }
 
-    /// Service the deferred close queue one pin per stop check: each
-    /// drop may close a last-owner pidfd, so the drain paces like
-    /// any I/O work. A stop defers the remainder under coordinator
-    /// custody (the fold receipt already published); a quiet pass
-    /// drains the queue whole, so steady state piles nothing up.
-    fn drain_close_queue(&mut self, stop: &dyn Fn() -> bool) {
+    /// Service the deferred close queue one pin per stop check, at most
+    /// [`FOLD_PLAN_STRIDE`] closes per fold credit (INV-2, D5): each
+    /// drop may close a last-owner pidfd, so the drain paces like any
+    /// I/O work. The call's spent fold credits pay for the pins their
+    /// folds released (each credit already charges up to one stride of
+    /// member units, pidfd custody included); a call that folded
+    /// nothing still spends one credit on the backlog. The remainder
+    /// stays queued under coordinator custody for the next pass, and a
+    /// stop defers it the same way (the fold receipt already published).
+    fn drain_close_queue(&mut self, stop: &dyn Fn() -> bool, credits: usize) {
+        let budget = u64::try_from(credits.max(1))
+            .unwrap_or(u64::MAX)
+            .saturating_mul(FOLD_PLAN_STRIDE);
+        let mut stride = FoldStride::new();
         while !self.pending_close_queue.is_empty() {
-            if stop() {
+            if stop() || !stride.spend_within(budget) {
                 break;
             }
             drop(self.pending_close_queue.pop());
@@ -7559,9 +7580,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// can never close them in one unchecked batch; then one pin
     /// closes per further-stop check. A set stop keeps the remainder,
     /// which the caller transfers to the established exit retention;
-    /// a quiet drain closes everything. The queue holds at most one
-    /// pass's folds, so a quiet drain is bounded by the caller budget,
-    /// and at most one close runs past a stop.
+    /// a quiet drain closes everything. The per-pass drain closes at
+    /// least as many pins per credit as the folds release, so the queue
+    /// holds about one pass's folds plus a backlog the drain is working
+    /// down; a quiet drain is bounded by the caller budget, and at most
+    /// one close runs past a stop.
     pub(crate) fn drain_pending_closes_for_exit(
         &mut self,
         further_stop: &dyn Fn() -> bool,
@@ -7584,6 +7607,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         subset: Option<&AttestedSubset>,
         stop: &dyn Fn() -> bool,
         handoff: &mut Vec<Arc<PidPin>>,
+        spent: &mut usize,
     ) -> FoldReceipt {
         let mut stride = FoldStride::new();
         // One referenced-caller set per call, not one scan per candidate:
@@ -7812,6 +7836,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 receipt.folded_instances.extend(folded_caller.instances);
             }
         }
+        // The credits this call's folds spent pay the close drain.
+        *spent = FOLD_CALLERS_PER_PUBLICATION.saturating_sub(credits);
         // Every forgotten row releases its pid's incarnation counter;
         // the map then tracks only retained rows (bounded by the caller
         // budget), never every pid the capture ever met. The prune is
@@ -31533,6 +31559,157 @@ exit 0
         assert!(
             pins.iter().all(|pin| pin.upgrade().is_none()),
             "the retention release closes the tail exactly once"
+        );
+    }
+
+    /// D5: queue `backlog` clones of one real pidfd pin (one fd, so the
+    /// count, not the fd table, measures the closes) behind `callers`
+    /// exited callers that each hold their own last-owner pin, wire a
+    /// quiet operator counter, and render the callers.
+    fn stage_close_backlog(
+        callers: u32,
+        backlog: usize,
+    ) -> (
+        NativeScene,
+        std::sync::Arc<crate::process::PidPin>,
+        Vec<std::sync::Weak<crate::process::PidPin>>,
+    ) {
+        let (mut native, _live) = NativeScene::new();
+        let domain = native.domain;
+        let here = std::process::id();
+        let shared = std::sync::Arc::new(crate::process::PidPin::test_pidfd_only(here));
+        for _ in 0..backlog {
+            native
+                .scene
+                .coordinator
+                .pending_close_queue
+                .push(std::sync::Arc::clone(&shared));
+        }
+        let mut ids = Vec::new();
+        let mut owned = Vec::new();
+        for caller in 0..callers {
+            let id = stage_exited_caller(&mut native, 5120 + caller, 100);
+            native.scene.coordinator.binder.stage_cookie_for_test(
+                domain,
+                200 + u64::from(caller),
+                0,
+                Some(id),
+            );
+            let pin = std::sync::Arc::new(crate::process::PidPin::test_pidfd_only(here));
+            owned.push(std::sync::Arc::downgrade(&pin));
+            native
+                .scene
+                .coordinator
+                .semantic_bindings
+                .insert_for_test(semantics::SemanticCallerBinding::scripted(
+                    id,
+                    ModuleKey::physical(7, 7, 777, None, "/bound/provider.so"),
+                    domain,
+                    ImageIdentity {
+                        task_cookie: 600 + u64::from(caller),
+                        exec_id: 1,
+                    },
+                    pin,
+                ))
+                .expect("the binding fits");
+            ids.push(id);
+        }
+        native.scene.coordinator.note_rendered_callers(&ids);
+        (native, shared, owned)
+    }
+
+    /// The typed close-drain state after one retire call: rows
+    /// retired, pins still queued, backlog clones still queued (the
+    /// shared pin's other owners), and the callers' own pins closed.
+    #[derive(Debug, PartialEq, Eq)]
+    struct CloseDrain {
+        retired: u64,
+        queued: usize,
+        backlog_queued: usize,
+        owned_closed: usize,
+    }
+
+    fn close_drain_state(
+        native: &NativeScene,
+        retired: u64,
+        shared: &std::sync::Arc<crate::process::PidPin>,
+        owned: &[std::sync::Weak<crate::process::PidPin>],
+    ) -> CloseDrain {
+        CloseDrain {
+            retired,
+            queued: native.scene.coordinator.pending_close_queue.len(),
+            backlog_queued: std::sync::Arc::strong_count(shared) - 1,
+            owned_closed: owned.iter().filter(|pin| pin.upgrade().is_none()).count(),
+        }
+    }
+
+    /// D5: a quiet pass with nothing to fold closes one credit of the
+    /// backlog (one stride), never the whole queue; the rest closes
+    /// over the following passes. A stop closes nothing.
+    #[test]
+    fn close_drain_closes_one_stride_per_quiet_pass() {
+        let stride = FOLD_PLAN_STRIDE as usize;
+        let (mut native, shared, owned) = stage_close_backlog(0, 200);
+        let receipt =
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers_with_stop(300, None, &|| true);
+        assert_eq!(
+            close_drain_state(&native, receipt.retired, &shared, &owned),
+            CloseDrain {
+                retired: 0,
+                queued: 200,
+                backlog_queued: 200,
+                owned_closed: 0,
+            },
+            "a stop closes nothing"
+        );
+        let mut left = 200;
+        for pass in 0..4 {
+            let receipt =
+                native
+                    .scene
+                    .coordinator
+                    .retire_rendered_callers_with_stop(300, None, &|| false);
+            left -= stride.min(left);
+            assert_eq!(
+                close_drain_state(&native, receipt.retired, &shared, &owned),
+                CloseDrain {
+                    retired: 0,
+                    queued: left,
+                    backlog_queued: left,
+                    owned_closed: 0,
+                },
+                "pass {pass} closes one stride"
+            );
+        }
+        assert_eq!(left, 0, "the backlog drains over four passes");
+    }
+
+    /// D5: a pass that folds callers pays the drain with its spent
+    /// credits: four single-credit folds close four strides, the
+    /// folds' own pins first, and the rest of the backlog waits.
+    #[test]
+    fn close_drain_spends_one_stride_per_fold_credit() {
+        let stride = FOLD_PLAN_STRIDE as usize;
+        let backlog = 300;
+        let (mut native, shared, owned) = stage_close_backlog(4, backlog);
+        let receipt =
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers_with_stop(300, None, &|| false);
+        let closed = 4 * stride;
+        assert_eq!(
+            close_drain_state(&native, receipt.retired, &shared, &owned),
+            CloseDrain {
+                retired: 4,
+                queued: backlog + 4 - closed,
+                backlog_queued: backlog + 4 - closed,
+                owned_closed: 4,
+            },
+            "four credits close four strides"
         );
     }
 

@@ -21691,11 +21691,7 @@ int main(int argc, char **argv) {
         let sites: [(&str, Option<&'static str>, Option<&'static str>); 3] = [
             ("collection stop", Some(COLLECTION_STOP_REASON), None),
             ("clock stop", None, Some(SCAN_CLOCK_REASON)),
-            (
-                "table-window stop",
-                Some(TABLE_WINDOW_CEILING_REASON),
-                None,
-            ),
+            ("table-window stop", Some(TABLE_WINDOW_CEILING_REASON), None),
         ];
         for (site, latched, trip) in sites {
             let mut reader = StreamReader {

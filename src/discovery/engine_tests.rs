@@ -60022,11 +60022,9 @@ fn admitted_inventory_views_carry_the_mount_park_grant() {
     for granted in [false, true] {
         let mut engine = Engine::empty();
         let sleep = e06_spawn_sleeps(1);
-        let old = crate::process::ProcessView::open(
-            crate::process::ProcessViewId(501),
-            sleep[0].pid(),
-        )
-        .unwrap();
+        let old =
+            crate::process::ProcessView::open(crate::process::ProcessViewId(501), sleep[0].pid())
+                .unwrap();
         engine.views.push(old);
         if granted {
             let pool = crate::semantics_edge::resources::SemanticResourcePool::default();

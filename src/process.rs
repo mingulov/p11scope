@@ -4862,10 +4862,7 @@ int main(int argc, char **argv) {
             }
         }
         let text = text.expect("the parked read completes");
-        assert!(
-            !view.has_parked_mount_table(),
-            "the completed read unparks"
-        );
+        assert!(!view.has_parked_mount_table(), "the completed read unparks");
         if !witness.changed() {
             assert_eq!(text, expected, "the resumed table is the whole table");
         }

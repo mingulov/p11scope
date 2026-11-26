@@ -10472,10 +10472,7 @@ fn discover_plan(
                     // debits here beside the pins: the slot persists
                     // across passes, so the next admission decision must
                     // see it the same tick.
-                    tick.note_mount_table_park(
-                        mount_parked_before,
-                        view.has_parked_mount_table(),
-                    );
+                    tick.note_mount_table_park(mount_parked_before, view.has_parked_mount_table());
                 }
                 discovered.note_scan_observed(view.id(), view.view_admission(), &found);
                 discovered.scan_inputs.insert(

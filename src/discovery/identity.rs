@@ -12379,19 +12379,17 @@ fn mountinfo_detail_is_healable_stop(error: &str) -> bool {
             | IO_CEILING_REASON
             | TABLE_WINDOW_CEILING_REASON
             | INTERFACE_WINDOW_CEILING_REASON
-    ) || crate::discovery::scan::parse_mount_table_read_reason(error).is_some_and(
-        |(_, detail)| {
-            matches!(
-                detail,
-                WORK_CEILING_REASON
-                    | SCAN_DEADLINE_REASON
-                    | SCAN_CLOCK_REASON
-                    | IO_CEILING_REASON
-                    | TABLE_WINDOW_CEILING_REASON
-                    | INTERFACE_WINDOW_CEILING_REASON
-            )
-        },
-    )
+    ) || crate::discovery::scan::parse_mount_table_read_reason(error).is_some_and(|(_, detail)| {
+        matches!(
+            detail,
+            WORK_CEILING_REASON
+                | SCAN_DEADLINE_REASON
+                | SCAN_CLOCK_REASON
+                | IO_CEILING_REASON
+                | TABLE_WINDOW_CEILING_REASON
+                | INTERFACE_WINDOW_CEILING_REASON
+        )
+    })
 }
 
 impl UnprovenCause {
@@ -23085,10 +23083,7 @@ mod tests {
                             "{site}: the read's own stop arrives wrapped"
                         );
                     } else {
-                        assert_eq!(
-                            reason, stop,
-                            "{site}: a proof-step stop arrives bare"
-                        );
+                        assert_eq!(reason, stop, "{site}: a proof-step stop arrives bare");
                     }
                 }
                 other => panic!(
@@ -23127,8 +23122,7 @@ mod tests {
         match outcome {
             Err(PinOutcome::Unproven { reason, .. }) => {
                 assert_eq!(
-                    reason,
-                    "the target mount table is unreadable; the pre-copy-up pin was refused",
+                    reason, "the target mount table is unreadable; the pre-copy-up pin was refused",
                     "a collection stop keeps the fixed text byte for byte"
                 );
             }
@@ -32983,11 +32977,7 @@ mod tests {
             )),
             "a second drop changes nothing"
         );
-        assert_eq!(
-            pins.revision(),
-            revision_before + 1,
-            "no change, no bump"
-        );
+        assert_eq!(pins.revision(), revision_before + 1, "no change, no bump");
     }
 
     /// Site: `retire_view_custody` (claimless path). Synthetic or

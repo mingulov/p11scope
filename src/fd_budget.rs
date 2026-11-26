@@ -478,9 +478,12 @@ mod tests {
     /// resumed re-park, a discard and a no-park scan debit nothing.
     #[test]
     fn mount_table_park_debits_only_a_newly_parked_fd() {
-        for (before, after, debit) in
-            [(false, true, 1), (false, false, 0), (true, true, 0), (true, false, 0)]
-        {
+        for (before, after, debit) in [
+            (false, true, 1),
+            (false, false, 0),
+            (true, true, 0),
+            (true, false, 0),
+        ] {
             let mut tick = FdReserveTick::from_counts(100, 1024);
             tick.note_mount_table_park(before, after);
             assert_eq!(

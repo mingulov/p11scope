@@ -56365,6 +56365,105 @@ fn merge_preflight_success_implies_identical_merge_results() {
     );
 }
 
+/// Success-side equivalence for a missing fallback replacement: the
+/// preflight passes, both merges succeed with byte-identical
+/// histories carrying the named gap, and both publish identical
+/// discovery. There is no failure mode here — the loss degrades.
+#[test]
+fn missing_replacement_merges_identically_with_its_gap() {
+    use crate::discovery::identity::test_fixture::pin_set;
+    let key_plan = ObjectKey {
+        device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+        inode: 42,
+    };
+    let key_repl = ObjectKey {
+        device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+        inode: 43,
+    };
+    let mut pins = pin_set(
+        &[(key_plan, "sha-plan", 7), (key_repl, "sha-repl", 7)],
+        false,
+    );
+    let ids: Vec<_> = pins.pinned().map(|pin| pin.id).collect();
+    let (plan_id, replacement) = (ids[0], ids[1]);
+    let mut plan = plan_with(2, 0);
+    plan.modules[0].object = plan_id;
+    for slot in &mut plan.slots {
+        slot.object = plan_id;
+    }
+    pins.remove_pin_for_test(replacement);
+    let mut counters = DiscoveryCounters::default();
+    counters.manifest_fallbacks.push(ManifestFallback {
+        manifest: 0,
+        object: 3,
+        reason: ManifestStaleReason::IdentityMismatch,
+        replacement,
+        proof: BoundFallbackProof {
+            module: replacement,
+            tables: Vec::new(),
+            required_targets: BTreeMap::new(),
+        },
+    });
+    let facts = CaptureFacts::default();
+    facts
+        .resolve_merge_inputs(&plan, &pins, &[], &[], &[])
+        .expect("a missing replacement still resolves");
+    let mut first = facts.clone();
+    first
+        .merge_current(
+            &plan,
+            &pins,
+            &[],
+            &[],
+            &[],
+            &counters,
+            &crate::prearm_module::PrearmState::empty(),
+            &BTreeMap::new(),
+        )
+        .expect("the merge accepts the gap");
+    let mut second = facts.clone();
+    second
+        .merge_current(
+            &plan,
+            &pins,
+            &[],
+            &[],
+            &[],
+            &counters,
+            &crate::prearm_module::PrearmState::empty(),
+            &BTreeMap::new(),
+        )
+        .expect("the merge is repeatable");
+    assert_eq!(
+        format!("{:?}", first.visible_history()),
+        format!("{:?}", second.visible_history()),
+        "merges produce identical histories"
+    );
+    let gap = (
+        "manifest object fallback".to_string(),
+        "manifest 0 object 3 lost its replacement pin before evidence rendered; the fallback row is unattributed"
+            .to_string(),
+    );
+    assert_eq!(
+        first.visible_history().losses.get(&gap),
+        second.visible_history().losses.get(&gap),
+        "both histories carry the same named gap"
+    );
+    assert!(
+        first.visible_history().losses.contains_key(&gap),
+        "the gap names the lost replacement"
+    );
+    let mut plan_a = plan.clone();
+    let mut plan_b = plan.clone();
+    first.apply_to_plan(&mut plan_a);
+    second.apply_to_plan(&mut plan_b);
+    assert_eq!(
+        format!("{:?}", first.discovery(&plan_a, &[], &[], &[])),
+        format!("{:?}", second.discovery(&plan_b, &[], &[], &[])),
+        "merges publish identical discovery"
+    );
+}
+
 /// The scan-to-live-candidate completeness contract: a clean scan over a
 /// live budget is complete; stops, refusals and truncating skips are not,
 /// while verified-absence skips keep a scan complete.

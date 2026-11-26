@@ -3503,11 +3503,12 @@ impl CaptureFacts {
         for (object, _) in plan.refused_modules() {
             self.module_id_for_object(pinned, object)?;
         }
-        // Pin loss on plan objects degrades at render, never refuses
-        // here: a planned module or slot without a pin drops only
-        // its own rows into a named gap while the other modules
-        // publish, so refusing would freeze renderable publications.
-        // (`pinned` still feeds the identity checks above.)
+        // Pin loss degrades at render, never refuses here: a planned
+        // module, slot or manifest-fallback replacement without a pin
+        // drops only its own rows into a named gap while the other
+        // modules publish, so refusing would freeze renderable
+        // publications. (`pinned` still feeds the identity checks
+        // above.)
         Ok(())
     }
 
@@ -10984,6 +10985,7 @@ impl Engine {
 /// of panicking the live render path. Callers file those gaps into
 /// history losses, which disclose them and force PARTIAL.
 const PLANNED_OBJECT_WITHOUT_PIN_SUBJECT: &str = "planned provider object";
+const MANIFEST_FALLBACK_WITHOUT_PIN_SUBJECT: &str = "manifest object fallback";
 
 fn discovery_evidence(
     plan: &plan::AttachPlan,
@@ -11007,6 +11009,15 @@ fn discovery_evidence(
             reason: format!(
                 "planned slot object '{}' dropped with its unrenderable module; its calls are unattributed",
                 crate::render::escape_controls(path),
+            ),
+        }
+    }
+    fn missing_replacement_gap(fallback: &ManifestFallback) -> Skipped {
+        Skipped {
+            subject: MANIFEST_FALLBACK_WITHOUT_PIN_SUBJECT.into(),
+            reason: format!(
+                "manifest {} object {} lost its replacement pin before evidence rendered; the fallback row is unattributed",
+                fallback.manifest, fallback.object,
             ),
         }
     }
@@ -11106,7 +11117,10 @@ fn discovery_evidence(
         .manifest_fallbacks
         .iter()
         .filter_map(|fallback| {
-            let replacement = pinned.summary(fallback.replacement)?;
+            let replacement = pinned.summary(fallback.replacement).or_else(|| {
+                gaps.push(missing_replacement_gap(fallback));
+                None
+            })?;
             Some(render::ManifestObjectFallback {
                 manifest: fallback.manifest,
                 object: fallback.object,

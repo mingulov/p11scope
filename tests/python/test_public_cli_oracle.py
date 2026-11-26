@@ -797,8 +797,21 @@ class RunnerNoiseTests(unittest.TestCase):
     run_case = OracleTests.run_case
 
     def run_case_mt_system(self, mutate=None, *, want=0, census=None,
-                           allow_pid_descendant_gaps=False):
+                           allow_pid_descendant_gaps=False, cell="mt-system"):
         report, ledger, receipt = inputs_mt_system()
+        if cell == "mt-system-metrics":
+            report["schema"] = "p11scope/observed-profile/v3-metrics"
+            report["lane"] = "metrics"
+            report["capture"]["mode"] = "metrics"
+            # The metrics lane is selection-blind: no profile-only keys.
+            for key in ("interface_selection", "attach_mechanisms",
+                        "pid_descendant_gaps", "multi_rebuild_gaps",
+                        "pid_descendant_gaps_admitted",
+                        "member_stop_attached", "member_stop_unattached",
+                        "learned_staged_files", "learned_event_loss",
+                        "learned_cap_skipped"):
+                report["evidence"].pop(key, None)
+        receipt["cell"] = cell
         if mutate:
             mutate(report, ledger, receipt)
         with tempfile.TemporaryDirectory() as raw:
@@ -810,7 +823,7 @@ class RunnerNoiseTests(unittest.TestCase):
             paths["ledger"] = tmp / "ledger"
             paths["ledger"].write_text("\n".join(ledger) + "\n")
             args = [sys.executable, "-I", str(ORACLE),
-                    "--cell", "mt-system", *sum((["--" + key, str(path)]
+                    "--cell", cell, *sum((["--" + key, str(path)]
                                          for key, path in paths.items()), [])]
             if allow_pid_descendant_gaps:
                 args.append("--allow-pid-descendant-gaps")
@@ -821,9 +834,51 @@ class RunnerNoiseTests(unittest.TestCase):
             proc = subprocess.run(args, capture_output=True, text=True, timeout=5)
         self.assertEqual(proc.returncode, want, proc.stdout + proc.stderr)
         result = json.loads(proc.stdout)
-        self.assertEqual(result["cell"], "mt-system")
+        self.assertEqual(result["cell"], cell)
         self.assertEqual(result["pass"], want == 0)
         return result
+
+    # Retire-window lane (audits F1/G1): the mt-system workload in metrics
+    # mode is an exact cell too, with the same typed terminal check.
+    def test_mt_system_metrics_exact_passes(self):
+        result = self.run_case_mt_system(cell="mt-system-metrics")
+        self.assertEqual(result["qualification"], "owned-provider-counts")
+
+    def test_mt_system_metrics_coverage_retired_fails(self):
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [{
+                "name": "counting coverage",
+                "reason": "counting probes were retired mid-capture; "
+                          "calls in the retire window were not observed"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped", "coverage_retired_slots"]}
+            d["evidence"]["coverage_retired_slots"] = 68
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case_mt_system(mutate, want=1, cell="mt-system-metrics")
+        self.assertIn("lossy or unknown observation gap class", result["detail"])
+
+    def test_mt_system_cells_refuse_a_retired_slot_count_on_exact_observation(self):
+        # Typed check: an exact observation class never excuses a nonzero
+        # retired-slot count (both modes).
+        for cell in ("mt-system", "mt-system-metrics"):
+            def mutate(d, l, r):
+                d["evidence"]["coverage_retired_slots"] = 1
+            result = self.run_case_mt_system(mutate, want=1, cell=cell)
+            self.assertIn("counting coverage retired mid-capture", result["detail"])
+
+    def test_mt_system_cells_refuse_a_missing_retired_slot_count(self):
+        for cell in ("mt-system", "mt-system-metrics"):
+            def mutate(d, l, r):
+                del d["evidence"]["coverage_retired_slots"]
+            result = self.run_case_mt_system(mutate, want=1, cell=cell)
+            self.assertIn("counting coverage retired mid-capture", result["detail"])
+
+    def test_mt_system_cells_refuse_exact_observation_with_a_gap_verdict(self):
+        for cell in ("mt-system", "mt-system-metrics"):
+            def mutate(d, l, r):
+                d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+            result = self.run_case_mt_system(mutate, want=1, cell=cell)
+            self.assertIn("exact terminal verdict", result["detail"])
 
     def test_exact_with_noise_passes_when_allowed(self):
         def mutate(d, l, r):
@@ -1414,7 +1469,11 @@ class RunnerNoiseTests(unittest.TestCase):
         result = self.run_case_mt_system(mutate, want=1)
         self.assertIn("owned target count differs", result["detail"])
 
-    def test_coverage_retired_passes_on_mt_system_in_strict_mode(self):
+    def test_coverage_retired_fails_on_mt_system_in_strict_mode(self):
+        # v0.7.2 retire-window lane (audits F1, H1): the product no longer
+        # files R1 for a proof-backed exit with zero remaining mappers, so
+        # mt-system must read exact again; every R1 arm is gone and this
+        # once-accepted shape now fails at the gap gate.
         # Coverage-retired lane 2026-11-20 (controller ruling, 6g
         # round 2): mt-system's exited workload retires the
         # provider's full 68-slot cover with exact owned counts.
@@ -1430,10 +1489,15 @@ class RunnerNoiseTests(unittest.TestCase):
                 "status": "lossy", "causes": ["skipped", "coverage_retired_slots"]}
             d["evidence"]["coverage_retired_slots"] = 68
             d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
-        result = self.run_case_mt_system(mutate)
-        self.assertEqual(result["qualification"], "owned-provider-counts")
+        result = self.run_case_mt_system(mutate, want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
 
-    def test_coverage_retired_passes_on_mt_system_when_allowed(self):
+    def test_coverage_retired_fails_on_mt_system_when_allowed(self):
+        # v0.7.2 retire-window lane (audits F1, H1): the product no longer
+        # files R1 for a proof-backed exit with zero remaining mappers, so
+        # mt-system must read exact again; every R1 arm is gone and this
+        # once-accepted shape now fails at the gap gate.
         # The R1 shape qualifies relaxed too: the hosted host leg
         # runs mt-system with the runner-noise flag, and the fixed
         # retirement disclosure is not runner noise.
@@ -1446,8 +1510,9 @@ class RunnerNoiseTests(unittest.TestCase):
                 "status": "lossy", "causes": ["skipped", "coverage_retired_slots"]}
             d["evidence"]["coverage_retired_slots"] = 68
             d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
-        result = self.run_case_mt_system(mutate, allow_pid_descendant_gaps=True)
-        self.assertEqual(result["qualification"], "owned-provider-counts")
+        result = self.run_case_mt_system(mutate, allow_pid_descendant_gaps=True, want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
 
     def test_coverage_retired_with_partial_slots_fails_on_mt_system(self):
         # The R1 pin is the full 68-slot provider cover: a partial
@@ -1499,8 +1564,9 @@ class RunnerNoiseTests(unittest.TestCase):
                       result["detail"])
 
     def test_coverage_retired_with_count_mismatch_fails_on_mt_system(self):
-        # The R1 arm never waives exact owned counts: the disclosed
-        # retirement with a 39/40 deficit still fails.
+        # With the R1 arm removed (retire-window lane, audits F1/H1) the
+        # disclosed retirement fails at the gap gate before the count
+        # check; the 39/40 deficit stays a failure either way.
         def mutate(d, l, r):
             d["evidence"]["skipped"] = [{
                 "name": "counting coverage",
@@ -1512,7 +1578,7 @@ class RunnerNoiseTests(unittest.TestCase):
             d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
             d["functions"][0]["calls"] = 39
         result = self.run_case_mt_system(mutate, want=1)
-        self.assertIn("owned target count differs", result["detail"])
+        self.assertIn("lossy or unknown observation gap class", result["detail"])
 
     def test_coverage_retired_on_system_fails_in_strict_mode(self):
         # The R1 disjunct is mt-system-only (only its workload exits
@@ -1530,7 +1596,11 @@ class RunnerNoiseTests(unittest.TestCase):
         self.assertIn("lossy or unknown observation gap class",
                       result["detail"])
 
-    def test_coverage_retired_with_runner_gap_passes_when_allowed(self):
+    def test_coverage_retired_with_runner_gap_fails_when_allowed(self):
+        # v0.7.2 retire-window lane (audits F1, H1): the product no longer
+        # files R1 for a proof-backed exit with zero remaining mappers, so
+        # mt-system must read exact again; every R1 arm is gone and this
+        # once-accepted shape now fails at the gap gate.
         # Relaxed composition: the fixed R1 disclosure plus one
         # already-ruled ambient descendant gap qualifies on the
         # flagged host leg with exact owned counts. Shape mirrors
@@ -1547,12 +1617,15 @@ class RunnerNoiseTests(unittest.TestCase):
             d["evidence"]["coverage_retired_slots"] = 68
             d["evidence"]["pid_descendant_gaps"] = 1
             d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
-        result = self.run_case_mt_system(mutate, allow_pid_descendant_gaps=True)
-        self.assertEqual(result["qualification"],
-                         "owned-provider-counts-with-runner-noise")
-        self.assertIn("pid_descendant_gaps=1", result["detail"])
+        result = self.run_case_mt_system(mutate, allow_pid_descendant_gaps=True, want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
 
-    def test_coverage_retired_with_two_runner_gaps_passes_when_allowed(self):
+    def test_coverage_retired_with_two_runner_gaps_fails_when_allowed(self):
+        # v0.7.2 retire-window lane (audits F1, H1): the product no longer
+        # files R1 for a proof-backed exit with zero remaining mappers, so
+        # mt-system must read exact again; every R1 arm is gone and this
+        # once-accepted shape now fails at the gap gate.
         # Like every other relaxed runner-noise arm, any nonzero gap
         # count composes with the R1 disclosure on the flagged leg.
         def mutate(d, l, r):
@@ -1566,9 +1639,9 @@ class RunnerNoiseTests(unittest.TestCase):
             d["evidence"]["coverage_retired_slots"] = 68
             d["evidence"]["pid_descendant_gaps"] = 2
             d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
-        result = self.run_case_mt_system(mutate, allow_pid_descendant_gaps=True)
-        self.assertEqual(result["qualification"],
-                         "owned-provider-counts-with-runner-noise")
+        result = self.run_case_mt_system(mutate, allow_pid_descendant_gaps=True, want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
 
     def test_coverage_retired_with_runner_gap_fails_in_strict_mode(self):
         # Strict keeps the exact two-cause pin: a gap-plus-retirement
@@ -1588,7 +1661,11 @@ class RunnerNoiseTests(unittest.TestCase):
         self.assertIn("lossy or unknown observation gap class",
                       result["detail"])
 
-    def test_coverage_retired_quiet_passes_in_strict_mode(self):
+    def test_coverage_retired_quiet_fails_in_strict_mode(self):
+        # v0.7.2 retire-window lane (audits F1, H1): the product no longer
+        # files R1 for a proof-backed exit with zero remaining mappers, so
+        # mt-system must read exact again; every R1 arm is gone and this
+        # once-accepted shape now fails at the gap gate.
         # Quiet composition: the fixed R1 disclosure plus the lone
         # quiet discovery skip qualifies strict with exact counts.
         # Shape mirrors run 44798792754 (v7.4-rc3: lossy [skipped,
@@ -1604,10 +1681,15 @@ class RunnerNoiseTests(unittest.TestCase):
                 "status": "lossy", "causes": ["skipped", "coverage_retired_slots"]}
             d["evidence"]["coverage_retired_slots"] = 68
             d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
-        result = self.run_case_mt_system(mutate)
-        self.assertEqual(result["qualification"], "owned-provider-counts")
+        result = self.run_case_mt_system(mutate, want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
 
-    def test_coverage_retired_quiet_reversed_passes_in_strict_mode(self):
+    def test_coverage_retired_quiet_reversed_fails_in_strict_mode(self):
+        # v0.7.2 retire-window lane (audits F1, H1): the product no longer
+        # files R1 for a proof-backed exit with zero remaining mappers, so
+        # mt-system must read exact again; every R1 arm is gone and this
+        # once-accepted shape now fails at the gap gate.
         # Skip order is not load-bearing: the same pair in reverse
         # order qualifies strict too.
         def mutate(d, l, r):
@@ -1620,10 +1702,15 @@ class RunnerNoiseTests(unittest.TestCase):
                 "status": "lossy", "causes": ["skipped", "coverage_retired_slots"]}
             d["evidence"]["coverage_retired_slots"] = 68
             d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
-        result = self.run_case_mt_system(mutate)
-        self.assertEqual(result["qualification"], "owned-provider-counts")
+        result = self.run_case_mt_system(mutate, want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
 
-    def test_coverage_retired_quiet_passes_when_allowed(self):
+    def test_coverage_retired_quiet_fails_when_allowed(self):
+        # v0.7.2 retire-window lane (audits F1, H1): the product no longer
+        # files R1 for a proof-backed exit with zero remaining mappers, so
+        # mt-system must read exact again; every R1 arm is gone and this
+        # once-accepted shape now fails at the gap gate.
         # The quiet composition qualifies relaxed too (the host twin
         # is the same shape).
         def mutate(d, l, r):
@@ -1636,10 +1723,9 @@ class RunnerNoiseTests(unittest.TestCase):
                 "status": "lossy", "causes": ["skipped", "coverage_retired_slots"]}
             d["evidence"]["coverage_retired_slots"] = 68
             d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
-        result = self.run_case_mt_system(mutate, allow_pid_descendant_gaps=True)
-        self.assertEqual(result["qualification"],
-                         "owned-provider-counts-with-runner-noise")
-        self.assertIn("discovery_skips=1", result["detail"])
+        result = self.run_case_mt_system(mutate, allow_pid_descendant_gaps=True, want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
 
     def test_coverage_retired_quiet_with_gap_fails(self):
         # A further descendant gap on top of the quiet composition
@@ -1665,8 +1751,8 @@ class RunnerNoiseTests(unittest.TestCase):
                       result["detail"])
 
     def test_coverage_retired_quiet_with_count_mismatch_fails(self):
-        # The quiet arm never waives exact owned counts: the disclosed
-        # pair with a 39/40 deficit still fails.
+        # With the quiet R1 arm removed (retire-window lane) the disclosed
+        # pair fails at the gap gate; the 39/40 deficit stays a failure.
         def mutate(d, l, r):
             d["evidence"]["skipped"] = [
                 {"name": "discovery subject", "reason": "discovery unavailable"},
@@ -1679,7 +1765,7 @@ class RunnerNoiseTests(unittest.TestCase):
             d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
             d["functions"][0]["calls"] = 39
         result = self.run_case_mt_system(mutate, want=1)
-        self.assertIn("owned target count differs", result["detail"])
+        self.assertIn("lossy or unknown observation gap class", result["detail"])
 
     def test_coverage_retired_exit_fails_in_strict_mode(self):
         # The R1 composition inherits the exit row's ambiguity (fedora

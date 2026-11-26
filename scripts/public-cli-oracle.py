@@ -25,14 +25,21 @@ NAMES = ("C_GenerateRandom", "C_DigestInit", "C_Digest",
 # count, error and CKR total is asserted exactly.
 MT_NAMES = ("C_GenerateRandom", "C_DigestInit", "C_DigestUpdate", "C_DigestFinal",
             "C_FindObjectsInit", "C_FindObjects", "C_FindObjectsFinal", "C_GetSessionInfo")
+# The multi-process system workload in each capture mode (v0.7.2
+# retire-window lane, audits F1/G1): the forked children exit
+# mid-capture, so a zero-mapper retire would show in every mode. The
+# twins inherit every mt-system ruling; they differ only in mode.
+MT_SYSTEM_CELLS = {"mt-system", "mt-system-metrics", "mt-system-trace"}
 MT_CELLS = {"mt-metrics", "mt-errors", "mt-shared", "mt-churn", "mt-trace", "mt-system",
+            "mt-system-metrics", "mt-system-trace",
             "counter-latency-mt"}
 # Live per-cell session shape from qualify-public-cli.sh: the sessions-mode
 # cells open one session per thread, mt-shared runs 32 threads on one shared
 # session, mt-churn runs two 32-thread generations, mt-system runs 4
 # processes x 8 sessions-mode threads.
 MT_SCAFFOLD_OPENS = {"mt-metrics": 8, "mt-errors": 8, "mt-shared": 1, "mt-churn": 64,
-                     "mt-trace": 8, "counter-latency-mt": 8, "mt-system": 32}
+                     "mt-trace": 8, "counter-latency-mt": 8, "mt-system": 32,
+                     "mt-system-metrics": 32, "mt-system-trace": 32}
 COUNT_CELLS = {"profile-pid", "metrics-pid", "mt-exact", "system",
                "names-pid", "verdict-pid",
                "run-short", "run-cover", "run-ia32", "sigint",
@@ -42,8 +49,9 @@ COUNT_CELLS = {"profile-pid", "metrics-pid", "mt-exact", "system",
                "select-endpoint-pid", "select-endpoint-system",
                "profile-pid-ia32",
                "mt-metrics", "mt-errors", "mt-shared", "mt-churn", "mt-system",
+               "mt-system-metrics",
                "counter-latency-mt"}
-SMOKE_CELLS = {"trace-pid", "trace-cgroup", "mt-trace"}
+SMOKE_CELLS = {"trace-pid", "trace-cgroup", "mt-trace", "mt-system-trace"}
 RUN_CELLS = {"run-short", "run-cover", "run-ia32"}
 COUNTER_MODES = {
     "counter-counts-pid": "counts", "counter-timestamps-pid": "timestamps",
@@ -55,6 +63,7 @@ COUNTER_MODES = {
 }
 CELL_SCOPES = {
     "system": "system", "mt-system": "system",
+    "mt-system-metrics": "system", "mt-system-trace": "system",
     "counter-counts-system": "system", "counter-timestamps-system": "system",
     "counter-latency-system": "system", "select-endpoint-system": "system",
     "profile-cgroup": "cgroup", "metrics-cgroup": "cgroup", "trace-cgroup": "cgroup",
@@ -66,7 +75,7 @@ METRICS_CELLS = {"metrics-pid", "metrics-cgroup",
                  "counter-counts-pid", "counter-timestamps-pid", "counter-latency-pid",
                  "counter-counts-system", "counter-timestamps-system", "counter-latency-system",
                  "select-endpoint-pid", "select-endpoint-system",
-                 "mt-metrics", "counter-latency-mt"}
+                 "mt-metrics", "counter-latency-mt", "mt-system-metrics"}
 LOSS_COUNTERS = ("event_loss", "in_flight_at_end", "start_insert_failures", "unmatched_returns",
                  "rv_update_failures", "cgroup_scope_failures", "abi_refusals", "malformed_records",
                  "discovery_ring_loss", "discovery_state_failures", "discovery_read_failures",
@@ -87,12 +96,6 @@ DISCLOSABLE_DISCOVERY_SKIP = {"name": "discovery subject", "reason": "discovery 
 # Kept as a named constant so the vocabulary pin
 # (test_skip_reason_vocabulary.py) keeps it tied to the producer.
 EXIT_MID_FLIGHT_SKIP = {"name": "discovery subject", "reason": "process exited mid-flight"}
-# R1 fixed row: live attached counting slots a mid-capture global
-# retirement detached with no same-apply reattach. The affected-slot
-# count rides in evidence.coverage_retired_slots, never in the reason.
-COVERAGE_RETIRED_SKIP = {"name": "counting coverage",
-                         "reason": "counting probes were retired mid-capture; "
-                                   "calls in the retire window were not observed"}
 # Learned first-use fixed row (v0.8.0): a provider file the fanotify
 # drain staged after its first use. The staged-file count rides in
 # evidence.learned_staged_files, the loss in
@@ -290,7 +293,7 @@ def fixture(text, receipt, cell):
                 "invalid fixture ledger schema")
     require(ledger.get("pid") == pid and ledger.get("complete") is True,
             "invalid or incomplete fixture ledger")
-    if cell == "mt-system":
+    if cell in MT_SYSTEM_CELLS:
         require(len(children) == 4 and len(set(children)) == 4 and pid not in children,
                 "multi-process workload did not report 4 distinct children")
     names = {NAMES[0]} if cell == "mt-exact" else (set(MT_NAMES) if mt else set(NAMES))
@@ -317,7 +320,7 @@ def fixture(text, receipt, cell):
             require(integer(attempts) and integer(successes) and attempts > 0 and attempts == successes,
                     "workload had failed calls or no successful calls")
             errinfo[name] = (0, None)
-        if CELL_SCOPES.get(cell, "pid") == "system" and cell != "mt-system":
+        if CELL_SCOPES.get(cell, "pid") == "system" and cell not in MT_SYSTEM_CELLS:
             require(attempts == 500, "strict SYSTEM requires 500 successful calls per target: " + name)
         expected[name] = attempts
     require(set(expected) == names, "missing fixture ledger function")
@@ -713,7 +716,7 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
     # discloses the named discovery-skip pair above. Each named cause may
     # be present or absent with its count printed; owned counts stay
     # exact and any other cause still fails.
-    relaxed = cell in {"system", "mt-system"} and allow_pid_descendant_gaps is True
+    relaxed = (cell == "system" or cell in MT_SYSTEM_CELLS) and allow_pid_descendant_gaps is True
     # Flake-66: the 6.6 leg rarely reports PARTIAL with exactly one
     # redacted discovery skip while every count stays exact. The harness
     # passes the flag on 6.6 kernels only, for select-endpoint-system
@@ -791,7 +794,7 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
     # more) still fails. The ceiling is exactly one, never nonzero:
     # two ambient exits are not a lone gap.
     ok_lone_gap = (
-        cell in ("system", "mt-system")
+        (cell == "system" or cell in MT_SYSTEM_CELLS)
         and observation.get("status") == "lossy"
         and observation.get("causes") == ["pid_descendant_gaps"]
         and skip_entries == []
@@ -813,7 +816,7 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
     _strategies = _loader.get("strategies")
     _strategies = _strategies if isinstance(_strategies, dict) else {}
     ok_loader_quiet = (
-        cell in ("system", "mt-system")
+        (cell == "system" or cell in MT_SYSTEM_CELLS)
         and observation.get("status") == "lossy"
         and observation.get("causes") == ["skipped", "loader_discovery"]
         and skip_entries == [DISCLOSABLE_DISCOVERY_SKIP]
@@ -836,7 +839,7 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
     # cause still fails. A quiet (zero-gap) first-use stays a new
     # shape until observed.
     ok_learned_first_use = (
-        cell in ("system", "mt-system")
+        (cell == "system" or cell in MT_SYSTEM_CELLS)
         and observation.get("status") == "lossy"
         and observation.get("causes") == ["skipped", "pid_descendant_gaps"]
         and skip_entries == [LEARNED_FIRST_USE_SKIP]
@@ -849,69 +852,11 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
         and evidence.get("learned_event_loss", 0) == 0
         and type(evidence.get("learned_cap_skipped", 0)) is int
         and evidence.get("learned_cap_skipped", 0) == 0)
-    # Coverage-retired lane 2026-11-20 (controller ruling, 6g round 2):
-    # mt-system's parent plus 4 forked children exit mid-capture; the
-    # engine retires the provider's counting slots exactly when its
-    # last mapper is gone and discloses the tail window under the
-    # fixed R1 row. Per-slot evidence (local instrumented run, exact
-    # CI twin): one window, modules={ModuleId(0)}, slots=68 on the
-    # sole provider object; all 5 workload views retired
-    # ExpectedRemoval with pin-proven exit and zero remaining
-    # mappers; zero GenerationLost intents anywhere; every owned
-    # count exact (gap-gate-neutered oracle pass). Owned counts stay
-    # exact (checked below), zero loss (checked above), no other
-    # class. Any other cell, cause set, skip, slot count (partial
-    # retirements are a different phenomenon) or gap still fails.
-    ok_coverage_retired = (
-        cell == "mt-system"
-        and observation.get("status") == "lossy"
-        and observation.get("causes") == ["skipped", "coverage_retired_slots"]
-        and skip_entries == [COVERAGE_RETIRED_SKIP]
-        and evidence.get("modules_skipped") == []
-        and evidence.get("pid_descendant_gaps", 0) == 0
-        and type(evidence.get("coverage_retired_slots", 0)) is int
-        and evidence.get("coverage_retired_slots", 0) == 68)
-    # Relaxed composition (same ruling): the hosted host leg runs
-    # mt-system with the runner-noise flag, and a capture can carry
-    # the fixed R1 disclosure plus an already-ruled ambient
-    # descendant gap (CI-GAP-1). Strict keeps the exact two-cause
-    # pin above; a guest gap-plus-retirement stays a new shape.
-    # Shape mirrors run 44781310336 (lossy [skipped,
-    # coverage_retired_slots, pid_descendant_gaps], 1 R1 skip,
-    # slots=68, gaps=1, exact 64065). Any nonzero gap count
-    # qualifies here, like every other relaxed runner-noise arm;
-    # any further cause, skip or slot count still fails.
-    ok_coverage_retired_noise = (
-        relaxed
-        and cell == "mt-system"
-        and observation.get("status") == "lossy"
-        and observation.get("causes")
-        == ["skipped", "coverage_retired_slots", "pid_descendant_gaps"]
-        and skip_entries == [COVERAGE_RETIRED_SKIP]
-        and evidence.get("modules_skipped") == []
-        and type(evidence.get("pid_descendant_gaps", 0)) is int
-        and evidence.get("pid_descendant_gaps", 0) >= 1
-        and type(evidence.get("coverage_retired_slots", 0)) is int
-        and evidence.get("coverage_retired_slots", 0) == 68)
-    # Quiet composition (same ruling): a vng guest can carry the fixed
-    # R1 disclosure plus the already-ruled lone quiet discovery skip
-    # (tick-quantum deferral, exact counts). Either skip order
-    # qualifies; the cause pair is unchanged (the quiet row adds no
-    # cause beyond "skipped"). Shape mirrors run 44798792754
-    # (v7.4-rc3: lossy [skipped, coverage_retired_slots],
-    # [discovery, R1] skips, slots=68, gaps=0, exact 64065).
-    # Accepted strict and relaxed alike (the host twin is the same
-    # shape); a further gap or cause stays a new shape.
-    ok_coverage_retired_quiet = (
-        cell == "mt-system"
-        and observation.get("status") == "lossy"
-        and observation.get("causes") == ["skipped", "coverage_retired_slots"]
-        and (skip_entries == [DISCLOSABLE_DISCOVERY_SKIP, COVERAGE_RETIRED_SKIP]
-             or skip_entries == [COVERAGE_RETIRED_SKIP, DISCLOSABLE_DISCOVERY_SKIP])
-        and evidence.get("modules_skipped") == []
-        and evidence.get("pid_descendant_gaps", 0) == 0
-        and type(evidence.get("coverage_retired_slots", 0)) is int
-        and evidence.get("coverage_retired_slots", 0) == 68)
+    # No R1 arm (v0.7.2 retire-window lane, audits F1/H1): a
+    # proof-backed exit that leaves zero mappers files no coverage
+    # retirement, so mt-system reads exact again. A capture that still
+    # carries the R1 row lost coverage while a mapper could call, and
+    # fails at the gap gate like any other loss, strict and relaxed.
     # No R1-plus-exit composition either: the folded row beside the
     # fixed R1 disclosure carries the same unproven exit claim, so the
     # pair fails closed like the lone row, strict and relaxed alike.
@@ -926,7 +871,7 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
     # on a cell the lone arm still passes.
     burst_note = None
     if (census_text is not None and not relaxed
-            and cell in ("system", "mt-system")
+            and (cell == "system" or cell in MT_SYSTEM_CELLS)
             and observation.get("status") == "lossy"
             and observation.get("causes") == ["pid_descendant_gaps"]):
         children = []
@@ -958,7 +903,7 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
         ok_noise = (observation.get("status") == "lossy" and
                     observation.get("causes") == ["pid_descendant_gaps"])
         ok_skip_family = (
-            cell == "mt-system"
+            cell in MT_SYSTEM_CELLS
             and observation.get("status") == "lossy"
             and isinstance(observation.get("causes"), list)
             and "skipped" in observation["causes"]
@@ -967,8 +912,7 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
                     (isinstance(skip, dict) and skip.get("reason") == "null pointer")
                     for skip in evidence.get("skipped", [])))
         require(ok_exact or ok_noise or ok_skip_family or ok_ambient or ok_quiet
-                or ok_loader_quiet or ok_learned_first_use or ok_coverage_retired
-                or ok_coverage_retired_noise or ok_coverage_retired_quiet,
+                or ok_loader_quiet or ok_learned_first_use,
                 "lossy or unknown observation gap class")
     elif gap66:
         ok_gap = (observation.get("status") == "lossy" and
@@ -982,11 +926,23 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
         if burst_note is not None:
             gap_detail += "; " + burst_note
         require(ok_exact or ok_ambient or ok_quiet or ok_lone_gap
-                or ok_loader_quiet or ok_learned_first_use
-                or ok_coverage_retired or ok_coverage_retired_quiet,
+                or ok_loader_quiet or ok_learned_first_use,
                 gap_detail)
     else:
         require(ok_exact, "lossy or unknown observation gap class")
+    if cell in MT_SYSTEM_CELLS:
+        # Retire-window lane (audits F1/G1), typed: the workload's
+        # proven exits leave zero mappers, so no counting coverage may
+        # retire with possible loss, and an exact observation must
+        # carry an exact terminal verdict in every capture mode (the
+        # v3 and v3-metrics schemas share these keys).
+        retired = evidence.get("coverage_retired_slots")
+        require(type(retired) is int and retired == 0,
+                "counting coverage retired mid-capture: coverage_retired_slots=%r" % (retired,))
+        if ok_exact:
+            verdict = (evidence.get("completeness"), evidence.get("verdict_detail"))
+            require(verdict in {("COMPLETE", "clean_proven"), ("PARTIAL", "attribution_only")},
+                    "exact observation without an exact terminal verdict: %r" % (verdict,))
     kernel = evidence.get("kernel_control", {})
     require(kernel.get("capture_halted") is False and kernel.get("owner_poison") == [] and
             kernel.get("root_affiliation_failures") == [], "kernel capture halted or unknown")
@@ -999,8 +955,7 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
     terminal(evidence, profile=mode == "profile")
     # Past the gap gate above, an accepted ambient shape is exactly
     # ok_ambient, ok_quiet, ok_lone_gap, ok_loader_quiet or
-    # ok_learned_first_use (the pure coverage-retired shapes qualify
-    # plain below): any other cause set failed already, so the flags
+    # ok_learned_first_use: any other cause set failed already, so the flags
     # (not re-spelled causes) decide the qualification. Metrics
     # evidence carries no gaps keys, which read as zero below;
     # profile-cgroup/run cells carry them and must read 0.
@@ -1105,7 +1060,7 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
         gaps = evidence.get("pid_descendant_gaps", 0)
         skips = sum(1 for skip in evidence.get("skipped", [])
                     if skip == DISCLOSABLE_DISCOVERY_SKIP)
-        if cell == "mt-system" or skips > 0:
+        if cell in MT_SYSTEM_CELLS or skips > 0:
             noise = (f"pid_descendant_gaps={gaps}; discovery_skips={skips}")
         else:
             noise = f"pid_descendant_gaps={gaps}"

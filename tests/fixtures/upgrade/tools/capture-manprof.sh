@@ -28,5 +28,10 @@ $LOCK sudo -n --preserve-env=TMPDIR $BIN profile --pid $APID --module $PROV \
 echo "rc=$?"
 $LOCK sudo -n chown $ME:$ME $OUT/$TAG-manprof.json
 kill $APID 2>/dev/null || true
-wait 2>/dev/null || true
+ANCHOR_RC=0
+wait "$APID" 2>/dev/null || ANCHOR_RC=$?
+case "$ANCHOR_RC" in
+  0|143) ;;
+  *) echo "$TAG manprof: anchor failed rc=$ANCHOR_RC" >&2; exit 1 ;;
+esac
 ls -la $OUT/$TAG-manprof.json

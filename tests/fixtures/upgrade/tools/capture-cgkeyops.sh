@@ -55,16 +55,25 @@ $LOCK sudo -n --preserve-env=TMPDIR $BIN inventory --cgroup $CG --module $PROV \
   --capture native --key-operations --manifest $OUT/v071-manifest-softhsm.json \
   --duration 65s -o $OUT/$TAG-inventory-cgkeyops.json 2>$OUT/$TAG.cgkeyops.stderr &
 OPID=$!
-for i in $(seq 1 600); do
+for i in $(seq 1 ${READY_BUDGET:-600}); do
   grep -q "semantic lane ready" $OUT/$TAG.cgkeyops.stderr 2>/dev/null && break
   sleep 0.2
 done
-grep -q "semantic lane ready" $OUT/$TAG.cgkeyops.stderr || echo "WARNING: semantic lane never ready"
-touch $STEADY_GO
+READY_SEEN=0
+if grep -q "semantic lane ready" $OUT/$TAG.cgkeyops.stderr 2>/dev/null; then
+  READY_SEEN=1
+  touch "$STEADY_GO"
+else
+  echo "cgkeyops: semantic lane never ready; gate left untouched" >&2
+fi
 wait $OPID
 echo "rc=$?"
 $LOCK sudo -n chown $ME:$ME $OUT/$TAG-inventory-cgkeyops.json
 wait $WPID
 rm -f $OUT/$TAG.go
 $LOCK sudo -n rmdir $CG
+if [ "$READY_SEEN" != 1 ]; then
+  echo "$TAG cgkeyops: semantic lane never ready" >&2
+  exit 1
+fi
 ls -la $OUT/$TAG-inventory-cgkeyops.json

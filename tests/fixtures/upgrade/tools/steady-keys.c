@@ -17,8 +17,9 @@
  * key pair with the CKA_ID given as even-length hex (1..64 chars)
  * and signs 32 bytes with CKM_SHA256_RSA_PKCS about once a second
  * until SECONDS elapse from process start. Prints
- * "created id=<hex> signs=<n>". Exit 0 on a full window, 1 when a
- * PKCS#11 call (or the gate wait) fails, 2 on usage/setup failure.
+ * "created id=<hex> signs=<n>". Exit 0 on a full window with at
+ * least one sign, 1 when a PKCS#11 call or the gate wait fails or
+ * no sign completed, 2 on usage/setup failure.
  *
  * Run against a fresh token (see tests/fixtures/upgrade/README.md,
  * "Regenerate"). Compiled against a real pkcs11.h; needs

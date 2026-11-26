@@ -54,8 +54,9 @@ to the same canonical value in every file): the capture prefix
 (`sanitize.py`'s third argument, default the lane path) becomes
 `/work`, Debian library paths become `/usr/lib/...`
 counterparts, Fedora `/usr/lib64/pkcs11/` maps into the same
-`/usr/lib/softhsm/` provider dir, cargo shim paths become
-`/usr/bin/...`; PIDs (fields,
+`/usr/lib/softhsm/` provider dir and other `/usr/lib64/` paths map
+under `/usr/lib/`, cargo shim paths become `/usr/bin/...`; PIDs
+(fields,
 `pid:` scopes, `/proc/` and gap-reason mentions) map from 4242 up;
 digests (40/64 hex) map to zero-padded indexes; device numbers map
 to small constants; inodes map from 100 up; mtimes become fixed;
@@ -101,6 +102,8 @@ captures (the scripts take the repo privileged lock themselves).
    - `tools/capture-churn.sh <observer> <tag> <rawdir>` with tags
      `v071` and `v072` → `v071-inventory-churn.json`,
      `v072-inventory-churn.json`
+   - `p11scope-discover-0.7.1 --module <provider> -o <rawdir>/v071-manifest-softhsm.json`
+     (first: the `--manifest` captures below read it)
    - `tools/capture-ops.sh <v071-observer> v071 keyops <rawdir>` →
      `v071-inventory-keyops.json` (v0.7.1 only)
    - `tools/capture-ops.sh <observer> <tag> profile <rawdir>` with
@@ -109,12 +112,15 @@ captures (the scripts take the repo privileged lock themselves).
    - `tools/capture-ops.sh <observer> <tag> metrics <rawdir>` with
      tags `v071` and `v072` → `v071-observed-metrics.json`,
      `v072-observed-metrics.json`
-   - `p11scope-discover-0.7.1 --module <provider> -o <rawdir>/v071-manifest-softhsm.json`
-     (before the `--manifest` captures)
    Rename the raw v0.7.1 profile inside `<rawdir>` to
    `v071-observed-profile-signer.json` (see above). No collection
    step: every capture writes its `-o` file directly into
-   `<rawdir>`, which is the sanitizer input set, exactly:
+   `<rawdir>`, which then holds the sanitizer input set below
+   (plus scratch logs the sanitizer never reads). Only the rows
+   above feed the sanitizer: `capture-keyops.sh` shares the
+   keyops `-o` name (never run it into `<rawdir>`), and the
+   `cgkeyops`/`syskeyops`/`manprof` outputs are exploratory,
+   not sanitizer inputs:
 
    ```manifest
    v071-inventory-scan.json

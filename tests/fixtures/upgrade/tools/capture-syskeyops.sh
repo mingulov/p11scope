@@ -16,7 +16,7 @@ export STEADY_GO=$OUT/$TAG.sysgo
 ME=$(id -un)
 LOCK="flock /var/tmp/p11scope-ws-tmp/privileged.lock"
 rm -f $STEADY_GO
-$TMPDIR/f2/bin/steady-keys $PROV 1234 90 ${HEXID:-e100} >$OUT/$TAG.syskeyops.sign.log 2>&1 &
+$TMPDIR/f2/bin/steady-keys $PROV 1234 45 ${HEXID:-e100} >$OUT/$TAG.syskeyops.sign.log 2>&1 &
 APID=$!
 sleep 1
 echo "anchor pid=$APID"
@@ -38,13 +38,12 @@ fi
 wait $OPID
 echo "rc=$?"
 $LOCK sudo -n chown $ME:$ME $OUT/$TAG-inventory-syskeyops.json
-kill $APID 2>/dev/null || true
 ANCHOR_RC=0
 wait "$APID" 2>/dev/null || ANCHOR_RC=$?
-case "$ANCHOR_RC" in
-  0|143) ;;
-  *) echo "$TAG syskeyops: anchor failed rc=$ANCHOR_RC" >&2; exit 1 ;;
-esac
+if [ "$ANCHOR_RC" -ne 0 ]; then
+  echo "$TAG syskeyops: anchor failed rc=$ANCHOR_RC" >&2
+  exit 1
+fi
 if [ "$READY_SEEN" != 1 ]; then
   echo "$TAG syskeyops: semantic lane never ready" >&2
   exit 1

@@ -35,5 +35,10 @@ $LOCK sudo -n --preserve-env=TMPDIR $BIN inventory --pid $APID --module $PROV \
 echo "native rc=$?"
 $LOCK sudo -n chown $ME:$ME $OUT/$TAG-inventory-native.json
 kill $APID 2>/dev/null || true
-wait 2>/dev/null || true
+ANCHOR_RC=0
+wait "$APID" 2>/dev/null || ANCHOR_RC=$?
+case "$ANCHOR_RC" in
+  0|143) ;;
+  *) echo "$TAG single: anchor failed rc=$ANCHOR_RC" >&2; exit 1 ;;
+esac
 ls -la $OUT/$TAG-inventory-*.json

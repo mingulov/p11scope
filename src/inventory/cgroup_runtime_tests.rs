@@ -221,13 +221,21 @@ fn returning_read_control_gate(reason: GateStop, native: bool) {
     let clock_expired = expired.clone();
     let base = Instant::now();
     let deadline = (reason == GateStop::Deadline).then_some(base + Duration::from_secs(1));
+    // Production wires the run control to the shared operator-stop signal,
+    // which the pass-0 worker control inherits through `without_deadline`
+    // and reads directly in every checkpoint and at `freeze_at_return`. The
+    // test must model the stop the same way: a `clock.stop` latch alone races
+    // the worker's return (the loop latches the worker control only while
+    // `!worker_returned`, after the tick already released the worker).
+    let operator_source = Arc::new(AtomicUsize::new(0));
     let control = CollectionControl::with_clock(deadline, move || {
         if clock_expired.load(Ordering::SeqCst) {
             base + Duration::from_secs(1)
         } else {
             base
         }
-    });
+    })
+    .with_operator_stop_source(Arc::clone(&operator_source));
     let (capture, native_log) = crate::inventory_capture::tests::cgroup_runtime_lane();
     let lane = native.then(|| {
         NativeLane::start(capture, &mut coordinator, LaneWindows::PROVISIONAL, None)
@@ -275,12 +283,20 @@ fn returning_read_control_gate(reason: GateStop, native: bool) {
         })
     }));
     let tick_stop = stop.clone();
+    let tick_source = operator_source.clone();
     let tick_count = ticks.clone();
     driver.tick = Some(Box::new(move || {
         if read_receiver.try_recv().is_ok() {
             // Mirrors dashboard quit: drawing sets stop; cancellation must
             // be latched after on_tick returns, before the next worker unit.
             tick_stop.store(reason == GateStop::Operator, Ordering::SeqCst);
+            if reason == GateStop::Operator {
+                // The production signal reaches the worker control directly
+                // through the shared source, so the held worker's checkpoints
+                // and its return freeze observe the stop however the loop's
+                // own latch interleaves with the worker's return.
+                tick_source.store(1, Ordering::SeqCst);
+            }
             expired.store(reason == GateStop::Deadline, Ordering::SeqCst);
             if native {
                 tick_service.set(

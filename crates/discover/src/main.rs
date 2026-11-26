@@ -923,14 +923,12 @@ mod tests {
         // non-root real uid, where SUDO_UID is attacker-chosen: only a
         // fully-root process may take it.
         for uids in [[1000, 0, 0], [1000, 0, 1000], [0, 0, 1000]] {
-            let error = super::prepare_drop_with(
-                uids,
-                [1000, 1000, 1000],
-                Some(1001),
-                Some(1001),
-            )
-            .unwrap_err();
-            assert_eq!(error, "refusing discovery with set-id credentials", "{uids:?}");
+            let error = super::prepare_drop_with(uids, [1000, 1000, 1000], Some(1001), Some(1001))
+                .unwrap_err();
+            assert_eq!(
+                error, "refusing discovery with set-id credentials",
+                "{uids:?}"
+            );
         }
     }
 
@@ -960,8 +958,7 @@ mod tests {
             ([1000, 1000, 1000], [1000, 1000, 0]),
             ([1000, 1000, 1000], [0, 0, 0]),
         ] {
-            let error =
-                super::prepare_drop_with(uids, gids, None, None).unwrap_err();
+            let error = super::prepare_drop_with(uids, gids, None, None).unwrap_err();
             assert_eq!(
                 error, "refusing discovery with set-id credentials",
                 "{uids:?}/{gids:?}"

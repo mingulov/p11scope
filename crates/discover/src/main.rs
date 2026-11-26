@@ -15,7 +15,7 @@ const USAGE: &str = "usage: p11scope-discover --module <provider.so> [-o manifes
 
 const MANIFEST_GUIDANCE: &str = "Use it only after an explicit observer --manifest choice; it does not prove application use or semantic attestation.";
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct DropTarget {
     uid: libc::uid_t,
     gid: libc::gid_t,
@@ -66,10 +66,26 @@ fn current_ids() -> Result<([libc::uid_t; 3], [libc::gid_t; 3]), String> {
 
 fn prepare_drop() -> Result<DropTarget, String> {
     let (uids, gids) = current_ids()?;
+    prepare_drop_with(uids, gids, target_id("SUDO_UID"), target_id("SUDO_GID"))
+}
+
+fn prepare_drop_with(
+    uids: [libc::uid_t; 3],
+    gids: [libc::gid_t; 3],
+    sudo_uid: Option<u32>,
+    sudo_gid: Option<u32>,
+) -> Result<DropTarget, String> {
     if uids[1] == 0 {
+        // A setuid-root install (or sudo) reaches this branch with a
+        // non-root real uid, where the SUDO_UID/SUDO_GID environment is
+        // attacker-chosen: only a fully-root process may take it, so no
+        // user can pick the identity their module runs as.
+        if uids != [0; 3] {
+            return Err("refusing discovery with set-id credentials".into());
+        }
         return Ok(DropTarget {
-            uid: target_id("SUDO_UID").unwrap_or(65_534),
-            gid: target_id("SUDO_GID").unwrap_or(65_534),
+            uid: sudo_uid.unwrap_or(65_534),
+            gid: sudo_gid.unwrap_or(65_534),
             credential_transition: true,
         });
     }
@@ -899,6 +915,58 @@ mod tests {
         super::write_private_atomically(&name, b"{}").expect("publish beside squatted names");
         assert_eq!(std::fs::read(&name).unwrap(), b"{}");
         std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn non_root_effective_root_credentials_are_refused() {
+        // A setuid-root helper (or sudo) reaches the root branch with a
+        // non-root real uid, where SUDO_UID is attacker-chosen: only a
+        // fully-root process may take it.
+        for uids in [[1000, 0, 0], [1000, 0, 1000], [0, 0, 1000]] {
+            let error = super::prepare_drop_with(
+                uids,
+                [1000, 1000, 1000],
+                Some(1001),
+                Some(1001),
+            )
+            .unwrap_err();
+            assert_eq!(error, "refusing discovery with set-id credentials", "{uids:?}");
+        }
+    }
+
+    #[test]
+    fn fully_root_credentials_take_the_drop_branch() {
+        let target =
+            super::prepare_drop_with([0, 0, 0], [0, 0, 0], Some(1000), Some(1000)).unwrap();
+        assert_eq!(target.uid, 1000);
+        assert_eq!(target.gid, 1000);
+        assert!(target.credential_transition);
+        let target = super::prepare_drop_with([0, 0, 0], [0, 0, 0], None, None).unwrap();
+        assert_eq!(target.uid, 65_534);
+        assert_eq!(target.gid, 65_534);
+        assert!(target.credential_transition);
+    }
+
+    #[test]
+    fn ordinary_credentials_keep_their_identity() {
+        let target =
+            super::prepare_drop_with([1000, 1000, 1000], [1000, 1000, 1000], None, None).unwrap();
+        assert_eq!(target.uid, 1000);
+        assert_eq!(target.gid, 1000);
+        assert!(!target.credential_transition);
+        // The non-root branch keeps refusing set-id credentials and gid 0.
+        for (uids, gids) in [
+            ([1000, 1000, 0], [1000, 1000, 1000]),
+            ([1000, 1000, 1000], [1000, 1000, 0]),
+            ([1000, 1000, 1000], [0, 0, 0]),
+        ] {
+            let error =
+                super::prepare_drop_with(uids, gids, None, None).unwrap_err();
+            assert_eq!(
+                error, "refusing discovery with set-id credentials",
+                "{uids:?}/{gids:?}"
+            );
+        }
     }
 
     #[test]

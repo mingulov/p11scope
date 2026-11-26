@@ -11747,7 +11747,7 @@ pub(crate) mod tests {
     /// a corrupt split (admitted above the total) clamps instead of
     /// rendering a negative remainder.
     #[test]
-    fn descendant_gap_split_names_admitted_and_never_observed() {
+    fn descendant_gap_split_names_seen_after_start_and_never_seen() {
         let mut ev = evidence();
         ev.pid_descendant_gaps = 32;
         ev.pid_descendant_gaps_admitted = 5;

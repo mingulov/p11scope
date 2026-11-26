@@ -539,11 +539,16 @@ least one mapper attached with none unattached, every recorded load
 resolved benignly, the loader aggregate's only roots are the
 unconfirmed hold's unproven timing, and no learned-file row exists,
 the text folds the partly-paused-load row and the unconfirmed
-loader-tracking row into one (`<n> load(s) held only by the member-stop
-backstop`); the verdict stays `PARTIAL` and JSON keeps both causes.
-The backstop proof is at-least-one per capture, not per counted load:
-the row count rides `pause_partial` while proven holds are counted
-separately in `member_stop_attached`. The counts never feed shares,
+loader-tracking row into one: `<n> load(s) held only by the member-stop
+backstop` when every counted load is a proven hold
+(`member_stop_attached` ≥ `pause_partial`), otherwise `<held> of <n>
+loads held only by the member-stop backstop`, where `<held>` is
+`member_stop_attached` and `<n>` is `pause_partial`. The verdict stays
+`PARTIAL` and JSON keeps both causes. The backstop proof is
+at-least-one per capture, not per counted load: the row count rides
+`pause_partial` while proven holds are counted separately in
+`member_stop_attached`, so the text never claims more held loads than
+were proven. The counts never feed shares,
 verdicts, or completeness.
 
 `gap_exe_hints` is present if and only if the capture armed extensive

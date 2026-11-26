@@ -1333,13 +1333,13 @@ class UpgradeGate5SimulationTests(unittest.TestCase):
                 "old capture schema",
                 {},
                 {"capture-old-wrong-schema": ""},
-                "old capture report failed typed validation: schema is 'wrong/schema', expected 'p11scope/inventory/v1'",
+                "old capture report failed typed validation: inventory schema: $.schema: value 'wrong/schema' is not const 'p11scope/inventory/v1'",
             ),
             (
                 "old capture sparse",
                 {},
                 {"capture-old-sparse": ""},
-                "old capture report failed typed validation: missing inventory root field 'scope'",
+                "old capture report failed typed validation: inventory schema: $: required property 'scope' is missing",
             ),
             (
                 "empty recovery hash before",
@@ -1393,13 +1393,13 @@ class UpgradeGate5SimulationTests(unittest.TestCase):
                 "new capture schema",
                 {},
                 {"capture-new-wrong-schema": ""},
-                "new capture report failed typed validation: schema is 'wrong/schema', expected 'p11scope/inventory/v1'",
+                "new capture report failed typed validation: inventory schema: $.schema: value 'wrong/schema' is not const 'p11scope/inventory/v1'",
             ),
             (
                 "new capture sparse",
                 {},
                 {"capture-new-sparse": ""},
-                "new capture report failed typed validation: missing inventory root field 'scope'",
+                "new capture report failed typed validation: inventory schema: $: required property 'scope' is missing",
             ),
             (
                 "empty recovery hash after",
@@ -1456,8 +1456,8 @@ class UpgradeArtifactValidationTests(unittest.TestCase):
 
     def test_inventory_validator_rejects_schema_only_document_typed_exactly(self):
         errors = self.validation.inventory_errors({"schema": "p11scope/inventory/v1"})
-        self.assertEqual(errors[0], "missing inventory root field 'scope'")
-        self.assertIn("missing inventory root field 'gaps_suppressed'", errors)
+        self.assertEqual(errors[0], "inventory schema: $: required property 'scope' is missing")
+        self.assertIn("inventory schema: $: required property 'gaps_suppressed' is missing", errors)
 
     def test_inventory_positive_payload_rejects_hollow_typed_rows(self):
         document = substantive_inventory()
@@ -1484,23 +1484,16 @@ class UpgradeArtifactValidationTests(unittest.TestCase):
             self.assertIn(f"diff positive payload: fewer than one compared caller row on {side}", errors)
 
     def test_inventory_validator_rejects_each_required_root_field(self):
-        for key in (
-            "scope",
-            "clock",
-            "observation",
-            "budgets",
-            "callers",
-            "modules",
-            "edges",
-            "gaps",
-            "gaps_suppressed",
-        ):
+        schema = json.loads((ROOT / "docs/schema/inventory-v1.schema.json").read_text())
+        required = schema["required"]
+        self.assertEqual(len(required), 12)
+        for key in required:
             with self.subTest(key=key):
                 document = substantive_inventory()
                 del document[key]
-                self.assertEqual(
-                    self.validation.inventory_errors(document)[0],
-                    f"missing inventory root field '{key}'",
+                self.assertIn(
+                    f"inventory schema: $: required property '{key}' is missing",
+                    self.validation.inventory_errors(document),
                 )
 
     def test_cbom_inventory_validator_requires_source_flow_through(self):
@@ -1513,19 +1506,48 @@ class UpgradeArtifactValidationTests(unittest.TestCase):
         hollow_errors = self.validation.cbom_inventory_errors(hollow, source)
         self.assertIn("cbom positive payload: fewer than one typed applications component", hollow_errors)
         self.assertIn("cbom positive payload: fewer than one typed providers component", hollow_errors)
-        mismatched = copy.deepcopy(cbom)
-        for prop in mismatched["metadata"]["properties"]:
-            if prop["name"] == "p11scope:applications":
-                prop["value"] = "2"
-        mismatch_errors = self.validation.cbom_inventory_errors(mismatched, source)
+        self.assertIn("cbom positive payload: fewer than one typed algorithms component", hollow_errors)
+        present = {"applications": 1, "providers": 1, "algorithms": 1, "keys": 0}
+        for name, count in present.items():
+            with self.subTest(name=name):
+                mismatched = copy.deepcopy(cbom)
+                for prop in mismatched["metadata"]["properties"]:
+                    if prop["name"] == f"p11scope:{name}":
+                        prop["value"] = "2"
+                mismatch_errors = self.validation.cbom_inventory_errors(mismatched, source)
+                self.assertIn(
+                    f"cbom positive payload: 'p11scope:{name}' is 2, "
+                    f"but {count} typed component(s) are present",
+                    mismatch_errors,
+                )
+        non_decimal = copy.deepcopy(cbom)
+        for prop in non_decimal["metadata"]["properties"]:
+            if prop["name"] == "p11scope:established_source_query":
+                prop["value"] = "x"
         self.assertIn(
-            "cbom positive payload: 'p11scope:applications' is 2, but 1 typed component(s) are present",
-            mismatch_errors,
+            "cbom property 'p11scope:established_source_query' is 'x', expected a decimal count",
+            self.validation.cbom_inventory_errors(non_decimal, source),
         )
         sparse = {"bomFormat": "CycloneDX", "metadata": {"properties": []}}
         self.assertEqual(
             self.validation.cbom_inventory_errors(sparse, source)[0],
-            "missing cbom root field 'specVersion'",
+            "cbom property 'p11scope:source_schema' is None, expected 'p11scope/inventory/v1'",
+        )
+
+    def test_cbom_inventory_validator_rejects_schema_violations(self):
+        source = substantive_inventory()
+        cbom = UpgradeGate6Harness.cbom(inventory_cbom_properties(source))
+        bad_name = copy.deepcopy(cbom)
+        bad_name["components"][0]["name"] = 123
+        self.assertEqual(
+            self.validation.cbom_inventory_errors(bad_name, source),
+            ["cbom schema: $.components[0].name: is integer, expected string"],
+        )
+        bad_dependency = copy.deepcopy(cbom)
+        bad_dependency["dependencies"][0] = {"ref": 123}
+        self.assertEqual(
+            self.validation.cbom_inventory_errors(bad_dependency, source),
+            ["cbom schema: $.dependencies[0].ref: is integer, expected string"],
         )
 
     def test_diff_validator_requires_ten_field_typed_document_and_consistency(self):
@@ -1533,19 +1555,27 @@ class UpgradeArtifactValidationTests(unittest.TestCase):
         after = substantive_inventory()
         document = valid_diff_document(before, after)
         self.assertEqual(self.validation.diff_errors(document, before, after), [])
-        sparse = {
-            "schema": "p11scope/inventory-diff/v1",
-            "application_changes": [],
-            "module_path_changes": [],
-        }
+        schema = json.loads((ROOT / "docs/schema/inventory-diff-v1.schema.json").read_text())
+        required = schema["required"]
+        self.assertEqual(len(required), 10)
+        for key in required:
+            with self.subTest(key=key):
+                sparse = copy.deepcopy(document)
+                del sparse[key]
+                self.assertIn(
+                    f"diff schema: $: required property '{key}' is missing",
+                    self.validation.diff_errors(sparse, before, after),
+                )
+        mistyped = copy.deepcopy(document)
+        mistyped["summary"]["module_paths_changed"] = "1"
         self.assertEqual(
-            self.validation.diff_errors(sparse, before, after)[0],
-            "missing diff root field 'before'",
+            self.validation.diff_errors(mistyped, before, after),
+            ["diff schema: $.summary.module_paths_changed: is string, expected integer"],
         )
         inconsistent = copy.deepcopy(document)
-        inconsistent["summary"]["module_paths_changed"] = 1
+        inconsistent["before"]["scope"] = "other"
         self.assertIn(
-            "diff summary module_paths_changed is 1, expected 0",
+            "diff before.scope is 'other', expected 'system'",
             self.validation.diff_errors(inconsistent, before, after),
         )
 
@@ -1553,21 +1583,21 @@ class UpgradeArtifactValidationTests(unittest.TestCase):
         document = substantive_inventory()
         document["observation"]["passes"] = "2"
         self.assertIn(
-            "inventory observation.passes is string, expected a positive integer",
+            "inventory schema: $.observation.passes: is string, expected integer",
             self.validation.inventory_errors(document),
         )
 
         document = substantive_inventory()
         document["modules"][0]["paths"] = None
         self.assertIn(
-            "inventory modules[0].paths is null, expected an array of nonempty strings",
+            "inventory schema: $.modules[0].paths: is null, expected array",
             self.validation.inventory_errors(document),
         )
 
         document = substantive_inventory()
         document["gaps_suppressed"] = True
         self.assertIn(
-            "inventory field 'gaps_suppressed' is bool, expected a nonnegative integer",
+            "inventory schema: $.gaps_suppressed: is boolean, expected integer",
             self.validation.inventory_errors(document),
         )
 
@@ -1870,7 +1900,10 @@ class UpgradeGate6ActivationTests(unittest.TestCase):
         result = self.assert_gate_failure(
             "diff_old_old_zero", fault="diff-zero-wrong-schema"
         )
-        self.assertIn("diff schema is 'other'", result["checks"]["diff_old_old_zero"]["detail"])
+        self.assertIn(
+            "diff schema: $.schema: value 'other' is not const 'p11scope/inventory-diff/v1'",
+            result["checks"]["diff_old_old_zero"]["detail"],
+        )
 
     def test_v071_profile_fixture_is_real_old_shaped_and_substantive(self):
         path = ROOT / "tests/fixtures/upgrade/v071-observed-profile.json"
@@ -1898,29 +1931,70 @@ class UpgradeGate6ActivationTests(unittest.TestCase):
         )
 
     def test_profile_fixture_flow_requires_substantive_typed_conversion(self):
-        window = "2026-11-25T11:14:57Z..2026-11-25T11:15:00Z (capture wall clock)"
-        note = (
-            "profile input: mechanisms are capture-global, without caller, usage-edge or key linkage"
-        )
-        document = {
-            "metadata": {
-                "properties": [
-                    {"name": "p11scope:source_schema", "value": "p11scope/observed-profile/v3"},
-                    {"name": "p11scope:window", "value": window},
-                    {"name": "p11scope:profile_note", "value": note},
-                    {"name": "p11scope:completeness", "value": "COMPLETE"},
-                    {"name": "p11scope:providers", "value": "1"},
-                    {"name": "p11scope:algorithms", "value": "1"},
-                ]
-            }
+        validation = self.gate6.artifact_validation
+        profile = {
+            "schema": "p11scope/observed-profile/v3",
+            "capture": {
+                "start": "2026-11-25T11:14:57Z",
+                "end": "2026-11-25T11:15:00Z",
+                "modules": [{"path": "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so"}],
+            },
+            "evidence": {"completeness": "COMPLETE"},
+            "mechanisms": [{"mechanism": 592, "name": "CKM_SHA256"}],
         }
-        self.assertTrue(self.gate6.cbom_profile_fixture_flow(document, window))
-        changed = copy.deepcopy(document)
-        changed["metadata"]["properties"][4]["value"] = "0"
-        self.assertFalse(self.gate6.cbom_profile_fixture_flow(changed, window))
-        changed = copy.deepcopy(document)
-        changed["metadata"]["properties"][5]["value"] = "0"
-        self.assertFalse(self.gate6.cbom_profile_fixture_flow(changed, window))
+        properties = {
+            "p11scope:source_schema": "p11scope/observed-profile/v3",
+            "p11scope:window": "2026-11-25T11:14:57Z..2026-11-25T11:15:00Z (capture wall clock)",
+            "p11scope:profile_note": (
+                "profile input: mechanisms are capture-global, without caller, "
+                "usage-edge or key linkage"
+            ),
+            "p11scope:completeness": "COMPLETE",
+            "p11scope:providers": "1",
+            "p11scope:algorithms": "1",
+            "p11scope:applications": "0",
+            "p11scope:keys": "0",
+            "p11scope:object_observations": "absent",
+            "p11scope:established_source_query": "0",
+            "p11scope:established_source_creation_success": "0",
+            "p11scope:established_source_unrecorded": "0",
+            "p11scope:callers_unknown_exe": "0",
+            "p11scope:mechanisms_unnamed": "1",
+            "p11scope:mechanisms_unknown_primitive": "1",
+            "p11scope:keys_unknown_size": "0",
+            "p11scope:keys_unknown_type": "0",
+        }
+        document = UpgradeGate6Harness.cbom(properties)
+        self.assertEqual(validation.cbom_profile_errors(document, profile), [])
+        for name in (
+            "p11scope:providers",
+            "p11scope:algorithms",
+            "p11scope:completeness",
+            "p11scope:window",
+            "p11scope:profile_note",
+        ):
+            with self.subTest(name=name):
+                changed = copy.deepcopy(document)
+                for prop in changed["metadata"]["properties"]:
+                    if prop["name"] == name:
+                        prop["value"] = "wrong"
+                self.assertTrue(validation.cbom_profile_errors(changed, profile))
+        hollow = copy.deepcopy(document)
+        hollow["components"] = []
+        hollow["dependencies"] = []
+        hollow_errors = validation.cbom_profile_errors(hollow, profile)
+        self.assertIn(
+            "cbom positive payload: fewer than one typed providers component", hollow_errors
+        )
+        self.assertIn(
+            "cbom positive payload: fewer than one typed algorithms component", hollow_errors
+        )
+        bad_name = copy.deepcopy(document)
+        bad_name["components"][0]["name"] = 123
+        self.assertEqual(
+            validation.cbom_profile_errors(bad_name, profile),
+            ["cbom schema: $.components[0].name: is integer, expected string"],
+        )
 
 
 class UpgradeTestPackageTests(unittest.TestCase):

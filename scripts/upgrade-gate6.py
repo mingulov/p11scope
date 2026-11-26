@@ -260,17 +260,6 @@ def cbom_profile_markers_present(document: dict, window: str = PROFILE_TEST_WIND
     )
 
 
-def cbom_profile_fixture_flow(document: dict, window: str) -> bool:
-    """True when substantive v0.7.1 profile rows flow into typed cbom output."""
-    props = cbom_properties(document)
-    return (
-        cbom_profile_markers_present(document, window)
-        and props.get("p11scope:completeness") == "COMPLETE"
-        and props.get("p11scope:providers") == "1"
-        and props.get("p11scope:algorithms") == "1"
-    )
-
-
 def profile_fixture_old_shape(document: dict) -> bool:
     """True only for a substantive v0.7.1 profile lacking the new evidence keys."""
     evidence = document.get("evidence", {})

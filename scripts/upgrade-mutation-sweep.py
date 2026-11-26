@@ -25,6 +25,14 @@ VALIDATOR_TEST = "UpgradeArtifactValidationTests"
 GATE5_KILLER = "UpgradeGate5SimulationTests.test_simulated_negative_controls_fail_with_exact_typed_reasons"
 GATE6_KILLER = "UpgradeGate6ActivationTests.test_run_gate_activation_negative_controls"
 
+GATE6_POSITIVE_KILLER = (
+    "UpgradeGate6ActivationTests.test_run_gate_positive_synthetic_typed_flow_is_exact"
+)
+PROFILE_FLOW_KILLER = (
+    "UpgradeGate6ActivationTests.test_profile_fixture_flow_requires_substantive_typed_conversion"
+)
+CBOM_SCHEMA_KILLER = f"{VALIDATOR_TEST}.test_cbom_inventory_validator_rejects_schema_violations"
+
 MUTATIONS = [
     {
         "site": "gate5 old capture typed validation",
@@ -83,25 +91,25 @@ MUTATIONS = [
         "killer": GATE6_KILLER,
     },
     {
-        "site": "inventory root positive-content contract",
-        "file": "scripts/upgrade_artifact_validation.py",
-        "old": '    "scope",\n',
-        "new": "",
-        "killer": f"{VALIDATOR_TEST}.test_inventory_validator_rejects_each_required_root_field",
+        "site": "gate6 b3 old-against-tag schema check",
+        "file": "scripts/upgrade-gate6.py",
+        "old": '        "b3_old_schema_passes",',
+        "new": '        "b3_old_schema_passes_dropped",',
+        "killer": GATE6_POSITIVE_KILLER,
     },
     {
-        "site": "inventory nested observation typing",
-        "file": "scripts/upgrade_artifact_validation.py",
-        "old": '        validate_inventory_observation(document["observation"], errors)',
-        "new": "        pass",
-        "killer": f"{VALIDATOR_TEST}.test_inventory_validator_rejects_wrong_nested_types",
+        "site": "gate6 b3 old-against-head expected-failure check",
+        "file": "scripts/upgrade-gate6.py",
+        "old": '        "b3_old_against_head_expected_failure",',
+        "new": '        "b3_old_against_head_expected_failure_dropped",',
+        "killer": GATE6_POSITIVE_KILLER,
     },
     {
-        "site": "inventory row typing",
-        "file": "scripts/upgrade_artifact_validation.py",
-        "old": "                for index, row in enumerate(rows):\n                    row_validator(row, index, errors)",
-        "new": "                pass",
-        "killer": f"{VALIDATOR_TEST}.test_inventory_validator_rejects_wrong_nested_types",
+        "site": "gate6 diff churn lifecycle check",
+        "file": "scripts/upgrade-gate6.py",
+        "old": '        "diff_churn_lifecycle",',
+        "new": '        "diff_churn_lifecycle_dropped",',
+        "killer": GATE6_POSITIVE_KILLER,
     },
     {
         "site": "cbom exact source flow-through comparison",
@@ -111,25 +119,25 @@ MUTATIONS = [
         "killer": GATE6_KILLER,
     },
     {
-        "site": "cbom structural root contract",
+        "site": "cbom numeric property decimal loop",
         "file": "scripts/upgrade_artifact_validation.py",
-        "old": 'CBOM_ROOT_FIELDS = ("bomFormat", "specVersion", "metadata", "components", "dependencies")',
-        "new": 'CBOM_ROOT_FIELDS = ("bomFormat", "metadata", "components", "dependencies")',
+        "old": "    for name in CBOM_NUMERIC_PROPERTIES:",
+        "new": "    for name in ():",
         "killer": f"{VALIDATOR_TEST}.test_cbom_inventory_validator_requires_source_flow_through",
     },
     {
-        "site": "diff ten-root-field contract",
+        "site": "profile providers derivation",
         "file": "scripts/upgrade_artifact_validation.py",
-        "old": '    "before",\n',
-        "new": "",
-        "killer": f"{VALIDATOR_TEST}.test_diff_validator_requires_ten_field_typed_document_and_consistency",
+        "old": '        "p11scope:providers": str(len(modules)),',
+        "new": '        "p11scope:providers": "0",',
+        "killer": PROFILE_FLOW_KILLER,
     },
     {
-        "site": "diff summary exact-count consistency",
+        "site": "profile algorithms derivation",
         "file": "scripts/upgrade_artifact_validation.py",
-        "old": "            for key, expected in expected_summary.items():",
-        "new": "            for key, expected in {}.items():",
-        "killer": f"{VALIDATOR_TEST}.test_diff_validator_requires_ten_field_typed_document_and_consistency",
+        "old": '        "p11scope:algorithms": str(len(mechanism_ids)),',
+        "new": '        "p11scope:algorithms": "0",',
+        "killer": PROFILE_FLOW_KILLER,
     },
     {
         "site": "inventory positive caller row",
@@ -153,18 +161,67 @@ MUTATIONS = [
         "killer": f"{VALIDATOR_TEST}.test_inventory_positive_payload_rejects_hollow_typed_rows",
     },
     {
-        "site": "cbom positive application count equality",
+        "site": "cbom positive applications count equality",
         "file": "scripts/upgrade_artifact_validation.py",
         "old": '    for name in ("applications", "providers", "algorithms", "keys"):',
         "new": '    for name in ("providers", "algorithms", "keys"):',
         "killer": f"{VALIDATOR_TEST}.test_cbom_inventory_validator_requires_source_flow_through",
     },
     {
-        "site": "cbom positive minimum component rule",
+        "site": "cbom positive providers count equality",
         "file": "scripts/upgrade_artifact_validation.py",
-        "old": '    for name in minimums:\n        if counts[name] < 1:',
-        "new": "    for name in ():\n        if counts[name] < 1:",
+        "old": '    for name in ("applications", "providers", "algorithms", "keys"):',
+        "new": '    for name in ("applications", "algorithms", "keys"):',
         "killer": f"{VALIDATOR_TEST}.test_cbom_inventory_validator_requires_source_flow_through",
+    },
+    {
+        "site": "cbom positive algorithms count equality",
+        "file": "scripts/upgrade_artifact_validation.py",
+        "old": '    for name in ("applications", "providers", "algorithms", "keys"):',
+        "new": '    for name in ("applications", "providers", "keys"):',
+        "killer": f"{VALIDATOR_TEST}.test_cbom_inventory_validator_requires_source_flow_through",
+    },
+    {
+        "site": "cbom positive keys count equality",
+        "file": "scripts/upgrade_artifact_validation.py",
+        "old": '    for name in ("applications", "providers", "algorithms", "keys"):',
+        "new": '    for name in ("applications", "providers", "algorithms"):',
+        "killer": f"{VALIDATOR_TEST}.test_cbom_inventory_validator_requires_source_flow_through",
+    },
+    {
+        "site": "cbom positive inventory applications minimum",
+        "file": "scripts/upgrade_artifact_validation.py",
+        "old": '    minimums = ("providers", "algorithms") if profile_input else ("applications", "providers", "algorithms")',
+        "new": '    minimums = ("providers", "algorithms") if profile_input else ("providers", "algorithms")',
+        "killer": f"{VALIDATOR_TEST}.test_cbom_inventory_validator_requires_source_flow_through",
+    },
+    {
+        "site": "cbom positive inventory providers minimum",
+        "file": "scripts/upgrade_artifact_validation.py",
+        "old": '    minimums = ("providers", "algorithms") if profile_input else ("applications", "providers", "algorithms")',
+        "new": '    minimums = ("providers", "algorithms") if profile_input else ("applications", "algorithms")',
+        "killer": f"{VALIDATOR_TEST}.test_cbom_inventory_validator_requires_source_flow_through",
+    },
+    {
+        "site": "cbom positive inventory algorithms minimum",
+        "file": "scripts/upgrade_artifact_validation.py",
+        "old": '    minimums = ("providers", "algorithms") if profile_input else ("applications", "providers", "algorithms")',
+        "new": '    minimums = ("providers", "algorithms") if profile_input else ("applications", "providers")',
+        "killer": f"{VALIDATOR_TEST}.test_cbom_inventory_validator_requires_source_flow_through",
+    },
+    {
+        "site": "cbom positive profile providers minimum",
+        "file": "scripts/upgrade_artifact_validation.py",
+        "old": '    minimums = ("providers", "algorithms") if profile_input else ("applications", "providers", "algorithms")',
+        "new": '    minimums = ("algorithms",) if profile_input else ("applications", "providers", "algorithms")',
+        "killer": PROFILE_FLOW_KILLER,
+    },
+    {
+        "site": "cbom positive profile algorithms minimum",
+        "file": "scripts/upgrade_artifact_validation.py",
+        "old": '    minimums = ("providers", "algorithms") if profile_input else ("applications", "providers", "algorithms")',
+        "new": '    minimums = ("providers",) if profile_input else ("applications", "providers", "algorithms")',
+        "killer": PROFILE_FLOW_KILLER,
     },
     {
         "site": "diff positive before caller occurrence",
@@ -179,6 +236,34 @@ MUTATIONS = [
         "old": '    for side in ("before", "after"):',
         "new": '    for side in ("before",):',
         "killer": f"{VALIDATOR_TEST}.test_diff_positive_payload_rejects_hollow_caller_projections",
+    },
+    {
+        "site": "inventory product-schema shape call",
+        "file": "scripts/upgrade_artifact_validation.py",
+        "old": "    errors = product_schema_errors(document, INVENTORY_SCHEMA_FILE, \"inventory\")",
+        "new": "    errors = []",
+        "killer": f"{VALIDATOR_TEST}.test_inventory_validator_rejects_each_required_root_field",
+    },
+    {
+        "site": "cbom inventory product-schema shape call",
+        "file": "scripts/upgrade_artifact_validation.py",
+        "old": "        errors.append(\"cbom property 'p11scope:gaps_suppressed' is present for a zero source count\")\n    if not errors:\n        errors.extend(product_schema_errors(document, CBOM_SCHEMA_FILE, \"cbom\"))",
+        "new": "        errors.append(\"cbom property 'p11scope:gaps_suppressed' is present for a zero source count\")\n    if False:\n        errors.extend(product_schema_errors(document, CBOM_SCHEMA_FILE, \"cbom\"))",
+        "killer": CBOM_SCHEMA_KILLER,
+    },
+    {
+        "site": "cbom profile product-schema shape call",
+        "file": "scripts/upgrade_artifact_validation.py",
+        "old": "    compare_cbom_properties(document, expected, errors)\n    if not errors:\n        errors.extend(product_schema_errors(document, CBOM_SCHEMA_FILE, \"cbom\"))",
+        "new": "    compare_cbom_properties(document, expected, errors)\n    if False:\n        errors.extend(product_schema_errors(document, CBOM_SCHEMA_FILE, \"cbom\"))",
+        "killer": PROFILE_FLOW_KILLER,
+    },
+    {
+        "site": "diff product-schema shape call",
+        "file": "scripts/upgrade_artifact_validation.py",
+        "old": "    diff_source_consistency(document.get(\"after\"), after_source, \"after\", errors)\n    if not errors:\n        errors.extend(product_schema_errors(document, DIFF_SCHEMA_FILE, \"diff\"))",
+        "new": "    diff_source_consistency(document.get(\"after\"), after_source, \"after\", errors)\n    if False:\n        errors.extend(product_schema_errors(document, DIFF_SCHEMA_FILE, \"diff\"))",
+        "killer": f"{VALIDATOR_TEST}.test_diff_validator_requires_ten_field_typed_document_and_consistency",
     },
     {
         "site": "diff snapshot/source exact consistency",

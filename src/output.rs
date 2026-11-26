@@ -2808,6 +2808,31 @@ mod tests {
         );
     }
 
+    /// An abandoned file unlinks its temp on drop: an early error
+    /// after the sink opened (a startup stop, a refused path) leaves
+    /// no orphan `.p11scope.<pid>.*.tmp` behind, and a previous
+    /// report stays untouched.
+    #[test]
+    fn abandoning_unlinks_the_temp_and_keeps_any_previous_report() {
+        let dir = private_tempdir();
+        let path = dir.path().join("observed.json");
+        std::fs::write(&path, b"stale").unwrap();
+        let mut a = AtomicFile::create(&path).unwrap();
+        std::io::Write::write_all(a.file(), b"{\"ok\":true}").unwrap();
+        assert_eq!(temp_litter(dir.path()).len(), 1, "one live temp");
+        drop(a);
+        assert_eq!(
+            temp_litter(dir.path()),
+            Vec::<String>::new(),
+            "no orphan temp left"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"stale",
+            "the previous report stays untouched"
+        );
+    }
+
     /// The commit gate is identity/owner/mode-only: it re-verifies the
     /// temp's dev/ino, owner and mode, never its bytes. Anyone who can
     /// open the live temp for writing can therefore append bytes that

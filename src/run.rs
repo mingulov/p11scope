@@ -3624,6 +3624,18 @@ fn capture_with_host(
         // No named view and no cgroup path: discovery sweeps /proc itself.
         ScopeArg::System => (Scope::System, None),
     };
+    // M-1: own Ctrl-C/SIGTERM/SIGHUP before anything slow or
+    // strandable runs. The host capability probe below loads BPF and
+    // can take a noticeable slice of startup; the `-o` temp file, a
+    // created trace file, and discovery follow. A default
+    // disposition there would strand the temp files, and an
+    // inherited SIG_IGN (a backgrounded launch ignores SIGINT) would
+    // lose a stop landing before the handler is installed: the run
+    // would then wait for a provider forever instead of exiting. A
+    // stop that lands before the attach is honoured just after
+    // discovery (which cannot be interrupted part-way), by returning
+    // an error that drops the sink.
+    let stop = install_stop_flag()?;
     let _host = host()?;
     match (kind, a.duration) {
         (Kind::Trace, None) => emit_capture_diagnostic(&no_duration_notice()),
@@ -3646,12 +3658,6 @@ fn capture_with_host(
         flag: "--allow-uretprobe-on-confined-target",
         reason,
     });
-    // M-1: own Ctrl-C/SIGTERM/SIGHUP before anything exists that a default
-    // disposition would strand — the `-o` temp file below, a created trace
-    // file — and before discovery, which can take seconds. A stop that lands
-    // before the attach is honoured just after discovery (which cannot be
-    // interrupted part-way), by returning an error that drops the sink.
-    let stop = install_stop_flag()?;
     // Before the discovery scan: a bad `-o` path must fail fast (F-Scale-6)
     // instead of after a scan — and still before any probe is on. The profile
     // sink stays an atomically-published temp file; opening it early only
@@ -30326,7 +30332,11 @@ int main(int argc, char **argv) {
     /// M-1: `capture` must own Ctrl-C/SIGTERM/SIGHUP before it creates the
     /// `-o` temp file and starts discovery (a default disposition there kills
     /// the process and leaves `.p11scope.<pid>.*.tmp` behind), and must look
-    /// at the flag again before attaching.
+    /// at the flag again before attaching. The flag also precedes the
+    /// slow host capability probe: a stop landing before the handler is
+    /// installed is lost silently when SIGINT is inherited ignored (a
+    /// backgrounded launch), and the run then waits for a provider
+    /// forever instead of exiting.
     #[test]
     fn capture_owns_stop_signals_before_output_and_discovery() {
         let source = include_str!("run.rs");
@@ -30342,13 +30352,18 @@ int main(int argc, char **argv) {
             body.find(needle).unwrap()
         };
         let install = at("install_stop_flag()");
+        let host = at("let _host = host()?;");
         let open = at("OutputSink::open(");
         // The discovery pass threads the stop flag (fix1 F1.2), so the call
-        // is `discover_with_cancel`; the M-1 ordering (install < open <
-        // discover < refuse < attach) is unchanged.
+        // is `discover_with_cancel`; the M-1 ordering (install < host <
+        // open < discover < refuse < attach) is unchanged.
         let discover = at("Engine::discover_with_cancel(");
         let refuse = at("refuse_if_interrupted_before_attach(&stop)");
         let attach = at("start_session(");
+        assert!(
+            install < host,
+            "stop flag after the host probe: an early stop is lost"
+        );
         assert!(install < open, "stop flag after the output sink opened");
         assert!(
             open < discover,
@@ -30356,6 +30371,23 @@ int main(int argc, char **argv) {
         );
         assert!(discover < refuse, "no interruption check after discovery");
         assert!(refuse < attach, "interruption checked only after attach");
+    }
+
+    /// Installing the stop flag replaces an inherited SIG_IGN (a
+    /// backgrounded launch ignores SIGINT): the disposition becomes
+    /// the observer's handler. No signal is delivered, so nothing
+    /// else observes the dance; the previous disposition restores on
+    /// scope end. Serialized with the other actual-signal tests.
+    #[test]
+    fn installing_the_stop_flag_overrides_inherited_ignore() {
+        let _signal_guard = ACTUAL_SIGNAL_TEST.lock().unwrap();
+        let _restore = RestoreDisposition::save(libc::SIGINT);
+        set_disposition(libc::SIGINT, libc::SIG_IGN);
+        assert_eq!(current_disposition(libc::SIGINT), libc::SIG_IGN);
+        let _state = install_stop_flag().expect("install succeeds");
+        let installed = current_disposition(libc::SIGINT);
+        assert_ne!(installed, libc::SIG_IGN, "ignore survives install");
+        assert_ne!(installed, libc::SIG_DFL, "install leaves default");
     }
 
     /// Exercises the interrupt path directly, with no real signal sent:

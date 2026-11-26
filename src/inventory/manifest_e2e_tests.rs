@@ -1374,6 +1374,158 @@ fn privileged_inventory_system_manifest_scale4097_softsm_edges_lp64() -> Result<
     keep_workload_on_failure(workload, outcome, "SCALE2_E2E")
 }
 
+/// Counts the ledger caller's populated folded aggregates in a scale
+/// report: only `departed_use` aggregates whose identities name
+/// `ledger_pid` count, every mechanism must carry its returns rows
+/// (an aggregate without returns proves nothing about the ledger's
+/// API results), and the aggregate must record entries and API
+/// returns. Powers the `ledger_caller.is_none()` arm of
+/// `scale4097_inner`, which the live scale cell rarely reaches, so
+/// the twins below drive it directly with synthetic folded reports.
+fn count_folded_ledger_aggregates(report: &serde_json::Value, ledger_pid: u32) -> Result<usize> {
+    let modules = report
+        .get("modules")
+        .and_then(serde_json::Value::as_array)
+        .context("modules array")?;
+    let mut populated = 0usize;
+    for departed in modules
+        .iter()
+        .filter_map(|module| module.get("departed_use"))
+        .filter(|departed| {
+            departed
+                .get("identities")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|identities| {
+                    identities.iter().any(|ident| {
+                        ident.get("pid").and_then(serde_json::Value::as_u64)
+                            == Some(u64::from(ledger_pid))
+                    })
+                })
+        })
+    {
+        let Some(mechanisms) = departed
+            .get("mechanisms")
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        if mechanisms.is_empty() {
+            continue;
+        }
+        let mut calls = 0u64;
+        let mut ok = false;
+        for mechanism in mechanisms {
+            calls += mechanism
+                .get("calls")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let returns = mechanism
+                .get("evidence")
+                .and_then(|evidence| evidence.get("returns"))
+                .and_then(serde_json::Value::as_array)
+                .context("mechanism returns")?;
+            ok |= returns
+                .iter()
+                .any(|ret| ret.get("rv").and_then(serde_json::Value::as_u64) == Some(0));
+        }
+        if calls == 0 || !ok {
+            continue;
+        }
+        let entries = departed
+            .get("entries")
+            .and_then(|entries| entries.get("count"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        ensure!(entries > 0, "the folded aggregate records entries");
+        let api_returns = departed
+            .get("instances")
+            .and_then(|instances| instances.get("api_returns"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        ensure!(api_returns > 0, "the folded aggregate records API returns");
+        populated += 1;
+    }
+    Ok(populated)
+}
+
+/// One synthetic folded row: a module whose `departed_use` aggregate
+/// carries `pid` in its identities, one mechanism with `calls` calls
+/// (with CKR_OK returns rows when `with_returns`), and positive
+/// entry/API-return totals.
+fn folded_module(pid: u32, calls: u64, with_returns: bool) -> serde_json::Value {
+    let mechanism = if with_returns {
+        serde_json::json!({
+            "calls": calls,
+            "evidence": {"returns": [{"rv": 0}]},
+        })
+    } else {
+        serde_json::json!({"calls": calls})
+    };
+    serde_json::json!({
+        "departed_use": {
+            "identities": [{"pid": pid}],
+            "mechanisms": [mechanism],
+            "entries": {"count": calls},
+            "instances": {"api_returns": calls},
+        },
+    })
+}
+
+fn folded_report(modules: Vec<serde_json::Value>) -> serde_json::Value {
+    serde_json::json!({"modules": modules})
+}
+
+#[test]
+fn folded_ledger_aggregate_with_returns_counts_once() {
+    // The ledger row counts; a populated row for another pid in the
+    // same report does not double-count.
+    let report = folded_report(vec![
+        folded_module(4242, 5, true),
+        folded_module(9999, 5, true),
+    ]);
+    assert_eq!(
+        count_folded_ledger_aggregates(&report, 4242).expect("the ledger aggregate counts"),
+        1,
+    );
+}
+
+#[test]
+fn folded_other_pid_aggregate_is_ignored() {
+    // Only the ledger row counts: a populated row for another pid
+    // alone counts nothing (a dropped pid filter would count 1).
+    let report = folded_report(vec![folded_module(9999, 5, true)]);
+    assert_eq!(
+        count_folded_ledger_aggregates(&report, 4242).expect("non-ledger rows never error"),
+        0,
+    );
+}
+
+#[test]
+fn folded_ledger_aggregate_without_returns_errors() {
+    // The ledger row without returns rows is a hard error naming the
+    // missing proof (optional returns would return Ok(0) instead).
+    let report = folded_report(vec![folded_module(4242, 5, false)]);
+    let error = count_folded_ledger_aggregates(&report, 4242)
+        .err()
+        .expect("the returns-less ledger row errors");
+    assert!(
+        format!("{error:#}").contains("mechanism returns"),
+        "the error names the missing returns: {error:#}"
+    );
+}
+
+#[test]
+fn folded_other_pid_aggregate_without_returns_is_ignored() {
+    // The pid filter runs before the returns requirement: a
+    // returns-less row for another pid is skipped silently, never an
+    // error (a dropped pid filter would error here instead).
+    let report = folded_report(vec![folded_module(9999, 5, false)]);
+    assert_eq!(
+        count_folded_ledger_aggregates(&report, 4242).expect("non-ledger rows never error"),
+        0,
+    );
+}
+
 fn scale4097_inner(
     workload: &E2eWorkload,
     module: &str,
@@ -1763,71 +1915,9 @@ fn scale4097_inner(
         // rows (calls, CKR_OK returns) plus folded entry/API-return
         // totals. The per-edge "observed" string folds into the label
         // distribution, so the populated-mechanisms proof stands in.
-        // Only aggregates that folded the ledger caller count: the
-        // identities must name ledger_pid, and every mechanism must
-        // carry its returns rows (an aggregate without returns proves
-        // nothing about the ledger's API results).
-        let modules = report
-            .get("modules")
-            .and_then(serde_json::Value::as_array)
-            .context("modules array")?;
-        for departed in modules
-            .iter()
-            .filter_map(|module| module.get("departed_use"))
-            .filter(|departed| {
-                departed
-                    .get("identities")
-                    .and_then(serde_json::Value::as_array)
-                    .is_some_and(|identities| {
-                        identities.iter().any(|ident| {
-                            ident.get("pid").and_then(serde_json::Value::as_u64)
-                                == Some(u64::from(ledger_pid))
-                        })
-                    })
-            })
-        {
-            let Some(mechanisms) = departed
-                .get("mechanisms")
-                .and_then(serde_json::Value::as_array)
-            else {
-                continue;
-            };
-            if mechanisms.is_empty() {
-                continue;
-            }
-            let mut calls = 0u64;
-            let mut ok = false;
-            for mechanism in mechanisms {
-                calls += mechanism
-                    .get("calls")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0);
-                let returns = mechanism
-                    .get("evidence")
-                    .and_then(|evidence| evidence.get("returns"))
-                    .and_then(serde_json::Value::as_array)
-                    .context("mechanism returns")?;
-                ok |= returns
-                    .iter()
-                    .any(|ret| ret.get("rv").and_then(serde_json::Value::as_u64) == Some(0));
-            }
-            if calls == 0 || !ok {
-                continue;
-            }
-            let entries = departed
-                .get("entries")
-                .and_then(|entries| entries.get("count"))
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0);
-            ensure!(entries > 0, "the folded aggregate records entries");
-            let api_returns = departed
-                .get("instances")
-                .and_then(|instances| instances.get("api_returns"))
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0);
-            ensure!(api_returns > 0, "the folded aggregate records API returns");
-            populated += 1;
-        }
+        // Only aggregates that folded the ledger caller count (see
+        // count_folded_ledger_aggregates).
+        populated += count_folded_ledger_aggregates(&report, ledger_pid)?;
     }
     println!("SCALE2_E2E populated_edges={populated}");
     ensure!(

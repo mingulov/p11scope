@@ -625,9 +625,9 @@ fn read_mountinfo_pass<R: Read>(
             }
             // Lines a stopped pass read but could not charge are owed:
             // charge them before the table is published.
-            let lines = progress
-                .newline_count
-                .saturating_add(usize::from(progress.table.last().is_some_and(|byte| *byte != b'\n')));
+            let lines = progress.newline_count.saturating_add(usize::from(
+                progress.table.last().is_some_and(|byte| *byte != b'\n'),
+            ));
             let owed = lines.saturating_sub(progress.observed_lines);
             if owed > 0 {
                 if let Err(reason) = budget.spend(u64::try_from(owed).unwrap_or(u64::MAX)) {
@@ -21204,12 +21204,33 @@ int main(int argc, char **argv) {
             budget.set_work_ceiling_for_test(ceiling);
             budget
         };
-        type Site = (&'static str, CaptureWorkBudget, Option<u32>, &'static str, u64, u64);
+        type Site = (
+            &'static str,
+            CaptureWorkBudget,
+            Option<u32>,
+            &'static str,
+            u64,
+            u64,
+        );
         let sites: Vec<Site> = vec![
             ("io ceiling", io_budget(), None, IO_CEILING_REASON, 10, 1),
             ("deadline", roomy(), Some(2), SCAN_DEADLINE_REASON, 8, 1),
-            ("read charge", work_budget(0), None, WORK_CEILING_REASON, 0, 0),
-            ("line charge", work_budget(1), None, WORK_CEILING_REASON, 8, 0),
+            (
+                "read charge",
+                work_budget(0),
+                None,
+                WORK_CEILING_REASON,
+                0,
+                0,
+            ),
+            (
+                "line charge",
+                work_budget(1),
+                None,
+                WORK_CEILING_REASON,
+                8,
+                0,
+            ),
         ];
         for (site, mut budget, trip, reason, parked, line_work) in sites {
             let mut reader = StreamReader {
@@ -21233,15 +21254,20 @@ int main(int argc, char **argv) {
             let work = budget.work_units_count();
             let reads = reader.requests.len() as u64;
             assert_eq!(
-                (stopped(step).as_str(), progress.bytes_read(), work.saturating_sub(reads)),
+                (
+                    stopped(step).as_str(),
+                    progress.bytes_read(),
+                    work.saturating_sub(reads)
+                ),
                 (reason, parked, line_work),
                 "{site}: pass 1 stops, keeps its bytes and charges its lines"
             );
             assert_eq!(reader.at as u64, parked, "{site}: every byte read is kept");
             let mut resume = roomy();
             reader.requests.clear();
-            let step = read_mountinfo_resumable_with(&mut reader, &mut resume, 8, |_| None, &mut progress)
-                .unwrap();
+            let step =
+                read_mountinfo_resumable_with(&mut reader, &mut resume, 8, |_| None, &mut progress)
+                    .unwrap();
             let resumed_lines = resume.work_units_count() - reader.requests.len() as u64;
             assert_eq!(
                 step,
@@ -21302,7 +21328,8 @@ int main(int argc, char **argv) {
     /// typed stop is resumable-only), so the one-shot shape is unchanged.
     #[test]
     fn mountinfo_one_shot_reader_keeps_budget_stops_as_errors() {
-        let mut reader = RecordingReader::new([ReaderStep::Bytes(b"abc\n".to_vec()), ReaderStep::Eof]);
+        let mut reader =
+            RecordingReader::new([ReaderStep::Bytes(b"abc\n".to_vec()), ReaderStep::Eof]);
         let mut budget = CaptureWorkBudget::new(ScanLimits {
             per_object_bytes: u64::MAX,
             total_bytes: u64::MAX,

@@ -2677,8 +2677,7 @@ fn async_global_newcomer_waits_for_the_detach_then_admits_on_the_settling_frame(
     assert_eq!(outcome.disposition, ApplyDisposition::Deferred);
     case.entered.recv_timeout(Duration::from_secs(2)).unwrap();
     e06_write_listing(scope.path(), &[case.child.id(), newcomer]);
-    let admitted =
-        |engine: &Engine| engine.views.iter().any(|view| view.pid() == newcomer);
+    let admitted = |engine: &Engine| engine.views.iter().any(|view| view.pid() == newcomer);
     let scans = case.engine.deep_scans;
     for frame in 0..40 {
         case.engine

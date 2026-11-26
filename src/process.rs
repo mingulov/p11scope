@@ -552,7 +552,8 @@ fn read_view_mountinfo_resumable(
             // Count the parked work: the gap names the bytes read so far,
             // and the remainder after them is the next pass's.
             let parked_bytes = progress.bytes_read();
-            park_mount_table(&mut *slot, parking, table, progress).map_err(|error| reason(&error))?;
+            park_mount_table(&mut *slot, parking, table, progress)
+                .map_err(|error| reason(&error))?;
             Err(reason(&format!(
                 "{} ({parked_bytes} bytes read so far)",
                 crate::discovery::scan::MOUNTINFO_RESUME_REASON
@@ -564,7 +565,8 @@ fn read_view_mountinfo_resumable(
             // so the next pass resumes instead of restarting from byte
             // zero. The stop's own reason stays the gap text, so callers
             // keep classifying it as the budget wait it is.
-            park_mount_table(&mut *slot, parking, table, progress).map_err(|error| reason(&error))?;
+            park_mount_table(&mut *slot, parking, table, progress)
+                .map_err(|error| reason(&error))?;
             Err(reason(&stop))
         }
     }
@@ -4256,8 +4258,12 @@ int main(int argc, char **argv) {
         use std::io::Write as _;
         let mut table = tempfile::NamedTempFile::new().unwrap();
         for row in 0..6 {
-            writeln!(table, "{} 1 8:1 / /m{row} rw,relatime - ext4 /dev/sda1 rw", 100 + row)
-                .unwrap();
+            writeln!(
+                table,
+                "{} 1 8:1 / /m{row} rw,relatime - ext4 /dev/sda1 rw",
+                100 + row
+            )
+            .unwrap();
         }
         table.flush().unwrap();
         table
@@ -4284,7 +4290,11 @@ int main(int argc, char **argv) {
             ),
             "the one-shot refusal keeps its own reason"
         );
-        assert_eq!(view.parked_mount_table_bytes_for_test(), None, "nothing parks");
+        assert_eq!(
+            view.parked_mount_table_bytes_for_test(),
+            None,
+            "nothing parks"
+        );
         assert_eq!(mount_pass(&view, size, |_| false).unwrap(), content);
     }
 
@@ -4349,14 +4359,22 @@ int main(int argc, char **argv) {
                 )
             )
         );
-        assert_eq!(view.parked_mount_table_bytes_for_test(), None, "nothing is held");
+        assert_eq!(
+            view.parked_mount_table_bytes_for_test(),
+            None,
+            "nothing is held"
+        );
         let after = full.snapshot();
         assert_eq!(
             (after.charged_bytes, after.refused),
             (before.charged_bytes, before.refused + 1),
             "the refusal charges nothing and is counted"
         );
-        assert_eq!(mountinfo_discards_for_test() - discards, 1, "the read is discarded");
+        assert_eq!(
+            mountinfo_discards_for_test() - discards,
+            1,
+            "the read is discarded"
+        );
     }
 
     /// Healable-stop class at the parked slot (controller ruling N4): a
@@ -4398,9 +4416,24 @@ int main(int argc, char **argv) {
             budget
         };
         let sites: [(&str, CaptureWorkBudget, &str, u64); 3] = [
-            ("io ceiling", io(), crate::discovery::scan::IO_CEILING_REASON, 20),
-            ("work ceiling", work(), crate::discovery::scan::WORK_CEILING_REASON, 0),
-            ("deadline", deadline(), crate::discovery::scan::SCAN_DEADLINE_REASON, 0),
+            (
+                "io ceiling",
+                io(),
+                crate::discovery::scan::IO_CEILING_REASON,
+                20,
+            ),
+            (
+                "work ceiling",
+                work(),
+                crate::discovery::scan::WORK_CEILING_REASON,
+                0,
+            ),
+            (
+                "deadline",
+                deadline(),
+                crate::discovery::scan::SCAN_DEADLINE_REASON,
+                0,
+            ),
         ];
         for (site, mut budget, stop, parked) in sites {
             let slot = std::sync::Mutex::new(None);
@@ -4409,8 +4442,9 @@ int main(int argc, char **argv) {
                 opens.set(opens.get() + 1);
                 std::fs::File::open(table.path())
             };
-            let error = read_view_mountinfo_resumable(pid, &slot, parking, |_| false, &mut budget, open)
-                .expect_err("pass 1 stops short");
+            let error =
+                read_view_mountinfo_resumable(pid, &slot, parking, |_| false, &mut budget, open)
+                    .expect_err("pass 1 stops short");
             let parked_now = slot
                 .lock()
                 .unwrap()
@@ -4434,10 +4468,20 @@ int main(int argc, char **argv) {
                 },
             )
             .unwrap_or_else(|error| panic!("{site}: the resumed read completes: {error}"));
-            assert_eq!(text, content, "{site}: the resumed table is the whole table");
+            assert_eq!(
+                text, content,
+                "{site}: the resumed table is the whole table"
+            );
             assert_eq!(opens.get(), 1, "{site}: the resume never reopens");
-            assert_eq!(mountinfo_discards_for_test(), discards, "{site}: nothing discards");
-            assert!(slot.lock().unwrap().is_none(), "{site}: the completed read unparks");
+            assert_eq!(
+                mountinfo_discards_for_test(),
+                discards,
+                "{site}: nothing discards"
+            );
+            assert!(
+                slot.lock().unwrap().is_none(),
+                "{site}: the completed read unparks"
+            );
         }
 
         // Refusal twin: an invalid table refuses and discards its slot.
@@ -4445,24 +4489,42 @@ int main(int argc, char **argv) {
         invalid.write_all(b"1 1 8:1 / /m rw\n\xff\n").unwrap();
         invalid.flush().unwrap();
         let slot = std::sync::Mutex::new(None);
-        let error = read_view_mountinfo_resumable(pid, &slot, parking, |_| false, &mut roomy(), || {
-            std::fs::File::open(invalid.path())
-        })
+        let error = read_view_mountinfo_resumable(
+            pid,
+            &slot,
+            parking,
+            |_| false,
+            &mut roomy(),
+            || std::fs::File::open(invalid.path()),
+        )
         .expect_err("an invalid table refuses");
-        assert!(error.starts_with(&reason("mount table is not valid UTF-8")), "{error}");
+        assert!(
+            error.starts_with(&reason("mount table is not valid UTF-8")),
+            "{error}"
+        );
         assert!(slot.lock().unwrap().is_none(), "a refusal never parks");
 
         // Generation twin: a stop re-parks, then a changed witness at the
         // resume discards the kept bytes and restarts from byte zero.
         let slot = std::sync::Mutex::new(None);
-        let _ = read_view_mountinfo_resumable(pid, &slot, parking, |_| false, &mut io(), || {
-            std::fs::File::open(table.path())
-        })
+        let _ = read_view_mountinfo_resumable(
+            pid,
+            &slot,
+            parking,
+            |_| false,
+            &mut io(),
+            || std::fs::File::open(table.path()),
+        )
         .expect_err("pass 1 stops short");
         let discards = mountinfo_discards_for_test();
-        let (_, text) = read_view_mountinfo_resumable(pid, &slot, parking, |_| true, &mut roomy(), || {
-            std::fs::File::open(table.path())
-        })
+        let (_, text) = read_view_mountinfo_resumable(
+            pid,
+            &slot,
+            parking,
+            |_| true,
+            &mut roomy(),
+            || std::fs::File::open(table.path()),
+        )
         .unwrap();
         assert_eq!(text, content);
         assert_eq!(

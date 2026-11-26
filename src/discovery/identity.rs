@@ -4022,7 +4022,7 @@ impl PinnedObjects {
             if self
                 .raw_ownership
                 .get(&view)
-                .is_some_and(|owned| owned.contains(&raw))
+                .is_some_and(|owned| owned.is_fresh() && owned.contains(&raw))
             {
                 let claims = self.ownership.entry(view).or_default();
                 if !claims.pins.contains(&id) {

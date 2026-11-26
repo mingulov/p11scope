@@ -101683,6 +101683,12 @@ fn mo_entry_e2_carried() -> MoEntryOutcome {
     engine.pinned = carried.pinned;
     engine.modules = carried.modules;
     engine.views.retain(|candidate| candidate.id() != view);
+    // Production releases the exited member's view id once its rows
+    // ride as carrier, which clears its scan custody; without the
+    // release the stale custody aliases the pin and the detach commit
+    // cannot reclaim it. Replicates the custody-clearing half of the
+    // id release (the id bookkeeping is inert in this fixture).
+    engine.pinned.clear_view_scan_records(view);
     assert!(
         engine.modules.iter().any(|module| {
             module.scanned.view == Engine::CARRIED_VIEW_ID && module.object == object

@@ -709,13 +709,25 @@ NOTE = Record("note", {
     "caller": (Nullable(STR), "note caller"), "pid": (Nullable(PID), "note pid"),
     "module": (Nullable(STR), "note module"), "subject": (STR, "note subject"),
     "reason": (STR, "note reason"), "repeats": (Unsigned(1), "note repeats")})
+# The producer's coverage inputs. `BudgetView::refusals`
+# (src/inventory/present.rs) sums the refusals of exactly these four
+# resources; `budgets_json` and the report document
+# (src/inventory/mod.rs) always emit `budgets.<resource>.refused` and
+# `gaps_suppressed`, so a report missing any of them is refused, never
+# read as zero.
+COVERAGE_RESOURCES = ("callers", "modules", "edges", "endpoints")
+BUDGET_RESOURCE = Record("cgroup-budget", {"refused": (U64, "budget refused")}, closed=False)
+BUDGETS = Record("cgroup-budgets", {resource: (BUDGET_RESOURCE, "budgets %s" % resource)
+                                    for resource in COVERAGE_RESOURCES}, closed=False)
 CGROUP_REPORT = Record("cgroup-report", {
     "schema": (OneOf("p11scope/inventory/v1"), "inventory schema"),
     "scope": (STR, "inventory scope"),
     "callers": (ListOf(CALLER, item="caller"), "callers", N),
     "modules": (ListOf(MODULE, item="module"), "modules", N),
     "edges": (ListOf(EDGE, item="edge"), "edges", N),
-    "gaps": (ListOf(GAP, item="gap"), "gaps", N)},
+    "gaps": (ListOf(GAP, item="gap"), "gaps", N),
+    "budgets": (BUDGETS, "budgets"),
+    "gaps_suppressed": (U64, "gaps_suppressed")},
     optional={"notes": (ListOf(NOTE, item="note"), "notes"),
               "notes_suppressed": (U64, "notes_suppressed")},
     closed=False)
@@ -838,6 +850,11 @@ def judge_cgroup_inventory(args):
     launched_outside = arg_int(args.outside_pid, "outside pid", 1, PID_MAX)
     modpath, modfs = args.module, args.module_fs
     report = CGROUP_REPORT.check(strict_json(run.read_product(args.report, "inventory report"), "inventory report"))
+    # The producer emits `notes` and `notes_suppressed` together or not
+    # at all: one without the other is a malformed report, never zero.
+    require_type(("notes" in report) == ("notes_suppressed" in report), CGROUP_REPORT.rule,
+                 "notes and notes_suppressed are not both present or both absent: %r"
+                 % (sorted(k for k in ("notes", "notes_suppressed") if k in report),))
     inside = run.read(args.inside_wl, "inside workload log")
     outside = run.read(args.outside_wl, "outside workload log")
     pin = PIN.check(strict_json(args.pin, "provider pin"))
@@ -1063,25 +1080,19 @@ def judge_cgroup_inventory(args):
             require(g["subject"] == modpath, GAP_UNPROVEN, "overlay unproven subject")
             require(g["module"] is None, GAP_UNPROVEN, "overlay unproven module")
             require(g["pid"] == workload[g["caller"]]["pid"], GAP_UNPROVEN, "overlay unproven pid")
-    # The producer's coverage rule (src/inventory/present.rs): complete
-    # if and only if there are no loss gaps, no budget refusals and no
-    # suppressed gaps. Notes never count. Missing counters default to
-    # zero (fixtures omit the always-present report keys); a mistyped
-    # counter cannot prove zero, so it reads partial.
-    budgets = report.get("budgets") or {}
-    refused = 0
-    for resource in ("callers", "modules", "edges", "endpoints"):
-        section = budgets.get(resource) or {}
-        count = section.get("refused", 0)
-        refused += count if type(count) is int else 1
-    suppressed = report.get("gaps_suppressed", 0)
-    if type(suppressed) is not int:
-        suppressed = 1
-    coverage = ("complete" if not (report["gaps"] or []) and refused == 0 and suppressed == 0
-                else "partial")
     return ("inventory cgroup: inside=%d child=%d outside=%d excluded module=%s admission=%s unproven=%d gaps=%d notes=%d coverage=%s"
             % (inside_pid, child_pid, outside_pid, owned_id, state, len(unproven), len(report["gaps"]),
-               len(notes), coverage))
+               len(notes), cgroup_coverage(report)))
+
+
+def cgroup_coverage(report):
+    """The producer's coverage rule (src/inventory/present.rs) over a
+    report `CGROUP_REPORT` typed: complete if and only if there are no
+    loss gaps, no budget refusal over `COVERAGE_RESOURCES` and no
+    suppressed gap. Notes never count. Every input is a required, typed
+    key: nothing defaults."""
+    refused = sum(report["budgets"][resource]["refused"] for resource in COVERAGE_RESOURCES)
+    return "complete" if not report["gaps"] and refused == 0 and report["gaps_suppressed"] == 0 else "partial"
 
 
 # -- run pre-arm --------------------------------------------------------------

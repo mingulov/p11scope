@@ -180,6 +180,19 @@ def activation_note(caller, pid, *, kind="activation_unsettled", reason=None,
             "repeats": repeats}
 
 
+# The producer's coverage inputs (src/inventory/mod.rs budgets_json
+# and the report document): every report carries the four refusing
+# resources' `refused` counters and `gaps_suppressed`; these are their
+# healthy zero values in the producer's shape.
+COVERAGE_RESOURCES = ("callers", "modules", "edges", "endpoints")
+
+
+def producer_counters():
+    return {"budgets": {resource: {"limit": 4096, "occupied": 0, "refused": 0}
+                        for resource in COVERAGE_RESOURCES},
+            "gaps_suppressed": 0}
+
+
 RECORDS = ROOT / "scripts/qualify_records.py"
 RUN_ID = "test-run"
 
@@ -289,6 +302,7 @@ def decided_report():
         "notes": [activation_note("c0", 100),
                   activation_note("c1", 101, repeats=8)],
         "notes_suppressed": 0,
+        **producer_counters(),
     }
 
 
@@ -464,6 +478,7 @@ def healthy_report_with_unbound():
              "reason": unbound_reason(), "subject": UNBOUND_SUBJECT,
              "repeats": 1},
         ],
+        **producer_counters(),
     }
 
 
@@ -1420,18 +1435,65 @@ class DeferredActivationTests(unittest.TestCase):
         self.assertIn("unproven=2 gaps=2 notes=2 coverage=partial", out)
 
     def test_coverage_counts_refusals_and_suppressed_gaps(self):
-        # Each coverage input beyond the gap list flips the pin: a
-        # budget refusal or a suppressed gap reads partial with zero
-        # gaps shown.
-        for budgets, suppressed in (({"callers": {"refused": 1}}, 0),
-                                    ({}, 1)):
-            with self.subTest(budgets=budgets, suppressed=suppressed):
+        # Each coverage input beyond the gap list flips the pin on its
+        # own: one refusal of any one refusing resource, or one
+        # suppressed gap, reads partial with zero gaps shown (one
+        # killing case per input).
+        cases = [("refused", resource) for resource in COVERAGE_RESOURCES]
+        cases.append(("suppressed", None))
+        for kind, resource in cases:
+            with self.subTest(kind=kind, resource=resource):
                 report = deferred_recovered_report(modfs_witness=True)
-                report["budgets"] = budgets
-                report["gaps_suppressed"] = suppressed
-                rc, out = run_oracle(report, modfs="ext4")
+                if resource is None:
+                    report["gaps_suppressed"] = 1
+                else:
+                    report["budgets"][resource]["refused"] = 1
+                verdict = {}
+                rc, out = run_oracle(report, modfs="ext4", verdict_out=verdict)
                 self.assertEqual(rc, 0, out)
-                self.assertIn("coverage=partial", out)
+                self.assertEqual(verdict["verdict"], "pass", verdict)
+                self.assertTrue(verdict["detail"].endswith(" gaps=0 notes=2 coverage=partial"), verdict)
+
+    def test_missing_coverage_inputs_fail_typing(self):
+        # The producer always emits these keys: a report without one
+        # (or with a mistyped one) is refused by the report record,
+        # never read as a zero that pins complete.
+        def drop(*path):
+            def go(report):
+                node = report
+                for key in path[:-1]:
+                    node = node[key]
+                del node[path[-1]]
+            return go
+
+        def put(value, *path):
+            def go(report):
+                node = report
+                for key in path[:-1]:
+                    node = node[key]
+                node[path[-1]] = value
+            return go
+
+        rows = [("budgets", drop("budgets"), "record.cgroup-report"),
+                ("gaps_suppressed", drop("gaps_suppressed"), "record.cgroup-report"),
+                ("gaps_suppressed mistyped", put(0.0, "gaps_suppressed"), "record.cgroup-report"),
+                ("notes_suppressed beside notes", drop("notes_suppressed"), "record.cgroup-report"),
+                ("notes beside notes_suppressed", drop("notes"), "record.cgroup-report")]
+        for resource in COVERAGE_RESOURCES:
+            rows.append(("budgets." + resource, drop("budgets", resource), "record.cgroup-budgets"))
+            rows.append(("budgets.%s.refused" % resource, drop("budgets", resource, "refused"),
+                         "record.cgroup-budget"))
+            rows.append(("budgets.%s.refused mistyped" % resource, put(True, "budgets", resource, "refused"),
+                         "record.cgroup-budget"))
+        for name, mutate, rule in rows:
+            with self.subTest(case=name):
+                report = deferred_recovered_report(modfs_witness=True)
+                mutate(report)
+                verdict = {}
+                rc, out = run_oracle(report, modfs="ext4", verdict_out=verdict)
+                self.assertNotEqual(rc, 0, out)
+                self.assertEqual((verdict["verdict"], verdict["rule"], verdict["stage"]),
+                                 ("fail", rule, "type"), verdict)
 
     def test_deferred_member_that_stays_scan_pinned_fails(self):
         # Recover and continue: a deferral is a disclosure of one

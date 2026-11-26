@@ -1351,13 +1351,14 @@ fn member_demotion_row(pid: u32) -> RegistryGap {
     }
 }
 
-/// Whether a walk that saw `seen` (pid -> recorded start time) proves
-/// the `(pid, start_time)` generation departed: the pid was not seen, or
-/// was seen at another start time. An unreadable start time proves
-/// nothing. Only meaningful for a complete walk.
-fn walk_generation_departed(seen: &BTreeMap<u32, Option<u64>>, pid: u32, start_time: u64) -> bool {
-    match seen.get(&pid) {
-        Some(Some(seen_start)) => *seen_start != start_time,
+/// Whether a walk whose record of the pid is `seen` (`None`: not seen;
+/// else its recorded start time) proves the `(pid, start_time)`
+/// generation departed: the pid was not seen, or was seen at another
+/// start time. An unreadable start time proves nothing. Only meaningful
+/// for a complete walk.
+fn walk_generation_departed(seen: Option<Option<u64>>, start_time: u64) -> bool {
+    match seen {
+        Some(Some(seen_start)) => seen_start != start_time,
         Some(None) => false,
         None => true,
     }
@@ -5825,66 +5826,90 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// not complete proves nothing by absence: only unfinished cursors'
     /// generations it did not see are probed, each through the metered
     /// generation proof, and only a proven change drops. Charged from
-    /// the collection's own work without latching any stop (one unit
-    /// per 64 entries walked, one per probe unit); a refused charge
-    /// leaves everything for the next pass and the collection's outcome
-    /// untouched. A pid whose start time the walk could not read keeps
-    /// all its generations. Sibling: a death proven inside the member's
-    /// own scan drops its cursors before the view names its gaps, so
-    /// the raw stops stay verbatim (the pid-wide retirement in
-    /// `scan.rs`).
+    /// the collection's own work without latching any stop: one unit
+    /// per 64 entries the prune visits plus one, before any of them is
+    /// visited, and one per probe unit; a refused charge leaves
+    /// everything for the next pass and the collection's outcome
+    /// untouched. The prune makes one pass over the cursors (finding
+    /// what to drop, probing in that same pass, and counting each
+    /// generation's objects) and one over the history it forgets; the
+    /// walk's member record is read by point lookups, never re-walked.
+    /// A pid whose start time the walk could not read keeps all its
+    /// generations. Sibling: a death proven inside the member's own
+    /// scan drops its cursors before the view names its gaps, so the
+    /// raw stops stay verbatim (the pid-wide retirement in `scan.rs`).
     fn drop_departed_decode_generations(
         &mut self,
         collection: &CgroupCollection,
         work: &crate::inspect_system::inventory_cgroup::SharedCollectionWork,
     ) {
+        use crate::discovery::scan_pass::HistoryPrune;
         let extent = self.cgroup_file_facts.decode_prune_extent();
         if extent == 0 {
             return;
         }
-        let mut seen: BTreeMap<u32, Option<u64>> = BTreeMap::new();
-        for (pid, start_time) in collection.member_generations() {
-            seen.insert(pid, start_time);
-        }
-        let live = |seen: &BTreeMap<u32, Option<u64>>, pid: u32, start_time: u64| {
-            !walk_generation_departed(seen, pid, start_time)
+        let departed_from_walk = |pid: u32, start_time: u64| {
+            walk_generation_departed(collection.member_start_time(pid), start_time)
         };
-        match collection.outcome() {
+        let outcome = match collection.outcome() {
             ScopedCollectionOutcome::Complete => {
                 if !work.try_charge(extent.div_ceil(64).saturating_add(1)) {
                     return;
                 }
-                let outcome = self.cgroup_file_facts.drop_departed_decode_generations(
-                    &mut |pid, start_time| !live(&seen, pid, start_time),
-                );
-                self.name_pruned_unfinished_scans(outcome.unfinished_generations);
+                self.cgroup_file_facts.drop_departed_decode_generations(
+                    &mut |pid, start_time| departed_from_walk(pid, start_time),
+                    HistoryPrune::Departed,
+                )
             }
-            ScopedCollectionOutcome::Cancelled(_) => {}
+            ScopedCollectionOutcome::Cancelled(_) => return,
             ScopedCollectionOutcome::Incomplete(_) => {
-                let mut gone = BTreeSet::new();
-                for (pid, start_time) in self.cgroup_file_facts.unfinished_decode_generations() {
-                    if live(&seen, pid, start_time) {
-                        continue;
-                    }
-                    match crate::process::metered_pid_generation(pid, start_time, &mut || {
-                        work.try_charge(1)
-                    }) {
-                        Some(crate::process::GenerationProof::Changed) => {
-                            gone.insert((pid, start_time));
-                        }
-                        Some(_) => {}
-                        None => break,
-                    }
-                }
-                if gone.is_empty() || !work.try_charge(extent.div_ceil(64).saturating_add(1)) {
+                // Absence proves nothing here: without an unfinished
+                // cursor there is nothing to probe or drop (`O(1)`).
+                if self.cgroup_file_facts.scan_progress_totals().is_none()
+                    || !work.try_charge(extent.div_ceil(64).saturating_add(1))
+                {
                     return;
                 }
-                let outcome = self.cgroup_file_facts.drop_departed_decode_generations(
-                    &mut |pid, start_time| gone.contains(&(pid, start_time)),
-                );
-                self.name_pruned_unfinished_scans(outcome.unfinished_generations);
+                // Each unseen generation is probed once, inside the
+                // prune's own cursor pass; a refused probe unit ends
+                // probing for this pass (the rest wait for the next).
+                let mut proofs: BTreeMap<(u32, u64), bool> = BTreeMap::new();
+                let mut probing = true;
+                self.cgroup_file_facts.drop_departed_decode_generations(
+                    &mut |pid, start_time| {
+                        if !departed_from_walk(pid, start_time) {
+                            return false;
+                        }
+                        if let Some(gone) = proofs.get(&(pid, start_time)) {
+                            return *gone;
+                        }
+                        if !probing {
+                            return false;
+                        }
+                        let gone = match crate::process::metered_pid_generation(
+                            pid,
+                            start_time,
+                            &mut || work.try_charge(1),
+                        ) {
+                            Some(crate::process::GenerationProof::Changed) => true,
+                            Some(_) => false,
+                            None => {
+                                probing = false;
+                                return false;
+                            }
+                        };
+                        proofs.insert((pid, start_time), gone);
+                        gone
+                    },
+                    HistoryPrune::Dropped,
+                )
             }
-        }
+        };
+        debug_assert_eq!(
+            outcome.walked, extent,
+            "the prune visits exactly the entries it charged for"
+        );
+        self.name_pruned_unfinished_scans(outcome.unfinished_generations);
     }
 
     /// Name each departed generation whose unfinished scan the prune
@@ -47889,7 +47914,9 @@ int main(void) {
     /// v0.7.2 B2 mechanism, Incomplete arm: refused probe and prune
     /// charges leave the collection's own stop untouched and keep every
     /// cursor. RED before the fix: the refused probe charge latched
-    /// WorkLimit over the pass's own stop.
+    /// WorkLimit over the pass's own stop. Since r3 the prune charge
+    /// comes first and refuses here; the refused-proof leg is
+    /// `refused_proof_after_a_paid_incomplete_prune_drops_nothing`.
     #[test]
     fn refused_probe_charge_keeps_an_incomplete_collections_witness() {
         let (_dir, _child, mut coordinator) = cgroup_provider_scene();
@@ -48055,9 +48082,9 @@ int main(void) {
         coordinator
             .apply_cgroup_collection(collection, crate::discovery::caller_registry::now_ns())
             .unwrap();
-        // Guard: the one unseen unfinished generation's probe spends a
-        // unit before the extent charge, which still faces 199 units
-        // against a 251-unit cost — a genuine refusal.
+        // Guard: the extent charge comes first (the probe runs inside
+        // the charged pass), so it faces all 200 units against a
+        // 251-unit cost — a genuine refusal (199 bounds it either way).
         let cost = coordinator
             .cgroup_file_facts
             .decode_prune_extent()
@@ -48119,6 +48146,244 @@ int main(void) {
         assert_eq!(
             exited.reason,
             member_exited_mid_scan_reason(DEPARTED_TEST_PID, 0, 8000)
+        );
+    }
+
+    /// A cgroup collection over the provider scene whose carried bundle
+    /// holds exactly `cursors` (`(pid, start_time, inode, complete)`),
+    /// ready for a direct prune call (apply's bundle handoff mimicked).
+    fn direct_prune_fixture(
+        cursors: &[(u32, u64, u64, bool)],
+        incomplete: bool,
+    ) -> (
+        tempfile::TempDir,
+        crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild,
+        InventoryCoordinator<OsProcessSource>,
+        CgroupCollection,
+        crate::inspect_system::inventory_cgroup::SharedCollectionWork,
+    ) {
+        let (dir, child, mut coordinator) = cgroup_provider_scene();
+        let _ = one_cgroup_pass(&mut coordinator, false);
+        let mut budget = crate::discovery::scan::CaptureWorkBudget::default()
+            .with_retained_file_facts(crate::discovery::scan::RetainedFileFacts::default());
+        for &(pid, start_time, inode, complete) in cursors {
+            assert!(budget.record_decode_cursor(
+                departed_test_key(pid, start_time, inode),
+                departed_test_cursor(complete)
+            ));
+        }
+        coordinator.cgroup_file_facts = budget.take_retained_file_facts();
+        let mut collection = coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap()();
+        if incomplete {
+            collection.preparation_incomplete();
+        }
+        let work = collection.work();
+        coordinator.cgroup_file_facts = collection.take_retained_file_facts();
+        (dir, child, coordinator, collection, work)
+    }
+
+    /// The pruned-scan rows the prune staged, as `(pid, reason)`, read
+    /// from the presentation once the staged rows commit.
+    fn exit_rows(
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    ) -> Vec<(Option<u32>, String)> {
+        coordinator.commit_batch(false).unwrap();
+        crate::inventory_present::Presentation::capture(coordinator, "cgroup", 0, 1, 1)
+            .gaps
+            .iter()
+            .filter(|gap| gap.subject == MEMBER_EXITED_MID_SCAN_SUBJECT)
+            .map(|gap| (gap.pid, gap.reason.clone()))
+            .collect()
+    }
+
+    /// v0.7.2 r3 INV-2, Complete arm: a successful prune consumes
+    /// exactly its one up-front charge (one unit per 64 entries visited
+    /// plus one) and nothing else, while its single cursor pass names
+    /// two departed generations with exact counts each. Two departed
+    /// generations with interleaved inodes, one live member's
+    /// generation untouched. RED for the mutants that charge nothing,
+    /// skip a generation's row, or miscount across generations.
+    #[test]
+    fn successful_complete_prune_consumes_exactly_its_charge_and_counts_each_generation() {
+        const OTHER: u32 = DEPARTED_TEST_PID + 1;
+        let (_dir, _child, mut coordinator, collection, work) = direct_prune_fixture(
+            &[
+                (DEPARTED_TEST_PID, 9, 11, false),
+                (DEPARTED_TEST_PID, 9, 13, true),
+                (DEPARTED_TEST_PID, 9, 15, true),
+                (OTHER, 4, 12, false),
+                (OTHER, 4, 14, false),
+                (OTHER, 4, 16, true),
+            ],
+            false,
+        );
+        assert_eq!(collection.outcome(), ScopedCollectionOutcome::Complete);
+        let extent = coordinator.cgroup_file_facts.decode_prune_extent();
+        assert!(
+            extent >= 6,
+            "setup: six cursors plus their history, {extent}"
+        );
+        let before = work.remaining_work_for_test();
+        coordinator.drop_departed_decode_generations(&collection, &work);
+        assert_eq!(
+            before - work.remaining_work_for_test(),
+            extent.div_ceil(64) + 1,
+            "the prune spends exactly its up-front charge"
+        );
+        assert_eq!(collection.outcome(), ScopedCollectionOutcome::Complete);
+        assert_eq!(
+            carried_cursor_table(&coordinator, &[DEPARTED_TEST_PID, OTHER]),
+            vec![
+                (DEPARTED_TEST_PID, 9, 13, true),
+                (DEPARTED_TEST_PID, 9, 15, true),
+                (OTHER, 4, 16, true),
+            ],
+            "every unfinished cursor of both departed generations drops"
+        );
+        assert_eq!(
+            exit_rows(&mut coordinator),
+            vec![
+                (
+                    Some(DEPARTED_TEST_PID),
+                    member_exited_mid_scan_reason(DEPARTED_TEST_PID, 2, 3)
+                ),
+                (Some(OTHER), member_exited_mid_scan_reason(OTHER, 1, 3)),
+            ],
+            "one row per departed generation, each with its own exact counts"
+        );
+    }
+
+    /// v0.7.2 r3 INV-2, Incomplete arm: a successful prune consumes
+    /// exactly its up-front charge plus the one generation proof it
+    /// runs inside its cursor pass (that proof's own metered units,
+    /// measured on the same pid), and probes each unseen generation
+    /// once however many unfinished cursors it holds. An unseen
+    /// generation with only completed work is never probed and keeps
+    /// its cursor and history: an incomplete walk forgets only what it
+    /// dropped. RED for the mutants that probe per cursor, probe
+    /// history-only generations, or forget unprobed history.
+    #[test]
+    fn successful_incomplete_prune_consumes_its_charge_plus_one_proof() {
+        const OTHER: u32 = DEPARTED_TEST_PID + 1;
+        let (_dir, _child, mut coordinator, collection, work) = direct_prune_fixture(
+            &[
+                (DEPARTED_TEST_PID, 9, 11, false),
+                (DEPARTED_TEST_PID, 9, 12, false),
+                (DEPARTED_TEST_PID, 9, 13, false),
+                (OTHER, 4, 20, true),
+            ],
+            true,
+        );
+        assert_ne!(collection.outcome(), ScopedCollectionOutcome::Complete);
+        let mut proof_units = 0usize;
+        assert_eq!(
+            crate::process::metered_pid_generation(DEPARTED_TEST_PID, 9, &mut || {
+                proof_units += 1;
+                true
+            }),
+            Some(crate::process::GenerationProof::Changed),
+            "setup: the fixture pid is provably gone"
+        );
+        let extent = coordinator.cgroup_file_facts.decode_prune_extent();
+        let before = work.remaining_work_for_test();
+        coordinator.drop_departed_decode_generations(&collection, &work);
+        assert_eq!(
+            before - work.remaining_work_for_test(),
+            extent.div_ceil(64) + 1 + proof_units,
+            "the prune spends its up-front charge and exactly one proof"
+        );
+        assert_eq!(
+            carried_cursor_table(&coordinator, &[DEPARTED_TEST_PID, OTHER]),
+            vec![(OTHER, 4, 20, true)],
+            "only the probed generation's unfinished cursors drop"
+        );
+        let mut history = coordinator
+            .cgroup_file_facts
+            .resume_history_pairs_for_test();
+        history.retain(|(pid, _)| [DEPARTED_TEST_PID, OTHER].contains(pid));
+        history.dedup();
+        assert_eq!(
+            history,
+            vec![(OTHER, 4)],
+            "only the dropped generation's history goes"
+        );
+        assert_eq!(
+            exit_rows(&mut coordinator),
+            vec![(
+                Some(DEPARTED_TEST_PID),
+                member_exited_mid_scan_reason(DEPARTED_TEST_PID, 0, 3)
+            )]
+        );
+    }
+
+    /// v0.7.2 r3: an incomplete pass whose prune charge is paid but whose
+    /// first proof unit is refused drops nothing, forgets no history,
+    /// names nothing and keeps the pass's own stop: a refused proof
+    /// never reads as a departure. RED for the mutant that treats a
+    /// refused proof as gone.
+    #[test]
+    fn refused_proof_after_a_paid_incomplete_prune_drops_nothing() {
+        let (_dir, _child, mut coordinator, collection, work) =
+            direct_prune_fixture(&[(DEPARTED_TEST_PID, 9, 11, false)], true);
+        let history = coordinator
+            .cgroup_file_facts
+            .resume_history_pairs_for_test();
+        let extent = coordinator.cgroup_file_facts.decode_prune_extent();
+        let cost = extent.div_ceil(64) + 1;
+        let left = work.remaining_work_for_test();
+        assert!(
+            work.charge(left - cost),
+            "setup: leave exactly the prune charge"
+        );
+        coordinator.drop_departed_decode_generations(&collection, &work);
+        assert_eq!(
+            work.remaining_work_for_test(),
+            0,
+            "the prune charge was paid"
+        );
+        assert_eq!(
+            collection.outcome(),
+            ScopedCollectionOutcome::Incomplete(
+                crate::inspect_system::inventory_cgroup::ScopedCollectionGap::ScanIncomplete
+            ),
+            "the refused proof latches no stop"
+        );
+        assert_eq!(
+            carried_cursor_table(&coordinator, &[DEPARTED_TEST_PID]),
+            vec![(DEPARTED_TEST_PID, 9, 11, false)]
+        );
+        assert_eq!(
+            coordinator
+                .cgroup_file_facts
+                .resume_history_pairs_for_test(),
+            history,
+            "no history pair is forgotten"
+        );
+        assert!(exit_rows(&mut coordinator).is_empty());
+    }
+
+    /// v0.7.2 r3: an incomplete pass with no unfinished cursor has
+    /// nothing to probe or drop, so its prune charges nothing (an
+    /// `O(1)` check, not a walk), even with completed cursors and
+    /// history carried.
+    #[test]
+    fn incomplete_prune_without_unfinished_cursors_charges_nothing() {
+        let (_dir, _child, mut coordinator, collection, work) =
+            direct_prune_fixture(&[(DEPARTED_TEST_PID, 9, 11, true)], true);
+        assert!(coordinator.cgroup_file_facts.decode_prune_extent() > 0);
+        let before = work.remaining_work_for_test();
+        coordinator.drop_departed_decode_generations(&collection, &work);
+        assert_eq!(work.remaining_work_for_test(), before);
+        assert_eq!(
+            carried_cursor_table(&coordinator, &[DEPARTED_TEST_PID]),
+            vec![(DEPARTED_TEST_PID, 9, 11, true)]
         );
     }
 
@@ -48186,7 +48451,13 @@ int main(void) {
         let seen = BTreeMap::from([(10u32, Some(100u64)), (11, None)]);
         let table: Vec<(u32, u64, bool)> = [(10, 100), (10, 101), (11, 7), (12, 100)]
             .into_iter()
-            .map(|(pid, start)| (pid, start, walk_generation_departed(&seen, pid, start)))
+            .map(|(pid, start)| {
+                (
+                    pid,
+                    start,
+                    walk_generation_departed(seen.get(&pid).copied(), start),
+                )
+            })
             .collect();
         assert_eq!(
             table,

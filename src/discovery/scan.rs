@@ -1982,26 +1982,27 @@ impl RetainedFileFacts {
         budget.take_retained_file_facts()
     }
 
-    /// Size of a departed-generation prune over this bundle (cursors
-    /// plus resume-history pairs): what the caller charges for it.
+    /// Entries a departed-generation prune over this bundle visits
+    /// (every cursor plus every resume-history entry its forget walks):
+    /// what the caller charges for it.
     pub(crate) fn decode_prune_extent(&self) -> usize {
         self.decode_cursors.prune_extent()
     }
 
-    /// Unfinished carried cursors' `(pid, start_time)` generations.
-    pub(crate) fn unfinished_decode_generations(&self) -> BTreeSet<(u32, u64)> {
-        self.decode_cursors.unfinished_generations()
-    }
-
-    /// Drop every decode cursor and resume-history pair of a generation
-    /// `departed` proves gone, keeping the shared retained-byte account
-    /// exact. Returns what the prune removed, including the per-generation
-    /// object counts the caller names its unfinished scans from.
+    /// Drop every unfinished decode cursor of a generation `departed`
+    /// proves gone, and the resume-history pairs `history` selects,
+    /// keeping the shared retained-byte account exact. Returns what the
+    /// prune removed, including the per-generation object counts the
+    /// caller names its unfinished scans from, and the entries it
+    /// visited.
     pub(crate) fn drop_departed_decode_generations(
         &mut self,
         departed: &mut dyn FnMut(u32, u64) -> bool,
+        history: super::scan_pass::HistoryPrune,
     ) -> super::scan_pass::DepartedPruneOutcome {
-        let outcome = self.decode_cursors.drop_departed_generations(departed);
+        let outcome = self
+            .decode_cursors
+            .drop_departed_generations(departed, history);
         self.retained_cache_bytes = self
             .retained_cache_bytes
             .saturating_sub(outcome.freed_bytes);

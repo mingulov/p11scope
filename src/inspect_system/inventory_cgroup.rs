@@ -393,12 +393,13 @@ impl CgroupCollection {
     pub(crate) fn member_pids(&self) -> impl Iterator<Item = u32> + '_ {
         self.originals.keys().copied()
     }
-    /// Each pinned member's pid with its recorded start time (`None`
-    /// when unreadable): the walk's member generations.
-    pub(crate) fn member_generations(&self) -> impl Iterator<Item = (u32, Option<u64>)> + '_ {
+    /// The walk's record of `pid`: `None` when the walk did not pin it,
+    /// else its recorded start time (`None` when unreadable). A point
+    /// lookup, so a prune asking per cursor never re-walks the members.
+    pub(crate) fn member_start_time(&self, pid: u32) -> Option<Option<u64>> {
         self.originals
-            .iter()
-            .map(|(pid, member)| (*pid, member.generation.start_time))
+            .get(&pid)
+            .map(|member| member.generation.start_time)
     }
     pub(crate) fn outcome(&self) -> ScopedCollectionOutcome {
         let stopped = self.work.stopped();

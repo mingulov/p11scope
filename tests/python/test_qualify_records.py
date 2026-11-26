@@ -77,6 +77,10 @@ def entries():
             "observation": "observed", "saturated": False, "in_flight": False}
 
 
+# Literal: the four refusing resources of the producer's coverage rule.
+COVERAGE_RESOURCES = ("callers", "modules", "edges", "endpoints")
+
+
 def cgroup_case(modfs="ext4"):
     report = {
         "schema": "p11scope/inventory/v1", "scope": "cgroup",
@@ -89,7 +93,11 @@ def cgroup_case(modfs="ext4"):
                      "retired": False, "image": {"authority": "native_exact"}}],
         "edges": [{"caller": "c0", "module": "m0", "entries": entries()},
                   {"caller": "c1", "module": "m0", "entries": entries()}],
-        "gaps": []}
+        "gaps": [],
+        # The producer's always-present coverage inputs, at zero (only
+        # the consumed `refused` counter of each refusing resource).
+        "budgets": {resource: {"refused": 0} for resource in COVERAGE_RESOURCES},
+        "gaps_suppressed": 0}
     if modfs == "overlayfs":
         report["gaps"] = [{"caller": c, "pid": p, "module": None, "subject": MODPATH,
                            "reason": Q.UNPROVEN + ": scoped collection deactivates the kernel proof"}
@@ -408,6 +416,18 @@ DEADLINE_GAP = gap(subject="cgroup scope transaction incomplete", reason=Q.DEADL
                    budget=None, repeats=1)
 RETAINED_GAP = gap(caller="c0", pid=100, subject="native owner refresh refused", reason=Q.RETAINED)
 ACTIVATION_GAP = gap(caller="c0", pid=100, subject=Q.ACTIVATION, reason=Q.SETTLE_REASON)
+# A recovered activation delay as the producer publishes it: a typed
+# note (v0.7.2 I1), with `notes_suppressed` beside it.
+ACTIVATION_NOTE = {"kind": "activation_unsettled", "caller": "c0", "pid": 100, "module": None,
+                   "subject": Q.ACTIVATION, "reason": Q.SETTLE_REASON, "repeats": 1}
+DEFERRED_NOTE = dict(ACTIVATION_NOTE, kind="activation_deferred", reason=Q.DEFERRED_REASON)
+
+
+def add_notes(*notes, suppressed=0):
+    def go(case):
+        case["report"].setdefault("notes", []).extend(copy.deepcopy(list(notes)))
+        case["report"]["notes_suppressed"] = suppressed
+    return go
 ADMISSION_GAP = gap(caller="c0", pid=100, module="m0", subject="module admission changed",
                     reason=MODPATH + ": admission changed from unresolved to admitted")
 UNBOUND_GAP = gap(module="m0", subject="used by an unidentified caller image", reason=UNBOUND_REASON)
@@ -749,11 +769,38 @@ NEGATIVE = [
     ("cgroup.member-once", "cgroup-inventory", lambda c: c["report"]["callers"].pop()),
     ("cgroup.no-orphan-edge", "cgroup-inventory", lambda c: c["report"]["edges"].append(
         {"caller": "c7", "module": "m0", "entries": entries()})),
+] + [
+    row for resource in COVERAGE_RESOURCES for row in (
+        ("record.cgroup-budgets", "cgroup-inventory", at(("report", "budgets", resource), delete=True)),
+        ("record.cgroup-budget", "cgroup-inventory",
+         at(("report", "budgets", resource, "refused"), delete=True)),
+        ("record.cgroup-budget", "cgroup-inventory", at(("report", "budgets", resource, "refused"), True)))
+] + [
     ("gap.unclassified", "cgroup-inventory", add_gaps(gap(subject="made up"))),
     ("gap.unclassified", "cgroup-inventory", add_gaps(gap(module="m0", subject="made up"))),
     ("gap.activation", "cgroup-inventory", add_gaps(dict(ACTIVATION_GAP, subject="other"))),
     ("gap.activation", "cgroup-inventory", add_gaps(dict(ACTIVATION_GAP, pid=101))),
     ("gap.activation", "cgroup-inventory", add_gaps(gap(subject=Q.ACTIVATION, reason="else"))),
+    # v0.7.2 I1: a recovered delay is a note; one still in gaps never recovered
+    ("gap.activation", "cgroup-inventory", add_gaps(ACTIVATION_GAP)),
+    ("gap.activation", "cgroup-inventory", add_notes(dict(ACTIVATION_NOTE, subject="other"))),
+    ("gap.activation", "cgroup-inventory", add_notes(dict(ACTIVATION_NOTE, reason=Q.DEFERRED_REASON))),
+    ("gap.activation", "cgroup-inventory", add_notes(dict(ACTIVATION_NOTE, pid=101))),
+    ("gap.activation", "cgroup-inventory", add_notes(dict(ACTIVATION_NOTE, module="m0"))),
+    ("gap.activation", "cgroup-inventory", chain(add_notes(ACTIVATION_NOTE),
+                                                 caller(0, image={"authority": "scan_pinned"}))),
+    ("note.unclassified", "cgroup-inventory", add_notes(ACTIVATION_NOTE, suppressed=1)),
+    ("note.unclassified", "cgroup-inventory", add_notes(dict(ACTIVATION_NOTE, kind="member_demoted"))),
+    ("record.note", "cgroup-inventory", add_notes(dict(ACTIVATION_NOTE, repeats=0))),
+    ("record.note", "cgroup-inventory", add_notes(dict(ACTIVATION_NOTE, extra=1))),
+    # the producer's coverage inputs are required, typed keys (never a default zero)
+    ("record.cgroup-report", "cgroup-inventory", at(("report", "budgets"), delete=True)),
+    ("record.cgroup-report", "cgroup-inventory", at(("report", "gaps_suppressed"), delete=True)),
+    ("record.cgroup-report", "cgroup-inventory", at(("report", "gaps_suppressed"), 0.0)),
+    ("record.cgroup-report", "cgroup-inventory", chain(add_notes(ACTIVATION_NOTE),
+                                                       at(("report", "notes_suppressed"), delete=True))),
+    ("record.cgroup-report", "cgroup-inventory", chain(add_notes(ACTIVATION_NOTE),
+                                                       at(("report", "notes"), delete=True))),
     ("gap.retained", "cgroup-inventory", add_gaps(RETAINED_GAP)),
     ("gap.retained", "cgroup-inventory", add_gaps(RETAINED_GAP, RETAINED_GAP, DEADLINE_GAP)),
     ("gap.retained", "cgroup-inventory", add_gaps(dict(RETAINED_GAP, caller="c9"), DEADLINE_GAP)),
@@ -938,8 +985,9 @@ NEGATIVE = [
 
 # Positive rows beyond each judge's valid base case: (rule, judge, mutation).
 POSITIVE = [
-    ("gap.activation", "cgroup-inventory", add_gaps(ACTIVATION_GAP)),
-    ("gap.activation", "cgroup-inventory", add_gaps(dict(ACTIVATION_GAP, reason=Q.DEFERRED_REASON))),
+    ("gap.activation", "cgroup-inventory", add_notes(ACTIVATION_NOTE)),
+    ("gap.activation", "cgroup-inventory", add_notes(DEFERRED_NOTE)),
+    ("note.unclassified", "cgroup-inventory", add_notes(ACTIVATION_NOTE, DEFERRED_NOTE)),
     ("gap.retained", "cgroup-inventory", add_gaps(RETAINED_GAP, DEADLINE_GAP)),
     ("gap.deadline", "cgroup-inventory", add_gaps(DEADLINE_GAP)),
     ("gap.prep", "cgroup-inventory", add_gaps(PREP_GAP, DEADLINE_GAP)),
@@ -1214,6 +1262,40 @@ class BoundedReadTests(unittest.TestCase):
             self.check("procs " + name, dict(base("cgroup-member"), procs=data), limit, want)
 
 
+class CoverageTests(unittest.TestCase):
+    """The cgroup judge's coverage pin, decided from the typed value
+    `cgroup_coverage` returns (exact equality), one killing case per
+    producer input."""
+
+    def test_refusing_resources_are_the_producers(self):
+        # Literal pin, then the producer's own sum: BudgetView::refusals
+        # adds exactly these `<resource>_refused` counters, in order.
+        self.assertEqual(Q.COVERAGE_RESOURCES, COVERAGE_RESOURCES)
+        present = (ROOT / "src" / "inventory" / "present.rs").read_text()
+        body = re.search(r"fn refusals\(&self\) -> u64 \{(.*?)\n    \}", present, re.S)
+        self.assertIsNotNone(body, "BudgetView::refusals not found")
+        self.assertEqual(tuple(re.findall(r"self\.(\w+)_refused", body.group(1))), COVERAGE_RESOURCES)
+
+    def test_each_input_flips_the_pin_on_its_own(self):
+        report = base("cgroup-inventory")["report"]
+        self.assertEqual(Q.cgroup_coverage(report), "complete")
+        cases = [("refused " + resource, at(("report", "budgets", resource, "refused"), 1))
+                 for resource in COVERAGE_RESOURCES]
+        cases += [("suppressed", at(("report", "gaps_suppressed"), 1)),
+                  ("gap", add_gaps(UNBOUND_GAP)),
+                  ("note only", add_notes(ACTIVATION_NOTE))]
+        want = {name: "partial" for name, _ in cases}
+        want["note only"] = "complete"
+        got = {}
+        for name, mutate in cases:
+            case = build("cgroup-inventory", mutate)
+            got[name] = Q.cgroup_coverage(case["report"])
+            record, _ = run_case(case)
+            self.assertEqual(record["verdict"], "pass", (name, record))
+            self.assertTrue(record["detail"].endswith(" coverage=" + got[name]), (name, record))
+        self.assertEqual(got, want)
+
+
 class RuleTableTests(unittest.TestCase):
     def test_every_declared_rule_has_a_negative_and_a_positive(self):
         negatives = {rule for rule, _, _ in NEGATIVE}
@@ -1351,7 +1433,10 @@ VALUE_DECIDED = {
     ("parent-chain", ("report", "callers", 1, "launched_by_unit"), "x"),
 } | {("cgroup-inventory", ("report", "gaps", "*", key), item)
      for key in ("caller", "module", "reason") for item in (None, "x")} | {
-    ("cgroup-inventory", ("report", "gaps", "*", "pid"), None)}
+    ("cgroup-inventory", ("report", "gaps", "*", "pid"), None)} | {
+    # A note's nullable attribution binds the workload caller exactly.
+    ("cgroup-inventory", ("report", "notes", "*", key), item)
+    for key, item in (("caller", None), ("pid", None), ("module", "x"))}
 
 
 def value_decided(judge, path, item):
@@ -1366,6 +1451,7 @@ CLOSED = {
     ("event-stdout", ("stream", "*", "event", "totals")),
     ("event-stdout", ("stream", "*", "event", "stdout_lost")),
     ("event-stdout", ("*", "event_output")),
+    ("cgroup-inventory", ("report", "notes", "*")),
     ("run-prearm", ("*", 0, "discovery", "*", "unobserved_windows", "*")),
     ("run-prearm", ("held_ledger", "*")),
     ("run-prearm", ("passive_ledger", "*")),

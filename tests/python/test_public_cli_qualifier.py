@@ -116,6 +116,18 @@ def counted_edge(caller, module="m0", count=1507):
                         "coverage": {"state": "counted", "lossy": False}}}
 
 
+def producer_counters(*, notes=False):
+    """The coverage inputs every producer report carries
+    (src/inventory/mod.rs: budgets.<resource>.refused and gaps_suppressed;
+    notes_suppressed beside notes), at their healthy zero values."""
+    counters = {"budgets": {resource: {"limit": 4096, "occupied": 0, "refused": 0}
+                            for resource in ("callers", "modules", "edges", "endpoints")},
+                "gaps_suppressed": 0}
+    if notes:
+        counters["notes_suppressed"] = 0
+    return counters
+
+
 def overlay_report():
     """The regressed 0-module overlay shape: the scan-pinned fallback
     dropped the found module. This must fail loudly (never
@@ -139,6 +151,7 @@ def overlay_report():
              "reason": NATIVE, "subject": "native owner activation refused",
              "repeats": 9},
         ],
+        **producer_counters(),
     }
 
 
@@ -173,6 +186,7 @@ def overlay_published_report():
              "pid": 101, "reason": NATIVE,
              "subject": "native owner activation refused", "repeats": 9},
         ],
+        **producer_counters(notes=True),
     }
 
 
@@ -755,6 +769,7 @@ class InventoryOverlayTests(unittest.TestCase):
             "callers": workload_callers(),
             "edges": [counted_edge("c0"), counted_edge("c1")],
             "gaps": [],
+            **producer_counters(),
         }
         rc, out = run_oracle(report, modfs="ext4", pin=pin)
         self.assertEqual(rc, 0, out)

@@ -110,7 +110,10 @@ pub(crate) fn scan_in_progress_reason(done: usize, total: usize, tables: usize) 
 /// belongs to exactly this process image and this file pin; anything
 /// else misses and scans fresh. `None` when the image was unreadable
 /// (no worse than the pre-exec check: pid plus start time still bind
-/// the task).
+/// the task). The field order is load-bearing: the derived order sorts
+/// by `(pid, start_time)` first, so one generation's cursors are
+/// contiguous in the store and the departed-generation prune counts
+/// each generation in its single charged pass.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct DecodeCursorKey {
     pub(crate) pid: u32,
@@ -588,20 +591,57 @@ impl ResumeHistory {
         self.covered.len().saturating_add(self.completed.len())
     }
 
+    /// Entries a [`ResumeHistory::forget_generations`] walk visits: the
+    /// covered pairs, their eviction index and the completion record.
+    /// The departed-generation prune charges for exactly this many.
+    pub(crate) fn walk_extent(&self) -> usize {
+        self.covered
+            .len()
+            .saturating_add(self.evictable.len())
+            .saturating_add(self.completed.len())
+    }
+
     /// Forget every pair whose `(pid, start_time)` generation `departed`
     /// proves gone. The key carries the start time, so such a pair can
     /// never be recorded again: dropping it changes no decision for any
     /// live generation (no rise is earned or lost, no live ground is
     /// uncovered) and frees its slot for live work. Returns the pairs
-    /// forgotten.
+    /// forgotten. (The prune uses
+    /// [`ResumeHistory::forget_generations_walked`].)
+    #[cfg(test)]
     fn forget_generations(&mut self, departed: &mut dyn FnMut(u32, u64) -> bool) -> usize {
+        self.forget_generations_walked(departed).0
+    }
+
+    /// [`ResumeHistory::forget_generations`], also returning the entries
+    /// the walk visited (always [`ResumeHistory::walk_extent`] before
+    /// the walk), counted where each entry is visited.
+    fn forget_generations_walked(
+        &mut self,
+        departed: &mut dyn FnMut(u32, u64) -> bool,
+    ) -> (usize, usize) {
         let before = self.pairs();
-        let mut gone = |key: &DecodeCursorKey| departed(key.pid, key.start_time);
+        let mut walked = 0usize;
+        let mut gone = |key: &DecodeCursorKey| {
+            walked += 1;
+            departed(key.pid, key.start_time)
+        };
         self.covered.retain(|(key, _), _| !gone(key));
         self.evictable.retain(|_, (key, _)| !gone(key));
         self.completed.retain(|(key, _)| !gone(key));
-        before.saturating_sub(self.pairs())
+        (before.saturating_sub(self.pairs()), walked)
     }
+}
+
+/// Which resume-history pairs a departed-generation prune forgets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HistoryPrune {
+    /// Every pair of a generation the predicate proves gone (a complete
+    /// walk proves every unseen generation gone).
+    Departed,
+    /// Only the pairs of generations whose unfinished cursors this
+    /// prune dropped (an incomplete walk proves only what it probed).
+    Dropped,
 }
 
 /// One accepted pass's resume summary, read in `O(1)` at publication:
@@ -619,11 +659,14 @@ pub(crate) struct ResumeObservation {
 /// unfinished cursor — its `(decoded, total)` object counts, so the
 /// caller can name the unfinished scan the departed member leaves
 /// behind. Generations that lost only history pairs name nothing:
-/// their cursors (if any) were complete.
+/// their cursors (if any) were complete. `walked` is the entries the
+/// prune visited, counted where each is visited: always the
+/// [`DecodeCursorStore::prune_extent`] the caller charged before it.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DepartedPruneOutcome {
     pub(crate) freed_bytes: u64,
     pub(crate) unfinished_generations: BTreeMap<(u32, u64), (usize, usize)>,
+    pub(crate) walked: usize,
 }
 
 /// The carried decode cursors with their incrementally kept totals and
@@ -683,66 +726,92 @@ impl DecodeCursorStore {
         self.history.generations_for_test()
     }
 
-    /// Carried cursors plus remembered history pairs: the size a
-    /// departed-generation prune walks.
+    /// Entries a departed-generation prune visits: every carried
+    /// cursor plus every resume-history entry its forget walks. The
+    /// caller charges this before the prune, and the prune's
+    /// [`DepartedPruneOutcome::walked`] equals it.
     pub(crate) fn prune_extent(&self) -> usize {
-        self.cursors.len().saturating_add(self.history.pairs())
-    }
-
-    /// Unfinished carried cursors' generations, for the liveness probe
-    /// of members an incomplete walk did not see.
-    pub(crate) fn unfinished_generations(&self) -> BTreeSet<(u32, u64)> {
         self.cursors
-            .iter()
-            .filter(|(_, cursor)| !cursor.complete)
-            .map(|(key, _)| (key.pid, key.start_time))
-            .collect()
+            .len()
+            .saturating_add(self.history.walk_extent())
     }
 
-    /// Drop every unfinished cursor and every history pair of a
-    /// generation `departed` proves gone (`(pid, start_time)`). A
-    /// departed member's unfinished cursor would otherwise keep the
-    /// run "in progress" for good, and its history pairs would fill
-    /// the bounded record. Completed cursors count as done (no
-    /// progress row) and are already the first reclamation victims
-    /// under pressure, so they stay.
+    /// Drop every unfinished cursor of a generation `departed` proves
+    /// gone (`(pid, start_time)`), and the history pairs `history`
+    /// selects. A departed member's unfinished cursor would otherwise
+    /// keep the run "in progress" for good, and its history pairs
+    /// would fill the bounded record. Completed cursors count as done
+    /// (no progress row) and are already the first reclamation victims
+    /// under pressure, so they stay. `departed` is asked only for
+    /// unfinished cursors, so a caller may meter a proof behind it.
+    ///
+    /// One pass over the cursors does all the cursor work: it finds the
+    /// stale keys and, since the key order puts one generation's
+    /// cursors together, counts each generation's objects as it goes.
+    /// `decoded` counts a touched generation's completed cursors
+    /// (kept); `total` counts all its cursors. A touched generation
+    /// always holds an unfinished cursor, so `decoded` is always below
+    /// `total`. The only other walk is the history forget; the two
+    /// together visit exactly [`DecodeCursorStore::prune_extent`]
+    /// entries.
     pub(crate) fn drop_departed_generations(
         &mut self,
         departed: &mut dyn FnMut(u32, u64) -> bool,
+        history: HistoryPrune,
     ) -> DepartedPruneOutcome {
-        let stale: Vec<DecodeCursorKey> = self
-            .cursors
-            .iter()
-            .filter(|(key, cursor)| !cursor.complete && departed(key.pid, key.start_time))
-            .map(|(key, _)| key.clone())
-            .collect();
-        // Per-generation object counts before the drop: a generation
-        // the prune touches names how many of its objects decoded.
-        // `decoded` counts its completed cursors (kept); `total`
-        // counts all its cursors. A touched generation always holds
-        // an unfinished cursor, so `decoded` is always below `total`.
-        let touched: BTreeSet<(u32, u64)> =
-            stale.iter().map(|key| (key.pid, key.start_time)).collect();
+        let mut walked = 0usize;
+        let mut stale: Vec<DecodeCursorKey> = Vec::new();
         let mut unfinished_generations: BTreeMap<(u32, u64), (usize, usize)> = BTreeMap::new();
-        for (key, cursor) in self.cursors.iter() {
-            if touched.contains(&(key.pid, key.start_time)) {
-                let counts = unfinished_generations
-                    .entry((key.pid, key.start_time))
-                    .or_insert((0, 0));
-                counts.1 += 1;
-                counts.0 += usize::from(cursor.complete);
+        // The generation being counted: `(generation, decoded, total,
+        // touched)`, flushed into the outcome when a touched one ends.
+        type Open = Option<((u32, u64), usize, usize, bool)>;
+        fn flush(current: Open, into: &mut BTreeMap<(u32, u64), (usize, usize)>) {
+            if let Some((generation, decoded, total, true)) = current {
+                into.insert(generation, (decoded, total));
             }
         }
+        let mut current: Open = None;
+        for (key, cursor) in self.cursors.iter() {
+            walked += 1;
+            let generation = (key.pid, key.start_time);
+            if current.is_none_or(|(open, ..)| open != generation) {
+                debug_assert!(
+                    current.is_none_or(|(open, ..)| open < generation),
+                    "cursor keys order by generation first"
+                );
+                flush(current.take(), &mut unfinished_generations);
+                current = Some((generation, 0, 0, false));
+            }
+            if let Some((_, decoded, total, touched)) = current.as_mut() {
+                *total += 1;
+                if cursor.complete {
+                    *decoded += 1;
+                } else if departed(key.pid, key.start_time) {
+                    *touched = true;
+                    stale.push(key.clone());
+                }
+            }
+        }
+        flush(current, &mut unfinished_generations);
         let mut freed = 0u64;
         for key in &stale {
             if let Some(old) = self.remove(key) {
                 freed = freed.saturating_add(decode_cursor_bytes(key, &old));
             }
         }
-        self.history.forget_generations(departed);
+        let (_, history_walked) = match history {
+            HistoryPrune::Departed => self.history.forget_generations_walked(departed),
+            HistoryPrune::Dropped => {
+                self.history
+                    .forget_generations_walked(&mut |pid, start_time| {
+                        unfinished_generations.contains_key(&(pid, start_time))
+                    })
+            }
+        };
         DepartedPruneOutcome {
             freed_bytes: freed,
             unfinished_generations,
+            walked: walked.saturating_add(history_walked),
         }
     }
 
@@ -3595,5 +3664,174 @@ mod departed_history_tests {
             !history.raised(),
             "no new ground: the live frontier is kept"
         );
+    }
+}
+
+#[cfg(test)]
+mod departed_prune_tests {
+    use super::{
+        CommittedCursorProgress, DecodeCursor, DecodeCursorKey, DecodeCursorStore, HistoryPrune,
+        SweepFrontier,
+    };
+    use std::collections::BTreeMap;
+
+    fn key(pid: u32, start_time: u64, inode: u64) -> DecodeCursorKey {
+        let file = std::fs::File::open("/bin/sh").unwrap();
+        DecodeCursorKey {
+            pid,
+            start_time,
+            file: crate::discovery::scan::InspectedFileKey {
+                device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+                inode,
+                pin: crate::discovery::identity::pin_of(&file).unwrap(),
+                fd_dev: 7,
+            },
+            exec: None,
+        }
+    }
+
+    fn cursor(complete: bool) -> DecodeCursor {
+        DecodeCursor {
+            fingerprint: Vec::new(),
+            tables: SweepFrontier {
+                snapshot: 0,
+                word: u64::from(complete),
+            },
+            interfaces: SweepFrontier {
+                snapshot: 0,
+                word: 0,
+            },
+            anchors: None,
+            cached_tables: Vec::new(),
+            cached_interfaces: Vec::new(),
+            unlinked: Vec::new(),
+            targets: Vec::new(),
+            complete,
+            validated: complete,
+            seq: 0,
+        }
+    }
+
+    fn progress(complete: bool) -> CommittedCursorProgress {
+        CommittedCursorProgress {
+            layout: 1,
+            tables: SweepFrontier {
+                snapshot: 0,
+                word: 1,
+            },
+            interfaces: SweepFrontier {
+                snapshot: 0,
+                word: 0,
+            },
+            tables_decoded: 0,
+            complete,
+        }
+    }
+
+    const A: (u32, u64) = (5, 50);
+    const B: (u32, u64) = (6, 60);
+    const LIVE: (u32, u64) = (7, 70);
+    const DONE: (u32, u64) = (8, 80);
+
+    /// Two departed generations with unfinished work (interleaved
+    /// inodes), one live generation, and one departed generation whose
+    /// cursors all completed; every cursor also folds its progress into
+    /// the history (covered, evictable and completion-record entries).
+    fn store() -> DecodeCursorStore {
+        let mut store = DecodeCursorStore::default();
+        for (generation, inode, complete) in [
+            (A, 1, true),
+            (B, 2, false),
+            (A, 3, false),
+            (B, 4, false),
+            (A, 5, true),
+            (LIVE, 6, false),
+            (DONE, 7, true),
+        ] {
+            let key = key(generation.0, generation.1, inode);
+            store.history.record(&key, &progress(complete));
+            store.insert(key, cursor(complete));
+        }
+        store
+    }
+
+    fn generations(store: &DecodeCursorStore) -> Vec<((u32, u64), bool)> {
+        store
+            .cursors
+            .iter()
+            .map(|(key, cursor)| ((key.pid, key.start_time), cursor.complete))
+            .collect()
+    }
+
+    /// v0.7.2 r3 INV-2: the prune's one cursor pass counts every touched
+    /// generation exactly (decoded of total, before the drop), asks the
+    /// predicate once per unfinished cursor and never for a completed
+    /// one, and visits exactly the charged extent. RED for a second
+    /// counting pass (extra visits), a dropped flush (the last touched
+    /// generation unnamed) and a count that leaks across generations.
+    #[test]
+    fn one_pass_counts_each_departed_generation_exactly() {
+        let mut store = store();
+        let extent = store.prune_extent();
+        assert_eq!(
+            extent,
+            store.len() + store.history.walk_extent(),
+            "setup: the extent is the cursors plus the history walk"
+        );
+        let mut asked = Vec::new();
+        let outcome = store.drop_departed_generations(
+            &mut |pid, start_time| {
+                asked.push((pid, start_time));
+                [A, B, DONE].contains(&(pid, start_time))
+            },
+            HistoryPrune::Dropped,
+        );
+        assert_eq!(
+            outcome.unfinished_generations,
+            BTreeMap::from([(A, (2, 3)), (B, (0, 2))]),
+            "exact decoded/total per touched generation; DONE lost nothing unfinished"
+        );
+        assert_eq!(
+            outcome.walked, extent,
+            "one pass: exactly the charged extent"
+        );
+        assert_eq!(
+            asked,
+            vec![A, B, B, LIVE],
+            "asked once per unfinished cursor, in key order"
+        );
+        assert_eq!(
+            generations(&store),
+            vec![(A, true), (A, true), (LIVE, false), (DONE, true)]
+        );
+        assert_eq!(
+            store.progress_totals(),
+            Some((3, 4, 0)),
+            "the incremental totals follow the drop"
+        );
+    }
+
+    /// The two history modes: `Departed` forgets every departed
+    /// generation's pairs (DONE included); `Dropped` forgets only the
+    /// generations whose unfinished cursors dropped (DONE kept). Both
+    /// visit exactly the charged extent.
+    #[test]
+    fn history_prune_modes_forget_exactly_their_generations() {
+        for (mode, kept) in [
+            (HistoryPrune::Departed, vec![LIVE]),
+            (HistoryPrune::Dropped, vec![LIVE, DONE]),
+        ] {
+            let mut store = store();
+            let extent = store.prune_extent();
+            let outcome = store.drop_departed_generations(
+                &mut |pid, start_time| [A, B, DONE].contains(&(pid, start_time)),
+                mode,
+            );
+            assert_eq!(outcome.walked, extent, "{mode:?}");
+            let mut remembered = store.history_generations_for_test();
+            remembered.sort_unstable();
+            remembered.dedup();
+            assert_eq!(remembered, kept, "{mode:?}");
+        }
     }
 }

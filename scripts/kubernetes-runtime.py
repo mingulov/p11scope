@@ -137,20 +137,21 @@ def validate_results(cell, work):
             or Counter(row.get("check") for row in recorded) != records):
         raise ValueError("required oracle checks missing, duplicated or not successful")
     profiles = [row for row in gated if row["check"] == "profile-exact"]
-    if sorted(row.get("calls", -1) for row in profiles) != ([1500, 1800, 2400] if cell == "K1" else [2400]):
+    profile_calls = [row.get("calls", -1) for row in profiles]
+    if not all(type(calls) is int for calls in profile_calls) or sorted(profile_calls) != ([1500, 1800, 2400] if cell == "K1" else [2400]):
         raise ValueError("original exact profile counts are missing")
     for row in gated:
         if row["check"] in {"profile-exact", "trace-exact", "copy-up-neg"}:
             if row.get("pid_namespace_causes") != ["pid_namespace"]:
                 raise ValueError("nested PID namespace disclosure is missing")
-        if row["check"] == "trace-exact" and row.get("calls") != 1200:
+        if row["check"] == "trace-exact" and not (type(row.get("calls")) is int and row.get("calls") == 1200):
             raise ValueError("original exact trace count is missing")
         if row["check"] == "copy-up-neg":
-            if row.get("calls") != 3900:
+            if not (type(row.get("calls")) is int and row.get("calls") == 3900):
                 raise ValueError("original exact copy-up count is missing")
             if row.get("modules") != ["/tmp/copyup/libsofthsm2.so"]:
                 raise ValueError("original copy-up module inventory is missing")
-            if row.get("skipped_rows") != 3:
+            if not (type(row.get("skipped_rows")) is int and row.get("skipped_rows") == 3):
                 raise ValueError("original copy-up skipped-row count is missing")
         if row["check"] == "scan-limit":
             if "pid_namespace" not in row.get("causes", []):

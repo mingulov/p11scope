@@ -126,6 +126,22 @@ class SummaryTests(unittest.TestCase):
         rows[-1]["causes"] = ["pid_descendant_gaps"]
         with self.assertRaises(ValueError):
             self.check("K2", rows)
+        rows = k1_rows()
+        next(row for row in rows if row["check"] == "profile-exact")["calls"] = 2400.0
+        with self.assertRaises(ValueError):
+            self.check("K1", rows)
+        rows = k1_rows()
+        next(row for row in rows if row["check"] == "trace-exact")["calls"] = 1200.0
+        with self.assertRaises(ValueError):
+            self.check("K1", rows)
+        rows = k1_rows()
+        next(row for row in rows if row["check"] == "copy-up-neg")["calls"] = 3900.0
+        with self.assertRaises(ValueError):
+            self.check("K1", rows)
+        rows = k1_rows()
+        next(row for row in rows if row["check"] == "copy-up-neg")["skipped_rows"] = 3.0
+        with self.assertRaises(ValueError):
+            self.check("K1", rows)
         for leg, disclosure in (("attached-zero", []), ("absent", []), ("unknown", ["loader_discovery"])):
             rows = k2_rows()
             rows[-1].update(leg=leg, disclosure=disclosure)

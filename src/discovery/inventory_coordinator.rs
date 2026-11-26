@@ -857,12 +857,21 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// fold-revival gap over the outer-bound window instead of
     /// re-crediting, then consumes the latch — a neighbor generation
     /// can neither take the gap nor burn it, so healthy keys stage
-    /// normally. Cleared per domain at finish, like every other
+    /// normally. Capped at the prune bound; past the cap, evictions
+    /// count on the class fallback below instead of growing this
+    /// set. Cleared per domain at finish, like every other
     /// per-domain departed structure.
     pair_fold_lost: HashSet<PairKey>,
-    /// Folded-key memory evictions of live tasks past the bound
-    /// (sticky, saturating; counted once). Each one latches its
-    /// evicted key above.
+    /// Counted class fallback for fold loss past the latch cap: each
+    /// unit buys one future outer-bound gap for a revival-shaped
+    /// staging in its class, consumed on fire. Bounded by the class
+    /// key space, like the exact aggregate; cleared per domain at
+    /// finish.
+    pair_fold_lost_class_overflow: HashMap<PairKeyClass, u64>,
+    /// Folded-key memory evictions past the bound (sticky,
+    /// saturating; counted once). Window evictions are proven live;
+    /// unvisited ones leave presumed-live without a probe. Each one
+    /// latches its evicted key above.
     pair_fold_memory_overflow: u64,
     /// Resume cursors for the two victim sweeps (tombstone
     /// eviction, folded-memory eviction): same
@@ -1910,6 +1919,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             pair_drain_cursor: None,
             pair_folded: HashMap::new(),
             pair_fold_lost: HashSet::new(),
+            pair_fold_lost_class_overflow: HashMap::new(),
             pair_fold_memory_overflow: 0,
             pair_evict_cursor: None,
             pair_fold_evict_cursor: None,
@@ -5195,6 +5205,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 size_of::<PairKey>(),
                 HEAP_MAP_ENTRY,
             ),
+            pair_fold_lost_classes: counter_row(
+                self.pair_fold_lost_class_overflow.len(),
+                size_of::<(PairKeyClass, u64)>(),
+                HEAP_MAP_ENTRY,
+            ),
             preadmission: counter_row(
                 preadmission,
                 size_of::<(u32, PreadmissionEntry)>(),
@@ -7066,6 +7081,24 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         );
     }
 
+    /// Record one live-fold eviction for its revival: an exact keyed
+    /// latch while the set has room, else a counted unit on the
+    /// bounded class fallback. Callers already counted the overflow.
+    fn insert_fold_latch(&mut self, victim: PairKey) {
+        if self.pair_fold_lost.len() < self.pair_prune_cap {
+            self.pair_fold_lost.insert(victim);
+            return;
+        }
+        let class = PairKeyClass {
+            domain: victim.image.domain(),
+            object: victim.object,
+        };
+        self.pair_fold_lost_class_overflow
+            .entry(class)
+            .and_modify(|units| *units = units.saturating_add(1))
+            .or_insert(1);
+    }
+
     /// Pre-evict room for this pass's folded rows, once per pass: one
     /// snapshot sorted oldest-first, one rotated window of liveness
     /// probes (gone folds leave silently), then the oldest visited
@@ -7124,7 +7157,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 continue;
             }
             self.pair_fold_memory_overflow = self.pair_fold_memory_overflow.saturating_add(1);
-            self.pair_fold_lost.insert(victim);
+            self.insert_fold_latch(victim);
             shortfall -= 1;
         }
     }
@@ -7140,7 +7173,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         {
             self.pair_folded.remove(&victim);
             self.pair_fold_memory_overflow = self.pair_fold_memory_overflow.saturating_add(1);
-            self.pair_fold_lost.insert(victim);
+            self.insert_fold_latch(victim);
         }
         self.pair_folded.insert(
             key,
@@ -7201,8 +7234,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.pair_prune_overflow
     }
 
-    /// Folded-key memory evictions of live tasks past the bound
-    /// (each counted once, when the memory leaves the map).
+    /// Folded-key memory evictions past the bound (each counted once,
+    /// when the memory leaves the map; unvisited evictions are
+    /// presumed live).
     pub(crate) fn pair_fold_memory_overflow(&self) -> u64 {
         self.pair_fold_memory_overflow
     }
@@ -10228,14 +10262,17 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.exec_loss_domains.remove(&domain);
         self.pair_dropped_tombstones
             .retain(|key, _| key.image.domain() != domain);
-        // Fold memory and the fold-loss latch are per-domain departed
-        // state like the tombstones: a finished domain's revivals are
-        // impossible, so its folds and latches leave with it instead
-        // of misfiring on a later domain's same-class keys.
+        // Fold memory, the fold-loss latch and its class fallback are
+        // per-domain departed state like the tombstones: a finished
+        // domain's revivals are impossible, so its folds and latches
+        // leave with it instead of misfiring on a later domain's
+        // same-class keys.
         self.pair_folded
             .retain(|key, _| key.image.domain() != domain);
         self.pair_fold_lost
             .retain(|key| key.image.domain() != domain);
+        self.pair_fold_lost_class_overflow
+            .retain(|class, _| class.domain != domain);
     }
 
     /// `LEADER_EXIT` records (H6 slice 2): a leader exit whose generation
@@ -11991,7 +12028,29 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     }
                     // Exact evicted key only: a neighbor generation
                     // shares the image but never this latch.
-                    self.pair_fold_lost.remove(&key).then_some(0)
+                    if self.pair_fold_lost.remove(&key) {
+                        return Some(0);
+                    }
+                    // Bounded class fallback past the latch cap: one
+                    // counted unit buys one gap, consumed on fire.
+                    let class = PairKeyClass {
+                        domain: key.image.domain(),
+                        object: key.object,
+                    };
+                    let units = self
+                        .pair_fold_lost_class_overflow
+                        .get(&class)
+                        .copied()
+                        .unwrap_or(0);
+                    if units == 0 {
+                        return None;
+                    }
+                    if units == 1 {
+                        self.pair_fold_lost_class_overflow.remove(&class);
+                    } else {
+                        self.pair_fold_lost_class_overflow.insert(class, units - 1);
+                    }
+                    Some(0)
                 }
             }
         });
@@ -46456,6 +46515,182 @@ int main(void) {
         );
     }
 
+    /// Past the latch cap, live evictions count on the bounded class
+    /// fallback instead of growing the exact set: one unit buys one
+    /// future gap in its class, consumed on fire, with no sticky
+    /// repeat for later keys.
+    #[test]
+    fn latch_overflow_past_cap_uses_a_counted_class_fallback() {
+        let (mut native, caller) = NativeScene::new();
+        let at = native.stamps.tick();
+        native.scene.coordinator.set_pair_prune_cap_for_test(2);
+        for ticket in [90u64, 91] {
+            native.scene.coordinator.pair_dropped_tombstones.insert(
+                PairKey {
+                    image: DomainCookie::scripted(native.domain, ticket),
+                    exec: 1,
+                    object: 0,
+                },
+                PrunedPairBase {
+                    base: 9,
+                    base_since: at,
+                    pruned_since: at,
+                    pid: 7,
+                },
+            );
+        }
+        for (pass, exec) in [9u64, 10, 11, 12, 13].iter().enumerate() {
+            native.scene.coordinator.pair_targets.insert(
+                PairKey {
+                    image: DomainCookie::scripted(native.domain, 41),
+                    exec: *exec,
+                    object: 0,
+                },
+                PairTarget::Dropped {
+                    base: 3,
+                    base_since: at,
+                    pid: 7,
+                },
+            );
+            native.scene.coordinator.prune_departed_native_state(
+                at + EXEC_STATE_GRACE_NS + pass as u64,
+            );
+        }
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .pair_fold_memory_overflow_for_test(),
+            3,
+            "three live folds drop with counted overflows"
+        );
+        assert_eq!(
+            native.scene.coordinator.pair_fold_lost.len(),
+            2,
+            "the exact set holds its cap"
+        );
+        let class = PairKeyClass {
+            domain: native.domain,
+            object: 0,
+        };
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .pair_fold_lost_class_overflow
+                .get(&class),
+            Some(&1),
+            "the third eviction counts on the class fallback"
+        );
+        // The class-covered (41, exec 11) revives: one outer-bound
+        // gap, consuming the unit.
+        let row = native.row(41, 11, 7, at, 0);
+        native.scene.coordinator.bind_pair_count(&row, caller, &[]);
+        native.counts_read(Vec::new(), vec![(41, 11, 0, 7)]);
+        let staged = native
+            .scene
+            .coordinator
+            .registry
+            .staged_pending_counts_for_test();
+        assert!(
+            staged.is_empty(),
+            "revival past the class fallback stages nothing: {staged:?}"
+        );
+        native.scene.coordinator.registry.publish();
+        let gaps: Vec<String> = native
+            .scene
+            .coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == "revived folded count")
+            .map(|gap| gap.reason.clone())
+            .collect();
+        assert_eq!(
+            gaps,
+            vec![
+                "the pair revived past a counted fold for absolute count range (0, 7] (7 unattributed calls); the folded base stays in the class aggregate and no pre-revival use is recorded"
+                    .to_string()
+            ],
+            "the class fallback gaps exactly once"
+        );
+        assert!(
+            native
+                .scene
+                .coordinator
+                .pair_fold_lost_class_overflow
+                .is_empty(),
+            "the fired unit leaves the fallback"
+        );
+        // A later key in the same class finds no units left and
+        // stages normally: no sticky repeat.
+        let row = native.row(44, 1, 7, at, 0);
+        native.scene.coordinator.bind_pair_count(&row, caller, &[]);
+        native.counts_read(Vec::new(), vec![(44, 1, 0, 7)]);
+        let staged = native
+            .scene
+            .coordinator
+            .registry
+            .staged_pending_counts_for_test();
+        assert_eq!(staged.len(), 1, "fresh 44 stages once: {staged:?}");
+        assert_eq!(staged[0].1, 7, "fresh 44 stages its full count: {staged:?}");
+    }
+
+    /// Calling remember on a full map without pre-eviction still
+    /// holds the bound through the fallback: one entry leaves
+    /// counted-and-latched and the new fold inserts.
+    #[test]
+    fn remember_on_full_map_without_prep_evicts_through_the_fallback() {
+        let (mut native, _caller) = NativeScene::new();
+        let at = native.stamps.tick();
+        native.scene.coordinator.set_pair_prune_cap_for_test(2);
+        for ticket in [41u64, 42] {
+            native.scene.coordinator.pair_folded.insert(
+                PairKey {
+                    image: DomainCookie::scripted(native.domain, ticket),
+                    exec: 1,
+                    object: 0,
+                },
+                FoldedPair {
+                    pid: 7,
+                    folded_since: at,
+                    base: 3,
+                },
+            );
+        }
+        let key = PairKey {
+            image: DomainCookie::scripted(native.domain, 43),
+            exec: 1,
+            object: 0,
+        };
+        native
+            .scene
+            .coordinator
+            .remember_folded_pair(key, 7, 3, at + 1);
+        assert_eq!(
+            native.scene.coordinator.pair_folded.len(),
+            2,
+            "the map holds its bound"
+        );
+        assert!(
+            native.scene.coordinator.pair_folded.contains_key(&key),
+            "the new fold inserts"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .pair_fold_memory_overflow_for_test(),
+            1,
+            "the fallback eviction counts"
+        );
+        assert_eq!(
+            native.scene.coordinator.pair_fold_lost.len(),
+            1,
+            "the fallback victim latches"
+        );
+    }
+
     /// Devin #2: finishing a domain drops its folded pairs along
     /// with its tombstones; other domains' entries stay. (Latch
     /// halves arrive with the latch in GREEN.)
@@ -46494,6 +46729,11 @@ int main(void) {
                 exec: 1,
                 object: 1,
             });
+            native
+                .scene
+                .coordinator
+                .pair_fold_lost_class_overflow
+                .insert(PairKeyClass { domain, object: 1 }, 2);
         }
         native.stage(NativeBatch::Finish {
             domain: native.domain,
@@ -46511,6 +46751,24 @@ int main(void) {
             native.scene.coordinator.pair_fold_lost.len(),
             1,
             "the other domain's latch stays"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .pair_fold_lost_class_overflow
+                .len(),
+            1,
+            "the other domain's class fallback stays"
+        );
+        assert!(
+            !native
+                .scene
+                .coordinator
+                .pair_fold_lost_class_overflow
+                .keys()
+                .any(|class| class.domain == native.domain),
+            "the finished domain's class fallback is gone"
         );
         assert!(
             !native

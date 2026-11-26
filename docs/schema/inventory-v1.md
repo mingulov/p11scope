@@ -1195,7 +1195,9 @@ Additive budgets are:
   pair's own revival-shaped staging with no fold memory files the
   same disclosed gap over the outer-bound window instead of
   re-crediting, consuming the latch so later growth stages — lost
-  fold memory never becomes positive attribution.
+  fold memory never becomes positive attribution. Past the prune
+  bound the exact set stops growing and further evictions count on
+  a bounded per-class fallback instead, one gap per unit.
   `exec_prune_overflow` counts
   pruned EXEC stashes discarded past their tombstone bound; the domain
   latches EXEC loss and late rows there read `exec_record_lost`. EXEC

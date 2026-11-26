@@ -98646,7 +98646,7 @@ fn stop_then_read_sites_settle_before_sigstop() {
             .unwrap_or_else(|| panic!("{name}: no stop_member_for_test(pid)"));
         assert!(settle < stop, "{name}: settle must precede the stop");
     }
-    // The shared helper all 15 `stopped_member_with_row` uses funnel through.
+    // The shared helper all 17 `stopped_member_with_row` calls funnel through.
     let helper = needle_fn_body(source, "stopped_member_with_row");
     let settle = helper
         .find("wait_sleep_child_settled(pid)")

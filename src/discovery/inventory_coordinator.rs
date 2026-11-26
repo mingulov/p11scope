@@ -28545,6 +28545,126 @@ exit 0
         }
     }
 
+    /// Shared-key Bound/Pending held twins: the B1 clause pins. Each
+    /// exited caller has a live Bound or Pending target, a stalled
+    /// recovery with withheld (10, 16] and a held cumulative read at 20
+    /// on one key. The loop-1 settle must cover each variant with the
+    /// held read: one exact typed (10, 20] gap and Dropped base 20 per
+    /// key. Without the settle (or with the Bound or Pending arm
+    /// dropped) loop 2 settles that key with no held read and discloses
+    /// only (10, 16], losing (16, 20] silently.
+    #[test]
+    fn fold_gaps_held_read_with_shared_prefix_for_bound_and_pending_targets() {
+        use crate::discovery::caller_registry::{DEMOTED_COUNT_REJECTED, RegistryGap};
+        let (mut native, _live) = NativeScene::new();
+        let domain = native.domain;
+        let held = || {
+            HeldPairCount::new(PairCount {
+                count: 20,
+                first_ns: 90,
+                anchor_ns: 100,
+                last_ns: 110,
+                retirement_usable: true,
+                diagnostic_observation: 0,
+                diagnostic_transition: 0,
+            })
+        };
+        let stalled = |id| {
+            let mut recovery = PairRecovery::scripted(id, 0, ModuleId(3));
+            recovery.watermark = 10;
+            recovery.withheld_through = 16;
+            recovery.discarded_through = 10;
+            recovery
+        };
+        let bound_id = stage_exited_caller(&mut native, 5110, 100);
+        let bound_key = PairKey::scripted(domain, 611, 0, 0);
+        native.scene.coordinator.pair_targets.insert(
+            bound_key,
+            PairTarget::scripted_bound(
+                bound_id,
+                ModuleKey::physical(8, 1, 7110, None, "/fold/bound-held.so"),
+                0,
+                10,
+                10,
+            ),
+        );
+        let pending_id = stage_exited_caller(&mut native, 5120, 100);
+        let pending_key = PairKey::scripted(domain, 612, 0, 0);
+        native.scene.coordinator.pair_targets.insert(
+            pending_key,
+            PairTarget::Pending {
+                caller: pending_id,
+                modules: vec![ModuleKey::physical(
+                    8,
+                    1,
+                    7120,
+                    None,
+                    "/fold/pending-held.so",
+                )],
+                staged: 10,
+                staged_ns: 0,
+                endpoint: EndpointId(0),
+                base: 10,
+                base_since: 0,
+            },
+        );
+        for (id, key) in [(bound_id, bound_key), (pending_id, pending_key)] {
+            native.scene.coordinator.recoveries.insert(key, stalled(id));
+            native.scene.coordinator.recovery_order.push(key);
+            native.scene.coordinator.pair_counts.insert(key, held());
+        }
+        native
+            .scene
+            .coordinator
+            .note_rendered_callers(&[bound_id, pending_id]);
+        let receipt = native.scene.coordinator.retire_rendered_callers(300, None);
+        assert_eq!(receipt.retired, 2, "both exited callers fold");
+        native.scene.coordinator.registry.publish();
+        for (id, key) in [(bound_id, bound_key), (pending_id, pending_key)] {
+            let expected = RegistryGap {
+                caller: Some(id),
+                module: None,
+                pid: None,
+                subject: DEMOTED_COUNT_REJECTED.into(),
+                reason: "the current physical owner is not proven for absolute count range (10, 20] (10 unattributed calls); historical counts remain and no witness or module-level use is recorded".into(),
+                budget: None,
+            };
+            let gaps: Vec<RegistryGap> = native
+                .scene
+                .coordinator
+                .registry
+                .gaps()
+                .iter()
+                .filter(|gap| gap.subject == DEMOTED_COUNT_REJECTED && gap.caller == Some(id))
+                .cloned()
+                .collect();
+            assert_eq!(
+                gaps,
+                vec![expected],
+                "the held read joins the prefix in one exact gap for {id:?}"
+            );
+            assert!(
+                matches!(
+                    native.scene.coordinator.pair_targets.get(&key),
+                    Some(PairTarget::Dropped { base: 20, .. })
+                ),
+                "the dropped base lands at the held absolute for {key:?}"
+            );
+            assert!(
+                !native.scene.coordinator.pair_counts.contains_key(&key),
+                "the held read leaves with the target for {key:?}"
+            );
+        }
+        assert!(
+            native.scene.coordinator.recoveries.is_empty(),
+            "no recovery survives its caller"
+        );
+        assert!(
+            native.scene.coordinator.recovery_order.is_empty(),
+            "the service order is exact"
+        );
+    }
+
     /// Shared-key held twin: a live suspended target, a stalled
     /// recovery with withheld (10, 16], and a held cumulative read at
     /// 20 for the same caller. The fold gaps the held read together

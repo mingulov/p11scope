@@ -31571,13 +31571,37 @@ int main(int argc, char **argv) {
         // handlers installed, no signals raised.
         let fresh = crate::inventory_dashboard::StopFlag::test_without_handlers();
         assert!(!fresh.note_outputs_attempted());
-        // A counted stop reads `again`.
-        let _signal_guard = ACTUAL_SIGNAL_TEST.lock().unwrap();
+        // A counted stop reads `again`. The raise runs in a child: an
+        // armed, counted flag must never linger in this process, where
+        // a stray hangup would exit it at once.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "run::tests::note_outputs_child_counts_a_stop_before_outputs",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("P11SCOPE_NOTE_CHILD", "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("COUNTED_STOP_READS_AGAIN"), "{stdout}");
+        assert!(output.status.success(), "{output:?}");
+    }
+
+    /// The child half of the hint-answer test: inert unless the parent
+    /// sets the environment.
+    #[test]
+    fn note_outputs_child_counts_a_stop_before_outputs() {
+        if std::env::var_os("P11SCOPE_NOTE_CHILD").is_none() {
+            return;
+        }
         let flag = crate::inventory_dashboard::StopFlag::install().unwrap();
-        // SAFETY: raise() with a handled signal; the handler only counts.
-        assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
+        // SAFETY: raising a signal whose handler is installed.
+        unsafe { libc::raise(libc::SIGINT) };
         assert!(flag.stopped());
         assert!(flag.note_outputs_attempted());
+        println!("COUNTED_STOP_READS_AGAIN");
     }
 
     /// F-T4-5: the owned command starts with SIGPIPE at its default. The

@@ -708,8 +708,7 @@ class BrowserCells(unittest.TestCase):
             s1={"sign_mechanisms": {"family_ids": sorted(_RSA_FAMILY_IDS),
                                     "min_calls": 1}})
 
-    @gate_system("firefox")
-
+    @gate("chromium")
     def test_cr_run_nodelay_observes_client_cert_signs(self):
         """CR-RUN-NODELAY: run-owned Chromium signs are observed with no spawn delay.
 
@@ -738,6 +737,11 @@ class BrowserCells(unittest.TestCase):
                     "system softokn provider not found")
             self.skipTest("browser gate prerequisite missing: "
                           "system softokn provider not found")
+        missing = cells.missing_nss_seed_tools()
+        if missing:
+            raise AssertionError(
+                "installed browser cell requires NSS seed tools: "
+                f"{', '.join(missing)}")
         cred = softhsm.generate_client_credential(self.work / "cred")
         key, cert = tls_server.make_server_credential(self.work / "srv")
         with tls_server.FlowServer(cert=cert, key=key, require_client_cert=True,
@@ -4212,21 +4216,22 @@ class BrowserS1Oracle(unittest.TestCase):
         require_s1_wiring(self)
         found, missing = live_cells_missing_s1(
             Path(__file__).read_text())
-        self.assertEqual(len(found), 6)
+        self.assertEqual(len(found), 7)
         self.assertEqual(missing, [])
 
     def test_nss_seeding_cells_call_the_seed_gate(self):
         """Twin: every NSS-seeding live cell gates the seed tools first.
 
-        CR-RUN-SIGN and FF-FIRST-BG seed an NSS client credential
-        before launch; both must call missing_nss_seed_tools at the
-        gate (skip, or strict-fail, naming the absent tools) instead
-        of erroring mid-cell from the seed step. The seeding set is
-        pinned exactly: a future seeder fails here until gated.
+        CR-RUN-SIGN, CR-RUN-NODELAY and FF-FIRST-BG seed an NSS client
+        credential before launch; all must call missing_nss_seed_tools
+        at the gate (skip, or strict-fail, naming the absent tools)
+        instead of erroring mid-cell from the seed step. The seeding
+        set is pinned exactly: a future seeder fails here until gated.
         """
         found, missing = seeding_cells_missing_nss_gate(
             Path(__file__).read_text())
         self.assertEqual(sorted(found), [
+            "test_cr_run_nodelay_observes_client_cert_signs",
             "test_cr_run_sign_observes_client_cert_signs",
             "test_ff_first_with_background_provider_covers_browser",
         ])

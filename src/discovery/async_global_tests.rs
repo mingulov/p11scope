@@ -4044,3 +4044,72 @@ fn kill_leg_wait_records_only_actual_pending_closes() {
     assert_eq!(again, Duration::ZERO);
     assert_eq!(waits.total, waited, "a settled barrier adds no wait");
 }
+
+/// Freed-slot admission: a newcomer that arrives while a retired slot's
+/// links detach on the cleanup worker waits behind that global
+/// retirement (a pending batch owns the whole candidate boundary), however
+/// many frames run, and admits on the first frame after the worker
+/// settles. The wait is bounded by the worker's actual close, never by a
+/// frame count: the deterministic half of the live freed-slot leg.
+#[test]
+fn async_global_newcomer_waits_for_the_detach_then_admits_on_the_settling_frame() {
+    let mut case = Case::new();
+    let scope = case.bounded_scope();
+    let peers = e06_spawn_sleeps(1);
+    let newcomer = peers[0].pid();
+    let candidate = case.candidate();
+    let outcome = case
+        .engine
+        .apply_candidate(&mut case.session, candidate, &mut true, false, &[])
+        .unwrap();
+    assert_eq!(outcome.disposition, ApplyDisposition::Deferred);
+    case.entered.recv_timeout(Duration::from_secs(2)).unwrap();
+    e06_write_listing(scope.path(), &[case.child.id(), newcomer]);
+    let admitted =
+        |engine: &Engine| engine.views.iter().any(|view| view.pid() == newcomer);
+    let scans = case.engine.deep_scans;
+    for frame in 0..40 {
+        case.engine
+            .drain_discovery_shallow_from(&mut case.session, false)
+            .unwrap();
+        case.engine
+            .service_backlog_quantum(&mut case.session)
+            .unwrap();
+        assert!(
+            case.engine.pending_global_retirement.is_some(),
+            "frame {frame}: the worker still holds the detach"
+        );
+        assert!(
+            !admitted(&case.engine),
+            "frame {frame}: no newcomer admits behind a pending retirement"
+        );
+    }
+    assert_eq!(
+        case.engine.deep_scans, scans,
+        "a blocked frame scans nothing it would have to discard"
+    );
+    case.release();
+    wait_for(|| {
+        case.session
+            .global_retirement
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .released()
+            == 2
+    });
+    let outcome = case
+        .engine
+        .service_backlog_quantum(&mut case.session)
+        .unwrap();
+    assert!(outcome.progressed);
+    assert!(case.engine.pending_global_retirement.is_none());
+    assert!(case.engine.take_immediate_exec_recovery_frame());
+    case.engine
+        .drain_discovery_shallow_from(&mut case.session, false)
+        .unwrap();
+    assert!(
+        admitted(&case.engine),
+        "the newcomer admits on the first frame after the worker settles"
+    );
+}

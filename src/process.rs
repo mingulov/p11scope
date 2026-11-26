@@ -4760,6 +4760,54 @@ int main(int argc, char **argv) {
         );
     }
 
+    /// Terminal-stop twin at the parked slot (finding 5): a collection
+    /// stop discards with its reason — it never parks the fd and bytes
+    /// across a stop the capture will not heal.
+    #[test]
+    fn collection_stops_discard_the_mount_table_without_parking() {
+        let pool = crate::semantics_edge::resources::SemanticResourcePool::default();
+        let grant = pool.reserver();
+        let parking = Some(&grant);
+        let table = compact_mount_table();
+        let pid = 4242;
+        let mut budget = CaptureWorkBudget::new(crate::discovery::scan::ScanLimits {
+            per_object_bytes: u64::MAX,
+            total_bytes: u64::MAX,
+        });
+        budget
+            .pass_owner()
+            .set_scan_stop(crate::discovery::scan::COLLECTION_STOP_REASON);
+        let slot = std::sync::Mutex::new(None);
+        let before = pool.snapshot();
+        let error = read_view_mountinfo_resumable(
+            pid,
+            &slot,
+            parking,
+            |_| false,
+            &mut budget,
+            || std::fs::File::open(table.path()),
+        )
+        .expect_err("a collection stop refuses");
+        assert_eq!(
+            error,
+            crate::discovery::scan::mount_table_read_reason(
+                pid,
+                crate::discovery::scan::COLLECTION_STOP_REASON
+            ),
+            "the refusal names the stop"
+        );
+        assert!(
+            slot.lock().unwrap().is_none(),
+            "a terminal stop never parks its fd"
+        );
+        let after = pool.snapshot();
+        assert_eq!(
+            (after.charged_bytes, after.refused),
+            (before.charged_bytes, before.refused),
+            "a terminal stop leases no bytes and counts no refusal"
+        );
+    }
+
     #[test]
     fn changed_generation_discards_the_parked_table_and_never_splices() {
         let view = parking_view();

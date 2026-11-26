@@ -242,12 +242,12 @@ pub(crate) const MOUNTINFO_ENTRY_CEILING_REASON: &str =
 /// read so far stay parked with their open table fd, and the next pass
 /// continues from there (INV-2: bounded per pass, resumed next pass).
 pub(crate) const MOUNTINFO_RESUME_REASON: &str = "capture mountinfo byte ceiling reached for this pass; the incomplete mount table resumes next pass";
-/// A parked mount-table read whose mount namespace changed before it
-/// completed: the partial bytes were discarded (never spliced with the
-/// new generation) and the read restarts.
 /// The parked read could not reserve its held bytes in the owner's
 /// resource pool: the partial table is discarded instead of held unpaid.
 pub(crate) const MOUNTINFO_PARK_REFUSED_REASON: &str = "capture resource pool refused to hold the incomplete mount table across passes; the partial table was discarded";
+/// A parked mount-table read whose mount namespace changed before it
+/// completed: the partial bytes were discarded (never spliced with the
+/// new generation) and the read restarts.
 pub(crate) const MOUNTINFO_GENERATION_CHANGED_REASON: &str = "mount table changed while its read was parked; the partial table was discarded and the read restarts";
 
 pub(crate) fn target_layout(abi: ElfAbi) -> LinuxLayout {
@@ -622,11 +622,12 @@ pub(crate) enum MountinfoStep {
     Complete(String),
     /// A resumable read met this pass's per-object leg before EOF.
     LegReached,
-    /// A resumable read met a healable budget stop (deadline, I/O
-    /// ceiling, work ceiling, a stopped pass) before EOF. Every byte the
-    /// fd already returned is kept in the progress, so the caller parks
-    /// the read and resumes it next pass; only a refusal (the `Err` arm)
-    /// or a generation change discards it. A one-shot read never returns
+    /// A resumable read met a controller-healable budget stop (exactly
+    /// the deadline, I/O-ceiling and work-ceiling stops, ruling N4)
+    /// before EOF. Every byte the fd already returned is kept in the
+    /// progress, so the caller parks the read and resumes it next pass;
+    /// only a refusal (the `Err` arm — terminal stops included) or a
+    /// generation change discards it. A one-shot read never returns
     /// this: its budget stops stay errors.
     Stopped(String),
 }
@@ -640,6 +641,20 @@ enum MountinfoBound {
     /// At most the per-object leg (plus the one-byte EOF probe) per call,
     /// the whole table within 64 MiB across calls; the leg parks.
     Resumable,
+}
+
+/// Whether a mount-table stop reason re-parks a resumable read
+/// (controller ruling N4): exactly the deadline, I/O-ceiling and
+/// work-ceiling stops. Every other stop — the terminal collection stop
+/// above all, plus clock and decode-allowance stops — refuses with its
+/// reason, so it never holds the parked fd and bytes across passes.
+/// Callers still classify waits from the refusal text through the
+/// existing budget-stop rules.
+fn mountinfo_stop_parks(reason: &str) -> bool {
+    matches!(
+        reason,
+        SCAN_DEADLINE_REASON | IO_CEILING_REASON | WORK_CEILING_REASON
+    )
 }
 
 fn read_mountinfo_pass<R: Read>(
@@ -665,10 +680,15 @@ fn read_mountinfo_pass<R: Read>(
     };
     let pass_start = progress.table.len();
     // Budget stops heal: a resumable read keeps its progress and parks,
-    // a one-shot read refuses as before.
+    // a one-shot read refuses as before. Only the controller-named
+    // healable stops park (ruling N4); every other stop refuses even
+    // when resumable, so a terminal stop never holds the slot.
     let stop = |reason: &str| match bound {
         MountinfoBound::OneShot => Err(reason.to_string()),
-        MountinfoBound::Resumable => Ok(MountinfoStep::Stopped(reason.to_string())),
+        MountinfoBound::Resumable if mountinfo_stop_parks(reason) => {
+            Ok(MountinfoStep::Stopped(reason.to_string()))
+        }
+        MountinfoBound::Resumable => Err(reason.to_string()),
     };
 
     let mut chunk = vec![0; chunk_size.max(1)];
@@ -21641,6 +21661,65 @@ int main(int argc, char **argv) {
             read_mountinfo_with(&mut reader, &mut budget, 8, |_| None).unwrap_err(),
             WORK_CEILING_REASON
         );
+    }
+
+    /// Terminal-stop class (finding 5): only the controller-named healable
+    /// stops (deadline, I/O ceiling, work ceiling — ruling N4) park as
+    /// [`MountinfoStep::Stopped`]; every other stop refuses with its
+    /// reason, so a terminal stop never holds the slot across passes.
+    #[test]
+    fn mountinfo_resumable_reader_refuses_non_healable_stops() {
+        let table = b"00 1 8:1 / /m rw\n".to_vec();
+        let roomy = || {
+            CaptureWorkBudget::new(ScanLimits {
+                per_object_bytes: u64::MAX,
+                total_bytes: u64::MAX,
+            })
+        };
+        // (site, latched stop, deadline-trip reason)
+        let sites: [(&str, Option<&'static str>, Option<&'static str>); 3] = [
+            ("collection stop", Some(COLLECTION_STOP_REASON), None),
+            ("clock stop", None, Some(SCAN_CLOCK_REASON)),
+            (
+                "table-window stop",
+                Some(TABLE_WINDOW_CEILING_REASON),
+                None,
+            ),
+        ];
+        for (site, latched, trip) in sites {
+            let mut reader = StreamReader {
+                data: table.clone(),
+                at: 0,
+                requests: Vec::new(),
+            };
+            let mut budget = roomy();
+            if let Some(latched) = latched {
+                budget.pass_owner().set_scan_stop(latched);
+            }
+            let mut progress = MountinfoProgress::default();
+            let mut calls = 0u32;
+            let error = read_mountinfo_resumable_with(
+                &mut reader,
+                &mut budget,
+                64,
+                |_| {
+                    calls += 1;
+                    (trip.is_some() && calls == 1).then(|| trip.unwrap_or("unreachable"))
+                },
+                &mut progress,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error,
+                latched.or(trip).unwrap_or("unreachable"),
+                "{site}: a non-healable stop refuses with its reason"
+            );
+            assert_eq!(
+                progress.bytes_read(),
+                0,
+                "{site}: a refused stop keeps no bytes"
+            );
+        }
     }
 
     /// The absolute 64 MiB cap still refuses a resumable read (only the

@@ -9316,7 +9316,7 @@ pub(crate) fn mount_table_read_reason(pid: u32, detail: &str) -> String {
 }
 
 /// The pid and detail of a [`mount_table_read_reason`] row.
-fn parse_mount_table_read_reason(reason: &str) -> Option<(u32, &str)> {
+pub(crate) fn parse_mount_table_read_reason(reason: &str) -> Option<(u32, &str)> {
     let rest = reason.strip_prefix("cannot read pid ")?;
     let (pid, detail) = rest.split_once("'s mount table: ")?;
     if pid.is_empty() || !pid.bytes().all(|byte| byte.is_ascii_digit()) {

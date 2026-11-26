@@ -12196,6 +12196,17 @@ impl PinOutcome {
         )
     }
 
+    /// A pre-copy-up pin whose mount-table read failed: a healable
+    /// budget stop keeps its exact mount-table text, so the outer
+    /// classifier waits on it with its exact cause (17:27 I3); anything
+    /// else is missing evidence with today's fixed text, byte for byte.
+    fn for_pre_copy_up_mountinfo_error(view: &ProcessView, error: String) -> Self {
+        if mountinfo_detail_is_healable_stop(&error) {
+            return Self::for_view_error(view, error);
+        }
+        Self::for_mountinfo_unreadable()
+    }
+
     /// A pre-copy-up pin whose proven lower candidate diverged.
     fn for_pre_candidate_diverged() -> Self {
         Self::unproven(
@@ -12332,6 +12343,37 @@ impl PinOutcome {
             "file changed while it was being identified - retry".to_string(),
         )
     }
+}
+
+/// Whether a pre-copy-up mount-table error names a healable budget
+/// stop, exactly: the bare stop sentence (a budget-charging proof step
+/// tripped before the table read) or the exact mount-table wrapper
+/// with a healable detail (the read itself stopped). Mirrors the outer
+/// pin classifier's six wait-mapped causes (`pin_scanned_object`); a
+/// collection stop is never healable, and anything else keeps today's
+/// fixed text.
+fn mountinfo_detail_is_healable_stop(error: &str) -> bool {
+    matches!(
+        error,
+        WORK_CEILING_REASON
+            | SCAN_DEADLINE_REASON
+            | SCAN_CLOCK_REASON
+            | IO_CEILING_REASON
+            | TABLE_WINDOW_CEILING_REASON
+            | INTERFACE_WINDOW_CEILING_REASON
+    ) || crate::discovery::scan::parse_mount_table_read_reason(error).is_some_and(
+        |(_, detail)| {
+            matches!(
+                detail,
+                WORK_CEILING_REASON
+                    | SCAN_DEADLINE_REASON
+                    | SCAN_CLOCK_REASON
+                    | IO_CEILING_REASON
+                    | TABLE_WINDOW_CEILING_REASON
+                    | INTERFACE_WINDOW_CEILING_REASON
+            )
+        },
+    )
 }
 
 impl UnprovenCause {
@@ -13536,8 +13578,8 @@ fn pin_scanned_object_inner(
         };
         let text = match view.open_then_cached_mountinfo(|_| Ok(()), mounts, budget) {
             Ok(((), text)) => text,
-            Err(_) => {
-                return Err(PinOutcome::for_mountinfo_unreadable());
+            Err(error) => {
+                return Err(PinOutcome::for_pre_copy_up_mountinfo_error(view, error));
             }
         };
         let candidates =
@@ -22827,6 +22869,260 @@ mod tests {
             "budget exhaustion must wait (it would reject a live key): {:?}",
             outcome.as_ref().map(|_| ()),
         );
+    }
+
+    /// Pre-copy-up consumer twin (finding 2): a pre-copy-up pin whose
+    /// mount-table read meets a healable budget stop waits with that
+    /// stop's exact cause (17:27 I3) — it never files ordinary
+    /// unreadable evidence. One row per stop; the read is one-shot (an
+    /// ungranted view), so every stop arrives as the wrapped
+    /// mount-table error.
+    #[test]
+    fn pre_copy_up_mountinfo_stop_waits_with_its_exact_cause() {
+        let view = ProcessView::open(ProcessViewId(21), std::process::id()).unwrap();
+        let (path, key) = maps_libc_line(std::process::id());
+        let spent_work = || {
+            let mut budget = CaptureWorkBudget::with_work_ceiling(1);
+            assert!(budget.charge(1));
+            budget
+        };
+        let tiny_io = || {
+            CaptureWorkBudget::new(crate::discovery::scan::ScanLimits {
+                per_object_bytes: u64::MAX,
+                total_bytes: 20,
+            })
+        };
+        let past_deadline = || {
+            let mut budget = CaptureWorkBudget::default();
+            budget.set_deadline(Some(1));
+            budget
+        };
+        let latched = |reason: &'static str| {
+            let mut budget = CaptureWorkBudget::default();
+            budget.pass_owner().set_scan_stop(reason);
+            budget
+        };
+        // (site, budget, stop, cause, wrapped): the I/O ceiling trips
+        // inside the table read itself (the proof steps charge no window
+        // I/O), so it arrives wrapped; every other stop trips a proof
+        // step first and arrives bare.
+        let sites: Vec<(&str, CaptureWorkBudget, &str, WaitCause, bool)> = vec![
+            (
+                "work ceiling",
+                spent_work(),
+                WORK_CEILING_REASON,
+                WaitCause::WorkCeiling,
+                false,
+            ),
+            (
+                "io ceiling",
+                tiny_io(),
+                IO_CEILING_REASON,
+                WaitCause::IoCeiling,
+                true,
+            ),
+            (
+                "deadline",
+                past_deadline(),
+                SCAN_DEADLINE_REASON,
+                WaitCause::Deadline,
+                false,
+            ),
+            (
+                "clock",
+                latched(SCAN_CLOCK_REASON),
+                SCAN_CLOCK_REASON,
+                WaitCause::ClockUnavailable,
+                false,
+            ),
+            (
+                "table window",
+                latched(TABLE_WINDOW_CEILING_REASON),
+                TABLE_WINDOW_CEILING_REASON,
+                WaitCause::TableWindowCeiling,
+                false,
+            ),
+            (
+                "interface window",
+                latched(INTERFACE_WINDOW_CEILING_REASON),
+                INTERFACE_WINDOW_CEILING_REASON,
+                WaitCause::InterfaceWindowCeiling,
+                false,
+            ),
+        ];
+        for (site, mut budget, stop, cause, wrapped) in sites {
+            let mut module = module(key);
+            module.path = path.clone();
+            module.pre_copy_up = Some(0);
+            let raw = RawObjectInstance::scanned(&module, key, &module.path).unwrap();
+            let mut mounts = MountTableCache::default();
+            let outcome = pin_scanned_object(
+                &view,
+                raw,
+                None,
+                Some(0),
+                &|_| Err("test pinned identity never runs on a stopped budget".into()),
+                &mut mounts,
+                &mut budget,
+            );
+            match outcome {
+                Err(PinOutcome::Wait {
+                    cause: actual,
+                    reason,
+                    ..
+                }) => {
+                    assert_eq!(actual, cause, "{site}: the wait names its exact cause");
+                    if wrapped {
+                        assert_eq!(
+                            reason,
+                            crate::discovery::scan::mount_table_read_reason(
+                                std::process::id(),
+                                stop
+                            ),
+                            "{site}: the read's own stop arrives wrapped"
+                        );
+                    } else {
+                        assert_eq!(
+                            reason, stop,
+                            "{site}: a proof-step stop arrives bare"
+                        );
+                    }
+                }
+                other => panic!(
+                    "{site}: a healable mount-table stop waits, never {:?}",
+                    other.as_ref().map(|_| ())
+                ),
+            }
+        }
+    }
+
+    /// Pre-copy-up control twin: a collection stop is never retried, so
+    /// it keeps the fixed unreadable text byte for byte — the healable
+    /// gate must not swallow it.
+    #[test]
+    fn pre_copy_up_mountinfo_collection_stop_keeps_the_fixed_text() {
+        let view = ProcessView::open(ProcessViewId(22), std::process::id()).unwrap();
+        let (path, key) = maps_libc_line(std::process::id());
+        let mut module = module(key);
+        module.path = path;
+        module.pre_copy_up = Some(0);
+        let raw = RawObjectInstance::scanned(&module, key, &module.path).unwrap();
+        let mut mounts = MountTableCache::default();
+        let mut budget = CaptureWorkBudget::default();
+        budget
+            .pass_owner()
+            .set_scan_stop(crate::discovery::scan::COLLECTION_STOP_REASON);
+        let outcome = pin_scanned_object(
+            &view,
+            raw,
+            None,
+            Some(0),
+            &|_| Err("test pinned identity never runs on a stopped budget".into()),
+            &mut mounts,
+            &mut budget,
+        );
+        match outcome {
+            Err(PinOutcome::Unproven { reason, .. }) => {
+                assert_eq!(
+                    reason,
+                    "the target mount table is unreadable; the pre-copy-up pin was refused",
+                    "a collection stop keeps the fixed text byte for byte"
+                );
+            }
+            other => panic!(
+                "a collection stop is missing evidence, never a wait: {:?}",
+                other.as_ref().map(|_| ())
+            ),
+        }
+    }
+
+    /// Pre-copy-up futile twin: a stop against a zero cap can never
+    /// heal, so the outer futile rule refuses it — but the refusal names
+    /// the actual stop instead of the fixed unreadable text.
+    #[test]
+    fn pre_copy_up_zero_cap_mountinfo_stop_names_its_stop() {
+        let view = ProcessView::open(ProcessViewId(23), std::process::id()).unwrap();
+        let (path, key) = maps_libc_line(std::process::id());
+        let mut module = module(key);
+        module.path = path;
+        module.pre_copy_up = Some(0);
+        let raw = RawObjectInstance::scanned(&module, key, &module.path).unwrap();
+        let mut mounts = MountTableCache::default();
+        let mut budget = CaptureWorkBudget::with_work_ceiling(0);
+        let outcome = pin_scanned_object(
+            &view,
+            raw,
+            None,
+            Some(0),
+            &|_| Err("test pinned identity never runs on a stopped budget".into()),
+            &mut mounts,
+            &mut budget,
+        );
+        match outcome {
+            Err(PinOutcome::Unproven { reason, .. }) => {
+                assert!(
+                    reason.contains(crate::discovery::scan::WORK_CEILING_REASON),
+                    "a futile stop refuses but names its stop: {reason}"
+                );
+            }
+            other => panic!(
+                "a zero cap refuses, never waits: {:?}",
+                other.as_ref().map(|_| ())
+            ),
+        }
+    }
+
+    /// Gate table for the pre-copy-up mountinfo site: each healable stop
+    /// detail keeps its exact wrapped text (the outer classifier waits on
+    /// it); a collection stop and every non-stop error keep the fixed
+    /// text byte for byte.
+    #[test]
+    fn pre_copy_up_mountinfo_gate_keeps_exact_stop_text() {
+        let view = ProcessView::open(ProcessViewId(24), std::process::id()).unwrap();
+        let wrapped = |detail: &str| {
+            crate::discovery::scan::mount_table_read_reason(std::process::id(), detail)
+        };
+        for stop in [
+            WORK_CEILING_REASON,
+            SCAN_DEADLINE_REASON,
+            SCAN_CLOCK_REASON,
+            IO_CEILING_REASON,
+            TABLE_WINDOW_CEILING_REASON,
+            INTERFACE_WINDOW_CEILING_REASON,
+        ] {
+            let error = wrapped(stop);
+            assert_eq!(
+                PinOutcome::for_pre_copy_up_mountinfo_error(&view, error.clone()),
+                PinOutcome::Unproven {
+                    cause: UnprovenCause::IdentityUnreadable,
+                    reason: error,
+                },
+                "healable [{stop}] preserves its text for the outer wait"
+            );
+            assert_eq!(
+                PinOutcome::for_pre_copy_up_mountinfo_error(&view, stop.to_string()),
+                PinOutcome::Unproven {
+                    cause: UnprovenCause::IdentityUnreadable,
+                    reason: stop.to_string(),
+                },
+                "bare healable [{stop}] preserves its text for the outer wait"
+            );
+        }
+        for error in [
+            wrapped(COLLECTION_STOP_REASON),
+            "cannot open pid 7's mount table: os error 2".to_string(),
+            crate::discovery::scan::MOUNTINFO_CEILING_REASON.to_string(),
+            wrapped(crate::discovery::scan::MOUNTINFO_CEILING_REASON),
+            wrapped(crate::discovery::scan::MOUNTINFO_RESUME_REASON),
+            wrapped(crate::discovery::scan::MOUNTINFO_GENERATION_CHANGED_REASON),
+            "synthetic stop nobody latches".to_string(),
+        ] {
+            assert_eq!(
+                PinOutcome::for_pre_copy_up_mountinfo_error(&view, error),
+                PinOutcome::for_mountinfo_unreadable(),
+                "non-healable input keeps the fixed text"
+            );
+        }
     }
 
     /// Twin: a Gone pin loss files its gap without rejecting the key,

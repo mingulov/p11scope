@@ -31129,6 +31129,14 @@ fn drive_r4_stop_row(row: &R4Row) {
         capture_ended_reason, stop_loss_unattributed_reason,
     };
     let mut fixture = CanonicalFanoutScene::prior_sealed();
+    let pre_push_census = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .retained_census_len_for_test();
     match row.push {
         R4Push::Complete => fixture.push_two("C_SignInit", 2),
         R4Push::Endless => fixture.push_two_without_end("C_SignInit", 2),
@@ -31568,6 +31576,13 @@ fn drive_r4_stop_row(row: &R4Row) {
                 "{}: exact leftover claims",
                 row.name,
             );
+            // N6: every consumed open released its census member.
+            assert_eq!(
+                owner.adapter().retained_census_len_for_test(),
+                pre_push_census,
+                "{}: N6: the retained census balances",
+                row.name,
+            );
         }
         R4Expect::Refuse => {
             assert_eq!(
@@ -31907,6 +31922,23 @@ fn joint_stop_loss_predicate_table_publishes_counted_loss() {
             expect: loss,
             leftover_claims: 0,
             unattributed_rows: 2,
+        },
+        // Stopped take, live keys (a fixture stop ends takes, not
+        // key eras): unclaimed sole-image opens count under their
+        // consumer exactly like the scripted-takes twin above.
+        R4Row {
+            name: "unclaimed_stopped_take",
+            push: P::Endless,
+            begin_only: true,
+            takes: T::StoppedCapture,
+            corrupt: C::None,
+            unclaimed: U::None,
+            expect: E::Loss {
+                replayed: 0,
+                disposed: 2,
+            },
+            leftover_claims: 0,
+            unattributed_rows: 0,
         },
     ];
     for row in &rows {

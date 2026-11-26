@@ -4359,6 +4359,13 @@ impl JournalAdapter {
         self.open.get(&native).map(|entry| entry.image)
     }
 
+    /// Tests-only census size: total retained members (N6 pin: every
+    /// `take_open` pairs with its `retained_member_dec`).
+    #[cfg(test)]
+    pub(crate) fn retained_census_len_for_test(&self) -> usize {
+        self.retained_counts.values().map(Vec::len).sum()
+    }
+
     /// Tests-only stale claim: file one unstaged claim under the
     /// image's sole bound key for one open original's identity,
     /// cloning the shape's front claim when one exists, else the
@@ -14724,6 +14731,52 @@ pub(crate) mod tests {
                 },
                 expect: Err(()),
             },
+            Row {
+                name: "ambiguous_floors_refuse",
+                evidence: {
+                    let mut ev = healthy_end();
+                    ev.my_claims = 2;
+                    ev.floors_ok = false;
+                    ev
+                },
+                expect: Err(()),
+            },
+            Row {
+                name: "unclaimed_foreign_image",
+                evidence: {
+                    let mut ev = healthy_endless();
+                    ev.my_claims = 0;
+                    ev.claiming_keys = 0;
+                    ev.staged.clear();
+                    ev.image_ok = false;
+                    ev
+                },
+                expect: Ok(O::Outside),
+            },
+            Row {
+                name: "unclaimed_unbound",
+                evidence: {
+                    let mut ev = healthy_endless();
+                    ev.my_claims = 0;
+                    ev.claiming_keys = 0;
+                    ev.staged.clear();
+                    ev.me_bound = false;
+                    ev
+                },
+                expect: Ok(O::Outside),
+            },
+            Row {
+                name: "unclaimed_owner_marked",
+                evidence: {
+                    let mut ev = healthy_endless();
+                    ev.my_claims = 0;
+                    ev.claiming_keys = 0;
+                    ev.staged.clear();
+                    ev.owner_marked = true;
+                    ev
+                },
+                expect: Ok(O::Outside),
+            },
             // END-less uniform loss ignores linkage predicates.
             Row {
                 name: "endless_abandon_loses",
@@ -14772,7 +14825,7 @@ pub(crate) mod tests {
         }
         // Every row above names its mutand: flipping any single arm of
         // `decide_stop_original` must fail exactly its rows.
-        assert_eq!(rows.len(), 34, "the table covers every predicate arm");
+        assert_eq!(rows.len(), 38, "the table covers every predicate arm");
     }
 
     fn resource_audit(h3: H3DispositionEvidence) -> JournalAuditReceipt {

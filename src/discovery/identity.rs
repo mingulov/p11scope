@@ -33,9 +33,9 @@ use super::handle_table::{AcquireOutcome, DeferredReason, Filing, HandleTable, H
 use super::refresh_queue::RetirementProof;
 use crate::discovery::scan::{
     COLLECTION_STOP_REASON, CaptureWorkBudget, INTERFACE_WINDOW_CEILING_REASON, IO_CEILING_REASON,
-    InspectedFileKey, MOUNTINFO_BYTE_STRIDE, MOUNTINFO_STRIDE, SCAN_CLOCK_REASON, SCAN_DEADLINE_REASON, ScannedEntry, ScannedModule,
-    Skipped, TABLE_WINDOW_CEILING_REASON, WORK_CEILING_REASON, read_maps_or_refuse, read_mountinfo,
-    standard_function_names,
+    InspectedFileKey, MOUNTINFO_BYTE_STRIDE, MOUNTINFO_STRIDE, SCAN_CLOCK_REASON,
+    SCAN_DEADLINE_REASON, ScannedEntry, ScannedModule, Skipped, TABLE_WINDOW_CEILING_REASON,
+    WORK_CEILING_REASON, read_maps_or_refuse, read_mountinfo, standard_function_names,
 };
 
 #[cfg(test)]

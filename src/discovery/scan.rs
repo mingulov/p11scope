@@ -738,7 +738,8 @@ fn read_mountinfo_pass<R: Read>(
                 ));
             }
             if pending_lines == MOUNTINFO_STRIDE {
-                if progress.observed_lines
+                if progress
+                    .observed_lines
                     .checked_add(lines_charged)
                     .and_then(|lines| lines.checked_add(MOUNTINFO_STRIDE))
                     .is_none_or(|lines| lines > MAX_MOUNTINFO_ENTRIES)
@@ -788,12 +789,14 @@ fn read_mountinfo_pass<R: Read>(
         // partial for free, leaving the new trailing bytes uncounted.
         pending_lines +=
             usize::from(chunk[read - 1] != b'\n' && (chunk_newlines > 0 || !prev_partial));
-        let next_newline_count = progress.newline_count
+        let next_newline_count = progress
+            .newline_count
             .checked_add(chunk_newlines)
             .ok_or_else(|| MOUNTINFO_ENTRY_CEILING_REASON.to_string())?;
         while pending_lines > 0 {
             let stride = pending_lines.min(MOUNTINFO_STRIDE);
-            if progress.observed_lines
+            if progress
+                .observed_lines
                 .checked_add(lines_charged)
                 .and_then(|lines| lines.checked_add(stride))
                 .is_none_or(|lines| lines > MAX_MOUNTINFO_ENTRIES)
@@ -812,7 +815,8 @@ fn read_mountinfo_pass<R: Read>(
         if u64::try_from(next_len).unwrap_or(u64::MAX) > table_cap {
             return Err(MOUNTINFO_CEILING_REASON.into());
         }
-        let next_lines = progress.observed_lines
+        let next_lines = progress
+            .observed_lines
             .checked_add(lines_charged)
             .ok_or_else(|| MOUNTINFO_ENTRY_CEILING_REASON.to_string())?;
         if next_lines > MAX_MOUNTINFO_ENTRIES {
@@ -21580,7 +21584,8 @@ int main(int argc, char **argv) {
         .unwrap_err();
         assert_eq!(error, SCAN_DEADLINE_REASON);
         assert_eq!(
-            budget.work_units_count(), 65,
+            budget.work_units_count(),
+            65,
             "one read plus the first 64-line stride: {}",
             budget.work_units_count()
         );
@@ -21606,7 +21611,8 @@ int main(int argc, char **argv) {
         .unwrap_err();
         assert_eq!(error, SCAN_DEADLINE_REASON);
         assert_eq!(
-            budget.work_units_count(), 65,
+            budget.work_units_count(),
+            65,
             "one read plus the first 64-line stride: {}",
             budget.work_units_count()
         );
@@ -21653,7 +21659,8 @@ int main(int argc, char **argv) {
             "no terminator in a newline-free chunk"
         );
         assert_eq!(
-            budget.work_units_count(), 2,
+            budget.work_units_count(),
+            2,
             "one read plus the first byte stride: {}",
             budget.work_units_count()
         );
@@ -21676,7 +21683,8 @@ int main(int argc, char **argv) {
             "abcd"
         );
         assert_eq!(
-            budget.work_units_count(), 4,
+            budget.work_units_count(),
+            4,
             "three reads plus the one split line: {}",
             budget.work_units_count()
         );

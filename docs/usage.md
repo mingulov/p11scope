@@ -797,7 +797,10 @@ acquisition error recorded on its surface). The default `trusted` profile
 keeps today's ambient behavior after the standard privilege drop.
 
 The isolated profile is a damage-reduction fence, not a full sandbox.
-Residuals: the provider runs in-process as your uid, reads every file you
+It protects the host from the provider, not the honesty of the manifest:
+the provider shares the helper process with the manifest writer, so a
+hostile provider can shape what the manifest says about objects it
+loaded. Residuals: the provider runs in-process as your uid, reads every file you
 can read, inherits your environment (including any tokens) and
 supplementary groups, and may signal your processes or lower their
 priority; terminal stdio ioctls other than

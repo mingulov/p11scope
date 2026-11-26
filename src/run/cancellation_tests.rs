@@ -12,6 +12,9 @@ const CHILD_MODE: &str = "P11SCOPE_CANCEL_MARKER_CHILD";
 fn marker_child() -> Option<std::ffi::OsString> {
     let mode = std::env::var_os(CHILD_MODE)?;
     if mode == "late" {
+        // Fresh process (libtest re-exec): no contention, but the
+        // install contract requires the guard all the same.
+        let _signal_guard = super::tests::ActualSignalTestGuard::hold();
         let signals = install_stop_flag().unwrap();
         let cancellation = CaptureCancellation::default();
         observe_capture_cancel(&signals, &cancellation, 42, CancellationPhase::Finalization);

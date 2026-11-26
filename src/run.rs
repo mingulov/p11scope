@@ -14806,13 +14806,15 @@ mod tests {
     /// dispositions) in a test holds this. It locks
     /// `ACTUAL_SIGNAL_TEST` and marks this thread; `install_stop_flag`
     /// debug-asserts the mark, so an unguarded install fails loudly
-    /// instead of racing a fidelity test's dispositions.
-    struct ActualSignalTestGuard {
+    /// instead of racing a fidelity test's dispositions. Visible to
+    /// the whole `run` module: the cancellation child (a re-exec, so
+    /// it cannot inherit the mark) holds it in its own process.
+    pub(super) struct ActualSignalTestGuard {
         _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl ActualSignalTestGuard {
-        fn hold() -> Self {
+        pub(super) fn hold() -> Self {
             let lock = ACTUAL_SIGNAL_TEST.lock().unwrap();
             super::SIGNAL_TEST_HOLDING.with(|held| held.set(true));
             Self { _lock: lock }

@@ -1995,14 +1995,17 @@ impl RetainedFileFacts {
 
     /// Drop every decode cursor and resume-history pair of a generation
     /// `departed` proves gone, keeping the shared retained-byte account
-    /// exact. Returns `(cursors dropped, history pairs forgotten)`.
+    /// exact. Returns what the prune removed, including the per-generation
+    /// object counts the caller names its unfinished scans from.
     pub(crate) fn drop_departed_decode_generations(
         &mut self,
         departed: &mut dyn FnMut(u32, u64) -> bool,
-    ) -> (usize, usize) {
-        let (freed, cursors, pairs) = self.decode_cursors.drop_departed_generations(departed);
-        self.retained_cache_bytes = self.retained_cache_bytes.saturating_sub(freed);
-        (cursors, pairs)
+    ) -> super::scan_pass::DepartedPruneOutcome {
+        let outcome = self.decode_cursors.drop_departed_generations(departed);
+        self.retained_cache_bytes = self
+            .retained_cache_bytes
+            .saturating_sub(outcome.freed_bytes);
+        outcome
     }
 
     /// Whether the carried bundle holds any decode cursor: a bundle

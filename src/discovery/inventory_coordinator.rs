@@ -1374,6 +1374,18 @@ pub(crate) fn cgroup_walk_incomplete_reason(passes: u64) -> String {
     )
 }
 
+/// Terminal row subject for a member generation that exited before its
+/// scan finished: the prune dropped its unfinished cursors, so the run
+/// names the unfinished scan instead of reading converged.
+pub(crate) const MEMBER_EXITED_MID_SCAN_SUBJECT: &str = "member exited before its scan finished";
+
+pub(crate) fn member_exited_mid_scan_reason(pid: u32, decoded: usize, total: usize) -> String {
+    format!(
+        "pid {pid} exited with {decoded} of {total} objects decoded; a provider only its \
+         undecoded objects reach may be missing"
+    )
+}
+
 /// The scoped native activation refusal subject.
 pub(crate) const ACTIVATION_REFUSED_SUBJECT: &str = "native owner activation refused";
 
@@ -5804,18 +5816,23 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 
     /// Drop the carried decode cursors and resume-history pairs of
-    /// member generations this accepted pass proves gone, so a member
-    /// that exited mid-decode never leaves the run "in progress" for
-    /// good and dead pairs never fill the bounded history. A complete
-    /// membership walk proves every generation it did not see gone
-    /// (start times are in the keys, so a gone generation never
-    /// returns). A walk that did not complete proves nothing by
-    /// absence: only unfinished cursors' generations it did not see are
-    /// probed, each through the metered generation proof, and only a
-    /// proven change drops. Charged from the collection's own work
-    /// (one unit per 64 entries walked, one per probe unit); a refused
-    /// charge leaves everything for the next pass. A pid whose start
-    /// time the walk could not read keeps all its generations.
+    /// member generations this accepted pass proves gone, so dead pairs
+    /// never fill the bounded history — and name each generation whose
+    /// unfinished scan the prune drops, so a member that exited
+    /// mid-decode never reads as converged. A complete membership walk
+    /// proves every generation it did not see gone (start times are in
+    /// the keys, so a gone generation never returns). A walk that did
+    /// not complete proves nothing by absence: only unfinished cursors'
+    /// generations it did not see are probed, each through the metered
+    /// generation proof, and only a proven change drops. Charged from
+    /// the collection's own work without latching any stop (one unit
+    /// per 64 entries walked, one per probe unit); a refused charge
+    /// leaves everything for the next pass and the collection's outcome
+    /// untouched. A pid whose start time the walk could not read keeps
+    /// all its generations. Sibling: a death proven inside the member's
+    /// own scan drops its cursors before the view names its gaps, so
+    /// the raw stops stay verbatim (the pid-wide retirement in
+    /// `scan.rs`).
     fn drop_departed_decode_generations(
         &mut self,
         collection: &CgroupCollection,
@@ -5834,13 +5851,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         };
         match collection.outcome() {
             ScopedCollectionOutcome::Complete => {
-                if !work.charge(extent.div_ceil(64).saturating_add(1)) {
+                if !work.try_charge(extent.div_ceil(64).saturating_add(1)) {
                     return;
                 }
-                self.cgroup_file_facts
-                    .drop_departed_decode_generations(&mut |pid, start_time| {
-                        !live(&seen, pid, start_time)
-                    });
+                let outcome = self.cgroup_file_facts.drop_departed_decode_generations(
+                    &mut |pid, start_time| !live(&seen, pid, start_time),
+                );
+                self.name_pruned_unfinished_scans(outcome.unfinished_generations);
             }
             ScopedCollectionOutcome::Cancelled(_) => {}
             ScopedCollectionOutcome::Incomplete(_) => {
@@ -5850,7 +5867,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         continue;
                     }
                     match crate::process::metered_pid_generation(pid, start_time, &mut || {
-                        work.charge(1)
+                        work.try_charge(1)
                     }) {
                         Some(crate::process::GenerationProof::Changed) => {
                             gone.insert((pid, start_time));
@@ -5859,14 +5876,32 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         None => break,
                     }
                 }
-                if gone.is_empty() || !work.charge(extent.div_ceil(64).saturating_add(1)) {
+                if gone.is_empty() || !work.try_charge(extent.div_ceil(64).saturating_add(1)) {
                     return;
                 }
-                self.cgroup_file_facts
-                    .drop_departed_decode_generations(&mut |pid, start_time| {
-                        gone.contains(&(pid, start_time))
-                    });
+                let outcome = self.cgroup_file_facts.drop_departed_decode_generations(
+                    &mut |pid, start_time| gone.contains(&(pid, start_time)),
+                );
+                self.name_pruned_unfinished_scans(outcome.unfinished_generations);
             }
+        }
+    }
+
+    /// Name each departed generation whose unfinished scan the prune
+    /// just dropped: one counted loss row per generation, attributed by
+    /// pid. The dropped cursors held the only record that the member's
+    /// decode never finished; without this row its exit mid-scan would
+    /// read as converged.
+    fn name_pruned_unfinished_scans(&mut self, generations: BTreeMap<(u32, u64), (usize, usize)>) {
+        for ((pid, _), (decoded, total)) in generations {
+            self.registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: Some(pid),
+                subject: MEMBER_EXITED_MID_SCAN_SUBJECT.into(),
+                reason: member_exited_mid_scan_reason(pid, decoded, total),
+                budget: None,
+            });
         }
     }
 
@@ -22477,6 +22512,55 @@ pub(crate) mod tests {
                 assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGSTOP) }, 0);
             },
         )
+    }
+
+    /// A cgroup scene whose one member maps no provider (a plain
+    /// `sleep` child): collection and commit stay cheap, so the
+    /// prune-refusal twins can drain the shared work below the prune's
+    /// cost while still funding everything after it.
+    pub(crate) fn cgroup_plain_scene() -> (
+        tempfile::TempDir,
+        crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild,
+        InventoryCoordinator<OsProcessSource>,
+    ) {
+        use crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild;
+        let dir = tempfile::tempdir().unwrap();
+        let child = OwnedStoppedChild::spawn_stopped(
+            std::process::Command::new("/bin/sleep")
+                .arg("300")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()),
+            |pid| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                loop {
+                    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                        && stat.contains("(sleep)")
+                    {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "owned plain child did not exec sleep"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                // SAFETY: pid names the child retained by spawn_stopped.
+                assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGSTOP) }, 0);
+            },
+        );
+        std::fs::write(dir.path().join("cgroup.procs"), format!("{}\n", child.id())).unwrap();
+        let mut coordinator = InventoryCoordinator::new(
+            crate::scope::cgroup(dir.path()).unwrap(),
+            HookRegistry::builtin(),
+            vec![],
+            vec![],
+            OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap();
+        coordinator.begin_capture_coverage(CaptureScopeCoverage::Cgroup);
+        (dir, child, coordinator)
     }
 
     /// Sparse ELF64 with one `.dynsym`/`.dynstr` pair of the given byte
@@ -47625,11 +47709,16 @@ int main(void) {
 
     /// v0.7.2 I2: a member that exits mid-decode leaves an unfinished
     /// cursor; after the next accepted pass whose complete walk no
-    /// longer sees its generation, the cursor is gone and the run
-    /// shows no live in-progress row. The departed member's completed
-    /// cursor stays (it is done; reclamation already takes it first),
-    /// and so does nothing else. RED before the fix: the dead cursor
-    /// kept the run in progress for good.
+    /// longer sees its generation, the cursor is gone and the run names
+    /// the departed member's unfinished scan as one counted loss row —
+    /// an honest PARTIAL, since the departed member never converged —
+    /// with no live in-progress row left. The departed member's
+    /// completed cursor stays (it is done; reclamation already takes it
+    /// first), and so does nothing else. The progress stash is replaced
+    /// after the prune, so the converged bundle clears it: a reordered
+    /// stash would keep the stale live row. RED before the r1 fix: the
+    /// dead cursor kept the run in progress for good. RED before the r2
+    /// fix: no row named the unfinished scan.
     #[test]
     fn complete_walk_drops_a_departed_members_unfinished_cursor() {
         let (_dir, _child, mut coordinator) = cgroup_provider_scene();
@@ -47673,13 +47762,31 @@ int main(void) {
             "{:?}",
             presentation.gaps
         );
+        let exited = presentation
+            .gaps
+            .iter()
+            .find(|gap| gap.subject == MEMBER_EXITED_MID_SCAN_SUBJECT)
+            .expect("the prune names the departed member's unfinished scan");
+        assert_eq!(exited.caller, None);
+        assert_eq!(exited.pid, Some(DEPARTED_TEST_PID));
+        assert_eq!(
+            exited.reason,
+            member_exited_mid_scan_reason(DEPARTED_TEST_PID, 1, 2)
+        );
+        assert_eq!(presentation.gaps_suppressed, 0);
+        assert_eq!(
+            presentation.budgets.refusals(),
+            0,
+            "no hidden loss: nothing refused or suppressed beside the named rows"
+        );
     }
 
     /// v0.7.2 I2, incomplete-walk leg: absence from a walk that did not
     /// complete proves nothing, so only a metered generation proof
     /// drops: a dead generation's unfinished cursor drops, a live
     /// non-member generation's unfinished cursor (this test process)
-    /// stays. Twin of the complete-walk leg.
+    /// stays. The dropped generation names its unfinished scan as one
+    /// counted loss row. Twin of the complete-walk leg.
     #[test]
     fn incomplete_walk_drops_only_proven_dead_unfinished_cursors() {
         let (_dir, _child, mut coordinator) = cgroup_provider_scene();
@@ -47714,6 +47821,359 @@ int main(void) {
         assert!(
             coordinator.live_scan_progress_gap().is_some(),
             "the live unfinished cursor still names its progress"
+        );
+        let presentation =
+            crate::inventory_present::Presentation::capture(&coordinator, "cgroup", 0, 1, 1);
+        let exited = presentation
+            .gaps
+            .iter()
+            .find(|gap| gap.subject == MEMBER_EXITED_MID_SCAN_SUBJECT)
+            .expect("the prune names the proven-dead generation's unfinished scan");
+        assert_eq!(exited.pid, Some(DEPARTED_TEST_PID));
+        assert_eq!(
+            exited.reason,
+            member_exited_mid_scan_reason(DEPARTED_TEST_PID, 0, 1)
+        );
+    }
+
+    /// v0.7.2 B2 mechanism, Complete arm: a refused prune charge
+    /// leaves the collection's outcome untouched (drained to zero, so
+    /// no charge can succeed) and keeps every cursor for the next pass.
+    /// RED before the fix: the refused charge latched WorkLimit.
+    #[test]
+    fn refused_prune_charge_leaves_a_complete_collection_complete() {
+        let (_dir, _child, mut coordinator) = cgroup_provider_scene();
+        let _ = one_cgroup_pass(&mut coordinator, false);
+        let mut budget = crate::discovery::scan::CaptureWorkBudget::default()
+            .with_retained_file_facts(crate::discovery::scan::RetainedFileFacts::default());
+        assert!(budget.record_decode_cursor(
+            departed_test_key(DEPARTED_TEST_PID, 9, 11),
+            departed_test_cursor(false)
+        ));
+        assert!(budget.record_decode_cursor(
+            departed_test_key(DEPARTED_TEST_PID, 9, 12),
+            departed_test_cursor(true)
+        ));
+        coordinator.cgroup_file_facts = budget.take_retained_file_facts();
+        let mut collection = coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap()();
+        assert_eq!(collection.outcome(), ScopedCollectionOutcome::Complete);
+        let work = collection.work();
+        let left = work.remaining_work_for_test();
+        assert!(work.charge(left), "setup: drain to zero");
+        assert_eq!(work.remaining_work_for_test(), 0);
+        // Mimic apply's handoff: the prune runs on the returned bundle.
+        coordinator.cgroup_file_facts = collection.take_retained_file_facts();
+        coordinator.drop_departed_decode_generations(&collection, &work);
+        assert_eq!(
+            collection.outcome(),
+            ScopedCollectionOutcome::Complete,
+            "the refused prune latches no stop"
+        );
+        assert_eq!(
+            carried_cursor_table(&coordinator, &[DEPARTED_TEST_PID]),
+            vec![
+                (DEPARTED_TEST_PID, 9, 11, false),
+                (DEPARTED_TEST_PID, 9, 12, true)
+            ],
+            "the refused prune keeps every cursor for the next pass"
+        );
+    }
+
+    /// v0.7.2 B2 mechanism, Incomplete arm: refused probe and prune
+    /// charges leave the collection's own stop untouched and keep every
+    /// cursor. RED before the fix: the refused probe charge latched
+    /// WorkLimit over the pass's own stop.
+    #[test]
+    fn refused_probe_charge_keeps_an_incomplete_collections_witness() {
+        let (_dir, _child, mut coordinator) = cgroup_provider_scene();
+        let _ = one_cgroup_pass(&mut coordinator, false);
+        let mut budget = crate::discovery::scan::CaptureWorkBudget::default()
+            .with_retained_file_facts(crate::discovery::scan::RetainedFileFacts::default());
+        assert!(budget.record_decode_cursor(
+            departed_test_key(DEPARTED_TEST_PID, 9, 11),
+            departed_test_cursor(false)
+        ));
+        coordinator.cgroup_file_facts = budget.take_retained_file_facts();
+        let mut collection = coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap()();
+        collection.preparation_incomplete();
+        assert_eq!(
+            collection.outcome(),
+            ScopedCollectionOutcome::Incomplete(
+                crate::inspect_system::inventory_cgroup::ScopedCollectionGap::ScanIncomplete
+            )
+        );
+        let work = collection.work();
+        let left = work.remaining_work_for_test();
+        assert!(work.charge(left), "setup: drain to zero");
+        // Mimic apply's handoff: the prune runs on the returned bundle.
+        coordinator.cgroup_file_facts = collection.take_retained_file_facts();
+        coordinator.drop_departed_decode_generations(&collection, &work);
+        assert_eq!(
+            collection.outcome(),
+            ScopedCollectionOutcome::Incomplete(
+                crate::inspect_system::inventory_cgroup::ScopedCollectionGap::ScanIncomplete
+            ),
+            "refused probes latch no stop over the pass's own"
+        );
+        assert_eq!(
+            carried_cursor_table(&coordinator, &[DEPARTED_TEST_PID]),
+            vec![(DEPARTED_TEST_PID, 9, 11, false)],
+            "the refused prune keeps every cursor for the next pass"
+        );
+    }
+
+    /// v0.7.2 B2(a): a complete collection with fewer units left than
+    /// the prune costs stays Complete end to end. The plain scene keeps
+    /// collection and commit cheap, so the pass drains to 200 units —
+    /// below the 251-unit prune cost of 8000 unfinished cursors, above
+    /// the ~85 units the reconcile and commit behind the prune need.
+    /// The refused prune waits for the next pass (its cursors stay and
+    /// still name their continuation), no fence or transaction row is
+    /// filed, and the R1 counter stays down. RED before the fix: the
+    /// refused charge latched WorkLimit and the pass translated.
+    #[test]
+    fn complete_collection_below_the_prune_cost_stays_complete() {
+        let (_dir, _child, mut coordinator) = cgroup_plain_scene();
+        let _ = one_cgroup_pass(&mut coordinator, false);
+        let mut budget = crate::discovery::scan::CaptureWorkBudget::default()
+            .with_retained_file_facts(crate::discovery::scan::RetainedFileFacts::default());
+        for inode in 1000..9000u64 {
+            assert!(budget.record_decode_cursor(
+                departed_test_key(DEPARTED_TEST_PID, 9, inode),
+                departed_test_cursor(false)
+            ));
+        }
+        coordinator.cgroup_file_facts = budget.take_retained_file_facts();
+        let collection = coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap()();
+        assert_eq!(collection.outcome(), ScopedCollectionOutcome::Complete);
+        let work = collection.work();
+        let left = work.remaining_work_for_test();
+        assert!(left > 200, "setup: the walk leaves room to drain, {left}");
+        assert!(work.charge(left - 200), "setup: drain to 200 units");
+        coordinator
+            .apply_cgroup_collection(collection, crate::discovery::caller_registry::now_ns())
+            .unwrap();
+        // Guard: the refused prune changed nothing, so the post-apply
+        // extent is the post-collect one; its cost still exceeds the
+        // 200 units left, so the refusal is genuine.
+        let cost = coordinator
+            .cgroup_file_facts
+            .decode_prune_extent()
+            .div_ceil(64)
+            + 1;
+        assert!(200 < cost, "setup: prune cost {cost} exceeds 200 units");
+        coordinator.commit_batch(false).unwrap();
+        let completion = coordinator.take_cgroup_completion().unwrap();
+        assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+        assert!(
+            coordinator.live_walk_incomplete_gap().is_none(),
+            "no translated R1 row"
+        );
+        assert!(
+            coordinator.live_scan_progress_gap().is_some(),
+            "the kept cursors still name their continuation"
+        );
+        assert_eq!(
+            carried_cursor_table(&coordinator, &[DEPARTED_TEST_PID]).len(),
+            8000,
+            "the refused prune keeps every cursor for the next pass"
+        );
+        let presentation =
+            crate::inventory_present::Presentation::capture(&coordinator, "cgroup", 0, 1, 1);
+        assert!(
+            presentation
+                .gaps
+                .iter()
+                .all(|gap| gap.subject != "cgroup scope transaction incomplete"
+                    && gap.subject != ACTIVATION_REFUSED_SUBJECT),
+            "no transaction or fence row: {:?}",
+            presentation.gaps
+        );
+    }
+
+    /// v0.7.2 B2(b): a refused prune charge on an incomplete pass never
+    /// rewrites the pass's own stop. The pass stays incomplete for its
+    /// real (non-work) reason with its permanent transaction row —
+    /// never the resettable R1 counter — and the row survives the next
+    /// complete walk, which prunes the departed cursors and names their
+    /// unfinished scan. RED before the fix: the charge latched
+    /// WorkLimit, the pass translated, and the complete walk reset the
+    /// counter away.
+    #[test]
+    fn incomplete_collections_own_stop_survives_a_refused_prune_charge() {
+        let (_dir, _child, mut coordinator) = cgroup_plain_scene();
+        let _ = one_cgroup_pass(&mut coordinator, false);
+        let mut budget = crate::discovery::scan::CaptureWorkBudget::default()
+            .with_retained_file_facts(crate::discovery::scan::RetainedFileFacts::default());
+        for inode in 1000..9000u64 {
+            assert!(budget.record_decode_cursor(
+                departed_test_key(DEPARTED_TEST_PID, 9, inode),
+                departed_test_cursor(false)
+            ));
+        }
+        coordinator.cgroup_file_facts = budget.take_retained_file_facts();
+        let mut collection = coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap()();
+        collection.preparation_incomplete();
+        assert_eq!(
+            collection.outcome(),
+            ScopedCollectionOutcome::Incomplete(
+                crate::inspect_system::inventory_cgroup::ScopedCollectionGap::ScanIncomplete
+            )
+        );
+        let work = collection.work();
+        let left = work.remaining_work_for_test();
+        assert!(left > 200, "setup: the walk leaves room to drain, {left}");
+        assert!(work.charge(left - 200), "setup: drain to 200 units");
+        coordinator
+            .apply_cgroup_collection(collection, crate::discovery::caller_registry::now_ns())
+            .unwrap();
+        // Guard: the one unseen unfinished generation's probe spends a
+        // unit before the extent charge, which still faces 199 units
+        // against a 251-unit cost — a genuine refusal.
+        let cost = coordinator
+            .cgroup_file_facts
+            .decode_prune_extent()
+            .div_ceil(64)
+            + 1;
+        assert!(199 < cost, "setup: prune cost {cost} exceeds 199 units");
+        coordinator.commit_batch(false).unwrap();
+        let completion = coordinator.take_cgroup_completion().unwrap();
+        assert_eq!(
+            completion.outcome,
+            ScopedCollectionOutcome::Incomplete(
+                crate::inspect_system::inventory_cgroup::ScopedCollectionGap::ScanIncomplete
+            ),
+            "the pass keeps its own non-work stop"
+        );
+        assert!(
+            coordinator.live_walk_incomplete_gap().is_none(),
+            "never translated: no R1 row"
+        );
+        assert_eq!(
+            carried_cursor_table(&coordinator, &[DEPARTED_TEST_PID]).len(),
+            8000,
+            "the refused prune keeps every cursor for the next pass"
+        );
+        let presentation =
+            crate::inventory_present::Presentation::capture(&coordinator, "cgroup", 0, 1, 1);
+        assert!(
+            presentation
+                .gaps
+                .iter()
+                .any(|gap| gap.subject == "cgroup scope transaction incomplete"),
+            "the permanent transaction row is filed: {:?}",
+            presentation.gaps
+        );
+        // The next complete walk prunes at full budget and names the
+        // unfinished scan, while the transaction row survives it.
+        let completion = one_cgroup_pass(&mut coordinator, false);
+        assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+        assert!(
+            coordinator.live_scan_progress_gap().is_none(),
+            "the prune converged every cursor"
+        );
+        let presentation =
+            crate::inventory_present::Presentation::capture(&coordinator, "cgroup", 0, 1, 1);
+        assert!(
+            presentation
+                .gaps
+                .iter()
+                .any(|gap| gap.subject == "cgroup scope transaction incomplete"),
+            "the loss row survives the complete walk: {:?}",
+            presentation.gaps
+        );
+        let exited = presentation
+            .gaps
+            .iter()
+            .find(|gap| gap.subject == MEMBER_EXITED_MID_SCAN_SUBJECT)
+            .expect("the prune names the unfinished scan it dropped");
+        assert_eq!(exited.pid, Some(DEPARTED_TEST_PID));
+        assert_eq!(
+            exited.reason,
+            member_exited_mid_scan_reason(DEPARTED_TEST_PID, 0, 8000)
+        );
+    }
+
+    /// v0.7.2 N6: a cancelled walk drops nothing — no cursor moves and
+    /// no exit row is minted. RED for the mutant that prunes the
+    /// cancelled arm like a complete walk.
+    #[test]
+    fn cancelled_walk_prunes_no_cursors() {
+        let (_dir, _child, mut coordinator) = cgroup_provider_scene();
+        let _ = one_cgroup_pass(&mut coordinator, false);
+        let mut budget = crate::discovery::scan::CaptureWorkBudget::default()
+            .with_retained_file_facts(crate::discovery::scan::RetainedFileFacts::default());
+        assert!(budget.record_decode_cursor(
+            departed_test_key(DEPARTED_TEST_PID, 9, 11),
+            departed_test_cursor(false)
+        ));
+        coordinator.cgroup_file_facts = budget.take_retained_file_facts();
+        let control = CollectionControl::new(None);
+        let collection = coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                control.clone(),
+                None,
+            )
+            .unwrap()();
+        control.cancel();
+        assert!(
+            matches!(collection.outcome(), ScopedCollectionOutcome::Cancelled(_)),
+            "setup: cancelled"
+        );
+        coordinator
+            .apply_cgroup_collection(collection, crate::discovery::caller_registry::now_ns())
+            .unwrap();
+        coordinator.commit_batch(false).unwrap();
+        let completion = coordinator.take_cgroup_completion().unwrap();
+        assert!(
+            matches!(completion.outcome, ScopedCollectionOutcome::Cancelled(_)),
+            "the pass stays cancelled, got {:?}",
+            completion.outcome
+        );
+        assert_eq!(
+            carried_cursor_table(&coordinator, &[DEPARTED_TEST_PID]),
+            vec![(DEPARTED_TEST_PID, 9, 11, false)],
+            "a cancelled walk drops nothing"
+        );
+        let presentation =
+            crate::inventory_present::Presentation::capture(&coordinator, "cgroup", 0, 1, 1);
+        assert!(
+            presentation
+                .gaps
+                .iter()
+                .all(|gap| gap.subject != MEMBER_EXITED_MID_SCAN_SUBJECT),
+            "no exit row without a drop: {:?}",
+            presentation.gaps
         );
     }
 

@@ -208,6 +208,15 @@ impl CgroupWalkBudget {
         self.used.units += units;
         Ok(())
     }
+    /// Units still chargeable under the work allowance and the
+    /// discovery slice, mirroring [`Self::charge_work`]'s two bounds.
+    #[cfg(test)]
+    pub(crate) fn remaining_work_for_test(&self) -> usize {
+        let end = self.slice_end.map_or(self.limits.work_units, |end| {
+            end.min(self.limits.work_units)
+        });
+        end.saturating_sub(self.used.units)
+    }
     fn directory(&mut self) -> Result<(), CollectionOutcome> {
         charge(
             &mut self.used.directories,

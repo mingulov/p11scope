@@ -4366,8 +4366,12 @@ pub(crate) struct CallerRegistry {
     gap_index: HashMap<RegistryGap, usize>,
     /// Distinct gaps already counted as suppressed (bounded by
     /// `MAX_SUPPRESSED_GAP_MEMORY`), so a suppressed gap that recurs every
-    /// pass is counted once.
-    suppressed_seen: HashSet<u64>,
+    /// pass is counted once. Each fingerprint remembers whether it was
+    /// suppressed as a loss: the memory is keyed by identity alone, so a
+    /// repeat with the other class would count in neither counter, and
+    /// debug builds assert no identity is ever suppressed as both a
+    /// note and a loss (no such identity exists today).
+    suppressed_seen: HashMap<u64, bool>,
     /// Randomly keyed, so a target cannot steer fingerprint collisions.
     suppressed_hasher: std::hash::RandomState,
     gaps_suppressed: u64,
@@ -4789,7 +4793,7 @@ impl CallerRegistry {
             gap_classes: Vec::new(),
             notes_suppressed: 0,
             gap_index: HashMap::new(),
-            suppressed_seen: HashSet::new(),
+            suppressed_seen: HashMap::new(),
             suppressed_hasher: std::hash::RandomState::new(),
             gaps_suppressed: 0,
             unrouted_aggregates: HashMap::new(),
@@ -6963,16 +6967,22 @@ impl CallerRegistry {
         };
         if !retain {
             let fingerprint = self.suppressed_hasher.hash_one(&gap);
-            if self.suppressed_seen.contains(&fingerprint) {
+            let is_loss = class == GapClass::Loss;
+            if let Some(&was_loss) = self.suppressed_seen.get(&fingerprint) {
+                debug_assert_eq!(
+                    was_loss, is_loss,
+                    "a gap identity suppressed as both a note and a loss counts in neither \
+                     counter: {gap:?}"
+                );
                 return;
             }
-            if class == GapClass::Loss {
+            if is_loss {
                 self.gaps_suppressed = self.gaps_suppressed.saturating_add(1);
             } else {
                 self.notes_suppressed = self.notes_suppressed.saturating_add(1);
             }
             if self.suppressed_seen.len() < MAX_SUPPRESSED_GAP_MEMORY {
-                self.suppressed_seen.insert(fingerprint);
+                self.suppressed_seen.insert(fingerprint, is_loss);
             }
             return;
         }
@@ -11549,6 +11559,38 @@ pub(crate) mod tests {
             (registry.gaps_suppressed(), registry.notes_suppressed()),
             (1, 1)
         );
+    }
+
+    /// No identity is ever suppressed as both a note and a loss: the
+    /// suppression memory is keyed by identity alone, so a repeat with
+    /// the other class would count in neither counter. Debug builds
+    /// assert against it (no production identity is recorded both
+    /// ways).
+    #[test]
+    #[should_panic(expected = "suppressed as both")]
+    fn same_identity_suppressed_as_note_and_loss_trips_the_debug_assert() {
+        use super::NoteKind;
+        let mut registry =
+            CallerRegistry::new(RegistryLimits::new(64, 64, 64, 1, 1 << 20, 64).unwrap());
+        registry.record_gap(RegistryGap {
+            caller: None,
+            module: None,
+            pid: Some(0),
+            subject: "filler".into(),
+            reason: "r".into(),
+            budget: None,
+        });
+        let row = RegistryGap {
+            caller: None,
+            module: None,
+            pid: Some(7),
+            subject: "s".into(),
+            reason: "r".into(),
+            budget: None,
+        };
+        registry.record_note(row.clone(), NoteKind::FoldDeferredOversized);
+        registry.record_gap(row);
+        registry.publish();
     }
 
     fn collapse_gap() -> RegistryGap {

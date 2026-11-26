@@ -1063,8 +1063,25 @@ def judge_cgroup_inventory(args):
             require(g["subject"] == modpath, GAP_UNPROVEN, "overlay unproven subject")
             require(g["module"] is None, GAP_UNPROVEN, "overlay unproven module")
             require(g["pid"] == workload[g["caller"]]["pid"], GAP_UNPROVEN, "overlay unproven pid")
-    return ("inventory cgroup: inside=%d child=%d outside=%d excluded module=%s admission=%s unproven=%d gaps=%d notes=%d"
-            % (inside_pid, child_pid, outside_pid, owned_id, state, len(unproven), len(report["gaps"]), len(notes)))
+    # The producer's coverage rule (src/inventory/present.rs): complete
+    # if and only if there are no loss gaps, no budget refusals and no
+    # suppressed gaps. Notes never count. Missing counters default to
+    # zero (fixtures omit the always-present report keys); a mistyped
+    # counter cannot prove zero, so it reads partial.
+    budgets = report.get("budgets") or {}
+    refused = 0
+    for resource in ("callers", "modules", "edges", "endpoints"):
+        section = budgets.get(resource) or {}
+        count = section.get("refused", 0)
+        refused += count if type(count) is int else 1
+    suppressed = report.get("gaps_suppressed", 0)
+    if type(suppressed) is not int:
+        suppressed = 1
+    coverage = ("complete" if not (report["gaps"] or []) and refused == 0 and suppressed == 0
+                else "partial")
+    return ("inventory cgroup: inside=%d child=%d outside=%d excluded module=%s admission=%s unproven=%d gaps=%d notes=%d coverage=%s"
+            % (inside_pid, child_pid, outside_pid, owned_id, state, len(unproven), len(report["gaps"]),
+               len(notes), coverage))
 
 
 # -- run pre-arm --------------------------------------------------------------

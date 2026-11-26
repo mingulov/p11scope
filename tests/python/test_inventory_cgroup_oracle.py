@@ -1402,6 +1402,37 @@ class DeferredActivationTests(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertIn("unproven=0 gaps=0 notes=2", out)
 
+    def test_healthy_fork_leg_pins_coverage_complete(self):
+        # N5: the healthy fork leg (both members settle, the deferral
+        # recovered as a note) is coverage complete: no loss gap, no
+        # refusal, nothing suppressed. Notes never count.
+        report = deferred_recovered_report(modfs_witness=True)
+        rc, out = run_oracle(report, modfs="ext4")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("unproven=0 gaps=0 notes=2 coverage=complete", out)
+
+    def test_degraded_fork_leg_pins_coverage_partial(self):
+        # The same recovered shape on overlayfs keeps its named
+        # unproven gaps: the cell passes, but coverage is partial.
+        report = deferred_recovered_report()
+        rc, out = run_oracle(report, modfs="overlayfs")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("unproven=2 gaps=2 notes=2 coverage=partial", out)
+
+    def test_coverage_counts_refusals_and_suppressed_gaps(self):
+        # Each coverage input beyond the gap list flips the pin: a
+        # budget refusal or a suppressed gap reads partial with zero
+        # gaps shown.
+        for budgets, suppressed in (({"callers": {"refused": 1}}, 0),
+                                    ({}, 1)):
+            with self.subTest(budgets=budgets, suppressed=suppressed):
+                report = deferred_recovered_report(modfs_witness=True)
+                report["budgets"] = budgets
+                report["gaps_suppressed"] = suppressed
+                rc, out = run_oracle(report, modfs="ext4")
+                self.assertEqual(rc, 0, out)
+                self.assertIn("coverage=partial", out)
+
     def test_deferred_member_that_stays_scan_pinned_fails(self):
         # Recover and continue: a deferral is a disclosure of one
         # delayed activation, never a resting state.

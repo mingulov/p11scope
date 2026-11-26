@@ -185,6 +185,35 @@ impl SharedCollectionWork {
         }
         true
     }
+    /// Charge work without latching any stop: for post-acceptance
+    /// maintenance (the departed-generation prune) whose verdict
+    /// inputs are already fixed. A refusal returns false and records
+    /// nothing — control cancellation, fence loss and budget
+    /// exhaustion stay for the collection's own outcome poll to
+    /// report, so a refused maintenance charge can neither downgrade
+    /// a complete collection nor rewrite another stop.
+    pub(crate) fn try_charge(&self, units: usize) -> bool {
+        if self.control().check().is_err() {
+            return false;
+        }
+        if !self.fence.current() {
+            return false;
+        }
+        if self.stopped.lock().unwrap().is_some() {
+            return false;
+        }
+        self.budget
+            .lock()
+            .unwrap()
+            .charge_work(self.control(), units)
+            .is_ok()
+    }
+    /// Units still chargeable under the work allowance (test seam for
+    /// the prune-refusal twins: drain to just under the prune cost).
+    #[cfg(test)]
+    pub(crate) fn remaining_work_for_test(&self) -> usize {
+        self.budget.lock().unwrap().remaining_work_for_test()
+    }
     fn hook(&self) -> CollectionWork {
         let shared = self.clone();
         CollectionWork::new(move |units| {

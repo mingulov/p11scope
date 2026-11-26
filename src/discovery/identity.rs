@@ -15525,6 +15525,9 @@ mod tests {
             x
         }
         let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        // Restoration (controller ruling 18:58): every mutation arm must
+        // actually run, so the refused-pairs arm is counted.
+        let mut arm_rounds = [0u32; 6];
         for round in 0..200u64 {
             let count = 1 + (xorshift(&mut state) % 3) as usize;
             let mut entries: Vec<(ObjectKey, String, i64)> = Vec::new();
@@ -15548,7 +15551,9 @@ mod tests {
                 "round {round}: identical content must match in any order"
             );
 
-            let mutated = match xorshift(&mut state) % 6 {
+            let arm = xorshift(&mut state) % 6;
+            arm_rounds[arm as usize] += 1;
+            let mutated = match arm {
                 0 => {
                     let mut m = pin_set(&refs, false);
                     m.by_id.values_mut().next().unwrap().sha256.push('x');
@@ -15585,6 +15590,10 @@ mod tests {
                 "round {round}: one mutation must break the match"
             );
         }
+        assert!(
+            arm_rounds.iter().all(|rounds| *rounds > 0),
+            "every mutation arm ran, the refused-pairs arm included: {arm_rounds:?}"
+        );
     }
 
     #[test]
@@ -20876,6 +20885,13 @@ mod tests {
             "physical identity is ambiguous; the collision group was not attached"
         );
         let rendered = serde_json::to_string(&public).unwrap();
+        // Restoration (controller ruling 18:58, B): the leak checks
+        // below judge the rendered ambiguity row itself, never an empty
+        // or unrelated rendering.
+        assert!(
+            rendered.contains("physical identity is ambiguous"),
+            "the rendered row is the ambiguity row: {rendered}"
+        );
         for private in [
             "first.so",
             "second.so",
@@ -20906,22 +20922,40 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut aggregate = PinnedObjects::empty();
         let mut skipped = Vec::new();
-        for (inode, first_name, second_name) in [
+        let mut keys = Vec::new();
+        for (n, (inode, first_name, second_name)) in [
             (INODE, "first-a.so", "second-a.so"),
             (INODE + 1, "first-b.so", "second-b.so"),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let key = ObjectKey {
                 device: Device { major: 8, minor: 1 },
                 inode,
             };
+            keys.push(key);
             let mut first = image_pins(&[(key, "aaaaaaaa", 1)]);
             reback(&mut first, &backing_file(&dir, first_name));
             let mut second = image_pins(&[(key, "aaaaaaaa", 1)]);
             reback(&mut second, &backing_file(&dir, second_name));
             second.by_id.values_mut().next().unwrap().mapping.mount_id += 1;
             skipped.extend(first.absorb(second));
+            // Restoration (controller ruling 18:58, C): the local
+            // collision rejects its key before the aggregate merge, and
+            // each key publishes its own row as it merges.
+            assert!(first.rejects(key), "the local collision rejects {key:?}");
             skipped.extend(aggregate.absorb(first));
+            assert_eq!(
+                ambiguity_count(&skipped),
+                n + 1,
+                "key {n} publishes its own row: {skipped:?}"
+            );
         }
+        assert!(
+            keys.iter().all(|key| aggregate.rejects(*key)),
+            "both collisions replay into the aggregate"
+        );
         assert_eq!(
             ambiguity_count(&skipped),
             2,

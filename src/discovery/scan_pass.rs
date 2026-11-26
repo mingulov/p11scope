@@ -3308,6 +3308,54 @@ mod tests {
         );
     }
 
+    /// Restoration (controller ruling 18:58, D): pruning drops a
+    /// departed member from every tier, a demoted budget-stop streak
+    /// included, while each live member keeps its exact row.
+    #[test]
+    fn cursor_prune_to_live_drops_departed_pids_from_every_tier() {
+        let mut cursor = super::ResumeCursor::default();
+        let live_examined = (11u32, Some(110u64));
+        let gone_examined = (12u32, Some(120u64));
+        let live_retry = (13u32, Some(130u64));
+        let gone_retry = (14u32, Some(140u64));
+        let live_streak = (15u32, Some(150u64));
+        let gone_streak = (16u32, Some(160u64));
+        cursor.note_member_outcomes(&[
+            (live_examined, MemberOutcome::Examined, 7),
+            (gone_examined, MemberOutcome::Examined, 8),
+            (live_retry, MemberOutcome::CutShortOther, 9),
+            (gone_retry, MemberOutcome::CutShortOther, 10),
+        ]);
+        for _ in 0..BUDGET_STOP_DEMOTE_AFTER {
+            cursor.note_member_outcomes(&[
+                (live_streak, MemberOutcome::CutShortBudgetStop, 1),
+                (gone_streak, MemberOutcome::CutShortBudgetStop, 1),
+            ]);
+        }
+        assert_eq!(
+            cursor.examined_for_test(),
+            BTreeSet::from([live_examined, gone_examined])
+        );
+        assert_eq!(cursor.fresh, BTreeSet::from([live_retry, gone_retry]));
+        assert_eq!(cursor.streaks_for_test().len(), 2);
+        assert_eq!(cursor.own_spend_for_test().len(), 6);
+        cursor.prune_to_live(&BTreeSet::from([11u32, 13, 15]));
+        assert_eq!(cursor.examined_for_test(), BTreeSet::from([live_examined]));
+        assert_eq!(cursor.fresh, BTreeSet::from([live_retry]));
+        assert_eq!(
+            cursor.streaks_for_test(),
+            BTreeMap::from([(live_streak, BUDGET_STOP_DEMOTE_AFTER)])
+        );
+        assert_eq!(
+            cursor.own_spend_for_test(),
+            BTreeMap::from([
+                (live_examined, 7),
+                (live_retry, 9),
+                (live_streak, u64::from(BUDGET_STOP_DEMOTE_AFTER)),
+            ])
+        );
+    }
+
     /// Own-spend accumulation: per-member spend totals across passes,
     /// pruned to live pids and cleared on pid reuse, so fair-share
     /// ordering reflects what each incarnation actually spent.

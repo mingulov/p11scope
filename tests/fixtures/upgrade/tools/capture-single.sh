@@ -6,7 +6,7 @@
 # usage: capture-single.sh <observer-bin> <tag> <outdir>
 set -eu
 BIN=$1; TAG=$2; OUT=$3
-TMPDIR=/var/tmp/p11scope-ws-tmp/v072-compat-071
+TMPDIR=${TMPDIR:-/var/tmp/p11scope-ws-tmp/v072-compat-071}
 PROV=/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so
 export SOFTHSM2_CONF=$TMPDIR/f2/work/softhsm2.conf
 ME=$(id -un)

@@ -7,7 +7,7 @@
 #   mode: keyops | profile | metrics
 set -eu
 BIN=$1; TAG=$2; MODE=$3; OUT=$4
-TMPDIR=/var/tmp/p11scope-ws-tmp/v072-compat-071
+TMPDIR=${TMPDIR:-/var/tmp/p11scope-ws-tmp/v072-compat-071}
 PROV=/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so
 export SOFTHSM2_CONF=$TMPDIR/f2/work/softhsm2.conf
 ME=$(id -un)

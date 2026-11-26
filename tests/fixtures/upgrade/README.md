@@ -45,15 +45,63 @@ Files:
   existing unit tests.
 - `v071-observed-profile-v3.schema.json`: frozen copy of the schema
   at tag `v0.7.1` (blob `250a88da2eadacc1fee792ecb57a657c1e8c773a`).
-- `tools/`: the regeneration helpers (`sanitize.py` and the
-  `capture-*.sh` capture scripts).
+- `tools/`: the regeneration helpers (`sanitize.py`, the
+  `capture-*.sh` capture scripts, and the `creator.c` /
+  `steady-keys.c` workload-helper sources).
 
 Sanitizer rules (one run, shared maps, so the same real value maps
-to the same canonical value in every file): the worktree prefix
-becomes `/work`, Debian library paths become `/usr/lib/...`
+to the same canonical value in every file): the capture prefix
+(`sanitize.py`'s third argument, default the lane path) becomes
+`/work`, Debian library paths become `/usr/lib/...`
 counterparts, cargo shim paths become `/usr/bin/...`; PIDs (fields,
 `pid:` scopes, `/proc/` and gap-reason mentions) map from 4242 up;
 digests (40/64 hex) map to zero-padded indexes; device numbers map
 to small constants; inodes map from 100 up; mtimes become fixed;
-`launched_by` exe names become `launcher`. Counts, labels,
-structures, instants, enums and offsets stay byte-real.
+`launched_by` exe names become `launcher`; cgroup slices and
+scopes canonicalize to `user-1000.slice` / `session-1.scope`.
+Counts, labels, structures, instants, enums and offsets stay
+byte-real.
+
+## Regenerate
+
+Prerequisites: `gcc`, SoftHSM (`softhsm2-util` and
+`libsofthsm2.so`; `/usr/lib/x86_64-linux-gnu/softhsm/` on
+Debian/Ubuntu, `/usr/lib64/pkcs11/` on Fedora), a `pkcs11.h`
+(`libp11-kit-dev`, a system softhsm include dir, or the
+`cryptoki-sys` vendored copy under `~/.cargo/registry`), the
+v0.7.1 release observer/discover binaries (hashes above) plus a
+current-tree observer, and passwordless sudo for the privileged
+captures (the scripts take the repo privileged lock themselves).
+
+1. Pick a work root and export it (any directory works; the
+   capture scripts honor `$TMPDIR`):
+   `export TMPDIR=/var/tmp/p11scope-ws-tmp/v072-compat-071`.
+2. Build the workload helpers into `$TMPDIR/f2/bin`:
+   `catalog-driver` from `tests/fixtures/catalog-driver.c` and
+   `shortlived-sign` from
+   `tests/fixtures/shortlived-sign/shortlived-sign.c` with
+   `cc -O2 -o bin/<name> <src> -ldl`, plus `creator` and
+   `steady-keys` from `tests/fixtures/upgrade/tools/*.c` with
+   the same line plus `-I <pkcs11.h dir>`.
+3. Init the token:
+   `export SOFTHSM2_CONF=$TMPDIR/f2/work/softhsm2.conf`
+   (tokendir `$TMPDIR/f2/work/tokens`, file backend, `ALL`
+   mechanisms), then `softhsm2-util --init-token --free --label
+   upgrade-f2 --so-pin 1234 --pin 1234`, then prime the id the
+   signer finds: `$TMPDIR/f2/bin/creator <provider> 1234 0102`.
+4. Capture: `tools/capture-single.sh` (scan unprivileged, native
+   privileged), `tools/capture-churn.sh`, and
+   `tools/capture-ops.sh` per mode (`keyops`, `profile`,
+   `metrics`) — once with the v0.7.1 binary (tag `v071`) and,
+   for the churn pair, once with the current binary (tag `v072`).
+   Generate the discover manifest
+   (`p11scope-discover-0.7.1 --module <provider>`) before the
+   `--manifest` captures. Rename the raw v0.7.1 profile to
+   `v071-observed-profile-signer.json` (see above).
+5. Sanitize in one run (shared maps):
+   `tools/sanitize.py <rawdir> <outdir> [$TMPDIR]`.
+
+On kernels where BPF task-storage creation fails, key-operations
+captures come out keyless under both releases; a host where the
+semantic lane births (6.x) is needed for a nonzero established
+fixture.

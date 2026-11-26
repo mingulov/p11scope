@@ -7,14 +7,17 @@
 # instant and enum. One run over all fixtures with shared maps, so
 # the same real value maps to the same canonical value in every file
 # (the T2 pair stays comparable).
-"""Usage: sanitize.py <rawdir> <outdir>"""
+"""Usage: sanitize.py <rawdir> <outdir> [prefix]"""
 import json
 import sys
 
+if len(sys.argv) < 3 or len(sys.argv) > 4:
+    sys.exit("Usage: sanitize.py <rawdir> <outdir> [prefix]")
 RAW, OUT = sys.argv[1], sys.argv[2]
-TMPDIR = "/var/tmp/p11scope-ws-tmp/v072-compat-071"
+PREFIX = sys.argv[3] if len(sys.argv) > 3 else \
+    "/var/tmp/p11scope-ws-tmp/v072-compat-071"
 PREFIXES = [
-    (TMPDIR, "/work"),
+    (PREFIX, "/work"),
     ("/usr/lib/x86_64-linux-gnu/softhsm", "/usr/lib/softhsm"),
     ("/usr/lib/x86_64-linux-gnu", "/usr/lib"),
     ("/usr/lib/cargo/bin/coreutils", "/usr/bin"),
@@ -43,9 +46,11 @@ def scrub_string(s):
     s = re.sub(r"/proc/(\d+)",
                lambda m: f"/proc/{canon(pid_map, int(m.group(1)), 'pid', lambda n: n)}",
                s)
-    return re.sub(r"\bpid (\d+)",
-                  lambda m: f"pid {canon(pid_map, int(m.group(1)), 'pid', lambda n: n)}",
-                  s)
+    s = re.sub(r"\bpid (\d+)",
+               lambda m: f"pid {canon(pid_map, int(m.group(1)), 'pid', lambda n: n)}",
+               s)
+    s = re.sub(r"user-\d+\.slice", "user-1000.slice", s)
+    return re.sub(r"session-[A-Za-z0-9_.-]+\.scope", "session-1.scope", s)
 
 
 def is_hex(s, lengths=(40, 64)):

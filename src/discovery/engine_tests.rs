@@ -98269,6 +98269,79 @@ fn member_stop_bind_rejected_key_refuses_the_hold_without_a_commit() {
     );
 }
 
+/// A drain-first staging (queued by the fanotify drain before any stop)
+/// records its key too: when a member stops on the file later, the
+/// intake skips the settled identity without marking it, but the hold
+/// it creates still ends refused on the key's rejection.
+#[test]
+fn member_stop_drain_first_staging_key_refuses_the_later_hold() {
+    let (fixture, _view, _module, _pins) = loaded_seed_provider();
+    let pid = fixture.child.id();
+    let library = fixture._dir.path().join("seed-provider.so");
+    touch_for_test(&library, 1_000_000);
+    let pin1 = crate::discovery::identity::pin_of(&std::fs::File::open(&library).unwrap()).unwrap();
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::default();
+    // The drain stages generation 1 before any member stops.
+    let file = std::fs::File::open(&library).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    tx.send(crate::fanotify::LearnMsg::Candidate(
+        crate::fanotify::LearnedCandidate {
+            file,
+            dev,
+            ino,
+            display_path: library.to_string_lossy().into_owned(),
+            loader_exe: None,
+            loader_unknown_reason: None,
+            run_learned: false,
+            proving_retained: false,
+        },
+    ))
+    .unwrap();
+    let _drain_alive = &tx;
+    engine.set_learned_rx_for_test(rx);
+    engine.service_learned_files();
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        1,
+        "generation 1 stages"
+    );
+    // A member stops on the settled file: intake creates the hold
+    // without queueing or marking.
+    stop_member_for_test(pid);
+    let key = member_exec_key_for_test(pid, &library);
+    let mut io = ScriptedMemberStops::default();
+    io.rows.insert(pid, member_stop_row(pid, &library, key));
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    assert!(engine.member_stops_held(), "intake holds the mapper");
+    // Churn, then the conflicting observation.
+    touch_for_test(&library, 2_000_000);
+    let pin2 = crate::discovery::identity::pin_of(&std::fs::File::open(&library).unwrap()).unwrap();
+    assert_ne!(pin1, pin2, "the churn step moves the pin");
+    let file = std::fs::File::open(&library).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    engine.stage_learned_candidate(crate::fanotify::LearnedCandidate {
+        file,
+        dev,
+        ino,
+        display_path: library.to_string_lossy().into_owned(),
+        loader_exe: None,
+        loader_unknown_reason: None,
+        run_learned: false,
+        proving_retained: false,
+    });
+    engine.service_member_stops(&mut io, &mut session, Some(10_000_000));
+    assert!(
+        !engine.member_stops_held(),
+        "a drain-first rejection refuses the hold"
+    );
+    let stats = engine.member_stop_stats_for_test();
+    assert_eq!(stats.refused_resumes, 1, "{stats:?}");
+    assert_eq!(stats.timed_out, 0, "{stats:?}");
+    assert!(member_resumed_for_test(pid), "the member runs again");
+}
+
 /// A bind that drops a module for a rejected entry while its key stays
 /// live refuses nothing: only a rejected key proves the attach
 /// impossible.

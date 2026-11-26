@@ -189,6 +189,15 @@ impl MemberStopState {
         }
     }
 
+    /// The staged identity pinned under `key`, if any: reverse lookup
+    /// for bind rejections (rejection ticks only).
+    pub(crate) fn staged_identity_for_key(&self, key: ObjectKey) -> Option<(u64, u64)> {
+        self.staged_keys
+            .iter()
+            .find(|(_, staged)| **staged == key)
+            .map(|(identity, _)| *identity)
+    }
+
     /// Records the maps key a staged identity pinned under. Every staging
     /// records, held or not: the intake and the drain race to queue first,
     /// so conditioning on the stop mark would miss drain-first holds, and
@@ -1877,6 +1886,24 @@ mod tests {
                 .contains_key(&(0, MEMBER_STOP_STAGED_CAP as u64 + 1)),
             "the excess identity goes unrecorded"
         );
+    }
+
+    /// Reverse lookup misses unknown keys: a bind rejection for a file no
+    /// staging recorded refuses nothing.
+    #[test]
+    fn staged_identity_lookup_misses_unknown_keys() {
+        let key = ObjectKey {
+            device: p11scope_manifest::maps::Device { major: 0, minor: 1 },
+            inode: 7,
+        };
+        let mut state = MemberStopState::default();
+        state.note_staged_key((0, 1), key);
+        let other = ObjectKey {
+            device: p11scope_manifest::maps::Device { major: 0, minor: 1 },
+            inode: 8,
+        };
+        assert_eq!(state.staged_identity_for_key(key), Some((0, 1)));
+        assert_eq!(state.staged_identity_for_key(other), None);
     }
 
     #[test]

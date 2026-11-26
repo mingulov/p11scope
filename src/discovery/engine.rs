@@ -19765,19 +19765,38 @@ impl Engine {
         // Retired carrier rows keep the stricter filter: no live
         // prover refreshes them, so a rejected entry dependency drops
         // the stale row wholesale and its carrier-only pin reclaims.
+        let mut rejected_keys = Vec::new();
         raw_modules.retain(|module| {
-            if pinned.rejects(module.key) {
-                return false;
+            let keep = if pinned.rejects(module.key) {
+                false
+            } else if module.view != Self::CARRIED_VIEW_ID {
+                true
+            } else {
+                !module
+                    .tables
+                    .iter()
+                    .flat_map(|table| &table.entries)
+                    .any(|entry| pinned.rejects(entry.object))
+            };
+            if !keep {
+                rejected_keys.push(module.key);
             }
-            if module.view != Self::CARRIED_VIEW_ID {
-                return true;
-            }
-            !module
-                .tables
-                .iter()
-                .flat_map(|table| &table.entries)
-                .any(|entry| pinned.rejects(entry.object))
+            keep
         });
+        // A rejected module key refuses the staged holds on it: no slot
+        // ever builds under it, so the hold's attach is impossible (never
+        // at the bound) — even when this candidate never commits. Only
+        // key rejections refuse; an entry-only drop leaves a live key
+        // waiting for its attach. The reverse lookup scans the staged map;
+        // rejection ticks only.
+        for key in rejected_keys {
+            if !pinned.rejects(key) {
+                continue;
+            }
+            if let Some(identity) = self.member_stops.staged_identity_for_key(key) {
+                self.member_stops.note_refused(identity);
+            }
+        }
         if crate::run::capture_diagnostics_on() && raw_with_learned > raw_before_learned {
             eprintln!(
                 "p11scope: candidate scan inputs: {} frame + {} run-learned, {} survive rejects",

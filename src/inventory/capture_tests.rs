@@ -5981,7 +5981,7 @@ fn d1_stop_stages_held_info_before_the_terminal_cut() {
         0,
     );
     let mut arrivals = vec![bound];
-    arrivals.extend(std::iter::repeat([0xAB; 176]).take(29));
+    arrivals.extend(std::iter::repeat_n([0xAB; 176], 29));
     started.capture.arrive_info_records(arrivals);
     started.collecting_tick(true);
     started.collecting_tick(true);

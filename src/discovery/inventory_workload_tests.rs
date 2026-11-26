@@ -2037,6 +2037,12 @@ fn inject_provider_mutation_case(invoke_getter: bool, hinted: bool) {
         )
         .unwrap();
     coordinator.commit_batch(false).unwrap();
+    // The reclaim worker drops pass transients asynchronously; the FD
+    // census below races it without this quiescence.
+    assert!(
+        coordinator.wait_reclaim_idle(std::time::Duration::from_secs(10)),
+        "the reclaim worker drains its handoffs"
+    );
     // Atomic replace plus the driver's dlclose/dlopen: the same path
     // resolves to a new physical instance. The retained old pin acquires
     // a deleted-path annotation; settle that intentional change before
@@ -2067,6 +2073,12 @@ fn inject_provider_mutation_case(invoke_getter: bool, hinted: bool) {
         )
         .unwrap();
     coordinator.commit_batch(false).unwrap();
+    // The reclaim worker drops pass transients asynchronously; the FD
+    // census below races it without this quiescence.
+    assert!(
+        coordinator.wait_reclaim_idle(std::time::Duration::from_secs(10)),
+        "the reclaim worker drains its handoffs"
+    );
     // A second provider generation adds one coordinator-owned pin. Account
     // for its exact new inode rather than allowing arbitrary FD growth;
     // assert_delta also preserves every baseline pin, including the old one.

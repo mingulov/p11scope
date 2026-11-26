@@ -1535,6 +1535,10 @@ pub(crate) struct PassReclaim {
     // `Send` alone); every access is `get_mut`, never a lock wait.
     custody: std::sync::Mutex<std::collections::VecDeque<ReclaimItem>>,
     counts: ReclaimCounts,
+    /// Handed values the worker finished dropping (FD-census tests
+    /// wait for this to catch up with `handed`; production never
+    /// waits).
+    completed: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Default for PassReclaim {
@@ -1549,6 +1553,7 @@ impl PassReclaim {
             worker: ReclaimWorker::NotStarted,
             custody: std::sync::Mutex::new(std::collections::VecDeque::new()),
             counts: ReclaimCounts::default(),
+            completed: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -1604,13 +1609,38 @@ impl PassReclaim {
         self.counts
     }
 
+    /// Test quiescence for FD-census tests: the worker drops
+    /// handed values asynchronously, so a census right after a pass
+    /// races it. Drive the custody and wait until every handed value
+    /// has dropped. False on timeout (a stuck worker). Production
+    /// never waits.
+    #[cfg(test)]
+    pub(crate) fn wait_reclaim_idle(&mut self, timeout: std::time::Duration) -> bool {
+        let end = std::time::Instant::now() + timeout;
+        loop {
+            if self.counts.held > 0 {
+                self.service();
+            }
+            if self.counts.held == 0
+                && self.completed.load(std::sync::atomic::Ordering::SeqCst) == self.counts.handed
+            {
+                return true;
+            }
+            if std::time::Instant::now() >= end {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
     fn sender(&mut self) -> Option<&std::sync::mpsc::SyncSender<ReclaimItem>> {
         if matches!(self.worker, ReclaimWorker::NotStarted) {
             let (sender, receiver) =
                 std::sync::mpsc::sync_channel::<ReclaimItem>(RECLAIM_QUEUE_DEPTH);
+            let completed = std::sync::Arc::clone(&self.completed);
             self.worker = match std::thread::Builder::new()
                 .name("p11scope-reclaim".into())
-                .spawn(move || reclaim_worker(&receiver))
+                .spawn(move || reclaim_worker(&receiver, &completed))
             {
                 // Detached: the handle is never joined. The worker
                 // exits once every sender is gone and its queue is
@@ -1657,7 +1687,11 @@ impl Drop for PassReclaim {
 
 /// The reclaim worker's loop: one drop per received value. A panicking
 /// drop is reported and the loop continues, so the worker outlives it.
-fn reclaim_worker(receiver: &std::sync::mpsc::Receiver<ReclaimItem>) {
+/// Every attempt counts as completed once the value is gone.
+fn reclaim_worker(
+    receiver: &std::sync::mpsc::Receiver<ReclaimItem>,
+    completed: &std::sync::atomic::AtomicU64,
+) {
     while let Ok(item) = receiver.recv() {
         let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(item)));
         if dropped.is_err() {
@@ -1665,6 +1699,7 @@ fn reclaim_worker(receiver: &std::sync::mpsc::Receiver<ReclaimItem>) {
                 "p11scope: pass-heap reclaim drop panicked; the worker continues",
             );
         }
+        completed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -1875,6 +1910,29 @@ mod pass_reclaim_tests {
             wait_until(|| dropped.load(Ordering::SeqCst) == 2 + RECLAIM_QUEUE_DEPTH),
             "the teardown custody is reclaimed off the dropping thread"
         );
+    }
+
+    /// The quiescence wait reports idle once every handed value
+    /// dropped, and times out while the worker is stuck.
+    #[test]
+    fn wait_reclaim_idle_reports_quiescence_and_timeout() {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let (stuck, entered, release) = blocking(&dropped);
+        let mut reclaim = PassReclaim::new();
+        reclaim.hand_off(stuck);
+        entered
+            .recv_timeout(WATCHDOG)
+            .expect("the worker took the stuck value");
+        assert!(
+            !reclaim.wait_reclaim_idle(Duration::from_millis(50)),
+            "a stuck worker never goes idle"
+        );
+        release.send(()).expect("the stuck drop still waits");
+        assert!(
+            reclaim.wait_reclaim_idle(WATCHDOG),
+            "a freed worker drains to idle"
+        );
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
     }
 
     /// A panicking drop does not end the worker: later values still

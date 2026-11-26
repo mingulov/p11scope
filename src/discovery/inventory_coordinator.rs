@@ -4330,6 +4330,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.pass_reclaim.counts()
     }
 
+    /// Test quiescence for FD-census tests: the reclaim worker drops
+    /// handed values asynchronously, so a census right after a pass
+    /// races it. Drive the custody and wait until every handed value
+    /// has dropped. False on timeout (a stuck worker). Production
+    /// never waits.
+    #[cfg(test)]
+    pub(crate) fn wait_reclaim_idle(&mut self, timeout: std::time::Duration) -> bool {
+        self.pass_reclaim.wait_reclaim_idle(timeout)
+    }
+
     /// Stage the pass-heap reclaim stall gap at the terminal commit
     /// when the reclaim worker was busy or still holds transients (a
     /// close blocked, e.g. on a stopped FUSE daemon). True when a gap

@@ -7357,7 +7357,8 @@ impl LowerSkipStage {
 /// search — the proof, not the path, selects the file — with every
 /// refusal collected alongside. A spent witness budget stops the
 /// search. `None` keeps today's gap, naming the refused count and
-/// the finite stages.
+/// the finite stages. A mount-table read failure is an error with its
+/// exact text, never "no candidates".
 fn prove_lower_candidates(
     io: &mut impl ScanIo,
     view: &ProcessView,
@@ -7365,13 +7366,10 @@ fn prove_lower_candidates(
     range: (u64, u64),
     merged: &Path,
     budget: &mut CaptureWorkBudget,
-) -> (Option<LowerProof>, Vec<LowerSkip>) {
+) -> Result<(Option<LowerProof>, Vec<LowerSkip>), String> {
     let mut skips = Vec::new();
-    for (index, candidate) in io
-        .lower_candidates(view, merged, budget)
-        .into_iter()
-        .enumerate()
-    {
+    let candidates = io.lower_candidates(view, merged, budget)?;
+    for (index, candidate) in candidates.into_iter().enumerate() {
         let Ok(candidate_index) = u32::try_from(index) else {
             skips.push(LowerSkip {
                 stage: LowerSkipStage::IndexOverflow,
@@ -7393,20 +7391,20 @@ fn prove_lower_candidates(
         let outcome = io.prove_original_file_diagnosed(view, &file, &mapped, key, range, budget);
         match outcome.verdict {
             WitnessVerdict::SameFile => {
-                return (
+                return Ok((
                     Some(LowerProof {
                         file,
                         mapped,
                         candidate: candidate_index,
                     }),
                     skips,
-                );
+                ));
             }
             WitnessVerdict::Failed(WitnessFailure::BudgetExhausted) => {
                 skips.push(LowerSkip {
                     stage: LowerSkipStage::BudgetExhausted,
                 });
-                return (None, skips);
+                return Ok((None, skips));
             }
             WitnessVerdict::OtherFile => skips.push(LowerSkip {
                 stage: LowerSkipStage::OtherFile,
@@ -7419,7 +7417,7 @@ fn prove_lower_candidates(
             }),
         }
     }
-    (None, skips)
+    Ok((None, skips))
 }
 
 /// The terminal gap reason for a fallback search that proved no lower
@@ -7472,7 +7470,7 @@ pub(crate) fn witness_join_with_copyup(
         return Ok(CopyUpJoin::Held);
     }
     if outcome.verdict == WitnessVerdict::OtherFile {
-        let (proof, skips) = prove_lower_candidates(io, view, key, range, merged, budget);
+        let (proof, skips) = prove_lower_candidates(io, view, key, range, merged, budget)?;
         if let Some(proof) = proof {
             return Ok(CopyUpJoin::LowerProven(proof));
         }
@@ -8970,15 +8968,17 @@ pub(crate) trait ScanIo {
     /// Lower-layer candidates for a merged path, in kernel stack order,
     /// read back from the target's mount table. The default names none,
     /// so scripted scans keep the named gap; the production IO parses
-    /// the target's table exactly like the pin site does.
+    /// the target's table exactly like the pin site does. A mount-table
+    /// read failure is an error with its exact text — never an empty
+    /// list, so a budget stop cannot read as "no lower candidates".
     fn lower_candidates(
         &mut self,
         view: &ProcessView,
         merged: &Path,
         budget: &mut CaptureWorkBudget,
-    ) -> Vec<PathBuf> {
+    ) -> Result<Vec<PathBuf>, String> {
         let _ = (view, merged, budget);
-        Vec::new()
+        Ok(Vec::new())
     }
     /// Open one lower candidate in the observer's mount namespace (the
     /// mounter's: a container cannot see its own lowerdirs). The default
@@ -9220,25 +9220,30 @@ impl ScanIo for ProcScanIo {
         view: &ProcessView,
         merged: &Path,
         budget: &mut CaptureWorkBudget,
-    ) -> Vec<PathBuf> {
+    ) -> Result<Vec<PathBuf>, String> {
         // The target's own table through the retained view (never the
         // observer's): the mountpoints match the merged path there. The
         // lowerdir paths the table names resolve in the mounter's
-        // namespace instead (see `open_lower_candidate`). Any read or
-        // normalization failure names nothing.
+        // namespace instead (see `open_lower_candidate`). A read failure
+        // propagates with its exact text (a budget stop keeps its stop
+        // for the continuation filters); only a normalization failure
+        // names nothing.
         let mut mounts = MountTableCache::default();
         let table = view.open_then_cached_mountinfo(|_| Ok(()), &mut mounts, budget);
         let ((), text) = match table {
             Ok(table) => table,
-            Err(_) => return Vec::new(),
+            Err(error) => return Err(error),
         };
         let Some(normalized) = merged
             .to_str()
             .and_then(crate::discovery::identity::normalize_target_path)
         else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
-        lower_candidates_from_mountinfo(text, Path::new(&normalized))
+        Ok(lower_candidates_from_mountinfo(
+            text,
+            Path::new(&normalized),
+        ))
     }
 
     fn open_lower_candidate(
@@ -9293,6 +9298,10 @@ const SCAN_GENERATION_CHANGED_REASON: &str =
 pub(crate) enum ScanStopKind {
     /// [`WORK_CEILING_REASON`]: the pass's work allowance tripped.
     WorkCeiling,
+    /// [`SCAN_DEADLINE_REASON`]: the pass's deadline tripped.
+    Deadline,
+    /// [`IO_CEILING_REASON`]: the pass's attempted-I/O window tripped.
+    IoCeiling,
     /// [`COLLECTION_STOP_REASON`]: the cgroup collection stopped or its
     /// shared allowance ran out.
     CollectionStop,
@@ -9328,6 +9337,8 @@ pub(crate) fn parse_mount_table_read_reason(reason: &str) -> Option<(u32, &str)>
 fn bare_scan_stop(detail: &str) -> Option<ScanStopKind> {
     match detail {
         WORK_CEILING_REASON => Some(ScanStopKind::WorkCeiling),
+        SCAN_DEADLINE_REASON => Some(ScanStopKind::Deadline),
+        IO_CEILING_REASON => Some(ScanStopKind::IoCeiling),
         COLLECTION_STOP_REASON => Some(ScanStopKind::CollectionStop),
         _ => None,
     }
@@ -26847,6 +26858,152 @@ int main(int argc, char **argv) {
         assert_eq!(skipped.len(), 7);
     }
 
+    /// Stop-provenance table (finding 2): the exact bare sentence, the
+    /// producer-owned scan-refusal wrappings and the pin-time mount-table
+    /// wrapper all classify work, deadline, I/O and collection stops;
+    /// another process's wrapped stop, a pathname containing the sentence
+    /// and unrelated text never classify. The presentation fold still
+    /// matches work stops only.
+    #[test]
+    fn scan_stop_kind_names_every_healable_stop_shape() {
+        let kinds = [
+            (WORK_CEILING_REASON, ScanStopKind::WorkCeiling),
+            (SCAN_DEADLINE_REASON, ScanStopKind::Deadline),
+            (IO_CEILING_REASON, ScanStopKind::IoCeiling),
+            (COLLECTION_STOP_REASON, ScanStopKind::CollectionStop),
+        ];
+        for (stop, kind) in kinds {
+            assert_eq!(scan_stop_kind(stop, None), Some(kind), "bare [{stop}]");
+            assert_eq!(
+                scan_stop_kind(stop, Some(7)),
+                Some(kind),
+                "a bare stop ignores pid"
+            );
+            for prefix in [
+                INITIAL_MAPS_UNAVAILABLE_REASON,
+                FINAL_MAPS_UNAVAILABLE_REASON,
+                SCAN_GENERATION_CHANGED_REASON,
+            ] {
+                let wrapped = format!("{prefix}: {stop}");
+                assert_eq!(
+                    scan_stop_kind(&wrapped, None),
+                    Some(kind),
+                    "refusal [{wrapped}]"
+                );
+            }
+            let tabled = mount_table_read_reason(7, stop);
+            assert_eq!(
+                scan_stop_kind(&tabled, Some(7)),
+                Some(kind),
+                "own mount-table [{tabled}]"
+            );
+            assert_eq!(
+                scan_stop_kind(&tabled, None),
+                Some(kind),
+                "unpid mount-table [{tabled}]"
+            );
+            assert_eq!(
+                scan_stop_kind(&tabled, Some(8)),
+                None,
+                "another pid's stop is not this member's"
+            );
+        }
+        let tricky_path = format!("/tmp/evil/{WORK_CEILING_REASON}/libprovider.so");
+        let tricky = no_table_found_reason(&tricky_path, false);
+        assert_eq!(
+            scan_stop_kind(&tricky, None),
+            None,
+            "a pathname containing the sentence never classifies"
+        );
+        assert_eq!(
+            scan_stop_kind(&format!("prefix: {WORK_CEILING_REASON}"), None),
+            None,
+            "a generic wrapping never classifies"
+        );
+        assert_eq!(
+            scan_stop_kind("unrelated refusal", None),
+            None,
+            "a non-stop never classifies"
+        );
+        assert_eq!(
+            scan_stop_kind(SCAN_CLOCK_REASON, None),
+            None,
+            "clock stays unrecognized"
+        );
+        assert_eq!(
+            scan_stop_kind(TABLE_WINDOW_CEILING_REASON, None),
+            None,
+            "decode windows stay unrecognized"
+        );
+        assert!(
+            is_work_ceiling_stop(WORK_CEILING_REASON),
+            "work still folds"
+        );
+        assert!(
+            !is_work_ceiling_stop(SCAN_DEADLINE_REASON),
+            "deadline never folds"
+        );
+        assert!(!is_work_ceiling_stop(IO_CEILING_REASON), "I/O never folds");
+    }
+
+    /// Continuation twin (finding 2): while the view holds unfinished
+    /// cursors, deadline and I/O stops — bare or in this member's
+    /// mount-table wrapper — drop like work stops and the in-progress gap
+    /// names the continuation; another member's wrapped stop and unrelated
+    /// text stay verbatim.
+    #[test]
+    fn continued_view_gap_drops_deadline_and_io_stops_while_unfinished() {
+        let foreign = mount_table_read_reason(8, IO_CEILING_REASON);
+        let skips = || {
+            vec![
+                Skipped {
+                    subject: "m".into(),
+                    reason: SCAN_DEADLINE_REASON.into(),
+                },
+                Skipped {
+                    subject: "m".into(),
+                    reason: IO_CEILING_REASON.into(),
+                },
+                Skipped {
+                    subject: "m".into(),
+                    reason: mount_table_read_reason(7, SCAN_DEADLINE_REASON),
+                },
+                Skipped {
+                    subject: "m".into(),
+                    reason: mount_table_read_reason(7, IO_CEILING_REASON),
+                },
+                Skipped {
+                    subject: "m".into(),
+                    reason: foreign.clone(),
+                },
+                Skipped {
+                    subject: "m".into(),
+                    reason: "unrelated refusal".into(),
+                },
+            ]
+        };
+        let mut budget =
+            CaptureWorkBudget::default().with_retained_file_facts(RetainedFileFacts::default());
+        let (key, cursor) = decode_cursor_for_test(7, 9, 11, false, 0);
+        assert!(budget.record_decode_cursor(key, cursor));
+        let mut skipped = skips();
+        let gap = continued_view_gap(&mut skipped, &budget, 7, Some(9))
+            .expect("an unfinished view names its continuation");
+        assert_eq!(gap.0, SCAN_IN_PROGRESS_SUBJECT);
+        assert_eq!(
+            skipped
+                .iter()
+                .map(|skip| skip.reason.as_str())
+                .collect::<Vec<_>>(),
+            vec![foreign.as_str(), "unrelated refusal"],
+            "healable stops drop while unfinished, foreign and unrelated stay"
+        );
+        let bare = CaptureWorkBudget::default();
+        let mut skipped = skips();
+        assert_eq!(continued_view_gap(&mut skipped, &bare, 7, Some(9)), None);
+        assert_eq!(skipped.len(), 6, "a stall keeps its exact raw wording");
+    }
+
     /// Cursor reclamation under a tight byte ceiling: dead generations
     /// go first, then the oldest completed cursor; a live unfinished
     /// cursor is never evicted, and a refusal keeps the old cursor.
@@ -31365,6 +31522,7 @@ int main(int argc, char **argv) {
         witness_used: u32,
         witness_max: u32,
         candidates: Vec<std::path::PathBuf>,
+        candidates_err: Option<String>,
         opens: std::collections::BTreeMap<std::path::PathBuf, std::fs::File>,
         opened: Vec<std::path::PathBuf>,
         held: MappedFile,
@@ -31379,6 +31537,7 @@ int main(int argc, char **argv) {
                 witness_used: 0,
                 witness_max: 8,
                 candidates,
+                candidates_err: None,
                 opens: std::collections::BTreeMap::new(),
                 opened: Vec::new(),
                 held: MappedFile {
@@ -31390,6 +31549,12 @@ int main(int argc, char **argv) {
 
         fn serve(&mut self, candidate: &std::path::Path, file: std::fs::File) {
             self.opens.insert(candidate.to_path_buf(), file);
+        }
+
+        /// Fail the next lower-candidates enumeration with `error`
+        /// (a mount-table read failure, never "no candidates").
+        fn fail_candidates(&mut self, error: String) {
+            self.candidates_err = Some(error);
         }
 
         fn exhaust(&mut self) {
@@ -31497,8 +31662,11 @@ int main(int argc, char **argv) {
             _: &ProcessView,
             _: &Path,
             _: &mut CaptureWorkBudget,
-        ) -> Vec<PathBuf> {
-            self.candidates.clone()
+        ) -> Result<Vec<PathBuf>, String> {
+            if let Some(error) = &self.candidates_err {
+                return Err(error.clone());
+            }
+            Ok(self.candidates.clone())
         }
 
         fn open_lower_candidate(
@@ -31582,6 +31750,49 @@ int main(int argc, char **argv) {
             Ok(CopyUpJoin::Held) => {}
             other => panic!("the held file joins without a fallback: {other:?}"),
         }
+        assert_eq!(io.prove_calls, 1, "only the held query runs");
+        assert!(io.opened.is_empty(), "no candidate opens");
+    }
+
+    /// Lower-candidate consumer twin (finding 2): a mount-table read
+    /// failure while enumerating lower candidates is an error with its
+    /// exact text — never an empty list. A budget stop therefore reaches
+    /// the scan as the stop it is, not as "no lower candidates".
+    #[test]
+    fn lower_candidates_propagates_a_mount_table_stop() {
+        let view =
+            ProcessView::open(crate::process::ProcessViewId(31), std::process::id()).unwrap();
+        let mut io = ProcScanIo::new();
+        let mut budget = CaptureWorkBudget::with_work_ceiling(1);
+        assert!(budget.charge(1));
+        let error = io
+            .lower_candidates(&view, Path::new("/mnt/merged/lib.so"), &mut budget)
+            .expect_err("a stopped table read is an error, never an empty list");
+        assert!(
+            error.contains(WORK_CEILING_REASON),
+            "the stop keeps its text: {error}"
+        );
+        // Control: the same read with a roomy budget succeeds, so the
+        // error above is the stop, not unconditional breakage.
+        let mut roomy = CaptureWorkBudget::default();
+        io.lower_candidates(&view, Path::new("/mnt/merged/lib.so"), &mut roomy)
+            .expect("a roomy read succeeds");
+    }
+
+    /// Lower-candidate chain twin: a mount-table stop while enumerating
+    /// propagates through the fallback search and the copy-up join with
+    /// its exact text.
+    #[test]
+    fn copyup_join_propagates_a_lower_candidates_stop() {
+        let mut io = CopyUpScriptIo::scripted(
+            vec![WitnessVerdict::OtherFile],
+            vec![PathBuf::from("/lower/lib.so")],
+        );
+        let stop = mount_table_read_reason(std::process::id(), WORK_CEILING_REASON);
+        io.fail_candidates(stop.clone());
+        let error = run_copyup_join(&mut io, Path::new("/mnt/merged/lib.so"))
+            .expect_err("a lower-candidates stop refuses the join");
+        assert_eq!(error, stop, "the stop keeps its exact text");
         assert_eq!(io.prove_calls, 1, "only the held query runs");
         assert!(io.opened.is_empty(), "no candidate opens");
     }

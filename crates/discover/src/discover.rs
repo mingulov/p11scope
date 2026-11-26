@@ -1869,7 +1869,9 @@ fn stable_selection_maps(
     read_maps: &impl Fn() -> std::io::Result<Vec<u8>>,
 ) -> Result<Vec<maps::MapEntry>, ()> {
     let mut budget = UnboundedProbeBudget;
-    let bytes = read_maps().map_err(|_| ())?;
+    // A torn snapshot is read again like every other maps read here,
+    // instead of failing the revalidation spuriously.
+    let current_maps = read_self_maps_with(read_maps).map_err(|_| ())?;
     stable_selection_maps_with_probe(
         module_path,
         expected_key,
@@ -1877,7 +1879,7 @@ fn stable_selection_maps(
         &KernelSelfMappingProbe,
         &mut budget,
         identify_spent,
-        &bytes,
+        current_maps,
     )
 }
 
@@ -1888,9 +1890,8 @@ fn stable_selection_maps_with_probe(
     probe: &impl SelfMappingProbe,
     budget: &mut dyn ProbeBudget,
     identify_spent: &IdentifyBudget,
-    maps_bytes: &[u8],
+    current_maps: Vec<maps::MapEntry>,
 ) -> Result<Vec<maps::MapEntry>, ()> {
-    let current_maps = maps::parse_maps(maps_bytes).map_err(|_| ())?;
     let file = identity::open_object(module_path).map_err(|_| ())?;
     let current_key = file_key(&file).map_err(|_| ())?;
     let current_identity = validated_file_identity_with_probe(
@@ -2893,7 +2894,13 @@ mod tests {
         let third_file = identity::open_object(&third).unwrap();
         let third_key = file_key(&third_file).unwrap();
         let error = validated_identity(&third, third_key, &budget).unwrap_err();
-        assert!(error.contains("total more than the"), "{error}");
+        assert_eq!(
+            error,
+            format!(
+                "cannot identify {} for reuse: read failed: identified objects total more than the {MAX_TOTAL_OBJECT_BYTES}-byte limit",
+                third.display()
+            )
+        );
         assert_eq!(
             budget.spent.get(),
             MAX_TOTAL_OBJECT_BYTES,
@@ -2931,13 +2938,16 @@ mod tests {
         let third_key = file_key(&third_file).unwrap();
         let error =
             validated_provenance_identity(&third, &third_file, third_key, &budget).unwrap_err();
-        assert!(error.contains("total more than the"), "{error}");
+        assert_eq!(
+            error,
+            format!(
+                "cannot identify {} for reuse: read failed: identified objects total more than the {MAX_TOTAL_OBJECT_BYTES}-byte limit",
+                third.display()
+            )
+        );
         assert_eq!(budget.spent.get(), MAX_TOTAL_OBJECT_BYTES);
     }
 
-    /// `ObjectTable::resolve` identifies dependencies against the table's
-    /// shared counter, not a fresh one: an exhausted budget turns the
-    /// target unusable with the limit reason instead of resolving it.
     /// One synthetic maps line carrying `key`, for tests that must not
     /// depend on a live (tearing) maps read. Addresses are fixed: only
     /// device/inode feed the key under test.
@@ -3057,7 +3067,28 @@ mod tests {
         );
         let spent = Rc::new(IdentifyBudget::exhausted_for_test());
         let error = discover_with_budget(&provider, open_memory(), spent).unwrap_err();
-        assert!(error.contains("total more than the"), "{error}");
+        assert_eq!(
+            error,
+            format!(
+                "cannot identify {} for reuse: read failed: identified objects total more than the {MAX_TOTAL_OBJECT_BYTES}-byte limit",
+                provider.display()
+            )
+        );
+    }
+
+    /// The public entry delegates to the budgeted pipeline: full
+    /// discovery through `discover_with_self_memory` succeeds with a
+    /// valid manifest. Behavioral backstop for the wiring pin below: a
+    /// deleted delegation panics here instead of passing silently.
+    #[test]
+    fn public_entry_discovers_through_the_budgeted_pipeline() {
+        let provider = selection_spend_fixture();
+        let manifest =
+            discover_with_self_memory(&provider, ProcessMemory::open().unwrap().0).unwrap();
+        assert!(
+            p11scope_manifest::validate::validate_structure(&manifest).is_empty(),
+            "public-entry discovery stays structurally valid"
+        );
     }
 
     /// Structural pin (not a behavioral guarantee): every production
@@ -3153,6 +3184,9 @@ mod tests {
         }
     }
 
+    /// `ObjectTable::resolve` identifies dependencies against the table's
+    /// shared counter, not a fresh one: an exhausted budget turns the
+    /// target unusable with the limit reason instead of resolving it.
     #[test]
     fn object_resolve_charges_the_shared_identify_budget() {
         use std::os::unix::ffi::OsStrExt as _;
@@ -3197,7 +3231,13 @@ mod tests {
         let Resolution::UnusableFile { reason, .. } = resolution else {
             panic!("an exhausted budget must not resolve: {resolution:?}");
         };
-        assert!(reason.contains("total more than the"), "{reason}");
+        assert_eq!(
+            reason,
+            format!(
+                "cannot identify {} for reuse: read failed: identified objects total more than the {MAX_TOTAL_OBJECT_BYTES}-byte limit",
+                exe.display()
+            )
+        );
     }
 
     /// `stable_selection_maps` revalidates the module against the passed
@@ -3225,6 +3265,33 @@ mod tests {
             stable_selection_maps(&exe, key, &identity, &spent, &|| Ok(maps_bytes.clone()))
                 .is_err()
         );
+    }
+
+    /// A torn maps snapshot is read again instead of failing the
+    /// revalidation: the first scripted read arrives out of order, the
+    /// second carries the key, and the reader runs exactly twice.
+    #[test]
+    fn stable_selection_maps_retries_a_torn_snapshot() {
+        let exe = small_owned_elf();
+        let file = identity::open_object(&exe).unwrap();
+        let key = file_key(&file).unwrap();
+        let identity = identity_and_key(&exe, &IdentifyBudget::default())
+            .unwrap()
+            .1;
+        let valid = scripted_maps_bytes(&key);
+        let calls = Cell::new(0u32);
+        let maps = stable_selection_maps(&exe, key, &identity, &IdentifyBudget::default(), &|| {
+            let n = calls.get();
+            calls.set(n + 1);
+            Ok(if n == 0 {
+                TORN_MAPS.to_vec()
+            } else {
+                valid.clone()
+            })
+        })
+        .unwrap();
+        assert_eq!(calls.get(), 2);
+        assert!(!maps.is_empty());
     }
 
     /// `provenance_objects` debits the passed counter for every mapping
@@ -3823,7 +3890,7 @@ mod tests {
             &probe,
             &mut budget,
             &IdentifyBudget::default(),
-            &scripted_maps_bytes(&key),
+            maps::parse_maps(&scripted_maps_bytes(&key)).unwrap(),
         )
         .unwrap();
         assert!(maps.iter().any(|mapping| ObjectKey::of(mapping) == key));
@@ -3847,7 +3914,7 @@ mod tests {
             &probe,
             &mut budget,
             &IdentifyBudget::default(),
-            &scripted_maps_bytes(&key),
+            maps::parse_maps(&scripted_maps_bytes(&key)).unwrap(),
         )
         .unwrap_err();
         assert_eq!(probe.probes.get(), 0);

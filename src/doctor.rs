@@ -5390,8 +5390,8 @@ mod tests {
             "detail must survive escaped on its own row: {out:?}"
         );
         assert!(
-            out.lines().count() == 7,
-            "one check must render five summary lines + one row + verdict: {out:?}"
+            out.lines().count() == 8,
+            "one check must render six summary lines + one row + verdict: {out:?}"
         );
     }
 

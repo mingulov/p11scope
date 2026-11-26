@@ -7139,16 +7139,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// holds its bound by construction either way. Never probes: all
     /// liveness for the pass happened in the pre-eviction window.
     fn remember_folded_pair(&mut self, key: PairKey, pid: u32, base: u64, now_ns: u64) {
-        if self.pair_folded.len() >= self.pair_prune_cap {
-            if let Some(victim) = self.pair_folded.keys().next().copied() {
-                self.pair_folded.remove(&victim);
-                self.pair_fold_memory_overflow = self.pair_fold_memory_overflow.saturating_add(1);
-                self.pair_fold_lost.insert(PairFoldLatchKey {
-                    domain: victim.image.domain(),
-                    image: victim.image,
-                    object: victim.object,
-                });
-            }
+        if self.pair_folded.len() >= self.pair_prune_cap
+            && let Some(victim) = self.pair_folded.keys().next().copied()
+        {
+            self.pair_folded.remove(&victim);
+            self.pair_fold_memory_overflow = self.pair_fold_memory_overflow.saturating_add(1);
+            self.pair_fold_lost.insert(PairFoldLatchKey {
+                domain: victim.image.domain(),
+                image: victim.image,
+                object: victim.object,
+            });
         }
         self.pair_folded.insert(
             key,

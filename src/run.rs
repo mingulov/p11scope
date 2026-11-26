@@ -31323,10 +31323,9 @@ int main(int argc, char **argv) {
         }
         let quiet = SignalState::new();
         assert!(
-            matches!(
-                capture_end(&engine, None, &quiet, Duration::ZERO, duration).unwrap(),
-                None
-            ),
+            capture_end(&engine, None, &quiet, Duration::ZERO, duration)
+                .unwrap()
+                .is_none(),
             "no stop and no elapsed duration must not end the loop"
         );
     }

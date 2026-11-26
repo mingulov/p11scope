@@ -98427,14 +98427,13 @@ fn member_stop_bind_entry_drop_keeps_the_hold_waiting() {
     assert_eq!(stats.timed_out, 0, "{stats:?}");
 }
 
-/// Refused takes precedence over attached: a hold whose provider is
-/// refused after its slots attached (stamps landed, links live) ends
-/// refused with the first-use row, never attached. Deliberate
-/// fail-closed over-refusal: the shape needs a rejection to land
-/// after the attach within one pass.
+/// A trial-only rejection never refuses a hold: newcomer-isolation
+/// trials restore the pending rejected-key set, so a rejection
+/// visible only in a trial build leaves a hold with live slots to
+/// end attached, never refused (ruled re-pin of the latch shape).
 #[test]
-fn member_stop_refused_hold_with_live_slots_ends_refused() {
-    let (fixture, _view, module, _pins) = loaded_seed_provider();
+fn member_stop_trial_only_rejection_keeps_a_live_hold_attached() {
+    let (fixture, view, module, _pins) = loaded_seed_provider();
     let pid = fixture.child.id();
     let library = fixture._dir.path().join("seed-provider.so");
     stop_member_for_test(pid);
@@ -98492,32 +98491,94 @@ fn member_stop_refused_hold_with_live_slots_ends_refused() {
         engine.provider_attached_for_test((dev, ino), &session),
         "stamps landed: the attach side holds"
     );
-    // A bind rejection lands after the attach (working copy only: the
-    // committed pins stay clean, the slots stay live).
-    let mut working = engine.pinned.clone();
-    working.reapply_rejected_keys(&std::collections::BTreeSet::from([staged_key]));
-    let _candidate = engine.live_candidate_with_pending(
-        working,
-        vec![module],
-        Vec::new(),
-        None,
+    // Sanity: the staged key is rejected nowhere durable yet.
+    assert!(!engine.pinned.rejects(staged_key), "nothing committed");
+    assert!(
+        !engine.pending_rejected_keys.contains(&staged_key),
+        "nothing pending"
+    );
+    // The trial: a newcomer whose pins reject the staged key, run
+    // through real newcomer isolation (baseline + trial builds).
+    let mut trial_pins = engine.pinned.clone();
+    trial_pins.reapply_rejected_keys(&std::collections::BTreeSet::from([staged_key]));
+    let mut new_views = vec![(view, vec![module], trial_pins)];
+    let saved = engine.pending_rejected_keys.clone();
+    let calls_before = engine.inventory_candidate_calls_for_test;
+    let mut skipped = Vec::new();
+    let mut tick: fn() -> Option<u64> = || None;
+    let _isolation = engine.isolate_broken_newcomers(
         &std::collections::BTreeSet::new(),
+        &[],
+        &mut new_views,
+        &mut skipped,
         &std::collections::BTreeSet::new(),
-        &std::collections::BTreeSet::new(),
+        saved.clone(),
+        &mut tick,
     );
     assert!(
-        engine.hold_refused_for_test((dev, ino)),
-        "the bind rejection records the hold refusal"
+        engine.inventory_candidate_calls_for_test >= calls_before + 2,
+        "the baseline and the trial both ran"
+    );
+    assert_eq!(
+        engine.pending_rejected_keys, saved,
+        "the trial leaks no rejection"
+    );
+    assert!(
+        !engine.hold_refused_for_test((dev, ino)),
+        "a trial-only rejection records no refusal"
     );
     assert!(
         engine.provider_attached_for_test((dev, ino), &session),
-        "the slots stay live: attached and refused both hold"
+        "the slots stay live"
     );
     engine.service_member_stops(&mut io, &mut session, Some(10_000_000));
     assert!(!engine.member_stops_held(), "the hold ends");
     let stats = engine.member_stop_stats_for_test();
+    assert_eq!(stats.attached_resumes, 1, "{stats:?}");
+    assert_eq!(stats.refused_resumes, 0, "{stats:?}");
+    assert_eq!(stats.timed_out, 0, "{stats:?}");
+    assert!(
+        !files_the_first_use_row(&engine),
+        "an attached end files no gap row"
+    );
+}
+
+/// A pending (uncommitted, non-trial) rejection refuses the hold: the
+/// stalled-pipeline shape, where rejections never commit but stay
+/// queued in the engine's pending rejected-key set.
+#[test]
+fn member_stop_pending_rejection_refuses_the_hold() {
+    let (fixture, _view, _module, _pins) = loaded_seed_provider();
+    let pid = fixture.child.id();
+    let library = fixture._dir.path().join("seed-provider.so");
+    stop_member_for_test(pid);
+    let key = member_exec_key_for_test(pid, &library);
+    let mut io = ScriptedMemberStops::default();
+    io.rows.insert(pid, member_stop_row(pid, &library, key));
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    assert!(engine.member_stops_held(), "intake holds the mapper");
+    engine.service_learned_files();
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        1,
+        "the staging lands"
+    );
+    let staged_key = engine
+        .prearm_input
+        .as_ref()
+        .and_then(|prearm| prearm.inputs.first().map(|input| input.key))
+        .expect("staging records its key");
+    assert!(!engine.pinned.rejects(staged_key), "nothing committed");
+    engine.pending_rejected_keys.insert(staged_key);
+    engine.service_member_stops(&mut io, &mut session, Some(10_000_000));
+    assert!(
+        !engine.member_stops_held(),
+        "a pending rejection refuses the hold"
+    );
+    let stats = engine.member_stop_stats_for_test();
     assert_eq!(stats.refused_resumes, 1, "{stats:?}");
-    assert_eq!(stats.attached_resumes, 0, "{stats:?}");
     assert_eq!(stats.timed_out, 0, "{stats:?}");
     assert!(
         files_the_first_use_row(&engine),

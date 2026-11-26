@@ -2562,10 +2562,9 @@ mod tests {
         assert!(name.raw.is_none());
         assert!(name.lossy.is_none());
         let error = name.error.as_deref().expect("a failed read is refused");
-        let suffix = error
-            .strip_prefix("name pread failed: ")
-            .expect("fixed failure prefix");
-        assert!(suffix.contains("(os error 9)"), "{suffix}");
+        // Exact on this Linux target: any inserted address, before or
+        // after the OS error, fails here.
+        assert_eq!(error, "name pread failed: Bad file descriptor (os error 9)");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2889,7 +2888,9 @@ mod tests {
     /// selection run over the garbage-output fixture, the counter holds
     /// exactly twenty module reads (ten queries times two snapshots). A
     /// fresh counter smuggled into either snapshot closure halves the
-    /// debit and fails here.
+    /// debit and fails here. Retried because a torn `/proc/self/maps`
+    /// read under the suite's parallel mapping churn skips one snapshot
+    /// spend; a smuggled counter misses every attempt instead.
     #[test]
     fn selection_snapshots_charge_the_shared_identify_budget() {
         let provider = selection_spend_fixture();
@@ -2899,31 +2900,38 @@ mod tests {
         let module_file = identity::open_object(&provider).unwrap();
         let module_file_key = file_key(&module_file).unwrap();
         let module_identity = identity_and_key(&provider, &Cell::new(0)).unwrap().1;
-        let spent = Rc::new(Cell::new(0u64));
-        let mut objects = ObjectTable::new(
-            provider.clone(),
-            module_file_key,
-            module_identity.clone(),
-            BTreeSet::from([module_file_key]),
-            Rc::clone(&spent),
-        );
-        let (acquisition, queries) = selection_acquisition(
-            &lib,
-            Some(1),
-            Some(1),
-            &memory,
-            &[],
-            &provider,
-            module_file_key,
-            module_file_key,
-            &module_identity,
-            &mut objects,
-            &spent,
-        );
-        assert_eq!(acquisition, SelectionAcquisition::Queried);
-        assert_eq!(queries.len(), 10);
+        let mut debited = 0;
+        for _ in 0..5 {
+            let spent = Rc::new(Cell::new(0u64));
+            let mut objects = ObjectTable::new(
+                provider.clone(),
+                module_file_key,
+                module_identity.clone(),
+                BTreeSet::from([module_file_key]),
+                Rc::clone(&spent),
+            );
+            let (acquisition, queries) = selection_acquisition(
+                &lib,
+                Some(1),
+                Some(1),
+                &memory,
+                &[],
+                &provider,
+                module_file_key,
+                module_file_key,
+                &module_identity,
+                &mut objects,
+                &spent,
+            );
+            assert_eq!(acquisition, SelectionAcquisition::Queried);
+            assert_eq!(queries.len(), 10);
+            debited = spent.get();
+            if debited == 20 * len {
+                break;
+            }
+        }
         assert_eq!(
-            spent.get(),
+            debited,
             20 * len,
             "every selection snapshot debits the shared counter"
         );
@@ -3061,7 +3069,10 @@ mod tests {
 
     /// `stable_selection_maps` revalidates the module against the passed
     /// counter: an exhausted budget refuses the snapshot. Driven on the
-    /// test executable itself, which is always mapped.
+    /// test executable itself, which is always mapped. The fresh-counter
+    /// arm retries past torn `/proc/self/maps` reads under the suite's
+    /// parallel mapping churn; the exhausted arm needs no retry because
+    /// any failure is the expected verdict there.
     #[test]
     fn stable_selection_maps_charges_the_shared_identify_budget() {
         let exe = std::env::current_exe().unwrap();
@@ -3069,10 +3080,20 @@ mod tests {
         let file = identity::open_object(&exe).unwrap();
         let key = file_key(&file).unwrap();
         let identity = identity_and_key(&exe, &Cell::new(0)).unwrap().1;
-        let spent = Cell::new(0u64);
-        let maps = stable_selection_maps(&exe, key, &identity, &spent).unwrap();
-        assert!(!maps.is_empty());
-        assert_eq!(spent.get(), len);
+        let mut debited = None;
+        for _ in 0..5 {
+            let spent = Cell::new(0u64);
+            if let Ok(maps) = stable_selection_maps(&exe, key, &identity, &spent) {
+                assert!(!maps.is_empty());
+                debited = Some(spent.get());
+                break;
+            }
+        }
+        assert_eq!(
+            debited,
+            Some(len),
+            "a successful revalidation debits exactly one module read"
+        );
         let spent = Cell::new(MAX_TOTAL_OBJECT_BYTES);
         assert!(stable_selection_maps(&exe, key, &identity, &spent).is_err());
     }

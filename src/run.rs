@@ -3567,8 +3567,15 @@ fn install_stop_flag() -> Result<Arc<SignalState>> {
         SIGNAL_TEST_HOLDING.with(|held| held.get()),
         "install_stop_flag in tests must hold ActualSignalTestGuard (see the site table)",
     );
+    install_stop_flag_for(&STOP_SIGNALS)
+}
+
+/// Install the stop handlers for each of `signals` (an ignored SIGHUP
+/// is left alone). The list is a parameter so the failure path is
+/// testable, like inventory's `install_for`.
+fn install_stop_flag_for(signals: &[libc::c_int]) -> Result<Arc<SignalState>> {
     let state = Arc::new(SignalState::new());
-    for signal in STOP_SIGNALS {
+    for signal in signals.iter().copied() {
         if signal == libc::SIGHUP && !should_install_hangup_handler(current_disposition(signal)) {
             continue;
         }
@@ -31501,6 +31508,20 @@ int main(int argc, char **argv) {
             sighup_ignored_in_own_status(),
             "SigIgn lost the SIGHUP bit across the stop-flag install"
         );
+    }
+
+    /// The capture twin of the inventory #11 test: a failed
+    /// stop-handler registration fails startup with a named error,
+    /// never a silent drop. An invalid signal stands in for an
+    /// uninstallable one.
+    #[test]
+    fn install_stop_flag_names_a_failed_handler_registration() {
+        let error = match install_stop_flag_for(&[-1]) {
+            Ok(_) => panic!("installing a handler for an invalid signal must fail"),
+            Err(error) => error,
+        };
+        let text = format!("{error:#}");
+        assert!(text.contains("installing handler for signal -1"), "{text}");
     }
 
     /// Audit test 4: the inventory twin — an inherited SIGHUP ignore

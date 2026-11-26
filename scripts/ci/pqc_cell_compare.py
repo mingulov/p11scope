@@ -28,6 +28,10 @@ hint, plus the `pqc keys:` spotlight with all twelve
 parameter-set/operation segments. Anything missing fails: no skip
 counts as a pass.
 
+Scope: exactly ML-DSA-44/65/87 and ML-KEM-512/768/1024.
+SLH-DSA is not exercised by this cell; SLH-DSA inference stays
+pinned by unit tests only.
+
 Loss disclosure, not loss refusal: the workload's setup calls
 (Initialize, sessions, login) legitimately precede the semantic
 receipt under deferred admission, so a `before_semantic_boundary`

@@ -9,6 +9,9 @@
 # pqc_cell_compare.py: every key row must show family + parameter set
 # in verbose text and --json, with known exact counts. No skip counts
 # as a pass: a missing file, row or spotlight line fails its leg.
+# Scope: exactly ML-DSA-44/65/87 and ML-KEM-512/768/1024 (mechanisms
+# 15/23/28/29). SLH-DSA is not exercised by this cell; SLH-DSA
+# inference stays pinned by unit tests only.
 # The workflow fetches kryoptic first (scripts/ci/fetch-provider.sh
 # kryoptic into TASK_DIR); the token lives under
 # $TASK_DIR/kryoptic/. PINs via P11TEST_PIN/P11TEST_SO_PIN env (never

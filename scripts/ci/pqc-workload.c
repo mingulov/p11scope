@@ -2,7 +2,8 @@
 /* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* PQC CI cell workload: ML-DSA-44/65/87 + ML-KEM-512/768/1024 keygen and
  * single use against a PQC-capable provider (kryoptic), with exact known
- * counts for the observer to attribute.
+ * counts for the observer to attribute. Scope: exactly those six sets
+ * (SLH-DSA is not exercised here).
  *
  *   pqc-workload --module P --ready F --go G [--slot N]
  *                  [--post-sleep S] [--pace S] [--settle S]

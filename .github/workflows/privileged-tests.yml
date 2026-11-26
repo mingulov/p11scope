@@ -72,7 +72,8 @@ name: privileged-tests
 #   pinned kryoptic under inventory --pid --key-operations, with and
 #   without --key-sizes (scripts/ci/pqc-cell.sh); every key row must show
 #   family + parameter set in text and --json, with exact known counts
-#   (no skip passes).
+#   (no skip passes). Scope: exactly those six sets; SLH-DSA is not
+#   exercised here.
 # Weekly lib campaign: workflow_dispatch input campaign selects default,
 # long (--include-long) or all (long plus the fixture-skip groups once
 # WP-2 adds them). GitHub schedules run only on the default branch, so the
@@ -2315,6 +2316,8 @@ jobs:
   # plus ML-KEM-512/768/1024 keygen and single use with known counts,
   # observed with and without --key-sizes. Every required row must
   # pass; a missing row, count or spotlight line fails the job.
+  # Scope: exactly those six sets; SLH-DSA is not exercised here
+  # (SLH-DSA inference stays pinned by unit tests only).
   pqc-keys:
     needs: release-build
     if: github.event_name != 'schedule'

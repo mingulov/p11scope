@@ -2115,15 +2115,22 @@ fn run_with_terminal_budget(
         InventoryRunScope::Cgroup => (None, "cgroup".to_string()),
     };
     let started_ns = now_ns();
-    let mut coordinator = InventoryCoordinator::new_with_budget(
-        engine_scope.clone(),
-        hooks.clone(),
-        modules.to_vec(),
-        excludes.to_vec(),
-        OsProcessSource,
-        registry_limits(max_gaps),
-        endpoint_budget,
-    )?;
+    // The run owns its coordinator through the terminal-drain guard
+    // (D6): every exit path, an error return included, runs the
+    // caller-metadata join and the pidfd close drain before the
+    // coordinator's own drop.
+    let mut coordinator = TerminalDrains::new(
+        InventoryCoordinator::new_with_budget(
+            engine_scope.clone(),
+            hooks.clone(),
+            modules.to_vec(),
+            excludes.to_vec(),
+            OsProcessSource,
+            registry_limits(max_gaps),
+            endpoint_budget,
+        )?,
+        request.second_signal,
+    );
     if caller_metadata {
         coordinator.enable_caller_metadata(started_ns)?;
     }
@@ -2646,11 +2653,81 @@ fn run_with_terminal_budget(
     outcome.notices(previously_reported.as_deref(), &mut |line| {
         let _ = crate::sink::try_stderr_line(line);
     });
-    finish_caller_metadata_cleanup(&mut coordinator, request.second_signal);
-    finish_pending_close_drain(&mut coordinator, request.second_signal);
+    coordinator.finish();
     let cleanup = finish_semantic_native_cleanup(semantic_lane, request.second_signal);
     combine_semantic_terminal_errors(capture_error, cleanup)?;
     Ok(outcome.exit_code())
+}
+
+/// The run's coordinator under its terminal-drain guard (D6): both
+/// terminal drains (the caller-metadata join and the pidfd close
+/// drain) run exactly once on every exit path. The success tails call
+/// [`Self::finish`] at their place (after outputs, before the semantic
+/// cleanup); an error return or `?` runs them from the drop instead,
+/// before the coordinator's own drop could close the queue unchecked.
+pub(crate) struct TerminalDrains<'a> {
+    coordinator: InventoryCoordinator<OsProcessSource>,
+    second_signal: &'a dyn Fn() -> bool,
+    finished: bool,
+}
+
+impl<'a> TerminalDrains<'a> {
+    pub(crate) fn new(
+        coordinator: InventoryCoordinator<OsProcessSource>,
+        second_signal: &'a dyn Fn() -> bool,
+    ) -> Self {
+        Self {
+            coordinator,
+            second_signal,
+            finished: false,
+        }
+    }
+
+    /// Run both terminal drains now (idempotent).
+    pub(crate) fn finish(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        #[cfg(test)]
+        terminal_drains_test::note_run();
+        finish_caller_metadata_cleanup(&mut self.coordinator, self.second_signal);
+        finish_pending_close_drain(&mut self.coordinator, self.second_signal);
+    }
+}
+
+impl std::ops::Deref for TerminalDrains<'_> {
+    type Target = InventoryCoordinator<OsProcessSource>;
+    fn deref(&self) -> &Self::Target {
+        &self.coordinator
+    }
+}
+
+impl std::ops::DerefMut for TerminalDrains<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.coordinator
+    }
+}
+
+impl Drop for TerminalDrains<'_> {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod terminal_drains_test {
+    //! Counts terminal-drain runs on this thread, so the D6 twins
+    //! prove one run per exit path from a typed count.
+    std::thread_local! {
+        static RUNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+    pub(crate) fn note_run() {
+        RUNS.with(|runs| runs.set(runs.get() + 1));
+    }
+    pub(crate) fn take_runs() -> u64 {
+        RUNS.with(|runs| runs.replace(0))
+    }
 }
 
 fn finish_caller_metadata_cleanup(
@@ -10176,7 +10253,7 @@ fn unbounded_dashboard_deadline() -> Instant {
 #[allow(clippy::too_many_arguments)]
 fn run_dashboard(
     run: DashboardRun,
-    mut coordinator: InventoryCoordinator<OsProcessSource>,
+    mut coordinator: TerminalDrains<'_>,
     lane: Option<NativeLane<FacadeLane>>,
     display: Display,
     sink: Option<AtomicFile>,
@@ -10547,8 +10624,7 @@ fn run_dashboard(
             ExitRelease::RetainedForExit
         },
     );
-    finish_caller_metadata_cleanup(&mut coordinator, second_signal);
-    finish_pending_close_drain(&mut coordinator, second_signal);
+    coordinator.finish();
     let cleanup = finish_semantic_native_cleanup(semantic_lane, second_signal);
     // A restore the terminal shed (Ctrl-S then `q`) leaves the shell in
     // the alternate screen: after output attempts, it can wait longer.
@@ -12234,6 +12310,67 @@ mod tests {
                 }
                 assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 3);
             }
+        }
+    }
+
+    /// D6 through the real run: a failed native startup (an error
+    /// return after the coordinator exists) runs the terminal drains
+    /// once, and so does the scan-fallback success twin.
+    #[test]
+    fn d6_failed_native_startup_runs_the_terminal_drains() {
+        let dir = private_tempdir();
+        for (capture, fails) in [(CaptureMode::Native, true), (CaptureMode::Auto, false)] {
+            let out = dir.path().join(format!("out-{fails}.json"));
+            let mut stdout = Vec::new();
+            super::terminal_drains_test::take_runs();
+            let result = super::native_preparation_test::with(
+                |_, _, _| Err(anyhow::anyhow!("injected native unavailable for test")),
+                || {
+                    run_with_terminal_budget(
+                        InspectScope::Pid(std::process::id()),
+                        &[],
+                        &[],
+                        &[],
+                        &[],
+                        &[],
+                        &HookRegistry::builtin(),
+                        true,
+                        Some(1),
+                        None,
+                        inventory_endpoint_budget(None).unwrap(),
+                        None,
+                        Some(&out),
+                        false,
+                        None,
+                        None,
+                        None,
+                        None,
+                        capture,
+                        crate::attach::BackendSelection::Singles,
+                        None,
+                        false,
+                        &|| false,
+                        &|| {},
+                        false,
+                        &mut WriterStdout(&mut stdout),
+                        &DashboardIo::stdio(),
+                        DiagnosticRequest::disabled(),
+                        None,
+                        &|| Ok(crate::attach::MultiCapableHost::for_test()),
+                        None,
+                        None,
+                        false,
+                        false,
+                        false,
+                    )
+                },
+            );
+            assert_eq!(result.is_err(), fails, "{capture:?}: {result:?}");
+            assert_eq!(
+                super::terminal_drains_test::take_runs(),
+                1,
+                "{capture:?}: the terminal drains run once"
+            );
         }
     }
 
@@ -34504,6 +34641,54 @@ mod seal_readiness_tests {
                 "{channel:?}"
             );
         }
+    }
+
+    /// D6: an error return (a mid-run commit failure, a `?`) runs the
+    /// terminal drains exactly once from the guard, before the
+    /// coordinator's drop: under a further signal the queued pin moves
+    /// to the exit retention (still open after the drop), and a quiet
+    /// drain closes it. The success tail's explicit finish runs them
+    /// once, never again from the drop.
+    #[test]
+    fn d6_every_exit_path_runs_the_terminal_drains_once() {
+        use std::sync::Arc;
+        for (further_signal, retained) in [(false, false), (true, true)] {
+            let pin = Arc::new(crate::process::PidPin::test_pidfd_only(std::process::id()));
+            let weak = Arc::downgrade(&pin);
+            let signal = move || further_signal;
+            super::terminal_drains_test::take_runs();
+            let result: anyhow::Result<()> = (|| {
+                let mut drains = super::TerminalDrains::new(coordinator(), &signal);
+                drains.queue_close_for_test(pin);
+                anyhow::bail!("mid-run commit error");
+            })();
+            assert!(result.is_err());
+            assert_eq!(
+                (
+                    super::terminal_drains_test::take_runs(),
+                    weak.upgrade().is_some()
+                ),
+                (1, retained),
+                "further signal {further_signal}: one drain run, pin retained {retained}"
+            );
+        }
+        let pin = Arc::new(crate::process::PidPin::test_pidfd_only(std::process::id()));
+        let weak = Arc::downgrade(&pin);
+        super::terminal_drains_test::take_runs();
+        {
+            let mut drains = super::TerminalDrains::new(coordinator(), &|| false);
+            drains.queue_close_for_test(pin);
+            drains.finish();
+            assert!(
+                weak.upgrade().is_none(),
+                "the explicit finish closes the pin"
+            );
+        }
+        assert_eq!(
+            super::terminal_drains_test::take_runs(),
+            1,
+            "the success tail runs the drains once, not again from the drop"
+        );
     }
 
     /// Both journal starts refuse with `--key-sizes`: the sizes

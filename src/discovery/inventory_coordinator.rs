@@ -7599,6 +7599,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         owned
     }
 
+    /// Queue one pin for the paced close drain (test seam for the
+    /// terminal-drain twins).
+    #[cfg(test)]
+    pub(crate) fn queue_close_for_test(&mut self, pin: Arc<PidPin>) {
+        self.pending_close_queue.push(pin);
+    }
+
     /// One retirement pass under an explicit stop query, with
     /// released pidfd custody handed out for the caller's drain.
     fn retire_inner(

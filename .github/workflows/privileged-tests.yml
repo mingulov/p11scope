@@ -1187,6 +1187,7 @@ jobs:
               --require mt-exact --require system --require sigint --require second-sigint \
               --require mt-metrics --require mt-errors --require mt-shared --require mt-churn \
               --require mt-trace --require counter-latency-mt --require mt-system \
+              --require mt-system-metrics \
               --require inventory-mt-pid --require inventory-mt-system \
               --require fifo-refused --require inventory-event-stdout \
               >"$RUNNER_TEMP/qual.log" 2>&1 || qual_rc=$?
@@ -1254,6 +1255,7 @@ jobs:
             --require mt-exact --require system --require sigint --require second-sigint \
             --require mt-metrics --require mt-errors --require mt-shared --require mt-churn \
             --require mt-trace --require counter-latency-mt --require mt-system \
+            --require mt-system-metrics \
             --require inventory-mt-pid --require inventory-mt-system \
             --require fifo-refused --require inventory-event-stdout
           # The wrapper translates the documented nonqualifying-smoke exit 2
@@ -1268,7 +1270,7 @@ jobs:
           need = {"doctor", "profile-pid", "names-pid", "verdict-pid", "metrics-pid", "trace-pid",
                   "run-short", "run-cover", "run-prearm", "parent-chain", "mt-exact", "system", "sigint", "second-sigint",
                   "mt-metrics", "mt-errors", "mt-shared", "mt-churn", "mt-trace",
-                  "counter-latency-mt", "mt-system",
+                  "counter-latency-mt", "mt-system", "mt-system-metrics",
                   "inventory-mt-pid", "inventory-mt-system",
                   "fifo-refused", "inventory-event-stdout",
                   "profile-cgroup", "metrics-cgroup", "trace-cgroup", "inventory-cgroup",

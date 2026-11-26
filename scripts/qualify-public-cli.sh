@@ -15,8 +15,9 @@
 # evidence (including unexpected passes), 2 means valid smoke/nonqualifying or
 # expected-failure evidence, 0 qualifies the subset with no caveats.
 # P11SCOPE_ALLOW_PID_DESCENDANT_GAPS=1 (ruling CI-GAP-1) discloses hosted
-# runner noise on the system cells (`system`, `mt-system`) only; default 0
-# keeps every cell strict. Ruling U1: on `mt-system` only, the same flag
+# runner noise on the system cells (`system`, `mt-system` and its mode
+# twins `mt-system-metrics`, `mt-system-trace`) only; default 0 keeps
+# every cell strict. Ruling U1: on `mt-system` only, the same flag
 # also discloses the named {discovery subject, discovery unavailable}
 # skips; each named cause prints its count, owned counts stay exact, and
 # any other cause still fails.
@@ -52,8 +53,8 @@ fi
 # shellcheck disable=SC2086
 for _cell in ${P11SCOPE_PUBLIC_CLI_CELLS:-}; do
   case $_cell in
-    profile-pid|metrics-pid|trace-pid|mt-exact|system|mt-metrics|mt-errors|mt-shared|mt-churn|mt-trace|mt-system|counter-latency-mt|inventory-mt-pid|inventory-mt-system) ;;
-    *) echo "unsupported subset cell: $_cell (supported: profile-pid metrics-pid trace-pid mt-exact system mt-metrics mt-errors mt-shared mt-churn mt-trace mt-system counter-latency-mt inventory-mt-pid inventory-mt-system)" >&2; exit 64 ;;
+    profile-pid|metrics-pid|trace-pid|mt-exact|system|mt-metrics|mt-errors|mt-shared|mt-churn|mt-trace|mt-system|mt-system-metrics|mt-system-trace|counter-latency-mt|inventory-mt-pid|inventory-mt-system) ;;
+    *) echo "unsupported subset cell: $_cell (supported: profile-pid metrics-pid trace-pid mt-exact system mt-metrics mt-errors mt-shared mt-churn mt-trace mt-system mt-system-metrics mt-system-trace counter-latency-mt inventory-mt-pid inventory-mt-system)" >&2; exit 64 ;;
   esac
 done
 unset _cell
@@ -325,7 +326,10 @@ judge() {
   # allowance to the named discovery-skip pair; `system` keeps the
   # CI-GAP-1 cause set.
   local -a extra=()
-  if [[ "${4:-}" = system || "${4:-}" = mt-system ]] && [ "${P11SCOPE_ALLOW_PID_DESCENDANT_GAPS:-0}" = 1 ]; then
+  # The mt-system mode twins (mt-system-metrics, mt-system-trace) run the
+  # same workload and inherit its rulings.
+  if [[ "${4:-}" = system || "${4:-}" = mt-system || "${4:-}" = mt-system-metrics || "${4:-}" = mt-system-trace ]] \
+      && [ "${P11SCOPE_ALLOW_PID_DESCENDANT_GAPS:-0}" = 1 ]; then
     extra=(--allow-pid-descendant-gaps)
   fi
   # Flake-66: the 6.6 leg rarely reports PARTIAL with exactly one
@@ -357,7 +361,7 @@ judge() {
 gated() {
   local cell=$1 scope=$2 fixture=$3; shift 3
   local gate=$OUT/$cell.gate ext=json
-  case "$cell" in trace-*|mt-trace) ext=txt;; esac
+  case "$cell" in trace-*|mt-trace|mt-system-trace) ext=txt;; esac
   rm -f -- "$gate" "$cell.$ext" "$cell.wl" "$cell.stderr" "$cell.stdout" "$cell.receipt.json" "$cell.eventlog.jsonl" \
     "$cell.census.jsonl" "$cell.census.stop" "$cell.census.capturing" "$cell.census.settled" "$cell.census.ready" "$cell.census.stderr"
   local output; output=$(product_output "$cell.$ext")
@@ -374,7 +378,7 @@ gated() {
     mt-churn) asuser "$fixture" "$MODULE" 32 250 "$gate" churn 0 > "$cell.wl" 2>&1 & ;;
     mt-trace) asuser "$fixture" "$MODULE" 8 100 "$gate" sessions 0 > "$cell.wl" 2>&1 & ;;
     counter-latency-mt) asuser "$fixture" "$MODULE" 8 500 "$gate" sessions 0 > "$cell.wl" 2>&1 & ;;
-    mt-system) asuser "$fixture" "$MODULE" 4 8 250 "$gate" 0 > "$cell.wl" 2>&1 & ;;
+    mt-system|mt-system-metrics|mt-system-trace) asuser "$fixture" "$MODULE" 4 8 250 "$gate" 0 > "$cell.wl" 2>&1 & ;;
     inventory-mt-pid) asuser "$fixture" "$MODULE" 8 1000 "$gate" sessions 0 > "$cell.wl" 2>&1 & ;;
     inventory-mt-system) asuser "$fixture" "$MODULE" 4 8 250 "$gate" 0 > "$cell.wl" 2>&1 & ;;
     *) asuser "$fixture" "$MODULE" "$ITERS" 200 "$gate" > "$cell.wl" 2>&1 & ;;
@@ -469,7 +473,7 @@ gated() {
   # any poll-quantum straggler out of the ambient join either way.
   if [ -n "$census_pid" ] && [ "$census_pid" != pending ]; then : >> "$cell.census.settled"; fi
   case "$cell" in
-    mt-exact|mt-metrics|mt-errors|mt-shared|mt-churn|mt-trace|counter-latency-mt|mt-system)
+    mt-exact|mt-metrics|mt-errors|mt-shared|mt-churn|mt-trace|counter-latency-mt|mt-system|mt-system-metrics|mt-system-trace)
       # The mt workloads self-exit after LEDGER; every other workload holds.
       if [ "$released" = 1 ] && finish "$wl" "$LEDGER_TICKS"; then
         workload_rc=$LAST_EXIT
@@ -980,6 +984,8 @@ if [ -n "${P11SCOPE_PUBLIC_CLI_CELLS:-}" ]; then
       mt-trace) gated mt-trace pid "$MTM" trace --pid @PID@ --duration 12 -o "$OUT/mt-trace.txt" ;;
       counter-latency-mt) counter_cell counter-latency-mt pid "$MTM" profile --mode metrics --counter-mode latency --pid @PID@ --duration 12 -o "$OUT/counter-latency-mt.json" ;;
       mt-system) gated mt-system system "$MTF" profile --system --module "$MODULE" --duration 25 -o "$OUT/mt-system.json" ;;
+      mt-system-metrics) gated mt-system-metrics system "$MTF" profile --mode metrics --system --module "$MODULE" --duration 25 -o "$OUT/mt-system-metrics.json" ;;
+      mt-system-trace) gated mt-system-trace system "$MTF" trace --system --module "$MODULE" --duration 25 -o "$OUT/mt-system-trace.txt" ;;
       inventory-mt-pid) MT_MIXED_HOLD=1 gated inventory-mt-pid pid "$MTM" inventory --pid @PID@ --capture native --duration 120 --event-log "$OUT/inventory-mt-pid.eventlog.jsonl" -o "$OUT/inventory-mt-pid.json" ;;
       inventory-mt-system) MT_MIXED_HOLD=1 gated inventory-mt-system system "$MTF" inventory --system --module "$MODULE" --capture native --duration 120 --event-log "$OUT/inventory-mt-system.eventlog.jsonl" -o "$OUT/inventory-mt-system.json" ;;
     esac
@@ -1038,6 +1044,12 @@ gated mt-churn pid "$MTM" profile --pid @PID@ --duration 12 -o "$OUT/mt-churn.js
 gated mt-trace pid "$MTM" trace --pid @PID@ --duration 12 -o "$OUT/mt-trace.txt"
 counter_cell counter-latency-mt pid "$MTM" profile --mode metrics --counter-mode latency --pid @PID@ --duration 12 -o "$OUT/counter-latency-mt.json"
 gated mt-system system "$MTF" profile --system --module "$MODULE" --duration 25 -o "$OUT/mt-system.json"
+# The same multi-process workload in metrics mode: its forked children
+# exit mid-capture, so a proof-backed zero-mapper retire must stay exact
+# there too (retire-window lane, audits F1/G1). The trace twin
+# (mt-system-trace) is subset-only: its strict trace judge has no
+# runner-noise arm for the hosted runner's ambient descendant exits.
+gated mt-system-metrics system "$MTF" profile --mode metrics --system --module "$MODULE" --duration 25 -o "$OUT/mt-system-metrics.json"
 # Inventory MT-exact cells: the held workload keeps its process alive across
 # inventory passes; per-edge usage and the event-log stream are judged exact.
 # The observer runs until the harness stops it after the ledger settles
@@ -1154,5 +1166,5 @@ startup_cell() {
   result "$cell" 1 "$detail"
 }
 startup_cell
-summary doctor profile-pid names-pid verdict-pid metrics-pid trace-pid run-short run-cover run-prearm parent-chain mt-exact system mt-metrics mt-errors mt-shared mt-churn mt-trace counter-latency-mt mt-system inventory-mt-pid inventory-mt-system sigint second-sigint fifo-refused inventory-event-stdout profile-cgroup metrics-cgroup trace-cgroup inventory-cgroup counter-counts-pid counter-timestamps-pid counter-latency-pid counter-counts-system counter-timestamps-system counter-latency-system select-endpoint-pid select-endpoint-system profile-pid-ia32 run-ia32 startup-to-capturing
+summary doctor profile-pid names-pid verdict-pid metrics-pid trace-pid run-short run-cover run-prearm parent-chain mt-exact system mt-metrics mt-errors mt-shared mt-churn mt-trace counter-latency-mt mt-system mt-system-metrics inventory-mt-pid inventory-mt-system sigint second-sigint fifo-refused inventory-event-stdout profile-cgroup metrics-cgroup trace-cgroup inventory-cgroup counter-counts-pid counter-timestamps-pid counter-latency-pid counter-counts-system counter-timestamps-system counter-latency-system select-endpoint-pid select-endpoint-system profile-pid-ia32 run-ia32 startup-to-capturing
 exit $?

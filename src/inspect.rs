@@ -1201,10 +1201,7 @@ mod tests {
     struct FailingWriter;
     impl std::io::Write for FailingWriter {
         fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "injected report-write failure",
-            ))
+            Err(std::io::Error::other("injected report-write failure"))
         }
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())

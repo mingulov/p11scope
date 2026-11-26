@@ -31252,6 +31252,34 @@ int main(int argc, char **argv) {
         assert_eq!(stop.sigint_deliveries(), 0);
     }
 
+    /// A stop observed on a capture tick ends the loop by signal —
+    /// over an already-elapsed duration too — so the terminal path
+    /// below seals the report for a signal end. No stop, no end.
+    #[test]
+    fn capture_end_maps_an_observed_stop_to_a_signal_end() {
+        let engine = Engine::empty_for_test();
+        let duration = Some(Duration::from_secs(1));
+        let interrupted = SignalState::new();
+        interrupted.observe(libc::SIGINT);
+        for elapsed in [Duration::ZERO, Duration::from_secs(5)] {
+            assert!(
+                matches!(
+                    capture_end(&engine, None, &interrupted, elapsed, duration).unwrap(),
+                    Some(CaptureEnd::Signal)
+                ),
+                "a stop at elapsed {elapsed:?} must end by signal"
+            );
+        }
+        let quiet = SignalState::new();
+        assert!(
+            matches!(
+                capture_end(&engine, None, &quiet, Duration::ZERO, duration).unwrap(),
+                None
+            ),
+            "no stop and no elapsed duration must not end the loop"
+        );
+    }
+
     /// Reads one signal's current disposition without changing it.
     fn signal_disposition(signal: libc::c_int) -> libc::sighandler_t {
         // SAFETY: zeroed sigaction is the documented output buffer, and a

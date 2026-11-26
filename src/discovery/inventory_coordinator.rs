@@ -7077,11 +7077,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// fold grows the map, so a pass that also tombstones rebound
     /// keys may over-evict slightly — every eviction is still
     /// counted, never silent.
-    fn preevict_folded_room(
-        &mut self,
-        folds_expected: usize,
-        gone_memo: &mut HashMap<u32, bool>,
-    ) {
+    fn preevict_folded_room(&mut self, folds_expected: usize, gone_memo: &mut HashMap<u32, bool>) {
         let shortfall = self
             .pair_folded
             .len()
@@ -7127,8 +7123,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             if self.pair_folded.remove(&victim).is_none() {
                 continue;
             }
-            self.pair_fold_memory_overflow =
-                self.pair_fold_memory_overflow.saturating_add(1);
+            self.pair_fold_memory_overflow = self.pair_fold_memory_overflow.saturating_add(1);
             self.pair_fold_lost.insert(PairFoldLatchKey {
                 domain: victim.image.domain(),
                 image: victim.image,
@@ -7147,8 +7142,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         if self.pair_folded.len() >= self.pair_prune_cap {
             if let Some(victim) = self.pair_folded.keys().next().copied() {
                 self.pair_folded.remove(&victim);
-                self.pair_fold_memory_overflow =
-                    self.pair_fold_memory_overflow.saturating_add(1);
+                self.pair_fold_memory_overflow = self.pair_fold_memory_overflow.saturating_add(1);
                 self.pair_fold_lost.insert(PairFoldLatchKey {
                     domain: victim.image.domain(),
                     image: victim.image,
@@ -45969,9 +45963,10 @@ int main(void) {
                     pid: 7,
                 },
             );
-            native.scene.coordinator.prune_departed_native_state(
-                at + EXEC_STATE_GRACE_NS + pass as u64,
-            );
+            native
+                .scene
+                .coordinator
+                .prune_departed_native_state(at + EXEC_STATE_GRACE_NS + pass as u64);
         }
         assert_eq!(
             native
@@ -46043,9 +46038,10 @@ int main(void) {
                     pid: 7,
                 },
             );
-            native.scene.coordinator.prune_departed_native_state(
-                at + EXEC_STATE_GRACE_NS + pass as u64,
-            );
+            native
+                .scene
+                .coordinator
+                .prune_departed_native_state(at + EXEC_STATE_GRACE_NS + pass as u64);
         }
         assert_eq!(
             native
@@ -46152,9 +46148,10 @@ int main(void) {
                     pid: 7,
                 },
             );
-            native.scene.coordinator.prune_departed_native_state(
-                at + EXEC_STATE_GRACE_NS + pass as u64,
-            );
+            native
+                .scene
+                .coordinator
+                .prune_departed_native_state(at + EXEC_STATE_GRACE_NS + pass as u64);
         }
         assert_eq!(
             native
@@ -46188,11 +46185,15 @@ int main(void) {
             "no fold-revival gap for a mid-life advance"
         );
         assert!(
-            native.scene.coordinator.pair_fold_lost.contains(&PairFoldLatchKey {
-                domain: native.domain,
-                image: DomainCookie::scripted(native.domain, 41),
-                object: 0,
-            }),
+            native
+                .scene
+                .coordinator
+                .pair_fold_lost
+                .contains(&PairFoldLatchKey {
+                    domain: native.domain,
+                    image: DomainCookie::scripted(native.domain, 41),
+                    object: 0,
+                }),
             "the advance preserves the latch for the evicted key"
         );
     }
@@ -46230,11 +46231,15 @@ int main(void) {
                     base: 3,
                 },
             );
-            native.scene.coordinator.pair_fold_lost.insert(PairFoldLatchKey {
-                domain,
-                image: DomainCookie::scripted(domain, ticket),
-                object: 1,
-            });
+            native
+                .scene
+                .coordinator
+                .pair_fold_lost
+                .insert(PairFoldLatchKey {
+                    domain,
+                    image: DomainCookie::scripted(domain, ticket),
+                    object: 1,
+                });
         }
         native.stage(NativeBatch::Finish {
             domain: native.domain,

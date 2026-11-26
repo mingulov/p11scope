@@ -86998,12 +86998,7 @@ fn tail_twice_with_missing_module_pin_drops_with_exact_gap() {
             )
         })
         .next()
-        .unwrap_or_else(|| {
-            format!(
-                "planned module '{}' has no comparable pin",
-                module.path
-            )
-        });
+        .unwrap_or_else(|| format!("planned module '{}' has no comparable pin", module.path));
     // Lose the pin, dirty the revision so the tail attempts, then
     // snapshot the published history the drops must keep. No fresh
     // reconciled modules this batch (the plan stays): a module the

@@ -30424,14 +30424,19 @@ int main(int argc, char **argv) {
             body.find(needle).unwrap()
         };
         let install = at("install_stop_flag()");
+        let policy = at("capture_policy(");
         let host = at("let _host = host()?;");
         let open = at("OutputSink::open(");
         // The discovery pass threads the stop flag (fix1 F1.2), so the call
-        // is `discover_with_cancel`; the M-1 ordering (install < host <
-        // open < discover < refuse < attach) is unchanged.
+        // is `discover_with_cancel`; the M-1 ordering (install < policy <
+        // host < open < discover < refuse < attach) is unchanged.
         let discover = at("Engine::discover_with_cancel(");
         let refuse = at("refuse_if_interrupted_before_attach(&stop)");
         let attach = at("start_session(");
+        assert!(
+            install < policy,
+            "stop flag not first: only process start precedes it"
+        );
         assert!(
             install < host,
             "stop flag after the host probe: an early stop is lost"

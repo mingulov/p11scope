@@ -33484,7 +33484,7 @@ impl Engine {
     fn carried_absence_proven(&self) -> bool {
         self.last_scope_walk_complete
             && self.newcomer_first_seen.is_empty()
-            && self.refresh_requested.is_empty()
+            && self.refresh_queue.is_empty()
             && self.held_back.is_empty()
             && self.views.len() < self.max_scan_pids
             && !self.last_selection_deferred_any
@@ -33525,7 +33525,7 @@ impl Engine {
             verdict: false,
             walk_complete: self.last_scope_walk_complete,
             marks_empty: self.newcomer_first_seen.is_empty(),
-            refresh_empty: self.refresh_requested.is_empty(),
+            refresh_empty: self.refresh_queue.is_empty(),
             held_back_empty: self.held_back.is_empty(),
             spare_capacity: self.views.len() < self.max_scan_pids,
             selection_deferred: self.last_selection_deferred_any,

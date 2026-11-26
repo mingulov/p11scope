@@ -103362,7 +103362,7 @@ fn carried_fix2_queued_refresh_keeps_carrier() {
     engine.set_disable_empty_tick_fast_path_for_test(false);
     let serviced = engine.refresh_request_snapshot();
     engine.complete_refresh_requests(&serviced, &BTreeSet::new());
-    assert!(engine.refresh_requested.is_empty(), "the queue drains");
+    assert!(engine.refresh_queue.is_empty(), "the queue drains");
     engine.plan_rebuild_stable = true;
     let freed = engine
         .inventory_candidate(&empty, &[], &[], Vec::new(), &empty)
@@ -103434,7 +103434,7 @@ fn carried_fix2_held_back_keeps_carrier() {
         "no timing mark remains"
     );
     assert!(
-        engine.refresh_requested.is_empty(),
+        engine.refresh_queue.is_empty(),
         "no refresh request waits"
     );
     assert!(
@@ -104384,7 +104384,7 @@ fn carried_fix2_selection_deferred_keeps_carrier() {
         "no timing mark remains"
     );
     assert!(
-        engine.refresh_requested.is_empty(),
+        engine.refresh_queue.is_empty(),
         "no refresh request waits"
     );
     assert!(engine.held_back.is_empty(), "no held-back retry waits");

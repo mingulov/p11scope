@@ -72,7 +72,7 @@ fn fix3_seed_carrier(key_minor: u64) -> (Engine, PinnedObjectId) {
         engine.newcomer_first_seen.is_empty(),
         "no timing mark remains"
     );
-    assert!(engine.refresh_requested.is_empty(), "no refresh waits");
+    assert!(engine.refresh_queue.is_empty(), "no refresh waits");
     assert!(engine.held_back.is_empty(), "no held-back retry waits");
     assert!(
         engine.views.len() < engine.max_scan_pids,

@@ -29152,7 +29152,7 @@ mod tests {
             .raw_ownership
             .entry(view)
             .or_default()
-            .insert(RawObjectInstance::scanned(&main, main.key, &main.path).unwrap());
+            .file_fresh(RawObjectInstance::scanned(&main, main.key, &main.path).unwrap());
         let global_key = overlay(891);
         let global_module = module(global_key);
         assert!(

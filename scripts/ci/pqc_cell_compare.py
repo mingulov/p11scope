@@ -34,16 +34,28 @@ pinned by unit tests only.
 
 Loss disclosure, not loss refusal: the workload's setup calls
 (Initialize, sessions, login) legitimately precede the semantic
-receipt under deferred admission, so a `before_semantic_boundary`
-coverage reason is expected and harmless; the exact PQC mechanism
+receipt under deferred admission, and the exact PQC mechanism
 and row counts prove every PQC operation was observed instead (a
-missed PQC op breaks counts first). Any other disclosed loss — a
-non-populated section status, a model gap row, suppressed gap rows,
-a refused row budget, or a lossy semantic edge — does not fail the
-leg either, but the result row reports qualification "partial"
-with the typed reason instead of "qualified". Only a run with no
-loss anywhere qualifies. Session rows stay unchecked (lifecycle,
-not loss: the section status already aggregates authority).
+missed PQC op breaks counts first). Disclosed loss does not fail
+the leg; the result row reports qualification "partial" with the
+typed reason instead of "qualified". Qualified requires a typed
+proof of absence on every read channel: a populated section with
+reason none; no section gap rows and exactly zero suppressed
+section gaps; zero refused section row budgets; no unattributed
+counter rows; no lost or malformed session rows (a lost session
+ended with a model gap); no top-level gap rows except the
+producer's explicit "attribution complete" completeness note, and
+exactly zero suppressed top-level gaps; zero refused or
+loss-bearing top-level budget counters; and benign coverage on
+every semantic edge — a clean edge, a fresh no-call edge, or
+exactly the setup-only pre-boundary shape (lossy with only
+`before_semantic_boundary`, the real producer shape for setup
+loss). Any other shape — loss, contradiction, or missing or
+malformed disclosure — is partial. Census, limit, occupancy,
+exact-retention aggregation and classification keys are
+measurements, not loss disclosures, and gate nothing;
+observation, clock, instance, physical-edge, caller and module
+detail are outside this cell's qualification contract.
 
 Usage:
   pqc_cell_compare.py --sizes-log F --sizes-exit N --sizes-inventory F
@@ -539,21 +551,73 @@ def check_text(fail, leg, text_path, sizes, inv):
 
 
 # Coverage reasons that describe expected setup (pre-admission
-# workload calls), not observation loss; every other reason, or a
-# lossy edge, discloses loss (the S1 coverage vocabulary in
-# docs/schema/inventory-v1.md).
+# workload calls). The producer selects BeforeSemanticBoundary
+# as a historical reduction and sets lossy with it
+# (src/discovery/caller_registry/instance_input.rs:3664-3668),
+# so the benign shape is lossy with exactly this reason set.
 BENIGN_COVERAGE_REASONS = frozenset({"before_semantic_boundary"})
+# Fresh edges that observed zero calls carry exactly this reason
+# with lossy false (instance_input.rs:3574,3664): no calls and
+# no loss, so likewise benign.
+NO_CALL_REASONS = frozenset({"no_calls"})
+# The producer's refused/loss-bearing top-level budget counters:
+# (block, counter) pairs that must be exactly zero for a run to
+# qualify (src/inventory/mod.rs:10830-10977). Census, limit,
+# occupancy, exact-retention aggregation (retired/folded rows,
+# pair_dropped bases) and classification (unknown-edge counts,
+# semantic status) keys are measurements, not loss disclosures,
+# and gate nothing.
+TOP_BUDGET_ZERO_INTS = (
+    ("callers", "refused"),
+    ("callers", "late_refused"),
+    ("modules", "refused"),
+    ("edges", "refused"),
+    ("endpoints", "refused"),
+    ("inventory_endpoints", "refused"),
+    ("inventory_attach_modules", "refused"),
+    ("counters", "saturated_edges"),
+    ("semantic_state", "refused"),
+    ("instances", "refused"),
+    ("instance_semantic_state", "refused"),
+    ("instance_negative_state", "refused"),
+    ("instance_semantic_resources", "refused"),
+    ("retained_history", "suppressed"),
+    ("departed_use", "identities_dropped"),
+    ("departed_use", "mech_overflow"),
+    ("native_departed", "pair_prune_overflow"),
+    ("native_departed", "exec_prune_overflow"),
+    ("native_preadmission", "refused"),
+    ("native_preadmission", "pruned"),
+)
+
+
+def _is_completeness_note(row):
+    """Whether a top-level gap row is the producer's explicit
+    completeness note (subject "discovery capped" with an
+    "attribution complete: ..." reason from its single emitter
+    at src/inspect_system.rs:3090-3099, documented as a note,
+    not a loss): the one row shape that does not void
+    qualification."""
+    return (isinstance(row, dict)
+            and row.get("subject") == "discovery capped"
+            and isinstance(row.get("reason"), str)
+            and row.get("reason").startswith("attribution complete"))
 
 
 def leg_qualification(inv):
     """Derive a leg's (qualification, reason) from loss disclosure.
 
-    "qualified" requires proof of no loss: a populated section, no
-    model gap rows, no suppressed gap rows, no refused row budgets,
-    and no lossy semantic edge. Anything else — including malformed
-    disclosure the judge cannot audit — is "partial" with the typed
-    reason. Never raises: this runs on the same inventories the
-    checks just judged, malformed or not.
+    "qualified" requires a typed proof of absence on every read
+    channel (the module docstring lists them): populated status
+    with reason none, empty section gaps with exactly zero
+    suppressed, zero refused section row budgets, empty
+    unattributed, no lost or malformed sessions, no non-note
+    top-level gaps with exactly zero suppressed, zero refused
+    top-level budget counters, and benign coverage on every
+    edge. Anything else — loss, contradiction, or missing/
+    malformed disclosure — is "partial" with the typed reason.
+    Never raises: this runs on the same inventories the checks
+    just judged, malformed or not.
     """
     if inv is None:
         return ("partial", "inventory_unreadable")
@@ -562,9 +626,13 @@ def leg_qualification(inv):
     oo = inv.get("object_observations")
     if not isinstance(oo, dict):
         return ("partial", "section_malformed")
-    if oo.get("status") != "populated":
-        return ("partial",
-                f"status/{oo.get('status')}/{oo.get('reason')}")
+    status = oo.get("status")
+    reason = oo.get("reason")
+    if status != "populated":
+        return ("partial", f"status/{status}/{reason}")
+    if reason != "none":
+        # REASON_LABELS: "none" only when populated.
+        return ("partial", f"status/populated/{reason}")
     gaps = oo.get("gaps")
     if not isinstance(gaps, dict):
         return ("partial", "gaps_malformed")
@@ -572,9 +640,14 @@ def leg_qualification(inv):
     if not isinstance(rows, list):
         return ("partial", "gaps_malformed")
     for gap in sorted(rows, key=str):
-        reason = gap.get("reason") if isinstance(gap, dict) else None
-        return ("partial", f"gap/{reason}")
-    if gaps.get("suppressed", 0) != 0:
+        gap_reason = gap.get("reason") if isinstance(gap, dict) else None
+        if not isinstance(gap_reason, str) or not gap_reason:
+            return ("partial", "gap/malformed")
+        return ("partial", f"gap/{gap_reason}")
+    suppressed = gaps.get("suppressed")
+    if type(suppressed) is not int:
+        return ("partial", "gaps_malformed")
+    if suppressed != 0:
         return ("partial", "gap/suppressed")
     budgets = oo.get("budgets")
     if not isinstance(budgets, dict):
@@ -583,26 +656,112 @@ def leg_qualification(inv):
         block = budgets.get(name)
         if not isinstance(block, dict):
             return ("partial", f"budget/{name}_malformed")
-        if block.get("refused", 0) != 0:
+        refused = block.get("refused")
+        if type(refused) is not int:
+            return ("partial", f"budget/{name}_malformed")
+        if refused != 0:
             return ("partial", f"budget/{name}_refused")
+    unattributed = oo.get("unattributed")
+    if not isinstance(unattributed, list):
+        return ("partial", "unattributed_malformed")
+    for row in sorted(unattributed, key=str):
+        row_reason = row.get("reason") if isinstance(row, dict) else None
+        if not isinstance(row_reason, str) or not row_reason:
+            return ("partial", "unattributed_malformed")
+        return ("partial", f"unattributed/{row_reason}")
+    sessions = oo.get("sessions")
+    if not isinstance(sessions, list):
+        return ("partial", "sessions_malformed")
+    for entry in sorted(sessions, key=str):
+        if not isinstance(entry, dict):
+            return ("partial", "sessions_malformed")
+        label = entry.get("session")
+        label = label if type(label) is int else "?"
+        entry_status = entry.get("status")
+        if entry_status == "lost":
+            # SessionState::Ended carries a model gap.
+            return ("partial", f"session/{label}/lost")
+        if entry_status not in ("live", "closed"):
+            return ("partial", f"session/{label}/malformed")
+    top_gaps = inv.get("gaps")
+    if not isinstance(top_gaps, list):
+        return ("partial", "root-gaps_malformed")
+    for row in sorted(top_gaps, key=str):
+        if _is_completeness_note(row):
+            continue
+        if not isinstance(row, dict):
+            return ("partial", "root-gap/malformed")
+        text = row.get("reason")
+        if not isinstance(text, str) or not text:
+            text = row.get("subject")
+        if not isinstance(text, str) or not text:
+            return ("partial", "root-gap/malformed")
+        return ("partial", f"root-gap/{text}")
+    top_suppressed = inv.get("gaps_suppressed")
+    if type(top_suppressed) is not int:
+        return ("partial", "root-gaps_malformed")
+    if top_suppressed != 0:
+        return ("partial", "root-gap/suppressed")
+    top_budgets = inv.get("budgets")
+    if not isinstance(top_budgets, dict):
+        return ("partial", "top-budgets_malformed")
+    for block, counter in TOP_BUDGET_ZERO_INTS:
+        value = top_budgets.get(block)
+        if value is None and block == "native_preadmission":
+            continue  # scan lane emits null, not a stash
+        if not isinstance(value, dict):
+            return ("partial", f"top-budget/{block}/malformed")
+        seen = value.get(counter)
+        if type(seen) is not int:
+            return ("partial",
+                    f"top-budget/{block}/{counter}/malformed")
+        if seen != 0:
+            return ("partial", f"top-budget/{block}/{counter}")
+    negative = top_budgets.get("instance_negative_state")
+    if not isinstance(negative, dict):
+        return ("partial",
+                "top-budget/instance_negative_state/malformed")
+    exhausted = negative.get("exhausted")
+    if exhausted is True:
+        return ("partial",
+                "top-budget/instance_negative_state/exhausted")
+    if exhausted is not False:
+        return ("partial",
+                "top-budget/instance_negative_state/exhausted/"
+                "malformed")
     edges = inv.get("semantic_edges")
     if not isinstance(edges, list):
         return ("partial", "edges_malformed")
     for edge in edges:
         if not isinstance(edge, dict):
-            continue
+            return ("partial", "edge/edge_malformed")
         coverage = edge.get("coverage")
         if coverage is None:
-            continue
+            return ("partial", "edge/coverage_missing")
         if not isinstance(coverage, dict):
             return ("partial", "edge/coverage_malformed")
-        reasons = coverage.get("reasons", [])
-        if not isinstance(reasons, list):
-            return ("partial", "edge/coverage_malformed")
-        loss = sorted(str(item) for item in reasons
-                      if item not in BENIGN_COVERAGE_REASONS)
-        if coverage.get("lossy", False) or loss:
-            return ("partial", f"edge/{loss[0] if loss else 'lossy'}")
+        lossy = coverage.get("lossy")
+        if type(lossy) is not bool:
+            return ("partial", "edge/lossy_malformed")
+        reasons = coverage.get("reasons")
+        if (not isinstance(reasons, list)
+                or any(not isinstance(item, str)
+                       for item in reasons)):
+            return ("partial", "edge/reasons_malformed")
+        have = set(reasons)
+        if not have and lossy is False:
+            continue  # clean active edge
+        if have == NO_CALL_REASONS and lossy is False:
+            continue  # fresh edge: zero calls, zero loss
+        if have == BENIGN_COVERAGE_REASONS and lossy is True:
+            continue  # setup-only pre-boundary loss
+        outsiders = sorted(have - BENIGN_COVERAGE_REASONS
+                           - NO_CALL_REASONS)
+        if outsiders:
+            return ("partial", f"edge/{outsiders[0]}")
+        if not have:
+            return ("partial", "edge/lossy")
+        return ("partial", "edge/coverage_contradictory")
     return ("qualified", None)
 
 

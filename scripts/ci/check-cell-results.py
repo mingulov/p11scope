@@ -10,8 +10,10 @@ owned-provider-counts-with-runner-noise,
 owned-provider-counts-with-66-discovery-gap,
 owned-provider-counts-with-ambient-gap, owned-edge-usage-counts,
 prearm-exactness, verdict-consistency, semantic-names and failed are
-qualified and every qualified row must pass (partial discloses
-observed loss beside exact rows, with the typed reason in detail;
+qualified and every qualified row must pass (a passing partial row
+discloses observed loss beside exact rows and must carry the typed
+reason as `partial (<reason>): ...` with a closed-vocabulary
+reason; a failing partial row carries problem detail instead;
 owned-edge-usage-counts requires its proof fields in detail);
 nonqualifying smoke may pass or
 fail but every nonqualifying row must be allow-listed and the allow-list
@@ -55,6 +57,51 @@ OWNED_EDGE_USAGE_DETAIL = re.compile(
 def has_owned_edge_usage_proof(detail):
     match = OWNED_EDGE_USAGE_DETAIL.search(detail)
     return match is not None and int(match.group(1)) > 0 and int(match.group(2)) > 0
+
+
+# Closed reason heads for passing partial rows (the judge's typed
+# loss vocabulary). Bare heads stand alone; tailed heads require
+# a slash plus a nonempty paren/comma-free tail. Run-joining rows
+# prefix each comma-separated item with its leg.
+PARTIAL_BARE_HEADS = {"inventory_unreadable", "inventory_malformed",
+                      "section_malformed", "gaps_malformed",
+                      "budgets_malformed", "unattributed_malformed",
+                      "sessions_malformed", "root-gaps_malformed",
+                      "top-budgets_malformed", "edges_malformed"}
+PARTIAL_TAILED_HEADS = {"status", "gap", "budget", "unattributed",
+                        "session", "root-gap", "top-budget", "edge"}
+PARTIAL_LEGS = ("sizes/", "nosizes/")
+
+
+def _partial_item_ok(item):
+    for leg in PARTIAL_LEGS:
+        if item.startswith(leg):
+            item = item[len(leg):]
+            break
+    head, sep, tail = item.partition("/")
+    if head in PARTIAL_BARE_HEADS:
+        return sep == "" and not tail
+    if head not in PARTIAL_TAILED_HEADS:
+        return False
+    if sep != "/" or not tail:
+        return False
+    return "(" not in tail and ")" not in tail and "," not in tail
+
+
+def has_partial_proof(detail):
+    """Whether a passing partial row carries the closed reason
+    grammar: `partial (<reason>): <rest>` with a nonempty
+    closed-vocabulary reason and nonempty rest."""
+    if not detail.startswith("partial ("):
+        return False
+    prefix, sep, rest = detail.partition("): ")
+    if not sep or not rest:
+        return False
+    reason = prefix[len("partial ("):]
+    if not reason or "(" in reason or ")" in reason:
+        return False
+    return all(_partial_item_ok(item.strip())
+               for item in reason.split(","))
 
 
 def main(argv):
@@ -161,7 +208,13 @@ def main(argv):
                 qualification == "owned-edge-usage-counts"
                 and not has_owned_edge_usage_proof(row["detail"])
             )
-            status = "PASS" if (passed and not missing_proof) else "FAIL"
+            missing_partial_proof = (
+                qualification == "partial"
+                and passed
+                and not has_partial_proof(row["detail"])
+            )
+            status = "PASS" if (passed and not missing_proof
+                                and not missing_partial_proof) else "FAIL"
             print(f"{status} {cell} {detail}")
             if not passed:
                 problems.append(f"failed qualified cell {cell}")
@@ -169,6 +222,8 @@ def main(argv):
                 problems.append(f"inconsistent row for {cell}: pass with failed qualification")
             if missing_proof:
                 problems.append(f"missing owned-edge-usage-counts proof fields for {cell}")
+            if missing_partial_proof:
+                problems.append(f"partial row without a typed reason for {cell}")
     actual = sorted(row["cell"] for row in rows if row["qualification"] == "expected-failure")
     wanted = sorted(set(expected))
     if len(wanted) != len(expected):

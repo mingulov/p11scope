@@ -67,9 +67,12 @@ def scope_skip(ident):
     ran. tearDown* skips arrive after real outcomes and must not
     override them; unparseable ids fail closed (no marking).
     """
-    match = re.fullmatch(r"setUpClass \((?:[A-Za-z_][\w.]*\.)?([A-Za-z_]\w*)\)", ident)
+    match = re.fullmatch(r"setUpClass \(([A-Za-z_][\w.]*)\)", ident)
     if match is not None:
-        return ("class", match.group(1))
+        qualified = match.group(1)
+        if "." not in qualified:
+            return None
+        return ("class", qualified)
     match = re.fullmatch(r"setUpModule \(([A-Za-z_][\w.]*)\)", ident)
     if match is not None:
         return ("module", match.group(1))
@@ -109,6 +112,7 @@ class Recorder:
     def __init__(self):
         self.selection = []
         self.selection_modules = []
+        self.selection_classes = []
         self.events = []
         self.suite_events = []
         self.scope_skips = []
@@ -122,6 +126,11 @@ class Recorder:
             self.selection.append(test_identity(test))
             module = getattr(test.__class__, "__module__", "")
             self.selection_modules.append(module if isinstance(module, str) else "")
+            qualname = getattr(test.__class__, "__qualname__", "")
+            if isinstance(module, str) and isinstance(qualname, str) and module and qualname:
+                self.selection_classes.append(f"{module}.{qualname}")
+            else:
+                self.selection_classes.append("")
 
     def note(self, test, state, err=None):
         if self.depth != 1:
@@ -262,20 +271,21 @@ def execute_suite(suite, arguments, discover_only):
 def fragment(path, invocation, process_exit):
     outcomes = RECORDER.outcomes()
     skipped_modules = {name for scope, name in RECORDER.scope_skips if scope == "module"}
-    class_skipped = {name for scope, name in RECORDER.scope_skips if scope == "class"}
+    skipped_classes = {name for scope, name in RECORDER.scope_skips if scope == "class"}
     rows = []
     complete = True
     for index, test in enumerate(RECORDER.selection):
         event = outcomes.get(test)
         if event is None:
             module = RECORDER.selection_modules[index] if index < len(RECORDER.selection_modules) else ""
+            qualified = RECORDER.selection_classes[index] if index < len(RECORDER.selection_classes) else ""
             if module in skipped_modules:
                 event = {
                     "test": test,
                     "state": "skipped",
                     "signature": {"branch": "module_skip", "oracle": "unittest"},
                 }
-            elif any(test.startswith(name + ".") for name in class_skipped):
+            elif qualified in skipped_classes:
                 event = {
                     "test": test,
                     "state": "skipped",

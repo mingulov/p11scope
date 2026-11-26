@@ -1967,8 +1967,8 @@ pub(crate) struct NativeStop<L> {
     lane: NativeLane<L>,
     events: Vec<CallerEvent>,
     held: std::vec::IntoIter<DiscoveryBatch>,
-    /// INFO quanta the collection ticks held, staged after the held
-    /// lifecycle batches in the Held phase (D1).
+    /// INFO quanta the collection ticks held, staged on InfoDrain
+    /// entry after the terminal witnesses (D1, NB1).
     held_info: std::vec::IntoIter<InfoBatch>,
     phase: NativeStopPhase,
     pending: Option<NativeBatch>,
@@ -2098,14 +2098,10 @@ impl<L> NativeStop<L> {
                     self.after_stage = NativeAfterStage::Held;
                     self.phase = NativeStopPhase::Stage;
                 }
-                None => match self.held_info.next() {
-                    Some(info) => {
-                        self.pending = Some(NativeBatch::Info(info));
-                        self.after_stage = NativeAfterStage::Held;
-                        self.phase = NativeStopPhase::Stage;
-                    }
-                    None => self.enter(NativeStopPhase::PreDrain, now),
-                },
+                // Held INFO never stages here: the bindings its rows
+                // resolve against settle only in the terminal
+                // witnesses below (NB1). It stages on InfoDrain entry.
+                None => self.enter(NativeStopPhase::PreDrain, now),
             },
             NativeStopPhase::Stage => {
                 let batch = self
@@ -2291,6 +2287,20 @@ impl<L> NativeStop<L> {
                 ));
             }
             NativeStopPhase::InfoDrain => {
+                // NB1: the ticks' held INFO stages here, after the
+                // terminal witnesses whose bindings the join resolves
+                // against — never in the Held phase, where the
+                // bindings are unsettled. One batch per step through
+                // the Stage below, ahead of the terminal cut quanta.
+                if let Some(info) = self.held_info.next() {
+                    self.pending = Some(NativeBatch::Info(info));
+                    self.after_stage = NativeAfterStage::InfoDrain {
+                        done: false,
+                        idle: false,
+                    };
+                    self.phase = NativeStopPhase::Stage;
+                    return NativeStopProgress::Pending(self);
+                }
                 // Keymeta Task 7 (spec §17.4): the cooperative
                 // terminal INFO cut — the shared classification with
                 // the blocking stop, one quantum per step. Read

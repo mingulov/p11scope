@@ -638,16 +638,95 @@ impl ScriptedLane {
     /// Inject `n` INFO records into the scripted ring (D1 twins):
     /// arrivals past the cap drop with counted ring loss.
     fn arrive_info(&mut self, n: usize) {
+        let records = vec![[0xAB; 176]; n];
+        self.arrive_info_records(records);
+    }
+
+    /// Inject exact record bytes into the scripted ring (NB1: one
+    /// valid witness-bound record among malformed traffic), with the
+    /// same cap and loss accounting.
+    fn arrive_info_records(&mut self, records: Vec<[u8; 176]>) {
         let cap = self.info_ring_cap.expect("the INFO ring model is armed");
-        for _ in 0..n {
+        for record in records {
             self.info_produced += 1;
             if self.info_ring.len() >= cap {
                 self.info_ring_loss += 1;
             } else {
-                self.info_ring.push_back([0xAB; 176]);
+                self.info_ring.push_back(record);
             }
         }
     }
+}
+
+/// One writer-built INFO record for capture-level ingest tests (NB1):
+/// the production return adapter packs the struct bytes and the
+/// shared encoder emits the 176-byte record (spec §17.4). Mirrors
+/// the coordinator ingest helper; this module cannot reach it.
+fn info_record_bytes(
+    kind: u8,
+    struct_bytes: &[u8],
+    endpoint: u32,
+    cookie: u64,
+    exec: u64,
+    slot: u64,
+    mechanism: u64,
+) -> [u8; 176] {
+    use p11scope_ebpf_common::inventory_info::{
+        INFO_LAYOUT_LP64, INFO_RECORD_LEN, INFO_STATUS_OK, InfoHeader, encode_info_record,
+    };
+    use p11scope_ebpf_common::object_flow::{InfoReturnVerdict, InfoStart, adapter_info_return};
+    use p11scope_ebpf_common::{FnByteReader, LinuxLayout};
+    let base = 0x4000u64;
+    let stash = InfoStart {
+        info_ptr: base,
+        slot,
+        mechanism,
+        kind,
+        layout: INFO_LAYOUT_LP64,
+        reserved: [0; 6],
+    };
+    let mut reader = FnByteReader(|address: u64, _: LinuxLayout, out: &mut [u8]| {
+        let start = usize::try_from(address.wrapping_sub(base)).map_err(|_| ())?;
+        out.copy_from_slice(struct_bytes.get(start..start + out.len()).ok_or(())?);
+        Ok(())
+    });
+    let mut payload = [0u8; 120];
+    assert!(matches!(
+        adapter_info_return(&stash, 0, LinuxLayout::Lp64, &mut payload, &mut reader),
+        InfoReturnVerdict::Emit(_)
+    ));
+    let header = InfoHeader {
+        endpoint,
+        kind,
+        layout: INFO_LAYOUT_LP64,
+        reserved0: 0,
+        host_tgid: 7,
+        reserved1: 0,
+        task_cookie: cookie,
+        exec_id: exec,
+        slot,
+        mechanism,
+    };
+    let mut out = [0u8; INFO_RECORD_LEN];
+    assert!(encode_info_record(
+        &mut out,
+        &header,
+        INFO_STATUS_OK,
+        &payload
+    ));
+    out
+}
+
+fn scripted_token_struct() -> Vec<u8> {
+    let mut bytes = vec![0u8; 208];
+    bytes[32..64].copy_from_slice(&[b'M'; 32]);
+    bytes[64..80].copy_from_slice(&[b'X'; 16]);
+    bytes[96..104].copy_from_slice(&0x06u64.to_le_bytes());
+    bytes[136..144].copy_from_slice(&255u64.to_le_bytes());
+    bytes[144..152].copy_from_slice(&4u64.to_le_bytes());
+    bytes[184..186].copy_from_slice(&[2, 6]);
+    bytes[186..188].copy_from_slice(&[2, 7]);
+    bytes
 }
 
 impl NativeIdentity<Pin> for ScriptedLane {
@@ -5852,18 +5931,58 @@ fn d1_info_overflow_past_the_held_cap_is_counted_exactly() {
     );
 }
 
-/// D1: INFO the ticks held stages in the stop's Held phase, ahead of
-/// the terminal cut.
+/// D1: INFO the ticks held stages after the terminal witnesses,
+/// ahead of the terminal cut. One held row is witness-bound: its
+/// caller settles only in the terminal witness, so it binds when
+/// staged after it (NB1) and refuses with `info_caller_unavailable`
+/// when staged before.
 #[test]
 fn d1_stop_stages_held_info_before_the_terminal_cut() {
+    use p11scope_ebpf_common::inventory_info::INFO_KIND_TOKEN;
     let log = Log::default();
     let mut scene = Scene::new(&log);
     let mut lane = ScriptedLane::new(&log);
     lane.info_ring_cap = Some(400);
+    // The first pass reads no rows; the stop's terminal witness
+    // settles the caller's binding, and the held INFO row below
+    // names it.
+    lane.reads.push_back(Vec::new());
+    lane.reads.push_back(vec![RowSpec {
+        endpoint: 0,
+        tgid: PID,
+        ticket: TICKET,
+    }]);
     let mut started = NativeLane::start(lane, &mut scene, windows(), None)
         .map_err(|(_, reason)| reason)
         .unwrap();
-    started.capture.arrive_info(30);
+    // Pass 1, manually: discover + admit + attach the fixture (like
+    // run()'s first pass), without consuming the stop's witness row,
+    // so the binding still settles only in the terminal witness.
+    let job = scene.collector();
+    let catalog = match job {
+        CollectJob::Legacy(run) => run().expect("fixture catalog collects"),
+        _ => unreachable!("the scene collects legacy"),
+    };
+    let collected = CollectedPass::Legacy(Ok(Box::new(catalog)));
+    scene
+        .apply(collected, started.identity(), now_ns())
+        .expect("pass applies");
+    started.extend_targets(&mut scene);
+    scene.commit(false).expect("pass commits");
+    started.after_pass(&mut scene);
+    let endpoint = started.capture.attached[0].id.0;
+    let bound = info_record_bytes(
+        INFO_KIND_TOKEN,
+        &scripted_token_struct(),
+        endpoint,
+        TICKET,
+        1,
+        3,
+        0,
+    );
+    let mut arrivals = vec![bound];
+    arrivals.extend(std::iter::repeat([0xAB; 176]).take(29));
+    started.capture.arrive_info_records(arrivals);
     started.collecting_tick(true);
     started.collecting_tick(true);
     let stop = started
@@ -5892,15 +6011,28 @@ fn d1_stop_stages_held_info_before_the_terminal_cut() {
     };
     assert_eq!(
         scene.staged_info_records,
-        [30, 0],
-        "the held batch, then the terminal cut: {:?}",
+        [0, 30, 0],
+        "the pass quantum, the held batch, then the terminal cut: {:?}",
         scene.staged_info_records
     );
     assert_eq!(
         scene.staged_info_terminal,
-        [false, true],
+        [false, false, true],
         "only the terminal cut marks terminal: {:?}",
         scene.staged_info_terminal
+    );
+    let (_, observations) = scene.coordinator.provider_info_snapshot();
+    assert_eq!(
+        observations.tokens.len(),
+        1,
+        "the witness-bound row binds: {:?}",
+        observations.tokens
+    );
+    assert_eq!(observations.tokens[0].slot, 3);
+    assert_eq!(
+        observations.gaps.caller_unavailable, 0,
+        "no caller-unavailable refusal: {:?}",
+        observations.gaps
     );
 }
 

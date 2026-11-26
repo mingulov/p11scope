@@ -3851,10 +3851,21 @@ impl LiveJointMachine {
                                 .label()
                         ),
                     );
+                    // Stream voids return no seal failure, so no
+                    // delivery queues their reseed: queue the live
+                    // Joint feeds the void ends here, so the Births
+                    // phase re-arms them for one more birth. Same call
+                    // as the synchronous Idle completion above; a void
+                    // completes in exactly one of the two places.
+                    coordinator.queue_reseed_for_joint_feeds();
                     self.skip_absence_once = true;
                     return (Phase::Idle, Ok(Step::Continue));
                 }
                 coordinator.start_staged_disposal();
+                // Same reseed queue as the scoped path, before staged
+                // disposal drains: the void ended feeds here, and the
+                // disposal never re-arms them.
+                coordinator.queue_reseed_for_joint_feeds();
                 (Phase::VoidingStaged, Ok(Step::Continue))
             }
             Phase::VoidingStaged => {

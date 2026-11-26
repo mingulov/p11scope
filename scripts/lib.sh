@@ -598,3 +598,32 @@ discover_copied_provider() {
 rewrite_container_manifest() {
     timeout --signal=TERM --kill-after=5s 60s python3 -I scripts/lane-lib-oracle-6.py "$@"
 }
+
+# Scheduling diagnostics for a failed readiness wait: the namespace's
+# wide pod listing plus its events, on stderr (the harness log keeps
+# them; the workflow uploads a bounded tail). Uses the caller's `kc`
+# (same cluster, same objects, whatever identity ran the wait). Never
+# fails: a failed dump must not mask the wait failure it explains.
+dump_pod_scheduling() {
+    echo "--- kubectl -n $1 get pods -o wide ---" >&2
+    if ! kc -n "$1" get pods -o wide >&2; then
+        echo "kubectl get pods -o wide failed" >&2
+    fi
+    echo "--- kubectl -n $1 get events --sort-by=.metadata.creationTimestamp ---" >&2
+    if ! kc -n "$1" get events --sort-by=.metadata.creationTimestamp >&2; then
+        echo "kubectl get events failed" >&2
+    fi
+    return 0
+}
+
+# A workload wait failure must carry the scheduler's own evidence into the
+# harness log; the runtime workflow uploads a bounded tail of that log.
+# Shared by both kind harnesses (identical `kc` and `WL_NS` there).
+wait_for_workload_pods() {
+    if kc -n "$WL_NS" wait --for=condition=Ready pod --all --timeout=240s; then
+        return 0
+    fi
+    echo "workload pods did not become Ready; scheduling diagnostics follow" >&2
+    dump_pod_scheduling "$WL_NS"
+    return 1
+}

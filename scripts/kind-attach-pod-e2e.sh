@@ -34,6 +34,10 @@
 set -eu
 cd "$(dirname "$0")/.."
 
+# Shared helpers first: the self-test below exercises the wait/dump
+# functions, so they must exist before it runs.
+. scripts/lib.sh
+
 ORACLE=scripts/kind-e2e-oracle.py
 HOLDER_DOCKERFILE=deploy/Dockerfile.holder
 # Pinned base reused from deploy/Dockerfile.holder (both FROM lines); the
@@ -394,6 +398,25 @@ k2_provision_self_test() {
         fi
     done
     STUB_FAIL=
+    # A failed in-node wait dumps the namespace's pods and events
+    # through the host kubectl before refusing.
+    : > "$pst_stub/calls.txt"
+    if WORK=$pst_stub/work FACTS=$pst_stub/work/facts.log NODE=node-stub \
+            OBSERVER=$pst_stub/observer STUB_NODE_KUBECTL=1 \
+            STUB_FAIL="wait --for=condition=Ready" \
+            STUB_CALLS=$pst_stub/calls.txt PATH="$pst_stub:$PATH" provision_node \
+            >"$pst_stub/provision-fail.out" 2>&1; then
+        echo "failed in-node wait accepted" >&2
+        exit 1
+    fi
+    STUB_FAIL=
+    grep -q "workloads never became Ready inside the node" "$pst_stub/provision-fail.out" \
+        || { echo "in-node wait failure went unnamed" >&2; exit 1; }
+    grep -q "kubectl -n p11scope-e2e get pods -o wide" "$pst_stub/calls.txt" \
+        || { echo "in-node wait lost the wide pod listing" >&2; exit 1; }
+    grep -q "kubectl -n p11scope-e2e get events --sort-by=.metadata.creationTimestamp" \
+        "$pst_stub/calls.txt" \
+        || { echo "in-node wait lost the namespace events" >&2; exit 1; }
 }
 
 # Capture waiters, pod identity and the LEDGER rule, all without a cluster.
@@ -885,7 +908,7 @@ provision_node() {
         || { echo "node kubeconfig setup failed" >&2; return 1; }
     docker exec -u "$K2_USER" "$NODE" kubectl --kubeconfig "$K2_KUBECONFIG" \
         -n "$WL_NS" wait --for=condition=Ready pod --all --timeout=240s \
-        || { echo "workloads never became Ready inside the node" >&2; return 1; }
+        || { dump_pod_scheduling "$WL_NS"; echo "workloads never became Ready inside the node" >&2; return 1; }
     # attach-pod.sh resolves kubectl through the caller's environment: prove
     # that path, not just the explicit --kubeconfig one.
     docker exec -u "$K2_USER" -e "KUBECONFIG=$K2_KUBECONFIG" "$NODE" kubectl -n "$WL_NS" get pod ledger-a >/dev/null \
@@ -1234,7 +1257,6 @@ done
 valid_token "$TOKEN" || usage
 valid_count "$DURATION" || usage
 
-. scripts/lib.sh
 require_non_root_caller
 [ "$(uname -m)" = x86_64 ] || { echo "the observer binary is x86-64 only" >&2; exit 1; }
 for command in docker kind kubectl python3 timeout; do
@@ -1293,8 +1315,7 @@ sed "s#image: p11scope-holder:1\$#image: $HOLD_IMAGE#" "$WORKLOADS" > "$WORK/wor
 [ "$(grep -c "image: $HOLD_IMAGE" "$WORK/workloads.yaml")" -eq 6 ] \
     || unrun "workloads render lost an image anchor"
 kc apply -f "$WORK/workloads.yaml" || unrun "workloads apply failed"
-kc -n "$WL_NS" wait --for=condition=Ready pod --all --timeout=240s \
-    || unrun "workloads never became Ready"
+wait_for_workload_pods || unrun "workloads never became Ready"
 wait_log ledger-a '^READY ' 120 || unrun "ledger-a never became ready"
 
 say "=== provision the node for attach-pod.sh ==="

@@ -802,11 +802,11 @@ can read, inherits your environment (including any tokens) and
 supplementary groups, and may signal your processes or lower their
 priority; terminal stdio ioctls other than
 `TIOCSTI`/`TIOCLINUX` still pass, as does `AF_UNIX` datagram `sendto`
-without `connect`. Cross-process memory stays readable through
-`/proc/<pid>/mem` for same-uid dumpable processes; only the direct
-`ptrace`, `process_vm` and `pidfd_getfd` calls are denied, and
-cross-process `/proc/<pid>/fd`, `/proc/<pid>/environ` and
-`/proc/<pid>/maps` opens are refused by the Landlock rules.
+without `connect`. Cross-process `/proc/<pid>/mem`, `/proc/<pid>/environ`,
+`/proc/<pid>/maps` and `/proc/<pid>/fd` are all refused by Landlock
+ptrace scoping (a fenced process reaches only processes in its own
+domain), and the direct `ptrace`, `process_vm` and `pidfd_getfd` calls
+are denied by seccomp on top.
 World-readable entries such as `/proc/<pid>/cmdline` stay visible. Ioctls of
 filesystems outside the listed types still pass until a later allowlist
 lands.

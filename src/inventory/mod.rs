@@ -1594,9 +1594,9 @@ impl PassReclaim {
         *self.custody_mut() = pending;
     }
 
-    /// Typed reclaim counts (the twins assert the busy path
-    /// through these; production keeps counting without reading).
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Typed reclaim counts: the terminal stall disclosure reads
+    /// them in production, and the twins assert the busy path through
+    /// them.
     pub(crate) fn counts(&self) -> ReclaimCounts {
         self.counts
     }
@@ -2518,6 +2518,11 @@ fn run_with_terminal_budget(
         } else if terminal_newcomers || unseated_seal {
             let _ = driver.commit(false);
         }
+    }
+    // A stalled pass-heap reclaim discloses on every lane before the
+    // final view commits it (N2).
+    if driver.coordinator.disclose_reclaim_stall() {
+        let _ = driver.commit(false);
     }
     let presentation =
         final_view_guarded(&driver, &stream_state, &scope_label, started_ns, now_ns());
@@ -10580,6 +10585,11 @@ fn run_dashboard(
         } else if terminal_newcomers || unseated_seal {
             let _ = driver.commit(false);
         }
+    }
+    // A stalled pass-heap reclaim discloses on every lane before the
+    // final view commits it (N2).
+    if driver.coordinator.disclose_reclaim_stall() {
+        let _ = driver.commit(false);
     }
     let presentation =
         final_view_guarded(&driver, &stream_state, &scope_label, started_ns, now_ns());

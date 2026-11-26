@@ -4323,6 +4323,50 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         });
     }
 
+    /// Typed pass-heap reclaim counts (N2): the terminal stall
+    /// disclosure reads the worker-busy and held counts here instead
+    /// of parsing gap text.
+    pub(crate) fn reclaim_counts(&self) -> crate::inventory::ReclaimCounts {
+        self.pass_reclaim.counts()
+    }
+
+    /// Stage the pass-heap reclaim stall gap at the terminal commit
+    /// when the reclaim worker was busy or still holds transients (a
+    /// close blocked, e.g. on a stopped FUSE daemon). True when a gap
+    /// was staged.
+    pub(crate) fn disclose_reclaim_stall(&mut self) -> bool {
+        let counts = self.reclaim_counts();
+        if counts.worker_busy == 0 && counts.held == 0 {
+            return false;
+        }
+        self.note_scope_gap(
+            "pass-heap reclaim stalled".into(),
+            Self::reclaim_stall_reason(counts),
+        );
+        true
+    }
+
+    /// The stall-gap reason over the typed counts, with singular
+    /// forms for the common single-handoff stall.
+    fn reclaim_stall_reason(counts: crate::inventory::ReclaimCounts) -> String {
+        format!(
+            "{} {} found the reclaim worker busy; {} {} held (a file close is blocked, e.g. \
+             on a stopped FUSE daemon)",
+            counts.worker_busy,
+            if counts.worker_busy == 1 {
+                "handoff"
+            } else {
+                "handoffs"
+            },
+            counts.held,
+            if counts.held == 1 {
+                "transient"
+            } else {
+                "transients"
+            },
+        )
+    }
+
     /// Latch the lane's journal linkage from its drain producers at
     /// machine init: the label reads `bootstrap_unavailable` instead
     /// of `journal_unavailable` on linked lanes before the first
@@ -19564,6 +19608,131 @@ pub(crate) mod tests {
             lowered.pass_reclaim.counts(),
             crate::inventory::ReclaimCounts { handed: 1, ..empty },
             "an unretained lowering reaches the worker"
+        );
+    }
+
+    /// N2: a stalled pass-heap reclaim (the worker stuck behind a
+    /// blocked close) discloses one named scope gap with the typed
+    /// counts at the terminal commit; a healthy reclaim discloses
+    /// nothing.
+    #[test]
+    fn reclaim_stall_discloses_typed_counts_at_terminal_commit() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::mpsc;
+        use std::time::Duration;
+        const WATCHDOG: Duration = Duration::from_secs(10);
+        // Healthy twin: no stall, no gap.
+        let mut healthy = coordinator();
+        assert!(!healthy.disclose_reclaim_stall());
+        healthy.registry_mut().publish();
+        assert!(
+            healthy
+                .registry()
+                .gaps()
+                .iter()
+                .all(|gap| gap.subject != "pass-heap reclaim stalled"),
+            "a healthy reclaim discloses nothing"
+        );
+        // A drop that blocks until released, like a close on a
+        // stopped FUSE daemon. It counts when done.
+        struct Blocking {
+            entered: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
+            dropped: Arc<AtomicUsize>,
+        }
+        impl Drop for Blocking {
+            fn drop(&mut self) {
+                let _ = self.entered.send(());
+                let _ = self.release.recv_timeout(WATCHDOG);
+                self.dropped.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered) = mpsc::channel();
+        let (release_tx, release) = mpsc::channel();
+        let mut coordinator = coordinator();
+        coordinator.pass_reclaim.hand_off(Blocking {
+            entered: entered_tx,
+            release,
+            dropped: Arc::clone(&dropped),
+        });
+        entered
+            .recv_timeout(WATCHDOG)
+            .expect("the worker took the stuck value");
+        // Fill the worker's queue, then hand one more value to the
+        // busy worker (bounded: the queue depth stays an
+        // implementation detail).
+        let mut hands = 0u64;
+        for _ in 0..16 {
+            coordinator.pass_reclaim.hand_off(0u8);
+            hands += 1;
+            if coordinator.reclaim_counts().worker_busy > 0 {
+                break;
+            }
+        }
+        assert_eq!(
+            coordinator.reclaim_counts(),
+            crate::inventory::ReclaimCounts {
+                worker_busy: 1,
+                held: 1,
+                handed: hands,
+                inline: 0,
+            },
+            "the typed counts name the stall"
+        );
+        assert!(coordinator.disclose_reclaim_stall());
+        coordinator.registry_mut().publish();
+        let gaps: Vec<(String, String)> = coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == "pass-heap reclaim stalled")
+            .map(|gap| (gap.subject.clone(), gap.reason.clone()))
+            .collect();
+        assert_eq!(
+            gaps,
+            vec![(
+                "pass-heap reclaim stalled".to_string(),
+                "1 handoff found the reclaim worker busy; 1 transient held (a file close is \
+                 blocked, e.g. on a stopped FUSE daemon)"
+                    .to_string(),
+            )],
+            "the stall gap carries the typed counts"
+        );
+        release_tx.send(()).expect("the stuck drop still waits");
+        let end = std::time::Instant::now() + WATCHDOG;
+        while dropped.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            1,
+            "the worker reclaims on release"
+        );
+    }
+
+    /// N2: the stall reason pluralizes both counts.
+    #[test]
+    fn reclaim_stall_reason_pluralizes_counts() {
+        use crate::inventory::ReclaimCounts;
+        let reason = |worker_busy: u64, held: usize| {
+            InventoryCoordinator::<OsProcessSource>::reclaim_stall_reason(ReclaimCounts {
+                worker_busy,
+                held,
+                handed: 0,
+                inline: 0,
+            })
+        };
+        assert_eq!(
+            reason(1, 1),
+            "1 handoff found the reclaim worker busy; 1 transient held (a file close is \
+             blocked, e.g. on a stopped FUSE daemon)"
+        );
+        assert_eq!(
+            reason(3, 2),
+            "3 handoffs found the reclaim worker busy; 2 transients held (a file close is \
+             blocked, e.g. on a stopped FUSE daemon)"
         );
     }
 

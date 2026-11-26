@@ -14,7 +14,7 @@ PROV=$(probe_provider) || exit 2
 export SOFTHSM2_CONF=$TMPDIR/f2/work/softhsm2.conf
 export STEADY_GO=$OUT/$TAG.cggo
 ME=$(id -un)
-CG=/sys/fs/cgroup/p11compat071
+CG=${CG:-/sys/fs/cgroup/p11compat071}
 LOCK="flock /var/tmp/p11scope-ws-tmp/privileged.lock"
 
 $LOCK sudo -n sh -c "mkdir -p $CG"

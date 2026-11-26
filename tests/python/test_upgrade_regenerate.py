@@ -26,6 +26,7 @@ UPGRADE = ROOT / "tests" / "fixtures" / "upgrade"
 README = UPGRADE / "README.md"
 SANITIZE = UPGRADE / "tools" / "sanitize.py"
 TOOLS = UPGRADE / "tools"
+_UNSET = object()
 
 
 def load_sanitize():
@@ -242,6 +243,7 @@ while [ $# -gt 0 ]; do
     --preserve-env=*) shift ;;
     --preserve-env) shift; shift ;;
     chown) exit 0 ;;
+    rmdir) exit 0 ;;
     *) break ;;
   esac
 done
@@ -291,7 +293,18 @@ sleep 60
 """
 
 FAKE_SIGNER = """#!/bin/sh
-exit ${CHURN_SIGNER_RC:-0}
+# Fails only arrival index $CHURN_SIGNER_FAIL_AT (unset: pass).
+# Arrival order matches spawn order (2s stagger, ms runtimes);
+# the mkdir lock makes the counter atomic.
+state=${CHURN_SIGNER_STATE:-}
+[ -n "$state" ] || exit 2
+lockdir=$state.lock
+while ! mkdir "$lockdir" 2>/dev/null; do sleep 0.01; done
+n=0; [ -f "$state" ] && n=$(cat "$state")
+echo $((n + 1)) > "$state"
+rmdir "$lockdir"
+[ -n "${CHURN_SIGNER_FAIL_AT:-}" ] && [ "$n" = "$CHURN_SIGNER_FAIL_AT" ] && exit 1
+exit 0
 """
 
 FAKE_CATALOG = """#!/bin/sh
@@ -331,7 +344,7 @@ class DriverTests(unittest.TestCase):
         return work, out, env
 
     def run_keyops(self, script, helper_rc, observer=STUB_OBSERVER,
-                     budget=None, helper_sleep=None):
+                     budget=None, helper_sleep=None, fake_cgroup=False):
         tmp = Path(tempfile.mkdtemp(prefix="upgrade-driver-"))
         try:
             work, out, env = self.stage(tmp, observer)
@@ -340,6 +353,8 @@ class DriverTests(unittest.TestCase):
                 env["READY_BUDGET"] = str(budget)
             if helper_sleep is not None:
                 env["FAKE_HELPER_SLEEP"] = str(helper_sleep)
+            if fake_cgroup:
+                env["CG"] = str(work / "cg")
             args = ["sh", str(TOOLS / script), f"{tmp}/bin/observer",
                       "v071"]
             if script == "capture-ops.sh":
@@ -402,11 +417,28 @@ class DriverTests(unittest.TestCase):
         self.assertIn("semantic lane never ready", proc.stderr)
         self.assertNotIn("v071.sysgo", files)
 
+    def test_cgkeyops_gate_untouched_without_readiness(self):
+        """No readiness, no gate touch, exit 1 (fake cgroup fs)."""
+        proc, files = self.run_keyops(
+            "capture-cgkeyops.sh", 0, observer=STUB_OBSERVER_SILENT,
+            budget=2, fake_cgroup=True)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("semantic lane never ready", proc.stderr)
+        self.assertNotIn("v071.cggo", files)
+
+    def test_cgkeyops_success_path_writes_output(self):
+        """The passing leg proves the failure leg is non-vacuous."""
+        proc, files = self.run_keyops(
+            "capture-cgkeyops.sh", 0, fake_cgroup=True)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("v071-inventory-cgkeyops.json", files)
+        self.assertIn("v071.cggo", files)
+
 
 class ChurnTests(unittest.TestCase):
     """The churn workload propagates signer failures."""
 
-    def run_workload(self, signer_rc):
+    def run_workload(self, fail_at=_UNSET):
         tmp = Path(tempfile.mkdtemp(prefix="upgrade-churn-"))
         try:
             out = tmp / "out"
@@ -420,7 +452,10 @@ class ChurnTests(unittest.TestCase):
             (helpers / "catalog-driver").chmod(0o755)
             (helpers / "shortlived-sign").chmod(0o755)
             (out / "v071.go").write_text("go\n", encoding="utf-8")
-            env = dict(os.environ, CHURN_SIGNER_RC=str(signer_rc))
+            env = dict(os.environ,
+                       CHURN_SIGNER_STATE=str(tmp / "signer-count"))
+            if fail_at is not _UNSET:
+                env["CHURN_SIGNER_FAIL_AT"] = str(fail_at)
             proc = subprocess.run(
                 [str(TOOLS / "churn-workload.sh"),
                  str(out), "v071", str(helpers), "/nonexistent-prov.so"],
@@ -429,17 +464,78 @@ class ChurnTests(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
-    def test_failing_signer_fails_workload(self):
-        """Any nonzero signer status fails the workload."""
-        proc = self.run_workload(1)
+    def test_first_failing_signer_fails_workload(self):
+        """A single early failure propagates (kills last-only
+        aggregation)."""
+        proc = self.run_workload(fail_at=0)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("signer failed", proc.stdout + proc.stderr)
+
+    def test_middle_failing_signer_fails_workload(self):
+        """A single middle failure propagates (kills truncation)."""
+        proc = self.run_workload(fail_at=4)
         self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("signer failed", proc.stdout + proc.stderr)
 
     def test_passing_signers_complete(self):
-        """The passing leg proves the failure leg is non-vacuous."""
-        proc = self.run_workload(0)
+        """The passing leg proves the failure legs are non-vacuous."""
+        proc = self.run_workload()
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("workload-done", proc.stdout)
+
+    def run_churn_driver(self, fail_at=_UNSET):
+        tmp = Path(tempfile.mkdtemp(prefix="upgrade-churn-driver-"))
+        try:
+            work = tmp / "work"
+            helpers = work / "f2" / "bin"
+            helpers.mkdir(parents=True)
+            bin = tmp / "bin"
+            bin.mkdir()
+            (bin / "sudo").write_text(STUB_SUDO, encoding="utf-8")
+            (bin / "flock").write_text(STUB_FLOCK, encoding="utf-8")
+            (bin / "observer").write_text(STUB_OBSERVER, encoding="utf-8")
+            for name in ("sudo", "flock", "observer"):
+                (bin / name).chmod(0o755)
+            (helpers / "catalog-driver").write_text(
+                FAKE_ANCHOR, encoding="utf-8")
+            (helpers / "shortlived-sign").write_text(
+                FAKE_SIGNER, encoding="utf-8")
+            (helpers / "catalog-driver").chmod(0o755)
+            (helpers / "shortlived-sign").chmod(0o755)
+            out = work / "out"
+            out.mkdir()
+            prov = tmp / "prov.so"
+            prov.write_text("stub", encoding="utf-8")
+            env = dict(os.environ, TMPDIR=str(work), PROV=str(prov),
+                       CG=str(work / "cg"),
+                       CHURN_SIGNER_STATE=str(tmp / "signer-count"),
+                       PATH=f"{bin}{os.pathsep}{os.environ['PATH']}")
+            if fail_at is not _UNSET:
+                env["CHURN_SIGNER_FAIL_AT"] = str(fail_at)
+            proc = subprocess.run(
+                ["sh", str(TOOLS / "capture-churn.sh"),
+                 f"{tmp}/bin/observer", "v071", str(out)],
+                capture_output=True, text=True, timeout=300, env=env)
+            workload_log = out / "v071.workload.log"
+            log = workload_log.read_text(encoding="utf-8") \
+                if workload_log.is_file() else ""
+            files = sorted(p.name for p in out.iterdir())
+            return proc, files, log
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_driver_propagates_signer_failure(self):
+        """The driver awaits the template without discarding status."""
+        proc, _, log = self.run_churn_driver(fail_at=0)
+        self.assertEqual(proc.returncode, 3, proc.stdout + proc.stderr)
+        self.assertIn("signer failed", log)
+
+    def test_driver_success_path_writes_output(self):
+        """The passing leg proves the failure leg is non-vacuous."""
+        proc, files, log = self.run_churn_driver()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("v071-inventory-churn.json", files)
+        self.assertIn("workload-done", log)
 
     def test_capture_script_invokes_workload_template(self):
         """The driver runs this template, not an embedded copy."""
@@ -449,17 +545,6 @@ class ChurnTests(unittest.TestCase):
         self.assertTrue(
             os.access(TOOLS / "churn-workload.sh", os.X_OK),
             "the template is directly executable")
-
-    def test_cgkeyops_gates_on_readiness(self):
-        """The cgroup key-ops driver touches its gate only on
-        observed readiness (static: the script needs real cgroups
-        to execute)."""
-        text = (TOOLS / "capture-cgkeyops.sh").read_text(encoding="utf-8")
-        self.assertIn("READY_SEEN=0", text)
-        self.assertIn("gate left untouched", text)
-        self.assertNotIn('|| echo "WARNING: semantic lane never ready"',
-                         text)
-
 
 class AnchorTests(unittest.TestCase):
     """Single/manprof drivers propagate abnormal anchor death."""
@@ -526,6 +611,13 @@ class AnchorTests(unittest.TestCase):
             "capture-manprof.sh", 0, ("/tmp/x.json", "v071"))
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("v071-manprof.json", files)
+
+    def test_manprof_accepts_intentional_kill(self):
+        """A resident anchor killed by design (143) still passes."""
+        proc, _ = self.run_simple(
+            "capture-manprof.sh", 0, ("/tmp/x.json", "v071"),
+            anchor_sleep=30)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
 
 class ProbeTests(unittest.TestCase):

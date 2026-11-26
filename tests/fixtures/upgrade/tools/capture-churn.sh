@@ -14,7 +14,7 @@ case $0 in */*) TOOLS_DIR=${0%/*};; *) TOOLS_DIR=.;; esac
 PROV=$(probe_provider) || exit 2
 export SOFTHSM2_CONF=$TMPDIR/f2/work/softhsm2.conf
 ME=$(id -un)
-CG=/sys/fs/cgroup/p11compat071
+CG=${CG:-/sys/fs/cgroup/p11compat071}
 LOCK="flock /var/tmp/p11scope-ws-tmp/privileged.lock"
 
 $LOCK sudo -n sh -c "mkdir -p $CG"

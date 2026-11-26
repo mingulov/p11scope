@@ -652,7 +652,7 @@ fn read_view_mountinfo_resumable(
             // Count the parked work: the gap names the bytes read so far,
             // and the remainder after them is the next pass's.
             let parked_bytes = progress.bytes_read();
-            park_mount_table(&mut *slot, parking, table, progress)
+            park_mount_table(&mut slot, parking, table, progress)
                 .map_err(|error| reason(&error))?;
             Err(reason(&format!(
                 "{} ({parked_bytes} bytes read so far)",
@@ -665,7 +665,7 @@ fn read_view_mountinfo_resumable(
             // so the next pass resumes instead of restarting from byte
             // zero. The stop's own reason stays the gap text, so callers
             // keep classifying it as the budget wait it is.
-            park_mount_table(&mut *slot, parking, table, progress)
+            park_mount_table(&mut slot, parking, table, progress)
                 .map_err(|error| reason(&error))?;
             Err(reason(&stop))
         }

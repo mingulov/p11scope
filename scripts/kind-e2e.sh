@@ -77,6 +77,10 @@
 set -eu
 cd "$(dirname "$0")/.."
 
+# Shared helpers first: the self-test below exercises the wait/dump
+# functions, so they must exist before it runs.
+. scripts/lib.sh
+
 ORACLE=scripts/kind-e2e-oracle.py
 PIDNS_OBSERVER=nested
 OBS_NS=p11scope
@@ -230,22 +234,83 @@ ledgers2_is() {
     rm -f "$ledger_tmp"
 }
 
-# A workload wait failure must carry the scheduler's own evidence into the
-# harness log; the runtime workflow uploads a bounded tail of that log.
-wait_for_workload_pods() {
-    if kc -n "$WL_NS" wait --for=condition=Ready pod --all --timeout=240s; then
+# An observer rollout failure carries the same scheduling evidence as a
+# workload wait failure (wait_for_workload_pods in scripts/lib.sh), for
+# the observer namespace instead.
+wait_for_observer_rollout() {
+    if kc -n "$OBS_NS" rollout status daemonset/p11scope-observer --timeout=240s; then
         return 0
     fi
-    echo "workload pods did not become Ready; scheduling diagnostics follow" >&2
-    echo "--- kubectl get pods -o wide ---" >&2
-    if ! kc -n "$WL_NS" get pods -o wide >&2; then
-        echo "kubectl get pods -o wide failed" >&2
-    fi
-    echo "--- kubectl get events --sort-by=.metadata.creationTimestamp ---" >&2
-    if ! kc -n "$WL_NS" get events --sort-by=.metadata.creationTimestamp >&2; then
-        echo "kubectl get events failed" >&2
-    fi
+    echo "observer rollout did not complete; scheduling diagnostics follow" >&2
+    dump_pod_scheduling "$OBS_NS"
     return 1
+}
+
+# Capture helpers (above self_test: the self-test exercises them).
+# start_capture NAME [k8s-profile-entry args...]: background `kubectl
+# exec`; the capture's stdout/stderr land in WORK/NAME.{out,err}.
+# CAPTURE_PID is the new capture's local `kubectl exec`, which lives exactly as
+# long as the capture in the pod; CAPTURE_PIDS keeps every live one for cleanup.
+start_capture() {
+    sc_name=$1
+    shift
+    kc -n "$OBS_NS" exec "$OBS" -- "$@" > "$WORK/$sc_name.out" 2> "$WORK/$sc_name.err" &
+    CAPTURE_PID=$!
+    CAPTURE_PIDS="$CAPTURE_PIDS $CAPTURE_PID"
+}
+# dump_capture_discovery NAME POD_UID: on a capture refusal, dump the
+# observer's per-pid discovery view for the same pod — member pids plus
+# one truncated `inspect --pid` each — into the bounded artifact. The
+# *.err name lands in the workflow's bounded diagnostics (cell/*.err);
+# a copy also goes to stderr (the harness log). Best-effort, never
+# fails: the refusal itself is the verdict; this names what the
+# observer saw at refusal time.
+dump_capture_discovery() {
+    dd_file=$WORK/$1-discovery.err
+    : > "$dd_file" 2>/dev/null \
+        || { echo "cannot write $dd_file" >&2; return 0; }
+    {
+        echo "=== discovery view for pod uid $2 (after $1 refusal) ==="
+        kc -n "$OBS_NS" exec "$OBS" -- sh -c '
+            pod_cg=$(k8s-profile-entry --print-pod-cgroup --pod-uid "$1") \
+                || { echo "pod cgroup unresolvable"; exit 0; }
+            echo "pod cgroup: $pod_cg"
+            pids=$(find "$pod_cg" -name cgroup.procs -exec cat {} + 2>/dev/null | grep -v "^0$")
+            n=0
+            for pid in $pids; do
+                case $pid in ""|*[!0-9]*) continue ;; esac
+                n=$((n + 1))
+                if [ "$n" -gt 8 ]; then echo "(more member pids truncated)"; break; fi
+                echo "=== inspect --pid $pid ==="
+                p11scope inspect --pid "$pid" 2>&1 | grep -m 30 "^"
+            done
+            [ "$n" -eq 0 ] && echo "no member pids"
+            exit 0
+        ' sh "$2" 2>&1 || echo "discovery dump exec failed"
+    } >>"$dd_file" 2>&1 || true
+    cat "$dd_file" >&2 || true
+    return 0
+}
+# wait_ready NAME PID POD_UID
+wait_ready() {
+    wr_i=0
+    while [ "$wr_i" -lt 360 ]; do
+        grep -q 'p11scope: capturing:' "$WORK/$1.err" && return 0
+        kill -0 "$2" 2>/dev/null || break
+        sleep 0.5
+        wr_i=$((wr_i + 1))
+    done
+    echo "capture $1 never became ready" >&2
+    cat "$WORK/$1.err" >&2
+    dump_capture_discovery "$1" "$3"
+    return 1
+}
+# finish_capture NAME EXT PID POD_UID
+finish_capture() {
+    fc_status=0
+    wait "$3" || fc_status=$?
+    [ "$fc_status" -eq 0 ] || { echo "capture $1 exited $fc_status" >&2; cat "$WORK/$1.err" >&2; dump_capture_discovery "$1" "$4"; return 1; }
+    kc -n "$OBS_NS" cp "$OBS:/tmp/$1.$2" "$WORK/$1.$2" >/dev/null
 }
 
 self_test() {
@@ -392,6 +457,10 @@ self_test() {
     done
     rm -rf "$ledger_stub"
     wait_stub=$(mktemp -d "${TMPDIR:-/tmp}/p11scope-kind-wait-XXXXXX")
+    # shellcheck disable=SC2064
+    trap "rm -rf '$wait_stub'" EXIT
+    # The strict stub pins the exact wait command: any other kubectl
+    # call (a changed timeout, a dump on the success path) exits 9.
     kc() {
         case "$*" in
             "-n $WL_NS wait --for=condition=Ready pod --all --timeout=240s") return 1 ;;
@@ -399,7 +468,7 @@ self_test() {
                 printf '%s\n' 'NAME READY STATUS' 'ledger-c 0/1 Pending' ;;
             "-n $WL_NS get events --sort-by=.metadata.creationTimestamp")
                 printf '%s\n' 'LAST SEEN TYPE REASON OBJECT MESSAGE' '1m Warning FailedScheduling pod/ledger-c Insufficient cpu' ;;
-            *) return 9 ;;
+            *) echo "unexpected kc call: $*" >&2; exit 9 ;;
         esac
     }
     if wait_for_workload_pods >"$wait_stub/out" 2>&1; then
@@ -414,7 +483,114 @@ self_test() {
         echo "failed workload wait lost the namespace events" >&2
         exit 1
     fi
+    kc() {
+        case "$*" in
+            "-n $WL_NS wait --for=condition=Ready pod --all --timeout=240s") return 0 ;;
+            *) echo "unexpected kc call: $*" >&2; exit 9 ;;
+        esac
+    }
+    wait_for_workload_pods >"$wait_stub/ok" 2>&1 \
+        || { echo "ready workload wait refused" >&2; exit 1; }
+    kc() {
+        case "$*" in
+            "-n $OBS_NS rollout status daemonset/p11scope-observer --timeout=240s") return 1 ;;
+            "-n $OBS_NS get pods -o wide")
+                printf '%s\n' 'NAME READY STATUS' 'p11scope-observer-x 0/1 Pending' ;;
+            "-n $OBS_NS get events --sort-by=.metadata.creationTimestamp")
+                printf '%s\n' 'LAST SEEN TYPE REASON OBJECT MESSAGE' '1m Warning FailedScheduling pod/p11scope-observer-x Insufficient cpu' ;;
+            *) echo "unexpected kc call: $*" >&2; exit 9 ;;
+        esac
+    }
+    if wait_for_observer_rollout >"$wait_stub/rollout" 2>&1; then
+        echo "failed observer rollout accepted" >&2
+        exit 1
+    fi
+    if ! grep -q 'p11scope-observer-x 0/1 Pending' "$wait_stub/rollout"; then
+        echo "failed observer rollout lost the wide pod listing" >&2
+        exit 1
+    fi
+    if ! grep -q 'FailedScheduling' "$wait_stub/rollout"; then
+        echo "failed observer rollout lost the namespace events" >&2
+        exit 1
+    fi
+    kc() {
+        case "$*" in
+            "-n $OBS_NS rollout status daemonset/p11scope-observer --timeout=240s") return 0 ;;
+            *) echo "unexpected kc call: $*" >&2; exit 9 ;;
+        esac
+    }
+    wait_for_observer_rollout >"$wait_stub/rollout-ok" 2>&1 \
+        || { echo "completed observer rollout refused" >&2; exit 1; }
     rm -rf "$wait_stub"
+    # A capture refusal dumps the observer's per-pid discovery view for
+    # the same pod into the bounded artifact, and says so on stderr.
+    dump_stub=$(mktemp -d "${TMPDIR:-/tmp}/p11scope-kind-dump-XXXXXX")
+    # shellcheck disable=SC2064
+    trap "rm -rf '$dump_stub'" EXIT
+    WORK=$dump_stub OBS=dump-obs DUMP_UID=01234567-89ab-cdef-0123-456789abcdef
+    kc() {
+        case "$*" in
+            *" exec dump-obs -- sh -c "*)
+                printf '%s\n' 'pod cgroup: /sys/fs/cgroup/kubepods/test.slice' \
+                    '=== inspect --pid 4321 ===' 'maps: readable mem: readable modules: 1' ;;
+            *) echo "unexpected kc call: $*" >&2; exit 9 ;;
+        esac
+    }
+    dump_capture_discovery probe "$DUMP_UID" >"$dump_stub/stderr" 2>&1 \
+        || { echo "discovery dump failed" >&2; exit 1; }
+    for target in "$dump_stub/probe-discovery.err" "$dump_stub/stderr"; do
+        grep -q 'inspect --pid 4321' "$target" \
+            || { echo "discovery dump lost the per-pid view: $target" >&2; exit 1; }
+    done
+    # A failed dump exec is best-effort: the dump still exits 0 and says so.
+    kc() { return 1; }
+    dump_capture_discovery failpod "$DUMP_UID" >/dev/null 2>&1 \
+        || { echo "failed dump exec failed the dump" >&2; exit 1; }
+    grep -q 'discovery dump exec failed' "$dump_stub/failpod-discovery.err" \
+        || { echo "failed dump exec went unnamed" >&2; exit 1; }
+    # wait_ready refuses an unready capture and dumps it; a ready one
+    # passes with no dump.
+    kc() {
+        case "$*" in
+            *" exec dump-obs -- sh -c "*)
+                printf '%s\n' '=== inspect --pid 4321 ===' ;;
+            *) echo "unexpected kc call: $*" >&2; exit 9 ;;
+        esac
+    }
+    : > "$dump_stub/wr.err"
+    if wait_ready wr 999999999 "$DUMP_UID" >"$dump_stub/wr-out" 2>&1; then
+        echo "unready capture accepted" >&2
+        exit 1
+    fi
+    grep -q 'inspect --pid 4321' "$dump_stub/wr-discovery.err" \
+        || { echo "unready capture lost its discovery dump" >&2; exit 1; }
+    printf '%s\n' 'p11scope: capturing: 1 probes attached; stop with Ctrl-C' \
+        > "$dump_stub/ok.err"
+    wait_ready ok 999999999 "$DUMP_UID" >/dev/null 2>&1 \
+        || { echo "ready capture refused" >&2; exit 1; }
+    [ ! -e "$dump_stub/ok-discovery.err" ] \
+        || { echo "ready capture dumped" >&2; exit 1; }
+    # finish_capture: an exited capture dumps, a clean one copies.
+    : > "$dump_stub/fc.err"
+    false & fc_pid=$!
+    if finish_capture fc json "$fc_pid" "$DUMP_UID" >"$dump_stub/fc-out" 2>&1; then
+        echo "exited capture accepted" >&2
+        exit 1
+    fi
+    grep -q 'inspect --pid 4321' "$dump_stub/fc-discovery.err" \
+        || { echo "exited capture lost its discovery dump" >&2; exit 1; }
+    kc() {
+        case "$*" in
+            "-n $OBS_NS cp dump-obs:/tmp/ok2.json $dump_stub/ok2.json") return 0 ;;
+            *) echo "unexpected kc call: $*" >&2; exit 9 ;;
+        esac
+    }
+    true & ok_pid=$!
+    finish_capture ok2 json "$ok_pid" "$DUMP_UID" >/dev/null 2>&1 \
+        || { echo "clean capture refused" >&2; exit 1; }
+    [ ! -e "$dump_stub/ok2-discovery.err" ] \
+        || { echo "clean capture dumped" >&2; exit 1; }
+    rm -rf "$dump_stub"
     trap - EXIT
     echo "kind-e2e self-test: OK"
     exit 0
@@ -429,7 +605,6 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
-. scripts/lib.sh
 require_non_root_caller
 [ "$(uname -m)" = x86_64 ] || { echo "the observer image is x86-64 only" >&2; exit 1; }
 for command in docker kind kubectl python3 timeout; do
@@ -620,7 +795,7 @@ sed "s#image: p11scope-holder:1\$#image: $HOLD_IMAGE#" deploy/k8s/e2e/workloads-
 [ "$(grep -c "image: $HOLD_IMAGE" "$MANIFESTS/workloads-copyup.yaml")" -eq 1 ] \
     || { echo "workloads-copyup render lost its image anchor" >&2; exit 1; }
 kc apply -f "$MANIFESTS/workloads-copyup.yaml"
-kc -n "$OBS_NS" rollout status daemonset/p11scope-observer --timeout=240s
+wait_for_observer_rollout
 wait_for_workload_pods
 
 wait_log() {
@@ -722,38 +897,6 @@ for verb_resource in "get pods" "list pods" "list nodes" "get secrets"; do
 done
 record '{"check": "posture", "ok": true, "token_mounted": false, "rbac": "none", "read_only_root": true}'
 
-# capture NAME [k8s-profile-entry args...]: background `kubectl exec`; the
-# capture's stdout/stderr land in WORK/NAME.{out,err}.
-# CAPTURE_PID is the new capture's local `kubectl exec`, which lives exactly as
-# long as the capture in the pod; CAPTURE_PIDS keeps every live one for cleanup.
-start_capture() {
-    sc_name=$1
-    shift
-    kc -n "$OBS_NS" exec "$OBS" -- "$@" > "$WORK/$sc_name.out" 2> "$WORK/$sc_name.err" &
-    CAPTURE_PID=$!
-    CAPTURE_PIDS="$CAPTURE_PIDS $CAPTURE_PID"
-}
-# wait_ready NAME PID
-wait_ready() {
-    wr_i=0
-    while [ "$wr_i" -lt 360 ]; do
-        grep -q 'p11scope: capturing:' "$WORK/$1.err" && return 0
-        kill -0 "$2" 2>/dev/null || break
-        sleep 0.5
-        wr_i=$((wr_i + 1))
-    done
-    echo "capture $1 never became ready" >&2
-    cat "$WORK/$1.err" >&2
-    return 1
-}
-# finish_capture NAME EXT PID
-finish_capture() {
-    fc_status=0
-    wait "$3" || fc_status=$?
-    [ "$fc_status" -eq 0 ] || { echo "capture $1 exited $fc_status" >&2; cat "$WORK/$1.err" >&2; return 1; }
-    kc -n "$OBS_NS" cp "$OBS:/tmp/$1.$2" "$WORK/$1.$2" >/dev/null
-}
-
 UID_A=$(pod_uid ledger-a)
 UID_B=$(pod_uid ledger-b)
 UID_P=$(pod_uid ledger-p)
@@ -785,8 +928,8 @@ PID_A=$CAPTURE_PID
 start_capture profile-b k8s-profile-entry --pod-uid "$UID_B" -- \
     --duration 30 -o /tmp/profile-b.json
 PID_B=$CAPTURE_PID
-wait_ready profile-a "$PID_A"
-wait_ready profile-b "$PID_B"
+wait_ready profile-a "$PID_A" "$UID_A"
+wait_ready profile-b "$PID_B" "$UID_B"
 release ledger-a ledger-b
 if kill -0 "$PID_A" 2>/dev/null && kill -0 "$PID_B" 2>/dev/null; then
     OVERLAP=true
@@ -794,8 +937,8 @@ else
     echo "a capture ended before both ledgers completed: isolation unproven" >&2
     exit 1
 fi
-finish_capture profile-a json "$PID_A"
-finish_capture profile-b json "$PID_B"
+finish_capture profile-a json "$PID_A" "$UID_A"
+finish_capture profile-b json "$PID_B" "$UID_B"
 unlock_step
 ledger_is ledger-a 400
 ledger_is ledger-b 250
@@ -809,9 +952,9 @@ echo "=== profile-p: non-root workload, provider in a private 0700 directory ===
 lock_step
 start_capture profile-p k8s-profile-entry --pod-uid "$UID_P" -- \
     --duration 20 -o /tmp/profile-p.json
-wait_ready profile-p "$CAPTURE_PID"
+wait_ready profile-p "$CAPTURE_PID" "$UID_P"
 release ledger-p
-finish_capture profile-p json "$CAPTURE_PID"
+finish_capture profile-p json "$CAPTURE_PID" "$UID_P"
 unlock_step
 ledger_is ledger-p 300
 RESULT=$(python3 -I "$ORACLE" --expect-observer "$PIDNS_OBSERVER" profile-exact "$WORK/profile-p.json" 300 /tmp/private/libsofthsm2.so)
@@ -821,9 +964,9 @@ echo "=== trace-t: one line per call ==="
 lock_step
 start_capture trace-t k8s-profile-entry --pod-uid "$UID_T" --command trace -- \
     --duration 20 -o /tmp/trace-t.txt
-wait_ready trace-t "$CAPTURE_PID"
+wait_ready trace-t "$CAPTURE_PID" "$UID_T"
 release ledger-t
-finish_capture trace-t txt "$CAPTURE_PID"
+finish_capture trace-t txt "$CAPTURE_PID" "$UID_T"
 unlock_step
 ledger_is ledger-t 200
 TRACE=$(python3 -I "$ORACLE" --expect-observer "$PIDNS_OBSERVER" trace-exact "$WORK/trace-t.txt" 200)
@@ -842,9 +985,9 @@ echo "=== copy-up-neg: a genuine in-place change blocks and is disclosed ==="
 lock_step
 start_capture copy-up-neg k8s-profile-entry --pod-uid "$UID_C" -- \
     --duration 60 -o /tmp/copy-up-neg.json
-wait_ready copy-up-neg "$CAPTURE_PID"
+wait_ready copy-up-neg "$CAPTURE_PID" "$UID_C"
 release ledger-c
-finish_capture copy-up-neg json "$CAPTURE_PID"
+finish_capture copy-up-neg json "$CAPTURE_PID" "$UID_C"
 unlock_step
 ledgers2_is ledger-c 400 250
 RESULT=$(python3 -I "$ORACLE" --expect-observer "$PIDNS_OBSERVER" copy-up-neg "$WORK/copy-up-neg.json" 400 250 /tmp/copyup/libsofthsm2.so)
@@ -853,7 +996,7 @@ record "$RESULT"
 echo "=== negative: the idle pod maps no provider ==="
 lock_step
 observe k8s-profile-entry --pod-uid "$UID_IDLE" -- --duration 5 -o /tmp/negative.json \
-    > "$WORK/negative.out" 2> "$WORK/negative.err" || { cat "$WORK/negative.err" >&2; exit 1; }
+    > "$WORK/negative.out" 2> "$WORK/negative.err" || { cat "$WORK/negative.err" >&2; dump_capture_discovery negative "$UID_IDLE"; exit 1; }
 unlock_step
 kc -n "$OBS_NS" cp "$OBS:/tmp/negative.json" "$WORK/negative.json" >/dev/null
 # The entry log proves the idle pod's process was visible and readable, so

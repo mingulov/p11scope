@@ -17,8 +17,8 @@ use crate::inventory_semantics::{
     SCAN_REFUSAL_LABELS, admitted_mints_line, count_scan_refusals, image_query_refusal_index,
     image_query_refusal_label, joint_audit_refusal_line, joint_audit_subjects_line,
     joint_birth_funnel_line, joint_births_line, joint_decoder_line, joint_seal_stages_line,
-    joint_seals_line,
-    joint_taints_line, joint_voids_line, scan_refusals_gap_reason, semantic_stop_line,
+    joint_seals_line, joint_taints_line, joint_voids_line, scan_refusals_gap_reason,
+    semantic_stop_line,
 };
 
 #[test]

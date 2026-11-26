@@ -44088,9 +44088,11 @@ fn joint_failure_yielded_spend_counts_progress_at_delivery() {
         (1, Some(JournalGap::BootstrapMismatch)),
         "the retry records a real stale streak and its cause"
     );
-    // The collection moves after the retry: the next seal fails
+    // The fault cell saturates after the retry: the next seal fails
     // closed with a loss both feeds must drain through bounded visits.
-    fault.epoch.set(1);
+    // (Saturation voids instead of absorbing; a plain move would absorb
+    // under the fault-absorb contract and leave no failure to deliver.)
+    fault.epoch.set(u64::from(u32::MAX) + 1);
     let mut births = NativeFrameBirths {
         h0: &h0,
         attached: &fixture.attached,
@@ -44193,9 +44195,11 @@ fn joint_failure_yielded_spend_resets_park_cursors_at_delivery() {
         .joint_frame_ports(&fixture.scene.producers)
         .unwrap();
     frame.bind_targets(&ports).unwrap();
-    // The collection moves before any seal: the next seal fails
+    // The fault cell saturates before any seal: the next seal fails
     // closed with a loss both feeds must drain through bounded visits.
-    fault.epoch.set(1);
+    // (Saturation voids instead of absorbing; a plain move would absorb
+    // under the fault-absorb contract and leave no failure to deliver.)
+    fault.epoch.set(u64::from(u32::MAX) + 1);
     let mut births = NativeFrameBirths {
         h0: &h0,
         attached: &fixture.attached,

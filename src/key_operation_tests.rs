@@ -663,11 +663,25 @@ impl JointScene {
         audit_epoch: u64,
         cell_epoch: u64,
     ) -> Result<SealSuccess, SealFailure> {
+        self.seal_with_fault_before(audit_epoch, audit_epoch, cell_epoch)
+    }
+
+    /// One seal whose audit shows a collected fault move
+    /// (`fault_before` to `audit_epoch`) plus a seal-time cell move:
+    /// the fault is not post-collection absorbable, so the seal voids
+    /// instead of absorbing. For void-dependent flows (doom, mint,
+    /// reseed, quarantine-end) under the absorb contract.
+    fn seal_with_fault_before(
+        &mut self,
+        fault_before: u64,
+        audit_epoch: u64,
+        cell_epoch: u64,
+    ) -> Result<SealSuccess, SealFailure> {
         self.install_closure();
         let bootstrap = self.bootstrap();
         let frontier = self.adapter.consumed_frontier();
         let audit = JournalAuditReceipt::scripted(
-            audit_epoch,
+            fault_before,
             audit_epoch,
             None,
             0,
@@ -25307,7 +25321,7 @@ fn key_operation_reseed_fresh_barred_after_stuck_degrade_until_void() {
     let abandon = abandon_bytes(9, 1, JOURNAL_REASON_EXEC_EXIT, (COOKIE, EXEC));
     scene.ingest(&abandon);
     let failure = scene
-        .seal_with_fault(7, 8)
+        .seal_with_fault_before(6, 7, 8)
         .expect_err("the moved cell voids");
     assert_eq!(failure.gap, JournalGap::FaultChanged);
     let fence = failure.fence.expect("a void fences");
@@ -25472,7 +25486,7 @@ fn key_operation_reseed_fresh_allowed_after_void_clears_bar() {
     let abandon = abandon_bytes(9, 1, JOURNAL_REASON_EXEC_EXIT, (COOKIE, EXEC));
     scene.ingest(&abandon);
     let failure = scene
-        .seal_with_fault(7, 8)
+        .seal_with_fault_before(6, 7, 8)
         .expect_err("the moved cell voids");
     assert_eq!(failure.gap, JournalGap::FaultChanged);
     let fence = failure.fence.expect("a void fences");
@@ -25687,7 +25701,7 @@ fn key_operation_reseed_onto_new_domain_incarnation() {
     let abandon = abandon_bytes(9, 1, JOURNAL_REASON_EXEC_EXIT, (COOKIE, EXEC));
     assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
     let failure = scene
-        .seal_with_fault(7, 8)
+        .seal_with_fault_before(6, 7, 8)
         .expect_err("the moved cell voids");
     assert_eq!(failure.gap, JournalGap::FaultChanged);
     let fence = failure.fence.expect("a void fences");
@@ -25849,7 +25863,7 @@ fn key_operation_reseed_superseding_incarnation_bypasses_tainted_fallback() {
     let abandon = abandon_bytes(9, 1, JOURNAL_REASON_EXEC_EXIT, (COOKIE, EXEC));
     assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
     let failure = scene
-        .seal_with_fault(7, 8)
+        .seal_with_fault_before(6, 7, 8)
         .expect_err("the moved cell voids");
     assert_eq!(failure.gap, JournalGap::FaultChanged);
     let fence = failure.fence.expect("a void fences");
@@ -25983,7 +25997,7 @@ fn key_operation_reentry_old_handles_stay_unknown() {
     // The void: the seal-time fault cell moved (native fault twin).
     // Its real failure delivers to the feed, which ends fenced.
     let failure = scene
-        .seal_with_fault(7, 8)
+        .seal_with_fault_before(6, 7, 8)
         .expect_err("the moved cell voids");
     assert_eq!(failure.gap, JournalGap::FaultChanged);
     let fence = failure.fence.expect("a void fences");
@@ -26385,7 +26399,7 @@ fn key_operation_quarantine_end_refind_recovers_after_capable_doom() {
     let abandon = abandon_bytes(9, 1, JOURNAL_REASON_SCOPE_LOST, (COOKIE, EXEC));
     assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
     let failure = scene
-        .seal_with_fault(7, 8)
+        .seal_with_fault_before(6, 7, 8)
         .expect_err("the moved cell voids");
     assert_eq!(failure.gap, JournalGap::FaultChanged);
     let fence = failure.fence.expect("a void fences");
@@ -26590,7 +26604,7 @@ fn key_operation_quarantine_end_handle_reuse_binds_fresh_row() {
     let abandon = abandon_bytes(9, 1, JOURNAL_REASON_SCOPE_LOST, (COOKIE, EXEC));
     scene.ingest(&abandon);
     let failure = scene
-        .seal_with_fault(7, 8)
+        .seal_with_fault_before(6, 7, 8)
         .expect_err("the moved cell voids");
     assert_eq!(failure.gap, JournalGap::FaultChanged);
     let fence = failure.fence.expect("a void fences");
@@ -26769,7 +26783,7 @@ fn key_operation_quarantine_end_session_reuse_binds_fresh_rows() {
     let abandon = abandon_bytes(9, 1, JOURNAL_REASON_SCOPE_LOST, (COOKIE, EXEC));
     scene.ingest(&abandon);
     let failure = scene
-        .seal_with_fault(7, 8)
+        .seal_with_fault_before(6, 7, 8)
         .expect_err("the moved cell voids");
     assert_eq!(failure.gap, JournalGap::FaultChanged);
     let fence = failure.fence.expect("a void fences");
@@ -26993,7 +27007,7 @@ fn key_operation_quarantine_end_without_refind_stays_unknown() {
     let abandon = abandon_bytes(9, 1, JOURNAL_REASON_SCOPE_LOST, (COOKIE, EXEC));
     scene.ingest(&abandon);
     let failure = scene
-        .seal_with_fault(7, 8)
+        .seal_with_fault_before(6, 7, 8)
         .expect_err("the moved cell voids");
     assert_eq!(failure.gap, JournalGap::FaultChanged);
     let mut clean = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));

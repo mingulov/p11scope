@@ -6851,8 +6851,9 @@ fn start_semantic_lane(
             Err(journal_refusal) => {
                 // The sizes-off and ordinary retries below are separate
                 // new capture attempts: a stop latching during the
-                // journal start forbids them, so neither begins, and the
-                // skipped retry is named.
+                // journal start forbids them, so neither begins; the
+                // refused start still discloses its unavailability
+                // first, then names the skipped retry.
                 if stopped() {
                     note_retry_skipped_on_stop(coordinator, spec.key_sizes, &journal_refusal);
                     return None;
@@ -6916,16 +6917,7 @@ fn start_semantic_lane(
                     }
                 }
                 let reason = key_operations_refusal_reason(&refusal);
-                coordinator.note_scope_gap(
-                    "key operations unavailable".into(),
-                    format!(
-                        "{reason}; broad inventory continues with S1 mechanisms and API results"
-                    ),
-                );
-                inventory_diagnostic(&format!(
-                    "p11scope: key operations unavailable: {reason}; broad inventory \
-                     continues with S1 mechanisms and API results"
-                ));
+                note_key_operations_unavailable(coordinator, &reason);
                 journal_refused = Some(reason);
             }
         }
@@ -7003,15 +6995,45 @@ fn ordinary_retry_skipped_reason(reason: &str) -> String {
     )
 }
 
+/// The standard "key operations unavailable" disclosure with its
+/// stderr line: the summary's cause lookup and the scan-seal terminal
+/// hook match on this exact subject. Written both when the startup
+/// falls through past a refused journal start and when a stop skips
+/// the retries (B1): the stop never drops the disclosure.
+fn note_key_operations_unavailable(
+    coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    reason: &str,
+) {
+    coordinator.note_scope_gap(
+        "key operations unavailable".into(),
+        format!("{reason}; broad inventory continues with S1 mechanisms and API results"),
+    );
+    inventory_diagnostic(&format!(
+        "p11scope: key operations unavailable: {reason}; broad inventory \
+         continues with S1 mechanisms and API results"
+    ));
+}
+
 /// A stop seen right after a refused journal start (or during the
-/// sizes-off re-mint): no retry begins, and the run names which ones
-/// it skipped with the refusal's reason (D2).
+/// sizes-off re-mint): no retry begins. The refused start still
+/// discloses its unavailability first — the sizes gap when sizes were
+/// requested, then the key-operations gap — and the run names which
+/// retries the stop skipped, with the refusal's reason (D2, B1).
 fn note_retry_skipped_on_stop(
     coordinator: &mut InventoryCoordinator<OsProcessSource>,
     key_sizes: bool,
     refusal: &crate::inventory_semantics::SemanticRefusal,
 ) {
     let reason = key_operations_refusal_reason(refusal);
+    if key_sizes {
+        // The sizes start was refused and the sizes-off retry never
+        // ran, so there is no second refusal to quote (unlike the
+        // double-refused gap below).
+        let detail = format!("{reason}; sizes-off retry skipped: stop requested");
+        coordinator.note_scope_gap("key sizes unavailable".into(), detail.clone());
+        inventory_diagnostic(&format!("p11scope: key sizes unavailable: {detail}"));
+    }
+    note_key_operations_unavailable(coordinator, &reason);
     let (subject, detail) = if key_sizes {
         (
             KEY_SIZES_RETRY_SKIPPED_SUBJECT,
@@ -34446,6 +34468,19 @@ mod seal_readiness_tests {
         )
     }
 
+    /// B1: the refused sizes start still discloses its own gap when a
+    /// stop skips the sizes-off retry (the retry never ran, so there is
+    /// no second refusal to quote).
+    fn sizes_unavailable_skipped() -> (String, String) {
+        (
+            "key sizes unavailable".into(),
+            format!(
+                "{}; sizes-off retry skipped: stop requested",
+                refused_reason()
+            ),
+        )
+    }
+
     fn sizes_double_refused() -> (String, String) {
         (
             "key sizes unavailable".into(),
@@ -34462,7 +34497,8 @@ mod seal_readiness_tests {
     /// gate, the sizes-off retry gate and its post-mint gate, the
     /// ordinary retry gate and its post-mint gate, the fallback-shell
     /// gate) sees the operator counter, and a stop after a refused
-    /// journal start names the skipped retry. Exact typed outcomes.
+    /// journal start discloses the unavailability first, then names
+    /// the skipped retry (B1). Exact typed outcomes.
     #[test]
     fn d2_operator_stop_reaches_every_startup_boundary() {
         let refused = || Err(SemanticRefusal::Unavailable);
@@ -34504,7 +34540,11 @@ mod seal_readiness_tests {
                         seated: false,
                         journals: vec![Some(true)],
                         prepared_left: 6,
-                        gaps: vec![sizes_retry_skipped()],
+                        gaps: vec![
+                            sizes_unavailable_skipped(),
+                            key_operations_unavailable(),
+                            sizes_retry_skipped(),
+                        ],
                     },
                 ),
                 (
@@ -34517,7 +34557,11 @@ mod seal_readiness_tests {
                         seated: false,
                         journals: vec![Some(true)],
                         prepared_left: 4,
-                        gaps: vec![sizes_retry_skipped()],
+                        gaps: vec![
+                            sizes_unavailable_skipped(),
+                            key_operations_unavailable(),
+                            sizes_retry_skipped(),
+                        ],
                     },
                 ),
                 (
@@ -34547,7 +34591,7 @@ mod seal_readiness_tests {
                         seated: false,
                         journals: vec![Some(false)],
                         prepared_left: 6,
-                        gaps: vec![ordinary_retry_skipped()],
+                        gaps: vec![key_operations_unavailable(), ordinary_retry_skipped()],
                     },
                 ),
                 (
@@ -34641,6 +34685,70 @@ mod seal_readiness_tests {
                 "{channel:?}"
             );
         }
+    }
+
+    /// B1 scan-path twin: a stop landing during the deferred seal's
+    /// journal start still discloses "key operations unavailable" with
+    /// the refusal reason, so the terminal hook finds it and reports no
+    /// false "scan seal never seated" gap.
+    #[test]
+    fn b1_scan_path_stop_discloses_unavailability_without_false_never_seated() {
+        use super::promotion_driver_tests::{driver_with_display, headless_display};
+        use crate::discovery::identity::PinnedObjectId;
+        use std::collections::BTreeSet;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        take_sealed_for_test();
+        let mut coordinator = coordinator();
+        // The run setup wires the operator counter on the coordinator
+        // for every scope; the scan path hands no run control.
+        let source = Arc::new(AtomicUsize::new(0));
+        coordinator.set_stop_source(Arc::clone(&source));
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.scan_seal_pending = true;
+        let scope = InspectScope::Pid(std::process::id());
+        let one: BTreeSet<PinnedObjectId> = BTreeSet::from([PinnedObjectId(0)]);
+        let peeks = vec![Some(one); super::SCAN_SEAL_STABLE_PEEKS as usize];
+        let attempts = peeks.len();
+        seal_startup_test::with_peek_queue(
+            peeks,
+            vec![some_preparation(), some_preparation()],
+            vec![Err(SemanticRefusal::Unavailable)],
+            || {
+                for n in 1..attempts {
+                    driver.attempt_deferred_scan_seal(Scope::from(scope));
+                    assert!(driver.semantic.is_none(), "attempt {n} still settles");
+                }
+                // Latch the stop while the journal start returns its
+                // refusal: the retries must not run, but the refused
+                // start still discloses.
+                seal_startup_test::queue_start_hook(Box::new({
+                    let source = Arc::clone(&source);
+                    move || source.store(1, Ordering::SeqCst)
+                }));
+                driver.attempt_deferred_scan_seal(Scope::from(scope));
+            },
+        );
+        assert!(driver.semantic.is_none(), "a refused start seats nothing");
+        assert!(driver.scan_seal_pending, "a refused start keeps pending");
+        // Pass commits publish staged gaps during a real run; the twin
+        // has no passes, so it publishes before the terminal hook.
+        driver.coordinator.registry_mut().publish();
+        assert!(
+            !driver.disclose_unseated_scan_seal(),
+            "the refused start disclosed unavailability: no never-seated gap"
+        );
+        assert_eq!(
+            gaps_for_subject(&mut *driver.coordinator, "key operations unavailable"),
+            vec![key_operations_unavailable()],
+            "the stop arm records the refusal, not the never-seated text"
+        );
+        assert_eq!(
+            gaps_for_subject(&mut *driver.coordinator, "key operations retry skipped").len(),
+            1,
+            "the skipped retry is still named"
+        );
     }
 
     /// D6: an error return (a mid-run commit failure, a `?`) runs the

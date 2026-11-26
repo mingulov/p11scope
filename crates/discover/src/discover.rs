@@ -2450,7 +2450,8 @@ mod tests {
             TEST_PROVIDER_KEY,
             overlong.as_ptr() as usize,
         );
-        assert!(name.error.as_deref().unwrap().contains("overlong"));
+        let expected = format!("overlong interface name (cap {INTERFACE_NAME_CAP} bytes)");
+        assert_eq!(name.error.as_deref(), Some(expected.as_str()));
         assert_eq!(name.raw.as_deref(), Some(overlong.as_slice()));
 
         assert!(memory.read_exact(usize::MAX, 2).is_err());
@@ -2502,7 +2503,7 @@ mod tests {
         assert_eq!(unsafe { libc::munmap(base, page * 2) }, 0);
 
         let error = name.error.as_deref().expect("an in-VMA NUL is required");
-        assert!(error.contains("mapping end"), "{error}");
+        assert_eq!(error, "unterminated interface name at readable mapping end");
         assert!(
             name.raw
                 .as_deref()
@@ -2510,6 +2511,52 @@ mod tests {
             "the read crossed into the adjacent mapping: {:?}",
             name.raw
         );
+    }
+
+    #[test]
+    fn name_read_reports_a_short_pread_without_an_address() {
+        // A regular file shorter than the read offset answers Ok(0):
+        // the helper's address never enters the diagnostic.
+        let dir = std::env::temp_dir().join(format!("name-short-pread-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("short");
+        std::fs::write(&path, b"01234567").unwrap();
+        let memory = ProcessMemory(File::open(&path).unwrap());
+        let probe = b"unread\0";
+        let entries = read_self_maps().unwrap();
+        let view = provider_view(&entries, &[probe.as_ptr() as u64], TEST_PROVIDER_KEY);
+        let index = validated_map_index(&view).unwrap();
+        let name = read_name(&memory, &index, TEST_PROVIDER_KEY, probe.as_ptr() as usize);
+        assert!(name.raw.is_none());
+        assert!(name.lossy.is_none());
+        assert_eq!(name.error.as_deref(), Some("short name pread"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn name_read_reports_a_failed_pread_without_an_address() {
+        // A write-only descriptor fails the read: only the fixed prefix
+        // plus the OS error are recorded, never the address.
+        let dir = std::env::temp_dir().join(format!("name-failed-pread-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("write-only");
+        std::fs::write(&path, b"01234567").unwrap();
+        let memory = ProcessMemory(File::options().write(true).open(&path).unwrap());
+        let probe = b"unread\0";
+        let entries = read_self_maps().unwrap();
+        let view = provider_view(&entries, &[probe.as_ptr() as u64], TEST_PROVIDER_KEY);
+        let index = validated_map_index(&view).unwrap();
+        let name = read_name(&memory, &index, TEST_PROVIDER_KEY, probe.as_ptr() as usize);
+        assert!(name.raw.is_none());
+        assert!(name.lossy.is_none());
+        let error = name.error.as_deref().expect("a failed read is refused");
+        let suffix = error
+            .strip_prefix("name pread failed: ")
+            .expect("fixed failure prefix");
+        assert!(suffix.contains("(os error 9)"), "{suffix}");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -2720,8 +2767,8 @@ mod tests {
             .error
             .as_deref()
             .expect("a name without a NUL is refused");
-        assert!(error.contains("overlong"), "{error}");
-        assert!(error.contains("cap 64 bytes"), "{error}");
+        let expected = format!("overlong interface name (cap {INTERFACE_NAME_CAP} bytes)");
+        assert_eq!(error, expected.as_str());
     }
 
     #[test]

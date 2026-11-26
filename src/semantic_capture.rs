@@ -3058,7 +3058,9 @@ impl SemanticCapture {
     /// Acquire while the original H0 owner is idle, after the quiet prefix was
     /// ingested and before any later appearance. Both cursor snapshots must
     /// be empty; a BUSY reservation is not an absence boundary.
-    #[allow(dead_code)] // The later lane activation calls this idle acquisition port.
+    /// Live through `acquire_absence` (no activation step gates it);
+    /// the absence-gate call order above the session reads is a v0.7.3
+    /// seam item (same outcome at the only consumer today).
     pub(crate) fn acquire_absence_birth(
         &mut self,
         session: &mut Session,

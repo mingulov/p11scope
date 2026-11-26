@@ -13628,14 +13628,18 @@ fn carrier_covered_by_live(carrier: &ScannedModule, live: &[&ScannedModule]) -> 
 /// on the first complete, serviced walk. The rest ride and
 /// re-evaluate next tick, so retirement converges over ticks instead
 /// of bulk-dropping.
+///
+/// Returns the summed [`MergeOverflow`] of the carrier unions: the
+/// caller routes it through [`Engine::absorb_merge_overflow`], so
+/// live drops count on the live counter and mark live loss with the
+/// named gap instead of folding silently into the heuristic count.
 fn normalize_carried_modules(
     raw_modules: &mut Vec<ScannedModule>,
     pins: &PinnedObjects,
     removed: &BTreeSet<ProcessViewId>,
     live: &BTreeSet<ProcessViewId>,
     absence_proven: bool,
-    tables_dropped: &mut u64,
-) {
+) -> MergeOverflow {
     let mut newly_carried: BTreeSet<CarriedModuleKey> = BTreeSet::new();
     for raw in raw_modules.iter_mut() {
         if removed.contains(&raw.view) {
@@ -13647,13 +13651,14 @@ fn normalize_carried_modules(
         .extract_if(.., |module| module.view == Engine::CARRIED_VIEW_ID)
         .collect();
     if carriers.is_empty() {
-        return;
+        return MergeOverflow::default();
     }
+    let mut total = MergeOverflow::default();
     let mut merged: Vec<ScannedModule> = Vec::with_capacity(carriers.len());
     for carrier in carriers.drain(..) {
         let overflow = merge_scanned_module(&mut merged, carrier);
-        *tables_dropped =
-            tables_dropped.saturating_add(overflow.dropped.saturating_add(overflow.live_dropped));
+        total.dropped = total.dropped.saturating_add(overflow.dropped);
+        total.live_dropped = total.live_dropped.saturating_add(overflow.live_dropped);
     }
     let mut live_by_object: BTreeMap<PinnedObjectId, Vec<&ScannedModule>> = BTreeMap::new();
     for module in raw_modules
@@ -13695,6 +13700,7 @@ fn normalize_carried_modules(
         false
     });
     raw_modules.extend(merged);
+    total
 }
 
 fn usable_path(maps: &MapIndex<'_>, mapping: &MapEntry) -> Option<PathBuf> {
@@ -16595,7 +16601,8 @@ impl Engine {
 
     /// Accumulate one union's counted overflow, marking live loss for
     /// live overflow. The single counting choke behind
-    /// `merge_tables_marked` and the run-learned harvest.
+    /// `merge_tables_marked`, the run-learned harvest, and the
+    /// carried-carrier unions (via `normalize_carried_modules`).
     fn absorb_merge_overflow(&mut self, overflow: MergeOverflow) {
         self.merge_tables_dropped = self.merge_tables_dropped.saturating_add(overflow.dropped);
         if overflow.live_dropped > 0 {
@@ -20283,14 +20290,14 @@ impl Engine {
             .filter(|module| module.view == Self::CARRIED_VIEW_ID)
             .filter_map(|module| pinned.id_for_scanned(module, module.key, &module.path))
             .collect();
-        normalize_carried_modules(
+        let overflow = normalize_carried_modules(
             &mut raw_modules,
             &pinned,
             retirements,
             &live_past_replay,
             absence_proven,
-            &mut self.merge_tables_dropped,
         );
+        self.absorb_merge_overflow(overflow);
         self.stage_timings.span(
             crate::timing::StageKind::Merge,
             "conservative_assemble",
@@ -34256,14 +34263,14 @@ impl Engine {
             .filter(|module| module.view == Self::CARRIED_VIEW_ID)
             .filter_map(|module| candidate_pins.id_for_scanned(module, module.key, &module.path))
             .collect();
-        normalize_carried_modules(
+        let overflow = normalize_carried_modules(
             &mut raw_modules,
             &candidate_pins,
             removed,
             &live_past_tick,
             absence_proven,
-            &mut self.merge_tables_dropped,
         );
+        self.absorb_merge_overflow(overflow);
         self.stage_timings.span(
             crate::timing::StageKind::Merge,
             "inventory_assemble",

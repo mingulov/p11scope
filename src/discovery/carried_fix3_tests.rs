@@ -299,14 +299,17 @@ fn carried_fix3_normalize_keeps_redirected_table_link() {
         let mut pins = overlay_view_pin(&live, 7100, OVERLAY_SHA, 1, false);
         record_scan_ownership(&mut pins, live_view, key, &live.path);
         let mut raw = vec![carrier, live];
-        let mut dropped = 0u64;
-        super::normalize_carried_modules(
+        let overflow = super::normalize_carried_modules(
             &mut raw,
             &pins,
             &BTreeSet::new(),
             &BTreeSet::from([live_view]),
             false,
-            &mut dropped,
+        );
+        assert_eq!(
+            overflow,
+            super::MergeOverflow::default(),
+            "the tiny union drops nothing"
         );
         let kept = raw
             .iter()
@@ -327,14 +330,17 @@ fn carried_fix3_normalize_keeps_redirected_table_link() {
     let mut pins = overlay_view_pin(&live, 7101, OVERLAY_SHA, 1, false);
     record_scan_ownership(&mut pins, live_view, key, &live.path);
     let mut raw = vec![carrier, live];
-    let mut dropped = 0u64;
-    super::normalize_carried_modules(
+    let overflow = super::normalize_carried_modules(
         &mut raw,
         &pins,
         &BTreeSet::new(),
         &BTreeSet::from([live_view]),
         false,
-        &mut dropped,
+    );
+    assert_eq!(
+        overflow,
+        super::MergeOverflow::default(),
+        "the tiny union drops nothing"
     );
     assert!(
         raw.iter()
@@ -1437,14 +1443,17 @@ fn carried_fix4_normalize_keeps_unproven_table_identity() {
         let mut pins = overlay_view_pin(&live, 7600 + (*shape as u64), OVERLAY_SHA, 1, false);
         record_scan_ownership(&mut pins, live_view, key, &live.path);
         let mut raw = vec![carrier, live];
-        let mut dropped = 0u64;
-        super::normalize_carried_modules(
+        let overflow = super::normalize_carried_modules(
             &mut raw,
             &pins,
             &BTreeSet::new(),
             &BTreeSet::from([live_view]),
             false,
-            &mut dropped,
+        );
+        assert_eq!(
+            overflow,
+            super::MergeOverflow::default(),
+            "the tiny union drops nothing"
         );
         let kept = raw
             .iter()

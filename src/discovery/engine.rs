@@ -25711,34 +25711,35 @@ impl Engine {
         if !self
             .pinned
             .module_aliased_under(&module, Self::RUN_LEARNED_VIEW_ID)
-            && Self::harvest_absorb_would_serve(&self.pinned, source, &module)
         {
-            let absorbed = self.pinned.absorb(source.clone());
-            attribution::note_all(&absorbed);
-            for skip in absorbed {
-                if !self.counters.object_skips.contains(&skip) {
-                    self.counters.object_skips.push(skip);
+            if Self::harvest_absorb_would_serve(&self.pinned, source, &module) {
+                let absorbed = self.pinned.absorb(source.clone());
+                attribution::note_all(&absorbed);
+                for skip in absorbed {
+                    if !self.counters.object_skips.contains(&skip) {
+                        self.counters.object_skips.push(skip);
+                    }
                 }
             }
-        }
-        let allowance = crate::fanotify::LEARNED_FILES_PER_CAPTURE_CAP
-            .saturating_sub(self.pinned.owned_raw_count_under(Self::RUN_LEARNED_VIEW_ID));
-        let refused = self.pinned.alias_scanned_module_under_capped(
-            &module,
-            Self::RUN_LEARNED_VIEW_ID,
-            allowance,
-        );
-        if refused > 0 {
-            self.run_learned_alias_refused = self
-                .run_learned_alias_refused
-                .saturating_add(u64::try_from(refused).unwrap_or(u64::MAX));
-            if crate::run::capture_diagnostics_on() {
-                eprintln!(
-                    "p11scope: run-learned tables for {}: {} reserved alias{} past the 32-entry budget refused (tables still persist)",
-                    proof.path,
-                    refused,
-                    if refused == 1 { "" } else { "es" },
-                );
+            let allowance = crate::fanotify::LEARNED_FILES_PER_CAPTURE_CAP
+                .saturating_sub(self.pinned.owned_raw_count_under(Self::RUN_LEARNED_VIEW_ID));
+            let refused = self.pinned.alias_scanned_module_under_capped(
+                &module,
+                Self::RUN_LEARNED_VIEW_ID,
+                allowance,
+            );
+            if refused > 0 {
+                self.run_learned_alias_refused = self
+                    .run_learned_alias_refused
+                    .saturating_add(u64::try_from(refused).unwrap_or(u64::MAX));
+                if crate::run::capture_diagnostics_on() {
+                    eprintln!(
+                        "p11scope: run-learned tables for {}: {} reserved alias{} past the 32-entry budget refused (tables still persist)",
+                        proof.path,
+                        refused,
+                        if refused == 1 { "" } else { "es" },
+                    );
+                }
             }
         }
         Some(module)

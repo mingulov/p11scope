@@ -105664,6 +105664,42 @@ fn run_learned_repeated_proof_skips_its_absorb() {
     sleeper.wait().expect("reap sleeper");
 }
 
+/// Re-proving an already-aliased learned module changes nothing in
+/// the committed pins: the absorb is skipped (nothing new to serve)
+/// and the alias call with it, so `pinned.revision()` — which feeds
+/// candidate reuse and graph installs — does not move. Without the
+/// alias guard, every re-proof bumps the revision through the alias
+/// call's unconditional revision bump.
+#[test]
+fn run_learned_reproof_of_aliased_module_keeps_pinned_revision() {
+    use crate::discovery::identity::test_fixture::real_scan_pin;
+    let (_dir, mut sleeper, mut engine, key, path) = learned_tables_engine_with(None);
+    let mut pins = real_scan_pin(std::path::Path::new(&path), None, 400, &"ef".repeat(32));
+    record_scan_ownership(&mut pins, ProcessViewId(9), key, &path);
+    let object = pins.pinned().next().expect("one pin").id;
+    let module = engine.run_learned_modules[0].clone();
+    let proof = || OwnedLearnProof {
+        view: ProcessViewId(9),
+        path: path.clone(),
+        object,
+        loader_exe: None,
+        loader_unknown_reason: Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
+        module: module.clone(),
+    };
+    // The module already aliases complete from the fixture harvest,
+    // so both learns below are re-proofs.
+    engine.learn_owned_proofs(&mut pins.clone(), &[proof()]);
+    let revision = engine.pinned.revision();
+    engine.learn_owned_proofs(&mut pins.clone(), &[proof()]);
+    assert_eq!(
+        engine.pinned.revision(),
+        revision,
+        "a re-proof of an aliased module leaves pinned revision unchanged"
+    );
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
 /// Reserved-owner aliases stop at the second 32-entry budget: a proof
 /// naming 33 distinct dependency files aliases 32 raws, refuses the
 /// tail loudly through the counted diagnostic, and still persists

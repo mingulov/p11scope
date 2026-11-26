@@ -3026,7 +3026,9 @@ mod tests {
         let maps = read_self_maps().unwrap();
         let index = validated_map_index(&maps).unwrap();
         let exports = ExportAddresses {
-            get_function_list: Some(loaded_module_key_recheck_uses_the_shared_budget as usize),
+            get_function_list: Some(
+                loaded_module_key_recheck_uses_the_shared_budget as *const () as usize
+            ),
             get_interface_list: None,
             get_interface: None,
         };

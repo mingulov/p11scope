@@ -5791,9 +5791,10 @@ fn privileged_key_operations_seal_generation_gated_by_flag() -> Result<()> {
 /// kernel and the seal publishes); on a build without the length
 /// programs the sizes request refuses loudly, explained by the
 /// embedded object. On a build without the journal pair the twin
-/// asserts the two linked refusals it owns (journal preparation
-/// names the omitted build; a linked start refuses attachment) and
-/// reports the cell inapplicable. Every arm pins its shape live —
+/// asserts the sizes-request refusal plus the two linked refusals it
+/// owns (journal preparation names the omitted build; a linked start
+/// refuses attachment) and reports the cell inapplicable. Every arm
+/// pins its shape live —
 /// the one privileged cell that loads the length pair.
 #[test]
 #[ignore = "privileged: live journal lane seals with key sizes on FULL, refuses without the length pair"]
@@ -5814,6 +5815,18 @@ fn privileged_key_sizes_journal_seals_with_length_pair() -> Result<()> {
         "keyops-sizes-held.dr37.json",
     )?;
     if env!("P11SCOPE_JOURNAL_ENABLED") != "1" {
+        // The cell's subject is the sizes request: it refuses on an
+        // omitted build too, with the same finite reason.
+        use anyhow::Context as _;
+        let sizes_spec = crate::attach::journal::JournalSpec { key_sizes: true };
+        let error = sizes_spec
+            .prepare()
+            .err()
+            .context("the omitted build refuses the sizes request")?;
+        ensure!(
+            format!("{error:#}").contains("journal-pair-unavailable-in-build"),
+            "the omitted build refuses sizes with its finite reason: {error:#}"
+        );
         return refuse_linked_without_journal(
             &mut coordinator,
             vec![manifest_soft, manifest_held],

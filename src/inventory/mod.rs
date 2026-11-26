@@ -2716,6 +2716,12 @@ impl std::ops::DerefMut for TerminalDrains<'_> {
 
 impl Drop for TerminalDrains<'_> {
     fn drop(&mut self) {
+        // A panic unwind keeps the pre-guard teardown: running the
+        // drains here would tick the metadata lane, and a second
+        // panic there would abort instead of unwinding (N5).
+        if std::thread::panicking() {
+            return;
+        }
         self.finish();
     }
 }
@@ -35068,6 +35074,24 @@ mod seal_readiness_tests {
             super::terminal_drains_test::take_runs(),
             1,
             "the success tail runs the drains once, not again from the drop"
+        );
+    }
+
+    /// N5: a panic unwinding past the guard keeps the pre-guard
+    /// teardown — the drains do not run, so a second panic in the
+    /// metadata lane cannot abort the unwind.
+    #[test]
+    fn n5_panicking_drop_skips_the_terminal_drains() {
+        super::terminal_drains_test::take_runs();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _drains = super::TerminalDrains::new(coordinator(), &|| false);
+            panic!("scripted unwind with a live guard");
+        }));
+        assert!(result.is_err(), "the scripted panic unwinds");
+        assert_eq!(
+            super::terminal_drains_test::take_runs(),
+            0,
+            "no drain runs while panicking"
         );
     }
 

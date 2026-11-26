@@ -98578,6 +98578,199 @@ fn member_stop_bind_rejected_key_refuses_the_hold_without_a_commit() {
     );
 }
 
+/// A scan that observes a new generation of a staged file (same bytes,
+/// stepped ctime) supersedes the staged pin in the working copy: the key
+/// stays routable (no rejection), the bind harvests the supersede into
+/// the pending set, and the hold on the stale generation ends refused
+/// before its bound with the first-use row — while the fresh generation
+/// races on toward attach.
+#[test]
+fn member_stop_superseded_staging_key_refuses_the_hold() {
+    let (fixture, view, module, _pins) = loaded_seed_provider();
+    let pid = fixture.child.id();
+    let library = fixture._dir.path().join("seed-provider.so");
+    // Generation 1.
+    touch_for_test(&library, 1_000_000);
+    stop_member_for_test(pid);
+    let key = member_exec_key_for_test(pid, &library);
+    let mut io = ScriptedMemberStops::default();
+    io.rows.insert(pid, member_stop_row(pid, &library, key));
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    assert!(engine.member_stops_held(), "intake holds the mapper");
+    // The drain stages generation 1 through the real path.
+    engine.service_learned_files();
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        1,
+        "generation 1 stages"
+    );
+    let staged_key = engine
+        .prearm_input
+        .as_ref()
+        .and_then(|prearm| prearm.inputs.first().map(|input| input.key))
+        .expect("staging records its key");
+    // Generation 2: metadata only (bytes identical, ctime stepped). The
+    // scan's fresh observation of it absorbs into a working copy only
+    // (a dropped candidate): committed stays clean.
+    touch_for_test(&library, 2_000_000);
+    let mut budget = CaptureWorkBudget::default();
+    let (scan2, _scan_skips) =
+        pin_scanned_view_objects(&view, std::slice::from_ref(&module), &mut budget).unwrap();
+    assert_eq!(scan2.pinned().count(), 1, "the scan observes generation 2");
+    // Non-vacuity: the fresh scan pins are innocent on their own — the
+    // working copy rejects (today) only through the conflict below.
+    let mut probe = PinnedObjects::empty();
+    let probe_skips = probe.absorb(scan2.clone());
+    assert!(
+        probe_skips.is_empty(),
+        "fresh scan pins file clean: {probe_skips:?}"
+    );
+    assert!(!probe.rejects(staged_key), "fresh scan pins reject nothing");
+    let mut working = engine.pinned.clone();
+    let absorbed = working.absorb(scan2);
+    assert!(
+        !working.rejects(staged_key),
+        "a touched file is not a collision"
+    );
+    assert!(working.supersedes(staged_key), "the rotation is recorded");
+    assert!(absorbed.is_empty(), "supersede files no skip: {absorbed:?}");
+    assert!(
+        working.sweep_match_keys().contains_key(&staged_key),
+        "the key routes the fresh pin"
+    );
+    assert!(
+        !engine.pinned.rejects(staged_key),
+        "committed stays clean: no commit"
+    );
+    assert!(
+        !engine.pinned.supersedes(staged_key),
+        "committed stays clean: no commit"
+    );
+    let _candidate = engine.live_candidate_with_pending(
+        working,
+        vec![module],
+        Vec::new(),
+        None,
+        &std::collections::BTreeSet::new(),
+        &std::collections::BTreeSet::new(),
+        &std::collections::BTreeSet::new(),
+    );
+    assert!(
+        engine.pending_superseded_keys.contains(&staged_key),
+        "the bind harvests the supersede"
+    );
+    // Resolve BEFORE the bound (10 ms after an intake at ~0).
+    engine.service_member_stops(&mut io, &mut session, Some(10_000_000));
+    assert!(
+        !engine.member_stops_held(),
+        "a superseded staging key refuses the hold"
+    );
+    let stats = engine.member_stop_stats_for_test();
+    assert_eq!(stats.refused_resumes, 1, "{stats:?}");
+    assert_eq!(stats.timed_out, 0, "{stats:?}");
+    assert!(member_resumed_for_test(pid), "the member runs again");
+    assert!(
+        files_the_first_use_row(&engine),
+        "the refused hold files the first-use row"
+    );
+}
+
+/// Staging a new generation over a committed scan pin (the scan-first
+/// order) supersedes in the committed set directly: no candidate runs,
+/// so the hold refuses through the committed markers alone.
+#[test]
+fn member_stop_committed_supersede_refuses_the_hold() {
+    let (fixture, _view, _module, pins) = loaded_seed_provider();
+    let pid = fixture.child.id();
+    let library = fixture._dir.path().join("seed-provider.so");
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::default();
+    // The scan-first order: a scan pin commits before any staging. The
+    // committed set is empty (no intake yet), so the scan files clean.
+    let scan_key = pins
+        .pinned()
+        .next()
+        .map(|pin| pin.key)
+        .expect("scan pins its file");
+    let setup_skips = engine.pinned.absorb(pins);
+    assert!(
+        setup_skips.is_empty(),
+        "the scan files clean: {setup_skips:?}"
+    );
+    assert!(
+        engine.pinned.sweep_match_keys().contains_key(&scan_key),
+        "the scan routes its pin"
+    );
+    // Generation 2: metadata only (bytes identical, ctime stepped). No
+    // intake ran yet, so the twin drives the real staging path directly
+    // for the new generation.
+    touch_for_test(&library, 2_000_000);
+    let file = std::fs::File::open(&library).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    engine.stage_learned_candidate(crate::fanotify::LearnedCandidate {
+        file,
+        dev,
+        ino,
+        display_path: library.to_string_lossy().into_owned(),
+        loader_exe: None,
+        loader_unknown_reason: None,
+        run_learned: false,
+        proving_retained: false,
+    });
+    // Scan-covered staging stages silently (no count, no row): the pins
+    // still join the committed set, and the staged key is recorded.
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        0,
+        "scan-covered staging counts nothing"
+    );
+    assert!(
+        !engine.pinned.rejects(scan_key),
+        "a touched file is not a collision"
+    );
+    assert!(
+        engine.pinned.supersedes(scan_key),
+        "the rotation is recorded"
+    );
+    assert!(
+        engine.pinned.sweep_match_keys().contains_key(&scan_key),
+        "the key routes the fresh pin"
+    );
+    assert!(
+        engine.pending_superseded_keys.is_empty(),
+        "no candidate ran: committed-only"
+    );
+    // A member stops on the settled file: intake creates the hold
+    // without queueing, and the hold refuses through the committed
+    // markers alone.
+    stop_member_for_test(pid);
+    let key = member_exec_key_for_test(pid, &library);
+    let mut io = ScriptedMemberStops::default();
+    io.rows.insert(pid, member_stop_row(pid, &library, key));
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    assert!(engine.member_stops_held(), "intake holds the mapper");
+    assert!(
+        engine.pending_superseded_keys.is_empty(),
+        "the apply harvests nothing new"
+    );
+    // Resolve BEFORE the bound (10 ms after an intake at ~0).
+    engine.service_member_stops(&mut io, &mut session, Some(10_000_000));
+    assert!(
+        !engine.member_stops_held(),
+        "a committed supersede refuses the hold"
+    );
+    let stats = engine.member_stop_stats_for_test();
+    assert_eq!(stats.refused_resumes, 1, "{stats:?}");
+    assert_eq!(stats.timed_out, 0, "{stats:?}");
+    assert!(member_resumed_for_test(pid), "the member runs again");
+    assert!(
+        files_the_first_use_row(&engine),
+        "the refused hold files the first-use row"
+    );
+}
+
 /// A drain-first staging (queued by the fanotify drain before any stop)
 /// records its key too: when a member stops on the file later, the
 /// intake skips the settled identity without marking it, but the hold

@@ -2010,6 +2010,15 @@ pub struct PinnedObjects {
     by_id: BTreeMap<PinnedObjectId, Entry>,
     raw_to_id: RawToId,
     rejected_keys: BTreeSet<ObjectKey>,
+    /// Maps keys whose retained pin a same-file generation rotation
+    /// superseded (same kernel file, equal digest, stepped ctime, a
+    /// live scan on one side): the stale entry was evicted and the
+    /// fresh observation filed, so the key stays routable and the
+    /// attach races on. A per-absorb signal, not identity content:
+    /// entry diffs already distinguish superseded sets, so the
+    /// content comparison and the conservative copy skip it; the
+    /// engine-side pending set is the durable record.
+    superseded_keys: BTreeSet<ObjectKey>,
     /// Transient pin-failure marks per viewing process: refused
     /// observations never reject by themselves, but two views refusing
     /// one key publish ambiguity, and a view filing a key it previously
@@ -2064,6 +2073,7 @@ impl Clone for PinnedObjects {
             by_id: self.by_id.clone(),
             raw_to_id: self.raw_to_id.clone(),
             rejected_keys: self.rejected_keys.clone(),
+            superseded_keys: self.superseded_keys.clone(),
             refused_keys: self.refused_keys.clone(),
             proven_collision_keys: self.proven_collision_keys.clone(),
             ambiguous_keys: self.ambiguous_keys.clone(),
@@ -2202,6 +2212,7 @@ impl PinnedObjects {
             by_id: BTreeMap::new(),
             raw_to_id: RawToId::default(),
             rejected_keys: BTreeSet::new(),
+            superseded_keys: BTreeSet::new(),
             refused_keys: BTreeSet::new(),
             proven_collision_keys: BTreeSet::new(),
             ambiguous_keys: BTreeSet::new(),
@@ -3335,6 +3346,23 @@ impl PinnedObjects {
 
     pub(crate) fn rejects(&self, key: ObjectKey) -> bool {
         self.rejected_keys.contains(&key)
+    }
+
+    /// Whether a same-file generation rotation superseded the
+    /// retained pin under `key` (stale entry evicted, fresh filed):
+    /// the key stays routable, unlike a rejection.
+    pub(crate) fn supersedes(&self, key: ObjectKey) -> bool {
+        self.superseded_keys.contains(&key)
+    }
+
+    /// Keys this set superseded that `committed` has not: the
+    /// per-candidate signal the bind head harvests, mirroring
+    /// [`PinnedObjects::newly_rejected_keys`].
+    pub(crate) fn newly_superseded_keys(&self, committed: &Self) -> BTreeSet<ObjectKey> {
+        self.superseded_keys
+            .difference(&committed.superseded_keys)
+            .copied()
+            .collect()
     }
 
     /// The raw maps keys that name exactly one opened object, for C1b sweep
@@ -14210,7 +14238,7 @@ pub(crate) mod test_fixture {
 mod tests {
     use super::test_fixture::{
         FakeSelfMappingProbe, INODE, PATH, SHA, backing_file, mark_pre_copy_up, module, overlay,
-        own_all_raws, own_all_raws_under, pin_set, pins, reback, repath_single_pin, view_pin,
+        own_all_raws, own_all_raws_under, pin_set, pins, prearm_pin, reback, repath_single_pin, view_pin,
     };
     use super::*;
     use crate::discovery::scan::ScannedEntry;
@@ -20458,6 +20486,244 @@ mod tests {
         assert!(acc.rejects(key));
         assert_eq!(acc.pinned().count(), 0);
         assert!(!skipped.is_empty(), "the rewrite is disclosed, not silent");
+    }
+
+    #[test]
+    fn absorbing_same_file_same_digest_rotated_ctime_supersedes_the_stale_pin() {
+        // The churn shape: generation 1 staged (a pre-arm proof), then a
+        // live scan observes generation 2 of the same file with identical
+        // bytes and a stepped ctime. The stale pin is superseded (evicted,
+        // fresh filed), never a group rejection: one touched file is not
+        // an identity collision, and the key must stay routable so the
+        // attach races on.
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let mut staged = prearm_pin(key, "aaaaaaaa", 1);
+        reback(&mut staged, &file);
+        let mut acc = PinnedObjects::empty();
+        assert!(acc.absorb(staged).is_empty());
+        let mut scan = image_pins(&[(key, "aaaaaaaa", 2)]);
+        reback(&mut scan, &file);
+        // The scan resolves the same mount view as the staging (one
+        // file, one mount): align the forged mount ids.
+        let staged_mapping = acc.by_id.values().next().unwrap().mapping;
+        scan.by_id.values_mut().next().unwrap().mapping = staged_mapping;
+        let skipped = acc.absorb(scan);
+        assert!(!acc.rejects(key), "a touched file is not a collision");
+        assert!(acc.supersedes(key), "the rotation is recorded");
+        assert!(skipped.is_empty(), "supersede files no skip: {skipped:?}");
+        assert_eq!(acc.pinned().count(), 1, "the fresh generation routes");
+        let routed = acc
+            .sweep_match_keys()
+            .get(&key)
+            .copied()
+            .expect("the key routes the fresh pin");
+        assert_eq!(
+            acc.by_id.get(&routed).unwrap().pin.test_parts().2,
+            (2, 7),
+            "generation 2 is kept"
+        );
+        assert_eq!(acc.raw_to_id.len(), 1, "the stale raw is gone");
+        let (raw, owner) = acc.raw_to_id.iter().next().unwrap();
+        assert!(raw.mount_namespace.is_some(), "only the scan raw survives");
+        assert_eq!(*owner, routed, "the scan raw owns the fresh pin");
+    }
+
+    #[test]
+    fn absorbing_second_staging_of_a_touched_file_still_rejects() {
+        // Two point-in-time proofs disagreeing (the drain never produces
+        // this: settled identities skip re-staging): fail closed, like
+        // today. Only a live scan supersedes a stale proof.
+        // Engine-level twin: member_stop_rejected_staging_key_refuses_the_hold.
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let mut first = prearm_pin(key, "aaaaaaaa", 1);
+        reback(&mut first, &file);
+        let mut acc = PinnedObjects::empty();
+        assert!(acc.absorb(first).is_empty());
+        let mut second = prearm_pin(key, "aaaaaaaa", 2);
+        reback(&mut second, &file);
+        let skipped = acc.absorb(second);
+        assert!(acc.rejects(key), "proofs disagreeing still fail closed");
+        assert!(!acc.supersedes(key), "no supersede without a live scan");
+        assert_eq!(acc.pinned().count(), 0);
+        assert!(
+            !skipped.is_empty(),
+            "the rejection is disclosed, not silent"
+        );
+    }
+
+    #[test]
+    fn absorbing_rotated_ctime_across_mount_views_still_rejects() {
+        // Same file, same bytes, stepped ctime — but observed through a
+        // different mount view (different mapping): the eviction would
+        // drop a mount view the supersede cannot re-prove, so the
+        // rotation fails closed. Named residual: multi-mount churn keeps
+        // today's reject (single-mount churn supersedes).
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let mut staged = prearm_pin(key, "aaaaaaaa", 1);
+        reback(&mut staged, &file);
+        let mut acc = PinnedObjects::empty();
+        assert!(acc.absorb(staged).is_empty());
+        let mut scan = image_pins(&[(key, "aaaaaaaa", 2)]);
+        reback(&mut scan, &file);
+        let mut view = acc.by_id.values().next().unwrap().mapping;
+        view.mount_id = view.mount_id.wrapping_add(1);
+        scan.by_id.values_mut().next().unwrap().mapping = view;
+        let skipped = acc.absorb(scan);
+        assert!(acc.rejects(key), "a cross-view rotation fails closed");
+        assert!(!acc.supersedes(key), "no supersede across mount views");
+        assert_eq!(acc.pinned().count(), 0);
+        assert!(
+            !skipped.is_empty(),
+            "the rejection is disclosed, not silent"
+        );
+    }
+
+    #[test]
+    fn absorbing_unhashed_rotation_sides_still_rejects() {
+        // A rotation both sides must hash: an empty digest proves no
+        // bytes, so an unhashed side fails closed whichever side it is
+        // on (either side alone, or both).
+        for (kept_sha, scan_sha) in [("aaaaaaaa", ""), ("", "aaaaaaaa"), ("", "")] {
+            let key = ObjectKey {
+                device: Device { major: 8, minor: 1 },
+                inode: INODE,
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let file = backing_file(&dir, "provider.so");
+            let mut staged = prearm_pin(key, kept_sha, 1);
+            reback(&mut staged, &file);
+            let mut acc = PinnedObjects::empty();
+            assert!(acc.absorb(staged).is_empty());
+            let mut scan = image_pins(&[(key, scan_sha, 2)]);
+            reback(&mut scan, &file);
+            let staged_mapping = acc.by_id.values().next().unwrap().mapping;
+            scan.by_id.values_mut().next().unwrap().mapping = staged_mapping;
+            let skipped = acc.absorb(scan);
+            assert!(
+                acc.rejects(key),
+                "unhashed side {kept_sha:?}/{scan_sha:?} rejects"
+            );
+            assert!(!acc.supersedes(key), "no supersede without two digests");
+            assert_eq!(acc.pinned().count(), 0);
+            assert!(!skipped.is_empty(), "the rejection is disclosed");
+        }
+    }
+
+    #[test]
+    fn absorbing_rotation_against_a_proven_pre_rejects_and_spares_the_pre() {
+        // A witness-proven pre-copy-up observation never supersedes: the
+        // proof outranks the rotation, so the key fails closed. A kept
+        // pre survives the rejection; a newcomer pre is not filed.
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        // Newcomer pre against a kept plain: the key rejects and the
+        // plain is evicted, while the unfiled pre stands nowhere.
+        let mut staged = prearm_pin(key, "aaaaaaaa", 1);
+        reback(&mut staged, &file);
+        let mut acc = PinnedObjects::empty();
+        assert!(acc.absorb(staged).is_empty());
+        let mut scan = image_pins(&[(key, "aaaaaaaa", 2)]);
+        reback(&mut scan, &file);
+        let staged_mapping = acc.by_id.values().next().unwrap().mapping;
+        scan.by_id.values_mut().next().unwrap().mapping = staged_mapping;
+        mark_pre_copy_up(&mut scan);
+        let skipped = acc.absorb(scan);
+        assert!(acc.rejects(key), "a newcomer pre fails the key closed");
+        assert!(!acc.supersedes(key), "a pre never supersedes");
+        assert_eq!(acc.pinned().count(), 0);
+        assert!(!skipped.is_empty(), "the rejection is disclosed");
+        // Plain newcomer against a kept pre: the key rejects and the
+        // proven pre survives it.
+        let mut staged = prearm_pin(key, "aaaaaaaa", 1);
+        reback(&mut staged, &file);
+        mark_pre_copy_up(&mut staged);
+        let mut acc = PinnedObjects::empty();
+        assert!(acc.absorb(staged).is_empty());
+        let mut scan = image_pins(&[(key, "aaaaaaaa", 2)]);
+        reback(&mut scan, &file);
+        let staged_mapping = acc.by_id.values().next().unwrap().mapping;
+        scan.by_id.values_mut().next().unwrap().mapping = staged_mapping;
+        let skipped = acc.absorb(scan);
+        assert!(acc.rejects(key), "a kept pre fails the key closed");
+        assert!(!acc.supersedes(key), "a pre never supersedes");
+        assert_eq!(acc.pinned().count(), 1, "the proven pre survives");
+        assert!(
+            acc.by_id.values().next().unwrap().pre_copy_up,
+            "the survivor is the pre"
+        );
+        // Nothing was evicted (the pre stands), so no skip files: the
+        // spare-pre silence is today's behavior, unchanged here.
+        assert!(skipped.is_empty(), "a spared pre discloses nothing: {skipped:?}");
+    }
+
+    #[test]
+    fn absorbing_same_mapping_distinct_files_still_rejects() {
+        // Same maps key, same mount view, same digest, stepped ctime —
+        // but two kernel files (non-unique inode numbers, or a forgery):
+        // same_kernel_file refuses, so the group fails closed.
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut staged = prearm_pin(key, "aaaaaaaa", 1);
+        reback(&mut staged, &backing_file(&dir, "first.so"));
+        let mut acc = PinnedObjects::empty();
+        assert!(acc.absorb(staged).is_empty());
+        let mut scan = image_pins(&[(key, "aaaaaaaa", 2)]);
+        reback(&mut scan, &backing_file(&dir, "second.so"));
+        let staged_mapping = acc.by_id.values().next().unwrap().mapping;
+        scan.by_id.values_mut().next().unwrap().mapping = staged_mapping;
+        let skipped = acc.absorb(scan);
+        assert!(acc.rejects(key), "distinct files fail closed");
+        assert!(!acc.supersedes(key), "no supersede across files");
+        assert_eq!(acc.pinned().count(), 0);
+        assert!(!skipped.is_empty(), "the rejection is disclosed");
+    }
+
+    #[test]
+    fn absorbing_same_generation_scan_merges_into_the_staged_pin() {
+        // Control: without rotation (equal pins) the scan merges into
+        // the staged pin instead of conflicting — the mount views agree,
+        // so only a stepped ctime can reach the supersede arm.
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let mut staged = prearm_pin(key, "aaaaaaaa", 1);
+        reback(&mut staged, &file);
+        let mut acc = PinnedObjects::empty();
+        assert!(acc.absorb(staged).is_empty());
+        let mut scan = image_pins(&[(key, "aaaaaaaa", 1)]);
+        reback(&mut scan, &file);
+        let staged_mapping = acc.by_id.values().next().unwrap().mapping;
+        scan.by_id.values_mut().next().unwrap().mapping = staged_mapping;
+        let skipped = acc.absorb(scan);
+        assert!(!acc.rejects(key), "one generation never collides");
+        assert!(!acc.supersedes(key), "a merge is not a rotation");
+        assert_eq!(acc.pinned().count(), 1, "the generation merges");
+        assert!(skipped.is_empty(), "a merge files no skip: {skipped:?}");
     }
 
     #[test]

@@ -1336,7 +1336,9 @@ impl Engine {
         // with the first-use row instead of risking unobserved first
         // calls. Trial-only rejections never reach this bool.
         let refused = held.providers.iter().any(|identity| {
-            self.member_stops.refused.contains(identity) || self.stop_staged_key_rejected(*identity)
+            self.member_stops.refused.contains(identity)
+                || self.stop_staged_key_rejected(*identity)
+                || self.stop_staged_key_superseded(*identity)
         });
         // Attached means real session attach stamps, never scheduling
         // flags: a deferred, refused or no-link apply can clear those
@@ -1371,6 +1373,22 @@ impl Engine {
             .get(&identity)
             .is_some_and(|key| {
                 self.pinned.rejects(*key) || self.pending_rejected_keys.contains(key)
+            })
+    }
+
+    /// Whether a stop-staged identity's maps key has been superseded
+    /// since its staging (a same-file generation rotation evicted the
+    /// staged pin): the hold's staged generation can never attach, so
+    /// it ends refused while the fresh generation races on. Reads the
+    /// committed markers plus the bind-harvested pending set, so
+    /// supersedes that never commit (a stalled candidate pipeline)
+    /// still refuse. Unrecorded identities keep the bound backstop.
+    fn stop_staged_key_superseded(&self, identity: (u64, u64)) -> bool {
+        self.member_stops
+            .staged_keys
+            .get(&identity)
+            .is_some_and(|key| {
+                self.pinned.supersedes(*key) || self.pending_superseded_keys.contains(key)
             })
     }
 

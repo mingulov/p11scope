@@ -46221,15 +46221,11 @@ int main(void) {
             "no fold-revival gap for a mid-life advance"
         );
         assert!(
-            native
-                .scene
-                .coordinator
-                .pair_fold_lost
-                .contains(&PairKey {
-                    image: DomainCookie::scripted(native.domain, 41),
-                    exec: 9,
-                    object: 0,
-                }),
+            native.scene.coordinator.pair_fold_lost.contains(&PairKey {
+                image: DomainCookie::scripted(native.domain, 41),
+                exec: 9,
+                object: 0,
+            }),
             "the advance preserves the latch for the evicted key"
         );
     }
@@ -46273,9 +46269,10 @@ int main(void) {
                     pid: 7,
                 },
             );
-            native.scene.coordinator.prune_departed_native_state(
-                at + EXEC_STATE_GRACE_NS + pass as u64,
-            );
+            native
+                .scene
+                .coordinator
+                .prune_departed_native_state(at + EXEC_STATE_GRACE_NS + pass as u64);
         }
         assert_eq!(
             native
@@ -46396,9 +46393,10 @@ int main(void) {
                     pid: 7,
                 },
             );
-            native.scene.coordinator.prune_departed_native_state(
-                fold_at + EXEC_STATE_GRACE_NS + pass as u64,
-            );
+            native
+                .scene
+                .coordinator
+                .prune_departed_native_state(fold_at + EXEC_STATE_GRACE_NS + pass as u64);
         }
         assert_eq!(
             native
@@ -46552,9 +46550,10 @@ int main(void) {
                     pid: 7,
                 },
             );
-            native.scene.coordinator.prune_departed_native_state(
-                at + EXEC_STATE_GRACE_NS + pass as u64,
-            );
+            native
+                .scene
+                .coordinator
+                .prune_departed_native_state(at + EXEC_STATE_GRACE_NS + pass as u64);
         }
         assert_eq!(
             native
@@ -46753,11 +46752,7 @@ int main(void) {
             "the other domain's latch stays"
         );
         assert_eq!(
-            native
-                .scene
-                .coordinator
-                .pair_fold_lost_class_overflow
-                .len(),
+            native.scene.coordinator.pair_fold_lost_class_overflow.len(),
             1,
             "the other domain's class fallback stays"
         );

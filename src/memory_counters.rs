@@ -1251,7 +1251,10 @@ mod tests {
         assert_eq!(inventory.r1_native_pair_folded.expect("native").len, 40);
         assert_eq!(inventory.r1_native_pair_fold_lost.expect("native").len, 41);
         assert_eq!(
-            inventory.r1_native_pair_fold_lost_classes.expect("native").len,
+            inventory
+                .r1_native_pair_fold_lost_classes
+                .expect("native")
+                .len,
             42
         );
         assert_eq!(inventory.r1_native_preadmission.expect("native").len, 32);

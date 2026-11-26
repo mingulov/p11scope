@@ -107,6 +107,9 @@ jobs:
         run: |
           set -euo pipefail
           umask 022
+          epoch=$(git log -1 --format=%ct HEAD)
+          case $epoch in ''|*[!0-9]*) echo "not a commit epoch: $epoch" >&2; exit 1;; esac
+          export SOURCE_DATE_EPOCH=$epoch
           bases=$(sed -n 's/^FROM //p' deploy/Dockerfile.observer-release | awk '{print $1}')
           test -n "$bases"
           # The runtime stage is FROM scratch: nothing to pull. Every other
@@ -123,6 +126,7 @@ jobs:
           tarball_sha256=$(cat "$RUNNER_TEMP/observer-tarball-sha256.txt")
           docker build --network=none -f deploy/Dockerfile.observer-release \
             --build-arg "TARBALL=$tarball" --build-arg "TARBALL_SHA256=$tarball_sha256" \
+            --output type=docker,rewrite-timestamp=true \
             -t p11scope-observer:preview "$RUNNER_TEMP/container-publish-ctx"
           docker inspect --format '{{.Id}}' p11scope-observer:preview \
             | tee "$RUNNER_TEMP/image-id.txt"

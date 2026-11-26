@@ -7,16 +7,18 @@
 # arguments:
 #   docker run --rm --pid=host --cap-add SYS_ADMIN --cap-add SYS_PTRACE \
 #     --cap-add DAC_READ_SEARCH -v /sys/fs/cgroup:/sys/fs/cgroup:ro \
-#     ghcr.io/mingulov/p11scope:0.7.0 inventory --system
+#     ghcr.io/mingulov/p11scope:0.7.2 inventory --system
 # (see deploy/README.md for the measured DaemonSet set and what each grant is
 # for). The in-cluster entry script stays available by explicit name for
 # `kubectl exec` into the DaemonSet pod; the DaemonSet overrides the
 # container command with its idle agent anyway.
 #
 # Built from a staged minimal context holding the tarball and the entry script:
-#   docker build --network=none -f deploy/Dockerfile.observer-release \
-#     --build-arg TARBALL=p11scope-0.7.0-x86_64-linux-musl.tar.gz \
+#   SOURCE_DATE_EPOCH=$(git log -1 --format=%ct HEAD) \
+#     docker build --network=none -f deploy/Dockerfile.observer-release \
+#     --build-arg TARBALL=p11scope-0.7.2-x86_64-linux-musl.tar.gz \
 #     --build-arg TARBALL_SHA256=<sha256 from SHA256SUMS> \
+#     --output type=docker,rewrite-timestamp=true \
 #     -t <tag> "$CTX"
 # (CTX/<tarball>, CTX/scripts/k8s-profile-entry.sh).
 # container-publish downloads the release tarball, SHA256SUMS and RELEASE.json,
@@ -31,7 +33,7 @@
 # The tarball must hold exactly one `*/p11scope` regular file (the release
 # layout); anything else is refused. LICENSE, LICENSES/, notices/ and
 # RELEASE.json ride along from the same verified bytes for provenance
-# (COPYRIGHT too: 0.7.0 tarballs carry it, and the final stage refuses an
+# (COPYRIGHT too: 0.7.2 tarballs carry it, and the final stage refuses an
 # image without it).
 # The base tag+digest stay matched with Dockerfile.observer.
 # Base rationale (see deploy/k8s/README.md): the observer is static-pie and
@@ -47,10 +49,12 @@
 # tests/artifact_contracts.rs (busybox_pin).
 # No curl/jq: the observer never talks to the Kubernetes API.
 # The base is pinned by digest (multi-arch index of busybox:1.37.0-musl as
-# published 2026-10-27); bump tag and digest together. Layer timestamps
-# float, so the image is repeatable, not bit-reproducible; the
-# container-publish push job re-identifies the exact bytes by image ID instead
-# of trusting the tag.
+# published 2026-10-27); bump tag and digest together. Layer timestamps are
+# pinned, not floating: builders export SOURCE_DATE_EPOCH (the release
+# commit time) and pass --output type=docker,rewrite-timestamp=true, so the
+# same tarball bytes rebuild the same image ID; the container-publish push
+# job still re-identifies the exact bytes by image ID instead of trusting
+# the tag.
 FROM busybox:1.37.0-musl@sha256:f6a95d611e0a8780fabdb2aec43e31275b2720dfefa3e41b16835bfc42454478 AS src
 ARG TARBALL
 ARG TARBALL_SHA256

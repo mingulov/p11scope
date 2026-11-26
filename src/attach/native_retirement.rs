@@ -43,6 +43,23 @@ impl RetirementTicket {
     pub(crate) fn retired_slots(&self) -> &BTreeSet<u32> {
         &self.identity.retired_slots
     }
+
+    /// Side-effect-free batch status for tests (unlike `poll`, never
+    /// consumes `Released`): `None` when the ticket carries no batch.
+    #[cfg(test)]
+    pub(crate) fn batch_status_for_test(&self) -> Option<BatchStatus> {
+        self.identity.batch.as_ref().map(BatchTicket::status)
+    }
+
+    /// Total links in this ticket's batch, if it carries one (test seam
+    /// for the freed-slot wall bound).
+    #[cfg(test)]
+    pub(crate) fn link_total_for_test(&self) -> Option<usize> {
+        self.identity
+            .batch
+            .as_ref()
+            .map(BatchTicket::link_total_for_test)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

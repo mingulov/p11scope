@@ -523,6 +523,14 @@ impl BatchTicket {
     pub(crate) fn belongs_to(&self, worker: &CleanupWorker) -> bool {
         Arc::ptr_eq(&self.owner, &worker.state)
     }
+
+    /// Total links submitted in this batch (test seam for the
+    /// freed-slot wall bound: link count times close cost). A poisoned
+    /// batch reports zero, so the bound falls back to its floor.
+    #[cfg(test)]
+    pub(crate) fn link_total_for_test(&self) -> usize {
+        self.state.lock().map(|state| state.total).unwrap_or(0)
+    }
 }
 
 pub(crate) struct SubmissionFailure {
@@ -1542,8 +1550,10 @@ pub(crate) fn settle_cleanup_exit(exit: CleanupExit) -> Result<Vec<String>, Clea
 }
 
 /// Serial close cost per single probe link on kernels without batched
-/// uprobe detach, rounded up from the ~49 ms measured per link.
-const SINGLE_LINK_CLOSE_MS: u64 = 50;
+/// uprobe detach, rounded up from the ~49 ms measured per link. Tests
+/// use it to derive worker-pending wall bounds; the value is a
+/// measurement, never a budget to raise.
+pub(crate) const SINGLE_LINK_CLOSE_MS: u64 = 50;
 
 /// The terminal stop estimate prints only once it reaches this floor: a
 /// shorter stop already reads as instant, and the line must not add

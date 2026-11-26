@@ -4097,6 +4097,10 @@ fn async_global_newcomer_waits_for_the_detach_then_admits_on_the_settling_frame(
             .released()
             == 2
     });
+    assert!(
+        case.engine.pending_global_retirement.is_some(),
+        "the worker finished but the engine has not polled yet: settlement happens at the next service call"
+    );
     let outcome = case
         .engine
         .service_backlog_quantum(&mut case.session)
@@ -4111,6 +4115,84 @@ fn async_global_newcomer_waits_for_the_detach_then_admits_on_the_settling_frame(
         admitted(&case.engine),
         "the newcomer admits on the first frame after the worker settles"
     );
+}
+
+/// Deterministic-twin Refused arm (binding ruling 17:58): when the
+/// worker fails the closes, the engine quarantines — the head stays
+/// deferred, the exact partial row is filed, nothing admits, and the
+/// ticket stays parked.
+#[test]
+fn async_global_newcomer_stays_deferred_when_the_detach_refuses() {
+    let mut case = Case::with_close_failure(true);
+    let scope = case.bounded_scope();
+    let peers = e06_spawn_sleeps(1);
+    let newcomer = peers[0].pid();
+    let admitted = |engine: &Engine| engine.views.iter().any(|view| view.pid() == newcomer);
+    let quarantined = |engine: &Engine| {
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "global native retirement"
+                && skip.reason
+                    == "original static ownership remains uncertain; replacement admission is blocked"
+        })
+    };
+    let candidate = case.candidate();
+    let outcome = case
+        .engine
+        .apply_candidate(&mut case.session, candidate, &mut true, false, &[])
+        .unwrap();
+    assert_eq!(outcome.disposition, ApplyDisposition::Deferred);
+    assert!(case.engine.pending_global_retirement.is_some());
+    case.entered.recv_timeout(Duration::from_secs(2)).unwrap();
+    e06_write_listing(scope.path(), &[case.child.id(), newcomer]);
+    case.release();
+    wait_for(|| {
+        case.session
+            .global_retirement
+            .as_ref()
+            .unwrap()
+            .borrow_mut()
+            .poll(case.engine.pending_global_retirement.as_ref().unwrap())
+            == crate::attach::RetirementPoll::Refused
+    });
+    for frame in 0..10 {
+        case.engine
+            .drain_discovery_shallow_from(&mut case.session, false)
+            .unwrap();
+        case.engine
+            .service_backlog_quantum(&mut case.session)
+            .unwrap();
+        assert!(
+            !admitted(&case.engine),
+            "frame {frame}: nothing admits behind a refused detach"
+        );
+        assert!(
+            case.engine.pending_global_retirement.is_some(),
+            "frame {frame}: the refused ticket stays parked"
+        );
+        if quarantined(&case.engine) {
+            break;
+        }
+    }
+    assert!(
+        quarantined(&case.engine),
+        "the refused detach files its quarantine row"
+    );
+    for frame in 0..5 {
+        case.engine
+            .drain_discovery_shallow_from(&mut case.session, false)
+            .unwrap();
+        case.engine
+            .service_backlog_quantum(&mut case.session)
+            .unwrap();
+        assert!(
+            !admitted(&case.engine),
+            "hold {frame}: the quarantine sticks"
+        );
+        assert!(
+            case.engine.pending_global_retirement.is_some(),
+            "hold {frame}: the refused ticket stays parked"
+        );
+    }
 }
 
 /// Refresh-skip gate twin (B2a): a batch that arrives with

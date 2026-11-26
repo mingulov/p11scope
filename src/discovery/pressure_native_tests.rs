@@ -72,7 +72,7 @@
 
 use super::session_fixture::ScriptedSession;
 use super::*;
-use crate::attach::{BackendSelection, CapturePolicy, Scope};
+use crate::attach::{BatchStatus, BackendSelection, CapturePolicy, SINGLE_LINK_CLOSE_MS, Scope};
 use crate::cli::{CaptureArgs, Kind, ScopeArg};
 use crate::discovery::hooks::HookRegistry;
 use crate::discovery::identity::PinnedObjectId;
@@ -1425,6 +1425,112 @@ fn minted_ids(engine: &Engine) -> BTreeSet<u16> {
         );
     }
     ids
+}
+
+/// Which clock a freed-slot wait tick charges (binding ruling 17:58).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FreedSlotWaitPhase {
+    /// A worker batch is genuinely pending on a running worker: exempt
+    /// from the engine budget, bounded by the derived wall bound instead.
+    WorkerPending,
+    /// The batch failed, lost its worker, or the ticket carries no
+    /// batch: the leg fails at once (the engine quarantines).
+    Refused,
+    /// Every other tick, including queued retirements or rejected keys
+    /// without a pending batch: counts against the one engine budget.
+    Engine,
+}
+
+/// Typed freed-slot wait state for one tick, read side-effect-free
+/// from the engine (ticket presence, queue presence) and the session
+/// (batch status, worker liveness). Never by polling (which would
+/// consume `Settled`) and never from log text.
+#[derive(Debug, Clone, Copy)]
+struct FreedSlotWaitState {
+    ticket_present: bool,
+    /// The ticket's batch status; meaningful only with a ticket
+    /// (`None` there means a batchless ticket).
+    batch: Option<BatchStatus>,
+    worker_running: bool,
+    retirements_queued: bool,
+    rejected_keys_queued: bool,
+}
+
+/// Worker-pending wall-bound margin over the measured serial close
+/// cost (test timeout, not a product budget): covers close slowdown
+/// under load. Validated by the Fedora loaded control.
+const FREED_SLOT_CLOSE_MARGIN: u64 = 4;
+/// Worker-pending wall-bound floor in ms (test timeout): worker wakeup
+/// plus loaded scheduling plus engine frames around the closes.
+const FREED_SLOT_CLOSE_FLOOR_MS: u64 = 60_000;
+
+/// Classify one freed-slot wait tick from typed retirement state.
+/// Mirrors `NativeRetirement::poll` without its side effects (no
+/// `refused` latching, no `pending` consumption): `WorkerPending` only
+/// while a batch is actually pending on a running worker; queued
+/// retirements or rejected keys without a pending batch are engine
+/// work, never worker waiting.
+fn freed_slot_wait_phase(state: FreedSlotWaitState) -> FreedSlotWaitPhase {
+    let Some(batch) = state.batch.filter(|_| state.ticket_present) else {
+        // No ticket, or a ticket without a batch: without a ticket the
+        // engine is free to admit whatever queues (M2: queues alone
+        // never exempt); a batchless ticket is already refused.
+        let _ = (state.retirements_queued, state.rejected_keys_queued);
+        if state.ticket_present {
+            return FreedSlotWaitPhase::Refused;
+        }
+        return FreedSlotWaitPhase::Engine;
+    };
+    match batch {
+        BatchStatus::Pending if state.worker_running => FreedSlotWaitPhase::WorkerPending,
+        BatchStatus::Pending | BatchStatus::Failed => FreedSlotWaitPhase::Refused,
+        BatchStatus::Released => FreedSlotWaitPhase::Engine,
+    }
+}
+
+/// Phase-helper truth table on scripted states (binding ruling 17:58,
+/// M2): queued retirements or rejected keys without a pending batch
+/// are engine ticks; only a pending batch on a running worker is
+/// exempt; failed, workerless and batchless tickets refuse; a
+/// released batch is engine work (the engine's next poll settles it).
+#[test]
+fn freed_slot_wait_phase_classifies_typed_retirement_state() {
+    use FreedSlotWaitPhase::{Engine, Refused, WorkerPending};
+    // (ticket, batch, worker, retirements, rejected keys, phase)
+    let rows: &[(bool, Option<BatchStatus>, bool, bool, bool, FreedSlotWaitPhase)] = &[
+        (false, None, false, false, false, Engine),
+        (false, None, true, false, false, Engine),
+        (false, None, true, true, false, Engine),
+        (false, None, false, false, true, Engine),
+        (false, None, true, true, true, Engine),
+        (false, Some(BatchStatus::Pending), true, false, false, Engine),
+        (true, Some(BatchStatus::Pending), true, false, false, WorkerPending),
+        (true, Some(BatchStatus::Pending), true, true, true, WorkerPending),
+        (true, Some(BatchStatus::Pending), false, false, false, Refused),
+        (true, Some(BatchStatus::Pending), false, true, true, Refused),
+        (true, Some(BatchStatus::Failed), true, false, false, Refused),
+        (true, Some(BatchStatus::Failed), false, true, true, Refused),
+        (true, None, true, false, false, Refused),
+        (true, None, false, true, true, Refused),
+        (true, Some(BatchStatus::Released), true, true, true, Engine),
+        (true, Some(BatchStatus::Released), false, false, false, Engine),
+    ];
+    for (ticket_present, batch, worker_running, retirements_queued, rejected_keys_queued, phase) in
+        rows.iter().copied()
+    {
+        assert_eq!(
+            freed_slot_wait_phase(FreedSlotWaitState {
+                ticket_present,
+                batch,
+                worker_running,
+                retirements_queued,
+                rejected_keys_queued,
+            }),
+            phase,
+            "ticket={ticket_present} batch={batch:?} worker={worker_running} \
+             retirements={retirements_queued} keys={rejected_keys_queued}"
+        );
+    }
 }
 
 /// Zero episode loss: no queue refusal, no dropped newcomer, and no
@@ -4575,25 +4681,35 @@ fn pressure_live256_all_blocked_twin_refuses_once() {
         "{WHAT}: sacrificed child {sacrificed} must reap"
     );
     population.children.remove(0);
-    // Admission can lag the freed slot by several ticks: each tick still
-    // services the retained refilled requests, and the head's newcomer
-    // window only survives the tick quantum once that service lightens
-    // (service may also rearm retired owned views through recycled
-    // slots, which legitimately grows the arm count past 256 — only the
-    // head's own ticketlessness is pinned below). Thirty ticks bounds
-    // the wait with margin; the loop exits on admission.
+    // Two-clock bound: only ticks where a worker batch is genuinely
+    // pending on a running worker are exempt from the engine budget;
+    // every other tick — including queued retirements or rejected keys
+    // without a pending batch — counts against ONE 30-tick budget from
+    // the kill, never reset. A refused batch fails at once. The
+    // worker-pending wait is bounded in wall time derived from the
+    // batch's own link total, not by an arbitrary constant. Each tick
+    // still services the retained refilled requests, and the head's
+    // newcomer window only survives the tick quantum once that service
+    // lightens (service may also rearm retired owned views through
+    // recycled slots, which legitimately grows the arm count past 256 —
+    // only the head's own deferral is pinned below). The loop exits on
+    // admission; every other exit is a bound failure.
     //
     // A tick that starts behind an in-flight global native retirement
     // does no engine work by design: the pending batch owns the whole
-    // candidate boundary until the worker has actually closed its links
-    // (`async_global_cgroup_departure_defers_conservative_replay_until_
-    // actual_close` pins that). Such a tick returns in microseconds while
-    // the kernel detach takes hundreds of milliseconds, so it is not an
-    // admission opportunity: each counted tick first waits out the actual
-    // close, within the same settle deadline the episode settles use.
+    // candidate boundary until the worker has actually closed its links.
+    // Such a tick returns in microseconds while the kernel detach takes
+    // hundreds of milliseconds, so it is not an admission opportunity:
+    // each counted tick first waits out the actual close, within the
+    // same settle deadline the episode settles use.
+    let kill_instant = Instant::now();
+    let dropped_before_kill = engine.newcomer_ages.dropped_unknown;
     let mut admitted_tick = None;
+    let mut engine_ticks = 0u32;
+    let mut worker_pending_ticks = 0u32;
+    let mut link_total = 0usize;
     let mut waits = RetirementWaits::default();
-    for tick in 0..30u32 {
+    for tick in 0u32.. {
         let tick_wait =
             wait_for_global_retirement(&mut engine, &mut session, &mut waits, tick, WHAT);
         engine
@@ -4606,18 +4722,86 @@ fn pressure_live256_all_blocked_twin_refuses_once() {
             .views
             .iter()
             .any(|view| view.pid() == head_pid && view.still_the_same());
+        let ticket = engine.pending_global_retirement.as_ref();
+        if link_total == 0 {
+            if let Some(total) = ticket.and_then(|ticket| ticket.link_total_for_test()) {
+                link_total = total;
+            }
+        }
+        let phase = freed_slot_wait_phase(FreedSlotWaitState {
+            ticket_present: ticket.is_some(),
+            batch: ticket.and_then(|ticket| ticket.batch_status_for_test()),
+            worker_running: session.cleanup_worker_running_for_test(),
+            retirements_queued: !engine.pending_retirements.is_empty(),
+            rejected_keys_queued: !engine.pending_rejected_keys.is_empty(),
+        });
+        let elapsed_ms = u64::try_from(kill_instant.elapsed().as_millis()).unwrap_or(u64::MAX);
         println!(
-            "t8: {WHAT}: admission tick {tick}: views={} head_view={head_view} minted={} truncated={} close_wait={tick_wait:?} close_waits_total={:?}",
+            "t8: {WHAT}: admission tick {tick}: views={} head_view={head_view} phase={phase:?} engine={engine_ticks} worker_pending={worker_pending_ticks} links={link_total} close_ms={elapsed_ms} minted={} truncated={} close_wait={tick_wait:?} close_waits_total={:?}",
             engine.views.len(),
             minted_ids(&engine).len(),
             engine.discovery_truncated,
             waits,
         );
+        match phase {
+            FreedSlotWaitPhase::Refused => {
+                // Let the engine poll once more so its barrier files the
+                // quarantine row for this refusal, then fail on it.
+                engine
+                    .service_backlog_quantum(&mut session)
+                    .unwrap_or_else(|error| panic!("{WHAT}: refusal service failed: {error:#}"));
+                assert!(
+                    engine.counters.object_skips.iter().any(|skip| skip.subject
+                        == "global native retirement"
+                        && skip.reason
+                            == "original static ownership remains uncertain; replacement admission is blocked"),
+                    "{WHAT}: a refused batch files its quarantine row"
+                );
+                panic!("{WHAT}: the freed slot's batch refused at tick {tick}");
+            }
+            FreedSlotWaitPhase::WorkerPending => {
+                worker_pending_ticks += 1;
+                assert!(
+                    !head_view,
+                    "{WHAT}: the head holds no view while the worker is pending"
+                );
+                assert_eq!(
+                    engine.newcomer_ages.dropped_unknown, dropped_before_kill,
+                    "{WHAT}: no age is dropped while the worker is pending"
+                );
+                assert!(
+                    engine
+                        .discovery_truncated
+                        .saturating_sub(engine.exit_ended_truncations)
+                        <= truncated_before_kill.saturating_sub(exit_ended_before_kill),
+                    "{WHAT}: worker-pending truncation growth stays exit-explained"
+                );
+                let bound_ms = u64::try_from(link_total)
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(SINGLE_LINK_CLOSE_MS)
+                    .saturating_mul(FREED_SLOT_CLOSE_MARGIN)
+                    .max(FREED_SLOT_CLOSE_FLOOR_MS);
+                assert!(
+                    elapsed_ms < bound_ms,
+                    "{WHAT}: the worker close exceeded its derived bound (links={link_total} close_ms={elapsed_ms} bound_ms={bound_ms})"
+                );
+            }
+            FreedSlotWaitPhase::Engine => {
+                engine_ticks += 1;
+                assert!(
+                    engine_ticks <= 30,
+                    "{WHAT}: the deferred head admits within 30 engine ticks of the freed slot"
+                );
+            }
+        }
         if head_view {
             admitted_tick = Some(tick);
             break;
         }
     }
+    println!(
+        "t8: {WHAT}: head admitted after {engine_ticks} engine and {worker_pending_ticks} worker-pending ticks ({link_total} links)"
+    );
     assert!(
         admitted_tick.is_some(),
         "{WHAT}: the deferred head admits once a slot frees"

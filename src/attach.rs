@@ -140,7 +140,9 @@ pub(crate) use instance::{
 mod cleanup_worker;
 pub mod identity_iter;
 pub use cleanup_worker::CleanupInterrupted;
-pub(crate) use cleanup_worker::{CleanupWorker, DetachOrder, OwnedLink};
+pub(crate) use cleanup_worker::{
+    BatchStatus, CleanupWorker, DetachOrder, OwnedLink, SINGLE_LINK_CLOSE_MS,
+};
 #[cfg(test)]
 mod async_value_flags_tests;
 #[cfg(test)]
@@ -10631,6 +10633,16 @@ impl Session {
             return RetirementPoll::Refused;
         };
         self.native_retirement.poll(ticket, worker)
+    }
+
+    /// Whether the session's cleanup worker thread is still running
+    /// (test seam for the freed-slot phase; side-effect-free, unlike a
+    /// join or a poll).
+    #[cfg(test)]
+    pub(crate) fn cleanup_worker_running_for_test(&self) -> bool {
+        self.cleanup_worker
+            .as_ref()
+            .is_some_and(|worker| worker.running())
     }
 
     /// Bounded collected retirement on this original stopped Session. STOP

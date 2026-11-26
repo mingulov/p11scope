@@ -3532,10 +3532,12 @@ thread_local! {
 }
 
 fn install_stop_flag() -> Result<Arc<SignalState>> {
+    // Plain assert, not debug-only: release-mode unit tests must keep
+    // the guard too. Still test-only via the gate below.
     #[cfg(test)]
-    debug_assert!(
+    assert!(
         SIGNAL_TEST_HOLDING.with(|held| held.get()),
-        "install_stop_flag in tests must hold ActualSignalTestGuard (see the B2 site table)",
+        "install_stop_flag in tests must hold ActualSignalTestGuard (see the site table)",
     );
     let state = Arc::new(SignalState::new());
     for signal in STOP_SIGNALS {
@@ -14811,7 +14813,7 @@ mod tests {
     /// Class guard: whoever installs stop handlers (or dances
     /// dispositions) in a test holds this. It locks
     /// `ACTUAL_SIGNAL_TEST` and marks this thread; `install_stop_flag`
-    /// debug-asserts the mark, so an unguarded install fails loudly
+    /// asserts the mark (all profiles), so an unguarded install fails loudly
     /// instead of racing a fidelity test's dispositions. Shared
     /// crate-wide for tests: external cells that drive owned runs,
     /// and re-exec children that cannot inherit the mark, hold it in

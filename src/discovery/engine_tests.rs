@@ -98427,6 +98427,104 @@ fn member_stop_bind_entry_drop_keeps_the_hold_waiting() {
     assert_eq!(stats.timed_out, 0, "{stats:?}");
 }
 
+/// Refused takes precedence over attached: a hold whose provider is
+/// refused after its slots attached (stamps landed, links live) ends
+/// refused with the first-use row, never attached. Deliberate
+/// fail-closed over-refusal: the shape needs a rejection to land
+/// after the attach within one pass.
+#[test]
+fn member_stop_refused_hold_with_live_slots_ends_refused() {
+    let (fixture, _view, module, _pins) = loaded_seed_provider();
+    let pid = fixture.child.id();
+    let library = fixture._dir.path().join("seed-provider.so");
+    stop_member_for_test(pid);
+    let key = member_exec_key_for_test(pid, &library);
+    let mut io = ScriptedMemberStops::default();
+    io.rows.insert(pid, member_stop_row(pid, &library, key));
+    let mut engine = member_stop_engine();
+    // Stamps off: the staging applies (slots built) but the hold waits.
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    assert!(engine.member_stops_held(), "intake holds the mapper");
+    engine.service_learned_files();
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        1,
+        "the staging lands"
+    );
+    engine.service_member_stops(&mut io, &mut session, Some(20));
+    assert!(
+        engine.member_stops_held(),
+        "no stamps: the hold waits for its attach"
+    );
+    let staged_key = engine
+        .prearm_input
+        .as_ref()
+        .and_then(|prearm| prearm.inputs.first().map(|input| input.key))
+        .expect("staging records its key");
+    assert_eq!(
+        module.key, staged_key,
+        "the fixture scan names the staged key"
+    );
+    let file = std::fs::File::open(&library).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    assert!(
+        !session.attached_requests.is_empty(),
+        "the apply attached slots"
+    );
+    assert!(
+        !engine.provider_attached_for_test((dev, ino), &session),
+        "no stamps yet: the attach side is down"
+    );
+    // The attach completes between passes: every attached slot gains
+    // its stamp and live link, like the real session's per-slot
+    // completion.
+    let attached: Vec<u32> = session
+        .attached_requests
+        .iter()
+        .flat_map(|targets| targets.iter().map(|(slot, _, _)| *slot))
+        .collect();
+    for slot in attached {
+        session.scripted_stamps.insert(slot, 5);
+        session.scripted_links.insert(slot);
+    }
+    assert!(
+        engine.provider_attached_for_test((dev, ino), &session),
+        "stamps landed: the attach side holds"
+    );
+    // A bind rejection lands after the attach (working copy only: the
+    // committed pins stay clean, the slots stay live).
+    let mut working = engine.pinned.clone();
+    working.reapply_rejected_keys(&std::collections::BTreeSet::from([staged_key]));
+    let _candidate = engine.live_candidate_with_pending(
+        working,
+        vec![module],
+        Vec::new(),
+        None,
+        &std::collections::BTreeSet::new(),
+        &std::collections::BTreeSet::new(),
+        &std::collections::BTreeSet::new(),
+    );
+    assert!(
+        engine.hold_refused_for_test((dev, ino)),
+        "the bind rejection records the hold refusal"
+    );
+    assert!(
+        engine.provider_attached_for_test((dev, ino), &session),
+        "the slots stay live: attached and refused both hold"
+    );
+    engine.service_member_stops(&mut io, &mut session, Some(10_000_000));
+    assert!(!engine.member_stops_held(), "the hold ends");
+    let stats = engine.member_stop_stats_for_test();
+    assert_eq!(stats.refused_resumes, 1, "{stats:?}");
+    assert_eq!(stats.attached_resumes, 0, "{stats:?}");
+    assert_eq!(stats.timed_out, 0, "{stats:?}");
+    assert!(
+        files_the_first_use_row(&engine),
+        "the refused hold files the first-use row"
+    );
+}
+
 /// The watchdog gone, the observer alone must not keep anyone stopped:
 /// the next pass deactivates (and detaches) the stops and resumes every
 /// held and pending member, and later passes resume any row that is

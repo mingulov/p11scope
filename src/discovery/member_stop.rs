@@ -657,6 +657,18 @@ impl Engine {
         self.member_stops.refused.contains(&identity)
     }
 
+    /// Whether `identity`'s provider file is attached (test probe for
+    /// the attach side of the hold-state precedence: live slots with
+    /// real stamps and links).
+    #[cfg(test)]
+    pub(crate) fn provider_attached_for_test(
+        &self,
+        identity: (u64, u64),
+        session: &dyn EngineSession,
+    ) -> bool {
+        self.provider_object_attached(identity, session)
+    }
+
     #[cfg(test)]
     pub(crate) fn resume_member_for_test(
         io: &mut dyn MemberStopIo,

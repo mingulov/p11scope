@@ -8516,15 +8516,17 @@ impl JournalAdapter {
         if fresh
             && let Some(siblings) = self.image_keys.get(&(key.cookie, key.exec))
             && siblings.iter().any(|sibling| {
-                // Both the re-entry rule (no unfenced history a new
-                // key could re-examine) and the scoped-fence rule (a
-                // conversion fenced only by a scoped void still
-                // blocks: scoped fences never exempt) must agree the
-                // sibling holds nothing. The scoped rule is the
-                // stricter of the two and governs.
+                // Either rule blocks a second live key: the re-entry
+                // rule (no unfenced history a new key could
+                // re-examine) or the scoped-fence rule (a conversion
+                // fenced only by a scoped void still blocks: scoped
+                // fences never exempt). The scoped rule subsumes the
+                // re-entry one and governs; the re-entry predicate
+                // stays so the merged guard names both reviewed
+                // conditions.
                 sibling != &key
-                    && self.sibling_holds_unfenced_history(*sibling)
-                    && self.sibling_blocks_rebirth(*sibling)
+                    && (self.sibling_holds_unfenced_history(*sibling)
+                        || self.sibling_blocks_rebirth(*sibling))
             })
         {
             return Err(AttestationRefusal::ImageSealed);

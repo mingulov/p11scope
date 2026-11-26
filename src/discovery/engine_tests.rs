@@ -103375,99 +103375,76 @@ fn teardown_shared_budget_caps_total_wait_and_keeps_later_loud() {
     );
 }
 
-/// Stop twin: the operator stop set during the teardown wait breaks the
-/// wait promptly and the scan stays loud (unproven, no silence on a
-/// cancelled wait). Retries the setup (bounded, 3 attempts) when a
-/// parallel-load deschedule lets the zombie arrive before the scan starts
-/// (then the scan would silence via the scan-start excuse, not the wait).
+/// Stop twin: a stop latched before the scan skips the teardown wait (its
+/// proof still runs once, unproven while the window holds) and the scan
+/// stays loud (no silence on a cancelled wait). The window-hit helper owns
+/// setup retries; the scan itself is single-shot, with no sleeper thread.
 #[test]
 fn teardown_wait_breaks_on_stop_and_stays_loud() {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicBool;
     use std::time::{Duration, Instant};
     let refusal = Skipped {
         subject: "capture discovery".into(),
         reason: "memory scan refused: initial mapping validation unavailable: empty or truncated /proc maps snapshot".into(),
     };
-    for attempt in 1..=3 {
-        let (mut holder, pid, view) = teardown_spawn_until_window_hit(ProcessViewId(9105));
-        let cancel = Arc::new(AtomicBool::new(false));
-        let setter_cancel = Arc::clone(&cancel);
-        // 10 ms lands during the teardown on any host (1 GiB needs tens of
-        // ms even on the fastest host, ~160 ms on 7.0.0-43), so the wait
-        // breaks on the stop, not on the zombie.
-        let setter = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(10));
-            setter_cancel.store(true, Ordering::SeqCst);
-        });
-        // A deschedule between the window observation and the scan start
-        // may have let the zombie arrive: then this attempt would silence
-        // via the scan-start excuse. Retry with a fresh child instead.
-        if !crate::process::leader_exiting_not_zombie(&view) || view.final_exit_in_progress() {
-            setter.join().unwrap();
-            teardown_wait_zombie(pid);
-            holder.child.wait().unwrap();
-            continue;
-        }
-        let mut counters = DiscoveryCounters::default();
-        let mut stage = crate::timing::StageTimings::default();
-        let mut teardown = TeardownDeferralBudget::new();
-        let start = Instant::now();
-        let result = scan_and_pin_with(
-            &view,
-            &[],
-            &HookRegistry::builtin(),
-            &mut CaptureWorkBudget::default(),
-            &mut counters,
-            false,
-            &mut stage,
-            &mut teardown,
-            Some(&cancel),
-            |_, _, _| {
-                Ok::<_, String>(ScanOutcome::Scanned {
-                    modules: Vec::new(),
-                    skipped: vec![refusal.clone()],
-                    scan_ms: 0,
-                })
-            },
-            None,
-            crate::discovery::handle_table::Filing::Untracked,
-        );
-        let elapsed = start.elapsed();
-        setter.join().unwrap();
-        if let Err(error) = &result {
-            assert!(
-                error.to_string().contains("process generation exited")
-                    || error.to_string().contains("pinning process view"),
-                "a teardown pin fails only on the proven exit: {error:?}"
-            );
-        }
-        teardown_wait_zombie(pid);
-        holder.child.wait().unwrap();
-        // A silence here means the zombie won the race against the stop
-        // (descheduled scan start under parallel load): retry while attempts
-        // remain, fail only when every attempt silences.
-        let loud = counters.object_skips.iter().any(|skip| skip == &refusal);
-        if !loud && attempt < 3 {
-            continue;
-        }
+    let (mut holder, pid, view) = teardown_spawn_until_window_hit(ProcessViewId(9105));
+    // Deterministic stop: latched before the scan, so the teardown wait
+    // always observes the stop instead of racing the zombie against a
+    // 10 ms sleeper thread.
+    let cancel = AtomicBool::new(true);
+    // The helper selected this attempt on the window shape; re-assert it
+    // here so the test fails, not the helper, if the shape regresses.
+    assert!(
+        crate::process::leader_exiting_not_zombie(&view) && !view.final_exit_in_progress(),
+        "the scan starts in the teardown window"
+    );
+    let mut counters = DiscoveryCounters::default();
+    let mut stage = crate::timing::StageTimings::default();
+    let mut teardown = TeardownDeferralBudget::new();
+    let start = Instant::now();
+    let result = scan_and_pin_with(
+        &view,
+        &[],
+        &HookRegistry::builtin(),
+        &mut CaptureWorkBudget::default(),
+        &mut counters,
+        false,
+        &mut stage,
+        &mut teardown,
+        Some(&cancel),
+        |_, _, _| {
+            Ok::<_, String>(ScanOutcome::Scanned {
+                modules: Vec::new(),
+                skipped: vec![refusal.clone()],
+                scan_ms: 0,
+            })
+        },
+        None,
+        crate::discovery::handle_table::Filing::Untracked,
+    );
+    let elapsed = start.elapsed();
+    if let Err(error) = &result {
         assert!(
-            elapsed < Duration::from_millis(500),
-            "a stop during the wait returns promptly, not after the 1 s budget: {elapsed:?}"
+            error.to_string().contains("process generation exited")
+                || error.to_string().contains("pinning process view"),
+            "a teardown pin fails only on the proven exit: {error:?}"
         );
-        assert!(
-            loud,
-            "a stop-broken wait stays loud: {:?}",
-            counters.object_skips
-        );
-        assert_eq!(
-            counters.ending_suppressed_skips, 0,
-            "a stop-broken wait suppresses nothing: {counters:?}"
-        );
-        return;
     }
-    panic!(
-        "no stop-broken attempt in 3 tries; the host descheduled every scan start past the window"
+    teardown_wait_zombie(pid);
+    holder.child.wait().unwrap();
+    let loud = counters.object_skips.iter().any(|skip| skip == &refusal);
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "a stop during the wait returns promptly, not after the 1 s budget: {elapsed:?}"
+    );
+    assert!(
+        loud,
+        "a stop-broken wait stays loud: {:?}",
+        counters.object_skips
+    );
+    assert_eq!(
+        counters.ending_suppressed_skips, 0,
+        "a stop-broken wait suppresses nothing: {counters:?}"
     );
 }
 

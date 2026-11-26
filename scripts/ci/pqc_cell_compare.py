@@ -717,10 +717,9 @@ def leg_qualification(inv):
                     f"top-budget/{block}/{counter}/malformed")
         if seen != 0:
             return ("partial", f"top-budget/{block}/{counter}")
+    # Proven a dict by the ("instance_negative_state", "refused")
+    # spec entry above, which returns malformed otherwise.
     negative = top_budgets.get("instance_negative_state")
-    if not isinstance(negative, dict):
-        return ("partial",
-                "top-budget/instance_negative_state/malformed")
     exhausted = negative.get("exhausted")
     if exhausted is True:
         return ("partial",

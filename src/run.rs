@@ -24224,6 +24224,7 @@ int main(int argc, char **argv) {
 
     #[test]
     fn refused_multi_host_precedes_capture_sinks_and_empty_provider_discovery() {
+        let _signal_guard = ACTUAL_SIGNAL_TEST.lock().unwrap();
         use crate::attach::{MultiHostRefusal, MultiHostStage};
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path().join("existing-trace.jsonl");
@@ -24259,6 +24260,7 @@ int main(int argc, char **argv) {
 
     #[test]
     fn refused_multi_host_precedes_owned_workload_and_output() {
+        let _signal_guard = ACTUAL_SIGNAL_TEST.lock().unwrap();
         use crate::attach::{MultiHostRefusal, MultiHostStage};
         let dir = tempfile::tempdir().unwrap();
         let sentinel = dir.path().join("workload-ran");

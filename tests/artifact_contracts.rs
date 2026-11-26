@@ -11167,9 +11167,30 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
     let sudo_invoked = |script: &str| {
         // Its own text counts only for a quoted `sudo` argv token; the docstrings
         // and parsed evidence that made a plain word-scan useless never quote it.
-        if read(script).lines().map(str::trim).any(|line| {
+        // `scripts/check-known-failing.py` is excluded from that rule: its one
+        // quoted "sudo" is a shell-token boundary in COMMAND_BOUNDARY for parsing
+        // workflow text, never a sudo argv invocation (it only runs the typed
+        // probe, the cargo wrapper and cell --list-cells, all unprivileged).
+        // The pin below fails if a second quoted sudo appears or the boundary
+        // table goes away, so a real sudo invocation cannot hide here.
+        let own_text_quotes_sudo = read(script).lines().map(str::trim).any(|line| {
             !line.starts_with('#') && (line.contains("\"sudo\"") || line.contains("'sudo'"))
-        }) {
+        });
+        if script == "scripts/check-known-failing.py" {
+            let quoted = read(script)
+                .lines()
+                .filter(|line| line.contains("\"sudo\"") || line.contains("'sudo'"))
+                .count();
+            assert_eq!(
+                quoted, 1,
+                "check-known-failing.py quotes sudo {quoted}x, not 1x: re-review the boundary-table exclusion"
+            );
+            assert!(
+                read(script).contains("COMMAND_BOUNDARY"),
+                "check-known-failing.py lost COMMAND_BOUNDARY: re-review the sudo_invoked exclusion"
+            );
+        }
+        if own_text_quotes_sudo && script != "scripts/check-known-failing.py" {
             return true;
         }
         let file = script.rsplit('/').next().unwrap_or(script).to_string();

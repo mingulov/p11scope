@@ -1419,6 +1419,13 @@ pub struct Engine {
     /// pass-containment twins below.
     #[cfg(test)]
     inventory_candidate_calls_for_test: u64,
+    /// Test-only seam: skip the tick-tail loader-arm phase, simulating
+    /// the production tick whose tail never runs (additions blocked,
+    /// frame exhausted). Lets the B1 red twins construct the
+    /// no-follow-up tick deterministically: admission commits, but no
+    /// post-push apply follows.
+    #[cfg(test)]
+    skip_tick_arm_for_test: bool,
     /// Test-only one-shot: fail the Nth `inventory_candidate` call
     /// (1-based over the capture), driving the pass-containment path.
     #[cfg(test)]
@@ -15394,6 +15401,8 @@ impl Engine {
             captured_candidates_for_test: Vec::new(),
             #[cfg(test)]
             inventory_candidate_calls_for_test: 0,
+            #[cfg(test)]
+            skip_tick_arm_for_test: false,
             #[cfg(test)]
             fail_inventory_candidate_call_for_test: None,
             #[cfg(test)]
@@ -37852,7 +37861,11 @@ impl Engine {
         // child cannot starve them.
         let child_priority = self.owned_child_arm_priority(&tick_view_ids, &mut tick_arm_order);
         let mut child_priority_deferred = BTreeSet::new();
-        let arm_result = if *additions_allowed {
+        #[cfg(test)]
+        let skip_arm = self.skip_tick_arm_for_test;
+        #[cfg(not(test))]
+        let skip_arm = false;
+        let arm_result = if *additions_allowed && !skip_arm {
             arm_refreshed_views_with(&tick_arm_order, |position| {
                 // H-1: a spent live frame arms no more views; each one left
                 // is requested, so the next frame rescans and arms it.

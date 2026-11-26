@@ -3692,32 +3692,46 @@ fn cgroup_refresh_park() -> (
 /// newcomer admission pipelines over ticks (a scan can defer a tick),
 /// so the B1 twins wait for the re-attach they assert about instead
 /// of assuming its tick. Fails loudly when cover never returns.
-fn cgroup_refresh_until_cover(engine: &mut Engine, session: &mut ScriptedSession) {
+/// Returns the per-tick apply counts; the completion tick's count pins
+/// the no-follow-up shape (the seam suppresses the loader-arm apply).
+fn cgroup_refresh_until_cover_counted(
+    engine: &mut Engine,
+    session: &mut ScriptedSession,
+) -> Vec<usize> {
+    let mut counts = Vec::new();
+    engine.capture_candidates_for_test = true;
     for _ in 0..6 {
+        engine.captured_candidates_for_test.clear();
         refresh_inventory_with(engine, session);
+        counts.push(engine.captured_candidates_for_test.len());
         if engine
             .plan
             .slots
             .iter()
             .any(|slot| engine.plan.is_active(slot.index))
         {
-            return;
+            engine.capture_candidates_for_test = false;
+            return counts;
         }
     }
+    engine.capture_candidates_for_test = false;
     panic!("cover never returned within 6 ticks");
 }
 
-/// B1 twin (1): a parked retire plus a same-tick admit and re-attach
-/// through the real refresh path (the mapper rides only as an
-/// extra_view: its scans commit in the apply but its view joins
-/// `self.views` after it). The post-push settlement promotes the park
-/// to one window from the detach instant, closed at the re-attach,
-/// with the row and an exact endpoint count — and a later idle tick
-/// leaves its end untouched. Regression twin: on success-path ticks
-/// the loader-arm follow-up promotes even without the post-push
-/// settlement, so this pins the contract, not the fix's red path; the
-/// fix covers the tick without a follow-up (additions blocked, frame
-/// exhausted), which no deterministic test constructs.
+fn cgroup_refresh_until_cover(engine: &mut Engine, session: &mut ScriptedSession) {
+    cgroup_refresh_until_cover_counted(engine, session);
+}
+
+/// B1 twin (1), red: a parked retire plus a same-tick admit and
+/// re-attach through the real refresh path, on a tick with no
+/// follow-up (the seam skips the loader-arm phase, like the
+/// production tick whose tail never runs). The mapper rides only as
+/// an extra_view: its scans commit in the apply but its view joins
+/// `self.views` after it. Only the post-push settlement can promote:
+/// removing it leaves the park and no window. Passes with one window
+/// from the detach instant, closed at the re-attach, the row and an
+/// exact endpoint count — and a later idle tick leaves its end
+/// untouched.
 #[test]
 fn cgroup_refresh_admit_and_reattach_promotes_parked_retire_closed_at_reattach() {
     let (mut engine, mut session, dir, retired, endpoints) = cgroup_refresh_park();
@@ -3725,7 +3739,13 @@ fn cgroup_refresh_admit_and_reattach_promotes_parked_retire_closed_at_reattach()
     let mapper_pid = mapper.id();
     std::fs::write(dir.path().join("cgroup.procs"), format!("{mapper_pid}\n"))
         .expect("a cgroup.procs");
-    cgroup_refresh_until_cover(&mut engine, &mut session);
+    engine.skip_tick_arm_for_test = true;
+    let counts = cgroup_refresh_until_cover_counted(&mut engine, &mut session);
+    assert_eq!(
+        counts.last(),
+        Some(&1),
+        "premise: the completion tick ran only the admit apply, no follow-up: {counts:?}"
+    );
     assert!(
         engine.views.iter().any(|view| view.pid() == mapper_pid),
         "premise: the refresh admitted the mapper"
@@ -3777,11 +3797,13 @@ fn cgroup_refresh_admit_and_reattach_promotes_parked_retire_closed_at_reattach()
     mapper.wait().unwrap();
 }
 
-/// B1 twin (1b): the park and the admit share one tick (the common
-/// sequential-client shape: A exits while B is already listed). The
-/// replay parks before B's scans commit, the apply admits and
-/// re-attaches B, and the post-push settlement closes the window at
-/// the re-attach.
+/// B1 twin (1b), red: the park and the admit share one tick (the common
+/// sequential-client shape: A exits while B is already listed), with
+/// no follow-up (seam, see twin (1)). The replay parks before B's
+/// scans commit, the apply admits and re-attaches B, and only the
+/// post-push settlement can promote. The completion tick runs the
+/// replay plus the admit when nothing defers (2), else the admit
+/// alone (1).
 #[test]
 fn cgroup_refresh_same_tick_exit_and_admit_discloses_until_reattach() {
     let (mut engine, mut session, dir, retired, mut first, endpoints) =
@@ -3792,7 +3814,12 @@ fn cgroup_refresh_same_tick_exit_and_admit_discloses_until_reattach() {
     first.wait().unwrap();
     std::fs::write(dir.path().join("cgroup.procs"), format!("{mapper_pid}\n"))
         .expect("a cgroup.procs");
-    cgroup_refresh_until_cover(&mut engine, &mut session);
+    engine.skip_tick_arm_for_test = true;
+    let counts = cgroup_refresh_until_cover_counted(&mut engine, &mut session);
+    assert!(
+        counts.last().is_some_and(|count| *count <= 2),
+        "premise: the completion tick ran no follow-up apply: {counts:?}"
+    );
     assert!(
         engine.views.iter().any(|view| view.pid() == mapper_pid),
         "premise: the refresh admitted the mapper"
@@ -3813,11 +3840,11 @@ fn cgroup_refresh_same_tick_exit_and_admit_discloses_until_reattach() {
     mapper.wait().unwrap();
 }
 
-/// B1 twin (2): the mapper admitted in tick 2 exits before tick 3. The
-/// post-push settlement already promoted the park, so the closed
-/// window survives the exit. Tick 3 parks the mapper's own exit, like
-/// twin (a). Regression twin, same caveat as twin (1): the loader-arm
-/// follow-up promotes on success-path ticks with or without the fix.
+/// B1 twin (2), red: the mapper admitted with no follow-up (seam,
+/// see twin (1)) exits before the next tick. Only the post-push
+/// settlement can promote, so removing it leaves the park parked and
+/// the exit undisclosed. Passes with the closed window surviving the
+/// exit; the exit tick parks the mapper's own exit, like twin (a).
 #[test]
 fn cgroup_refresh_short_lived_mapper_leaves_a_disclosed_window() {
     let (mut engine, mut session, dir, retired, endpoints) = cgroup_refresh_park();
@@ -3825,7 +3852,13 @@ fn cgroup_refresh_short_lived_mapper_leaves_a_disclosed_window() {
     let mapper_pid = mapper.id();
     std::fs::write(dir.path().join("cgroup.procs"), format!("{mapper_pid}\n"))
         .expect("a cgroup.procs");
-    cgroup_refresh_until_cover(&mut engine, &mut session);
+    engine.skip_tick_arm_for_test = true;
+    let counts = cgroup_refresh_until_cover_counted(&mut engine, &mut session);
+    assert_eq!(
+        counts.last(),
+        Some(&1),
+        "premise: the completion tick ran only the admit apply, no follow-up: {counts:?}"
+    );
     let windows = engine.coverage_retire_windows();
     assert_eq!(
         windows.len(),

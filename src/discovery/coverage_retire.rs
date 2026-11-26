@@ -76,7 +76,10 @@ struct Parked {
     /// Whether the parking apply committed. Stamped at settlement;
     /// sticky-false across merges: a park filed by a failed apply is
     /// never dropped (its detach may still have happened), only
-    /// promoted.
+    /// promoted. Accepted residual: after an invisible (scanless)
+    /// re-attach such a park can promote late — over-disclosure in a
+    /// doubly-rare corner, fail-closed, where dropping would risk a
+    /// real partial-detach silence.
     committed: bool,
 }
 
@@ -175,12 +178,14 @@ impl CoverageRetireLedger {
     /// promotion: cover returned, so per the module contract they never
     /// surface (no window, no row, no count). Only committed parks
     /// drop; a partial re-attach (some endpoint still down) keeps the
-    /// entry for promotion. Returns how many entries were dropped.
+    /// entry for promotion. Parked entries always name at least one
+    /// endpoint (`park` inserts one per module), so the universal
+    /// quantifier below is never vacuous. Returns how many entries
+    /// were dropped.
     pub(crate) fn drop_reattached(&mut self, active: &BTreeSet<RetiredEndpoint>) -> usize {
         let before = self.parked.len();
         self.parked.retain(|_, parked| {
-            parked.endpoints.is_empty()
-                || !parked.committed
+            !parked.committed
                 || !parked
                     .endpoints
                     .iter()
@@ -396,10 +401,14 @@ mod tests {
     fn drop_reattached_needs_every_endpoint_back_and_a_committed_park() {
         use std::collections::BTreeSet;
         let mut ledger = CoverageRetireLedger::default();
+        // Two endpoints parked for one module: a partial re-attach
+        // (only one back) must keep the entry — `.any()` here would
+        // silently cancel the other endpoint's window.
         ledger.park(&set(&[0]), endpoint(16), 100);
+        ledger.park(&set(&[0]), endpoint(32), 100);
         ledger.settle_fresh_parks(true);
-        // A partial re-attach (some endpoint still down) keeps the
-        // entry for promotion.
+        assert_eq!(ledger.drop_reattached(&BTreeSet::from([endpoint(16)])), 0);
+        assert_eq!(ledger.parked_modules(), set(&[0]));
         assert_eq!(ledger.drop_reattached(&BTreeSet::from([endpoint(32)])), 0);
         assert_eq!(ledger.parked_modules(), set(&[0]));
         // Every endpoint back without promotion: dropped, never surfaces.

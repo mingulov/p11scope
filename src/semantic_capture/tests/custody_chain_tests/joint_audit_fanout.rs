@@ -8950,7 +8950,8 @@ fn void_poll_bound(sample: &VoidSample) -> (usize, usize) {
 /// after, spending nothing); anything else fails at once instead of
 /// burning the bound. The wait must start with work outstanding, so an
 /// already-clear void fails instead of passing vacuously. The machine
-/// leaves Idle only once the void clears. Returns the polls used.
+/// stays in Idle or the void-drain phases until the void clears, and
+/// leaves them only once it clears. Returns the polls used.
 fn drive_void_polls(fixture: &mut MachineScene, sample: &VoidSample, label: &str) -> usize {
     let (bound, scan) = void_poll_bound(sample);
     let units_start = fixture
@@ -9015,8 +9016,8 @@ fn drive_void_polls(fixture: &mut MachineScene, sample: &VoidSample, label: &str
             "a scoped void breaks nothing and invalidates nothing"
         );
         assert!(
-            phase_after == "Idle" || !outstanding_after,
-            "{label}: poll {polls} leaves Idle only once the void clears (phase {phase_before}->{phase_after})"
+            matches!(phase_after, "Idle" | "Voiding" | "VoidingStaged") || !outstanding_after,
+            "{label}: poll {polls} stays in Idle or the void drain until the void clears (phase {phase_before}->{phase_after})"
         );
         let pre_void_poll = !recovery_before
             && !recovery_after

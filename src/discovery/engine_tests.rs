@@ -98759,6 +98759,106 @@ fn member_stop_trial_entry_discards_first_build_pollution() {
     );
 }
 
+/// All-broken isolation discards the broken trial's key: a newcomer
+/// whose trial binds a rejected staged key and then fails is
+/// excluded, the baseline becomes the final candidate, and the
+/// baseline-restore drops the trial's key — so the live hold ends
+/// attached.
+#[test]
+fn member_stop_trial_all_broken_discards_the_broken_trial_key() {
+    let (fixture, view, module, _pins) = loaded_seed_provider();
+    let pid = fixture.child.id();
+    let library = fixture._dir.path().join("seed-provider.so");
+    stop_member_for_test(pid);
+    let key = member_exec_key_for_test(pid, &library);
+    let mut io = ScriptedMemberStops::default();
+    io.rows.insert(pid, member_stop_row(pid, &library, key));
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    assert!(engine.member_stops_held(), "intake holds the mapper");
+    engine.service_learned_files();
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        1,
+        "the staging lands"
+    );
+    engine.service_member_stops(&mut io, &mut session, Some(20));
+    assert!(
+        engine.member_stops_held(),
+        "no stamps: the hold waits for its attach"
+    );
+    let staged_key = engine
+        .prearm_input
+        .as_ref()
+        .and_then(|prearm| prearm.inputs.first().map(|input| input.key))
+        .expect("staging records its key");
+    let file = std::fs::File::open(&library).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    let attached: Vec<u32> = session
+        .attached_requests
+        .iter()
+        .flat_map(|targets| targets.iter().map(|(slot, _, _)| *slot))
+        .collect();
+    assert!(!attached.is_empty(), "the apply attached slots");
+    for slot in attached {
+        session.scripted_stamps.insert(slot, 5);
+        session.scripted_links.insert(slot);
+    }
+    assert!(
+        engine.provider_attached_for_test((dev, ino), &session),
+        "stamps landed: the attach side holds"
+    );
+    assert!(!engine.pinned.rejects(staged_key), "nothing committed");
+    assert!(
+        !engine.pending_rejected_keys.contains(&staged_key),
+        "nothing pending"
+    );
+    // One newcomer: binds the rejected staged key, then fails.
+    let mut trial_pins = engine.pinned.clone();
+    trial_pins.reapply_rejected_keys(&std::collections::BTreeSet::from([staged_key]));
+    engine.fail_candidate_with_pid_after_bind_for_test = Some(view.pid());
+    let mut new_views = vec![(view, vec![module], trial_pins)];
+    let saved = engine.pending_rejected_keys.clone();
+    let mut skipped = Vec::new();
+    let mut tick: fn() -> Option<u64> = || None;
+    let isolation = engine.isolate_broken_newcomers(
+        &std::collections::BTreeSet::new(),
+        &[],
+        &mut new_views,
+        &mut skipped,
+        &std::collections::BTreeSet::new(),
+        saved.clone(),
+        &mut tick,
+    );
+    engine.fail_candidate_with_pid_after_bind_for_test = None;
+    let isolation = isolation.expect("all-broken isolation reuses the baseline");
+    assert!(new_views.is_empty(), "every newcomer is excluded");
+    assert_eq!(isolation.held.len(), 1, "one newcomer held back");
+    assert_eq!(
+        engine.pending_rejected_keys, saved,
+        "the baseline restore drops the broken trial key"
+    );
+    assert!(
+        !engine.hold_refused_for_test((dev, ino)),
+        "a trial-only rejection records no refusal"
+    );
+    assert!(
+        engine.provider_attached_for_test((dev, ino), &session),
+        "the slots stay live"
+    );
+    engine.service_member_stops(&mut io, &mut session, Some(10_000_000));
+    assert!(!engine.member_stops_held(), "the hold ends");
+    let stats = engine.member_stop_stats_for_test();
+    assert_eq!(stats.attached_resumes, 1, "{stats:?}");
+    assert_eq!(stats.refused_resumes, 0, "{stats:?}");
+    assert_eq!(stats.timed_out, 0, "{stats:?}");
+    assert!(
+        !files_the_first_use_row(&engine),
+        "an attached end files no gap row"
+    );
+}
+
 /// All-broken isolation reinstates the baseline pending set: with
 /// every newcomer excluded, the final candidate is the baseline and
 /// its pending set stands — so a staged key pending from before the

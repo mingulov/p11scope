@@ -60079,6 +60079,144 @@ fn bare_engine_reports_no_mount_park_reserver() {
     assert!(!Engine::empty().mount_park_reserver_for_test());
 }
 
+/// Park-debit drive twin (scan_and_pin_with_proof): a granted scan
+/// that parks mid-table holds its park at scan end, and the funnel
+/// debits exactly one fd. A minimal sleep keeps the mapping count low,
+/// and the leg adapts to the measured table and mapping count so the
+/// table cannot complete within the scan; ungranted and roomy controls
+/// debit nothing.
+#[test]
+fn scan_and_pin_with_proof_debits_a_newly_parked_mount_table() {
+    let sleep = e06_spawn_sleeps(1);
+    let table_len =
+        std::fs::read_to_string("/proc/self/mountinfo").expect("a readable table").len() as u64;
+    let maps = std::fs::read_to_string(format!("/proc/{}/maps", sleep[0].pid()))
+        .expect("readable maps")
+        .lines()
+        .count() as u64;
+    assert!(
+        table_len > 8 * (maps + 2),
+        "premise: the table dwarfs the mappings ({table_len} bytes, {maps} maps)"
+    );
+    let leg = table_len / (4 * maps + 8);
+    for (granted, legged) in [(false, true), (true, true), (true, false)] {
+        let view = ProcessView::open(ProcessViewId(503), sleep[0].pid()).unwrap();
+        if granted {
+            let pool = crate::semantics_edge::resources::SemanticResourcePool::default();
+            view.grant_mount_table_parking(pool.reserver());
+        }
+        let mut budget = if legged {
+            CaptureWorkBudget::new(crate::discovery::scan::ScanLimits {
+                per_object_bytes: leg,
+                total_bytes: u64::MAX,
+            })
+        } else {
+            CaptureWorkBudget::default()
+        };
+        let mut counters = DiscoveryCounters::default();
+        let mut stage = crate::timing::StageTimings::new();
+        let mut tick = crate::fd_budget::FdReserveTick::sample().expect("a readable snapshot");
+        let scanned = scan_and_pin_with_proof(
+            &view,
+            &[],
+            &HookRegistry::builtin(),
+            &mut budget,
+            &mut counters,
+            false,
+            &mut stage,
+            &mut TeardownDeferralBudget::new(),
+            None,
+            |request, view, budget| {
+                crate::discovery::scan::scan_process_view_examined(request, view, budget)
+                    .map(|(outcome, examined, _, own_shape)| (outcome, examined, own_shape))
+            },
+            Some(&mut tick),
+            crate::discovery::handle_table::Filing::Untracked,
+        );
+        assert!(
+            scanned.is_ok(),
+            "granted={granted} legged={legged}: leg parks become skips, never scan errors"
+        );
+        let expect = u64::from(granted && legged);
+        assert_eq!(
+            tick.opened_for_test(),
+            expect,
+            "granted={granted} legged={legged}: the scan debits exactly its new park"
+        );
+        assert_eq!(
+            view.has_parked_mount_table(),
+            granted && legged,
+            "granted={granted} legged={legged}: the slot holds exactly the granted parked read"
+        );
+    }
+}
+
+/// Park-debit drive twin (scan_retained_view): same funnel contract
+/// through the retained path — a granted scan that parks mid-table
+/// holds its park at scan end and debits exactly one fd. A minimal
+/// sleep keeps the mapping count low, and the leg adapts to the
+/// measured table and mapping count so the table cannot complete
+/// within the scan; ungranted and roomy controls debit nothing.
+#[test]
+fn scan_retained_view_debits_a_newly_parked_mount_table() {
+    let sleep = e06_spawn_sleeps(1);
+    let table_len =
+        std::fs::read_to_string("/proc/self/mountinfo").expect("a readable table").len() as u64;
+    let maps = std::fs::read_to_string(format!("/proc/{}/maps", sleep[0].pid()))
+        .expect("readable maps")
+        .lines()
+        .count() as u64;
+    assert!(
+        table_len > 8 * (maps + 2),
+        "premise: the table dwarfs the mappings ({table_len} bytes, {maps} maps)"
+    );
+    let leg = table_len / (4 * maps + 8);
+    for (granted, legged) in [(false, true), (true, true), (true, false)] {
+        let view = ProcessView::open(ProcessViewId(504), sleep[0].pid()).unwrap();
+        if granted {
+            let pool = crate::semantics_edge::resources::SemanticResourcePool::default();
+            view.grant_mount_table_parking(pool.reserver());
+        }
+        let mut budget = if legged {
+            CaptureWorkBudget::new(crate::discovery::scan::ScanLimits {
+                per_object_bytes: leg,
+                total_bytes: u64::MAX,
+            })
+        } else {
+            CaptureWorkBudget::default()
+        };
+        let mut stage = crate::timing::StageTimings::new();
+        let mut tick = crate::fd_budget::FdReserveTick::sample().expect("a readable snapshot");
+        let (scanned, _) = Engine::scan_retained_view(
+            &view,
+            &[],
+            &HookRegistry::builtin(),
+            &mut budget,
+            false,
+            &mut stage,
+            &mut TeardownDeferralBudget::new(),
+            None,
+            Some(&mut tick),
+            crate::discovery::handle_table::Filing::Untracked,
+        );
+        assert!(
+            scanned.is_ok(),
+            "granted={granted} legged={legged}: leg parks become skips, never scan errors"
+        );
+        let expect = u64::from(granted && legged);
+        assert_eq!(
+            tick.opened_for_test(),
+            expect,
+            "granted={granted} legged={legged}: the scan debits exactly its new park"
+        );
+        assert_eq!(
+            view.has_parked_mount_table(),
+            granted && legged,
+            "granted={granted} legged={legged}: the slot holds exactly the granted parked read"
+        );
+    }
+}
+
 /// View-collapse fix6 A2 (owner 20:20): past the concurrent library-handle
 /// cap the newcomer-admission loop defers with its requests retained and a
 /// counted named gap, never dropping. The test cap of 2 exercises the same

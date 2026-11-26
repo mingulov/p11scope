@@ -298,6 +298,12 @@ impl FdReserveTick {
             self.note_opened();
         }
     }
+
+    /// Same-tick debits so far (test seam for the park-debit drive tests).
+    #[cfg(test)]
+    pub(crate) fn opened_for_test(&self) -> u64 {
+        self.opened
+    }
 }
 
 /// True when the next views must wait for the next tick. Fail open: an

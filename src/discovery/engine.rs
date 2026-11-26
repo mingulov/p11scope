@@ -8017,7 +8017,7 @@ fn scan_and_pin_with(
         &ProcessView,
         &mut CaptureWorkBudget,
     ) -> std::result::Result<ScanOutcome, String>,
-    reserve: Option<&crate::fd_budget::FdReserveTick>,
+    reserve: Option<&mut crate::fd_budget::FdReserveTick>,
     filing: Filing<'_>,
 ) -> Result<(Vec<ScannedModule>, PinnedObjects, bool)> {
     scan_and_pin_with_proof(
@@ -8317,9 +8317,10 @@ fn scan_and_pin_with_proof(
         (ScanOutcome, Vec<ExaminedObject>, BTreeSet<ObjectKey>),
         String,
     >,
-    reserve: Option<&crate::fd_budget::FdReserveTick>,
+    mut reserve: Option<&mut crate::fd_budget::FdReserveTick>,
     filing: Filing<'_>,
 ) -> Result<ScanProofResult> {
+    let mount_parked_before = view.has_parked_mount_table();
     let stop_before = budget.stopped_reason();
     let refusals_before = budget.refusal_counts();
     // A group already in its final exit when its scan starts can run no
@@ -8460,7 +8461,7 @@ fn scan_and_pin_with_proof(
         view,
         &modules,
         budget,
-        reserve,
+        reserve.as_deref(),
         filing,
         &mut pin_wait_causes,
     );
@@ -8489,6 +8490,15 @@ fn scan_and_pin_with_proof(
             continue;
         }
         record_scan_skip(counters, skipped);
+    }
+    // The scan's mount-table park, if newly retained, debits here beside
+    // the pins: the slot persists across passes, so the next admission
+    // decision must see it the same tick. Unconditional (even when the
+    // pins waited whole): named waited views retain their parks, and an
+    // unnamed drop corrects at the next snapshot — conservative like the
+    // pidfd debit, which never refunds either.
+    if let Some(tick) = reserve.as_mut() {
+        tick.note_mount_table_park(mount_parked_before, view.has_parked_mount_table());
     }
     Ok((modules, pinned, complete, scan_examined, scan_shape))
 }
@@ -10312,7 +10322,6 @@ fn discover_plan(
         // through the single `acquire()`, so one scan can no longer
         // retain past the cap; shares file no new row.
         let admits_before = discovered.handle_table.stats().admits;
-        let mount_parked_before = view.has_parked_mount_table();
         let stop_before = discovered.budget.stopped_reason();
         let scan_result = scan_and_pin_with_proof(
             &view,
@@ -10328,8 +10337,9 @@ fn discover_plan(
                 scan_process_view_examined(request, view, budget)
                     .map(|(outcome, examined, _, own_shape)| (outcome, examined, own_shape))
             },
-            // Fix7 F1: the pass's reserve budgets the pin loop itself.
-            reserve_tick.as_ref(),
+            // Fix7 F1: the pass's reserve budgets the pin loop itself
+            // and takes the scan's mount-table park debit.
+            reserve_tick.as_mut(),
             Filing::Acquire(&mut discovered.handle_table, DeferredReason::Initial),
         );
         // 6.14 Option B: the scan observed this generation alive; learn
@@ -10468,11 +10478,6 @@ fn discover_plan(
                 // mid-pass. Shares filed no row and hold no new fd.
                 if let Some(tick) = reserve_tick.as_mut() {
                     tick.note_opened_n(discovered.handle_table.stats().admits - admits_before);
-                    // The scan's mount-table park, if newly retained,
-                    // debits here beside the pins: the slot persists
-                    // across passes, so the next admission decision must
-                    // see it the same tick.
-                    tick.note_mount_table_park(mount_parked_before, view.has_parked_mount_table());
                 }
                 discovered.note_scan_observed(view.id(), view.view_admission(), &found);
                 discovered.scan_inputs.insert(
@@ -18851,7 +18856,7 @@ impl Engine {
         stage: &mut crate::timing::StageTimings,
         teardown: &mut TeardownDeferralBudget,
         cancel: Option<&std::sync::atomic::AtomicBool>,
-        reserve: Option<&crate::fd_budget::FdReserveTick>,
+        reserve: Option<&mut crate::fd_budget::FdReserveTick>,
         filing: Filing<'_>,
     ) -> (
         Result<(Vec<ScannedModule>, PinnedObjects, bool)>,
@@ -36316,7 +36321,6 @@ impl Engine {
             // scan can no longer retain past the cap; shares file no
             // new row.
             let admits_before = self.handle_table.stats().admits;
-            let mount_parked_before = view.has_parked_mount_table();
             let cancel = self.cancel_flag.as_deref();
             let (scan_result, mut counters) = Self::scan_retained_view(
                 &view,
@@ -36327,8 +36331,9 @@ impl Engine {
                 &mut self.stage_timings,
                 &mut self.teardown_deferral,
                 cancel,
-                // Fix7 F1: the tick's reserve budgets the pin loop itself.
-                reserve_tick.as_ref(),
+                // Fix7 F1: the tick's reserve budgets the pin loop itself
+                // and takes the scan's mount-table park debit.
+                reserve_tick.as_mut(),
                 Filing::Acquire(&mut self.handle_table, DeferredReason::Live),
             );
             // 6.14 Option B: learn the newcomer's executable path.
@@ -36422,14 +36427,6 @@ impl Engine {
                     // and hold no new fd.
                     if let Some(tick) = reserve_tick.as_mut() {
                         tick.note_opened_n(self.handle_table.stats().admits - admits_before);
-                        // The scan's mount-table park, if newly retained,
-                        // debits here beside the pins: the slot persists
-                        // across passes, so the next admission decision
-                        // must see it the same tick.
-                        tick.note_mount_table_park(
-                            mount_parked_before,
-                            view.has_parked_mount_table(),
-                        );
                     }
                     // Provider-proven slot priority: a complete scan that
                     // proves provider-freedom yields the last free slot

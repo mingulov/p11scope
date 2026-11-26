@@ -424,7 +424,7 @@ def command_first_line(arguments, what: str) -> str:
 
 
 def dpkg_package_version(name: str) -> str:
-    return command_first_line(["dpkg-query", "-W", f"-f=${{Version}}", name], name)
+    return command_first_line(["dpkg-query", "-W", "-f=${Version}", name], name)
 
 
 def package_tool_versions() -> dict:

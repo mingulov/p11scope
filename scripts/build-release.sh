@@ -705,7 +705,9 @@ receipt_receipt_run() {
     # Keep the nightly selections made by the complete ledger in this shell.
     receipt_tool_ledger > "$RECEIPT_ROOT/artifacts/tools.initial.tsv" || exit 77
     RECEIPT_TOOLS=$(cat "$RECEIPT_ROOT/artifacts/tools.initial.tsv") || exit 77
-    receipt_fact clang_18_version "$(clang-18 --version | head -n 1)" || exit 77
+    # First line of the version banner via sed: the receipt
+    # architecture pins this file against path-order selection.
+    receipt_fact clang_18_version "$(clang-18 --version | sed -n '1p')" || exit 77
     printf '%s\n' "$RECEIPT_TOOLS" >> "$RECEIPT_FACTS"
     "$T4_TOOL_python3" -I scripts/prepared-dependency-evidence.py capture \
         --prefix "$RECEIPT_PREPARED_PREFIX" \

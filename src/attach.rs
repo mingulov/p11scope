@@ -2230,6 +2230,17 @@ fn submit_terminal_ownership(
     failures
 }
 
+/// The live-attach identity gate: every pinned object must still match
+/// its pin right now (held-fd `fstat`). Shared by the session preflight
+/// and the engine's scripted test session, so engine seams judge the same
+/// gate production applies.
+pub(crate) fn preflight_pinned_identity(objects: &PinnedObjects) -> Result<()> {
+    if !objects.check_unchanged().map_err(anyhow::Error::msg)? {
+        bail!("a pinned provider object changed before live attachment");
+    }
+    Ok(())
+}
+
 /// A detach error leaves a Session's ownership bookkeeping inconsistent.
 /// It does not prove a kernel producer survived or that the kernel is quiet.
 /// Session-wide refusal is kept for the scripted test sessions;
@@ -9329,9 +9340,7 @@ impl Session {
             &self.quarantine_reasons,
             &targets.iter().map(|slot| slot.index).collect::<Vec<_>>(),
         )?;
-        if !objects.check_unchanged().map_err(anyhow::Error::msg)? {
-            bail!("a pinned provider object changed before live attachment");
-        }
+        preflight_pinned_identity(objects)?;
         let admitted: BTreeSet<u32> = admitted.into_iter().collect();
         for target in targets.iter().filter(|slot| admitted.contains(&slot.index)) {
             objects

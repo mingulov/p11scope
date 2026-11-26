@@ -98884,6 +98884,100 @@ fn member_stop_retry_staged_rotation_keeps_stable_object() {
     );
 }
 
+/// The churn freeze end to end: a staged learned pin joins the committed
+/// set unattached, the run loop's pin sweep sees the touched file and
+/// latches the committed history, and every later candidate clones that
+/// history. Without a re-proof the stale staging never attaches; once a
+/// scan observation of the same bytes rotates the pin in place, the
+/// production identity gate judges the rotated pins as they are now and
+/// the staging attaches, the hold resumes attached, and the history stays
+/// latched for the report.
+#[test]
+fn staged_provider_attaches_after_a_latched_sweep_once_a_scan_reproves_it() {
+    let (fixture, view, module, _pins) = loaded_seed_provider();
+    let pid = fixture.child.id();
+    let library = fixture._dir.path().join("seed-provider.so");
+    // Generation 1.
+    touch_for_test(&library, 1_000_000);
+    stop_member_for_test(pid);
+    let key = member_exec_key_for_test(pid, &library);
+    let mut io = ScriptedMemberStops::default();
+    io.rows.insert(pid, member_stop_row(pid, &library, key));
+    let mut engine = member_stop_engine();
+    // A pause-owned batch defers the event-driven apply, as a busy tick
+    // does: the staging stays unattached while the file moves on.
+    engine.pause_owned_batch = true;
+    let mut session = attaching_session();
+    session.preflight_checks_pins = true;
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        1,
+        "generation 1 stages"
+    );
+    assert!(engine.member_stops_held(), "intake holds the mapper");
+    let staged_key = engine
+        .prearm_input
+        .as_ref()
+        .and_then(|prearm| prearm.inputs.first().map(|input| input.key))
+        .expect("staging records its key");
+    // Generation 2 lands; the run loop's pin sweep latches the committed
+    // history (`check_unchanged` on the committed set, as `run.rs` does).
+    touch_for_test(&library, 2_000_000);
+    assert_eq!(
+        engine.pinned.check_unchanged(),
+        Ok(false),
+        "the sweep sees the change"
+    );
+    assert!(
+        engine.pinned.provider_changed(),
+        "the committed history latches"
+    );
+    // Control: without a re-proof the stale staging cannot attach.
+    engine.pause_owned_batch = false;
+    engine.apply_learned_staging(&mut session);
+    assert!(engine.learned_unapplied, "a stale pin never attaches");
+    // A scan observes generation 2 (same bytes) and joins the committed
+    // set: the pin rotates in place under the same object id.
+    let mut budget = CaptureWorkBudget::default();
+    let (scan2, _scan_skips) =
+        pin_scanned_view_objects(&view, std::slice::from_ref(&module), &mut budget).unwrap();
+    assert_eq!(scan2.pinned().count(), 1, "the scan observes generation 2");
+    assert!(engine.pinned.absorb(scan2).is_empty());
+    assert!(
+        engine.pinned.supersedes(staged_key),
+        "the rotation is recorded"
+    );
+    engine.apply_learned_staging(&mut session);
+    assert!(!engine.learned_unapplied, "the re-proved staging attaches");
+    let staged_objects: std::collections::BTreeSet<_> = engine
+        .pinned
+        .pinned()
+        .filter(|pin| pin.key == staged_key)
+        .map(|pin| pin.id)
+        .collect();
+    assert_eq!(staged_objects.len(), 1, "one file, one object");
+    assert!(
+        engine
+            .plan
+            .slots
+            .iter()
+            .any(|slot| engine.plan.is_active(slot.index) && staged_objects.contains(&slot.object)),
+        "the plan holds an active slot for the re-proved file"
+    );
+    assert!(
+        engine.pinned.provider_changed(),
+        "the history stays latched for the report"
+    );
+    engine.service_member_stops(&mut io, &mut session, Some(20));
+    assert!(!engine.member_stops_held(), "the hold resolves");
+    let stats = engine.member_stop_stats_for_test();
+    assert_eq!(stats.attached_resumes, 1, "{stats:?}");
+    assert_eq!(stats.refused_resumes, 0, "{stats:?}");
+    assert_eq!(stats.timed_out, 0, "{stats:?}");
+    assert!(member_resumed_for_test(pid), "the member runs again");
+}
+
 /// Staging a new generation over a committed scan pin (the scan-first
 /// order) supersedes in the committed set directly: no candidate runs,
 /// so the hold refuses through the committed markers alone.

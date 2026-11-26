@@ -20626,6 +20626,187 @@ mod tests {
         );
     }
 
+    /// Sets every entry's pin to its backing file's real `fstat`, so the
+    /// held-fd check judges the file as it is now (the forged fixture
+    /// pins never match a real file).
+    fn repin_to_backing_file(pins: &mut PinnedObjects) {
+        for entry in pins.by_id.values_mut() {
+            entry.pin = pin_of(&entry.file).unwrap();
+        }
+    }
+
+    /// A metadata-only change (bytes identical, ctime stepped), like
+    /// `touch -m` on a provider file.
+    fn step_mtime(path: &std::path::Path, secs: u64) {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+            .unwrap();
+    }
+
+    /// One staged provider pinned at its real current `fstat`, plus the
+    /// scan observation of the same file a later absorb rotates in.
+    fn staged_real_pin(
+        dir: &tempfile::TempDir,
+        name: &str,
+        key: ObjectKey,
+    ) -> (PinnedObjects, std::path::PathBuf, Arc<std::fs::File>) {
+        let path = dir.path().join(name);
+        let file = backing_file(dir, name);
+        let mut staged = prearm_pin(key, "aaaaaaaa", 1);
+        reback(&mut staged, &file);
+        repin_to_backing_file(&mut staged);
+        (staged, path, file)
+    }
+
+    fn rotating_scan_for(
+        acc: &PinnedObjects,
+        key: ObjectKey,
+        file: &Arc<std::fs::File>,
+    ) -> PinnedObjects {
+        let mut scan = image_pins(&[(key, "aaaaaaaa", 2)]);
+        reback(&mut scan, file);
+        let staged_mapping = acc.by_id.values().next().unwrap().mapping;
+        scan.by_id.values_mut().next().unwrap().mapping = staged_mapping;
+        repin_to_backing_file(&mut scan);
+        scan
+    }
+
+    /// The churn freeze, at its seam: a detected change latches the
+    /// history (the report's provider-changed flag and the per-object
+    /// bracket), but the live-attach gate judges the pins as they are now.
+    /// Once an in-place rotation re-proves the same bytes under the fresh
+    /// ctime, the check passes again on the set and on the candidate
+    /// clones built from it; the history stays latched on both.
+    #[test]
+    fn check_unchanged_passes_again_once_a_rotation_reproves_the_pin() {
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (staged, path, file) = staged_real_pin(&dir, "provider.so", key);
+        let mut acc = PinnedObjects::empty();
+        assert!(acc.absorb(staged).is_empty());
+        assert_eq!(
+            acc.check_unchanged(),
+            Ok(true),
+            "the fresh staging validates"
+        );
+        assert!(!acc.provider_changed());
+        step_mtime(&path, 1_000_000);
+        assert_eq!(
+            acc.check_unchanged(),
+            Ok(false),
+            "the touched file fails the held-fd check"
+        );
+        assert!(acc.provider_changed(), "the detection latches the history");
+        let kept = acc.pinned().next().unwrap().id;
+        let bracket = acc
+            .change_bracket(kept)
+            .expect("the detection is bracketed");
+        let scan = rotating_scan_for(&acc, key, &file);
+        assert!(acc.absorb(scan).is_empty());
+        assert!(acc.supersedes(key), "the scan rotates the pin in place");
+        assert_eq!(
+            acc.check_unchanged(),
+            Ok(true),
+            "the re-proved pin passes the live-attach gate"
+        );
+        let candidate = acc.clone();
+        assert_eq!(
+            candidate.check_unchanged(),
+            Ok(true),
+            "a candidate clone judges the same current pins"
+        );
+        assert!(acc.provider_changed(), "the history stays latched");
+        assert!(candidate.provider_changed(), "clones carry the history");
+        let after = acc.change_bracket(kept).expect("the bracket stays");
+        assert_eq!(
+            (after.detected_ns, after.previous_ino),
+            (bracket.detected_ns, bracket.previous_ino),
+            "the first detection keeps its bracket"
+        );
+    }
+
+    /// Without a re-proof a stale pin keeps refusing: every check re-reads
+    /// the held fd and refuses, on the set and on its clones, and repeated
+    /// detections neither move the first bracket nor advance last-ok.
+    #[test]
+    fn check_unchanged_keeps_refusing_a_stale_pin_without_reproof() {
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (staged, path, _file) = staged_real_pin(&dir, "provider.so", key);
+        let mut acc = PinnedObjects::empty();
+        assert!(acc.absorb(staged).is_empty());
+        assert_eq!(acc.check_unchanged(), Ok(true));
+        step_mtime(&path, 1_000_000);
+        assert_eq!(acc.check_unchanged(), Ok(false));
+        let kept = acc.pinned().next().unwrap().id;
+        let first = acc
+            .change_bracket(kept)
+            .expect("the detection is bracketed");
+        assert_eq!(
+            acc.check_unchanged(),
+            Ok(false),
+            "a stale pin keeps refusing"
+        );
+        assert_eq!(
+            acc.clone().check_unchanged(),
+            Ok(false),
+            "and so do its clones"
+        );
+        let again = acc.change_bracket(kept).expect("the bracket stays");
+        assert_eq!(
+            (again.last_ok_ns, again.detected_ns),
+            (first.last_ok_ns, first.detected_ns),
+            "repeated detections keep the first bracket"
+        );
+        assert!(acc.provider_changed());
+    }
+
+    /// A changed object that left the set (here: a rewrite under the same
+    /// key fails closed and evicts it) no longer blocks the objects that
+    /// stayed: the gate judges what is pinned now, while the history keeps
+    /// the change for the report.
+    #[test]
+    fn check_unchanged_judges_only_objects_still_pinned() {
+        let stale_key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let other_key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE + 1,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (stale, stale_path, stale_file) = staged_real_pin(&dir, "stale.so", stale_key);
+        let (other, _other_path, _other_file) = staged_real_pin(&dir, "other.so", other_key);
+        let mut acc = PinnedObjects::empty();
+        assert!(acc.absorb(stale).is_empty());
+        assert!(acc.absorb(other).is_empty());
+        assert_eq!(acc.pinned().count(), 2);
+        step_mtime(&stale_path, 1_000_000);
+        assert_eq!(acc.check_unchanged(), Ok(false));
+        let mut rewrite = image_pins(&[(stale_key, "bbbbbbbb", 2)]);
+        reback(&mut rewrite, &stale_file);
+        repin_to_backing_file(&mut rewrite);
+        assert!(!acc.absorb(rewrite).is_empty(), "the rewrite is disclosed");
+        assert!(acc.rejects(stale_key), "the rewrite fails closed");
+        assert_eq!(acc.pinned().count(), 1, "only the unchanged object stays");
+        assert_eq!(
+            acc.check_unchanged(),
+            Ok(true),
+            "the object that stayed is judged on its own pin"
+        );
+        assert!(acc.provider_changed(), "the history keeps the change");
+    }
+
     #[test]
     fn absorbing_second_staging_of_a_touched_file_still_rejects() {
         // Two point-in-time proofs disagreeing (the drain never produces

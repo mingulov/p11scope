@@ -45191,6 +45191,10 @@ pub(crate) mod session_fixture {
         fail_dynamic_attach_pids: BTreeSet<u32>,
         /// Refuses every `preflight_targets`, i.e. a pure preflight refusal.
         refuse_preflight: bool,
+        /// When set, `preflight_targets` runs the production identity gate
+        /// over the candidate's pins (`preflight_pinned_identity`) before
+        /// its scripted refusals. Unset, pins are not judged.
+        pub(crate) preflight_checks_pins: bool,
         /// One entry per upcoming `preflight_targets` call; `true` refuses
         /// that call. Later calls follow `refuse_preflight`.
         preflight_refusals: RefCell<VecDeque<bool>>,
@@ -45737,7 +45741,7 @@ pub(crate) mod session_fixture {
             self.process_creation_tracking_unavailable
         }
 
-        fn preflight_targets(&self, targets: &[plan::Slot], _: &PinnedObjects) -> Result<()> {
+        fn preflight_targets(&self, targets: &[plan::Slot], objects: &PinnedObjects) -> Result<()> {
             #[cfg(feature = "h6-reexec-diagnostic")]
             self.diagnostic_at_preflight.set(
                 self.reexec_diagnostic
@@ -45764,6 +45768,9 @@ pub(crate) mod session_fixture {
             attachment_admission(&self.detach_failures, !targets.is_empty())?;
             if refused {
                 bail!("scripted target preflight refused the candidate");
+            }
+            if self.preflight_checks_pins {
+                crate::attach::preflight_pinned_identity(objects)?;
             }
             Ok(())
         }

@@ -183,6 +183,8 @@ const SYS_OPEN_TREE_ATTR: u32 = 467;
 const SYS_MOUNT_SETATTR: u32 = 442;
 const SYS_FSOPEN: u32 = 430;
 const SYS_FSMOUNT: u32 = 432;
+const SYS_FSCONFIG: u32 = 431;
+const SYS_FSPICK: u32 = 433;
 const SYS_PTRACE: u32 = 101;
 const SYS_PROCESS_VM_WRITEV: u32 = 311;
 // process_vm_readv reads another process's memory and pidfd_getfd steals
@@ -269,6 +271,8 @@ const DENY_ALWAYS: &[u32] = &[
     SYS_MOUNT_SETATTR,
     SYS_FSOPEN,
     SYS_FSMOUNT,
+    SYS_FSCONFIG,
+    SYS_FSPICK,
     SYS_UNSHARE,
     SYS_SETNS,
     SYS_PTRACE,
@@ -1228,6 +1232,8 @@ mod tests {
             (SYS_MOUNT_SETATTR, libc::SYS_mount_setattr, "mount_setattr"),
             (SYS_FSOPEN, libc::SYS_fsopen, "fsopen"),
             (SYS_FSMOUNT, libc::SYS_fsmount, "fsmount"),
+            (SYS_FSCONFIG, libc::SYS_fsconfig, "fsconfig"),
+            (SYS_FSPICK, libc::SYS_fspick, "fspick"),
             (SYS_UNSHARE, libc::SYS_unshare, "unshare"),
             (SYS_SETNS, libc::SYS_setns, "setns"),
             (SYS_PTRACE, libc::SYS_ptrace, "ptrace"),
@@ -1750,9 +1756,17 @@ mod tests {
             "wrong number for mount_setattr"
         );
         assert_eq!(SYS_OPEN_TREE_ATTR, 467, "wrong number for open_tree_attr");
+        assert_eq!(
+            SYS_FSCONFIG,
+            libc::SYS_fsconfig as u32,
+            "wrong number for fsconfig"
+        );
+        assert_eq!(SYS_FSPICK, libc::SYS_fspick as u32, "wrong number for fspick");
         for (nr, name) in [
             (SYS_MOUNT_SETATTR, "mount_setattr"),
             (SYS_OPEN_TREE_ATTR, "open_tree_attr"),
+            (SYS_FSCONFIG, "fsconfig"),
+            (SYS_FSPICK, "fspick"),
         ] {
             assert_eq!(
                 eval_filter(&insns, AUDIT_ARCH_X86_64, nr, 0, 0),

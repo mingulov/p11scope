@@ -394,6 +394,13 @@ def trace_judge(report_text, expected):
     require(isinstance(evidence, dict), "trace EVIDENCE is not an object")
     for key in LOSS_COUNTERS:
         require(type(evidence.get(key)) is int and evidence[key] == 0, "trace loss or unknown " + key)
+    # Retire-window lane, typed like the profile/metrics check below: no
+    # trace cell may retire counting coverage with possible loss. Its own
+    # check, so a later relaxation of the observation gate cannot let a
+    # retire through.
+    retired = evidence.get("coverage_retired_slots")
+    require(type(retired) is int and retired == 0,
+            "trace counting coverage retired mid-capture: coverage_retired_slots=%r" % (retired,))
     observation = evidence.get("gap_classes", {}).get("observation", {})
     require(observation.get("status") == "exact" and observation.get("causes") == [],
             "trace lossy or unknown observation gap class")
@@ -934,8 +941,10 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
         # Retire-window lane (audits F1/G1), typed: the workload's
         # proven exits leave zero mappers, so no counting coverage may
         # retire with possible loss, and an exact observation must
-        # carry an exact terminal verdict in every capture mode (the
-        # v3 and v3-metrics schemas share these keys).
+        # carry an exact terminal verdict in the profile and metrics
+        # modes (the v3 and v3-metrics schemas share these keys; trace
+        # cells return earlier and carry the same slots check in
+        # trace_judge).
         retired = evidence.get("coverage_retired_slots")
         require(type(retired) is int and retired == 0,
                 "counting coverage retired mid-capture: coverage_retired_slots=%r" % (retired,))

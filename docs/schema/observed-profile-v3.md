@@ -624,16 +624,29 @@ A nonzero value closes that view's owned selection coverage and forces
 `PARTIAL`; it is not merged into process-tracking or generic discovery-loss
 counters.
 
-`coverage_retired_slots` is a saturating u64 count of live attached
-counting slots retired mid-capture across every `coverage_retired`
-window (scope, never a missed-call count). It is assessed at capture
-end from the engine's retire ledger: each mid-capture global
-retirement that detached attached counting probes with no same-apply
-reattach contributes its retired live slots once, whether or not the
-module later revived. A nonzero value forces `PARTIAL` through the
-`coverage_retired_slots` observation cause beside the `skipped` cause
-carried by the paired `counting coverage` row, whose interval rides
-the affected records' `unobserved_windows`.
+`coverage_retired_slots` is a saturating u64 count of distinct live
+attached counting probe points retired mid-capture with possible loss
+(scope, never a missed-call count). A probe point is one endpoint: the
+provider file's exact opened identity (the capture-local pin when the
+file has none, which can only over-count) plus the endpoint's file
+offset. It is assessed at capture end from the engine's retire ledger:
+a mid-capture global retirement that detached attached counting probes
+with no same-apply reattach adds each of its probe points once, so
+repeated retire/re-attach cycles of one provider count its points once,
+whether or not the module later revived. A retirement whose every
+mapper of the object provably exited (a ready expected removal with no
+rejected key and no other committed scan of the object) and that leaves
+no process mapping it is parked: no call was possible, so it adds
+nothing, opens no window and files no row. A parked retirement counts,
+opens its window from its detach instant and files its row only when a
+live process is later seen mapping the module (the new mapper's calls
+before the re-attach were not observed; the window still starts at the
+detach instant even when the mapper is seen after cover returned,
+never at the mapper-seen instant). One whose
+module never regains a mapper never surfaces. A nonzero value
+forces `PARTIAL` through the `coverage_retired_slots` observation cause
+beside the `skipped` cause carried by the paired `counting coverage`
+row, whose intervals ride the affected records' `unobserved_windows`.
 
 `abi_refusals` is a u64 count of scoped probe processing refused because the
 execution-mode selector is unsupported or does not match the target-width
@@ -726,12 +739,24 @@ endpoint attached. `unobserved_windows` is a list of
 `late_discovery`, `mapped_unattached`, `health_loss`, `scope_uncertain`,
 or `coverage_retired`; absent means undisclosed, and an explicitly empty
 list reads as exact only with an R2-D1-6 proof behind it. Key presence
-never proves exactness. A `coverage_retired` window opens when a
-mid-capture global retirement detaches live attached counting probes
-with no same-apply reattach (`start_ns` is the detach decision
-instant, conservative by the async worker latency) and closes when
-every module in the window re-attaches, else it reads open-ended at
-capture end. An owned-run retirement composed with same-apply
+never proves exactness. A `coverage_retired` window opens on each
+retired module when a mid-capture global retirement detaches live
+attached counting probes with no same-apply reattach, unless the
+retirement is parked (every mapper provably exited and none remains,
+see `coverage_retired_slots`); a parked retirement opens its window
+only when a live process is later seen mapping the module.
+`start_ns` is the detach decision instant, conservative by the async
+worker latency. Each module's window closes when that module
+re-attaches (a partial revival closes only the revived modules'
+windows), else it reads open-ended at capture end. A module keeps at
+most 8 windows (an engineering bound on memory and JSON size); a later
+retire of a module that already holds 8 folds into its last window,
+which becomes the conservative hull of both (the earlier start, open
+until the module re-attaches again), and counts in the record's
+`coverage_retired_folded`. That key (additive, u64) is present exactly
+when the module has a counting-coverage retire window, `0` when no
+retire folded, and absent otherwise; it stays when an unreadable clock
+omits an open window. An owned-run retirement composed with same-apply
 reattach files no window; a pure owned retire with no same-apply
 reattach files one like any live retire. The intended silence is the
 paused ExecRefresh/static-to-exact generation turnover, whose reattach
@@ -749,7 +774,7 @@ shape — a stale view that exec'd while keeping the provider mapped,
 stranding a not-yet-admitted caller until reattach — stays undisclosed
 pending lifecycle judgment. Every
 window carries conservative outer bounds, never a missed-call
-estimate; the affected-slot count rides in
+estimate; the distinct retired probe-point count rides in
 `evidence.coverage_retired_slots`.
 Modules the fanotify drain staged also carry `first_loaded_by`:
 `{exe, exe_unknown_reason, pre_attach_loads}`. `exe` is the loading
@@ -1311,10 +1336,15 @@ is `{name: "counting coverage", reason}` with `reason` exactly:
 
 - `counting probes were retired mid-capture; calls in the retire
   window were not observed`: a mid-capture global retirement detached
-  live attached counting probes with no same-apply reattach. Repeat
-  retirements dedupe to this one row; the affected-slot count rides in
-  `evidence.coverage_retired_slots`, and each retire interval rides the
-  affected records' `coverage_retired` unobserved window.
+  live attached counting probes with no same-apply reattach, and a
+  mapper of the object may have remained (a parked retirement, whose
+  every mapper provably exited, files this row only when a live process
+  is later seen mapping the module). Repeat retirements dedupe to
+  this one row; the distinct retired probe-point count rides in
+  `evidence.coverage_retired_slots`, and each module's retire intervals
+  ride its records' `coverage_retired` unobserved windows: at most 8 per
+  module, later retires folded into the last one and counted in the
+  record's `coverage_retired_folded`.
 
 `evidence.run_tree_handed_back` (integer, `run` documents only, required
 there) counts the handed-back survivors: measured zero when the tree

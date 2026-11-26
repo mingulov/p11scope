@@ -1626,7 +1626,7 @@ fn async_global_revived_module_closes_its_coverage_window() {
 /// module's record keeps its window open, never silently un-disclosing
 /// its tail loss. Only the second revival closes the second window.
 #[test]
-fn async_global_partial_revive_keeps_the_shared_coverage_window_open() {
+fn async_global_partial_revive_keeps_the_dark_modules_window_open() {
     let (_child, mut engine, modules) = engine_with_one_accepted_provider();
     let mut session = ScriptedSession::default();
     let peer = peer_candidate(&mut engine, &modules);
@@ -2736,6 +2736,53 @@ fn record_retire_windows(engine: &Engine, module: crate::plan::ModuleId) -> Vec<
         .collect()
 }
 
+/// The published `coverage_retired_folded` key of every record of
+/// `module`, read from the rendered v3 evidence (the typed JSON a consumer
+/// sees, not the ledger): `None` where the key is absent. Panics when the
+/// module has no record, so an assertion over it is never vacuous.
+fn published_retire_folded(
+    engine: &Engine,
+    module: crate::plan::ModuleId,
+) -> Vec<Option<serde_json::Value>> {
+    let facts = engine.capture_facts();
+    let ids: Vec<crate::plan::ModuleId> = facts
+        .discovery
+        .modules
+        .iter()
+        .map(|record| record.id)
+        .collect();
+    let mut ev = crate::render::tests::evidence();
+    ev.discovery = facts.discovery;
+    ev.coverage_retired_slots = engine.coverage_retired_slots();
+    let capture = crate::render::CaptureMeta {
+        started: "t0",
+        ended: "t1",
+        kernel: "6.8.0",
+        policy: crate::attach::CapturePolicy::Allowlisted,
+        scope: "system",
+        caller: None,
+        ring_bytes: p11scope_ebpf_common::RING_BYTES,
+        drain_interval_ms: 1000,
+    };
+    let document = crate::render::json(&[], &ev, &capture);
+    let records = document["evidence"]["discovery"]
+        .as_array()
+        .expect("evidence.discovery is a list");
+    assert_eq!(
+        records.len(),
+        ids.len(),
+        "one JSON record per module record"
+    );
+    let published: Vec<Option<serde_json::Value>> = ids
+        .iter()
+        .zip(records)
+        .filter(|(id, _)| **id == module)
+        .map(|(_, record)| record.get("coverage_retired_folded").cloned())
+        .collect();
+    assert!(!published.is_empty(), "premise: the module has a record");
+    published
+}
+
 /// System-scope engine whose only provider mapper exits: the slot is
 /// session-proven attached, the child is killed and reaped, and the real
 /// ExpectedRemoval path (pin-proven readiness, view removal, conservative
@@ -3135,6 +3182,12 @@ fn repeated_retire_cycles_stay_bounded_with_an_exact_slot_count() {
         .apply_candidate(&mut session, peer, &mut true, false, &[])
         .unwrap();
     let module = engine.plan.slots[0].module_ids[0];
+    assert!(
+        published_retire_folded(&engine, module)
+            .iter()
+            .all(Option::is_none),
+        "no retire window yet, so no folded key"
+    );
     let cycles = MAX_COVERAGE_RETIRE_WINDOWS_PER_MODULE + 4;
     for cycle in 0..cycles {
         let one = engine
@@ -3168,6 +3221,16 @@ fn repeated_retire_cycles_stay_bounded_with_an_exact_slot_count() {
         engine
             .apply_candidate(&mut session, revive, &mut true, false, &[])
             .unwrap();
+        // The typed JSON count: present from the first window, 0 until
+        // the cap is reached, then one per retire folded past it.
+        let folded = (cycle + 1).saturating_sub(MAX_COVERAGE_RETIRE_WINDOWS_PER_MODULE) as u64;
+        for published in published_retire_folded(&engine, module) {
+            assert_eq!(
+                published,
+                Some(serde_json::json!(folded)),
+                "cycle {cycle}: published folded count"
+            );
+        }
     }
     let windows = engine.coverage_retire_windows();
     assert_eq!(windows.len(), MAX_COVERAGE_RETIRE_WINDOWS_PER_MODULE);
@@ -3184,6 +3247,11 @@ fn repeated_retire_cycles_stay_bounded_with_an_exact_slot_count() {
     assert_eq!(
         record_retire_windows(&engine, module).len(),
         MAX_COVERAGE_RETIRE_WINDOWS_PER_MODULE
+    );
+    // 12 cycles, cap 8: the literal pins the cap and the fold together.
+    assert_eq!(
+        published_retire_folded(&engine, module),
+        vec![Some(serde_json::json!(4))]
     );
 }
 

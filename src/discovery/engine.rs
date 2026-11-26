@@ -10631,6 +10631,7 @@ fn discovery_evidence(
                 watch: prearm.get(m.object).map(|watch| watch.render()),
                 attached_at_ns: None,
                 unobserved_windows: None,
+                coverage_retired_folded: None,
                 first_attached_at_ns: None,
                 first_attach_points: None,
                 first_loaded_by: pinned
@@ -15686,13 +15687,19 @@ impl Engine {
         // record appends the windows of its own module id. Open windows
         // read open-ended at now (an unreadable clock omits them rather
         // than fabricating an end); the stored windows stay untouched so
-        // repeated reads project identically.
+        // repeated reads project identically. A module with a retire
+        // window also publishes how many later retires folded into its
+        // last window past the cap (0 when none did), so the cap never
+        // hides a retire.
         if !self.coverage_retire.is_empty() {
             let now = crate::attach::monotonic_ns();
             for record in discovery.modules.iter_mut() {
-                let mut extra: Vec<render::UnobservedWindow> = self
-                    .coverage_retire
-                    .windows_for(record.id)
+                let windows = self.coverage_retire.windows_for(record.id);
+                if !windows.is_empty() {
+                    record.coverage_retired_folded =
+                        Some(self.coverage_retire.folded_for(record.id));
+                }
+                let mut extra: Vec<render::UnobservedWindow> = windows
                     .iter()
                     .filter_map(|window| {
                         let end_ns = match (window.end_ns, now) {
@@ -23626,6 +23633,7 @@ impl Engine {
                 watch: None,
                 attached_at_ns: Some(None),
                 unobserved_windows: None,
+                coverage_retired_folded: None,
                 first_attached_at_ns: None,
                 first_attach_points: None,
                 first_loaded_by: Some(note.clone()),

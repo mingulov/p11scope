@@ -1,3 +1,5 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Mid-capture counting-coverage retirement ledger.
 //!
 //! A live global retire detaches attached counting probes. Whether that
@@ -86,6 +88,10 @@ pub(crate) struct CoverageRetireLedger {
     modules: BTreeMap<ModuleId, ModuleWindows>,
     /// Distinct lossy endpoints across all modules.
     endpoints: BTreeSet<RetiredEndpoint>,
+    /// Parked entries stay until promotion on purpose: a module that
+    /// left the plan can return under the same id (same-file re-pin),
+    /// and only then does its parked retire disclose. One entry per
+    /// distinct module ever parked bounds the map.
     parked: BTreeMap<ModuleId, Parked>,
 }
 
@@ -206,7 +212,8 @@ impl CoverageRetireLedger {
             .map_or(&[], |windows| windows.windows.as_slice())
     }
 
-    #[cfg(test)]
+    /// Retires of one module folded into its last window past the cap
+    /// (published per module as `coverage_retired_folded`).
     pub(crate) fn folded_for(&self, module: ModuleId) -> u64 {
         self.modules
             .get(&module)

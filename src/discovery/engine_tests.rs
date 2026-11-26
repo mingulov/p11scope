@@ -98609,6 +98609,7 @@ fn member_stop_trial_mixed_newcomers_clear_trial_keys_before_rebuild() {
     let mut pins_b = engine.pinned.clone();
     pins_b.reapply_rejected_keys(&std::collections::BTreeSet::from([staged_key]));
     engine.fail_candidate_with_pid_after_bind_for_test = Some(view2.pid());
+    let pid_b = view2.pid();
     let mut new_views = vec![
         (view1, vec![module1], pins_a),
         (view2, vec![module2], pins_b),
@@ -98629,10 +98630,10 @@ fn member_stop_trial_mixed_newcomers_clear_trial_keys_before_rebuild() {
     engine.fail_candidate_with_pid_after_bind_for_test = None;
     let isolation = isolation.expect("mixed newcomers rebuild a final candidate");
     assert_eq!(new_views.len(), 1, "the broken newcomer is excluded");
-    assert!(
-        isolation.held.contains(&fixture2.child.id()) || isolation.held.len() == 1,
-        "one newcomer held back: {:?}",
-        isolation.held
+    assert_eq!(
+        isolation.held,
+        std::collections::BTreeSet::from([pid_b]),
+        "exactly the broken newcomer is held back"
     );
     assert!(
         engine.inventory_candidate_calls_for_test >= calls_before + 4,

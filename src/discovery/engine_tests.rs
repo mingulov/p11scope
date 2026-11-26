@@ -38996,8 +38996,7 @@ fn manifest_getter_attach_with_queued_refresh_retries_without_filing_the_gap() {
     engine.refresh_queue.remove_for_test(&pid);
     let mut session = ScriptedSession::default();
     let mut additions_allowed = true;
-    let outcome =
-        engine.attach_manifest_getters(view, &mut session, &mut additions_allowed);
+    let outcome = engine.attach_manifest_getters(view, &mut session, &mut additions_allowed);
     assert_eq!(outcome, (false, false, false, false));
     assert!(
         engine.counters.object_skips.iter().any(|skip| {
@@ -39013,8 +39012,7 @@ fn manifest_getter_attach_with_queued_refresh_retries_without_filing_the_gap() {
         engine.request_refresh(pid, crate::attach::monotonic_ns()),
         "the deferred arm's re-arm request queues"
     );
-    let outcome =
-        engine.attach_manifest_getters(view, &mut session, &mut additions_allowed);
+    let outcome = engine.attach_manifest_getters(view, &mut session, &mut additions_allowed);
     assert_eq!(outcome, (false, false, true, false));
     assert_eq!(
         engine.counters.object_skips.len(),

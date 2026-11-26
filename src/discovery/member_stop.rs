@@ -198,6 +198,13 @@ impl MemberStopState {
             .map(|(identity, _)| *identity)
     }
 
+    /// The staged identities pinned under `key`: reverse lookup for
+    /// bind rejections (rejection ticks only). RED stub: the single
+    /// old result until the reverse index lands.
+    pub(crate) fn staged_identities_for_key(&self, key: ObjectKey) -> Vec<(u64, u64)> {
+        self.staged_identity_for_key(key).into_iter().collect()
+    }
+
     /// Records the maps key a staged identity pinned under. Every staging
     /// records, held or not: the intake and the drain race to queue first,
     /// so conditioning on the stop mark would miss drain-first holds, and
@@ -247,6 +254,9 @@ pub(crate) struct MemberStopStats {
     /// staging files its own first-use row, or its hold keeps the bound
     /// backstop).
     pub(crate) stop_staged_overflow: u64,
+    /// Refused stagings not retained past the cap (their holds keep the
+    /// bound backstop, counted as timed-out there).
+    pub(crate) refused_overflow: u64,
     /// Members resumed unproven because a mapped file is FUSE-backed.
     pub(crate) fuse_resumes: u64,
     /// Release-time maps reads that waited out a member's in-flight hook
@@ -284,6 +294,7 @@ pub(crate) fn member_stop_coverage(stats: &MemberStopStats) -> (u64, u64) {
         unproven_resumes,
         lost_guard_resumes,
         stop_staged_overflow: _,
+        refused_overflow: _,
         fuse_resumes,
         unsettled_reads: _,
     } = *stats;
@@ -1825,6 +1836,7 @@ mod tests {
             "resume_unavailable",
             "not_members",
             "stop_staged_overflow",
+            "refused_overflow",
             "unsettled_reads",
         ] {
             let mut stats = MemberStopStats {
@@ -1839,6 +1851,7 @@ mod tests {
                 "resume_unavailable" => stats.resume_unavailable = 5,
                 "not_members" => stats.not_members = 5,
                 "stop_staged_overflow" => stats.stop_staged_overflow = 5,
+                "refused_overflow" => stats.refused_overflow = 5,
                 "unsettled_reads" => stats.unsettled_reads = 5,
                 _ => unreachable!("table field {field}"),
             }
@@ -1902,8 +1915,111 @@ mod tests {
             device: p11scope_manifest::maps::Device { major: 0, minor: 1 },
             inode: 8,
         };
-        assert_eq!(state.staged_identity_for_key(key), Some((0, 1)));
-        assert_eq!(state.staged_identity_for_key(other), None);
+        assert_eq!(state.staged_identities_for_key(key), vec![(0, 1)]);
+        assert!(state.staged_identities_for_key(other).is_empty());
+    }
+
+    /// Reverse lookup returns every staged identity under a shared maps
+    /// key: two staged identities can share one key (btrfs subvolume
+    /// clones render the one filesystem-wide `s_dev` while `st_dev` is
+    /// per-subvolume anonymous), and a bind rejection must refuse every
+    /// hold on it, not just the first recorded.
+    #[test]
+    fn staged_lookup_returns_every_identity_under_a_shared_key() {
+        let key = ObjectKey {
+            device: p11scope_manifest::maps::Device { major: 0, minor: 1 },
+            inode: 7,
+        };
+        let mut state = MemberStopState::default();
+        state.note_staged_key((0, 1), key);
+        state.note_staged_key((1, 1), key);
+        assert_eq!(
+            state.staged_identities_for_key(key),
+            vec![(0, 1), (1, 1)],
+            "a shared key refuses every staged identity on it"
+        );
+    }
+
+    /// Re-recording a retained identity under a new key moves the
+    /// reverse lookup: the old key resolves nothing, the new key
+    /// resolves it (a stale old-key entry would refuse a hold for a
+    /// key it no longer stages under).
+    #[test]
+    fn staged_lookup_forgets_the_old_key_on_rerecord() {
+        let key = ObjectKey {
+            device: p11scope_manifest::maps::Device { major: 0, minor: 1 },
+            inode: 7,
+        };
+        let key2 = ObjectKey {
+            device: p11scope_manifest::maps::Device { major: 0, minor: 2 },
+            inode: 8,
+        };
+        let mut state = MemberStopState::default();
+        state.note_staged_key((0, 1), key);
+        state.note_staged_key((0, 1), key2);
+        assert!(
+            state.staged_identities_for_key(key).is_empty(),
+            "the old key resolves nothing after the move"
+        );
+        assert_eq!(state.staged_identities_for_key(key2), vec![(0, 1)]);
+    }
+
+    /// Reverse lookup resolves at a full staged map: the first and
+    /// last recorded identities stay resolvable at the cap (the
+    /// lookup is indexed, never a whole-map scan).
+    #[test]
+    fn staged_lookup_resolves_a_full_staged_map() {
+        let mut state = MemberStopState::default();
+        for index in 0..(MEMBER_STOP_STAGED_CAP as u64) {
+            let key = ObjectKey {
+                device: p11scope_manifest::maps::Device { major: 0, minor: 1 },
+                inode: 100 + index,
+            };
+            state.note_staged_key((0, index), key);
+        }
+        assert_eq!(state.staged_keys.len(), MEMBER_STOP_STAGED_CAP);
+        let first = ObjectKey {
+            device: p11scope_manifest::maps::Device { major: 0, minor: 1 },
+            inode: 100,
+        };
+        let last = ObjectKey {
+            device: p11scope_manifest::maps::Device { major: 0, minor: 1 },
+            inode: 100 + MEMBER_STOP_STAGED_CAP as u64 - 1,
+        };
+        assert_eq!(state.staged_identities_for_key(first), vec![(0, 0)]);
+        assert_eq!(
+            state.staged_identities_for_key(last),
+            vec![(0, MEMBER_STOP_STAGED_CAP as u64 - 1)]
+        );
+    }
+
+    /// A refused staging past the refused cap stays unretained and
+    /// counted: its hold keeps the bound backstop (counted there as
+    /// timed-out), and the dropped refusal is visible instead of
+    /// silent. Re-recording an already-retained identity never counts.
+    #[test]
+    fn refused_overflow_counts_past_cap_identities() {
+        let mut state = MemberStopState::default();
+        for index in 0..(MEMBER_STOP_REFUSED_CAP as u64) {
+            state.note_refused((0, index));
+        }
+        assert_eq!(state.refused.len(), MEMBER_STOP_REFUSED_CAP);
+        state.note_refused((0, MEMBER_STOP_REFUSED_CAP as u64));
+        assert_eq!(
+            state.stats.refused_overflow, 1,
+            "the excess refusal counts"
+        );
+        assert!(
+            !state
+                .refused
+                .contains(&(0, MEMBER_STOP_REFUSED_CAP as u64)),
+            "the excess refusal stays unretained"
+        );
+        state.note_refused((0, 0));
+        assert_eq!(
+            state.stats.refused_overflow, 1,
+            "re-recording a retained identity never counts"
+        );
     }
 
     #[test]

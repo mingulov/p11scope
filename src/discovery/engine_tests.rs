@@ -3101,10 +3101,7 @@ fn discovery_evidence_without_a_module_pin_gaps_its_live_slot_rows() {
         device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
         inode: 43,
     };
-    let pins = pin_set(
-        &[(key_a, "sha-a", 7), (key_b, "sha-b", 7)],
-        false,
-    );
+    let pins = pin_set(&[(key_a, "sha-a", 7), (key_b, "sha-b", 7)], false);
     let mut ids = pins.pinned().map(|pin| pin.id);
     let (id_a, id_b) = (ids.next().unwrap(), ids.next().unwrap());
     let mut plan = plan_with(2, 0);

@@ -6644,8 +6644,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             })
             .map(|(key, tomb)| (*key, tomb.pruned_since, tomb.pid))
             .collect();
-        let (start, end) =
-            Self::rotate_sweep_window(&mut expired, &mut self.pair_drain_cursor);
+        let (start, end) = Self::rotate_sweep_window(&mut expired, &mut self.pair_drain_cursor);
         let source = self.adapter.source();
         for (_, _, pid) in &expired[start..end] {
             Self::tombstone_owner_gone(gone_memo, source, *pid);
@@ -45808,9 +45807,10 @@ int main(void) {
                     pid: 7,
                 },
             );
-            native.scene.coordinator.prune_departed_native_state(
-                at + EXEC_STATE_GRACE_NS + pass as u64,
-            );
+            native
+                .scene
+                .coordinator
+                .prune_departed_native_state(at + EXEC_STATE_GRACE_NS + pass as u64);
         }
         assert_eq!(
             native
@@ -45940,10 +45940,7 @@ int main(void) {
         let at = native.stamps.tick();
         const EXTRA: usize = 4;
         let total = EVER_ENUMERATED_SWEEP + EXTRA;
-        native
-            .scene
-            .coordinator
-            .set_pair_prune_cap_for_test(total);
+        native.scene.coordinator.set_pair_prune_cap_for_test(total);
         for i in 0..EVER_ENUMERATED_SWEEP {
             let pid = 100_000 + i as u32;
             native.scene.source.spawn(pid, 500);
@@ -46048,10 +46045,7 @@ int main(void) {
         // would re-scan an all-live head window and count a second
         // live eviction instead of finding the gone folds.
         let total = EVER_ENUMERATED_SWEEP + EXTRA + 1;
-        native
-            .scene
-            .coordinator
-            .set_pair_prune_cap_for_test(total);
+        native.scene.coordinator.set_pair_prune_cap_for_test(total);
         for i in 0..total {
             let pid = 700_000 + i as u32;
             native.scene.source.spawn(pid, 500);

@@ -13048,6 +13048,13 @@ fn sleep_child_maps_settled(
         && loader.is_none_or(|loader| maps_have_executable_image(maps, loader))
 }
 
+/// True when two consecutive full-maps snapshots show a stable child:
+/// non-empty and byte-identical. Split out so the parked-wait fallback
+/// has a deterministic unit test.
+fn maps_snapshots_stable(previous: &str, current: &str) -> bool {
+    !current.is_empty() && previous == current
+}
+
 #[test]
 fn exec_readiness_needs_the_new_images_executable_mapping() {
     let image = std::path::Path::new("/usr/bin/busybox");
@@ -13101,6 +13108,18 @@ fn settle_readiness_needs_the_loaders_executable_mapping_too() {
     // No image row: never settled, with or without a loader.
     assert!(!sleep_child_maps_settled("", image, Some(loader)));
     assert!(!sleep_child_maps_settled("", image, None));
+}
+
+#[test]
+fn parked_fallback_needs_two_identical_nonempty_snapshots() {
+    // Identical non-empty snapshots: stable.
+    assert!(maps_snapshots_stable("a\n", "a\n"));
+    // Anything empty: never stable (no maps read yet, or the race read air).
+    assert!(!maps_snapshots_stable("", ""));
+    assert!(!maps_snapshots_stable("", "a\n"));
+    assert!(!maps_snapshots_stable("a\n", ""));
+    // Any difference: the loader is still mapping.
+    assert!(!maps_snapshots_stable("a\n", "a\nb\n"));
 }
 
 /// Task E1: a static executable (no PT_INTERP, so the locator returns
@@ -16002,18 +16021,8 @@ fn initial_scan_zombie_member_is_silent_like_a_reaped_exit() {
     );
     let live = children.0[0].id();
     let zombie = children.0[1].id();
-    let self_exe = std::env::current_exe().unwrap();
     for pid in [live, zombie] {
-        let exe = format!("/proc/{pid}/exe");
-        let mut execed = false;
-        for _ in 0..500 {
-            if std::fs::read_link(&exe).is_ok_and(|target| target != self_exe) {
-                execed = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(execed, "sleep child {pid} never execed");
+        wait_sleep_child_parked(pid);
     }
     children.0[1].kill().unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -16144,19 +16153,8 @@ fn max_scan_pids_bounds_initial_scan_and_refresh() {
     // Readiness (same idiom as the id-exhaustion sibling): a pre-exec child
     // still maps this test binary, which would split the provider groups and
     // move the representatives. Discover only once every child execed sleep.
-    let self_exe = std::env::current_exe().unwrap();
     for child in &children.0 {
-        let pid = child.id();
-        let exe = format!("/proc/{pid}/exe");
-        let mut execed = false;
-        for _ in 0..500 {
-            if std::fs::read_link(&exe).is_ok_and(|target| target != self_exe) {
-                execed = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(execed, "sleep child {pid} never execed");
+        wait_sleep_child_parked(child.id());
     }
 
     // The sweep can transiently degrade under parallel load (one maps read
@@ -16396,19 +16394,8 @@ fn zero_cap_refresh_short_circuits_the_sweep_to_empty() {
 
     // Readiness (same idiom as the cap sibling): discover only once every
     // child execed sleep, so no maps read races a fork-exec transition.
-    let self_exe = std::env::current_exe().unwrap();
     for child in &children.0 {
-        let pid = child.id();
-        let exe = format!("/proc/{pid}/exe");
-        let mut execed = false;
-        for _ in 0..500 {
-            if std::fs::read_link(&exe).is_ok_and(|target| target != self_exe) {
-                execed = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(execed, "sleep child {pid} never execed");
+        wait_sleep_child_parked(child.id());
     }
 
     let mut engine = Engine::discover(&args, &scope, None).expect("an uncapped cgroup captures");
@@ -16506,19 +16493,8 @@ fn ordinary_over_cap_refresh_performs_no_maps_sweep() {
     };
     let scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
 
-    let self_exe = std::env::current_exe().unwrap();
     for child in &children.0 {
-        let pid = child.id();
-        let exe = format!("/proc/{pid}/exe");
-        let mut execed = false;
-        for _ in 0..500 {
-            if std::fs::read_link(&exe).is_ok_and(|target| target != self_exe) {
-                execed = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(execed, "sleep child {pid} never execed");
+        wait_sleep_child_parked(child.id());
     }
 
     let mut engine = Engine::discover(&args, &scope, None).expect("an uncapped cgroup captures");
@@ -17197,19 +17173,8 @@ fn reconcile_pass_rereads_maps_rarity_selects_and_advances_cursor() {
     };
     let scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
 
-    let self_exe = std::env::current_exe().unwrap();
     for child in &children.0 {
-        let pid = child.id();
-        let exe = format!("/proc/{pid}/exe");
-        let mut execed = false;
-        for _ in 0..500 {
-            if std::fs::read_link(&exe).is_ok_and(|target| target != self_exe) {
-                execed = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(execed, "sleep child {pid} never execed");
+        wait_sleep_child_parked(child.id());
     }
 
     // The initial sweep can transiently degrade under parallel load (one maps
@@ -17599,19 +17564,8 @@ fn reconcile_waiter_outside_slice_settles_within_one_sweep() {
 
     // Every child must have execed into sleep: a pre-exec child still shows
     // the test binary's mappings and would scan as a provider carrier.
-    let self_exe = std::env::current_exe().unwrap();
     for child in &children.0 {
-        let pid = child.id();
-        let exe = format!("/proc/{pid}/exe");
-        let mut execed = false;
-        for _ in 0..500 {
-            if std::fs::read_link(&exe).is_ok_and(|target| target != self_exe) {
-                execed = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(execed, "sleep child {pid} never execed");
+        wait_sleep_child_parked(child.id());
     }
 
     let mut engine = Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
@@ -17719,19 +17673,8 @@ fn reconcile_quantum_zero_defers_the_whole_slice() {
     };
     let scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
 
-    let self_exe = std::env::current_exe().unwrap();
     for child in &children.0 {
-        let pid = child.id();
-        let exe = format!("/proc/{pid}/exe");
-        let mut execed = false;
-        for _ in 0..500 {
-            if std::fs::read_link(&exe).is_ok_and(|target| target != self_exe) {
-                execed = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(execed, "sleep child {pid} never execed");
+        wait_sleep_child_parked(child.id());
     }
 
     let mut engine = Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
@@ -17949,19 +17892,8 @@ fn refresh_requests_survive_allocation_exhaustion() {
     };
     let scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
 
-    let self_exe = std::env::current_exe().unwrap();
     for child in &children.0 {
-        let pid = child.id();
-        let exe = format!("/proc/{pid}/exe");
-        let mut execed = false;
-        for _ in 0..500 {
-            if std::fs::read_link(&exe).is_ok_and(|target| target != self_exe) {
-                execed = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(execed, "sleep child {pid} never execed");
+        wait_sleep_child_parked(child.id());
     }
 
     let mut engine = Engine::discover(&args, &scope, None).expect("an uncapped cgroup captures");
@@ -18054,19 +17986,8 @@ fn id_exhaustion_publishes_skip_instead_of_failing() {
     // dynamic test binary, and its exe link already resolves then (to our
     // own image) — so only discover once no child's exe link still points
     // at us. Identical sleep groups keep selection deterministic.
-    let self_exe = std::env::current_exe().unwrap();
     for child in &children {
-        let pid = child.id();
-        let exe = format!("/proc/{pid}/exe");
-        let mut execed = false;
-        for _ in 0..500 {
-            if std::fs::read_link(&exe).is_ok_and(|target| target != self_exe) {
-                execed = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(execed, "sleep child {pid} never execed");
+        wait_sleep_child_parked(child.id());
     }
 
     let mut engine = Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
@@ -44479,6 +44400,83 @@ fn wait_sleep_child_settled(pid: u32) {
     }
 }
 
+/// Wait until a just-spawned `sleep` child has parked: finished dynamic
+/// startup and blocked in its sleep, so its full maps shape holds still.
+/// This is the strongest readiness, for census/shape consumers (engine
+/// scans, maps censuses). `wait_sleep_child_settled` (image plus loader
+/// rows mapped) suffices only for executable-row consumers: those rows
+/// land before the loader finishes mapping the rest, and a census read
+/// then is still transient. Primary signal is `wchan == nanosleep`;
+/// where `wchan` is unavailable the fallback requires the image row plus
+/// two identical full-maps snapshots 5 ms apart. Everything is gated on
+/// the exec: a pre-exec fork shows this test binary's wchan and maps,
+/// which can look parked/stable already.
+fn wait_sleep_child_parked(pid: u32) {
+    let this_image = std::env::current_exe().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut previous = String::new();
+    loop {
+        if let Ok(image) = std::fs::read_link(format!("/proc/{pid}/exe"))
+            && image != this_image
+        {
+            if std::fs::read_to_string(format!("/proc/{pid}/wchan"))
+                .is_ok_and(|wchan| wchan.contains("nanosleep"))
+            {
+                return;
+            }
+            if let Ok(maps) = std::fs::read_to_string(format!("/proc/{pid}/maps")) {
+                if maps_have_executable_image(&maps, &image)
+                    && maps_snapshots_stable(&previous, &maps)
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    if std::fs::read_to_string(format!("/proc/{pid}/maps")).is_ok_and(|again| {
+                        maps_have_executable_image(&again, &image)
+                            && maps_snapshots_stable(&maps, &again)
+                    }) {
+                        return;
+                    }
+                }
+                previous = maps;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "sleep child {pid} never parked"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// A parked sleeper's full maps shape holds still: two snapshots 5 ms
+/// apart are byte-identical and carry the image row. This is the live
+/// half of the parked guarantee (the unit test above pins the fallback
+/// predicate); with the weaker image+loader wait the pair still differs
+/// while the loader maps the rest.
+#[test]
+fn parked_sleep_has_a_stable_full_census() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    wait_sleep_child_parked(pid);
+    let first = std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let second = std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap();
+    assert!(
+        maps_snapshots_stable(&first, &second),
+        "a parked sleeper's maps hold still"
+    );
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).unwrap();
+    assert!(
+        maps_have_executable_image(&second, &exe),
+        "the stable maps carry the image row"
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// A live `sleep` child whose exec has completed and whose loader is mapped.
 /// Until its exec completes the child is a fork of this test binary, and a
 /// scan racing that exec is not what the U-11 ticks below are about; until
@@ -65579,10 +65577,10 @@ fn peer_census_alignment_respawns_a_mismatched_peer() {
         .expect("spawn the mismatched peer");
     let alien_pid = alien.id();
     fixture.peers.push(alien);
-    // Settle before the census: the exe link switches before the image
-    // maps, and a partially exec'd peer is not the proven-different
-    // census this test needs.
-    wait_sleep_child_settled(alien_pid);
+    // Park before the census: image-plus-loader rows land before the
+    // loader finishes mapping the rest, so only a parked peer has the
+    // proven-different stable census this test needs.
+    wait_sleep_child_parked(alien_pid);
     assert_ne!(
         peer_maps_census(alien_pid),
         expected,
@@ -87087,18 +87085,8 @@ fn opus_spawn_static_sleeps(
             )
         })
         .collect();
-    let self_exe = std::env::current_exe().unwrap();
     for guard in &guards {
-        let exe = format!("/proc/{}/exe", guard.pid());
-        let mut execed = false;
-        for _ in 0..500 {
-            if std::fs::read_link(&exe).is_ok_and(|target| target != self_exe) {
-                execed = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(execed, "static sleeper child never execed");
+        wait_sleep_child_parked(guard.pid());
     }
     (guards, hold)
 }
@@ -98592,12 +98580,23 @@ fn needle_fn_body<'a>(source: &'a str, name: &str) -> &'a str {
     &rest[..cut]
 }
 
-/// Needle: every stop-then-read site settles its child before SIGSTOP, in
-/// source order. Reverting any site to an exe-link-only (or no) wait fails
-/// here deterministically — the live-child race itself is far too rare to
-/// kill reliably in-suite. Covers the 6 `wait_sleep_exec_row` sites, the 5
-/// bare settled stops, the shared `stopped_member_with_row` helper, and the
-/// alien census site; plus a global ban on exe-link-only exe polls.
+/// Index of the first source line in `body` whose `//`-stripped, trimmed
+/// text equals `stmt`: for needles that must match real statements, so a
+/// comment or string literal mentioning the call cannot satisfy them.
+fn needle_stmt_line(body: &str, stmt: &str) -> Option<usize> {
+    body.lines()
+        .position(|line| line.split_once("//").map_or(line, |(code, _)| code).trim() == stmt)
+}
+
+/// Needle: every stop-then-read site settles its child before SIGSTOP, and
+/// every census/shape consumer parks its children before the scan — in
+/// source order, matched as whole statements. Reverting any site to an
+/// exe-link-only (or no) wait fails here deterministically; the live-child
+/// race itself is far too rare to kill reliably in-suite. Covers the 6
+/// `wait_sleep_exec_row` sites, the 5 bare settled stops, the shared
+/// `stopped_member_with_row` helper, the 9 parked pre-discover sites, the
+/// static-sleeper spawner, and the alien census site; plus global bans on
+/// exe-link-only exe polls.
 #[test]
 fn stop_then_read_sites_settle_before_sigstop() {
     let source = include_str!("engine_tests.rs");
@@ -98616,12 +98615,10 @@ fn stop_then_read_sites_settle_before_sigstop() {
     );
     for name in exec_row_sites {
         let body = needle_fn_body(source, name);
-        let settle = body
-            .find("wait_sleep_exec_row(pid)")
-            .unwrap_or_else(|| panic!("{name}: no wait_sleep_exec_row(pid)"));
-        let stop = body
-            .find("stop_member_for_test(pid)")
-            .unwrap_or_else(|| panic!("{name}: no stop_member_for_test(pid)"));
+        let settle = needle_stmt_line(body, "let exe = wait_sleep_exec_row(pid);")
+            .unwrap_or_else(|| panic!("{name}: no settle statement"));
+        let stop = needle_stmt_line(body, "stop_member_for_test(pid);")
+            .unwrap_or_else(|| panic!("{name}: no stop statement"));
         assert!(settle < stop, "{name}: settle must precede the stop");
     }
     let bare_sites = [
@@ -98638,40 +98635,103 @@ fn stop_then_read_sites_settle_before_sigstop() {
     );
     for name in bare_sites {
         let body = needle_fn_body(source, name);
-        let settle = body
-            .find("wait_sleep_child_settled(pid)")
-            .unwrap_or_else(|| panic!("{name}: no wait_sleep_child_settled(pid)"));
-        let stop = body
-            .find("stop_member_for_test(pid)")
-            .unwrap_or_else(|| panic!("{name}: no stop_member_for_test(pid)"));
+        let settle = needle_stmt_line(body, "wait_sleep_child_settled(pid);")
+            .unwrap_or_else(|| panic!("{name}: no settle statement"));
+        let stop = needle_stmt_line(body, "stop_member_for_test(pid);")
+            .unwrap_or_else(|| panic!("{name}: no stop statement"));
         assert!(settle < stop, "{name}: settle must precede the stop");
     }
     // The shared helper all 17 `stopped_member_with_row` calls funnel through.
     let helper = needle_fn_body(source, "stopped_member_with_row");
-    let settle = helper
-        .find("wait_sleep_child_settled(pid)")
-        .expect("helper settles");
-    let stop = helper
-        .find("stop_member_for_test(pid)")
-        .expect("helper stops");
+    let settle =
+        needle_stmt_line(helper, "wait_sleep_child_settled(pid);").expect("helper settles");
+    let stop = needle_stmt_line(helper, "stop_member_for_test(pid);").expect("helper stops");
     assert!(settle < stop, "helper: settle must precede the stop");
+    // The 9 parked pre-discover sites: the parked wait precedes the scan.
+    let parked_sites: [(&str, &str); 9] = [
+        (
+            "initial_scan_zombie_member_is_silent_like_a_reaped_exit",
+            "wait_sleep_child_parked(pid);",
+        ),
+        (
+            "max_scan_pids_bounds_initial_scan_and_refresh",
+            "wait_sleep_child_parked(child.id());",
+        ),
+        (
+            "zero_cap_refresh_short_circuits_the_sweep_to_empty",
+            "wait_sleep_child_parked(child.id());",
+        ),
+        (
+            "ordinary_over_cap_refresh_performs_no_maps_sweep",
+            "wait_sleep_child_parked(child.id());",
+        ),
+        (
+            "reconcile_pass_rereads_maps_rarity_selects_and_advances_cursor",
+            "wait_sleep_child_parked(child.id());",
+        ),
+        (
+            "reconcile_waiter_outside_slice_settles_within_one_sweep",
+            "wait_sleep_child_parked(child.id());",
+        ),
+        (
+            "reconcile_quantum_zero_defers_the_whole_slice",
+            "wait_sleep_child_parked(child.id());",
+        ),
+        (
+            "refresh_requests_survive_allocation_exhaustion",
+            "wait_sleep_child_parked(child.id());",
+        ),
+        (
+            "id_exhaustion_publishes_skip_instead_of_failing",
+            "wait_sleep_child_parked(child.id());",
+        ),
+    ];
+    for (name, stmt) in parked_sites {
+        let body = needle_fn_body(source, name);
+        let settle =
+            needle_stmt_line(body, stmt).unwrap_or_else(|| panic!("{name}: no parked statement"));
+        let discover = body
+            .lines()
+            .position(|line| {
+                line.split_once("//")
+                    .map_or(line, |(code, _)| code)
+                    .contains("Engine::discover(")
+            })
+            .unwrap_or_else(|| panic!("{name}: no discover call"));
+        assert!(settle < discover, "{name}: park must precede the scan");
+    }
+    // The static-sleeper spawner parks every child it returns.
+    let opus = needle_fn_body(source, "opus_spawn_static_sleeps");
+    assert!(
+        needle_stmt_line(opus, "wait_sleep_child_parked(guard.pid());").is_some(),
+        "opus: no parked statement"
+    );
     // Ban needles, built at runtime so this needle's own source never
     // matches them.
     let banned_basename = ["name", "==", "\"sleep\""].join(" ");
     let ends_with_sleep = ["ends_with(", "\"sleep\")"].concat();
-    // The alien census site settles before its maps read (no SIGSTOP there).
-    let alien = needle_fn_body(source, "peer_census_alignment_respawns_a_mismatched_peer");
+    let target_not_self = ["target", "!=", "self_exe"].join(" ");
     assert!(
-        alien.contains("wait_sleep_child_settled(alien_pid)"),
-        "alien: no wait_sleep_child_settled(alien_pid)"
+        !opus.contains(&target_not_self),
+        "opus: exe-link-only loop is back"
     );
+    // The alien census site parks before its first census read (no SIGSTOP).
+    let alien = needle_fn_body(source, "peer_census_alignment_respawns_a_mismatched_peer");
+    let settle = needle_stmt_line(alien, "wait_sleep_child_parked(alien_pid);")
+        .expect("alien: no parked statement");
+    let census = alien
+        .lines()
+        .position(|line| line.contains("peer_maps_census(alien_pid)"))
+        .expect("alien: no census read");
+    assert!(settle < census, "alien: park must precede the census");
     assert!(
         !alien.contains(&ends_with_sleep),
         "alien: exe-link-only poll is back"
     );
-    // Global bans: no basename-only exe poll loop may reappear anywhere,
-    // and the only ends_with poll left is the post-settle assertion in the
-    // loader-name twin.
+    // Global bans: no basename-only exe poll loop may reappear anywhere;
+    // the only ends_with poll left is the post-settle assertion in the
+    // loader-name twin; the only target-not-self loop left is the
+    // additionally guarded e06 spawner.
     assert!(
         !source.contains(&banned_basename),
         "a basename-only exe poll loop is back"
@@ -98681,10 +98741,15 @@ fn stop_then_read_sites_settle_before_sigstop() {
         1,
         "an exe-link-only ends_with poll is back (want only the loader-name assert)"
     );
+    assert_eq!(
+        source.matches(&target_not_self).count(),
+        1,
+        "an exe-link-only readiness loop is back (want only the e06 guarded site)"
+    );
 }
 
 /// Needle: the teardown cancel guard pins all three joints. Limits (see
-/// the fix2 report): with cancel pre-latched, EITHER the pre-set skip OR
+/// the fix3 report): with cancel pre-latched, EITHER the pre-set skip OR
 /// an in-loop break observes it, so no behavioral test through the scan
 /// entrypoint can kill exactly one branch — deterministic mid-wait
 /// coverage needs a wait-start hook outside this TEST-ONLY lane. These
@@ -98696,14 +98761,17 @@ fn teardown_cancel_guard_needles() {
     // (a) Test side: the stop is latched before the scan starts.
     let tests = include_str!("engine_tests.rs");
     let body = needle_fn_body(tests, "teardown_pre_latched_stop_skips_wait_and_stays_loud");
-    let latch = body
-        .find("AtomicBool::new(true)")
+    let latch = needle_stmt_line(body, "let cancel = AtomicBool::new(true);")
         .expect("teardown test latches cancel");
     let scan = body
-        .find("scan_and_pin_with(")
+        .lines()
+        .position(|line| line.contains("scan_and_pin_with("))
         .expect("teardown test scans");
     assert!(latch < scan, "the stop must latch before the scan");
     // (b)+(c) Production side: the pre-set skip and both loop breaks.
+    // Anchored on the cancel condition itself: the budget-zero branch
+    // above returns the same proof text, so matching the return alone
+    // would pin the wrong early return.
     let engine = include_str!("engine.rs");
     let wait = engine
         .split_once("fn teardown_wait_and_reprove(")
@@ -98712,13 +98780,21 @@ fn teardown_cancel_guard_needles() {
         .split_once("fn scan_and_pin_with_proof(")
         .expect("next fn")
         .0;
-    let skip = wait
-        .find("return process::whole_group_proven_exited(view);")
-        .expect("pre-set skip");
+    let skip_if = wait
+        .find("if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))")
+        .expect("pre-set skip condition");
     let start = wait
         .find("let start = Instant::now();")
         .expect("wait start");
-    assert!(skip < start, "the pre-set skip must precede the wait");
+    assert!(skip_if < start, "the pre-set skip must precede the wait");
+    let skip_ret = skip_if
+        + wait[skip_if..]
+            .find("return process::whole_group_proven_exited(view);")
+            .expect("pre-set skip return");
+    assert!(
+        skip_ret < start,
+        "the pre-set skip must return before the wait"
+    );
     assert_eq!(
         wait.matches("|| cancelled()").count(),
         2,

@@ -1297,25 +1297,40 @@ fn run_unknown_user_is_a_usage_error_exit_2() {
 }
 
 /// A missing `--exclude-module` path refuses after parsing like a
-/// usage error (exit 2) with the scoped hint, before any capture.
+/// usage error (exit 2) with the scoped hint, before any capture, on
+/// every command that validates excludes.
 #[test]
 fn missing_exclude_path_is_a_usage_error_exit_2() {
-    let usage = run(&[
-        "profile",
-        "--pid",
-        "42",
-        "--exclude-module",
-        "/no/such/p11scope-missing.so",
-    ]);
-    assert_eq!(usage.code, Some(2), "{}", usage.stderr);
-    assert!(
-        usage
-            .stderr
-            .contains("--exclude-module /no/such/p11scope-missing.so does not exist"),
-        "{}",
-        usage.stderr
-    );
-    assert_scoped_hint(&usage.stderr, "profile");
+    let missing = "/no/such/p11scope-missing.so";
+    for (argv, command) in [
+        (
+            vec!["profile", "--pid", "42", "--exclude-module", missing],
+            "profile",
+        ),
+        (
+            vec!["run", "--exclude-module", missing, "--", "/bin/true"],
+            "run",
+        ),
+        (
+            vec!["inspect", "--pid", "42", "--exclude-module", missing],
+            "inspect",
+        ),
+        (
+            vec!["inventory", "--pid", "42", "--exclude-module", missing],
+            "inventory",
+        ),
+    ] {
+        let usage = run(&argv);
+        assert_eq!(usage.code, Some(2), "{argv:?}: {}", usage.stderr);
+        assert!(
+            usage
+                .stderr
+                .contains(&format!("--exclude-module {missing} does not exist")),
+            "{argv:?}: {}",
+            usage.stderr
+        );
+        assert_scoped_hint(&usage.stderr, command);
+    }
 }
 
 /// B2: a huge `--duration` is a usage error, never a panic. A bare

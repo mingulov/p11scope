@@ -47,6 +47,8 @@ PRODUCER_CONSTANTS = (
     "LOADER_CONTEXT_CHILD_RESERVE",
     "LOADER_SCAN_LEDGER_EXCEEDED",
     "LOADER_ARM_LEDGER_FULL",
+    # The renewing work-ceiling gap projects to its public reason.
+    "DISCOVERY_WORK_CEILING_DEFERRED",
     # Never-stop discovery gaps: one bad manifest object, pre-arm path,
     # or live-ring dequeue gaps without aborting siblings.
     "MANIFEST_OBJECT_UNAVAILABLE",
@@ -122,6 +124,7 @@ def producer_reasons():
         const["LOADER_CONTEXT_CHILD_RESERVE"],
         const["LOADER_SCAN_LEDGER_EXCEEDED"],
         const["LOADER_ARM_LEDGER_FULL"],
+        const["DISCOVERY_WORK_CEILING_DEFERRED"],
         const["MANIFEST_OBJECT_UNAVAILABLE"],
         const["PREARM_OBJECT_UNAVAILABLE"],
         const["DISCOVERY_TRANSPORT_UNAVAILABLE"],

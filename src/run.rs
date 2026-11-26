@@ -3571,9 +3571,10 @@ fn should_stop(interrupted: &SignalState, elapsed: Duration, duration: Option<Du
     interrupted.interrupted() || duration.is_some_and(|d| elapsed >= d)
 }
 
-/// `profile` and `trace` against an external target: decide the policy,
-/// discover and pin what is in scope, install the stop flag, then run the same
-/// loop `run` runs — with no owned child, so no pause is ever possible.
+/// `profile` and `trace` against an external target: install the stop
+/// flag first, then decide the policy, run the preflights, discover
+/// and pin what is in scope, and run the same loop `run` runs — with
+/// no owned child, so no pause is ever possible.
 pub fn capture(a: &CaptureArgs) -> Result<()> {
     capture_with_host(a, &crate::attach::require_multi_capable_host)
 }

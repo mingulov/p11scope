@@ -1255,11 +1255,7 @@ mod tests {
             ),
             (SYS_KCMP, libc::SYS_kcmp, "kcmp"),
             (SYS_MOVE_PAGES, libc::SYS_move_pages, "move_pages"),
-            (
-                SYS_MIGRATE_PAGES,
-                libc::SYS_migrate_pages,
-                "migrate_pages",
-            ),
+            (SYS_MIGRATE_PAGES, libc::SYS_migrate_pages, "migrate_pages"),
             (SYS_BPF, libc::SYS_bpf, "bpf"),
             (
                 SYS_PERF_EVENT_OPEN,
@@ -1404,11 +1400,7 @@ mod tests {
             ),
             (SYS_KCMP, libc::SYS_kcmp, "kcmp"),
             (SYS_MOVE_PAGES, libc::SYS_move_pages, "move_pages"),
-            (
-                SYS_MIGRATE_PAGES,
-                libc::SYS_migrate_pages,
-                "migrate_pages",
-            ),
+            (SYS_MIGRATE_PAGES, libc::SYS_migrate_pages, "migrate_pages"),
         ] {
             assert_eq!(nr, want as u32, "wrong number for {name}");
             assert_eq!(
@@ -1761,7 +1753,11 @@ mod tests {
             libc::SYS_fsconfig as u32,
             "wrong number for fsconfig"
         );
-        assert_eq!(SYS_FSPICK, libc::SYS_fspick as u32, "wrong number for fspick");
+        assert_eq!(
+            SYS_FSPICK,
+            libc::SYS_fspick as u32,
+            "wrong number for fspick"
+        );
         for (nr, name) in [
             (SYS_MOUNT_SETATTR, "mount_setattr"),
             (SYS_OPEN_TREE_ATTR, "open_tree_attr"),

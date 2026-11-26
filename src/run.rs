@@ -5763,25 +5763,23 @@ fn seal_owned_handoff_trace(context: &mut HandoffReportContext) -> Result<()> {
     // A dead stdout at creation still routes through the shared emitter
     // with a fallback null sink held closed, so the file-only path keeps
     // the byte-exact terminal accounting below.
-    let (mut stdout_sink, mut stdout_open) = match crate::sink::watched_stdout_sink(
-        context.signals.cancel_flag(),
-    ) {
-        Ok(sink) => (sink, true),
-        Err(error) => {
-            if out_file.is_none() {
-                return Err(
-                    anyhow::Error::new(error).context("run: opening stdout for the handoff trace")
-                );
+    let (mut stdout_sink, mut stdout_open) =
+        match crate::sink::watched_stdout_sink(context.signals.cancel_flag()) {
+            Ok(sink) => (sink, true),
+            Err(error) => {
+                if out_file.is_none() {
+                    return Err(anyhow::Error::new(error)
+                        .context("run: opening stdout for the handoff trace"));
+                }
+                emit_capture_diagnostic(&format!(
+                    "p11scope: stdout unavailable for the handoff trace; continuing file-only: {}",
+                    crate::render::escape_controls(&error.to_string()),
+                ));
+                let fallback = crate::sink::watched_null_sink(context.signals.cancel_flag())
+                    .map_err(|error| anyhow::anyhow!("run: opening stdout fallback: {error}"))?;
+                (fallback, false)
             }
-            emit_capture_diagnostic(&format!(
-                "p11scope: stdout unavailable for the handoff trace; continuing file-only: {}",
-                crate::render::escape_controls(&error.to_string()),
-            ));
-            let fallback = crate::sink::watched_null_sink(context.signals.cancel_flag())
-                .map_err(|error| anyhow::anyhow!("run: opening stdout fallback: {error}"))?;
-            (fallback, false)
-        }
-    };
+        };
     stdout_sink.begin_tick(crate::sink::SINK_TICK_BUDGET);
     let header = trace::header(context.policy, context.engine.plan());
     if let Err(error) = emit_trace_line(&header, &mut stdout_sink, &mut stdout_open, &mut out_file)
@@ -31380,29 +31378,24 @@ int main(int argc, char **argv) {
             .lines()
             .filter(|line| !line.trim_start().starts_with("//"))
             .collect();
-        let count = |needle: &str| {
-            code.iter()
-                .filter(|line| line.contains(needle))
-                .count()
-        };
+        let count = |needle: &str| code.iter().filter(|line| line.contains(needle)).count();
         // The two handoff seals build watched stdout sinks; the opener
         // and the trace fallback build watched null sinks.
         assert_eq!(count("watched_stdout_sink("), 2, "seal constructions");
-        assert_eq!(count("watched_null_sink("), 2, "null-fallback constructions");
+        assert_eq!(
+            count("watched_null_sink("),
+            2,
+            "null-fallback constructions"
+        );
         // No raw sink construction survives in production: a bypass
         // mutant adding any of these fails here.
-        let bare_stdout =
-            count("stdout_sink(") - count("watched_stdout_sink(");
+        let bare_stdout = count("stdout_sink(") - count("watched_stdout_sink(");
         assert_eq!(bare_stdout, 0, "raw stdout_sink( calls");
         let bare_null = count("null_sink(") - count("watched_null_sink(");
         assert_eq!(bare_null, 0, "raw null_sink( calls");
         assert_eq!(count("SinkWriter::new("), 0, "raw SinkWriter::new(");
         assert_eq!(count("sink_on_fd("), 0, "dashboard-only sink_on_fd(");
-        assert_eq!(
-            count("without_flag_change("),
-            0,
-            "raw without_flag_change("
-        );
+        assert_eq!(count("without_flag_change("), 0, "raw without_flag_change(");
         // The opener wires whatever `open` returns, and the engine
         // keeps its single direct wiring with the exact shared flag.
         // The engine call is a bare statement, so only an exact full
@@ -31415,8 +31408,7 @@ int main(int argc, char **argv) {
             code.iter()
                 .filter(|line| {
                     line.len() - line.trim_start().len() == 4
-                        && line.trim()
-                            == "engine.set_cancel_flag(interrupted.cancel_flag());"
+                        && line.trim() == "engine.set_cancel_flag(interrupted.cancel_flag());"
                 })
                 .count(),
             1,

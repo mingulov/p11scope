@@ -3974,7 +3974,7 @@ impl PinnedObjects {
     /// Ownership rows filed under `view`: the committed size a capped
     /// alias caller measures its fresh-row allowance against.
     pub(crate) fn owned_raw_count_under(&self, view: ProcessViewId) -> usize {
-        self.raw_ownership.get(&view).map_or(0, BTreeSet::len)
+        self.raw_ownership.get(&view).map_or(0, |owned| owned.len())
     }
 
     /// Files scan-owned raw aliases for `module` — its own file plus
@@ -4546,6 +4546,24 @@ impl PinnedObjects {
         self.id_for_scanned_with_carry(module, key, path, false)
     }
 
+    /// Raw-identity resolution without the per-view proof fence: the
+    /// pinned object filed for a scanned raw, if any, regardless of
+    /// which view proved it. Coverage, reclaim candidacy, harvest
+    /// absorb gating and generation-digest comparison ask which
+    /// object a row's file is, never whether the asking view proved
+    /// it; those callers use this instead of [`Self::id_for_scanned`].
+    /// Live binds keep the fence.
+    pub(crate) fn id_for_raw_identity(
+        &self,
+        module: &ScannedModule,
+        key: ObjectKey,
+        path: &str,
+    ) -> Option<PinnedObjectId> {
+        self.raw_to_id
+            .get(&RawObjectInstance::scanned(module, key, path)?)
+            .copied()
+    }
+
     /// Scan resolution with the custody generation read from its typed
     /// tag ([`CustodyGeneration`]). Fresh custody of the resolving view is
     /// proof; carried custody of the resolving view is proof only for a
@@ -4560,17 +4578,18 @@ impl PinnedObjects {
         allow_carried: bool,
     ) -> Option<PinnedObjectId> {
         let raw = RawObjectInstance::scanned(module, key, path)?;
-        if module.view == crate::discovery::engine::Engine::CARRIED_VIEW_ID {
-            // Re-owned carrier rows ask which object their file is
-            // (coverage, reclaim candidacy, rebinding a decided row),
-            // never whether a live view proved it: the engine moved
-            // these rows under the reserved carrier at retirement,
-            // and the proof fence below would refuse every carrier
-            // that shares its file with a live row. Raw identity is
-            // the whole question, and an unmapped raw still resolves
-            // nowhere. The allocator mints sequential ids under view
-            // capacity, so no live or scanned view can hold this id
-            // and ride this arm.
+        if !crate::discovery::engine::Engine::is_process_generation_view(module.view) {
+            // Reserved views (re-owned carriers, run-learned tables,
+            // the probationary sentinel) name no live generation, so
+            // the proof fence below cannot apply to them: resolving
+            // one asks which object its file is (coverage, reclaim
+            // candidacy, rebinding a decided row), never whether a
+            // live view proved it. The fence would refuse every such
+            // row that shares its file with a live row. Raw identity
+            // is the whole question, and an unmapped raw still
+            // resolves nowhere. The allocator mints sequential ids
+            // under view capacity, so no live or scanned view can
+            // hold these ids and ride this arm.
             return self.raw_to_id.get(&raw).copied();
         }
         if self
@@ -12536,7 +12555,7 @@ fn bind_scanned_modules_inner(
                             &original.object_path,
                             !authority.authorizes(module.view),
                         )
-                    });
+                    })
                 };
                 match target {
                     Some(id)
@@ -30493,7 +30512,11 @@ mod tests {
         custody_file(&mut learned, l, k1);
         let raw1 = custody_file(&mut learned, v, k1);
         learned.drop_view_claims(v);
-        learned.alias_scanned_module_under(&custody_module(k1, v), v);
+        // No budget pressure in this generation unit: the alias budget
+        // is pinned by the reserved-alias twins, not here.
+        let refused =
+            learned.alias_scanned_module_under_capped(&custody_module(k1, v), v, usize::MAX);
+        assert_eq!(refused, 0);
         assert_eq!(
             custody_of(&learned, v),
             Some((CustodyGeneration::Fresh, vec![raw1]))

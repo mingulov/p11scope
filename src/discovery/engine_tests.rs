@@ -105767,6 +105767,7 @@ fn run_learned_reserved_aliases_stop_at_thirty_two() {
             &BTreeSet::new(),
             &BTreeSet::new(),
             &BTreeSet::new(),
+            None,
         )
         .expect("a live candidate builds before retirement");
     assert_eq!(
@@ -105787,7 +105788,10 @@ fn run_learned_reserved_aliases_stop_at_thirty_two() {
         record_scan_ownership(&mut engine.pinned, ProcessViewId(9), *key, path);
     }
     assert!(
-        engine.pinned.remove_view(ProcessViewId(9)).is_some(),
+        engine
+            .pinned
+            .retire_view_only_if_proven_gone(ProcessViewId(9), RetirementProof::OperatorRemoval)
+            .is_some(),
         "the proving view owned pins to retire"
     );
     let candidate = engine
@@ -105799,6 +105803,7 @@ fn run_learned_reserved_aliases_stop_at_thirty_two() {
             &BTreeSet::new(),
             &BTreeSet::new(),
             &BTreeSet::new(),
+            None,
         )
         .expect("a live candidate builds after retirement");
     assert_eq!(
@@ -106272,7 +106277,7 @@ fn learned_staging_stops_requesting_refreshes_once_the_queue_is_full() {
             "the queue fills without refusal"
         );
     }
-    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    assert_eq!(engine.refresh_queue.len(), MAX_PENDING_REFRESH);
     let mut sleepers = Vec::new();
     for id in 0..10u32 {
         let sleeper = std::process::Command::new("sleep")
@@ -106295,6 +106300,7 @@ fn learned_staging_stops_requesting_refreshes_once_the_queue_is_full() {
         loader_unknown_reason: None,
         run_learned: true,
         proving_retained: false,
+        loader_pid: None,
     });
     assert_eq!(
         engine.learned_staged_files_for_test(),
@@ -106333,7 +106339,7 @@ fn refresh_refusals_past_a_full_queue_burn_no_work_budget() {
             "the queue fills without refusal"
         );
     }
-    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    assert_eq!(engine.refresh_queue.len(), MAX_PENDING_REFRESH);
     assert!(engine.budget_charge_for_test(WORK_CEILING - 1));
     for index in 0..REFUSALS {
         assert!(
@@ -106346,7 +106352,7 @@ fn refresh_refusals_past_a_full_queue_burn_no_work_budget() {
         );
     }
     assert_eq!(
-        engine.refresh_requested.len(),
+        engine.refresh_queue.len(),
         MAX_PENDING_REFRESH,
         "the overload refuses without growing the queue"
     );

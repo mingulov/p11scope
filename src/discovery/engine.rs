@@ -19613,12 +19613,27 @@ impl Engine {
         // too (it is authorized below, so the scrub spares it).
         let ridden: BTreeSet<ProcessViewId> =
             raw_modules.iter().map(|module| module.view).collect();
-        // Entry-dependency rejections never drop the whole module here:
+        // Entry-dependency rejections never drop a live module here:
         // a rejected key's raws still resolve to the kept file, so the
         // strict binder below refuses those entries while keeping the
         // module's valid ones. Only a rejected module key — the
         // module's own identity — discards the module before the bind.
-        raw_modules.retain(|module| !pinned.rejects(module.key));
+        // Retired carrier rows keep the stricter filter: no live
+        // prover refreshes them, so a rejected entry dependency drops
+        // the stale row wholesale and its carrier-only pin reclaims.
+        raw_modules.retain(|module| {
+            if pinned.rejects(module.key) {
+                return false;
+            }
+            if module.view != Self::CARRIED_VIEW_ID {
+                return true;
+            }
+            !module
+                .tables
+                .iter()
+                .flat_map(|table| &table.entries)
+                .any(|entry| pinned.rejects(entry.object))
+        });
         if crate::run::capture_diagnostics_on() && raw_with_learned > raw_before_learned {
             eprintln!(
                 "p11scope: candidate scan inputs: {} frame + {} run-learned, {} survive rejects",
@@ -25436,8 +25451,8 @@ impl Engine {
                     .map(|entry| (entry.object, entry.object_path.as_str())),
             )
             .any(|(key, path)| {
-                incoming.id_for_scanned(module, key, path).is_some()
-                    && committed.id_for_scanned(module, key, path).is_none()
+                incoming.id_for_raw_identity(module, key, path).is_some()
+                    && committed.id_for_raw_identity(module, key, path).is_none()
             })
     }
 
@@ -25529,7 +25544,7 @@ impl Engine {
             .filter(|digest| !digest.is_empty())
             .zip(
                 self.pinned
-                    .id_for_scanned(&learned_query, learned_query.key, &learned_query.path)
+                    .id_for_raw_identity(&learned_query, learned_query.key, &learned_query.path)
                     .and_then(|id| self.pinned.summary(id))
                     .map(|summary| summary.sha256)
                     .filter(|digest| !digest.is_empty()),
@@ -25617,7 +25632,7 @@ impl Engine {
             }
         }
         if module.tables.is_empty() && module.interfaces.is_empty() {
-            return;
+            return None;
         }
         // Generation-local addresses never identify a persistent
         // table: consecutive provers map the same tables at
@@ -25696,6 +25711,7 @@ impl Engine {
         if !self
             .pinned
             .module_aliased_under(&module, Self::RUN_LEARNED_VIEW_ID)
+            && Self::harvest_absorb_would_serve(&self.pinned, source, &module)
         {
             let absorbed = self.pinned.absorb(source.clone());
             attribution::note_all(&absorbed);
@@ -25704,8 +25720,26 @@ impl Engine {
                     self.counters.object_skips.push(skip);
                 }
             }
-            self.pinned
-                .alias_scanned_module_under(&module, Self::RUN_LEARNED_VIEW_ID);
+        }
+        let allowance = crate::fanotify::LEARNED_FILES_PER_CAPTURE_CAP
+            .saturating_sub(self.pinned.owned_raw_count_under(Self::RUN_LEARNED_VIEW_ID));
+        let refused = self.pinned.alias_scanned_module_under_capped(
+            &module,
+            Self::RUN_LEARNED_VIEW_ID,
+            allowance,
+        );
+        if refused > 0 {
+            self.run_learned_alias_refused = self
+                .run_learned_alias_refused
+                .saturating_add(u64::try_from(refused).unwrap_or(u64::MAX));
+            if crate::run::capture_diagnostics_on() {
+                eprintln!(
+                    "p11scope: run-learned tables for {}: {} reserved alias{} past the 32-entry budget refused (tables still persist)",
+                    proof.path,
+                    refused,
+                    if refused == 1 { "" } else { "es" },
+                );
+            }
         }
         Some(module)
     }
@@ -25730,8 +25764,18 @@ impl Engine {
     ) {
         match remap_source {
             // Fresh proofs share their call's namespace: the target
-            // already holds the proving entries, so alias only.
-            None => target.alias_scanned_module_under(&module, Self::RUN_LEARNED_VIEW_ID),
+            // already holds the proving entries, so alias only. The
+            // 32-entry budget binds per store; the refusal count
+            // rides the prepare call, so the mirror discards its own.
+            None => {
+                let allowance = crate::fanotify::LEARNED_FILES_PER_CAPTURE_CAP
+                    .saturating_sub(target.owned_raw_count_under(Self::RUN_LEARNED_VIEW_ID));
+                let _ = target.alias_scanned_module_under_capped(
+                    &module,
+                    Self::RUN_LEARNED_VIEW_ID,
+                    allowance,
+                );
+            }
             // Deferred proofs split source (stashed proving pins)
             // and target (the draining store, cloned before the
             // drain absorbed): remap the proving entries into the
@@ -25756,7 +25800,14 @@ impl Engine {
                             self.counters.object_skips.push(skip);
                         }
                     }
-                    target.alias_scanned_module_under(&module, Self::RUN_LEARNED_VIEW_ID);
+                    let allowance = crate::fanotify::LEARNED_FILES_PER_CAPTURE_CAP.saturating_sub(
+                        target.owned_raw_count_under(Self::RUN_LEARNED_VIEW_ID),
+                    );
+                    let _ = target.alias_scanned_module_under_capped(
+                        &module,
+                        Self::RUN_LEARNED_VIEW_ID,
+                        allowance,
+                    );
                 }
             }
         }
@@ -26539,7 +26590,7 @@ impl Engine {
                 // plus /proc probes) and file an owed intent. The
                 // ordinary refresh path still covers every view; the
                 // prompt round is best-effort expedition only.
-                if self.refresh_requested.len() >= MAX_PENDING_REFRESH {
+                if self.refresh_queue.len() >= MAX_PENDING_REFRESH {
                     break;
                 }
                 self.request_refresh(*pid, now_ns);

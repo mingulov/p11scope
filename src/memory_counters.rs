@@ -132,6 +132,8 @@ pub(crate) struct NativeRetentionLens {
     pub pair_counts: CounterRow,
     pub pair_tombstones: CounterRow,
     pub pair_totals: CounterRow,
+    pub pair_folded: CounterRow,
+    pub pair_fold_lost: CounterRow,
     pub preadmission: CounterRow,
     pub pending_ids: CounterRow,
     pub placement_generations: CounterRow,
@@ -389,6 +391,8 @@ pub(crate) struct MemorySnapshot {
     r1_native_pair_counts: Option<CounterRow>,
     r1_native_pair_tombstones: Option<CounterRow>,
     r1_native_pair_totals: Option<CounterRow>,
+    r1_native_pair_folded: Option<CounterRow>,
+    r1_native_pair_fold_lost: Option<CounterRow>,
     r1_native_preadmission: Option<CounterRow>,
     r1_native_pending_ids: Option<CounterRow>,
     r1_native_placement_generations: Option<CounterRow>,
@@ -573,6 +577,8 @@ impl MemorySnapshot {
             r1_native_pair_counts: None,
             r1_native_pair_tombstones: None,
             r1_native_pair_totals: None,
+            r1_native_pair_folded: None,
+            r1_native_pair_fold_lost: None,
             r1_native_preadmission: None,
             r1_native_pending_ids: None,
             r1_native_placement_generations: None,
@@ -685,6 +691,8 @@ impl MemorySnapshot {
             r1_native_pair_counts: Some(lens.native.pair_counts),
             r1_native_pair_tombstones: Some(lens.native.pair_tombstones),
             r1_native_pair_totals: Some(lens.native.pair_totals),
+            r1_native_pair_folded: Some(lens.native.pair_folded),
+            r1_native_pair_fold_lost: Some(lens.native.pair_fold_lost),
             r1_native_preadmission: Some(lens.native.preadmission),
             r1_native_pending_ids: Some(lens.native.pending_ids),
             r1_native_placement_generations: Some(lens.native.placement_generations),
@@ -1063,6 +1071,8 @@ mod tests {
                 pair_counts: row(25),
                 pair_tombstones: row(26),
                 pair_totals: row(27),
+                pair_folded: row(40),
+                pair_fold_lost: row(41),
                 preadmission: row(32),
                 pending_ids: row(28),
                 placement_generations: row(29),
@@ -1233,6 +1243,8 @@ mod tests {
         assert_eq!(inventory.r1_native_exec_pruned.expect("native").len, 22);
         assert_eq!(inventory.r1_native_pair_targets.expect("native").len, 24);
         assert_eq!(inventory.r1_native_pair_totals.expect("native").len, 27);
+        assert_eq!(inventory.r1_native_pair_folded.expect("native").len, 40);
+        assert_eq!(inventory.r1_native_pair_fold_lost.expect("native").len, 41);
         assert_eq!(inventory.r1_native_preadmission.expect("native").len, 32);
         assert_eq!(
             inventory.r1_native_rendered_callers.expect("native").len,
@@ -1270,6 +1282,8 @@ mod tests {
         );
         assert!(profile.r1_native_exec_exe.is_none());
         assert!(trace.r1_native_pair_targets.is_none());
+        assert!(profile.r1_native_pair_folded.is_none());
+        assert!(trace.r1_native_pair_fold_lost.is_none());
         assert_eq!(inventory.r1_native_binder.expect("binder").len, 39);
         assert_eq!(inventory.r1_ownership.expect("ownership").len, 43);
         assert_eq!(inventory.caller_metadata_table.expect("metadata").len, 47);
@@ -1441,6 +1455,8 @@ mod tests {
                 pair_counts: cap(65_536, 128),
                 pair_tombstones: cap(65_536, 48),
                 pair_totals: cap(1024, 64),
+                pair_folded: cap(65_536, 48),
+                pair_fold_lost: cap(1024, 64),
                 preadmission: cap(4096, 112),
                 pending_ids: cap(65_536, 128),
                 placement_generations: cap(65_536, 64),

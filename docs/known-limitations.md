@@ -2964,10 +2964,18 @@ The old bounds are measurements, not a product startup SLA.
   keeps its exact tombstone; otherwise the row is folded into the same
   aggregate and counted once in `budgets.native_departed.pair_prune_overflow`:
   no base is forgotten silently and the map does not grow. A revival past
-  a remembered fold files a disclosed gap and rebases past the current
-  absolute instead of re-crediting; remembered folds past their own bound
-  drop oldest-first with a counted `pair_fold_memory_overflow` naming the
-  limit. Tombstones past the keep window (two prune graces past pruning)
+  a remembered fold files a disclosed gap over the window past the folded
+  base (the gap amount excludes the base the class aggregate already
+  holds) and rebases past the current absolute instead of re-crediting;
+  remembered folds past their own bound drop the oldest fold in the
+  visited window with a counted `pair_fold_memory_overflow` naming the
+  limit, and each dropped live fold latches its key class: a later
+  revival with no fold memory in a latched class files the same gap
+  over the outer-bound window instead of re-crediting. Both victim
+  sweeps rotate oldest-first with a resume cursor, like the age drain,
+  so a sweep that cannot finish in one pass resumes instead of
+  re-scanning its head. Tombstones past the keep window
+  (two prune graces past pruning)
   drain by age on the same pass with the same counting, so the tombstone map
   stays flat under churn instead of living until domain stop. `pair_dropped_rows`
   and `pair_dropped_base` publish the exact aggregate. Every other

@@ -851,11 +851,25 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// first (a gone task cannot revive); a live eviction counts in
     /// `pair_fold_memory_overflow` and names the limit.
     pair_folded: HashMap<PairKey, FoldedPair>,
+    /// Fold-loss latch per key class (domain, object): set when a
+    /// live fold evicts past the bound. A revival with no tombstone
+    /// and no fold memory in a latched class files the fold-revival
+    /// gap over the outer-bound window instead of re-crediting, so
+    /// forgotten folds can never silently re-credit. Same key space
+    /// (and bound) as the class aggregate. Cleared per domain at
+    /// finish, like every other per-domain departed structure.
+    pair_fold_lost_classes: HashSet<PairKeyClass>,
     /// Folded-key memory evictions of live tasks past the bound
-    /// (sticky, saturating; counted once). A revival past an
-    /// evicted fold re-credits silently: the counter discloses the
-    /// limit instead of claiming exactness.
+    /// (sticky, saturating; counted once). Each one latches its
+    /// class above.
     pair_fold_memory_overflow: u64,
+    /// Resume cursors for the two victim sweeps (tombstone
+    /// eviction, folded-memory eviction): same
+    /// `((stamp, pid), tie-skip)` rotation as the age drain, so a
+    /// sweep that cannot finish in one pass resumes instead of
+    /// re-scanning its head forever.
+    pair_evict_cursor: Option<((u64, u32), usize)>,
+    pair_fold_evict_cursor: Option<((u64, u32), usize)>,
     /// Exact aggregate of pruned dropped-pair bases per key class
     /// (domain and object): rows and saturating base total. Counts stay
     /// exact when the per-pair rows leave the map.
@@ -1894,7 +1908,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             pair_dropped_tombstones: HashMap::new(),
             pair_drain_cursor: None,
             pair_folded: HashMap::new(),
+            pair_fold_lost_classes: HashSet::new(),
             pair_fold_memory_overflow: 0,
+            pair_evict_cursor: None,
+            pair_fold_evict_cursor: None,
             pair_dropped_totals: HashMap::new(),
             pair_prune_overflow: 0,
             pair_prune_cap: MAX_PRUNED_PAIR_TOMBSTONES,
@@ -5167,6 +5184,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 size_of::<(PairKeyClass, DroppedPairTotal)>(),
                 0,
             ),
+            pair_folded: counter_row(
+                self.pair_folded.len(),
+                size_of::<(PairKey, FoldedPair)>(),
+                0,
+            ),
+            pair_fold_lost: counter_row(
+                self.pair_fold_lost_classes.len(),
+                size_of::<PairKeyClass>(),
+                HEAP_MAP_ENTRY,
+            ),
             preadmission: counter_row(
                 preadmission,
                 size_of::<(u32, PreadmissionEntry)>(),
@@ -6460,6 +6487,58 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         *memo.entry(pid).or_insert_with(|| source.gone(pid))
     }
 
+    /// One rotation step over a drain-ordered `(key, stamp, pid)`
+    /// snapshot: sorts by `(stamp, pid)` when over budget or resuming,
+    /// takes up to one sweep bound past the cursor (a cursor past
+    /// every entry restarts from the oldest — removals since last
+    /// pass can only shrink the snapshot), and advances the cursor
+    /// past the taken window (ties advance by consumed count, so no
+    /// position starves). Returns the taken slice bounds. Shared by
+    /// the age drain and both victim sweeps so rotation, tie-advance
+    /// and wrap behave identically everywhere; the rest of the
+    /// snapshot waits for later passes instead of stalling this one.
+    fn rotate_sweep_window(
+        entries: &mut Vec<(PairKey, u64, u32)>,
+        cursor: &mut Option<((u64, u32), usize)>,
+    ) -> (usize, usize) {
+        if entries.len() > EVER_ENUMERATED_SWEEP || cursor.is_some() {
+            entries.sort_by_key(|a| (a.1, a.2));
+        }
+        let mut start = match *cursor {
+            None => 0,
+            Some(((ts, pid), skipped)) => {
+                let less = entries
+                    .iter()
+                    .take_while(|(_, t, p)| (*t, *p) < (ts, pid))
+                    .count();
+                let tied = entries[less..]
+                    .iter()
+                    .take_while(|(_, t, p)| (*t, *p) == (ts, pid))
+                    .count();
+                (less + skipped.min(tied)).min(entries.len())
+            }
+        };
+        if start >= entries.len() && !entries.is_empty() {
+            start = 0;
+        }
+        let end = (start + EVER_ENUMERATED_SWEEP).min(entries.len());
+        if end >= entries.len() {
+            *cursor = None;
+        } else if let Some((_, ts, pid)) = entries[start..end].last() {
+            let run = entries[start..end]
+                .iter()
+                .rev()
+                .take_while(|(_, t, p)| (*t, *p) == (*ts, *pid))
+                .count();
+            let carry = match *cursor {
+                Some(((cts, cpid), k)) if (cts, cpid) == (*ts, *pid) => k,
+                _ => 0,
+            };
+            *cursor = Some(((*ts, *pid), carry + run));
+        }
+        (start, end)
+    }
+
     /// Prune dropped pair targets whose base is older than the grace
     /// into the exact per-class aggregate. A tombstone keeps the base
     /// so a late revival rebases past it; past the tombstone bound the
@@ -6476,17 +6555,21 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     fn prune_dropped_pair_targets(&mut self, now_ns: u64, gone_memo: &mut HashMap<u32, bool>) {
         // Gone-first room: when the tombstone map is full, evict
         // gone-task tombstones (a gone task cannot revive) so due
-        // rows keep exact tombstones instead of folding. Bounded
-        // probes per pass; each eviction counts like any fold.
+        // rows keep exact tombstones instead of folding. One sweep
+        // bound of tombstones per pass, oldest first, resuming past
+        // the cursor; each eviction counts like any fold.
         if self.pair_dropped_tombstones.len() >= self.pair_prune_cap {
-            let source = self.adapter.source();
-            let mut victims = Vec::new();
-            for (key, tomb) in self
+            let mut candidates: Vec<(PairKey, u64, u32)> = self
                 .pair_dropped_tombstones
                 .iter()
-                .take(EVER_ENUMERATED_SWEEP)
-            {
-                if Self::tombstone_owner_gone(gone_memo, source, tomb.pid) {
+                .map(|(key, tomb)| (*key, tomb.pruned_since, tomb.pid))
+                .collect();
+            let (start, end) =
+                Self::rotate_sweep_window(&mut candidates, &mut self.pair_evict_cursor);
+            let source = self.adapter.source();
+            let mut victims = Vec::new();
+            for (key, _, pid) in &candidates[start..end] {
+                if Self::tombstone_owner_gone(gone_memo, source, *pid) {
                     victims.push(*key);
                 }
             }
@@ -6543,7 +6626,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 );
             } else {
                 self.pair_prune_overflow = self.pair_prune_overflow.saturating_add(1);
-                self.remember_folded_pair(key, pid, now_ns, gone_memo);
+                self.remember_folded_pair(key, pid, base, now_ns, gone_memo);
             }
         }
         // Age drain: a tombstone past the keep window leaves the map
@@ -6551,10 +6634,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // base stays in the exact aggregate, and the overflow counts
         // each age fold once, like a bound fold. Liveness resolves
         // through the pass memo shared with the binder and EXEC
-        // stash, and each pass visits at most one sweep bound of
-        // expired tombstones, oldest first, resuming past the cursor
-        // (ties advance by consumed count, so no position starves);
-        // the rest wait for later passes instead of stalling this one.
+        // stash; rotation matches both victim sweeps.
         let mut expired: Vec<(PairKey, u64, u32)> = self
             .pair_dropped_tombstones
             .iter()
@@ -6564,31 +6644,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             })
             .map(|(key, tomb)| (*key, tomb.pruned_since, tomb.pid))
             .collect();
-        if expired.len() > EVER_ENUMERATED_SWEEP || self.pair_drain_cursor.is_some() {
-            expired.sort_by_key(|a| (a.1, a.2));
-        }
-        let start = match self.pair_drain_cursor {
-            None => 0,
-            Some(((ts, pid), skipped)) => {
-                let less = expired
-                    .iter()
-                    .take_while(|(_, t, p)| (*t, *p) < (ts, pid))
-                    .count();
-                let tied = expired[less..]
-                    .iter()
-                    .take_while(|(_, t, p)| (*t, *p) == (ts, pid))
-                    .count();
-                (less + skipped.min(tied)).min(expired.len())
-            }
-        };
-        // A cursor past every expired entry restarts from the oldest:
-        // removals since last pass can only shrink the snapshot.
-        let start = if start >= expired.len() && !expired.is_empty() {
-            0
-        } else {
-            start
-        };
-        let end = (start + EVER_ENUMERATED_SWEEP).min(expired.len());
+        let (start, end) =
+            Self::rotate_sweep_window(&mut expired, &mut self.pair_drain_cursor);
         let source = self.adapter.source();
         for (_, _, pid) in &expired[start..end] {
             Self::tombstone_owner_gone(gone_memo, source, *pid);
@@ -6599,20 +6656,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 self.pair_dropped_tombstones.remove(key);
                 drained = drained.saturating_add(1);
             }
-        }
-        if end >= expired.len() {
-            self.pair_drain_cursor = None;
-        } else if let Some((_, ts, pid)) = expired[start..end].last() {
-            let run = expired[start..end]
-                .iter()
-                .rev()
-                .take_while(|(_, t, p)| (*t, *p) == (*ts, *pid))
-                .count();
-            let carry = match self.pair_drain_cursor {
-                Some(((cts, cpid), k)) if (cts, cpid) == (*ts, *pid) => k,
-                _ => 0,
-            };
-            self.pair_drain_cursor = Some(((*ts, *pid), carry + run));
         }
         self.pair_prune_overflow = self.pair_prune_overflow.saturating_add(drained);
     }
@@ -7024,28 +7067,47 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         &mut self,
         key: PairKey,
         pid: u32,
+        base: u64,
         now_ns: u64,
         gone_memo: &mut HashMap<u32, bool>,
     ) {
         if self.pair_folded.len() >= self.pair_prune_cap {
+            let mut candidates: Vec<(PairKey, u64, u32)> = self
+                .pair_folded
+                .iter()
+                .map(|(candidate, folded)| (*candidate, folded.folded_since, folded.pid))
+                .collect();
+            let (start, end) =
+                Self::rotate_sweep_window(&mut candidates, &mut self.pair_fold_evict_cursor);
             let source = self.adapter.source();
-            let mut oldest: Option<(PairKey, u64)> = None;
-            let mut gone_victim = None;
-            for (candidate, folded) in self.pair_folded.iter().take(EVER_ENUMERATED_SWEEP) {
-                if Self::tombstone_owner_gone(gone_memo, source, folded.pid) {
-                    gone_victim = Some(*candidate);
-                    break;
-                }
-                let older = oldest.is_none_or(|(_, since)| folded.folded_since < since);
-                if older {
-                    oldest = Some((*candidate, folded.folded_since));
+            let mut gone_victims = Vec::new();
+            for (candidate, _, candidate_pid) in &candidates[start..end] {
+                if Self::tombstone_owner_gone(gone_memo, source, *candidate_pid) {
+                    gone_victims.push(*candidate);
                 }
             }
-            if let Some(victim) = gone_victim {
-                self.pair_folded.remove(&victim);
-            } else if let Some((victim, _)) = oldest {
-                self.pair_folded.remove(&victim);
-                self.pair_fold_memory_overflow = self.pair_fold_memory_overflow.saturating_add(1);
+            for victim in &gone_victims {
+                self.pair_folded.remove(victim);
+            }
+            // No gone task in the window: the oldest unvisited fold
+            // leaves, counted, and latches its class — a later
+            // revival with no fold memory in that class files the
+            // fold-revival gap over the outer-bound window instead of
+            // re-crediting (an impossible revival stays impossible).
+            if gone_victims.is_empty() && self.pair_folded.len() >= self.pair_prune_cap {
+                let oldest = candidates[start..end]
+                    .iter()
+                    .min_by_key(|(_, since, pid)| (*since, *pid))
+                    .map(|(victim, _, _)| *victim);
+                if let Some(victim) = oldest {
+                    self.pair_folded.remove(&victim);
+                    self.pair_fold_memory_overflow =
+                        self.pair_fold_memory_overflow.saturating_add(1);
+                    self.pair_fold_lost_classes.insert(PairKeyClass {
+                        domain: victim.image.domain(),
+                        object: victim.object,
+                    });
+                }
             }
         }
         self.pair_folded.insert(
@@ -7053,6 +7115,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             FoldedPair {
                 pid,
                 folded_since: now_ns,
+                base,
             },
         );
     }
@@ -10133,6 +10196,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.exec_loss_domains.remove(&domain);
         self.pair_dropped_tombstones
             .retain(|key, _| key.image.domain() != domain);
+        // Fold memory and the fold-loss latch are per-domain departed
+        // state like the tombstones: a finished domain's revivals are
+        // impossible, so its folds and latches leave with it instead
+        // of misfiring on a later domain's same-class keys.
+        self.pair_folded
+            .retain(|key, _| key.image.domain() != domain);
+        self.pair_fold_lost_classes
+            .retain(|class| class.domain != domain);
     }
 
     /// `LEADER_EXIT` records (H6 slice 2): a leader exit whose generation
@@ -11858,12 +11929,27 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     ) -> bool {
         // A revival past a counted fold cannot rebase past the folded
         // base (it lives only in the class aggregate): disclose the
-        // unattributed window and rebase the live target past the
-        // current absolute so only post-revival growth stages. Zero
+        // window past the folded base and rebase the live target past
+        // the current absolute so only post-revival growth stages. A
+        // revival with no fold memory in a latched class (the memory
+        // evicted a live fold past the bound) discloses the
+        // outer-bound window instead of re-crediting. Zero
         // observations leave the memory for the first nonzero staging.
-        if observation.count > 0 && self.pair_folded.remove(&key).is_some() {
+        // Exact memory first; the class latch covers forgotten folds.
+        let fold_window_base = (observation.count > 0).then(|| {
+            let class = PairKeyClass {
+                domain: key.image.domain(),
+                object: key.object,
+            };
+            match self.pair_folded.remove(&key) {
+                Some(folded) => Some(folded.base),
+                None if self.pair_fold_lost_classes.contains(&class) => Some(0),
+                None => None,
+            }
+        });
+        if let Some(Some(window_base)) = fold_window_base {
             self.registry
-                .note_fold_revival_count_gap(caller, 0, observation.count);
+                .note_fold_revival_count_gap(caller, window_base, observation.count);
             if let Some(
                 PairTarget::Pending {
                     base: target_base,
@@ -15697,13 +15783,14 @@ struct PrunedPairBase {
 }
 
 /// A cap-folded dropped pair remembered for its revival: the owning
-/// host tgid at fold time plus when it folded. A revival past this
-/// entry files a disclosed gap instead of re-crediting the absolute
-/// the class aggregate already holds.
+/// host tgid and absolute base at fold time plus when it folded. A
+/// revival past this entry files a disclosed gap for the window
+/// past the folded base instead of re-crediting.
 #[derive(Debug, Clone, Copy)]
 struct FoldedPair {
     pid: u32,
     folded_since: u64,
+    base: u64,
 }
 
 /// Exact aggregate of pruned dropped-pair bases for one class.
@@ -44330,6 +44417,18 @@ int main(void) {
                 pid: 7,
             },
         );
+        native.scene.coordinator.pair_folded.insert(
+            PairKey {
+                image: cookie,
+                exec: 1,
+                object: 1,
+            },
+            FoldedPair {
+                pid: 7,
+                folded_since: 100,
+                base: 3,
+            },
+        );
         native.stage(NativeBatch::Finish {
             domain: native.domain,
         });
@@ -44343,6 +44442,11 @@ int main(void) {
             native.scene.coordinator.dropped_pair_tombstones_for_test(),
             0,
             "the finished domain's pair tombstones are gone"
+        );
+        assert_eq!(
+            native.scene.coordinator.pair_folded.len(),
+            0,
+            "the finished domain's folded pairs are gone"
         );
     }
 
@@ -45780,12 +45884,32 @@ int main(void) {
                 FoldedPair {
                     pid: 7,
                     folded_since: 100,
+                    base: 3,
                 },
             );
+            native
+                .scene
+                .coordinator
+                .pair_fold_lost_classes
+                .insert(PairKeyClass { domain, object: 1 });
         }
         native.stage(NativeBatch::Finish {
             domain: native.domain,
         });
+        assert!(
+            !native
+                .scene
+                .coordinator
+                .pair_fold_lost_classes
+                .iter()
+                .any(|class| class.domain == native.domain),
+            "the finished domain's fold-loss latches are gone"
+        );
+        assert_eq!(
+            native.scene.coordinator.pair_fold_lost_classes.len(),
+            1,
+            "the other domain's latch stays"
+        );
         assert!(
             !native
                 .scene
@@ -45953,6 +46077,7 @@ int main(void) {
                 FoldedPair {
                     pid,
                     folded_since: at + i as u64,
+                    base: 1,
                 },
             );
         }
@@ -45966,6 +46091,7 @@ int main(void) {
                 FoldedPair {
                     pid: 900_000 + i as u32,
                     folded_since: at + 5000 + i as u64,
+                    base: 1,
                 },
             );
         }

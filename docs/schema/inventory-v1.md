@@ -1187,11 +1187,14 @@ Additive budgets are:
   folded into that aggregate past the exact per-pair revival-tombstone bound or
   past its keep window (two prune graces past pruning); each
   row is counted once and its base is still in the aggregate. A revival past
-  a remembered bound-fold files a disclosed gap and rebases past the current
-  absolute instead of re-crediting; a revival past an age-folded gone task
-  still restarts from zero. `pair_fold_memory_overflow` counts remembered
-  folds dropped past their own bound (a revival past one of those
-  re-credits, disclosed by this count).
+  a remembered bound-fold files a disclosed gap over the window past the
+  folded base and rebases past the current absolute instead of re-crediting;
+  a revival past an age-folded gone task still restarts from zero.
+  `pair_fold_memory_overflow` counts remembered folds dropped past their
+  own bound; each one latches its domain/object class, and a revival with
+  no fold memory in a latched class files the same disclosed gap over the
+  outer-bound window instead of re-crediting — lost fold memory never
+  becomes positive attribution.
   `exec_prune_overflow` counts
   pruned EXEC stashes discarded past their tombstone bound; the domain
   latches EXEC loss and late rows there read `exec_record_lost`. EXEC

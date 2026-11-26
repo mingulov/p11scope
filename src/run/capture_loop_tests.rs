@@ -3857,7 +3857,6 @@ fn terminal_root_drain_success_seals_without_a_gap() {
 #[test]
 fn unavailable_capture_stdout_degrades_to_a_closed_sink_with_a_gap() {
     let gap = std::cell::Cell::new(false);
-    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let opened = open_capture_stdout(
         || gap.set(true),
         || {
@@ -3866,7 +3865,7 @@ fn unavailable_capture_stdout_degrades_to_a_closed_sink_with_a_gap() {
                 "fd 1 closed",
             ))
         },
-        &cancel,
+        SignalState::new().stop_token(),
     )
     .expect("a degraded open must still hand back a sink");
     assert!(gap.get(), "the failure must file its named gap");
@@ -3891,8 +3890,8 @@ fn unavailable_capture_stdout_degrades_to_a_closed_sink_with_a_gap() {
 #[test]
 fn available_capture_stdout_opens_live_with_no_gap() {
     let gap = std::cell::Cell::new(false);
-    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let opened = open_capture_stdout(|| gap.set(true), crate::sink::stdout_sink, &cancel)
+    let opened =
+        open_capture_stdout(|| gap.set(true), crate::sink::stdout_sink, SignalState::new().stop_token())
         .expect("a live stdout must open");
     assert!(!gap.get(), "a live open files no gap");
     assert!(opened.open, "a live open stays open");
@@ -3921,7 +3920,7 @@ fn opener_wires_the_returned_sink_to_the_stop_flag() {
             use std::os::unix::io::AsRawFd as _;
             crate::sink::sink_on_fd(writer.as_raw_fd())
         },
-        &interrupted.cancel_flag(),
+        interrupted.stop_token(),
     )
     .expect("a live open must hand back a sink");
     assert!(opened.open);
@@ -3929,15 +3928,14 @@ fn opener_wires_the_returned_sink_to_the_stop_flag() {
     sink.begin_tick(std::time::Duration::from_millis(250));
     let payload = vec![8u8; 4096];
     sink.write_all(&payload).unwrap();
-    let start = std::time::Instant::now();
     sink.flush().unwrap();
-    assert!(
-        start.elapsed() < std::time::Duration::from_millis(150),
-        "a wired open must shed promptly, not wait out its budget"
-    );
     let drops = sink.take_drops();
     assert_eq!(drops.timeouts, 1);
     assert_eq!(drops.dropped_bytes, payload.len() as u64);
+    assert_eq!(
+        drops.cancelled_sheds, 1,
+        "a wired open must take the cancel path, not the budget path"
+    );
     drop(reader);
 }
 

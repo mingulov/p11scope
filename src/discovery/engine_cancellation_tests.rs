@@ -34,7 +34,7 @@ fn named_contradicted_loss_report_defers_without_bail() {
         "the deferral is marked: {:?}",
         engine.counters.object_skips
     );
-    engine.set_cancel_flag(Arc::new(std::sync::atomic::AtomicBool::new(true)));
+    engine.set_cancel_flag(crate::run::mint_test_stop_token(true));
     session
         .pid_continuity
         .as_mut()
@@ -79,7 +79,7 @@ fn recorded_named_loss_still_fails_closed() {
 #[test]
 fn named_cancellation_with_current_original_does_not_invent_generation_loss() {
     let (_fixture, mut engine, mut session) = continuity_route();
-    engine.set_cancel_flag(Arc::new(std::sync::atomic::AtomicBool::new(true)));
+    engine.set_cancel_flag(crate::run::mint_test_stop_token(true));
     session
         .pid_continuity
         .as_mut()

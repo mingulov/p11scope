@@ -858,7 +858,7 @@ fn async_global_stop_after_handoff_never_requests_recovery() {
     let mut case = Case::new();
     case.hold_pending();
     case.engine
-        .set_cancel_flag(Arc::new(std::sync::atomic::AtomicBool::new(true)));
+        .set_cancel_flag(crate::run::mint_test_stop_token(true));
     case.release();
     wait_for(|| {
         case.session

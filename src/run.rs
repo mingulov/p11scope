@@ -3298,6 +3298,41 @@ const STOP_SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHU
 /// way: stop polling, print the final frame, write `-o` if given — never
 /// torn down mid-write.
 ///
+/// A stop flag that only a [`SignalState`] can mint: the field is
+/// private to this module, so production code outside `run.rs` cannot
+/// fabricate one, and inside `run.rs` the constructor below is the
+/// only production minter (pinned by count). Sinks and the engine
+/// take this instead of a bare flag, so passing a fresh decoy flag
+/// does not compile. Copies share provenance: every copy traces to
+/// the single mint, which is what the count pins.
+#[derive(Clone)]
+pub(crate) struct StopToken(Arc<AtomicBool>);
+
+impl StopToken {
+    pub(crate) fn into_inner(self) -> Arc<AtomicBool> {
+        self.0
+    }
+
+    /// Test-only shared handle: engine tests drive the same flag the
+    /// engine watches (e.g. also handing it to a preflight change).
+    #[cfg(test)]
+    pub(crate) fn clone_inner(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.0)
+    }
+}
+
+/// Test-only minter: a real [`SignalState`], observed iff asked, so
+/// other modules' tests drive tokens through the real machinery
+/// instead of fabricating flags (which they cannot do).
+#[cfg(test)]
+pub(crate) fn mint_test_stop_token(observed: bool) -> StopToken {
+    let state = SignalState::new();
+    if observed {
+        state.observe(libc::SIGINT);
+    }
+    state.stop_token()
+}
+
 /// `signal_hook::low_level::register` is used instead of a hand-rolled
 /// `libc::signal` handler: the callback is the signal-safe minimum, while the
 /// capture loop retains the first identity and counts repeated Ctrl-C.
@@ -3324,6 +3359,12 @@ impl SignalState {
     /// sink only loads it.
     fn cancel_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.cancel)
+    }
+
+    /// Mints the stop token handed to sinks and the engine. The only
+    /// production minter (pinned by count with the type above).
+    pub(crate) fn stop_token(&self) -> StopToken {
+        StopToken(Arc::clone(&self.cancel))
     }
 
     /// A delivery with no timestamp: always a distinct stop request.
@@ -4101,7 +4142,7 @@ fn run_loop(
     session.note_attach_complete();
     // A live discovery frame checks the operator's stop between work items
     // and defers the rest, so the loop's end check comes sooner (H-1).
-    engine.set_cancel_flag(interrupted.cancel_flag());
+    engine.set_cancel_flag(interrupted.stop_token());
     let drain = resolve_drain_cadence(kind, drain_interval);
     let evidence = match kind {
         Kind::Profile => {
@@ -5665,7 +5706,7 @@ fn seal_owned_handoff_profile(context: &mut HandoffReportContext) -> Result<()> 
     let live_display = LiveDisplay::for_capture(true);
     let mut stdout_open = true;
     let stdout_result = (|| -> Result<()> {
-        let mut stdout_sink = crate::sink::watched_stdout_sink(context.signals.cancel_flag())
+        let mut stdout_sink = crate::sink::watched_stdout_sink(context.signals.stop_token())
             .map_err(|error| {
                 anyhow::anyhow!("run: opening stdout for the handoff report: {error}")
             })?;
@@ -5764,7 +5805,7 @@ fn seal_owned_handoff_trace(context: &mut HandoffReportContext) -> Result<()> {
     // with a fallback null sink held closed, so the file-only path keeps
     // the byte-exact terminal accounting below.
     let (mut stdout_sink, mut stdout_open) =
-        match crate::sink::watched_stdout_sink(context.signals.cancel_flag()) {
+        match crate::sink::watched_stdout_sink(context.signals.stop_token()) {
             Ok(sink) => (sink, true),
             Err(error) => {
                 if out_file.is_none() {
@@ -5775,7 +5816,7 @@ fn seal_owned_handoff_trace(context: &mut HandoffReportContext) -> Result<()> {
                     "p11scope: stdout unavailable for the handoff trace; continuing file-only: {}",
                     crate::render::escape_controls(&error.to_string()),
                 ));
-                let fallback = crate::sink::watched_null_sink(context.signals.cancel_flag())
+                let fallback = crate::sink::watched_null_sink(context.signals.stop_token())
                     .map_err(|error| anyhow::anyhow!("run: opening stdout fallback: {error}"))?;
                 (fallback, false)
             }
@@ -6283,16 +6324,17 @@ struct OpenedCaptureStdout {
 /// before the loop — the caller routes that through settlement.
 /// Both the live sink and the degraded fallback leave here watching
 /// the capture's stop flag, so a stop sheds slow flushes promptly
-/// instead of waiting out budgets.
+/// instead of waiting out budgets. Takes the token (not a bare flag),
+/// so only the shared minted flag can reach either path.
 fn open_capture_stdout(
     note_gap: impl FnOnce(),
     open: impl FnOnce() -> std::io::Result<crate::sink::SinkWriter<crate::sink::StdoutInner>>,
-    cancel: &Arc<AtomicBool>,
+    stop: StopToken,
 ) -> std::io::Result<OpenedCaptureStdout> {
     match open() {
         Ok(sink) => {
             let mut sink = sink;
-            sink.set_cancel_flag(Arc::clone(cancel));
+            sink.set_cancel_flag(stop.into_inner());
             Ok(OpenedCaptureStdout {
                 sink,
                 open: true,
@@ -6305,7 +6347,7 @@ fn open_capture_stdout(
                 "p11scope: capture stdout unavailable ({}); continuing without stdout",
                 crate::render::escape_controls(&error.to_string()),
             ));
-            let sink = crate::sink::watched_null_sink(Arc::clone(cancel))?;
+            let sink = crate::sink::watched_null_sink(stop)?;
             Ok(OpenedCaptureStdout {
                 sink,
                 open: false,
@@ -9691,7 +9733,7 @@ fn capture_profile(
     } = match open_capture_stdout(
         || engine.note_stdout_unavailable(),
         crate::sink::stdout_sink,
-        &interrupted.cancel_flag(),
+        interrupted.stop_token(),
     ) {
         Ok(opened) => opened,
         Err(error) => {
@@ -11652,7 +11694,7 @@ fn capture_trace(
     } = match open_capture_stdout(
         || engine.note_stdout_unavailable(),
         crate::sink::stdout_sink,
-        &interrupted.cancel_flag(),
+        interrupted.stop_token(),
     ) {
         Ok(opened) => opened,
         Err(error) => {
@@ -31263,6 +31305,7 @@ int main(int argc, char **argv) {
             timeouts: 1,
             dropped_bytes: 10,
             stall_ms: 250,
+            cancelled_sheds: 0,
         };
         let idle = crate::sink::SinkDrops::default();
         let noted = Instant::now();
@@ -31348,16 +31391,14 @@ int main(int argc, char **argv) {
         sink.begin_tick(Duration::from_millis(250));
         let payload = vec![8u8; 4096];
         sink.write_all(&payload).unwrap();
-        let start = Instant::now();
         sink.flush().unwrap();
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed < Duration::from_millis(150),
-            "a stopped final flush must shed promptly, not wait out its budget: {elapsed:?}"
-        );
         let drops = sink.take_drops();
         assert_eq!(drops.timeouts, 1);
         assert_eq!(drops.dropped_bytes, payload.len() as u64);
+        assert_eq!(
+            drops.cancelled_sheds, 1,
+            "a stopped final flush must take the cancel path, not the budget path"
+        );
         drop(reader);
     }
 
@@ -31368,8 +31409,10 @@ int main(int argc, char **argv) {
     /// production code — a new unwired sink fails these counts. The
     /// discovery engine keeps its single direct wiring (it defers
     /// remaining frame work on stop; shedding is the sinks' job).
-    /// Comment lines are discounted like the architecture guards, so
-    /// commenting out a call fails instead of passing.
+    /// Stop tokens flow only from the single stop state: the token
+    /// type is minted in one place and the state itself is built
+    /// once. Comment lines are discounted like the architecture
+    /// guards, so commenting out a call fails instead of passing.
     #[test]
     fn capture_stdout_construction_stays_watched_and_counted() {
         let source = include_str!("run.rs");
@@ -31408,11 +31451,46 @@ int main(int argc, char **argv) {
             code.iter()
                 .filter(|line| {
                     line.len() - line.trim_start().len() == 4
-                        && line.trim() == "engine.set_cancel_flag(interrupted.cancel_flag());"
+                        && line.trim() == "engine.set_cancel_flag(interrupted.stop_token());"
                 })
                 .count(),
             1,
-            "engine wiring as one live statement with the exact shared flag"
+            "engine wiring as one live statement with the exact shared token"
+        );
+        // Tokens originate only in `stop_token` (the struct definition
+        // plus its single construction): fabricating one anywhere else
+        // in this file fails here, and other modules cannot name the
+        // private field at all.
+        assert_eq!(count("StopToken("), 2, "token mint sites");
+        // Exactly one production stop state exists (the install in
+        // `install_stop_flag_for`); the other two constructions are the
+        // cfg(test) loop helper and the cfg(test) token minter, which a
+        // production decoy state would push to four.
+        assert_eq!(count("SignalState::new()"), 3, "stop-state constructions");
+    }
+
+    /// The engine takes the shared stop flag before the capture
+    /// dispatch, so discovery can see a stop while the capture runs.
+    /// Wiring moved after the dispatch fails here (moved-late mutant).
+    #[test]
+    fn engine_takes_the_stop_flag_before_the_capture_dispatch() {
+        let source = include_str!("run.rs");
+        let body = source
+            .split_once("fn run_loop(")
+            .unwrap()
+            .1
+            .split_once("\nfn pause_failure(")
+            .unwrap()
+            .0;
+        let wire = body
+            .find("engine.set_cancel_flag(interrupted.stop_token());")
+            .expect("engine wiring exists");
+        let dispatch = body
+            .find("let evidence = match kind {")
+            .expect("capture dispatch exists");
+        assert!(
+            wire < dispatch,
+            "engine wiring moved after the capture dispatch"
         );
     }
 

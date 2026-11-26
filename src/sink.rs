@@ -40,6 +40,9 @@ pub(crate) struct SinkDrops {
     pub(crate) timeouts: u64,
     pub(crate) dropped_bytes: u64,
     pub(crate) stall_ms: u64,
+    /// Sheds taken because a stop was observed, rather than by budget
+    /// expiry: the typed record that distinguishes a cancelled flush.
+    pub(crate) cancelled_sheds: u64,
 }
 
 /// A `Write` sink with a bounded buffer and a poll-bounded flush: bytes
@@ -157,10 +160,11 @@ pub(crate) fn stdout_sink() -> io::Result<SinkWriter<StdoutInner>> {
 /// A capture stdout sink already watching the capture's stop flag:
 /// the only way production builds a live capture sink, so a stop
 /// sheds slow flushes promptly instead of waiting out budgets.
-/// Unit tests cover the unwired primitive directly.
-pub(crate) fn watched_stdout_sink(cancel: Arc<AtomicBool>) -> io::Result<SinkWriter<StdoutInner>> {
+/// Takes the token (not a bare flag), so only a SignalState-minted
+/// flag can reach it. Unit tests cover the unwired primitive directly.
+pub(crate) fn watched_stdout_sink(stop: crate::run::StopToken) -> io::Result<SinkWriter<StdoutInner>> {
     let mut sink = stdout_sink()?;
-    sink.set_cancel_flag(cancel);
+    sink.set_cancel_flag(stop.into_inner());
     Ok(sink)
 }
 
@@ -185,9 +189,9 @@ pub(crate) fn null_sink() -> io::Result<SinkWriter<StdoutInner>> {
 /// the only way production builds a fallback null sink. Bytes still
 /// reach `/dev/null`; the flag keeps the invariant total (every
 /// capture sink watched, no exceptions).
-pub(crate) fn watched_null_sink(cancel: Arc<AtomicBool>) -> io::Result<SinkWriter<StdoutInner>> {
+pub(crate) fn watched_null_sink(stop: crate::run::StopToken) -> io::Result<SinkWriter<StdoutInner>> {
     let mut sink = null_sink()?;
-    sink.set_cancel_flag(cancel);
+    sink.set_cancel_flag(stop.into_inner());
     Ok(sink)
 }
 
@@ -1003,6 +1007,7 @@ impl<W: Write + AsRawFd> SinkWriter<W> {
             }
         }
         if !self.buf.is_empty() {
+            self.drops.cancelled_sheds = self.drops.cancelled_sheds.saturating_add(1);
             self.drop_pending();
         }
         Ok(())
@@ -1149,6 +1154,7 @@ mod tests {
             timeouts: 0,
             dropped_bytes: 0,
             stall_ms: 101,
+            cancelled_sheds: 0,
         };
         // Expected-panic noise: the hook is process-global, so no swap.
         let caught = std::panic::catch_unwind(|| assert_lossless_drain(over));
@@ -1157,6 +1163,7 @@ mod tests {
             timeouts: 0,
             dropped_bytes: 0,
             stall_ms: 100,
+            cancelled_sheds: 0,
         });
     }
 
@@ -1606,16 +1613,16 @@ mod tests {
         assert_eq!(sink.take_drops(), SinkDrops::default());
     }
 
-    /// The watched constructors wire the exact flag they are given: a
-    /// watched sink observes a later stop through the same predicate
-    /// the flush path consults, while an unwired sink never does.
+    /// The watched constructors wire the exact token they are given,
+    /// minted by a real stop state: a watched sink observes a later
+    /// stop through the same predicate the flush path consults, while
+    /// an unwired sink never does.
     #[test]
     fn watched_stdout_sink_observes_the_passed_stop_flag() {
-        let cancel = Arc::new(AtomicBool::new(false));
-        let sink = watched_stdout_sink(Arc::clone(&cancel)).unwrap();
-        assert!(!sink.cancelled(), "an unset flag cancels nothing");
-        cancel.store(true, Ordering::SeqCst);
-        assert!(sink.cancelled(), "a watched sink must see the stop");
+        let quiet = watched_stdout_sink(crate::run::mint_test_stop_token(false)).unwrap();
+        assert!(!quiet.cancelled(), "an unset flag cancels nothing");
+        let stopped = watched_stdout_sink(crate::run::mint_test_stop_token(true)).unwrap();
+        assert!(stopped.cancelled(), "a watched sink must see the stop");
         let unwired = stdout_sink().unwrap();
         assert!(
             !unwired.cancelled(),
@@ -1626,11 +1633,10 @@ mod tests {
     /// Same contract for the degraded null sink.
     #[test]
     fn watched_null_sink_observes_the_passed_stop_flag() {
-        let cancel = Arc::new(AtomicBool::new(false));
-        let sink = watched_null_sink(Arc::clone(&cancel)).unwrap();
-        assert!(!sink.cancelled(), "an unset flag cancels nothing");
-        cancel.store(true, Ordering::SeqCst);
-        assert!(sink.cancelled(), "a watched sink must see the stop");
+        let quiet = watched_null_sink(crate::run::mint_test_stop_token(false)).unwrap();
+        assert!(!quiet.cancelled(), "an unset flag cancels nothing");
+        let stopped = watched_null_sink(crate::run::mint_test_stop_token(true)).unwrap();
+        assert!(stopped.cancelled(), "a watched sink must see the stop");
     }
 
     /// PA-14: a single write larger than the ceiling must not grow the

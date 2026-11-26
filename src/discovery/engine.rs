@@ -16440,8 +16440,8 @@ impl Engine {
 
     /// The capture's operator-stop flag: a live frame that sees it set
     /// defers its remaining work so the loop can end sooner (H-1).
-    pub(crate) fn set_cancel_flag(&mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
-        self.cancel_flag = Some(flag);
+    pub(crate) fn set_cancel_flag(&mut self, stop: crate::run::StopToken) {
+        self.cancel_flag = Some(stop.into_inner());
     }
 
     /// The admission rule this capture's plan keeps for its whole lifetime

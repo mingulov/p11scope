@@ -4048,9 +4048,7 @@ fn frame_deferred_loader_records_resolve_rt_add_before_exec_retirement() {
         session.dequeues = [Ok(Some(crate::events::DiscoveryItem::Record(consistent)))].into();
         engine.frame_work_budget_ns = if cancelled { u64::MAX } else { 0 };
         if cancelled {
-            engine.set_cancel_flag(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
-                true,
-            )));
+            engine.set_cancel_flag(crate::run::mint_test_stop_token(true));
         }
         engine.drain_discovery_from(&mut session).unwrap();
 
@@ -4656,8 +4654,7 @@ fn a_frame_deferral_is_scheduling_evidence_and_loss_only_if_never_completed() {
 fn a_live_frame_defers_its_work_once_the_capture_is_interrupted() {
     let (mut engine, _scope) = engine_over_cgroup_naming(&[]);
     engine.frame_work_budget_ns = LIVE_FRAME_WORK_BUDGET_NS;
-    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-    engine.set_cancel_flag(std::sync::Arc::clone(&cancel));
+    engine.set_cancel_flag(crate::run::mint_test_stop_token(true));
     let mut session = ScriptedSession::default();
     session.dequeues = [Ok(Some(crate::events::DiscoveryItem::Record(
         exec_record_for(FAKE_PID_FLOOR + 10),
@@ -12616,9 +12613,7 @@ fn stalled_wait_with_cancellation_requested_does_not_trip() {
             - EXPECTED_TARGET_EXIT_NO_PROGRESS_TIMEOUT
             - std::time::Duration::from_secs(1),
     );
-    engine.set_cancel_flag(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
-        true,
-    )));
+    engine.set_cancel_flag(crate::run::mint_test_stop_token(true));
     let skips_before = engine.counters.object_skips.clone();
     let mut session = ScriptedSession::default();
     engine
@@ -61709,9 +61704,7 @@ pub(crate) mod detailed_proof_driver {
             ),
             (0, 0, 0)
         );
-        engine.set_cancel_flag(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
-            true,
-        )));
+        engine.set_cancel_flag(crate::run::mint_test_stop_token(true));
         assert!(service(&mut engine, &mut io).is_empty());
         assert_eq!((io.samples.get(), io.health_reads.get()), (0, 0));
     }
@@ -69695,7 +69688,6 @@ fn automatic_exec_cold_leader_exit_all_older_exits_recover_once() {
 fn automatic_exec_cold_leader_exit_stop_terminal_cancel_never_mutates() {
     for condition in 0..4 {
         let (_fixture, mut engine, mut session, _exec) = cold_leader_exit_bound_route();
-        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         match condition {
             0 => {
                 session
@@ -69720,8 +69712,7 @@ fn automatic_exec_cold_leader_exit_stop_terminal_cancel_never_mutates() {
                     .producers_detached = true
             }
             _ => {
-                cancel.store(true, std::sync::atomic::Ordering::Release);
-                engine.set_cancel_flag(cancel);
+                engine.set_cancel_flag(crate::run::mint_test_stop_token(true));
             }
         }
         let before = session
@@ -70230,9 +70221,7 @@ fn automatic_exec_loader_arm_catchup_defers_without_renewing_or_losing_work() {
                     .borrow_mut()
                     .stop_word = p11scope_ebpf_common::STOP_GATE_STOP
             }
-            "cancel" => engine.set_cancel_flag(std::sync::Arc::new(
-                std::sync::atomic::AtomicBool::new(true),
-            )),
+            "cancel" => engine.set_cancel_flag(crate::run::mint_test_stop_token(true)),
             _ => {}
         }
         let used = engine.budget.work_units_count();
@@ -70573,8 +70562,9 @@ fn automatic_exec_completed_rearm_task_replaced_revalidates_after_fallible_prefl
 fn assert_completed_rearm_revalidates_after_fallible_preflight(recovered_class: u8) {
     for case in 0..10 {
         let (_fixture, mut engine, mut session, _record) = completed_rearm_route(recovered_class);
-        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        engine.set_cancel_flag(cancel.clone());
+        let token = crate::run::mint_test_stop_token(false);
+        let cancel = token.clone_inner();
+        engine.set_cancel_flag(token);
         let candidate = carried_completed_rearm(&mut engine, &mut session);
         let before = session
             .pid_continuity
@@ -72198,8 +72188,9 @@ fn automatic_exec_pid_continuity_renewal_and_settlement_keep_serviced_serial() {
 fn automatic_exec_pid_continuity_apply_recheck_refuses_before_mutation() {
     for condition in 0..8 {
         let (_fixture, mut engine, mut session) = continuity_route();
-        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        engine.set_cancel_flag(cancel.clone());
+        let token = crate::run::mint_test_stop_token(false);
+        let cancel = token.clone_inner();
+        engine.set_cancel_flag(token);
         let change = match condition {
             0 => crate::attach::PreflightChange::Producer,
             1 => crate::attach::PreflightChange::Observation,
@@ -72334,9 +72325,7 @@ fn automatic_exec_pid_continuity_direct_health_clock_stop_fail_closed() {
             }
         }
         if condition == 14 {
-            engine.set_cancel_flag(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
-                true,
-            )));
+            engine.set_cancel_flag(crate::run::mint_test_stop_token(true));
             assert!(
                 !engine.frame_work_exhausted(),
                 "outside a frame cancellation still has to block apply explicitly"
@@ -77820,9 +77809,7 @@ fn graph_inputs_epoch_bumps_on_mutating_entry_points() {
     assert_eq!(engine.graph_inputs_epoch_for_test(), epoch);
     engine.note_unprotected_owned(std::process::id());
     assert_eq!(engine.graph_inputs_epoch_for_test(), epoch);
-    engine.set_cancel_flag(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
-        false,
-    )));
+    engine.set_cancel_flag(crate::run::mint_test_stop_token(false));
     assert_eq!(engine.graph_inputs_epoch_for_test(), epoch);
     engine.account_unvalidated_discovery(1);
     assert_eq!(engine.graph_inputs_epoch_for_test(), epoch);

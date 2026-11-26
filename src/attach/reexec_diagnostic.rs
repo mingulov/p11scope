@@ -829,6 +829,7 @@ mod tests {
                     timeouts: 1,
                     dropped_bytes: 23,
                     stall_ms: 0,
+                    cancelled_sheds: 0,
                 })
             });
             assert!(

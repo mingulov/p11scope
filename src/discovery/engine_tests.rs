@@ -60075,6 +60075,12 @@ fn admitted_inventory_views_carry_the_mount_park_grant() {
     }
 }
 
+/// N3 wiring twin (negative): a bare engine reports no park reserver.
+#[test]
+fn bare_engine_reports_no_mount_park_reserver() {
+    assert!(!Engine::empty().mount_park_reserver_for_test());
+}
+
 /// View-collapse fix6 A2 (owner 20:20): past the concurrent library-handle
 /// cap the newcomer-admission loop defers with its requests retained and a
 /// counted named gap, never dropping. The test cap of 2 exercises the same

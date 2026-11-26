@@ -56094,8 +56094,19 @@ fn merge_preflight_agrees_with_merge_on_failure_modes() {
         ordinals: Vec<u32>,
         pins: PinnedObjects,
         facts: CaptureFacts,
+        plan: plan::AttachPlan,
     }
     let object_without_identity = PinnedObjectId(999);
+    // Pin-mode plans carry their own consistent pins: every plan
+    // object is pinned except the targeted one, and the remaining
+    // inputs are minimal-valid (as in the class test) so the pin
+    // checks are what fail.
+    let (mut module_pin_plan, module_pin_pins) = plan_with_pins(2, 0);
+    module_pin_plan.modules[0].object = PinnedObjectId(424242);
+    module_pin_plan.modules[0].path = "/opt/p11-missing.so".to_string();
+    let (mut slot_pin_plan, slot_pin_pins) = plan_with_pins(2, 0);
+    slot_pin_plan.slots[1].object = PinnedObjectId(424243);
+    slot_pin_plan.slots[1].object_path = "/opt/p11-gone.so".to_string();
     let modes = vec![
         FailureMode {
             name: "ordinal mismatch",
@@ -56104,6 +56115,7 @@ fn merge_preflight_agrees_with_merge_on_failure_modes() {
             ordinals: Vec::new(),
             pins: engine.pinned.clone(),
             facts: engine.capture_facts.clone(),
+            plan: plan.clone(),
         },
         FailureMode {
             name: "module without opened identity",
@@ -56120,6 +56132,7 @@ fn merge_preflight_agrees_with_merge_on_failure_modes() {
             ordinals: Vec::new(),
             pins: engine.pinned.clone(),
             facts: engine.capture_facts.clone(),
+            plan: plan.clone(),
         },
         FailureMode {
             name: "module without stable ID",
@@ -56128,6 +56141,7 @@ fn merge_preflight_agrees_with_merge_on_failure_modes() {
             ordinals: Vec::new(),
             pins: engine.pinned.clone(),
             facts: CaptureFacts::default(),
+            plan: plan.clone(),
         },
         FailureMode {
             name: "table without parallel identities",
@@ -56144,6 +56158,7 @@ fn merge_preflight_agrees_with_merge_on_failure_modes() {
             ordinals: Vec::new(),
             pins: engine.pinned.clone(),
             facts: engine.capture_facts.clone(),
+            plan: plan.clone(),
         },
         FailureMode {
             name: "entry target without identity",
@@ -56163,6 +56178,7 @@ fn merge_preflight_agrees_with_merge_on_failure_modes() {
             ordinals: Vec::new(),
             pins: engine.pinned.clone(),
             facts: engine.capture_facts.clone(),
+            plan: plan.clone(),
         },
         FailureMode {
             name: "manifest without pinned identity",
@@ -56171,11 +56187,30 @@ fn merge_preflight_agrees_with_merge_on_failure_modes() {
             ordinals: vec![0],
             pins: engine.pinned.clone(),
             facts: engine.capture_facts.clone(),
+            plan: plan.clone(),
+        },
+        FailureMode {
+            name: "planned module without pin",
+            modules: Vec::new(),
+            manifests: Vec::new(),
+            ordinals: Vec::new(),
+            pins: module_pin_pins.clone(),
+            facts: CaptureFacts::default(),
+            plan: module_pin_plan.clone(),
+        },
+        FailureMode {
+            name: "active slot without pin",
+            modules: Vec::new(),
+            manifests: Vec::new(),
+            ordinals: Vec::new(),
+            pins: slot_pin_pins.clone(),
+            facts: CaptureFacts::default(),
+            plan: slot_pin_plan.clone(),
         },
     ];
     for mode in modes {
         let preflight = match mode.facts.resolve_merge_inputs(
-            &plan,
+            &mode.plan,
             &mode.pins,
             &mode.modules,
             &mode.manifests,
@@ -56186,7 +56221,7 @@ fn merge_preflight_agrees_with_merge_on_failure_modes() {
         };
         let mut attempted = mode.facts.clone();
         let merge = match attempted.merge_current(
-            &plan,
+            &mode.plan,
             &mode.pins,
             &mode.modules,
             &mode.manifests,

@@ -42192,6 +42192,87 @@ fn merge_tables_marked_counts_live_overflow_with_a_named_gap() {
 }
 
 #[test]
+fn normalize_carried_modules_routes_live_overflow_through_the_choke() {
+    // The carrier-union twin of the choke pin above: two same-file
+    // carriers (64 + 1 live tables) union past the live allowance,
+    // and normalize returns the live drop instead of folding it
+    // into the heuristic count — so the callers' absorb marks the
+    // named live gap instead of losing the observation silently.
+    let live_table = |slot: u64| ScannedTable {
+        version: (3, 2),
+        walk: "full",
+        entries: vec![],
+        null_entries: vec![],
+        unpinned: vec![],
+        address: 0x7f00_0000 + slot,
+        file_offset: None,
+        live_return: true,
+        manifest_supported: false,
+        extension_impossible: false,
+    };
+    let carrier = |view: ProcessViewId, tables: Vec<ScannedTable>| ScannedModule {
+        key_is_identity: false,
+        module_hint: None,
+        mapped_identity: None,
+        double_loaded: false,
+        same_file_loads: 1,
+        pre_copy_up: None,
+        view,
+        mount_namespace: crate::process::MountNamespaceId {
+            device: 1,
+            inode: 2,
+        },
+        key: ObjectKey {
+            device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+            inode: 42,
+        },
+        path: "/opt/p.so".into(),
+        tables_scan_finished: true,
+        decoder_abi: None,
+        exports: vec![],
+        tables,
+        interfaces: vec![],
+    };
+    let live_cap = MAX_LIVE_TABLES_PER_MODULE;
+    let first = ProcessViewId(910);
+    let second = ProcessViewId(911);
+    let mut raw = vec![
+        carrier(first, (0..live_cap as u64).map(live_table).collect()),
+        carrier(second, vec![live_table(10_000)]),
+    ];
+    let pins = PinnedObjects::empty();
+    let overflow = normalize_carried_modules(
+        &mut raw,
+        &pins,
+        &BTreeSet::from([first, second]),
+        &BTreeSet::new(),
+        false,
+    );
+    assert_eq!(overflow.dropped, 0);
+    assert_eq!(overflow.live_dropped, 1);
+    assert_eq!(raw.len(), 1, "same-file carriers union into one row");
+    assert_eq!(
+        raw[0].tables.iter().filter(|t| t.live_return).count(),
+        live_cap,
+        "the 65th live table drops past the allowance"
+    );
+    // The production callers route the sum through the choke: the
+    // live counter moves and the named gap marks live loss.
+    let mut engine = Engine::empty();
+    engine.absorb_merge_overflow(overflow);
+    assert_eq!(engine.merge_tables_dropped(), 0);
+    assert_eq!(engine.merge_live_tables_dropped(), 1);
+    assert!(
+        engine.counters.object_skips.contains(&Skipped {
+            subject: MERGE_LIVE_OVERFLOW_SUBJECT.into(),
+            reason: merge_live_overflow_reason(),
+        }),
+        "carrier live overflow marks its named gap: {:?}",
+        engine.counters.object_skips
+    );
+}
+
+#[test]
 fn live_overflow_reason_is_built_from_the_live_allowance() {
     assert_eq!(
         merge_live_overflow_reason(),
@@ -105302,14 +105383,17 @@ fn carried_fix2_unresolvable_carrier_keeps_unless_absence_proven() {
     );
     for absence_proven in [false, true] {
         let mut raw = vec![carrier.clone()];
-        let mut dropped = 0u64;
-        normalize_carried_modules(
+        let overflow = normalize_carried_modules(
             &mut raw,
             &pins,
             &BTreeSet::new(),
             &BTreeSet::new(),
             absence_proven,
-            &mut dropped,
+        );
+        assert_eq!(
+            overflow,
+            MergeOverflow::default(),
+            "the single-carrier union drops nothing"
         );
         if absence_proven {
             assert!(

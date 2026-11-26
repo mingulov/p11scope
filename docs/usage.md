@@ -780,8 +780,11 @@ already exist as a single-link regular file (the rename-over case) — a
 hard link, symlink or directory there is refused. Without `-o` nothing
 is writable. IP networking, socket connect/bind, and
 exec/mount/ptrace/BPF/io_uring/file-metadata syscalls fail with `EACCES`,
-as do the terminal-input-injection ioctls `TIOCSTI`/`TIOCLINUX` and the
-filesystem-mutation ioctl types: btrfs (`0x94`, including subvolume,
+as do namespace creation (`unshare`, `setns`, `clone` with any
+`CLONE_NEW*` flag) and `AF_NETLINK` protocols other than route (0);
+`clone3` fails with `ENOSYS` so thread creation falls back to `clone`.
+The terminal-input-injection ioctls `TIOCSTI`/`TIOCLINUX` and the
+filesystem-mutation ioctl types fail too: btrfs (`0x94`, including subvolume,
 snapshot, `FICLONE`/`FIDEDUPERANGE`/`FICLONERANGE`), `f` (`0x66`:
 inode flags, verity, fscrypt), `X` (`0x58`: fsxattr), `v` (`0x76`:
 versions), f2fs (`0xf5`), ocfs2 (`0x6f`: reflink) and FAT (`0x72`:

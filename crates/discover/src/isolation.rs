@@ -6,13 +6,15 @@
 //! (task 7.07a, helper-policy part). The fence is Landlock (read-only
 //! filesystem plus denied TCP bind/connect) followed by a seccomp denylist
 //! (no IP networking or socket connect/bind; no exec, mount, ptrace, BPF,
-//! io_uring, keyring or file-metadata syscalls; no terminal-input-injection
-//! ioctls or filesystem-mutation ioctl types). Every denial fails with
-//! `EACCES`, never
-//! kill/trap, so a fenced
-//! provider call reads as an ordinary error. Applied after the shared
-//! privilege drop and before any provider code runs; any failure refuses
-//! before `dlopen`.
+//! io_uring, keyring, namespace or file-metadata syscalls; `clone` with
+//! any `CLONE_NEW*` flag is denied while plain thread creation stays
+//! allowed; `AF_NETLINK` keeps only the route protocol; no
+//! terminal-input-injection ioctls or filesystem-mutation ioctl types).
+//! Every denial fails with `EACCES`, never kill/trap, so a fenced
+//! provider call reads as an ordinary error — except `clone3`, which
+//! fails with `ENOSYS` so the C library falls back to `clone`. Applied
+//! after the shared privilege drop and before any provider code runs;
+//! any failure refuses before `dlopen`.
 //!
 //! Documented residuals: the provider still runs in-process as the
 //! helper's uid with its environment, supplementary groups, readable
@@ -117,8 +119,19 @@ const ARCH_OFFSET: u32 = 4;
 const NR_OFFSET: u32 = 0;
 const ARG0_LO_OFFSET: u32 = 16;
 const ARG1_LO_OFFSET: u32 = 24;
+const ARG2_LO_OFFSET: u32 = 32;
 const AF_UNIX: u32 = 1;
 const AF_NETLINK: u32 = 16;
+/// The only `AF_NETLINK` protocol the fence allows: `NETLINK_ROUTE`
+/// (0). Every other protocol (netfilter, uevent, generic, ...) can
+/// drive privileged kernel subsystems and is denied.
+const NETLINK_ROUTE: u32 = 0;
+/// Every `CLONE_NEW*` bit a provider could pass to `clone` to enter a
+/// new namespace: `NEWNS NEWUTS NEWIPC NEWPID NEWNET NEWUSER NEWCGROUP
+/// NEWTIME` = `0x7E020080`. Plain thread creation (what glibc's
+/// `pthread_create` passes after its `clone3` fallback) sets none of
+/// these and stays allowed.
+const CLONE_NEW_MASK: u32 = 0x7E02_0080;
 // Ioctl denials below: terminal-input-injection stays exact
 // (TIOCSTI/TIOCLINUX), while filesystem mutation is denied by _IOC_TYPE
 // byte (bits 8-15 of the command): btrfs subvolume/snapshot creation
@@ -150,6 +163,10 @@ const IOCTL_TYPE_FAT: u32 = 0x7200;
 const SYS_IOCTL: u32 = 16;
 const SYS_SOCKET: u32 = 41;
 const SYS_PRLIMIT64: u32 = 302;
+const SYS_CLONE: u32 = 56;
+const SYS_CLONE3: u32 = 435;
+const SYS_UNSHARE: u32 = 272;
+const SYS_SETNS: u32 = 308;
 const SYS_CONNECT: u32 = 42;
 const SYS_BIND: u32 = 49;
 const SYS_LISTEN: u32 = 50;
@@ -223,12 +240,14 @@ const SYS_UTIMES: u32 = 235;
 const SYS_FUTIMESAT: u32 = 261;
 const SYS_UTIMENSAT: u32 = 280;
 
-/// Unconditional denials. `socket`, `ioctl` and `prlimit64` are handled
-/// separately: `AF_UNIX` and `AF_NETLINK` socket domains stay allowed
-/// while every other domain is denied, only the terminal-injection
-/// commands and the filesystem-mutation type bytes are denied for
-/// `ioctl`, and only `prlimit64` on pid 0 (the calling process) stays
-/// allowed.
+/// Unconditional denials. `socket`, `ioctl`, `prlimit64`, `clone` and
+/// `clone3` are handled separately: `AF_UNIX` stays allowed while every
+/// other socket domain is denied and `AF_NETLINK` keeps only the route
+/// protocol (0); only the terminal-injection commands and the
+/// filesystem-mutation type bytes are denied for `ioctl`; only
+/// `prlimit64` on pid 0 (the calling process) stays allowed; `clone`
+/// stays allowed unless its flags carry any `CLONE_NEW*` bit; `clone3`
+/// fails with `ENOSYS` so glibc falls back to `clone`.
 const DENY_ALWAYS: &[u32] = &[
     SYS_CONNECT,
     SYS_BIND,
@@ -246,6 +265,8 @@ const DENY_ALWAYS: &[u32] = &[
     SYS_MOUNT_SETATTR,
     SYS_FSOPEN,
     SYS_FSMOUNT,
+    SYS_UNSHARE,
+    SYS_SETNS,
     SYS_PTRACE,
     SYS_PROCESS_VM_WRITEV,
     SYS_PROCESS_VM_READV,
@@ -385,16 +406,31 @@ impl FilterBuilder {
         for nr in DENY_ALWAYS {
             deny_jumps.push(self.jeq(*nr));
         }
+        let clone3_jump = self.jeq(SYS_CLONE3);
+        let clone_jump = self.jeq(SYS_CLONE);
         let socket_jump = self.jeq(SYS_SOCKET);
         let ioctl_jump = self.jeq(SYS_IOCTL);
         let prlimit_jump = self.jeq(SYS_PRLIMIT64);
         let allow = self.emit(stmt(BPF_RET_K, SECCOMP_RET_ALLOW));
         let deny = self.emit(stmt(BPF_RET_K, SECCOMP_RET_ERRNO | libc::EACCES as u32));
         let x32_deny = self.emit(stmt(BPF_RET_K, SECCOMP_RET_ERRNO | libc::ENOSYS as u32));
-        // socket(domain, ...): AF_UNIX and AF_NETLINK stay allowed.
+        // clone(flags, ...): any CLONE_NEW* bit would enter a new
+        // namespace (a user namespace would grant capabilities neither
+        // Landlock nor this filter can see), so it is denied; plain
+        // thread and fork flags stay allowed.
+        let clone_check = self.emit(stmt(BPF_LD_W_ABS, ARG0_LO_OFFSET));
+        self.emit(stmt(BPF_ALU_AND_K, CLONE_NEW_MASK));
+        let clone_no_ns = self.jeq(0);
+        let deny_clone = self.emit(stmt(BPF_RET_K, SECCOMP_RET_ERRNO | libc::EACCES as u32));
+        let allow_clone = self.emit(stmt(BPF_RET_K, SECCOMP_RET_ALLOW));
+        // socket(domain, ...): AF_UNIX stays allowed, and AF_NETLINK
+        // keeps only the route protocol (0): the other protocols drive
+        // privileged kernel subsystems (netfilter, uevent, generic).
         let socket_check = self.emit(stmt(BPF_LD_W_ABS, ARG0_LO_OFFSET));
         let is_unix = self.jeq(AF_UNIX);
         let is_netlink = self.jeq(AF_NETLINK);
+        let netlink_check = self.emit(stmt(BPF_LD_W_ABS, ARG2_LO_OFFSET));
+        let is_route = self.jeq(NETLINK_ROUTE);
         let deny_socket = self.emit(stmt(BPF_RET_K, SECCOMP_RET_ERRNO | libc::EACCES as u32));
         let allow_unix = self.emit(stmt(BPF_RET_K, SECCOMP_RET_ALLOW));
         // ioctl(fd, cmd, ...): TIOCSTI/TIOCLINUX inject input into the
@@ -434,17 +470,25 @@ impl FilterBuilder {
         // Every target is known now; patch the whole chain explicitly.
         // Each `jeq nr`: equal falls into `deny`, else the next check,
         // walked back to front so `next` is always the following check.
-        let mut next = socket_jump;
+        let mut next = clone3_jump;
         for at in deny_jumps.iter().rev() {
             self.patch(*at, deny, next)?;
             next = *at;
         }
         self.patch(x32, x32_deny, next)?;
+        // clone3 shares the ENOSYS return: glibc's pthread_create falls
+        // back to clone only on ENOSYS.
+        self.patch(clone3_jump, x32_deny, clone_jump)?;
+        self.patch(clone_jump, clone_check, socket_jump)?;
         self.patch(socket_jump, socket_check, ioctl_jump)?;
         self.patch(ioctl_jump, ioctl_check, prlimit_jump)?;
         self.patch(prlimit_jump, prlimit_check, allow)?;
+        // The masked clone flags equal zero exactly when no CLONE_NEW*
+        // bit is set; anything else is a namespace-creating clone.
+        self.patch(clone_no_ns, allow_clone, deny_clone)?;
         self.patch(is_unix, allow_unix, is_netlink)?;
-        self.patch(is_netlink, allow_unix, deny_socket)?;
+        self.patch(is_netlink, netlink_check, deny_socket)?;
+        self.patch(is_route, allow_unix, deny_socket)?;
         // Each denied ioctl type: equal falls into `deny_ioctl`, else
         // the next type check, walked back to front; the last falls to
         // allow. The exact checks above fall into the mask instead.
@@ -851,6 +895,10 @@ mod tests {
             SYS_PTRACE,
             SYS_BPF,
             SYS_PERF_EVENT_OPEN,
+            SYS_UNSHARE,
+            SYS_SETNS,
+            SYS_CLONE,
+            SYS_CLONE3,
             AF_UNIX,
             AF_NETLINK,
         ] {
@@ -1097,12 +1145,23 @@ mod tests {
         assert_eq!(error, "landlock stage failed");
     }
 
-    /// A classic-BPF interpreter over (arch, nr, arg0, arg1): the
-    /// executable meaning of the built filter. Every denylisted number
-    /// below is evaluated to its verdict, so a mistargeted jump or a
-    /// flipped patch fails here instead of silently fencing the wrong
-    /// syscall.
+    /// A classic-BPF interpreter over (arch, nr, arg0, arg1, arg2):
+    /// the executable meaning of the built filter. Every denylisted
+    /// number below is evaluated to its verdict, so a mistargeted jump
+    /// or a flipped patch fails here instead of silently fencing the
+    /// wrong syscall.
     fn eval_filter(insns: &[SockFilter], arch: u32, nr: u32, arg0: u32, arg1: u32) -> u32 {
+        eval_filter_args(insns, arch, nr, arg0, arg1, 0)
+    }
+
+    fn eval_filter_args(
+        insns: &[SockFilter],
+        arch: u32,
+        nr: u32,
+        arg0: u32,
+        arg1: u32,
+        arg2: u32,
+    ) -> u32 {
         let mut acc = 0u32;
         let mut pc = 0usize;
         for _ in 0..insns.len() + 16 {
@@ -1114,6 +1173,7 @@ mod tests {
                         ARCH_OFFSET => arch,
                         ARG0_LO_OFFSET => arg0,
                         ARG1_LO_OFFSET => arg1,
+                        ARG2_LO_OFFSET => arg2,
                         other => panic!("evaluator hit an unexpected load offset {other}"),
                     };
                     pc += 1;
@@ -1160,6 +1220,8 @@ mod tests {
             (SYS_MOUNT_SETATTR, libc::SYS_mount_setattr, "mount_setattr"),
             (SYS_FSOPEN, libc::SYS_fsopen, "fsopen"),
             (SYS_FSMOUNT, libc::SYS_fsmount, "fsmount"),
+            (SYS_UNSHARE, libc::SYS_unshare, "unshare"),
+            (SYS_SETNS, libc::SYS_setns, "setns"),
             (SYS_PTRACE, libc::SYS_ptrace, "ptrace"),
             (
                 SYS_PROCESS_VM_WRITEV,
@@ -1263,8 +1325,9 @@ mod tests {
                 "{name} escapes the fence"
             );
         }
-        // socket() with an IP domain is denied; AF_UNIX and AF_NETLINK
-        // stay allowed for the loader.
+        // socket() with an IP domain is denied; AF_UNIX stays allowed
+        // for the loader, and AF_NETLINK keeps only the route protocol
+        // (protocol 0 here; the other protocols have their own test).
         assert_eq!(
             eval_filter(
                 &insns,
@@ -1663,6 +1726,126 @@ mod tests {
                 eval_filter(&insns, AUDIT_ARCH_X86_64, nr, 0, 0),
                 denied,
                 "{name} escapes the fence"
+            );
+        }
+    }
+
+    #[test]
+    fn clone_with_namespace_flags_evaluates_to_eacces() {
+        let insns = FilterBuilder::new().build().unwrap();
+        let denied = SECCOMP_RET_ERRNO | libc::EACCES as u32;
+        assert_eq!(SYS_CLONE, libc::SYS_clone as u32, "wrong number for clone");
+        // Each CLONE_NEW* bit is keyed to libc, not to itself: the mask
+        // below must be exactly their union, or a namespace-creating
+        // clone escapes the fence.
+        let new_bits: &[(u32, libc::c_int, &str)] = &[
+            (0x0002_0000, libc::CLONE_NEWNS, "NEWNS"),
+            (0x0400_0000, libc::CLONE_NEWUTS, "NEWUTS"),
+            (0x0800_0000, libc::CLONE_NEWIPC, "NEWIPC"),
+            (0x2000_0000, libc::CLONE_NEWPID, "NEWPID"),
+            (0x4000_0000, libc::CLONE_NEWNET, "NEWNET"),
+            (0x1000_0000, libc::CLONE_NEWUSER, "NEWUSER"),
+            (0x0200_0000, libc::CLONE_NEWCGROUP, "NEWCGROUP"),
+            (0x0000_0080, libc::CLONE_NEWTIME, "NEWTIME"),
+        ];
+        let mut union = 0u32;
+        for (ours, want, name) in new_bits {
+            assert_eq!(*ours, *want as u32, "wrong bit for CLONE_{name}");
+            union |= *ours;
+            assert_eq!(
+                eval_filter(&insns, AUDIT_ARCH_X86_64, SYS_CLONE, *ours, 0),
+                denied,
+                "clone(CLONE_{name}) escapes the fence"
+            );
+        }
+        assert_eq!(
+            CLONE_NEW_MASK, union,
+            "the fence mask must cover all eight bits"
+        );
+        assert_eq!(
+            eval_filter(&insns, AUDIT_ARCH_X86_64, SYS_CLONE, union, 0),
+            denied,
+            "clone with every CLONE_NEW* bit escapes the fence"
+        );
+        // The plain thread flags glibc's pthread_create passes after its
+        // clone3 fallback stay allowed, as does fork (SIGCHLD).
+        let thread_flags = (libc::CLONE_VM
+            | libc::CLONE_FS
+            | libc::CLONE_FILES
+            | libc::CLONE_SIGHAND
+            | libc::CLONE_THREAD
+            | libc::CLONE_SYSVSEM
+            | libc::CLONE_SETTLS
+            | libc::CLONE_PARENT_SETTID
+            | libc::CLONE_CHILD_CLEARTID) as u32;
+        assert_eq!(
+            thread_flags & CLONE_NEW_MASK,
+            0,
+            "thread flags must not intersect the namespace mask"
+        );
+        for flags in [thread_flags, libc::SIGCHLD as u32] {
+            assert_eq!(
+                eval_filter(&insns, AUDIT_ARCH_X86_64, SYS_CLONE, flags, 0),
+                SECCOMP_RET_ALLOW,
+                "clone({flags:#x}) must stay allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn clone3_evaluates_to_enosys() {
+        let insns = FilterBuilder::new().build().unwrap();
+        // ENOSYS, not EACCES: glibc's pthread_create falls back to clone
+        // only on ENOSYS; anything else would break thread creation.
+        let enosys = SECCOMP_RET_ERRNO | libc::ENOSYS as u32;
+        assert_eq!(
+            SYS_CLONE3,
+            libc::SYS_clone3 as u32,
+            "wrong number for clone3"
+        );
+        assert_eq!(
+            eval_filter(&insns, AUDIT_ARCH_X86_64, SYS_CLONE3, 0, 0),
+            enosys,
+            "clone3 escapes the fence"
+        );
+    }
+
+    #[test]
+    fn netlink_socket_protocols_are_restricted() {
+        let insns = FilterBuilder::new().build().unwrap();
+        let denied = SECCOMP_RET_ERRNO | libc::EACCES as u32;
+        assert_eq!(
+            NETLINK_ROUTE,
+            libc::NETLINK_ROUTE as u32,
+            "wrong NETLINK_ROUTE"
+        );
+        assert_eq!(
+            eval_filter_args(
+                &insns,
+                AUDIT_ARCH_X86_64,
+                SYS_SOCKET,
+                AF_NETLINK,
+                1,
+                NETLINK_ROUTE
+            ),
+            SECCOMP_RET_ALLOW,
+            "AF_NETLINK protocol 0 must stay allowed"
+        );
+        // Netfilter, sock-diag, generic and uevent all drive privileged
+        // kernel subsystems through their own protocols; each is keyed to
+        // libc like the denylist numbers.
+        let denied_protocols: &[(u32, libc::c_int, &str)] = &[
+            (12, libc::NETLINK_NETFILTER, "NETFILTER"),
+            (4, libc::NETLINK_SOCK_DIAG, "SOCK_DIAG"),
+            (16, libc::NETLINK_GENERIC, "GENERIC"),
+            (15, libc::NETLINK_KOBJECT_UEVENT, "KOBJECT_UEVENT"),
+        ];
+        for (ours, want, name) in denied_protocols {
+            assert_eq!(*ours, *want as u32, "wrong NETLINK_{name}");
+            assert_eq!(
+                eval_filter_args(&insns, AUDIT_ARCH_X86_64, SYS_SOCKET, AF_NETLINK, 1, *ours),
+                denied,
+                "AF_NETLINK protocol {name} escapes the fence"
             );
         }
     }

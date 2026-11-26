@@ -3093,12 +3093,12 @@ mod tests {
 
     /// `stable_selection_maps` revalidates the module against the passed
     /// counter: an exhausted budget refuses the snapshot. Driven on the
-    /// test executable with scripted maps carrying its key, so no live
+    /// owned fixture with scripted maps carrying its key, so no live
     /// (tearing) read stands between the test and the exact debit:
     /// single attempt.
     #[test]
     fn stable_selection_maps_charges_the_shared_identify_budget() {
-        let exe = std::env::current_exe().unwrap();
+        let exe = small_owned_elf();
         let len = std::fs::metadata(&exe).unwrap().len();
         let file = identity::open_object(&exe).unwrap();
         let key = file_key(&file).unwrap();
@@ -3148,11 +3148,15 @@ mod tests {
 
     /// `loaded_module_key` rechecks the resolved module against the
     /// passed counter: an exhausted budget skips every export instead of
-    /// confirming one. Driven on the test executable at a real code
-    /// address in its own mappings.
+    /// confirming one. Driven on the dlopened owned fixture at its
+    /// exported entry address.
     #[test]
     fn loaded_module_key_recheck_uses_the_shared_budget() {
-        let exe = std::env::current_exe().unwrap();
+        let exe = small_owned_elf();
+        let lib = unsafe { Library::new(&exe) }.expect("dlopen the owned fixture");
+        let entry: libloading::Symbol<unsafe extern "C" fn()> =
+            unsafe { lib.get(b"p11scope_discover_small_owned_entry\0") }
+                .expect("owned entry symbol");
         let len = std::fs::metadata(&exe).unwrap().len();
         let module_file = identity::open_object(&exe).unwrap();
         let module_file_key = file_key(&module_file).unwrap();
@@ -3160,9 +3164,7 @@ mod tests {
         let maps = read_self_maps().unwrap();
         let index = validated_map_index(&maps).unwrap();
         let exports = ExportAddresses {
-            get_function_list: Some(
-                loaded_module_key_recheck_uses_the_shared_budget as *const () as usize,
-            ),
+            get_function_list: Some(*entry as usize),
             get_interface_list: None,
             get_interface: None,
         };

@@ -11479,6 +11479,7 @@ pub(crate) mod tests {
             subject: subject.into(),
             reason: "r".into(),
             budget: None,
+            units: None,
         };
         let mut registry = registry();
         registry.record_gap(row("delay"));
@@ -11548,6 +11549,7 @@ pub(crate) mod tests {
             subject: format!("s{n}"),
             reason: "r".into(),
             budget: None,
+            units: None,
         };
         registry.record_gap(row(0));
         registry.record_note(row(1), NoteKind::FoldDeferredOversized);

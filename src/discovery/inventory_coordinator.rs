@@ -1440,6 +1440,7 @@ impl ActivationDelay {
             subject: ACTIVATION_REFUSED_SUBJECT.into(),
             reason: self.reason().into(),
             budget: None,
+            units: None,
         }
     }
 }
@@ -5932,6 +5933,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 subject: MEMBER_EXITED_MID_SCAN_SUBJECT.into(),
                 reason: member_exited_mid_scan_reason(pid, decoded, total),
                 budget: None,
+                units: None,
             });
         }
     }

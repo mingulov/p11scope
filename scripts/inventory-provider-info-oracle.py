@@ -5,11 +5,12 @@
 
 Cell `inventory-provider-info-pid` runs one single-process workload
 (`tests/fixtures/public-cli/provider_info.c`) under `inventory --pid
---capture native --provider-info`. The workload makes exactly one
-observed call per info query (C_GetInfo, one C_GetSlotList, per slot
-one C_GetTokenInfo plus, on token slots, one C_GetMechanismList and
-one C_GetMechanismInfo per listed mechanism) and ledgers the returned
-facts. This checker asserts:
+--capture native --provider-info`. The workload primes binder
+association with counted C_GetSlotList calls until the second gate,
+then makes exactly one observed call per info query (C_GetInfo, one
+C_GetSlotList, per slot one C_GetTokenInfo plus, on token slots, one
+C_GetMechanismList and one C_GetMechanismInfo per listed mechanism)
+and ledgers the returned facts. This checker asserts:
 
 - the snapshot inventories the owned provider (admitted) and the one
   workload caller, with no gaps about the owned module;
@@ -21,7 +22,7 @@ facts. This checker asserts:
   exactly the ledger's (slot, mechanism) facts (same keys, same
   sizes/flags, completions 1, changes 0), with no observation gaps;
 - the workload edge carries `counted` non-lossy coverage whose count
-  equals the ledger's post-gate call total exactly, and the
+  equals the priming plus sweep call total exactly, and the
   `--event-log` stream ends cleanly with the same total;
 - no `serial` or `label` key appears anywhere in the report.
 
@@ -198,7 +199,7 @@ def check_slots(slots):
 
 
 def check_ledger(text, receipt, cell):
-    targets, ledgers, ready, children = [], [], [], []
+    targets, ledgers, ready, children, primes = [], [], [], [], []
     for line in text.splitlines():
         if line.startswith("TARGET "):
             require(
@@ -209,6 +210,14 @@ def check_ledger(text, receipt, cell):
         elif line.startswith("LEDGER "):
             require(len(ready) == 1, "fixture ledger emitted before workload READY")
             ledgers.append(parse(line[7:]))
+        elif line.startswith("PRIME "):
+            match = re.fullmatch(r"PRIME calls=([0-9]+)", line)
+            require(match is not None, "invalid workload PRIME line")
+            require(
+                len(ready) == 1 and not ledgers,
+                "fixture PRIME outside the priming window",
+            )
+            primes.append(int(match[1]))
         elif line.startswith("READY "):
             match = re.fullmatch(r"READY pid=([0-9]+)", line)
             require(match is not None, "invalid workload READY")
@@ -231,6 +240,8 @@ def check_ledger(text, receipt, cell):
         "invalid or incomplete fixture ledger",
     )
     require(not children, "single-process workload reported children")
+    require(len(primes) == 1, "missing or duplicate PRIME line")
+    prime = primes[0]
     info = check_info_record(ledger.get("info"))
     token_slots, mech_facts = check_slots(ledger.get("slots"))
     dev_ino = set()
@@ -248,12 +259,13 @@ def check_ledger(text, receipt, cell):
         sorted(row.get("name") for row in targets) == sorted(INFO_NAMES),
         "fixture targets are not exactly the info functions",
     )
-    # Post-gate through-table calls: C_GetInfo + C_GetSlotList, per slot
-    # C_GetTokenInfo, per token slot C_GetMechanismList, per mechanism
-    # C_GetMechanismInfo. C_Initialize runs pre-gate (unobserved) and the
-    # workload holds instead of finalizing.
+    # Post-gate through-table calls: the PRIME priming calls plus the
+    # sweep (C_GetInfo + C_GetSlotList, per slot C_GetTokenInfo, per
+    # token slot C_GetMechanismList, per mechanism C_GetMechanismInfo).
+    # C_Initialize runs pre-gate (unobserved) and the workload holds
+    # instead of finalizing.
     slots = ledger.get("slots")
-    total = 2 + len(slots)
+    total = prime + 2 + len(slots)
     for entry in slots:
         if entry.get("token") is True:
             total += 1 + len(entry.get("mechanisms"))

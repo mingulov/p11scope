@@ -32415,7 +32415,10 @@ mod tests {
 
         let revision_before = pins.revision();
         pins.retire_view_except_proven(v, RetirementProof::Exited, &BTreeSet::from([id]));
-        assert_eq!(custody_of(&pins, v), Some((RETIRED_EXITED, vec![raw.clone()])));
+        assert_eq!(
+            custody_of(&pins, v),
+            Some((RETIRED_EXITED, vec![raw.clone()]))
+        );
         assert_eq!(
             strict(&pins, key, w),
             Some(id),
@@ -33225,8 +33228,16 @@ mod tests {
                 .map(|claims| claims.pins.clone())
                 .unwrap_or_default()
         };
-        assert_eq!(claims_of(&pinned, refuser), vec![id], "precondition: the refuser claims");
-        assert_eq!(claims_of(&pinned, peer), vec![id], "precondition: the peer claims");
+        assert_eq!(
+            claims_of(&pinned, refuser),
+            vec![id],
+            "precondition: the refuser claims"
+        );
+        assert_eq!(
+            claims_of(&pinned, peer),
+            vec![id],
+            "precondition: the peer claims"
+        );
         record_scanned_candidate(
             &mut pinned,
             refuser,
@@ -33235,8 +33246,16 @@ mod tests {
             &mut skipped,
             true,
         );
-        assert_eq!(pinned.raw_to_id.get(&raw), Some(&id), "the peer keeps the raw");
-        assert_eq!(claims_of(&pinned, peer), vec![id], "the peer keeps its claim");
+        assert_eq!(
+            pinned.raw_to_id.get(&raw),
+            Some(&id),
+            "the peer keeps the raw"
+        );
+        assert_eq!(
+            claims_of(&pinned, peer),
+            vec![id],
+            "the peer keeps its claim"
+        );
         assert!(
             pinned.view_claims(refuser).is_none(),
             "the refuser's stale claim ends with its row: {:?}",

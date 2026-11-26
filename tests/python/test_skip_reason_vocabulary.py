@@ -58,6 +58,7 @@ PRODUCER_CONSTANTS = (
     "MID_FLIGHT_REASON",
     "SCAN_BUDGET_REASON",
     "LOADER_CONTEXT_REASON",
+    "DISCOVERY_WORK_CEILING_DEFERRED",
     # Run-tree scope gaps: survivors, degradation, unreadable
     # membership — filed under their own subject with finite reasons.
     "RUN_TREE_SURVIVORS",
@@ -97,7 +98,7 @@ def producer_reasons():
 
     Entry granularity (function subjects and the one gated null) renders
     "null pointer" or ENTRY_UNAVAILABLE; discovery scope renders one of the
-    nineteen discovery reasons; the run-tree scope renders one of its three
+    twenty discovery reasons; the run-tree scope renders one of its three
     reasons under its own subject, and the learned-file scope renders one
     of its ten reasons under its own subject. The split mirrors
     `capture_skipped_out`'s branches; the strings themselves come from the
@@ -127,6 +128,7 @@ def producer_reasons():
         const["MID_FLIGHT_REASON"],
         const["SCAN_BUDGET_REASON"],
         const["LOADER_CONTEXT_REASON"],
+        const["DISCOVERY_WORK_CEILING_DEFERRED"],
     }
     run_tree = {
         const["RUN_TREE_SURVIVORS"],
@@ -147,7 +149,7 @@ def producer_reasons():
     }
     assert (
         len(entry) == 2
-        and len(discovery) == 19
+        and len(discovery) == 20
         and len(run_tree) == 3
         and len(learned) == 10
     ), const

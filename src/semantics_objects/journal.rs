@@ -36022,10 +36022,7 @@ pub(crate) mod tests {
             .adapter
             .attest_key(&other.admit())
             .expect("a fresh binding binds beside an ended unfenced sibling");
-        assert_ne!(
-            rebind.key, proof.key,
-            "the fresh binding names a new key"
-        );
+        assert_ne!(rebind.key, proof.key, "the fresh binding names a new key");
     }
 
     #[test]

@@ -3541,14 +3541,18 @@ impl PinnedObjects {
     /// out and returned for the caller's routing purge. The post-purge
     /// pruning drops every carried row whose object did not survive, and
     /// `release_view_id` clears the rest before the numeric ID is reused.
+    ///
+    /// Returns the removed rows and whether the kept rows changed their
+    /// generation tag: the tag is content, so a retag alone (a claimless
+    /// view whose every row is kept) must still move the revision.
     fn retire_view_custody(
         &mut self,
         view: ProcessViewId,
         keep: &BTreeSet<PinnedObjectId>,
         proof: RetirementProof,
-    ) -> BTreeSet<RawObjectInstance> {
+    ) -> (BTreeSet<RawObjectInstance>, bool) {
         let Some(mut custody) = self.raw_ownership.remove(&view) else {
-            return BTreeSet::new();
+            return (BTreeSet::new(), false);
         };
         let removed: BTreeSet<RawObjectInstance> = custody
             .iter()
@@ -3556,11 +3560,14 @@ impl PinnedObjects {
             .cloned()
             .collect();
         custody.retain(|raw| !removed.contains(raw));
+        let mut retagged = false;
         if !custody.is_empty() {
+            let before = custody.generation();
             custody.carry(CarryCause::Retired(proof));
+            retagged = custody.generation() != before;
             self.raw_ownership.insert(view, custody);
         }
-        removed
+        (removed, retagged)
     }
 
     pub(crate) fn clear_view_scan_records(&mut self, view: ProcessViewId) {
@@ -3630,9 +3637,9 @@ impl PinnedObjects {
         // fresh proof, never a fence); every other row retires with the
         // view. A claimless view (synthetic or replace-preserved custody)
         // gets the same treatment as one with claims.
-        let removed_raws = self.retire_view_custody(view, keep, proof);
+        let (removed_raws, retagged) = self.retire_view_custody(view, keep, proof);
         let Some(removed) = self.ownership.remove(&view) else {
-            if pruned_refused || !removed_raws.is_empty() {
+            if pruned_refused || retagged || !removed_raws.is_empty() {
                 self.bump_revision();
             }
             return None;
@@ -28390,12 +28397,29 @@ mod tests {
         gone.retire_view_only_if_proven_gone(v, RetirementProof::Exited);
         assert_eq!(custody_of(&gone, v), None, "no carry: every row retires");
 
+        let revision_before = pins.revision();
         pins.retire_view_except_proven(v, RetirementProof::Exited, &BTreeSet::from([id]));
-        assert_eq!(custody_of(&pins, v), Some((RETIRED_EXITED, vec![raw])));
+        assert_eq!(custody_of(&pins, v), Some((RETIRED_EXITED, vec![raw.clone()])));
         assert_eq!(
             strict(&pins, key, w),
             Some(id),
             "carry does not fence: the claimless carried pin stays resolvable"
+        );
+        // The tag is content: a retag that removes no row still moves
+        // the revision, so an in-flight copy of the fresh tag is fenced.
+        assert_eq!(
+            pins.revision(),
+            revision_before + 1,
+            "a claimless retag bumps the revision exactly once"
+        );
+        // An already-carried set retires again without a retag: no bump.
+        let revision_carried = pins.revision();
+        pins.retire_view_except_proven(v, RetirementProof::Exited, &BTreeSet::from([id]));
+        assert_eq!(custody_of(&pins, v), Some((RETIRED_EXITED, vec![raw])));
+        assert_eq!(
+            pins.revision(),
+            revision_carried,
+            "re-retiring carried custody changes nothing"
         );
     }
 

@@ -46043,7 +46043,11 @@ int main(void) {
         let (mut native, _caller) = NativeScene::new();
         let at = native.stamps.tick();
         const EXTRA: usize = 4;
-        let total = EVER_ENUMERATED_SWEEP + EXTRA;
+        // One live fold past the sweep bound: the first pass evicts
+        // one live fold, so without a resume cursor the second pass
+        // would re-scan an all-live head window and count a second
+        // live eviction instead of finding the gone folds.
+        let total = EVER_ENUMERATED_SWEEP + EXTRA + 1;
         native
             .scene
             .coordinator
@@ -46065,7 +46069,7 @@ int main(void) {
                 },
             );
         }
-        for i in 0..EVER_ENUMERATED_SWEEP {
+        for i in 0..EVER_ENUMERATED_SWEEP + 1 {
             let pid = 800_000 + i as u32;
             native.scene.source.spawn(pid, 500);
             native.scene.coordinator.pair_folded.insert(
@@ -46086,7 +46090,7 @@ int main(void) {
                 PairKey {
                     image: DomainCookie::scripted(native.domain, 41),
                     exec: 1,
-                    object: (EVER_ENUMERATED_SWEEP + i) as u32,
+                    object: (EVER_ENUMERATED_SWEEP + 1 + i) as u32,
                 },
                 FoldedPair {
                     pid: 900_000 + i as u32,
@@ -46144,7 +46148,7 @@ int main(void) {
             !native.scene.coordinator.pair_folded.contains_key(&PairKey {
                 image: DomainCookie::scripted(native.domain, 41),
                 exec: 1,
-                object: EVER_ENUMERATED_SWEEP as u32,
+                object: (EVER_ENUMERATED_SWEEP + 1) as u32,
             }),
             "the gone fold outside the first window evicts on resume"
         );

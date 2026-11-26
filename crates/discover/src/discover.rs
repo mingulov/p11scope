@@ -212,8 +212,11 @@ struct IdentifyBudget {
 }
 
 impl IdentifyBudget {
-    /// False while `key` never contributed a byte. Single-threaded use
-    /// only: each call borrows briefly and never nests.
+    /// False while `key` was never completely identified. A failed
+    /// attempt — partial debit, short read, unparseable bytes — leaves
+    /// the key uncharged, so the next attempt debits again instead of
+    /// streaming a bypass. Single-threaded use only: each call borrows
+    /// briefly and never nests.
     fn is_charged(&self, key: &ObjectKey) -> bool {
         self.charged.borrow().contains(key)
     }
@@ -727,24 +730,26 @@ fn validated_file_identity(
 }
 
 /// The identify-read wrapper every object read in one discovery goes
-/// through for `key`: the key's bytes debit the shared budget on first
-/// identification, while rechecks of an already-charged key stream
-/// without a debit. Reads fail incrementally once the cumulative
-/// allowance is gone. A file is never refused for its own size: what
-/// fits is read and hashed, and a failed inspection keeps its partial
-/// debit.
+/// through for `key`, plus the completion handle that marks the key
+/// charged. Reads debit while the key is uncharged and stream free
+/// once charged; the handle must run only after a complete, successful
+/// identification, so every attempt debits until one succeeds. Reads
+/// fail incrementally once the cumulative allowance is gone. A file is
+/// never refused for its own size: what fits is read and hashed, and a
+/// failed inspection keeps its partial debit.
+/// The reader/completer pair is returned as a tuple so the two stay
+/// together; boxing them only to simplify this signature would add two
+/// heap allocations per identification for no gain.
+#[allow(clippy::type_complexity)]
 fn budgeted_reader_for(
     budget: &IdentifyBudget,
     key: ObjectKey,
-) -> impl FnMut(&File, &mut [u8], u64) -> std::io::Result<usize> + '_ {
-    // Decided on first read, not at construction: a key counts as
-    // charged only once it actually debits a byte, so an exhausted
-    // budget keeps refusing a fresh key instead of marking it charged
-    // for free rechecks later.
-    let mut charging: Option<bool> = None;
-    move |file, bytes, offset| {
-        let charging = *charging.get_or_insert_with(|| !budget.is_charged(&key));
-        if !charging {
+) -> (
+    impl FnMut(&File, &mut [u8], u64) -> std::io::Result<usize> + '_,
+    impl Fn() + '_,
+) {
+    let reader = move |file: &File, bytes: &mut [u8], offset: u64| {
+        if budget.is_charged(&key) {
             return file.read_at(bytes, offset);
         }
         let left = MAX_TOTAL_OBJECT_BYTES.saturating_sub(budget.spent.get());
@@ -758,11 +763,12 @@ fn budgeted_reader_for(
         budget
             .spent
             .set(budget.spent.get().saturating_add(read as u64));
-        if read > 0 {
-            budget.charged.borrow_mut().insert(key);
-        }
         Ok(read)
-    }
+    };
+    let complete = move || {
+        budget.charged.borrow_mut().insert(key);
+    };
+    (reader, complete)
 }
 
 fn validated_file_identity_with_probe(
@@ -773,14 +779,11 @@ fn validated_file_identity_with_probe(
     budget: &mut dyn ProbeBudget,
     identify_spent: &IdentifyBudget,
 ) -> Result<ObjectIdentity, String> {
-    validated_file_identity_with_probe_and_reader(
-        path,
-        file,
-        expected,
-        probe,
-        budget,
-        budgeted_reader_for(identify_spent, expected),
-    )
+    let (reader, complete) = budgeted_reader_for(identify_spent, expected);
+    let identity =
+        validated_file_identity_with_probe_and_reader(path, file, expected, probe, budget, reader)?;
+    complete();
+    Ok(identity)
 }
 
 fn validated_file_identity_with_probe_and_reader(
@@ -827,14 +830,17 @@ fn validated_provenance_identity(
     identify_spent: &IdentifyBudget,
 ) -> Result<ObjectIdentity, String> {
     let mut budget = UnboundedProbeBudget;
-    validated_file_identity_with_probe_and_reader(
+    let (reader, complete) = budgeted_reader_for(identify_spent, expected);
+    let identity = validated_file_identity_with_probe_and_reader(
         path,
         file,
         expected,
         &KernelSelfMappingProbe,
         &mut budget,
-        budgeted_reader_for(identify_spent, expected),
-    )
+        reader,
+    )?;
+    complete();
+    Ok(identity)
 }
 
 struct ProcessMemory(File);
@@ -2905,6 +2911,63 @@ mod tests {
             budget.spent.get(),
             MAX_TOTAL_OBJECT_BYTES,
             "the partial head stays debited"
+        );
+    }
+
+    /// Charge-state lifecycle twin: a first identification that fails
+    /// after a partial debit must NOT mark the key charged — the
+    /// immediate recheck is still a charged attempt and fails closed
+    /// instead of streaming the whole file free.
+    #[test]
+    fn failed_partial_first_identification_stays_uncharged() {
+        let third = copied_owned_elf("twin-third");
+        let third_file = identity::open_object(&third).unwrap();
+        let third_key = file_key(&third_file).unwrap();
+        let budget = IdentifyBudget::default();
+        budget.spent.set(MAX_TOTAL_OBJECT_BYTES - 10);
+        let error = validated_identity(&third, third_key, &budget).unwrap_err();
+        assert_eq!(
+            error,
+            format!(
+                "cannot identify {} for reuse: read failed: identified objects total more than the {MAX_TOTAL_OBJECT_BYTES}-byte limit",
+                third.display()
+            )
+        );
+        assert_eq!(budget.spent.get(), MAX_TOTAL_OBJECT_BYTES);
+        let error = validated_identity(&third, third_key, &budget).unwrap_err();
+        assert_eq!(
+            error,
+            format!(
+                "cannot identify {} for reuse: read failed: identified objects total more than the {MAX_TOTAL_OBJECT_BYTES}-byte limit",
+                third.display()
+            )
+        );
+        assert_eq!(budget.spent.get(), MAX_TOTAL_OBJECT_BYTES);
+    }
+
+    /// A key whose bytes read in full but fail identification (here:
+    /// unparseable bytes) is not marked charged either: every attempt
+    /// debits until one succeeds.
+    #[test]
+    fn failed_parse_does_not_charge_the_key() {
+        let dir = std::env::temp_dir().join(format!(
+            "p11scope-discover-unparseable-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("note.bin");
+        std::fs::write(&path, b"this is not an ELF object").unwrap();
+        let len = std::fs::metadata(&path).unwrap().len();
+        let file = identity::open_object(&path).unwrap();
+        let key = file_key(&file).unwrap();
+        let budget = IdentifyBudget::default();
+        validated_identity(&path, key, &budget).unwrap_err();
+        assert_eq!(budget.spent.get(), len);
+        validated_identity(&path, key, &budget).unwrap_err();
+        assert_eq!(
+            budget.spent.get(),
+            2 * len,
+            "a failed key re-debits instead of streaming free"
         );
     }
 

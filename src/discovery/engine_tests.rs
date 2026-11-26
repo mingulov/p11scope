@@ -98663,6 +98663,150 @@ fn member_stop_trial_mixed_newcomers_clear_trial_keys_before_rebuild() {
     let _ = fixture2;
 }
 
+/// Recovery through the production refresh path clears a
+/// first-build-only rejection: the first candidate build binds a
+/// rejected staged key and then fails, the caller passes the
+/// pre-first-build snapshot (not the polluted set) into newcomer
+/// isolation, and the recovered candidate leaves the live hold
+/// attached. A third sleep is the named enumeration target so the
+/// admitted newcomer never duplicates the crafted views.
+#[test]
+fn member_stop_refresh_recovery_clears_first_build_rejection() {
+    let (fixture1, view1, module1, _pins1) = loaded_seed_provider();
+    let pid1 = fixture1.child.id();
+    let library1 = fixture1._dir.path().join("seed-provider.so");
+    let (fixture2, view2, module2, _pins2) = loaded_seed_provider();
+    let mut child3 = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let pid3 = child3.id();
+    stop_member_for_test(pid1);
+    let key = member_exec_key_for_test(pid1, &library1);
+    let mut io = ScriptedMemberStops::default();
+    io.rows.insert(pid1, member_stop_row(pid1, &library1, key));
+    // Cgroup scope over exactly the third sleep: the enumeration
+    // finds one real newcomer (no host walk), and the crafted views
+    // ride along untouched.
+    let (mut engine, _scope_dir) = engine_over_cgroup_naming(&[pid3]);
+    engine.member_stops.pass_budget = Some(std::time::Duration::from_secs(30));
+    engine.member_stops.member_budget = Some(std::time::Duration::from_secs(30));
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    assert!(engine.member_stops_held(), "intake holds the mapper");
+    engine.service_learned_files();
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        1,
+        "the staging lands"
+    );
+    engine.service_member_stops(&mut io, &mut session, Some(20));
+    assert!(
+        engine.member_stops_held(),
+        "no stamps: the hold waits for its attach"
+    );
+    let staged_key = engine
+        .prearm_input
+        .as_ref()
+        .and_then(|prearm| prearm.inputs.first().map(|input| input.key))
+        .expect("staging records its key");
+    let file = std::fs::File::open(&library1).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    let attached: Vec<u32> = session
+        .attached_requests
+        .iter()
+        .flat_map(|targets| targets.iter().map(|(slot, _, _)| *slot))
+        .collect();
+    assert!(!attached.is_empty(), "the apply attached slots");
+    for slot in attached {
+        session.scripted_stamps.insert(slot, 5);
+        session.scripted_links.insert(slot);
+    }
+    assert!(
+        engine.provider_attached_for_test((dev, ino), &session),
+        "stamps landed: the attach side holds"
+    );
+    assert!(!engine.pinned.rejects(staged_key), "nothing committed");
+    assert!(
+        !engine.pending_rejected_keys.contains(&staged_key),
+        "nothing pending"
+    );
+    // Crafted newcomers: A healthy, B binds the rejected staged key
+    // and then fails (post-bind poison).
+    let pins_a = engine.pinned.clone();
+    let mut pins_b = engine.pinned.clone();
+    pins_b.reapply_rejected_keys(&std::collections::BTreeSet::from([staged_key]));
+    engine.fail_candidate_with_pid_after_bind_for_test = Some(view2.pid());
+    let pid_a = view1.pid();
+    let pid_b = view2.pid();
+    let mut new_views = vec![
+        (view1, vec![module1], pins_a),
+        (view2, vec![module2], pins_b),
+    ];
+    // The enumeration finds the third sleep as a real newcomer, so
+    // the pass reaches the first build; the crafted views ride along.
+    let mut tick: fn() -> Option<u64> = || None;
+    let mut collect = Engine::collect_discovery_records;
+    let mut additions = true;
+    let mut records = Vec::new();
+    let mut pending_views = PendingViewRetirements::new();
+    let mut closure = PauseClosure::new(true);
+    let calls_before = engine.inventory_candidate_calls_for_test;
+    let outcome = engine.refresh_inventory_inner(
+        &mut session,
+        &mut additions,
+        &mut records,
+        &mut pending_views,
+        &mut collect,
+        &mut closure,
+        &mut new_views,
+        &mut tick,
+    );
+    engine.fail_candidate_with_pid_after_bind_for_test = None;
+    assert!(outcome.is_ok(), "recovery returns Ok: {outcome:?}");
+    assert!(
+        engine.inventory_candidate_calls_for_test >= calls_before + 5,
+        "first build, baseline, trials and final rebuild ran"
+    );
+    // The tail consumes the newcomer vec into admitted views: the
+    // survivor commits, the broken newcomer is excluded.
+    let admitted: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
+    assert!(
+        admitted.contains(&pid_a),
+        "the healthy newcomer is admitted: {admitted:?}"
+    );
+    assert!(
+        !admitted.contains(&pid_b),
+        "the broken newcomer is excluded: {admitted:?}"
+    );
+    assert!(
+        !engine.pending_rejected_keys.contains(&staged_key),
+        "the first-build-only rejection is cleared, not baselined"
+    );
+    assert!(
+        !engine.hold_refused_for_test((dev, ino)),
+        "a first-build-only rejection records no refusal"
+    );
+    assert!(
+        engine.provider_attached_for_test((dev, ino), &session),
+        "the slots stay live"
+    );
+    engine.service_member_stops(&mut io, &mut session, Some(10_000_000));
+    assert!(!engine.member_stops_held(), "the hold ends");
+    let stats = engine.member_stop_stats_for_test();
+    assert_eq!(stats.attached_resumes, 1, "{stats:?}");
+    assert_eq!(stats.refused_resumes, 0, "{stats:?}");
+    assert_eq!(stats.timed_out, 0, "{stats:?}");
+    assert!(
+        !files_the_first_use_row(&engine),
+        "an attached end files no gap row"
+    );
+    child3.kill().unwrap();
+    child3.wait().unwrap();
+    let _ = fixture2;
+}
+
 /// Isolation entry restores the pre-first-build pending set:
 /// first-build pollution is discarded before the baseline runs, so a
 /// staged key rejected only by the failed first build never refuses

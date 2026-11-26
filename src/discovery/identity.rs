@@ -9732,8 +9732,9 @@ fn identity_of_in_mountinfo(
 /// The fd stays open across the retry, so its mount cannot be detached
 /// underneath the re-resolution, and the re-read runs under the same retained
 /// view checks as the first read. The retry is purely opportunistic: success
-/// returns the key, while persistent absence — or a failed re-read — returns
-/// today's error text unchanged. No other error retries.
+/// returns the key, while persistent absence — or a failed non-stop re-read —
+/// returns today's error text unchanged. A healable stop preempts with
+/// itself instead (below). No other error retries.
 #[cfg(test)]
 fn identity_of_in_mountinfo_with_reread(
     file: &std::fs::File,
@@ -9747,7 +9748,10 @@ fn identity_of_in_mountinfo_with_reread(
 
 /// The retry half of the rule above, given the first resolution's result.
 /// The re-read receives the budget, so the retry's table open and the
-/// second resolution charge the same allowance as the first.
+/// second resolution charge the same allowance as the first. A
+/// healable stop during the re-read preempts the first error: the
+/// stop is transient-global and must wait, while any other re-read
+/// failure keeps today's first error unchanged.
 fn reread_on_missing_mount(
     first: Result<MappingFileKey, String>,
     file: &std::fs::File,
@@ -9757,6 +9761,7 @@ fn reread_on_missing_mount(
     match first {
         Err(error) if is_missing_mount_id_error(&error) => match reread(budget) {
             Ok(fresh) => identity_of_in_mountinfo(file, &fresh, budget),
+            Err(stop) if mountinfo_detail_is_healable_stop(&stop) => Err(stop),
             Err(_) => Err(error),
         },
         outcome => outcome,
@@ -17910,6 +17915,91 @@ mod tests {
             ),
             "a failed re-read keeps the first error text byte-for-byte"
         );
+    }
+
+    /// Re-read preemption twin (finding 2): a healable stop during the
+    /// mount-table re-read preempts the first missing-mount error — the
+    /// stop is transient-global and must wait, while any other re-read
+    /// failure keeps the first error unchanged.
+    #[test]
+    fn stopped_re_read_preempts_with_the_stop() {
+        let file = open_regular(Path::new("/bin/sh")).unwrap();
+        let observer = mapping_file_key(&file).unwrap();
+        assert_ne!(
+            observer.mount_id, 999999,
+            "fixture assumes the fd's mount row is absent from the stale table"
+        );
+        let stale = "999999 1 8:1 / /other rw - ext4 /dev/other rw\n";
+        let stops = [
+            WORK_CEILING_REASON,
+            SCAN_DEADLINE_REASON,
+            SCAN_CLOCK_REASON,
+            IO_CEILING_REASON,
+            TABLE_WINDOW_CEILING_REASON,
+            INTERFACE_WINDOW_CEILING_REASON,
+        ];
+        for stop in stops {
+            for error in [
+                stop.to_string(),
+                crate::discovery::scan::mount_table_read_reason(7, stop),
+            ] {
+                let rereads = RefCell::new(0usize);
+                let outcome = identity_of_in_mountinfo_with_reread(&file, stale, || {
+                    *rereads.borrow_mut() += 1;
+                    Err(error.clone())
+                })
+                .expect_err("a stopped re-read fails");
+                assert_eq!(*rereads.borrow(), 1, "the table is re-read exactly once");
+                assert_eq!(
+                    outcome, error,
+                    "a healable [{stop}] preempts the missing-mount error"
+                );
+            }
+        }
+    }
+
+    /// Re-read preemption at the cached-table site: a stop during the
+    /// retry read surfaces as the stop (bare here — a proof step trips
+    /// first), never as the missing mount the retry was chasing.
+    #[test]
+    fn identity_in_cached_table_stop_during_reread_preempts() {
+        let view = ProcessView::open(ProcessViewId(25), std::process::id()).unwrap();
+        let file = open_regular(Path::new("/bin/sh")).unwrap();
+        let observer = mapping_file_key(&file).unwrap();
+        assert_ne!(
+            observer.mount_id, 999999,
+            "fixture assumes the fd's mount row is absent from the stale table"
+        );
+        let stale = "999999 1 8:1 / /other rw - ext4 /dev/other rw\n";
+        let first = identity_of_in_mountinfo(&file, stale);
+        assert!(
+            matches!(&first, Err(error) if is_missing_mount_id_error(error)),
+            "premise: the first resolution misses the mount"
+        );
+        let mut mounts = MountTableCache::default();
+        let mut budget = CaptureWorkBudget::with_work_ceiling(1);
+        assert!(budget.charge(1));
+        let error = identity_in_cached_table(&view, &file, first, &mut mounts, &mut budget)
+            .expect_err("a stopped re-read fails");
+        assert_eq!(
+            error, WORK_CEILING_REASON,
+            "the stop preempts the missing-mount error"
+        );
+    }
+
+    /// Channel twin (finding 2): a mount-table read failure inside the
+    /// retained-key lookup propagates as the error (bare here — a proof
+    /// step trips first), never masked or defaulted.
+    #[test]
+    fn retained_object_key_cached_propagates_a_mount_table_stop() {
+        let view = ProcessView::open(ProcessViewId(26), std::process::id()).unwrap();
+        let file = open_regular(Path::new("/bin/sh")).unwrap();
+        let mut mounts = MountTableCache::default();
+        let mut budget = CaptureWorkBudget::with_work_ceiling(1);
+        assert!(budget.charge(1));
+        let error = retained_object_key_cached(&view, &file, &mut mounts, &mut budget)
+            .expect_err("a stopped read fails");
+        assert_eq!(error, WORK_CEILING_REASON, "the stop propagates bare");
     }
 
     #[test]
@@ -32856,6 +32946,48 @@ mod tests {
         let id = strict(&pins, key, r).unwrap();
         pins.retire_view_except_proven(r, RetirementProof::IdentityChanged, &BTreeSet::from([id]));
         assert_eq!(custody_of(&pins, r), None);
+    }
+
+    /// Site: `drop_view_claims` retag (N1 class). Dropping a view's
+    /// claims retags its fresh custody as carry, and the retag moves
+    /// the revision exactly once; dropping an already-claimless
+    /// carried view changes nothing.
+    #[test]
+    fn drop_view_claims_retag_moves_the_revision_once() {
+        let key = custody_key(41);
+        let (v, w) = (ProcessViewId(41), ProcessViewId(42));
+        let mut pins = PinnedObjects::empty();
+        let raw = custody_file(&mut pins, v, key);
+        custody_file(&mut pins, w, key);
+        let revision_before = pins.revision();
+        pins.drop_view_claims(v);
+        assert_eq!(
+            custody_of(&pins, v),
+            Some((
+                CustodyGeneration::Carried(CarryCause::ClaimsDenied),
+                vec![raw.clone()]
+            )),
+            "the drop retags fresh custody as carry"
+        );
+        assert_eq!(
+            pins.revision(),
+            revision_before + 1,
+            "the retag bumps the revision exactly once"
+        );
+        pins.drop_view_claims(v);
+        assert_eq!(
+            custody_of(&pins, v),
+            Some((
+                CustodyGeneration::Carried(CarryCause::ClaimsDenied),
+                vec![raw]
+            )),
+            "a second drop changes nothing"
+        );
+        assert_eq!(
+            pins.revision(),
+            revision_before + 1,
+            "no change, no bump"
+        );
     }
 
     /// Site: `retire_view_custody` (claimless path). Synthetic or

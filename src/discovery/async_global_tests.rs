@@ -4236,3 +4236,70 @@ fn async_global_apply_defers_behind_a_pending_ticket() {
     assert!(outcome.progressed);
     assert!(case.engine.pending_global_retirement.is_none());
 }
+
+/// Learned-staging barrier twin (B2c callers): while a global
+/// retirement ticket is pending, learned staging keeps its latch and
+/// attaches nothing — the caller never reaches its apply.
+#[test]
+fn async_global_learned_staging_keeps_its_latch_behind_a_pending_ticket() {
+    let mut case = Case::new();
+    case.engine.learned_unapplied = true;
+    case.hold_pending();
+    let attached = case.session.attached_slots.iter().sum::<usize>();
+    case.engine.apply_learned_staging(&mut case.session);
+    assert!(
+        case.engine.learned_unapplied,
+        "the latch survives the ticket"
+    );
+    assert_eq!(
+        case.session.attached_slots.iter().sum::<usize>(),
+        attached,
+        "nothing attaches behind the ticket"
+    );
+    assert!(case.engine.pending_global_retirement.is_some());
+    case.release();
+    wait_for(|| {
+        case.engine
+            .service_backlog_quantum(&mut case.session)
+            .unwrap();
+        case.engine.pending_global_retirement.is_none()
+    });
+}
+
+/// Conservative-replay twin (B2c callers): while a global retirement
+/// ticket is pending, the replay's apply defers at the entry guard and
+/// retains its queue — nothing commits, nothing drains.
+#[test]
+fn async_global_conservative_replay_defers_behind_a_pending_ticket() {
+    let mut case = Case::new();
+    let view = case.engine.views[0].id();
+    case.engine.pending_retirements.insert(view);
+    case.hold_pending();
+    let mut additions = true;
+    let outcome = case.engine.replay_pending_conservative(
+        &mut case.session,
+        &mut additions,
+        &mut PendingViewRetirements::new(),
+    );
+    assert_eq!(
+        outcome.disposition,
+        ApplyDisposition::Deferred,
+        "a pending batch owns the replay boundary too"
+    );
+    assert!(
+        !additions,
+        "a deferred replay closes the tick for additions"
+    );
+    assert!(
+        case.engine.pending_retirements.contains(&view),
+        "the deferred replay retains its queue"
+    );
+    assert!(case.engine.pending_global_retirement.is_some());
+    case.release();
+    wait_for(|| {
+        case.engine
+            .service_backlog_quantum(&mut case.session)
+            .unwrap();
+        case.engine.pending_global_retirement.is_none()
+    });
+}

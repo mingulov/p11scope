@@ -31779,6 +31779,29 @@ int main(int argc, char **argv) {
             .expect("a roomy read succeeds");
     }
 
+    /// Empty-check arms twin (finding 2): the production probe reports
+    /// true only for a read that succeeds with empty text. A failed
+    /// read keeps the mount-table guard (false), exactly like a table
+    /// that reads anything at all.
+    #[test]
+    fn target_mountinfo_is_empty_keeps_the_guard_on_a_failed_read() {
+        let view =
+            ProcessView::open(crate::process::ProcessViewId(33), std::process::id()).unwrap();
+        let mut io = ProcScanIo::new();
+        let mut mounts = MountTableCache::default();
+        let mut stopped = CaptureWorkBudget::with_work_ceiling(1);
+        assert!(stopped.charge(1));
+        assert!(
+            !io.target_mountinfo_is_empty(&view, &mut mounts, &mut stopped),
+            "a failed read keeps the guard"
+        );
+        let mut roomy = CaptureWorkBudget::default();
+        assert!(
+            !io.target_mountinfo_is_empty(&view, &mut mounts, &mut roomy),
+            "a nonempty table keeps the guard"
+        );
+    }
+
     /// Lower-candidate chain twin: a mount-table stop while enumerating
     /// propagates through the fallback search and the copy-up join with
     /// its exact text.

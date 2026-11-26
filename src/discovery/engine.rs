@@ -38907,6 +38907,13 @@ impl Engine {
         self.mount_park_reserver = Some(reserver);
     }
 
+    /// Whether the coordinator wired a mount-table park reserver into
+    /// this engine (test seam for the N3 wiring).
+    #[cfg(test)]
+    pub(crate) fn mount_park_reserver_for_test(&self) -> bool {
+        self.mount_park_reserver.is_some()
+    }
+
     /// Reservation handle on the Engine's dedicated counter pool. Each
     /// counter capture mints its preparation, stage and read reservers
     /// here; no counter lease comes from another pool.

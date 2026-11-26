@@ -60014,6 +60014,67 @@ fn tick_quantum_expires_mid_path_in_newcomer_admission() {
     );
 }
 
+/// N3 wiring twin: with the coordinator's reserver set, pre-existing
+/// retained views and newly admitted views carry the mount-table
+/// parking grant; without it their reads stay one-shot.
+#[test]
+fn admitted_inventory_views_carry_the_mount_park_grant() {
+    for granted in [false, true] {
+        let mut engine = Engine::empty();
+        let sleep = e06_spawn_sleeps(1);
+        let old = crate::process::ProcessView::open(
+            crate::process::ProcessViewId(501),
+            sleep[0].pid(),
+        )
+        .unwrap();
+        engine.views.push(old);
+        if granted {
+            let pool = crate::semantics_edge::resources::SemanticResourcePool::default();
+            engine.set_mount_park_reserver(pool.reserver());
+        }
+        assert!(
+            engine
+                .views
+                .iter()
+                .all(|view| view.mount_table_parking_granted() == granted),
+            "granted={granted}: pre-existing views carry the grant iff set"
+        );
+        let live_pid = std::process::id();
+        engine
+            .scheduler
+            .set_tick_quantum_ns_for_test(3_600_000_000_000);
+        engine.scheduler.begin_deep_scan_tick(Some(1_000_000));
+        let mut tick_now = || Some(1_000_000u64);
+        let max_scan_pids = engine.max_scan_pids;
+        let (new_views, failed, _) = engine.admit_inventory_new_views(
+            vec![live_pid],
+            &AdmissionLedger::Free {
+                backlog: BTreeSet::new(),
+            },
+            max_scan_pids,
+            &mut tick_now,
+        );
+        assert!(
+            !failed.contains(&live_pid),
+            "granted={granted}: the live pid is attempted: {failed:?}"
+        );
+        let staged: Vec<_> = new_views
+            .iter()
+            .filter(|(view, _, _)| view.pid() == live_pid)
+            .collect();
+        assert_eq!(
+            staged.len(),
+            1,
+            "granted={granted}: the live pid stages exactly once"
+        );
+        assert_eq!(
+            staged[0].0.mount_table_parking_granted(),
+            granted,
+            "the staged view carries the grant iff the reserver is set"
+        );
+    }
+}
+
 /// View-collapse fix6 A2 (owner 20:20): past the concurrent library-handle
 /// cap the newcomer-admission loop defers with its requests retained and a
 /// counted named gap, never dropping. The test cap of 2 exercises the same

@@ -18019,6 +18019,17 @@ pub(crate) mod tests {
         .unwrap()
     }
 
+    /// N3 wiring twin: the coordinator wires the registry pool to its
+    /// engine, so retained views park mount-table reads against it.
+    #[test]
+    fn coordinator_grants_its_engine_mount_table_parking() {
+        let coordinator = coordinator();
+        assert!(
+            coordinator.engine.mount_park_reserver_for_test(),
+            "the coordinator sets the engine's park reserver"
+        );
+    }
+
     /// The retained decoder snapshot defaults to unknown; each note
     /// overwrites, so the tails always read the last released lane.
     #[test]

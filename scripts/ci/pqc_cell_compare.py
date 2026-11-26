@@ -28,13 +28,18 @@ hint, plus the `pqc keys:` spotlight with all twelve
 parameter-set/operation segments. Anything missing fails: no skip
 counts as a pass.
 
-No gap assertion: the workload's setup calls (Initialize, sessions,
-login) legitimately precede the semantic receipt under deferred
-admission, so a `before_semantic_boundary` gap is expected and harmless;
-the exact PQC mechanism and row counts prove every PQC operation was
-observed instead (a missed PQC op breaks counts first). Likewise the
-section status/reason, session rows, gap rows and budgets are the
-producer's volatile disclosure, not attribution, and stay unchecked.
+Loss disclosure, not loss refusal: the workload's setup calls
+(Initialize, sessions, login) legitimately precede the semantic
+receipt under deferred admission, so a `before_semantic_boundary`
+coverage reason is expected and harmless; the exact PQC mechanism
+and row counts prove every PQC operation was observed instead (a
+missed PQC op breaks counts first). Any other disclosed loss — a
+non-populated section status, a model gap row, suppressed gap rows,
+a refused row budget, or a lossy semantic edge — does not fail the
+leg either, but the result row reports qualification "partial"
+with the typed reason instead of "qualified". Only a run with no
+loss anywhere qualifies. Session rows stay unchecked (lifecycle,
+not loss: the section status already aggregates authority).
 
 Usage:
   pqc_cell_compare.py --sizes-log F --sizes-exit N --sizes-inventory F
@@ -529,15 +534,84 @@ def check_text(fail, leg, text_path, sizes, inv):
             fail.add(leg, f"spotlight has extra {rest.strip()!r}")
 
 
+# Coverage reasons that describe expected setup (pre-admission
+# workload calls), not observation loss; every other reason, or a
+# lossy edge, discloses loss (the S1 coverage vocabulary in
+# docs/schema/inventory-v1.md).
+BENIGN_COVERAGE_REASONS = frozenset({"before_semantic_boundary"})
+
+
+def leg_qualification(inv):
+    """Derive a leg's (qualification, reason) from loss disclosure.
+
+    "qualified" requires proof of no loss: a populated section, no
+    model gap rows, no suppressed gap rows, no refused row budgets,
+    and no lossy semantic edge. Anything else — including malformed
+    disclosure the judge cannot audit — is "partial" with the typed
+    reason. Never raises: this runs on the same inventories the
+    checks just judged, malformed or not.
+    """
+    if inv is None:
+        return ("partial", "inventory_unreadable")
+    if not isinstance(inv, dict):
+        return ("partial", "inventory_malformed")
+    oo = inv.get("object_observations")
+    if not isinstance(oo, dict):
+        return ("partial", "section_malformed")
+    if oo.get("status") != "populated":
+        return ("partial",
+                f"status/{oo.get('status')}/{oo.get('reason')}")
+    gaps = oo.get("gaps")
+    if not isinstance(gaps, dict):
+        return ("partial", "gaps_malformed")
+    rows = gaps.get("rows")
+    if not isinstance(rows, list):
+        return ("partial", "gaps_malformed")
+    for gap in sorted(rows, key=str):
+        reason = gap.get("reason") if isinstance(gap, dict) else None
+        return ("partial", f"gap/{reason}")
+    if gaps.get("suppressed", 0) != 0:
+        return ("partial", "gap/suppressed")
+    budgets = oo.get("budgets")
+    if not isinstance(budgets, dict):
+        return ("partial", "budgets_malformed")
+    for name in ("key_rows", "object_rows"):
+        block = budgets.get(name)
+        if not isinstance(block, dict):
+            return ("partial", f"budget/{name}_malformed")
+        if block.get("refused", 0) != 0:
+            return ("partial", f"budget/{name}_refused")
+    edges = inv.get("semantic_edges")
+    if not isinstance(edges, list):
+        return ("partial", "edges_malformed")
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        coverage = edge.get("coverage")
+        if coverage is None:
+            continue
+        if not isinstance(coverage, dict):
+            return ("partial", "edge/coverage_malformed")
+        reasons = coverage.get("reasons", [])
+        if not isinstance(reasons, list):
+            return ("partial", "edge/coverage_malformed")
+        loss = sorted(str(item) for item in reasons
+                      if item not in BENIGN_COVERAGE_REASONS)
+        if coverage.get("lossy", False) or loss:
+            return ("partial", f"edge/{loss[0] if loss else 'lossy'}")
+    return ("qualified", None)
+
+
 def judge_leg(fail, leg, args, sizes):
     # A judge bug must fail loudly with results written, never as a bare
     # traceback with no results file (the wrapper then reports only that
     # the file is missing).
+    inv = None
     try:
         inv = load_inventory(fail, leg, args[f"{leg}_inventory"],
                              int(args[f"{leg}_inventory_exit"]))
         if inv is None:
-            return
+            return None
         check_section_version(fail, leg, inv)
         check_mechanisms(fail, leg, inv)
         check_key_rows(fail, leg, inv, sizes)
@@ -546,6 +620,7 @@ def judge_leg(fail, leg, args, sizes):
         check_text(fail, leg, args[f"{leg}_text"], sizes, inv)
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
         fail.add(leg, f"judge error: {exc!r}")
+    return inv
 
 
 def parse_args(argv):
@@ -581,32 +656,55 @@ def main(argv):
         check_truth(truth_fail, "nosizes",
                     args["nosizes_log"], int(args["nosizes_exit"]))
         sizes_fail = Failures()
-        judge_leg(sizes_fail, "sizes", args, True)
+        sizes_inv = judge_leg(sizes_fail, "sizes", args, True)
         nosizes_fail = Failures()
-        judge_leg(nosizes_fail, "nosizes", args, False)
+        nosizes_inv = judge_leg(nosizes_fail, "nosizes", args, False)
     except (OSError, ValueError) as exc:
         print(f"pqc_cell_compare: harness error: {exc}", file=sys.stderr)
         return 2
+    sizes_qual, sizes_reason = leg_qualification(sizes_inv)
+    nosizes_qual, nosizes_reason = leg_qualification(nosizes_inv)
+    # The truth row joins both legs' runs, so it inherits both legs'
+    # loss disclosure; each leg row discloses only its own leg.
+    truth_loss = [(leg, reason)
+                  for leg, qual, reason
+                  in (("sizes", sizes_qual, sizes_reason),
+                      ("nosizes", nosizes_qual, nosizes_reason))
+                  if qual != "qualified"]
+    if truth_loss:
+        truth_qual = "partial"
+        truth_reason = ", ".join(f"{leg}/{reason}"
+                                 for leg, reason in truth_loss)
+    else:
+        truth_qual, truth_reason = "qualified", None
+
+    def detail(base, fail, qual, reason):
+        if not fail.ok():
+            return "; ".join(fail.problems)
+        if qual == "qualified":
+            return base
+        return f"partial ({reason}): {base}"
+
     rows = [
         {"cell": "pqc-workload-truth", "pass": truth_fail.ok(),
-         "qualification": "qualified",
-         "detail": ("both legs ran 3+3 PQC keypairs with exact counts and "
-                    "FIPS lengths" if truth_fail.ok()
-                    else "; ".join(truth_fail.problems))},
+         "qualification": truth_qual,
+         "detail": detail("both legs ran 3+3 PQC keypairs with exact "
+                          "counts and FIPS lengths",
+                          truth_fail, truth_qual, truth_reason)},
         {"cell": "pqc-sizes-rows", "pass": sizes_fail.ok(),
-         "qualification": "qualified",
-         "detail": ("12 key rows carry exact roles, object bindings, "
-                    "family + template label + length set; 18 objects "
-                    "pair-bound; 6 keygens; 4 mechanism rows exact"
-                    if sizes_fail.ok()
-                    else "; ".join(sizes_fail.problems))},
+         "qualification": sizes_qual,
+         "detail": detail("12 key rows carry exact roles, object "
+                          "bindings, family + template label + length "
+                          "set; 18 objects pair-bound; 6 keygens; "
+                          "4 mechanism rows exact",
+                          sizes_fail, sizes_qual, sizes_reason)},
         {"cell": "pqc-nosizes-rows", "pass": nosizes_fail.ok(),
-         "qualification": "qualified",
-         "detail": ("12 key rows carry exact roles, object bindings and "
-                    "family + template label; 18 objects pair-bound; "
-                    "6 keygens; 4 mechanism rows exact"
-                    if nosizes_fail.ok()
-                    else "; ".join(nosizes_fail.problems))},
+         "qualification": nosizes_qual,
+         "detail": detail("12 key rows carry exact roles, object "
+                          "bindings and family + template label; "
+                          "18 objects pair-bound; 6 keygens; "
+                          "4 mechanism rows exact",
+                          nosizes_fail, nosizes_qual, nosizes_reason)},
     ]
     with open(args["out_results"], "w", encoding="utf-8") as file:
         for row in rows:

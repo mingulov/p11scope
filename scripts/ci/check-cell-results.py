@@ -5,13 +5,15 @@
 
 Each line must be one JSON object with exactly the keys cell, pass,
 qualification and detail. Qualification is a closed set: qualified,
-command-contract, owned-provider-counts,
+partial, command-contract, owned-provider-counts,
 owned-provider-counts-with-runner-noise,
 owned-provider-counts-with-66-discovery-gap,
 owned-provider-counts-with-ambient-gap, owned-edge-usage-counts,
 prearm-exactness, verdict-consistency, semantic-names and failed are
-qualified and every qualified row must pass (with owned-edge-usage-counts
-requiring its proof fields in detail); nonqualifying smoke may pass or
+qualified and every qualified row must pass (partial discloses
+observed loss beside exact rows, with the typed reason in detail;
+owned-edge-usage-counts requires its proof fields in detail);
+nonqualifying smoke may pass or
 fail but every nonqualifying row must be allow-listed and the allow-list
 must equal the nonqualifying set; expected-failure must equal its
 declared list and an expected failure that passes is a failure. An
@@ -35,7 +37,8 @@ def fail(message):
     return 1
 
 
-QUALIFIED = {"qualified", "command-contract", "owned-provider-counts",
+QUALIFIED = {"qualified", "partial", "command-contract",
+             "owned-provider-counts",
              "owned-provider-counts-with-runner-noise",
              "owned-provider-counts-with-66-discovery-gap",
              "owned-provider-counts-with-ambient-gap",

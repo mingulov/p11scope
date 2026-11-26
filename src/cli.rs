@@ -665,7 +665,7 @@ examples:
   sudo p11scope profile --pid 4242 --duration 30s -o profile.json
   sudo p11scope inventory --system --duration 30s
 
-exit codes: 0 ok; 1 the command failed; 2 wrong arguments. run exits with its command's status.
+exit codes: 0 ok; 1 the command failed; 2 wrong arguments. run exits with its command's status (130 when a second Ctrl-C abandoned observer cleanup).
 ";
 /// `p11scope profile --help`: scoped syntax, examples and evidence limits.
 const PROFILE_HELP: &str = "usage:
@@ -823,7 +823,7 @@ Default text output is concise: totals, coverage, and the function and mechanism
 -v/--verbose prints one line naming the run-as identity (running CMD as USER (uid N); the sudo-drop path adds (groups and home restored)).
 --user <name|uid> (root only, like strace -u) starts CMD as that account with its groups and home environment; --user root stays root on purpose.
 --output-owner UID[:GID] trusts -o directories owned by UID and hands the report to UID:GID (GID defaults to UID); root only, for a container bind mount owned by the host user. Needs -o.
-exit codes: the command's exit status; 1 if observing failed; 2 for wrong arguments.
+exit codes: the command's exit status; 1 if observing failed; 2 for wrong arguments; 130 a second Ctrl-C abandoned observer cleanup.
 ";
 
 /// `p11scope inspect --help`: scoped syntax, examples and evidence limits.
@@ -6680,8 +6680,12 @@ mod tests {
         // 3152/0xc83ab24b6cef5974 pin is exactly `<…>` to `<...>` on
         // the four duration synopsis lines (+0, same byte length) and
         // the em dash to `-` on the discovery line (-2); no other drift.
-        assert_eq!(USAGE.len(), 3150);
-        assert_eq!(hash, 0x2652cac918725293);
+        // 3204 / 0xdc26231ff48b5f5c (run 130 clause): diff vs the
+        // 3150/0x2652cac918725293 pin is exactly ` (130 when a second
+        // Ctrl-C abandoned observer cleanup)` on the exit-codes line
+        // (+54); no other drift.
+        assert_eq!(USAGE.len(), 3204);
+        assert_eq!(hash, 0xdc26231ff48b5f5c);
         assert_eq!(HelpTopic::Global.text(), USAGE.to_string());
     }
 
@@ -7677,11 +7681,12 @@ mod tests {
     }
 
     /// Audit test 7: every `exit codes:` line lists 130 where a second
-    /// signal can abandon the run — profile/trace link cleanup (130)
-    /// and the inventory detach (128 + signal).
+    /// signal can abandon the run — profile/trace/run link cleanup
+    /// (130), the global run clause, and the inventory detach (128 +
+    /// signal).
     #[test]
     fn exit_code_lines_list_130_where_a_second_signal_abandons() {
-        for topic in [HelpTopic::Profile, HelpTopic::Trace] {
+        for topic in [HelpTopic::Profile, HelpTopic::Trace, HelpTopic::Run] {
             let help = topic.text();
             let line = help
                 .lines()
@@ -7692,6 +7697,15 @@ mod tests {
                 "{topic:?} can exit 130 on a second Ctrl-C: {line}"
             );
         }
+        let global = HelpTopic::Global.text();
+        let line = global
+            .lines()
+            .find(|line| line.starts_with("exit codes:"))
+            .unwrap();
+        assert!(
+            line.contains("130"),
+            "the global run clause names observer-side 130: {line}"
+        );
         let help = HelpTopic::Inventory.text();
         let line = help
             .lines()

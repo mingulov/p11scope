@@ -3523,8 +3523,8 @@ fn clear_startup_signal_dispositions_for_test() {
     STARTUP_SIGNAL_DISPOSITIONS.store(0, Ordering::SeqCst);
 }
 
-/// B2 class guard (test builds only): set while the current test
-/// thread holds `ActualSignalTestGuard`.
+// B2 class guard (test builds only): set while the current test
+// thread holds `ActualSignalTestGuard`.
 #[cfg(test)]
 thread_local! {
     static SIGNAL_TEST_HOLDING: std::cell::Cell<bool> =

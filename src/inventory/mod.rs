@@ -1523,8 +1523,12 @@ enum ReclaimWorker {
 /// custody, counts `worker_busy`, and the next pass hands it again,
 /// so the main loop keeps servicing the rings even when a close in
 /// the drop blocks (a pinned module fd on a stopped FUSE daemon).
-/// The pass trim ([`trim_pass_heap`]) stays at the publication seam;
-/// pages a drop frees after one trim return at the next.
+/// The worker is long-lived, so unlike the old per-pass worker it
+/// keeps its tcache across passes, and the pass trim
+/// ([`trim_pass_heap`]) stays at the publication seam where it can
+/// run before the worker has finished dropping: freed pages then
+/// come back one pass late. This only affects glibc builds; the
+/// static musl release compiles the trim out.
 pub(crate) struct PassReclaim {
     worker: ReclaimWorker,
     // Behind a mutex only so the owner stays `Sync` (the values are
@@ -1581,10 +1585,9 @@ impl PassReclaim {
                     break;
                 }
                 Err(std::sync::mpsc::TrySendError::Disconnected(item)) => {
-                    // The worker is gone (it never unwinds past one
-                    // drop, so only a teardown race gets here): mark
-                    // it unavailable, and the value and the rest drop
-                    // inline through the empty-sender arm above.
+                    // Defensive; unreachable while the sender is owned
+                    // here. If it ever fires, the value and the rest
+                    // drop inline through the empty-sender arm above.
                     self.worker = ReclaimWorker::Unavailable;
                     pending.push_front(item);
                 }

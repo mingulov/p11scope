@@ -154,6 +154,16 @@ pub(crate) fn stdout_sink() -> io::Result<SinkWriter<StdoutInner>> {
     stdout_sink_from(std::io::stdout().as_raw_fd())
 }
 
+/// A capture stdout sink already watching the capture's stop flag:
+/// the only way production builds a live capture sink, so a stop
+/// sheds slow flushes promptly instead of waiting out budgets.
+/// Unit tests cover the unwired primitive directly.
+pub(crate) fn watched_stdout_sink(cancel: Arc<AtomicBool>) -> io::Result<SinkWriter<StdoutInner>> {
+    let mut sink = stdout_sink()?;
+    sink.set_cancel_flag(cancel);
+    Ok(sink)
+}
+
 /// The same sink over any writer fd (the dashboard passes its stderr):
 /// bounded diagnostic lines next to an interactive view, whose terminal
 /// may be the stalled one (C5.3).
@@ -169,6 +179,16 @@ pub(crate) fn sink_on_fd(fd: RawFd) -> io::Result<SinkWriter<StdoutInner>> {
 pub(crate) fn null_sink() -> io::Result<SinkWriter<StdoutInner>> {
     let null = std::fs::OpenOptions::new().write(true).open("/dev/null")?;
     Ok(SinkWriter::without_flag_change(StdoutInner::File(null)))
+}
+
+/// A degraded capture sink already watching the capture's stop flag:
+/// the only way production builds a fallback null sink. Bytes still
+/// reach `/dev/null`; the flag keeps the invariant total (every
+/// capture sink watched, no exceptions).
+pub(crate) fn watched_null_sink(cancel: Arc<AtomicBool>) -> io::Result<SinkWriter<StdoutInner>> {
+    let mut sink = null_sink()?;
+    sink.set_cancel_flag(cancel);
+    Ok(sink)
 }
 
 /// Best-effort diagnostics: use existing descriptor-safe transports and
@@ -1584,6 +1604,33 @@ mod tests {
 
         assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
         assert_eq!(sink.take_drops(), SinkDrops::default());
+    }
+
+    /// The watched constructors wire the exact flag they are given: a
+    /// watched sink observes a later stop through the same predicate
+    /// the flush path consults, while an unwired sink never does.
+    #[test]
+    fn watched_stdout_sink_observes_the_passed_stop_flag() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let sink = watched_stdout_sink(Arc::clone(&cancel)).unwrap();
+        assert!(!sink.cancelled(), "an unset flag cancels nothing");
+        cancel.store(true, Ordering::SeqCst);
+        assert!(sink.cancelled(), "a watched sink must see the stop");
+        let unwired = stdout_sink().unwrap();
+        assert!(
+            !unwired.cancelled(),
+            "the unwired primitive stays unwired no matter the flag"
+        );
+    }
+
+    /// Same contract for the degraded null sink.
+    #[test]
+    fn watched_null_sink_observes_the_passed_stop_flag() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let sink = watched_null_sink(Arc::clone(&cancel)).unwrap();
+        assert!(!sink.cancelled(), "an unset flag cancels nothing");
+        cancel.store(true, Ordering::SeqCst);
+        assert!(sink.cancelled(), "a watched sink must see the stop");
     }
 
     /// PA-14: a single write larger than the ceiling must not grow the

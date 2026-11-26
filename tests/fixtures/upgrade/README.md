@@ -45,6 +45,8 @@ Files:
   existing unit tests.
 - `v071-observed-profile-v3.schema.json`: frozen copy of the schema
   at tag `v0.7.1` (blob `250a88da2eadacc1fee792ecb57a657c1e8c773a`).
+- `tools/`: the regeneration helpers (`sanitize.py` and the
+  `capture-*.sh` capture scripts).
 
 Sanitizer rules (one run, shared maps, so the same real value maps
 to the same canonical value in every file): the worktree prefix

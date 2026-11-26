@@ -594,13 +594,28 @@ fn render_minimal(
 ) -> Vec<String> {
     let presentation = frame.presentation.as_ref();
     let budgets = &presentation.budgets;
+    let provider_gaps = crate::inventory_present::provider_gap_total(presentation);
+    // The provider segment matches the concise line's words, so a
+    // downgraded info feed reads the same live and final; the compact
+    // log-loss form counts it as `p` beside the `g`/`r`/`s` family.
+    // Zero stays out everywhere, like every concise segment.
+    let provider_words = if provider_gaps > 0 {
+        format!(" provider info: {provider_gaps} refused")
+    } else {
+        String::new()
+    };
+    let provider_compact = if provider_gaps > 0 {
+        format!(" {provider_gaps}p")
+    } else {
+        String::new()
+    };
     let coverage = if frame.log.dropped_lines > 0 || frame.log.dropped_bytes > 0 {
         let dropped = format!(
             "; dropped {}L {}B",
             frame.log.dropped_lines, frame.log.dropped_bytes,
         );
         let coverage = format!(
-            "coverage: {}g {}r {}s",
+            "coverage: {}g {}r {}s{provider_compact}",
             presentation.gaps.len(),
             budgets.refusals(),
             presentation.gaps_suppressed,
@@ -614,7 +629,7 @@ fn render_minimal(
         )
     } else {
         format!(
-            "coverage: {} gaps {} refusals {} suppressed",
+            "coverage: {} gaps {} refusals {} suppressed{provider_words}",
             presentation.gaps.len(),
             budgets.refusals(),
             presentation.gaps_suppressed,
@@ -852,6 +867,14 @@ fn render_full(
 ) -> Vec<String> {
     let presentation = frame.presentation.as_ref();
     let budgets = &presentation.budgets;
+    let provider_gaps = crate::inventory_present::provider_gap_total(presentation);
+    // The provider segment matches the concise line's words, like the
+    // minimal header; zero stays out.
+    let provider_words = if provider_gaps > 0 {
+        format!(" provider info: {provider_gaps} refused")
+    } else {
+        String::new()
+    };
     let total = state.items_total(presentation);
     let scroll = state.scroll.min(total.saturating_sub(1));
     // The H9 projection line shows only while a publication exists
@@ -889,10 +912,11 @@ fn render_full(
         ),
         truncate_cell(
             &format!(
-                "coverage: {} gaps {} refusals {} suppressed | endpoints {}/{} | attach {}/{} | semantic {} ({} held, {} unknown, {} refused)",
+                "coverage: {} gaps {} refusals {} suppressed{} | endpoints {}/{} | attach {}/{} | semantic {} ({} held, {} unknown, {} refused)",
                 presentation.gaps.len(),
                 budgets.refusals(),
                 presentation.gaps_suppressed,
+                provider_words,
                 budgets.endpoints_occupied,
                 budgets.endpoints_limit,
                 budgets.inventory_endpoints_occupied,

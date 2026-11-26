@@ -3098,6 +3098,18 @@ fn loss_gap_count(gaps: &[GapView]) -> usize {
     gaps.len()
 }
 
+/// Provider-info gaps that count toward PARTIAL: the JSON
+/// `provider_observations.gaps` total. One helper for the concise
+/// line and the live dashboard headers, so the two can never disagree
+/// about the count.
+pub(crate) fn provider_gap_total(presentation: &Presentation) -> u64 {
+    presentation
+        .provider_observations
+        .as_ref()
+        .map(|observations| observations.gaps.total())
+        .unwrap_or(0)
+}
+
 /// True for a foreign-root open failure: the retained-root prefix plus
 /// the target-root suffix the scan appends. Only these fold by reason;
 /// precondition refusals never match.
@@ -5022,11 +5034,7 @@ fn render_snapshot_inner(
     // below names the reasons. Never `complete` while the JSON
     // `provider_observations.gaps` hold counts.
     let gaps = loss_gap_count(&presentation.gaps);
-    let provider_gaps = presentation
-        .provider_observations
-        .as_ref()
-        .map(|observations| observations.gaps.total())
-        .unwrap_or(0);
+    let provider_gaps = provider_gap_total(presentation);
     if gaps == 0
         && budgets.refusals() == 0
         && presentation.gaps_suppressed == 0

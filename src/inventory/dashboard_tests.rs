@@ -348,6 +348,115 @@ fn next_frame_still_shows_an_exited_callers_calls() {
     );
 }
 
+/// hy4f-B2: provider-info gaps show in the live dashboard coverage
+/// lines, not just the final concise line — a downgraded info feed
+/// must not read `0 gaps 0 refusals 0 suppressed` mid-run.
+#[test]
+fn dashboard_coverage_lines_count_provider_info_gaps() {
+    use crate::inventory_provider_info::{ProviderGaps, ProviderObservations};
+    let mut presentation = varied_presentation();
+    // Typed gap counts, built literally: a new ProviderGaps field
+    // fails to compile here until the dashboard accounts it.
+    presentation.provider_observations = Some(ProviderObservations {
+        tokens: Vec::new(),
+        mechanisms: Vec::new(),
+        gaps: ProviderGaps {
+            aliased: 1,
+            return_deferred: 2,
+            return_refused_hazard: 3,
+            caller_unavailable: 4,
+            mechanism_refused: 5,
+            tokens_refused: 6,
+            mechanisms_refused: 7,
+            tokens_departed: 8,
+            mechanisms_departed: 9,
+        },
+    });
+    assert_eq!(
+        presentation
+            .provider_observations
+            .as_ref()
+            .map(|observations| observations.gaps.total())
+            .unwrap_or(0),
+        45,
+        "the fixture total is the typed segment input"
+    );
+    let frame = frame_for(&presentation);
+    // The full header names the provider segment with the typed total.
+    let full = frame_text(&render_frame(
+        &frame,
+        Viewport {
+            width: 200,
+            height: 24,
+        },
+        &DashboardState::new(),
+    ));
+    let full_coverage = full
+        .lines()
+        .find(|line| line.starts_with("coverage:"))
+        .expect("the full header carries a coverage line");
+    assert!(
+        full_coverage.contains("provider info: 45 refused"),
+        "{full_coverage}"
+    );
+    // The minimal words form names it too (a short viewport keeps the
+    // minimal layout; the segment fits at this width).
+    let minimal = frame_text(&render_frame(
+        &frame,
+        Viewport {
+            width: 100,
+            height: 10,
+        },
+        &DashboardState::new(),
+    ));
+    let minimal_coverage = minimal
+        .lines()
+        .find(|line| line.starts_with("coverage:"))
+        .expect("the minimal header carries a coverage line");
+    assert!(
+        minimal_coverage.contains("provider info: 45 refused"),
+        "{minimal_coverage}"
+    );
+    // The compact log-loss form counts provider gaps as `p`, beside
+    // the `g`/`r`/`s` family.
+    let mut lossy = frame_for(&presentation);
+    lossy.log.dropped_lines = 7;
+    lossy.log.dropped_bytes = 99;
+    let compact = frame_text(&render_frame(
+        &lossy,
+        Viewport {
+            width: 100,
+            height: 10,
+        },
+        &DashboardState::new(),
+    ));
+    let loss_row = compact
+        .lines()
+        .find(|line| line.starts_with("coverage:"))
+        .expect("the compact header carries a coverage line");
+    assert!(loss_row.contains("45p"), "{loss_row}");
+    assert!(loss_row.contains("dropped 7L 99B"), "{loss_row}");
+    // Without observations the lines keep their old shape: no provider
+    // segment appears from nowhere.
+    let mut bare = varied_presentation();
+    bare.provider_observations = None;
+    let bare_frame = frame_for(&bare);
+    let bare_full = frame_text(&render_frame(
+        &bare_frame,
+        Viewport {
+            width: 200,
+            height: 24,
+        },
+        &DashboardState::new(),
+    ));
+    for line in bare_full
+        .lines()
+        .filter(|line| line.starts_with("coverage:"))
+    {
+        assert!(!line.contains("provider"), "{line}");
+    }
+}
+
 /// A failed stop-handler registration fails startup with a named
 /// error — never a silent drop that would leave the signal killing
 /// the run with no report.

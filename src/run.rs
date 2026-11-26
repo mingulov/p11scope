@@ -3788,14 +3788,30 @@ fn capture_with_host(
 /// a trace file it created) and leaves a previous file untouched. Once the
 /// session is attached, the capture loop's own stop path takes over and
 /// publishes the report as usual.
+/// A stop that landed before the attach, honored after discovery:
+/// typed so tests match the refusal rather than its text (NB2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StartupInterrupted {
+    pub signal: libc::c_int,
+}
+
+impl std::fmt::Display for StartupInterrupted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "interrupted by {} during startup, before anything was attached: nothing was \
+             captured and no report was written",
+            stop_signal_name(self.signal)
+        )
+    }
+}
+
+impl std::error::Error for StartupInterrupted {}
+
 fn refuse_if_interrupted_before_attach(stop: &SignalState) -> Result<()> {
     match stop.first_signal() {
         None => Ok(()),
-        Some(signal) => Err(anyhow!(
-            "interrupted by {} during startup, before anything was attached: nothing was \
-             captured and no report was written",
-            stop_signal_name(signal)
-        )),
+        Some(signal) => Err(StartupInterrupted { signal }.into()),
     }
 }
 
@@ -30417,6 +30433,81 @@ int main(int argc, char **argv) {
         assert!(
             output.status.success() && stdout.contains("test result: ok. 1 passed"),
             "child override check failed: {} {stdout}",
+            output.status
+        );
+    }
+
+    /// Behavioural twin at the F-11 seam, in a subprocess: with
+    /// SIGINT inherited ignored, a stop landing in the host probe is
+    /// recorded (the install precedes it) and refused after
+    /// discovery with the typed startup interrupt, leaving no orphan
+    /// temp file. Moving the install below the probe loses the stop
+    /// and the child takes another path (NB2). Privileged: capture
+    /// startup runs the BPF self-probe for return-probe admission.
+    /// The duration bounds even a lost stop (NB3).
+    #[test]
+    #[ignore = "privileged: startup stop through real capture startup (needs BPF probe admission)"]
+    fn startup_stop_in_host_window_refuses_and_leaves_no_temp() {
+        if std::env::var("P11SCOPE_F11_SEAM_CHILD").is_ok() {
+            // SAFETY: `signal` installs no handler code; `raise`
+            // delivers SIGINT to this thread, whose handler the
+            // install below provides.
+            unsafe {
+                libc::signal(libc::SIGINT, libc::SIG_IGN);
+            }
+            // Under /var/tmp (sticky): the sink refuses group-writable
+            // ancestry, and the test TMPDIR may sit under some.
+            let dir = tempfile::Builder::new()
+                .prefix("p11scope-f11-seam")
+                .tempdir_in("/var/tmp")
+                .unwrap();
+            let mut args = capture_args(ScopeArg::Pid(std::process::id()));
+            args.out = Some(dir.path().join("report.json"));
+            args.duration = Some(Duration::from_secs(1));
+            let error = capture_with_host(&args, &|| {
+                unsafe {
+                    libc::raise(libc::SIGINT);
+                }
+                Ok(crate::attach::MultiCapableHost::for_test())
+            })
+            .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<StartupInterrupted>(),
+                Some(&StartupInterrupted {
+                    signal: libc::SIGINT
+                }),
+                "{error:#}"
+            );
+            let litter: Vec<String> =
+                std::fs::read_dir(dir.path())
+                    .unwrap()
+                    .filter_map(|entry| {
+                        entry.ok().and_then(|entry| {
+                            entry.file_name().into_string().ok().filter(|name| {
+                                name.starts_with(".p11scope.") && name.ends_with(".tmp")
+                            })
+                        })
+                    })
+                    .collect();
+            assert_eq!(litter, Vec::<String>::new(), "no orphan temp left");
+            return;
+        }
+        let exe = std::env::current_exe().expect("test binary path");
+        let output = std::process::Command::new(exe)
+            .arg("run::tests::startup_stop_in_host_window_refuses_and_leaves_no_temp")
+            .arg("--exact")
+            .arg("--ignored")
+            .arg("--nocapture")
+            .env("P11SCOPE_F11_SEAM_CHILD", "1")
+            .output()
+            .expect("spawn self");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let mut detail = format!("{stdout}\n{stderr}");
+        detail.truncate(3000);
+        assert!(
+            output.status.success() && stdout.contains("test result: ok. 1 passed"),
+            "child seam check failed: {} {detail}",
             output.status
         );
     }

@@ -736,6 +736,11 @@ output::tests::privileged_sudo_output_reports_are_owned_by_the_invoker
 # passwd HOME/USER into the exec'd environment (needs only root and the
 # nobody account, no BPF).
 run::tests::privileged_spawned_child_home_matches_the_target_passwd_row
+# Startup-stop seam: with SIGINT inherited ignored, a stop landing in
+# the host probe is recorded and refused after discovery with the
+# typed startup interrupt, leaving no orphan temp; needs BPF for the
+# return-probe admission self-probe.
+run::tests::startup_stop_in_host_window_refuses_and_leaves_no_temp
 # Run-owned cgroup placement: creating a subgroup, moving a child into it
 # and proving the landing (needs only root and a cgroup v2 mount, no BPF).
 scope::tests::privileged_run_cgroup_place_moves_a_real_child

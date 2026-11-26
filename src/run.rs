@@ -31405,11 +31405,22 @@ int main(int argc, char **argv) {
         );
         // The opener wires whatever `open` returns, and the engine
         // keeps its single direct wiring with the exact shared flag.
+        // The engine call is a bare statement, so only an exact full
+        // line matches it: a dead branch reindents, a comment prefixes,
+        // and a fresh flag rewords — all fail. (Every other wiring is
+        // a `let` binding whose removal or commenting breaks compilation,
+        // or a watched constructor pinned behaviorally.)
         assert_eq!(count("set_cancel_flag("), 2, "direct wirings");
         assert_eq!(
-            count("engine.set_cancel_flag(interrupted.cancel_flag())"),
+            code.iter()
+                .filter(|line| {
+                    line.len() - line.trim_start().len() == 4
+                        && line.trim()
+                            == "engine.set_cancel_flag(interrupted.cancel_flag());"
+                })
+                .count(),
             1,
-            "engine wiring with the exact shared flag"
+            "engine wiring as one live statement with the exact shared flag"
         );
     }
 

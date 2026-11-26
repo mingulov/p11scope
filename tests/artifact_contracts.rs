@@ -12915,6 +12915,7 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
         watch: None,
         attached_at_ns: None,
         unobserved_windows: None,
+        coverage_retired_folded: None,
         first_attached_at_ns: None,
         first_attach_points: None,
         first_loaded_by: None,

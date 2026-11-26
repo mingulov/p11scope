@@ -1260,6 +1260,12 @@ pub struct DiscoveredModule {
     /// explicitly empty list reads as exact only with an R2-D1-6 proof.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unobserved_windows: Option<Vec<UnobservedWindow>>,
+    /// Mid-capture retires of this module folded into its last
+    /// `coverage_retired` window past the per-module window cap, merged at
+    /// evidence assembly. Present (0 when nothing folded) exactly when the
+    /// module has a counting-coverage retire window; absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coverage_retired_folded: Option<u64>,
     /// First complete attach instant, `CLOCK_MONOTONIC`, merged at evidence
     /// assembly: for each endpoint (the declared set under a watch, else
     /// every attach point of the module) the earliest real stamp over
@@ -8768,6 +8774,7 @@ pub(crate) mod tests {
             watch: None,
             attached_at_ns: None,
             unobserved_windows: None,
+            coverage_retired_folded: None,
             first_attached_at_ns: None,
             first_attach_points: None,
             first_loaded_by: None,

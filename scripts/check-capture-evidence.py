@@ -2837,8 +2837,9 @@ def semantic_join_eligible(function, module, *, has_manifest_object_fallback):
 def exact_prearm_keys(module):
     """Packet 6.13 additive keys: `watch`, `attached_at_ns`,
     `unobserved_windows`, plus the additive first-attach keys
-    `first_attached_at_ns` and `first_attach_points` and the learned
-    `first_loaded_by`. `watch` is pre-arm-only; present keys must match
+    `first_attached_at_ns` and `first_attach_points`, the learned
+    `first_loaded_by`, and the per-module `coverage_retired_folded`
+    count. `watch` is pre-arm-only; present keys must match
     their frozen shapes. The first-attach instant keeps its declared-set
     meaning (the latest endpoint's first attach) and never follows a known
     current attach; each point is the earliest stamp at its endpoint's file
@@ -2978,6 +2979,13 @@ def exact_prearm_keys(module):
                 and window["reason"] in ALLOWED_UNOBSERVED_REASONS,
                 f"invalid unobserved window: {module}",
             )
+    if "coverage_retired_folded" in module:
+        # Retires of this module folded into its last `coverage_retired`
+        # window past the per-module cap: a u64, 0 when none folded.
+        require(
+            u64(module["coverage_retired_folded"]),
+            f"invalid coverage_retired_folded: {module}",
+        )
     if "first_loaded_by" in module:
         by = module["first_loaded_by"]
         require(
@@ -5405,6 +5413,16 @@ def self_test():
     ):
         rejected(lambda bad=bad: exact_prearm_keys(dict(attach_module, **bad)))
     print("first attach keys survive a failed replacement and pin their shape: OK")
+    # The per-module folded retire count beside `coverage_retired`
+    # windows: a u64 (0 when nothing folded), never null, negative,
+    # fractional, boolean or a string.
+    for good in (0, 4, 2**64 - 1):
+        exact_prearm_keys(dict(attach_module, coverage_retired_folded=good))
+    for bad in (None, -1, 1.5, True, "4", 2**64):
+        rejected(
+            lambda bad=bad: exact_prearm_keys(dict(attach_module, coverage_retired_folded=bad))
+        )
+    print("coverage_retired_folded pins its u64 shape: OK")
     # The always-emitted standard-layout withheld count (ruling
     # 2026-11-11 clause 2): zero and nonzero ride the clean lane
     # without moving completeness, and malformed values are refused

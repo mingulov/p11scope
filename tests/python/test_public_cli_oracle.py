@@ -880,6 +880,44 @@ class RunnerNoiseTests(unittest.TestCase):
             result = self.run_case_mt_system(mutate, want=1, cell=cell)
             self.assertIn("exact terminal verdict", result["detail"])
 
+    # Retire-window lane r2: trace cells (mt-system-trace among them)
+    # return before the profile/metrics typed check, so trace_judge
+    # carries its own typed retired-slot check. The fixtures keep an
+    # exact observation, so only that check can refuse them.
+    @staticmethod
+    def trace_stream(evidence_update=None, drop=()):
+        calls = ["00:00:01.%06d pid 7 tid 7 C_Digest -> CKR_OK 3.0us" % index
+                 for index in range(2)]
+        evidence = {key: 0 for key in runpy.run_path(str(ORACLE))["LOSS_COUNTERS"]}
+        evidence.update({
+            "coverage_retired_slots": 0,
+            "gap_classes": {"observation": {"status": "exact", "causes": []}},
+            "drain_proven": True, "final_drain": True,
+            "completeness": "COMPLETE", "verdict_detail": "clean_proven",
+            "trace_truncated": False, "semantic_capture_failures": 0})
+        evidence.update(evidence_update or {})
+        for key in drop:
+            del evidence[key]
+        counts = {"stats_entered": 2, "stats_returned": 2, "raw_calls": 2}
+        return "\n".join(["CAPTURE privacy=allowlisted", *calls,
+                          "COUNT_EVIDENCE " + json.dumps(counts),
+                          "EVIDENCE " + json.dumps(evidence)]) + "\n"
+
+    def test_trace_judge_exact_stream_passes(self):
+        oracle = runpy.run_path(str(ORACLE))
+        oracle["trace_judge"](self.trace_stream(), {"C_Digest": 2})
+
+    def test_trace_judge_refuses_a_retired_slot_count(self):
+        oracle = runpy.run_path(str(ORACLE))
+        for bad, drop in (({"coverage_retired_slots": 1}, ()),
+                          ({"coverage_retired_slots": True}, ()),
+                          ({"coverage_retired_slots": "0"}, ()),
+                          ({}, ("coverage_retired_slots",))):
+            with self.subTest(bad=bad, drop=drop):
+                with self.assertRaisesRegex(oracle["EvidenceError"],
+                                            "trace counting coverage retired mid-capture"):
+                    oracle["trace_judge"](self.trace_stream(bad, drop), {"C_Digest": 2})
+
     def test_exact_with_noise_passes_when_allowed(self):
         def mutate(d, l, r):
             d["evidence"]["pid_descendant_gaps"] = 1

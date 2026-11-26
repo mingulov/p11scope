@@ -126,9 +126,13 @@ versioned separately and are opaque, exact dispatch keys.
   narrowing the capture: when an attached counting slot retires
   mid-capture (a `run` member exits, a scope detaches), the
   affected records carry a `coverage_retired` unobserved window
-  and `evidence.coverage_retired_slots` counts the retired slots.
-  Run-tree retire windows attribute to the member that actually
-  retired.
+  and `evidence.coverage_retired_slots` counts the distinct retired
+  probe points. Run-tree retire windows attribute to the member that
+  actually retired. A retire whose every mapper provably exited
+  discloses nothing unless a process is later seen mapping the
+  provider. Each module keeps at most 8 windows; later
+  retires fold into the last one and count in the record's
+  `coverage_retired_folded`.
 - Key-operations watchdog recovery is now scoped to the stuck
   session: a transient audit refusal or an audit no-progress trip on
   a running lane discards only the stuck session's staged calls,

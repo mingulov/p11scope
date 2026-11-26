@@ -1353,12 +1353,15 @@ impl Engine {
                     .any(|queued| (queued.dev, queued.ino) == *identity)
                     && self.provider_object_attached(*identity, session)
             });
+        // Per identity: a superseded provider refuses only while that
+        // provider itself has no live probe. Another provider still
+        // pending, or a queued learned retry of this one, never turns an
+        // attached superseded provider into a refusal.
         let refused = hard_refused
-            || (!attached_now
-                && held
-                    .providers
-                    .iter()
-                    .any(|identity| self.stop_staged_key_superseded(*identity)));
+            || held.providers.iter().any(|identity| {
+                self.stop_staged_key_superseded(*identity)
+                    && !self.provider_object_attached(*identity, session)
+            });
         let attached = !refused && attached_now;
         HoldState {
             departed,
@@ -1386,9 +1389,11 @@ impl Engine {
     }
 
     /// Whether a stop-staged identity's maps key has been superseded
-    /// since its staging (a same-file generation rotation evicted the
-    /// staged pin): the hold's staged generation can never attach, so
-    /// it ends refused while the fresh generation races on. Reads the
+    /// since its staging (a same-file generation rotation re-proved the
+    /// staged object's pin in place). The rotated object can still
+    /// attach, but not within the hold's 1 s bound reliably under churn:
+    /// a hold on it ends refused while that provider has no live probe,
+    /// with its first-use row, instead of riding the bound. Reads the
     /// committed markers plus the bind-harvested pending set, so
     /// supersedes that never commit (a stalled candidate pipeline)
     /// still refuse. Unrecorded identities keep the bound backstop.

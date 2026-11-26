@@ -98765,6 +98765,86 @@ fn member_stop_superseded_key_attaches_once_proven() {
     );
 }
 
+/// The superseded refusal is judged per provider identity: a hold whose
+/// superseded provider is really attached never ends refused because a
+/// learned retry of that identity is still queued (common under churn).
+/// The queued retry only keeps the hold waiting; once it drains, the
+/// hold ends attached.
+#[test]
+fn member_stop_superseded_attached_provider_with_queued_retry_never_refuses() {
+    let (fixture, view, module, _pins) = loaded_seed_provider();
+    let pid = fixture.child.id();
+    let library = fixture._dir.path().join("seed-provider.so");
+    touch_for_test(&library, 1_000_000);
+    stop_member_for_test(pid);
+    let key = member_exec_key_for_test(pid, &library);
+    let mut io = ScriptedMemberStops::default();
+    io.rows.insert(pid, member_stop_row(pid, &library, key));
+    let mut engine = member_stop_engine();
+    engine.pause_owned_batch = true;
+    let mut session = attaching_session();
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    assert_eq!(engine.learned_staged_files_for_test(), 1);
+    let staged_key = engine
+        .prearm_input
+        .as_ref()
+        .and_then(|prearm| prearm.inputs.first().map(|input| input.key))
+        .expect("staging records its key");
+    touch_for_test(&library, 2_000_000);
+    let mut budget = CaptureWorkBudget::default();
+    let (scan2, _scan_skips) =
+        pin_scanned_view_objects(&view, std::slice::from_ref(&module), &mut budget).unwrap();
+    let mut working = engine.pinned.clone();
+    assert!(working.absorb(scan2).is_empty());
+    assert!(working.supersedes(staged_key), "the rotation is recorded");
+    let _candidate = engine.live_candidate_with_pending(
+        working,
+        vec![module],
+        Vec::new(),
+        None,
+        &std::collections::BTreeSet::new(),
+        &std::collections::BTreeSet::new(),
+        &std::collections::BTreeSet::new(),
+    );
+    assert!(engine.pending_superseded_keys.contains(&staged_key));
+    engine.pause_owned_batch = false;
+    engine.apply_learned_staging(&mut session);
+    assert!(!engine.learned_unapplied, "the staging applied");
+    // A learned retry of the same identity is still queued.
+    let file = std::fs::File::open(&library).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    engine
+        .pending_learned
+        .push(crate::fanotify::LearnedCandidate {
+            file,
+            dev,
+            ino,
+            display_path: library.to_string_lossy().into_owned(),
+            loader_exe: None,
+            loader_unknown_reason: Some("test"),
+            run_learned: false,
+            proving_retained: false,
+        });
+    engine.service_member_stops(&mut io, &mut session, Some(20));
+    let stats = engine.member_stop_stats_for_test();
+    assert_eq!(
+        stats.refused_resumes, 0,
+        "an attached superseded provider never refuses: {stats:?}"
+    );
+    assert!(
+        engine.member_stops_held(),
+        "the queued retry keeps the hold waiting"
+    );
+    engine.pending_learned.clear();
+    engine.service_member_stops(&mut io, &mut session, Some(30));
+    assert!(!engine.member_stops_held(), "the hold resolves");
+    let stats = engine.member_stop_stats_for_test();
+    assert_eq!(stats.attached_resumes, 1, "{stats:?}");
+    assert_eq!(stats.refused_resumes, 0, "{stats:?}");
+    assert_eq!(stats.timed_out, 0, "{stats:?}");
+    assert!(member_resumed_for_test(pid), "the member runs again");
+}
+
 /// The churn seam end to end (df2401d80's path): a file-changed HIT
 /// requeues, the retry stages generation 1, a scan observes generation
 /// 2, and the bind keeps the module — across a second rotation the same

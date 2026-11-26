@@ -4580,16 +4580,18 @@ impl PinnedObjects {
         let raw = RawObjectInstance::scanned(module, key, path)?;
         if !crate::discovery::engine::Engine::is_process_generation_view(module.view) {
             // Reserved views (re-owned carriers, run-learned tables,
-            // the probationary sentinel) name no live generation, so
-            // the proof fence below cannot apply to them: resolving
-            // one asks which object its file is (coverage, reclaim
-            // candidacy, rebinding a decided row), never whether a
-            // live view proved it. The fence would refuse every such
-            // row that shares its file with a live row. Raw identity
-            // is the whole question, and an unmapped raw still
-            // resolves nowhere. The allocator mints sequential ids
-            // under view capacity, so no live or scanned view can
-            // hold these ids and ride this arm.
+            // the probationary sentinel) bypass the proof fence
+            // below: resolving one asks which object its file is
+            // (coverage, reclaim candidacy, rebinding a decided row),
+            // never whether a live view proved it. The fence would
+            // refuse every such row that shares its file with a live
+            // row. Raw identity is the whole question, and an
+            // unmapped raw still resolves nowhere. The probationary
+            // sentinel is itself a generation pin, but verdict-only:
+            // its probe files nothing and resolves no ids. The
+            // allocator mints sequential ids under view capacity, so
+            // no live or scanned view can hold these ids and ride
+            // this arm.
             return self.raw_to_id.get(&raw).copied();
         }
         if self

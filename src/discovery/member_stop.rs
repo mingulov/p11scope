@@ -1998,6 +1998,10 @@ mod tests {
             "the old key resolves nothing after the move"
         );
         assert_eq!(state.staged_identities_for_key(key2), vec![(0, 1)]);
+        assert!(
+            !state.staged_by_key.contains_key(&key),
+            "the emptied old key leaves no reverse entry"
+        );
     }
 
     /// Reverse lookup resolves at a full staged map: the first and

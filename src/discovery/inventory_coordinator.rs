@@ -6235,7 +6235,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         recovery.discarded_through = recovery.watermark;
         self.flush_withheld_prefix(key, &mut recovery, DiagnosticReason::IdentityChanged);
         if live_same_caller {
+            // The Dropped base remembers attributed or disclosed
+            // history: never below the flushed watermark, so a later
+            // revival rebinds past the disclosed range instead of
+            // attributing it again.
             let (base, base_since) = self.pair_drop_base(&key);
+            let base = base.max(recovery.watermark);
             let _ = self.take_pruned_pair_base(&key);
             self.pair_targets
                 .insert(key, PairTarget::Dropped { base, base_since });
@@ -28538,9 +28543,9 @@ exit 0
             assert!(
                 matches!(
                     native.scene.coordinator.pair_targets.get(&key),
-                    Some(PairTarget::Dropped { base: 10, .. })
+                    Some(PairTarget::Dropped { base: 16, .. })
                 ),
-                "the dropped base lands exactly for {key:?}"
+                "the dropped base covers the disclosed range for {key:?}"
             );
         }
     }
@@ -29047,9 +29052,9 @@ exit 0
         assert!(
             matches!(
                 native.scene.coordinator.pair_targets.get(&key),
-                Some(PairTarget::Dropped { base: 10, .. })
+                Some(PairTarget::Dropped { base: 16, .. })
             ),
-            "the dead caller's target drops"
+            "the dead caller's target drops past the disclosed range"
         );
     }
 

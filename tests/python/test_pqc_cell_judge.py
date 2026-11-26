@@ -323,21 +323,30 @@ def verbose(sizes):
     return "\n".join(lines) + "\n"
 
 
-def run_judge(sizes_inv, sizes_text, nosizes_inv, nosizes_text,
-              sizes_log=TRUTH_LOG, nosizes_log=TRUTH_LOG,
-              sizes_exit="0", nosizes_exit="0",
-              sizes_inventory_exit="0", nosizes_inventory_exit="0"):
-    """Run the judge CLI on fabricated legs; return (rc, summary)."""
+def run_judge_full(sizes_inv, sizes_text, nosizes_inv, nosizes_text,
+                   sizes_log=TRUTH_LOG, nosizes_log=TRUTH_LOG,
+                   sizes_exit="0", nosizes_exit="0",
+                   sizes_inventory_exit="0", nosizes_inventory_exit="0",
+                   missing=()):
+    """Run the judge CLI on fabricated legs; return (rc, summary, rows).
+
+    `missing` names tmp files to leave unwritten (e.g. "sizes.json")
+    to simulate unreadable inputs; `rows` is the parsed results.jsonl
+    (None when the judge wrote none).
+    """
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
-        (tmp / "sizes.log").write_text(sizes_log, encoding="utf-8")
-        (tmp / "nosizes.log").write_text(nosizes_log, encoding="utf-8")
-        (tmp / "sizes.json").write_text(json.dumps(sizes_inv),
-                                        encoding="utf-8")
-        (tmp / "nosizes.json").write_text(json.dumps(nosizes_inv),
-                                          encoding="utf-8")
-        (tmp / "sizes.txt").write_text(sizes_text, encoding="utf-8")
-        (tmp / "nosizes.txt").write_text(nosizes_text, encoding="utf-8")
+        payloads = {
+            "sizes.log": sizes_log,
+            "nosizes.log": nosizes_log,
+            "sizes.json": json.dumps(sizes_inv),
+            "nosizes.json": json.dumps(nosizes_inv),
+            "sizes.txt": sizes_text,
+            "nosizes.txt": nosizes_text,
+        }
+        for name, payload in payloads.items():
+            if name not in missing:
+                (tmp / name).write_text(payload, encoding="utf-8")
         argv = [sys.executable, "-I", str(JUDGE),
                "--sizes-log", str(tmp / "sizes.log"),
                "--sizes-exit", sizes_exit,
@@ -353,7 +362,47 @@ def run_judge(sizes_inv, sizes_text, nosizes_inv, nosizes_text,
                "--out-summary", str(tmp / "summary.txt")]
         completed = subprocess.run(argv, capture_output=True, text=True,
                                    timeout=60)
-        return completed.returncode, completed.stdout
+        rows = None
+        results = tmp / "results.jsonl"
+        if results.exists():
+            rows = [json.loads(line) for line in
+                    results.read_text(encoding="utf-8").splitlines()
+                    if line.strip()]
+        return completed.returncode, completed.stdout, rows
+
+
+def run_judge(sizes_inv, sizes_text, nosizes_inv, nosizes_text,
+              sizes_log=TRUTH_LOG, nosizes_log=TRUTH_LOG,
+              sizes_exit="0", nosizes_exit="0",
+              sizes_inventory_exit="0", nosizes_inventory_exit="0"):
+    """Run the judge CLI on fabricated legs; return (rc, summary)."""
+    rc, summary, _rows = run_judge_full(
+        sizes_inv, sizes_text, nosizes_inv, nosizes_text,
+        sizes_log=sizes_log, nosizes_log=nosizes_log,
+        sizes_exit=sizes_exit, nosizes_exit=nosizes_exit,
+        sizes_inventory_exit=sizes_inventory_exit,
+        nosizes_inventory_exit=nosizes_inventory_exit)
+    return rc, summary
+
+
+def result_for(rows, cell):
+    """The one result row for a cell name."""
+    found = [row for row in rows if row["cell"] == cell]
+    assert len(found) == 1, f"want one {cell} row"
+    return found[0]
+
+
+def populated_inventory(sizes):
+    """A loss-free leg inventory: populated status, no gaps, clean
+    budgets, the session closed (not lost)."""
+    inv = inventory(sizes)
+    oo = inv["object_observations"]
+    oo["status"] = "populated"
+    oo["reason"] = "none"
+    oo["sessions"] = [{"session": 1, "origin": "opened",
+                       "status": "closed"}]
+    oo["gaps"] = {"rows": [], "suppressed": 0}
+    return inv
 
 
 def relabel(inv, text, sizes, operation, old, new):
@@ -1090,6 +1139,131 @@ class JudgeTwins(unittest.TestCase):
         self.assertEqual(rc, 1, summary)
         self.assertIn("pqc-sizes-rows: FAIL", summary)
         self.assertIn("length set", summary)
+
+    def test_missing_inventory_fails_leg(self):
+        # The unreadable-inventory guard: without its fail.add the
+        # leg returns early with no problems recorded and passes.
+        rc, summary, _rows = run_judge_full(
+            inventory(True), verbose(True),
+            inventory(False), verbose(False),
+            missing=("sizes.json",))
+        self.assertEqual(rc, 1, summary)
+        self.assertIn("pqc-sizes-rows: FAIL", summary)
+        self.assertIn("pqc-nosizes-rows: PASS", summary)
+        self.assertIn("unreadable", summary)
+
+    def test_judge_error_fails_leg_with_results(self):
+        # The judge-error catch: a malformed edge must fail loudly
+        # with results still written, never as a bare traceback
+        # with no results file.
+        inv = copy.deepcopy(inventory(True))
+        inv["semantic_edges"] = [42]
+        rc, summary, rows = run_judge_full(
+            inv, verbose(True), inventory(False), verbose(False))
+        self.assertEqual(rc, 1, summary)
+        self.assertIn("pqc-sizes-rows: FAIL", summary)
+        self.assertIn("judge error", summary)
+        self.assertIsNotNone(rows)
+        self.assertFalse(result_for(rows, "pqc-sizes-rows")["pass"])
+        self.assertTrue(result_for(rows, "pqc-nosizes-rows")["pass"])
+
+    def test_partial_leg_reports_partial_qualification(self):
+        # The healthy cell discloses partial/authority_lost with an
+        # outcome_lost gap: the rows stay exact (PASS) but the run
+        # is partial, with the typed reason.
+        rc, summary, rows = run_judge_full(
+            inventory(True), verbose(True),
+            inventory(False), verbose(False))
+        self.assertEqual(rc, 0, summary)
+        for cell in ("pqc-workload-truth", "pqc-sizes-rows",
+                     "pqc-nosizes-rows"):
+            found = result_for(rows, cell)
+            self.assertTrue(found["pass"], summary)
+            self.assertEqual(found["qualification"], "partial",
+                             summary)
+        self.assertIn("authority_lost",
+                      result_for(rows, "pqc-sizes-rows")["detail"])
+
+    def test_populated_leg_reports_qualified(self):
+        # A loss-free run (populated status, no gaps, clean
+        # budgets) is the only shape that qualifies.
+        rc, summary, rows = run_judge_full(
+            populated_inventory(True), verbose(True),
+            populated_inventory(False), verbose(False))
+        self.assertEqual(rc, 0, summary)
+        for cell in ("pqc-workload-truth", "pqc-sizes-rows",
+                     "pqc-nosizes-rows"):
+            found = result_for(rows, cell)
+            self.assertTrue(found["pass"], summary)
+            self.assertEqual(found["qualification"], "qualified",
+                             summary)
+
+    def test_edge_loss_reports_partial_qualification(self):
+        # A lossy semantic edge (beyond the expected setup
+        # boundary) makes its leg partial; the clean leg stays
+        # qualified while the run-joining truth row goes partial.
+        inv = populated_inventory(True)
+        inv["semantic_edges"][0]["coverage"] = {
+            "lossy": True, "reasons": ["semantic_loss"]}
+        rc, summary, rows = run_judge_full(
+            inv, verbose(True),
+            populated_inventory(False), verbose(False))
+        self.assertEqual(rc, 0, summary)
+        found = result_for(rows, "pqc-sizes-rows")
+        self.assertTrue(found["pass"], summary)
+        self.assertEqual(found["qualification"], "partial", summary)
+        self.assertIn("semantic_loss", found["detail"])
+        self.assertEqual(result_for(
+            rows, "pqc-nosizes-rows")["qualification"],
+            "qualified", summary)
+        self.assertEqual(result_for(
+            rows, "pqc-workload-truth")["qualification"],
+            "partial", summary)
+
+    def test_setup_coverage_stays_qualified(self):
+        # The expected pre-admission setup calls
+        # (before_semantic_boundary) are harmless disclosure, not
+        # loss: a run carrying only them still qualifies.
+        inv = populated_inventory(True)
+        inv["semantic_edges"][0]["coverage"] = {
+            "lossy": False, "reasons": ["before_semantic_boundary"]}
+        rc, summary, rows = run_judge_full(
+            inv, verbose(True),
+            populated_inventory(False), verbose(False))
+        self.assertEqual(rc, 0, summary)
+        for cell in ("pqc-workload-truth", "pqc-sizes-rows",
+                     "pqc-nosizes-rows"):
+            self.assertEqual(result_for(rows, cell)["qualification"],
+                             "qualified", summary)
+
+    def test_budget_refusal_reports_partial_qualification(self):
+        # Refused rows are omitted associations: the leg passes on
+        # its exact rows but reports partial with the typed budget.
+        inv = populated_inventory(True)
+        inv["object_observations"]["budgets"]["key_rows"]["refused"] = 2
+        rc, summary, rows = run_judge_full(
+            inv, verbose(True),
+            populated_inventory(False), verbose(False))
+        self.assertEqual(rc, 0, summary)
+        found = result_for(rows, "pqc-sizes-rows")
+        self.assertTrue(found["pass"], summary)
+        self.assertEqual(found["qualification"], "partial", summary)
+        self.assertIn("budget/key_rows_refused", found["detail"])
+
+    def test_suppressed_gaps_report_partial_qualification(self):
+        # Suppressed gap rows hide loss detail the judge cannot
+        # audit: the leg passes on its exact rows but reports
+        # partial.
+        inv = populated_inventory(True)
+        inv["object_observations"]["gaps"]["suppressed"] = 3
+        rc, summary, rows = run_judge_full(
+            inv, verbose(True),
+            populated_inventory(False), verbose(False))
+        self.assertEqual(rc, 0, summary)
+        found = result_for(rows, "pqc-sizes-rows")
+        self.assertTrue(found["pass"], summary)
+        self.assertEqual(found["qualification"], "partial", summary)
+        self.assertIn("gap/suppressed", found["detail"])
 
 
 if __name__ == "__main__":

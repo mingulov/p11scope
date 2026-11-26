@@ -107,6 +107,20 @@ class CheckCellResultsTests(unittest.TestCase):
                                   "counts match; disclosed 6.6 discovery gap")])
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_partial_qualification_accepted(self):
+        result = run_checker([row("pqc-sizes-rows", True, "partial",
+                                  "partial (status/partial/authority_lost): "
+                                  "12 key rows carry exact roles")])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("PASS pqc-sizes-rows", result.stdout)
+
+    def test_partial_failure_fails(self):
+        result = run_checker([row("pqc-sizes-rows", False, "partial",
+                                  "sizes: inventory.json unreadable")])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("failed qualified cell pqc-sizes-rows",
+                      result.stderr)
+
     def test_ambient_burst_qualification_rejected(self):
         # The oracle no longer emits the burst label (evidence-only
         # census since the pdg-harden holdouts): the checker's closed

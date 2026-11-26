@@ -837,7 +837,6 @@ fn snapshot_events_and_dashboard_agree_on_a_repeated_gap() {
                 subject: "overlay collapse".into(),
                 reason: "two overlay instances map one inode".into(),
                 budget: None,
-
                 units: None,
             });
         if pass == 9 {
@@ -851,7 +850,6 @@ fn snapshot_events_and_dashboard_agree_on_a_repeated_gap() {
                     subject: "distinct".into(),
                     reason: "seen once".into(),
                     budget: None,
-
                     units: None,
                 });
         }

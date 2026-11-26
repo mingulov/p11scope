@@ -7288,7 +7288,6 @@ fn demotion_retirement_round5_lifetime_callers_with_calls_fold_past_the_budget()
                     subject: "test fold gap".into(),
                     reason: "names a caller the fold retires".into(),
                     budget: None,
-
                     units: None,
                 },
             );

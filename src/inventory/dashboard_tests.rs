@@ -1840,8 +1840,8 @@ fn observed_presentation() -> Presentation {
         subject: "detail probe gap".into(),
         reason: "the gaps page must show this row verbatim even when it wraps across two eighty-column terminal lines".into(),
         budget: None,
-
-        units: None,});
+        units: None,
+    });
     harness.commit();
     capture_presentation(&harness)
 }
@@ -1961,7 +1961,6 @@ fn gaps_page_lists_gaps_that_name_no_edge() {
             limit: 3,
             requested: 4,
         }),
-
         units: None,
     });
     harness.commit();
@@ -2024,7 +2023,6 @@ fn dashboard_gap_scroll_survives_redraw() {
                     subject: format!("gap probe {index}"),
                     reason: format!("retained gap {index} of the redraw-clamp probe"),
                     budget: None,
-
                     units: None,
                 });
         }
@@ -2110,7 +2108,6 @@ fn gaps_page_exposes_multiframe_gap_at_80x14() {
             subject: "tall probe gap".into(),
             reason: reason.clone(),
             budget: None,
-
             units: None,
         });
     harness
@@ -2123,7 +2120,6 @@ fn gaps_page_exposes_multiframe_gap_at_80x14() {
             subject: "short trailer gap".into(),
             reason: "the record after the tall one".into(),
             budget: None,
-
             units: None,
         });
     harness.commit();
@@ -2273,7 +2269,6 @@ fn gap_continuation_offset_clamps_after_reflow_or_shrink() {
                 subject: subject.into(),
                 reason: reason.into(),
                 budget: None,
-
                 units: None,
             });
     }
@@ -2394,7 +2389,6 @@ fn each_detail_page_scrolls_its_own_items_with_clamped_ranges() {
             subject: "detail probe gap".into(),
             reason: "one gap".into(),
             budget: None,
-
             units: None,
         });
     harness.commit();

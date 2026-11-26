@@ -2276,7 +2276,6 @@ fn snapshot_gap_lines_escape_target_controlled_control_characters() {
                 subject: hostile_subject.into(),
                 reason: hostile_reason.into(),
                 budget,
-
                 units: None,
             });
     }
@@ -2335,7 +2334,6 @@ fn verbose_details_renders_identical_size_gaps_unfolded() {
                 subject: "/opt/google/chrome/chrome".into(),
                 reason: reason.into(),
                 budget: None,
-
                 units: None,
             });
     }
@@ -2376,7 +2374,6 @@ fn verbose_details_fold_leaves_lone_and_non_size_gaps_alone() {
             subject: "/opt/big.so".into(),
             reason: reason.into(),
             budget: None,
-
             units: None,
         });
     for pid in [1002u32, 1003] {
@@ -2390,7 +2387,6 @@ fn verbose_details_fold_leaves_lone_and_non_size_gaps_alone() {
                 subject: "/opt/other.so".into(),
                 reason: "some other refusal".into(),
                 budget: None,
-
                 units: None,
             });
     }
@@ -2437,7 +2433,6 @@ fn verbose_details_fold_leaves_budgeted_size_gaps_unfolded() {
                     limit: 1,
                     requested: 2,
                 }),
-
                 units: None,
             });
     }
@@ -2474,8 +2469,8 @@ fn snapshot_merged_rearm_gap_row_shows_its_repeat_count() {
         subject: crate::inventory_semantics::RUNNING_REARM_SUBJECT.into(),
         reason: "semantic_unavailable; processes already running keep exact call counts but lose per-key rows for the rest of the run; processes started later are tracked".into(),
         budget: None,
-
-        units: None,};
+        units: None,
+    };
     for _ in 0..5 {
         harness
             .coordinator_mut()
@@ -3634,7 +3629,6 @@ fn quiet_summary_omits_gap_lines_while_json_keeps_every_gap() {
                 subject: subject.into(),
                 reason: format!("{subject} reason"),
                 budget,
-
                 units: None,
             });
     }
@@ -3711,7 +3705,6 @@ fn partial_results_with_gaps_exit_zero_while_a_failed_sink_exits_one() {
             subject: "partial coverage gap".into(),
             reason: "partial coverage gap reason".into(),
             budget: None,
-
             units: None,
         });
     harness.commit();

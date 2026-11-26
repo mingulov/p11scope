@@ -18126,7 +18126,6 @@ mod tests {
                 subject: "overlay collapse".into(),
                 reason: "two overlay instances map one inode".into(),
                 budget: None,
-
                 units: None,
             });
             if pass == 2 {
@@ -18137,7 +18136,6 @@ mod tests {
                     subject: "once".into(),
                     reason: "only on pass 2".into(),
                     budget: None,
-
                     units: None,
                 });
             }
@@ -18233,7 +18231,6 @@ mod tests {
                 subject: "steady".into(),
                 reason: "every pass".into(),
                 budget: None,
-
                 units: None,
             });
             coordinator.commit_batch(false).unwrap();
@@ -34864,7 +34861,6 @@ mod module_init_render_tests {
                 subject: subject.into(),
                 reason: "test loss".into(),
                 budget: None,
-
                 units: None,
             });
             coordinator.registry_mut().publish();

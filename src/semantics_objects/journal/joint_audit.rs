@@ -2901,7 +2901,6 @@ impl IngestedJointQuantum {
                         subject: FALLBACK_FENCED_SUBJECT.to_string(),
                         reason: decision.gap_reason(units as u64),
                         budget: None,
-
                         units: None,
                     });
                 }
@@ -2963,8 +2962,8 @@ impl IngestedJointQuantum {
                             units,
                         ),
                         budget: None,
-
-                        units: None,});
+                        units: None,
+                    });
                 }
                 // Diagnostic-only (scope round): the void above ended a
                 // Joint feed. One void fanning out to many feeds counts

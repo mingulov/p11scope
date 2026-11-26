@@ -1827,7 +1827,6 @@ fn name_refused_image_binding(
             subject: crate::inventory_present::JOINT_BIRTH_UNAVAILABLE_SUBJECT.into(),
             reason: JOINT_IMAGE_REFUSED.into(),
             budget: None,
-
             units: None,
         });
     }
@@ -1880,7 +1879,6 @@ fn consume_current_admission<Source: ProcessSource>(
             subject: "semantic admission refused".into(),
             reason: code,
             budget: None,
-
             units: None,
         });
         if matches!(
@@ -1897,7 +1895,6 @@ fn consume_current_admission<Source: ProcessSource>(
                 subject: format!("semantic provider file {requested_file} admission refused"),
                 reason: reason.code().into(),
                 budget: None,
-
                 units: None,
             });
         }
@@ -2650,7 +2647,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             subject: "semantic admission deferred".into(),
             reason: reason.to_string(),
             budget: None,
-
             units: None,
         });
     }
@@ -2663,7 +2659,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             subject: "semantic admission refused".into(),
             reason: reason.into(),
             budget: None,
-
             units: None,
         });
     }
@@ -2699,7 +2694,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             subject: "semantic scan refused".into(),
             reason,
             budget: None,
-
             units: None,
         });
     }
@@ -2973,7 +2967,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                      the batch was refused through the audited path"
                     .into(),
                 budget: None,
-
                 units: None,
             });
             self.stash_drop_shed(&batch, "ended_domain");
@@ -2997,8 +2990,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 subject: "semantic batch refused for another Session".into(),
                 reason: "the retained Session has not completed; another domain cannot stage or change its finalizer namespace".into(),
                 budget: None,
-
-                units: None,});
+                units: None,
+            });
             return;
         }
         let backpressure = namespace.pending_semantic.is_some();
@@ -3026,7 +3019,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                      finalize and publish before another semantic collection"
                     .into(),
                 budget: None,
-
                 units: None,
             });
             self.record_semantic_drop(&batch);
@@ -3095,7 +3087,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             subject: "reload disclosure identities shed".into(),
             reason,
             budget: None,
-
             units: None,
         });
     }
@@ -3257,7 +3248,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         subject: "semantic collection refused".into(),
                         reason: reason.code().into(),
                         budget: None,
-
                         units: None,
                     });
                 }
@@ -3403,7 +3393,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 self.semantic_bindings.len()
             ),
             budget: None,
-
             units: None,
         });
         lane.note_shed_calls(total);
@@ -3431,7 +3420,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                  (kernel reserve failures; exact count in events_lost)"
                 .into(),
             budget: None,
-
             units: None,
         });
     }
@@ -3457,8 +3445,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 reason: "the EVENTS ring-loss counter could not be read; events_lost may undercount until a later good read restores the exact cumulative total"
                     .into(),
                 budget: None,
-
-                units: None,});
+                units: None,
+            });
         }
     }
 
@@ -3615,7 +3603,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                              batch was dropped through the audited path"
                             .into(),
                         budget: None,
-
                         units: None,
                     });
                     self.record_semantic_drop(&dropped);
@@ -3697,7 +3684,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                          uncertainty stands without a semantic cut"
                         .into(),
                     budget: None,
-
                     units: None,
                 });
                 continue;
@@ -3812,7 +3798,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                                  dropped through the audited path"
                                 .into(),
                             budget: None,
-
                             units: None,
                         });
                     }
@@ -3832,7 +3817,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                                  in this domain refuses permanently"
                                 .into(),
                             budget: None,
-
                             units: None,
                         });
                     }
@@ -3863,8 +3847,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 subject: "semantic finalizer refused another Session".into(),
                 reason: "the retained Session must complete before a fresh H0 namespace can be installed".into(),
                 budget: None,
-
-                units: None,});
+                units: None,
+            });
             return;
         }
         // Stashed drop shed flushes on the matching lane only: a foreign
@@ -3914,7 +3898,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                      the batch was refused through the audited path"
                     .into(),
                 budget: None,
-
                 units: None,
             });
             let counted = unjoined_shed_counts(batch.outcomes());
@@ -3940,7 +3923,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                      through the audited path without staging"
                     .into(),
                 budget: None,
-
                 units: None,
             });
             self.record_semantic_drop(&batch);
@@ -4048,7 +4030,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         subject: "semantic receipt refused".into(),
                         reason: code.into(),
                         budget: None,
-
                         units: None,
                     });
                 }
@@ -4087,7 +4068,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         subject: "semantic collection refused".into(),
                         reason: reason.code().into(),
                         budget: None,
-
                         units: None,
                     });
                 }
@@ -4477,7 +4457,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     limit: MAX_INSTANCES,
                     requested: MAX_INSTANCES + shed_calls,
                 }),
-
                 units: None,
             });
         }
@@ -4535,8 +4514,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     self.semantic_bindings.len()
                 ),
                 budget: None,
-
-                units: None,});
+                units: None,
+            });
         }
         // Validated registrations second: every covered id registers.
         // Conversion borrows end before staging mutates the registry.
@@ -4792,7 +4771,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             subject: "semantic input refused".into(),
             reason: reason.code().into(),
             budget: None,
-
             units: None,
         });
     }

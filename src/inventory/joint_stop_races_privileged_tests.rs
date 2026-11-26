@@ -5398,7 +5398,6 @@ fn seal_cell_across_stop(force_shed: bool) -> Result<()> {
             subject: history_subject,
             reason: "joint_pregrant_nonadmission_history_loss calls=1".to_string(),
             budget: None,
-
             units: None,
         };
         ensure!(
@@ -6027,7 +6026,6 @@ fn seal_cell_across_stop(force_shed: bool) -> Result<()> {
                 subject: history_subject.clone(),
                 reason: "joint_seal_bootstrap_mismatch_fallback".to_string(),
                 budget: None,
-
                 units: None,
             })
             .collect();

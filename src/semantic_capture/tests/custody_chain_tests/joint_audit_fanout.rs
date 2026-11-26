@@ -22126,7 +22126,6 @@ fn watchdog_rearm_loss_under_a_full_gap_cap_is_counted_not_named() {
                 subject: format!("gap-pressure-filler-{n}"),
                 reason: format!("filler row {n}"),
                 budget: None,
-
                 units: None,
             });
         }
@@ -22284,7 +22283,6 @@ fn watchdog_park_loss_under_a_full_gap_cap_is_counted_not_named() {
                 subject: format!("gap-pressure-filler-{n}"),
                 reason: format!("filler row {n}"),
                 budget: None,
-
                 units: None,
             });
         }

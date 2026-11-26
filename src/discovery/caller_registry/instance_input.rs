@@ -2611,7 +2611,6 @@ impl CallerRegistry {
                     subject: crate::inventory_present::JOINT_BIRTH_UNAVAILABLE_SUBJECT.into(),
                     reason: "joint_birth_original_mismatch".into(),
                     budget: None,
-
                     units: None,
                 });
             }
@@ -2739,7 +2738,6 @@ impl CallerRegistry {
                 subject: crate::inventory_present::JOINT_REENTRY_SUBJECT.into(),
                 reason: "joint_reentry_stuck_degraded".into(),
                 budget: None,
-
                 units: None,
             });
         }
@@ -2873,7 +2871,6 @@ impl CallerRegistry {
                 .into(),
             reason: "joint_journal_unavailable".into(),
             budget: None,
-
             units: None,
         });
     }
@@ -4218,7 +4215,6 @@ impl CallerRegistry {
             subject: "instance semantics refused".into(),
             reason: reason.label().into(),
             budget,
-
             units: None,
         });
     }
@@ -4352,7 +4348,6 @@ impl CallerRegistry {
                                     .into(),
                                 reason: "joint_birth_reseed_session_unhealthy".into(),
                                 budget: None,
-
                                 units: None,
                             });
                         } else {
@@ -4381,7 +4376,6 @@ impl CallerRegistry {
                                             crate::inventory_present::JOINT_REENTRY_COMPLETED_REASON
                                                 .into(),
                                         budget: None,
-
                                         units: None,
                                     });
                                 }
@@ -4413,8 +4407,8 @@ impl CallerRegistry {
                                             .into(),
                                     reason: reason.into(),
                                     budget: None,
-
-                                    units: None,});
+                                    units: None,
+                                });
                                 }
                                 Err(_) => {}
                             }
@@ -4433,7 +4427,6 @@ impl CallerRegistry {
                                 .into(),
                             reason: block.unwrap_or_else(|| "joint_birth_feed_selected".into()),
                             budget: None,
-
                             units: None,
                         });
                     }
@@ -4451,7 +4444,6 @@ impl CallerRegistry {
                     subject: crate::inventory_present::JOINT_BIRTH_UNAVAILABLE_SUBJECT.into(),
                     reason: "joint_birth_original_mismatch".into(),
                     budget: None,
-
                     units: None,
                 });
             }
@@ -4787,7 +4779,6 @@ impl CallerRegistry {
                 subject: crate::inventory_present::JOINT_RETAINED_S1_SUBJECT.into(),
                 reason: cause.reason().into(),
                 budget: None,
-
                 units: None,
             });
         }
@@ -4878,7 +4869,6 @@ impl CallerRegistry {
                         subject: crate::inventory_present::JOINT_RETAINED_S1_SUBJECT.into(),
                         reason: "joint_resume_deferred_below_fence".into(),
                         budget: None,
-
                         units: None,
                     });
                 }

@@ -9027,7 +9027,6 @@ mod joint_ledger_parse_tests {
                 subject: "semantic input refused".into(),
                 reason: "slot".into(),
                 budget: None,
-
                 units: None,
             });
         }
@@ -9038,7 +9037,6 @@ mod joint_ledger_parse_tests {
             subject: "semantic input refused".into(),
             reason: "slot".into(),
             budget: None,
-
             units: None,
         });
         // Gaps stage until publication; the two identical rows share
@@ -9094,7 +9092,6 @@ mod joint_ledger_parse_tests {
                 subject: "semantic input refused".into(),
                 reason: "slot".into(),
                 budget: None,
-
                 units: None,
             });
         }
@@ -9134,7 +9131,6 @@ mod joint_ledger_parse_tests {
                 subject: "semantic input refused".into(),
                 reason: "slot".into(),
                 budget: None,
-
                 units: None,
             });
         }
@@ -9154,7 +9150,6 @@ mod joint_ledger_parse_tests {
             subject: "semantic calls unrouted".into(),
             reason: "1 calls shed without a route (pending=1)".into(),
             budget: None,
-
             units: None,
         });
         coordinator.registry_mut().publish();
@@ -9173,7 +9168,6 @@ mod joint_ledger_parse_tests {
             subject: "semantic calls lost".into(),
             reason: "loss".into(),
             budget: None,
-
             units: None,
         });
         coordinator.registry_mut().publish();
@@ -9326,7 +9320,6 @@ mod joint_ledger_parse_tests {
                 subject: subject.into(),
                 reason: reason.into(),
                 budget: None,
-
                 units: None,
             });
             coordinator.registry_mut().publish();
@@ -9376,7 +9369,6 @@ mod joint_ledger_parse_tests {
             subject: "semantic input refused".into(),
             reason: "slot".into(),
             budget: None,
-
             units: None,
         });
         coordinator.registry_mut().publish();
@@ -9408,7 +9400,6 @@ mod joint_ledger_parse_tests {
             subject: "selected promotion refused".into(),
             reason: "view expired".into(),
             budget: None,
-
             units: None,
         });
         coordinator.registry_mut().publish();
@@ -9423,7 +9414,6 @@ mod joint_ledger_parse_tests {
             subject: "selected promotion refused".into(),
             reason: "manifest unavailable".into(),
             budget: None,
-
             units: None,
         });
         coordinator.registry_mut().publish();
@@ -9453,7 +9443,6 @@ mod joint_ledger_parse_tests {
             subject: "selected promotion refused".into(),
             reason: "view expired".into(),
             budget: None,
-
             units: None,
         });
         coordinator.registry_mut().publish();

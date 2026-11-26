@@ -42,8 +42,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 subject: "leader exit adjudication refused".into(),
                 reason: "pending-exit storage unavailable; original caller custody stays unresolved and semantic inputs refuse".into(),
                 budget: None,
-
-                units: None,});
+                units: None,
+            });
             return;
         };
         self.pending_leader_exits.insert(
@@ -126,8 +126,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 subject: "leader task link loss".into(),
                 reason: "the leader task exited while a same-generation nonleader was proven live and not exiting; original custody is retained with no tombstone, and a later EXEC may renew recovery".into(),
                 budget: None,
-
-                units: None,});
+                units: None,
+            });
             if self.semantic_bindings.get(caller).is_some() {
                 self.tail_uncertain.insert(caller);
             }
@@ -164,8 +164,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 subject: "leader exit status unresolved at stop".into(),
                 reason: format!("final hook={hook_ns} domain={domain:?} had no live-worker or group-exit proof within the shared final-batch allowance; semantic inputs retain custody refusal"),
                 budget: None,
-
-                units: None,}),
+                units: None,
+            }),
         }
         // No reservation, retry row or new retained pin survives this
         // final disposition. The caller bit keeps unproved inputs fenced.
@@ -190,8 +190,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 subject: "leader exit status unresolved at stop".into(),
                 reason: format!("{count} pending leader exit(s) remain unknown; first hook={} domain={:?}; semantic inputs retain custody refusal", pending.hook_ns, pending.domain),
                 budget: None,
-
-                units: None,});
+                units: None,
+            });
         }
         self.pending_leader_exits.clear();
     }

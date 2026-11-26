@@ -5790,15 +5790,14 @@ fn privileged_key_operations_seal_generation_gated_by_flag() -> Result<()> {
 /// seals with `key_sizes: true` (the length pair loads on this
 /// kernel and the seal publishes); on a build without the length
 /// programs the sizes request refuses loudly, explained by the
-/// embedded object. Either arm pins the sizes-request shape live —
+/// embedded object. On a build without the journal pair the twin
+/// asserts the two linked refusals it owns (journal preparation
+/// names the omitted build; a linked start refuses attachment) and
+/// reports the cell inapplicable. Every arm pins its shape live —
 /// the one privileged cell that loads the length pair.
 #[test]
 #[ignore = "privileged: live journal lane seals with key sizes on FULL, refuses without the length pair"]
 fn privileged_key_sizes_journal_seals_with_length_pair() -> Result<()> {
-    if env!("P11SCOPE_JOURNAL_ENABLED") != "1" {
-        eprintln!("KEY_SIZES_JOURNAL journal=inapplicable");
-        return Ok(());
-    }
     let workload = JointWorkload::build()?;
     let mut coordinator =
         system_joint_coordinator(&[workload.soft_copy.clone(), workload.held.clone()])?;
@@ -5814,6 +5813,13 @@ fn privileged_key_sizes_journal_seals_with_length_pair() -> Result<()> {
         &["C_SignInit", "C_Sign"],
         "keyops-sizes-held.dr37.json",
     )?;
+    if env!("P11SCOPE_JOURNAL_ENABLED") != "1" {
+        return refuse_linked_without_journal(
+            &mut coordinator,
+            vec![manifest_soft, manifest_held],
+            "KEY_SIZES_JOURNAL",
+        );
+    }
     match start_joint_lane_with_journal_sizes(
         &mut coordinator,
         vec![manifest_soft, manifest_held],

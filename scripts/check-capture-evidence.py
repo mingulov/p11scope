@@ -2954,6 +2954,17 @@ def exact_prearm_keys(module):
                 and window["reason"] in ALLOWED_UNOBSERVED_REASONS,
                 f"invalid unobserved window: {module}",
             )
+    if any(
+        window.get("reason") == "coverage_retired"
+        for window in module.get("unobserved_windows", [])
+    ):
+        # The producer emits the folded count beside every
+        # `coverage_retired` window: a window without the key is a
+        # dropped disclosure.
+        require(
+            "coverage_retired_folded" in module,
+            f"missing coverage_retired_folded: {module}",
+        )
     if "coverage_retired_folded" in module:
         # Retires of this module folded into its last `coverage_retired`
         # window past the per-module cap: a u64, 0 when none folded.
@@ -5391,6 +5402,25 @@ def self_test():
             lambda bad=bad: exact_prearm_keys(dict(attach_module, coverage_retired_folded=bad))
         )
     print("coverage_retired_folded pins its u64 shape: OK")
+    # A record with a `coverage_retired` window must carry the folded
+    # count: the producer emits them together, so a window without the
+    # key is a dropped disclosure. Other window reasons need no key.
+    retired_window = {"start_ns": 100, "end_ns": 200, "reason": "coverage_retired"}
+    other_window = {"start_ns": 100, "end_ns": 200, "reason": "late_discovery"}
+    exact_prearm_keys(
+        dict(attach_module, unobserved_windows=[retired_window], coverage_retired_folded=0)
+    )
+    exact_prearm_keys(dict(attach_module, unobserved_windows=[other_window]))
+    exact_prearm_keys(dict(attach_module))
+    rejected(
+        lambda: exact_prearm_keys(dict(attach_module, unobserved_windows=[retired_window]))
+    )
+    rejected(
+        lambda: exact_prearm_keys(
+            dict(attach_module, unobserved_windows=[other_window, retired_window])
+        )
+    )
+    print("coverage_retired_folded is required beside a coverage_retired window: OK")
     # The always-emitted standard-layout withheld count (ruling
     # 2026-11-11 clause 2): zero and nonzero ride the clean lane
     # without moving completeness, and malformed values are refused

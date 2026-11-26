@@ -57,7 +57,9 @@ DEADLINE = "cgroup collection deadline reached"
 PREP_INPUT_INTERRUPTED = "cgroup provider input comparison interrupted"
 # The other seven preparation reasons the producer files under the
 # same subject and shape (src/discovery/inventory_attach_set.rs
-# prepare_absorption): the qualifier validates all eight.
+# prepare_absorption): the qualifier refuses all seven until one is
+# observed with evidence. Only PREP_INPUT_INTERRUPTED qualifies, with
+# a run-deadline straddle.
 PREP_INPUT_CEILING = "cgroup provider preparation input ceiling reached"
 PREP_INTERRUPTED_OR_ALLOWANCE = (
     "cgroup provider preparation interrupted or allowance exhausted")
@@ -1238,14 +1240,19 @@ class CrossPairTests(unittest.TestCase):
                     self.assert_cross_pair_refusal(
                         report, modfs, optimized, "gap.unclassified")
 
-    def test_other_prep_reasons_pass_with_deadline(self):
+    def test_other_prep_reasons_fail_without_evidence(self):
         # The seven other filed preparation reasons carry the same
-        # producer shape and straddle the same run deadline, so each
-        # qualifies on both substrates, identically under -O.
+        # producer shape and straddle the same run deadline, but none
+        # was ever observed, so each fails loudly on both substrates,
+        # identically under -O. Re-allowing one needs evidence plus an
+        # allowlist edit here and in the qualifier.
         self.assertEqual(len(OTHER_PREP_REASONS), 7)
         for reason in OTHER_PREP_REASONS:
-            for modfs, base in (("overlayfs", decided_report),
-                                ("ext4", witness_available_report)):
+            for modfs, base, message in (
+                    ("overlayfs", decided_report,
+                     "overlay published extra gap"),
+                    ("ext4", witness_available_report,
+                     "witness-available published extra gap")):
                 for optimized in (False, True):
                     with self.subTest(reason=reason,
                                       substrate=modfs,
@@ -1257,7 +1264,8 @@ class CrossPairTests(unittest.TestCase):
                         run = (run_oracle_optimized if optimized
                                else run_oracle)
                         rc, out = run(report, modfs=modfs)
-                        self.assertEqual(rc, 0, out)
+                        self.assertNotEqual(rc, 0, out)
+                        self.assertIn(message, out)
 
     def test_unnamed_extra_gap_fails_witness_available(self):
         # The witness-available branch refuses unnamed gaps too: a

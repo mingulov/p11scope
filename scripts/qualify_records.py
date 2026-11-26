@@ -785,18 +785,14 @@ ACTIVATION_REFUSALS = {DEFERRED_REASON: "deferred activation never recovered",
 # owner, its delay row is a note of this kind with this exact reason.
 NOTE_REASONS = {"activation_deferred": DEFERRED_REASON, "activation_unsettled": SETTLE_REASON}
 PREP_SUBJECT = "cgroup provider preparation incomplete"
-# The producer files eight reasons under this subject and shape
-# (src/discovery/inventory_attach_set.rs prepare_absorption). A ninth
-# reason — or a prep reason under another subject — stays unclassified.
+# Only the observed reason qualifies: the interrupted provider-input
+# comparison with a run-deadline straddle (the one seen on every
+# substrate). The producer files seven more reasons under this subject
+# and shape (src/discovery/inventory_attach_set.rs prepare_absorption);
+# each stays unclassified until observed with evidence — a ninth reason,
+# or a prep reason under another subject, stays unclassified too.
 PREP_REASONS = frozenset([
-    "cgroup provider preparation input ceiling reached",
-    "cgroup provider preparation interrupted or allowance exhausted",
-    "cgroup provider preparation interrupted after retention",
-    "cgroup provider resolution interrupted",
-    "cgroup provider preparation comparison ceiling reached",
-    "cgroup provider identity comparison interrupted",
     "cgroup provider input comparison interrupted",
-    "cgroup provider preparation interrupted before completion",
 ])
 TRANSITIONS = ("unresolved to refused", "unresolved to admitted", "refused to admitted")
 EXACT_ENTRIES = {"state": "counted", "lossy": False, "observation": "observed",

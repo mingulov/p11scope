@@ -12,11 +12,13 @@ use p11scope_manifest::identity::{
 };
 use p11scope_manifest::manifest::*;
 use pkcs11_module::{RawInterface, Surface, TableSet, function_list, interface_list, tables_for};
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::os::raw::c_void;
 use std::os::unix::fs::FileExt as _;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 const INTERFACE_NAME_CAP: usize = 64;
 const MAX_OBJECTS: usize = 512;
@@ -199,7 +201,13 @@ pub fn discover_with_self_memory(
         .to_str()
         .ok_or_else(|| "--module path must be valid UTF-8 for the manifest".to_string())?;
     let memory = ProcessMemory(self_memory);
-    let (module_file_key, module_identity) = identity_and_key(module_path)?;
+    // Cumulative identify-read bytes, shared by the module, every
+    // dependency, the selection revalidations and the provenance loop:
+    // one discovery never hashes more than MAX_TOTAL_OBJECT_BYTES in
+    // total, whatever object the bytes belong to. Shared (not threaded)
+    // so cloned candidate tables still charge the bytes they read.
+    let identify_spent = Rc::new(Cell::new(0u64));
+    let (module_file_key, module_identity) = identity_and_key(module_path, &identify_spent)?;
     let before_maps = read_self_maps()?;
     let before_index = validated_map_index(&before_maps)?;
     let before_keys: BTreeSet<ObjectKey> =
@@ -236,6 +244,7 @@ pub fn discover_with_self_memory(
         module_file_key,
         &module_identity,
         &module_file,
+        &identify_spent,
     )?;
     let initial_module_mappings: Vec<maps::MapEntry> = map_index
         .entries()
@@ -250,7 +259,7 @@ pub fn discover_with_self_memory(
         .filter(|key| !before_keys.contains(key))
         .collect();
     approved_keys.insert(module_map_key);
-    let current_identity = validated_identity(module_path, module_file_key)?;
+    let current_identity = validated_identity(module_path, module_file_key, &identify_spent)?;
     if current_identity != module_identity {
         return Err(format!(
             "module {} changed while discovery was running",
@@ -272,6 +281,7 @@ pub fn discover_with_self_memory(
         module_map_key,
         module_identity.clone(),
         approved_keys,
+        Rc::clone(&identify_spent),
     );
 
     let (legacy, legacy_240, legacy_ptr) = legacy_surface(
@@ -309,12 +319,13 @@ pub fn discover_with_self_memory(
         module_map_key,
         &module_identity,
         &mut objects,
+        &identify_spent,
     );
     let selection_evidence = selection_records(selection_raw, &surfaces);
     let alias_groups = alias_groups(&surfaces);
     let final_maps = read_self_maps()?;
     let final_map_index = validated_map_index(&final_maps)?;
-    let (final_file_key, final_identity) = identity_and_key(module_path)?;
+    let (final_file_key, final_identity) = identity_and_key(module_path, &identify_spent)?;
     if final_file_key != module_file_key
         || final_identity != module_identity
         || !initial_module_mappings
@@ -326,7 +337,7 @@ pub fn discover_with_self_memory(
             module_path.display()
         ));
     }
-    let provenance_objects = provenance_objects(&final_map_index, &objects)?;
+    let provenance_objects = provenance_objects(&final_map_index, &objects, &identify_spent)?;
 
     Ok(Manifest {
         schema: SCHEMA.to_string(),
@@ -379,6 +390,7 @@ fn validated_map_index(entries: &[maps::MapEntry]) -> Result<maps::MapIndex<'_>,
 fn provenance_objects(
     index: &maps::MapIndex<'_>,
     objects: &ObjectTable,
+    identify_spent: &Cell<u64>,
 ) -> Result<Vec<ProvenanceObject>, String> {
     const MAX_OPTIONAL_DIAGNOSTICS: u64 = 8;
     const MAX_DIAGNOSTIC_CHARS: usize = 256;
@@ -393,7 +405,6 @@ fn provenance_objects(
     }
     let mut by_key: BTreeMap<ObjectKey, ProvenanceObject> = BTreeMap::new();
     let mut opened_paths = BTreeMap::new();
-    let mut total_bytes = 0u64;
     let mut omitted = 0u64;
 
     // Optional runtime mappings cannot consume the object/byte budget before
@@ -448,13 +459,14 @@ fn provenance_objects(
                 let file = identity::open_object(&path).map_err(|error| {
                     format!("cannot open executable mapping {}: {error}", path.display())
                 })?;
-                // v0.8.0: the batch byte allowance debits what identify
-                // reads actually move (cumulative in `total_bytes`; a
-                // failed inspection keeps its partial debit), so best
-                // effort stays bounded without refusing any object for
-                // its own size.
+                // The discovery-wide byte allowance debits what identify
+                // reads actually move (cumulative in `identify_spent`,
+                // shared with the module, dependency and revalidation
+                // reads; a failed inspection keeps its partial debit),
+                // so best effort stays bounded without refusing any
+                // object for its own size.
                 let object_identity =
-                    validated_provenance_identity(&path, &file, key, &mut total_bytes)?;
+                    validated_provenance_identity(&path, &file, key, identify_spent)?;
                 if required
                     .get(&key)
                     .is_some_and(|expected| **expected != object_identity)
@@ -538,6 +550,7 @@ fn loaded_module_key(
     module_file_key: ObjectKey,
     module_identity: &ObjectIdentity,
     module_file: &File,
+    identify_spent: &Cell<u64>,
 ) -> Result<ObjectKey, String> {
     let mut budget = UnboundedProbeBudget;
     loaded_module_key_with_probe(
@@ -548,9 +561,11 @@ fn loaded_module_key(
         module_file,
         &KernelSelfMappingProbe,
         &mut budget,
+        identify_spent,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn loaded_module_key_with_probe(
     exports: ExportAddresses,
     maps: &maps::MapIndex<'_>,
@@ -559,6 +574,7 @@ fn loaded_module_key_with_probe(
     module_file: &File,
     probe: &impl SelfMappingProbe,
     budget: &mut dyn ProbeBudget,
+    identify_spent: &Cell<u64>,
 ) -> Result<ObjectKey, String> {
     for address in [
         exports.get_function_list,
@@ -585,8 +601,14 @@ fn loaded_module_key_with_probe(
                     // When the kernel-reported path is reachable, require the
                     // same exact fd identity and whole-file identity too.
                     if std::fs::metadata(&path).is_ok()
-                        && validated_identity_with_probe(&path, module_file_key, probe, budget)
-                            .as_ref()
+                        && validated_identity_with_probe(
+                            &path,
+                            module_file_key,
+                            probe,
+                            budget,
+                            identify_spent,
+                        )
+                        .as_ref()
                             != Ok(module_identity)
                     {
                         continue;
@@ -610,9 +632,19 @@ fn file_key(file: &File) -> Result<ObjectKey, String> {
     })
 }
 
-fn validated_identity(path: &Path, expected: ObjectKey) -> Result<ObjectIdentity, String> {
+fn validated_identity(
+    path: &Path,
+    expected: ObjectKey,
+    identify_spent: &Cell<u64>,
+) -> Result<ObjectIdentity, String> {
     let mut budget = UnboundedProbeBudget;
-    validated_identity_with_probe(path, expected, &KernelSelfMappingProbe, &mut budget)
+    validated_identity_with_probe(
+        path,
+        expected,
+        &KernelSelfMappingProbe,
+        &mut budget,
+        identify_spent,
+    )
 }
 
 fn validated_identity_with_probe(
@@ -620,17 +652,21 @@ fn validated_identity_with_probe(
     expected: ObjectKey,
     probe: &impl SelfMappingProbe,
     budget: &mut dyn ProbeBudget,
+    identify_spent: &Cell<u64>,
 ) -> Result<ObjectIdentity, String> {
     let file = identity::open_object(path)
         .map_err(|e| format!("cannot open {} for reuse: {e}", path.display()))?;
-    validated_file_identity_with_probe(path, &file, expected, probe, budget)
+    validated_file_identity_with_probe(path, &file, expected, probe, budget, identify_spent)
 }
 
-fn identity_and_key(path: &Path) -> Result<(ObjectKey, ObjectIdentity), String> {
+fn identity_and_key(
+    path: &Path,
+    identify_spent: &Cell<u64>,
+) -> Result<(ObjectKey, ObjectIdentity), String> {
     let file = identity::open_object(path)
         .map_err(|e| format!("cannot open {} for reuse: {e}", path.display()))?;
     let key = file_key(&file)?;
-    let identity = validated_file_identity(path, &file, key)?;
+    let identity = validated_file_identity(path, &file, key, identify_spent)?;
     Ok((key, identity))
 }
 
@@ -638,9 +674,40 @@ fn validated_file_identity(
     path: &Path,
     file: &File,
     expected: ObjectKey,
+    identify_spent: &Cell<u64>,
 ) -> Result<ObjectIdentity, String> {
     let mut budget = UnboundedProbeBudget;
-    validated_file_identity_with_probe(path, file, expected, &KernelSelfMappingProbe, &mut budget)
+    validated_file_identity_with_probe(
+        path,
+        file,
+        expected,
+        &KernelSelfMappingProbe,
+        &mut budget,
+        identify_spent,
+    )
+}
+
+/// The identify-read wrapper every object read in one discovery goes
+/// through: each actual read debits `identify_spent`, shared across the
+/// module, dependencies, revalidations and provenance, and fails
+/// incrementally once the cumulative allowance is gone. A file is never
+/// refused for its own size: what fits is read and hashed, and a failed
+/// inspection keeps its partial debit.
+fn budgeted_reader(
+    identify_spent: &Cell<u64>,
+) -> impl FnMut(&File, &mut [u8], u64) -> std::io::Result<usize> + '_ {
+    |file, bytes, offset| {
+        let left = MAX_TOTAL_OBJECT_BYTES.saturating_sub(identify_spent.get());
+        let allowed = left.min(bytes.len() as u64) as usize;
+        if allowed == 0 && !bytes.is_empty() {
+            return Err(std::io::Error::other(format!(
+                "identified objects total more than the {MAX_TOTAL_OBJECT_BYTES}-byte limit"
+            )));
+        }
+        let read = file.read_at(&mut bytes[..allowed], offset)?;
+        identify_spent.set(identify_spent.get().saturating_add(read as u64));
+        Ok(read)
+    }
 }
 
 fn validated_file_identity_with_probe(
@@ -649,6 +716,7 @@ fn validated_file_identity_with_probe(
     expected: ObjectKey,
     probe: &impl SelfMappingProbe,
     budget: &mut dyn ProbeBudget,
+    identify_spent: &Cell<u64>,
 ) -> Result<ObjectIdentity, String> {
     validated_file_identity_with_probe_and_reader(
         path,
@@ -656,7 +724,7 @@ fn validated_file_identity_with_probe(
         expected,
         probe,
         budget,
-        |file, bytes, offset| file.read_at(bytes, offset),
+        budgeted_reader(identify_spent),
     )
 }
 
@@ -694,14 +762,14 @@ fn validated_file_identity_with_probe_and_reader(
     Ok(value)
 }
 
-/// Provenance-loop identity with the batch byte allowance enforced
-/// incrementally as identify reads stream (v0.8.0: never an upfront
-/// size refusal). `spent` carries the loop's cumulative hashed bytes.
+/// Provenance-loop identity with the discovery-wide byte allowance
+/// enforced incrementally as identify reads stream (never an upfront
+/// size refusal). `identify_spent` carries the cumulative hashed bytes.
 fn validated_provenance_identity(
     path: &Path,
     file: &File,
     expected: ObjectKey,
-    spent: &mut u64,
+    identify_spent: &Cell<u64>,
 ) -> Result<ObjectIdentity, String> {
     let mut budget = UnboundedProbeBudget;
     validated_file_identity_with_probe_and_reader(
@@ -710,18 +778,7 @@ fn validated_provenance_identity(
         expected,
         &KernelSelfMappingProbe,
         &mut budget,
-        |file, bytes, offset| {
-            let left = MAX_TOTAL_OBJECT_BYTES.saturating_sub(*spent);
-            let allowed = left.min(bytes.len() as u64) as usize;
-            if allowed == 0 && !bytes.is_empty() {
-                return Err(std::io::Error::other(format!(
-                    "executable provenance objects total more than the {MAX_TOTAL_OBJECT_BYTES}-byte limit"
-                )));
-            }
-            let read = file.read_at(&mut bytes[..allowed], offset)?;
-            *spent = spent.saturating_add(read as u64);
-            Ok(read)
-        },
+        budgeted_reader(identify_spent),
     )
 }
 
@@ -1391,6 +1448,7 @@ fn selection_acquisition(
     module_key: ObjectKey,
     module_identity: &ObjectIdentity,
     objects: &mut ObjectTable,
+    identify_spent: &Cell<u64>,
 ) -> (SelectionAcquisition, Vec<RawSelectionQuery>) {
     if raw_export.is_none() {
         return (SelectionAcquisition::ExportAbsent, Vec::new());
@@ -1439,7 +1497,14 @@ fn selection_acquisition(
                 let mut captured = None;
                 let mut candidate_objects = objects.clone();
                 let bracket = selection_bracket(
-                    || stable_selection_maps(module_path, module_file_key, module_identity),
+                    || {
+                        stable_selection_maps(
+                            module_path,
+                            module_file_key,
+                            module_identity,
+                            identify_spent,
+                        )
+                    },
                     |maps_a| {
                         let (name_pointer, table_pointer, returned_flags) =
                             read_interface(memory, output as usize)
@@ -1549,7 +1614,14 @@ fn selection_acquisition(
                         ));
                         Ok(())
                     },
-                    || stable_selection_maps(module_path, module_file_key, module_identity),
+                    || {
+                        stable_selection_maps(
+                            module_path,
+                            module_file_key,
+                            module_identity,
+                            identify_spent,
+                        )
+                    },
                 );
                 match bracket {
                     Ok(()) => {
@@ -1735,6 +1807,7 @@ fn stable_selection_maps(
     module_path: &Path,
     expected_key: ObjectKey,
     expected_identity: &ObjectIdentity,
+    identify_spent: &Cell<u64>,
 ) -> Result<Vec<maps::MapEntry>, ()> {
     let mut budget = UnboundedProbeBudget;
     stable_selection_maps_with_probe(
@@ -1743,6 +1816,7 @@ fn stable_selection_maps(
         expected_identity,
         &KernelSelfMappingProbe,
         &mut budget,
+        identify_spent,
     )
 }
 
@@ -1752,14 +1826,21 @@ fn stable_selection_maps_with_probe(
     expected_identity: &ObjectIdentity,
     probe: &impl SelfMappingProbe,
     budget: &mut dyn ProbeBudget,
+    identify_spent: &Cell<u64>,
 ) -> Result<Vec<maps::MapEntry>, ()> {
     let bytes = std::fs::read("/proc/self/maps").map_err(|_| ())?;
     let current_maps = maps::parse_maps(&bytes).map_err(|_| ())?;
     let file = identity::open_object(module_path).map_err(|_| ())?;
     let current_key = file_key(&file).map_err(|_| ())?;
-    let current_identity =
-        validated_file_identity_with_probe(module_path, &file, current_key, probe, budget)
-            .map_err(|_| ())?;
+    let current_identity = validated_file_identity_with_probe(
+        module_path,
+        &file,
+        current_key,
+        probe,
+        budget,
+        identify_spent,
+    )
+    .map_err(|_| ())?;
     if current_key != expected_key || current_identity != *expected_identity {
         return Err(());
     }
@@ -2105,6 +2186,7 @@ struct ObjectTable {
     approved: BTreeSet<ObjectKey>,
     ids: BTreeMap<ObjectKey, u32>,
     records: Vec<ObjectRecord>,
+    identify_spent: Rc<Cell<u64>>,
 }
 
 impl ObjectTable {
@@ -2113,6 +2195,7 @@ impl ObjectTable {
         module_key: ObjectKey,
         identity: ObjectIdentity,
         approved: BTreeSet<ObjectKey>,
+        identify_spent: Rc<Cell<u64>>,
     ) -> Self {
         let mut ids = BTreeMap::new();
         ids.insert(module_key, 0);
@@ -2125,6 +2208,7 @@ impl ObjectTable {
                 path: module_path.display().to_string(),
                 identity,
             }],
+            identify_spent,
         }
     }
 
@@ -2165,7 +2249,7 @@ impl ObjectTable {
                 &raw_path,
             );
         }
-        let object_identity = match validated_identity(&path, key) {
+        let object_identity = match validated_identity(&path, key, &self.identify_spent) {
             Ok(identity) => identity,
             Err(reason) => return unusable_file(reason, &raw_path),
         };
@@ -2643,15 +2727,61 @@ mod tests {
     #[test]
     fn mapped_path_identity_requires_device_and_inode() {
         let exe = small_owned_elf();
-        let key = identity_and_key(&exe).unwrap().0;
-        assert!(validated_identity(&exe, key).unwrap().reusable);
+        let key = identity_and_key(&exe, &Cell::new(0)).unwrap().0;
+        assert!(
+            validated_identity(&exe, key, &Cell::new(0))
+                .unwrap()
+                .reusable
+        );
 
         let wrong = ObjectKey {
             inode: key.inode.wrapping_add(1),
             ..key
         };
-        let err = validated_identity(&exe, wrong).unwrap_err();
+        let err = validated_identity(&exe, wrong, &Cell::new(0)).unwrap_err();
         assert!(err.contains("device/inode mismatch"), "{err}");
+    }
+
+    #[test]
+    fn identify_reads_share_one_cumulative_byte_budget() {
+        let exe = small_owned_elf();
+        let len = std::fs::metadata(&exe).unwrap().len();
+        let spent = Cell::new(0u64);
+        let key = identity_and_key(&exe, &spent).unwrap().0;
+        assert_eq!(spent.get(), len, "the first read charges its bytes");
+        validated_identity(&exe, key, &spent).unwrap();
+        assert_eq!(spent.get(), 2 * len, "reads accumulate on one counter");
+        // Near the cap the next read debits its partial head, then
+        // fails: never an upfront size refusal, and a failed
+        // inspection keeps its partial debit.
+        spent.set(MAX_TOTAL_OBJECT_BYTES - 10);
+        let error = validated_identity(&exe, key, &spent).unwrap_err();
+        assert!(error.contains("total more than the"), "{error}");
+        assert_eq!(
+            spent.get(),
+            MAX_TOTAL_OBJECT_BYTES,
+            "the partial head stays debited"
+        );
+    }
+
+    #[test]
+    fn provenance_reads_share_the_identify_budget() {
+        let exe = small_owned_elf();
+        let len = std::fs::metadata(&exe).unwrap().len();
+        let file = identity::open_object(&exe).unwrap();
+        let key = file_key(&file).unwrap();
+        let spent = Cell::new(0u64);
+        validated_identity(&exe, key, &spent).unwrap();
+        validated_provenance_identity(&exe, &file, key, &spent).unwrap();
+        assert_eq!(
+            spent.get(),
+            2 * len,
+            "module and provenance reads share one counter"
+        );
+        spent.set(MAX_TOTAL_OBJECT_BYTES - 10);
+        let error = validated_provenance_identity(&exe, &file, key, &spent).unwrap_err();
+        assert!(error.contains("total more than the"), "{error}");
+        assert_eq!(spent.get(), MAX_TOTAL_OBJECT_BYTES);
     }
 
     #[test]
@@ -2660,7 +2790,9 @@ mod tests {
             device: Device { major: 8, minor: 1 },
             inode: 7,
         };
-        let module_identity = identity_and_key(&small_owned_elf()).unwrap().1;
+        let module_identity = identity_and_key(&small_owned_elf(), &Cell::new(0))
+            .unwrap()
+            .1;
         let provider = maps::MapEntry {
             start: 0x1000,
             end: 0x2000,
@@ -2674,7 +2806,14 @@ mod tests {
         let valid = vec![provider];
         let load = |exports, entries: &[maps::MapEntry]| {
             let index = validated_map_index(entries)?;
-            loaded_module_key(exports, &index, module_key, &module_identity, &module_file)
+            loaded_module_key(
+                exports,
+                &index,
+                module_key,
+                &module_identity,
+                &module_file,
+                &Cell::new(0),
+            )
         };
 
         assert_eq!(
@@ -2945,7 +3084,9 @@ mod tests {
     #[test]
     fn loaded_split_probe_equal_keys_accept_without_probing() {
         let (_dir, module_file) = probe_tempfile("loaded-equal");
-        let module_identity = identity_and_key(&small_owned_elf()).unwrap().1;
+        let module_identity = identity_and_key(&small_owned_elf(), &Cell::new(0))
+            .unwrap()
+            .1;
         let entries = vec![provider_entry(split_fd_key())];
         let index = validated_map_index(&entries).unwrap();
         let probe = FakeSelfMappingProbe::new(true, None);
@@ -2959,6 +3100,7 @@ mod tests {
                 &module_file,
                 &probe,
                 &mut budget,
+                &Cell::new(0),
             ),
             Ok(split_fd_key())
         );
@@ -2969,7 +3111,9 @@ mod tests {
     #[test]
     fn loaded_split_probe_overlay_match_accepts_the_maps_key() {
         let (_dir, module_file) = probe_tempfile("loaded-match");
-        let module_identity = identity_and_key(&small_owned_elf()).unwrap().1;
+        let module_identity = identity_and_key(&small_owned_elf(), &Cell::new(0))
+            .unwrap()
+            .1;
         let entries = vec![provider_entry(split_maps_key())];
         let index = validated_map_index(&entries).unwrap();
         let probe = FakeSelfMappingProbe::new(true, Some(split_maps_key()));
@@ -2983,6 +3127,7 @@ mod tests {
                 &module_file,
                 &probe,
                 &mut budget,
+                &Cell::new(0),
             ),
             Ok(split_maps_key())
         );
@@ -2992,7 +3137,9 @@ mod tests {
     #[test]
     fn loaded_split_probe_overlay_mismatch_refuses_with_todays_message() {
         let (_dir, module_file) = probe_tempfile("loaded-mismatch");
-        let module_identity = identity_and_key(&small_owned_elf()).unwrap().1;
+        let module_identity = identity_and_key(&small_owned_elf(), &Cell::new(0))
+            .unwrap()
+            .1;
         let entries = vec![provider_entry(split_maps_key())];
         let index = validated_map_index(&entries).unwrap();
         let probe = FakeSelfMappingProbe::new(true, Some(wrong_key()));
@@ -3006,6 +3153,7 @@ mod tests {
                 &module_file,
                 &probe,
                 &mut budget,
+                &Cell::new(0),
             )
             .unwrap_err(),
             "no module acquisition export maps to the requested file identity"
@@ -3015,7 +3163,9 @@ mod tests {
     #[test]
     fn loaded_split_probe_non_overlay_mismatch_refuses_without_probing() {
         let (_dir, module_file) = probe_tempfile("loaded-non-overlay");
-        let module_identity = identity_and_key(&small_owned_elf()).unwrap().1;
+        let module_identity = identity_and_key(&small_owned_elf(), &Cell::new(0))
+            .unwrap()
+            .1;
         let entries = vec![provider_entry(split_maps_key())];
         let index = validated_map_index(&entries).unwrap();
         let probe = FakeSelfMappingProbe::new(false, Some(split_maps_key()));
@@ -3029,6 +3179,7 @@ mod tests {
                 &module_file,
                 &probe,
                 &mut budget,
+                &Cell::new(0),
             )
             .unwrap_err(),
             "no module acquisition export maps to the requested file identity"
@@ -3040,7 +3191,9 @@ mod tests {
     #[test]
     fn loaded_split_probe_error_refuses() {
         let (_dir, module_file) = probe_tempfile("loaded-error");
-        let module_identity = identity_and_key(&small_owned_elf()).unwrap().1;
+        let module_identity = identity_and_key(&small_owned_elf(), &Cell::new(0))
+            .unwrap()
+            .1;
         let entries = vec![provider_entry(split_maps_key())];
         let index = validated_map_index(&entries).unwrap();
         let probe = FakeSelfMappingProbe::new(true, None);
@@ -3054,6 +3207,7 @@ mod tests {
                 &module_file,
                 &probe,
                 &mut budget,
+                &Cell::new(0),
             )
             .unwrap_err(),
             "no module acquisition export maps to the requested file identity"
@@ -3068,9 +3222,16 @@ mod tests {
         let probe = FakeSelfMappingProbe::new(true, None);
         let mut budget = UnboundedProbeBudget;
         assert!(
-            validated_file_identity_with_probe(&exe, &file, key, &probe, &mut budget)
-                .unwrap()
-                .reusable
+            validated_file_identity_with_probe(
+                &exe,
+                &file,
+                key,
+                &probe,
+                &mut budget,
+                &Cell::new(0),
+            )
+            .unwrap()
+            .reusable
         );
         assert_eq!(probe.overlay_checks.get(), 0);
         assert_eq!(probe.probes.get(), 0);
@@ -3085,9 +3246,16 @@ mod tests {
         // `expected` is the maps rendering (backing) while the fd resolves
         // to the overlay device, so only the probe bridges them.
         assert!(
-            validated_file_identity_with_probe(&exe, &file, split_maps_key(), &probe, &mut budget,)
-                .unwrap()
-                .reusable
+            validated_file_identity_with_probe(
+                &exe,
+                &file,
+                split_maps_key(),
+                &probe,
+                &mut budget,
+                &Cell::new(0),
+            )
+            .unwrap()
+            .reusable
         );
         assert_eq!(probe.probes.get(), 1);
     }
@@ -3108,6 +3276,7 @@ mod tests {
                 split_maps_key(),
                 &probe,
                 &mut budget,
+                &Cell::new(0),
             )
             .unwrap_err();
             assert!(err.contains("device/inode mismatch"), "{err}");
@@ -3120,11 +3289,18 @@ mod tests {
         // The module must be live-mapped in this process: dlopen the
         // fixture instead of relying on the test binary's own mapping.
         let _live = unsafe { Library::new(&exe) }.expect("dlopen the owned fixture");
-        let (key, identity) = identity_and_key(&exe).unwrap();
+        let (key, identity) = identity_and_key(&exe, &Cell::new(0)).unwrap();
         let probe = FakeSelfMappingProbe::new(true, None);
         let mut budget = UnboundedProbeBudget;
-        let maps =
-            stable_selection_maps_with_probe(&exe, key, &identity, &probe, &mut budget).unwrap();
+        let maps = stable_selection_maps_with_probe(
+            &exe,
+            key,
+            &identity,
+            &probe,
+            &mut budget,
+            &Cell::new(0),
+        )
+        .unwrap();
         assert!(maps.iter().any(|mapping| ObjectKey::of(mapping) == key));
         assert_eq!(probe.probes.get(), 0);
     }
@@ -3132,14 +3308,22 @@ mod tests {
     #[test]
     fn stable_maps_changed_key_refuses() {
         let exe = small_owned_elf();
-        let (key, identity) = identity_and_key(&exe).unwrap();
+        let (key, identity) = identity_and_key(&exe, &Cell::new(0)).unwrap();
         let wrong = ObjectKey {
             inode: key.inode.wrapping_add(1),
             ..key
         };
         let probe = FakeSelfMappingProbe::new(true, Some(wrong));
         let mut budget = UnboundedProbeBudget;
-        stable_selection_maps_with_probe(&exe, wrong, &identity, &probe, &mut budget).unwrap_err();
+        stable_selection_maps_with_probe(
+            &exe,
+            wrong,
+            &identity,
+            &probe,
+            &mut budget,
+            &Cell::new(0),
+        )
+        .unwrap_err();
         assert_eq!(probe.probes.get(), 0);
     }
 
@@ -3160,7 +3344,7 @@ mod tests {
         std::fs::remove_file(&link).unwrap();
         std::os::unix::fs::symlink(replacement, &link).unwrap();
 
-        let actual = validated_file_identity(&link, &file, key).unwrap();
+        let actual = validated_file_identity(&link, &file, key, &Cell::new(0)).unwrap();
         assert_eq!(actual, identity::identify(&original));
         assert_ne!(actual, identity::identify(replacement));
 
@@ -3296,6 +3480,7 @@ mod tests {
             approved: BTreeSet::new(),
             ids: BTreeMap::new(),
             records: Vec::new(),
+            identify_spent: Rc::new(Cell::new(0)),
         };
 
         let valid_table_absence = selection_bracket(
@@ -3454,12 +3639,13 @@ mod tests {
         };
         let module_key = ObjectKey { device, inode };
         let executable = small_owned_elf();
-        let identity = identity_and_key(&executable).unwrap().1;
+        let identity = identity_and_key(&executable, &Cell::new(0)).unwrap().1;
         let mut objects = ObjectTable::new(
             executable,
             module_key,
             identity,
             BTreeSet::from([module_key]),
+            Rc::new(Cell::new(0)),
         );
         let (observed, _) = selection_table_for(
             pointer,

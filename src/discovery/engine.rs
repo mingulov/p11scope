@@ -25800,9 +25800,8 @@ impl Engine {
                             self.counters.object_skips.push(skip);
                         }
                     }
-                    let allowance = crate::fanotify::LEARNED_FILES_PER_CAPTURE_CAP.saturating_sub(
-                        target.owned_raw_count_under(Self::RUN_LEARNED_VIEW_ID),
-                    );
+                    let allowance = crate::fanotify::LEARNED_FILES_PER_CAPTURE_CAP
+                        .saturating_sub(target.owned_raw_count_under(Self::RUN_LEARNED_VIEW_ID));
                     let _ = target.alias_scanned_module_under_capped(
                         &module,
                         Self::RUN_LEARNED_VIEW_ID,

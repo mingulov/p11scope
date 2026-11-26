@@ -12547,15 +12547,15 @@ fn bind_scanned_modules_inner(
                     None
                 } else {
                     *resolved
-                    .entry((original.object, original.object_path.as_str()))
-                    .or_insert_with(|| {
-                        pinned.id_for_scanned_with_carry(
-                            module,
-                            original.object,
-                            &original.object_path,
-                            !authority.authorizes(module.view),
-                        )
-                    })
+                        .entry((original.object, original.object_path.as_str()))
+                        .or_insert_with(|| {
+                            pinned.id_for_scanned_with_carry(
+                                module,
+                                original.object,
+                                &original.object_path,
+                                !authority.authorizes(module.view),
+                            )
+                        })
                 };
                 match target {
                     Some(id)

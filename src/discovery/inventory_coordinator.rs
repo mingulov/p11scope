@@ -6498,7 +6498,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// and wrap behave identically everywhere; the rest of the
     /// snapshot waits for later passes instead of stalling this one.
     fn rotate_sweep_window(
-        entries: &mut Vec<(PairKey, u64, u32)>,
+        entries: &mut [(PairKey, u64, u32)],
         cursor: &mut Option<((u64, u32), usize)>,
     ) -> (usize, usize) {
         if entries.len() > EVER_ENUMERATED_SWEEP || cursor.is_some() {

@@ -2837,7 +2837,7 @@ mod tests {
     fn verbosity_test_guard_restores_on_drop() {
         for round in 0..10 {
             let guard = VerbosityTestGuard::set(TextVerbosity::Verbose);
-            let previous = guard.previous.clone();
+            let previous = guard.previous;
             assert_eq!(text_verbosity(), TextVerbosity::Verbose);
             drop(guard);
             let start = std::time::Instant::now();

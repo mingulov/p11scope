@@ -4453,6 +4453,19 @@ impl PinnedObjects {
         allow_carried: bool,
     ) -> Option<PinnedObjectId> {
         let raw = RawObjectInstance::scanned(module, key, path)?;
+        if module.view == crate::discovery::engine::Engine::CARRIED_VIEW_ID {
+            // Re-owned carrier rows ask which object their file is
+            // (coverage, reclaim candidacy, rebinding a decided row),
+            // never whether a live view proved it: the engine moved
+            // these rows under the reserved carrier at retirement,
+            // and the proof fence below would refuse every carrier
+            // that shares its file with a live row. Raw identity is
+            // the whole question, and an unmapped raw still resolves
+            // nowhere. The allocator mints sequential ids under view
+            // capacity, so no live or scanned view can hold this id
+            // and ride this arm.
+            return self.raw_to_id.get(&raw).copied();
+        }
         if self
             .raw_ownership
             .get(&module.view)

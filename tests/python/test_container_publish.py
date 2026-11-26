@@ -141,9 +141,11 @@ class ContainerPublishTests(unittest.TestCase):
                        "verify-container-image.sh --image",
                        "check-cell-results.py",
                        "--require host-exact", "--require container-exact",
-                       "--require refusal-pidns", "--require refusal-cap"):
+                       "--require refusal-pidns", "--require refusal-cap",
+                       "--require five-cap-exact", "--require recovery-var-tmp"):
             self.assertIn(marker, bodies, f"build must {marker}")
         for marker in ("docker run", "--version", "doctor", "inventory --system",
+                       "inventory_code=$?", 'test "$inventory_code" -eq 0',
                        "softhsm", "p11scope/inventory/v1"):
             self.assertIn(marker, bodies, f"build smoke must {marker}")
         self.assertIn("GITHUB_REF_NAME", bodies, "smoke must assert --version matches the tag")

@@ -137,10 +137,12 @@ class InventoryMtOracleTests(unittest.TestCase):
     def test_pid_healthy_passes(self):
         result = self.run_case(cell="inventory-mt-pid")
         self.assertEqual(result["qualification"], "owned-edge-usage-counts")
+        self.assertEqual(result["proof"], {"edge_total": 209, "caller_count": 1})
 
     def test_system_healthy_passes(self):
         result = self.run_case(cell="inventory-mt-system")
         self.assertEqual(result["qualification"], "owned-edge-usage-counts")
+        self.assertEqual(result["proof"], {"edge_total": 209, "caller_count": 5})
 
     def test_snapshot_undercount_fails(self):
         result = self.run_case(lambda d, l, r, e: d["edges"][0]["entries"].update(count=208),

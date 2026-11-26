@@ -43,9 +43,23 @@ def run_checker(rows, *extra):
         return result
 
 
-def row(cell, passed, qualification="qualified", detail="ok"):
-    return {"cell": cell, "pass": passed,
-            "qualification": qualification, "detail": detail}
+def row(cell, passed, qualification="qualified", detail="ok", proof=None):
+    row = {"cell": cell, "pass": passed,
+           "qualification": qualification, "detail": detail}
+    if proof is not None:
+        row["proof"] = proof
+    return row
+
+
+def edge_proof(total=64017, callers=1):
+    return {"edge_total": total, "caller_count": callers}
+
+
+def info_proof(manufacturer="SoftHSM", major=2, minor=6, tokens=2,
+               mechanisms=140, slots=2):
+    return {"manufacturer": manufacturer, "library_major": major,
+            "library_minor": minor, "token_rows": tokens,
+            "mechanism_rows": mechanisms, "slots": slots}
 
 
 class CheckCellResultsTests(unittest.TestCase):
@@ -66,79 +80,94 @@ class CheckCellResultsTests(unittest.TestCase):
                                   "counts match; disclosed honest ambient gap")])
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_owned_edge_usage_counts_accepted_with_proof_fields(self):
+    def test_owned_edge_usage_counts_accepted_with_proof(self):
+        # The verdict decides over the typed proof record; the
+        # detail sentence is human prose and is never parsed (its
+        # content is deliberately unrelated here).
         result = run_checker([
             row("inventory-mt-pid", True, "owned-edge-usage-counts",
-                "owned per-edge usage and streamed edge totals match the independent ledger "
-                "total 64017 over 1 workload callers; per-caller attribution is by caller pid"),
+                "human detail, ignored by the verdict",
+                proof=edge_proof(64017, 1)),
             row("inventory-mt-system", True, "owned-edge-usage-counts",
-                "owned per-edge usage and streamed edge totals match the independent ledger "
-                "total 64065 over 5 workload callers; per-caller attribution is by caller pid"),
+                "human detail, ignored by the verdict",
+                proof=edge_proof(64065, 5)),
         ])
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_owned_edge_usage_counts_rejects_missing_proof_fields(self):
-        canonical = ("owned per-edge usage and streamed edge totals match the independent ledger "
-                     "total 64017 over 1 workload callers; per-caller attribution is by caller pid")
+    def test_owned_edge_usage_counts_rejects_bad_proof(self):
         cases = [
-            "ok",
-            "",
-            "owned per-edge usage match independent ledger total 64017 over 1 workload callers; per-caller attribution is by caller pid",
-            "owned per-edge usage and streamed edge totals match the independent ledger total 64017 over 1 workload callers; per-caller attribution is not established",
-            "owned per-edge usage and streamed edge totals match the independent ledger total 0 over 1 workload callers; per-caller attribution is by caller pid",
-            "owned per-edge usage and streamed edge totals match the independent ledger total 64017 over 0 workload callers; per-caller attribution is by caller pid",
-            # Full-string match: prefix, suffix and contradictory
-            # trailing text are refused, not searched past.
-            "PASS: " + canonical,
-            canonical + " (lossy)",
-            canonical + "; serialNumber and sessionCount were published",
+            None,
+            "not-an-object",
+            {},
+            {"edge_total": 64017},
+            {"edge_total": 64017, "caller_count": 1, "extra": 0},
+            {"edge_total": 0, "caller_count": 1},
+            {"edge_total": 64017, "caller_count": 0},
+            {"edge_total": -1, "caller_count": 1},
+            {"edge_total": True, "caller_count": 1},
+            {"edge_total": "64017", "caller_count": 1},
         ]
-        for detail in cases:
-            with self.subTest(detail=detail):
-                result = run_checker([row("inventory-mt-pid", True, "owned-edge-usage-counts", detail)])
+        for proof in cases:
+            with self.subTest(proof=proof):
+                result = run_checker([row("inventory-mt-pid", True,
+                                          "owned-edge-usage-counts",
+                                          "human detail", proof=proof)])
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn("missing owned-edge-usage-counts proof fields", result.stderr)
+                self.assertIn("owned-edge-usage-counts proof", result.stderr)
+                self.assertNotIn("inventory-mt-pid", result.stdout)
 
-    def test_provider_info_exact_accepted_with_proof_fields(self):
+    def test_provider_info_exact_accepted_with_proof(self):
+        # The verdict decides over the typed proof record; the
+        # detail sentence is human prose and is never parsed (its
+        # content is deliberately unrelated here).
         result = run_checker([
             row("inventory-provider-info-pid", True, "provider-info-exact",
-                "provider SoftHSM library 2.6: 2 token rows and 140 mechanism rows "
-                "match the ledger over 2 slots; serial/label absent"),
+                "human detail, ignored by the verdict",
+                proof=info_proof()),
         ])
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_provider_info_exact_rejects_missing_proof_fields(self):
-        canonical = ("provider SoftHSM library 2.6: 2 token rows and 140 mechanism rows "
-                     "match the ledger over 2 slots; serial/label absent")
+    def test_provider_info_exact_rejects_bad_proof(self):
+        good = info_proof()
         cases = [
-            "ok",
-            "",
-            "provider SoftHSM library 2.6: 2 token rows and 140 mechanism rows match the ledger over 2 slots",
-            "provider SoftHSM library 2.6: 0 token rows and 140 mechanism rows match the ledger over 2 slots; serial/label absent",
-            "provider SoftHSM library 2.6: 2 token rows and 0 mechanism rows match the ledger over 2 slots; serial/label absent",
-            "provider SoftHSM library 2.6: 2 token rows and 140 mechanism rows match the ledger over 0 slots; serial/label absent",
-            # Full-string match: prefix, suffix, contradictory
-            # trailing text and a nested fake proof inside the
-            # manufacturer field are all refused.
-            "PASS: " + canonical,
-            canonical + " (lossy)",
-            canonical + "; serialNumber and sessionCount were published",
-            ("provider evil library 9.9: 0 token rows and 0 mechanism rows match the ledger "
-             "over 0 slots; serial/label absent library 2.6: 2 token rows and 140 mechanism rows "
-             "match the ledger over 2 slots; serial/label absent"),
+            None,
+            "not-an-object",
+            {},
+            dict(good, token_rows=0),
+            dict(good, mechanism_rows=0),
+            dict(good, slots=0),
+            dict(good, token_rows=-1),
+            dict(good, token_rows=True),
+            dict(good, token_rows="2"),
+            dict(good, manufacturer=""),
+            dict(good, manufacturer=7),
+            dict(good, library_major=256),
+            dict(good, library_minor=-1),
+            dict(good, extra=0),
+            {key: value for key, value in good.items() if key != "slots"},
         ]
-        for detail in cases:
-            with self.subTest(detail=detail):
+        for proof in cases:
+            with self.subTest(proof=proof):
                 result = run_checker([row("inventory-provider-info-pid", True,
-                                          "provider-info-exact", detail)])
+                                          "provider-info-exact",
+                                          "human detail", proof=proof)])
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn("missing provider-info-exact proof fields", result.stderr)
+                self.assertIn("provider-info-exact proof", result.stderr)
+                self.assertNotIn("inventory-provider-info-pid", result.stdout)
+
+    def test_proof_on_other_qualifications_refused(self):
+        # Only the two exact-proof qualifications may carry proof;
+        # any other row with a proof key is schema-invalid.
+        result = run_checker([row("a", True, "qualified", "ok",
+                                  proof=info_proof())])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("want no proof", result.stderr)
 
     def test_provider_info_exact_failure_rejected(self):
         result = run_checker([
             row("inventory-provider-info-pid", False, "provider-info-exact",
-                "provider SoftHSM library 2.6: 2 token rows and 140 mechanism rows "
-                "match the ledger over 2 slots; serial/label absent"),
+                "human detail, ignored by the verdict",
+                proof=info_proof()),
         ])
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("failed qualified cell inventory-provider-info-pid", result.stderr)
@@ -146,8 +175,8 @@ class CheckCellResultsTests(unittest.TestCase):
     def test_owned_edge_usage_counts_failure_rejected(self):
         result = run_checker([
             row("inventory-mt-pid", False, "owned-edge-usage-counts",
-                "owned per-edge usage and streamed edge totals match the independent ledger "
-                "total 64017 over 1 workload callers; per-caller attribution is by caller pid"),
+                "human detail, ignored by the verdict",
+                proof=edge_proof()),
         ])
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("failed qualified cell inventory-mt-pid", result.stderr)

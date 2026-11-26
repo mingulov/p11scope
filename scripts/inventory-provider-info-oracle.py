@@ -609,6 +609,17 @@ def judge(report_text, ledger_text, receipt, event_text, cell):
     check_observations(report, owned, caller, token_slots, mech_facts)
     check_no_excluded_keys(report)
     check_edge_and_stream(report, event_text, owned, caller, total)
+    # The typed proof record is what the workflow checker decides
+    # over; the detail sentence carries the same numbers for human
+    # readers only and is never parsed.
+    proof = {
+        "manufacturer": info["manufacturer"],
+        "library_major": info["library_major"],
+        "library_minor": info["library_minor"],
+        "token_rows": len(token_slots),
+        "mechanism_rows": len(mech_facts),
+        "slots": nslots,
+    }
     return (
         "provider-info-exact",
         "provider %s library %d.%d: %d token rows and %d mechanism rows "
@@ -621,6 +632,7 @@ def judge(report_text, ledger_text, receipt, event_text, cell):
             len(mech_facts),
             nslots,
         ),
+        proof,
     )
 
 
@@ -631,14 +643,16 @@ def main(argv=None):
     args = parser.parse_args(argv)
     result = {"cell": args.cell, "pass": False, "detail": "", "qualification": "failed"}
     try:
-        qualification, detail = judge(
+        qualification, detail, proof = judge(
             read(Path(args.report)),
             read(Path(args.ledger)),
             parse(read(Path(args.receipt))),
             read(Path(getattr(args, "event_log"))),
             args.cell,
         )
-        result.update({"pass": True, "qualification": qualification, "detail": detail})
+        result.update(
+            {"pass": True, "qualification": qualification, "detail": detail, "proof": proof}
+        )
         code = 0
     except (
         EvidenceError,

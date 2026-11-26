@@ -41,6 +41,10 @@ import json
 import subprocess
 import sys
 import zipfile
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from result_row import validate_row  # noqa: E402
 
 # The run-tree matrix legs (privileged-tests.yml); public-cli and
 # witness-cli carry v7.4-rc3 too, run-tree does not.
@@ -107,20 +111,32 @@ def run_artifacts(repo, run_id):
 
 
 def artifact_results(url):
+    # Returns (rows, note): rows is None when the artifact carries
+    # no usable evidence. An artifact with any schema-invalid row
+    # is unusable as a whole (its source run already went red):
+    # corrupt evidence never counts as a pass or a miss.
     blob = gh(["api", url])
     try:
         with zipfile.ZipFile(io.BytesIO(blob)) as archive:
             try:
                 raw = archive.read(RESULTS_PATH).decode("utf-8")
             except KeyError:
-                return None
+                return None, "results file absent"
     except zipfile.BadZipFile:
         raise RuntimeError("artifact zip is unparseable")
     rows = []
-    for line in raw.splitlines():
-        if line.strip():
-            rows.append(json.loads(line))
-    return rows
+    for number, line in enumerate(raw.splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError as error:
+            return None, "line %d: invalid JSON: %s" % (number, error)
+        problems = validate_row(row)
+        if problems:
+            return None, "line %d: %s" % (number, problems[0])
+        rows.append(row)
+    return rows, ""
 
 
 def fetch_history(repo, workflow, window, kernels):
@@ -148,9 +164,13 @@ def fetch_history(repo, workflow, window, kernels):
                 results[kernel] = None
                 continue
             try:
-                results[kernel] = artifact_results(url)
+                rows, note = artifact_results(url)
             except (RuntimeError, ValueError) as error:
                 return None, f"run {run_id} {kernel}: {error}"
+            if rows is None:
+                print(f"check-intermittent-bounds: SKIP run {run_id} "
+                      f"{kernel}: unusable artifact ({note})")
+            results[kernel] = rows
         if all(value is None for value in results.values()):
             continue
         history.append({"id": run_id, "branch": run.get("headBranch"),
@@ -177,6 +197,17 @@ def load_history_json(path):
         if not isinstance(run, dict) or not isinstance(
                 run.get("results"), dict):
             return None, "history run must carry a results map"
+        for kernel, rows in run["results"].items():
+            if rows is None:
+                continue
+            if not isinstance(rows, list):
+                return None, "history run %r kernel %r: results must be a list" % (
+                    run.get("id"), kernel)
+            for row in rows:
+                problems = validate_row(row)
+                if problems:
+                    return None, "history run %r kernel %r: %s" % (
+                        run.get("id"), kernel, problems[0])
         history.append(run)
     return history, ""
 
@@ -197,6 +228,10 @@ def is_positive(row):
 
 
 def judge(history, cells, kernels, window):
+    # Precondition: every row already passed the shared schema
+    # validation at load (fetch_history skips corrupt artifacts
+    # loudly; load_history_json refuses corrupt input). The judge
+    # therefore decides presence and positivity only.
     lanes = {}
     for cell, lane in cells:
         lanes.setdefault(cell, []).append(lane)
@@ -220,7 +255,7 @@ def judge(history, cells, kernels, window):
                     continue
                 artifacts += 1
                 for row in rows:
-                    if isinstance(row, dict) and row.get("cell") == cell:
+                    if row.get("cell") == cell:
                         observed.append(run.get("id"))
                         if is_positive(row) and last_pass is None:
                             last_pass = run.get("id")
@@ -275,8 +310,6 @@ def main(argv=None):
         return fail("at least one --cell is required")
     kernels = tuple(args.kernel) if args.kernel else DEFAULT_KERNELS
     if args.history_json is not None:
-        from pathlib import Path
-
         history, error = load_history_json(Path(args.history_json))
         if history is None:
             return fail(error)

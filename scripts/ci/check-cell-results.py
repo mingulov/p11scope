@@ -4,7 +4,10 @@
 """Validate a cell-script results.jsonl file.
 
 Each line must be one JSON object with exactly the keys cell, pass,
-qualification and detail. Qualification is a closed set: qualified,
+qualification and detail, plus an optional proof object (see
+result_row.py, the one shared row validator: the verdict gates
+decide over these typed records with exact equality, never over
+the human detail prose). Qualification is a closed set: qualified,
 command-contract, owned-provider-counts,
 owned-provider-counts-with-runner-noise,
 owned-provider-counts-with-66-discovery-gap,
@@ -12,7 +15,7 @@ owned-provider-counts-with-ambient-gap, owned-edge-usage-counts,
 provider-info-exact, prearm-exactness, verdict-consistency,
 semantic-names and failed are qualified and every qualified row must
 pass (with owned-edge-usage-counts and provider-info-exact requiring
-their proof fields in detail); nonqualifying smoke may pass or
+their strictly validated proof records); nonqualifying smoke may pass or
 fail but every nonqualifying row must be allow-listed and the allow-list
 must equal the nonqualifying set; expected-failure must equal its
 declared list and an expected failure that passes is a failure. An
@@ -33,47 +36,13 @@ import re
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from result_row import validate_row  # noqa: E402
+
 
 def fail(message):
     print(f"check-cell-results: {message}", file=sys.stderr)
     return 1
-
-
-QUALIFIED = {"qualified", "command-contract", "owned-provider-counts",
-             "owned-provider-counts-with-runner-noise",
-             "owned-provider-counts-with-66-discovery-gap",
-             "owned-provider-counts-with-ambient-gap",
-             "owned-edge-usage-counts", "provider-info-exact",
-             "prearm-exactness",
-             "verdict-consistency", "semantic-names", "failed"}
-VALID_QUALIFICATIONS = QUALIFIED | {"nonqualifying", "expected-failure"}
-OWNED_EDGE_USAGE_DETAIL = re.compile(
-    r"owned per-edge usage and streamed edge totals match the independent ledger "
-    r"total ([0-9]+) over ([0-9]+) workload callers; "
-    r"per-caller attribution is by caller pid"
-)
-# Both proof patterns are matched with fullmatch against the
-# oracles' canonical emissions (no surrounding text): prefix,
-# suffix or contradictory trailing text is refused, so fullmatch
-# only ever rejects drift or forgery, never a true positive. The
-# manufacturer class excludes newlines and colons so a nested
-# fake proof cannot smuggle inside it.
-PROVIDER_INFO_DETAIL = re.compile(
-    r"provider ([^\n:]+?) library ([0-9]+)\.([0-9]+): ([0-9]+) token rows and "
-    r"([0-9]+) mechanism rows match the ledger over ([0-9]+) slots; "
-    r"serial/label absent"
-)
-
-
-def has_owned_edge_usage_proof(detail):
-    match = OWNED_EDGE_USAGE_DETAIL.fullmatch(detail)
-    return match is not None and int(match.group(1)) > 0 and int(match.group(2)) > 0
-
-
-def has_provider_info_proof(detail):
-    match = PROVIDER_INFO_DETAIL.fullmatch(detail)
-    return (match is not None and int(match.group(4)) > 0 and
-            int(match.group(5)) > 0 and int(match.group(6)) > 0)
 
 
 LANE_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*")
@@ -151,35 +120,16 @@ def main(argv):
         except json.JSONDecodeError as error:
             problems.append(f"line {number}: invalid JSON: {error}")
             continue
-        if not isinstance(row, dict):
-            problems.append(f"line {number}: row is not an object")
-            continue
-        if set(row) != {"cell", "pass", "qualification", "detail"}:
-            problems.append(f"line {number}: row must have exactly cell/pass/qualification/detail")
+        row_problems = validate_row(row)
+        if row_problems:
+            for problem in row_problems:
+                problems.append(f"line {number}: {problem}")
             continue
         cell = row["cell"]
-        passed = row["pass"]
-        qualification = row["qualification"]
-        detail = row["detail"]
-        if not isinstance(cell, str) or not cell:
-            problems.append(f"line {number}: cell must be a nonempty string")
-            continue
         if cell in seen:
             problems.append(f"line {number}: duplicate cell {cell}")
             continue
         seen.add(cell)
-        if not isinstance(passed, bool):
-            problems.append(f"line {number}: pass must be a boolean for {cell}")
-            continue
-        if not isinstance(qualification, str) or not qualification:
-            problems.append(f"line {number}: qualification must be a nonempty string for {cell}")
-            continue
-        if qualification not in VALID_QUALIFICATIONS:
-            problems.append(f"line {number}: unknown qualification {qualification!r} for {cell}")
-            continue
-        if not isinstance(detail, str):
-            problems.append(f"line {number}: detail must be a string for {cell}")
-            continue
         rows.append(row)
     if not rows and not problems:
         return fail("no result rows")
@@ -199,20 +149,15 @@ def main(argv):
             if cell not in set(allowed_smoke):
                 problems.append(f"nonqualifying cell not in allow list: {cell}")
         else:
-            if qualification == "owned-edge-usage-counts":
-                missing_proof = not has_owned_edge_usage_proof(row["detail"])
-            elif qualification == "provider-info-exact":
-                missing_proof = not has_provider_info_proof(row["detail"])
-            else:
-                missing_proof = False
-            status = "PASS" if (passed and not missing_proof) else "FAIL"
+            # Rows reaching this branch already passed the shared
+            # schema validation (proof records included); the
+            # human detail prose is printed but never parsed.
+            status = "PASS" if passed else "FAIL"
             print(f"{status} {cell} {detail}")
             if not passed:
                 problems.append(f"failed qualified cell {cell}")
             if qualification == "failed" and passed:
                 problems.append(f"inconsistent row for {cell}: pass with failed qualification")
-            if missing_proof:
-                problems.append(f"missing {qualification} proof fields for {cell}")
     actual = sorted(row["cell"] for row in rows if row["qualification"] == "expected-failure")
     wanted = sorted(set(expected))
     if len(wanted) != len(expected):

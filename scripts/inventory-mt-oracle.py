@@ -270,10 +270,15 @@ def judge(report_text, ledger_text, receipt, event_text, cell):
     edges = snapshot_edges(report, provider, pids)
     check_edge_totals(edges, total, "snapshot")
     check_event_log(event_text, edges, total)
+    # The typed proof record is what the workflow checker decides
+    # over; the detail sentence carries the same numbers for human
+    # readers only and is never parsed.
+    proof = {"edge_total": total, "caller_count": len(pids)}
     return ("owned-edge-usage-counts",
             "owned per-edge usage and streamed edge totals match the independent ledger "
             "total %d over %d workload callers; per-caller attribution is by caller pid" %
-            (total, len(pids)))
+            (total, len(pids)),
+            proof)
 
 
 def main(argv=None):
@@ -283,10 +288,11 @@ def main(argv=None):
     args = parser.parse_args(argv)
     result = {"cell": args.cell, "pass": False, "detail": "", "qualification": "failed"}
     try:
-        qualification, detail = judge(read(Path(args.report)), read(Path(args.ledger)),
+        qualification, detail, proof = judge(read(Path(args.report)), read(Path(args.ledger)),
                                       parse(read(Path(args.receipt))),
                                       read(Path(getattr(args, "event_log"))), args.cell)
-        result.update({"pass": True, "qualification": qualification, "detail": detail})
+        result.update({"pass": True, "qualification": qualification, "detail": detail,
+                       "proof": proof})
         code = 0
     except (EvidenceError, OSError, ValueError, TypeError, KeyError, AttributeError, AssertionError) as error:
         result["detail"] = str(error)

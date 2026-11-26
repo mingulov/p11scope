@@ -265,6 +265,17 @@ class ProviderInfoOracleTests(unittest.TestCase):
         self.assertEqual(result["qualification"], "provider-info-exact")
         self.assertIn("1 token rows and 2 mechanism rows", result["detail"])
         self.assertIn("serial/label absent", result["detail"])
+        self.assertEqual(
+            result["proof"],
+            {
+                "manufacturer": "SoftHSM",
+                "library_major": 2,
+                "library_minor": 6,
+                "token_rows": 1,
+                "mechanism_rows": 2,
+                "slots": 2,
+            },
+        )
 
     def test_manufacturer_mismatch_fails(self):
         result = self.run_case(

@@ -8,10 +8,12 @@ judge pre-fetched histories (--history-json), never the network.
 """
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -158,7 +160,9 @@ class IntermittentBoundsTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(f"{CELL} on host went", result.stderr)
 
-    def test_non_boolean_pass_is_not_a_pass(self):
+    def test_history_with_non_boolean_pass_is_refused(self):
+        # Schema-invalid rows never reach the judge: --history-json
+        # input with a non-boolean pass fails at load.
         doc = history([
             run_entry(2, host_rows=[{"cell": CELL, "pass": "yes",
                                      "qualification": "qualified",
@@ -169,18 +173,114 @@ class IntermittentBoundsTests(unittest.TestCase):
         ])
         result = self.run_bounds(doc, "--cell", f"{CELL}=task/fix")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn(f"{CELL} on host went", result.stderr)
+        self.assertIn("pass must be a boolean", result.stderr)
 
-    def test_row_missing_keys_is_not_a_pass(self):
+    def test_history_missing_detail_is_refused(self):
+        # Devin's case: a pass-shaped row missing `detail` must not
+        # reset the window; the history input is refused instead.
         doc = history([
-            run_entry(2, host_rows=[{"cell": CELL, "pass": True}],
+            run_entry(2, host_rows=[{"cell": CELL, "pass": True,
+                                     "qualification": "qualified"}],
                       guest_rows=[row(CELL, True)]),
             run_entry(1, host_rows=[row(CELL, False, "expected-failure")],
                       guest_rows=[row(CELL, True)]),
         ])
         result = self.run_bounds(doc, "--cell", f"{CELL}=task/fix")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn(f"{CELL} on host went", result.stderr)
+        self.assertIn("row must have exactly cell/pass/qualification/detail",
+                      result.stderr)
+
+    def test_history_extra_key_is_refused(self):
+        doc = history([
+            run_entry(2, host_rows=[dict(row(CELL, True), notes="extra")],
+                      guest_rows=[row(CELL, True)]),
+            run_entry(1, host_rows=[row(CELL, False, "expected-failure")],
+                      guest_rows=[row(CELL, True)]),
+        ])
+        result = self.run_bounds(doc, "--cell", f"{CELL}=task/fix")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("row must have exactly cell/pass/qualification/detail",
+                      result.stderr)
+
+    def test_history_non_string_detail_is_refused(self):
+        bad = row(CELL, True)
+        bad["detail"] = ["ok"]
+        doc = history([
+            run_entry(2, host_rows=[bad],
+                      guest_rows=[row(CELL, True)]),
+            run_entry(1, host_rows=[row(CELL, False, "expected-failure")],
+                      guest_rows=[row(CELL, True)]),
+        ])
+        result = self.run_bounds(doc, "--cell", f"{CELL}=task/fix")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("detail must be a string", result.stderr)
+
+    def test_history_wrong_key_types_are_refused(self):
+        bad = {"cell": 42, "pass": True, "qualification": "qualified",
+               "detail": "ok"}
+        doc = history([
+            run_entry(2, host_rows=[bad],
+                      guest_rows=[row(CELL, True)]),
+            run_entry(1, host_rows=[row(CELL, False, "expected-failure")],
+                      guest_rows=[row(CELL, True)]),
+        ])
+        result = self.run_bounds(doc, "--cell", f"{CELL}=task/fix")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cell must be a nonempty string", result.stderr)
+
+    def test_live_malformed_artifact_is_skipped_loudly(self):
+        # The live fetch path (fake gh below, no network): an
+        # artifact whose rows fail the shared schema is skipped
+        # with a loud note and contributes neither pass nor miss.
+        # Run 7's host artifact carries a pass-shaped row missing
+        # `detail` (Devin's case over the live path); run 6 is
+        # valid but never ran the cell. The gate fails closed on
+        # both legs instead of counting the malformed row.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            bad = tmpdir / "bad.zip"
+            with zipfile.ZipFile(bad, "w") as bundle:
+                bundle.writestr(
+                    "cells/results.jsonl",
+                    json.dumps({"cell": CELL, "pass": True,
+                                "qualification": "qualified"})
+                    + "\n",
+                )
+            good = tmpdir / "good.zip"
+            with zipfile.ZipFile(good, "w") as bundle:
+                bundle.writestr(
+                    "cells/results.jsonl", json.dumps(row(OTHER, True)) + "\n"
+                )
+            fake = tmpdir / "gh"
+            fake.write_text(
+                "#!/bin/sh\n"
+                'if [ "$1" = "run" ]; then\n'
+                '  echo \'[{"databaseId": 7, "headBranch": "test/x",'
+                ' "conclusion": "failure", "createdAt": "t"},'
+                ' {"databaseId": 6, "headBranch": "test/x",'
+                ' "conclusion": "success", "createdAt": "t"}]\'\n'
+                "elif [ \"$2\" = \"repos/x/y/actions/runs/7/artifacts\" ]; then\n"
+                f"  printf 'run-tree-host\\tfile://{bad}\\tfalse\\n'\n"
+                "elif [ \"$2\" = \"repos/x/y/actions/runs/6/artifacts\" ]; then\n"
+                f"  printf 'run-tree-host\\tfile://{good}\\tfalse\\n'\n"
+                "else\n"
+                '  cat "${2#file://}"\n'
+                "fi\n"
+            )
+            fake.chmod(0o755)
+            env = dict(os.environ)
+            env["PATH"] = str(tmpdir) + ":" + env["PATH"]
+            args = [sys.executable, "-I", str(SCRIPT),
+                    "--repo", "x/y", "--window", "3",
+                    "--kernel", "host", "--kernel", "v6.6.157",
+                    "--cell", f"{CELL}=task/fix"]
+            proc = subprocess.run(args, capture_output=True, text=True,
+                                  timeout=30, env=env)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("SKIP run 7 host: unusable artifact", proc.stdout)
+        self.assertIn(f"{CELL} on host never ran in the window", proc.stderr)
+        self.assertIn("has no run-tree artifacts in", proc.stderr)
+        self.assertNotIn("last pass", proc.stdout)
 
     def test_two_cells_judged_independently(self):
         doc = history([

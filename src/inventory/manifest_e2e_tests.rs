@@ -1403,8 +1403,10 @@ fn mechanism_proof(mechanisms: &[serde_json::Value]) -> Result<(u64, bool)> {
 /// report: only `departed_use` aggregates whose identities name
 /// `ledger_pid` count, every mechanism must carry its returns rows
 /// (an aggregate without returns proves nothing about the ledger's
-/// API results), and the aggregate must record entries and API
-/// returns. Powers the `ledger_caller.is_none()` arm of
+/// API results), the aggregate must record entries and API returns,
+/// and its folded label distribution must show observed semantics
+/// (the live arm's `semantics == "observed"` string, folded).
+/// Powers the `ledger_caller.is_none()` arm of
 /// `scale4097_inner`, which the live scale cell rarely reaches, so
 /// the twins below drive it directly with synthetic folded reports.
 fn count_folded_ledger_aggregates(report: &serde_json::Value, ledger_pid: u32) -> Result<usize> {
@@ -1440,6 +1442,13 @@ fn count_folded_ledger_aggregates(report: &serde_json::Value, ledger_pid: u32) -
         let (calls, ok) = mechanism_proof(mechanisms)?;
         ensure!(calls > 0, "the folded aggregate records mechanism calls");
         ensure!(ok, "the folded aggregate records a CKR_OK API result");
+        ensure!(
+            departed["semantics"]["labels"]["observed"]
+                .as_u64()
+                .unwrap_or(0)
+                > 0,
+            "the folded aggregate records observed semantics"
+        );
         let entries = departed
             .get("entries")
             .and_then(|entries| entries.get("count"))
@@ -1462,17 +1471,19 @@ fn count_folded_ledger_aggregates(report: &serde_json::Value, ledger_pid: u32) -
 /// (with CKR_OK returns rows when `with_returns`), and positive
 /// entry/API-return totals.
 fn folded_module(pid: u32, calls: u64, with_returns: bool) -> serde_json::Value {
-    folded_module_full(pid, calls, with_returns.then_some(0), calls, calls)
+    folded_module_full(pid, calls, with_returns.then_some(0), calls, calls, calls)
 }
 
 /// One synthetic folded row with explicit returns `rv` (none when
-/// `returns_rv` is `None`) and explicit entry/API-return totals.
+/// `returns_rv` is `None`), explicit entry/API-return totals, and an
+/// explicit observed-label count.
 fn folded_module_full(
     pid: u32,
     calls: u64,
     returns_rv: Option<u64>,
     entries: u64,
     api_returns: u64,
+    observed: u64,
 ) -> serde_json::Value {
     let mechanism = match returns_rv {
         Some(rv) => serde_json::json!({
@@ -1485,6 +1496,7 @@ fn folded_module_full(
         "departed_use": {
             "identities": [{"pid": pid}],
             "mechanisms": [mechanism],
+            "semantics": {"labels": {"observed": observed}},
             "entries": {"count": entries},
             "instances": {"api_returns": api_returns},
         },
@@ -1550,7 +1562,7 @@ fn folded_ledger_aggregate_without_calls_errors() {
     // A ledger row with zero mechanism calls is a hard error naming
     // the missing calls, even with positive entries and API returns
     // (deleting the calls check would count it).
-    let report = folded_report(vec![folded_module_full(4242, 0, Some(0), 5, 5)]);
+    let report = folded_report(vec![folded_module_full(4242, 0, Some(0), 5, 5, 1)]);
     let error = count_folded_ledger_aggregates(&report, 4242)
         .expect_err("the calls-less ledger row errors");
     assert!(
@@ -1563,7 +1575,7 @@ fn folded_ledger_aggregate_without_calls_errors() {
 fn folded_ledger_aggregate_without_ok_errors() {
     // A ledger row whose returns carry no CKR_OK is a hard error
     // naming the missing proof (a silent skip would return Ok(0)).
-    let report = folded_report(vec![folded_module_full(4242, 5, Some(1), 5, 5)]);
+    let report = folded_report(vec![folded_module_full(4242, 5, Some(1), 5, 5, 1)]);
     let error =
         count_folded_ledger_aggregates(&report, 4242).expect_err("the non-OK ledger row errors");
     assert!(
@@ -1576,7 +1588,7 @@ fn folded_ledger_aggregate_without_ok_errors() {
 fn folded_ledger_aggregate_without_entries_errors() {
     // A ledger row with populated mechanisms but zero entries is a
     // hard error (deleting the entries check would count it).
-    let report = folded_report(vec![folded_module_full(4242, 5, Some(0), 0, 5)]);
+    let report = folded_report(vec![folded_module_full(4242, 5, Some(0), 0, 5, 1)]);
     let error = count_folded_ledger_aggregates(&report, 4242)
         .expect_err("the entries-less ledger row errors");
     assert!(
@@ -1589,12 +1601,25 @@ fn folded_ledger_aggregate_without_entries_errors() {
 fn folded_ledger_aggregate_without_api_returns_errors() {
     // A ledger row with populated mechanisms but zero API returns is
     // a hard error (deleting the API-returns check would count it).
-    let report = folded_report(vec![folded_module_full(4242, 5, Some(0), 5, 0)]);
+    let report = folded_report(vec![folded_module_full(4242, 5, Some(0), 5, 0, 1)]);
     let error = count_folded_ledger_aggregates(&report, 4242)
         .expect_err("the API-returns-less ledger row errors");
     assert!(
         format!("{error:#}").contains("records API returns"),
         "the error names the missing API returns: {error:#}"
+    );
+}
+
+#[test]
+fn folded_ledger_aggregate_without_observed_label_errors() {
+    // A ledger row with populated mechanisms but no observed label
+    // is a hard error (deleting the labels check would count it).
+    let report = folded_report(vec![folded_module_full(4242, 5, Some(0), 5, 5, 0)]);
+    let error = count_folded_ledger_aggregates(&report, 4242)
+        .expect_err("the unobserved ledger row errors");
+    assert!(
+        format!("{error:#}").contains("records observed semantics"),
+        "the error names the missing observed semantics: {error:#}"
     );
 }
 
@@ -1971,9 +1996,10 @@ fn scale4097_inner(
         // Folded: the departed aggregate carries the same per-mechanism
         // rows (calls, CKR_OK returns) plus folded entry/API-return
         // totals. The per-edge "observed" string folds into the label
-        // distribution, so the populated-mechanisms proof stands in.
-        // Only aggregates that folded the ledger caller count (see
-        // count_folded_ledger_aggregates).
+        // distribution, which the helper checks directly
+        // (`semantics.labels.observed > 0`), like the live arm checks
+        // the string. Only aggregates that folded the ledger caller
+        // count (see count_folded_ledger_aggregates).
         populated += count_folded_ledger_aggregates(&report, ledger_pid)?;
     }
     println!("SCALE2_E2E populated_edges={populated}");

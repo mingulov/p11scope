@@ -95851,6 +95851,58 @@ fn export_attach_with_queued_refresh_retries_without_filing_the_gap() {
     );
 }
 
+/// Fail-closed twin: two attached contexts are ambiguous, never a deferred
+/// arm, so a queued refresh does not retry them — the gap still files.
+#[test]
+fn export_attach_with_two_attached_contexts_still_files_the_gap() {
+    use p11scope_manifest::elf::SymbolFact;
+
+    let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+    let view = engine.views[0].id();
+    let pid = engine.views[0].pid();
+    engine.modules[0].scanned.exports = vec!["C_GetFunctionList".into()];
+    for hook in [0x2100u64, 0x2200u64] {
+        let spec = LoaderContextSpec {
+            view,
+            loader: PinnedObjectId(9),
+            mapping: Some(MapEntry {
+                start: 0x4000,
+                end: 0x5000,
+                file_offset: 0x2000,
+                permissions: *b"r-xp",
+                device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+                inode: 7,
+                raw_path: Some(b"/lib/ld.so".to_vec()),
+            }),
+            hook: SymbolFact {
+                virtual_address: hook,
+                file_offset: hook,
+            },
+            state_address: None,
+        };
+        let prepared = engine.loader_registry.preflight(spec).unwrap();
+        let context = engine.loader_registry.prepare(prepared).unwrap();
+        engine.loader_registry.mark_attached(context).unwrap();
+    }
+    assert_eq!(engine.loader_registry.ids_for_view(view).len(), 2);
+    assert!(
+        engine.request_refresh(pid, crate::attach::monotonic_ns()),
+        "a refresh queues beside the ambiguity"
+    );
+    let outcome = engine.attach_refreshed_exports(view, &mut ScriptedSession::default(), &mut true);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_eq!(outcome, (false, false, false, false));
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live export hook"
+                && skip.reason == "a refreshed provider had no unique attached loader context"
+        }),
+        "{:?}",
+        engine.counters.object_skips
+    );
+}
+
 /// A tick stopped by queued retirements postpones nothing observable
 /// only when every queued retirement is an ending group and no newcomer,
 /// refreshed live view or rejected retry waits behind it.

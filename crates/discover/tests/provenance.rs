@@ -2,11 +2,8 @@
 //! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! An unrelated executable mapping must not erase useful provider observations.
 
-#[allow(dead_code)]
-#[path = "../../../src/manifest_input.rs"]
-mod manifest_input;
-
 use p11scope_discover::manifest::{Manifest, Resolution, SurfaceSource};
+use p11scope_manifest::validate::validate_structure;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -62,7 +59,7 @@ impl Fixture {
             "a usable provider must yield its manifest: {stderr}"
         );
         let manifest: Manifest = serde_json::from_slice(&output.stdout).unwrap();
-        let problems = manifest_input::validate_structure(&manifest);
+        let problems = validate_structure(&manifest);
         assert!(problems.is_empty(), "invalid helper manifest: {problems:?}");
         for object in &manifest.objects {
             assert!(object.identity.reusable, "unusable object: {object:?}");

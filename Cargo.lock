@@ -647,9 +647,11 @@ dependencies = [
 name = "p11scope-manifest"
 version = "0.0.0"
 dependencies = [
+ "cryptoki-sys",
  "libc",
  "memmap2",
  "object",
+ "pkcs11-module",
  "serde",
  "serde_json",
  "sha2",

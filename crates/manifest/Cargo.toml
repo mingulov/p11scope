@@ -17,6 +17,8 @@ identify = ["dep:libc", "dep:memmap2", "dep:object", "dep:sha2"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
+cryptoki-sys = "0.5"
+pkcs11-module = "0.2.3"
 object = { version = "0.39", default-features = false, features = ["read"], optional = true }
 libc = { version = "0.2", optional = true }
 memmap2 = { version = "0.9", optional = true }

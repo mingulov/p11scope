@@ -2,11 +2,10 @@
 //! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Selected observations remain useful independently of stronger authority.
 
-#[allow(dead_code)]
-#[path = "../../../src/manifest_input.rs"]
-mod manifest_input;
-
 use p11scope_discover::manifest::*;
+use p11scope_manifest::validate::{
+    selection_table_inventory_incomplete, selection_table_name_authorized, validate_structure,
+};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -86,7 +85,7 @@ fn only_table(manifest: &Manifest, words: usize) -> &SelectionTable {
             && query.authority == SelectionAuthority::SelectionCountOnly
             && query.inventory_matches.is_empty()
     }));
-    let problems = manifest_input::validate_structure(manifest);
+    let problems = validate_structure(manifest);
     assert!(problems.is_empty(), "{problems:?}");
     table
 }
@@ -225,7 +224,7 @@ fn conflicting_selected_observations_retain_both_target_sets() {
             .iter()
             .all(|q| q.authority == SelectionAuthority::SelectionCountOnly)
     );
-    assert!(manifest_input::validate_structure(&manifest).is_empty());
+    assert!(validate_structure(&manifest).is_empty());
 }
 
 #[test]
@@ -240,7 +239,7 @@ fn failed_or_null_selection_has_no_observed_table() {
                 .iter()
                 .all(|q| q.authority == SelectionAuthority::None)
         );
-        assert!(manifest_input::validate_structure(&manifest).is_empty());
+        assert!(validate_structure(&manifest).is_empty());
     }
 }
 
@@ -265,7 +264,7 @@ fn selected_unreadable_header_keeps_body_and_an_unambiguous_placeholder() {
         .functions
         .truncate(67);
     imported_short.selection_evidence.selection_truncated = true;
-    assert!(manifest_input::validate_structure(&imported_short).is_empty());
+    assert!(validate_structure(&imported_short).is_empty());
     for mutation in 0..4 {
         let mut invalid = manifest.clone();
         match mutation {
@@ -285,7 +284,7 @@ fn selected_unreadable_header_keeps_body_and_an_unambiguous_placeholder() {
             }
         }
         assert!(
-            !manifest_input::validate_structure(&invalid).is_empty(),
+            !validate_structure(&invalid).is_empty(),
             "mutation{mutation}"
         );
     }
@@ -312,21 +311,19 @@ fn selected_drift_evidence_retains_the_observed_extent_without_naming_authority(
         query.helper_failure = Some(SelectionFailure::UnreadableVersion);
     }
     only_table(&manifest, 104);
-    assert!(!manifest_input::selection_table_name_authorized(
-        &manifest, 0
-    ));
-    assert!(!manifest_input::selection_table_inventory_incomplete(
+    assert!(!selection_table_name_authorized(&manifest, 0));
+    assert!(!selection_table_inventory_incomplete(
         &manifest.selection_evidence,
         &manifest.selection_evidence.tables[0]
     ));
     assert!(!manifest.selection_evidence.selection_truncated);
     let mut inconsistent = manifest.clone();
     inconsistent.selection_evidence.queries[0].helper_failure = None;
-    assert!(!manifest_input::validate_structure(&inconsistent).is_empty());
+    assert!(!validate_structure(&inconsistent).is_empty());
     manifest.selection_evidence.tables[0].functions.truncate(67);
     manifest.selection_evidence.selection_truncated = true;
     only_table(&manifest, 67);
-    assert!(manifest_input::selection_table_inventory_incomplete(
+    assert!(selection_table_inventory_incomplete(
         &manifest.selection_evidence,
         &manifest.selection_evidence.tables[0]
     ));

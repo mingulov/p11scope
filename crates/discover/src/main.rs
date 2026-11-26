@@ -643,6 +643,28 @@ fn write_private_atomically_with(
     published
 }
 
+/// The manifest about to be written, checked against the observer's own
+/// limits first: structural validity plus the 16 MiB total. A manifest
+/// the observer would reject is refused here instead of published.
+fn validated_manifest_json(m: &p11scope_discover::manifest::Manifest) -> Result<String, String> {
+    let problems = p11scope_manifest::validate::validate_structure(m);
+    if !problems.is_empty() {
+        return Err(format!(
+            "refusing to write a manifest the observer would reject: {}",
+            problems.join("; ")
+        ));
+    }
+    let json = serde_json::to_string_pretty(m).expect("manifest serializes");
+    if json.len() as u64 > p11scope_manifest::validate::MAX_MANIFEST_BYTES {
+        return Err(format!(
+            "refusing to write a {}-byte manifest; limit is {}",
+            json.len(),
+            p11scope_manifest::validate::MAX_MANIFEST_BYTES
+        ));
+    }
+    Ok(json)
+}
+
 fn main() {
     let mut module: Option<PathBuf> = None;
     let mut out: Option<PathBuf> = None;
@@ -765,7 +787,13 @@ fn main() {
                     );
                 }
             }
-            let json = serde_json::to_string_pretty(&m).expect("manifest serializes");
+            let json = match validated_manifest_json(&m) {
+                Ok(json) => json,
+                Err(error) => {
+                    eprintln!("p11scope-discover: {error}");
+                    std::process::exit(1);
+                }
+            };
             match out {
                 None => {
                     println!("{json}");
@@ -964,6 +992,137 @@ mod tests {
                 "{uids:?}/{gids:?}"
             );
         }
+    }
+
+    use p11scope_discover::manifest::*;
+
+    fn invalid_manifest() -> Manifest {
+        Manifest {
+            schema: "bogus".into(),
+            module_path: "/x.so".into(),
+            objects: vec![],
+            provenance_objects: vec![],
+            interface_list: Acquisition::Absent,
+            surfaces: vec![],
+            vendor_interfaces: vec![],
+            alias_groups: vec![],
+            selection_evidence: SelectionEvidence::default(),
+            getters: vec![],
+        }
+    }
+
+    /// The canonical 3.2 interface layout, from the same catalogue the
+    /// validator checks surfaces against.
+    fn canonical_32_names() -> Vec<&'static str> {
+        use pkcs11_module::{Surface, TableSet, tables_for};
+        let version = cryptoki_sys::CK_VERSION { major: 3, minor: 2 };
+        let spans = match tables_for(Surface::StandardInterface { version }) {
+            TableSet::Walk(spans) | TableSet::WalkKnownPrefix(spans) => spans,
+            TableSet::Refuse => panic!("the 3.2 layout must walk"),
+        };
+        spans
+            .iter()
+            .flat_map(|span| span.fields().iter().map(|field| field.name))
+            .collect()
+    }
+
+    /// One structurally valid surface at every string bound: full
+    /// canonical functions, each with a 4096-byte reason and an
+    /// 8192-hex-digit path.
+    fn maxed_surface(index: usize, names: &[&'static str]) -> SurfaceRecord {
+        SurfaceRecord {
+            source: SurfaceSource::Interface {
+                index,
+                raw_name_hex: Some("ab".repeat(256)),
+                name_lossy: Some("n".repeat(768)),
+                name_error: Some("e".repeat(4096)),
+                flags: 0,
+                classification: InterfaceClassification::CorroboratedStandardPrefix,
+            },
+            acquisition: Acquisition::Ok,
+            version: Some(Version { major: 3, minor: 2 }),
+            walk: WalkOutcome::KnownPrefix,
+            functions: names
+                .iter()
+                .map(|name| FunctionRecord {
+                    name: name.to_string(),
+                    resolution: Resolution::UnusableFile {
+                        reason: "r".repeat(4096),
+                        path_hex: "cd".repeat(4096),
+                    },
+                })
+                .collect(),
+        }
+    }
+
+    /// A structurally valid manifest with `surface_count` maxed 3.2
+    /// surfaces plus the required legacy record.
+    fn sized_manifest(surface_count: usize, names: &[&'static str]) -> Manifest {
+        let hex = "11".repeat(32);
+        let identity = p11scope_manifest::identity::ObjectIdentity {
+            kind: p11scope_manifest::identity::IdentityKind::Sha256,
+            value: Some(hex.clone()),
+            sha256: Some(hex),
+            reusable: true,
+            note: None,
+        };
+        let mut surfaces = vec![SurfaceRecord {
+            source: SurfaceSource::LegacyFunctionList,
+            acquisition: Acquisition::Absent,
+            version: None,
+            walk: WalkOutcome::NotWalked,
+            functions: vec![],
+        }];
+        surfaces.extend((0..surface_count).map(|index| maxed_surface(index, names)));
+        Manifest {
+            schema: p11scope_manifest::manifest::SCHEMA.to_string(),
+            module_path: "/obj/mod.so".into(),
+            objects: vec![ObjectRecord {
+                id: 0,
+                path: "/obj/mod.so".into(),
+                identity: identity.clone(),
+            }],
+            provenance_objects: vec![ProvenanceObject {
+                path: "/obj/mod.so".into(),
+                device_major: 8,
+                device_minor: 1,
+                inode: 7,
+                identity,
+            }],
+            interface_list: Acquisition::Ok,
+            surfaces,
+            vendor_interfaces: vec![],
+            alias_groups: vec![],
+            selection_evidence: SelectionEvidence::default(),
+            getters: vec![],
+        }
+    }
+
+    #[test]
+    fn structurally_invalid_helper_manifest_is_refused_before_writing() {
+        let error = super::validated_manifest_json(&invalid_manifest()).unwrap_err();
+        assert!(error.contains("observer would reject"), "{error}");
+    }
+
+    #[test]
+    fn oversize_helper_manifest_is_refused_before_writing() {
+        let names = canonical_32_names();
+        let big = sized_manifest(24, &names);
+        assert!(
+            p11scope_manifest::validate::validate_structure(&big).is_empty(),
+            "the oversize fixture must be structurally valid"
+        );
+        let json = serde_json::to_string_pretty(&big).unwrap();
+        assert!(
+            json.len() as u64 > p11scope_manifest::validate::MAX_MANIFEST_BYTES,
+            "the fixture must actually breach 16 MiB: {} bytes",
+            json.len()
+        );
+        let error = super::validated_manifest_json(&big).unwrap_err();
+        assert!(error.contains("limit"), "{error}");
+        // Control: one surface is accepted, so the refusal is the size.
+        let small = sized_manifest(1, &names);
+        assert!(super::validated_manifest_json(&small).is_ok());
     }
 
     #[test]

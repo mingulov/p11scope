@@ -10,6 +10,7 @@ pub mod identity;
 pub mod manifest;
 #[cfg(feature = "identify")]
 pub mod maps;
+pub mod validate;
 
 pub use identity::{IdentityKind, ObjectIdentity};
 pub use manifest::*;

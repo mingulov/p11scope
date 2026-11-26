@@ -2691,6 +2691,54 @@ fn write_report(out: &mut dyn std::io::Write, text: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// Exit-1 derivation: a report-write failure (anything but a gone
+    /// reader) fails the command even though every lane passed — the
+    /// help line must name report writing beside lane verdicts.
+    #[test]
+    fn doctor_report_write_failure_fails_the_command() {
+        struct FailingWriter;
+        impl std::io::Write for FailingWriter {
+            fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "injected report-write failure",
+                ))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let error = write_report(&mut FailingWriter, "Doctor: ok\n").unwrap_err();
+        assert!(
+            format!("{error:#}").contains("writing the doctor report to stdout"),
+            "{error:#}"
+        );
+        assert!(
+            format!("{error:#}").contains("injected report-write failure"),
+            "{error:#}"
+        );
+    }
+
+    /// The gone-reader twin: EPIPE keeps the verdict (HIGH-4), only a
+    /// real write failure fails.
+    #[test]
+    fn doctor_report_broken_pipe_keeps_the_verdict() {
+        struct ClosedReader;
+        impl std::io::Write for ClosedReader {
+            fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "reader went away",
+                ))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        write_report(&mut ClosedReader, "Doctor: ok\n")
+            .expect("a closed reader keeps the verdict");
+    }
+
     #[test]
     fn correction1_failed_setup_never_invokes_active_seccomp_probe() {
         let mut active_calls = 0;

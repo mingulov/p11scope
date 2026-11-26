@@ -1195,6 +1195,44 @@ mod tests {
         );
     }
 
+    /// A writer that fails every write with a distinctive error, so a
+    /// report-write failure is attributable to the writer, never the
+    /// scan.
+    struct FailingWriter;
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "injected report-write failure",
+            ))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Exit-1 derivation: after a successful scan, a report-write
+    /// failure exits 1 even though the target was read — the help
+    /// line must name report writing beside target reading.
+    #[test]
+    fn successful_scan_with_failing_writer_fails_the_command() {
+        let child =
+            crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild::new();
+        let error = run_with_writer(
+            child.id(),
+            &[],
+            &[],
+            &HookRegistry::builtin(),
+            true,
+            &mut FailingWriter,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("injected report-write failure"),
+            "the scan must succeed so the writer failure surfaces: {error:#}"
+        );
+    }
+
     /// Hard errors never reach the diagnosis renderer: a pid that names
     /// nothing fails before a single byte is written, so stdout stays
     /// empty and `main` reports the error on stderr instead.

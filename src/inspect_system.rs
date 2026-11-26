@@ -6056,6 +6056,55 @@ mod tests {
     use crate::cli::IdentityBackendSelection;
     use std::sync::atomic::Ordering;
 
+    /// A writer that fails every write with a distinctive error, so a
+    /// report-write failure is attributable to the writer, never the
+    /// scan.
+    struct FailingWriter;
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "injected report-write failure",
+            ))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Exit-1 derivation: after a successful system scan, a report-write
+    /// failure exits 1 even though the machine was read. The healthy
+    /// run first proves the scan works in this environment, so the
+    /// failing run pins the writer, not the scan.
+    #[test]
+    fn successful_system_scan_with_failing_writer_fails_the_command() {
+        let mut healthy = Vec::new();
+        let code = super::run_with_writer(
+            &[],
+            &[],
+            &crate::discovery::hooks::HookRegistry::builtin(),
+            true,
+            None,
+            &mut healthy,
+        )
+        .expect("the system scan must succeed in this environment");
+        assert_eq!(code, 0);
+        assert!(!healthy.is_empty());
+        let error = super::run_with_writer(
+            &[],
+            &[],
+            &crate::discovery::hooks::HookRegistry::builtin(),
+            true,
+            None,
+            &mut FailingWriter,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("injected report-write failure"),
+            "the writer failure must surface: {error:#}"
+        );
+    }
+
     /// `inventory --manifest` refuses a manifest that names getters by
     /// name (it never hooks one), instead of a misleading mapping refusal.
     #[test]

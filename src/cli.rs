@@ -715,7 +715,7 @@ Live capture needs root and usable uprobe_multi host capability (normally Linux 
 Ctrl-C or SIGTERM ends capture cleanly and writes the final -o report.
 --output-owner UID[:GID] trusts -o directories owned by UID and hands the report to UID:GID (GID defaults to UID); root only, for a container bind mount owned by the host user. Needs -o.
 Default text output is concise: totals, coverage, and the function and mechanism tables. -v, --verbose adds every gap and reason, Evidence, and timing plus informational stderr notes. --quiet prints only the totals and coverage. Evidence counts probes: one entry and one return probe per watched function, so probes run at twice functions.
-exit codes: 0 ok (partial results still exit 0); 1 capture failed; 2 wrong arguments; 130 a second Ctrl-C abandoned cleanup.
+exit codes: 0 ok (partial results still exit 0); 1 the capture, its report, or probe detach failed; 2 wrong arguments; 130 a second Ctrl-C abandoned cleanup.
 ";
 
 /// `p11scope trace --help`: scoped syntax, examples and evidence limits.
@@ -766,7 +766,7 @@ const TRACE_HELP_TAIL: &str = "-o copies the trace to a file; -o - uses stdout o
 --output-owner UID[:GID] trusts -o directories owned by UID and hands the report to UID:GID (GID defaults to UID); root only, for a container bind mount owned by the host user. Needs -o.
 Ctrl-C or SIGTERM ends capture cleanly.
 Trace events print the same at every verbosity; -v, --verbose additionally shows informational stderr notes (discovery, timing) and restores the EVIDENCE record on stdout.
-exit codes: 0 ok (partial results still exit 0); 1 capture failed; 2 wrong arguments; 130 a second Ctrl-C abandoned cleanup.
+exit codes: 0 ok (partial results still exit 0); 1 the capture, its report, or probe detach failed; 2 wrong arguments; 130 a second Ctrl-C abandoned cleanup.
 ";
 
 /// `p11scope run --help`: scoped syntax, examples and evidence limits.
@@ -823,7 +823,7 @@ Default text output is concise: totals, coverage, and the function and mechanism
 -v/--verbose prints one line naming the run-as identity (running CMD as USER (uid N); the sudo-drop path adds (groups and home restored)).
 --user <name|uid> (root only, like strace -u) starts CMD as that account with its groups and home environment; --user root stays root on purpose.
 --output-owner UID[:GID] trusts -o directories owned by UID and hands the report to UID:GID (GID defaults to UID); root only, for a container bind mount owned by the host user. Needs -o.
-exit codes: the command's exit status; 1 if observing failed; 2 for wrong arguments; 130 a second Ctrl-C abandoned observer cleanup.
+exit codes: the command's exit status; 1 if observing, the report, or probe detach failed; 2 for wrong arguments; 130 a second Ctrl-C abandoned observer cleanup.
 ";
 
 /// `p11scope inspect --help`: scoped syntax, examples and evidence limits.
@@ -844,7 +844,7 @@ Choose --pid or --system. --json preserves the same discovery facts for scripts.
 Unreadable or unexamined identities remain unknown.
 Inspect reads mappings without live capture; it loads a short-lived kernel identity check for overlay/9p original-file proofs, and without CAP_BPF/CAP_PERFMON those providers become named gaps.
 Default text output is concise: the mapped providers, one coverage line, and a hint. -v, --verbose shows every gap and reason with per-table data. --quiet prints only the summary head.
-exit codes: 0 ok (partial results still exit 0); 1 the target could not be read; 2 wrong arguments.
+exit codes: 0 ok (partial results still exit 0); 1 the target could not be read or the report could not be written; 2 wrong arguments.
 ";
 
 /// `p11scope doctor --help`: scoped syntax, examples and evidence limits.
@@ -859,7 +859,7 @@ Without --pid or --cgroup, target readiness is unassessed.
 Live capture needs root and usable uprobe_multi host capability (normally Linux 6.6+); this command only checks.
 --extra-strict also treats warnings as failure; see docs/usage.md for privilege requirements.
 Default text output is concise: the verdict, the failing and warning rows, and the next step. -v, --verbose shows every row; --quiet prints only the Doctor line.
-exit codes: 0 every requested lane passed; 1 a requested lane is unavailable (--extra-strict: any warning fails too); 2 wrong arguments.
+exit codes: 0 every requested lane passed; 1 a requested lane is unavailable (--extra-strict: any warning fails too) or the report could not be written; 2 wrong arguments.
 ";
 
 /// `p11scope inventory --help`: scoped syntax, examples and evidence limits.
@@ -937,7 +937,7 @@ A missing observation or incomplete retained history does not establish zero act
 Compare saved files offline with inventory diff, and export one saved file as CycloneDX CBOM with inventory cbom; see docs/usage.md.
 --attach-backend auto (default) uses one multi-uprobe link per attach group where one links, else safe per-offset fallback; multi forces multi, singles forces per-offset.
 Live capture (auto/native) needs root and usable uprobe_multi host capability (normally Linux 6.6+); --capture scan does not.
-exit codes: 0 ok (partial results still exit 0); 1 nothing could be observed; 2 wrong arguments; 128+signal a further stop during the detach.
+exit codes: 0 ok (partial results still exit 0); 1 inventory, output or diagnostics failed; 2 wrong arguments; 128+signal a further stop during the detach.
 ";
 
 /// The assembled inventory help: head, the live `--max-endpoints` line,
@@ -7714,6 +7714,71 @@ mod tests {
         assert!(
             line.contains("128"),
             "inventory can exit 128+signal during the detach: {line}"
+        );
+    }
+
+    /// Fix2 B3: every `exit codes:` line names every exit-1 class the
+    /// command can actually produce — the behavioral derivation tests
+    /// (failing-writer injections per class) prove the code side; this
+    /// test pins the words so the line cannot silently drop a class
+    /// again.
+    #[test]
+    fn exit_code_lines_name_every_exit_1_class() {
+        let line_for = |topic: HelpTopic| {
+            topic
+                .text()
+                .lines()
+                .find(|line| line.starts_with("exit codes:"))
+                .unwrap()
+                .to_string()
+        };
+        // Capture commands fail in capture, report delivery, or probe
+        // detach; run's observing class covers its child-startup,
+        // pause, settlement and handoff errors too.
+        for (topic, first) in [
+            (HelpTopic::Profile, "capture"),
+            (HelpTopic::Trace, "capture"),
+            (HelpTopic::Run, "observing"),
+        ] {
+            let line = line_for(topic);
+            for class in [first, "report", "detach"] {
+                assert!(
+                    line.contains(class),
+                    "{topic:?} exit 1 must name its {class} failures: {line}"
+                );
+            }
+        }
+        // Inspect and doctor fail reading/checking, or writing the
+        // report afterwards.
+        for topic in [HelpTopic::Inspect, HelpTopic::Doctor] {
+            let line = line_for(topic);
+            assert!(
+                line.contains("report"),
+                "{topic:?} exit 1 must name report-write failures: {line}"
+            );
+        }
+        // Inventory fails observing nothing, writing no sink, or
+        // diagnosing.
+        let inventory = line_for(HelpTopic::Inventory);
+        for class in ["inventory", "output", "diagnostics"] {
+            assert!(
+                inventory.contains(class),
+                "inventory exit 1 must name its {class} failures: {inventory}"
+            );
+        }
+        // Offline converters already name input/output failures; the
+        // global line stays the generic umbrella.
+        for topic in [HelpTopic::InventoryDiff, HelpTopic::InventoryCbom] {
+            let line = line_for(topic);
+            assert!(
+                line.contains("input/output failures exit 1"),
+                "{topic:?} must keep naming input/output failures: {line}"
+            );
+        }
+        let global = line_for(HelpTopic::Global);
+        assert!(
+            global.contains("1 the command failed"),
+            "the global line stays the generic umbrella: {global}"
         );
     }
 

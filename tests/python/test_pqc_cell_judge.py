@@ -405,6 +405,17 @@ def populated_inventory(sizes):
     return inv
 
 
+def load_judge_module():
+    """Import the judge script as a module (it has no import-time
+    side effects beyond compiling its regexes)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "pqc_cell_compare", JUDGE)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def relabel(inv, text, sizes, operation, old, new):
     """Relabel one matrix pair consistently (row, detail and text).
 
@@ -1264,6 +1275,72 @@ class JudgeTwins(unittest.TestCase):
         self.assertTrue(found["pass"], summary)
         self.assertEqual(found["qualification"], "partial", summary)
         self.assertIn("gap/suppressed", found["detail"])
+
+    def test_gap_row_reports_partial_qualification(self):
+        # A model gap row beside a populated status is still
+        # disclosed loss: the leg passes on its exact rows but
+        # reports partial with the typed gap.
+        inv = populated_inventory(True)
+        inv["object_observations"]["gaps"]["rows"] = [
+            {"reason": "outcome_lost", "repeats": 1,
+             "subject": "model"}]
+        rc, summary, rows = run_judge_full(
+            inv, verbose(True),
+            populated_inventory(False), verbose(False))
+        self.assertEqual(rc, 0, summary)
+        found = result_for(rows, "pqc-sizes-rows")
+        self.assertTrue(found["pass"], summary)
+        self.assertEqual(found["qualification"], "partial", summary)
+        self.assertIn("gap/outcome_lost", found["detail"])
+
+    def test_malformed_disclosure_is_partial(self):
+        # Totality: every malformed disclosure shape reports
+        # partial with a typed reason instead of raising (a raise
+        # would skip the results file and void the wrapper's
+        # failure attribution).
+        judge = load_judge_module()
+        valid = populated_inventory(True)
+        valid_edge = valid["semantic_edges"][0]
+        cases = [
+            ("none", None),
+            ("scalar", 42),
+            ("empty", {}),
+            ("section_list", {"object_observations": []}),
+        ]
+        mutated = copy.deepcopy(valid)
+        mutated["object_observations"]["gaps"] = None
+        cases.append(("gaps_none", mutated))
+        mutated = copy.deepcopy(valid)
+        mutated["object_observations"]["gaps"] = {"rows": {},
+                                                 "suppressed": 0}
+        cases.append(("gaps_rows_dict", mutated))
+        mutated = copy.deepcopy(valid)
+        mutated["object_observations"]["budgets"] = None
+        cases.append(("budgets_none", mutated))
+        mutated = copy.deepcopy(valid)
+        mutated["object_observations"]["budgets"]["key_rows"] = None
+        cases.append(("budget_block_none", mutated))
+        mutated = copy.deepcopy(valid)
+        mutated["semantic_edges"] = {}
+        cases.append(("edges_dict", mutated))
+        mutated = copy.deepcopy(valid)
+        mutated["semantic_edges"][0]["coverage"] = 42
+        cases.append(("coverage_scalar", mutated))
+        mutated = copy.deepcopy(valid)
+        mutated["semantic_edges"][0]["coverage"] = {"lossy": False,
+                                                  "reasons": "x"}
+        cases.append(("coverage_reasons_str", mutated))
+        mutated = copy.deepcopy(valid)
+        mutated["semantic_edges"][0]["coverage"] = {"lossy": True,
+                                                  "reasons": []}
+        cases.append(("lossy_without_reasons", mutated))
+        self.assertNotIn("coverage", valid_edge)
+        for name, inv in cases:
+            qual, reason = judge.leg_qualification(inv)
+            self.assertEqual(qual, "partial", name)
+            self.assertIsInstance(reason, str, name)
+        qual, reason = judge.leg_qualification(valid)
+        self.assertEqual((qual, reason), ("qualified", None))
 
 
 if __name__ == "__main__":

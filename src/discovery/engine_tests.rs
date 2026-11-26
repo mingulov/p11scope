@@ -105596,7 +105596,23 @@ fn run_learned_repeated_proof_skips_its_absorb() {
     assert_ne!(key, badkey, "the rejected key names another file");
     let mut pins = real_scan_pin(std::path::Path::new(&path), None, 400, &"ef".repeat(32));
     record_scan_ownership(&mut pins, ProcessViewId(9), key, &path);
-    pins.reapply_rejected_keys(&BTreeSet::from([badkey]));
+    // Proven rejection via the production group-reject path: two proven
+    // entries contradict under badkey (same digest, different kernel
+    // files), so the key group-rejects with a proven mark that harvest
+    // absorb transfers. An unproven reapply mark would not transfer.
+    let baddir = tempfile::tempdir().expect("badkey backing dir");
+    let bad_a = baddir.path().join("bad-a.so");
+    let bad_b = baddir.path().join("bad-b.so");
+    std::fs::write(&bad_a, "p11scope-fixture:badkey-file-a").expect("write bad-a");
+    std::fs::write(&bad_b, "p11scope-fixture:badkey-file-b").expect("write bad-b");
+    let bad = real_scan_pin(&bad_a, Some(badkey), 400, &"ab".repeat(32));
+    let conflicting = real_scan_pin(&bad_b, Some(badkey), 400, &"ab".repeat(32));
+    pins.absorb(bad);
+    pins.absorb(conflicting);
+    assert!(
+        pins.rejects(badkey),
+        "setup: badkey group-rejects through the production path"
+    );
     let object = pins.pinned().next().expect("one pin").id;
     let module = engine.run_learned_modules[0].clone();
     let proof = || OwnedLearnProof {

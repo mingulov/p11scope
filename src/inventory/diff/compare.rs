@@ -167,9 +167,15 @@ pub(super) fn compare(before: &Snapshot, after: &Snapshot) -> DiffReport {
     // fold, so its exited callers are live rows where the other side
     // holds folded aggregates. The module facet then ignores
     // `departed_use` (a format difference, not an observation one) and
-    // the report carries the `pre_fold_input` limitation; the folded
-    // group itself still reports its `departed_use` row change below.
+    // the report carries the sided `pre_fold_before`/`pre_fold_after`
+    // limitation; the folded group itself still reports its
+    // `departed_use` row change below.
     let mixed_fold = before.pre_fold_input != after.pre_fold_input;
+    let fold_limitation = match (before.pre_fold_input, after.pre_fold_input) {
+        (true, false) => Some("pre_fold_before"),
+        (false, true) => Some("pre_fold_after"),
+        _ => None,
+    };
     let (br, ar) = ranks(before, after, mixed_fold);
     let b = prepare(before, &br);
     let a = prepare(after, &ar);
@@ -313,12 +319,7 @@ pub(super) fn compare(before: &Snapshot, after: &Snapshot) -> DiffReport {
             .into_iter()
             .map(str::to_owned),
         )
-        .chain(
-            mixed_fold
-                .then_some("pre_fold_input")
-                .into_iter()
-                .map(str::to_owned),
-        )
+        .chain(fold_limitation.into_iter().map(str::to_owned))
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
@@ -694,6 +695,7 @@ fn prepare(s: &Snapshot, r: &Ranks) -> Prepared {
             scope_completeness: "unknown",
             reported_gaps: s.gaps.len(),
             suppressed_gaps: s.gaps_suppressed,
+            gap_links_dropped: s.gap_links_dropped,
             refusals: Refusals {
                 reported_budget_gaps: s.gaps.iter().filter(|g| g.budget.is_some()).count(),
                 budget_counters: counters,

@@ -715,34 +715,77 @@ fn wrong_schema_refusal_names_the_found_schema_and_the_cbom_command() {
     assert!(error.len() < 1024, "{error}");
 }
 
+/// A null `departed_use` key plus a zero `retired_with_calls`
+/// counter declare a current writer (see
+/// `pre_fold_detection_needs_both_markers_absent`).
+fn current_era(value: &mut Value) {
+    value["modules"][0]["departed_use"] = json!(null);
+    value["budgets"]["callers"]["retired_with_calls"] = json!(0);
+}
+
 #[test]
-fn dangling_gap_links_drop_while_edges_stay_strict() {
-    // A gap may name a caller or module id whose live row folded
-    // away; the gap (with its pid, subject and reason) survives and
-    // only the link drops.
-    for (pointer, key, label) in [
-        ("/gaps/0/caller", "caller", "c99"),
-        ("/gaps/0/module", "module", "m99"),
-    ] {
-        let mut v = fixture();
-        *v.pointer_mut(pointer).unwrap() = json!(label);
-        let snapshot = parse_snapshot(&bytes(&v)).unwrap();
-        let gap = &snapshot.gaps[0];
-        if key == "caller" {
-            assert!(gap.caller.is_none());
-        } else {
-            assert!(gap.module.is_none());
-        }
-        assert_eq!(
-            gap.subject,
-            v.pointer("/gaps/0/subject").unwrap().as_str().unwrap()
-        );
-    }
-    // Malformed links still refuse, and so do dangling edge links:
-    // edges define the compared groups.
+fn dangling_gap_caller_links_drop_only_in_current_era() {
+    // A current-era gap may name a caller id whose live row folded
+    // away; the gap (with its pid, subject and reason) survives, only
+    // the link drops, and the drop counts.
     let mut v = fixture();
+    current_era(&mut v);
+    v["gaps"][0]["caller"] = json!("c99");
+    let snapshot = parse_snapshot(&bytes(&v)).unwrap();
+    assert!(!snapshot.pre_fold_input);
+    assert!(snapshot.gaps[0].caller.is_none());
+    assert_eq!(snapshot.gaps[0].module, Some(0));
+    assert_eq!(snapshot.gap_links_dropped, 1);
+    assert_eq!(
+        snapshot.gaps[0].subject,
+        v["gaps"][0]["subject"].as_str().unwrap()
+    );
+    // A resolved link never counts as dropped.
+    let mut v = fixture();
+    current_era(&mut v);
+    assert_eq!(parse_snapshot(&bytes(&v)).unwrap().gap_links_dropped, 0);
+    // Two dangling caller labels count twice.
+    let mut v = fixture();
+    current_era(&mut v);
+    let mut extra = v["gaps"][0].clone();
+    extra["caller"] = json!("c98");
+    v["gaps"][0]["caller"] = json!("c99");
+    v["gaps"].as_array_mut().unwrap().push(extra);
+    let snapshot = parse_snapshot(&bytes(&v)).unwrap();
+    assert_eq!(snapshot.gap_links_dropped, 2);
+}
+
+#[test]
+fn dangling_gap_module_labels_stay_strict() {
+    // Module rows never fold: an `m` label — on either link — in a
+    // current-era file is corruption, not a folded caller.
+    for (pointer, field) in [("/gaps/0/caller", "caller"), ("/gaps/0/module", "module")] {
+        let mut v = fixture();
+        current_era(&mut v);
+        *v.pointer_mut(pointer).unwrap() = json!("m99");
+        rejected(&v, field);
+    }
+    // Malformed links still refuse.
+    let mut v = fixture();
+    current_era(&mut v);
     v["gaps"][0]["caller"] = json!(42);
     rejected(&v, "caller");
+}
+
+#[test]
+fn pre_fold_dangling_gap_links_stay_strict() {
+    // The marker-less pre-fold shape never folded, so even a
+    // `c`-shaped dangling link refuses exactly as 0.7.1 refused it.
+    let v = fixture();
+    assert!(parse_snapshot(&bytes(&v)).unwrap().pre_fold_input);
+    let mut v = v.clone();
+    v["gaps"][0]["caller"] = json!("c99");
+    rejected(&v, "caller");
+}
+
+#[test]
+fn dangling_edge_links_stay_strict() {
+    // Edges define the compared groups: their links always resolve.
     let mut v = fixture();
     v["edges"][0]["caller"] = json!("c99");
     rejected(&v, "caller");

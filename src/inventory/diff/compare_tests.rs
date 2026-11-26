@@ -2317,7 +2317,10 @@ fn real_v071_inventories_self_diff_to_zero() {
             "{name} path diff changed"
         );
         assert!(
-            !report.limitations.contains(&"pre_fold_input".to_owned()),
+            !report
+                .limitations
+                .iter()
+                .any(|code| code == "pre_fold_before" || code == "pre_fold_after"),
             "{name} self-diff names no fold limitation"
         );
     }
@@ -2334,11 +2337,14 @@ fn real_mixed_churn_keeps_every_group_present() {
     let new = upgrade_snapshot(UPGRADE_CHURN072);
     assert!(old.pre_fold_input);
     assert!(!new.pre_fold_input);
-    for (left, right) in [(&old, &new), (&new, &old)] {
+    for (left, right, code) in [
+        (&old, &new, "pre_fold_before"),
+        (&new, &old, "pre_fold_after"),
+    ] {
         let report = compare(left, right);
         assert!(
-            report.limitations.contains(&"pre_fold_input".to_owned()),
-            "mixed versions name the fold limitation: {:?}",
+            report.limitations.contains(&code.to_owned()),
+            "mixed versions name the older side: {:?}",
             report.limitations
         );
         assert_eq!(
@@ -2394,18 +2400,31 @@ fn rendered(report: &model::DiffReport) -> Vec<String> {
 }
 
 /// A pre-fold input compared against a folded current input names
-/// the `pre_fold_input` limitation, keeps the folded group present
+/// the sided fold limitation, keeps the folded group present
 /// on both sides, and leaves the other group on the shared module
-/// unchanged — in both directions.
+/// unchanged — in both directions, with the full Note sentence pinned.
 #[test]
 fn mixed_version_fold_marks_only_the_folded_group() {
     let before = mixed_version_before();
     let after = mixed_version_after();
-    for (left, right) in [(&before, &after), (&after, &before)] {
+    for (left, right, code, note) in [
+        (
+            &before,
+            &after,
+            "pre_fold_before",
+            "the before input predates the departed-caller fold (v0.7.1 or older): exited callers are live rows in the before input and folded aggregates in the after input; `caller_population`/`content_presence`/`departed_use` changes on the folded group may be format only, and groups may read removed when folded identities were dropped.",
+        ),
+        (
+            &after,
+            &before,
+            "pre_fold_after",
+            "the after input predates the departed-caller fold (v0.7.1 or older): exited callers are live rows in the after input and folded aggregates in the before input; `caller_population`/`content_presence`/`departed_use` changes on the folded group may be format only, and groups may read removed when folded identities were dropped.",
+        ),
+    ] {
         let report = compare(&snapshot(left), &snapshot(right));
         assert!(
-            report.limitations.contains(&"pre_fold_input".to_owned()),
-            "mixed versions name the fold limitation: {:?}",
+            report.limitations.contains(&code.to_owned()),
+            "mixed versions name the older side: {:?}",
             report.limitations
         );
         assert_eq!(report.summary.application_groups_compared, 2);
@@ -2444,12 +2463,39 @@ fn mixed_version_fold_marks_only_the_folded_group() {
         );
         for output in rendered(&report) {
             let words = output.split_whitespace().collect::<Vec<_>>().join(" ");
+            let flat_note = note.split_whitespace().collect::<Vec<_>>().join(" ");
             assert!(
-                words.contains(
-                    "Note: one input predates the departed-caller fold (v0.7.1 or older)"
-                ),
-                "both renderings carry the fold note: {output}"
+                words.contains(&format!("Note: {flat_note}")),
+                "both renderings carry the full fold note: {output}"
             );
         }
+    }
+}
+
+/// A dropped gap link is named in the report evidence and in verbose
+/// text, not just nulled: the count rides both sides' summaries.
+#[test]
+fn dropped_gap_links_render_their_count() {
+    let mut v = document();
+    v["gaps"][0]["caller"] = json!("c99");
+    let side = snapshot(&v);
+    assert_eq!(side.gap_links_dropped, 1);
+    let report = compare(&side, &side);
+    assert_eq!(report.before.gap_links_dropped, 1);
+    assert_eq!(report.after.gap_links_dropped, 1);
+    let outputs = rendered(&report);
+    assert!(
+        outputs[0].contains("Dropped gap subject links 1"),
+        "verbose text names the dropped link: {}",
+        outputs[0]
+    );
+    let clean = snapshot(&document());
+    assert_eq!(clean.gap_links_dropped, 0);
+    let report = compare(&clean, &clean);
+    for output in rendered(&report) {
+        assert!(
+            !output.contains("Dropped gap subject links"),
+            "no dropped-link line at zero: {output}"
+        );
     }
 }

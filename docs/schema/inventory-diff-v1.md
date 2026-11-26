@@ -16,7 +16,9 @@ Each input must be one UTF-8 JSON object with exact schema ID
 their required inventory v1 fields. Profiles and inventory-event JSONL are
 unsupported. Duplicate object keys, trailing documents, malformed required
 fields, invalid numeric types or overflow, duplicate caller/module IDs,
-duplicate caller/module edge pairs, and dangling non-null references fail.
+duplicate caller/module edge pairs, and dangling non-null references fail,
+except a current-era gap caller link in `c`-label shape naming a retired
+caller, which drops to null and counts as `gap_links_dropped` (below).
 A non-null SHA-256 must be 64 ASCII hex digits; output normalizes lowercase.
 
 Legacy additive omissions are accepted: `pid_namespace`; observation `lane`,
@@ -74,8 +76,8 @@ must preserve large integer values rather than rounding through floating point.
 | `limitations` | Sorted, duplicate-free interpretation codes |
 
 Each snapshot has `scope`, `clock`, `observation`, `pid_namespace`,
-`scope_completeness`, `reported_gaps`, `suppressed_gaps`, `refusals`, `budgets`,
-`loss_evidence`, `gaps`, and `evidence`. Input filenames are not report fields.
+`scope_completeness`, `reported_gaps`, `suppressed_gaps`, `gap_links_dropped`,
+`refusals`, `budgets`, `loss_evidence`, `gaps`, and `evidence`. Input filenames are not report fields.
 
 `clock` has `basis` and `unit`. `observation` has `started_ns`, `ended_ns`,
 `passes`, `usage_feed`, `lane`, `settlement`, `retirement`, `attach`,
@@ -112,7 +114,10 @@ with `{limit, occupied, refused, pruned}`.
 
 Each gap has `caller`, `module`, `pid`, `subject`, `reason`, `budget`, and
 `repeats`. References and `pid` may be null; `budget` is null or
-`{resource, limit, requested}`. References resolve in that snapshot's pools.
+`{resource, limit, requested}`. References resolve in that snapshot's pools,
+except a gap caller link naming a retired (folded-away) caller label, which
+drops to null and counts in the snapshot's `gap_links_dropped`; gap module
+links and edge links stay strict.
 
 ## Evidence pools and references
 
@@ -234,7 +239,12 @@ Every report includes `absence_is_not_removal`,
 `host_boot_continuity_unknown`, `physical_continuity_unknown`,
 `process_continuity_unknown`, `scope_completeness_unknown`, and
 `semantic_details_not_compared`. Inputs may add `unknown_clock_basis`,
-`unknown_clock_unit`, and `unknown_start_time_unit`.
+`unknown_clock_unit`, and `unknown_start_time_unit`. A mixed-era comparison —
+one side predating the departed-caller fold (no `departed_use` key on any
+module and no `budgets.callers.retired_with_calls` counter) against a current
+side — adds `pre_fold_before` or `pre_fold_after`, naming the older side, and
+leaves `departed_use` out of the module facet for that comparison, while the
+folded group itself keeps its `departed_use` row change.
 
 Recognized snapshot time is `CLOCK_MONOTONIC` in `ns`; caller start time
 uses `clock_ticks_since_boot`. Unknown units retain raw numbers and the

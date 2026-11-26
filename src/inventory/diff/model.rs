@@ -28,6 +28,7 @@ pub(super) struct SnapshotSummary {
     pub scope_completeness: &'static str,
     pub reported_gaps: usize,
     pub suppressed_gaps: u64,
+    pub gap_links_dropped: usize,
     pub refusals: Refusals,
     pub budgets: input::Budgets,
     pub loss_evidence: LossEvidence,

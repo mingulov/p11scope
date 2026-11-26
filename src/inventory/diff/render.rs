@@ -161,13 +161,20 @@ fn render_caveats(human: &mut Human) -> io::Result<()> {
     Ok(())
 }
 
-/// The mixed-version fold caveat: one side predates the fold, so
-/// its exited callers are live rows where the other side holds
-/// folded aggregates.
-const PRE_FOLD_INPUT_NOTE: &str = "one input predates the departed-caller fold (v0.7.1 or older): exited callers are live rows there and folded here; `departed_use`/`lifecycle` changes on shared modules may be format only.";
+/// The mixed-version fold caveat, one sentence per older side: the
+/// pre-fold side holds exited callers as live rows where the other
+/// holds folded aggregates, so the folded group's population, presence
+/// and fold codes may be format only, and groups past the fold's
+/// identity bounds may read removed.
+const PRE_FOLD_BEFORE_NOTE: &str = "the before input predates the departed-caller fold (v0.7.1 or older): exited callers are live rows in the before input and folded aggregates in the after input; `caller_population`/`content_presence`/`departed_use` changes on the folded group may be format only, and groups may read removed when folded identities were dropped.";
+const PRE_FOLD_AFTER_NOTE: &str = "the after input predates the departed-caller fold (v0.7.1 or older): exited callers are live rows in the after input and folded aggregates in the before input; `caller_population`/`content_presence`/`departed_use` changes on the folded group may be format only, and groups may read removed when folded identities were dropped.";
 
 fn pre_fold_note(limitation: &str) -> Option<&'static str> {
-    (limitation == "pre_fold_input").then_some(PRE_FOLD_INPUT_NOTE)
+    match limitation {
+        "pre_fold_before" => Some(PRE_FOLD_BEFORE_NOTE),
+        "pre_fold_after" => Some(PRE_FOLD_AFTER_NOTE),
+        _ => None,
+    }
 }
 
 /// Snapshot-specific limitations in plain words: the fixed codes stay out
@@ -819,6 +826,15 @@ impl Human<'_> {
                 side.reported_gaps, side.suppressed_gaps
             ),
         )?;
+        if side.gap_links_dropped > 0 {
+            self.line(
+                2,
+                &format!(
+                    "Dropped gap subject links {} (folded caller labels read as plain gaps)",
+                    side.gap_links_dropped
+                ),
+            )?;
+        }
         for (resource, refused) in &side.refusals.budget_counters {
             match refused {
                 Some(value) if *value > 0 => {

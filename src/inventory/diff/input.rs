@@ -35,6 +35,11 @@ pub(super) struct Snapshot {
     pub edges: Vec<Edge>,
     pub gaps: Vec<Gap>,
     pub gaps_suppressed: u64,
+    /// Dangling gap caller links dropped to null (a current-era gap
+    /// naming a folded-away caller label): the loss is counted here,
+    /// never silent. Pre-fold files and module links stay strict, so
+    /// they never add to this count.
+    pub gap_links_dropped: usize,
     pub limitations: Vec<String>,
     /// True when the file predates the departed-caller fold (v0.7.1 or
     /// older): exited callers are live rows here, folded aggregates in
@@ -921,6 +926,13 @@ fn convert_snapshot(value: &Value, limits: InputLimits) -> Result<Snapshot> {
         );
         edges.push(parse_edge(&o, caller, module)?);
     }
+    let budgets_object = root.object("budgets")?;
+    // Era before links: a pre-fold file never folded, so a dangling
+    // label-shaped link there is corruption and stays strict below.
+    // Both markers live outside the gaps array, so this needs no gap
+    // state.
+    let pre_fold = is_pre_fold_input(&root, &budgets_object)?;
+    let mut gap_links_dropped = 0usize;
     let mut gaps = Vec::new();
     for (i, v) in root.array("gaps")?.iter().enumerate() {
         let o = Object::new(v, format!("gaps[{i}]"))?;
@@ -945,9 +957,13 @@ fn convert_snapshot(value: &Value, limits: InputLimits) -> Result<Snapshot> {
             .map(u32::try_from)
             .transpose()
             .with_context(|| format!("gaps[{i}].pid: u32 overflow"))?;
+        let (caller, caller_dropped) = resolve_gap_link(&o, "caller", &caller_ids, pre_fold, true)?;
+        let (module, module_dropped) =
+            resolve_gap_link(&o, "module", &module_ids, pre_fold, false)?;
+        gap_links_dropped += usize::from(caller_dropped) + usize::from(module_dropped);
         gaps.push(Gap {
-            caller: resolve_gap_link(&o, "caller", &caller_ids)?,
-            module: resolve_gap_link(&o, "module", &module_ids)?,
+            caller,
+            module,
             pid,
             subject: o.text("subject")?,
             reason: o.text("reason")?,
@@ -983,7 +999,6 @@ fn convert_snapshot(value: &Value, limits: InputLimits) -> Result<Snapshot> {
             })
         })
         .transpose()?;
-    let budgets_object = root.object("budgets")?;
     Ok(Snapshot {
         scope: root.text("scope")?,
         clock,
@@ -995,8 +1010,9 @@ fn convert_snapshot(value: &Value, limits: InputLimits) -> Result<Snapshot> {
         edges,
         gaps,
         gaps_suppressed: root.uint("gaps_suppressed")?,
+        gap_links_dropped,
         limitations,
-        pre_fold_input: is_pre_fold_input(&root, &budgets_object)?,
+        pre_fold_input: pre_fold,
     })
 }
 
@@ -1036,29 +1052,38 @@ fn resolve(o: &Object<'_>, key: &str, ids: &BTreeMap<String, usize>) -> Result<u
         .copied()
         .with_context(|| format!("{}: dangling reference", o.field(key)))
 }
-/// Gap subject links are best-effort across the fold: the contract
-/// keeps gaps naming a folded caller by label after its live row is
-/// gone, so a dangling gap id in label shape (`c`/`m` plus digits)
-/// drops its link instead of refusing the file (the gap keeps its
-/// pid, subject and reason). Anything else still refuses, and edges
-/// keep strict resolution (they define the compared groups).
+/// Gap subject links are best-effort across the fold, and strict
+/// everywhere else. The contract keeps gaps naming a folded caller by
+/// label after its live row is gone, so in a current-era file a
+/// dangling caller id in `c`-label shape drops its link instead of
+/// refusing the file (the gap keeps its pid, subject and reason; the
+/// drop counts in [`Snapshot::gap_links_dropped`]). Module rows never
+/// fold, so module links always resolve strictly, as does every link
+/// in a pre-fold file — which by definition never folded — and every
+/// edge link (edges define the compared groups). Returns the resolved
+/// link and whether it dropped.
 fn resolve_gap_link(
     o: &Object<'_>,
     key: &str,
     ids: &BTreeMap<String, usize>,
-) -> Result<Option<usize>> {
+    pre_fold_input: bool,
+    caller_link: bool,
+) -> Result<(Option<usize>, bool)> {
     if o.value(key)?.is_null() {
-        Ok(None)
+        return Ok((None, false));
+    }
+    let id = o.text(key)?;
+    let lenient = caller_link
+        && !pre_fold_input
+        && id.len() > 1
+        && id.as_bytes()[0] == b'c'
+        && id.as_bytes()[1..].iter().all(u8::is_ascii_digit);
+    if lenient {
+        let link = ids.get(&id).copied();
+        let dropped = link.is_none();
+        Ok((link, dropped))
     } else {
-        let id = o.text(key)?;
-        let folded = id.len() > 1
-            && matches!(id.as_bytes()[0], b'c' | b'm')
-            && id.as_bytes()[1..].iter().all(u8::is_ascii_digit);
-        if folded {
-            Ok(ids.get(&id).copied())
-        } else {
-            resolve(o, key, ids).map(Some)
-        }
+        resolve(o, key, ids).map(|link| (Some(link), false))
     }
 }
 fn parse_caller(o: &Object<'_>) -> Result<Caller> {

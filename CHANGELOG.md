@@ -124,11 +124,11 @@ versioned separately and are opaque, exact dispatch keys.
   and edges (plus any identities or mechanisms past the row bound).
 - Mixed-version inventory diffs are explicit: diffing a pre-fold
   (v0.7.1 or older) inventory against a current one carries a
-  `pre_fold_input` limitation (a Note in text output) and leaves
-  `departed_use` out of the module facet for that comparison, so one
-  exited caller no longer marks every other group on the shared
-  module as changed; the folded group itself keeps presence `both`
-  with its `departed_use` change.
+  `pre_fold_before`/`pre_fold_after` limitation naming the older side
+  (a Note in text output) and leaves `departed_use` out of the module
+  facet for that comparison, so one exited caller no longer marks
+  every other group on the shared module as changed; the folded group
+  itself keeps presence `both` with its `departed_use` change.
 - Downgrade note: 0.7.1 tools misread 0.7.2 inventories. Its diff
   refuses folded files whose gaps name folded callers, and where it
   parses, folded applications read as added or removed; its CBOM
@@ -242,8 +242,10 @@ versioned separately and are opaque, exact dispatch keys.
   with the new `departed_use` change code instead of reading as
   removed against a live snapshot.
 - `inventory diff` reads folded inventories whose gaps name folded
-  callers: the gap keeps its pid, subject and reason with the link
-  dropped, instead of refusing the file as a dangling reference.
+  callers: a gap caller link in `c`-label shape keeps its pid, subject
+  and reason with the link dropped (counted as `gap_links_dropped`),
+  instead of refusing the file as a dangling reference. Module links
+  stay strict, and pre-fold files keep the old refusal.
 - `inventory cbom` counts a folded caller without an executable
   path once, not once per module it touched.
 - The streaming fold re-certifies carried callers every pass: a

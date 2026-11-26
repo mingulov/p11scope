@@ -432,8 +432,9 @@ impl CoveredFrontier {
 /// the record has room. Admission at capacity is refused — counted and
 /// named ([`SCAN_RESUME_HISTORY_FULL_SUBJECT`]) — when no unprotected
 /// completed pair exists or the completion record is full (the victim
-/// could not be remembered). The record never shrinks, so once it is
-/// full no pair is admitted at capacity again; a complete arrival that
+/// could not be remembered). Only [`ResumeHistory::forget_generations`]
+/// shrinks the record, for proven-dead generations, so once it is full
+/// no pair is admitted at capacity again; a complete arrival that
 /// cannot be recorded then is harmless (it can only return as a
 /// newcomer, which is refused).
 #[derive(Clone, Debug, Default)]
@@ -444,7 +445,8 @@ pub(crate) struct ResumeHistory {
     evictable: BTreeMap<u64, (DecodeCursorKey, u64)>,
     /// Completed pairs no longer in `covered` (evicted, or complete on
     /// arrival at capacity): covered ground for good. Bounded by
-    /// [`MAX_DECODE_CURSORS`]; never shrinks.
+    /// [`MAX_DECODE_CURSORS`]; only [`ResumeHistory::forget_generations`]
+    /// removes entries, for proven-dead generations.
     completed: std::collections::BTreeSet<(DecodeCursorKey, u64)>,
     next_seq: u64,
     /// Some record this pass rose past covered ground.
@@ -601,6 +603,18 @@ pub(crate) struct ResumeObservation {
     pub(crate) history_refused: u64,
 }
 
+/// What a departed-generation prune removed: the cursors' freed
+/// bytes, and — for every generation that lost at least one
+/// unfinished cursor — its `(decoded, total)` object counts, so the
+/// caller can name the unfinished scan the departed member leaves
+/// behind. Generations that lost only history pairs name nothing:
+/// their cursors (if any) were complete.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct DepartedPruneOutcome {
+    pub(crate) freed_bytes: u64,
+    pub(crate) unfinished_generations: BTreeMap<(u32, u64), (usize, usize)>,
+}
+
 /// The carried decode cursors with their incrementally kept totals and
 /// the resume history: the single owner of cursor-map mutation. Reads go
 /// through `Deref`; every insert and removal goes through the store, so
@@ -675,31 +689,50 @@ impl DecodeCursorStore {
     }
 
     /// Drop every unfinished cursor and every history pair of a
-    /// generation `departed` proves gone (`(pid, start_time)`),
-    /// returning the cursors' freed bytes, the cursors dropped and the
-    /// history pairs forgotten. A departed member's unfinished cursor
-    /// would otherwise keep the run "in progress" for good, and its
-    /// history pairs would fill the bounded record. Completed cursors
-    /// count as done (no progress row) and are already the first
-    /// reclamation victims under pressure, so they stay.
+    /// generation `departed` proves gone (`(pid, start_time)`). A
+    /// departed member's unfinished cursor would otherwise keep the
+    /// run "in progress" for good, and its history pairs would fill
+    /// the bounded record. Completed cursors count as done (no
+    /// progress row) and are already the first reclamation victims
+    /// under pressure, so they stay.
     pub(crate) fn drop_departed_generations(
         &mut self,
         departed: &mut dyn FnMut(u32, u64) -> bool,
-    ) -> (u64, usize, usize) {
+    ) -> DepartedPruneOutcome {
         let stale: Vec<DecodeCursorKey> = self
             .cursors
             .iter()
             .filter(|(key, cursor)| !cursor.complete && departed(key.pid, key.start_time))
             .map(|(key, _)| key.clone())
             .collect();
+        // Per-generation object counts before the drop: a generation
+        // the prune touches names how many of its objects decoded.
+        // `decoded` counts its completed cursors (kept); `total`
+        // counts all its cursors. A touched generation always holds
+        // an unfinished cursor, so `decoded` is always below `total`.
+        let touched: BTreeSet<(u32, u64)> =
+            stale.iter().map(|key| (key.pid, key.start_time)).collect();
+        let mut unfinished_generations: BTreeMap<(u32, u64), (usize, usize)> = BTreeMap::new();
+        for (key, cursor) in self.cursors.iter() {
+            if touched.contains(&(key.pid, key.start_time)) {
+                let counts = unfinished_generations
+                    .entry((key.pid, key.start_time))
+                    .or_insert((0, 0));
+                counts.1 += 1;
+                counts.0 += usize::from(cursor.complete);
+            }
+        }
         let mut freed = 0u64;
         for key in &stale {
             if let Some(old) = self.remove(key) {
                 freed = freed.saturating_add(decode_cursor_bytes(key, &old));
             }
         }
-        let forgotten = self.history.forget_generations(departed);
-        (freed, stale.len(), forgotten)
+        self.history.forget_generations(departed);
+        DepartedPruneOutcome {
+            freed_bytes: freed,
+            unfinished_generations,
+        }
     }
 
     /// `(done, total, tables)` over the store; `None` when no cursor is

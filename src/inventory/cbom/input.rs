@@ -406,9 +406,12 @@ fn convert_value(value: &Value, limits: InputLimits) -> Result<Projection> {
         SCHEMA_INVENTORY_V1 => convert_inventory(value),
         SCHEMA_PROFILE_V3 | SCHEMA_PROFILE_V2 => convert_profile(value, schema),
         SCHEMA_PROFILE_V3_METRICS => anyhow::bail!(
-            "unsupported CBOM input schema: {SCHEMA_PROFILE_V3_METRICS}: metrics output has no mechanism rows; save `profile -o`"
+            "unsupported CBOM input schema: {SCHEMA_PROFILE_V3_METRICS}: metrics output has no mechanism rows; capture without `--mode metrics`"
         ),
-        other => anyhow::bail!("unsupported CBOM input schema: {other}"),
+        other => anyhow::bail!(
+            "unsupported CBOM input schema: {}",
+            crate::render::render_found_schema(other)
+        ),
     }
 }
 

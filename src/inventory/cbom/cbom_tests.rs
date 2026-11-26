@@ -565,6 +565,36 @@ fn projection_refuses_unsupported_schemas() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("no schema string"), "{error}");
+    // Unknown ids render named and bounded, with controls escaped once.
+    let error = parse_input(
+        serde_json::to_vec(&json!({"schema": "p11scope/inventory/v9"}))
+            .unwrap()
+            .as_slice(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("\"p11scope/inventory/v9\""),
+        "{error}"
+    );
+    let error = parse_input(
+        serde_json::to_vec(&json!({"schema": "p11scope/".to_string() + &"x".repeat(16_000)}))
+            .unwrap()
+            .as_slice(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("truncated"), "{error}");
+    assert!(error.len() < 1024, "{error}");
+    let error = parse_input(
+        serde_json::to_vec(&json!({"schema": "odd\nschema"}))
+            .unwrap()
+            .as_slice(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("\\n"), "{error}");
+    assert!(!error.contains("\\\\n"), "{error}");
 }
 
 /// Real v0.7.1 captures (official release binary). See
@@ -802,12 +832,12 @@ fn cbom_v071_metrics_refusal_is_exact() {
     let error = parse_input(METRICS071).unwrap_err().to_string();
     assert_eq!(
         error,
-        "unsupported CBOM input schema: p11scope/observed-profile/v3-metrics: metrics output has no mechanism rows; save `profile -o`"
+        "unsupported CBOM input schema: p11scope/observed-profile/v3-metrics: metrics output has no mechanism rows; capture without `--mode metrics`"
     );
 }
 
 #[test]
-fn metrics_refusal_names_the_profile_command() {
+fn metrics_refusal_names_the_capture_remedy() {
     let error = parse_input(
         serde_json::to_vec(&json!({"schema": "p11scope/observed-profile/v3-metrics"}))
             .unwrap()
@@ -820,7 +850,7 @@ fn metrics_refusal_names_the_profile_command() {
         "{error}"
     );
     assert!(error.contains("no mechanism rows"), "{error}");
-    assert!(error.contains("profile -o"), "{error}");
+    assert!(error.contains("capture without `--mode metrics`"), "{error}");
 }
 
 // Task 7 (spec §17.5) CBOM twins: supplier/version on the library,

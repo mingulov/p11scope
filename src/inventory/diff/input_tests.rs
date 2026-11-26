@@ -713,6 +713,12 @@ fn wrong_schema_refusal_names_the_found_schema_and_the_cbom_command() {
     assert!(error.contains("unsupported schema"), "{error}");
     assert!(error.contains("truncated"), "{error}");
     assert!(error.len() < 1024, "{error}");
+    // Controls escape exactly once: no doubled backslashes.
+    let mut v = fixture();
+    v["schema"] = json!("p11scope/inventory/v1\ninjected");
+    let error = parse_snapshot(&bytes(&v)).unwrap_err().to_string();
+    assert!(error.contains("\\n"), "{error}");
+    assert!(!error.contains("\\\\n"), "{error}");
 }
 
 /// A null `departed_use` key plus a zero `retired_with_calls`
@@ -752,6 +758,13 @@ fn real_v071_profile_and_metrics_refuse_before_section_parsing() {
     }
     let error = parse_snapshot(PROFILE071).unwrap_err().to_string();
     assert!(error.contains("inventory cbom"), "{error}");
+    // Metrics output converts nowhere: the remedy names captures, not cbom.
+    let error = parse_snapshot(METRICS071).unwrap_err().to_string();
+    assert!(
+        error.contains("capture an inventory for each side instead"),
+        "{error}"
+    );
+    assert!(!error.contains("inventory cbom"), "{error}");
 }
 
 #[test]

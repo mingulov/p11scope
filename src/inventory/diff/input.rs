@@ -880,8 +880,9 @@ fn convert_snapshot(value: &Value, limits: InputLimits) -> Result<Snapshot> {
     let schema = root.text("schema")?;
     ensure!(
         schema == "p11scope/inventory/v1",
-        "root.schema: unsupported schema {}; inventory diff compares inventories; use `inventory cbom` for profiles",
-        render_found_schema(&schema)
+        "root.schema: unsupported schema {}; {}",
+        crate::render::render_found_schema(&schema),
+        diff_schema_remedy(&schema),
     );
     let mut rows = 0usize;
     for key in ["callers", "modules", "edges", "gaps"] {
@@ -1016,17 +1017,14 @@ fn convert_snapshot(value: &Value, limits: InputLimits) -> Result<Snapshot> {
     })
 }
 
-/// A found `schema` value for a refusal: control-escaped and
-/// length-bounded, so a hostile 16 KiB string cannot flood stderr.
-/// Genuine schema ids are short and render in full.
-fn render_found_schema(schema: &str) -> String {
-    const MAX_SCHEMA_HINT_CHARS: usize = 120;
-    let escaped = crate::render::escape_controls(schema);
-    let truncated: String = escaped.chars().take(MAX_SCHEMA_HINT_CHARS).collect();
-    if truncated.len() < escaped.len() {
-        format!("{truncated:?} (truncated)")
+/// The right next step for a refused input: profiles convert through
+/// `inventory cbom`, while metrics output has no inventory rows at all
+/// and needs fresh inventory captures for both sides.
+fn diff_schema_remedy(schema: &str) -> &'static str {
+    if schema == "p11scope/observed-profile/v3-metrics" {
+        "metrics output has no inventory rows; capture an inventory for each side instead"
     } else {
-        format!("{truncated:?}")
+        "inventory diff compares inventories; use `inventory cbom` for profiles"
     }
 }
 

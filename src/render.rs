@@ -38,6 +38,21 @@ pub(crate) fn escape_controls(s: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(out)
 }
 
+/// A found `schema` value for a refusal: control-escaped and
+/// length-bounded, so a hostile 16 KiB string cannot flood stderr.
+/// Genuine schema ids are short and render in full. One escaping
+/// pass: [`escape_controls`] must not run first, or the `{:?}`
+/// quoting below would escape its backslashes a second time.
+pub(crate) fn render_found_schema(schema: &str) -> String {
+    const MAX_SCHEMA_HINT_CHARS: usize = 120;
+    let truncated: String = schema.chars().take(MAX_SCHEMA_HINT_CHARS).collect();
+    if truncated.len() < schema.len() {
+        format!("{truncated:?} (truncated)")
+    } else {
+        format!("{truncated:?}")
+    }
+}
+
 /// Which live-discovery strategy each exact bound context used (design §9.2).
 /// Only `debug_state_every_hit` leaves no completeness gap.
 #[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]

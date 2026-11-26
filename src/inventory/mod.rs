@@ -6855,7 +6855,12 @@ fn start_semantic_lane(
                 // refused start still discloses its unavailability
                 // first, then names the skipped retry.
                 if stopped() {
-                    note_retry_skipped_on_stop(coordinator, spec.key_sizes, &journal_refusal);
+                    note_retry_skipped_on_stop(
+                        coordinator,
+                        spec.key_sizes,
+                        &journal_refusal,
+                        stop_cause(run_control),
+                    );
                     return None;
                 }
                 // A sizes-on refusal retries the journal once with
@@ -6911,7 +6916,12 @@ fn start_semantic_lane(
                             refusal = retry_refusal;
                         }
                         RetryWithoutSizes::Stopped => {
-                            note_retry_skipped_on_stop(coordinator, true, &refusal);
+                            note_retry_skipped_on_stop(
+                                coordinator,
+                                true,
+                                &refusal,
+                                stop_cause(run_control),
+                            );
                             return None;
                         }
                     }
@@ -6929,7 +6939,7 @@ fn start_semantic_lane(
         if let Some(reason) = journal_refused.as_deref() {
             coordinator.note_scope_gap(
                 KEY_OPERATIONS_RETRY_SKIPPED_SUBJECT.into(),
-                ordinary_retry_skipped_reason(reason),
+                ordinary_retry_skipped_reason(reason, stop_cause(run_control)),
             );
         }
     };
@@ -6981,17 +6991,42 @@ const KEY_SIZES_RETRY_SKIPPED_SUBJECT: &str = "key sizes retry skipped";
 /// the ordinary retry (D2).
 const KEY_OPERATIONS_RETRY_SKIPPED_SUBJECT: &str = "key operations retry skipped";
 
-fn sizes_retry_skipped_reason(reason: &str) -> String {
+/// The stop cause behind a latched stop, for the skipped-retry
+/// wording: the run control's sticky variant when one is handed (a
+/// `--duration` deadline reads as its own cause), else the operator
+/// signal the coordinator counter saw.
+fn stop_cause(
+    run_control: Option<&crate::scope::inventory_cgroup::CollectionControl>,
+) -> Option<crate::scope::inventory_cgroup::CollectionStop> {
+    run_control.and_then(|control| control.check().err())
+}
+
+fn stop_cause_word(cause: Option<crate::scope::inventory_cgroup::CollectionStop>) -> &'static str {
+    match cause {
+        Some(crate::scope::inventory_cgroup::CollectionStop::Deadline) => "run duration ended",
+        _ => "stop requested",
+    }
+}
+
+fn sizes_retry_skipped_reason(
+    reason: &str,
+    cause: Option<crate::scope::inventory_cgroup::CollectionStop>,
+) -> String {
     format!(
-        "stop requested; the key-sizes journal start was refused ({reason}), so neither the \
-         sizes-off nor the ordinary retry runs"
+        "{}; the key-sizes journal start was refused ({reason}), so neither the sizes-off nor \
+         the ordinary retry runs",
+        stop_cause_word(cause),
     )
 }
 
-fn ordinary_retry_skipped_reason(reason: &str) -> String {
+fn ordinary_retry_skipped_reason(
+    reason: &str,
+    cause: Option<crate::scope::inventory_cgroup::CollectionStop>,
+) -> String {
     format!(
-        "stop requested; the key-operations journal start was refused ({reason}), so the \
-         ordinary retry does not run"
+        "{}; the key-operations journal start was refused ({reason}), so the ordinary retry \
+         does not run",
+        stop_cause_word(cause),
     )
 }
 
@@ -7018,18 +7053,23 @@ fn note_key_operations_unavailable(
 /// sizes-off re-mint): no retry begins. The refused start still
 /// discloses its unavailability first — the sizes gap when sizes were
 /// requested, then the key-operations gap — and the run names which
-/// retries the stop skipped, with the refusal's reason (D2, B1).
+/// retries the stop skipped, with the refusal's reason (D2, B1). The
+/// cause words the skip: a run deadline reads as one (N4).
 fn note_retry_skipped_on_stop(
     coordinator: &mut InventoryCoordinator<OsProcessSource>,
     key_sizes: bool,
     refusal: &crate::inventory_semantics::SemanticRefusal,
+    cause: Option<crate::scope::inventory_cgroup::CollectionStop>,
 ) {
     let reason = key_operations_refusal_reason(refusal);
     if key_sizes {
         // The sizes start was refused and the sizes-off retry never
         // ran, so there is no second refusal to quote (unlike the
         // double-refused gap below).
-        let detail = format!("{reason}; sizes-off retry skipped: stop requested");
+        let detail = format!(
+            "{reason}; sizes-off retry skipped: {}",
+            stop_cause_word(cause)
+        );
         coordinator.note_scope_gap("key sizes unavailable".into(), detail.clone());
         inventory_diagnostic(&format!("p11scope: key sizes unavailable: {detail}"));
     }
@@ -7037,12 +7077,12 @@ fn note_retry_skipped_on_stop(
     let (subject, detail) = if key_sizes {
         (
             KEY_SIZES_RETRY_SKIPPED_SUBJECT,
-            sizes_retry_skipped_reason(&reason),
+            sizes_retry_skipped_reason(&reason, cause),
         )
     } else {
         (
             KEY_OPERATIONS_RETRY_SKIPPED_SUBJECT,
-            ordinary_retry_skipped_reason(&reason),
+            ordinary_retry_skipped_reason(&reason, cause),
         )
     };
     coordinator.note_scope_gap(subject.into(), detail);
@@ -34748,6 +34788,132 @@ mod seal_readiness_tests {
             gaps_for_subject(&mut *driver.coordinator, "key operations retry skipped").len(),
             1,
             "the skipped retry is still named"
+        );
+    }
+
+    /// N4: one scripted startup whose run control carries a scripted
+    /// clock, so the `--duration` deadline passes exactly when the
+    /// twin flips it (no wall clock). The coordinator counter stays
+    /// unset and the control has no operator source, isolating the
+    /// Deadline cause. Returns the startup's lane gaps in order.
+    fn deadline_gaps(
+        key_sizes: bool,
+        starts: Vec<Result<crate::inventory_semantics::AttestedSemanticLane, SemanticRefusal>>,
+        at: StopAt,
+    ) -> Vec<(String, String)> {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+        take_sealed_for_test();
+        let mut coordinator = coordinator();
+        coordinator.set_key_sizes_requested(key_sizes);
+        coordinator.set_stop_source(Arc::new(AtomicUsize::new(0)));
+        let base = Instant::now();
+        let now_ns = Arc::new(AtomicU64::new(0));
+        let control = crate::scope::inventory_cgroup::CollectionControl::with_clock(
+            Some(base + Duration::from_secs(60)),
+            {
+                let now_ns = Arc::clone(&now_ns);
+                move || base + Duration::from_nanos(now_ns.load(Ordering::SeqCst))
+            },
+        );
+        let scope = Scope::Pid(std::process::id());
+        seal_startup_test::with_start_queue(
+            (0..8).map(|_| some_preparation()).collect(),
+            starts,
+            || {
+                let flip = {
+                    let now_ns = Arc::clone(&now_ns);
+                    move || now_ns.store(61_000_000_000, Ordering::SeqCst)
+                };
+                match at {
+                    StopAt::Start(k) => {
+                        for _ in 0..k {
+                            seal_startup_test::queue_start_hook(Box::new(|| {}));
+                        }
+                        seal_startup_test::queue_start_hook(Box::new(flip));
+                    }
+                    StopAt::Prepare(k) => {
+                        for _ in 0..k {
+                            seal_startup_test::queue_prepare_hook(Box::new(|| {}));
+                        }
+                        seal_startup_test::queue_prepare_hook(Box::new(flip));
+                    }
+                    _ => panic!("the deadline twin flips mid-startup only"),
+                }
+                let _ = start_semantic_lane(
+                    &mut coordinator,
+                    &scope,
+                    crate::attach::BackendSelection::Auto,
+                    true,
+                    false,
+                    Some(&control),
+                );
+            },
+        );
+        coordinator.registry_mut().publish();
+        coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .filter(|gap| STARTUP_GAP_SUBJECTS.contains(&gap.subject.as_str()))
+            .map(|gap| (gap.subject.clone(), gap.reason.clone()))
+            .collect()
+    }
+
+    /// N4: when the stop cause is the run deadline rather than an
+    /// operator signal, the skipped-retry reasons say "run duration
+    /// ended", on every arm that names a skipped retry.
+    #[test]
+    fn n4_deadline_words_the_skipped_retry_reason() {
+        let refused = || Err(SemanticRefusal::Unavailable);
+        let ended_sizes = (
+            "key sizes retry skipped".to_string(),
+            format!(
+                "run duration ended; the key-sizes journal start was refused ({}), so neither \
+                 the sizes-off nor the ordinary retry runs",
+                refused_reason()
+            ),
+        );
+        let ended_ordinary = (
+            "key operations retry skipped".to_string(),
+            format!(
+                "run duration ended; the key-operations journal start was refused ({}), so the \
+                 ordinary retry does not run",
+                refused_reason()
+            ),
+        );
+        let ended_sizes_gap = (
+            "key sizes unavailable".to_string(),
+            format!(
+                "{}; sizes-off retry skipped: run duration ended",
+                refused_reason()
+            ),
+        );
+        // Deadline during the sizes-on journal start: sizes gap, the
+        // operations gap, then the skipped-retries gap.
+        assert_eq!(
+            deadline_gaps(
+                true,
+                vec![refused(), refused(), refused()],
+                StopAt::Start(0)
+            ),
+            vec![ended_sizes_gap, key_operations_unavailable(), ended_sizes,],
+            "sizes-on arm"
+        );
+        // Deadline during the sizes-off journal start (no sizes): the
+        // operations gap, then the skipped ordinary retry.
+        assert_eq!(
+            deadline_gaps(false, vec![refused(), refused()], StopAt::Start(0)),
+            vec![key_operations_unavailable(), ended_ordinary.clone()],
+            "sizes-off arm"
+        );
+        // Deadline during the ordinary re-mint: the fall-through
+        // operations gap, then the skipped ordinary retry.
+        assert_eq!(
+            deadline_gaps(false, vec![refused(), refused()], StopAt::Prepare(3)),
+            vec![key_operations_unavailable(), ended_ordinary],
+            "ordinary re-mint gate"
         );
     }
 

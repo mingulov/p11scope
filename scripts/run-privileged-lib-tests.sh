@@ -754,6 +754,12 @@ discovery::scan::tests::privileged_foreign_mount_namespace_scan_collapses_unopen
 # link and merges with its proven sibling instead of rejecting the whole
 # raw-key group (needs only root, no BPF).
 discovery::identity::tests::privileged_jailed_view_pins_through_map_files_without_poisoning_its_group
+# Joint seal cells across stop: a seal take held pending while the
+# capture stops falls back with named loss (pending), and the shed
+# twin publishes with named loss (needs root, a linked journal
+# session and the live-joint fixtures).
+inventory::joint_stop_races_privileged_tests::privileged_joint_seal_pending_across_stop_falls_back_live_lp64
+inventory::joint_stop_races_privileged_tests::privileged_joint_seal_shed_across_stop_falls_back_live_lp64
 )
 
 # Counter-fixture membership: the DEFAULT_TESTS members that need the

@@ -2511,6 +2511,18 @@
       "path": "regress071_privileged_tests::privileged_profile_system_bind_mount_two_view_exact_lp64",
       "reason": "privileged: profile --system counts two bind-mounted views of one provider exactly",
       "cell": "privileged"
+    },
+    {
+      "file": "src/inventory/joint_stop_races_privileged_tests.rs",
+      "path": "inventory::joint_stop_races_privileged_tests::privileged_joint_seal_pending_across_stop_falls_back_live_lp64",
+      "reason": "privileged: live Joint seal pending across stop falls back with named loss",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inventory/joint_stop_races_privileged_tests.rs",
+      "path": "inventory::joint_stop_races_privileged_tests::privileged_joint_seal_shed_across_stop_falls_back_live_lp64",
+      "reason": "privileged: live Joint shed across stop publishes with named loss",
+      "cell": "privileged"
     }
   ]
 }

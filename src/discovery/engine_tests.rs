@@ -65579,16 +65579,10 @@ fn peer_census_alignment_respawns_a_mismatched_peer() {
         .expect("spawn the mismatched peer");
     let alien_pid = alien.id();
     fixture.peers.push(alien);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while !std::fs::read_link(format!("/proc/{alien_pid}/exe"))
-        .is_ok_and(|exe| exe.ends_with("sleep"))
-    {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "mismatched peer {alien_pid} never exec'd sleep"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
+    // Settle before the census: the exe link switches before the image
+    // maps, and a partially exec'd peer is not the proven-different
+    // census this test needs.
+    wait_sleep_child_settled(alien_pid);
     assert_ne!(
         peer_maps_census(alien_pid),
         expected,
@@ -98580,6 +98574,158 @@ fn wait_sleep_exec_row(pid: u32) -> std::path::PathBuf {
     std::fs::read_link(format!("/proc/{pid}/exe")).unwrap()
 }
 
+/// Source slice of the item starting at `fn {name}(` up to the next item:
+/// for needle tests pinning guard order inside one function body. The
+/// `fn ` prefix is built at runtime so a needle's own source (which names
+/// its targets) never matches the slice key.
+fn needle_fn_body<'a>(source: &'a str, name: &str) -> &'a str {
+    let key = format!("fn {name}(");
+    let start = source
+        .find(&*key)
+        .unwrap_or_else(|| panic!("needle: no {key} in source"));
+    let rest = &source[start..];
+    let cut = ["\n#[test]", "\nfn "]
+        .into_iter()
+        .filter_map(|delim| rest[1..].find(delim).map(|pos| pos + 1))
+        .min()
+        .unwrap_or(rest.len());
+    &rest[..cut]
+}
+
+/// Needle: every stop-then-read site settles its child before SIGSTOP, in
+/// source order. Reverting any site to an exe-link-only (or no) wait fails
+/// here deterministically — the live-child race itself is far too rare to
+/// kill reliably in-suite. Covers the 6 `wait_sleep_exec_row` sites, the 5
+/// bare settled stops, the shared `stopped_member_with_row` helper, and the
+/// alien census site; plus a global ban on exe-link-only exe polls.
+#[test]
+fn stop_then_read_sites_settle_before_sigstop() {
+    let source = include_str!("engine_tests.rs");
+    let exec_row_sites = [
+        "member_stop_clears_non_provider_files_and_resumes_at_once",
+        "member_stop_clears_the_kernel_key_when_maps_show_another_device",
+        "member_stop_leaves_an_overlay_inode_mismatch_unproven",
+        "member_stop_leaves_a_process_outside_the_run_tree_untouched",
+        "member_stop_intake_is_bounded_per_pass",
+        "member_stop_never_proves_a_fuse_backed_file",
+    ];
+    assert_eq!(
+        exec_row_sites.len(),
+        6,
+        "the class table names 6 exec-row sites"
+    );
+    for name in exec_row_sites {
+        let body = needle_fn_body(source, name);
+        let settle = body
+            .find("wait_sleep_exec_row(pid)")
+            .unwrap_or_else(|| panic!("{name}: no wait_sleep_exec_row(pid)"));
+        let stop = body
+            .find("stop_member_for_test(pid)")
+            .unwrap_or_else(|| panic!("{name}: no stop_member_for_test(pid)"));
+        assert!(settle < stop, "{name}: settle must precede the stop");
+    }
+    let bare_sites = [
+        "member_stop_resume_keeps_the_row_without_signal_authority",
+        "member_stop_bound_never_signals_a_process_born_after_the_stop",
+        "member_stop_unreadable_exit_state_never_abandons_a_held_member",
+        "member_stop_unknown_stop_instant_is_doubt",
+        "member_stop_member_stays_stopped_without_a_service_pass",
+    ];
+    assert_eq!(
+        bare_sites.len(),
+        5,
+        "the class table names 5 bare settled stops"
+    );
+    for name in bare_sites {
+        let body = needle_fn_body(source, name);
+        let settle = body
+            .find("wait_sleep_child_settled(pid)")
+            .unwrap_or_else(|| panic!("{name}: no wait_sleep_child_settled(pid)"));
+        let stop = body
+            .find("stop_member_for_test(pid)")
+            .unwrap_or_else(|| panic!("{name}: no stop_member_for_test(pid)"));
+        assert!(settle < stop, "{name}: settle must precede the stop");
+    }
+    // The shared helper all 15 `stopped_member_with_row` uses funnel through.
+    let helper = needle_fn_body(source, "stopped_member_with_row");
+    let settle = helper
+        .find("wait_sleep_child_settled(pid)")
+        .expect("helper settles");
+    let stop = helper
+        .find("stop_member_for_test(pid)")
+        .expect("helper stops");
+    assert!(settle < stop, "helper: settle must precede the stop");
+    // Ban needles, built at runtime so this needle's own source never
+    // matches them.
+    let banned_basename = ["name", "==", "\"sleep\""].join(" ");
+    let ends_with_sleep = ["ends_with(", "\"sleep\")"].concat();
+    // The alien census site settles before its maps read (no SIGSTOP there).
+    let alien = needle_fn_body(source, "peer_census_alignment_respawns_a_mismatched_peer");
+    assert!(
+        alien.contains("wait_sleep_child_settled(alien_pid)"),
+        "alien: no wait_sleep_child_settled(alien_pid)"
+    );
+    assert!(
+        !alien.contains(&ends_with_sleep),
+        "alien: exe-link-only poll is back"
+    );
+    // Global bans: no basename-only exe poll loop may reappear anywhere,
+    // and the only ends_with poll left is the post-settle assertion in the
+    // loader-name twin.
+    assert!(
+        !source.contains(&banned_basename),
+        "a basename-only exe poll loop is back"
+    );
+    assert_eq!(
+        source.matches(&ends_with_sleep).count(),
+        1,
+        "an exe-link-only ends_with poll is back (want only the loader-name assert)"
+    );
+}
+
+/// Needle: the teardown cancel guard pins all three joints. Limits (see
+/// the fix2 report): with cancel pre-latched, EITHER the pre-set skip OR
+/// an in-loop break observes it, so no behavioral test through the scan
+/// entrypoint can kill exactly one branch — deterministic mid-wait
+/// coverage needs a wait-start hook outside this TEST-ONLY lane. These
+/// needles pin (a) the test latches before the scan, (b) production keeps
+/// the pre-set skip, (c) production keeps both in-loop breaks. Deleting
+/// any of them fails here.
+#[test]
+fn teardown_cancel_guard_needles() {
+    // (a) Test side: the stop is latched before the scan starts.
+    let tests = include_str!("engine_tests.rs");
+    let body = needle_fn_body(tests, "teardown_pre_latched_stop_skips_wait_and_stays_loud");
+    let latch = body
+        .find("AtomicBool::new(true)")
+        .expect("teardown test latches cancel");
+    let scan = body
+        .find("scan_and_pin_with(")
+        .expect("teardown test scans");
+    assert!(latch < scan, "the stop must latch before the scan");
+    // (b)+(c) Production side: the pre-set skip and both loop breaks.
+    let engine = include_str!("engine.rs");
+    let wait = engine
+        .split_once("fn teardown_wait_and_reprove(")
+        .expect("wait fn")
+        .1
+        .split_once("fn scan_and_pin_with_proof(")
+        .expect("next fn")
+        .0;
+    let skip = wait
+        .find("return process::whole_group_proven_exited(view);")
+        .expect("pre-set skip");
+    let start = wait
+        .find("let start = Instant::now();")
+        .expect("wait start");
+    assert!(skip < start, "the pre-set skip must precede the wait");
+    assert_eq!(
+        wait.matches("|| cancelled()").count(),
+        2,
+        "both in-loop cancelled() breaks stay"
+    );
+}
+
 /// Stops `pid` with SIGSTOP and waits until every task reports `T`.
 fn stop_member_for_test(pid: u32) {
     assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGSTOP) }, 0);
@@ -98878,6 +99024,9 @@ fn member_stop_resume_keeps_the_row_without_signal_authority() {
         .spawn()
         .unwrap();
     let pid = child.id();
+    // Settle the exec before stopping: SIGSTOP freezes the child wherever
+    // it lands, and the exe link alone is not readiness.
+    wait_sleep_child_settled(pid);
     stop_member_for_test(pid);
     let start = crate::process::process_start_time(pid).unwrap();
     let mut io = ScriptedMemberStops::default();
@@ -98906,7 +99055,9 @@ fn member_stop_resume_keeps_the_row_without_signal_authority() {
 }
 
 /// A stopped `sleep` with its pending row stamped after its birth on the
-/// hook's clock: the process its row names.
+/// hook's clock: the process its row names. Settled before the stop: the
+/// no-grace release paths read each member's maps before its resume, and
+/// SIGSTOP freezes the child wherever it lands.
 fn stopped_member_with_row(io: &mut ScriptedMemberStops) -> (std::process::Child, u32, u64) {
     let child = std::process::Command::new("sleep")
         .arg("30")
@@ -98914,6 +99065,7 @@ fn stopped_member_with_row(io: &mut ScriptedMemberStops) -> (std::process::Child
         .spawn()
         .unwrap();
     let pid = child.id();
+    wait_sleep_child_settled(pid);
     stop_member_for_test(pid);
     let stop_ns = crate::attach::monotonic_ns().unwrap();
     io.rows.insert(
@@ -99016,6 +99168,9 @@ fn member_stop_bound_never_signals_a_process_born_after_the_stop() {
         .spawn()
         .unwrap();
     let pid = child.id();
+    // Settle the exec before stopping: SIGSTOP freezes the child wherever
+    // it lands, and the exe link alone is not readiness.
+    wait_sleep_child_settled(pid);
     stop_member_for_test(pid);
     let mut io = ScriptedMemberStops::default();
     // Stamped at boot: long before this process existed.
@@ -99192,6 +99347,9 @@ fn member_stop_unreadable_exit_state_never_abandons_a_held_member() {
         .spawn()
         .unwrap();
     let pid = child.id();
+    // Settle the exec before stopping: SIGSTOP freezes the child wherever
+    // it lands, and the exe link alone is not readiness.
+    wait_sleep_child_settled(pid);
     stop_member_for_test(pid);
     let mut io = ScriptedMemberStops::default();
     let row = p11scope_ebpf_common::MemberStop {
@@ -101560,6 +101718,9 @@ fn member_stop_unknown_stop_instant_is_doubt() {
         .spawn()
         .unwrap();
     let pid = child.id();
+    // Settle the exec before stopping: SIGSTOP freezes the child wherever
+    // it lands, and the exe link alone is not readiness.
+    wait_sleep_child_settled(pid);
     stop_member_for_test(pid);
     let pin = crate::process::PidPin::open(pid).unwrap();
     assert!(super::stopped_member_moved_out(&pin, 0));
@@ -101577,6 +101738,9 @@ fn member_stop_member_stays_stopped_without_a_service_pass() {
         .spawn()
         .unwrap();
     let pid = child.id();
+    // Settle the exec before stopping: SIGSTOP freezes the child wherever
+    // it lands, and the exe link alone is not readiness.
+    wait_sleep_child_settled(pid);
     stop_member_for_test(pid);
     std::thread::sleep(std::time::Duration::from_millis(50));
     let states = crate::discovery::pause::read_task_states(pid).unwrap();
@@ -103537,7 +103701,10 @@ fn teardown_shared_budget_caps_total_wait_and_keeps_later_loud() {
 /// scan stays loud (no silence on a cancelled wait). The window-hit helper
 /// owns setup retries; the scan itself is single-shot, with no sleeper
 /// thread. The mid-wait break has no behavioral twin (it would need a
-/// wait-start hook in production test gates).
+/// wait-start hook in production test gates). Residual window
+/// (brief-accepted, no retry by design): a zombie landing between the
+/// helper return and the scan-start check still silences; the premise
+/// assert converts that into a clear message.
 #[test]
 fn teardown_pre_latched_stop_skips_wait_and_stays_loud() {
     use std::sync::atomic::AtomicBool;

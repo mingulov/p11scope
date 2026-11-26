@@ -2971,14 +2971,22 @@ mod tests {
 
     /// Structural pin (not a behavioral guarantee): every production
     /// call edge into the identify machinery spells the shared counter
-    /// at its call site, one assertion per edge over this file's own
-    /// text. Behavioral pass/fail cannot attribute edges — every
-    /// exhausted read fails identically and the pipeline short-circuits
-    /// — so the wiring shape is pinned here while the callees' counter
-    /// use is pinned behaviorally by the spend tests above.
+    /// at its call site, one assertion per edge. The haystack is the
+    /// production region of this file only (everything before the test
+    /// module), so no assertion can match its own literal: a vacuous
+    /// whole-file search would pass even with the wiring deleted.
+    /// Behavioral pass/fail cannot attribute edges — every exhausted
+    /// read fails identically and the pipeline short-circuits — so the
+    /// wiring shape is pinned here while the callees' counter use is
+    /// pinned behaviorally by the spend tests above.
     #[test]
     fn discovery_call_edges_pin_the_shared_counter_wiring() {
-        let lines: Vec<&str> = include_str!("discover.rs").lines().collect();
+        let source = include_str!("discover.rs");
+        let production = source
+            .find("mod tests {")
+            .map(|at| &source[..at])
+            .expect("test module marker");
+        let lines: Vec<&str> = production.lines().collect();
         let window_has_counter = |anchor: &str, window: usize| {
             let at = lines
                 .iter()
@@ -3026,9 +3034,14 @@ mod tests {
                 "{edge} must pass the shared counter"
             );
         }
+        let entry_at = lines
+            .iter()
+            .position(|line| line.contains("pub fn discover_with_self_memory("))
+            .expect("public entry anchor");
         assert!(
-            include_str!("discover.rs")
-                .contains("discover_with_budget(module_path, self_memory, Rc::new(Cell::new(0)))"),
+            lines[entry_at..(entry_at + 8).min(lines.len())]
+                .join("\n")
+                .contains("discover_with_budget(module_path, self_memory,"),
             "the public entry must delegate to the budgeted pipeline"
         );
     }

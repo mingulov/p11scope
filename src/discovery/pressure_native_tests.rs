@@ -4525,15 +4525,24 @@ fn pressure_live256_all_blocked_twin_refuses_once() {
         "{WHAT}: sacrificed child {sacrificed} must reap"
     );
     population.children.remove(0);
-    // Admission can lag the freed slot by several ticks: each tick still
-    // services the retained refilled requests, and the head's newcomer
-    // window only survives the tick quantum once that service lightens
-    // (service may also rearm retired owned views through recycled
-    // slots, which legitimately grows the arm count past 256 — only the
-    // head's own ticketlessness is pinned below). Thirty ticks bounds
-    // the wait with margin; the loop exits on admission.
+    // The freed slot's retirement detaches its links on the cleanup
+    // worker, in wall time, and a pending global retirement owns the whole
+    // candidate boundary: no newcomer admits until it settles, however
+    // many ticks run (a blocked tick is ~20 ms, so a tick count alone
+    // would race the worker's close). The wait is bounded in wall time;
+    // the admission itself is bounded in ticks the engine was free to
+    // admit. Each unblocked tick still services the retained refilled
+    // requests, and the head's newcomer window only survives the tick
+    // quantum once that service lightens (service may also rearm retired
+    // owned views through recycled slots, which legitimately grows the
+    // arm count past 256 — only the head's own ticketlessness is pinned
+    // below). Thirty unblocked ticks bound the wait with margin; the loop
+    // exits on admission.
+    let blocked_deadline = Instant::now() + Duration::from_secs(120);
     let mut admitted_tick = None;
-    for tick in 0..30u32 {
+    let mut unblocked_ticks = 0u32;
+    let mut blocked_ticks = 0u32;
+    for tick in 0u32.. {
         engine
             .drain_discovery_shallow(&mut session, true)
             .unwrap_or_else(|error| panic!("{WHAT}: admission drain {tick} failed: {error:#}"));
@@ -4544,8 +4553,11 @@ fn pressure_live256_all_blocked_twin_refuses_once() {
             .views
             .iter()
             .any(|view| view.pid() == head_pid && view.still_the_same());
+        let blocked = engine.pending_global_retirement.is_some()
+            || !engine.pending_retirements.is_empty()
+            || !engine.pending_rejected_keys.is_empty();
         println!(
-            "t8: {WHAT}: admission tick {tick}: views={} head_view={head_view} minted={} truncated={}",
+            "t8: {WHAT}: admission tick {tick}: views={} head_view={head_view} blocked={blocked} minted={} truncated={}",
             engine.views.len(),
             minted_ids(&engine).len(),
             engine.discovery_truncated,
@@ -4554,7 +4566,23 @@ fn pressure_live256_all_blocked_twin_refuses_once() {
             admitted_tick = Some(tick);
             break;
         }
+        if blocked {
+            blocked_ticks += 1;
+            assert!(
+                Instant::now() < blocked_deadline,
+                "{WHAT}: the freed slot's retirement settles within 120 s ({blocked_ticks} blocked ticks)"
+            );
+        } else {
+            unblocked_ticks += 1;
+            assert!(
+                unblocked_ticks <= 30,
+                "{WHAT}: the deferred head admits within 30 unblocked ticks of the freed slot"
+            );
+        }
     }
+    println!(
+        "t8: {WHAT}: head admitted after {blocked_ticks} blocked and {unblocked_ticks} unblocked ticks"
+    );
     assert!(
         admitted_tick.is_some(),
         "{WHAT}: the deferred head admits once a slot frees"

@@ -439,7 +439,7 @@ fn dashboard_coverage_lines_count_provider_info_gaps() {
     assert!(loss_row.contains("45p"), "{loss_row}");
     assert!(loss_row.contains("dropped 7L 99B"), "{loss_row}");
     // Without observations the lines keep their old shape: no provider
-    // segment appears from nowhere.
+    // segment appears from nowhere — in any of the three forms.
     let mut bare = varied_presentation();
     bare.provider_observations = None;
     let bare_frame = frame_for(&bare);
@@ -457,6 +457,42 @@ fn dashboard_coverage_lines_count_provider_info_gaps() {
     {
         assert!(!line.contains("provider"), "{line}");
     }
+    let bare_minimal = frame_text(&render_frame(
+        &bare_frame,
+        Viewport {
+            width: 100,
+            height: 10,
+        },
+        &DashboardState::new(),
+    ));
+    let bare_minimal_coverage = bare_minimal
+        .lines()
+        .find(|line| line.starts_with("coverage:"))
+        .expect("the minimal header carries a coverage line at zero");
+    assert!(
+        !bare_minimal_coverage.contains("provider"),
+        "{bare_minimal_coverage}"
+    );
+    let mut bare_lossy = frame_for(&bare);
+    bare_lossy.log.dropped_lines = 7;
+    bare_lossy.log.dropped_bytes = 99;
+    let bare_compact = frame_text(&render_frame(
+        &bare_lossy,
+        Viewport {
+            width: 100,
+            height: 10,
+        },
+        &DashboardState::new(),
+    ));
+    let bare_loss_row = bare_compact
+        .lines()
+        .find(|line| line.starts_with("coverage:"))
+        .expect("the compact header carries a coverage line at zero");
+    assert!(
+        !bare_loss_row.contains("0p"),
+        "no 0p segment at zero: {bare_loss_row}"
+    );
+    assert!(bare_loss_row.contains("dropped 7L 99B"), "{bare_loss_row}");
 }
 
 /// A failed stop-handler registration fails startup with a named

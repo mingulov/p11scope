@@ -4341,6 +4341,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     receipt.info_revoke_failed
                 ),
                 budget: None,
+                units: None,
             });
         }
         let Some(capture) = self.capture.as_mut() else {
@@ -7106,6 +7107,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     reason: crate::discovery::caller_registry::instance_input::FOLD_DEFERRED_DISPOSAL_REASON
                         .into(),
                     budget: None,
+                    units: None,
                 });
                 continue;
             }
@@ -7146,6 +7148,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     subject: FOLD_DEFERRED_OVERSIZED_SUBJECT.into(),
                     reason: FOLD_DEFERRED_OVERSIZED_REASON.into(),
                     budget: None,
+                    units: None,
                 });
                 continue;
             }
@@ -10078,6 +10081,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 subject: "provider info".into(),
                 reason: format!("{unresolvable} info record(s) named no admitted module; dropped"),
                 budget: None,
+                units: None,
             });
         }
         if malformed > 0 {
@@ -10088,6 +10092,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 subject: "provider info".into(),
                 reason: format!("{malformed} info record(s) failed validation; dropped"),
                 budget: None,
+                units: None,
             });
         }
         if let Some(failure) = batch.failure.as_deref() {
@@ -10098,6 +10103,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 subject: "provider info".into(),
                 reason: format!("info ring unreadable: {failure}"),
                 budget: None,
+                units: None,
             });
         }
         // Keymeta Task 7 evidence (spec §17.4, never silent): the
@@ -10134,6 +10140,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 subject: "provider info".into(),
                 reason: format!("info evidence: {delta} {what}(s)"),
                 budget: None,
+                units: None,
             });
         }
         if let Some(error) = batch.evidence_error.as_deref() {
@@ -10144,6 +10151,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 subject: "provider info".into(),
                 reason: format!("info evidence unreadable: {error}"),
                 budget: None,
+                units: None,
             });
         }
         // Every quantum's cut outcome carries to the stop,
@@ -10246,6 +10254,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 subject: "provider info".into(),
                 reason,
                 budget: None,
+                units: None,
             });
         }
         for (index, total) in self.info_evidence_totals.iter().enumerate() {
@@ -10263,6 +10272,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 subject: "provider info".into(),
                 reason: format!("info evidence run total: {total} {what}(s)"),
                 budget: None,
+                units: None,
             });
         }
         staged
@@ -10315,6 +10325,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                  (excluded from live rows; folded counts partial)"
             ),
             budget: None,
+            units: None,
         });
     }
 
@@ -13411,6 +13422,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     crate::discovery::scan_pass::BUDGET_STOP_DEMOTE_AFTER
                 ),
                 budget: None,
+                units: None,
             });
         }
         self.evict_enumerated_overflow();
@@ -28624,6 +28636,7 @@ exit 0
                 subject: DEMOTED_COUNT_REJECTED.into(),
                 reason: "the current physical owner is not proven for absolute count range (10, 16] (6 unattributed calls); historical counts remain and no witness or module-level use is recorded".into(),
                 budget: None,
+                units: None,
             };
             let gaps: Vec<RegistryGap> = native
                 .scene
@@ -28738,6 +28751,7 @@ exit 0
                 subject: DEMOTED_COUNT_REJECTED.into(),
                 reason: "the current physical owner is not proven for absolute count range (10, 20] (10 unattributed calls); historical counts remain and no witness or module-level use is recorded".into(),
                 budget: None,
+                units: None,
             };
             let gaps: Vec<RegistryGap> = native
                 .scene
@@ -28826,6 +28840,7 @@ exit 0
             subject: DEMOTED_COUNT_REJECTED.into(),
             reason: "the current physical owner is not proven for absolute count range (10, 20] (10 unattributed calls); historical counts remain and no witness or module-level use is recorded".into(),
             budget: None,
+            units: None,
         };
         let gaps: Vec<RegistryGap> = native
             .scene
@@ -28910,6 +28925,7 @@ exit 0
                 subject: DEMOTED_COUNT_REJECTED.into(),
                 reason: "the current physical owner is not proven for absolute count range (10, 16] (6 unattributed calls); historical counts remain and no witness or module-level use is recorded".into(),
                 budget: None,
+                units: None,
             };
             let gaps: Vec<RegistryGap> = native
                 .scene
@@ -29004,6 +29020,7 @@ exit 0
             subject: DEMOTED_COUNT_REJECTED.into(),
             reason: "the current physical owner is not proven for absolute count range (10, 16] (6 unattributed calls); historical counts remain and no witness or module-level use is recorded".into(),
             budget: None,
+            units: None,
         };
         let gaps: Vec<RegistryGap> = native
             .scene
@@ -29061,6 +29078,7 @@ exit 0
             subject: DEMOTED_COUNT_REJECTED.into(),
             reason: "the current physical owner is not proven for absolute count range (10, 16] (6 unattributed calls); historical counts remain and no witness or module-level use is recorded".into(),
             budget: None,
+            units: None,
         };
         let gaps: Vec<RegistryGap> = native
             .scene
@@ -29135,6 +29153,7 @@ exit 0
             subject: DEMOTED_COUNT_REJECTED.into(),
             reason: "the current physical owner is not proven for absolute count range (10, 16] (6 unattributed calls); historical counts remain and no witness or module-level use is recorded".into(),
             budget: None,
+            units: None,
         };
         let gaps: Vec<RegistryGap> = native
             .scene
@@ -29258,6 +29277,7 @@ exit 0
             subject: DEMOTED_COUNT_REJECTED.into(),
             reason: "the current physical owner is not proven for absolute count range (10, 16] (6 unattributed calls); historical counts remain and no witness or module-level use is recorded".into(),
             budget: None,
+            units: None,
         };
         let gaps: Vec<RegistryGap> = native
             .scene
@@ -45881,6 +45901,7 @@ int main(void) {
                 subject: format!("flood-{n}"),
                 reason: "x".into(),
                 budget: None,
+                units: None,
             });
         }
         native.scene.coordinator.commit_batch(false).unwrap();
@@ -46699,6 +46720,7 @@ int main(void) {
                 subject: format!("flood-{n}"),
                 reason: "x".into(),
                 budget: None,
+                units: None,
             });
         }
         native.scene.coordinator.commit_batch(false).unwrap();
@@ -46782,6 +46804,7 @@ int main(void) {
                 subject: format!("flood-{n}"),
                 reason: "x".into(),
                 budget: None,
+                units: None,
             });
         }
         native.scene.coordinator.commit_batch(false).unwrap();

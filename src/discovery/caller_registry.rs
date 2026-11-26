@@ -8388,6 +8388,7 @@ impl CallerRegistry {
                 subject: DEMOTED_COUNT_PLACED.into(),
                 reason: old,
                 budget: None,
+                units: None,
             });
             self.gap_index.insert(
                 RegistryGap {
@@ -8397,6 +8398,7 @@ impl CallerRegistry {
                     subject: DEMOTED_COUNT_PLACED.into(),
                     reason,
                     budget: None,
+                    units: None,
                 },
                 index,
             );
@@ -8415,6 +8417,7 @@ impl CallerRegistry {
             subject: DEMOTED_COUNT_PLACED.into(),
             reason,
             budget: None,
+            units: None,
         };
         let before = self.gaps.len();
         let terminal = self.terminal_phase;
@@ -11011,6 +11014,7 @@ pub(crate) mod tests {
             subject: "test gap".to_string(),
             reason: "test reason".to_string(),
             budget: None,
+            units: None,
         });
         assert_eq!(
             registry.staged_instance_invalidations_for_test(),
@@ -11776,6 +11780,7 @@ pub(crate) mod tests {
                 subject: format!("flood-{n}"),
                 reason: "x".into(),
                 budget: None,
+                units: None,
             });
         }
         registry.publish();
@@ -11788,6 +11793,7 @@ pub(crate) mod tests {
                 subject: format!("terminal-{n}"),
                 reason: "y".into(),
                 budget: None,
+                units: None,
             });
         }
         for n in 0..TERMINAL_AGGREGATE_HEADROOM {
@@ -11798,6 +11804,7 @@ pub(crate) mod tests {
                 subject: format!("aggregate-{n}"),
                 reason: "z".into(),
                 budget: None,
+                units: None,
             });
         }
         registry.record_gap(RegistryGap {
@@ -11807,6 +11814,7 @@ pub(crate) mod tests {
             subject: "terminal-overflow".into(),
             reason: "y".into(),
             budget: None,
+            units: None,
         });
         registry.publish();
         assert_eq!(
@@ -11844,6 +11852,7 @@ pub(crate) mod tests {
                 subject: format!("flood-{n}"),
                 reason: "x".into(),
                 budget: None,
+                units: None,
             });
         }
         registry.publish();
@@ -11855,6 +11864,7 @@ pub(crate) mod tests {
                 subject: format!("aggregate-{n}"),
                 reason: "z".into(),
                 budget: None,
+                units: None,
             });
         }
         registry.enter_terminal_phase();
@@ -11894,6 +11904,7 @@ pub(crate) mod tests {
                 subject: format!("flood-{n}"),
                 reason: "x".into(),
                 budget: None,
+                units: None,
             });
         }
         registry.publish();
@@ -11906,6 +11917,7 @@ pub(crate) mod tests {
                 subject: format!("aggregate-{n}"),
                 reason: "z".into(),
                 budget: None,
+                units: None,
             });
         }
         for n in 0..TERMINAL_GAP_RESERVE {
@@ -11916,6 +11928,7 @@ pub(crate) mod tests {
                 subject: format!("terminal-{n}"),
                 reason: "y".into(),
                 budget: None,
+                units: None,
             });
         }
         registry.publish();

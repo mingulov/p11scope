@@ -3970,6 +3970,7 @@ impl CallerRegistry {
                         subject: STAGED_DISPOSAL_INSTANCE_LOST_SUBJECT.into(),
                         reason: STAGED_DISPOSAL_INSTANCE_LOST_REASON.into(),
                         budget: None,
+                        units: None,
                     });
                     cursor.current = None;
                     cursor.done_upto = Some(id);
@@ -4068,6 +4069,7 @@ impl CallerRegistry {
             subject: STAGED_DISPOSAL_ABANDONED_SUBJECT.into(),
             reason: STAGED_DISPOSAL_ABANDONED_REASON.into(),
             budget: None,
+            units: None,
         });
     }
     pub(crate) fn observe_instance_semantic(&mut self, input: AdmittedInstanceCall) {
@@ -4129,6 +4131,7 @@ impl CallerRegistry {
                 subject: FOLD_DEFERRED_DISPOSAL_SUBJECT.into(),
                 reason: FOLD_DEFERRED_DISPOSAL_REASON.into(),
                 budget: None,
+                units: None,
             });
             return None;
         }

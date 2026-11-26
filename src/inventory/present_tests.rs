@@ -7794,6 +7794,7 @@ fn snapshot_folds_repeated_ceiling_stops_into_one_counted_row() {
                 subject: "capture discovery".into(),
                 reason: wordings[index as usize % wordings.len()].clone(),
                 budget: None,
+                units: None,
             });
     }
     harness
@@ -7806,6 +7807,7 @@ fn snapshot_folds_repeated_ceiling_stops_into_one_counted_row() {
             subject: "exact image authority unavailable".into(),
             reason: "no BPF image identity".into(),
             budget: None,
+            units: None,
         });
     let tricky_path = format!("/tmp/evil/{WORK_CEILING_REASON}/libprovider.so");
     let tricky_reason = crate::discovery::scan::no_table_found_reason(&tricky_path, false);
@@ -7819,6 +7821,7 @@ fn snapshot_folds_repeated_ceiling_stops_into_one_counted_row() {
             subject: tricky_path.clone(),
             reason: tricky_reason.clone(),
             budget: None,
+            units: None,
         });
     harness.commit();
     let document = harness.render();
@@ -7903,6 +7906,7 @@ fn snapshot_ceiling_fold_sums_repeats_at_first_position_with_bare_singleton() {
                         subject: subject.into(),
                         reason: reason.into(),
                         budget: None,
+                        units: None,
                     });
             }
         };
@@ -8008,6 +8012,7 @@ fn snapshot_ceiling_fold_sums_repeats_at_first_position_with_bare_singleton() {
                 subject: format!("ord-{index:02}"),
                 reason: format!("reason {index:02}"),
                 budget: None,
+                units: None,
             });
     };
     let ceiling = |harness: &mut Harness, subject: &str, times: usize| {
@@ -8022,6 +8027,7 @@ fn snapshot_ceiling_fold_sums_repeats_at_first_position_with_bare_singleton() {
                     subject: subject.into(),
                     reason: WORK_CEILING_REASON.into(),
                     budget: None,
+                    units: None,
                 });
         }
     };
@@ -8086,6 +8092,7 @@ fn concise_ceiling_anchors_rank_ordinary_groups_within_their_interval() {
                 subject: subject.into(),
                 reason: format!("{subject} reason"),
                 budget: None,
+                units: None,
             });
     };
     let ceiling = |harness: &mut Harness, subject: &str| {
@@ -8099,6 +8106,7 @@ fn concise_ceiling_anchors_rank_ordinary_groups_within_their_interval() {
                 subject: subject.into(),
                 reason: WORK_CEILING_REASON.into(),
                 budget: None,
+                units: None,
             });
     };
     let concise = |harness: &Harness| {
@@ -8170,6 +8178,7 @@ fn concise_ceiling_anchors_rank_ordinary_groups_within_their_interval() {
             subject: "z-early".into(),
             reason: "z-early reason".into(),
             budget: None,
+            units: None,
         });
     ordinary(&mut straddle, "a-late");
     straddle.commit();
@@ -8270,6 +8279,7 @@ fn concise_cap_keeps_run_wide_and_terminal_progress_rows() {
                         subject: format!("obj-{index:02}"),
                         reason: format!("reason {index:02}"),
                         budget: None,
+                        units: None,
                     });
             }
             harness
@@ -8282,6 +8292,7 @@ fn concise_cap_keeps_run_wide_and_terminal_progress_rows() {
                     subject: "libceil.so".into(),
                     reason: WORK_CEILING_REASON.into(),
                     budget: None,
+                    units: None,
                 });
             let needle = if terminal == "capture failed" {
                 harness
@@ -8294,6 +8305,7 @@ fn concise_cap_keeps_run_wide_and_terminal_progress_rows() {
                         subject: "inventory capture failed".into(),
                         reason: "the capture backend failed".into(),
                         budget: None,
+                        units: None,
                     });
                 "inventory capture failed"
             } else {
@@ -8363,6 +8375,7 @@ fn concise_cap_keeps_the_resume_history_refusal() {
                 subject: format!("obj-{index:02}"),
                 reason: format!("reason {index:02}"),
                 budget: None,
+                units: None,
             });
     }
     harness
@@ -8375,6 +8388,7 @@ fn concise_cap_keeps_the_resume_history_refusal() {
             subject: "libceil.so".into(),
             reason: WORK_CEILING_REASON.into(),
             budget: None,
+            units: None,
         });
     harness.coordinator_mut().set_cgroup_file_facts_for_test(
         crate::discovery::scan::RetainedFileFacts::saturated_resume_history_for_test(),
@@ -8424,6 +8438,7 @@ fn concise_protected_tier_is_never_capped() {
                 subject: "inventory capture failed".into(),
                 reason: format!("backend failure {index:02}"),
                 budget: None,
+                units: None,
             });
     }
     harness
@@ -8436,6 +8451,7 @@ fn concise_protected_tier_is_never_capped() {
             subject: "obj-ordinary".into(),
             reason: "ordinary reason".into(),
             budget: None,
+            units: None,
         });
     harness.commit();
     let document = harness.render();
@@ -8517,6 +8533,7 @@ fn ceiling_projection_folds_the_pin_time_work_wrapper() {
                     subject: (*subject).into(),
                     reason: reason.clone(),
                     budget: None,
+                    units: None,
                 });
         }
     }
@@ -8827,6 +8844,7 @@ fn member_continuation_filter_keeps_no_table_diagnosis() {
                 subject: gap.subject.clone(),
                 reason: gap.reason.clone(),
                 budget: None,
+                units: None,
             });
     }
     harness.commit();

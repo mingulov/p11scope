@@ -3472,6 +3472,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                  stale row; exact counts in the semantic capture summary)"
                 .into(),
             budget: None,
+            units: None,
         });
     }
 
@@ -3519,6 +3520,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 reason: "the length-stash counters could not be read; the summary may undercount until a later good read restores the exact cumulative totals"
                     .into(),
                 budget: None,
+                units: None,
             });
         }
     }

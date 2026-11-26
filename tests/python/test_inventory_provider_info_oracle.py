@@ -281,6 +281,74 @@ class ProviderInfoOracleTests(unittest.TestCase):
             want=1,
         )
 
+    def test_receipt_identity_change_fails(self):
+        # The binding physical-provider identity check (AGENTS.md):
+        # the independently hashed provider must be identical
+        # before and after the capture window.
+        def mutate(d, l, r, e):
+            r["provider_after"]["sha256"] = "b" * 64
+
+        result = self.run_case(mutate, want=1)
+        self.assertIn("provider physical identity or hash changed", result["detail"])
+
+    def test_owned_not_admitted_fails(self):
+        result = self.run_case(
+            lambda d, l, r, e: d["modules"][0].update(admission={"state": "refused"}),
+            want=1,
+        )
+        self.assertIn("owned provider not admitted", result["detail"])
+
+    def test_duplicate_owned_module_fails(self):
+        def mutate(d, l, r, e):
+            twin = copy.deepcopy(d["modules"][0])
+            twin["id"] = "m2"
+            d["modules"].append(twin)
+
+        result = self.run_case(mutate, want=1)
+        self.assertIn("duplicate owned provider module", result["detail"])
+
+    def test_caller_not_unique_fails(self):
+        def mutate(d, l, r, e):
+            twin = copy.deepcopy(d["callers"][0])
+            twin["id"] = "c9"
+            d["callers"].append(twin)
+
+        result = self.run_case(mutate, want=1)
+        self.assertIn("not exactly one caller", result["detail"])
+
+    def test_observations_version_fails(self):
+        result = self.run_case(
+            lambda d, l, r, e: d["provider_observations"].update(version=7),
+            want=1,
+        )
+        self.assertIn("not section version 8", result["detail"])
+
+    def test_mechanism_completions_two_fails(self):
+        self.run_case(
+            lambda d, l, r, e: d["provider_observations"]["mechanisms"][0].update(
+                completions=2
+            ),
+            want=1,
+        )
+
+    def test_token_changes_nonzero_fails(self):
+        result = self.run_case(
+            lambda d, l, r, e: d["provider_observations"]["tokens"][0].update(
+                changes=1
+            ),
+            want=1,
+        )
+        self.assertIn("want 0", result["detail"])
+
+    def test_mechanism_changes_nonzero_fails(self):
+        result = self.run_case(
+            lambda d, l, r, e: d["provider_observations"]["mechanisms"][0].update(
+                changes=1
+            ),
+            want=1,
+        )
+        self.assertIn("want 0", result["detail"])
+
     def test_missing_provider_info_fails(self):
         self.run_case(lambda d, l, r, e: d["modules"][0].pop("provider_info"), want=1)
 
@@ -291,6 +359,18 @@ class ProviderInfoOracleTests(unittest.TestCase):
             )
 
         self.run_case(mutate, want=1)
+
+    def test_spurious_refusal_reason_fails(self):
+        # The value matches the ledger but a refusal reason rides
+        # along: only the reason-absence guard names this (the
+        # fixture read clean bytes, so any reason is a lie).
+        def mutate(d, l, r, e):
+            d["modules"][0]["provider_info"].update(
+                manufacturer_reason="non_utf8_bytes"
+            )
+
+        result = self.run_case(mutate, want=1)
+        self.assertIn("refused although the fixture read clean bytes", result["detail"])
 
     def test_missing_token_row_fails(self):
         result = self.run_case(
@@ -344,20 +424,122 @@ class ProviderInfoOracleTests(unittest.TestCase):
         )
 
     def test_serial_key_fails(self):
-        self.run_case(
+        result = self.run_case(
             lambda d, l, r, e: d["provider_observations"]["tokens"][0].update(
                 serialNumber="deadbeef"
             ),
             want=1,
         )
+        self.assertIn("unknown keys", result["detail"])
 
     def test_label_key_fails(self):
-        self.run_case(
+        result = self.run_case(
             lambda d, l, r, e: d["provider_observations"]["tokens"][0].update(
                 label="qual"
             ),
             want=1,
         )
+        self.assertIn("unknown keys", result["detail"])
+
+    def test_pin_key_fails(self):
+        # Allowlist v1 excludes PINs: a smuggled PIN-class key dies
+        # at the exact key set (pin_min/max_len stay the only
+        # PIN-adjacent keys).
+        result = self.run_case(
+            lambda d, l, r, e: d["provider_observations"]["tokens"][0].update(
+                pin="1234"
+            ),
+            want=1,
+        )
+        self.assertIn("unknown keys", result["detail"])
+
+    def test_value_key_fails(self):
+        # CKA_VALUE / key-material class: never a row key.
+        result = self.run_case(
+            lambda d, l, r, e: d["provider_observations"]["mechanisms"][0].update(
+                value="key-bytes"
+            ),
+            want=1,
+        )
+        self.assertIn("unknown keys", result["detail"])
+
+    def test_argv_key_fails(self):
+        # Process-argument class: never captured, never a row key.
+        result = self.run_case(
+            lambda d, l, r, e: d["provider_observations"]["tokens"][0].update(
+                argv=["--pin", "1234"]
+            ),
+            want=1,
+        )
+        self.assertIn("unknown keys", result["detail"])
+
+    def test_env_key_fails(self):
+        # Environment class: never captured, never a row key.
+        result = self.run_case(
+            lambda d, l, r, e: d["provider_observations"]["mechanisms"][0].update(
+                env={"PIN": "1234"}
+            ),
+            want=1,
+        )
+        self.assertIn("unknown keys", result["detail"])
+
+    def test_excluded_v3_token_fields_fail(self):
+        # Allowlist v3 excludes session counts, memory sizes and
+        # clock readings from token rows; the reviewer's exact
+        # triple must fail.
+        def mutate(d, l, r, e):
+            d["provider_observations"]["tokens"][0].update(
+                sessionCount=3, totalPublicMemory=4096, utcTime="20261125000000"
+            )
+
+        result = self.run_case(mutate, want=1)
+        self.assertIn("unknown keys", result["detail"])
+
+    def test_top_level_serial_key_fails(self):
+        # The report-wide scan is the second layer: an excluded key
+        # outside any row (where no exact key set applies) still
+        # dies, here and only here.
+        result = self.run_case(
+            lambda d, l, r, e: d.update(serialNumber="deadbeef"), want=1
+        )
+        self.assertIn("excluded key", result["detail"])
+
+    def test_arbitrary_extra_key_fails(self):
+        # The row schema is closed: any unrelated extra key dies.
+        result = self.run_case(
+            lambda d, l, r, e: d["provider_observations"]["tokens"][0].update(
+                notes="not in the schema"
+            ),
+            want=1,
+        )
+        self.assertIn("unknown keys", result["detail"])
+
+    def test_provider_info_extra_key_fails(self):
+        result = self.run_case(
+            lambda d, l, r, e: d["modules"][0]["provider_info"].update(
+                serialNumber="deadbeef"
+            ),
+            want=1,
+        )
+        self.assertIn("unknown keys", result["detail"])
+
+    def test_missing_required_row_key_fails(self):
+        def mutate(d, l, r, e):
+            del d["provider_observations"]["tokens"][0]["model"]
+
+        result = self.run_case(mutate, want=1)
+        self.assertIn("misses required keys", result["detail"])
+
+    def test_approved_optional_keys_pass(self):
+        # instance (the schema-approved optional) rides rows without
+        # tripping the key set; values still judge exactly.
+        def mutate(d, l, r, e):
+            d["provider_observations"]["tokens"][0]["instance"] = "i-1"
+            for row in d["provider_observations"]["mechanisms"]:
+                row["instance"] = "i-1"
+
+        result = self.run_case(mutate)
+        self.assertEqual(result["qualification"], "provider-info-exact")
 
     def test_owned_module_gap_fails(self):
         self.run_case(
@@ -406,6 +588,27 @@ class ProviderInfoOracleTests(unittest.TestCase):
 
     def test_stream_missing_ended_fails(self):
         self.run_case(lambda d, l, r, e: e.pop(), want=1)
+
+    def test_consistent_edge_overcount_fails_at_the_ledger(self):
+        # Snapshot and stream agree on 19, but the ledger says 18:
+        # only the snapshot-vs-ledger equality catches a
+        # consistent lie (neither leg alone does).
+        def mutate(d, l, r, e):
+            d["edges"][0]["entries"]["count"] = 19
+            e[1]["event"]["entries"]["count"] = 19
+
+        result = self.run_case(mutate, want=1)
+        self.assertIn("independent ledger total", result["detail"])
+
+    def test_same_count_wrong_mechanism_keys_fail(self):
+        # Same row count, wrong keys: only the key-set equality
+        # names the extra/missing pair (a bare count check passes
+        # this, and the value loop would die on KeyError instead).
+        def mutate(d, l, r, e):
+            d["provider_observations"]["mechanisms"][0]["mechanism"] = 0x999
+
+        result = self.run_case(mutate, want=1)
+        self.assertIn("mechanism row keys differ", result["detail"])
 
     def test_stream_edge_total_drift_fails(self):
         def mutate(d, l, r, e):

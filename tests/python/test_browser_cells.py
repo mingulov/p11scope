@@ -146,33 +146,62 @@ def _stall_outcomes(server) -> str:
 #: keeps the self-skipping hosted default.
 STRICT = os.environ.get("P11SCOPE_BROWSER_STRICT") == "1"
 
-#: Doctor's journal-pair availability row and the one build-limit detail
-#: a journal-less build reports (src/doctor.rs JOURNAL_PAIR_ROW /
-#: BUILD_LIMIT_NOT_IN_BUILD): the key-operations refusal branch is only
-#: valid when the binary under test reports exactly this token.
+#: Doctor's journal-pair availability row and the one build-limit
+#: detail a journal-less build reports (src/doctor.rs
+#: JOURNAL_PAIR_ROW / BUILD_LIMIT_NOT_IN_BUILD, status word
+#: NotApplicable renders as "n/a"): the key-operations refusal
+#: branch is only valid when the binary under test reports
+#: exactly (word, detail) == ("n/a", "not in this build").
 _JOURNAL_PAIR_ROW = "journal pair preflight"
+_JOURNAL_PAIR_NA = "n/a"
 _JOURNAL_NOT_IN_BUILD = "not in this build"
+
+
+def _parse_doctor_row(line):
+    """Split one dotted doctor row into (status word, detail).
+
+    Grammar (src/doctor.rs render_row, full line): NAME + space +
+    dots + space + WORD + optional pad + detail. Returns None for
+    anything else; the caller fails closed on None.
+    """
+    prefix = _JOURNAL_PAIR_ROW + " "
+    if not line.startswith(prefix):
+        return None
+    parts = line[len(prefix):].split(None, 2)
+    if len(parts) < 2 or set(parts[0]) != {"."}:
+        return None
+    return parts[1], parts[2] if len(parts) > 2 else ""
 
 
 def observer_omits_journal():
     """Whether the binary under test omits the production journal.
 
     Asks the binary itself (`doctor -v` names the journal-pair
-    availability): only a `not in this build` row means a
-    journal-less build. Any other shape (available, unavailable for
-    a host reason) means the build carries the journal. A missing
-    row fails closed: an unprovable flavor never takes the refusal
+    availability) and decides by exact equality on the parsed
+    (status word, detail) pair: only ("n/a", "not in this build")
+    means a journal-less build. Any other row shape (available,
+    unavailable for a host reason, lookalike detail) means the
+    build carries the journal. A missing, duplicated or malformed
+    row raises: an unprovable flavor never takes the refusal
     branch.
     """
     binary = cells.p11scope_bin()
     proc = subprocess.run(
         [str(binary), "doctor", "-v"],
         capture_output=True, text=True, timeout=180, check=False)
-    for line in proc.stdout.splitlines():
-        if line.startswith(_JOURNAL_PAIR_ROW):
-            return _JOURNAL_NOT_IN_BUILD in line
-    raise AssertionError(
-        "doctor names no journal-pair row?! cannot prove the build flavor")
+    found = [line for line in proc.stdout.splitlines()
+             if line.startswith(_JOURNAL_PAIR_ROW + " ")]
+    if len(found) != 1:
+        raise AssertionError(
+            "doctor names no unique journal-pair row?! "
+            "cannot prove the build flavor")
+    parsed = _parse_doctor_row(found[0])
+    if parsed is None:
+        raise AssertionError(
+            "journal-pair row is malformed?! cannot prove the build "
+            "flavor: %r" % (found[0],))
+    word, detail = parsed
+    return word == _JOURNAL_PAIR_NA and detail == _JOURNAL_NOT_IN_BUILD
 
 
 def judge_key_observations_journal_branch(observations, report, *,
@@ -2459,29 +2488,64 @@ class BrowserFoldedLeg(unittest.TestCase):
                 observations, report, journal_omitted=True)
 
     def test_observer_omits_journal_reads_the_doctor_row(self):
-        # The flavor probe parses doctor -v: only the exact
-        # `not in this build` token means journal-less; a missing
-        # row fails closed.
-        for doctor_out, want in [
-                ("journal pair preflight .... not-applicable  not in this build\n",
-                 True),
-                ("journal pair preflight .... ok              available\n",
-                 False),
-                ("journal pair preflight .... warn            unavailable: pair missing (x)\n",
-                 False),
-        ]:
+        # The flavor probe parses doctor -v with a full-row grammar
+        # (src/doctor.rs render_row: NAME_WIDTH 34, STATUS_WIDTH 6)
+        # and decides by exact (word, detail) equality: only
+        # ("n/a", "not in this build") means journal-less.
+        omitted = ("journal pair preflight ............ n/a   "
+                   "not in this build\n")
+        available = ("journal pair preflight ............ ok    "
+                     "available\n")
+        host_unavailable = ("journal pair preflight ............ warn  "
+                            "unavailable: pair missing (x)\n")
+        for doctor_out, want in [(omitted, True),
+                                 (available, False),
+                                 (host_unavailable, False)]:
             with self.subTest(doctor_out=doctor_out):
                 with patch.object(cells, "p11scope_bin",
                                   return_value=Path("/bin/true")), patch(
                         "subprocess.run",
                         return_value=SimpleNamespace(stdout=doctor_out)):
                     self.assertIs(observer_omits_journal(), want)
-        with patch.object(cells, "p11scope_bin",
-                          return_value=Path("/bin/true")), patch(
-                "subprocess.run",
-                return_value=SimpleNamespace(stdout="Doctor: ok.\n")):
-            with self.assertRaisesRegex(AssertionError, "no journal-pair row"):
-                observer_omits_journal()
+
+    def test_observer_omits_journal_rejects_lookalikes(self):
+        # Substring lookalikes never prove omission: the detail and
+        # the status word must both match exactly, else the build
+        # carries the journal and a refusal fails as a regression.
+        base = "journal pair preflight ............ "
+        for doctor_out in [
+                base + "n/a   not in this build (extra)\n",
+                base + "n/a   xnot in this build\n",
+                base + "ok    not in this build\n",
+                base + "FAIL  not in this build\n",
+        ]:
+            with self.subTest(doctor_out=doctor_out):
+                with patch.object(cells, "p11scope_bin",
+                                  return_value=Path("/bin/true")), patch(
+                        "subprocess.run",
+                        return_value=SimpleNamespace(stdout=doctor_out)):
+                    self.assertIs(observer_omits_journal(), False)
+
+    def test_observer_omits_journal_fails_closed_on_malformed_rows(self):
+        # A missing, duplicated or malformed row raises: an
+        # unprovable flavor never takes the refusal branch.
+        good = ("journal pair preflight ............ n/a   "
+                "not in this build\n")
+        cases = [
+            "Doctor: ok.\n",
+            "  journal pair preflight ............ n/a   not in this build\n",
+            "journal pair preflightX ............ n/a   not in this build\n",
+            "journal pair preflight n/a not in this build\n",
+            good + good,
+        ]
+        for doctor_out in cases:
+            with self.subTest(doctor_out=doctor_out):
+                with patch.object(cells, "p11scope_bin",
+                                  return_value=Path("/bin/true")), patch(
+                        "subprocess.run",
+                        return_value=SimpleNamespace(stdout=doctor_out)):
+                    with self.assertRaises(AssertionError):
+                        observer_omits_journal()
 
     def test_bootstrap_with_live_browser_instances_fails(self):
         # Folded-leg-only allowance: bootstrap with S1 rows is

@@ -52,20 +52,26 @@ OWNED_EDGE_USAGE_DETAIL = re.compile(
     r"total ([0-9]+) over ([0-9]+) workload callers; "
     r"per-caller attribution is by caller pid"
 )
+# Both proof patterns are matched with fullmatch against the
+# oracles' canonical emissions (no surrounding text): prefix,
+# suffix or contradictory trailing text is refused, so fullmatch
+# only ever rejects drift or forgery, never a true positive. The
+# manufacturer class excludes newlines and colons so a nested
+# fake proof cannot smuggle inside it.
 PROVIDER_INFO_DETAIL = re.compile(
-    r"provider (.+) library ([0-9]+)\.([0-9]+): ([0-9]+) token rows and "
+    r"provider ([^\n:]+?) library ([0-9]+)\.([0-9]+): ([0-9]+) token rows and "
     r"([0-9]+) mechanism rows match the ledger over ([0-9]+) slots; "
     r"serial/label absent"
 )
 
 
 def has_owned_edge_usage_proof(detail):
-    match = OWNED_EDGE_USAGE_DETAIL.search(detail)
+    match = OWNED_EDGE_USAGE_DETAIL.fullmatch(detail)
     return match is not None and int(match.group(1)) > 0 and int(match.group(2)) > 0
 
 
 def has_provider_info_proof(detail):
-    match = PROVIDER_INFO_DETAIL.search(detail)
+    match = PROVIDER_INFO_DETAIL.fullmatch(detail)
     return (match is not None and int(match.group(4)) > 0 and
             int(match.group(5)) > 0 and int(match.group(6)) > 0)
 

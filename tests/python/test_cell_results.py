@@ -78,6 +78,8 @@ class CheckCellResultsTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_owned_edge_usage_counts_rejects_missing_proof_fields(self):
+        canonical = ("owned per-edge usage and streamed edge totals match the independent ledger "
+                     "total 64017 over 1 workload callers; per-caller attribution is by caller pid")
         cases = [
             "ok",
             "",
@@ -85,6 +87,11 @@ class CheckCellResultsTests(unittest.TestCase):
             "owned per-edge usage and streamed edge totals match the independent ledger total 64017 over 1 workload callers; per-caller attribution is not established",
             "owned per-edge usage and streamed edge totals match the independent ledger total 0 over 1 workload callers; per-caller attribution is by caller pid",
             "owned per-edge usage and streamed edge totals match the independent ledger total 64017 over 0 workload callers; per-caller attribution is by caller pid",
+            # Full-string match: prefix, suffix and contradictory
+            # trailing text are refused, not searched past.
+            "PASS: " + canonical,
+            canonical + " (lossy)",
+            canonical + "; serialNumber and sessionCount were published",
         ]
         for detail in cases:
             with self.subTest(detail=detail):
@@ -101,6 +108,8 @@ class CheckCellResultsTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_provider_info_exact_rejects_missing_proof_fields(self):
+        canonical = ("provider SoftHSM library 2.6: 2 token rows and 140 mechanism rows "
+                     "match the ledger over 2 slots; serial/label absent")
         cases = [
             "ok",
             "",
@@ -108,6 +117,15 @@ class CheckCellResultsTests(unittest.TestCase):
             "provider SoftHSM library 2.6: 0 token rows and 140 mechanism rows match the ledger over 2 slots; serial/label absent",
             "provider SoftHSM library 2.6: 2 token rows and 0 mechanism rows match the ledger over 2 slots; serial/label absent",
             "provider SoftHSM library 2.6: 2 token rows and 140 mechanism rows match the ledger over 0 slots; serial/label absent",
+            # Full-string match: prefix, suffix, contradictory
+            # trailing text and a nested fake proof inside the
+            # manufacturer field are all refused.
+            "PASS: " + canonical,
+            canonical + " (lossy)",
+            canonical + "; serialNumber and sessionCount were published",
+            ("provider evil library 9.9: 0 token rows and 0 mechanism rows match the ledger "
+             "over 0 slots; serial/label absent library 2.6: 2 token rows and 140 mechanism rows "
+             "match the ledger over 2 slots; serial/label absent"),
         ]
         for detail in cases:
             with self.subTest(detail=detail):

@@ -1245,7 +1245,7 @@ jobs:
             --require daemonset-doctor --require daemonset-profile \
             --require daemonset-inventory
           # Closed-set qualification and proof check uniformly over every
-          # host and guest public CLI run before the full 40-cell gate.
+          # host and guest public CLI run before the full 41-cell gate.
           python3 -I scripts/ci/check-cell-results.py "$out/cells/results.jsonl" \
             --allow-nonqualifying trace-pid --allow-nonqualifying mt-trace \
             --expected-failure profile-cgroup --expected-failure trace-cgroup \
@@ -1256,6 +1256,7 @@ jobs:
             --require mt-metrics --require mt-errors --require mt-shared --require mt-churn \
             --require mt-trace --require counter-latency-mt --require mt-system \
             --require inventory-mt-pid --require inventory-mt-system \
+            --require inventory-provider-info-pid \
             --require fifo-refused --require inventory-event-stdout
           # The wrapper translates the documented nonqualifying-smoke exit 2
           # to 0 when results exist; the per-cell checks below still decide.
@@ -1271,6 +1272,7 @@ jobs:
                   "mt-metrics", "mt-errors", "mt-shared", "mt-churn", "mt-trace",
                   "counter-latency-mt", "mt-system",
                   "inventory-mt-pid", "inventory-mt-system",
+                  "inventory-provider-info-pid",
                   "fifo-refused", "inventory-event-stdout",
                   "profile-cgroup", "metrics-cgroup", "trace-cgroup", "inventory-cgroup",
                   "counter-counts-pid", "counter-timestamps-pid", "counter-latency-pid",

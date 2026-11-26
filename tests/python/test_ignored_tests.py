@@ -2092,6 +2092,46 @@ class IgnoredTestsTests(unittest.TestCase):
         self.assertEqual(CHECKER_MOD["ALLOWED_UNTIL_VERSIONS"],
                          ("0.7.3", "0.8.0", "0.9.0"))
 
+    def test_versioned_untils_all_say_080(self):
+        # Every versioned deferral in the real inventory names the
+        # next feature release: moving one to another known label
+        # (0.7.3, 0.9.0) would pass the checker silently, so the
+        # values and the exact path set are pinned here and any move
+        # needs a reviewed bump of this test.
+        sites = json.loads(INVENTORY.read_text(encoding="utf-8"))["sites"]
+        versioned = {entry["path"]: entry["until"] for entry in sites
+                     if isinstance(entry.get("until"), str)}
+        self.assertEqual(
+            sorted(versioned),
+            ['attach::counter_banks::tests::counter_preparation_refuses_without_bpf_loop_on_old_kernels',
+             'attach::image_bank_proof::tests::privileged_image_bank_attach_cookie_through_dispatcher',
+             'attach::image_bank_proof::tests::privileged_image_bank_concurrent_cut_counts_once',
+             'attach::image_bank_proof::tests::privileged_image_bank_cut_262145th_leader_in_b',
+             'attach::image_bank_proof::tests::privileged_image_bank_exec_query_span_cut',
+             'attach::image_bank_proof::tests::privileged_image_bank_exhaustion_262144_then_quota',
+             'attach::image_bank_proof::tests::privileged_image_bank_failure_modes_refuse_and_balance',
+             'attach::image_bank_proof::tests::privileged_image_bank_fork_burn_sentinel',
+             'attach::image_bank_proof::tests::privileged_image_bank_held_return_across_cut',
+             'attach::image_bank_proof::tests::privileged_image_bank_inflight_cut_counts_once',
+             'attach::image_bank_proof::tests::privileged_image_bank_late_incarnation_refused',
+             'attach::image_bank_proof::tests::privileged_image_bank_omitted_route_refuses',
+             'attach::image_bank_proof::tests::privileged_image_bank_per_call_overhead',
+             'attach::image_bank_proof::tests::privileged_image_bank_second_rollover',
+             'attach::image_bank_proof::tests::privileged_image_bank_verifier_stats',
+             'attach::instance_tests::privileged_instance_small_state_lru_eviction_never_joins',
+             'attach::inventory::activation::privileged_tests::privileged_inventory_retirement_controlled_churn',
+             'attach::tests::bpf_loop_probe_reports_helper_presence_on_live_kernel',
+             'discovery::scan::tests::privileged_cross_device_same_inode_alias_is_refused_on_scan_path',
+             'first_use_probe::native::system_capture_observer_facts',
+             'metrics::counter_reader::tests::counter_bank_session_verifier_complexity_refuses_clean_lp64',
+             'run::root_fence_runtime::actual_original_exit_delayed_first_admission_retires_pending',
+             's1_tests::resource_probe::native_semantic_resource_final_probe',
+             's1_tests::resource_probe::native_semantic_resource_registry_probe',
+             'semantics_edge::resource_tests::native_semantic_resource_probe'])
+        for path, until in sorted(versioned.items()):
+            with self.subTest(path=path):
+                self.assertEqual(until, "0.8.0")
+
     def test_malformed_until_fails(self):
         for until in ("0.6.x", "soon", 7,
                       {"item": "kernel lanes"},

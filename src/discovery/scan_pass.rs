@@ -562,6 +562,14 @@ impl ResumeHistory {
             .collect()
     }
 
+    /// Test-only: the eviction index names only pairs still covered.
+    #[cfg(test)]
+    fn evictable_index_consistent_for_test(&self) -> bool {
+        self.evictable
+            .values()
+            .all(|(key, generation)| self.covered.contains_key(&(key.clone(), *generation)))
+    }
+
     /// Remembered pairs over both records (covered plus completed).
     pub(crate) fn pairs(&self) -> usize {
         self.covered.len().saturating_add(self.completed.len())
@@ -3387,6 +3395,10 @@ mod departed_history_tests {
         let mut pruned = ResumeHistory::default();
         churn(&mut pruned, true);
         assert_eq!(pruned.pairs(), 0, "every dead pair is forgotten");
+        assert!(
+            pruned.evictable_index_consistent_for_test(),
+            "the eviction index forgets them too"
+        );
         pruned.record(&key(42, 7), &progress(false));
         assert_eq!(
             (pruned.len(), pruned.refused()),
@@ -3422,6 +3434,7 @@ mod departed_history_tests {
         let forgotten =
             history.forget_generations(&mut |pid, start_time| (pid, start_time) == (7, 70));
         assert_eq!(forgotten, 1);
+        assert!(history.evictable_index_consistent_for_test());
         let mut generations = history.generations_for_test();
         generations.sort_unstable();
         assert_eq!(generations, vec![(5, 50), (6, 60)]);

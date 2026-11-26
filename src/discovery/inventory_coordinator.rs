@@ -46557,6 +46557,10 @@ int main(void) {
             "the departed member's unfinished cursor is dropped, its completed one kept"
         );
         assert!(
+            coordinator.cgroup_file_facts.bytes_match_entries_for_test(),
+            "the retained byte counter releases the dropped cursor's bytes"
+        );
+        assert!(
             coordinator.live_scan_progress_gap().is_none(),
             "every live member converged: no live in-progress row"
         );
@@ -46603,6 +46607,10 @@ int main(void) {
             carried_cursor_table(&coordinator, &[DEPARTED_TEST_PID, me]),
             vec![(me, my_start, 11, false)],
             "the proven-dead generation drops; the live one stays"
+        );
+        assert!(
+            coordinator.cgroup_file_facts.bytes_match_entries_for_test(),
+            "the retained byte counter releases the dropped cursor's bytes"
         );
         assert!(
             coordinator.live_scan_progress_gap().is_some(),

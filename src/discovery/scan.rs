@@ -1575,6 +1575,21 @@ impl RetainedFileFacts {
         }
     }
 
+    /// Test-only: whether the carried byte counter equals its entries
+    /// (the invariant the next install asserts).
+    #[cfg(test)]
+    pub(crate) fn bytes_match_entries_for_test(&self) -> bool {
+        self.retained_cache_bytes
+            == file_fact_bytes(
+                &self.inspected_files,
+                &self.elf_export_facts,
+                &self.table_cap_refusals,
+                &self.loader_elf_facts,
+                &self.preopen_file_facts,
+            )
+            .saturating_add(decode_cursor_bytes_total(&self.decode_cursors))
+    }
+
     #[cfg(test)]
     pub(crate) fn cursor_counts(&self) -> CursorCounts {
         CursorCounts {

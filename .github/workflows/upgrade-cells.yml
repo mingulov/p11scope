@@ -221,6 +221,7 @@ jobs:
       - name: Gate 6 report compat
         run: |
           set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/gate6"
           sudo git config --global --add safe.directory "$GITHUB_WORKSPACE"
           sudo TMPDIR="$RUNNER_TEMP" python3 -I scripts/upgrade-gate6.py \
             --old-binary "$RUNNER_TEMP/old-bin/p11scope" \

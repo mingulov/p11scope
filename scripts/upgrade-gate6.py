@@ -21,7 +21,7 @@ The three breaking items (docs/releases/v0.8.0.md upgrade notes):
      profiles fail the new schema file.
 
 Typed checks (exit 0 only if all pass):
-  1. Old inventory scan report generates with the v0.7.1 binary (rc 0,
+  1. Old inventory churn report generates with the v0.7.1 binary (rc 0,
      schema p11scope/inventory/v1).
   2. New binary reads old via cbom (rc 0, CycloneDX JSON), via diff
      old-vs-old (rc 0 and typed zero changes) and old-vs-new (rc 0).
@@ -47,6 +47,7 @@ import argparse
 import json
 import os
 import select
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -59,8 +60,10 @@ if str(SCRIPT_DIR) not in sys.path:
 
 import upgrade_artifact_validation as artifact_validation
 
-# B1: exact new-only inventory keys introduced by the departed_use fold.
-# From the v0.7.1-vs-current scan comparison (budgets + per-module).
+# B1: exact new-only inventory keys the current binary always emits.
+# Fold budgets plus the per-module departed_use key itself (its populated
+# subtree is conditional and lives in ADDITIVE_KEYS). Every B1 key must be
+# present in the new report; unexpected keys fail b1_exact.
 B1_KEYS = frozenset(
     [
         "budgets.callers.late_refused",
@@ -81,25 +84,106 @@ B1_KEYS = frozenset(
     ]
 )
 
-# Additive non-breaking new keys (optional counters, ignored by readers).
-# Pinned: any new key outside B1+ADDITIVE fails the "nothing else" proof.
+# Conditional new keys: present only when the capture populated their section.
+# The populated departed_use fold subtree appears only when callers folded
+# during the capture; the semantic_capture counters appear when the
+# observation section carries them. Pinned: any new key outside B1+ADDITIVE
+# fails the "nothing else" proof.
 ADDITIVE_KEYS = frozenset(
     [
-        "instance_reload_not_excluded",
-        "instance_reload_not_excluded.continued_across_global",
-        "instance_reload_not_excluded.identities",
-        "instance_reload_not_excluded.identities[0].instances",
-        "instance_reload_not_excluded.identities[0].module",
-        "instance_reload_not_excluded.joined_across_global",
-        "object_observations.gaps.rows[0].reason",
-        "object_observations.gaps.rows[0].repeats",
-        "object_observations.gaps.rows[0].subject",
-        "object_observations.unattributed",
-        "object_observations.unattributed[0].count",
-        "object_observations.unattributed[0].reason",
-        "object_observations.unknown_key_operations[0].mechanisms",
-        "object_observations.unknown_key_operations[0].mechanisms[0].mechanism",
-        "object_observations.unknown_key_operations[0].mechanisms[0].terminals",
+        "modules[0].departed_use.callers",
+        "modules[0].departed_use.edges",
+        "modules[0].departed_use.entries",
+        "modules[0].departed_use.entries.count",
+        "modules[0].departed_use.entries.coverage",
+        "modules[0].departed_use.entries.coverage.counted",
+        "modules[0].departed_use.entries.coverage.first_min_ns",
+        "modules[0].departed_use.entries.coverage.lossy",
+        "modules[0].departed_use.entries.coverage.pid_exit",
+        "modules[0].departed_use.entries.coverage.since_min_ns",
+        "modules[0].departed_use.entries.coverage.unknown",
+        "modules[0].departed_use.entries.coverage.unknown.caller_exited_before_match",
+        "modules[0].departed_use.entries.coverage.unknown.use_before_admission",
+        "modules[0].departed_use.entries.coverage.until_max_ns",
+        "modules[0].departed_use.entries.coverage.watched_no_use",
+        "modules[0].departed_use.entries.coverage.witnessed",
+        "modules[0].departed_use.entries.first_min_ns",
+        "modules[0].departed_use.entries.forwarding",
+        "modules[0].departed_use.entries.in_flight",
+        "modules[0].departed_use.entries.last_max_ns",
+        "modules[0].departed_use.entries.logical",
+        "modules[0].departed_use.entries.observation",
+        "modules[0].departed_use.entries.observation.unknown (usage observation unavailable)",
+        "modules[0].departed_use.entries.saturated",
+        "modules[0].departed_use.first_ns",
+        "modules[0].departed_use.folded_instances",
+        "modules[0].departed_use.folded_instances[0].caller",
+        "modules[0].departed_use.folded_instances[0].id",
+        "modules[0].departed_use.folded_instances_dropped",
+        "modules[0].departed_use.folded_instances_saturated",
+        "modules[0].departed_use.identities",
+        "modules[0].departed_use.identities[0].authority",
+        "modules[0].departed_use.identities[0].caller",
+        "modules[0].departed_use.identities[0].exe",
+        "modules[0].departed_use.identities[0].exe.dev",
+        "modules[0].departed_use.identities[0].exe.ino",
+        "modules[0].departed_use.identities[0].exe.mtime_nanos",
+        "modules[0].departed_use.identities[0].exe.mtime_secs",
+        "modules[0].departed_use.identities[0].exe.path",
+        "modules[0].departed_use.identities[0].exec_observed",
+        "modules[0].departed_use.identities[0].first_seen_ns",
+        "modules[0].departed_use.identities[0].incarnation",
+        "modules[0].departed_use.identities[0].last_seen_ns",
+        "modules[0].departed_use.identities[0].lifecycle",
+        "modules[0].departed_use.identities[0].lifecycle_reason",
+        "modules[0].departed_use.identities[0].metadata_status",
+        "modules[0].departed_use.identities[0].pid",
+        "modules[0].departed_use.identities[0].start_time",
+        "modules[0].departed_use.identities_dropped",
+        "modules[0].departed_use.identities_saturated",
+        "modules[0].departed_use.instances",
+        "modules[0].departed_use.instances.api_returns",
+        "modules[0].departed_use.instances.api_returns_saturated_rows",
+        "modules[0].departed_use.instances.first_min_ns",
+        "modules[0].departed_use.instances.folded",
+        "modules[0].departed_use.instances.historical_only_returns",
+        "modules[0].departed_use.instances.last_max_ns",
+        "modules[0].departed_use.instances.loss_reasons",
+        "modules[0].departed_use.instances.loss_reasons.capture_stopped",
+        "modules[0].departed_use.instances.loss_reasons.instance_retired",
+        "modules[0].departed_use.instances.loss_reasons.semantic_loss",
+        "modules[0].departed_use.instances.loss_reasons.task_retired",
+        "modules[0].departed_use.instances.lossy_rows",
+        "modules[0].departed_use.instances.null_reasons",
+        "modules[0].departed_use.instances.observed",
+        "modules[0].departed_use.instances.reasons",
+        "modules[0].departed_use.instances.reasons.task_retired",
+        "modules[0].departed_use.instances.retired",
+        "modules[0].departed_use.instances.settled_live",
+        "modules[0].departed_use.instances.uncertain",
+        "modules[0].departed_use.mapping",
+        "modules[0].departed_use.mapping.evidence",
+        "modules[0].departed_use.mapping.evidence.deep_scan",
+        "modules[0].departed_use.mapping.evidence.maps_match",
+        "modules[0].departed_use.mapping.first_min_ns",
+        "modules[0].departed_use.mapping.interruptions",
+        "modules[0].departed_use.mapping.last_max_ns",
+        "modules[0].departed_use.mapping.reasons",
+        "modules[0].departed_use.mapping.reasons.process exited (pid names no live process)",
+        "modules[0].departed_use.mapping.reasons_overflow",
+        "modules[0].departed_use.mapping.state",
+        "modules[0].departed_use.mapping.state.ended",
+        "modules[0].departed_use.mapping.state.mapped",
+        "modules[0].departed_use.mapping.state.uncertain",
+        "modules[0].departed_use.mechanisms",
+        "modules[0].departed_use.mechanisms_overflow",
+        "modules[0].departed_use.mechanisms_overflow.calls",
+        "modules[0].departed_use.mechanisms_overflow.errors",
+        "modules[0].departed_use.mechanisms_overflow.mechs",
+        "modules[0].departed_use.operations",
+        "modules[0].departed_use.semantics",
+        "modules[0].departed_use.semantics.labels",
+        "modules[0].departed_use.semantics.labels.unknown (semantic capture withheld)",
         "observation.semantic_capture.length_insert_failures",
         "observation.semantic_capture.length_stash_mismatches",
     ]
@@ -371,7 +455,7 @@ def load_profile_schemas() -> tuple[dict, dict]:
 
 
 def generate_manifest(helper: Path, module: str, output: Path) -> str:
-    """Generate the provider manifest needed for attested semantic capture."""
+    """Generate the provider manifest needed for attested mechanism capture."""
     completed = run(
         [str(helper), "--module", module, "-o", str(output)],
         timeout=30,
@@ -393,9 +477,10 @@ def output_owner_arguments(output: Path) -> list[str]:
 def generate_scan_report(binary: Path, output: Path, module: str) -> str:
     """Generate one churn-workload native inventory; empty string means success."""
     workload = SCRIPT_DIR / "upgrade-softhsm-workload.py"
+    child_python = output.parent / "churn-child-python"
     try:
         target = subprocess.Popen(
-            [sys.executable, str(workload), "--module", module],
+            [sys.executable, str(workload), "--module", module, "--child-python", str(child_python)],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -411,17 +496,25 @@ def generate_scan_report(binary: Path, output: Path, module: str) -> str:
         line = target.stdout.readline()
         if "ready" not in line:
             return f"target did not start for {binary}: {line[:200]}"
+        cgroup = Path("/sys/fs/cgroup/p11scope-upgrade") / f"gate6-{os.getpid()}"
+        try:
+            cgroup.mkdir(parents=True, exist_ok=True)
+            (cgroup / "cgroup.procs").write_text(str(target.pid))
+            members = (cgroup / "cgroup.procs").read_text().split()
+        except OSError as exc:
+            return f"cgroup setup failed for {binary}: {exc}"
+        if str(target.pid) not in members:
+            return f"cgroup membership unverified for {binary} pid={target.pid}"
         completed = run(
             [
                 str(binary),
                 "inventory",
-                "--pid",
-                str(target.pid),
+                "--cgroup",
+                str(cgroup),
                 "--capture",
                 "native",
                 "--duration",
-                "12s",
-                "--key-operations",
+                "24s",
                 "--manifest",
                 str(output.parent / "softhsm-manifest.json"),
                 "--json",
@@ -429,7 +522,7 @@ def generate_scan_report(binary: Path, output: Path, module: str) -> str:
                 str(output),
                 *output_owner_arguments(output),
             ],
-            timeout=30,
+            timeout=60,
         )
         if completed.returncode != 0 or not output.exists():
             return (
@@ -449,6 +542,18 @@ def generate_scan_report(binary: Path, output: Path, module: str) -> str:
             terminate_target(target)
         except (OSError, subprocess.TimeoutExpired):
             pass
+        try:
+            for member in (cgroup / "cgroup.procs").read_text().split():
+                try:
+                    os.kill(int(member), signal.SIGKILL)
+                except (OSError, ValueError):
+                    pass
+        except (OSError, NameError):
+            pass
+        try:
+            cgroup.rmdir()
+        except (OSError, NameError):
+            pass
 
 
 def run_gate(args, workdir: Path, result: dict) -> int:
@@ -462,7 +567,7 @@ def run_gate(args, workdir: Path, result: dict) -> int:
         f"old={args.old_binary} new={args.new_binary}",
     )
 
-    # 1. Generate old + new inventory scan reports from live targets.
+    # 1. Generate old + new inventory churn reports from live targets.
     module = find_provider_module()
     check(result, "reports_generated", module is not None, "no SoftHSM provider found")
     old_report = workdir / "v071-inventory.json"
@@ -503,105 +608,7 @@ def run_gate(args, workdir: Path, result: dict) -> int:
         else "old/new inventory reports carry typed root, observation, budget, row and gap content",
     )
 
-    # 2. New binary reads old via cbom and diff.
-    completed = run([str(args.new_binary), "inventory", "cbom", str(old_report), "--json"])
-    check(
-        result,
-        "cbom_reads_old",
-        completed.returncode == 0,
-        f"rc={completed.returncode}",
-    )
-    try:
-        cbom = json.loads(completed.stdout)
-        cbom_errors = artifact_validation.cbom_inventory_errors(cbom, old)
-        cbom_typed_ok = not cbom_errors
-        cbom_typed_detail = (
-            cbom_errors[0]
-            if cbom_errors
-            else "typed inventory cbom flow-through matches scope/window/passes/gaps/provider/application counts"
-        )
-    except json.JSONDecodeError as exc:
-        cbom_typed_ok = False
-        cbom_typed_detail = f"cbom JSON parse: {exc}"
-    check(result, "cbom_old_typed", cbom_typed_ok, cbom_typed_detail)
-
-    completed = run(
-        [
-            str(args.new_binary),
-            "inventory",
-            "diff",
-            str(old_report),
-            str(old_report),
-            "--json",
-        ]
-    )
-    zero_detail = f"rc={completed.returncode}"
-    zero_ok = completed.returncode == 0
-    if zero_ok:
-        try:
-            same_diff = json.loads(completed.stdout)
-            zero_errors = artifact_validation.diff_errors(same_diff, old, old)
-            if same_diff.get("application_changes") != [] or same_diff.get("module_path_changes") != []:
-                zero_errors.append("same-input diff has nonempty application/module-path changes")
-            zero_ok = not zero_errors
-            zero_detail = (
-                zero_errors[0]
-                if zero_errors
-                else "typed ten-field diff, consistent before/after snapshots and zero changes"
-            )
-        except json.JSONDecodeError as exc:
-            zero_ok = False
-            zero_detail = f"diff JSON parse: {exc}"
-    check(result, "diff_old_old_zero", zero_ok, zero_detail)
-
-    completed = run(
-        [
-            str(args.new_binary),
-            "inventory",
-            "diff",
-            str(old_report),
-            str(new_report),
-            "--json",
-        ]
-    )
-    check(result, "diff_old_new", completed.returncode == 0, f"rc={completed.returncode}")
-    try:
-        diff_doc = json.loads(completed.stdout)
-        diff_errors = artifact_validation.diff_errors(diff_doc, old, new)
-        diff_ok = not diff_errors
-        diff_detail = (
-            diff_errors[0]
-            if diff_errors
-            else "typed ten-field diff with consistent before/after snapshots, comparison and summary"
-        )
-    except json.JSONDecodeError as exc:
-        diff_doc = {}
-        diff_detail = f"diff JSON parse: {exc}"
-        diff_ok = False
-    check(result, "diff_typed", diff_ok, diff_detail)
-
-    # The churn workload keeps one caller alive while short-lived children
-    # enter and leave over several passes.  A lifecycle claim for that group
-    # is only acceptable when the reader names the pre-fold input limitation
-    # (lane v072-compat-071); otherwise independent windows must not invent
-    # a lifecycle transition.
-    lifecycle_rows = []
-    if isinstance(diff_doc, dict):
-        for row in diff_doc.get("application_changes", []):
-            if isinstance(row, dict) and any("lifecycle" in str(change) for change in row.get("changes", [])):
-                lifecycle_rows.append(row)
-    pre_fold_present = (
-        isinstance(diff_doc, dict)
-        and "pre_fold_input" in diff_doc.get("limitations", [])
-    )
-    check(
-        result,
-        "diff_churn_lifecycle",
-        not lifecycle_rows or pre_fold_present,
-        f"lifecycle_rows={len(lifecycle_rows)} pre_fold_input={pre_fold_present}",
-    )
-
-    # 3. B1: departed_use delta is exactly B1+additive, nothing else, and
+    # 2. B1: departed_use delta is exactly B1+additive, nothing else, and
     # every pinned B1 key is present in the new typed report.
     old_keys = set(flatten_keys(old))
     new_keys = set(flatten_keys(new))
@@ -634,7 +641,7 @@ def run_gate(args, workdir: Path, result: dict) -> int:
         else "no departed_use key in old report",
     )
 
-    # 4. B2: live_joint_feed_absent in the v1-v5 reason enums, and the new
+    # 3. B2: live_joint_feed_absent in the v1-v5 reason enums, and the new
     # reader renders it through rather than merely exiting zero.
     try:
         old_schemas, new_schemas = load_object_observation_schemas()
@@ -711,7 +718,7 @@ def run_gate(args, workdir: Path, result: dict) -> int:
         f"{reader_detail}, expected {expected_render!r}",
     )
 
-    # 5. B3: profile schema requires exactly the three new evidence fields
+    # 4. B3: profile schema requires exactly the three new evidence fields
     # in the profile-lane then.required and exactly those plus
     # coverage_retired_slots in the full evidence-required delta.
     try:
@@ -831,6 +838,104 @@ def run_gate(args, workdir: Path, result: dict) -> int:
             profile_detail = profile_errors[0]
     profile_ok = completed.returncode == 0 and not profile_errors
     check(result, "b3_reader_accepts_old", profile_ok, profile_detail)
+
+    # 5. New binary reads old via cbom and diff.
+    completed = run([str(args.new_binary), "inventory", "cbom", str(old_report), "--json"])
+    check(
+        result,
+        "cbom_reads_old",
+        completed.returncode == 0,
+        f"rc={completed.returncode}",
+    )
+    try:
+        cbom = json.loads(completed.stdout)
+        cbom_errors = artifact_validation.cbom_inventory_errors(cbom, old)
+        cbom_typed_ok = not cbom_errors
+        cbom_typed_detail = (
+            cbom_errors[0]
+            if cbom_errors
+            else "typed inventory cbom flow-through matches scope/window/passes/gaps/provider/application counts"
+        )
+    except json.JSONDecodeError as exc:
+        cbom_typed_ok = False
+        cbom_typed_detail = f"cbom JSON parse: {exc}"
+    check(result, "cbom_old_typed", cbom_typed_ok, cbom_typed_detail)
+
+    completed = run(
+        [
+            str(args.new_binary),
+            "inventory",
+            "diff",
+            str(old_report),
+            str(old_report),
+            "--json",
+        ]
+    )
+    zero_detail = f"rc={completed.returncode}"
+    zero_ok = completed.returncode == 0
+    if zero_ok:
+        try:
+            same_diff = json.loads(completed.stdout)
+            zero_errors = artifact_validation.diff_errors(same_diff, old, old)
+            if same_diff.get("application_changes") != [] or same_diff.get("module_path_changes") != []:
+                zero_errors.append("same-input diff has nonempty application/module-path changes")
+            zero_ok = not zero_errors
+            zero_detail = (
+                zero_errors[0]
+                if zero_errors
+                else "typed ten-field diff, consistent before/after snapshots and zero changes"
+            )
+        except json.JSONDecodeError as exc:
+            zero_ok = False
+            zero_detail = f"diff JSON parse: {exc}"
+    check(result, "diff_old_old_zero", zero_ok, zero_detail)
+
+    completed = run(
+        [
+            str(args.new_binary),
+            "inventory",
+            "diff",
+            str(old_report),
+            str(new_report),
+            "--json",
+        ]
+    )
+    check(result, "diff_old_new", completed.returncode == 0, f"rc={completed.returncode}")
+    try:
+        diff_doc = json.loads(completed.stdout)
+        diff_errors = artifact_validation.diff_errors(diff_doc, old, new)
+        diff_ok = not diff_errors
+        diff_detail = (
+            diff_errors[0]
+            if diff_errors
+            else "typed ten-field diff with consistent before/after snapshots, comparison and summary"
+        )
+    except json.JSONDecodeError as exc:
+        diff_doc = {}
+        diff_detail = f"diff JSON parse: {exc}"
+        diff_ok = False
+    check(result, "diff_typed", diff_ok, diff_detail)
+
+    # The churn workload keeps one caller alive while short-lived children
+    # enter and leave over several passes.  A lifecycle claim for that group
+    # is only acceptable when the reader names the pre-fold input limitation
+    # (lane v072-compat-071); otherwise independent windows must not invent
+    # a lifecycle transition.
+    lifecycle_rows = []
+    if isinstance(diff_doc, dict):
+        for row in diff_doc.get("application_changes", []):
+            if isinstance(row, dict) and any("lifecycle" in str(change) for change in row.get("changes", [])):
+                lifecycle_rows.append(row)
+    pre_fold_present = (
+        isinstance(diff_doc, dict)
+        and "pre_fold_input" in diff_doc.get("limitations", [])
+    )
+    check(
+        result,
+        "diff_churn_lifecycle",
+        not lifecycle_rows or pre_fold_present,
+        f"lifecycle_rows={len(lifecycle_rows)} pre_fold_input={pre_fold_present}",
+    )
 
     result["status"] = "pass"
     return emit(workdir, result, 0)

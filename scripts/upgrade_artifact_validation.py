@@ -165,6 +165,7 @@ def diff_positive_errors(document) -> list[str]:
             errors.append(f"diff positive payload: fewer than one compared caller row on {side}")
     return errors
 
+
 def inventory_errors(document) -> list[str]:
     """Product-schema shape plus the positive payload rule for an inventory."""
     if not isinstance(document, dict):

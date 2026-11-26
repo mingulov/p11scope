@@ -5,14 +5,18 @@
 
 The parent keeps one long-lived PKCS#11 session user alive, performs a known
 SHA-256 digest, and starts short-lived children that repeat the same known
-call sequence.  The workload uses only the public Cryptoki ABI through
-ctypes; no PIN, key material or payload bytes leave the process.
+call sequence.  Children run under a copy of the interpreter at a stable
+path so old and new captures group them identically while keeping them a
+separate application group from the long-lived parent.  The workload uses
+only the public Cryptoki ABI through ctypes; no PIN, key material or
+payload bytes leave the process.
 """
 from __future__ import annotations
 
 import argparse
 import ctypes
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -114,6 +118,10 @@ def child(module: str) -> int:
     library = open_provider(module)
     try:
         digest_once(library)
+        # Stay mapped long enough for several capture passes to observe this
+        # caller alive, then exit so the new binary folds it into departed_use
+        # while the old binary keeps it a live row.
+        time.sleep(2.0)
     finally:
         library.C_Finalize(None)
         if temporary is not None:
@@ -121,9 +129,24 @@ def child(module: str) -> int:
     return 0
 
 
-def parent(module: str, interval: float) -> int:
+def parent(module: str, interval: float, child_python: str) -> int:
     temporary = prepare_token()
     library = open_provider(module)
+    shutil.copyfile(sys.executable, child_python)
+    os.chmod(child_python, 0o755)
+    # The copy cannot resolve the installation prefix from its own path, so
+    # children inherit the parent's working prefix explicitly.
+    child_env = dict(os.environ)
+    child_env["PYTHONHOME"] = sys.base_prefix
+    probe = subprocess.run(
+        [child_python, __file__, "--module", module, "--child"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=child_env,
+    )
+    if probe.returncode != 0:
+        raise RuntimeError(f"churn child probe failed: {probe.stderr[:200]}")
     print("ready", flush=True)
     deadline = time.monotonic() + 60
     next_child = 0.0
@@ -135,12 +158,13 @@ def parent(module: str, interval: float) -> int:
             if now >= next_child:
                 children.append(
                     subprocess.Popen(
-                        [sys.executable, __file__, "--module", module, "--child"],
+                        [child_python, __file__, "--module", module, "--child"],
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
+                        env=child_env,
                     )
                 )
-                next_child = now + 0.45
+                next_child = now + 2.0
             children = [row for row in children if row.poll() is None]
             time.sleep(interval)
     finally:
@@ -155,10 +179,15 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--module", required=True)
     parser.add_argument("--child", action="store_true")
+    parser.add_argument("--child-python", default="")
     parser.add_argument("--interval", type=float, default=0.2)
     args = parser.parse_args()
     try:
-        return child(args.module) if args.child else parent(args.module, args.interval)
+        if args.child:
+            return child(args.module)
+        if not args.child_python:
+            raise RuntimeError("parent mode requires --child-python")
+        return parent(args.module, args.interval, args.child_python)
     except (OSError, RuntimeError) as exc:
         print(f"upgrade workload: {exc}", file=sys.stderr)
         return 1

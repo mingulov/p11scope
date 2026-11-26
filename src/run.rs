@@ -31625,8 +31625,7 @@ int main(int argc, char **argv) {
     /// hangup would exit it at once.
     #[test]
     fn note_outputs_attempted_reports_a_previously_counted_stop() {
-        const TEST: &str =
-            "run::tests::note_outputs_attempted_reports_a_previously_counted_stop";
+        const TEST: &str = "run::tests::note_outputs_attempted_reports_a_previously_counted_stop";
         if !crate::test_support::isolation::enter(TEST, "note-counted-stop") {
             return;
         }

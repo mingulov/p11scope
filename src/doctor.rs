@@ -2735,8 +2735,7 @@ mod tests {
                 Ok(())
             }
         }
-        write_report(&mut ClosedReader, "Doctor: ok\n")
-            .expect("a closed reader keeps the verdict");
+        write_report(&mut ClosedReader, "Doctor: ok\n").expect("a closed reader keeps the verdict");
     }
 
     #[test]

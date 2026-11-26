@@ -17961,10 +17961,11 @@ impl Engine {
     /// are charged to the pass time budget: at least one runs, then
     /// untried newcomers are deferred under the pending-newcomer gap.
     /// `saved_keys` is the pending rejected-key set from before the first
-    /// build, restored so trial builds never leak rejections. Returns
-    /// `None` when the failure is not attributable to single newcomers
-    /// (the caller drops the pass as before). Runs only on the failure
-    /// path.
+    /// build, restored so trial builds never leak rejections;
+    /// `saved_superseded` is the pending superseded-key set likewise.
+    /// Returns `None` when the failure is not attributable to single
+    /// newcomers (the caller drops the pass as before). Runs only on
+    /// the failure path.
     #[allow(clippy::too_many_arguments)]
     fn isolate_broken_newcomers(
         &mut self,
@@ -17974,17 +17975,20 @@ impl Engine {
         skipped: &mut Vec<Skipped>,
         declined: &BTreeSet<ProcessViewId>,
         saved_keys: BTreeSet<ObjectKey>,
+        saved_superseded: BTreeSet<ObjectKey>,
         tick_now: &mut TickClock<'_>,
     ) -> Option<NewcomerIsolation> {
         if new_views.is_empty() {
             return None;
         }
         self.pending_rejected_keys = saved_keys.clone();
+        self.pending_superseded_keys = saved_superseded.clone();
         self.force_full_candidate = true;
         let baseline = self.inventory_candidate(removed, refreshed, &[], skipped.clone(), declined);
         self.force_full_candidate = false;
         let baseline = baseline.ok()?;
         let baseline_keys = self.pending_rejected_keys.clone();
+        let baseline_superseded = self.pending_superseded_keys.clone();
         let mut broken = Vec::new();
         let mut tried = 0;
         for index in 0..new_views.len() {
@@ -18010,6 +18014,7 @@ impl Engine {
             // rejections for refreshed views queued, as the failed first
             // build had them, without any trial's.
             self.pending_rejected_keys = baseline_keys;
+            self.pending_superseded_keys = baseline_superseded;
             return None;
         }
         let pass = self.inventory_passes;
@@ -18056,9 +18061,11 @@ impl Engine {
         let candidate = if new_views.is_empty() && deferred.is_empty() {
             // Every newcomer was broken: the baseline is the final candidate.
             self.pending_rejected_keys = baseline_keys;
+            self.pending_superseded_keys = baseline_superseded;
             baseline
         } else {
             self.pending_rejected_keys = saved_keys;
+            self.pending_superseded_keys = saved_superseded;
             self.inventory_candidate(removed, refreshed, new_views, skipped.clone(), declined)
                 .ok()?
         };
@@ -19910,6 +19917,8 @@ impl Engine {
         let merge_head_start = crate::attach::monotonic_ns();
         self.pending_rejected_keys
             .extend(pinned.newly_rejected_keys(&self.pinned));
+        self.pending_superseded_keys
+            .extend(pinned.newly_superseded_keys(&self.pinned));
         let (_, overlay_skips) = canonicalize_scanned_overlays(&mut pinned);
         skipped.extend(overlay_skips);
         if self.pinned.has_overlay_uncertainty() || pinned.has_overlay_uncertainty() {
@@ -37021,6 +37030,7 @@ impl Engine {
         // Trial builds in newcomer isolation must not leak rejected keys:
         // remember the set the first build starts from.
         let saved_rejected_keys = self.pending_rejected_keys.clone();
+        let saved_superseded_keys = self.pending_superseded_keys.clone();
         // First-candidate reuse fences: the inputs the First build is
         // about to consume, the pin-set generation it clones, and the
         // changed-latch flags it clones (a `Cell` latch bumps no
@@ -37064,6 +37074,7 @@ impl Engine {
                 &mut skipped,
                 &declined,
                 saved_rejected_keys,
+                saved_superseded_keys,
                 &mut *tick_now,
             ) {
                 Some(isolation) => {

@@ -98734,34 +98734,41 @@ fn member_stop_committed_supersede_refuses_the_hold() {
         engine.pinned.supersedes(scan_key),
         "the rotation is recorded"
     );
-    assert!(
-        engine.pinned.sweep_match_keys().contains_key(&scan_key),
-        "the key routes the fresh pin"
-    );
+    // The fresh entry is the staging (a sweep matches scan aliases
+    // only, so it cannot route here): prove the rotation by pin
+    // freshness instead — the kept pin is the live file's.
+    assert_eq!(engine.pinned.pinned().count(), 1, "one generation routes");
+    let kept_id = engine.pinned.pinned().next().expect("one pin").id;
+    let kept_pin = engine.pinned.pin_for(kept_id).expect("the kept pin");
+    let live_pin =
+        crate::discovery::identity::pin_of(&std::fs::File::open(&library).unwrap()).unwrap();
+    assert_eq!(kept_pin, live_pin, "generation 2 is kept");
     assert!(
         engine.pending_superseded_keys.is_empty(),
         "no candidate ran: committed-only"
     );
     // A member stops on the settled file: intake creates the hold
-    // without queueing, and the hold refuses through the committed
-    // markers alone.
+    // without queueing, and the same pass refuses it through the
+    // committed markers alone (the rotation predates the stop, so no
+    // wait is owed).
     stop_member_for_test(pid);
     let key = member_exec_key_for_test(pid, &library);
     let mut io = ScriptedMemberStops::default();
     io.rows.insert(pid, member_stop_row(pid, &library, key));
     engine.service_member_stops(&mut io, &mut session, Some(10));
-    assert!(engine.member_stops_held(), "intake holds the mapper");
     assert!(
         engine.pending_superseded_keys.is_empty(),
         "the apply harvests nothing new"
     );
-    // Resolve BEFORE the bound (10 ms after an intake at ~0).
-    engine.service_member_stops(&mut io, &mut session, Some(10_000_000));
+    let stats = engine.member_stop_stats_for_test();
+    assert_eq!(
+        stats.provider_holds, 1,
+        "intake creates the hold: {stats:?}"
+    );
     assert!(
         !engine.member_stops_held(),
-        "a committed supersede refuses the hold"
+        "a committed supersede refuses the hold at once"
     );
-    let stats = engine.member_stop_stats_for_test();
     assert_eq!(stats.refused_resumes, 1, "{stats:?}");
     assert_eq!(stats.timed_out, 0, "{stats:?}");
     assert!(member_resumed_for_test(pid), "the member runs again");
@@ -98769,6 +98776,11 @@ fn member_stop_committed_supersede_refuses_the_hold() {
         files_the_first_use_row(&engine),
         "the refused hold files the first-use row"
     );
+    // Stability: a later pass changes nothing.
+    engine.service_member_stops(&mut io, &mut session, Some(10_000_000));
+    let stats = engine.member_stop_stats_for_test();
+    assert_eq!(stats.refused_resumes, 1, "{stats:?}");
+    assert_eq!(stats.timed_out, 0, "{stats:?}");
 }
 
 /// A drain-first staging (queued by the fanotify drain before any stop)

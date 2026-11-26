@@ -5012,7 +5012,9 @@ impl PinnedObjects {
             self.raw_to_id.insert(entry.raw, id);
             return Some(id);
         }
-        if !same_key.is_empty() {
+        if !same_key.is_empty()
+            && !self.supersede_same_file_generation(key, &same_key, &entry, incoming_scan_only)
+        {
             // Group rejection: two proven entries contradict under one
             // key. The only rejection that marks a proven collision.
             self.reject_key(key);
@@ -5054,11 +5056,22 @@ impl PinnedObjects {
     fn reject_key(&mut self, key: ObjectKey) {
         self.bump_revision();
         self.rejected_keys.insert(key);
-        // A witness-proven pre-copy-up observation stands on its own
-        // file: a carried rejection, or a sibling's forgery, never
-        // nukes it. Only unproven entries under the key are removed;
-        // their raws, ownership and claims go with them exactly as
-        // before, while the kept pre's raws stay routable.
+        if self.evict_key_entries(key) {
+            self.ambiguous_keys.insert(key);
+        }
+    }
+
+    /// Evicts every unproven entry under `key` with full custody (ids,
+    /// raws, ownership, claims, proven targets): shared by rejection
+    /// (which then poisons the key) and supersede (which files the
+    /// fresh generation instead). Returns whether anything was
+    /// evicted. A witness-proven pre-copy-up observation stands on its
+    /// own file: a carried rejection, a sibling's forgery — or a
+    /// rotation, which never involves one — never nukes it. Only
+    /// unproven entries under the key are removed; their raws,
+    /// ownership and claims go with them exactly as before, while the
+    /// kept pre's raws stay routable.
+    fn evict_key_entries(&mut self, key: ObjectKey) -> bool {
         let ids: BTreeSet<PinnedObjectId> = self
             .by_id
             .iter()
@@ -5085,9 +5098,58 @@ impl PinnedObjects {
         for claims in self.ownership.values_mut() {
             claims.remove(&ids);
         }
-        if !ids.is_empty() {
-            self.ambiguous_keys.insert(key);
+        !ids.is_empty()
+    }
+
+    /// Whether `entry` supersedes every observation kept under `key`:
+    /// a same-file generation rotation (stepped ctime, identical
+    /// bytes) with a live scan on one side. Evicts the stale entries,
+    /// records the rotation, and returns true; the caller then files
+    /// `entry` through the fresh-insert path, so the key stays
+    /// routable and the attach races on. A false return keeps today's
+    /// rejection. The merge above already failed, and the predicate
+    /// pins every other merge conjunct (mapping, fd device, digest,
+    /// inode uniqueness), so a firing arm always rotates the pin.
+    fn supersede_same_file_generation(
+        &mut self,
+        key: ObjectKey,
+        same_key: &[PinnedObjectId],
+        entry: &Entry,
+        incoming_scan_only: bool,
+    ) -> bool {
+        // Only a live scan supersedes: two point-in-time proofs
+        // disagreeing (a second staging — the drain never produces
+        // one) fail closed, like today.
+        let scan_involved = incoming_scan_only
+            || same_key.iter().any(|id| {
+                self.by_id
+                    .get(id)
+                    .is_some_and(|kept| kept.raw.mount_namespace.is_some())
+            });
+        if !scan_involved || entry.pre_copy_up {
+            return false;
         }
+        // Unanimity: every kept observation must be the same kernel
+        // file with the same hashed bytes under the same mount view.
+        // A rewrite, a distinct file, an unhashed or cross-view side,
+        // or a proven pre fails closed instead.
+        let rotation = !same_key.is_empty()
+            && same_key.iter().all(|id| {
+                self.by_id.get(id).is_some_and(|kept| {
+                    !kept.pre_copy_up
+                        && !kept.sha256.is_empty()
+                        && kept.sha256 == entry.sha256
+                        && kept.mapping == entry.mapping
+                        && kept.fd_dev == entry.fd_dev
+                        && same_kernel_file(&kept.file, &entry.file)
+                })
+            });
+        if !rotation {
+            return false;
+        }
+        self.evict_key_entries(key);
+        self.superseded_keys.insert(key);
+        true
     }
 
     /// Records another member of a group that is already known only as rejected.
@@ -20672,7 +20734,10 @@ mod tests {
         );
         // Nothing was evicted (the pre stands), so no skip files: the
         // spare-pre silence is today's behavior, unchanged here.
-        assert!(skipped.is_empty(), "a spared pre discloses nothing: {skipped:?}");
+        assert!(
+            skipped.is_empty(),
+            "a spared pre discloses nothing: {skipped:?}"
+        );
     }
 
     #[test]
@@ -20698,6 +20763,99 @@ mod tests {
         assert!(!acc.supersedes(key), "no supersede across files");
         assert_eq!(acc.pinned().count(), 0);
         assert!(!skipped.is_empty(), "the rejection is disclosed");
+    }
+
+    #[test]
+    fn absorbing_rotated_pin_fd_dev_divergent_scan_still_rejects() {
+        // Same file, same digest, rotated pin — but the held-fd device
+        // disagrees (the snapshot-twin shape: one mount view over two
+        // subvolume devices; the divergence is forged here because one
+        // file always records one device). The merge already failed on
+        // the pin, and the rotation arm must not revive the device
+        // disagreement: fail closed.
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let mut staged = prearm_pin(key, "aaaaaaaa", 1);
+        reback(&mut staged, &file);
+        let mut acc = PinnedObjects::empty();
+        assert!(acc.absorb(staged).is_empty());
+        let mut scan = image_pins(&[(key, "aaaaaaaa", 2)]);
+        reback(&mut scan, &file);
+        let staged_mapping = acc.by_id.values().next().unwrap().mapping;
+        let entry = scan.by_id.values_mut().next().unwrap();
+        entry.mapping = staged_mapping;
+        entry.fd_dev = entry.fd_dev.wrapping_add(1);
+        let skipped = acc.absorb(scan);
+        assert!(acc.rejects(key), "a device disagreement fails closed");
+        assert!(!acc.supersedes(key), "no supersede across devices");
+        assert_eq!(acc.pinned().count(), 0);
+        assert!(!skipped.is_empty(), "the rejection is disclosed");
+    }
+
+    #[test]
+    fn absorbing_supersede_evicts_with_full_custody() {
+        // The evicted stale entry leaves nothing behind: its id, raws,
+        // view ownership, claims and proven targets are scrubbed exactly
+        // like a rejection's, while the fresh entry files clean.
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let mut staged = prearm_pin(key, "aaaaaaaa", 1);
+        reback(&mut staged, &file);
+        let mut acc = PinnedObjects::empty();
+        assert!(acc.absorb(staged).is_empty());
+        let stale = acc.pinned().next().unwrap().id;
+        let stale_raw = acc.raw_to_id.iter().next().unwrap().0.clone();
+        let view = crate::process::ProcessViewId(7);
+        acc.raw_ownership
+            .entry(view)
+            .or_default()
+            .insert(stale_raw.clone());
+        acc.ownership.entry(view).or_default().pins.push(stale);
+        acc.ownership
+            .entry(view)
+            .or_default()
+            .targets
+            .push((stale, 0x1000));
+        acc.proven_targets.insert((stale, 0x1000));
+        let mut scan = image_pins(&[(key, "aaaaaaaa", 2)]);
+        reback(&mut scan, &file);
+        let staged_mapping = acc.by_id.values().next().unwrap().mapping;
+        scan.by_id.values_mut().next().unwrap().mapping = staged_mapping;
+        let skipped = acc.absorb(scan);
+        assert!(!acc.rejects(key));
+        assert!(acc.supersedes(key));
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert!(!acc.by_id.contains_key(&stale), "the stale id is gone");
+        assert!(
+            !acc.raw_to_id.contains_key(&stale_raw),
+            "the stale raw is gone"
+        );
+        assert!(
+            acc.raw_ownership
+                .get(&view)
+                .is_none_or(|raws| !raws.contains(&stale_raw)),
+            "the stale raw ownership is gone"
+        );
+        for claims in acc.ownership.values() {
+            assert!(!claims.pins.contains(&stale), "stale pin claims are gone");
+            assert!(
+                !claims.targets.iter().any(|(id, _)| *id == stale),
+                "stale target claims are gone"
+            );
+        }
+        assert!(
+            !acc.proven_targets.iter().any(|(id, _)| *id == stale),
+            "stale proven targets are gone"
+        );
+        assert_eq!(acc.pinned().count(), 1, "the fresh entry files");
     }
 
     #[test]

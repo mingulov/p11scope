@@ -2160,7 +2160,7 @@ pub(crate) fn joint_seal_stages_line(
          drain_mismatch={} domain_ended={} closure_stale={} frontier_regression={} \
          below_fence={} unbound_staging={} attribution_pending={} claim_unmatched={} \
          fresh_birth_no_history={} floors_past_frontier={} abandon_return_pending={} \
-         refused_return_pending={} h3_pending={} model_refused={} success={} \
+         refused_return_pending={} h3_pending={} model_refused={} sealed={} \
          stopped={} adapter_invalidated={} resource_unavailable={} cut_exhausted={} \
          open_staged={} refused_staged={} claims_held={}",
         counts.domain_tainted,

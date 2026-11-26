@@ -9013,7 +9013,7 @@ impl JournalAdapter {
         self.keys.get(&sibling).is_none_or(|state| {
             state.void_fence == 0
                 || state.sealed_through > state.void_fence
-                || state.sealed_through > self.voided_through
+                || state.sealed_through > *self.voided_through
         })
     }
 

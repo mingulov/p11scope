@@ -8106,6 +8106,103 @@ mod tests {
         }
     }
 
+    /// The programmatic `--key-sizes` mirror refuses with the same
+    /// plain-words P0 message as the parse site, before anything
+    /// loads — alone (precedence over the key-operations
+    /// requirement) and beside --key-operations.
+    #[test]
+    #[cfg(feature = "stub-object-attributes")]
+    fn inventory_programmatic_key_sizes_refused_under_p0() {
+        for key_operations in [false, true] {
+            let error = crate::inventory::run(
+                ScopeArg::Pid(7),
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &crate::discovery::hooks::HookRegistry::builtin(),
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+                CaptureMode::Native,
+                crate::attach::BackendSelection::default(),
+                None,
+                None,
+                IdentityBackendSelection::default(),
+                false,
+                CallerMetadataMode::default(),
+                key_operations,
+                true,
+                false,
+                false,
+            )
+            .unwrap_err();
+            assert!(
+                format!("{error:#}").contains(
+                    "--key-sizes requires key-size capture (this build was made without it)"
+                ),
+                "key_operations={key_operations}: {error:#}"
+            );
+        }
+    }
+
+    /// The programmatic `--provider-info` mirror refuses with the
+    /// same plain-words P0 message as the parse site, before anything
+    /// loads — alone and beside --key-operations.
+    #[test]
+    #[cfg(feature = "stub-object-attributes")]
+    fn inventory_programmatic_provider_info_refused_under_p0() {
+        for key_operations in [false, true] {
+            let error = crate::inventory::run(
+                ScopeArg::Pid(7),
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &crate::discovery::hooks::HookRegistry::builtin(),
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+                CaptureMode::Native,
+                crate::attach::BackendSelection::default(),
+                None,
+                None,
+                IdentityBackendSelection::default(),
+                false,
+                CallerMetadataMode::default(),
+                key_operations,
+                false,
+                true,
+                false,
+            )
+            .unwrap_err();
+            assert!(
+                format!("{error:#}").contains(
+                    "--provider-info requires provider-info capture (this build was made without it)"
+                ),
+                "key_operations={key_operations}: {error:#}"
+            );
+        }
+    }
+
     #[test]
     fn inventory_help_names_provider_info_flag() {
         // The flag, its usage slot beside --key-sizes, and the §17

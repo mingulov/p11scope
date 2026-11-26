@@ -164,15 +164,25 @@ class RegenerateTests(unittest.TestCase):
                 "/usr/lib64/pkcs11/libsofthsm2.so", prefixes),
             "/usr/lib/softhsm/libsofthsm2.so")
 
+    def test_scrub_maps_lib64_generic(self):
+        """Other Fedora library paths canonicalize under /usr/lib."""
+        prefixes = self.sanitize.build_prefixes("/custom/work")
+        self.assertEqual(
+            self.sanitize.scrub_string(
+                "/usr/lib64/libcrypto.so.3", prefixes),
+            "/usr/lib/libcrypto.so.3")
+
     def test_readme_documents_manifest_handoff(self):
         """The manifest producer and the single raw directory are
         spelled exactly, so collection cannot drift from prose."""
         words = " ".join(README.read_text(encoding="utf-8").split())
         self.assertIn("with OUT set to one raw directory `<rawdir>`", words)
-        self.assertIn(
-            "p11scope-discover-0.7.1 --module <provider> "
-            "-o <rawdir>/v071-manifest-softhsm.json",
-            words)
+        discover = ("p11scope-discover-0.7.1 --module <provider> "
+                    "-o <rawdir>/v071-manifest-softhsm.json")
+        self.assertIn(discover, words)
+        self.assertLess(
+            words.index(discover), words.index("keyops <rawdir>"),
+            "the discover producer precedes its keyops consumer")
 
     def write_raw_inputs(self, tmp):
         """Unsanitized copies of every committed fixture input."""
@@ -265,8 +275,33 @@ echo '{"stub": true}' > "$o"
 """
 
 FAKE_HELPER = """#!/bin/sh
+trap 'exit 42' TERM
 echo "mapped pid=$$"
+sleep ${FAKE_HELPER_SLEEP:-0}
 exit ${FAKE_HELPER_RC:-0}
+"""
+
+FAKE_ANCHOR = """#!/bin/sh
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "--ready" ]; then touch "$a"; fi
+  prev="$a"
+done
+sleep 60
+"""
+
+FAKE_SIGNER = """#!/bin/sh
+exit ${CHURN_SIGNER_RC:-0}
+"""
+
+FAKE_CATALOG = """#!/bin/sh
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "--ready" ]; then touch "$a"; fi
+  prev="$a"
+done
+sleep ${ANCHOR_SLEEP:-0}
+exit ${ANCHOR_RC:-0}
 """
 
 
@@ -289,18 +324,22 @@ class DriverTests(unittest.TestCase):
         out = work / "out"
         out.mkdir()
         (out / "v071-manifest-softhsm.json").write_text("{}", encoding="utf-8")
-        env = dict(os.environ, TMPDIR=str(work),
+        prov = tmp / "prov.so"
+        prov.write_text("stub", encoding="utf-8")
+        env = dict(os.environ, TMPDIR=str(work), PROV=str(prov),
                    PATH=f"{bin}{os.pathsep}{os.environ['PATH']}")
         return work, out, env
 
     def run_keyops(self, script, helper_rc, observer=STUB_OBSERVER,
-                     budget=None):
+                     budget=None, helper_sleep=None):
         tmp = Path(tempfile.mkdtemp(prefix="upgrade-driver-"))
         try:
             work, out, env = self.stage(tmp, observer)
             env["FAKE_HELPER_RC"] = str(helper_rc)
             if budget is not None:
                 env["READY_BUDGET"] = str(budget)
+            if helper_sleep is not None:
+                env["FAKE_HELPER_SLEEP"] = str(helper_sleep)
             args = ["sh", str(TOOLS / script), f"{tmp}/bin/observer",
                       "v071"]
             if script == "capture-ops.sh":
@@ -313,9 +352,10 @@ class DriverTests(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
     def test_ops_propagates_helper_failure(self):
-        """A failing key workload fails the capture (exit nonzero)."""
+        """A failing key workload fails the capture with its reason."""
         proc, _ = self.run_keyops("capture-ops.sh", 1)
-        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("anchor failed rc=1", proc.stderr)
 
     def test_ops_success_path_writes_output(self):
         """The passing leg proves the failure leg is non-vacuous."""
@@ -325,16 +365,26 @@ class DriverTests(unittest.TestCase):
         self.assertIn("v071.go", files)
 
     def test_ops_gate_untouched_without_readiness(self):
-        """No readiness, no gate touch, nonzero exit (bounded wait)."""
+        """No readiness, no gate touch, exit 1 (bounded wait)."""
         proc, files = self.run_keyops(
             "capture-ops.sh", 0, observer=STUB_OBSERVER_SILENT, budget=2)
-        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("semantic lane never ready", proc.stderr)
         self.assertNotIn("v071.go", files)
 
     def test_syskeyops_propagates_helper_failure(self):
-        """A failing key workload fails the capture (exit nonzero)."""
+        """A failing key workload fails the capture with its reason."""
         proc, _ = self.run_keyops("capture-syskeyops.sh", 1)
-        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("anchor failed rc=1", proc.stderr)
+
+    def test_syskeyops_waits_for_resident_anchor(self):
+        """A resident anchor runs to completion: no kill lands (the
+        trap would exit 42) and the capture succeeds."""
+        proc, files = self.run_keyops(
+            "capture-syskeyops.sh", 0, helper_sleep=3)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("v071-inventory-syskeyops.json", files)
 
     def test_syskeyops_success_path_writes_output(self):
         """The passing leg proves the failure leg is non-vacuous."""
@@ -344,12 +394,135 @@ class DriverTests(unittest.TestCase):
         self.assertIn("v071.sysgo", files)
 
     def test_syskeyops_gate_untouched_without_readiness(self):
-        """No readiness, no gate touch, nonzero exit (bounded wait)."""
+        """No readiness, no gate touch, exit 1 (bounded wait)."""
         proc, files = self.run_keyops(
             "capture-syskeyops.sh", 0, observer=STUB_OBSERVER_SILENT,
             budget=2)
-        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("semantic lane never ready", proc.stderr)
         self.assertNotIn("v071.sysgo", files)
+
+
+class ChurnTests(unittest.TestCase):
+    """The churn workload propagates signer failures."""
+
+    def run_workload(self, signer_rc):
+        tmp = Path(tempfile.mkdtemp(prefix="upgrade-churn-"))
+        try:
+            out = tmp / "out"
+            out.mkdir()
+            helpers = tmp / "bin"
+            helpers.mkdir()
+            (helpers / "catalog-driver").write_text(
+                FAKE_ANCHOR, encoding="utf-8")
+            (helpers / "shortlived-sign").write_text(
+                FAKE_SIGNER, encoding="utf-8")
+            (helpers / "catalog-driver").chmod(0o755)
+            (helpers / "shortlived-sign").chmod(0o755)
+            (out / "v071.go").write_text("go\n", encoding="utf-8")
+            env = dict(os.environ, CHURN_SIGNER_RC=str(signer_rc))
+            proc = subprocess.run(
+                ["sh", str(TOOLS / "churn-workload.sh"),
+                 str(out), "v071", str(helpers), "/nonexistent-prov.so"],
+                capture_output=True, text=True, timeout=300, env=env)
+            return proc
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_failing_signer_fails_workload(self):
+        """Any nonzero signer status fails the workload."""
+        proc = self.run_workload(1)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("signer failed", proc.stdout + proc.stderr)
+
+    def test_passing_signers_complete(self):
+        """The passing leg proves the failure leg is non-vacuous."""
+        proc = self.run_workload(0)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("workload-done", proc.stdout)
+
+    def test_capture_script_invokes_workload_template(self):
+        """The driver runs this template, not an embedded copy."""
+        text = (TOOLS / "capture-churn.sh").read_text(encoding="utf-8")
+        self.assertIn("churn-workload.sh", text)
+        self.assertNotIn("shortlived-sign", text)
+
+    def test_cgkeyops_gates_on_readiness(self):
+        """The cgroup key-ops driver touches its gate only on
+        observed readiness (static: the script needs real cgroups
+        to execute)."""
+        text = (TOOLS / "capture-cgkeyops.sh").read_text(encoding="utf-8")
+        self.assertIn("READY_SEEN=0", text)
+        self.assertIn("gate left untouched", text)
+        self.assertNotIn('|| echo "WARNING: semantic lane never ready"',
+                         text)
+
+
+class AnchorTests(unittest.TestCase):
+    """Single/manprof drivers propagate abnormal anchor death."""
+
+    def run_simple(self, script, anchor_rc, script_args, anchor_sleep=0):
+        tmp = Path(tempfile.mkdtemp(prefix="upgrade-anchor-"))
+        try:
+            bin = tmp / "bin"
+            bin.mkdir()
+            (bin / "sudo").write_text(STUB_SUDO, encoding="utf-8")
+            (bin / "flock").write_text(STUB_FLOCK, encoding="utf-8")
+            (bin / "observer").write_text(STUB_OBSERVER, encoding="utf-8")
+            for name in ("sudo", "flock", "observer"):
+                (bin / name).chmod(0o755)
+            work = tmp / "work"
+            helpers = work / "f2" / "bin"
+            helpers.mkdir(parents=True)
+            (helpers / "catalog-driver").write_text(
+                FAKE_CATALOG, encoding="utf-8")
+            (helpers / "catalog-driver").chmod(0o755)
+            out = work / "out"
+            out.mkdir()
+            manifest = out / "v071-manifest-softhsm.json"
+            manifest.write_text("{}", encoding="utf-8")
+            prov = tmp / "prov.so"
+            prov.write_text("stub", encoding="utf-8")
+            env = dict(os.environ, TMPDIR=str(work), PROV=str(prov),
+                       ANCHOR_RC=str(anchor_rc),
+                       ANCHOR_SLEEP=str(anchor_sleep),
+                       PATH=f"{bin}{os.pathsep}{os.environ['PATH']}")
+            proc = subprocess.run(
+                ["sh", str(TOOLS / script), f"{tmp}/bin/observer",
+                 *script_args, str(out)],
+                capture_output=True, text=True, timeout=120, env=env)
+            return proc, sorted(p.name for p in out.iterdir())
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_single_propagates_anchor_failure(self):
+        proc, _ = self.run_simple("capture-single.sh", 1, ("v071",))
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("anchor failed rc=1", proc.stderr)
+
+    def test_single_success_path_writes_output(self):
+        proc, files = self.run_simple("capture-single.sh", 0, ("v071",))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("v071-inventory-scan.json", files)
+        self.assertIn("v071-inventory-native.json", files)
+
+    def test_single_accepts_intentional_kill(self):
+        """A resident anchor killed by design (143) still passes."""
+        proc, _ = self.run_simple(
+            "capture-single.sh", 0, ("v071",), anchor_sleep=30)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    def test_manprof_propagates_anchor_failure(self):
+        proc, _ = self.run_simple(
+            "capture-manprof.sh", 1, ("/tmp/x.json", "v071"))
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("anchor failed rc=1", proc.stderr)
+
+    def test_manprof_success_path_writes_output(self):
+        proc, files = self.run_simple(
+            "capture-manprof.sh", 0, ("/tmp/x.json", "v071"))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("v071-manprof.json", files)
 
 
 class ProbeTests(unittest.TestCase):
@@ -357,6 +530,7 @@ class ProbeTests(unittest.TestCase):
 
     def probe(self, *candidates, extra_env=None):
         env = dict(os.environ)
+        env.pop("PROV", None)
         env.update(extra_env or {})
         return subprocess.run(
             ["sh", "-c", '. "$1/capture-env.sh"; shift; probe_provider "$@"',
@@ -374,6 +548,11 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip(), handle.name)
 
+    @unittest.skipUnless(
+        os.path.isfile(
+            "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so")
+        or os.path.isfile("/usr/lib64/pkcs11/libsofthsm2.so"),
+        "no system SoftHSM provider")
     def test_probe_finds_system_provider(self):
         proc = self.probe()
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -385,6 +564,22 @@ class ProbeTests(unittest.TestCase):
         proc = self.probe("/nonexistent-a.so", "/nonexistent-b.so")
         self.assertEqual(proc.returncode, 2)
         self.assertIn("missing prerequisite", proc.stderr)
+
+    def test_every_capture_script_sources_probe(self):
+        """Each of the seven drivers reaches the shared probe (a
+        revert to a hard-coded provider fails this test)."""
+        scripts = sorted(
+            p for p in TOOLS.glob("capture-*.sh")
+            if p.name != "capture-env.sh")
+        self.assertEqual(len(scripts), 7)
+        for script in scripts:
+            with self.subTest(script=script.name):
+                text = script.read_text(encoding="utf-8")
+                self.assertIn(". \"$TOOLS_DIR/capture-env.sh\"", text)
+                self.assertIn("PROV=$(probe_provider) || exit 2", text)
+                self.assertNotIn(
+                    "PROV=/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so",
+                    text)
 
 
 if __name__ == "__main__":

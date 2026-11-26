@@ -86929,6 +86929,121 @@ fn real_merge_ordinal_mismatch_drops_pass_with_gap() {
     child.wait().unwrap();
 }
 
+/// Opus T2 N1 (S1 twin): a planned-module pin lost on committed state
+/// drops the whole tail publication with an exact named gap, keeping
+/// the previous published history — twice, with the pin still
+/// missing. The second tail drops again (aggregate 2, frozen gap):
+/// no recovery while the pin is gone. Behavior-pinning: green on
+/// arrival; the fault hook is the only production change.
+#[test]
+fn tail_twice_with_missing_module_pin_drops_with_exact_gap() {
+    let (mut engine, raw) = retained_publication_engine(6, 1);
+    apply_publication_candidate(&mut engine, &raw);
+    engine.publish_batch_tail(false).unwrap();
+    assert!(
+        !engine.plan.modules.is_empty(),
+        "a module is planned after the healthy publish"
+    );
+    let module = engine.plan.modules[0].clone();
+    // Predict the resolve error in check order: this module's active
+    // slots sharing its object come before the module identity.
+    let expected = engine
+        .plan
+        .slots
+        .iter()
+        .filter(|s| {
+            engine.plan.is_active(s.index)
+                && s.module_ids.contains(&module.id)
+                && s.object == module.object
+        })
+        .map(|s| {
+            format!(
+                "planned slot object '{}' has no comparable pin",
+                s.object_path
+            )
+        })
+        .next()
+        .unwrap_or_else(|| {
+            format!(
+                "planned module '{}' has no comparable pin",
+                module.path
+            )
+        });
+    // Lose the pin, dirty the revision so the tail attempts, then
+    // snapshot the published history the drops must keep. No fresh
+    // reconciled modules this batch (the plan stays): a module the
+    // merge still reconciles would fail the earlier identity check,
+    // not the pin checks — the S1 shape is a planned module the
+    // batch no longer reconciles.
+    engine.pinned.remove_pin_for_test(module.object);
+    engine.modules.clear();
+    engine.mark_partial("tail twin dirties", "a new input must publish");
+    let history = engine.capture_facts.history.clone();
+    let plan = engine.plan.clone();
+    let published = engine.published_facts_revision;
+    let publishes = engine.tail_publishes;
+    // First tail with the pin missing: drops with the exact gap.
+    engine.publish_batch_tail(false).unwrap();
+    assert_eq!(
+        engine.published_facts_revision, published,
+        "the dropped tail publishes nothing"
+    );
+    assert_eq!(
+        engine.tail_publishes, publishes,
+        "the dropped tail counts no publish"
+    );
+    assert_eq!(
+        engine.capture_facts.history, history,
+        "the previous published history is kept"
+    );
+    assert_eq!(engine.plan.modules, plan.modules, "plan modules are kept");
+    assert_eq!(engine.plan.slots, plan.slots, "plan slots are kept");
+    assert!(
+        engine.plan.skipped.iter().any(|skip| {
+            skip.subject == "tail twin dirties" && skip.reason == "a new input must publish"
+        }),
+        "the tail carries the dirty marker forward: {:?}",
+        engine.plan.skipped
+    );
+    let gap = engine
+        .dropped_pass_gap
+        .clone()
+        .expect("a dropped-pass gap is filed");
+    assert_eq!(gap.subject, "live inventory pass");
+    let (first, _) = engine
+        .dropped_pass_span_for_test(&expected)
+        .expect("the pin error aggregates");
+    assert_eq!(
+        gap.reason,
+        format!("pass {first} dropped: {expected}"),
+        "the dropped-pass gap is exact"
+    );
+    assert_eq!(engine.dropped_pass_count_for_test(&expected), 1);
+    // Second tail, pin still missing: drops again — frozen history,
+    // same gap, count 2. No recovery while the pin is gone.
+    engine.publish_batch_tail(false).unwrap();
+    assert_eq!(
+        engine.published_facts_revision, published,
+        "the second dropped tail still publishes nothing"
+    );
+    assert_eq!(
+        engine.capture_facts.history, history,
+        "history stays frozen across the second drop"
+    );
+    assert_eq!(engine.plan.modules, plan.modules, "modules stay frozen");
+    assert_eq!(engine.plan.slots, plan.slots, "slots stay frozen");
+    let gap2 = engine
+        .dropped_pass_gap
+        .as_ref()
+        .expect("the gap is still filed");
+    assert_eq!(gap2.reason, gap.reason, "the first gap is kept");
+    assert_eq!(
+        engine.dropped_pass_count_for_test(&expected),
+        2,
+        "both tails drop on the same error"
+    );
+}
+
 /// Drives rounds until one more pass with `error` has dropped (bounded):
 /// an incidental healthy round under load only costs an extra round.
 fn drop_one_more_pass(

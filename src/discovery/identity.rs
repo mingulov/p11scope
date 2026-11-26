@@ -2864,6 +2864,18 @@ impl PinnedObjects {
     /// merge per pin): per-entry insert-and-sort is O(n^2 log n) and
     /// burns seconds on thousand-entry tables, starving live-child
     /// fixtures past their lifetime under load.
+    /// Fault injection for the S1 tail twin: the pin is gone but the
+    /// module stays planned. Mirrors production removal (raw filings
+    /// dropped with index invalidation, proven targets scrubbed,
+    /// revision bumped).
+    #[cfg(test)]
+    pub(crate) fn remove_pin_for_test(&mut self, id: PinnedObjectId) {
+        self.raw_to_id.retain(|_, owner| *owner != id);
+        self.scrub_proven_targets([id]);
+        self.by_id.remove(&id);
+        self.bump_revision();
+    }
+
     #[cfg(test)]
     pub(crate) fn prove_scanned_entries_for_test(&mut self, modules: &[ScannedModule]) {
         let mut by_target: BTreeMap<PinnedObjectId, Vec<u64>> = BTreeMap::new();

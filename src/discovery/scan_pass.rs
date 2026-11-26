@@ -656,7 +656,7 @@ pub(crate) struct ResumeObservation {
 
 /// What a departed-generation prune removed: the cursors' freed
 /// bytes, and — for every generation that lost at least one
-/// unfinished cursor — its `(decoded, total)` object counts, so the
+/// unfinished cursor — its `(decoded, total)` held-cursor counts, so the
 /// caller can name the unfinished scan the departed member leaves
 /// behind. Generations that lost only history pairs name nothing:
 /// their cursors (if any) were complete. `walked` is the entries the

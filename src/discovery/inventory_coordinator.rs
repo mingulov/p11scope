@@ -1380,10 +1380,16 @@ pub(crate) fn cgroup_walk_incomplete_reason(passes: u64) -> String {
 /// names the unfinished scan instead of reading converged.
 pub(crate) const MEMBER_EXITED_MID_SCAN_SUBJECT: &str = "member exited before its scan finished";
 
+/// The row counts the departed generation's *held* decode cursors
+/// (`decoded` complete of `total` held when the prune ran): a completed
+/// cursor the cache evicted under pressure, or never retained, is in
+/// neither count, so the text says so instead of claiming exact object
+/// counts. Exact counts across eviction are on the later list.
 pub(crate) fn member_exited_mid_scan_reason(pid: u32, decoded: usize, total: usize) -> String {
     format!(
-        "pid {pid} exited with {decoded} of {total} objects decoded; a provider only its \
-         undecoded objects reach may be missing"
+        "pid {pid} exited with {decoded} of its {total} held decode cursors complete; objects \
+         whose cursors were not held are not counted; a provider only its undecoded objects \
+         reach may be missing"
     )
 }
 
@@ -48384,6 +48390,23 @@ int main(void) {
         assert_eq!(
             carried_cursor_table(&coordinator, &[DEPARTED_TEST_PID]),
             vec![(DEPARTED_TEST_PID, 9, 11, true)]
+        );
+    }
+
+    /// v0.7.2 r4: the pruned-scan reason, pinned as literal text (every
+    /// other twin builds its expectation through the same function, so
+    /// only this pin catches a wording drift back to "objects decoded").
+    #[test]
+    fn member_exited_mid_scan_reason_says_it_counts_held_cursors() {
+        assert_eq!(
+            member_exited_mid_scan_reason(4_250_000, 2, 3),
+            "pid 4250000 exited with 2 of its 3 held decode cursors complete; objects whose \
+             cursors were not held are not counted; a provider only its undecoded objects \
+             reach may be missing"
+        );
+        assert_eq!(
+            MEMBER_EXITED_MID_SCAN_SUBJECT,
+            "member exited before its scan finished"
         );
     }
 

@@ -783,6 +783,7 @@ NEGATIVE = [
     ("gap.activation", "cgroup-inventory", add_gaps(gap(subject=Q.ACTIVATION, reason="else"))),
     # v0.7.2 I1: a recovered delay is a note; one still in gaps never recovered
     ("gap.activation", "cgroup-inventory", add_gaps(ACTIVATION_GAP)),
+    ("gap.activation", "cgroup-inventory", add_gaps(dict(ACTIVATION_GAP, reason=Q.DEFERRED_REASON))),
     ("gap.activation", "cgroup-inventory", add_notes(dict(ACTIVATION_NOTE, subject="other"))),
     ("gap.activation", "cgroup-inventory", add_notes(dict(ACTIVATION_NOTE, reason=Q.DEFERRED_REASON))),
     ("gap.activation", "cgroup-inventory", add_notes(dict(ACTIVATION_NOTE, pid=101))),

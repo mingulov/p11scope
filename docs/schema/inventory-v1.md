@@ -1813,7 +1813,9 @@ incomplete` gap until a complete walk follows. Resume cursors and resume
 history of member generations a complete walk no longer sees (or a metered
 generation proof shows gone) are dropped after each accepted pass. Each generation that loses an
 unfinished cursor names it as one counted `member exited before its scan finished` gap (attributed
-by pid, with decoded/total object counts), so a member that exits mid-decode never reads as
+by pid). Its reason counts the generation's held decode cursors (`D of its T held decode cursors
+complete`): objects whose cursors the bounded cache did not hold (evicted under pressure, or never
+retained) are not counted, and the reason says so. A member that exits mid-decode never reads as
 converged — only its lasting `scan_in_progress` row is gone.
 
 ## Example (abridged)

@@ -53,7 +53,11 @@ def test_identity(test):
 
 
 def suite_event_name(test):
-    return raw_test_id(test).split(".")[-1].split(" ", 1)[0]
+    ident = raw_test_id(test)
+    method = re.match(r"([A-Za-z_]\w*) \(", ident)
+    if method is not None:
+        return method.group(1)
+    return ident.split(".")[-1].split(" ", 1)[0]
 
 
 def scope_skip(ident):
@@ -66,8 +70,9 @@ def scope_skip(ident):
     match = re.fullmatch(r"setUpClass \((?:[A-Za-z_][\w.]*\.)?([A-Za-z_]\w*)\)", ident)
     if match is not None:
         return ("class", match.group(1))
-    if re.fullmatch(r"setUpModule \([A-Za-z_][\w.]*\)", ident) is not None:
-        return ("module", None)
+    match = re.fullmatch(r"setUpModule \(([A-Za-z_][\w.]*)\)", ident)
+    if match is not None:
+        return ("module", match.group(1))
     return None
 
 
@@ -103,6 +108,7 @@ def flatten_suite(test):
 class Recorder:
     def __init__(self):
         self.selection = []
+        self.selection_modules = []
         self.events = []
         self.suite_events = []
         self.scope_skips = []
@@ -114,6 +120,8 @@ class Recorder:
             return
         for test in flatten_suite(suite):
             self.selection.append(test_identity(test))
+            module = getattr(test.__class__, "__module__", "")
+            self.selection_modules.append(module if isinstance(module, str) else "")
 
     def note(self, test, state, err=None):
         if self.depth != 1:
@@ -253,14 +261,15 @@ def execute_suite(suite, arguments, discover_only):
 
 def fragment(path, invocation, process_exit):
     outcomes = RECORDER.outcomes()
-    module_skipped = any(scope == "module" for scope, _name in RECORDER.scope_skips)
+    skipped_modules = {name for scope, name in RECORDER.scope_skips if scope == "module"}
     class_skipped = {name for scope, name in RECORDER.scope_skips if scope == "class"}
     rows = []
     complete = True
-    for test in RECORDER.selection:
+    for index, test in enumerate(RECORDER.selection):
         event = outcomes.get(test)
         if event is None:
-            if module_skipped:
+            module = RECORDER.selection_modules[index] if index < len(RECORDER.selection_modules) else ""
+            if module in skipped_modules:
                 event = {
                     "test": test,
                     "state": "skipped",

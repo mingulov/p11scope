@@ -17,7 +17,8 @@ a textual pattern.
 Known-issue authority is the typed `p11scope/known-issues/v1` block in the
 `## Known limitations in 0.7.2` section of docs/known-limitations.md. Until
 that section lands, only an empty list is valid; once
-docs/releases/v0.7.2.md exists the empty list is refused.
+docs/releases/v0.7.2.md exists the typed registry must exist, and rule 2
+exact equality governs (zero `test: true` issues means zero rows is valid).
 
 Static validation checks row shape, executable test/cell discovery, suite
 registration, issue/row exact equality, reverse runner declarations per
@@ -262,6 +263,13 @@ def validate_row(raw, index):
         limited = [host for host in raw["hosts"] if host in ("fedora", "fedora-sm1")]
         if limited:
             problems.append(f"{label}: hosts {', '.join(limited)} have no CI judge: host-limited rows are refused until one exists")
+        if raw.get("runner") == "python-suite" and "github" not in raw["hosts"]:
+            problems.append(f"{label}: python-suite rows without github have no CI judge: python suites are judged only with host github")
+    if isinstance(raw.get("runner"), str) and raw["runner"].startswith("cell:"):
+        script = raw["runner"][len("cell:"):]
+        if isinstance(raw.get("path"), str) and raw["path"] != script and not raw["path"].endswith(".rs"):
+            problems.append(f"{label}: cell row path must equal the runner script or the .rs ignored-tests exception: "
+                            f"{raw['path']} has no CI judge for {raw['runner']}")
     if "invocation" in raw and not valid_invocation(raw["invocation"]):
         problems.append(f"{label}: invocation must be a list of nonempty argument strings")
     for key in ("since", "evidence"):
@@ -669,6 +677,26 @@ def workflow_invocations(root):
     return invocations, problems
 
 
+def _is_kf_host_wildcard(value):
+    if not isinstance(value, str):
+        return False
+    stripped = value.strip().strip('"').strip("'")
+    return stripped in ("$kf_host", "${kf_host}")
+
+
+def _cell_invocation_judges_row(row, invocation):
+    if invocation.get("runner") != row["runner"]:
+        return False
+    host = invocation.get("known_host")
+    if _is_kf_host_wildcard(host):
+        return True
+    if not isinstance(host, str) or host not in HOSTS:
+        return False
+    if "hosts" not in row:
+        return True
+    return host in row["hosts"]
+
+
 def validate_cell_runner_declarations(root, rows):
     problems = []
     cell_rows = [row for row in rows if row["runner"].startswith("cell:")]
@@ -696,6 +724,12 @@ def validate_cell_runner_declarations(root, rows):
             or invocation["require_file"]
         ):
             problems.append(f"{where}: typed cell result selection is empty")
+
+    for row in cell_rows:
+        if not any(_cell_invocation_judges_row(row, invocation) for invocation in invocations):
+            problems.append(
+                f"{row['test']}: cell runner {row['runner']} has no CI judge: "
+                "no workflow invocation with the same --known-failing-runner and a compatible host")
 
     groups = {}
     for invocation in invocations:
@@ -785,9 +819,8 @@ def validate_static(root, list_path, discover_executables=True):
     rows, problems = load_list(list_path)
     registry_present, registry, registry_problems = load_issue_registry(root)
     problems.extend(registry_problems)
-    if not rows and (root / "docs/releases/v0.7.2.md").is_file():
-        problems.append("empty known-failing list is refused once docs/releases/v0.7.2.md exists: "
-                        "the 0.7.2 release carries its rows")
+    if (root / "docs/releases/v0.7.2.md").is_file() and not registry_present:
+        problems.append("the 0.7.2 release needs the typed known-issue registry")
     if rows and not registry_present:
         problems.append("no typed known-issue registry: rows cannot name a known issue before the 0.7.2 section lands")
     elif registry_present and not registry_problems:

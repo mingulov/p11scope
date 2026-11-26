@@ -1752,6 +1752,8 @@ class JudgeTwins(unittest.TestCase):
                                    "no_calls"]})),
             ("edge_nondict", ("partial", "edge/edge_malformed"),
              set_path("semantic_edges", 0, 42)),
+            ("edges_dict", ("partial", "edges_malformed"),
+             set_path("semantic_edges", {})),
             ("outsider_mixed", ("partial", "edge/semantic_loss"),
              set_path("semantic_edges", 0, "coverage",
                       {"lossy": True,

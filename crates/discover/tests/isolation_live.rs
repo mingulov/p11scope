@@ -153,8 +153,21 @@ fn probe_child(pipe: RawFd) -> ! {
         );
     }
 
+    // Signalling outside the fenced domain: confined by the scoped
+    // SIGNAL right on Landlock ABI 6+, open below it.
+    let signal = unsafe { libc::kill(ppid, 0) };
+    emit(pipe, &denied_line("KILL_PP", signal == 0));
+
     unsafe { libc::close(pipe) };
     unsafe { libc::_exit(0) };
+}
+
+/// The running kernel's Landlock ABI, probed the way the fence does (a
+/// null-attr create with the version flag; 444 is
+/// `SYS_LANDLOCK_CREATE_RULESET`): the kill expectation depends on it,
+/// so it is observed, never assumed.
+fn landlock_abi() -> libc::c_long {
+    unsafe { libc::syscall(444, std::ptr::null::<u8>(), 0, 1) as libc::c_long }
 }
 
 fn read_report(pipe: RawFd) -> String {
@@ -242,6 +255,12 @@ fn fenced_child_reports_the_denial_table() {
         "the fence must apply in the probe child: {table:?}"
     );
     let eacces = format!("denied({})", libc::EACCES);
+    let eperm = format!("denied({})", libc::EPERM);
+    let kill_expected = if landlock_abi() >= 6 {
+        eperm.as_str()
+    } else {
+        "allowed"
+    };
     let expected: &[(&str, &str)] = &[
         ("ISOLATION_UNSHARE_NEWUSER", &eacces),
         ("ISOLATION_PTHREAD_CREATE", "ok"),
@@ -251,6 +270,7 @@ fn fenced_child_reports_the_denial_table() {
         ("ISOLATION_SOCKET_INET6", &eacces),
         ("ISOLATION_SOCKET_NETLINK_NF", &eacces),
         ("ISOLATION_SOCKET_NETLINK_ROUTE", "allowed"),
+        ("ISOLATION_KILL_PP", kill_expected),
     ];
     for (key, value) in expected {
         assert_eq!(

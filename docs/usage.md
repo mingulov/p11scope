@@ -802,8 +802,10 @@ the provider shares the helper process with the manifest writer, so a
 hostile provider can shape what the manifest says about objects it
 loaded. Residuals: the provider runs in-process as your uid, reads every file you
 can read, inherits your environment (including any tokens) and
-supplementary groups, and may signal your processes or lower their
-priority; terminal stdio ioctls other than
+supplementary groups, and may lower their priority; on Landlock ABI
+below 6 it may also signal your processes (ABI 6 and newer confine
+signals and abstract Unix sockets to the fenced domain); terminal stdio
+ioctls other than
 `TIOCSTI`/`TIOCLINUX` still pass, as does `AF_UNIX` datagram `sendto`
 without `connect`. Cross-process `/proc/<pid>/mem`, `/proc/<pid>/environ`,
 `/proc/<pid>/maps` and `/proc/<pid>/fd` are all refused by Landlock

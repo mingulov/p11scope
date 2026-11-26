@@ -18,8 +18,10 @@
 //!
 //! Documented residuals: the provider still runs in-process as the
 //! helper's uid with its environment, supplementary groups, readable
-//! files, signaling and priority changes (setpriority,
-//! sched_setscheduler, ioprio_set); other terminal ioctls pass, as does
+//! files and priority changes (setpriority, sched_setscheduler,
+//! ioprio_set); on Landlock ABI below 6 it may also signal your
+//! processes (ABI 6 and newer confine signals and abstract Unix
+//! sockets to the fenced domain); other terminal ioctls pass, as does
 //! `AF_UNIX` datagram `sendto` without `connect`.
 
 use std::fs::File;
@@ -95,6 +97,34 @@ const ALLOW_OUTPUT_DIR: u64 =
 struct RulesetAttr {
     handled_access_fs: u64,
     handled_access_net: u64,
+}
+
+/// The ABI 6+ ruleset: `scoped` confines signals and abstract Unix
+/// sockets to the fenced domain. Older kernels get the 16-byte shape
+/// above (a larger struct would be refused), so the size follows the
+/// probed ABI, never the build.
+#[repr(C)]
+struct RulesetAttrScoped {
+    handled_access_fs: u64,
+    handled_access_net: u64,
+    scoped: u64,
+}
+
+// Landlock scope rights (linux/landlock.h, ABI 6).
+const LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET: u64 = 1 << 0;
+const LANDLOCK_SCOPE_SIGNAL: u64 = 1 << 1;
+/// First ABI carrying the `scoped` ruleset field.
+const LANDLOCK_ABI_SCOPED: libc::c_long = 6;
+
+/// The `scoped` rights for a probed ABI: signals plus abstract Unix
+/// sockets on ABI 6 and newer, nothing below. The floor stays at 5:
+/// older kernels fence without scoping, exactly as before.
+fn scoped_for_abi(abi: libc::c_long) -> u64 {
+    if abi >= LANDLOCK_ABI_SCOPED {
+        LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET | LANDLOCK_SCOPE_SIGNAL
+    } else {
+        0
+    }
 }
 
 #[repr(C)]
@@ -726,14 +756,26 @@ fn apply_landlock(out: Option<&Path>) -> Result<(), String> {
         handled_access_fs: HANDLED_FS,
         handled_access_net: HANDLED_NET,
     };
-    let ruleset = unsafe {
-        libc::syscall(
-            SYS_LANDLOCK_CREATE_RULESET,
-            &attr,
+    let scoped_attr = RulesetAttrScoped {
+        handled_access_fs: HANDLED_FS,
+        handled_access_net: HANDLED_NET,
+        scoped: scoped_for_abi(abi),
+    };
+    // The struct size follows the probed ABI: 16 bytes below ABI 6
+    // (older kernels refuse the larger shape), 24 with `scoped` on
+    // ABI 6 and newer.
+    let (attr_ptr, attr_len) = if scoped_attr.scoped == 0 {
+        (
+            &attr as *const RulesetAttr as *const libc::c_void,
             size_of::<RulesetAttr>(),
-            0,
+        )
+    } else {
+        (
+            &scoped_attr as *const RulesetAttrScoped as *const libc::c_void,
+            size_of::<RulesetAttrScoped>(),
         )
     };
+    let ruleset = unsafe { libc::syscall(SYS_LANDLOCK_CREATE_RULESET, attr_ptr, attr_len, 0) };
     if ruleset < 0 {
         return Err(os_error("isolated profile: Landlock ruleset create failed"));
     }
@@ -1095,6 +1137,31 @@ mod tests {
             "{error}"
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn scoped_rights_follow_the_probed_landlock_abi() {
+        // linux/landlock.h: ABSTRACT_UNIX_SOCKET is bit 0, SIGNAL bit 1.
+        assert_eq!(LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET, 1);
+        assert_eq!(LANDLOCK_SCOPE_SIGNAL, 2);
+        assert_eq!(LANDLOCK_ABI_SCOPED, 6);
+        // The 16-byte shape is what older kernels accept; the 24-byte
+        // shape carries `scoped` on ABI 6+.
+        assert_eq!(size_of::<RulesetAttr>(), 16);
+        assert_eq!(size_of::<RulesetAttrScoped>(), 24);
+        // Below 6 nothing is scoped and the floor stays at 5; 6 and
+        // newer confine signals and abstract Unix sockets.
+        for abi in [1, 4, 5] {
+            assert_eq!(scoped_for_abi(abi), 0, "ABI {abi} must not scope");
+        }
+        assert_eq!(LANDLOCK_ABI_FLOOR, 5);
+        for abi in [6, 7, 8, 10] {
+            assert_eq!(
+                scoped_for_abi(abi),
+                LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET | LANDLOCK_SCOPE_SIGNAL,
+                "ABI {abi} must scope"
+            );
+        }
     }
 
     #[test]

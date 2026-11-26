@@ -34638,7 +34638,10 @@ mod seal_readiness_tests {
                     "stop during the ordinary re-mint: the ordinary retry never starts",
                     true,
                     false,
-                    vec![refused(), refused()],
+                    // The trailing verdict is never consumed: it turns
+                    // a deleted post-mint gate into a visible extra
+                    // start (N3) instead of a production BPF attempt.
+                    vec![refused(), refused(), refused()],
                     StopAt::Prepare(3),
                     StopRun {
                         seated: false,

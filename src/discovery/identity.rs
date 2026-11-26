@@ -3456,19 +3456,46 @@ impl PinnedObjects {
     /// own possibly-partial filing, and the raw itself only when no other
     /// view's custody shares it. A refusal fails its own observation; a
     /// proven peer that filed the same raw keeps its pin.
+    ///
+    /// Only a peer's FRESH custody shares the raw: carried rows are carry
+    /// evidence of a superseded generation, never proof, so they cannot
+    /// keep a refused raw alive. In the shared arm the refuser's own claim
+    /// on the raw's object ends too, unless another of the refuser's rows
+    /// still proves that object: a stale claim would otherwise hold the
+    /// id through later purges after the peer retires.
     fn scrub_observation(&mut self, view: ProcessViewId, raw: &RawObjectInstance) {
         let shared = self
             .raw_ownership
             .iter()
-            .any(|(owner, custody)| *owner != view && custody.contains(raw));
+            .any(|(owner, custody)| *owner != view && custody.is_fresh() && custody.contains(raw));
         if !shared {
             self.scrub_raw(raw);
             return;
         }
-        if let Some(custody) = self.raw_ownership.get_mut(&view)
-            && custody.remove(raw)
+        if !self
+            .raw_ownership
+            .get_mut(&view)
+            .is_some_and(|custody| custody.remove(raw))
         {
-            self.bump_revision();
+            return;
+        }
+        self.bump_revision();
+        let Some(id) = self.raw_to_id.get(raw).copied() else {
+            return;
+        };
+        let still_proven = self.raw_ownership.get(&view).is_some_and(|custody| {
+            custody
+                .iter()
+                .any(|other| self.raw_to_id.get(other) == Some(&id))
+        });
+        if still_proven {
+            return;
+        }
+        if let Some(claims) = self.ownership.get_mut(&view) {
+            claims.remove(&BTreeSet::from([id]));
+            if claims.tables.is_empty() && claims.targets.is_empty() && claims.pins.is_empty() {
+                self.ownership.remove(&view);
+            }
         }
     }
 
@@ -33053,5 +33080,126 @@ mod tests {
             !store_for("", "").proving_pins_conflict(&source, &main),
             "missing digests never conflict"
         );
+    }
+
+    fn refused_by_fallback() -> Result<Entry, PinOutcome> {
+        Err(PinOutcome::Unproven {
+            cause: UnprovenCause::FallbackRefused,
+            reason: "map_files range refused".to_string(),
+        })
+    }
+
+    /// Shared-raw scrub, stale-claim site: a view that filed a raw and
+    /// then refused it, with a fresh peer sharing the raw, loses its own
+    /// claim on the object with its custody row. The peer keeps both.
+    #[test]
+    fn a_refusal_beside_a_fresh_peer_drops_the_refusers_own_claim() {
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let mut source = image_pins(&[(key, "aaaaaaaa", 1)]);
+        let entry = source.by_id.pop_first().unwrap().1;
+        let raw = entry.raw.clone();
+        let (peer, refuser) = (ProcessViewId(0), ProcessViewId(1));
+        let mut pinned = PinnedObjects::empty();
+        let mut skipped = Vec::new();
+        record_scanned_candidate(
+            &mut pinned,
+            peer,
+            raw.clone(),
+            Ok(entry.clone()),
+            &mut skipped,
+            true,
+        );
+        record_scanned_candidate(
+            &mut pinned,
+            refuser,
+            raw.clone(),
+            Ok(entry),
+            &mut skipped,
+            true,
+        );
+        let id = *pinned.raw_to_id.get(&raw).expect("the raw is filed");
+        let claims_of = |pins: &PinnedObjects, view| {
+            pins.view_claims(view)
+                .map(|claims| claims.pins.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(claims_of(&pinned, refuser), vec![id], "precondition: the refuser claims");
+        assert_eq!(claims_of(&pinned, peer), vec![id], "precondition: the peer claims");
+        record_scanned_candidate(
+            &mut pinned,
+            refuser,
+            raw.clone(),
+            refused_by_fallback(),
+            &mut skipped,
+            true,
+        );
+        assert_eq!(pinned.raw_to_id.get(&raw), Some(&id), "the peer keeps the raw");
+        assert_eq!(claims_of(&pinned, peer), vec![id], "the peer keeps its claim");
+        assert!(
+            pinned.view_claims(refuser).is_none(),
+            "the refuser's stale claim ends with its row: {:?}",
+            pinned.view_claims(refuser)
+        );
+        assert!(
+            !pinned
+                .raw_ownership
+                .get(&refuser)
+                .is_some_and(|custody| custody.contains(&raw)),
+            "the refuser files nothing"
+        );
+        // The peer retires: no stale claim holds the id past it.
+        pinned.retire_view_only_if_proven_gone(peer, RetirementProof::Exited);
+        assert_eq!(pinned.pinned().count(), 0, "nothing outlives the peer");
+    }
+
+    /// Shared-raw scrub, carried-peer site: a peer's CARRIED custody is
+    /// carry evidence, not proof, so it never shares a refused raw: the
+    /// refusal scrubs the raw as if the refuser filed it alone.
+    #[test]
+    fn a_carried_peer_row_does_not_shield_a_refused_raw() {
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        for carried_peer in [false, true] {
+            let mut source = image_pins(&[(key, "aaaaaaaa", 1)]);
+            let entry = source.by_id.pop_first().unwrap().1;
+            let raw = entry.raw.clone();
+            let (peer, refuser) = (ProcessViewId(0), ProcessViewId(1));
+            let mut pinned = PinnedObjects::empty();
+            let mut skipped = Vec::new();
+            record_scanned_candidate(
+                &mut pinned,
+                peer,
+                raw.clone(),
+                Ok(entry),
+                &mut skipped,
+                true,
+            );
+            if carried_peer {
+                pinned.drop_view_claims(peer);
+                assert_eq!(
+                    custody_of(&pinned, peer).map(|(generation, _)| generation),
+                    Some(CustodyGeneration::Carried(CarryCause::ClaimsDenied)),
+                    "precondition: the peer's custody is carried"
+                );
+            }
+            record_scanned_candidate(
+                &mut pinned,
+                refuser,
+                raw.clone(),
+                refused_by_fallback(),
+                &mut skipped,
+                true,
+            );
+            assert_eq!(
+                pinned.raw_to_id.contains_key(&raw),
+                !carried_peer,
+                "[carried_peer={carried_peer}] only a fresh peer keeps the refused raw"
+            );
+        }
     }
 }

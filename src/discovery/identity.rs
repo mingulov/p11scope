@@ -2531,6 +2531,7 @@ impl PinnedObjects {
         self.changed.set(self.changed.get() || other.changed.get());
         self.overlay_uncertain |= other_overlay_uncertain;
         self.publish_ambiguities(&mut skipped);
+        self.debug_assert_claims_imply_fresh_custody();
         skipped
     }
 
@@ -3128,11 +3129,19 @@ impl PinnedObjects {
         // by-id/raw survival below is broadened, so preserved ids stay
         // resolvable without raw mappings.
         let restore_ownership = !claim_raws.is_empty();
+        // Claims imply fresh custody: rows restored beside restored
+        // claims rejoin as this generation's proof, so a claimed view
+        // never holds carried custody (it would neither fence nor prove).
+        let restore_generation = if restore_ownership {
+            CustodyGeneration::Fresh
+        } else {
+            view_generation
+        };
         if !resolve_raws.is_empty() {
             self.raw_ownership
                 .entry(view)
                 .or_default()
-                .restore(view_generation, resolve_raws);
+                .restore(restore_generation, resolve_raws);
         }
         if restore_ownership {
             self.ownership
@@ -3178,7 +3187,31 @@ impl PinnedObjects {
                 raws.retain(|raw| self.raw_to_id.contains_key(raw));
             }
         }
+        self.debug_assert_claims_imply_fresh_custody();
         skipped
+    }
+
+    /// The custody invariant: a view holding ownership claims holds fresh
+    /// custody or none. Carried custody belongs to a claimless (retired
+    /// or denied) generation only.
+    fn claimed_views_with_carried_custody(&self) -> Vec<ProcessViewId> {
+        self.ownership
+            .keys()
+            .filter(|view| {
+                self.raw_ownership
+                    .get(view)
+                    .is_some_and(|custody| !custody.is_empty() && !custody.is_fresh())
+            })
+            .copied()
+            .collect()
+    }
+
+    fn debug_assert_claims_imply_fresh_custody(&self) {
+        debug_assert!(
+            self.claimed_views_with_carried_custody().is_empty(),
+            "claimed views hold carried custody: {:?}",
+            self.claimed_views_with_carried_custody()
+        );
     }
 
     /// The only way to supersede one view's pins with a rescan's
@@ -32497,7 +32530,7 @@ mod tests {
         let id = strict(&pins, key, v).unwrap();
         pins.drop_view_claims(v);
         let mut replaced = pins.clone();
-        replaced.replace_view_pins(v, PinnedObjects::empty(), &[id]);
+        replaced.replace_view_pins_without_claims(v, PinnedObjects::empty(), &[id]);
         assert_eq!(
             custody_of(&replaced, v),
             Some((
@@ -32506,6 +32539,23 @@ mod tests {
             )),
             "a preserved carried row stays carry"
         );
+        assert!(replaced.view_claims(v).is_none(), "no claim was restored");
+        // Claims imply fresh custody (controller ruling N7, 02:24): when
+        // the replace restores the view's claims, the preserved rows
+        // rejoin as fresh proof, never as carry beside a claim.
+        let mut reclaimed = pins.clone();
+        reclaimed.replace_view_pins(v, PinnedObjects::empty(), &[id]);
+        assert_eq!(
+            reclaimed.view_claims(v).map(|claims| claims.pins.clone()),
+            Some(vec![id]),
+            "the replace restores the claim"
+        );
+        assert_eq!(
+            custody_of(&reclaimed, v),
+            Some((CustodyGeneration::Fresh, vec![raw.clone()])),
+            "restored claims restore fresh custody"
+        );
+        assert!(reclaimed.claimed_views_with_carried_custody().is_empty());
         let mut rescanned = pins.clone();
         let mut incoming = PinnedObjects::empty();
         let fresh_raw = custody_file(&mut incoming, v, key);

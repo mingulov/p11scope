@@ -981,6 +981,9 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// [`Self::drain_pending_closes_for_exit`]), so a latched stop
     /// never leaves it to the teardown batch.
     pending_close_queue: Vec<Arc<PidPin>>,
+    /// Pass transients (the catalog, the lowering) awaiting their drop
+    /// on the long-lived reclaim worker; the handoff never waits (D3).
+    pass_reclaim: crate::inventory::PassReclaim,
     /// Proven-exited caller rows retired into the counted aggregate
     /// (monotonic, saturating).
     retired_caller_rows: u64,
@@ -1970,6 +1973,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             pending_owners: BTreeMap::new(),
             rendered_callers: BTreeSet::new(),
             pending_close_queue: Vec::new(),
+            pass_reclaim: crate::inventory::PassReclaim::new(),
             retired_caller_rows: 0,
             retired_with_calls: 0,
             folded_terminal_missed: 0,
@@ -6406,10 +6410,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.reconcile_exec_newcomers(&catalog);
         self.prune_departed_native_state(now_ns);
         // Release the collected catalog (objects, observations, processes)
-        // on a short-lived thread: it was allocated on the collector
+        // on the reclaim worker: it was allocated on the collector
         // thread, and freeing it here would leave its arena's pages
-        // resident. The worker's teardown flushes its tcache first.
-        crate::inventory::drop_off_main_thread(catalog);
+        // resident. The handoff never waits (D3): a busy worker keeps
+        // it in custody for the next pass.
+        self.pass_reclaim.hand_off(catalog);
         self.completed_scan_pass = true;
         PassReport {
             pass,
@@ -9666,10 +9671,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             self.scan_mint_sources = Some((modules, pins));
         } else {
             // The lowering is the pass's largest transient and was built
-            // on the collector thread; free it on a short-lived thread so
-            // its arena/tcache pages return to the kernel instead of
-            // staying resident on the main thread's heap.
-            crate::inventory::drop_off_main_thread((plan, pins, modules));
+            // on the collector thread; free it on the reclaim worker so
+            // its arena pages return to the kernel instead of staying
+            // resident on the main thread's heap. Its pinned module fds
+            // close there too, so a close blocked on a wedged FUSE
+            // daemon never stops the main loop (D3).
+            self.pass_reclaim.hand_off((plan, pins, modules));
         }
         self.record_absorbed(absorbed)
     }
@@ -19488,6 +19495,42 @@ pub(crate) mod tests {
             coordinator.engine.teardown_deferral.remaining(),
             super::super::TeardownDeferralBudget::new().remaining(),
             "the owner scan sees a fresh budget, not the spent one"
+        );
+    }
+
+    /// D3 site table: both pass transients (the applied catalog and a
+    /// lowering the scan seal does not retain) reach the reclaim worker
+    /// through the non-waiting handoff, never an inline or joined drop.
+    #[test]
+    fn pass_transients_reach_the_reclaim_worker() {
+        let empty = crate::inventory::ReclaimCounts::default();
+        let mut applied = coordinator();
+        let pid = std::process::id();
+        let mut catalog = applied.collector(InventoryScope::Pid(pid), None)().unwrap();
+        catalog.lowering = None;
+        assert_eq!(applied.pass_reclaim.counts(), empty);
+        applied.apply_catalog(
+            catalog,
+            &mut UnavailableImageGuard,
+            &mut ScanOnlyIdentity,
+            u64::MAX,
+            crate::discovery::caller_registry::now_ns(),
+        );
+        assert_eq!(
+            applied.pass_reclaim.counts(),
+            crate::inventory::ReclaimCounts { handed: 1, ..empty },
+            "the applied catalog reaches the worker"
+        );
+        let mut lowered = coordinator();
+        lowered.absorb_lowering(Some(crate::inspect_system::CatalogLowering {
+            plan: crate::plan::AttachPlan::from_slots(Vec::new()),
+            pins: crate::discovery::identity::PinnedObjects::empty(),
+            modules: Vec::new(),
+        }));
+        assert_eq!(
+            lowered.pass_reclaim.counts(),
+            crate::inventory::ReclaimCounts { handed: 1, ..empty },
+            "an unretained lowering reaches the worker"
         );
     }
 

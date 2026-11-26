@@ -1485,37 +1485,408 @@ pub(crate) fn trim_pass_heap() {
     }
 }
 
-/// Drop `value` on a short-lived worker thread and wait for its pthread
-/// teardown (`tcache_thread_shutdown`). Pass transients allocated on the
-/// collector thread are freed into that thread's arena/tcache; freeing
-/// them on the main thread would leave the owning arena's pages resident.
-/// The worker's exit flushes its tcache, so the caller's pass-boundary
-/// [`trim_pass_heap`] can then hand the pages back; this function runs no
-/// trim of its own (the pass already runs one at its publication seam).
-/// A worker panic is reported rather than swallowed; any value it did not
-/// take is dropped on this thread as the safe fallback.
-pub(crate) fn drop_off_main_thread<T: Send>(value: T) {
-    let slot = std::sync::Mutex::new(Some(value));
-    std::thread::scope(|scope| {
-        if let Ok(handle) = std::thread::Builder::new()
-            .name("p11scope-reclaim".into())
-            .spawn_scoped(scope, || {
-                // A poisoned slot means an earlier drop panicked while
-                // holding it; leaving the value in the slot lets the
-                // main thread's fallback below own the drop.
-                if let Ok(mut guard) = slot.lock() {
+/// One owned pass transient awaiting its drop on the reclaim worker.
+type ReclaimItem = Box<dyn Send>;
+
+/// Handoffs the reclaim worker may queue behind the one it is
+/// dropping. A pass hands at most two transients (the catalog and the
+/// lowering), and a healthy drop finishes in milliseconds, so a full
+/// queue means the worker is stuck (a close blocked on a wedged FUSE
+/// daemon): the next value stays in custody instead of waiting.
+const RECLAIM_QUEUE_DEPTH: usize = 2;
+
+/// Typed counts of the pass-heap reclaim (D3). `worker_busy` counts
+/// the services that found the worker busy (monotonic, saturating);
+/// `held` is the custody waiting now for the next pass's handoff;
+/// `handed` counts values the worker took; `inline` counts values
+/// dropped on the calling thread because no worker could start (the
+/// pre-worker fallback).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReclaimCounts {
+    pub(crate) worker_busy: u64,
+    pub(crate) held: usize,
+    pub(crate) handed: u64,
+    pub(crate) inline: u64,
+}
+
+enum ReclaimWorker {
+    NotStarted,
+    Running(std::sync::mpsc::SyncSender<ReclaimItem>),
+    Unavailable,
+}
+
+/// Pass-heap reclaim off the main loop (D3): one long-lived worker
+/// thread, fed through a bounded channel, drops pass transients that
+/// were allocated on the collector thread, so freeing them never
+/// leaves their pages on the main thread's heap. The caller never
+/// waits for the worker: a full queue keeps the value in this
+/// custody, counts `worker_busy`, and the next pass hands it again,
+/// so the main loop keeps servicing the rings even when a close in
+/// the drop blocks (a pinned module fd on a stopped FUSE daemon).
+/// The pass trim ([`trim_pass_heap`]) stays at the publication seam;
+/// pages a drop frees after one trim return at the next.
+pub(crate) struct PassReclaim {
+    worker: ReclaimWorker,
+    // Behind a mutex only so the owner stays `Sync` (the values are
+    // `Send` alone); every access is `get_mut`, never a lock wait.
+    custody: std::sync::Mutex<std::collections::VecDeque<ReclaimItem>>,
+    counts: ReclaimCounts,
+}
+
+impl Default for PassReclaim {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PassReclaim {
+    pub(crate) fn new() -> Self {
+        Self {
+            worker: ReclaimWorker::NotStarted,
+            custody: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            counts: ReclaimCounts::default(),
+        }
+    }
+
+    /// Hand `value` to the reclaim worker without waiting. Earlier
+    /// custody goes first; a busy worker keeps the rest here.
+    pub(crate) fn hand_off<T: Send + 'static>(&mut self, value: T) {
+        self.custody_mut().push_back(Box::new(value));
+        self.service();
+    }
+
+    fn custody_mut(&mut self) -> &mut std::collections::VecDeque<ReclaimItem> {
+        self.custody
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Retry the custody: one non-blocking handoff attempt per held
+    /// value, in order, stopping at the first refusal (counted once).
+    pub(crate) fn service(&mut self) {
+        let mut pending = std::mem::take(self.custody_mut());
+        while let Some(item) = pending.pop_front() {
+            let Some(sender) = self.sender() else {
+                // No worker thread could start: drop here, exactly
+                // the pre-worker behavior.
+                drop(item);
+                self.counts.inline = self.counts.inline.saturating_add(1);
+                continue;
+            };
+            match sender.try_send(item) {
+                Ok(()) => self.counts.handed = self.counts.handed.saturating_add(1),
+                Err(std::sync::mpsc::TrySendError::Full(item)) => {
+                    pending.push_front(item);
+                    self.counts.worker_busy = self.counts.worker_busy.saturating_add(1);
+                    break;
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(item)) => {
+                    // The worker is gone (it never unwinds past one
+                    // drop, so only a teardown race gets here): mark
+                    // it unavailable, and the value and the rest drop
+                    // inline through the empty-sender arm above.
+                    self.worker = ReclaimWorker::Unavailable;
+                    pending.push_front(item);
+                }
+            }
+        }
+        self.counts.held = pending.len();
+        *self.custody_mut() = pending;
+    }
+
+    /// Typed reclaim counts (the twins assert the busy path
+    /// through these; production keeps counting without reading).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn counts(&self) -> ReclaimCounts {
+        self.counts
+    }
+
+    fn sender(&mut self) -> Option<&std::sync::mpsc::SyncSender<ReclaimItem>> {
+        if matches!(self.worker, ReclaimWorker::NotStarted) {
+            let (sender, receiver) =
+                std::sync::mpsc::sync_channel::<ReclaimItem>(RECLAIM_QUEUE_DEPTH);
+            self.worker = match std::thread::Builder::new()
+                .name("p11scope-reclaim".into())
+                .spawn(move || reclaim_worker(&receiver))
+            {
+                // Detached: the handle is never joined. The worker
+                // exits once every sender is gone and its queue is
+                // empty.
+                Ok(_detached) => ReclaimWorker::Running(sender),
+                Err(_) => ReclaimWorker::Unavailable,
+            };
+        }
+        match &self.worker {
+            ReclaimWorker::Running(sender) => Some(sender),
+            ReclaimWorker::NotStarted | ReclaimWorker::Unavailable => None,
+        }
+    }
+}
+
+impl Drop for PassReclaim {
+    fn drop(&mut self) {
+        self.service();
+        if self.custody_mut().is_empty() {
+            return;
+        }
+        // The worker is still busy at teardown: the remainder never
+        // drops here (that is the close the worker is stuck behind).
+        // A detached one-shot thread takes it; failing that, the
+        // process keeps it until exit.
+        let rest = std::mem::take(self.custody_mut());
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(rest)));
+        let worker_slot = std::sync::Arc::clone(&slot);
+        let spawned = std::thread::Builder::new()
+            .name("p11scope-reclaim-exit".into())
+            .spawn(move || {
+                if let Ok(mut guard) = worker_slot.lock() {
                     drop(guard.take());
                 }
-            })
-            && handle.join().is_err()
+            });
+        if spawned.is_err()
+            && let Ok(mut guard) = slot.lock()
+            && let Some(rest) = guard.take()
         {
+            ExitRetention::hold(rest);
+        }
+    }
+}
+
+/// The reclaim worker's loop: one drop per received value. A panicking
+/// drop is reported and the loop continues, so the worker outlives it.
+fn reclaim_worker(receiver: &std::sync::mpsc::Receiver<ReclaimItem>) {
+    while let Ok(item) = receiver.recv() {
+        let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(item)));
+        if dropped.is_err() {
             let _ = crate::sink::try_stderr_line(
-                "p11scope: pass-heap reclaim worker panicked; its transient stays \
-                 on the main thread's heap until the next pass trim",
+                "p11scope: pass-heap reclaim drop panicked; the worker continues",
             );
         }
-    });
-    drop(slot);
+    }
+}
+
+#[cfg(test)]
+mod pass_reclaim_tests {
+    //! D3 (lifecycle audit 11-25): the pass-heap reclaim never waits
+    //! on its worker. A value whose drop blocks (a close stuck on a
+    //! wedged FUSE daemon) must not stop the caller; the busy worker
+    //! keeps the next value in counted custody until a later pass.
+    use super::{PassReclaim, RECLAIM_QUEUE_DEPTH, ReclaimCounts};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    const WATCHDOG: Duration = Duration::from_secs(10);
+
+    struct Tracked(Arc<AtomicUsize>);
+    impl Drop for Tracked {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A drop that blocks until released, like a close on a stopped
+    /// FUSE daemon. It says when it entered and counts when done.
+    struct Blocking {
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+        dropped: Arc<AtomicUsize>,
+    }
+    impl Drop for Blocking {
+        fn drop(&mut self) {
+            let _ = self.entered.send(());
+            let _ = self.release.recv_timeout(WATCHDOG);
+            self.dropped.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn blocking(dropped: &Arc<AtomicUsize>) -> (Blocking, mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (entered, entered_rx) = mpsc::channel();
+        let (release_tx, release) = mpsc::channel();
+        (
+            Blocking {
+                entered,
+                release,
+                dropped: Arc::clone(dropped),
+            },
+            entered_rx,
+            release_tx,
+        )
+    }
+
+    fn wait_until(mut cond: impl FnMut() -> bool) -> bool {
+        let end = Instant::now() + WATCHDOG;
+        while Instant::now() < end {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        cond()
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct LoopRecord {
+        /// Drops finished when the first handoff returned.
+        dropped_at_return: usize,
+        /// Ring-service ticks the loop ran while the drop was stuck.
+        ticks: usize,
+        /// Counts after filling the worker's queue.
+        queued: ReclaimCounts,
+        /// Counts after one more handoff to the stuck worker.
+        busy: ReclaimCounts,
+    }
+
+    #[test]
+    fn a_blocked_drop_never_stops_the_main_loop() {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let (stuck, entered, release) = blocking(&dropped);
+        let (done_tx, done_rx) = mpsc::channel();
+        let loop_dropped = Arc::clone(&dropped);
+        // The main loop: hand the stuck value off, keep ticking, fill
+        // the queue, then hand one more value to the busy worker.
+        let main = std::thread::spawn(move || {
+            let mut reclaim = PassReclaim::new();
+            reclaim.hand_off(stuck);
+            let dropped_at_return = loop_dropped.load(Ordering::SeqCst);
+            entered
+                .recv_timeout(WATCHDOG)
+                .expect("the worker took the stuck value");
+            let mut ticks = 0;
+            for _ in 0..3 {
+                ticks += 1;
+                std::thread::sleep(super::SERVICE_TICK);
+            }
+            for _ in 0..RECLAIM_QUEUE_DEPTH {
+                reclaim.hand_off(Tracked(Arc::clone(&loop_dropped)));
+            }
+            let queued = reclaim.counts();
+            reclaim.hand_off(Tracked(Arc::clone(&loop_dropped)));
+            let busy = reclaim.counts();
+            let _ = done_tx.send(LoopRecord {
+                dropped_at_return,
+                ticks,
+                queued,
+                busy,
+            });
+            reclaim
+        });
+        let Ok(record) = done_rx.recv_timeout(WATCHDOG) else {
+            let _ = release.send(());
+            panic!("watchdog: the reclaim handoff waited on a blocked drop");
+        };
+        let depth = RECLAIM_QUEUE_DEPTH as u64;
+        assert_eq!(
+            record,
+            LoopRecord {
+                dropped_at_return: 0,
+                ticks: 3,
+                queued: ReclaimCounts {
+                    worker_busy: 0,
+                    held: 0,
+                    handed: 1 + depth,
+                    inline: 0,
+                },
+                busy: ReclaimCounts {
+                    worker_busy: 1,
+                    held: 1,
+                    handed: 1 + depth,
+                    inline: 0,
+                },
+            }
+        );
+        release.send(()).expect("the stuck drop still waits");
+        let mut reclaim = main.join().expect("the main loop returns");
+        assert!(
+            wait_until(|| dropped.load(Ordering::SeqCst) == 1 + RECLAIM_QUEUE_DEPTH),
+            "the worker drains its queue once the drop returns"
+        );
+        // The next pass hands the custody to the freed worker.
+        assert!(
+            wait_until(|| {
+                reclaim.service();
+                reclaim.counts().held == 0
+            }),
+            "the custody hands off on a later pass"
+        );
+        assert_eq!(
+            reclaim.counts(),
+            ReclaimCounts {
+                worker_busy: reclaim.counts().worker_busy,
+                held: 0,
+                handed: 2 + depth,
+                inline: 0,
+            }
+        );
+        assert!(reclaim.counts().worker_busy >= 1);
+        assert!(
+            wait_until(|| dropped.load(Ordering::SeqCst) == 2 + RECLAIM_QUEUE_DEPTH),
+            "every value is reclaimed"
+        );
+    }
+
+    /// Teardown with the worker still stuck: the owner's drop returns
+    /// at once, and its custody (itself a blocking drop) is reclaimed
+    /// off the dropping thread once the daemon recovers.
+    #[test]
+    fn teardown_with_a_stuck_worker_never_waits() {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let (stuck, entered, release) = blocking(&dropped);
+        let (held, _held_entered, held_release) = blocking(&dropped);
+        let (done_tx, done_rx) = mpsc::channel();
+        let loop_dropped = Arc::clone(&dropped);
+        std::thread::spawn(move || {
+            let mut reclaim = PassReclaim::new();
+            reclaim.hand_off(stuck);
+            entered
+                .recv_timeout(WATCHDOG)
+                .expect("the worker took the stuck value");
+            for _ in 0..RECLAIM_QUEUE_DEPTH {
+                reclaim.hand_off(Tracked(Arc::clone(&loop_dropped)));
+            }
+            reclaim.hand_off(held);
+            let counts = reclaim.counts();
+            drop(reclaim);
+            let _ = done_tx.send(counts);
+        });
+        let Ok(counts) = done_rx.recv_timeout(WATCHDOG) else {
+            let _ = held_release.send(());
+            let _ = release.send(());
+            panic!("watchdog: the reclaim teardown waited on a blocked drop");
+        };
+        assert_eq!((counts.worker_busy, counts.held), (1, 1));
+        assert_eq!(dropped.load(Ordering::SeqCst), 0, "nothing dropped inline");
+        release.send(()).expect("the stuck drop still waits");
+        held_release.send(()).expect("the held drop still waits");
+        assert!(
+            wait_until(|| dropped.load(Ordering::SeqCst) == 2 + RECLAIM_QUEUE_DEPTH),
+            "the teardown custody is reclaimed off the dropping thread"
+        );
+    }
+
+    /// A panicking drop does not end the worker: later values still
+    /// reclaim on it.
+    #[test]
+    fn a_panicking_drop_keeps_the_worker() {
+        struct Panics;
+        impl Drop for Panics {
+            fn drop(&mut self) {
+                panic!("scripted reclaim drop panic");
+            }
+        }
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let mut reclaim = PassReclaim::new();
+        reclaim.hand_off(Panics);
+        reclaim.hand_off(Tracked(Arc::clone(&dropped)));
+        assert!(
+            wait_until(|| dropped.load(Ordering::SeqCst) == 1),
+            "the worker survives a panicking drop"
+        );
+        reclaim.hand_off(Tracked(Arc::clone(&dropped)));
+        assert!(wait_until(|| dropped.load(Ordering::SeqCst) == 2));
+        assert_eq!(reclaim.counts().inline, 0);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

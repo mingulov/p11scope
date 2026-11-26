@@ -8,6 +8,28 @@ use p11scope_discover::discover::discover;
 use std::path::PathBuf;
 use std::process::Command;
 
+/// A scratch directory that is removed when the test leaves it, even on
+/// failure: the padded fixtures are tens of megabytes and must not linger
+/// in the lane temp directory after a red run.
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    fn create(tag: &str) -> Self {
+        let path = std::env::temp_dir().join(format!("{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
 /// A selection-capable provider padded past MAX/25 with a sparse
 /// section: under per-read charging its ~25 full re-hashes would
 /// exhaust the 512 MiB allowance and refuse the discovery.
@@ -62,10 +84,8 @@ fn padded_provider(dir: &std::path::Path) -> PathBuf {
 
 #[test]
 fn provider_past_a_twenty_fifth_of_the_cap_still_discovers() {
-    let dir = std::env::temp_dir().join(format!("identify-budget-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let provider = padded_provider(&dir);
+    let dir = TempDir::create("identify-budget");
+    let provider = padded_provider(&dir.path);
     let len = std::fs::metadata(&provider).unwrap().len();
     // Non-vacuous precondition: past the point where per-read charging
     // over ~25 re-hashes would exhaust the allowance.
@@ -78,5 +98,5 @@ fn provider_past_a_twenty_fifth_of_the_cap_still_discovers() {
         p11scope_manifest::validate::validate_structure(&manifest).is_empty(),
         "the large discovery stays structurally valid"
     );
-    std::fs::remove_dir_all(dir).unwrap();
+    drop(dir);
 }

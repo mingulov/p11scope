@@ -45293,16 +45293,22 @@ int main(void) {
             "refresh 7 past the fold stages nothing: {staged:?}"
         );
         native.scene.coordinator.registry.publish();
-        assert!(
-            native
-                .scene
-                .coordinator
-                .registry
-                .gaps()
-                .iter()
-                .any(|gap| gap.subject == "revived folded count" && gap.reason.contains("(0, 7]")),
-            "the revival files a disclosed gap: {:?}",
-            native.scene.coordinator.registry.gaps()
+        let gaps: Vec<String> = native
+            .scene
+            .coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == "revived folded count")
+            .map(|gap| gap.reason.clone())
+            .collect();
+        assert_eq!(
+            gaps,
+            vec![
+                "the pair revived past a counted fold for absolute count range (3, 7] (4 unattributed calls); the folded base stays in the class aggregate and no pre-revival use is recorded"
+                    .to_string()
+            ],
+            "the revival files exactly the folded-base-excluded gap"
         );
         native.counts_read(Vec::new(), vec![(41, 1, 0, 10)]);
         let staged = native
@@ -45370,23 +45376,31 @@ int main(void) {
             1,
             "the oldest live fold drops with a counted overflow"
         );
-        for ticket in [42u64, 43] {
+        for (ticket, absolute) in [(42u64, 7u64), (43, 9)] {
             let row = native.row(ticket, 1, 7, at, 0);
             native.scene.coordinator.bind_pair_count(&row, caller, &[]);
-            native.counts_read(Vec::new(), vec![(ticket, 1, 0, 7)]);
+            native.counts_read(Vec::new(), vec![(ticket, 1, 0, absolute)]);
             native.scene.coordinator.registry.publish();
-            assert!(
-                native
-                    .scene
-                    .coordinator
-                    .registry
-                    .gaps()
-                    .iter()
-                    .any(|gap| gap.subject == "revived folded count"),
-                "remembered fold {ticket} gaps on revival: {:?}",
-                native.scene.coordinator.registry.gaps()
-            );
         }
+        let gaps: Vec<String> = native
+            .scene
+            .coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == "revived folded count")
+            .map(|gap| gap.reason.clone())
+            .collect();
+        assert_eq!(
+            gaps,
+            vec![
+                "the pair revived past a counted fold for absolute count range (3, 7] (4 unattributed calls); the folded base stays in the class aggregate and no pre-revival use is recorded"
+                    .to_string(),
+                "the pair revived past a counted fold for absolute count range (3, 9] (6 unattributed calls); the folded base stays in the class aggregate and no pre-revival use is recorded"
+                    .to_string(),
+            ],
+            "both remembered folds gap exactly on revival"
+        );
     }
 
     /// N2: folded-key memory evicts a gone task's fold first and
@@ -45458,23 +45472,31 @@ int main(void) {
             0,
             "evicting the gone fold counts nothing"
         );
-        for ticket in [41u64, 43] {
+        for (ticket, absolute) in [(41u64, 7u64), (43, 9)] {
             let row = native.row(ticket, 1, 7, at, 0);
             native.scene.coordinator.bind_pair_count(&row, caller, &[]);
-            native.counts_read(Vec::new(), vec![(ticket, 1, 0, 7)]);
+            native.counts_read(Vec::new(), vec![(ticket, 1, 0, absolute)]);
             native.scene.coordinator.registry.publish();
-            assert!(
-                native
-                    .scene
-                    .coordinator
-                    .registry
-                    .gaps()
-                    .iter()
-                    .any(|gap| gap.subject == "revived folded count"),
-                "remembered fold {ticket} gaps on revival: {:?}",
-                native.scene.coordinator.registry.gaps()
-            );
         }
+        let gaps: Vec<String> = native
+            .scene
+            .coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == "revived folded count")
+            .map(|gap| gap.reason.clone())
+            .collect();
+        assert_eq!(
+            gaps,
+            vec![
+                "the pair revived past a counted fold for absolute count range (3, 7] (4 unattributed calls); the folded base stays in the class aggregate and no pre-revival use is recorded"
+                    .to_string(),
+                "the pair revived past a counted fold for absolute count range (3, 9] (6 unattributed calls); the folded base stays in the class aggregate and no pre-revival use is recorded"
+                    .to_string(),
+            ],
+            "both remembered folds gap exactly on revival"
+        );
     }
 
     /// N2: a re-drop after a fold-and-bind clears the stale fold
@@ -45641,6 +45663,364 @@ int main(void) {
                 .all(|gap| gap.subject != "revived folded count"),
             "no spurious fold gap: {:?}",
             native.scene.coordinator.registry.gaps()
+        );
+    }
+
+    /// Devin #1: a revival of the exact key whose fold memory was
+    /// evicted for a live task still gaps instead of re-crediting:
+    /// the eviction latches the key's class, and the latched revival
+    /// discloses the outer-bound window with no base to rebase past.
+    #[test]
+    fn revival_past_an_evicted_fold_files_a_gap_and_never_recredits() {
+        let (mut native, caller) = NativeScene::new();
+        let at = native.stamps.tick();
+        native.scene.coordinator.set_pair_prune_cap_for_test(2);
+        for ticket in [90u64, 91] {
+            native.scene.coordinator.pair_dropped_tombstones.insert(
+                PairKey {
+                    image: DomainCookie::scripted(native.domain, ticket),
+                    exec: 1,
+                    object: 0,
+                },
+                PrunedPairBase {
+                    base: 9,
+                    base_since: at,
+                    pruned_since: at,
+                    pid: 7,
+                },
+            );
+        }
+        for (pass, ticket) in [41u64, 42, 43].iter().enumerate() {
+            let key = PairKey {
+                image: DomainCookie::scripted(native.domain, *ticket),
+                exec: 1,
+                object: 0,
+            };
+            native.scene.coordinator.pair_targets.insert(
+                key,
+                PairTarget::Dropped {
+                    base: 3,
+                    base_since: at,
+                    pid: 7,
+                },
+            );
+            native.scene.coordinator.prune_departed_native_state(
+                at + EXEC_STATE_GRACE_NS + pass as u64,
+            );
+        }
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .pair_fold_memory_overflow_for_test(),
+            1,
+            "the oldest live fold drops with a counted overflow"
+        );
+        // The evicted key (ticket 41, folded first) revives: no
+        // tombstone, no memory — the class latch must still gap it.
+        let row = native.row(41, 1, 7, at, 0);
+        native.scene.coordinator.bind_pair_count(&row, caller, &[]);
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 7)]);
+        let staged = native
+            .scene
+            .coordinator
+            .registry
+            .staged_pending_counts_for_test();
+        assert!(
+            staged.is_empty(),
+            "revival past the evicted fold stages nothing: {staged:?}"
+        );
+        native.scene.coordinator.registry.publish();
+        let gaps: Vec<String> = native
+            .scene
+            .coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == "revived folded count")
+            .map(|gap| gap.reason.clone())
+            .collect();
+        assert_eq!(
+            gaps,
+            vec![
+                "the pair revived past a counted fold for absolute count range (0, 7] (7 unattributed calls); the folded base stays in the class aggregate and no pre-revival use is recorded"
+                    .to_string()
+            ],
+            "the latched revival discloses the outer-bound window"
+        );
+    }
+
+    /// Devin #2: finishing a domain drops its folded pairs along
+    /// with its tombstones; other domains' entries stay. (Latch
+    /// halves arrive with the latch in GREEN.)
+    #[test]
+    fn finishing_a_domain_drops_its_folded_pairs_and_latches() {
+        let (mut native, _caller) = NativeScene::new();
+        let other = NativeDomainId::mint();
+        for (domain, ticket) in [(native.domain, 41u64), (other, 42)] {
+            native.scene.coordinator.pair_dropped_tombstones.insert(
+                PairKey {
+                    image: DomainCookie::scripted(domain, ticket),
+                    exec: 1,
+                    object: 0,
+                },
+                PrunedPairBase {
+                    base: 5,
+                    base_since: 100,
+                    pruned_since: 100,
+                    pid: 7,
+                },
+            );
+            native.scene.coordinator.pair_folded.insert(
+                PairKey {
+                    image: DomainCookie::scripted(domain, ticket),
+                    exec: 1,
+                    object: 1,
+                },
+                FoldedPair {
+                    pid: 7,
+                    folded_since: 100,
+                },
+            );
+        }
+        native.stage(NativeBatch::Finish {
+            domain: native.domain,
+        });
+        assert!(
+            !native
+                .scene
+                .coordinator
+                .pair_folded
+                .keys()
+                .any(|key| key.image.domain() == native.domain),
+            "the finished domain's folded pairs are gone"
+        );
+        assert_eq!(
+            native.scene.coordinator.pair_folded.len(),
+            1,
+            "the other domain's folded pair stays"
+        );
+        assert_eq!(
+            native.scene.coordinator.dropped_pair_tombstones_for_test(),
+            1,
+            "the other domain's tombstone stays"
+        );
+    }
+
+    /// Devin #3: the tombstone eviction sweep resumes past its first
+    /// window: a gone tombstone outside the first sweep is evicted
+    /// on a later pass before the due row folds.
+    #[test]
+    fn tombstone_eviction_sweep_resumes_past_its_first_window() {
+        let (mut native, _caller) = NativeScene::new();
+        let at = native.stamps.tick();
+        const EXTRA: usize = 4;
+        let total = EVER_ENUMERATED_SWEEP + EXTRA;
+        native
+            .scene
+            .coordinator
+            .set_pair_prune_cap_for_test(total);
+        for i in 0..EVER_ENUMERATED_SWEEP {
+            let pid = 100_000 + i as u32;
+            native.scene.source.spawn(pid, 500);
+            native.scene.coordinator.pair_dropped_tombstones.insert(
+                PairKey {
+                    image: DomainCookie::scripted(native.domain, 41),
+                    exec: 1,
+                    object: i as u32,
+                },
+                PrunedPairBase {
+                    base: 1,
+                    base_since: at + i as u64,
+                    pruned_since: at + i as u64,
+                    pid,
+                },
+            );
+        }
+        for i in 0..EXTRA {
+            native.scene.coordinator.pair_dropped_tombstones.insert(
+                PairKey {
+                    image: DomainCookie::scripted(native.domain, 41),
+                    exec: 1,
+                    object: (EVER_ENUMERATED_SWEEP + i) as u32,
+                },
+                PrunedPairBase {
+                    base: 1,
+                    base_since: at + 5000 + i as u64,
+                    pruned_since: at + 5000 + i as u64,
+                    pid: 200_000 + i as u32,
+                },
+            );
+        }
+        let due_key = PairKey {
+            image: DomainCookie::scripted(native.domain, 43),
+            exec: 1,
+            object: 0,
+        };
+        native.scene.coordinator.pair_targets.insert(
+            due_key,
+            PairTarget::Dropped {
+                base: 3,
+                base_since: at,
+                pid: 7,
+            },
+        );
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(at + EXEC_STATE_GRACE_NS);
+        assert!(
+            !native
+                .scene
+                .coordinator
+                .pair_dropped_tombstones
+                .contains_key(&due_key),
+            "the first sweep cannot finish, so the due row folds"
+        );
+        native.scene.coordinator.pair_targets.insert(
+            due_key,
+            PairTarget::Dropped {
+                base: 3,
+                base_since: at,
+                pid: 7,
+            },
+        );
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(at + EXEC_STATE_GRACE_NS + 1);
+        assert!(
+            !native
+                .scene
+                .coordinator
+                .pair_dropped_tombstones
+                .contains_key(&PairKey {
+                    image: DomainCookie::scripted(native.domain, 41),
+                    exec: 1,
+                    object: EVER_ENUMERATED_SWEEP as u32,
+                }),
+            "the resume sweep evicts the gone tombstone outside the first window"
+        );
+        assert!(
+            native
+                .scene
+                .coordinator
+                .pair_dropped_tombstones
+                .contains_key(&due_key),
+            "freed room keeps the second due row exact"
+        );
+    }
+
+    /// Devin #3: the folded-memory victim sweep resumes past its
+    /// first window: a gone fold outside it evicts silently on a
+    /// later pass instead of counting a live eviction.
+    #[test]
+    fn folded_victim_sweep_resumes_past_its_first_window() {
+        let (mut native, _caller) = NativeScene::new();
+        let at = native.stamps.tick();
+        const EXTRA: usize = 4;
+        let total = EVER_ENUMERATED_SWEEP + EXTRA;
+        native
+            .scene
+            .coordinator
+            .set_pair_prune_cap_for_test(total);
+        for i in 0..total {
+            let pid = 700_000 + i as u32;
+            native.scene.source.spawn(pid, 500);
+            native.scene.coordinator.pair_dropped_tombstones.insert(
+                PairKey {
+                    image: DomainCookie::scripted(native.domain, 90),
+                    exec: 1,
+                    object: i as u32,
+                },
+                PrunedPairBase {
+                    base: 1,
+                    base_since: at,
+                    pruned_since: at,
+                    pid,
+                },
+            );
+        }
+        for i in 0..EVER_ENUMERATED_SWEEP {
+            let pid = 800_000 + i as u32;
+            native.scene.source.spawn(pid, 500);
+            native.scene.coordinator.pair_folded.insert(
+                PairKey {
+                    image: DomainCookie::scripted(native.domain, 41),
+                    exec: 1,
+                    object: i as u32,
+                },
+                FoldedPair {
+                    pid,
+                    folded_since: at + i as u64,
+                },
+            );
+        }
+        for i in 0..EXTRA {
+            native.scene.coordinator.pair_folded.insert(
+                PairKey {
+                    image: DomainCookie::scripted(native.domain, 41),
+                    exec: 1,
+                    object: (EVER_ENUMERATED_SWEEP + i) as u32,
+                },
+                FoldedPair {
+                    pid: 900_000 + i as u32,
+                    folded_since: at + 5000 + i as u64,
+                },
+            );
+        }
+        let due_key = PairKey {
+            image: DomainCookie::scripted(native.domain, 43),
+            exec: 1,
+            object: 0,
+        };
+        native.scene.coordinator.pair_targets.insert(
+            due_key,
+            PairTarget::Dropped {
+                base: 3,
+                base_since: at,
+                pid: 7,
+            },
+        );
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(at + EXEC_STATE_GRACE_NS);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .pair_fold_memory_overflow_for_test(),
+            1,
+            "the first sweep cannot finish, so a live fold drops counted"
+        );
+        native.scene.coordinator.pair_targets.insert(
+            due_key,
+            PairTarget::Dropped {
+                base: 3,
+                base_since: at,
+                pid: 7,
+            },
+        );
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(at + EXEC_STATE_GRACE_NS + 1);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .pair_fold_memory_overflow_for_test(),
+            1,
+            "the resume sweep finds the gone fold and counts nothing more"
+        );
+        assert!(
+            !native.scene.coordinator.pair_folded.contains_key(&PairKey {
+                image: DomainCookie::scripted(native.domain, 41),
+                exec: 1,
+                object: EVER_ENUMERATED_SWEEP as u32,
+            }),
+            "the gone fold outside the first window evicts on resume"
         );
     }
 

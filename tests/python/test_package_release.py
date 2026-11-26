@@ -356,6 +356,85 @@ class PackageReleaseTests(unittest.TestCase):
         for name, value in capped.items():
             self.assertEqual(value, "", f"file capability on {name}")
 
+    def test_system_package_metadata_names_floor_licenses_and_copyright(self):
+        self.package()
+        deb = self.output / "p11scope_0.1.0_amd64.deb"
+        rpm = self.output / "p11scope-0.1.0-1.x86_64.rpm"
+        # The bundled glibc helper needs glibc 2.34: apt must refuse
+        # older systems at install time instead of failing at runtime.
+        fields = subprocess.run(
+            ["dpkg-deb", "-f", str(deb), "Package", "Version", "Depends", "Installed-Size"],
+            check=True, capture_output=True, text=True, timeout=30).stdout
+        self.assertIn("Package: p11scope\n", fields)
+        self.assertIn("Version: 0.1.0\n", fields)
+        self.assertIn("Depends: libc6 (>= 2.34)\n", fields)
+        # Installed-Size is the installed payload in KiB, rounded up,
+        # recomputed here from the extracted bytes, not the formula.
+        payload = self.base / "deb-payload"
+        payload.mkdir()
+        subprocess.run(["dpkg-deb", "-x", str(deb), str(payload)],
+                       check=True, capture_output=True, timeout=30)
+        installed = sum(path.stat().st_size for path in payload.rglob("*") if path.is_file())
+        self.assertIn(f"Installed-Size: {(installed + 1023) // 1024}\n", fields)
+        # One SPDX expression covers the userspace, BPF and statically
+        # linked portions; the Debian copyright file carries the same split.
+        license_text = subprocess.run(
+            ["rpm", "-qp", "--qf", "%{LICENSE}\n", str(rpm)],
+            check=True, capture_output=True, text=True, timeout=30).stdout
+        self.assertEqual(license_text,
+                         "GPL-3.0-or-later AND GPL-2.0-only AND MIT AND Apache-2.0\n")
+        copyright_text = (payload / "usr/share/doc/p11scope/copyright").read_text()
+        self.assertTrue(copyright_text.startswith(
+            "Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/\n"))
+        for stanza in ("License: GPL-3.0-or-later", "License: GPL-2.0-only",
+                       "License: MIT and Apache-2.0"):
+            self.assertIn(stanza, copyright_text)
+        rpm_files = subprocess.run(["rpm", "-qlp", str(rpm)], check=True,
+                                   capture_output=True, text=True, timeout=30).stdout
+        self.assertIn("/usr/share/doc/p11scope/copyright\n", rpm_files)
+
+    def test_p0_artifacts_carry_distinct_names(self):
+        (self.receipt / "facts.log").write_text(
+            self.facts.replace("capture_mode\tfull", "capture_mode\tp0"))
+        PACKAGE.package(self.root, self.receipt, self.notices, self.source,
+                        self.output, capture_mode="p0")
+        expected = {
+            "p11scope-0.1.0+p0-x86_64-linux-musl.tar.gz",
+            "p11scope-discover-0.1.0+p0-x86_64-linux-gnu.tar.gz",
+            "p11scope-discover-0.1.0+p0-x86_64-linux-musl.tar.gz",
+            "p11scope-0.1.0+p0-source.tar.gz",
+            "p11scope_0.1.0+p0_amd64.deb", "p11scope-0.1.0+p0-1.x86_64.rpm",
+            "RELEASE.json", "SHA256SUMS",
+        }
+        self.assertEqual({path.name for path in self.output.iterdir()}, expected)
+        release = json.loads((self.output / "RELEASE.json").read_bytes())
+        self.assertEqual(release["packages"]["deb"]["file"], "p11scope_0.1.0+p0_amd64.deb")
+        self.assertEqual(release["packages"]["rpm"]["file"], "p11scope-0.1.0+p0-1.x86_64.rpm")
+        version = subprocess.run(
+            ["dpkg-deb", "-f", str(self.output / "p11scope_0.1.0+p0_amd64.deb"), "Version"],
+            check=True, capture_output=True, text=True, timeout=30).stdout
+        self.assertEqual(version, "0.1.0+p0\n")
+        identity = subprocess.run(
+            ["rpm", "-qp", "--qf", "%{NAME} %{VERSION} %{RELEASE} %{ARCH}\n",
+             str(self.output / "p11scope-0.1.0+p0-1.x86_64.rpm")],
+            check=True, capture_output=True, text=True, timeout=30).stdout
+        self.assertEqual(identity, "p11scope 0.1.0+p0 1 x86_64\n")
+
+    def test_release_records_packaging_tool_versions(self):
+        clang = "Ubuntu clang version 18.1.3 (1ubuntu1)"
+        (self.receipt / "facts.log").write_text(self.facts + f"clang_18_version\t{clang}\n")
+        self.package()
+        release = json.loads((self.output / "RELEASE.json").read_bytes())
+        # The receipt's clang fact flows through verbatim: a rebuild
+        # "with network" after an archive update stays identifiable.
+        self.assertEqual(release["clang-18"], clang)
+        tools = release["package_tools"]
+        self.assertEqual(set(tools), {"dpkg-deb", "rpmbuild", "zlib1g"})
+        for name, value in tools.items():
+            self.assertTrue(value and value == value.strip()
+                            and all(ord(char) >= 32 for char in value),
+                            f"packaging tool version must be one clean line: {name}")
+
     def test_default_provenance_is_full_capture(self):
         result = self.package()
         self.assertEqual(result["p11scope_features"], [])

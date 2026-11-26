@@ -31523,6 +31523,24 @@ int main(int argc, char **argv) {
         );
     }
 
+    /// #6: `note_outputs_attempted` answers whether a stop was already
+    /// counted — the detach hint reads `again` after a counted stop
+    /// and `twice` after a `--duration` end.
+    #[test]
+    fn note_outputs_attempted_reports_a_previously_counted_stop() {
+        // A duration end counts no stop: the hint reads `twice`. No
+        // handlers installed, no signals raised.
+        let fresh = crate::inventory_dashboard::StopFlag::test_without_handlers();
+        assert!(!fresh.note_outputs_attempted());
+        // A counted stop reads `again`.
+        let _signal_guard = ACTUAL_SIGNAL_TEST.lock().unwrap();
+        let flag = crate::inventory_dashboard::StopFlag::install().unwrap();
+        // SAFETY: raise() with a handled signal; the handler only counts.
+        assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
+        assert!(flag.stopped());
+        assert!(flag.note_outputs_attempted());
+    }
+
     /// F-T4-5: the owned command starts with SIGPIPE at its default. The
     /// Rust runtime ignores SIGPIPE and an ignored disposition survives
     /// `execve`, so without the reset the observed program sees EPIPE

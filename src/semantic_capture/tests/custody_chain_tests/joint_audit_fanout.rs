@@ -31846,6 +31846,20 @@ fn joint_stop_loss_predicate_table_publishes_counted_loss() {
             leftover_claims: 0,
             unattributed_rows: 0,
         },
+        // S0b: staged head with an invocation whose open entry is
+        // gone (its claims stay): the unmapped-present arm finds no
+        // entry and disposes the counted difference.
+        R4Row {
+            name: "open_dropped_end",
+            push: P::Complete,
+            begin_only: false,
+            takes: T::StoppedCapture,
+            corrupt: C::OpenDropped,
+            unclaimed: U::None,
+            expect: loss,
+            leftover_claims: 2,
+            unattributed_rows: 0,
+        },
         // S0b: staged head whose open entry is gone (its claims stay).
         R4Row {
             name: "open_dropped",

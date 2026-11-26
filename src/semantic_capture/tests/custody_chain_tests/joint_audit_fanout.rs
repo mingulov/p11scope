@@ -811,6 +811,10 @@ impl crate::inventory_semantics::JointMachineIo for HeldMachineIo<'_> {
         slot: u32,
         adapter: &mut JournalAdapter,
     ) -> Result<CommittedAbsenceBirth, BirthObservationRefusal> {
+        // The same final-latch preflight the production acquisition
+        // runs before any drain, cut or proof read: an ended or busy
+        // capture refuses here, never after a fallible read.
+        self.h0.0.borrow().capture.absence_acquire_gate()?;
         let before = self
             .drain
             .consumption_cut()
@@ -5817,6 +5821,251 @@ fn joint_machine_absence_before_appearance_publishes_first_joint() {
             .ledger()
             .roles_for_test()[..4],
         [0, 0, 0, 0]
+    );
+}
+
+/// The machine's scripted absence double runs the production
+/// final-latch preflight before any drain, endpoint or proof read,
+/// like the live acquisition entry: an ended capture refuses with
+/// its exact latch even when the drain holds an unconsumed record or
+/// the slot is unknown, busyness never outranks a latch, and a
+/// healthy capture surfaces the original drain or attachment error.
+/// Every refusal performs no proof-side operation (no absence read).
+#[test]
+fn joint_machine_double_acquire_preflights_final_latches_first() {
+    use crate::semantics_objects::journal::tests::AttestationFixture;
+    // The binding is never reached: every row refuses at the gate,
+    // the drain or the endpoint read, before the proof or the commit.
+    let probe = AttestationFixture::new_with_quiet_function(ImageIdentity {
+        task_cookie: 71,
+        exec_id: 0,
+    });
+    let binding = probe.binding();
+    let mut outcomes = Vec::new();
+    // busy: 0 = idle, 1 = a queued scan job, 2 = an awaited record.
+    // fault: 0 = a healthy drain and slot, 1 = an unconsumed drain
+    // record, 2 = an unknown slot.
+    for (busy, stopped, exhausted, image_failed, fault) in [
+        (0, true, false, false, 0),
+        (0, false, true, false, 0),
+        (0, false, false, true, 0),
+        (0, true, false, false, 1),
+        (0, false, true, false, 1),
+        (0, false, false, true, 1),
+        (0, true, false, false, 2),
+        (0, false, true, false, 2),
+        (0, false, false, true, 2),
+        (1, true, false, false, 1),
+        (2, true, false, false, 1),
+        (0, false, false, false, 1),
+        (0, false, false, false, 2),
+    ] {
+        let mut fixture = MachineScene::with_initial_files(2, &[0], true);
+        assert!(
+            fixture
+                .scene
+                .drain
+                .consumption_cut()
+                .expect("a fresh scene drain takes a cut")
+                .is_drained(),
+            "precondition: the fresh drain is idle"
+        );
+        {
+            let mut held = fixture.scene.real.h0.0.borrow_mut();
+            held.capture.stopped = stopped;
+            held.capture.exhausted = exhausted;
+            held.capture.image_failed = image_failed;
+            held.capture.jobs.clear();
+            held.capture.awaiting.clear();
+            // The gate only tests emptiness, never the queued content.
+            if busy == 1 {
+                let job = ScanJob {
+                    image: held.io.script.current_image,
+                    endpoint: Endpoint {
+                        object: crate::discovery::identity::PinnedObjectId(0),
+                        file_slot: 0,
+                        offset: 0,
+                    },
+                    slot: 0,
+                    pin: held.io.script.pin.clone(),
+                    deadline: held.io.script.now,
+                    birth_cut: None,
+                };
+                held.capture.jobs.push_back(job);
+            }
+            if busy == 2 {
+                held.io.script.call(1, 0);
+                let record = held
+                    .io
+                    .script
+                    .records
+                    .pop_front()
+                    .expect("a scripted awaited record");
+                held.capture.awaiting.insert(
+                    7,
+                    Awaiting {
+                        record,
+                        endpoint: None,
+                        collected_origin: None,
+                    },
+                );
+            }
+        }
+        if fault == 1 {
+            fixture
+                .scene
+                .push(std::process::id(), 0, "C_GetSessionInfo", 1);
+            assert!(
+                !fixture
+                    .scene
+                    .drain
+                    .consumption_cut()
+                    .expect("the poisoned drain takes a cut")
+                    .is_drained(),
+                "the pushed record leaves the drain unconsumed"
+            );
+        }
+        // Only the unknown slot is ever read (fault 2 refuses at the
+        // endpoint read); every other row refuses at the gate or the
+        // drain first.
+        let slot = if fault == 2 { u32::MAX } else { 0 };
+        let reads_before = fixture.native.absence_reads.len();
+        let taken = {
+            let MachineScene { scene, native, .. } = &mut fixture;
+            let mut io = HeldMachineIo {
+                drain: &mut scene.drain,
+                h0: &scene.real.h0,
+                producers: &scene.producers,
+                attached: scene.attached.as_ref().unwrap(),
+                native,
+                finish: None,
+                live_discovery: None,
+                stage_probe: None,
+            };
+            let adapter = scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture_mut()
+                .adapter_mut();
+            crate::inventory_semantics::JointMachineIo::acquire_absence(
+                &mut io,
+                &mut scene.real.lane,
+                binding,
+                slot,
+                adapter,
+            )
+            .map(|_| ())
+        };
+        outcomes.push((
+            (busy, stopped, exhausted, image_failed, fault),
+            taken,
+            fixture.native.absence_reads.len() - reads_before,
+        ));
+    }
+    assert_eq!(
+        outcomes,
+        vec![
+            (
+                (0, true, false, false, 0),
+                Err(BirthObservationRefusal::Stopped),
+                0
+            ),
+            (
+                (0, false, true, false, 0),
+                Err(BirthObservationRefusal::AuthorityExhausted),
+                0
+            ),
+            (
+                (0, false, false, true, 0),
+                Err(BirthObservationRefusal::CoverageFailed),
+                0
+            ),
+            (
+                (0, true, false, false, 1),
+                Err(BirthObservationRefusal::Stopped),
+                0
+            ),
+            (
+                (0, false, true, false, 1),
+                Err(BirthObservationRefusal::AuthorityExhausted),
+                0
+            ),
+            (
+                (0, false, false, true, 1),
+                Err(BirthObservationRefusal::CoverageFailed),
+                0
+            ),
+            (
+                (0, true, false, false, 2),
+                Err(BirthObservationRefusal::Stopped),
+                0
+            ),
+            (
+                (0, false, true, false, 2),
+                Err(BirthObservationRefusal::AuthorityExhausted),
+                0
+            ),
+            (
+                (0, false, false, true, 2),
+                Err(BirthObservationRefusal::CoverageFailed),
+                0
+            ),
+            (
+                (1, true, false, false, 1),
+                Err(BirthObservationRefusal::Stopped),
+                0
+            ),
+            (
+                (2, true, false, false, 1),
+                Err(BirthObservationRefusal::Stopped),
+                0
+            ),
+            (
+                (0, false, false, false, 1),
+                Err(BirthObservationRefusal::StreamCut),
+                0
+            ),
+            (
+                (0, false, false, false, 2),
+                Err(BirthObservationRefusal::AttachmentMismatch),
+                0
+            ),
+        ],
+        "the double preflights the final latches before any drain, endpoint or proof read"
+    );
+}
+
+/// The gated scripted double still acquires a healthy absence: the
+/// fake proof executes and the machine retains the negative. The
+/// capture is idle with clear latches (control for the preflight
+/// matrix above).
+#[test]
+fn joint_machine_double_acquire_commits_healthy_absence() {
+    let mut fixture = MachineScene::absence_scene(2);
+    {
+        let held = fixture.scene.real.h0.0.borrow();
+        assert!(
+            !held.capture.stopped && !held.capture.exhausted && !held.capture.image_failed,
+            "precondition: the control capture is live"
+        );
+        assert!(
+            held.capture.jobs.is_empty() && held.capture.awaiting.is_empty(),
+            "precondition: the control capture is idle"
+        );
+    }
+    fixture.wait_absence(1);
+    assert!(
+        fixture.pending_absence(1).is_some(),
+        "the healthy absence commits through the gated double"
+    );
+    assert!(
+        fixture
+            .native
+            .absence_reads
+            .iter()
+            .any(|(_, _, file)| *file == 1),
+        "the fake proof executed for the committed file"
     );
 }
 

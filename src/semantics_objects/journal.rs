@@ -30309,12 +30309,25 @@ pub(crate) mod tests {
             scene.adapter.consumed_through,
             scene.closure_generation(),
         );
+        let visits_before = scene.adapter.barrier_row_visits_for_test();
         let gap = scene.seal(&birth).err().map(|failure| failure.gap);
+        let visits = scene.adapter.barrier_row_visits_for_test() - visits_before;
         let marks = scene
             .adapter
             .death_marks
             .get(&proof.key)
             .map(|marks| (marks.straddler, marks.straddlers_unscanned));
+        // No entry at all: the mismatch arm records death marks only
+        // for a straddler or an unscanned remainder, so absence is the
+        // no-bound verdict. The visit count below proves the scan ran.
+        assert!(
+            marks.is_none(),
+            "an unfenced refused tail records no death-marks entry: neither a straddler nor a bound"
+        );
+        assert_eq!(
+            visits, 1,
+            "the paid scan visits exactly the deciding row; the second refusal stays unread"
+        );
         assert_eq!(
             (gap, marks.unwrap_or((None, false))),
             (Some(JournalGap::BootstrapMismatch), (None, false)),

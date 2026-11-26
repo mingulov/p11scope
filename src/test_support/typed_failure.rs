@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-// SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
+//! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Typed failure records for known-failing privileged lib tests.
 //!
 //! The privileged runner points `P11SCOPE_TYPED_FAILURE_PATH` at one empty

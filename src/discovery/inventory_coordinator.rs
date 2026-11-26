@@ -851,15 +851,15 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// first (a gone task cannot revive); a live eviction counts in
     /// `pair_fold_memory_overflow` and names the limit.
     pair_folded: HashMap<PairKey, FoldedPair>,
-    /// Fold-loss latch per evicted live task (domain, image, object):
-    /// set when a live fold evicts past the bound. A revival-shaped
-    /// staging with no fold memory under a latched key files the
+    /// Fold-loss latch per exact evicted pair: set when a live fold
+    /// evicts past the bound. Only the evicted key's own
+    /// revival-shaped staging with no fold memory files the
     /// fold-revival gap over the outer-bound window instead of
-    /// re-crediting, then consumes the latch, so forgotten folds can
-    /// never silently re-credit while healthy keys stage normally.
-    /// Cleared per domain at finish, like every other per-domain
-    /// departed structure.
-    pair_fold_lost: HashSet<PairFoldLatchKey>,
+    /// re-crediting, then consumes the latch — a neighbor generation
+    /// can neither take the gap nor burn it, so healthy keys stage
+    /// normally. Cleared per domain at finish, like every other
+    /// per-domain departed structure.
+    pair_fold_lost: HashSet<PairKey>,
     /// Folded-key memory evictions of live tasks past the bound
     /// (sticky, saturating; counted once). Each one latches its
     /// evicted key above.
@@ -5192,7 +5192,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             ),
             pair_fold_lost: counter_row(
                 self.pair_fold_lost.len(),
-                size_of::<PairFoldLatchKey>(),
+                size_of::<PairKey>(),
                 HEAP_MAP_ENTRY,
             ),
             preadmission: counter_row(
@@ -7124,11 +7124,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 continue;
             }
             self.pair_fold_memory_overflow = self.pair_fold_memory_overflow.saturating_add(1);
-            self.pair_fold_lost.insert(PairFoldLatchKey {
-                domain: victim.image.domain(),
-                image: victim.image,
-                object: victim.object,
-            });
+            self.pair_fold_lost.insert(victim);
             shortfall -= 1;
         }
     }
@@ -7144,11 +7140,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         {
             self.pair_folded.remove(&victim);
             self.pair_fold_memory_overflow = self.pair_fold_memory_overflow.saturating_add(1);
-            self.pair_fold_lost.insert(PairFoldLatchKey {
-                domain: victim.image.domain(),
-                image: victim.image,
-                object: victim.object,
-            });
+            self.pair_fold_lost.insert(victim);
         }
         self.pair_folded.insert(
             key,
@@ -10242,7 +10234,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // of misfiring on a later domain's same-class keys.
         self.pair_folded
             .retain(|key, _| key.image.domain() != domain);
-        self.pair_fold_lost.retain(|latch| latch.domain != domain);
+        self.pair_fold_lost
+            .retain(|key| key.image.domain() != domain);
     }
 
     /// `LEADER_EXIT` records (H6 slice 2): a leader exit whose generation
@@ -11970,9 +11963,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // base (it lives only in the class aggregate): disclose the
         // window past the folded base and rebase the live target past
         // the current absolute so only post-revival growth stages. A
-        // revival-shaped staging with no fold memory under a latched
-        // key (the memory evicted that task's live fold past the
-        // bound) discloses the outer-bound window instead of
+        // revival-shaped staging with no fold memory for the exact
+        // evicted key (the memory evicted that pair's live fold past
+        // the bound) discloses the outer-bound window instead of
         // re-crediting, then consumes the latch so later growth
         // stages. Zero observations leave the memory for the first
         // nonzero staging. Exact memory first; the latch covers
@@ -11996,12 +11989,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     if advanced {
                         return None;
                     }
-                    let latch = PairFoldLatchKey {
-                        domain: key.image.domain(),
-                        image: key.image,
-                        object: key.object,
-                    };
-                    self.pair_fold_lost.remove(&latch).then_some(0)
+                    // Exact evicted key only: a neighbor generation
+                    // shares the image but never this latch.
+                    self.pair_fold_lost.remove(&key).then_some(0)
                 }
             }
         });
@@ -15822,19 +15812,6 @@ impl PairKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct PairKeyClass {
     domain: NativeDomainId,
-    object: u32,
-}
-
-/// A lost fold's revival tripwire: the evicted live task's domain,
-/// image cookie and object. Narrower than the class aggregate (a
-/// live eviction means the task is still alive, so its cookie
-/// identifies it): healthy keys under other images stage normally.
-/// Consumed per key after its gap fires, so later growth stages.
-/// Cleared per domain at finish; the census discloses its size.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct PairFoldLatchKey {
-    domain: NativeDomainId,
-    image: DomainCookie,
     object: u32,
 }
 
@@ -46189,9 +46166,9 @@ int main(void) {
                 .scene
                 .coordinator
                 .pair_fold_lost
-                .contains(&PairFoldLatchKey {
-                    domain: native.domain,
+                .contains(&PairKey {
                     image: DomainCookie::scripted(native.domain, 41),
+                    exec: 9,
                     object: 0,
                 }),
             "the advance preserves the latch for the evicted key"
@@ -46512,15 +46489,11 @@ int main(void) {
                     base: 3,
                 },
             );
-            native
-                .scene
-                .coordinator
-                .pair_fold_lost
-                .insert(PairFoldLatchKey {
-                    domain,
-                    image: DomainCookie::scripted(domain, ticket),
-                    object: 1,
-                });
+            native.scene.coordinator.pair_fold_lost.insert(PairKey {
+                image: DomainCookie::scripted(domain, ticket),
+                exec: 1,
+                object: 1,
+            });
         }
         native.stage(NativeBatch::Finish {
             domain: native.domain,
@@ -46531,7 +46504,7 @@ int main(void) {
                 .coordinator
                 .pair_fold_lost
                 .iter()
-                .any(|latch| latch.domain == native.domain),
+                .any(|key| key.image.domain() == native.domain),
             "the finished domain's fold-loss latches are gone"
         );
         assert_eq!(

@@ -2969,10 +2969,10 @@ The old bounds are measurements, not a product startup SLA.
   holds) and rebases past the current absolute instead of re-crediting;
   remembered folds past their own bound drop the oldest fold in the
   visited window with a counted `pair_fold_memory_overflow` naming the
-  limit, and each dropped live fold latches its (domain, image,
-  object) key: a revival-shaped staging with no fold memory under a
-  latched key files the same gap over the outer-bound window instead
-  of re-crediting, then consumes the latch so later growth stages.
+  limit, and each dropped live fold latches its exact evicted pair:
+  only that pair's own revival-shaped staging with no fold memory
+  files the same gap over the outer-bound window instead of
+  re-crediting, then consumes the latch so later growth stages.
   Room for a pass's folds is pre-evicted once per pass with a single
   window of probes; the due loop then only inserts. Both victim
   sweeps rotate oldest-first with a resume cursor, like the age drain,

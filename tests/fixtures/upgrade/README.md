@@ -90,7 +90,8 @@ captures (the scripts take the repo privileged lock themselves).
    upgrade-f2 --so-pin 1234 --pin 1234`, then prime the id the
    signer finds: `$TMPDIR/f2/bin/creator <provider> 1234 0102`.
 4. Capture every sanitizer input (tag is the observer release;
-   scan is unprivileged, the rest take the privileged lock):
+   scan is unprivileged, the rest take the privileged lock;
+   create each out dir first):
    - `tools/capture-single.sh <v071-observer> v071 <out>` →
      `v071-inventory-scan.json`, `v071-inventory-native.json`
    - `tools/capture-churn.sh <observer> <tag> <out>` with tags

@@ -1763,6 +1763,10 @@ fn scale4097_inner(
         // rows (calls, CKR_OK returns) plus folded entry/API-return
         // totals. The per-edge "observed" string folds into the label
         // distribution, so the populated-mechanisms proof stands in.
+        // Only aggregates that folded the ledger caller count: the
+        // identities must name ledger_pid, and every mechanism must
+        // carry its returns rows (an aggregate without returns proves
+        // nothing about the ledger's API results).
         let modules = report
             .get("modules")
             .and_then(serde_json::Value::as_array)
@@ -1770,6 +1774,17 @@ fn scale4097_inner(
         for departed in modules
             .iter()
             .filter_map(|module| module.get("departed_use"))
+            .filter(|departed| {
+                departed
+                    .get("identities")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|identities| {
+                        identities.iter().any(|ident| {
+                            ident.get("pid").and_then(serde_json::Value::as_u64)
+                                == Some(u64::from(ledger_pid))
+                        })
+                    })
+            })
         {
             let Some(mechanisms) = departed
                 .get("mechanisms")
@@ -1787,15 +1802,14 @@ fn scale4097_inner(
                     .get("calls")
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(0);
-                if let Some(returns) = mechanism
+                let returns = mechanism
                     .get("evidence")
                     .and_then(|evidence| evidence.get("returns"))
                     .and_then(serde_json::Value::as_array)
-                {
-                    ok |= returns
-                        .iter()
-                        .any(|ret| ret.get("rv").and_then(serde_json::Value::as_u64) == Some(0));
-                }
+                    .context("mechanism returns")?;
+                ok |= returns
+                    .iter()
+                    .any(|ret| ret.get("rv").and_then(serde_json::Value::as_u64) == Some(0));
             }
             if calls == 0 || !ok {
                 continue;

@@ -56157,19 +56157,8 @@ fn merge_preflight_agrees_with_merge_on_failure_modes() {
         ordinals: Vec<u32>,
         pins: PinnedObjects,
         facts: CaptureFacts,
-        plan: plan::AttachPlan,
     }
     let object_without_identity = PinnedObjectId(999);
-    // Pin-mode plans carry their own consistent pins: every plan
-    // object is pinned except the targeted one, and the remaining
-    // inputs are minimal-valid (as in the class test) so the pin
-    // checks are what fail.
-    let (mut module_pin_plan, module_pin_pins) = plan_with_pins(2, 0);
-    module_pin_plan.modules[0].object = PinnedObjectId(424242);
-    module_pin_plan.modules[0].path = "/opt/p11-missing.so".to_string();
-    let (mut slot_pin_plan, slot_pin_pins) = plan_with_pins(2, 0);
-    slot_pin_plan.slots[1].object = PinnedObjectId(424243);
-    slot_pin_plan.slots[1].object_path = "/opt/p11-gone.so".to_string();
     let modes = vec![
         FailureMode {
             name: "ordinal mismatch",
@@ -56178,7 +56167,6 @@ fn merge_preflight_agrees_with_merge_on_failure_modes() {
             ordinals: Vec::new(),
             pins: engine.pinned.clone(),
             facts: engine.capture_facts.clone(),
-            plan: plan.clone(),
         },
         FailureMode {
             name: "module without opened identity",
@@ -56195,7 +56183,6 @@ fn merge_preflight_agrees_with_merge_on_failure_modes() {
             ordinals: Vec::new(),
             pins: engine.pinned.clone(),
             facts: engine.capture_facts.clone(),
-            plan: plan.clone(),
         },
         FailureMode {
             name: "module without stable ID",
@@ -56204,7 +56191,6 @@ fn merge_preflight_agrees_with_merge_on_failure_modes() {
             ordinals: Vec::new(),
             pins: engine.pinned.clone(),
             facts: CaptureFacts::default(),
-            plan: plan.clone(),
         },
         FailureMode {
             name: "table without parallel identities",
@@ -56221,7 +56207,6 @@ fn merge_preflight_agrees_with_merge_on_failure_modes() {
             ordinals: Vec::new(),
             pins: engine.pinned.clone(),
             facts: engine.capture_facts.clone(),
-            plan: plan.clone(),
         },
         FailureMode {
             name: "entry target without identity",
@@ -56241,7 +56226,6 @@ fn merge_preflight_agrees_with_merge_on_failure_modes() {
             ordinals: Vec::new(),
             pins: engine.pinned.clone(),
             facts: engine.capture_facts.clone(),
-            plan: plan.clone(),
         },
         FailureMode {
             name: "manifest without pinned identity",
@@ -56250,30 +56234,11 @@ fn merge_preflight_agrees_with_merge_on_failure_modes() {
             ordinals: vec![0],
             pins: engine.pinned.clone(),
             facts: engine.capture_facts.clone(),
-            plan: plan.clone(),
-        },
-        FailureMode {
-            name: "planned module without pin",
-            modules: Vec::new(),
-            manifests: Vec::new(),
-            ordinals: Vec::new(),
-            pins: module_pin_pins.clone(),
-            facts: CaptureFacts::default(),
-            plan: module_pin_plan.clone(),
-        },
-        FailureMode {
-            name: "active slot without pin",
-            modules: Vec::new(),
-            manifests: Vec::new(),
-            ordinals: Vec::new(),
-            pins: slot_pin_pins.clone(),
-            facts: CaptureFacts::default(),
-            plan: slot_pin_plan.clone(),
         },
     ];
     for mode in modes {
         let preflight = match mode.facts.resolve_merge_inputs(
-            &mode.plan,
+            &plan,
             &mode.pins,
             &mode.modules,
             &mode.manifests,
@@ -56284,7 +56249,7 @@ fn merge_preflight_agrees_with_merge_on_failure_modes() {
         };
         let mut attempted = mode.facts.clone();
         let merge = match attempted.merge_current(
-            &mode.plan,
+            &plan,
             &mode.pins,
             &mode.modules,
             &mode.manifests,
@@ -87073,19 +87038,19 @@ fn tails_with_missing_module_pin_publish_others_plus_gap() {
             engine.published_facts_revision > published_before,
             "tail {tail}: the publication advances instead of freezing"
         );
-        let paths: Vec<&str> = engine
+        let ids: Vec<_> = engine
             .discovery
             .modules
             .iter()
-            .map(|module| module.path.as_str())
+            .map(|module| module.id)
             .collect();
         assert!(
-            paths.contains(&healthy.path.as_str()),
-            "tail {tail}: the healthy module publishes: {paths:?}"
+            ids.contains(&healthy.id),
+            "tail {tail}: the healthy module publishes: {ids:?}"
         );
         assert!(
-            !paths.contains(&victim.path.as_str()),
-            "tail {tail}: the pinless module drops its rows: {paths:?}"
+            ids.contains(&victim.id),
+            "tail {tail}: the pinless module keeps its last-known rows, gapped: {ids:?}"
         );
         let expected = format!(
             "planned object '{}' lost its comparable pin before evidence rendered; its calls are unattributed",

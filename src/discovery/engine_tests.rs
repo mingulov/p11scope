@@ -13034,6 +13034,20 @@ fn maps_have_executable_image(maps: &str, image: &std::path::Path) -> bool {
     })
 }
 
+/// True when `maps` shows a settled child: the image has an executable
+/// mapping and — for a dynamically linked image — its PT_INTERP loader has
+/// one too (`None` loader: a static image, settled on the image alone).
+/// Split out so the loader clause has a deterministic unit test;
+/// `wait_sleep_child_settled` applies it to live `/proc` reads.
+fn sleep_child_maps_settled(
+    maps: &str,
+    image: &std::path::Path,
+    loader: Option<&std::path::Path>,
+) -> bool {
+    maps_have_executable_image(maps, image)
+        && loader.is_none_or(|loader| maps_have_executable_image(maps, loader))
+}
+
 #[test]
 fn exec_readiness_needs_the_new_images_executable_mapping() {
     let image = std::path::Path::new("/usr/bin/busybox");
@@ -13059,6 +13073,34 @@ fn exec_readiness_needs_the_new_images_executable_mapping() {
          560000001000-560000090000 r-xp 00001000 00:23 42                         /usr/bin/busybox\n",
         image
     ));
+}
+
+#[test]
+fn settle_readiness_needs_the_loaders_executable_mapping_too() {
+    let image = std::path::Path::new("/usr/bin/sleep");
+    let loader = std::path::Path::new("/lib64/ld-linux-x86-64.so.2");
+    let image_row = "560000001000-560000002000 r-xp 00001000 00:23 42 /usr/bin/sleep\n";
+    // Image mapped but the loader not yet: not settled (the loader clause).
+    assert!(!sleep_child_maps_settled(image_row, image, Some(loader)));
+    // A mapped-but-not-executable loader row does not count either.
+    assert!(!sleep_child_maps_settled(
+        "560000001000-560000002000 r-xp 00001000 00:23 42 /usr/bin/sleep\n\
+         7f0000000000-7f0000001000 r--p 00000000 00:23 43 /lib64/ld-linux-x86-64.so.2\n",
+        image,
+        Some(loader),
+    ));
+    // Both executable: settled.
+    assert!(sleep_child_maps_settled(
+        "560000001000-560000002000 r-xp 00001000 00:23 42 /usr/bin/sleep\n\
+         7f0000001000-7f0000002000 r-xp 00001000 00:23 43 /lib64/ld-linux-x86-64.so.2\n",
+        image,
+        Some(loader),
+    ));
+    // Static image (no loader): the image alone settles.
+    assert!(sleep_child_maps_settled(image_row, image, None));
+    // No image row: never settled, with or without a loader.
+    assert!(!sleep_child_maps_settled("", image, Some(loader)));
+    assert!(!sleep_child_maps_settled("", image, None));
 }
 
 /// Task E1: a static executable (no PT_INTERP, so the locator returns
@@ -44408,9 +44450,6 @@ fn wait_sleep_child_settled(pid: u32) {
             let Ok(maps) = std::fs::read_to_string(format!("/proc/{pid}/maps")) else {
                 return false;
             };
-            if !maps_have_executable_image(&maps, &image) {
-                return false;
-            }
             if loader.is_none() {
                 let Ok(file) = std::fs::File::open(&image) else {
                     return false;
@@ -44425,11 +44464,11 @@ fn wait_sleep_child_settled(pid: u32) {
                         .map(|path| std::fs::canonicalize(&path).unwrap_or(path)),
                 );
             }
-            loader
-                .as_ref()
-                .expect("resolved above")
-                .as_ref()
-                .is_none_or(|loader| maps_have_executable_image(&maps, loader))
+            sleep_child_maps_settled(
+                &maps,
+                &image,
+                loader.as_ref().expect("resolved above").as_deref(),
+            )
         });
         if settled {
             return;
@@ -98529,6 +98568,18 @@ impl MemberStopIo for ScriptedMemberStops {
     }
 }
 
+/// The settled image of a just-spawned `sleep` child: waits (as
+/// `wait_sleep_child_settled`) until the exec landed and the image has an
+/// executable mapping, then returns the `exe` link. The `member_stop` tests
+/// SIGSTOP the child right after, and SIGSTOP freezes it wherever it lands:
+/// the exe link switches in `begin_new_exec()`, before `load_elf_binary()`
+/// maps anything, so stopping on the link alone can freeze an unmapped
+/// child whose maps read then finds no executable row.
+fn wait_sleep_exec_row(pid: u32) -> std::path::PathBuf {
+    wait_sleep_child_settled(pid);
+    std::fs::read_link(format!("/proc/{pid}/exe")).unwrap()
+}
+
 /// Stops `pid` with SIGSTOP and waits until every task reports `T`.
 fn stop_member_for_test(pid: u32) {
     assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGSTOP) }, 0);
@@ -98640,15 +98691,9 @@ fn member_stop_clears_non_provider_files_and_resumes_at_once() {
         .spawn()
         .unwrap();
     let pid = child.id();
-    // Wait for the exec to land before reading its maps.
-    let exe = loop {
-        if let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe"))
-            && exe.file_name().is_some_and(|name| name == "sleep")
-        {
-            break exe;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(2));
-    };
+    // Settle the exec before stopping: SIGSTOP freezes the child wherever
+    // it lands, and the exe link alone is not readiness.
+    let exe = wait_sleep_exec_row(pid);
     stop_member_for_test(pid);
     let key = member_exec_key_for_test(pid, &exe);
     let mut io = ScriptedMemberStops::default();
@@ -98690,14 +98735,9 @@ fn member_stop_clears_the_kernel_key_when_maps_show_another_device() {
         .spawn()
         .unwrap();
     let pid = child.id();
-    let exe = loop {
-        if let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe"))
-            && exe.file_name().is_some_and(|name| name == "sleep")
-        {
-            break exe;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(2));
-    };
+    // Settle the exec before stopping: SIGSTOP freezes the child wherever
+    // it lands, and the exe link alone is not readiness.
+    let exe = wait_sleep_exec_row(pid);
     stop_member_for_test(pid);
     let maps_key = member_exec_key_for_test(pid, &exe);
     let kernel = p11scope_ebpf_common::MemberFileKey {
@@ -98735,14 +98775,9 @@ fn member_stop_leaves_an_overlay_inode_mismatch_unproven() {
         .spawn()
         .unwrap();
     let pid = child.id();
-    let exe = loop {
-        if let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe"))
-            && exe.file_name().is_some_and(|name| name == "sleep")
-        {
-            break exe;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(2));
-    };
+    // Settle the exec before stopping: SIGSTOP freezes the child wherever
+    // it lands, and the exe link alone is not readiness.
+    let exe = wait_sleep_exec_row(pid);
     stop_member_for_test(pid);
     let maps_key = member_exec_key_for_test(pid, &exe);
     let kernel = p11scope_ebpf_common::MemberFileKey {
@@ -98778,14 +98813,9 @@ fn member_stop_leaves_a_process_outside_the_run_tree_untouched() {
         .spawn()
         .unwrap();
     let pid = child.id();
-    let exe = loop {
-        if let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe"))
-            && exe.file_name().is_some_and(|name| name == "sleep")
-        {
-            break exe;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(2));
-    };
+    // Settle the exec before stopping: SIGSTOP freezes the child wherever
+    // it lands, and the exe link alone is not readiness.
+    let exe = wait_sleep_exec_row(pid);
     stop_member_for_test(pid);
     let key = member_exec_key_for_test(pid, &exe);
     let mut io = ScriptedMemberStops::default();
@@ -99249,14 +99279,9 @@ fn member_stop_intake_is_bounded_per_pass() {
             .spawn()
             .unwrap();
         let pid = child.id();
-        let exe = loop {
-            if let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe"))
-                && exe.file_name().is_some_and(|name| name == "sleep")
-            {
-                break exe;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        };
+        // Settle the exec before stopping: SIGSTOP freezes the child wherever
+        // it lands, and the exe link alone is not readiness.
+        let exe = wait_sleep_exec_row(pid);
         stop_member_for_test(pid);
         let key = member_exec_key_for_test(pid, &exe);
         let mut row = member_stop_row(pid, &exe, key);
@@ -101481,14 +101506,9 @@ fn member_stop_never_proves_a_fuse_backed_file() {
         .spawn()
         .unwrap();
     let pid = child.id();
-    let exe = loop {
-        if let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe"))
-            && exe.file_name().is_some_and(|name| name == "sleep")
-        {
-            break exe;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(2));
-    };
+    // Settle the exec before stopping: SIGSTOP freezes the child wherever
+    // it lands, and the exe link alone is not readiness.
+    let exe = wait_sleep_exec_row(pid);
     stop_member_for_test(pid);
     let key = member_exec_key_for_test(pid, &exe);
     let mut io = ScriptedMemberStops::default();
@@ -103512,12 +103532,14 @@ fn teardown_shared_budget_caps_total_wait_and_keeps_later_loud() {
     );
 }
 
-/// Stop twin: a stop latched before the scan skips the teardown wait (its
-/// proof still runs once, unproven while the window holds) and the scan
-/// stays loud (no silence on a cancelled wait). The window-hit helper owns
-/// setup retries; the scan itself is single-shot, with no sleeper thread.
+/// Pre-latched stop twin: a stop latched before the scan skips the teardown
+/// wait (its proof still runs once, unproven while the window holds) and the
+/// scan stays loud (no silence on a cancelled wait). The window-hit helper
+/// owns setup retries; the scan itself is single-shot, with no sleeper
+/// thread. The mid-wait break has no behavioral twin (it would need a
+/// wait-start hook in production test gates).
 #[test]
-fn teardown_wait_breaks_on_stop_and_stays_loud() {
+fn teardown_pre_latched_stop_skips_wait_and_stays_loud() {
     use std::sync::atomic::AtomicBool;
     use std::time::{Duration, Instant};
     let refusal = Skipped {
@@ -103572,16 +103594,16 @@ fn teardown_wait_breaks_on_stop_and_stays_loud() {
     let loud = counters.object_skips.iter().any(|skip| skip == &refusal);
     assert!(
         elapsed < Duration::from_millis(500),
-        "a stop during the wait returns promptly, not after the 1 s budget: {elapsed:?}"
+        "a pre-latched stop skips the wait promptly, without running the 1 s budget: {elapsed:?}"
     );
     assert!(
         loud,
-        "a stop-broken wait stays loud: {:?}",
+        "a pre-latched stop stays loud: {:?}",
         counters.object_skips
     );
     assert_eq!(
         counters.ending_suppressed_skips, 0,
-        "a stop-broken wait suppresses nothing: {counters:?}"
+        "a pre-latched stop suppresses nothing: {counters:?}"
     );
 }
 
@@ -103624,8 +103646,9 @@ fn discover_plan_shares_one_teardown_budget_across_its_scans() {
 
 /// Needle: the operator stop flag reaches the teardown wait through
 /// `discover_with_cancel` (`Some`) and the `discover_plan` scan site (the
-/// `cancel` param, not `None`). The stop twin proves the wait honors the
-/// flag behaviorally and M-1 pins the `run.rs` call site; this pins the
+/// `cancel` param, not `None`). The pre-latched stop twin proves the
+/// pre-set skip honors the flag behaviorally (the mid-wait break has no
+/// behavioral twin) and M-1 pins the `run.rs` call site; this pins the
 /// two threading joints between them so a dropped flag fails here. No
 /// behavioral `discover_with_cancel` twin: like the pass budget, it would
 /// need a real scan to reach the wait on demand (see above).

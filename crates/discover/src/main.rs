@@ -787,26 +787,34 @@ fn main() {
                     );
                 }
             }
-            let json = match validated_manifest_json(&m) {
-                Ok(json) => json,
-                Err(error) => {
-                    eprintln!("p11scope-discover: {error}");
-                    std::process::exit(1);
-                }
-            };
-            match out {
-                None => {
-                    println!("{json}");
-                    eprintln!("Manifest written to stdout. {MANIFEST_GUIDANCE}");
-                }
-                Some(p) => {
-                    if let Err(e) = write_private_atomically(&p, json.as_bytes()) {
-                        eprintln!("p11scope-discover: write {}: {e}", p.display());
-                        std::process::exit(1);
-                    }
-                    eprintln!("Manifest written to file. {MANIFEST_GUIDANCE}");
-                }
+            if let Err(error) = publish_manifest(&m, out.as_ref()) {
+                eprintln!("p11scope-discover: {error}");
+                std::process::exit(1);
             }
+        }
+    }
+}
+
+/// Validate, serialize and publish one manifest: the only write path,
+/// so no caller can serialize past the observer's limits. Returns the
+/// exact bytes published (the stdout form carries its trailing
+/// newline); a refusal returns the cause and publishes nothing.
+fn publish_manifest(
+    m: &p11scope_discover::manifest::Manifest,
+    out: Option<&PathBuf>,
+) -> Result<Vec<u8>, String> {
+    let json = validated_manifest_json(m)?;
+    match out {
+        None => {
+            println!("{json}");
+            eprintln!("Manifest written to stdout. {MANIFEST_GUIDANCE}");
+            Ok(format!("{json}\n").into_bytes())
+        }
+        Some(p) => {
+            write_private_atomically(p, json.as_bytes())
+                .map_err(|e| format!("write {}: {e}", p.display()))?;
+            eprintln!("Manifest written to file. {MANIFEST_GUIDANCE}");
+            Ok(json.into_bytes())
         }
     }
 }
@@ -1123,6 +1131,64 @@ mod tests {
         // Control: one surface is accepted, so the refusal is the size.
         let small = sized_manifest(1, &names);
         assert!(super::validated_manifest_json(&small).is_ok());
+    }
+
+    fn publish_dir(name: &str) -> std::path::PathBuf {
+        let directory =
+            std::env::temp_dir().join(format!("discover-publish-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
+    /// The factored write path refuses an invalid manifest before any
+    /// temporary file exists: nothing is published and nothing is left
+    /// behind. A plain-serialize mutant at the validated call publishes
+    /// the file and fails here.
+    #[test]
+    fn publish_refuses_invalid_manifest_without_writing() {
+        let directory = publish_dir("invalid");
+        let target = directory.join("manifest.json");
+        let error = super::publish_manifest(&invalid_manifest(), Some(&target)).unwrap_err();
+        assert!(error.contains("observer would reject"), "{error}");
+        assert!(!target.exists(), "nothing published on refusal");
+        let left: Vec<_> = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert!(left.is_empty(), "no temp files on refusal: {left:?}");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn publish_refuses_oversize_manifest_without_writing() {
+        let directory = publish_dir("oversize");
+        let target = directory.join("manifest.json");
+        let names = canonical_32_names();
+        let big = sized_manifest(24, &names);
+        let error = super::publish_manifest(&big, Some(&target)).unwrap_err();
+        assert!(error.contains("limit"), "{error}");
+        assert!(!target.exists(), "nothing published on refusal");
+        let left: Vec<_> = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert!(left.is_empty(), "no temp files on refusal: {left:?}");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn publish_writes_valid_manifest_bytes_to_file() {
+        let directory = publish_dir("valid");
+        let target = directory.join("manifest.json");
+        let names = canonical_32_names();
+        let small = sized_manifest(1, &names);
+        let published = super::publish_manifest(&small, Some(&target)).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), published);
+        let back: p11scope_discover::manifest::Manifest =
+            serde_json::from_slice(&published).unwrap();
+        assert_eq!(back, small);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

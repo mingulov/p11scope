@@ -3392,9 +3392,10 @@ fn system_zero_mapper_exit_keeps_metrics_completeness_complete() {
     );
 }
 
-/// The inventory-refresh open point (live `--cgroup`/`--system` path,
-/// audit H1b): the provider's only mapper leaves an authoritative
-/// membership walk, so the refresh retires its cover with zero mappers.
+/// The inventory-refresh route (live `--cgroup`/`--system` path, audit
+/// H1b): the provider's only mapper leaves an authoritative membership
+/// walk; the refresh queues it as a ready expected removal, whose
+/// pin-proven exit the conservative replay retires with zero mappers.
 /// `listed` keeps the reaped pid in `cgroup.procs`: a listed pid with no
 /// live process is not a member either (the walk keeps live user
 /// processes only), so it departs the same way.

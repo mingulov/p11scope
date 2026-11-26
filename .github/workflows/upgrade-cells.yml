@@ -205,7 +205,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/new-bin" "$RUNNER_TEMP/old-bin"
           tar xzf "$RUNNER_TEMP/new-pkgs/p11scope-0.7.2-x86_64-linux-musl.tar.gz" \
             -C "$RUNNER_TEMP/new-bin" --strip-components=1
-          tar xzf "$RUNNER_TEMP/new-pkgs/p11scope-discover-0.7.2-x86_64-linux-musl.tar.gz" \
+          tar xzf "$RUNNER_TEMP/new-pkgs/p11scope-discover-0.7.2-x86_64-linux-gnu.tar.gz" \
             -C "$RUNNER_TEMP/new-bin" --strip-components=1
           sha256sum "$RUNNER_TEMP/new-bin/p11scope" | tee "$RUNNER_TEMP/new-bin/official-v072.sha256"
           sha256sum "$RUNNER_TEMP/new-bin/p11scope-discover" | tee "$RUNNER_TEMP/new-bin/official-v072-discover.sha256"

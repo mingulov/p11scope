@@ -369,7 +369,7 @@ run_gate_body() {
   [ "$DOCTOR_NEW_RC" = 0 ] || [ "$DOCTOR_NEW_RC" = 1 ] || fail "new doctor rc=$DOCTOR_NEW_RC"
   grep -q '^Doctor:' "$WORKDIR/doctor-new.out" || fail "new doctor output has no Doctor line"
   [ "$DOCTOR_NEW_RC" = "$DOCTOR_OLD_RC" ] || fail "doctor rc flipped $DOCTOR_OLD_RC->$DOCTOR_NEW_RC"
-  # 8. New short capture (same system scan as old).
+  # 8. New short capture (same pid-target scan as old).
   if run_capture "$WORKDIR/post-upgrade.json" "$WORKDIR/capture-new.out"; then
     CAPTURE_NEW_RC=0
   else

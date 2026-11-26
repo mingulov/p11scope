@@ -29619,6 +29619,62 @@ fn joint_two_feeds_share_nonzero_audited_fallback_once() {
     );
 }
 
+/// Running-path bounds twin: the same audited fallback as above, but
+/// with the delivery window posed below every staged admission after
+/// the seal. The staged claims fall out of frame, so the running
+/// wrapper refuses; forcing the bounds check true replays instead.
+#[test]
+fn joint_running_fallback_refuses_out_of_window_staged_claim() {
+    for posed in [false, true] {
+        let mut fixture = CanonicalFanoutScene::prior_sealed();
+        fixture.push_two("C_SignInit", 2);
+        let mut frame = fixture.audited(2, 2, &BirthFault);
+        assert!(
+            matches!(
+                frame.audit_for_test().h3_for_test(),
+                H3DispositionEvidence::Clean {
+                    staged_max: 4,
+                    pending_floor: None
+                }
+            ),
+            "control: the real window covers the staged admissions",
+        );
+        let h0 = fixture.scene.real.h0.clone();
+        let mut births = NativeFrameBirths {
+            h0: &h0,
+            attached: &fixture.attached,
+            retained: &mut fixture.births,
+            seen: Vec::new(),
+            unreadable: true,
+        };
+        let mut ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        frame.bind_targets(&ports).unwrap();
+        assert_eq!(
+            frame.seal_next(&mut ports, &mut births, &BirthFault),
+            Ok(QuantumSealProgress::DeliveryReady),
+            "posed={posed}: the seal runs before the window pose",
+        );
+        if posed {
+            frame.pose_delivery_window_for_test(0, 0);
+        }
+        assert_eq!(
+            frame.deliver_next(&mut ports),
+            if posed {
+                Err(RawQuantumRefusal::DispositionMismatch)
+            } else {
+                Ok(QuantumSealProgress::LocalPending)
+            },
+            "posed={posed}: out-of-window staged claims refuse on the running path",
+        );
+    }
+}
+
 #[test]
 fn joint_fallback_preflight_preserves_incomplete_admitted_original() {
     let mut fixture = CanonicalFanoutScene::prior_sealed();

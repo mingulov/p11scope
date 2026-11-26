@@ -1468,6 +1468,20 @@ impl IngestedJointQuantum {
         &self.audit
     }
 
+    /// Tests-only delivery-window pose: rewrite this frame's H3 staged
+    /// maximum and H0 watermark after the seal, so the bounds twin
+    /// drives staged claims outside their frame without touching
+    /// staging. Delivery borrows this audit, so the posed window
+    /// reaches the fallback classifier.
+    #[cfg(test)]
+    pub(crate) fn pose_delivery_window_for_test(&mut self, staged_max: u64, h0_below: u64) {
+        self.audit.h3 = H3DispositionEvidence::Clean {
+            staged_max,
+            pending_floor: None,
+        };
+        self.audit.h0_below = h0_below;
+    }
+
     #[cfg(test)]
     pub(crate) fn awaits_fill_for_test(&self) -> bool {
         self.audit_fill.is_some() || self.raw_fill.is_some()

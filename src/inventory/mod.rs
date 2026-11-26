@@ -1730,8 +1730,11 @@ mod pass_reclaim_tests {
     struct LoopRecord {
         /// Drops finished when the first handoff returned.
         dropped_at_return: usize,
-        /// Ring-service ticks the loop ran while the drop was stuck.
-        ticks: usize,
+        /// Loop iterations that ran while the drop was stuck.
+        iterations_while_stuck: usize,
+        /// The drop was still stuck after those iterations: the loop
+        /// ran alongside the blocked drop, never behind it.
+        stuck_throughout: bool,
         /// Counts after filling the worker's queue.
         queued: ReclaimCounts,
         /// Counts after one more handoff to the stuck worker.
@@ -1753,11 +1756,12 @@ mod pass_reclaim_tests {
             entered
                 .recv_timeout(WATCHDOG)
                 .expect("the worker took the stuck value");
-            let mut ticks = 0;
+            let mut iterations_while_stuck = 0;
             for _ in 0..3 {
-                ticks += 1;
+                iterations_while_stuck += 1;
                 std::thread::sleep(super::SERVICE_TICK);
             }
+            let stuck_throughout = loop_dropped.load(Ordering::SeqCst) == 0;
             for _ in 0..RECLAIM_QUEUE_DEPTH {
                 reclaim.hand_off(Tracked(Arc::clone(&loop_dropped)));
             }
@@ -1766,7 +1770,8 @@ mod pass_reclaim_tests {
             let busy = reclaim.counts();
             let _ = done_tx.send(LoopRecord {
                 dropped_at_return,
-                ticks,
+                iterations_while_stuck,
+                stuck_throughout,
                 queued,
                 busy,
             });
@@ -1781,7 +1786,8 @@ mod pass_reclaim_tests {
             record,
             LoopRecord {
                 dropped_at_return: 0,
-                ticks: 3,
+                iterations_while_stuck: 3,
+                stuck_throughout: true,
                 queued: ReclaimCounts {
                     worker_busy: 0,
                     held: 0,
@@ -1803,8 +1809,12 @@ mod pass_reclaim_tests {
             "the worker drains its queue once the drop returns"
         );
         // The next pass hands the custody to the freed worker.
+        // Every service attempt that meets the full queue counts one
+        // busy; attempts after the worker freed hand off at once.
+        let mut attempts = 0u64;
         assert!(
             wait_until(|| {
+                attempts += 1;
                 reclaim.service();
                 reclaim.counts().held == 0
             }),
@@ -1813,13 +1823,12 @@ mod pass_reclaim_tests {
         assert_eq!(
             reclaim.counts(),
             ReclaimCounts {
-                worker_busy: reclaim.counts().worker_busy,
+                worker_busy: attempts,
                 held: 0,
                 handed: 2 + depth,
                 inline: 0,
             }
         );
-        assert!(reclaim.counts().worker_busy >= 1);
         assert!(
             wait_until(|| dropped.load(Ordering::SeqCst) == 2 + RECLAIM_QUEUE_DEPTH),
             "every value is reclaimed"

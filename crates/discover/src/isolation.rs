@@ -189,6 +189,10 @@ const SYS_PROCESS_VM_WRITEV: u32 = 311;
 // its descriptors: ptrace-equivalent without ptrace.
 const SYS_PROCESS_VM_READV: u32 = 310;
 const SYS_PIDFD_GETFD: u32 = 438;
+const SYS_PROCESS_MADVISE: u32 = 440;
+const SYS_KCMP: u32 = 312;
+const SYS_MOVE_PAGES: u32 = 279;
+const SYS_MIGRATE_PAGES: u32 = 256;
 const SYS_BPF: u32 = 321;
 const SYS_PERF_EVENT_OPEN: u32 = 298;
 const SYS_USERFAULTFD: u32 = 323;
@@ -271,6 +275,10 @@ const DENY_ALWAYS: &[u32] = &[
     SYS_PROCESS_VM_WRITEV,
     SYS_PROCESS_VM_READV,
     SYS_PIDFD_GETFD,
+    SYS_PROCESS_MADVISE,
+    SYS_KCMP,
+    SYS_MOVE_PAGES,
+    SYS_MIGRATE_PAGES,
     SYS_BPF,
     SYS_PERF_EVENT_OPEN,
     SYS_USERFAULTFD,
@@ -1234,6 +1242,18 @@ mod tests {
                 "process_vm_readv",
             ),
             (SYS_PIDFD_GETFD, libc::SYS_pidfd_getfd, "pidfd_getfd"),
+            (
+                SYS_PROCESS_MADVISE,
+                libc::SYS_process_madvise,
+                "process_madvise",
+            ),
+            (SYS_KCMP, libc::SYS_kcmp, "kcmp"),
+            (SYS_MOVE_PAGES, libc::SYS_move_pages, "move_pages"),
+            (
+                SYS_MIGRATE_PAGES,
+                libc::SYS_migrate_pages,
+                "migrate_pages",
+            ),
             (SYS_BPF, libc::SYS_bpf, "bpf"),
             (
                 SYS_PERF_EVENT_OPEN,
@@ -1371,6 +1391,18 @@ mod tests {
                 "process_vm_readv",
             ),
             (SYS_PIDFD_GETFD, libc::SYS_pidfd_getfd, "pidfd_getfd"),
+            (
+                SYS_PROCESS_MADVISE,
+                libc::SYS_process_madvise,
+                "process_madvise",
+            ),
+            (SYS_KCMP, libc::SYS_kcmp, "kcmp"),
+            (SYS_MOVE_PAGES, libc::SYS_move_pages, "move_pages"),
+            (
+                SYS_MIGRATE_PAGES,
+                libc::SYS_migrate_pages,
+                "migrate_pages",
+            ),
         ] {
             assert_eq!(nr, want as u32, "wrong number for {name}");
             assert_eq!(

@@ -242,9 +242,9 @@ class FlowServer:
         request is ever served. Session resumption is recorded per
         handshake too: a resumed handshake presents the original cert
         without a CertificateVerify, so only full presented
-        handshakes predict a client signature.
-        request is ever served. A presented cert on a connection that
-        saw CertificateRequest additionally owes one private-key sign:
+        handshakes predict a client signature. A presented cert on a
+        connection that saw CertificateRequest additionally owes one
+        private-key sign:
         a resumed handshake sends no request, so its cached peer cert
         (still reported by ``getpeercert``) owes none.
         """

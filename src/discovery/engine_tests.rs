@@ -105734,11 +105734,22 @@ fn run_learned_repeated_proof_skips_its_absorb() {
         "the unaliasable proof still absorbs its carried rejection"
     );
     let skips_after_second = engine.counters.object_skips.len();
+    let revision_after_second = engine.pinned.revision();
     engine.learn_owned_proofs(&mut pins.clone(), &[unaliasable_proof()]);
     assert_eq!(
         engine.counters.object_skips.len(),
         skips_after_second,
         "an identical re-proof files no fresh ambiguity row"
+    );
+    // The absorb-skip pin: the third call enters the alias guard
+    // (the module is unaliasable) but skips the absorb, so the
+    // committed revision moves only by the alias re-run's bump.
+    // Both absorb and the capped alias bump unconditionally, so a
+    // re-absorb would move it twice.
+    assert_eq!(
+        engine.pinned.revision(),
+        revision_after_second.saturating_add(1),
+        "an identical re-proof absorbs nothing: revision moves only by the alias re-run"
     );
     assert!(
         skips_after_second >= skips_after_first,

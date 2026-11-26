@@ -383,6 +383,7 @@ fn finish_capture_preserves_settlement_detach_and_terminal_attempt_boundaries() 
         FinishError,
         ErrorEnd,
         Success,
+        SignalEnd,
         DetachError,
     }
 
@@ -392,6 +393,7 @@ fn finish_capture_preserves_settlement_detach_and_terminal_attempt_boundaries() 
         Case::FinishError,
         Case::ErrorEnd,
         Case::Success,
+        Case::SignalEnd,
         Case::DetachError,
     ] {
         let mut phases = Vec::new();
@@ -399,6 +401,7 @@ fn finish_capture_preserves_settlement_detach_and_terminal_attempt_boundaries() 
         let loop_result = match case {
             Case::LoopError | Case::LoopErrorSettleFails => Err(anyhow::anyhow!("loop failure")),
             Case::ErrorEnd => Ok(CaptureEnd::Error),
+            Case::SignalEnd => Ok(CaptureEnd::Signal),
             _ => Ok(CaptureEnd::DurationExpired),
         };
         let result = finish_capture_with(
@@ -465,6 +468,14 @@ fn finish_capture_preserves_settlement_detach_and_terminal_attempt_boundaries() 
             Case::Success => {
                 assert_eq!(result.unwrap(), 17);
                 assert_eq!(observed, Some((CaptureEnd::DurationExpired, false)));
+                assert_eq!(phases, ["finish", "terminal", "detach"]);
+            }
+            Case::SignalEnd => {
+                // A signal end publishes exactly like a duration end:
+                // the terminal seals the report before detach runs, so
+                // a stop during the run still yields a report.
+                assert_eq!(result.unwrap(), 17);
+                assert_eq!(observed, Some((CaptureEnd::Signal, false)));
                 assert_eq!(phases, ["finish", "terminal", "detach"]);
             }
             Case::DetachError => {

@@ -11,10 +11,13 @@ compares them both ways against tests/ignored-tests.json:
 - an inventory entry with no matching site fails;
 - a skip entry (its path is curated in the runner's SKIP_TESTS list)
   without an `until` field fails, and so does an `until` on any other
-  entry: `until` is either a dotted version ("0.7.0") or an object
+  entry: `until` is either a dotted version ("0.8.0") or an object
   {"item": work item, "owner": lane/role that revisits it}. A version
   at or below the release under development fails as expired, so a
-  deferral ("deferred to 0.6.0") cannot outlive its release silently.
+  deferral ("deferred to 0.6.0") cannot outlive its release silently;
+  a version above it must name a known release
+  (ALLOWED_UNTIL_VERSIONS), so a stale label ("0.8.1") cannot stand
+  silently either.
 - a `feature` entry without a non-empty `owner` fails: the owner names
   the lane that runs the test (a runner list or a dedicated build).
   The owner must be one of ALLOWED_OWNERS, and every allowed owner has
@@ -67,6 +70,11 @@ DEFAULT_MANIFEST = "Cargo.toml"
 # expire only at the 0.7.0 release cut: fail-closed, but late. The
 # suite pins the value so bumps are deliberate and reviewed.
 DEVELOPMENT_VERSION = "0.6.0"
+# Known release labels a version `until` may name (controller fix1
+# note 2026-11-26: postponed items go to the next feature release;
+# an unknown label fails instead of standing silently). Extend
+# deliberately when a new release line opens; the suite pins refusals.
+ALLOWED_UNTIL_VERSIONS = ("0.7.3", "0.8.0", "0.9.0")
 SCAN_DIRS = ("src", "tests", "crates")
 EXCLUDED_SEGMENTS = ("third-party", "target")
 RUNNER_LISTS = (
@@ -516,8 +524,10 @@ def current_version(root):
 def until_problem(until, current):
     """Failure detail for an `until` value, or None when it stands.
 
-    A version fails when it is malformed or at/below the release under
-    development; a work item fails when it is not exactly
+    A version fails when it is malformed, at/below the release under
+    development (expiry judges first, so a past label reports
+    expired, never unknown), or above it without naming a known
+    release; a work item fails when it is not exactly
     {"item": ..., "owner": ...} with non-empty strings.
     """
     if isinstance(until, str):
@@ -527,6 +537,9 @@ def until_problem(until, current):
         if version_at_most(version, current):
             dotted = ".".join(str(part) for part in current)
             return f"until {until!r} expired at {dotted}"
+        if until not in ALLOWED_UNTIL_VERSIONS:
+            known = ", ".join(ALLOWED_UNTIL_VERSIONS)
+            return f"until {until!r} names no known release (allowed: {known})"
         return None
     if not isinstance(until, dict) or set(until) != {"item", "owner"}:
         return f"until {until!r} must be a version or {{\"item\", \"owner\"}}"

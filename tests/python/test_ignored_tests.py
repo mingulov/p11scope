@@ -1990,7 +1990,10 @@ class IgnoredTestsTests(unittest.TestCase):
                 self.assertIn("expired", result.stdout)
 
     def test_skip_entry_with_standing_until_passes(self):
-        for until in ("0.7.0",
+        # "0.7.3" is the standing known label (controller fix1 note
+        # 2026-11-26: a version until must name a known release;
+        # "0.7.0" no longer does).
+        for until in ("0.7.3",
                       {"item": "kernel lanes", "owner": "WP-9"}):
             with self.subTest(until=until):
                 sources = {
@@ -2015,6 +2018,34 @@ class IgnoredTestsTests(unittest.TestCase):
                                  result.stdout + result.stderr)
                 self.assertIn("all 1 inventoried site(s) match",
                               result.stdout)
+
+    def test_skip_entry_with_unknown_until_fails(self):
+        # A version above the release under development must still
+        # name a known release (controller fix1 note 2026-11-26):
+        # the old "0.8.1" label, an unlisted future and a
+        # non-canonical spelling all fail instead of standing.
+        for until in ("0.8.1", "9.9.9", "0.8"):
+            with self.subTest(until=until):
+                sources = {
+                    "src/lib.rs": "mod a;\n",
+                    "src/a.rs": (
+                        "#[test]\n"
+                        '#[ignore = "privileged: needs the lane"]\n'
+                        "fn t_skip() {}\n"
+                    ),
+                }
+                entries = [
+                    {"file": "src/a.rs", "path": "a::t_skip",
+                     "reason": "privileged: needs the lane",
+                     "cell": "privileged", "until": until},
+                ]
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    write_fixture(root, sources, entries, [],
+                                  skip_registered=["a::t_skip"])
+                    result = run_checker(root)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("no known release", result.stdout)
 
     def test_development_version_pin_is_deliberate(self):
         # The checker judges skip expiry against max(manifest,

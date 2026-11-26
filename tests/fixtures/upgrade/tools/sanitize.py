@@ -9,22 +9,47 @@
 # (the T2 pair stays comparable).
 """Usage: sanitize.py <rawdir> <outdir> [prefix]"""
 import json
+import os
+import re
 import sys
 
-if len(sys.argv) < 3 or len(sys.argv) > 4:
-    sys.exit("Usage: sanitize.py <rawdir> <outdir> [prefix]")
-RAW, OUT = sys.argv[1], sys.argv[2]
-PREFIX = sys.argv[3] if len(sys.argv) > 3 else \
-    "/var/tmp/p11scope-ws-tmp/v072-compat-071"
-PREFIXES = [
-    (PREFIX, "/work"),
-    ("/usr/lib/x86_64-linux-gnu/softhsm", "/usr/lib/softhsm"),
-    ("/usr/lib/x86_64-linux-gnu", "/usr/lib"),
-    ("/usr/lib/cargo/bin/coreutils", "/usr/bin"),
+DEFAULT_PREFIX = "/var/tmp/p11scope-ws-tmp/v072-compat-071"
+
+# Raw captures keep their capture names, except the v0.7.1 profile:
+# rename it to v071-observed-profile-signer.json before sanitizing
+# (the bare v071-observed-profile.json name belongs to the
+# upgrade-cells lane's own capture).
+FILES = [
+    "v071-inventory-scan.json",
+    "v071-inventory-native.json",
+    "v071-inventory-churn.json",
+    "v072-inventory-churn.json",
+    "v071-inventory-keyops.json",
+    "v071-observed-profile-signer.json",
+    "v071-observed-metrics.json",
+    "v072-observed-profile.json",
+    "v072-observed-metrics.json",
+    "v071-manifest-softhsm.json",
 ]
 
 pid_map, ino_map, dev_map, pair_map, digest_map = {}, {}, {}, {}, {}
 counters = {"pid": 4242, "ino": 100, "dev": 1, "pair": 1, "digest": 1}
+
+
+def fresh_state():
+    """Reset the shared canonical maps (one sanitize_tree run per state)."""
+    global pid_map, ino_map, dev_map, pair_map, digest_map, counters
+    pid_map, ino_map, dev_map, pair_map, digest_map = {}, {}, {}, {}, {}
+    counters = {"pid": 4242, "ino": 100, "dev": 1, "pair": 1, "digest": 1}
+
+
+def build_prefixes(prefix):
+    return [
+        (prefix, "/work"),
+        ("/usr/lib/x86_64-linux-gnu/softhsm", "/usr/lib/softhsm"),
+        ("/usr/lib/x86_64-linux-gnu", "/usr/lib"),
+        ("/usr/lib/cargo/bin/coreutils", "/usr/bin"),
+    ]
 
 
 def canon(mapping, key, counter, fmt):
@@ -34,11 +59,8 @@ def canon(mapping, key, counter, fmt):
     return mapping[key]
 
 
-import re
-
-
-def scrub_string(s):
-    for old, new in PREFIXES:
+def scrub_string(s, prefixes):
+    for old, new in prefixes:
         s = s.replace(old, new)
     whole = re.fullmatch(r"pid:(\d+)", s)
     if whole:
@@ -58,7 +80,7 @@ def is_hex(s, lengths=(40, 64)):
             and all(c in "0123456789abcdefABCDEF" for c in s))
 
 
-def walk(node, path=""):
+def walk(node, path, prefixes):
     if isinstance(node, dict):
         out = {}
         # Joint device_major/device_minor pair (manifest provenance).
@@ -106,41 +128,35 @@ def walk(node, path=""):
                     and isinstance(value, int):
                 out[key] = canon(ino_map, ("cookie", value), "ino", lambda n: n)
             else:
-                out[key] = walk(value, child)
+                out[key] = walk(value, child, prefixes)
         return out
     if isinstance(node, list):
-        return [walk(v, path) for v in node]
+        return [walk(v, path, prefixes) for v in node]
     if isinstance(node, str):
-        return scrub_string(node)
+        return scrub_string(node, prefixes)
     return node
 
 
-# Raw captures keep their capture names, except the v0.7.1 profile:
-# rename it to v071-observed-profile-signer.json before sanitizing
-# (the bare v071-observed-profile.json name belongs to the
-# upgrade-cells lane's own capture).
-FILES = [
-    "v071-inventory-scan.json",
-    "v071-inventory-native.json",
-    "v071-inventory-churn.json",
-    "v072-inventory-churn.json",
-    "v071-inventory-keyops.json",
-    "v071-observed-profile-signer.json",
-    "v071-observed-metrics.json",
-    "v072-observed-profile.json",
-    "v072-observed-metrics.json",
-    "v071-manifest-softhsm.json",
-]
-import os
-os.makedirs(OUT, exist_ok=True)
-for name in sorted(FILES):
-    with open(f"{RAW}/{name}", encoding="utf-8") as fh:
-        doc = json.load(fh)
-    clean = walk(doc)
-    with open(f"{OUT}/{name}", "w", encoding="utf-8") as fh:
-        json.dump(clean, fh, indent=2)
-        fh.write("\n")
-    print(f"{name}: {os.path.getsize(f'{OUT}/{name}')} bytes")
-print("maps:", {k: len(v) for k, v in
-      [("pid", pid_map), ("ino", ino_map), ("dev", dev_map),
-       ("pair", pair_map), ("digest", digest_map)]})
+def sanitize_tree(rawdir, outdir, prefix):
+    fresh_state()
+    prefixes = build_prefixes(prefix)
+    os.makedirs(outdir, exist_ok=True)
+    for name in sorted(FILES):
+        with open(f"{rawdir}/{name}", encoding="utf-8") as fh:
+            doc = json.load(fh)
+        clean = walk(doc, "", prefixes)
+        with open(f"{outdir}/{name}", "w", encoding="utf-8") as fh:
+            json.dump(clean, fh, indent=2)
+            fh.write("\n")
+        print(f"{name}: {os.path.getsize(f'{outdir}/{name}')} bytes")
+    print("maps:", {k: len(v) for k, v in
+          [("pid", pid_map), ("ino", ino_map), ("dev", dev_map),
+           ("pair", pair_map), ("digest", digest_map)]})
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 3 or len(sys.argv) > 4:
+        sys.exit("Usage: sanitize.py <rawdir> <outdir> [prefix]")
+    _raw, _out = sys.argv[1], sys.argv[2]
+    _prefix = sys.argv[3] if len(sys.argv) > 3 else DEFAULT_PREFIX
+    sanitize_tree(_raw, _out, _prefix)

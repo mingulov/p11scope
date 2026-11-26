@@ -200,6 +200,7 @@ RUN = [
     ("test_t7_campaign.py", []),
     ("test_tls_server_resumption.py", []),
     ("test_uprobe_close_throughput_probe.py", []),
+    ("test_upgrade_regenerate.py", []),
     ("test_vng_boot_watch.py", []),
     ("test_vng_wrapper_exits.py", []),
     ("test_wide_curation_message.py", []),

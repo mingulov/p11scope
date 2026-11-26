@@ -30,7 +30,7 @@
       "calls": 47,
       "cgroup_id": 13263,
       "errors": 0,
-      "label": "user.slice/user-1000.slice/session-c2.scope",
+      "label": "user.slice/user-1000.slice/session-1.scope",
       "mechanisms": [
         {
           "attribution_basis": "standard_layout",
@@ -43,7 +43,7 @@
         }
       ],
       "unadmitted": 0,
-      "workload": "session-c2.scope"
+      "workload": "session-1.scope"
     }
   ],
   "evidence": {

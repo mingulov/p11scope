@@ -89,15 +89,45 @@ captures (the scripts take the repo privileged lock themselves).
    mechanisms), then `softhsm2-util --init-token --free --label
    upgrade-f2 --so-pin 1234 --pin 1234`, then prime the id the
    signer finds: `$TMPDIR/f2/bin/creator <provider> 1234 0102`.
-4. Capture: `tools/capture-single.sh` (scan unprivileged, native
-   privileged), `tools/capture-churn.sh`, and
-   `tools/capture-ops.sh` per mode (`keyops`, `profile`,
-   `metrics`) — once with the v0.7.1 binary (tag `v071`) and,
-   for the churn pair, once with the current binary (tag `v072`).
-   Generate the discover manifest
-   (`p11scope-discover-0.7.1 --module <provider>`) before the
-   `--manifest` captures. Rename the raw v0.7.1 profile to
-   `v071-observed-profile-signer.json` (see above).
+4. Capture every sanitizer input (tag is the observer release;
+   scan is unprivileged, the rest take the privileged lock):
+   - `tools/capture-single.sh <v071-observer> v071 <out>` →
+     `v071-inventory-scan.json`, `v071-inventory-native.json`
+   - `tools/capture-churn.sh <observer> <tag> <out>` with tags
+     `v071` and `v072` → `v071-inventory-churn.json`,
+     `v072-inventory-churn.json`
+   - `tools/capture-ops.sh <v071-observer> v071 keyops <out>` →
+     `v071-inventory-keyops.json` (v0.7.1 only)
+   - `tools/capture-ops.sh <observer> <tag> profile <out>` with
+     tags `v071` and `v072` → `v071-observed-profile.json`,
+     `v072-observed-profile.json`
+   - `tools/capture-ops.sh <observer> <tag> metrics <out>` with
+     tags `v071` and `v072` → `v071-observed-metrics.json`,
+     `v072-observed-metrics.json`
+   - `p11scope-discover-0.7.1 --module <provider>` →
+     `v071-manifest-softhsm.json` (generate before the
+     `--manifest` captures)
+   Rename the raw v0.7.1 profile to
+   `v071-observed-profile-signer.json` (see above). The capture
+   set is exactly:
+
+   ```manifest
+   v071-inventory-scan.json
+   v071-inventory-native.json
+   v071-inventory-churn.json
+   v072-inventory-churn.json
+   v071-inventory-keyops.json
+   v071-observed-profile-signer.json
+   v071-observed-metrics.json
+   v072-observed-profile.json
+   v072-observed-metrics.json
+   v071-manifest-softhsm.json
+   ```
+
+   (`tests/python/test_upgrade_regenerate.py` fails if this list
+   and `sanitize.py`'s `FILES` drift apart.) The frozen schema is
+   not captured: `git show
+   v0.7.1:docs/schema/observed-profile-v3.schema.json`.
 5. Sanitize in one run (shared maps):
    `tools/sanitize.py <rawdir> <outdir> [$TMPDIR]`.
 

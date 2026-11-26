@@ -10170,9 +10170,10 @@ fn joint_machine_linked_break_ends_joint_and_keeps_s1() {
         .iter()
         .filter(|(_, mode)| *mode == crate::semantics_key_use::FeedMode::Joint)
         .collect();
-    assert!(
-        joint.len() <= 1,
-        "at most the fresh instance re-enters Joint: {feeds:?}"
+    assert_eq!(
+        joint.len(),
+        1,
+        "exactly the fresh instance re-enters Joint: {feeds:?}"
     );
     for (id, _) in &joint {
         assert!(
@@ -20047,6 +20048,49 @@ fn watchdog_entry_audit_trip_rearm() {
     );
     watchdog_assert_scoped_recovery(&scene, ROW);
     watchdog_assert_post_recovery_joins(&mut scene, ROW);
+}
+
+/// A scoped void never leaves a stale completed absence scan behind:
+/// the skip arms from the Voiding phase, whose polls clear the
+/// completed flag first, so recovery hands Idle an unscanned episode
+/// and the next polls scan (advance or complete) instead of skipping
+/// forever on a set flag.
+#[test]
+fn joint_machine_scoped_void_rescans_absence_after_skip() {
+    const ROW: &str = "scoped-void rescan";
+    let mut scene = watchdog_stuck_scene(ROW);
+    scene.fixture.native.fail_native_once = Some(SemanticRefusal::Unavailable);
+    assert_eq!(
+        scene.fixture.service(1),
+        Err(SemanticRefusal::Unavailable),
+        "{ROW}: the transient refusal latches"
+    );
+    assert_eq!(
+        scene.fixture.rearm("semantic_unavailable"),
+        Some(true),
+        "{ROW}: the applied quantum re-arms as published"
+    );
+    watchdog_assert_scoped_recovery(&scene, ROW);
+    let (done, _, _, _, _, _) = scene.fixture.machine.absence_episode_for_test();
+    assert!(
+        !done,
+        "{ROW}: scoped recovery clears the completed absence flag"
+    );
+    let before = scene.fixture.machine.absence_episode_for_test();
+    for _ in 0..8 {
+        scene.fixture.service(1).expect("post-recovery polls never refuse");
+        let (done, _, _, binding, after, entry) =
+            scene.fixture.machine.absence_episode_for_test();
+        let (_, _, _, binding_before, after_before, entry_before) = before;
+        if done
+            || binding != binding_before
+            || after != after_before
+            || entry != entry_before
+        {
+            return;
+        }
+    }
+    panic!("{ROW}: polls after a scoped void must scan, never skip forever");
 }
 
 /// E8: scoped recovery discards by bulk free with a counted gap —

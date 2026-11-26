@@ -31291,6 +31291,18 @@ int main(int argc, char **argv) {
         assert_eq!(stop.sigint_deliveries(), 0);
     }
 
+    /// The pause coordinator's cancellation reads the same stop flag
+    /// the loops poll: an accepted stop cancels a bounded pause cycle
+    /// instead of sleeping through it.
+    #[test]
+    fn pause_cancellation_follows_the_stop_flag() {
+        let quiet = SignalState::new();
+        assert_eq!(cancelled_by(&quiet)(), Ok(false));
+        let interrupted = SignalState::new();
+        interrupted.observe(libc::SIGTERM);
+        assert_eq!(cancelled_by(&interrupted)(), Ok(true));
+    }
+
     /// A stop observed on a capture tick ends the loop by signal —
     /// over an already-elapsed duration too — so the terminal path
     /// below seals the report for a signal end. No stop, no end.

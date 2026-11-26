@@ -12,6 +12,7 @@ reproduce them byte for byte.
 import filecmp
 import importlib.util
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -24,6 +25,7 @@ ROOT = Path(__file__).resolve().parents[2]
 UPGRADE = ROOT / "tests" / "fixtures" / "upgrade"
 README = UPGRADE / "README.md"
 SANITIZE = UPGRADE / "tools" / "sanitize.py"
+TOOLS = UPGRADE / "tools"
 
 
 def load_sanitize():
@@ -144,6 +146,34 @@ class RegenerateTests(unittest.TestCase):
                 self.assertNotEqual(proc.returncode, 0)
                 self.assertIn("Usage", proc.stderr)
 
+    def test_sanitizer_runs_by_direct_path(self):
+        """The README documents direct execution, so the file must be
+        executable, not only runnable through an interpreter."""
+        self.assertTrue(os.access(SANITIZE, os.X_OK), "sanitize.py is +x")
+        proc = subprocess.run(
+            [str(SANITIZE)], capture_output=True, text=True, timeout=60)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("Usage", proc.stderr)
+
+    def test_scrub_maps_fedora_provider_prefix(self):
+        """Fedora SoftHSM paths canonicalize to the same provider
+        directory as the Debian paths."""
+        prefixes = self.sanitize.build_prefixes("/custom/work")
+        self.assertEqual(
+            self.sanitize.scrub_string(
+                "/usr/lib64/pkcs11/libsofthsm2.so", prefixes),
+            "/usr/lib/softhsm/libsofthsm2.so")
+
+    def test_readme_documents_manifest_handoff(self):
+        """The manifest producer and the single raw directory are
+        spelled exactly, so collection cannot drift from prose."""
+        words = " ".join(README.read_text(encoding="utf-8").split())
+        self.assertIn("with OUT set to one raw directory `<rawdir>`", words)
+        self.assertIn(
+            "p11scope-discover-0.7.1 --module <provider> "
+            "-o <rawdir>/v071-manifest-softhsm.json",
+            words)
+
     def write_raw_inputs(self, tmp):
         """Unsanitized copies of every committed fixture input."""
         raw = tmp / "raw"
@@ -193,6 +223,138 @@ class RegenerateTests(unittest.TestCase):
             self.assert_matches_committed(out)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+STUB_SUDO = """#!/bin/sh
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -n) shift ;;
+    --preserve-env=*) shift ;;
+    --preserve-env) shift; shift ;;
+    chown) exit 0 ;;
+    *) break ;;
+  esac
+done
+exec "$@"
+"""
+
+STUB_FLOCK = """#!/bin/sh
+shift
+exec "$@"
+"""
+
+STUB_OBSERVER = """#!/bin/sh
+o=""; prev=""
+for a in "$@"; do
+  if [ "$prev" = "-o" ]; then o="$a"; fi
+  prev="$a"
+done
+[ -n "$o" ] || exit 2
+echo "semantic lane ready: stub" >&2
+echo '{"stub": true}' > "$o"
+"""
+
+FAKE_HELPER = """#!/bin/sh
+echo "mapped pid=$$"
+exit ${FAKE_HELPER_RC:-0}
+"""
+
+
+class DriverTests(unittest.TestCase):
+    """Key-operations capture drivers propagate helper results."""
+
+    def stage(self, tmp):
+        bin = tmp / "bin"
+        bin.mkdir()
+        (bin / "sudo").write_text(STUB_SUDO, encoding="utf-8")
+        (bin / "flock").write_text(STUB_FLOCK, encoding="utf-8")
+        (bin / "observer").write_text(STUB_OBSERVER, encoding="utf-8")
+        for name in ("sudo", "flock", "observer"):
+            (bin / name).chmod(0o755)
+        work = tmp / "work"
+        helpers = work / "f2" / "bin"
+        helpers.mkdir(parents=True)
+        (helpers / "steady-keys").write_text(FAKE_HELPER, encoding="utf-8")
+        (helpers / "steady-keys").chmod(0o755)
+        out = work / "out"
+        out.mkdir()
+        (out / "v071-manifest-softhsm.json").write_text("{}", encoding="utf-8")
+        env = dict(os.environ, TMPDIR=str(work),
+                   PATH=f"{bin}{os.pathsep}{os.environ['PATH']}")
+        return work, out, env
+
+    def run_keyops(self, script, helper_rc):
+        tmp = Path(tempfile.mkdtemp(prefix="upgrade-driver-"))
+        try:
+            work, out, env = self.stage(tmp)
+            env["FAKE_HELPER_RC"] = str(helper_rc)
+            args = ["sh", str(TOOLS / script), f"{tmp}/bin/observer",
+                      "v071"]
+            if script == "capture-ops.sh":
+                args.append("keyops")
+            args.append(str(out))
+            proc = subprocess.run(
+                args, capture_output=True, text=True, timeout=120, env=env)
+            return proc, sorted(p.name for p in out.iterdir())
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_ops_propagates_helper_failure(self):
+        """A failing key workload fails the capture (exit nonzero)."""
+        proc, _ = self.run_keyops("capture-ops.sh", 1)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    def test_ops_success_path_writes_output(self):
+        """The passing leg proves the failure leg is non-vacuous."""
+        proc, files = self.run_keyops("capture-ops.sh", 0)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("v071-inventory-keyops.json", files)
+
+    def test_syskeyops_propagates_helper_failure(self):
+        """A failing key workload fails the capture (exit nonzero)."""
+        proc, _ = self.run_keyops("capture-syskeyops.sh", 1)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    def test_syskeyops_success_path_writes_output(self):
+        """The passing leg proves the failure leg is non-vacuous."""
+        proc, files = self.run_keyops("capture-syskeyops.sh", 0)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("v071-inventory-syskeyops.json", files)
+
+
+class ProbeTests(unittest.TestCase):
+    """The shared provider probe honors overrides and fails named."""
+
+    def probe(self, *candidates, extra_env=None):
+        env = dict(os.environ)
+        env.update(extra_env or {})
+        return subprocess.run(
+            ["sh", "-c", '. "$1/capture-env.sh"; shift; probe_provider "$@"',
+             "probe", str(TOOLS), *candidates],
+            capture_output=True, text=True, timeout=60, env=env)
+
+    def test_override_missing_file_fails_named(self):
+        proc = self.probe(extra_env={"PROV": "/nonexistent-softHSM.so"})
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("missing prerequisite", proc.stderr)
+
+    def test_override_existing_file_wins(self):
+        with tempfile.NamedTemporaryFile() as handle:
+            proc = self.probe(extra_env={"PROV": handle.name})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), handle.name)
+
+    def test_probe_finds_system_provider(self):
+        proc = self.probe()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(proc.stdout.strip(), [
+            "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so",
+            "/usr/lib64/pkcs11/libsofthsm2.so"])
+
+    def test_probe_empty_set_fails_named(self):
+        proc = self.probe("/nonexistent-a.so", "/nonexistent-b.so")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("missing prerequisite", proc.stderr)
 
 
 if __name__ == "__main__":

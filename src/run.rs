@@ -4031,6 +4031,9 @@ enum OutputSink {
     Trace(crate::output::PrivateStream),
     /// Trace `-o -`: no file; stdout takes the file's role as the
     /// complete sink, so the terminal EVIDENCE stays on stdout.
+    /// Bounded-wait-drop still applies under backpressure, like every
+    /// stdout delivery: after a stop, a stalled reader sheds with
+    /// counters instead of receiving every byte.
     TraceStdout,
 }
 
@@ -31301,6 +31304,45 @@ int main(int argc, char **argv) {
         let interrupted = SignalState::new();
         interrupted.observe(libc::SIGTERM);
         assert_eq!(cancelled_by(&interrupted)(), Ok(true));
+    }
+
+    /// S5/S9 twin: the final stdout report after the stop that ended
+    /// capture. The observed stop raises the shared cancel flag, so a
+    /// stalled reader gets a prompt bounded shed — whatever fits is
+    /// delivered first, the rest drops with counters — instead of a
+    /// waited-out flush. The shed never fails the flush itself: drops
+    /// surface through counters, not errors.
+    #[test]
+    fn final_stdout_after_a_stop_sheds_a_stalled_reader_with_counters() {
+        use crate::sink::SinkWriter;
+        use std::io::Write as _;
+        use std::os::unix::net::UnixStream;
+        // The loop-ending stop, observed before the final publish.
+        let interrupted = SignalState::new();
+        interrupted.observe(libc::SIGINT);
+        // A stalled reader: fill the pipe, then hold it.
+        let (writer, reader) = UnixStream::pair().unwrap();
+        let mut filler = writer.try_clone().unwrap();
+        filler.set_nonblocking(true).unwrap();
+        let chunk = vec![7u8; 65536];
+        while filler.write(&chunk).is_ok() {}
+        drop(filler);
+        let mut sink = SinkWriter::new(writer).unwrap();
+        sink.set_cancel_flag(interrupted.cancel_flag());
+        sink.begin_tick(Duration::from_millis(250));
+        let payload = vec![8u8; 4096];
+        sink.write_all(&payload).unwrap();
+        let start = Instant::now();
+        sink.flush().unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(150),
+            "a stopped final flush must shed promptly, not wait out its budget: {elapsed:?}"
+        );
+        let drops = sink.take_drops();
+        assert_eq!(drops.timeouts, 1);
+        assert_eq!(drops.dropped_bytes, payload.len() as u64);
+        drop(reader);
     }
 
     /// A stop observed on a capture tick ends the loop by signal —

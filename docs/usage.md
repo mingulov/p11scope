@@ -950,7 +950,11 @@ program preflight already covers the whole-machine lane.
 seconds or `30s`/`5m`/`1h`, up to 366 days) requests shutdown after the
 given interval; a larger value is a usage error. Final
 reporting and probe teardown follow, in that order: the report is published
-at the stop gate's quiescence point, before any probe link is closed. Closing
+at the stop gate's quiescence point, before any probe link is closed. The
+`-o` file report is complete either way; the stdout report follows the
+bounded slow-sink policy once a stop is observed — a stalled reader gets
+whatever fits, the rest sheds with counters (an stderr note plus scheduling
+evidence), and the exit code is unaffected. Closing
 the links then runs in the background with a progress line on stderr about
 once a second (`p11scope: cleanup 1200/4227 links released, 38 s`) and a final
 `p11scope: cleanup completed, …` line (`cleanup incomplete, … uncertain` when
@@ -961,8 +965,9 @@ links one at a time (no batched uprobe detach on this kernel); about 212 s,
 progress follows`). A second
 Ctrl-C while the links are closing stops waiting: p11scope prints the
 progress and `p11scope: cleanup incomplete`, exits with status 130, and the
-kernel finishes the remaining closes as the process exits — the report is
-already written and stays intact. Only a second SIGINT does this; a second
+kernel finishes the remaining closes as the process exits — the `-o` report
+is already written and stays intact (stdout delivery stays bounded as
+above). Only a second SIGINT does this; a second
 SIGTERM does not escalate.
 
 `run` captures the command with its child processes: before release the

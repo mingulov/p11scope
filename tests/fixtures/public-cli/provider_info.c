@@ -4,26 +4,33 @@
  * `inventory-provider-info-pid` public cell (`inventory --pid --capture
  * native --provider-info -o`).
  *
- * usage: provider_info MODULE GATE
- *   GATE: path to wait for, or "-" for no wait (self-tests only)
+ * usage: provider_info MODULE GATE1 GATE2
+ *   GATE1/GATE2: paths to wait for, or "-" for no wait (self-tests only)
  *
- * After the gate opens the workload makes exactly one observed call per
- * info query: C_GetInfo, one C_GetSlotList over every slot, and per slot
- * one C_GetTokenInfo plus, on slots holding a token, one
- * C_GetMechanismList and one C_GetMechanismInfo per listed mechanism.
- * The LEDGER (schema p11scope/provider-info-ledger/v1) carries the
- * returned C_GetInfo record, the per-slot token presence and token
- * facts, and the per-slot mechanism facts, so the oracle asserts the
- * report's provider_info, token rows and mechanism rows exactly.
+ * After GATE1 opens the workload primes binder association with
+ * sessionless C_GetSlotList calls until GATE2 opens (the harness
+ * holds GATE2 shut until the workload edge is matched and K passes
+ * commit with priming calls flowing, so the binder settles before
+ * the ledgered sweep; without settled association the sweep's rows
+ * land in info_caller_unavailable gaps). After GATE2 it makes
+ * exactly one observed call per info query: C_GetInfo, one
+ * C_GetSlotList, and per slot one C_GetTokenInfo plus, on token
+ * slots, one C_GetMechanismList and one C_GetMechanismInfo per
+ * listed mechanism. The PRIME line carries the exact priming count
+ * (edge scaffolding, like mt_mixed's SCAFFOLD); the LEDGER (schema
+ * p11scope/provider-info-ledger/v1) carries the returned C_GetInfo
+ * record, the per-slot token presence and token facts, and the
+ * per-slot mechanism facts, so the oracle asserts the report's
+ * provider_info, token rows and mechanism rows exactly.
  *
  * Gate discipline (as mt_mixed): only dlopen/C_GetFunctionList/
- * C_Initialize run before READY; every info call happens after the
- * gate opens, i.e. after the observer attaches. Any unexpected return
- * (a should-succeed call failing, a should-fail call succeeding, a
- * truncated list) exits nonzero with no LEDGER, so a sample that did
- * not run exactly as scripted can never count. The ledger refuses
- * vacuity: zero slots, zero token rows or zero mechanism rows die
- * instead of emitting an empty expectation.
+ * C_Initialize run before READY; every counted call happens after
+ * GATE1 opens, i.e. after the observer attaches. Any unexpected
+ * return (a should-succeed call failing, a should-fail call
+ * succeeding, a truncated list) exits nonzero with no LEDGER, so
+ * a sample that did not run exactly as scripted can never count.
+ * The ledger refuses vacuity: zero slots, zero token rows or zero
+ * mechanism rows die instead of emitting an empty expectation.
  *
  * The ledger prints only allowlisted info fact fields (versions,
  * manufacturer, model, flags, PIN lengths, key sizes); token labels,
@@ -205,8 +212,8 @@ int main(int argc, char **argv)
     typedef struct { void *c, *d, *l, *u; CK_FLAGS flags; void *r; } INITARGS;
     INITARGS args;
 
-    if (argc != 3) {
-        fprintf(stderr, "usage: %s MODULE GATE\n", argv[0]);
+    if (argc != 4) {
+        fprintf(stderr, "usage: %s MODULE GATE1 GATE2\n", argv[0]);
         return 2;
     }
     handle = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
@@ -228,6 +235,29 @@ int main(int argc, char **argv)
     printf("READY pid=%d\n", (int)getpid());
     fflush(stdout);
     wait_gate(argv[2]);
+
+    /* Prime binder association: sessionless C_GetSlotList calls until
+     * GATE2 opens. Every call is counted exactly (PRIME line) and
+     * observed (post-match); the sweep below runs only after the
+     * harness settled association over these witnesses. */
+    {
+        unsigned long prime = 0;
+        CK_SLOT_ID pslots[MAX_SLOTS];
+        CK_ULONG pn;
+        for (;;) {
+            if (access(argv[3], F_OK) == 0)
+                break;
+            pn = MAX_SLOTS;
+            rv = F(fns, I_GetSlotList, CK_RV (*)(CK_BBOOL, CK_SLOT_ID *, CK_ULONG *))(0, pslots,
+                                                                                     &pn);
+            if (rv != CKR_OK)
+                info_die("prime C_GetSlotList", rv);
+            prime++;
+            usleep(10000);
+        }
+        printf("PRIME calls=%lu\n", prime);
+        fflush(stdout);
+    }
 
     memset(&info, 0, sizeof info);
     rv = F(fns, I_GetInfo, CK_RV (*)(CK_INFO *))(&info);
@@ -342,7 +372,7 @@ int main(int argc, char **argv)
     ncalls = 2 + nslots + ntokens;
     for (CK_ULONG s = 0; s < nslots; s++)
         ncalls += facts[s].nmechs;
-    fprintf(stderr, "provider_info: %lu post-gate table calls over %lu slots\n",
+    fprintf(stderr, "provider_info: %lu sweep table calls over %lu slots\n",
             (unsigned long)ncalls, (unsigned long)nslots);
 
     /* Hold for the harness stop (inventory windows only): SIGTERM/SIGINT. */

@@ -81,7 +81,7 @@ def token_entry(slot, manufacturer="SoftHSM project", model="SoftHSM v2"):
     }
 
 
-def ledger_lines(pid=123):
+def ledger_lines(pid=123, prime=11):
     lines = [
         "TARGET "
         + json.dumps(
@@ -90,6 +90,7 @@ def ledger_lines(pid=123):
         for i, name in enumerate(INFO_NAMES)
     ]
     lines.append("READY pid=%d" % pid)
+    lines.append("PRIME calls=%d" % prime)
     lines.append(
         "LEDGER "
         + json.dumps(
@@ -171,9 +172,10 @@ def mech_row(slot, mid, min_key, max_key, flags):
 
 
 def inputs(pid=123):
-    # Post-gate calls: GetInfo + GetSlotList (2), per slot GetTokenInfo
-    # (2), per token slot GetMechanismList (1) + GetMechanismInfo (2).
-    total = 7
+    # Post-gate calls: 11 priming + GetInfo + GetSlotList (2), per
+    # slot GetTokenInfo (2), per token slot GetMechanismList (1) +
+    # GetMechanismInfo (2).
+    total = 18
     report = {
         "schema": "p11scope/inventory/v1",
         "scope": "pid:%d" % pid,
@@ -364,14 +366,37 @@ class ProviderInfoOracleTests(unittest.TestCase):
 
     def test_edge_undercount_fails(self):
         result = self.run_case(
-            lambda d, l, r, e: d["edges"][0]["entries"].update(count=6), want=1
+            lambda d, l, r, e: d["edges"][0]["entries"].update(count=17), want=1
         )
         self.assertIn("differs from the independent ledger total", result["detail"])
 
     def test_edge_overcount_fails(self):
         self.run_case(
-            lambda d, l, r, e: d["edges"][0]["entries"].update(count=8), want=1
+            lambda d, l, r, e: d["edges"][0]["entries"].update(count=19), want=1
         )
+
+    def test_missing_prime_fails(self):
+        def mutate(d, l, r, e):
+            l[:] = [line for line in l if not line.startswith("PRIME ")]
+
+        self.run_case(mutate, want=1)
+
+    def test_malformed_prime_fails(self):
+        def mutate(d, l, r, e):
+            for i, line in enumerate(l):
+                if line.startswith("PRIME "):
+                    l[i] = "PRIME calls=many"
+
+        self.run_case(mutate, want=1)
+
+    def test_prime_count_feeds_the_edge_total(self):
+        def mutate(d, l, r, e):
+            for i, line in enumerate(l):
+                if line.startswith("PRIME "):
+                    l[i] = "PRIME calls=12"
+
+        result = self.run_case(mutate, want=1)
+        self.assertIn("differs from the independent ledger total", result["detail"])
 
     def test_lossy_coverage_fails(self):
         self.run_case(

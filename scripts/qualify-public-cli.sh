@@ -362,9 +362,9 @@ judge() {
 # require both processes alive and capture readiness, then release exactly once.
 gated() {
   local cell=$1 scope=$2 fixture=$3; shift 3
-  local gate=$OUT/$cell.gate ext=json
+  local gate=$OUT/$cell.gate gate2=$OUT/$cell.gate2 ext=json
   case "$cell" in trace-*|mt-trace|mt-system-trace) ext=txt;; esac
-  rm -f -- "$gate" "$cell.$ext" "$cell.wl" "$cell.stderr" "$cell.stdout" "$cell.receipt.json" "$cell.eventlog.jsonl" \
+  rm -f -- "$gate" "$gate2" "$cell.$ext" "$cell.wl" "$cell.stderr" "$cell.stdout" "$cell.receipt.json" "$cell.eventlog.jsonl" \
     "$cell.census.jsonl" "$cell.census.stop" "$cell.census.capturing" "$cell.census.settled" "$cell.census.ready" "$cell.census.stderr"
   local output; output=$(product_output "$cell.$ext")
   rm -f -- "$output"
@@ -383,7 +383,7 @@ gated() {
     mt-system|mt-system-metrics|mt-system-trace) asuser "$fixture" "$MODULE" 4 8 250 "$gate" 0 > "$cell.wl" 2>&1 & ;;
     inventory-mt-pid) asuser "$fixture" "$MODULE" 8 1000 "$gate" sessions 0 > "$cell.wl" 2>&1 & ;;
     inventory-mt-system) asuser "$fixture" "$MODULE" 4 8 250 "$gate" 0 > "$cell.wl" 2>&1 & ;;
-    inventory-provider-info-pid) asuser "$fixture" "$MODULE" "$gate" > "$cell.wl" 2>&1 & ;;
+    inventory-provider-info-pid) asuser "$fixture" "$MODULE" "$gate" "$gate2" > "$cell.wl" 2>&1 & ;;
     *) asuser "$fixture" "$MODULE" "$ITERS" 200 "$gate" > "$cell.wl" 2>&1 & ;;
   esac
   wl=$!; register "$wl" && gen=${CHILDREN[$wl]}
@@ -451,6 +451,23 @@ gated() {
       fi
       if [ "$match_ok" = 1 ] && "$release" "$gate"; then
         released=1
+        case "$cell" in
+          inventory-provider-info-pid)
+            # Binder association settles over witness batches, not
+            # instantly at match: priming calls flow while five passes
+            # commit, then the ledgered sweep runs once association
+            # holds it. A troubled settle fails loud here (fail-closed:
+            # an unsettled sweep would gap instead of binding).
+            if ! python3 -I "$HERE/inventory-mt-gate.py" --event-log "$evlog" --settle-passes 5 --timeout "$match_stall" --overall-timeout "$match_overall" --observer-pid "$pp"; then
+              terminate "$wl" || true; terminate "$pp" || true
+              result "$cell" 0 'association settle failed before gate2' failed; return 1
+            fi
+            if ! "$release" "$gate2"; then
+              terminate "$wl" || true; terminate "$pp" || true
+              result "$cell" 0 'gate2 release failed' failed; return 1
+            fi
+            ;;
+        esac
         if "$poll" "$cell.wl" '^LEDGER ' "$wl" "$LEDGER_TICKS" 1; then
           case "$cell" in
             inventory-mt-*|inventory-provider-info-pid)

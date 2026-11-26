@@ -4731,10 +4731,14 @@ impl PinnedObjects {
 
     /// Scan resolution with the custody generation read from its typed
     /// tag ([`CustodyGeneration`]). Fresh custody of the resolving view is
-    /// proof; carried custody of the resolving view is proof only for a
-    /// carried bind (`allow_carried`: the view is outside the rebuild's
-    /// claim authority). Fresh/reused views never pass it, so their
-    /// numeric ID never inherits a previous generation's proof.
+    /// proof; carried custody of the resolving view takes the own-custody
+    /// branch only for a carried bind (`allow_carried`: the view is
+    /// outside the rebuild's claim authority). Without it, a carried row
+    /// is no stronger than any surviving alias: it still resolves through
+    /// the alias fallthrough below whenever no view's fresh custody fences
+    /// the raw. A reused numeric ID is kept apart from a previous
+    /// generation by `release_view_id`, which clears the custody before
+    /// the ID is reused, not by this check.
     fn id_for_scanned_with_carry(
         &self,
         module: &ScannedModule,

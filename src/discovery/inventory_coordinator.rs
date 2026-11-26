@@ -46102,6 +46102,101 @@ int main(void) {
         assert_eq!(gaps, 1, "no second fold-revival gap");
     }
 
+    /// Opus T2 B1 (iii): a mid-life advance under a latched key is
+    /// not a revival — it stages past its base with no gap, and the
+    /// latch stays set for the evicted key's own revival.
+    #[test]
+    fn midlife_advance_under_a_latched_key_stages_and_keeps_the_latch() {
+        let (mut native, caller) = NativeScene::new();
+        let at = native.stamps.tick();
+        native.scene.coordinator.set_pair_prune_cap_for_test(2);
+        // Key (41, exec 1) advances to 5 while nothing is latched.
+        let row = native.row(41, 1, 7, at, 0);
+        native.scene.coordinator.bind_pair_count(&row, caller, &[]);
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 5)]);
+        let staged = native
+            .scene
+            .coordinator
+            .registry
+            .staged_pending_counts_for_test();
+        assert_eq!(staged.len(), 1, "the first advance stages: {staged:?}");
+        assert_eq!(staged[0].1, 5, "stages its full count: {staged:?}");
+        native.scene.coordinator.registry.publish();
+        // Evict a live fold of the same image: the latch keys
+        // (domain, image 41, object 0).
+        for ticket in [90u64, 91] {
+            native.scene.coordinator.pair_dropped_tombstones.insert(
+                PairKey {
+                    image: DomainCookie::scripted(native.domain, ticket),
+                    exec: 1,
+                    object: 0,
+                },
+                PrunedPairBase {
+                    base: 9,
+                    base_since: at,
+                    pruned_since: at,
+                    pid: 7,
+                },
+            );
+        }
+        for (pass, exec) in [9u64, 10, 11].iter().enumerate() {
+            native.scene.coordinator.pair_targets.insert(
+                PairKey {
+                    image: DomainCookie::scripted(native.domain, 41),
+                    exec: *exec,
+                    object: 0,
+                },
+                PairTarget::Dropped {
+                    base: 3,
+                    base_since: at,
+                    pid: 7,
+                },
+            );
+            native.scene.coordinator.prune_departed_native_state(
+                at + EXEC_STATE_GRACE_NS + pass as u64,
+            );
+        }
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .pair_fold_memory_overflow_for_test(),
+            1,
+            "the oldest live fold drops with a counted overflow"
+        );
+        // Advance (41, exec 1) to 8: staged progress (5 > 0) makes
+        // this a mid-life advance, not a revival — it stages
+        // normally (absolute, unrebased base 0), with no gap.
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 8)]);
+        let staged = native
+            .scene
+            .coordinator
+            .registry
+            .staged_pending_counts_for_test();
+        assert_eq!(staged.len(), 1, "the advance stages once: {staged:?}");
+        assert_eq!(staged[0].1, 8, "advance to 8 stages 8: {staged:?}");
+        assert_eq!(staged[0].2, 0, "the advance keeps base 0: {staged:?}");
+        native.scene.coordinator.registry.publish();
+        assert!(
+            native
+                .scene
+                .coordinator
+                .registry
+                .gaps()
+                .iter()
+                .all(|gap| gap.subject != "revived folded count"),
+            "no fold-revival gap for a mid-life advance"
+        );
+        assert!(
+            native.scene.coordinator.pair_fold_lost.contains(&PairFoldLatchKey {
+                domain: native.domain,
+                image: DomainCookie::scripted(native.domain, 41),
+                object: 0,
+            }),
+            "the advance preserves the latch for the evicted key"
+        );
+    }
+
     /// Devin #2: finishing a domain drops its folded pairs along
     /// with its tombstones; other domains' entries stay. (Latch
     /// halves arrive with the latch in GREEN.)

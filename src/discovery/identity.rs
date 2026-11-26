@@ -5135,16 +5135,23 @@ impl PinnedObjects {
         // disagreeing (a second staging — the drain never produces
         // one) fail closed, like today. In-place rotation needs a
         // unique target; several kept identities fail closed too.
-        let scan_involved = incoming_scan_only
-            || same_key.iter().any(|id| {
-                self.by_id
-                    .get(id)
-                    .is_some_and(|kept| kept.raw.mount_namespace.is_some())
-            });
-        if !scan_involved || entry.pre_copy_up || same_key.len() != 1 {
+        if entry.pre_copy_up || same_key.len() != 1 {
             return None;
         }
         let kept_id = same_key[0];
+        // Scan involvement is judged over every raw alias filed under the
+        // kept id, not only its representative: a pre-arm proof with a
+        // same-generation scan merged onto it is scan-covered, and its
+        // scan custody must survive the next staging. One pass over the
+        // raw index, like the same-key scan. The observation path below
+        // stays the representative's (never loosened by an alias).
+        let kept_scanned = self
+            .raw_to_id
+            .iter()
+            .any(|(raw, id)| *id == kept_id && raw.mount_namespace.is_some());
+        if !(incoming_scan_only || kept_scanned) {
+            return None;
+        }
         // The kept observation must be the same kernel file with the
         // same hashed bytes under the same mount view and observation
         // path. A rewrite, a distinct file, an unhashed, cross-view or
@@ -21577,6 +21584,76 @@ mod tests {
         assert!(!acc.supersedes(key), "a merge is not a rotation");
         assert_eq!(acc.pinned().count(), 1, "the generation merges");
         assert!(skipped.is_empty(), "a merge files no skip: {skipped:?}");
+    }
+
+    /// A pre-arm proof with a same-generation scan merged onto it is
+    /// scan-covered even though its representative raw is the pre-arm
+    /// alias: a later direct staging of the next generation (same file,
+    /// same bytes, stepped ctime) rotates in place and keeps the scan
+    /// custody, never rejecting the key and evicting the object.
+    #[test]
+    fn absorbing_rotation_after_scan_merge_keeps_scan_custody_alive() {
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let mut staged = plain_prearm_pin(key, "aaaaaaaa", 1);
+        reback(&mut staged, &file);
+        let mut acc = PinnedObjects::empty();
+        assert!(acc.absorb(staged).is_empty());
+        let kept = acc.pinned().next().unwrap().id;
+        let staged_mapping = acc.by_id.values().next().unwrap().mapping;
+        let mut scan = image_pins(&[(key, "aaaaaaaa", 1)]);
+        reback(&mut scan, &file);
+        scan.by_id.values_mut().next().unwrap().mapping = staged_mapping;
+        assert!(acc.absorb(scan).is_empty(), "generation 1 merges");
+        assert!(
+            acc.by_id.get(&kept).unwrap().raw.mount_namespace.is_none(),
+            "the representative stays the pre-arm alias"
+        );
+        let scan_raws: Vec<RawObjectInstance> = acc
+            .raw_to_id
+            .iter()
+            .filter(|(raw, id)| **id == kept && raw.mount_namespace.is_some())
+            .map(|(raw, _)| raw.clone())
+            .collect();
+        assert_eq!(
+            scan_raws.len(),
+            1,
+            "the scan alias is filed under the kept id"
+        );
+        let mut second = plain_prearm_pin(key, "aaaaaaaa", 2);
+        reback(&mut second, &file);
+        second.by_id.values_mut().next().unwrap().mapping = staged_mapping;
+        let skipped = acc.absorb(second);
+        assert!(!acc.rejects(key), "scan custody must not be evicted");
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert!(acc.supersedes(key), "the rotation is recorded");
+        assert!(acc.by_id.contains_key(&kept), "the id is stable");
+        assert_eq!(
+            acc.by_id.get(&kept).unwrap().pin.test_parts().2,
+            (2, 7),
+            "generation 2 rotates in"
+        );
+        assert_eq!(
+            acc.raw_to_id.get(&scan_raws[0]),
+            Some(&kept),
+            "the scan alias keeps routing to the kept id"
+        );
+        // Control: without the scan alias two point-in-time proofs still
+        // fail closed.
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let mut first = plain_prearm_pin(key, "aaaaaaaa", 1);
+        reback(&mut first, &file);
+        let mut acc = PinnedObjects::empty();
+        assert!(acc.absorb(first).is_empty());
+        let mut second = plain_prearm_pin(key, "aaaaaaaa", 2);
+        reback(&mut second, &file);
+        assert!(!acc.absorb(second).is_empty());
+        assert!(acc.rejects(key), "proof versus proof fails closed");
     }
 
     #[test]

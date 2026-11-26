@@ -5665,10 +5665,10 @@ fn seal_owned_handoff_profile(context: &mut HandoffReportContext) -> Result<()> 
     let live_display = LiveDisplay::for_capture(true);
     let mut stdout_open = true;
     let stdout_result = (|| -> Result<()> {
-        let mut stdout_sink = crate::sink::stdout_sink().map_err(|error| {
-            anyhow::anyhow!("run: opening stdout for the handoff report: {error}")
-        })?;
-        stdout_sink.set_cancel_flag(context.signals.cancel_flag());
+        let mut stdout_sink = crate::sink::watched_stdout_sink(context.signals.cancel_flag())
+            .map_err(|error| {
+                anyhow::anyhow!("run: opening stdout for the handoff report: {error}")
+            })?;
         stdout_sink.begin_tick(crate::sink::SINK_TICK_BUDGET);
         if let Some(bytes) = live_display.frame_bytes(&frame, true) {
             write_stdout(&mut stdout_sink, &mut stdout_open, bytes.as_bytes())?;
@@ -5763,7 +5763,9 @@ fn seal_owned_handoff_trace(context: &mut HandoffReportContext) -> Result<()> {
     // A dead stdout at creation still routes through the shared emitter
     // with a fallback null sink held closed, so the file-only path keeps
     // the byte-exact terminal accounting below.
-    let (mut stdout_sink, mut stdout_open) = match crate::sink::stdout_sink() {
+    let (mut stdout_sink, mut stdout_open) = match crate::sink::watched_stdout_sink(
+        context.signals.cancel_flag(),
+    ) {
         Ok(sink) => (sink, true),
         Err(error) => {
             if out_file.is_none() {
@@ -5775,16 +5777,11 @@ fn seal_owned_handoff_trace(context: &mut HandoffReportContext) -> Result<()> {
                 "p11scope: stdout unavailable for the handoff trace; continuing file-only: {}",
                 crate::render::escape_controls(&error.to_string()),
             ));
-            let null = std::fs::OpenOptions::new()
-                .write(true)
-                .open("/dev/null")
-                .map_err(|error| anyhow::anyhow!("run: opening stdout fallback: {error}"))?;
-            let fallback = crate::sink::SinkWriter::new(crate::sink::StdoutInner::File(null))
+            let fallback = crate::sink::watched_null_sink(context.signals.cancel_flag())
                 .map_err(|error| anyhow::anyhow!("run: opening stdout fallback: {error}"))?;
             (fallback, false)
         }
     };
-    stdout_sink.set_cancel_flag(context.signals.cancel_flag());
     stdout_sink.begin_tick(crate::sink::SINK_TICK_BUDGET);
     let header = trace::header(context.policy, context.engine.plan());
     if let Err(error) = emit_trace_line(&header, &mut stdout_sink, &mut stdout_open, &mut out_file)
@@ -6286,23 +6283,31 @@ struct OpenedCaptureStdout {
 /// with a named gap, and the terminal fails after publication so the
 /// run exits nonzero. Only a `/dev/null` failure itself still aborts
 /// before the loop — the caller routes that through settlement.
+/// Both the live sink and the degraded fallback leave here watching
+/// the capture's stop flag, so a stop sheds slow flushes promptly
+/// instead of waiting out budgets.
 fn open_capture_stdout(
     note_gap: impl FnOnce(),
     open: impl FnOnce() -> std::io::Result<crate::sink::SinkWriter<crate::sink::StdoutInner>>,
+    cancel: &Arc<AtomicBool>,
 ) -> std::io::Result<OpenedCaptureStdout> {
     match open() {
-        Ok(sink) => Ok(OpenedCaptureStdout {
-            sink,
-            open: true,
-            deferred: None,
-        }),
+        Ok(sink) => {
+            let mut sink = sink;
+            sink.set_cancel_flag(Arc::clone(cancel));
+            Ok(OpenedCaptureStdout {
+                sink,
+                open: true,
+                deferred: None,
+            })
+        }
         Err(error) => {
             note_gap();
             emit_capture_diagnostic(&format!(
                 "p11scope: capture stdout unavailable ({}); continuing without stdout",
                 crate::render::escape_controls(&error.to_string()),
             ));
-            let sink = crate::sink::null_sink()?;
+            let sink = crate::sink::watched_null_sink(Arc::clone(cancel))?;
             Ok(OpenedCaptureStdout {
                 sink,
                 open: false,
@@ -9688,6 +9693,7 @@ fn capture_profile(
     } = match open_capture_stdout(
         || engine.note_stdout_unavailable(),
         crate::sink::stdout_sink,
+        &interrupted.cancel_flag(),
     ) {
         Ok(opened) => opened,
         Err(error) => {
@@ -9700,7 +9706,6 @@ fn capture_profile(
             ));
         }
     };
-    stdout_sink.set_cancel_flag(interrupted.cancel_flag());
     let stdout: &mut crate::sink::SinkWriter<crate::sink::StdoutInner> = &mut stdout_sink;
     let profile = policy.uses_events();
     let mode = if profile { "profile" } else { "metrics" };
@@ -11649,6 +11654,7 @@ fn capture_trace(
     } = match open_capture_stdout(
         || engine.note_stdout_unavailable(),
         crate::sink::stdout_sink,
+        &interrupted.cancel_flag(),
     ) {
         Ok(opened) => opened,
         Err(error) => {
@@ -11661,7 +11667,6 @@ fn capture_trace(
             ));
         }
     };
-    stdout_sink.set_cancel_flag(interrupted.cancel_flag());
     let stdout: &mut crate::sink::SinkWriter<crate::sink::StdoutInner> = &mut stdout_sink;
 
     // Refusal disables naming only; the existing capture/count path continues.
@@ -31358,61 +31363,54 @@ int main(int argc, char **argv) {
         drop(reader);
     }
 
-    /// S5/S9 wiring: every production stdout sink and the discovery
-    /// engine watch the shared stop flag, so an observed stop sheds
-    /// slow flushes promptly (see the twin above for the wired
-    /// behavior) instead of waiting out budgets. One pin per wiring
-    /// owner — the sinks are function locals, so presence here is
-    /// what the mutants remove; each needle names the exact shared
-    /// flag, so wiring a fresh flag fails too.
+    /// Capture stdout construction stays centralized: every production
+    /// capture sink is built by a watched constructor (wired inside,
+    /// pinned behaviorally), the capture opener wires what `open`
+    /// returns, and no raw sink construction remains in this file's
+    /// production code — a new unwired sink fails these counts. The
+    /// discovery engine keeps its single direct wiring (it defers
+    /// remaining frame work on stop; shedding is the sinks' job).
+    /// Comment lines are discounted like the architecture guards, so
+    /// commenting out a call fails instead of passing.
     #[test]
-    fn every_production_sink_watches_the_shared_stop_flag() {
+    fn capture_stdout_construction_stays_watched_and_counted() {
         let source = include_str!("run.rs");
-        for (owner, start, end, needle) in [
-            (
-                "run_loop engine",
-                "fn run_loop(",
-                "\nfn pause_failure(",
-                "engine.set_cancel_flag(interrupted.cancel_flag())",
-            ),
-            (
-                "owned handoff profile seal",
-                "fn seal_owned_handoff_profile(",
-                "\nfn seal_owned_handoff_trace(",
-                "stdout_sink.set_cancel_flag(context.signals.cancel_flag())",
-            ),
-            (
-                "owned handoff trace seal",
-                "fn seal_owned_handoff_trace(",
-                "\nfn finish_capture_loop(",
-                "stdout_sink.set_cancel_flag(context.signals.cancel_flag())",
-            ),
-            (
-                "profile loop",
-                "fn capture_profile(",
-                "\nfn write_json_report(",
-                "stdout_sink.set_cancel_flag(interrupted.cancel_flag())",
-            ),
-            (
-                "trace loop",
-                "fn capture_trace(",
-                "\nfn terminal_trace_count_line(",
-                "stdout_sink.set_cancel_flag(interrupted.cancel_flag())",
-            ),
-        ] {
-            let body = source
-                .split_once(start)
-                .unwrap_or_else(|| panic!("{owner}: region start moved"))
-                .1
-                .split_once(end)
-                .unwrap_or_else(|| panic!("{owner}: region end moved"))
-                .0;
-            assert_eq!(
-                body.matches(needle).count(),
-                1,
-                "{owner}: shared-flag wiring call missing or duplicated"
-            );
-        }
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let code: Vec<&str> = production
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect();
+        let count = |needle: &str| {
+            code.iter()
+                .filter(|line| line.contains(needle))
+                .count()
+        };
+        // The two handoff seals build watched stdout sinks; the opener
+        // and the trace fallback build watched null sinks.
+        assert_eq!(count("watched_stdout_sink("), 2, "seal constructions");
+        assert_eq!(count("watched_null_sink("), 2, "null-fallback constructions");
+        // No raw sink construction survives in production: a bypass
+        // mutant adding any of these fails here.
+        let bare_stdout =
+            count("stdout_sink(") - count("watched_stdout_sink(");
+        assert_eq!(bare_stdout, 0, "raw stdout_sink( calls");
+        let bare_null = count("null_sink(") - count("watched_null_sink(");
+        assert_eq!(bare_null, 0, "raw null_sink( calls");
+        assert_eq!(count("SinkWriter::new("), 0, "raw SinkWriter::new(");
+        assert_eq!(count("sink_on_fd("), 0, "dashboard-only sink_on_fd(");
+        assert_eq!(
+            count("without_flag_change("),
+            0,
+            "raw without_flag_change("
+        );
+        // The opener wires whatever `open` returns, and the engine
+        // keeps its single direct wiring with the exact shared flag.
+        assert_eq!(count("set_cancel_flag("), 2, "direct wirings");
+        assert_eq!(
+            count("engine.set_cancel_flag(interrupted.cancel_flag())"),
+            1,
+            "engine wiring with the exact shared flag"
+        );
     }
 
     /// A stop observed on a capture tick ends the loop by signal —

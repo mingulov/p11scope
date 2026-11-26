@@ -39,6 +39,12 @@ Required fields: `path`, `test`, `cell`, `issues`, `target`, `runner`,
   judge exists.
 - `mode`: `always` (must fail; a pass is a stale row) or `intermittent`
   (may pass; a failure must match `signature` exactly, type-sensitive).
+- Every row has a CI judge. A `python-suite` row needs `github` in
+  `hosts`, or no `hosts` (python suites are judged only with host
+  `github`). A `cell:` row needs a workflow invocation with the same
+  `--known-failing-runner` and a compatible host (`"$kf_host"` matches
+  any host). A `cell:` row's `path` equals its runner script, except
+  `.rs` rows whose typed path comes from `tests/ignored-tests.json`.
 
 `privileged-lib` rows are refused until the privileged summary counts
 `XFAIL` rows: a typed row prints `XFAIL`, which `Prove full coverage`
@@ -52,7 +58,8 @@ does not count today, so the first such row would turn that job red.
    typed registry, and every `test: true` issue has at least one row.
    Exact equality both ways. Until the 0.7.2 section lands, only an
    empty list is valid; once `docs/releases/v0.7.2.md` exists the
-   empty list is refused.
+   typed registry must exist, and zero `test: true` issues means zero
+   rows is valid.
 3. Runner-declaration unification (row-to-workflow) is deferred to
    0.7.3 (controller ruling 2026-11-25 21:17). Only the reverse holds:
    no undeclared `--expected-failure` / `--intermittent-failure`
@@ -96,6 +103,10 @@ Rules the checker enforces on the block: exactly one marker comment in
 the section, strict JSON, top level exactly `schema` + `issues`, every
 issue exactly `id` + boolean `test`, no duplicate ids, and every
 registered id has a matching `### KI-nn` heading and vice versa.
+
+The registry lands in the same commit as the `v0.8.0.md` -> `v0.7.2.md`
+rename, or before it: once `docs/releases/v0.7.2.md` exists the checker
+refuses a tree without the registry.
 
 ## 0.7.2 row dispositions (plan section d.3)
 

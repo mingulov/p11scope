@@ -1723,7 +1723,7 @@ main() {
     local arg name i pass=0 fail=0 skipped=0 xfail=0 xpass=0 seq=0
     local tmpdir logdir eviddir results log evdir short start end seconds rc
     local result_line verdict branch_suffix sig_line matrix_note verdict_rc
-    local -a joint_verdict=()
+    local -a joint_verdict=() print_rc=()
     local m32_ok=0 p11kit_ok=0 need_m32=0 need_p11kit=0
     local need_ext4loop=0 ext4loop_skip=
     local need_counter=0 counter_skip=

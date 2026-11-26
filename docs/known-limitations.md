@@ -1016,8 +1016,9 @@ per-key rows while call counts stay exact. A fix is planned for 0.8.0.
 - What the user sees: an observer started in the background (`&`) inherits
   SIGINT ignored, so a SIGINT landing before its handler is installed is
   lost silently and the run continues until `--duration` ends instead of
-  exiting promptly. Present since v0.7.1; 0.7.2 narrows the window to
-  process start (loader plus argument parsing).
+  exiting promptly; without `--duration` it waits for a provider until
+  one arrives. Present in earlier releases; 0.7.2 narrows the window to
+  process start through argument parsing and the pre-install checks.
 - Kernels/conditions: backgrounded launches without a terminal.
 - Disclosure: this row.
 - Workaround: stop it with SIGTERM, or send SIGINT again.

@@ -3603,15 +3603,17 @@ fn capture_with_host(
     // M-1: own Ctrl-C/SIGTERM/SIGHUP on the first line, before the
     // policy checks, the preflights, the host capability probe (which
     // loads BPF and can take a noticeable slice of startup), the `-o`
-    // temp file, and discovery. A default disposition there would
-    // strand the temp files, and an inherited SIG_IGN (a backgrounded
-    // launch ignores SIGINT) would lose a stop landing before the
-    // handler is installed: the run would then run on until
-    // `--duration` ends instead of exiting promptly (without a
-    // duration it waits for a provider until one arrives). A stop
-    // that lands before the attach is honoured just after discovery
-    // (which cannot be interrupted part-way), by returning an error
-    // that drops the sink.
+    // temp file, and discovery. Only process start through argument
+    // parsing and the pre-install checks in `main` (CLI parsing, the
+    // capability drop, validations, dispatch) precedes it. A default
+    // disposition there would strand the temp files, and an inherited
+    // SIG_IGN (a backgrounded launch ignores SIGINT) would lose a
+    // stop landing before the handler is installed: the run would
+    // then run on until `--duration` ends instead of exiting promptly
+    // (without a duration it waits for a provider until one arrives).
+    // A stop that lands before the attach is honoured just after
+    // discovery (which cannot be interrupted part-way), by returning
+    // an error that drops the sink.
     let stop = install_stop_flag()?;
     let kind = a.kind;
     let policy = capture_policy(
@@ -30401,14 +30403,16 @@ int main(int argc, char **argv) {
         assert!(text.contains("no report was written"), "{text}");
     }
 
-    /// M-1: `capture` must own Ctrl-C/SIGTERM/SIGHUP before it creates the
-    /// `-o` temp file and starts discovery (a default disposition there kills
-    /// the process and leaves `.p11scope.<pid>.*.tmp` behind), and must look
-    /// at the flag again before attaching. The flag also precedes the
-    /// slow host capability probe: a stop landing before the handler is
-    /// installed is lost silently when SIGINT is inherited ignored (a
-    /// backgrounded launch), and the run then waits for a provider
-    /// forever instead of exiting.
+    /// M-1: `capture` must own Ctrl-C/SIGTERM/SIGHUP on its first
+    /// line, before the policy checks, the host probe, the `-o` temp
+    /// file, and discovery (a default disposition there kills the
+    /// process and leaves `.p11scope.<pid>.*.tmp` behind), and must
+    /// look at the flag again before attaching. A stop landing
+    /// before the handler is installed is lost silently when SIGINT
+    /// is inherited ignored (a backgrounded launch), and the run
+    /// then runs on until `--duration` ends instead of exiting
+    /// promptly (without a duration it waits for a provider until
+    /// one arrives).
     #[test]
     fn capture_owns_stop_signals_before_output_and_discovery() {
         let source = include_str!("run.rs");

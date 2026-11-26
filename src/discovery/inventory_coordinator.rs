@@ -14395,7 +14395,13 @@ fn diagnostic_binding_reason(reason: UnboundReason) -> DiagnosticReason {
         | UnboundReason::EvidenceIncomplete => DiagnosticReason::BindingUnproven,
         UnboundReason::LifecycleLoss => DiagnosticReason::CaptureLoss,
         UnboundReason::Capacity => DiagnosticReason::BudgetRefused,
-        _ => DiagnosticReason::IdentityChanged,
+        UnboundReason::NoLiveCaller
+        | UnboundReason::CallerExited
+        | UnboundReason::CookieMismatch
+        | UnboundReason::BeforeAdmission
+        | UnboundReason::ExecAfterAdmission
+        | UnboundReason::ExecAmbiguous
+        | UnboundReason::ExecTransition => DiagnosticReason::IdentityChanged,
     }
 }
 

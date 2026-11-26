@@ -2236,6 +2236,29 @@ fn a_cached_image_binds_rows_read_after_its_caller_exited() {
 }
 
 #[test]
+fn rows_sharing_a_batch_bind_through_the_decide_time_cache() {
+    // Two rows of one image absorbed before either decides: the first
+    // proves the image, the second binds through the decide-time
+    // cache. Dropping that check refuses the second row, since the
+    // incarnation already holds its exact image.
+    let mut run = Run::new();
+    let d = run.domain;
+    let x = run.world.admit(T, 1, 0, 1_000);
+    run.world.answer(T, 1, d, cookie(d, 7));
+    run.read(vec![
+        row_on(d, 7, 1, T, 1_500, 0),
+        row_on(d, 7, 1, T, 1_600, 1),
+    ]);
+    assert!(run.verdicts().is_empty(), "no horizon yet");
+    assert_eq!(
+        run.world.queries, 2,
+        "each row carries its own read-time query"
+    );
+    run.settle();
+    assert_eq!(run.verdicts(), vec![bound(x), bound(x)]);
+}
+
+#[test]
 fn discovery_loss_makes_binding_ambiguous() {
     // Ring loss detected after the admission.
     let mut run = Run::new();
@@ -2848,6 +2871,73 @@ fn demotion_retirement_current_binding_waits_for_fresh_horizons() {
         run.verdicts(),
         vec![Binding::Bound(caller)],
         "Finish cancels current proof but preserves exact cached historical binding"
+    );
+}
+
+#[test]
+fn incomparable_clocks_refuse_the_sighting_before_any_query() {
+    // Twin: with comparable clocks the same sighting spends its fresh
+    // query and succeeds; once the clocks go incomparable the refusal
+    // precedes the query, so a sighting that could only refuse spends
+    // no charged unit.
+    let mut run = Run::new();
+    let caller = run.world.admit(7, 500, 1, 50);
+    run.world.answer(7, 500, run.domain, cookie(run.domain, 41));
+    run.read(vec![row(run.domain, 41, 1, 7, 100)]);
+    run.settle();
+    assert_eq!(run.verdicts(), vec![Binding::Bound(caller)]);
+    let request = CurrentBindingRequest {
+        caller,
+        pid: 7,
+        image: DomainCookie::scripted(run.domain, 41),
+        exec_id: 1,
+    };
+    let spent = run.world.queries;
+    let sighted = {
+        let World {
+            live,
+            retained,
+            answers,
+            queries,
+            lookups,
+        } = &mut run.world;
+        run.binder.sight_current_binding_at(
+            request,
+            &Lookup(live, retained, lookups),
+            &mut AnswerTable { answers, queries },
+            || Some(2_000),
+        )
+    };
+    assert!(sighted.is_ok(), "the comparable twin sights");
+    assert_eq!(
+        run.world.queries,
+        spent + 1,
+        "a provable sighting spends its fresh query"
+    );
+    run.binder.set_exit_clocks_comparable(false);
+    let spent = run.world.queries;
+    let refused = {
+        let World {
+            live,
+            retained,
+            answers,
+            queries,
+            lookups,
+        } = &mut run.world;
+        run.binder.sight_current_binding_at(
+            request,
+            &Lookup(live, retained, lookups),
+            &mut AnswerTable { answers, queries },
+            || Some(2_100),
+        )
+    };
+    assert!(
+        matches!(refused, Err(UnboundReason::ClocksIncomparable)),
+        "the same sighting refuses once the clocks go incomparable"
+    );
+    assert_eq!(
+        run.world.queries, spent,
+        "a doomed sighting spends no query"
     );
 }
 

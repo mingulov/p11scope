@@ -2025,7 +2025,7 @@ class UpgradeGate6ActivationTests(unittest.TestCase):
             self.assertNotIn(key, document["evidence"])
         self.assertEqual(
             self.gate6.profile_window(document),
-            "2026-11-25T11:14:57Z..2026-11-25T11:15:00Z (capture wall clock)",
+            "2026-11-26T10:46:44Z..2026-11-26T10:46:54Z (capture wall clock)",
         )
 
     def test_profile_fixture_flow_requires_substantive_typed_conversion(self):

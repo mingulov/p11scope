@@ -4112,3 +4112,127 @@ fn async_global_newcomer_waits_for_the_detach_then_admits_on_the_settling_frame(
         "the newcomer admits on the first frame after the worker settles"
     );
 }
+
+/// Refresh-skip gate twin (B2a): a batch that arrives with
+/// retirements already queued skips the inventory refresh — the
+/// `pending_retirements` gate is independent, not redundant with the
+/// ticket barrier. The collected-finish budget is exhausted, so the
+/// batch's conservative replay is really skipped and the queued id
+/// (synthetic: never resolved, never detached) persists to the gate;
+/// no ticket exists anywhere. Releasing the budget lets the replay
+/// drain it and the next batch refreshes again.
+#[test]
+fn async_global_pending_retirements_alone_skip_the_refresh() {
+    let mut case = Case::new();
+    let _scope = case.bounded_scope();
+    case.engine
+        .pending_retirements
+        .insert(ProcessViewId(u32::MAX));
+    case.engine.collected_finish_actions = Some(0);
+    assert!(
+        case.engine.pending_global_retirement.is_none(),
+        "premise: no ticket"
+    );
+    let passes = case.engine.inventory_passes;
+    let scans = case.engine.deep_scans;
+    apply_ordinary_batch(&mut case.engine, &mut case.session, Vec::new()).unwrap();
+    assert_eq!(
+        case.engine.inventory_passes, passes,
+        "a queued retirement skips the refresh"
+    );
+    assert_eq!(
+        case.engine.deep_scans, scans,
+        "a skipped refresh scans nothing"
+    );
+    assert!(
+        case.engine.pending_global_retirement.is_none(),
+        "no ticket parks"
+    );
+    assert!(
+        !case.engine.pending_retirements.is_empty(),
+        "the skipped replay retains the queue"
+    );
+    // Releasing the budget lets the replay drain the queue, and the
+    // next batch refreshes again.
+    case.engine.collected_finish_actions = None;
+    apply_ordinary_batch(&mut case.engine, &mut case.session, Vec::new()).unwrap();
+    assert!(
+        case.engine.pending_retirements.is_empty(),
+        "the replay drains the trivial queue"
+    );
+    assert!(
+        case.engine.pending_global_retirement.is_none(),
+        "still no ticket"
+    );
+    assert_eq!(
+        case.engine.inventory_passes,
+        passes + 1,
+        "a clean batch refreshes"
+    );
+}
+
+/// Apply entry-guard twin (B2c): while a global retirement ticket is
+/// pending, a direct newcomer apply defers at the candidate-boundary
+/// guard — nothing commits, nothing admits. The guard is the final
+/// owner of the pending-batch invariant, behind every caller.
+#[test]
+fn async_global_apply_defers_behind_a_pending_ticket() {
+    let mut case = Case::new();
+    let _scope = case.bounded_scope();
+    // Establish the ticket exactly like the live leg: the first apply
+    // retires a slot and its detach pends on the worker.
+    let candidate = case.candidate();
+    let outcome = case
+        .engine
+        .apply_candidate(&mut case.session, candidate, &mut true, false, &[])
+        .unwrap();
+    assert_eq!(outcome.disposition, ApplyDisposition::Deferred);
+    assert!(
+        case.engine.pending_global_retirement.is_some(),
+        "premise: the detach parks its ticket"
+    );
+    case.entered.recv_timeout(Duration::from_secs(2)).unwrap();
+    // A fresh peer-newcomer candidate against the post-ticket engine:
+    // the first apply deactivated its slot, so the peer plus the
+    // re-planned slot allocate anew (no count pinned — the Deferred
+    // verdict below is the assertion). Nothing here detaches, so only
+    // the entry guard can defer it.
+    let mut pins = case.engine.pinned.clone();
+    let skipped = pins.absorb(pin_test_modules(&case.engine.views[0], &case.modules[1..2]));
+    let newcomer = case
+        .engine
+        .live_candidate(pins, case.modules.clone(), skipped)
+        .unwrap();
+    let views_before = case.engine.views.len();
+    let outcome = case
+        .engine
+        .apply_candidate(&mut case.session, newcomer, &mut true, false, &[])
+        .unwrap();
+    assert_eq!(
+        outcome.disposition,
+        ApplyDisposition::Deferred,
+        "a pending batch owns the whole candidate boundary"
+    );
+    assert_eq!(
+        case.engine.views.len(),
+        views_before,
+        "nothing admits behind the ticket"
+    );
+    // Teardown settles the worker exactly like the twin, so nothing hangs.
+    case.release();
+    wait_for(|| {
+        case.session
+            .global_retirement
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .released()
+            == 2
+    });
+    let outcome = case
+        .engine
+        .service_backlog_quantum(&mut case.session)
+        .unwrap();
+    assert!(outcome.progressed);
+    assert!(case.engine.pending_global_retirement.is_none());
+}

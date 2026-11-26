@@ -1128,15 +1128,15 @@ pub struct Engine {
     /// zero-state ends]. The buckets always sum to the total.
     exit_ended_by_route: [u64; 3],
     pending_rejected_keys: BTreeSet<ObjectKey>,
-    /// Staged maps keys a same-file generation rotation superseded
-    /// (stale pin evicted, fresh filed) in a candidate that may never
-    /// commit: the hold's staged generation can never attach, so the
-    /// hold ends refused while the fresh generation races on.
-    /// Harvested at the bind head from every candidate, restored
-    /// around trial builds like the rejected set, and monotonic: a
-    /// superseded generation never un-supersedes, so the refusal is
-    /// permanent like the refused set. One key per rotated file, the
-    /// same order as the rejected set.
+    /// Staged maps keys a same-file generation rotation superseded (the
+    /// staged object's pin re-proved in place under the same id) in a
+    /// candidate that may never commit. The rotated object can still
+    /// attach; a hold on it ends refused only while its provider has no
+    /// live probe, because the attach cannot be relied on within the
+    /// hold's 1 s bound under churn. Harvested at the bind head from
+    /// every candidate, restored around trial builds like the rejected
+    /// set, and monotonic: a superseded generation never un-supersedes.
+    /// One key per rotated file, the same order as the rejected set.
     pending_superseded_keys: BTreeSet<ObjectKey>,
     pending_retirements: BTreeSet<ProcessViewId>,
     /// Refreshed views a spent tick deep-scan quantum deferred, still owed

@@ -2247,7 +2247,8 @@ impl PinnedObjects {
     /// content: every raw observation resolves to an entry with the same
     /// mapping identity, held-fd device, pin, digest, ABI, exports and
     /// proof flags, and the rejection, proven-collision, ambiguity,
-    /// ownership, raw-ownership and carried-proof layers agree. Scan-local object ids, the held
+    /// ownership, raw-ownership, supersede and carried-proof layers
+    /// agree. Scan-local object ids, the held
     /// `File` handles and the per-object unchanged-check stamps are not
     /// content: ids are remapped by identity on absorb, and the stamps
     /// only ever move later under `check_unchanged`.
@@ -2259,6 +2260,7 @@ impl PinnedObjects {
             || self.ambiguity_published != other.ambiguity_published
             || self.overlay_uncertain != other.overlay_uncertain
             || self.changed.get() != other.changed.get()
+            || self.superseded_keys != other.superseded_keys
             || self.raw_ownership != other.raw_ownership
             || self.raw_to_id.len() != other.raw_to_id.len()
             || self.by_id.len() != other.by_id.len()
@@ -3352,8 +3354,9 @@ impl PinnedObjects {
     }
 
     /// Whether a same-file generation rotation superseded the
-    /// retained pin under `key` (stale entry evicted, fresh filed):
-    /// the key stays routable, unlike a rejection.
+    /// retained pin under `key` (the kept object's pin re-proved in
+    /// place under the same id): the key stays routable, unlike a
+    /// rejection.
     pub(crate) fn supersedes(&self, key: ObjectKey) -> bool {
         self.superseded_keys.contains(&key)
     }
@@ -5145,16 +5148,22 @@ impl PinnedObjects {
         // The kept observation must be the same kernel file with the
         // same hashed bytes under the same mount view and observation
         // path. A rewrite, a distinct file, an unhashed, cross-view or
-        // moved-path side, or a proven pre fails closed instead.
-        let rotation = self.by_id.get(&kept_id).is_some_and(|kept| {
-            !kept.pre_copy_up
-                && !kept.sha256.is_empty()
-                && kept.sha256 == entry.sha256
-                && kept.mapping == entry.mapping
-                && kept.fd_dev == entry.fd_dev
-                && kept.raw.path == entry.raw.path
-                && same_kernel_file(&kept.file, &entry.file)
-        });
+        // moved-path side, or a proven pre fails closed instead. Neither
+        // side may be an overlayfs open: a copy-up keeps the overlay
+        // `(dev, ino)`, bytes and path while only ctime moves, and the
+        // fd identity cannot tell the lower-backed fd from the upper
+        // file, so an overlay ctime step needs the kernel proof.
+        let rotation = !entry.overlay
+            && self.by_id.get(&kept_id).is_some_and(|kept| {
+                !kept.overlay
+                    && !kept.pre_copy_up
+                    && !kept.sha256.is_empty()
+                    && kept.sha256 == entry.sha256
+                    && kept.mapping == entry.mapping
+                    && kept.fd_dev == entry.fd_dev
+                    && kept.raw.path == entry.raw.path
+                    && same_kernel_file(&kept.file, &entry.file)
+            });
         if !rotation {
             return None;
         }
@@ -5164,6 +5173,15 @@ impl PinnedObjects {
             .by_id
             .get(&kept_id)
             .is_some_and(|kept| kept.pin.ctime < entry.pin.ctime);
+        // Both branches carry the incoming proof flags the ordinary
+        // merge carries: a collapse stays sticky, and the pin-time maps
+        // rendering survives under the same full mapping (checked above).
+        if let Some(kept) = self.by_id.get_mut(&kept_id) {
+            kept.collapsed |= entry.collapsed;
+            if kept.probed_maps_key.is_none() {
+                kept.probed_maps_key = entry.probed_maps_key;
+            }
+        }
         if !newer {
             self.raw_to_id.insert(entry.raw, kept_id);
             return Some(kept_id);
@@ -5172,8 +5190,15 @@ impl PinnedObjects {
         // stands still; the copy-version fence bumped at insert entry.
         if let Some(kept) = self.by_id.get_mut(&kept_id) {
             kept.pin = entry.pin;
-            if let Some(now) = crate::attach::monotonic_ns() {
-                kept.last_ok_ns.set(Some(now));
+            // `last_ok_ns` is the last instant a held-fd check proved the
+            // pin, never the absorb time: the incoming observation's own
+            // verification instant proved the rotated pin. An object
+            // already seen changed keeps its first bracket untouched, so
+            // the reported window never starts after the change or after
+            // its own end; the live gate still passes on the re-proved pin
+            // (`check_unchanged` judges the pins as they are now).
+            if !kept.changed.get() {
+                kept.last_ok_ns.set(entry.last_ok_ns.get());
             }
         }
         self.raw_to_id.insert(entry.raw, kept_id);
@@ -5990,6 +6015,10 @@ mod conservative_copy {
                 tree::<ObjectKey, ()>(source.proven_collision_keys.len())?,
             )?;
             add(&mut total, tree::<ObjectKey, ()>(keys)?)?;
+            add(
+                &mut total,
+                tree::<ObjectKey, ()>(source.superseded_keys.len())?,
+            )?;
             add(
                 &mut total,
                 tree::<ObjectKey, ()>(
@@ -14214,6 +14243,17 @@ pub(crate) mod test_fixture {
     /// A pre-arm pin as `pin_prearm_objects` files it: under the opened
     /// fd's key, with the same mapping, pin and digest as its scan pin. The
     /// pin's inode is the key's, as a real pin's always is.
+    /// [`prearm_pin`] on a plain (non-overlay) filesystem: the
+    /// same-file rotation fixtures. `prearm_pin` forges an overlayfs open,
+    /// which is the copy-up shape a rotation must refuse.
+    pub(crate) fn plain_prearm_pin(fd_key: ObjectKey, sha256: &str, ctime: i64) -> PinnedObjects {
+        let mut pins = prearm_pin(fd_key, sha256, ctime);
+        for entry in pins.by_id.values_mut() {
+            entry.overlay = false;
+        }
+        pins
+    }
+
     pub(crate) fn prearm_pin(fd_key: ObjectKey, sha256: &str, ctime: i64) -> PinnedObjects {
         let raw = RawObjectInstance::prearm(fd_key, PATH.to_string()).unwrap();
         let file = TableHandle::for_test(Arc::new(std::fs::File::open("/dev/null").unwrap()));
@@ -14336,7 +14376,8 @@ pub(crate) mod test_fixture {
 mod tests {
     use super::test_fixture::{
         FakeSelfMappingProbe, INODE, PATH, SHA, backing_file, mark_pre_copy_up, module, overlay,
-        own_all_raws, own_all_raws_under, pin_set, pins, prearm_pin, reback, repath_single_pin, view_pin,
+        own_all_raws, own_all_raws_under, pin_set, pins, plain_prearm_pin, prearm_pin, reback,
+        repath_single_pin, view_pin,
     };
     use super::*;
     use crate::discovery::scan::ScannedEntry;
@@ -20590,8 +20631,8 @@ mod tests {
     fn absorbing_same_file_same_digest_rotated_ctime_supersedes_the_stale_pin() {
         // The churn shape: generation 1 staged (a pre-arm proof), then a
         // live scan observes generation 2 of the same file with identical
-        // bytes and a stepped ctime. The stale pin is superseded (evicted,
-        // fresh filed), never a group rejection: one touched file is not
+        // bytes and a stepped ctime. The stale pin is superseded (rotated
+        // in place under the kept id), never a group rejection: one touched file is not
         // an identity collision, and the key must stay routable so the
         // attach races on.
         let key = ObjectKey {
@@ -20600,7 +20641,7 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let file = backing_file(&dir, "provider.so");
-        let mut staged = prearm_pin(key, "aaaaaaaa", 1);
+        let mut staged = plain_prearm_pin(key, "aaaaaaaa", 1);
         reback(&mut staged, &file);
         let mut acc = PinnedObjects::empty();
         assert!(acc.absorb(staged).is_empty());
@@ -20664,7 +20705,7 @@ mod tests {
     ) -> (PinnedObjects, std::path::PathBuf, Arc<std::fs::File>) {
         let path = dir.path().join(name);
         let file = backing_file(dir, name);
-        let mut staged = prearm_pin(key, "aaaaaaaa", 1);
+        let mut staged = plain_prearm_pin(key, "aaaaaaaa", 1);
         reback(&mut staged, &file);
         repin_to_backing_file(&mut staged);
         (staged, path, file)
@@ -20734,9 +20775,13 @@ mod tests {
         assert!(candidate.provider_changed(), "clones carry the history");
         let after = acc.change_bracket(kept).expect("the bracket stays");
         assert_eq!(
-            (after.detected_ns, after.previous_ino),
-            (bracket.detected_ns, bracket.previous_ino),
-            "the first detection keeps its bracket"
+            (after.last_ok_ns, after.detected_ns, after.previous_ino),
+            (
+                bracket.last_ok_ns,
+                bracket.detected_ns,
+                bracket.previous_ino
+            ),
+            "the first detection keeps its bracket: a later pass never moves last-ok"
         );
     }
 
@@ -20862,11 +20907,11 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let file = backing_file(&dir, "provider.so");
-        let mut first = prearm_pin(key, "aaaaaaaa", 1);
+        let mut first = plain_prearm_pin(key, "aaaaaaaa", 1);
         reback(&mut first, &file);
         let mut acc = PinnedObjects::empty();
         assert!(acc.absorb(first).is_empty());
-        let mut second = prearm_pin(key, "aaaaaaaa", 2);
+        let mut second = plain_prearm_pin(key, "aaaaaaaa", 2);
         reback(&mut second, &file);
         let skipped = acc.absorb(second);
         assert!(acc.rejects(key), "proofs disagreeing still fail closed");
@@ -20891,7 +20936,7 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let file = backing_file(&dir, "provider.so");
-        let mut staged = prearm_pin(key, "aaaaaaaa", 1);
+        let mut staged = plain_prearm_pin(key, "aaaaaaaa", 1);
         reback(&mut staged, &file);
         let mut acc = PinnedObjects::empty();
         assert!(acc.absorb(staged).is_empty());
@@ -20922,7 +20967,7 @@ mod tests {
             };
             let dir = tempfile::tempdir().unwrap();
             let file = backing_file(&dir, "provider.so");
-            let mut staged = prearm_pin(key, kept_sha, 1);
+            let mut staged = plain_prearm_pin(key, kept_sha, 1);
             reback(&mut staged, &file);
             let mut acc = PinnedObjects::empty();
             assert!(acc.absorb(staged).is_empty());
@@ -20954,7 +20999,7 @@ mod tests {
         let file = backing_file(&dir, "provider.so");
         // Newcomer pre against a kept plain: the key rejects and the
         // plain is evicted, while the unfiled pre stands nowhere.
-        let mut staged = prearm_pin(key, "aaaaaaaa", 1);
+        let mut staged = plain_prearm_pin(key, "aaaaaaaa", 1);
         reback(&mut staged, &file);
         let mut acc = PinnedObjects::empty();
         assert!(acc.absorb(staged).is_empty());
@@ -20970,7 +21015,7 @@ mod tests {
         assert!(!skipped.is_empty(), "the rejection is disclosed");
         // Plain newcomer against a kept pre: the key rejects and the
         // proven pre survives it.
-        let mut staged = prearm_pin(key, "aaaaaaaa", 1);
+        let mut staged = plain_prearm_pin(key, "aaaaaaaa", 1);
         reback(&mut staged, &file);
         mark_pre_copy_up(&mut staged);
         let mut acc = PinnedObjects::empty();
@@ -21005,7 +21050,7 @@ mod tests {
             inode: INODE,
         };
         let dir = tempfile::tempdir().unwrap();
-        let mut staged = prearm_pin(key, "aaaaaaaa", 1);
+        let mut staged = plain_prearm_pin(key, "aaaaaaaa", 1);
         reback(&mut staged, &backing_file(&dir, "first.so"));
         let mut acc = PinnedObjects::empty();
         assert!(acc.absorb(staged).is_empty());
@@ -21034,7 +21079,7 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let file = backing_file(&dir, "provider.so");
-        let mut staged = prearm_pin(key, "aaaaaaaa", 1);
+        let mut staged = plain_prearm_pin(key, "aaaaaaaa", 1);
         reback(&mut staged, &file);
         let mut acc = PinnedObjects::empty();
         assert!(acc.absorb(staged).is_empty());
@@ -21051,6 +21096,13 @@ mod tests {
         assert!(!skipped.is_empty(), "the rejection is disclosed");
     }
 
+    /// Distinct, ordered proof instants for the rotation fixtures (the
+    /// kept pin's verification precedes the incoming one), far from any
+    /// real `CLOCK_MONOTONIC` reading so an absorb-time stamp never
+    /// matches by accident.
+    const ROTATION_KEPT_PROOF_NS: u64 = 1_000;
+    const ROTATION_INCOMING_PROOF_NS: u64 = 2_000;
+
     #[test]
     fn absorbing_supersede_rotates_in_place_and_keeps_custody() {
         // In-place rotation: the kept id survives with the fresh pin and
@@ -21063,7 +21115,7 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let file = backing_file(&dir, "provider.so");
-        let mut staged = prearm_pin(key, "aaaaaaaa", 1);
+        let mut staged = plain_prearm_pin(key, "aaaaaaaa", 1);
         reback(&mut staged, &file);
         let mut acc = PinnedObjects::empty();
         assert!(acc.absorb(staged).is_empty());
@@ -21085,6 +21137,17 @@ mod tests {
         reback(&mut scan, &file);
         let staged_mapping = acc.by_id.values().next().unwrap().mapping;
         scan.by_id.values_mut().next().unwrap().mapping = staged_mapping;
+        acc.by_id
+            .get(&kept)
+            .unwrap()
+            .last_ok_ns
+            .set(Some(ROTATION_KEPT_PROOF_NS));
+        scan.by_id
+            .values()
+            .next()
+            .unwrap()
+            .last_ok_ns
+            .set(Some(ROTATION_INCOMING_PROOF_NS));
         let skipped = acc.absorb(scan);
         assert!(!acc.rejects(key), "a touched file is not a collision");
         assert!(acc.supersedes(key), "the rotation is recorded");
@@ -21095,9 +21158,10 @@ mod tests {
             (2, 7),
             "the pin rotates in place"
         );
-        assert!(
-            acc.by_id.get(&kept).unwrap().last_ok_ns.get().is_some(),
-            "the rotation re-stamps the proof"
+        assert_eq!(
+            acc.by_id.get(&kept).unwrap().last_ok_ns.get(),
+            Some(ROTATION_INCOMING_PROOF_NS),
+            "the rotated pin's proof is the incoming verification instant"
         );
         assert_eq!(
             acc.raw_to_id.get(&kept_raw),
@@ -21142,7 +21206,7 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let file = backing_file(&dir, "provider.so");
-        let mut staged = prearm_pin(key, "aaaaaaaa", 1);
+        let mut staged = plain_prearm_pin(key, "aaaaaaaa", 1);
         reback(&mut staged, &file);
         let mut acc = PinnedObjects::empty();
         assert!(acc.absorb(staged).is_empty());
@@ -21223,6 +21287,178 @@ mod tests {
         assert_eq!(acc.pinned().count(), 1, "one file, one object");
     }
 
+    /// The kept staging and the incoming scan of one touched file, with
+    /// the mount ids aligned (one file, one mount) and the given overlay
+    /// flags on each side.
+    fn rotation_pair(
+        dir: &tempfile::TempDir,
+        key: ObjectKey,
+        kept_overlay: bool,
+        incoming_overlay: bool,
+    ) -> (PinnedObjects, PinnedObjects) {
+        let file = backing_file(dir, "provider.so");
+        let mut staged = plain_prearm_pin(key, "aaaaaaaa", 1);
+        reback(&mut staged, &file);
+        for entry in staged.by_id.values_mut() {
+            entry.overlay = kept_overlay;
+        }
+        let mut acc = PinnedObjects::empty();
+        assert!(acc.absorb(staged).is_empty());
+        let mut scan = image_pins(&[(key, "aaaaaaaa", 2)]);
+        reback(&mut scan, &file);
+        let staged_mapping = acc.by_id.values().next().unwrap().mapping;
+        for entry in scan.by_id.values_mut() {
+            entry.mapping = staged_mapping;
+            entry.overlay = incoming_overlay;
+        }
+        (acc, scan)
+    }
+
+    /// An overlayfs side never rotates: a data copy-up keeps the overlay
+    /// `(dev, ino)`, the bytes and the path while only ctime moves, so the
+    /// fd identity cannot tell the lower-backed kept fd from the upper
+    /// file. Either side being an overlay open falls through to the
+    /// disclosed fail-closed rejection, with no supersede and no merge.
+    #[test]
+    fn absorbing_overlay_ctime_rotation_still_rejects() {
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        for (kept_overlay, incoming_overlay) in [(true, true), (true, false), (false, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut acc, scan) = rotation_pair(&dir, key, kept_overlay, incoming_overlay);
+            let case = format!("kept_overlay={kept_overlay} incoming_overlay={incoming_overlay}");
+            let skipped = acc.absorb(scan);
+            assert!(acc.rejects(key), "{case}: the copy-up shape fails closed");
+            assert!(!acc.supersedes(key), "{case}: no rotation is recorded");
+            assert_eq!(acc.pinned().count(), 0, "{case}: no object routes");
+            assert!(!skipped.is_empty(), "{case}: the rejection is disclosed");
+        }
+        // Control: the same pair without overlay rotates.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut acc, scan) = rotation_pair(&dir, key, false, false);
+        assert!(acc.absorb(scan).is_empty());
+        assert!(acc.supersedes(key), "the plain pair rotates");
+    }
+
+    /// An object already seen changed keeps its first bracket through a
+    /// rotation: the window never starts after the change or after its
+    /// own end, and the incoming proof instant never overwrites it. The
+    /// pin still rotates, so the live gate judges the re-proved pin.
+    #[test]
+    fn absorbing_rotation_keeps_a_latched_change_bracket() {
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (mut acc, scan) = rotation_pair(&dir, key, false, false);
+        let kept = acc.pinned().next().unwrap().id;
+        acc.by_id
+            .get(&kept)
+            .unwrap()
+            .last_ok_ns
+            .set(Some(ROTATION_KEPT_PROOF_NS));
+        // The forged pin never matches the backing file: the held-fd check
+        // detects a change and latches this object.
+        assert_eq!(acc.check_unchanged(), Ok(false));
+        let before = acc.change_bracket(kept).expect("the change is bracketed");
+        assert_eq!(before.last_ok_ns, ROTATION_KEPT_PROOF_NS);
+        assert!(before.detected_ns >= before.last_ok_ns);
+        let incoming_late = before.detected_ns.saturating_add(1_000_000_000);
+        scan.by_id
+            .values()
+            .next()
+            .unwrap()
+            .last_ok_ns
+            .set(Some(incoming_late));
+        assert!(acc.absorb(scan).is_empty());
+        assert!(acc.supersedes(key), "the pin rotates");
+        assert_eq!(
+            acc.by_id.get(&kept).unwrap().pin.test_parts().2,
+            (2, 7),
+            "the rotated pin is kept"
+        );
+        let after = acc.change_bracket(kept).expect("the bracket stays");
+        assert_eq!(
+            (after.last_ok_ns, after.detected_ns, after.previous_ino),
+            (before.last_ok_ns, before.detected_ns, before.previous_ino),
+            "the first bracket is untouched"
+        );
+        assert!(
+            after.last_ok_ns <= after.detected_ns,
+            "the window is ordered"
+        );
+        assert!(acc.provider_changed(), "the history stays latched");
+    }
+
+    /// The rotation carries the proof flags the ordinary merge carries: a
+    /// collapse stays sticky and the pin-time maps rendering survives
+    /// under the same full mapping, on both the rotating and the stale
+    /// branch.
+    #[test]
+    fn absorbing_rotation_carries_collapse_and_maps_rendering() {
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let rendered = ObjectKey {
+            device: Device {
+                major: 0,
+                minor: 77,
+            },
+            inode: INODE + 9,
+        };
+        for stale in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut acc, mut scan) = rotation_pair(&dir, key, false, false);
+            let kept = acc.pinned().next().unwrap().id;
+            if stale {
+                // The kept pin is the newer one: the scan is a stale look.
+                acc.by_id.get_mut(&kept).unwrap().pin = scan.by_id.values().next().unwrap().pin;
+                let mut older = plain_prearm_pin(key, "aaaaaaaa", 0);
+                std::mem::swap(
+                    &mut scan.by_id.values_mut().next().unwrap().pin,
+                    &mut older.by_id.values_mut().next().unwrap().pin,
+                );
+            }
+            for entry in scan.by_id.values_mut() {
+                entry.collapsed = true;
+                entry.probed_maps_key = Some(rendered);
+            }
+            assert!(acc.absorb(scan).is_empty());
+            assert_eq!(acc.supersedes(key), !stale, "stale={stale}");
+            let kept_entry = acc.by_id.get(&kept).unwrap();
+            assert!(kept_entry.collapsed, "stale={stale}: the collapse carries");
+            assert_eq!(
+                kept_entry.probed_maps_key,
+                Some(rendered),
+                "stale={stale}: the maps rendering carries"
+            );
+        }
+    }
+
+    /// Two pin sets that differ only in a recorded rotation are different
+    /// content: staging G1 plus a rotated scan G2 is not staging G2 plus a
+    /// merged scan G2.
+    #[test]
+    fn same_pin_content_distinguishes_superseded_keys() {
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let one = image_pins(&[(key, "aaaaaaaa", 2)]);
+        let mut rotated = one.clone();
+        assert!(one.same_pin_content(&rotated));
+        rotated.superseded_keys.insert(key);
+        assert!(
+            !one.same_pin_content(&rotated),
+            "a recorded rotation is content"
+        );
+        assert!(!rotated.same_pin_content(&one), "in both directions");
+    }
+
     #[test]
     fn absorbing_stale_rotation_observation_merges_without_superseding() {
         // A rotation observation older than the kept pin (a delayed scan
@@ -21235,7 +21471,7 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let file = backing_file(&dir, "provider.so");
-        let mut staged = prearm_pin(key, "aaaaaaaa", 2);
+        let mut staged = plain_prearm_pin(key, "aaaaaaaa", 2);
         reback(&mut staged, &file);
         let mut acc = PinnedObjects::empty();
         assert!(acc.absorb(staged).is_empty());
@@ -21273,7 +21509,7 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let file = backing_file(&dir, "provider.so");
-        let mut staged = prearm_pin(key, "aaaaaaaa", 1);
+        let mut staged = plain_prearm_pin(key, "aaaaaaaa", 1);
         reback(&mut staged, &file);
         let mut rotated = PinnedObjects::empty();
         assert!(rotated.absorb(staged).is_empty());
@@ -21301,7 +21537,7 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let file = backing_file(&dir, "provider.so");
-        let mut staged = prearm_pin(key, "aaaaaaaa", 1);
+        let mut staged = plain_prearm_pin(key, "aaaaaaaa", 1);
         reback(&mut staged, &file);
         let mut acc = PinnedObjects::empty();
         assert!(acc.absorb(staged).is_empty());
@@ -21328,7 +21564,7 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let file = backing_file(&dir, "provider.so");
-        let mut staged = prearm_pin(key, "aaaaaaaa", 1);
+        let mut staged = plain_prearm_pin(key, "aaaaaaaa", 1);
         reback(&mut staged, &file);
         let mut acc = PinnedObjects::empty();
         assert!(acc.absorb(staged).is_empty());
@@ -25796,6 +26032,60 @@ mod tests {
         assert!(ready, "the copy runs to Ready");
         let copy = cursor.pinned().expect("a Ready copy resolves");
         assert!(copy.supersedes(rotated), "the copy carries superseded keys");
+    }
+
+    /// The copy's up-front bound pays for the superseded-key set it will
+    /// rebuild: a source with many recorded rotations needs more than the
+    /// same source without them, and the bound covers the measured peak.
+    #[test]
+    fn conservative_copy_bound_pays_for_superseded_keys() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        let required = |extra: u64| {
+            let (_dir, mut source, modules) = conservative_cursor_fixture();
+            for inode in 0..extra {
+                source.superseded_keys.insert(ObjectKey {
+                    device: Device { major: 9, minor: 9 },
+                    inode: 1_000_000 + inode,
+                });
+            }
+            let pool = SemanticResourcePool::default();
+            let selection = conservative_selection(
+                &pool,
+                BTreeSet::from([ProcessViewId(1)]),
+                BTreeSet::from([modules[1].key]),
+            );
+            let reserve = pool.reserver();
+            let mut cursor = PinnedConservativeCursor::new();
+            let ((), peak) = crate::test_alloc::requested_peak_during(|| {
+                finish_conservative_copy(&source, &mut cursor, &selection, &reserve);
+                assert_eq!(
+                    cursor.pinned().unwrap().superseded_keys.len() as u64,
+                    extra,
+                    "every rotation is copied"
+                );
+                for _ in 0..4096 {
+                    if cursor
+                        .reclaim(Some(&source), &selection, &reserve, 1)
+                        .unwrap()
+                        == GraphStep::Ready
+                    {
+                        break;
+                    }
+                }
+            });
+            let bound = cursor.required_bytes().unwrap();
+            assert!(
+                bound >= peak.realloc_overlap_bytes.max(peak.peak_bytes),
+                "extra={extra}: bound {bound} covers the peak {peak:?}"
+            );
+            bound
+        };
+        let base = required(0);
+        let many = required(512);
+        assert!(
+            many >= base + 512 * std::mem::size_of::<ObjectKey>(),
+            "the bound grows with the superseded keys: {base} -> {many}"
+        );
     }
 
     #[test]

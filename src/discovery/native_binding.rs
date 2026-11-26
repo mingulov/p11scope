@@ -2294,6 +2294,12 @@ impl NativeBinder {
             .live_caller(request.pid)
             .filter(|caller| caller.id == request.caller)
             .ok_or(UnboundReason::NoLiveCaller)?;
+        // The completion clock is known before the query: under
+        // incomparable clocks the sighting below could only refuse,
+        // so refuse here without spending a charged query.
+        if !self.exit_clocks_comparable {
+            return Err(UnboundReason::ClocksIncomparable);
+        }
         let query = identity.query_cookie(request.image.domain(), caller.pin);
         // Query completion, never the caller's pass-start or an old witness stamp.
         let sighted_ns = clock()
@@ -2339,8 +2345,8 @@ impl NativeBinder {
             Some(UnboundReason::ExecTransition)
         } else if state.callers.get(&request.caller) != Some(&(request.image, request.exec_id)) {
             Some(UnboundReason::ExecAmbiguous)
-        // Production stages, syncing this flag, before any proof read.
         } else if !self.exit_clocks_comparable {
+            // Production stages, syncing this flag, before any proof read.
             Some(UnboundReason::ClocksIncomparable)
         } else if state
             .exec_ns
@@ -2794,10 +2800,12 @@ fn decide_retained_inner(
     let cookie = row.cookie();
     let exec = row.exec_id();
     let caller = retained.id;
-    if let Some(&(held, held_exec)) = state.callers.get(&caller) {
-        if held == cookie && held_exec == exec {
-            return Binding::Bound(caller);
-        }
+    // Any image the incarnation holds here differs from the row's: an
+    // exact held image never reaches this fallback, since the
+    // decide-time cache binds it first (a cached binding and its held
+    // image are always set and cleared together, and pruning keeps a
+    // held cookie's sequences).
+    if state.callers.contains_key(&caller) {
         return Binding::Unbound(UnboundReason::ExecAmbiguous);
     }
     if state.predates_coverage(retained.first_seen_ns)

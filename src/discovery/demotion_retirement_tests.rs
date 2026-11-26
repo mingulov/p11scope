@@ -2299,6 +2299,102 @@ fn round4_native_service(scene: &mut Scene) {
     scene.native.scene.coordinator.commit_batch(false).unwrap();
 }
 
+#[test]
+fn demotion_retirement_round4_incomparable_clocks_cancel_at_the_dispatch() {
+    // Reconciler-level twin of the fresh-rejection revocations: with
+    // the coordinator clock flag cleared, the retirement candidate's
+    // sighting refuses ClocksIncomparable at the dispatch and cancels
+    // — a Rejected BindingUnproven decision, the recovery reinserted,
+    // no wait — spending no native query. A per-variant Wait arm in
+    // front of the classifier must fail here.
+    let receipts = WorkReceipts::begin();
+    let mut scene = Scene::placed_with_diagnostics(Some(DiagnosticConfig {
+        ordinary_capacity: 8,
+        exceptional_capacity: 8,
+        ..DiagnosticConfig::default()
+    }));
+    scene.observe(true, true, 200);
+    scene.count(7);
+    assert_eq!(scene.counts(), (5, 0));
+    scene.native.unavailable_answer(7, 500);
+    scene.observe(false, true, 300);
+    scene.count(8);
+    let key = *scene
+        .native
+        .scene
+        .coordinator
+        .recoveries
+        .keys()
+        .next()
+        .unwrap();
+    let original = scene.native.scene.coordinator.recoveries[&key]
+        .fence
+        .expect("first actual8 retained under explicit Unavailable");
+    scene.count(10);
+    for _ in 0..4 {
+        scene.horizons();
+        receipts.assert_bounded();
+    }
+    let recovery = &scene.native.scene.coordinator.recoveries[&key];
+    let selected = recovery.fence.expect("unavailability preserves actual8");
+    assert_eq!(
+        (selected.count, selected.anchor_ns, selected.last_ns),
+        (8, original.anchor_ns, original.last_ns)
+    );
+    assert_eq!(recovery.scan.as_ref().unwrap().started_ns(), 300);
+    assert!(recovery.sighting.is_none());
+    assert_eq!(recovery.watermark, 7);
+    assert_eq!(scene.counts(), (5, 0));
+
+    // The completion clock goes incomparable (coordinator flag and the
+    // binder gate it syncs): the next service pass must cancel the
+    // candidate at the sighting dispatch, never wait on it.
+    scene.native.scene.coordinator.exit_clocks_comparable = false;
+    scene
+        .native
+        .scene
+        .coordinator
+        .binder
+        .set_exit_clocks_comparable(false);
+    assert!(!scene.native.scene.coordinator.exit_clocks_comparable);
+    let queries = scene.native.cookies.queries;
+    QUERY_CLOCK.with(|clock| clock.set(scene.native.stamps.tick()));
+    scene.native.read(Vec::new());
+    scene.native.scene.coordinator.commit_batch(false).unwrap();
+    assert_eq!(
+        scene.native.cookies.queries, queries,
+        "the doomed sighting spends no native query"
+    );
+    let recovery = scene
+        .native
+        .scene
+        .coordinator
+        .recoveries
+        .get(&key)
+        .expect("the cancelled recovery is reinserted, never dropped or settled");
+    assert!(
+        recovery.epoch.is_none()
+            && recovery.scan.is_none()
+            && recovery.fence.is_none()
+            && recovery.sighting.is_none(),
+        "an incomparable completion clock cancels the retirement candidate, never waits"
+    );
+    assert_eq!(
+        recovery
+            .diagnostic
+            .wait
+            .as_ref()
+            .map(|wait| (wait.0, wait.1)),
+        Some((
+            DiagnosticReason::BindingUnproven,
+            DiagnosticDecision::Rejected
+        )),
+        "the cancel files a Rejected decision, not a wait"
+    );
+    assert_eq!(scene.counts(), (5, 0));
+    receipts.assert_bounded();
+}
+
 fn round4_sole_is(scene: &Scene, caller: CallerId, object: u32, name: &str) -> bool {
     let coordinator = &scene.native.scene.coordinator;
     coordinator

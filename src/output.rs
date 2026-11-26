@@ -1973,9 +1973,16 @@ fn open_recovered_dir_or_sibling_fallback(base: &Path) -> Result<(std::fs::File,
 /// `/tmp`); once a writable parent is selected, the exact per-euid base
 /// keeps its squatter-resistant sibling fallback on that same parent.
 /// The warning names every parent skipped and its reason before naming
-/// the parent actually used.
+/// the parent actually used. A single-root chain (a caller-supplied or
+/// test base, never production) attempts its root directly: with no
+/// next root the preflight could only replace the sibling attempt's
+/// error — which names the base and the failed fallback — with its
+/// own verdict.
 fn open_recovered_dir_or_fallback(base: &Path) -> Result<(std::fs::File, PathBuf), String> {
     let chain = recovery_base_chain(base);
+    if chain.len() == 1 {
+        return open_recovered_dir_or_sibling_fallback(&chain[0].0);
+    }
     let mut skipped = Vec::new();
     for (index, (candidate, label)) in chain.iter().enumerate() {
         if let Some(reason) = recovery_parent_unusable(candidate) {
@@ -4954,7 +4961,7 @@ mod tests {
             deduped,
             vec![
                 (base.clone(), "/var/tmp"),
-                (Path::new("/tmp").join(&leaf), "/tmp")
+                (Path::new("/tmp").join(&leaf), "$TMPDIR")
             ]
         );
         let relative = recovery_base_chain_with_tmpdir(&base, Some(OsStr::new("relative-tmp")));

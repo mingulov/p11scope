@@ -2831,26 +2831,30 @@ mod tests {
     /// Compares against the level the guard recorded (not a racy
     /// pre-read), and polls boundedly: between the drop and the
     /// observation another verbosity test may briefly hold the lock.
+    /// Ten rounds: a single round could pass for the wrong reason
+    /// under load (observing a foreign hold), but not ten.
     #[test]
     fn verbosity_test_guard_restores_on_drop() {
-        let guard = VerbosityTestGuard::set(TextVerbosity::Verbose);
-        let previous = guard.previous.clone();
-        assert_eq!(text_verbosity(), TextVerbosity::Verbose);
-        drop(guard);
-        let start = std::time::Instant::now();
-        loop {
-            let serial = TEXT_VERBOSITY_TEST_LOCK
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            if text_verbosity() == previous {
-                break;
+        for round in 0..10 {
+            let guard = VerbosityTestGuard::set(TextVerbosity::Verbose);
+            let previous = guard.previous.clone();
+            assert_eq!(text_verbosity(), TextVerbosity::Verbose);
+            drop(guard);
+            let start = std::time::Instant::now();
+            loop {
+                let serial = TEXT_VERBOSITY_TEST_LOCK
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                if text_verbosity() == previous {
+                    break;
+                }
+                assert!(
+                    start.elapsed() < std::time::Duration::from_secs(3),
+                    "round {round}: drop restores the level"
+                );
+                drop(serial);
+                std::thread::yield_now();
             }
-            assert!(
-                start.elapsed() < std::time::Duration::from_secs(30),
-                "drop restores the level"
-            );
-            drop(serial);
-            std::thread::yield_now();
         }
     }
 

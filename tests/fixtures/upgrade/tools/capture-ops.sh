@@ -8,7 +8,10 @@
 set -eu
 BIN=$1; TAG=$2; MODE=$3; OUT=$4
 TMPDIR=${TMPDIR:-/var/tmp/p11scope-ws-tmp/v072-compat-071}
-PROV=/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so
+case $0 in */*) TOOLS_DIR=${0%/*};; *) TOOLS_DIR=.;; esac
+# shellcheck source=capture-env.sh
+. "$TOOLS_DIR/capture-env.sh"
+PROV=$(probe_provider) || exit 2
 export SOFTHSM2_CONF=$TMPDIR/f2/work/softhsm2.conf
 ME=$(id -un)
 LOCK="flock /var/tmp/p11scope-ws-tmp/privileged.lock"
@@ -37,8 +40,13 @@ case $MODE in
       grep -q "semantic lane ready" $OUT/$TAG.$MODE.stderr 2>/dev/null && break
       sleep 0.2
     done
-    grep -q "semantic lane ready" $OUT/$TAG.$MODE.stderr || echo "WARNING: semantic lane never ready"
-    touch $STEADY_GO
+    READY_SEEN=0
+    if grep -q "semantic lane ready" $OUT/$TAG.$MODE.stderr 2>/dev/null; then
+      READY_SEEN=1
+      touch "$STEADY_GO"
+    else
+      echo "keyops: semantic lane never ready; gate left untouched" >&2
+    fi
     wait $OPID
     echo "rc=$?"
     $LOCK sudo -n chown $ME:$ME $OUT/$TAG-inventory-keyops.json
@@ -56,5 +64,14 @@ case $MODE in
     $LOCK sudo -n chown $ME:$ME $OUT/$TAG-observed-metrics.json
     ;;
 esac
-wait $APID 2>/dev/null || true
+ANCHOR_RC=0
+wait "$APID" 2>/dev/null || ANCHOR_RC=$?
+if [ "$ANCHOR_RC" -ne 0 ]; then
+  echo "$TAG $MODE: anchor failed rc=$ANCHOR_RC" >&2
+  exit 1
+fi
+if [ "$MODE" = keyops ] && [ "${READY_SEEN:-0}" != 1 ]; then
+  echo "$TAG keyops: semantic lane never ready" >&2
+  exit 1
+fi
 ls -la $OUT/$TAG-*.json

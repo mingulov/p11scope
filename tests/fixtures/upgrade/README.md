@@ -53,7 +53,9 @@ Sanitizer rules (one run, shared maps, so the same real value maps
 to the same canonical value in every file): the capture prefix
 (`sanitize.py`'s third argument, default the lane path) becomes
 `/work`, Debian library paths become `/usr/lib/...`
-counterparts, cargo shim paths become `/usr/bin/...`; PIDs (fields,
+counterparts, Fedora `/usr/lib64/pkcs11/` maps into the same
+`/usr/lib/softhsm/` provider dir, cargo shim paths become
+`/usr/bin/...`; PIDs (fields,
 `pid:` scopes, `/proc/` and gap-reason mentions) map from 4242 up;
 digests (40/64 hex) map to zero-padded indexes; device numbers map
 to small constants; inodes map from 100 up; mtimes become fixed;
@@ -65,8 +67,9 @@ byte-real.
 ## Regenerate
 
 Prerequisites: `gcc`, SoftHSM (`softhsm2-util` and
-`libsofthsm2.so`; `/usr/lib/x86_64-linux-gnu/softhsm/` on
-Debian/Ubuntu, `/usr/lib64/pkcs11/` on Fedora), a `pkcs11.h`
+`libsofthsm2.so`; the scripts probe
+`/usr/lib/x86_64-linux-gnu/softhsm/` then `/usr/lib64/pkcs11/`,
+or honor `PROV=<path>`), a `pkcs11.h`
 (`libp11-kit-dev`, a system softhsm include dir, or the
 `cryptoki-sys` vendored copy under `~/.cargo/registry`), the
 v0.7.1 release observer/discover binaries (hashes above) plus a
@@ -89,28 +92,29 @@ captures (the scripts take the repo privileged lock themselves).
    mechanisms), then `softhsm2-util --init-token --free --label
    upgrade-f2 --so-pin 1234 --pin 1234`, then prime the id the
    signer finds: `$TMPDIR/f2/bin/creator <provider> 1234 0102`.
-4. Capture every sanitizer input (tag is the observer release;
-   scan is unprivileged, the rest take the privileged lock;
-   create each out dir first):
-   - `tools/capture-single.sh <v071-observer> v071 <out>` →
+4. Capture every sanitizer input with OUT set to one raw
+   directory `<rawdir>` (create it first; tag is the observer
+   release; scan is unprivileged, the rest take the privileged
+   lock):
+   - `tools/capture-single.sh <v071-observer> v071 <rawdir>` →
      `v071-inventory-scan.json`, `v071-inventory-native.json`
-   - `tools/capture-churn.sh <observer> <tag> <out>` with tags
+   - `tools/capture-churn.sh <observer> <tag> <rawdir>` with tags
      `v071` and `v072` → `v071-inventory-churn.json`,
      `v072-inventory-churn.json`
-   - `tools/capture-ops.sh <v071-observer> v071 keyops <out>` →
+   - `tools/capture-ops.sh <v071-observer> v071 keyops <rawdir>` →
      `v071-inventory-keyops.json` (v0.7.1 only)
-   - `tools/capture-ops.sh <observer> <tag> profile <out>` with
+   - `tools/capture-ops.sh <observer> <tag> profile <rawdir>` with
      tags `v071` and `v072` → `v071-observed-profile.json`,
      `v072-observed-profile.json`
-   - `tools/capture-ops.sh <observer> <tag> metrics <out>` with
+   - `tools/capture-ops.sh <observer> <tag> metrics <rawdir>` with
      tags `v071` and `v072` → `v071-observed-metrics.json`,
      `v072-observed-metrics.json`
-   - `p11scope-discover-0.7.1 --module <provider>` →
-     `v071-manifest-softhsm.json` (generate before the
-     `--manifest` captures)
-   Rename the raw v0.7.1 profile to
-   `v071-observed-profile-signer.json` (see above). The capture
-   set is exactly:
+   - `p11scope-discover-0.7.1 --module <provider> -o <rawdir>/v071-manifest-softhsm.json`
+     (before the `--manifest` captures)
+   Rename the raw v0.7.1 profile inside `<rawdir>` to
+   `v071-observed-profile-signer.json` (see above). No collection
+   step: every capture writes its `-o` file directly into
+   `<rawdir>`, which is the sanitizer input set, exactly:
 
    ```manifest
    v071-inventory-scan.json

@@ -199,6 +199,10 @@ int main(int argc, char **argv) {
     CHECK(fl->C_Logout(session), "C_Logout");
     CHECK(fl->C_CloseSession(session), "C_CloseSession");
     CHECK(fl->C_Finalize(NULL), "C_Finalize");
+    if (signs == 0) {
+        fprintf(stderr, "steady-keys: no signs completed in the window\n");
+        return 1;
+    }
     printf("created id=");
     for (size_t i = 0; i < hex_len / 2; i++) {
         printf("%02x", key_id[i]);

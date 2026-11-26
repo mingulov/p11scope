@@ -7,7 +7,10 @@
 set -eu
 BIN=$1; TAG=$2; OUT=$3
 TMPDIR=${TMPDIR:-/var/tmp/p11scope-ws-tmp/v072-compat-071}
-PROV=/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so
+case $0 in */*) TOOLS_DIR=${0%/*};; *) TOOLS_DIR=.;; esac
+# shellcheck source=capture-env.sh
+. "$TOOLS_DIR/capture-env.sh"
+PROV=$(probe_provider) || exit 2
 export SOFTHSM2_CONF=$TMPDIR/f2/work/softhsm2.conf
 export STEADY_GO=$OUT/$TAG.sysgo
 ME=$(id -un)
@@ -25,11 +28,25 @@ for i in $(seq 1 600); do
   grep -q "semantic lane ready" $OUT/$TAG.syskeyops.stderr 2>/dev/null && break
   sleep 0.2
 done
-grep -q "semantic lane ready" $OUT/$TAG.syskeyops.stderr || echo "WARNING: semantic lane never ready"
-touch $STEADY_GO
+READY_SEEN=0
+if grep -q "semantic lane ready" $OUT/$TAG.syskeyops.stderr 2>/dev/null; then
+  READY_SEEN=1
+  touch "$STEADY_GO"
+else
+  echo "syskeyops: semantic lane never ready; gate left untouched" >&2
+fi
 wait $OPID
 echo "rc=$?"
 $LOCK sudo -n chown $ME:$ME $OUT/$TAG-inventory-syskeyops.json
 kill $APID 2>/dev/null || true
-wait 2>/dev/null || true
+ANCHOR_RC=0
+wait "$APID" 2>/dev/null || ANCHOR_RC=$?
+case "$ANCHOR_RC" in
+  0|143) ;;
+  *) echo "$TAG syskeyops: anchor failed rc=$ANCHOR_RC" >&2; exit 1 ;;
+esac
+if [ "$READY_SEEN" != 1 ]; then
+  echo "$TAG syskeyops: semantic lane never ready" >&2
+  exit 1
+fi
 ls -la $OUT/$TAG-inventory-syskeyops.json

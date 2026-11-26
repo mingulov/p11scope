@@ -8,7 +8,10 @@
 set -eu
 BIN=$1; TAG=$2; OUT=$3
 TMPDIR=${TMPDIR:-/var/tmp/p11scope-ws-tmp/v072-compat-071}
-PROV=/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so
+case $0 in */*) TOOLS_DIR=${0%/*};; *) TOOLS_DIR=.;; esac
+# shellcheck source=capture-env.sh
+. "$TOOLS_DIR/capture-env.sh"
+PROV=$(probe_provider) || exit 2
 export SOFTHSM2_CONF=$TMPDIR/f2/work/softhsm2.conf
 ME=$(id -un)
 CG=/sys/fs/cgroup/p11compat071

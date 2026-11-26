@@ -48,6 +48,9 @@ def build_prefixes(prefix):
         (prefix, "/work"),
         ("/usr/lib/x86_64-linux-gnu/softhsm", "/usr/lib/softhsm"),
         ("/usr/lib/x86_64-linux-gnu", "/usr/lib"),
+        # Fedora SoftHSM lands in the same canonical provider dir, so a
+        # Fedora re-capture produces the same fixtures as a Debian one.
+        ("/usr/lib64/pkcs11", "/usr/lib/softhsm"),
         ("/usr/lib/cargo/bin/coreutils", "/usr/bin"),
     ]
 

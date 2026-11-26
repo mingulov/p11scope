@@ -40,6 +40,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SUITE_DIR = "tests/python"
+# Every terminal state the fragment producer can emit for a suite event.
+# Anything else is malformed evidence, not a quieter pass.
+SUITE_EVENT_STATES = {"passed", "failed", "error", "skipped", "unexpected_success"}
 
 
 def checker_module():
@@ -547,7 +550,9 @@ def merge_typed_fragments(fragment_specs, output, host):
         for event in fragment["suite_events"]:
             if (type(event) is dict and set(event) == {"event", "state", "signature"}
                     and type(event.get("event")) is str and event["event"]
-                    and type(event.get("state")) is str and event["state"]):
+                    and event.get("state") in SUITE_EVENT_STATES
+                    and (event.get("signature") is None
+                         or type(event.get("signature")) is dict)):
                 suite_events.append(event)
                 if event["state"] in event_failure_states:
                     failure_present = True

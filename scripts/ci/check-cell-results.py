@@ -160,6 +160,7 @@ def main(argv):
     rows = []
     seen = set()
     problems = []
+    checker = known_failing_checker_module()
     for number, line in enumerate(text.splitlines(), 1):
         if not line.strip():
             continue
@@ -293,8 +294,11 @@ def main(argv):
 def ignored_test_files():
     registry_path = Path(__file__).resolve().parents[2] / "tests" / "ignored-tests.json"
     try:
-        registry = json.loads(registry_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        text = registry_path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    registry, _problems = known_failing_checker_module().strict_json(text, str(registry_path))
+    if registry is None:
         return {}
     files = {}
     ambiguous = set()
@@ -328,10 +332,13 @@ def cell_sidecar_signature(result_dir, cell):
     if not path.exists():
         return None, None
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        text = path.read_text(encoding="utf-8")
+    except OSError:
         return None, f"typed failure record for {cell} is missing or invalid JSON"
     checker = known_failing_checker_module()
+    value, _load_problems = checker.strict_json(text, str(path))
+    if value is None:
+        return None, f"typed failure record for {cell} is missing or invalid JSON"
     problems = checker.signature_problems(value)
     if isinstance(value, dict) and "branch" not in value:
         problems.append("signature lacks a typed branch")

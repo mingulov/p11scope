@@ -13,6 +13,7 @@ cell script (prerequisite missing) always fails the job.
 Run: python3 -I tests/python/test_cell_results.py -v
 """
 
+import importlib.util
 import json
 import shutil
 import subprocess
@@ -26,6 +27,13 @@ ROOT = Path(__file__).resolve().parents[2]
 CHECKER = ROOT / "scripts" / "ci" / "check-cell-results.py"
 RUNNER = ROOT / "scripts" / "ci" / "run-cell-script.sh"
 WRAPPER = ROOT / "scripts" / "ci" / "public-cli-host.sh"
+
+
+def load_script(path, name):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def run_checker(rows, *extra):
@@ -366,6 +374,13 @@ class CheckCellResultsTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0, case)
                 self.assertIn(message, result.stderr, case)
 
+    def test_duplicate_row_keys_fail(self):
+        line = ('{"cell":"a","pass":false,"pass":true,'
+                '"qualification":"qualified","detail":"d"}')
+        result = run_checker([line], "--require", "a")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid JSON", result.stderr)
+
     def test_duplicate_cells_fail(self):
         result = run_checker([row("a", True), row("a", True)])
         self.assertNotEqual(result.returncode, 0)
@@ -625,6 +640,29 @@ class TypedCellResultsTests(unittest.TestCase):
             sidecars={"a": '{"branch":"raw prose with spaces"}\n'})
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("not a typed signature", result.stderr)
+
+    def test_duplicate_sidecar_keys_fail_closed(self):
+        result, _document = run_typed_checker(
+            [row("a", False)], "--require", "a",
+            sidecars={"a": '{"cell":"a","branch":"x","branch":"y"}\n'})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing or invalid JSON", result.stderr)
+
+    def test_duplicate_registry_keys_map_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            temp = Path(tmp)
+            (temp / "scripts/ci").mkdir(parents=True)
+            shutil.copy2(CHECKER, temp / "scripts/ci/check-cell-results.py")
+            shutil.copy2(ROOT / "scripts/check-known-failing.py",
+                         temp / "scripts/check-known-failing.py")
+            (temp / "tests").mkdir()
+            (temp / "tests/ignored-tests.json").write_text(
+                '{"schema": "p11scope/ignored-tests/v1", "sites": ['
+                '{"file": "a.rs", "path": "X", "file": "b.rs"}]}\n',
+                encoding="utf-8")
+            module = load_script(temp / "scripts/ci/check-cell-results.py",
+                                 "cell_checker_registry_dup")
+            self.assertEqual(module.ignored_test_files(), {})
 
     def test_passing_cell_with_failure_sidecar_is_a_protocol_violation(self):
         result, _document = run_typed_checker(

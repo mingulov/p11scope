@@ -1209,6 +1209,46 @@ class FragmentAdmissionTests(unittest.TestCase):
         self.assertEqual(problems, [])
         self.assertEqual(process["state"], "passed")
 
+    EVENT_TEMPLATE = (
+        '{"schema": "p11scope/python-suite-fragment/v1", '
+        '"path": "tests/python/test_sample.py", "invocation": [], '
+        '"process_exit": %d, "complete": true, '
+        '"selection": [{"test": "Sample.test_pass"}], '
+        '"results": [{"test": "Sample.test_pass", "state": "passed", "signature": null}], '
+        '"suite_events": [{"event": "tearDownModule", "state": %s, '
+        '"signature": {"branch": "error", "oracle": "unittest", '
+        '"exception": "AssertionError"}}]}\n')
+
+    def merge_event_text(self, state_literal, process_exit):
+        runner = load_script(ROOT / "scripts/run-python-suites.py",
+                             "python_suite_runner_event_vocab")
+        with tempfile.TemporaryDirectory() as temporary:
+            temp = Path(temporary)
+            fragment = temp / "fragment.json"
+            fragment.write_text(self.EVENT_TEMPLATE % (process_exit, state_literal),
+                                encoding="utf-8")
+            output = temp / "merged.json"
+            problems = runner.merge_typed_fragments(
+                [(fragment, "test_sample.py", [], process_exit)], output, "github")
+            document = json.loads(output.read_text(encoding="utf-8"))
+            return problems, {item["test"]: item for item in document["results"]}
+
+    def test_unknown_suite_event_state_is_fragment_invalid(self):
+        for state in ("eror", "not_a_state"):
+            with self.subTest(state=state):
+                problems, rows = self.merge_event_text(f'"{state}"', 0)
+                self.assertTrue(problems)
+                self.assertEqual(rows["<suite-process>"]["state"], "failed")
+                self.assertEqual(rows["<suite-process>"]["signature"]["branch"],
+                                 "fragment_invalid")
+
+    def test_known_suite_event_error_stays_typed_failure(self):
+        problems, rows = self.merge_event_text('"error"', 1)
+        self.assertEqual(problems, [])
+        self.assertEqual(rows["<suite-events>"]["state"], "failed")
+        self.assertEqual(rows["<suite-events>"]["signature"]["events"][0]["event"],
+                         "tearDownModule")
+
 
 class ScopeSkipTests(unittest.TestCase):
     CLASS_SKIP_BODY = (
@@ -1499,6 +1539,48 @@ class PrivilegedTypedBranchTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("typed signature", result.stderr)
 
+    def test_converter_refuses_duplicate_key_sidecar(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            temp = Path(temporary)
+            test_name = "inventory::privileged_tests::privileged_identity_kernel_sweep_cell_lp64"
+            selection = temp / "selection.txt"
+            verdicts = temp / "verdicts.tsv"
+            sidecar = temp / "sidecar.json"
+            output = temp / "out.json"
+            selection.write_text(test_name + "\n")
+            sidecar.write_text('{"cell":"X","branch":"x","branch":"y"}\n', encoding="utf-8")
+            verdicts.write_text(test_name + "\tFAIL\t" + str(sidecar) + "\n")
+            converter = ROOT / "scripts/ci/privileged-lib-results.py"
+            result = subprocess.run([sys.executable, "-I", str(converter), str(selection), str(verdicts), str(output), "github"],
+                                    capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("missing or invalid JSON", result.stderr)
+
+    def test_converter_refuses_duplicate_key_registry(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            temp = Path(temporary)
+            (temp / "scripts/ci").mkdir(parents=True)
+            (temp / "tests").mkdir()
+            shutil.copy2(ROOT / "scripts/ci/privileged-lib-results.py",
+                         temp / "scripts/ci/privileged-lib-results.py")
+            shutil.copy2(ROOT / "scripts/check-known-failing.py",
+                         temp / "scripts/check-known-failing.py")
+            (temp / "tests/ignored-tests.json").write_text(
+                '{"schema": "p11scope/ignored-tests/v1", "sites": ['
+                '{"file": "src/a.rs", "path": "X", "file": "src/b.rs"}]}\n',
+                encoding="utf-8")
+            test_name = "X"
+            selection = temp / "selection.txt"
+            verdicts = temp / "verdicts.tsv"
+            output = temp / "out.json"
+            selection.write_text(test_name + "\n")
+            verdicts.write_text(test_name + "\tPASS\n")
+            converter = temp / "scripts/ci/privileged-lib-results.py"
+            result = subprocess.run([sys.executable, "-I", str(converter), str(selection), str(verdicts), str(output), "github"],
+                                    capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("cannot read ignored-test registry", result.stderr)
+
 
 class ProducerMutationSweepTests(unittest.TestCase):
     def record(self, results, name, original_ok, mutant_ok):
@@ -1652,6 +1734,108 @@ class ProducerMutationSweepTests(unittest.TestCase):
                     mutant_ok = ok
         self.record(results, "python-fragment-dup-keys", original_ok, mutant_ok)
 
+        # Every merge admission clause is killed individually: each mutant
+        # drops exactly one exactness or invalid-marking clause, and its
+        # malformed input merges clean only under the mutant.
+        clause_cases = [
+            ("python-event-state-closed",
+             'and event.get("state") in SUITE_EVENT_STATES', "and True",
+             [{"test": "Sample.test_pass"}],
+             [{"test": "Sample.test_pass", "state": "passed", "signature": None}],
+             [{"event": "tearDownModule", "state": "eror",
+               "signature": {"branch": "error"}}],
+             0),
+            ("python-event-signature-shape",
+             'and (event.get("signature") is None\n'
+             '                         or type(event.get("signature")) is dict)):',
+             "and True):",
+             [{"test": "Sample.test_pass"}],
+             [{"test": "Sample.test_pass", "state": "passed", "signature": None}],
+             [{"event": "tearDownModule", "state": "error", "signature": "oops"}],
+             1),
+            ("python-event-keys",
+             'set(event) == {"event", "state", "signature"}', "True",
+             [{"test": "Sample.test_pass"}],
+             [{"test": "Sample.test_pass", "state": "passed", "signature": None}],
+             [{"event": "tearDownModule", "state": "error",
+               "signature": {"branch": "error"}, "extra": 1}],
+             1),
+            ("python-event-invalid",
+             'if event["state"] in event_failure_states:\n'
+             "                    failure_present = True\n"
+             "            else:\n"
+             "                invalid = True",
+             'if event["state"] in event_failure_states:\n'
+             "                    failure_present = True\n"
+             "            else:",
+             [{"test": "Sample.test_pass"}],
+             [{"test": "Sample.test_pass", "state": "passed", "signature": None}],
+             [{"broken": 1}],
+             0),
+            ("python-selection-keys",
+             'set(item) == {"test"}', "True",
+             [{"test": "Sample.test_x", "extra": 1}],
+             [{"test": "Sample.test_x", "state": "failed",
+               "signature": {"cell": "X", "branch": "B"}}],
+             [],
+             1),
+            ("python-selection-invalid",
+             'selection.append({"path": suite_path, "test": item["test"], "invocation": invocation})\n'
+             "            else:\n"
+             "                invalid = True",
+             'selection.append({"path": suite_path, "test": item["test"], "invocation": invocation})\n'
+             "            else:",
+             [{"broken": 1}],
+             [{"test": "Sample.test_x", "state": "failed",
+               "signature": {"cell": "X", "branch": "B"}}],
+             [],
+             1),
+            ("python-result-keys",
+             'set(item) != {"test", "state", "signature"}', "False",
+             [{"test": "Sample.test_x"}],
+             [{"test": "Sample.test_x", "state": "failed",
+               "signature": {"cell": "X", "branch": "B"}, "extra": 1}],
+             [],
+             1),
+            ("python-result-invalid",
+             "                invalid = True\n"
+             "                complete = False\n"
+             "                continue",
+             "                complete = False\n"
+             "                continue",
+             [{"test": "Sample.test_x"}],
+             [{"broken": 1}],
+             [],
+             0),
+        ]
+        for index, (name, old, new, selection, outcome, events, exit_code) in enumerate(clause_cases):
+            self.assertIn(old, runner_source, name)
+            mutant_source = runner_source.replace(old, new, 1)
+            clause_outcomes = {}
+            for label, source in (("original", runner_source), ("mutant", mutant_source)):
+                with tempfile.TemporaryDirectory() as temporary:
+                    temp = Path(temporary)
+                    script = temp / "run-python-suites.py"
+                    script.write_text(source, encoding="utf-8")
+                    shutil.copy2(ROOT / "scripts/check-known-failing.py",
+                                 temp / "check-known-failing.py")
+                    module = load_script(script, f"runner_clause_{index}_{label}")
+                    fragment = temp / "fragment.json"
+                    write_json(fragment, {
+                        "schema": "p11scope/python-suite-fragment/v1",
+                        "path": "tests/python/test_sample.py", "invocation": [],
+                        "process_exit": exit_code, "complete": True,
+                        "selection": selection, "results": outcome,
+                        "suite_events": events,
+                    })
+                    output = temp / "merged.json"
+                    problems = module.merge_typed_fragments(
+                        [(fragment, "test_sample.py", [], exit_code)], output, "github")
+                    rows = {row_["test"]: row_ for row_ in json.loads(output.read_text())["results"]}
+                    clause_outcomes[label] = (
+                        bool(problems) and rows["<suite-process>"]["state"] == "failed")
+            self.record(results, name, clause_outcomes["original"], clause_outcomes["mutant"])
+
         # Python module terminal events must reach the typed fragment.
         typed_source = (ROOT / "scripts/typed-python-suite.py").read_text(encoding="utf-8")
         typed_mutant = self.mutate_source(ROOT / "scripts/typed-python-suite.py",
@@ -1735,6 +1919,77 @@ class ProducerMutationSweepTests(unittest.TestCase):
                 outcomes[label] = emitted == signature
         self.record(results, "cell-branch-sidecar", outcomes["original"], outcomes["mutant"])
 
+        # Cell rows are admitted strictly: duplicate keys must fail the
+        # row instead of collapsing (a failed cell rewritten as a pass).
+        cell_mutant = self.mutate_source(ROOT / "scripts/ci/check-cell-results.py",
+                                         "row, row_problems = checker.strict_json(line, f\"line {number}\")",
+                                         "row, row_problems = json.loads(line), []")
+        outcomes = {}
+        for label, source in (("original", cell_source), ("mutant", cell_mutant)):
+            with tempfile.TemporaryDirectory() as temporary:
+                temp = Path(temporary)
+                (temp / "scripts/ci").mkdir(parents=True)
+                (temp / "scripts/check-known-failing.py").write_text(CHECKER.read_text(encoding="utf-8"), encoding="utf-8")
+                (temp / "scripts/qualify-public-cli.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+                script = temp / "scripts/ci/check-cell-results.py"
+                script.write_text(source, encoding="utf-8")
+                rows_path = temp / "results.jsonl"
+                rows_path.write_text('{"cell":"a","pass":false,"pass":true,'
+                                     '"qualification":"qualified","detail":"d"}\n', encoding="utf-8")
+                run = subprocess.run([sys.executable, "-I", str(script), str(rows_path), "--require", "a"],
+                                     capture_output=True, text=True)
+                outcomes[label] = run.returncode != 0
+        self.record(results, "cell-row-dup-keys", outcomes["original"], outcomes["mutant"])
+
+        # Cell sidecars are admitted strictly: contradictory duplicate
+        # branches must fail instead of collapsing to one.
+        cell_mutant = self.mutate_source(ROOT / "scripts/ci/check-cell-results.py",
+                                         "value, _load_problems = checker.strict_json(text, str(path))",
+                                         "value = json.loads(text)")
+        outcomes = {}
+        for label, source in (("original", cell_source), ("mutant", cell_mutant)):
+            with tempfile.TemporaryDirectory() as temporary:
+                temp = Path(temporary)
+                (temp / "scripts/ci").mkdir(parents=True)
+                (temp / "scripts/check-known-failing.py").write_text(CHECKER.read_text(encoding="utf-8"), encoding="utf-8")
+                (temp / "scripts/qualify-public-cli.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+                script = temp / "scripts/ci/check-cell-results.py"
+                script.write_text(source, encoding="utf-8")
+                rows_path = temp / "results.jsonl"
+                rows_path.write_text(json.dumps({"cell": "a", "pass": False, "detail": "d",
+                                                 "qualification": "qualified"}) + "\n", encoding="utf-8")
+                (temp / "a.typed-failure.json").write_text(
+                    '{"cell":"a","branch":"x","branch":"y"}\n', encoding="utf-8")
+                output = temp / "typed.json"
+                run = subprocess.run([sys.executable, "-I", str(script), str(rows_path), "--require", "a",
+                                      "--known-failing-results", str(output),
+                                      "--known-failing-runner", "cell:scripts/qualify-public-cli.sh",
+                                      "--known-failing-host", "github"],
+                                     capture_output=True, text=True)
+                outcomes[label] = run.returncode != 0 and not output.exists()
+        self.record(results, "cell-sidecar-dup-keys", outcomes["original"], outcomes["mutant"])
+
+        # The cell registry read is strict: a duplicate-key registry maps
+        # nothing instead of collapsing to one mapping.
+        cell_mutant = self.mutate_source(ROOT / "scripts/ci/check-cell-results.py",
+                                         "registry, _problems = known_failing_checker_module().strict_json(text, str(registry_path))",
+                                         "registry = json.loads(text)")
+        outcomes = {}
+        for label, source in (("original", cell_source), ("mutant", cell_mutant)):
+            with tempfile.TemporaryDirectory() as temporary:
+                temp = Path(temporary)
+                (temp / "scripts/ci").mkdir(parents=True)
+                (temp / "scripts/check-known-failing.py").write_text(CHECKER.read_text(encoding="utf-8"), encoding="utf-8")
+                (temp / "tests").mkdir()
+                (temp / "tests/ignored-tests.json").write_text(
+                    '{"schema": "p11scope/ignored-tests/v1", "sites": ['
+                    '{"file": "a.rs", "path": "X", "file": "b.rs"}]}\n', encoding="utf-8")
+                script = temp / "scripts/ci/check-cell-results.py"
+                script.write_text(source, encoding="utf-8")
+                module = load_script(script, f"cell_registry_{label}")
+                outcomes[label] = module.ignored_test_files() == {}
+        self.record(results, "cell-registry-dup-keys", outcomes["original"], outcomes["mutant"])
+
         # Privileged sidecars must drive the failed-row signature and remain
         # strictly typed.
         privileged_source = (ROOT / "scripts/ci/privileged-lib-results.py").read_text(encoding="utf-8")
@@ -1779,6 +2034,44 @@ class ProducerMutationSweepTests(unittest.TestCase):
         original_ok = original_run.returncode != 0
         mutant_ok = mutant_run.returncode != 0 or mutant_doc is None
         self.record(results, "privileged-invalid-sidecar-accepted", original_ok, mutant_ok)
+
+        # Privileged sidecars are admitted strictly: contradictory duplicate
+        # branches must fail instead of collapsing to one.
+        dup_sidecar = '{"cell":"X","branch":"x","branch":"y"}\n'
+        sidecar_mutant = self.mutate_source(
+            ROOT / "scripts/ci/privileged-lib-results.py",
+            "value, _load_problems = checker_module().strict_json(text, str(path))",
+            "value = json.loads(text)")
+        original_run, _doc = privileged_behavior(privileged_source, dup_sidecar)
+        mutant_run, _doc = privileged_behavior(sidecar_mutant, dup_sidecar)
+        self.record(results, "privileged-sidecar-dup-keys",
+                    original_run.returncode != 0, mutant_run.returncode != 0)
+
+        # The privileged registry read is strict: a duplicate-key registry
+        # fails instead of collapsing to one mapping.
+        registry_mutant = self.mutate_source(
+            ROOT / "scripts/ci/privileged-lib-results.py",
+            'registry, registry_problems = checker_module().strict_json(text, "ignored-test registry")',
+            "registry = json.loads(text)")
+        outcomes = {}
+        for label, source in (("original", privileged_source), ("mutant", registry_mutant)):
+            with tempfile.TemporaryDirectory() as temporary:
+                temp = Path(temporary)
+                (temp / "scripts/ci").mkdir(parents=True)
+                (temp / "tests").mkdir()
+                (temp / "scripts/check-known-failing.py").write_text(CHECKER.read_text(encoding="utf-8"), encoding="utf-8")
+                (temp / "tests/ignored-tests.json").write_text(
+                    '{"schema": "p11scope/ignored-tests/v1", "sites": ['
+                    '{"file": "src/a.rs", "path": "X", "file": "src/b.rs"}]}\n', encoding="utf-8")
+                script = temp / "scripts/ci/privileged-lib-results.py"
+                script.write_text(source, encoding="utf-8")
+                selection = temp / "selection.txt"; verdicts = temp / "verdicts.tsv"; output = temp / "out.json"
+                selection.write_text("X\n", encoding="utf-8")
+                verdicts.write_text("X\tPASS\n", encoding="utf-8")
+                run = subprocess.run([sys.executable, "-I", str(script), str(selection), str(verdicts), str(output), "github"],
+                                     capture_output=True, text=True)
+                outcomes[label] = run.returncode != 0
+        self.record(results, "privileged-registry-dup-keys", outcomes["original"], outcomes["mutant"])
 
         # Promoted curated tests outside the ignored registry are mapped by
         # the Rust-source fallback; disabling it recreates the shard failure.
@@ -2122,7 +2415,7 @@ class ProducerMutationSweepTests(unittest.TestCase):
                 outcomes[label] = run.returncode == 0
         self.record(results, "workflow-require-file-empty-selection", outcomes["original"], outcomes["mutant"])
 
-        total = 26
+        total = 39
         self.assertEqual(results["failures"], [],
                          f"surviving producer mutants: {results['failures']}; killed {results['killed']}/{total}")
         print(f"known-failing producer mutation sweep: {results['killed']}/{total} killed")

@@ -11112,9 +11112,10 @@ fn hosted_python_privilege_covers_real_owned_launcher_call_sites() {
 
 /// Every predicate the `COMMAND_BOUNDARY` sudo exclusion relies on: one
 /// quoted sudo line, the table present, the full assignment verbatim, the
-/// quoted line a bare literal, and exactly two `COMMAND_BOUNDARY` mentions
-/// (definition plus the sole scanner membership use). Any edit that moves,
-/// recomputes or reuses the token changes one of these and fails loudly.
+/// quoted line a bare literal, and exactly two literal `COMMAND_BOUNDARY`
+/// mentions (definition plus the sole scanner membership use). This pins
+/// literal reuse and assignment-shape edits only; a use that constructs
+/// the name without the contiguous token is out of scope for this text pin.
 fn checker_sudo_exclusion_holds(text: &str) -> Result<(), &'static str> {
     let quoted: Vec<&str> = text
         .lines()
@@ -11214,8 +11215,8 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
         // probe, the cargo wrapper and cell --list-cells, all unprivileged).
         // The pin this exclusion relies on is checked by
         // `checker_sudo_exclusion_holds` (one quoted line, full assignment
-        // verbatim, bare literal, exactly two mentions); a self-test proves
-        // it rejects a computed reuse of the set.
+        // verbatim, bare literal, exactly two literal mentions); a self-test
+        // proves it rejects a direct computed reuse of the set.
         let own_text_quotes_sudo = read(script).lines().map(str::trim).any(|line| {
             !line.starts_with('#') && (line.contains("\"sudo\"") || line.contains("'sudo'"))
         });

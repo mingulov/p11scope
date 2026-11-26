@@ -68,8 +68,11 @@ def rust_token_index():
 def typed_sidecar_signature(path_text):
     path = Path(path_text)
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None, "typed signature sidecar is missing or invalid JSON"
+    value, _load_problems = checker_module().strict_json(text, str(path))
+    if value is None:
         return None, "typed signature sidecar is missing or invalid JSON"
     problems = checker_module().signature_problems(value)
     if problems:
@@ -108,9 +111,13 @@ def main(argv):
         print("privileged-lib-results: verdict rows are not exactly one-to-one with the selection", file=sys.stderr)
         return 1
     try:
-        registry = json.loads((ROOT / "tests/ignored-tests.json").read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
+        text = (ROOT / "tests/ignored-tests.json").read_text(encoding="utf-8")
+    except OSError as error:
         print(f"privileged-lib-results: cannot read ignored-test registry: {error}", file=sys.stderr)
+        return 1
+    registry, registry_problems = checker_module().strict_json(text, "ignored-test registry")
+    if registry is None:
+        print(f"privileged-lib-results: cannot read ignored-test registry: {registry_problems[0]}", file=sys.stderr)
         return 1
     files = {}
     ambiguous = set()

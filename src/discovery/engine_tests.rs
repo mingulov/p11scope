@@ -3147,17 +3147,88 @@ fn discovery_evidence_without_a_module_pin_gaps_its_live_slot_rows() {
     );
 }
 
-/// Class test (binding controller note): every row-dropping
-/// `pinned.summary()` lookup in `discovery_evidence` — the module
-/// identity and each active slot object — also appears in
-/// `resolve_merge_inputs`, so preflight refuses (dropped pass)
-/// instead of certifying clean a publication the render would
-/// drop rows from. (Inline-degrading lookups — the pre-copy-up
-/// flag, the first-loaded-by annotation, the manifest fallbacks,
-/// the dropped-module slot-context probes — need no preflight:
-/// they render degraded output, never drop rows.)
+/// A manifest fallback whose replacement pin is gone files a named
+/// gap instead of silently dropping its row; rendered rows plus gaps
+/// still cover every fallback. Fails while the arm skips pinless
+/// replacements.
 #[test]
-fn resolve_merge_inputs_refuses_plan_objects_without_pins() {
+fn missing_fallback_replacement_files_a_named_gap() {
+    use crate::discovery::identity::test_fixture::pin_set;
+    let key_plan = ObjectKey {
+        device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+        inode: 42,
+    };
+    let key_repl = ObjectKey {
+        device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+        inode: 43,
+    };
+    let mut pins = pin_set(
+        &[(key_plan, "sha-plan", 7), (key_repl, "sha-repl", 7)],
+        false,
+    );
+    let mut ids = pins.pinned().map(|pin| pin.id);
+    let (plan_id, replacement) = (ids.next().unwrap(), ids.next().unwrap());
+    let mut plan = plan_with(2, 0);
+    plan.modules[0].object = plan_id;
+    for slot in &mut plan.slots {
+        slot.object = plan_id;
+    }
+    let mut counters = DiscoveryCounters::default();
+    counters.manifest_fallbacks.push(ManifestFallback {
+        manifest: 0,
+        object: 3,
+        reason: ManifestStaleReason::IdentityMismatch,
+        replacement,
+        proof: BoundFallbackProof {
+            module: replacement,
+            tables: Vec::new(),
+            required_targets: BTreeMap::new(),
+        },
+    });
+    // Control: the pinned replacement renders its row with no gap.
+    let (evidence, gaps) = discovery_evidence(
+        &plan,
+        &pins,
+        &counters,
+        &crate::prearm_module::PrearmState::empty(),
+        &BTreeMap::new(),
+    );
+    assert_eq!(evidence.manifest_object_fallbacks.len(), 1);
+    assert!(gaps.is_empty(), "no gap while pinned: {gaps:?}");
+    // Fault: the replacement pin is lost after the retain filters.
+    pins.remove_pin_for_test(replacement);
+    let (evidence, gaps) = discovery_evidence(
+        &plan,
+        &pins,
+        &counters,
+        &crate::prearm_module::PrearmState::empty(),
+        &BTreeMap::new(),
+    );
+    assert!(
+        evidence.manifest_object_fallbacks.is_empty(),
+        "the pinless row cannot render"
+    );
+    let reasons: Vec<(&str, &str)> = gaps
+        .iter()
+        .map(|gap| (gap.subject.as_str(), gap.reason.as_str()))
+        .collect();
+    assert_eq!(
+        reasons,
+        vec![(
+            "manifest object fallback",
+            "manifest 0 object 3 lost its replacement pin before evidence rendered; the fallback row is unattributed",
+        )],
+        "one named gap names the lost replacement: {gaps:?}"
+    );
+}
+
+/// Pin loss degrades at render instead of refusing the merge: a
+/// planned module or active slot object without a pin still
+/// resolves, and the evidence carries a named gap for the dropped
+/// rows while the other modules publish. Fails while the resolve
+/// refuses pinless plan objects.
+#[test]
+fn resolve_merge_inputs_accepts_pinless_plan_objects() {
     use crate::discovery::identity::test_fixture::pin_set;
     let key = ObjectKey {
         device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
@@ -3167,31 +3238,23 @@ fn resolve_merge_inputs_refuses_plan_objects_without_pins() {
     let present = pins.pinned().next().unwrap().id;
     let missing = crate::discovery::identity::PinnedObjectId(424242);
     let facts = CaptureFacts::default();
-    // Module identity without a pin refuses, naming the module.
+    // Module identity without a pin resolves; the render gaps it.
     let mut plan = plan_with(2, 0);
     plan.modules[0].object = missing;
     plan.modules[0].path = "/opt/p11.so".to_string();
     plan.slots[0].object = present;
     plan.slots[1].object = present;
-    let err = facts
+    facts
         .resolve_merge_inputs(&plan, &pins, &[], &[], &[])
-        .unwrap_err();
-    assert_eq!(
-        format!("{err:#}"),
-        "planned module '/opt/p11.so' has no comparable pin"
-    );
-    // Active slot object without a pin refuses, naming the slot path.
+        .expect("a pinless module resolves for degraded render");
+    // Active slot object without a pin resolves too.
     plan.modules[0].object = present;
     plan.slots[1].object = missing;
     plan.slots[1].object_path = "/opt/p11-gone.so".to_string();
-    let err = facts
+    facts
         .resolve_merge_inputs(&plan, &pins, &[], &[], &[])
-        .unwrap_err();
-    assert_eq!(
-        format!("{err:#}"),
-        "planned slot object '/opt/p11-gone.so' has no comparable pin"
-    );
-    // Complete pins pass.
+        .expect("a pinless slot resolves for degraded render");
+    // Complete pins still pass.
     plan.slots[1].object = present;
     facts
         .resolve_merge_inputs(&plan, &pins, &[], &[], &[])
@@ -86964,114 +87027,87 @@ fn real_merge_ordinal_mismatch_drops_pass_with_gap() {
     child.wait().unwrap();
 }
 
-/// Opus T2 N1 (S1 twin): a planned-module pin lost on committed state
-/// drops the whole tail publication with an exact named gap, keeping
-/// the previous published history — twice, with the pin still
-/// missing. The second tail drops again (aggregate 2, frozen gap):
-/// no recovery while the pin is gone. Behavior-pinning: green on
-/// arrival; the fault hook is the only production change.
+/// A planned-module pin lost on committed state degrades only that
+/// module: each tail still publishes the other modules plus one
+/// named gap for the missing rows. The publication revision advances
+/// on both tails — nothing freezes while the pin is gone. Fails while
+/// a pin loss drops the whole tail.
 #[test]
-fn tail_twice_with_missing_module_pin_drops_with_exact_gap() {
-    let (mut engine, raw) = retained_publication_engine(6, 1);
-    apply_publication_candidate(&mut engine, &raw);
-    engine.publish_batch_tail(false).unwrap();
-    assert!(
-        !engine.plan.modules.is_empty(),
-        "a module is planned after the healthy publish"
-    );
-    let module = engine.plan.modules[0].clone();
-    // Predict the resolve error in check order: this module's active
-    // slots sharing its object come before the module identity.
-    let expected = engine
-        .plan
-        .slots
-        .iter()
-        .filter(|s| {
-            engine.plan.is_active(s.index)
-                && s.module_ids.contains(&module.id)
-                && s.object == module.object
-        })
-        .map(|s| {
-            format!(
-                "planned slot object '{}' has no comparable pin",
-                s.object_path
-            )
-        })
-        .next()
-        .unwrap_or_else(|| format!("planned module '{}' has no comparable pin", module.path));
-    // Lose the pin, dirty the revision so the tail attempts, then
-    // snapshot the published history the drops must keep. No fresh
-    // reconciled modules this batch (the plan stays): a module the
-    // merge still reconciles would fail the earlier identity check,
-    // not the pin checks — the S1 shape is a planned module the
-    // batch no longer reconciles.
-    engine.pinned.remove_pin_for_test(module.object);
+fn tails_with_missing_module_pin_publish_others_plus_gap() {
+    // Two providers stay distinct objects through one shared pin set.
+    let raw_a = overlay_module(overlay_key(86));
+    let raw_b = overlay_module(overlay_key(87));
+    let dir = tempfile::tempdir().expect("backing dir");
+    let mut pins = overlay_pins(&[(raw_a.key, OVERLAY_SHA, 1)]);
+    overlay_reback(&mut pins, &overlay_backing_file(&dir, "a.so"));
+    let mut pins_b = overlay_pins(&[(raw_b.key, OVERLAY_SHA, 2)]);
+    overlay_reback(&mut pins_b, &overlay_backing_file(&dir, "b.so"));
+    assert!(pins.absorb(pins_b).is_empty());
+    pins.prove_scanned_entries_for_test(&[raw_a.clone(), raw_b.clone()]);
+    let (modules, skipped) = bind_scanned_modules(&[raw_a, raw_b], &mut pins);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    assert_eq!(modules.len(), 2, "both providers reconcile");
+    let mut engine = Engine::empty();
+    engine.plan = plan::build_from_reconciled_modules(&modules);
+    engine.pinned = pins;
+    engine.modules = modules;
+    engine
+        .capture_facts
+        .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+        .unwrap();
+    engine.publish_current_capture_facts().unwrap();
+    assert_eq!(engine.plan.modules.len(), 2, "both modules planned");
+    let victim = engine.plan.modules[0].clone();
+    let healthy = engine.plan.modules[1].clone();
+    assert_ne!(victim.object, healthy.object, "distinct plan objects");
+    // The victim stays planned but unreconciled this batch (a batch
+    // with no fresh scan for it): reconciled modules carry fresh pins
+    // and still refuse wholesale, which is a separate admission site.
+    engine.pinned.remove_pin_for_test(victim.object);
     engine.modules.clear();
-    engine.mark_partial("tail twin dirties", "a new input must publish");
-    let history = engine.capture_facts.history.clone();
-    let plan = engine.plan.clone();
-    let published = engine.published_facts_revision;
-    let publishes = engine.tail_publishes;
-    // First tail with the pin missing: drops with the exact gap.
-    engine.publish_batch_tail(false).unwrap();
-    assert_eq!(
-        engine.published_facts_revision, published,
-        "the dropped tail publishes nothing"
-    );
-    assert_eq!(
-        engine.tail_publishes, publishes,
-        "the dropped tail counts no publish"
-    );
-    assert_eq!(
-        engine.capture_facts.history, history,
-        "the previous published history is kept"
-    );
-    assert_eq!(engine.plan.modules, plan.modules, "plan modules are kept");
-    assert_eq!(engine.plan.slots, plan.slots, "plan slots are kept");
-    assert!(
-        engine.plan.skipped.iter().any(|skip| {
-            skip.subject == "tail twin dirties" && skip.reason == "a new input must publish"
-        }),
-        "the tail carries the dirty marker forward: {:?}",
-        engine.plan.skipped
-    );
-    let gap = engine
-        .dropped_pass_gap
-        .clone()
-        .expect("a dropped-pass gap is filed");
-    assert_eq!(gap.subject, "live inventory pass");
-    let (first, _) = engine
-        .dropped_pass_span_for_test(&expected)
-        .expect("the pin error aggregates");
-    assert_eq!(
-        gap.reason,
-        format!("pass {first} dropped: {expected}"),
-        "the dropped-pass gap is exact"
-    );
-    assert_eq!(engine.dropped_pass_count_for_test(&expected), 1);
-    // Second tail, pin still missing: drops again — frozen history,
-    // same gap, count 2. No recovery while the pin is gone.
-    engine.publish_batch_tail(false).unwrap();
-    assert_eq!(
-        engine.published_facts_revision, published,
-        "the second dropped tail still publishes nothing"
-    );
-    assert_eq!(
-        engine.capture_facts.history, history,
-        "history stays frozen across the second drop"
-    );
-    assert_eq!(engine.plan.modules, plan.modules, "modules stay frozen");
-    assert_eq!(engine.plan.slots, plan.slots, "slots stay frozen");
-    let gap2 = engine
-        .dropped_pass_gap
-        .as_ref()
-        .expect("the gap is still filed");
-    assert_eq!(gap2.reason, gap.reason, "the first gap is kept");
-    assert_eq!(
-        engine.dropped_pass_count_for_test(&expected),
-        2,
-        "both tails drop on the same error"
-    );
+    for tail in 1..=2 {
+        engine.mark_partial("degraded tail dirties", "a new input must publish");
+        let published_before = engine.published_facts_revision;
+        engine.publish_batch_tail(false).unwrap();
+        assert!(
+            engine.published_facts_revision > published_before,
+            "tail {tail}: the publication advances instead of freezing"
+        );
+        let paths: Vec<&str> = engine
+            .discovery
+            .modules
+            .iter()
+            .map(|module| module.path.as_str())
+            .collect();
+        assert!(
+            paths.contains(&healthy.path.as_str()),
+            "tail {tail}: the healthy module publishes: {paths:?}"
+        );
+        assert!(
+            !paths.contains(&victim.path.as_str()),
+            "tail {tail}: the pinless module drops its rows: {paths:?}"
+        );
+        let expected = format!(
+            "planned object '{}' lost its comparable pin before evidence rendered; its calls are unattributed",
+            victim.path
+        );
+        let gaps: Vec<(&str, &str)> = engine
+            .capture_facts
+            .history
+            .losses
+            .values()
+            .filter(|loss| {
+                loss.reason.contains(&victim.path)
+                    && loss.reason.contains("lost its comparable pin")
+            })
+            .map(|loss| (loss.subject.as_str(), loss.reason.as_str()))
+            .collect();
+        assert_eq!(
+            gaps,
+            vec![("planned provider object", expected.as_str())],
+            "tail {tail}: one named gap for the missing rows"
+        );
+    }
 }
 
 /// Drives rounds until one more pass with `error` has dropped (bounded):

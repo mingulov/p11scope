@@ -45926,9 +45926,9 @@ int main(void) {
         );
     }
 
-    /// Opus T2 B1 (i): a fresh key in a latched class is not a
-    /// revival — its full count stages with no gap. FAILS while the
-    /// latch spans the whole (domain, object) class.
+    /// A fresh key in a latched class is not a revival — its full
+    /// count stages with no gap. Fails while the latch spans the
+    /// whole (domain, object) class.
     #[test]
     fn fresh_key_in_a_latched_class_stages_its_full_count() {
         let (mut native, caller) = NativeScene::new();
@@ -46001,9 +46001,9 @@ int main(void) {
         );
     }
 
-    /// Opus T2 B1 (ii): the latched gap fires once — the next advance
-    /// stages its growth with no new gap. FAILS while the latch
-    /// persists past its gap.
+    /// The latched gap fires once — the next advance stages its
+    /// growth with no new gap. Fails while the latch persists past
+    /// its gap.
     #[test]
     fn advance_past_a_latched_gap_stages_its_growth() {
         let (mut native, caller) = NativeScene::new();
@@ -46098,9 +46098,9 @@ int main(void) {
         assert_eq!(gaps, 1, "no second fold-revival gap");
     }
 
-    /// Opus T2 B1 (iii): a mid-life advance under a latched key is
-    /// not a revival — it stages past its base with no gap, and the
-    /// latch stays set for the evicted key's own revival.
+    /// A mid-life advance under a latched key is not a revival —
+    /// it stages past its base with no gap, and the latch stays set
+    /// for the evicted key's own revival.
     #[test]
     fn midlife_advance_under_a_latched_key_stages_and_keeps_the_latch() {
         let (mut native, caller) = NativeScene::new();
@@ -46195,6 +46195,287 @@ int main(void) {
                     object: 0,
                 }),
             "the advance preserves the latch for the evicted key"
+        );
+    }
+
+    /// A sibling exec generation with an exact tombstone base stages
+    /// past it with no fold gap, and the evicted generation still
+    /// gaps on revival: the latch keys the exact evicted pair, so a
+    /// neighbor generation can neither take its gap nor burn it.
+    /// Fails while the latch ignores exec.
+    #[test]
+    fn sibling_exec_with_tombstone_base_stages_past_it() {
+        let (mut native, caller) = NativeScene::new();
+        let at = native.stamps.tick();
+        native.scene.coordinator.set_pair_prune_cap_for_test(2);
+        for ticket in [90u64, 91] {
+            native.scene.coordinator.pair_dropped_tombstones.insert(
+                PairKey {
+                    image: DomainCookie::scripted(native.domain, ticket),
+                    exec: 1,
+                    object: 0,
+                },
+                PrunedPairBase {
+                    base: 9,
+                    base_since: at,
+                    pruned_since: at,
+                    pid: 7,
+                },
+            );
+        }
+        // Evict (41, exec 9): folded first, oldest, live.
+        for (pass, exec) in [9u64, 10, 11].iter().enumerate() {
+            native.scene.coordinator.pair_targets.insert(
+                PairKey {
+                    image: DomainCookie::scripted(native.domain, 41),
+                    exec: *exec,
+                    object: 0,
+                },
+                PairTarget::Dropped {
+                    base: 3,
+                    base_since: at,
+                    pid: 7,
+                },
+            );
+            native.scene.coordinator.prune_departed_native_state(
+                at + EXEC_STATE_GRACE_NS + pass as u64,
+            );
+        }
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .pair_fold_memory_overflow_for_test(),
+            1,
+            "the oldest live fold drops with a counted overflow"
+        );
+        // Sibling (41, exec 1) carries an exact tombstone base 9: it
+        // stages +2 at 11 with no fold gap.
+        native.scene.coordinator.pair_dropped_tombstones.insert(
+            PairKey {
+                image: DomainCookie::scripted(native.domain, 41),
+                exec: 1,
+                object: 0,
+            },
+            PrunedPairBase {
+                base: 9,
+                base_since: at,
+                pruned_since: at,
+                pid: 7,
+            },
+        );
+        let row = native.row(41, 1, 7, at, 0);
+        native.scene.coordinator.bind_pair_count(&row, caller, &[]);
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 11)]);
+        let staged = native
+            .scene
+            .coordinator
+            .registry
+            .staged_pending_counts_for_test();
+        assert_eq!(staged.len(), 1, "the sibling stages once: {staged:?}");
+        assert_eq!(staged[0].1, 2, "11 past base 9 stages +2: {staged:?}");
+        assert_eq!(staged[0].2, 9, "the sibling rebases past 9: {staged:?}");
+        native.scene.coordinator.registry.publish();
+        assert!(
+            native
+                .scene
+                .coordinator
+                .registry
+                .gaps()
+                .iter()
+                .all(|gap| gap.subject != "revived folded count"),
+            "no fold gap for a key that is not the evicted one"
+        );
+        // The evicted (41, exec 9) revives: the latch is still its
+        // own, so it gaps instead of re-crediting.
+        let row = native.row(41, 9, 7, at, 0);
+        native.scene.coordinator.bind_pair_count(&row, caller, &[]);
+        native.counts_read(Vec::new(), vec![(41, 9, 0, 7)]);
+        let staged = native
+            .scene
+            .coordinator
+            .registry
+            .staged_pending_counts_for_test();
+        assert!(
+            staged.is_empty(),
+            "revival past the evicted fold stages nothing: {staged:?}"
+        );
+        native.scene.coordinator.registry.publish();
+        let gaps: Vec<String> = native
+            .scene
+            .coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == "revived folded count")
+            .map(|gap| gap.reason.clone())
+            .collect();
+        assert_eq!(
+            gaps,
+            vec![
+                "the pair revived past a counted fold for absolute count range (0, 7] (7 unattributed calls); the folded base stays in the class aggregate and no pre-revival use is recorded"
+                    .to_string()
+            ],
+            "the evicted generation gaps exactly once"
+        );
+    }
+
+    /// The same sibling setup through the demotion path: a demotion
+    /// re-root stages with staged == base, so the shape guard alone
+    /// cannot tell it from a revival — only the exact evicted key
+    /// can. Fails while the latch ignores exec.
+    #[test]
+    fn sibling_exec_through_demotion_stages_its_growth() {
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let (mut native, caller) = NativeScene::new();
+        // Evict (41, exec 9) first; the demotion ceremony below runs
+        // on (41, exec 1), a different generation of the same image.
+        let fold_at = native.stamps.tick();
+        native.scene.coordinator.set_pair_prune_cap_for_test(2);
+        for ticket in [90u64, 91] {
+            native.scene.coordinator.pair_dropped_tombstones.insert(
+                PairKey {
+                    image: DomainCookie::scripted(native.domain, ticket),
+                    exec: 1,
+                    object: 0,
+                },
+                PrunedPairBase {
+                    base: 9,
+                    base_since: fold_at,
+                    pruned_since: fold_at,
+                    pid: 7,
+                },
+            );
+        }
+        for (pass, exec) in [9u64, 10, 11].iter().enumerate() {
+            native.scene.coordinator.pair_targets.insert(
+                PairKey {
+                    image: DomainCookie::scripted(native.domain, 41),
+                    exec: *exec,
+                    object: 0,
+                },
+                PairTarget::Dropped {
+                    base: 3,
+                    base_since: fold_at,
+                    pid: 7,
+                },
+            );
+            native.scene.coordinator.prune_departed_native_state(
+                fold_at + EXEC_STATE_GRACE_NS + pass as u64,
+            );
+        }
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .pair_fold_memory_overflow_for_test(),
+            1,
+            "the oldest live fold drops with a counted overflow"
+        );
+        // Demotion ceremony for (41, exec 1): A=5 transfers to B=1 at
+        // absolute 6; B carries only post-demotion growth.
+        native.answer(7, 500, 41);
+        let row_a = native.row(41, 1, 7, 100, 0);
+        native.witness(vec![row_a]);
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 5)]);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let b = fx::provider(&native.scene._dir, "b.so", "provider-b");
+        let a_path = native.scene.path.clone();
+        native.scene.pins = fx::pass_pins(&[(&a_path, "sha-a"), (&b, "sha-b")]);
+        let policy =
+            crate::plan::AdmissionPolicy::Inventory(native.scene.coordinator.attach_set.budget());
+        let absorbed_b = native.scene.coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module_with_targets(
+                    &native.scene.pins,
+                    &b,
+                    &[(&a_path, 0x1000)],
+                )),
+                &native.scene.pins,
+                policy,
+            ),
+            &native.scene.pins,
+        );
+        native.scene.verdicts.extend(absorbed_b.verdicts);
+        let shared = native.scene.delta.endpoints[0];
+        native.scene.project_paths(7, &[&a_path, &b], 200);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let policy =
+            crate::plan::AdmissionPolicy::Inventory(native.scene.coordinator.attach_set.budget());
+        let relowered = native.scene.coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module(&native.scene.pins, &a_path, &[])),
+                &native.scene.pins,
+                policy,
+            ),
+            &native.scene.pins,
+        );
+        native.scene.verdicts.extend(relowered.verdicts);
+        let at = native.stamps.tick();
+        let mut batch = witness_batch();
+        batch.domain = native.domain;
+        batch.counts = vec![crate::attach::capture::CallerCountUpdate {
+            image: p11scope_ebpf_common::ImageIdentity {
+                task_cookie: 41,
+                exec_id: 1,
+            },
+            object: shared.object,
+            count: 6,
+        }];
+        batch.health.discovery_counters = Some([0; 5]);
+        batch.health_read_ns = at;
+        batch.rows_read_ns = at + 1;
+        batch.counts_read_ns = at + 1;
+        native.stage(NativeBatch::Witness(Box::new(batch)));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let edge_of = |native: &NativeScene, needle: &str| {
+            let registry = &native.scene.coordinator.registry;
+            registry
+                .edges()
+                .find(|edge| {
+                    edge.caller == caller
+                        && registry.module(edge.module).is_some_and(|module| {
+                            module.paths.iter().any(|path| path.contains(needle))
+                        })
+                })
+                .map(|edge| (edge.entry_count, edge.entry_first_seen_ns))
+        };
+        let (a_count, _) = edge_of(&native, "a.so").expect("A keeps its edge");
+        assert_eq!(a_count, 5, "A keeps exactly its history");
+        let (b_count, _) = edge_of(&native, "b.so").expect("B keeps its edge");
+        assert_eq!(b_count, 1, "B carries only post-demotion growth");
+        assert!(
+            native
+                .scene
+                .coordinator
+                .registry
+                .gaps()
+                .iter()
+                .all(|gap| gap.subject != "revived folded count"),
+            "no fold gap for a demotion re-root that is not the evicted key"
+        );
+        // The evicted (41, exec 9) revives: the latch is still its
+        // own, so it gaps instead of re-crediting.
+        let row = native.row(41, 9, 7, at, 0);
+        native.scene.coordinator.bind_pair_count(&row, caller, &[]);
+        native.counts_read(Vec::new(), vec![(41, 9, 0, 7)]);
+        native.scene.coordinator.registry.publish();
+        let gaps: Vec<String> = native
+            .scene
+            .coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == "revived folded count")
+            .map(|gap| gap.reason.clone())
+            .collect();
+        assert_eq!(
+            gaps,
+            vec![
+                "the pair revived past a counted fold for absolute count range (0, 7] (7 unattributed calls); the folded base stays in the class aggregate and no pre-revival use is recorded"
+                    .to_string()
+            ],
+            "the evicted generation gaps exactly once"
         );
     }
 
@@ -46496,13 +46777,13 @@ int main(void) {
         );
     }
 
-    /// Opus T2 B2: the fold-victim sweep probes at most one window
-    /// per pass no matter how many rows fold (2 x (cap / 4096) rows
-    /// here), and the cursor resumes across passes. FAILS while the
-    /// sweep runs once per folded row (one window of probes per
-    /// call). The per-pass ceiling is two windows: the tombstone
-    /// sweep's plus the fold sweep's (the drain probes nothing: no
-    /// tombstone is expired).
+    /// The fold-victim sweep probes at most one window per pass no
+    /// matter how many rows fold (2 x (cap / 4096) rows here), and
+    /// the cursor resumes across passes. Fails while the sweep runs
+    /// once per folded row (one window of probes per call). The
+    /// per-pass ceiling is two windows: the tombstone sweep's plus
+    /// the fold sweep's (the drain probes nothing: no tombstone is
+    /// expired).
     #[test]
     fn fold_victim_sweep_probes_one_window_per_pass() {
         let (mut native, _caller) = NativeScene::new();

@@ -1459,6 +1459,10 @@ fn owned_run_conservative_replay_keeps_carried_pins_claimless() {
     let (mut engine, _, object, _) = engine_with_overlay(89);
     engine.scope = cgroup;
     engine.owned_run_pid = Some(424242);
+    // Production replays freshen newcomer marks first, which walks the
+    // scope and stashes the walk verdict; the fixture's empty cgroup
+    // walks complete with no newcomers, so the replays prove absence.
+    engine.last_scope_walk_complete = true;
     engine
         .capture_facts
         .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
@@ -1495,6 +1499,12 @@ fn owned_run_conservative_replay_keeps_carried_pins_claimless() {
     engine.plan = carried.plan;
     engine.pinned = carried.pinned;
     engine.modules = carried.modules;
+    // Production releases the exited member's view id once its rows
+    // ride as carrier, which clears its scan custody; without the
+    // release the stale custody aliases the pin and the later replay
+    // cannot reclaim it. Replicates the custody-clearing half of the
+    // id release (the id bookkeeping is inert in this fixture).
+    engine.pinned.clear_view_scan_records(view);
     let later = engine
         .conservative_candidate(&BTreeSet::new(), &keys)
         .unwrap();

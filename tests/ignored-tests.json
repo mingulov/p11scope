@@ -2266,6 +2266,12 @@
       "cell": "privileged"
     },
     {
+      "file": "src/run.rs",
+      "path": "run::tests::startup_stop_in_host_window_refuses_and_leaves_no_temp",
+      "reason": "privileged: startup stop through real capture startup (needs BPF probe admission); run as root with --ignored --test-threads=1",
+      "cell": "privileged"
+    },
+    {
       "file": "crates/discover/tests/cli.rs",
       "path": "isolation_btrfs_subvolume_outside_the_output_is_denied",
       "reason": "needs btrfs scratch; run by exact selector (privileged-btrfs runs the equivalent scripts/ci/discover-btrfs-subvol.sh cell; the ignored test itself runs by hand on btrfs scratch)",

@@ -2969,9 +2969,11 @@ The old bounds are measurements, not a product startup SLA.
   holds) and rebases past the current absolute instead of re-crediting;
   remembered folds past their own bound drop the oldest fold in the
   visited window with a counted `pair_fold_memory_overflow` naming the
-  limit, and each dropped live fold latches its key class: a later
-  revival with no fold memory in a latched class files the same gap
-  over the outer-bound window instead of re-crediting. Both victim
+  limit, and each dropped live fold latches its (domain, image,
+  object) key: a revival-shaped staging with no fold memory under a
+  latched key files the same gap over the outer-bound window instead
+  of re-crediting, then consumes the latch so later growth stages.
+  Both victim
   sweeps rotate oldest-first with a resume cursor, like the age drain,
   so a sweep that cannot finish in one pass resumes instead of
   re-scanning its head. Tombstones past the keep window

@@ -1191,10 +1191,11 @@ Additive budgets are:
   folded base and rebases past the current absolute instead of re-crediting;
   a revival past an age-folded gone task still restarts from zero.
   `pair_fold_memory_overflow` counts remembered folds dropped past their
-  own bound; each one latches its domain/object class, and a revival with
-  no fold memory in a latched class files the same disclosed gap over the
-  outer-bound window instead of re-crediting — lost fold memory never
-  becomes positive attribution.
+  own bound; each one latches its domain/image/object key, and a
+  revival-shaped staging with no fold memory under a latched key files
+  the same disclosed gap over the outer-bound window instead of
+  re-crediting, consuming the latch so later growth stages — lost fold
+  memory never becomes positive attribution.
   `exec_prune_overflow` counts
   pruned EXEC stashes discarded past their tombstone bound; the domain
   latches EXEC loss and late rows there read `exec_record_lost`. EXEC

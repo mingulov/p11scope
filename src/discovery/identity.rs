@@ -16264,21 +16264,66 @@ mod tests {
             "a table suffix must exist"
         );
 
+        let leg_budget = || {
+            CaptureWorkBudget::new(crate::discovery::scan::ScanLimits {
+                per_object_bytes: u64::try_from(prefix.len()).unwrap(),
+                total_bytes: u64::try_from(prefix.len() + 1).unwrap(),
+            })
+        };
+        // A view nobody keeps across passes (no parking grant, controller
+        // ruling N3) refuses one-shot with the refusal reason and parks
+        // nothing: no resume is promised.
+        let transient = ProcessView::open(ProcessViewId(1), std::process::id()).unwrap();
+        let refused = open_view_object(&transient, path, &mut leg_budget())
+            .expect_err("an incomplete table never yields a key");
+        assert_eq!(
+            refused,
+            crate::discovery::scan::mount_table_read_reason(
+                std::process::id(),
+                crate::discovery::scan::MOUNTINFO_CEILING_REASON
+            )
+        );
+        assert_eq!(transient.parked_mount_table_bytes_for_test(), None);
+
+        // The retained view (its owner grants parking) parks instead, and
+        // the next pass resumes from the parked bytes to the same object.
+        let pool = crate::semantics_edge::resources::SemanticResourcePool::default();
         let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
-        let mut budget = CaptureWorkBudget::new(crate::discovery::scan::ScanLimits {
-            per_object_bytes: u64::try_from(prefix.len()).unwrap(),
-            total_bytes: u64::try_from(prefix.len() + 1).unwrap(),
-        });
+        view.grant_mount_table_parking(pool.reserver());
+        let witness = crate::process::MountChangeWitness::new();
+        let reads = crate::process::mountinfo_reads_for_test();
+        let mut budget = leg_budget();
         let error = open_view_object(&view, path, &mut budget)
             .expect_err("the real identity caller must return no key from an incomplete table");
         // The mount table is bounded by the per-object leg: a budget too
         // small to prove the complete table refuses at the mountinfo
         // byte ceiling, never with a key (controller ruling 18:58, A).
         assert!(error.contains("mountinfo byte ceiling"), "{error}");
+        // Exactly the parked-resume outcome, never the one-shot refusal
+        // (both texts carry "mountinfo byte ceiling"): this pass read the
+        // leg plus its one probe byte and parked them on the view.
+        let parked = u64::try_from(prefix.len() + 1).unwrap();
+        assert_eq!(
+            error,
+            crate::discovery::scan::mount_table_read_reason(
+                std::process::id(),
+                &format!(
+                    "{} ({parked} bytes read so far)",
+                    crate::discovery::scan::MOUNTINFO_RESUME_REASON
+                ),
+            )
+        );
+        assert_eq!(view.parked_mount_table_bytes_for_test(), Some(parked));
 
         let (opened, key) = open_view_object(&view, path, &mut CaptureWorkBudget::default())
             .expect("the same caller accepts the EOF-proven complete table");
         assert_eq!(key, object_key(identity_of(&opened).unwrap()));
+        // Pass 2 resumed the parked read: one table open across both
+        // passes, and the slot is empty again.
+        if !witness.changed() {
+            assert_eq!(crate::process::mountinfo_reads_for_test() - reads, 1);
+        }
+        assert_eq!(view.parked_mount_table_bytes_for_test(), None);
     }
 
     #[test]

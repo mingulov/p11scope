@@ -209,6 +209,9 @@ pub(crate) const MOUNTINFO_RESUME_REASON: &str = "capture mountinfo byte ceiling
 /// A parked mount-table read whose mount namespace changed before it
 /// completed: the partial bytes were discarded (never spliced with the
 /// new generation) and the read restarts.
+/// The parked read could not reserve its held bytes in the owner's
+/// resource pool: the partial table is discarded instead of held unpaid.
+pub(crate) const MOUNTINFO_PARK_REFUSED_REASON: &str = "capture resource pool refused to hold the incomplete mount table across passes; the partial table was discarded";
 pub(crate) const MOUNTINFO_GENERATION_CHANGED_REASON: &str = "mount table changed while its read was parked; the partial table was discarded and the read restarts";
 
 pub(crate) fn target_layout(abi: ElfAbi) -> LinuxLayout {
@@ -457,6 +460,8 @@ pub(crate) fn read_mountinfo_with<R: Read>(
         MountinfoStep::Complete(text) => Ok(text),
         // A one-shot read refuses at its leg inside the pass loop.
         MountinfoStep::LegReached => Err(MOUNTINFO_CEILING_REASON.into()),
+        // A one-shot read returns budget stops as errors inside the loop.
+        MountinfoStep::Stopped(reason) => Err(reason),
     }
 }
 
@@ -510,6 +515,12 @@ impl MountinfoProgress {
     pub(crate) fn bytes_read(&self) -> u64 {
         u64::try_from(self.table.len()).unwrap_or(u64::MAX)
     }
+
+    /// Bytes this progress holds in memory (its buffer's capacity), the
+    /// charge a parked read must reserve while it waits for the next pass.
+    pub(crate) fn held_bytes(&self) -> usize {
+        self.table.capacity()
+    }
 }
 
 /// How one mount-table read pass ended without an error.
@@ -519,6 +530,13 @@ pub(crate) enum MountinfoStep {
     Complete(String),
     /// A resumable read met this pass's per-object leg before EOF.
     LegReached,
+    /// A resumable read met a healable budget stop (deadline, I/O
+    /// ceiling, work ceiling, a stopped pass) before EOF. Every byte the
+    /// fd already returned is kept in the progress, so the caller parks
+    /// the read and resumes it next pass; only a refusal (the `Err` arm)
+    /// or a generation change discards it. A one-shot read never returns
+    /// this: its budget stops stay errors.
+    Stopped(String),
 }
 
 /// The bound a mount-table read pass applies.
@@ -554,14 +572,20 @@ fn read_mountinfo_pass<R: Read>(
         MountinfoBound::Resumable => MAX_MOUNTINFO_BYTES,
     };
     let pass_start = progress.table.len();
+    // Budget stops heal: a resumable read keeps its progress and parks,
+    // a one-shot read refuses as before.
+    let stop = |reason: &str| match bound {
+        MountinfoBound::OneShot => Err(reason.to_string()),
+        MountinfoBound::Resumable => Ok(MountinfoStep::Stopped(reason.to_string())),
+    };
 
     let mut chunk = vec![0; chunk_size.max(1)];
     loop {
         if let Some(reason) = budget.stopped_reason() {
-            return Err(reason.into());
+            return stop(reason);
         }
         if let Some(reason) = deadline(budget) {
-            return Err(reason.into());
+            return stop(reason);
         }
 
         let capture_left = budget.remaining_window_io().unwrap_or(0);
@@ -569,7 +593,7 @@ fn read_mountinfo_pass<R: Read>(
             if matches!(budget.policy(), DiscoveryPolicy::Inventory(_)) {
                 budget.pass_owner().set_scan_stop(IO_CEILING_REASON);
             }
-            return Err(IO_CEILING_REASON.into());
+            return stop(IO_CEILING_REASON);
         }
         let table_bytes = u64::try_from(progress.table.len()).unwrap_or(u64::MAX);
         let table_left = table_cap.saturating_sub(table_bytes);
@@ -585,7 +609,9 @@ fn read_mountinfo_pass<R: Read>(
         if wanted == 0 {
             return Err(MOUNTINFO_CEILING_REASON.into());
         }
-        budget.spend(1).map_err(str::to_string)?;
+        if let Err(reason) = budget.spend(1) {
+            return stop(reason);
+        }
 
         let read = match reader.read(&mut chunk[..wanted]) {
             Ok(read) => read,
@@ -595,7 +621,19 @@ fn read_mountinfo_pass<R: Read>(
         budget.record_io(read);
         if read == 0 {
             if let Some(reason) = deadline(budget) {
-                return Err(reason.into());
+                return stop(reason);
+            }
+            // Lines a stopped pass read but could not charge are owed:
+            // charge them before the table is published.
+            let lines = progress
+                .newline_count
+                .saturating_add(usize::from(progress.table.last().is_some_and(|byte| *byte != b'\n')));
+            let owed = lines.saturating_sub(progress.observed_lines);
+            if owed > 0 {
+                if let Err(reason) = budget.spend(u64::try_from(owed).unwrap_or(u64::MAX)) {
+                    return stop(reason);
+                }
+                progress.observed_lines = lines;
             }
             return String::from_utf8(std::mem::take(&mut progress.table))
                 .map(MountinfoStep::Complete)
@@ -616,9 +654,24 @@ fn read_mountinfo_pass<R: Read>(
             .checked_add(usize::from(chunk[read - 1] != b'\n'))
             .ok_or_else(|| MOUNTINFO_ENTRY_CEILING_REASON.to_string())?;
         let added_lines = next_lines.saturating_sub(progress.observed_lines);
-        budget
-            .spend(u64::try_from(added_lines).unwrap_or(u64::MAX))
-            .map_err(str::to_string)?;
+        if let Err(reason) = budget.spend(u64::try_from(added_lines).unwrap_or(u64::MAX)) {
+            if bound == MountinfoBound::OneShot {
+                return Err(reason.into());
+            }
+            // The bytes already left the fd: keep them (the caps still
+            // refuse) so a resumed read never skips any. Their lines stay
+            // owed (`observed_lines` does not advance) and are charged by
+            // the next chunk or at EOF.
+            if u64::try_from(next_len).unwrap_or(u64::MAX) > table_cap {
+                return Err(MOUNTINFO_CEILING_REASON.into());
+            }
+            if next_lines > MAX_MOUNTINFO_ENTRIES {
+                return Err(MOUNTINFO_ENTRY_CEILING_REASON.into());
+            }
+            progress.table.extend_from_slice(&chunk[..read]);
+            progress.newline_count = next_newline_count;
+            return stop(reason);
+        }
         if u64::try_from(next_len).unwrap_or(u64::MAX) > table_cap {
             return Err(MOUNTINFO_CEILING_REASON.into());
         }
@@ -21095,6 +21148,7 @@ int main(int argc, char **argv) {
             match step {
                 MountinfoStep::Complete(text) => break text,
                 MountinfoStep::LegReached => {}
+                MountinfoStep::Stopped(reason) => panic!("a roomy pass never stops: {reason}"),
             }
         };
         assert_eq!(
@@ -21112,6 +21166,151 @@ int main(int argc, char **argv) {
                 (vec![8], 0, 0, 0),
             ],
             "each pass reads its leg plus one probe byte and parks"
+        );
+    }
+
+    /// Healable-stop class (INV-2, controller ruling N4): a resumable pass
+    /// cut short by its budget keeps every byte the fd returned and stops
+    /// with a typed [`MountinfoStep::Stopped`]; a roomy next pass resumes
+    /// from those bytes and converges to the whole table. One site per
+    /// stop: the I/O ceiling, the deadline, the read's work charge and the
+    /// line-work charge after a read. Each record is (step, parked bytes,
+    /// line work) and the resumed text is exact.
+    #[test]
+    fn mountinfo_resumable_reader_keeps_its_progress_across_every_healable_stop() {
+        let table: Vec<u8> = (0..5)
+            .flat_map(|line| format!("{line:02} 1 8:1 / /m rw\n").into_bytes())
+            .collect();
+        let roomy = || {
+            CaptureWorkBudget::new(ScanLimits {
+                per_object_bytes: u64::MAX,
+                total_bytes: u64::MAX,
+            })
+        };
+        let stopped = |step: MountinfoStep| match step {
+            MountinfoStep::Stopped(reason) => reason,
+            other => panic!("a healable stop parks, never {other:?}"),
+        };
+        // (site, pass-1 budget, pass-1 deadline trip on call N, expected
+        // reason, parked bytes after pass 1, line work charged in pass 1)
+        let io_budget = || {
+            CaptureWorkBudget::new(ScanLimits {
+                per_object_bytes: u64::MAX,
+                total_bytes: 10,
+            })
+        };
+        let work_budget = |ceiling| {
+            let mut budget = roomy();
+            budget.set_work_ceiling_for_test(ceiling);
+            budget
+        };
+        type Site = (&'static str, CaptureWorkBudget, Option<u32>, &'static str, u64, u64);
+        let sites: Vec<Site> = vec![
+            ("io ceiling", io_budget(), None, IO_CEILING_REASON, 10, 1),
+            ("deadline", roomy(), Some(2), SCAN_DEADLINE_REASON, 8, 1),
+            ("read charge", work_budget(0), None, WORK_CEILING_REASON, 0, 0),
+            ("line charge", work_budget(1), None, WORK_CEILING_REASON, 8, 0),
+        ];
+        for (site, mut budget, trip, reason, parked, line_work) in sites {
+            let mut reader = StreamReader {
+                data: table.clone(),
+                at: 0,
+                requests: Vec::new(),
+            };
+            let mut progress = MountinfoProgress::default();
+            let mut calls = 0u32;
+            let step = read_mountinfo_resumable_with(
+                &mut reader,
+                &mut budget,
+                8,
+                |_| {
+                    calls += 1;
+                    (trip == Some(calls)).then_some(SCAN_DEADLINE_REASON)
+                },
+                &mut progress,
+            )
+            .unwrap_or_else(|error| panic!("{site}: a healable stop never refuses: {error}"));
+            let work = budget.work_units_count();
+            let reads = reader.requests.len() as u64;
+            assert_eq!(
+                (stopped(step).as_str(), progress.bytes_read(), work.saturating_sub(reads)),
+                (reason, parked, line_work),
+                "{site}: pass 1 stops, keeps its bytes and charges its lines"
+            );
+            assert_eq!(reader.at as u64, parked, "{site}: every byte read is kept");
+            let mut resume = roomy();
+            reader.requests.clear();
+            let step = read_mountinfo_resumable_with(&mut reader, &mut resume, 8, |_| None, &mut progress)
+                .unwrap();
+            let resumed_lines = resume.work_units_count() - reader.requests.len() as u64;
+            assert_eq!(
+                step,
+                MountinfoStep::Complete(String::from_utf8(table.clone()).unwrap()),
+                "{site}: the resumed read is the whole table, no byte skipped or repeated"
+            );
+            assert_eq!(
+                line_work + resumed_lines,
+                5,
+                "{site}: every line is charged exactly once across the passes"
+            );
+        }
+    }
+
+    /// The owed-line site at EOF: a stop that hits the line charge on the
+    /// final chunk leaves those lines owed, and the resuming pass, which
+    /// reads only EOF, charges them before it publishes the table.
+    #[test]
+    fn mountinfo_resumable_reader_charges_owed_lines_at_eof() {
+        let table = b"00 1 8:1 / /m rw\n".to_vec();
+        let mut reader = StreamReader {
+            data: table.clone(),
+            at: 0,
+            requests: Vec::new(),
+        };
+        let mut budget = CaptureWorkBudget::new(ScanLimits {
+            per_object_bytes: u64::MAX,
+            total_bytes: u64::MAX,
+        });
+        budget.set_work_ceiling_for_test(1);
+        let mut progress = MountinfoProgress::default();
+        let step =
+            read_mountinfo_resumable_with(&mut reader, &mut budget, 64, |_| None, &mut progress)
+                .unwrap();
+        assert_eq!(step, MountinfoStep::Stopped(WORK_CEILING_REASON.into()));
+        assert_eq!(progress.bytes_read(), table.len() as u64);
+        let mut resume = CaptureWorkBudget::new(ScanLimits {
+            per_object_bytes: u64::MAX,
+            total_bytes: u64::MAX,
+        });
+        reader.requests.clear();
+        let step =
+            read_mountinfo_resumable_with(&mut reader, &mut resume, 64, |_| None, &mut progress)
+                .unwrap();
+        assert_eq!(reader.requests, vec![64], "the resume reads only EOF");
+        assert_eq!(
+            step,
+            MountinfoStep::Complete(String::from_utf8(table).unwrap())
+        );
+        assert_eq!(
+            resume.work_units_count(),
+            2,
+            "one read charge plus the one owed line"
+        );
+    }
+
+    /// One-shot reads keep their budget stops as errors (the healable
+    /// typed stop is resumable-only), so the one-shot shape is unchanged.
+    #[test]
+    fn mountinfo_one_shot_reader_keeps_budget_stops_as_errors() {
+        let mut reader = RecordingReader::new([ReaderStep::Bytes(b"abc\n".to_vec()), ReaderStep::Eof]);
+        let mut budget = CaptureWorkBudget::new(ScanLimits {
+            per_object_bytes: u64::MAX,
+            total_bytes: u64::MAX,
+        });
+        budget.set_work_ceiling_for_test(0);
+        assert_eq!(
+            read_mountinfo_with(&mut reader, &mut budget, 8, |_| None).unwrap_err(),
+            WORK_CEILING_REASON
         );
     }
 

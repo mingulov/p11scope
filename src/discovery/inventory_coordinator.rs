@@ -1643,14 +1643,18 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // One caller budget, enforced where incarnations are minted; the
         // registry's caller cap stands behind it as a backstop.
         adapter.set_max_callers(registry_limits.max_callers);
+        let mut engine = Engine::inventory(
+            inventory_config(endpoint_budget)?,
+            scope,
+            hooks,
+            hints,
+            excludes,
+        )?;
+        // The engine keeps its views across passes: their parked
+        // mount-table reads are charged to the registry's pool.
+        engine.set_mount_park_reserver(registry.semantic_storage_reserver());
         Ok(Self {
-            engine: Engine::inventory(
-                inventory_config(endpoint_budget)?,
-                scope,
-                hooks,
-                hints,
-                excludes,
-            )?,
+            engine,
             collected_finish_progressed: false,
             promotion_finish: false,
             promotion_records_discarded: 0,

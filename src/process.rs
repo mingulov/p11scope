@@ -445,19 +445,73 @@ pub(crate) fn mountinfo_discards_for_test() -> u64 {
 pub(crate) struct ParkedMountTable {
     file: std::fs::File,
     progress: MountinfoProgress,
+    /// The held bytes' charge in the granting owner's pool, released with
+    /// the slot (resume, discard or view drop).
+    _lease: ResourceLease,
+}
+
+/// What one parked slot charges its owner's pool: the held table buffer,
+/// the slot itself and the allocation padding. The open table fd is held
+/// too; it counts against the capture's file-descriptor reserve, which
+/// samples every open fd of the observer each tick.
+fn parked_mount_table_charge(progress: &MountinfoProgress) -> usize {
+    progress
+        .held_bytes()
+        .saturating_add(std::mem::size_of::<ParkedMountTable>())
+        .saturating_add(OWNED_ALLOCATION_PADDING)
+}
+
+/// Parks one mount-table read in `slot`, charged to `parking`. A refused
+/// reservation discards the read with a named gap instead of holding it
+/// unpaid: the next pass restarts from byte zero.
+fn park_mount_table(
+    slot: &mut Option<ParkedMountTable>,
+    parking: &SemanticResourceReserver,
+    file: std::fs::File,
+    progress: MountinfoProgress,
+) -> Result<(), String> {
+    match parking.reserve(parked_mount_table_charge(&progress)) {
+        Ok(lease) => {
+            *slot = Some(ParkedMountTable {
+                file,
+                progress,
+                _lease: lease,
+            });
+            Ok(())
+        }
+        Err(_) => {
+            #[cfg(test)]
+            MOUNTINFO_DISCARDS.with(|discards| discards.set(discards.get() + 1));
+            Err(format!(
+                "{} ({} bytes read so far)",
+                crate::discovery::scan::MOUNTINFO_PARK_REFUSED_REASON,
+                progress.bytes_read()
+            ))
+        }
+    }
 }
 
 /// Reads one retained view's mount table through its parked slot: resumes a
 /// parked read when its generation is unchanged (discarding and restarting
 /// it otherwise), parks again at this pass's per-object leg, and returns the
 /// open fd with the complete table once EOF proves it.
+///
+/// Parking needs the owner's grant (`parking`): only an owner that keeps
+/// the view across passes grants it, and every parked slot is charged to
+/// that owner's pool. Without a grant the read is one-shot within the
+/// per-object leg and refuses past it with its own reason, so a view that
+/// is reopened every pass never promises a resume that cannot come.
 fn read_view_mountinfo_resumable(
     pid: u32,
     parked: &std::sync::Mutex<Option<ParkedMountTable>>,
+    parking: Option<&SemanticResourceReserver>,
     changed: fn(&std::fs::File) -> bool,
     budget: &mut CaptureWorkBudget,
     open: impl FnOnce() -> io::Result<std::fs::File>,
 ) -> Result<(std::fs::File, String), String> {
+    let Some(parking) = parking else {
+        return read_view_mountinfo(pid, budget, open);
+    };
     let reason = |detail: &str| crate::discovery::scan::mount_table_read_reason(pid, detail);
     let mut slot = parked
         .lock()
@@ -498,14 +552,20 @@ fn read_view_mountinfo_resumable(
             // Count the parked work: the gap names the bytes read so far,
             // and the remainder after them is the next pass's.
             let parked_bytes = progress.bytes_read();
-            *slot = Some(ParkedMountTable {
-                file: table,
-                progress,
-            });
+            park_mount_table(&mut *slot, parking, table, progress).map_err(|error| reason(&error))?;
             Err(reason(&format!(
                 "{} ({parked_bytes} bytes read so far)",
                 crate::discovery::scan::MOUNTINFO_RESUME_REASON
             )))
+        }
+        MountinfoStep::Stopped(stop) => {
+            // A healable budget stop (deadline, I/O or work ceiling) keeps
+            // the progress: re-park it under the same generation witness,
+            // so the next pass resumes instead of restarting from byte
+            // zero. The stop's own reason stays the gap text, so callers
+            // keep classifying it as the budget wait it is.
+            park_mount_table(&mut *slot, parking, table, progress).map_err(|error| reason(&error))?;
+            Err(reason(&stop))
         }
     }
 }
@@ -616,6 +676,7 @@ impl MountTableCache {
         &mut self,
         owner: (ProcessViewId, u32),
         parked: &std::sync::Mutex<Option<ParkedMountTable>>,
+        parking: Option<&SemanticResourceReserver>,
         budget: &mut CaptureWorkBudget,
         open: impl FnOnce() -> io::Result<std::fs::File>,
     ) -> Result<(), String> {
@@ -627,7 +688,7 @@ impl MountTableCache {
         }
         self.table = None;
         let (file, text) =
-            read_view_mountinfo_resumable(owner.1, parked, self.changed, budget, open)?;
+            read_view_mountinfo_resumable(owner.1, parked, parking, self.changed, budget, open)?;
         self.table = Some(CachedMountTable { owner, file, text });
         Ok(())
     }
@@ -690,6 +751,10 @@ pub struct ProcessView {
     /// This view's mount-table read parked at a pass's per-object leg, if
     /// any: the next pass's cached read resumes it (one slot per view).
     parked_mount_table: std::sync::Mutex<Option<ParkedMountTable>>,
+    /// The owner's parking grant: set once by an owner that keeps this
+    /// view across passes, with the pool every parked slot is charged to.
+    /// Unset, the view's mount-table reads are one-shot.
+    mount_table_parking: std::sync::OnceLock<SemanticResourceReserver>,
 }
 
 #[cfg(test)]
@@ -772,7 +837,15 @@ impl ProcessView {
             admitted_ns,
             cold_filesystem_observed: std::sync::atomic::AtomicBool::new(cold_filesystem),
             parked_mount_table: std::sync::Mutex::new(None),
+            mount_table_parking: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Grants this view's mount-table reads the right to park across
+    /// passes, charged to `pool` (the owner keeps the view across passes).
+    /// The first grant stands; a later one is ignored.
+    pub(crate) fn grant_mount_table_parking(&self, pool: SemanticResourceReserver) {
+        let _ = self.mount_table_parking.set(pool);
     }
 
     /// Bytes of this view's parked mount-table read, if one is parked.
@@ -1027,6 +1100,7 @@ impl ProcessView {
                 mounts.refresh(
                     owner,
                     &self.parked_mount_table,
+                    self.mount_table_parking.get(),
                     &mut work.borrow_mut(),
                     || filesystem.open_mountinfo(),
                 )
@@ -4099,6 +4173,19 @@ int main(int argc, char **argv) {
 
     /// One pass of the cached production read: a fresh per-scan cache, the
     /// view's parked slot, and `detector` as the generation witness.
+    /// A self view whose owner keeps it across passes: parking granted on
+    /// a default pool.
+    fn parking_view() -> ProcessView {
+        let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+        view.grant_mount_table_parking(PARKING_POOL.with(|pool| pool.reserver()));
+        view
+    }
+
+    thread_local! {
+        static PARKING_POOL: crate::semantics_edge::resources::SemanticResourcePool =
+            crate::semantics_edge::resources::SemanticResourcePool::default();
+    }
+
     fn mount_pass(
         view: &ProcessView,
         leg: u64,
@@ -4120,7 +4207,10 @@ int main(int argc, char **argv) {
 
     #[test]
     fn mount_table_larger_than_the_leg_parks_and_resumes_to_the_whole_table() {
-        let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+        let view = parking_view();
+        // Opened before `expected` is read: a change at any point from
+        // here on (during the reads included) excuses the comparison.
+        let witness = MountChangeWitness::new();
         let expected = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
         assert!(
             expected.len() as u64 > 2 * (MOUNT_LEG + 1),
@@ -4155,15 +4245,236 @@ int main(int argc, char **argv) {
             .map(|pass| pass * (MOUNT_LEG + 1))
             .collect();
         assert_eq!(parked, want);
-        let witness = MountChangeWitness::new();
         if !witness.changed() {
             assert_eq!(text, expected, "the resumed table is the whole table");
         }
     }
 
+    /// A fixed, compact mount table on disk for tests that must not
+    /// depend on the host table's size.
+    fn compact_mount_table() -> tempfile::NamedTempFile {
+        use std::io::Write as _;
+        let mut table = tempfile::NamedTempFile::new().unwrap();
+        for row in 0..6 {
+            writeln!(table, "{} 1 8:1 / /m{row} rw,relatime - ext4 /dev/sda1 rw", 100 + row)
+                .unwrap();
+        }
+        table.flush().unwrap();
+        table
+    }
+
+    /// Parking needs the owner's grant (controller ruling N3): a view
+    /// nobody keeps across passes reads its table one-shot within the leg
+    /// and refuses past it with the one-shot reason, never the resume
+    /// promise, and parks nothing. The same view inside the leg reads the
+    /// whole table.
+    #[test]
+    fn an_ungranted_view_reads_one_shot_and_refuses_past_the_leg() {
+        let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+        let table = compact_mount_table();
+        let _pinned = view_filesystem::pin_mountinfo_for_test(table.path());
+        let content = std::fs::read_to_string(table.path()).unwrap();
+        let size = content.len() as u64;
+        let error = mount_pass(&view, size - 1, |_| false).unwrap_err();
+        assert_eq!(
+            error,
+            crate::discovery::scan::mount_table_read_reason(
+                std::process::id(),
+                crate::discovery::scan::MOUNTINFO_CEILING_REASON
+            ),
+            "the one-shot refusal keeps its own reason"
+        );
+        assert_eq!(view.parked_mount_table_bytes_for_test(), None, "nothing parks");
+        assert_eq!(mount_pass(&view, size, |_| false).unwrap(), content);
+    }
+
+    /// Parked slots are charged to the granting owner's pool (controller
+    /// ruling N2): parking reserves the slot's exact charge and the resume
+    /// releases it; a refused reservation discards the read with the named
+    /// counted gap and holds nothing.
+    #[test]
+    fn parked_mount_tables_charge_the_owners_pool_and_refuse_when_it_is_full() {
+        let table = compact_mount_table();
+        let _pinned = view_filesystem::pin_mountinfo_for_test(table.path());
+        let content = std::fs::read_to_string(table.path()).unwrap();
+        let leg = content.len() as u64 - 2;
+
+        let pool = crate::semantics_edge::resources::SemanticResourcePool::default();
+        let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+        view.grant_mount_table_parking(pool.reserver());
+        let before = pool.snapshot();
+        let error = mount_pass(&view, leg, |_| false).unwrap_err();
+        assert!(
+            error.contains(crate::discovery::scan::MOUNTINFO_RESUME_REASON),
+            "{error}"
+        );
+        let held = view
+            .parked_mount_table
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|parked| parked_mount_table_charge(&parked.progress))
+            .expect("the read parked");
+        let parked = pool.snapshot();
+        assert_eq!(
+            (parked.charged_bytes - before.charged_bytes, parked.refused),
+            (held, before.refused),
+            "the parked slot holds exactly its charge"
+        );
+        assert_eq!(mount_pass(&view, leg, |_| false).unwrap(), content);
+        assert_eq!(
+            pool.snapshot().charged_bytes,
+            before.charged_bytes,
+            "the resume releases the charge"
+        );
+
+        // A full pool refuses the park: the read discards with the named
+        // gap, nothing is held, and the refusal is counted by the pool.
+        let full = crate::semantics_edge::resources::SemanticResourcePool::reference_limit(
+            crate::semantics_edge::resources::SEMANTIC_TRANSITION_SCRATCH,
+        );
+        let view = ProcessView::open(ProcessViewId(1), std::process::id()).unwrap();
+        view.grant_mount_table_parking(full.reserver());
+        let before = full.snapshot();
+        let discards = mountinfo_discards_for_test();
+        let error = mount_pass(&view, leg, |_| false).unwrap_err();
+        assert_eq!(
+            error,
+            crate::discovery::scan::mount_table_read_reason(
+                std::process::id(),
+                &format!(
+                    "{} ({} bytes read so far)",
+                    crate::discovery::scan::MOUNTINFO_PARK_REFUSED_REASON,
+                    leg + 1
+                )
+            )
+        );
+        assert_eq!(view.parked_mount_table_bytes_for_test(), None, "nothing is held");
+        let after = full.snapshot();
+        assert_eq!(
+            (after.charged_bytes, after.refused),
+            (before.charged_bytes, before.refused + 1),
+            "the refusal charges nothing and is counted"
+        );
+        assert_eq!(mountinfo_discards_for_test() - discards, 1, "the read is discarded");
+    }
+
+    /// Healable-stop class at the parked slot (controller ruling N4): a
+    /// pass cut short by its I/O ceiling, its work ceiling or its deadline
+    /// re-parks the read under the same fd, so the next pass resumes from
+    /// the kept bytes without reopening the table; a refusal (invalid
+    /// table) and a changed generation discard it. Typed record per site:
+    /// (error, parked bytes, opens) after pass 1, then the resumed text.
+    #[test]
+    fn healable_stops_re_park_the_mount_table_and_refusals_discard_it() {
+        use std::io::Write as _;
+        let pool = crate::semantics_edge::resources::SemanticResourcePool::default();
+        let grant = pool.reserver();
+        let parking = Some(&grant);
+        let table = compact_mount_table();
+        let content = std::fs::read_to_string(table.path()).unwrap();
+        let pid = 4242;
+        let reason = |detail: &str| crate::discovery::scan::mount_table_read_reason(pid, detail);
+        let roomy = || {
+            CaptureWorkBudget::new(crate::discovery::scan::ScanLimits {
+                per_object_bytes: u64::MAX,
+                total_bytes: u64::MAX,
+            })
+        };
+        let io = || {
+            CaptureWorkBudget::new(crate::discovery::scan::ScanLimits {
+                per_object_bytes: u64::MAX,
+                total_bytes: 20,
+            })
+        };
+        let work = || {
+            let mut budget = roomy();
+            budget.set_work_ceiling_for_test(0);
+            budget
+        };
+        let deadline = || {
+            let mut budget = roomy();
+            budget.set_deadline(Some(1));
+            budget
+        };
+        let sites: [(&str, CaptureWorkBudget, &str, u64); 3] = [
+            ("io ceiling", io(), crate::discovery::scan::IO_CEILING_REASON, 20),
+            ("work ceiling", work(), crate::discovery::scan::WORK_CEILING_REASON, 0),
+            ("deadline", deadline(), crate::discovery::scan::SCAN_DEADLINE_REASON, 0),
+        ];
+        for (site, mut budget, stop, parked) in sites {
+            let slot = std::sync::Mutex::new(None);
+            let opens = Cell::new(0u32);
+            let open = || {
+                opens.set(opens.get() + 1);
+                std::fs::File::open(table.path())
+            };
+            let error = read_view_mountinfo_resumable(pid, &slot, parking, |_| false, &mut budget, open)
+                .expect_err("pass 1 stops short");
+            let parked_now = slot
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|parked: &ParkedMountTable| parked.progress.bytes_read());
+            assert_eq!(
+                (error, parked_now, opens.get()),
+                (reason(stop), Some(parked), 1),
+                "{site}: the stop re-parks its progress under the one open fd"
+            );
+            let discards = mountinfo_discards_for_test();
+            let (_, text) = read_view_mountinfo_resumable(
+                pid,
+                &slot,
+                parking,
+                |_| false,
+                &mut roomy(),
+                || {
+                    opens.set(opens.get() + 1);
+                    std::fs::File::open(table.path())
+                },
+            )
+            .unwrap_or_else(|error| panic!("{site}: the resumed read completes: {error}"));
+            assert_eq!(text, content, "{site}: the resumed table is the whole table");
+            assert_eq!(opens.get(), 1, "{site}: the resume never reopens");
+            assert_eq!(mountinfo_discards_for_test(), discards, "{site}: nothing discards");
+            assert!(slot.lock().unwrap().is_none(), "{site}: the completed read unparks");
+        }
+
+        // Refusal twin: an invalid table refuses and discards its slot.
+        let mut invalid = tempfile::NamedTempFile::new().unwrap();
+        invalid.write_all(b"1 1 8:1 / /m rw\n\xff\n").unwrap();
+        invalid.flush().unwrap();
+        let slot = std::sync::Mutex::new(None);
+        let error = read_view_mountinfo_resumable(pid, &slot, parking, |_| false, &mut roomy(), || {
+            std::fs::File::open(invalid.path())
+        })
+        .expect_err("an invalid table refuses");
+        assert!(error.starts_with(&reason("mount table is not valid UTF-8")), "{error}");
+        assert!(slot.lock().unwrap().is_none(), "a refusal never parks");
+
+        // Generation twin: a stop re-parks, then a changed witness at the
+        // resume discards the kept bytes and restarts from byte zero.
+        let slot = std::sync::Mutex::new(None);
+        let _ = read_view_mountinfo_resumable(pid, &slot, parking, |_| false, &mut io(), || {
+            std::fs::File::open(table.path())
+        })
+        .expect_err("pass 1 stops short");
+        let discards = mountinfo_discards_for_test();
+        let (_, text) = read_view_mountinfo_resumable(pid, &slot, parking, |_| true, &mut roomy(), || {
+            std::fs::File::open(table.path())
+        })
+        .unwrap();
+        assert_eq!(text, content);
+        assert_eq!(
+            mountinfo_discards_for_test() - discards,
+            1,
+            "a changed generation discards the re-parked bytes"
+        );
+    }
+
     #[test]
     fn changed_generation_discards_the_parked_table_and_never_splices() {
-        let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+        let view = parking_view();
         let reads = mountinfo_reads_for_test();
         let discards = mountinfo_discards_for_test();
         for _ in 0..3 {
@@ -4204,8 +4515,13 @@ int main(int argc, char **argv) {
 
     #[test]
     fn a_change_during_the_final_pass_discards_the_resumed_table() {
-        let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
-        let size = std::fs::read("/proc/self/mountinfo").unwrap().len() as u64;
+        let view = parking_view();
+        // A compact pinned table: its size cannot change between the
+        // reads below, so the leg sits exactly two bytes under it on any
+        // host, busy or not.
+        let table = compact_mount_table();
+        let _pinned = view_filesystem::pin_mountinfo_for_test(table.path());
+        let size = std::fs::read(table.path()).unwrap().len() as u64;
         // Pass one parks at a leg just under the table; pass two finishes.
         let leg = size - 2;
         assert!(mount_pass(&view, leg, |_| false).is_err());

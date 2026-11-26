@@ -7409,8 +7409,12 @@ mod tests {
     fn v071_manifest_accepted_and_excludes_checked() {
         const MANIFEST: &[u8] =
             include_bytes!("../tests/fixtures/upgrade/v071-manifest-softhsm.json");
-        let manifest: p11scope_manifest::manifest::Manifest =
-            serde_json::from_slice(MANIFEST).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v071-softhsm.json");
+        std::fs::write(&path, MANIFEST).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let manifest = crate::discovery::engine::parse_manifest_text(&text, &path)
+            .expect("the runtime --manifest parser accepts the v0.7.1 manifest");
         assert_eq!(manifest.schema, p11scope_manifest::manifest::SCHEMA);
         assert!(
             crate::manifest_input::validate_structure(&manifest).is_empty(),
@@ -7418,9 +7422,6 @@ mod tests {
         );
         assert!(!manifest.surfaces.is_empty());
         assert!(!crate::manifest_input::is_getter_only(&manifest));
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("v071-softhsm.json");
-        std::fs::write(&path, MANIFEST).unwrap();
         assert!(
             validate_manifest_excludes(std::slice::from_ref(&path), &[PathBuf::from("other.so")])
                 .is_ok()

@@ -723,6 +723,37 @@ fn current_era(value: &mut Value) {
     value["budgets"]["callers"]["retired_with_calls"] = json!(0);
 }
 
+/// Real v0.7.1 captures (official release binary). See
+/// `tests/fixtures/upgrade/README.md` for provenance.
+const PROFILE071: &[u8] =
+    include_bytes!("../../../tests/fixtures/upgrade/v071-observed-profile-signer.json");
+const METRICS071: &[u8] =
+    include_bytes!("../../../tests/fixtures/upgrade/v071-observed-metrics.json");
+
+#[test]
+fn real_v071_profile_and_metrics_refuse_before_section_parsing() {
+    // Real non-inventory files carry no `callers`/`modules` arrays at
+    // all, so a named-schema refusal proves the schema check fires
+    // before section parsing (a schema-swapped inventory cannot).
+    for (bytes, schema, name) in [
+        (PROFILE071, "p11scope/observed-profile/v3", "profile"),
+        (
+            METRICS071,
+            "p11scope/observed-profile/v3-metrics",
+            "metrics",
+        ),
+    ] {
+        let document: Value = serde_json::from_slice(bytes).unwrap();
+        assert!(document.get("callers").is_none(), "{name} has no callers");
+        assert!(document.get("modules").is_none(), "{name} has no modules");
+        let error = parse_snapshot(bytes).unwrap_err().to_string();
+        assert!(error.contains("unsupported schema"), "{name}: {error}");
+        assert!(error.contains(schema), "{name}: {error}");
+    }
+    let error = parse_snapshot(PROFILE071).unwrap_err().to_string();
+    assert!(error.contains("inventory cbom"), "{error}");
+}
+
 #[test]
 fn dangling_gap_caller_links_drop_only_in_current_era() {
     // A current-era gap may name a caller id whose live row folded

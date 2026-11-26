@@ -571,67 +571,217 @@ fn projection_refuses_unsupported_schemas() {
 /// `tests/fixtures/upgrade/README.md` for provenance.
 const KEYOPS071: &[u8] =
     include_bytes!("../../../tests/fixtures/upgrade/v071-inventory-keyops.json");
+const SCAN071: &[u8] =
+    include_bytes!("../../../tests/fixtures/upgrade/v071-inventory-scan.json");
+const NATIVE071: &[u8] =
+    include_bytes!("../../../tests/fixtures/upgrade/v071-inventory-native.json");
+const CHURN071: &[u8] =
+    include_bytes!("../../../tests/fixtures/upgrade/v071-inventory-churn.json");
 const PROFILE071: &[u8] =
     include_bytes!("../../../tests/fixtures/upgrade/v071-observed-profile-signer.json");
 const METRICS071: &[u8] =
     include_bytes!("../../../tests/fixtures/upgrade/v071-observed-metrics.json");
 
-/// A real v0.7.1 `--key-operations` inventory converts: its key
-/// components render, every qualified established slot counts as
-/// source-unrecorded (v0.7.1 files carry no `source` field), and no
-/// supplier or token components appear (v0.7.1 has no provider
-/// info). This capture admitted no keys, so both counts are zero by
-/// consistency, counted independently from the file itself; the
-/// nonzero counting proof needs established key rows (see README).
+/// A real v0.7.1 `--key-operations` inventory converts: its 8
+/// key-referenced objects render as key rows with unknown established
+/// facts (all 96 slots are `unknown`, so the source tallies are 0 by
+/// consistency, counted independently from the file itself), and no
+/// supplier or token components appear (v0.7.1 has no provider info).
+/// A derived copy with three qualified slots proves the nonzero
+/// counting path and established-fact rendering; a nonzero real
+/// capture still needs a host where the semantic lane births (see
+/// README).
 #[test]
 fn cbom_v071_keyops_inventory_converts() {
-    let projection = parse_input(KEYOPS071).unwrap();
-    let document = super::render::render_json(&projection);
-    let properties = document["metadata"]["properties"]
-        .as_array()
-        .expect("metadata properties");
-    let tally = |name: &str| {
-        properties
-            .iter()
-            .find(|prop| prop["name"] == name)
-            .unwrap_or_else(|| panic!("{name} tally"))["value"]
-            .as_str()
-            .unwrap()
-            .to_string()
-    };
-    let file: Value = serde_json::from_slice(KEYOPS071).unwrap();
-    let mut qualified = 0u64;
-    for key in file["object_observations"]["objects"]
-        .as_array()
-        .expect("object rows")
-    {
-        for slot in [
-            "class",
-            "key_type",
-            "modulus_bits",
-            "value_len",
-            "ec_params",
-            "token",
-        ] {
-            if key["established"][slot]["status"] == "value" {
-                qualified += 1;
+    const SLOTS: [&str; 6] = [
+        "class",
+        "key_type",
+        "modulus_bits",
+        "value_len",
+        "ec_params",
+        "token",
+    ];
+    // The same real shape with three qualified slots on object 1
+    // (sourceless, like every v0.7.1 slot): a private key with a
+    // 2048-bit modulus.
+    let mut derived: Value = serde_json::from_slice(KEYOPS071).unwrap();
+    for (slot, code) in [("class", 3u64), ("key_type", 0), ("modulus_bits", 2048)] {
+        derived["object_observations"]["objects"][0]["established"][slot] =
+            json!({"status": "value", "value": code});
+    }
+    let derived_raw = serde_json::to_vec(&derived).unwrap();
+    for (name, bytes, expected) in [
+        ("real", KEYOPS071, 0u64),
+        ("derived", derived_raw.as_slice(), 3u64),
+    ] {
+        let projection = parse_input(bytes).unwrap();
+        let document = super::render::render_json(&projection);
+        let properties = document["metadata"]["properties"]
+            .as_array()
+            .expect("metadata properties");
+        let tally = |name: &str| {
+            properties
+                .iter()
+                .find(|prop| prop["name"] == name)
+                .unwrap_or_else(|| panic!("{name} tally"))["value"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let file: Value = serde_json::from_slice(bytes).unwrap();
+        let mut qualified = 0u64;
+        for key in file["object_observations"]["objects"]
+            .as_array()
+            .expect("object rows")
+        {
+            for slot in SLOTS {
+                if key["established"][slot]["status"] == "value" {
+                    qualified += 1;
+                }
             }
         }
+        assert_eq!(qualified, expected, "{name} independent count");
+        assert_eq!(
+            tally("p11scope:established_source_unrecorded"),
+            qualified.to_string(),
+            "{name} unrecorded tally"
+        );
+        assert_eq!(tally("p11scope:established_source_query"), "0");
+        assert_eq!(tally("p11scope:established_source_creation_success"), "0");
+        assert!(
+            projection
+                .providers
+                .iter()
+                .all(|provider| provider.supplier.is_none()),
+            "{name}: no supplier without provider info"
+        );
+        assert!(projection.tokens.is_empty(), "{name}: no token devices");
+        if expected == 0 {
+            assert_eq!(projection.keys.len(), 8, "used-as-key rows render");
+            assert!(
+                projection
+                    .keys
+                    .iter()
+                    .all(|key| key.class.is_none() && key.size_bits.is_none()),
+                "no established facts in this capture"
+            );
+        } else {
+            assert_eq!(projection.keys.len(), 9, "one more key row renders");
+            let row = projection
+                .keys
+                .iter()
+                .find(|key| key.object == 1)
+                .expect("object 1 renders");
+            assert_eq!(row.class, Some(3));
+            assert_eq!(row.key_type, Some(0));
+            assert_eq!(row.size_bits, Some(2048));
+        }
     }
-    assert_eq!(
-        tally("p11scope:established_source_unrecorded"),
-        qualified.to_string()
-    );
-    assert_eq!(tally("p11scope:established_source_query"), "0");
-    assert_eq!(tally("p11scope:established_source_creation_success"), "0");
-    assert!(
-        projection
-            .providers
+}
+
+/// Real v0.7.1 scan, native and churn inventories convert: the
+/// oldest shapes (object-observations v1, no folded rows, no
+/// provider info) render their application, provider and gap facts
+/// with no mechanism, key or token rows.
+#[test]
+fn cbom_v071_scan_native_churn_convert() {
+    for (
+        name,
+        bytes,
+        scope,
+        passes,
+        gap_count,
+        gap_subjects,
+        applications,
+    ) in [
+        (
+            "scan",
+            SCAN071,
+            "pid:4266",
+            1,
+            2,
+            vec![
+                "/proc/4266/mem".to_string(),
+                "exact image authority unavailable".to_string(),
+            ],
+            vec![("/work/f2/bin/catalog-driver".to_string(), 1, vec!["mapped"])],
+        ),
+        (
+            "native",
+            NATIVE071,
+            "pid:4266",
+            6,
+            1,
+            vec!["exact image authority unavailable".to_string()],
+            vec![("/work/f2/bin/catalog-driver".to_string(), 1, vec!["mapped"])],
+        ),
+        (
+            "churn",
+            CHURN071,
+            "cgroup",
+            23,
+            11,
+            vec![
+                "cgroup scope transaction incomplete".to_string(),
+                "native owner activation refused".to_string(),
+                "used by an unidentified caller image".to_string(),
+            ],
+            vec![
+                ("/usr/bin/dash".to_string(), 1, vec!["mapped"]),
+                ("/work/f2/bin/catalog-driver".to_string(), 1, vec!["mapped"]),
+                (
+                    "/usr/bin/sleep".to_string(),
+                    9,
+                    vec!["exited", "mapped"],
+                ),
+                (
+                    "/work/f2/bin/shortlived-sign".to_string(),
+                    7,
+                    vec!["exited"],
+                ),
+            ],
+        ),
+    ] {
+        let projection = parse_input(bytes).unwrap();
+        assert_eq!(projection.source_schema, "p11scope/inventory/v1", "{name}");
+        assert_eq!(projection.scope_note.as_deref(), Some(scope), "{name}");
+        assert_eq!(projection.passes, Some(passes), "{name}");
+        assert_eq!(projection.gap_count, gap_count, "{name}");
+        assert_eq!(projection.gaps_suppressed, 0, "{name}");
+        assert_eq!(projection.gap_subjects, gap_subjects, "{name}");
+        assert_eq!(
+            projection.object_observations, "unavailable (journal_unavailable)",
+            "{name}"
+        );
+        let apps: Vec<_> = projection
+            .applications
             .iter()
-            .all(|provider| provider.supplier.is_none()),
-        "no supplier without provider info"
-    );
-    assert!(projection.tokens.is_empty(), "no token devices");
+            .map(|app| (app.path.clone(), app.incarnations, app.lifecycles.clone()))
+            .collect();
+        let expected: Vec<_> = applications
+            .into_iter()
+            .map(|(path, incarnations, lifecycles): (String, u64, Vec<&str>)| {
+                (
+                    path,
+                    incarnations,
+                    lifecycles.into_iter().map(str::to_string).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(apps, expected, "{name} applications");
+        assert_eq!(projection.providers.len(), 1, "{name}");
+        assert_eq!(
+            projection.providers[0].name, "/usr/lib/softhsm/libsofthsm2.so",
+            "{name}"
+        );
+        assert!(
+            projection.providers[0].supplier.is_none(),
+            "{name} has no provider info"
+        );
+        assert!(projection.mechanisms.is_empty(), "{name}");
+        assert!(projection.keys.is_empty(), "{name}");
+        assert!(projection.tokens.is_empty(), "{name}");
+    }
 }
 
 /// A real v0.7.1 profile converts with its provider and mechanism rows.

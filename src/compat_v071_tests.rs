@@ -57,22 +57,55 @@ fn v071_documents_validate_against_both_schemas() {
 }
 
 /// Real current documents validate against the current schema and
-/// fail the v0.7.1 schema: the old closed evidence object rejects
-/// the newer fields. One-way break, documented in the changelog.
+/// fail the v0.7.1 schema with exactly the new-fields error: the old
+/// closed evidence object rejects the four newer fields on profiles
+/// and `coverage_retired_slots` on metrics. One-way break,
+/// documented in the changelog.
 #[test]
 fn v072_documents_fail_the_old_schema() {
+    use jsonschema::error::ValidationErrorKind;
+    use std::collections::BTreeSet;
     let old = schema_071();
     let new = schema_head();
-    for (name, bytes) in [("profile", PROFILE072), ("metrics", METRICS072)] {
+    let validator = jsonschema::options()
+        .build(&old)
+        .expect("the old schema builds");
+    for (name, bytes, unexpected) in [
+        (
+            "profile",
+            PROFILE072,
+            BTreeSet::from([
+                "coverage_retired_slots",
+                "member_stop_attached",
+                "member_stop_unattached",
+                "pid_descendant_gaps_admitted",
+            ]),
+        ),
+        (
+            "metrics",
+            METRICS072,
+            BTreeSet::from(["coverage_retired_slots"]),
+        ),
+    ] {
         let document = document(bytes);
         assert!(
             valid(&new, &document),
             "{name} validates against the current schema"
         );
-        assert!(
-            !valid(&old, &document),
-            "{name} fails the v0.7.1 schema (one-way break)"
-        );
+        let errors: Vec<_> = validator.iter_errors(&document).collect();
+        assert_eq!(errors.len(), 1, "{name} fails with one error");
+        let error = &errors[0];
+        assert_eq!(error.instance_path().to_string(), "/evidence", "{name}");
+        match error.kind() {
+            ValidationErrorKind::AdditionalProperties { unexpected: got } => {
+                assert_eq!(
+                    got.iter().map(String::as_str).collect::<BTreeSet<_>>(),
+                    unexpected,
+                    "{name} unexpected set"
+                );
+            }
+            other => panic!("{name}: expected additionalProperties, got {other:?}"),
+        }
     }
 }
 

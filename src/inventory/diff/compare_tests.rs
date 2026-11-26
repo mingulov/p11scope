@@ -2276,6 +2276,8 @@ const UPGRADE_NATIVE071: &[u8] =
     include_bytes!("../../../tests/fixtures/upgrade/v071-inventory-native.json");
 const UPGRADE_CHURN071: &[u8] =
     include_bytes!("../../../tests/fixtures/upgrade/v071-inventory-churn.json");
+const UPGRADE_KEYOPS071: &[u8] =
+    include_bytes!("../../../tests/fixtures/upgrade/v071-inventory-keyops.json");
 const UPGRADE_CHURN072: &[u8] =
     include_bytes!("../../../tests/fixtures/upgrade/v072-inventory-churn.json");
 
@@ -2291,6 +2293,7 @@ fn real_v071_inventories_self_diff_to_zero() {
         ("scan", UPGRADE_SCAN071, true),
         ("native", UPGRADE_NATIVE071, true),
         ("churn", UPGRADE_CHURN071, true),
+        ("keyops", UPGRADE_KEYOPS071, true),
         ("churn072", UPGRADE_CHURN072, false),
     ] {
         let snapshot = upgrade_snapshot(bytes);

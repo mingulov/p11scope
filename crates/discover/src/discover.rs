@@ -12,7 +12,7 @@ use p11scope_manifest::identity::{
 };
 use p11scope_manifest::manifest::*;
 use pkcs11_module::{RawInterface, Surface, TableSet, function_list, interface_list, tables_for};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::os::raw::c_void;
@@ -194,21 +194,49 @@ pub fn discover_with_self_memory(
     module_path: &Path,
     self_memory: File,
 ) -> Result<Manifest, String> {
-    discover_with_budget(module_path, self_memory, Rc::new(Cell::new(0u64)))
+    discover_with_budget(module_path, self_memory, Rc::new(IdentifyBudget::default()))
+}
+
+/// Discovery-wide identify budget: each distinct object's bytes are
+/// charged once, on first identification; rechecks of an already
+/// charged key stream without a debit. Rechecks are bounded by the
+/// fixed pipeline below (initial, loaded-key, revalidation, twenty
+/// selection snapshots, final, required provenance), so the total
+/// stays bounded while no file is ever refused for its own size.
+/// Shared (not threaded) so cloned candidate tables still charge the
+/// bytes they read.
+#[derive(Debug, Default)]
+struct IdentifyBudget {
+    spent: Cell<u64>,
+    charged: RefCell<BTreeSet<ObjectKey>>,
+}
+
+impl IdentifyBudget {
+    /// False while `key` never contributed a byte. Single-threaded use
+    /// only: each call borrows briefly and never nests.
+    fn is_charged(&self, key: &ObjectKey) -> bool {
+        self.charged.borrow().contains(key)
+    }
+
+    /// A budget with no allowance left, for tests that must fail closed.
+    #[cfg(test)]
+    fn exhausted_for_test() -> Self {
+        Self {
+            spent: Cell::new(MAX_TOTAL_OBJECT_BYTES),
+            charged: RefCell::new(BTreeSet::new()),
+        }
+    }
 }
 
 /// [`discover_with_self_memory`] with an injected identify budget: every
-/// identify read in the pipeline debits `identify_spent, shared by the
+/// identify read in the pipeline debits `identify_spent`, shared by the
 /// module, every dependency, the selection revalidations and the
-/// provenance loop, so one discovery never hashes more than
-/// MAX_TOTAL_OBJECT_BYTES in total, whatever object the bytes belong
-/// to. Shared (not threaded) so cloned candidate tables still charge
-/// the bytes they read. The counter is observable after the call, which
-/// is what proves the production pipeline uses one counter.
+/// provenance loop. The budget is observable after the call, which is
+/// what proves the production pipeline uses one counter.
 fn discover_with_budget(
     module_path: &Path,
     self_memory: File,
-    identify_spent: Rc<Cell<u64>>,
+    identify_spent: Rc<IdentifyBudget>,
 ) -> Result<Manifest, String> {
     if !module_path.is_absolute() {
         return Err("--module must be an absolute path".into());
@@ -401,7 +429,7 @@ fn validated_map_index(entries: &[maps::MapEntry]) -> Result<maps::MapIndex<'_>,
 fn provenance_objects(
     index: &maps::MapIndex<'_>,
     objects: &ObjectTable,
-    identify_spent: &Cell<u64>,
+    identify_spent: &IdentifyBudget,
 ) -> Result<Vec<ProvenanceObject>, String> {
     const MAX_OPTIONAL_DIAGNOSTICS: u64 = 8;
     const MAX_DIAGNOSTIC_CHARS: usize = 256;
@@ -561,7 +589,7 @@ fn loaded_module_key(
     module_file_key: ObjectKey,
     module_identity: &ObjectIdentity,
     module_file: &File,
-    identify_spent: &Cell<u64>,
+    identify_spent: &IdentifyBudget,
 ) -> Result<ObjectKey, String> {
     let mut budget = UnboundedProbeBudget;
     loaded_module_key_with_probe(
@@ -585,7 +613,7 @@ fn loaded_module_key_with_probe(
     module_file: &File,
     probe: &impl SelfMappingProbe,
     budget: &mut dyn ProbeBudget,
-    identify_spent: &Cell<u64>,
+    identify_spent: &IdentifyBudget,
 ) -> Result<ObjectKey, String> {
     for address in [
         exports.get_function_list,
@@ -646,7 +674,7 @@ fn file_key(file: &File) -> Result<ObjectKey, String> {
 fn validated_identity(
     path: &Path,
     expected: ObjectKey,
-    identify_spent: &Cell<u64>,
+    identify_spent: &IdentifyBudget,
 ) -> Result<ObjectIdentity, String> {
     let mut budget = UnboundedProbeBudget;
     validated_identity_with_probe(
@@ -663,7 +691,7 @@ fn validated_identity_with_probe(
     expected: ObjectKey,
     probe: &impl SelfMappingProbe,
     budget: &mut dyn ProbeBudget,
-    identify_spent: &Cell<u64>,
+    identify_spent: &IdentifyBudget,
 ) -> Result<ObjectIdentity, String> {
     let file = identity::open_object(path)
         .map_err(|e| format!("cannot open {} for reuse: {e}", path.display()))?;
@@ -672,7 +700,7 @@ fn validated_identity_with_probe(
 
 fn identity_and_key(
     path: &Path,
-    identify_spent: &Cell<u64>,
+    identify_spent: &IdentifyBudget,
 ) -> Result<(ObjectKey, ObjectIdentity), String> {
     let file = identity::open_object(path)
         .map_err(|e| format!("cannot open {} for reuse: {e}", path.display()))?;
@@ -685,7 +713,7 @@ fn validated_file_identity(
     path: &Path,
     file: &File,
     expected: ObjectKey,
-    identify_spent: &Cell<u64>,
+    identify_spent: &IdentifyBudget,
 ) -> Result<ObjectIdentity, String> {
     let mut budget = UnboundedProbeBudget;
     validated_file_identity_with_probe(
@@ -699,16 +727,27 @@ fn validated_file_identity(
 }
 
 /// The identify-read wrapper every object read in one discovery goes
-/// through: each actual read debits `identify_spent`, shared across the
-/// module, dependencies, revalidations and provenance, and fails
-/// incrementally once the cumulative allowance is gone. A file is never
-/// refused for its own size: what fits is read and hashed, and a failed
-/// inspection keeps its partial debit.
-fn budgeted_reader(
-    identify_spent: &Cell<u64>,
+/// through for `key`: the key's bytes debit the shared budget on first
+/// identification, while rechecks of an already-charged key stream
+/// without a debit. Reads fail incrementally once the cumulative
+/// allowance is gone. A file is never refused for its own size: what
+/// fits is read and hashed, and a failed inspection keeps its partial
+/// debit.
+fn budgeted_reader_for(
+    budget: &IdentifyBudget,
+    key: ObjectKey,
 ) -> impl FnMut(&File, &mut [u8], u64) -> std::io::Result<usize> + '_ {
-    |file, bytes, offset| {
-        let left = MAX_TOTAL_OBJECT_BYTES.saturating_sub(identify_spent.get());
+    // Decided on first read, not at construction: a key counts as
+    // charged only once it actually debits a byte, so an exhausted
+    // budget keeps refusing a fresh key instead of marking it charged
+    // for free rechecks later.
+    let mut charging: Option<bool> = None;
+    move |file, bytes, offset| {
+        let charging = *charging.get_or_insert_with(|| !budget.is_charged(&key));
+        if !charging {
+            return file.read_at(bytes, offset);
+        }
+        let left = MAX_TOTAL_OBJECT_BYTES.saturating_sub(budget.spent.get());
         let allowed = left.min(bytes.len() as u64) as usize;
         if allowed == 0 && !bytes.is_empty() {
             return Err(std::io::Error::other(format!(
@@ -716,7 +755,12 @@ fn budgeted_reader(
             )));
         }
         let read = file.read_at(&mut bytes[..allowed], offset)?;
-        identify_spent.set(identify_spent.get().saturating_add(read as u64));
+        budget
+            .spent
+            .set(budget.spent.get().saturating_add(read as u64));
+        if read > 0 {
+            budget.charged.borrow_mut().insert(key);
+        }
         Ok(read)
     }
 }
@@ -727,7 +771,7 @@ fn validated_file_identity_with_probe(
     expected: ObjectKey,
     probe: &impl SelfMappingProbe,
     budget: &mut dyn ProbeBudget,
-    identify_spent: &Cell<u64>,
+    identify_spent: &IdentifyBudget,
 ) -> Result<ObjectIdentity, String> {
     validated_file_identity_with_probe_and_reader(
         path,
@@ -735,7 +779,7 @@ fn validated_file_identity_with_probe(
         expected,
         probe,
         budget,
-        budgeted_reader(identify_spent),
+        budgeted_reader_for(identify_spent, expected),
     )
 }
 
@@ -780,7 +824,7 @@ fn validated_provenance_identity(
     path: &Path,
     file: &File,
     expected: ObjectKey,
-    identify_spent: &Cell<u64>,
+    identify_spent: &IdentifyBudget,
 ) -> Result<ObjectIdentity, String> {
     let mut budget = UnboundedProbeBudget;
     validated_file_identity_with_probe_and_reader(
@@ -789,7 +833,7 @@ fn validated_provenance_identity(
         expected,
         &KernelSelfMappingProbe,
         &mut budget,
-        budgeted_reader(identify_spent),
+        budgeted_reader_for(identify_spent, expected),
     )
 }
 
@@ -1459,7 +1503,7 @@ fn selection_acquisition(
     module_key: ObjectKey,
     module_identity: &ObjectIdentity,
     objects: &mut ObjectTable,
-    identify_spent: &Cell<u64>,
+    identify_spent: &IdentifyBudget,
     read_maps: &impl Fn() -> std::io::Result<Vec<u8>>,
 ) -> (SelectionAcquisition, Vec<RawSelectionQuery>) {
     if raw_export.is_none() {
@@ -1821,7 +1865,7 @@ fn stable_selection_maps(
     module_path: &Path,
     expected_key: ObjectKey,
     expected_identity: &ObjectIdentity,
-    identify_spent: &Cell<u64>,
+    identify_spent: &IdentifyBudget,
     read_maps: &impl Fn() -> std::io::Result<Vec<u8>>,
 ) -> Result<Vec<maps::MapEntry>, ()> {
     let mut budget = UnboundedProbeBudget;
@@ -1843,7 +1887,7 @@ fn stable_selection_maps_with_probe(
     expected_identity: &ObjectIdentity,
     probe: &impl SelfMappingProbe,
     budget: &mut dyn ProbeBudget,
-    identify_spent: &Cell<u64>,
+    identify_spent: &IdentifyBudget,
     maps_bytes: &[u8],
 ) -> Result<Vec<maps::MapEntry>, ()> {
     let current_maps = maps::parse_maps(maps_bytes).map_err(|_| ())?;
@@ -2203,7 +2247,7 @@ struct ObjectTable {
     approved: BTreeSet<ObjectKey>,
     ids: BTreeMap<ObjectKey, u32>,
     records: Vec<ObjectRecord>,
-    identify_spent: Rc<Cell<u64>>,
+    identify_spent: Rc<IdentifyBudget>,
 }
 
 impl ObjectTable {
@@ -2212,7 +2256,7 @@ impl ObjectTable {
         module_key: ObjectKey,
         identity: ObjectIdentity,
         approved: BTreeSet<ObjectKey>,
-        identify_spent: Rc<Cell<u64>>,
+        identify_spent: Rc<IdentifyBudget>,
     ) -> Self {
         let mut ids = BTreeMap::new();
         ids.insert(module_key, 0);
@@ -2790,9 +2834,11 @@ mod tests {
     #[test]
     fn mapped_path_identity_requires_device_and_inode() {
         let exe = small_owned_elf();
-        let key = identity_and_key(&exe, &Cell::new(0)).unwrap().0;
+        let key = identity_and_key(&exe, &IdentifyBudget::default())
+            .unwrap()
+            .0;
         assert!(
-            validated_identity(&exe, key, &Cell::new(0))
+            validated_identity(&exe, key, &IdentifyBudget::default())
                 .unwrap()
                 .reusable
         );
@@ -2801,27 +2847,55 @@ mod tests {
             inode: key.inode.wrapping_add(1),
             ..key
         };
-        let err = validated_identity(&exe, wrong, &Cell::new(0)).unwrap_err();
+        let err = validated_identity(&exe, wrong, &IdentifyBudget::default()).unwrap_err();
         assert!(err.contains("device/inode mismatch"), "{err}");
+    }
+
+    /// A distinct-key copy of the small fixture: same bytes, fresh
+    /// inode, so charge-once tests can tell rechecks from new objects.
+    fn copied_owned_elf(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "p11scope-discover-copy-{name}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("copy.so");
+        std::fs::copy(small_owned_elf(), &path).unwrap();
+        path
     }
 
     #[test]
     fn identify_reads_share_one_cumulative_byte_budget() {
         let exe = small_owned_elf();
         let len = std::fs::metadata(&exe).unwrap().len();
-        let spent = Cell::new(0u64);
-        let key = identity_and_key(&exe, &spent).unwrap().0;
-        assert_eq!(spent.get(), len, "the first read charges its bytes");
-        validated_identity(&exe, key, &spent).unwrap();
-        assert_eq!(spent.get(), 2 * len, "reads accumulate on one counter");
-        // Near the cap the next read debits its partial head, then
-        // fails: never an upfront size refusal, and a failed
-        // inspection keeps its partial debit.
-        spent.set(MAX_TOTAL_OBJECT_BYTES - 10);
-        let error = validated_identity(&exe, key, &spent).unwrap_err();
+        let other = selection_spend_fixture();
+        let other_len = std::fs::metadata(&other).unwrap().len();
+        let budget = IdentifyBudget::default();
+        let key = identity_and_key(&exe, &budget).unwrap().0;
+        assert_eq!(budget.spent.get(), len, "the first read charges its bytes");
+        validated_identity(&exe, key, &budget).unwrap();
+        assert_eq!(
+            budget.spent.get(),
+            len,
+            "a recheck of a charged key streams free"
+        );
+        identity_and_key(&other, &budget).unwrap();
+        assert_eq!(
+            budget.spent.get(),
+            len + other_len,
+            "a distinct key charges again"
+        );
+        // Near the cap the next fresh key debits its partial head, then
+        // fails: never an upfront size refusal, and a failed inspection
+        // keeps its partial debit.
+        budget.spent.set(MAX_TOTAL_OBJECT_BYTES - 10);
+        let third = copied_owned_elf("identify-third");
+        let third_file = identity::open_object(&third).unwrap();
+        let third_key = file_key(&third_file).unwrap();
+        let error = validated_identity(&third, third_key, &budget).unwrap_err();
         assert!(error.contains("total more than the"), "{error}");
         assert_eq!(
-            spent.get(),
+            budget.spent.get(),
             MAX_TOTAL_OBJECT_BYTES,
             "the partial head stays debited"
         );
@@ -2833,18 +2907,32 @@ mod tests {
         let len = std::fs::metadata(&exe).unwrap().len();
         let file = identity::open_object(&exe).unwrap();
         let key = file_key(&file).unwrap();
-        let spent = Cell::new(0u64);
-        validated_identity(&exe, key, &spent).unwrap();
-        validated_provenance_identity(&exe, &file, key, &spent).unwrap();
+        let other = copied_owned_elf("prov-other");
+        let other_len = std::fs::metadata(&other).unwrap().len();
+        let other_file = identity::open_object(&other).unwrap();
+        let other_key = file_key(&other_file).unwrap();
+        let budget = IdentifyBudget::default();
+        validated_identity(&exe, key, &budget).unwrap();
+        validated_provenance_identity(&exe, &file, key, &budget).unwrap();
         assert_eq!(
-            spent.get(),
-            2 * len,
+            budget.spent.get(),
+            len,
+            "a recheck of a charged key streams free"
+        );
+        validated_provenance_identity(&other, &other_file, other_key, &budget).unwrap();
+        assert_eq!(
+            budget.spent.get(),
+            len + other_len,
             "module and provenance reads share one counter"
         );
-        spent.set(MAX_TOTAL_OBJECT_BYTES - 10);
-        let error = validated_provenance_identity(&exe, &file, key, &spent).unwrap_err();
+        budget.spent.set(MAX_TOTAL_OBJECT_BYTES - 10);
+        let third = copied_owned_elf("prov-third");
+        let third_file = identity::open_object(&third).unwrap();
+        let third_key = file_key(&third_file).unwrap();
+        let error =
+            validated_provenance_identity(&third, &third_file, third_key, &budget).unwrap_err();
         assert!(error.contains("total more than the"), "{error}");
-        assert_eq!(spent.get(), MAX_TOTAL_OBJECT_BYTES);
+        assert_eq!(budget.spent.get(), MAX_TOTAL_OBJECT_BYTES);
     }
 
     /// `ObjectTable::resolve` identifies dependencies against the table's
@@ -2902,12 +2990,13 @@ mod tests {
             .clone()
     }
 
-    /// Both selection snapshots debit the shared counter: after one
-    /// selection run over the garbage-output fixture, the counter holds
-    /// exactly twenty module reads (ten queries times two snapshots). A
-    /// fresh counter smuggled into either snapshot closure halves the
-    /// debit and fails here. The snapshots parse scripted maps bytes,
-    /// so no live (tearing) read can skip a debit: single attempt.
+    /// Selection snapshots share the budget: one selection run over the
+    /// garbage-output fixture charges exactly one module read however
+    /// many snapshots recheck it. Per-closure counter threading is
+    /// pinned by the wiring shape test below: spend alone cannot
+    /// attribute free rechecks. The snapshots parse scripted maps
+    /// bytes, so no live (tearing) read can skip a debit: single
+    /// attempt.
     #[test]
     fn selection_snapshots_charge_the_shared_identify_budget() {
         let provider = selection_spend_fixture();
@@ -2916,9 +3005,11 @@ mod tests {
         let len = std::fs::metadata(&provider).unwrap().len();
         let module_file = identity::open_object(&provider).unwrap();
         let module_file_key = file_key(&module_file).unwrap();
-        let module_identity = identity_and_key(&provider, &Cell::new(0)).unwrap().1;
+        let module_identity = identity_and_key(&provider, &IdentifyBudget::default())
+            .unwrap()
+            .1;
         let maps_bytes = scripted_maps_bytes(&module_file_key);
-        let spent = Rc::new(Cell::new(0u64));
+        let spent = Rc::new(IdentifyBudget::default());
         let mut objects = ObjectTable::new(
             provider.clone(),
             module_file_key,
@@ -2943,9 +3034,9 @@ mod tests {
         assert_eq!(acquisition, SelectionAcquisition::Queried);
         assert_eq!(queries.len(), 10);
         assert_eq!(
-            spent.get(),
-            20 * len,
-            "every selection snapshot debits the shared counter"
+            spent.spent.get(),
+            len,
+            "the first snapshot charges the module; its rechecks stream free"
         );
     }
 
@@ -2957,14 +3048,14 @@ mod tests {
     fn discovery_pipeline_honors_the_injected_budget() {
         let provider = selection_spend_fixture();
         let open_memory = || ProcessMemory::open().unwrap().0;
-        let spent = Rc::new(Cell::new(0u64));
+        let spent = Rc::new(IdentifyBudget::default());
         let manifest = discover_with_budget(&provider, open_memory(), Rc::clone(&spent)).unwrap();
-        assert!(spent.get() > 0, "a discovery debits its budget");
+        assert!(spent.spent.get() > 0, "a discovery debits its budget");
         assert!(
             p11scope_manifest::validate::validate_structure(&manifest).is_empty(),
             "the budgeted discovery stays structurally valid"
         );
-        let spent = Rc::new(Cell::new(MAX_TOTAL_OBJECT_BYTES));
+        let spent = Rc::new(IdentifyBudget::exhausted_for_test());
         let error = discover_with_budget(&provider, open_memory(), spent).unwrap_err();
         assert!(error.contains("total more than the"), "{error}");
     }
@@ -3044,6 +3135,22 @@ mod tests {
                 .contains("discover_with_budget(module_path, self_memory,"),
             "the public entry must delegate to the budgeted pipeline"
         );
+        // Both selection snapshot closures forward the shared counter:
+        // spend alone cannot attribute free rechecks, so each closure
+        // is pinned separately.
+        let snapshots: Vec<&str> = production
+            .split("|| {\n                        stable_selection_maps(")
+            .collect();
+        assert_eq!(snapshots.len(), 3, "two snapshot closures expected");
+        for (n, tail) in snapshots[1..].iter().enumerate() {
+            assert!(
+                tail.lines()
+                    .take(8)
+                    .any(|line| line.contains("identify_spent,")),
+                "snapshot closure {} must pass the shared counter",
+                n + 1
+            );
+        }
     }
 
     #[test]
@@ -3058,8 +3165,10 @@ mod tests {
             inode: 7,
         };
         assert_ne!(key, module_key);
-        let identity = identity_and_key(&exe, &Cell::new(0)).unwrap().1;
-        let resolve = |spent: Rc<Cell<u64>>| {
+        let identity = identity_and_key(&exe, &IdentifyBudget::default())
+            .unwrap()
+            .1;
+        let resolve = |spent: Rc<IdentifyBudget>| {
             let mut objects = ObjectTable::new(
                 exe.clone(),
                 module_key,
@@ -3074,7 +3183,7 @@ mod tests {
                 key,
             )
         };
-        let spent = Rc::new(Cell::new(0u64));
+        let spent = Rc::new(IdentifyBudget::default());
         assert_eq!(
             resolve(Rc::clone(&spent)),
             Resolution::Resolved {
@@ -3082,8 +3191,8 @@ mod tests {
                 file_offset: 0
             }
         );
-        assert_eq!(spent.get(), len);
-        let spent = Rc::new(Cell::new(MAX_TOTAL_OBJECT_BYTES));
+        assert_eq!(spent.spent.get(), len);
+        let spent = Rc::new(IdentifyBudget::exhausted_for_test());
         let resolution = resolve(spent);
         let Resolution::UnusableFile { reason, .. } = resolution else {
             panic!("an exhausted budget must not resolve: {resolution:?}");
@@ -3102,14 +3211,16 @@ mod tests {
         let len = std::fs::metadata(&exe).unwrap().len();
         let file = identity::open_object(&exe).unwrap();
         let key = file_key(&file).unwrap();
-        let identity = identity_and_key(&exe, &Cell::new(0)).unwrap().1;
+        let identity = identity_and_key(&exe, &IdentifyBudget::default())
+            .unwrap()
+            .1;
         let maps_bytes = scripted_maps_bytes(&key);
-        let spent = Cell::new(0u64);
+        let spent = IdentifyBudget::default();
         let maps = stable_selection_maps(&exe, key, &identity, &spent, &|| Ok(maps_bytes.clone()))
             .unwrap();
         assert!(!maps.is_empty());
-        assert_eq!(spent.get(), len);
-        let spent = Cell::new(MAX_TOTAL_OBJECT_BYTES);
+        assert_eq!(spent.spent.get(), len);
+        let spent = IdentifyBudget::exhausted_for_test();
         assert!(
             stable_selection_maps(&exe, key, &identity, &spent, &|| Ok(maps_bytes.clone()))
                 .is_err()
@@ -3123,7 +3234,7 @@ mod tests {
     fn provenance_objects_charges_the_shared_identify_budget() {
         let entries = read_self_maps().unwrap();
         let index = validated_map_index(&entries).unwrap();
-        let table = |spent: Rc<Cell<u64>>| ObjectTable {
+        let table = |spent: Rc<IdentifyBudget>| ObjectTable {
             module_key: ObjectKey {
                 device: Device { major: 8, minor: 1 },
                 inode: 7,
@@ -3133,17 +3244,17 @@ mod tests {
             records: Vec::new(),
             identify_spent: spent,
         };
-        let spent = Rc::new(Cell::new(0u64));
+        let spent = Rc::new(IdentifyBudget::default());
         let objects = provenance_objects(&index, &table(Rc::clone(&spent)), &spent).unwrap();
         assert!(!objects.is_empty());
-        assert!(spent.get() > 0, "provenance reads charge the counter");
-        let spent = Rc::new(Cell::new(MAX_TOTAL_OBJECT_BYTES));
+        assert!(spent.spent.get() > 0, "provenance reads charge the counter");
+        let spent = Rc::new(IdentifyBudget::exhausted_for_test());
         let error = provenance_objects(&index, &table(Rc::clone(&spent)), &spent).unwrap_err();
         assert!(
             error.contains("no file-backed executable mappings"),
             "{error}"
         );
-        assert_eq!(spent.get(), MAX_TOTAL_OBJECT_BYTES);
+        assert_eq!(spent.spent.get(), MAX_TOTAL_OBJECT_BYTES);
     }
 
     /// `loaded_module_key` rechecks the resolved module against the
@@ -3160,7 +3271,9 @@ mod tests {
         let len = std::fs::metadata(&exe).unwrap().len();
         let module_file = identity::open_object(&exe).unwrap();
         let module_file_key = file_key(&module_file).unwrap();
-        let module_identity = identity_and_key(&exe, &Cell::new(0)).unwrap().1;
+        let module_identity = identity_and_key(&exe, &IdentifyBudget::default())
+            .unwrap()
+            .1;
         let maps = read_self_maps().unwrap();
         let index = validated_map_index(&maps).unwrap();
         let exports = ExportAddresses {
@@ -3169,7 +3282,7 @@ mod tests {
             get_interface: None,
         };
         let mut budget = UnboundedProbeBudget;
-        let spent = Cell::new(0u64);
+        let spent = IdentifyBudget::default();
         let found = loaded_module_key_with_probe(
             exports,
             &index,
@@ -3182,8 +3295,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(found, module_file_key);
-        assert_eq!(spent.get(), len);
-        let spent = Cell::new(MAX_TOTAL_OBJECT_BYTES);
+        assert_eq!(spent.spent.get(), len);
+        let spent = IdentifyBudget::exhausted_for_test();
         let error = loaded_module_key_with_probe(
             exports,
             &index,
@@ -3204,7 +3317,7 @@ mod tests {
             device: Device { major: 8, minor: 1 },
             inode: 7,
         };
-        let module_identity = identity_and_key(&small_owned_elf(), &Cell::new(0))
+        let module_identity = identity_and_key(&small_owned_elf(), &IdentifyBudget::default())
             .unwrap()
             .1;
         let provider = maps::MapEntry {
@@ -3226,7 +3339,7 @@ mod tests {
                 module_key,
                 &module_identity,
                 &module_file,
-                &Cell::new(0),
+                &IdentifyBudget::default(),
             )
         };
 
@@ -3498,7 +3611,7 @@ mod tests {
     #[test]
     fn loaded_split_probe_equal_keys_accept_without_probing() {
         let (_dir, module_file) = probe_tempfile("loaded-equal");
-        let module_identity = identity_and_key(&small_owned_elf(), &Cell::new(0))
+        let module_identity = identity_and_key(&small_owned_elf(), &IdentifyBudget::default())
             .unwrap()
             .1;
         let entries = vec![provider_entry(split_fd_key())];
@@ -3514,7 +3627,7 @@ mod tests {
                 &module_file,
                 &probe,
                 &mut budget,
-                &Cell::new(0),
+                &IdentifyBudget::default(),
             ),
             Ok(split_fd_key())
         );
@@ -3525,7 +3638,7 @@ mod tests {
     #[test]
     fn loaded_split_probe_overlay_match_accepts_the_maps_key() {
         let (_dir, module_file) = probe_tempfile("loaded-match");
-        let module_identity = identity_and_key(&small_owned_elf(), &Cell::new(0))
+        let module_identity = identity_and_key(&small_owned_elf(), &IdentifyBudget::default())
             .unwrap()
             .1;
         let entries = vec![provider_entry(split_maps_key())];
@@ -3541,7 +3654,7 @@ mod tests {
                 &module_file,
                 &probe,
                 &mut budget,
-                &Cell::new(0),
+                &IdentifyBudget::default(),
             ),
             Ok(split_maps_key())
         );
@@ -3551,7 +3664,7 @@ mod tests {
     #[test]
     fn loaded_split_probe_overlay_mismatch_refuses_with_todays_message() {
         let (_dir, module_file) = probe_tempfile("loaded-mismatch");
-        let module_identity = identity_and_key(&small_owned_elf(), &Cell::new(0))
+        let module_identity = identity_and_key(&small_owned_elf(), &IdentifyBudget::default())
             .unwrap()
             .1;
         let entries = vec![provider_entry(split_maps_key())];
@@ -3567,7 +3680,7 @@ mod tests {
                 &module_file,
                 &probe,
                 &mut budget,
-                &Cell::new(0),
+                &IdentifyBudget::default(),
             )
             .unwrap_err(),
             "no module acquisition export maps to the requested file identity"
@@ -3577,7 +3690,7 @@ mod tests {
     #[test]
     fn loaded_split_probe_non_overlay_mismatch_refuses_without_probing() {
         let (_dir, module_file) = probe_tempfile("loaded-non-overlay");
-        let module_identity = identity_and_key(&small_owned_elf(), &Cell::new(0))
+        let module_identity = identity_and_key(&small_owned_elf(), &IdentifyBudget::default())
             .unwrap()
             .1;
         let entries = vec![provider_entry(split_maps_key())];
@@ -3593,7 +3706,7 @@ mod tests {
                 &module_file,
                 &probe,
                 &mut budget,
-                &Cell::new(0),
+                &IdentifyBudget::default(),
             )
             .unwrap_err(),
             "no module acquisition export maps to the requested file identity"
@@ -3605,7 +3718,7 @@ mod tests {
     #[test]
     fn loaded_split_probe_error_refuses() {
         let (_dir, module_file) = probe_tempfile("loaded-error");
-        let module_identity = identity_and_key(&small_owned_elf(), &Cell::new(0))
+        let module_identity = identity_and_key(&small_owned_elf(), &IdentifyBudget::default())
             .unwrap()
             .1;
         let entries = vec![provider_entry(split_maps_key())];
@@ -3621,7 +3734,7 @@ mod tests {
                 &module_file,
                 &probe,
                 &mut budget,
-                &Cell::new(0),
+                &IdentifyBudget::default(),
             )
             .unwrap_err(),
             "no module acquisition export maps to the requested file identity"
@@ -3642,7 +3755,7 @@ mod tests {
                 key,
                 &probe,
                 &mut budget,
-                &Cell::new(0),
+                &IdentifyBudget::default(),
             )
             .unwrap()
             .reusable
@@ -3666,7 +3779,7 @@ mod tests {
                 split_maps_key(),
                 &probe,
                 &mut budget,
-                &Cell::new(0),
+                &IdentifyBudget::default(),
             )
             .unwrap()
             .reusable
@@ -3690,7 +3803,7 @@ mod tests {
                 split_maps_key(),
                 &probe,
                 &mut budget,
-                &Cell::new(0),
+                &IdentifyBudget::default(),
             )
             .unwrap_err();
             assert!(err.contains("device/inode mismatch"), "{err}");
@@ -3700,7 +3813,7 @@ mod tests {
     #[test]
     fn stable_maps_matching_module_accepts_without_probing() {
         let exe = small_owned_elf();
-        let (key, identity) = identity_and_key(&exe, &Cell::new(0)).unwrap();
+        let (key, identity) = identity_and_key(&exe, &IdentifyBudget::default()).unwrap();
         let probe = FakeSelfMappingProbe::new(true, None);
         let mut budget = UnboundedProbeBudget;
         let maps = stable_selection_maps_with_probe(
@@ -3709,7 +3822,7 @@ mod tests {
             &identity,
             &probe,
             &mut budget,
-            &Cell::new(0),
+            &IdentifyBudget::default(),
             &scripted_maps_bytes(&key),
         )
         .unwrap();
@@ -3720,7 +3833,7 @@ mod tests {
     #[test]
     fn stable_maps_changed_key_refuses() {
         let exe = small_owned_elf();
-        let (key, identity) = identity_and_key(&exe, &Cell::new(0)).unwrap();
+        let (key, identity) = identity_and_key(&exe, &IdentifyBudget::default()).unwrap();
         let wrong = ObjectKey {
             inode: key.inode.wrapping_add(1),
             ..key
@@ -3733,7 +3846,7 @@ mod tests {
             &identity,
             &probe,
             &mut budget,
-            &Cell::new(0),
+            &IdentifyBudget::default(),
             &scripted_maps_bytes(&key),
         )
         .unwrap_err();
@@ -3757,7 +3870,8 @@ mod tests {
         std::fs::remove_file(&link).unwrap();
         std::os::unix::fs::symlink(replacement, &link).unwrap();
 
-        let actual = validated_file_identity(&link, &file, key, &Cell::new(0)).unwrap();
+        let actual =
+            validated_file_identity(&link, &file, key, &IdentifyBudget::default()).unwrap();
         assert_eq!(actual, identity::identify(&original));
         assert_ne!(actual, identity::identify(replacement));
 
@@ -3893,7 +4007,7 @@ mod tests {
             approved: BTreeSet::new(),
             ids: BTreeMap::new(),
             records: Vec::new(),
-            identify_spent: Rc::new(Cell::new(0)),
+            identify_spent: Rc::new(IdentifyBudget::default()),
         };
 
         let valid_table_absence = selection_bracket(
@@ -4052,13 +4166,15 @@ mod tests {
         };
         let module_key = ObjectKey { device, inode };
         let executable = small_owned_elf();
-        let identity = identity_and_key(&executable, &Cell::new(0)).unwrap().1;
+        let identity = identity_and_key(&executable, &IdentifyBudget::default())
+            .unwrap()
+            .1;
         let mut objects = ObjectTable::new(
             executable,
             module_key,
             identity,
             BTreeSet::from([module_key]),
-            Rc::new(Cell::new(0)),
+            Rc::new(IdentifyBudget::default()),
         );
         let (observed, _) = selection_table_for(
             pointer,

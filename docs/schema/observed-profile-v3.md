@@ -1334,8 +1334,9 @@ Owned-pause arm failures file under their own subject. Each record is
   until a later retry released it. The debt retries on later
   passes while the child lives, up to three consecutive failures,
   then ends the capture with a lifecycle error instead of leaving
-  the child stopped; if the child exits first the debt settles
-  silently and the row stands as the record of the unproven window.
+  the child stopped; the escalation adds one `pause_partial`. If the
+  child exits first the debt settles silently and the row stands as
+  the record of the unproven window.
   The final cleanup probes liveness and resumes once for any debt
   still owed. A release against an already-gone child is moot and
   files nothing. Repeat filings dedupe to this one row.

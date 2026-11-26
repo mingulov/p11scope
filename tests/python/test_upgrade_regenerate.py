@@ -254,6 +254,16 @@ echo "semantic lane ready: stub" >&2
 echo '{"stub": true}' > "$o"
 """
 
+STUB_OBSERVER_SILENT = """#!/bin/sh
+o=""; prev=""
+for a in "$@"; do
+  if [ "$prev" = "-o" ]; then o="$a"; fi
+  prev="$a"
+done
+[ -n "$o" ] || exit 2
+echo '{"stub": true}' > "$o"
+"""
+
 FAKE_HELPER = """#!/bin/sh
 echo "mapped pid=$$"
 exit ${FAKE_HELPER_RC:-0}
@@ -263,12 +273,12 @@ exit ${FAKE_HELPER_RC:-0}
 class DriverTests(unittest.TestCase):
     """Key-operations capture drivers propagate helper results."""
 
-    def stage(self, tmp):
+    def stage(self, tmp, observer=STUB_OBSERVER):
         bin = tmp / "bin"
         bin.mkdir()
         (bin / "sudo").write_text(STUB_SUDO, encoding="utf-8")
         (bin / "flock").write_text(STUB_FLOCK, encoding="utf-8")
-        (bin / "observer").write_text(STUB_OBSERVER, encoding="utf-8")
+        (bin / "observer").write_text(observer, encoding="utf-8")
         for name in ("sudo", "flock", "observer"):
             (bin / name).chmod(0o755)
         work = tmp / "work"
@@ -283,11 +293,14 @@ class DriverTests(unittest.TestCase):
                    PATH=f"{bin}{os.pathsep}{os.environ['PATH']}")
         return work, out, env
 
-    def run_keyops(self, script, helper_rc):
+    def run_keyops(self, script, helper_rc, observer=STUB_OBSERVER,
+                     budget=None):
         tmp = Path(tempfile.mkdtemp(prefix="upgrade-driver-"))
         try:
-            work, out, env = self.stage(tmp)
+            work, out, env = self.stage(tmp, observer)
             env["FAKE_HELPER_RC"] = str(helper_rc)
+            if budget is not None:
+                env["READY_BUDGET"] = str(budget)
             args = ["sh", str(TOOLS / script), f"{tmp}/bin/observer",
                       "v071"]
             if script == "capture-ops.sh":
@@ -309,6 +322,14 @@ class DriverTests(unittest.TestCase):
         proc, files = self.run_keyops("capture-ops.sh", 0)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("v071-inventory-keyops.json", files)
+        self.assertIn("v071.go", files)
+
+    def test_ops_gate_untouched_without_readiness(self):
+        """No readiness, no gate touch, nonzero exit (bounded wait)."""
+        proc, files = self.run_keyops(
+            "capture-ops.sh", 0, observer=STUB_OBSERVER_SILENT, budget=2)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("v071.go", files)
 
     def test_syskeyops_propagates_helper_failure(self):
         """A failing key workload fails the capture (exit nonzero)."""
@@ -320,6 +341,15 @@ class DriverTests(unittest.TestCase):
         proc, files = self.run_keyops("capture-syskeyops.sh", 0)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("v071-inventory-syskeyops.json", files)
+        self.assertIn("v071.sysgo", files)
+
+    def test_syskeyops_gate_untouched_without_readiness(self):
+        """No readiness, no gate touch, nonzero exit (bounded wait)."""
+        proc, files = self.run_keyops(
+            "capture-syskeyops.sh", 0, observer=STUB_OBSERVER_SILENT,
+            budget=2)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("v071.sysgo", files)
 
 
 class ProbeTests(unittest.TestCase):

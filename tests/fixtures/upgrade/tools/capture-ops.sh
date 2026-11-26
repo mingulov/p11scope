@@ -36,7 +36,7 @@ case $MODE in
       --capture native --key-operations --manifest $OUT/v071-manifest-softhsm.json --duration $DUR -o $OUT/$TAG-inventory-keyops.json \
       2>$OUT/$TAG.$MODE.stderr &
     OPID=$!
-    for i in $(seq 1 600); do
+    for i in $(seq 1 ${READY_BUDGET:-600}); do
       grep -q "semantic lane ready" $OUT/$TAG.$MODE.stderr 2>/dev/null && break
       sleep 0.2
     done

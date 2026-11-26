@@ -24,7 +24,7 @@ $LOCK sudo -n --preserve-env=TMPDIR $BIN inventory --system --module $PROV \
   --capture native --key-operations --manifest $OUT/v071-manifest-softhsm.json \
   --duration 60s -o $OUT/$TAG-inventory-syskeyops.json 2>$OUT/$TAG.syskeyops.stderr &
 OPID=$!
-for i in $(seq 1 600); do
+for i in $(seq 1 ${READY_BUDGET:-600}); do
   grep -q "semantic lane ready" $OUT/$TAG.syskeyops.stderr 2>/dev/null && break
   sleep 0.2
 done

@@ -9333,6 +9333,20 @@ pub(crate) fn parse_mount_table_read_reason(reason: &str) -> Option<(u32, &str)>
 fn bare_scan_stop(detail: &str) -> Option<ScanStopKind> {
     match detail {
         WORK_CEILING_REASON => Some(ScanStopKind::WorkCeiling),
+        COLLECTION_STOP_REASON => Some(ScanStopKind::CollectionStop),
+        _ => None,
+    }
+}
+
+/// A mount-table-wrapped stop detail (binding ruling 17:58): the work
+/// and collection stops like the bare shape, plus the deadline and I/O
+/// stops, which classify ONLY here. Bare or refusal-wrapped deadline
+/// and I/O rows keep their long-standing treatment (never dropped by
+/// the continuation filters); the mount-table wrapper names the exact
+/// read that stopped, so its healable stops continue like work stops.
+fn mount_table_wrapped_scan_stop(detail: &str) -> Option<ScanStopKind> {
+    match detail {
+        WORK_CEILING_REASON => Some(ScanStopKind::WorkCeiling),
         SCAN_DEADLINE_REASON => Some(ScanStopKind::Deadline),
         IO_CEILING_REASON => Some(ScanStopKind::IoCeiling),
         COLLECTION_STOP_REASON => Some(ScanStopKind::CollectionStop),
@@ -9342,9 +9356,11 @@ fn bare_scan_stop(detail: &str) -> Option<ScanStopKind> {
 
 /// The single stop-provenance owner: which budget stop, if any, `reason`
 /// carries. Matches the exact bare sentence, `{refusal prefix}: {stop}`
-/// for a producer-owned scan refusal, or the pin-time mount-table
-/// wrapper with the exact stop detail — for `pid` only, when given
-/// (another process's wrapped stop is not this member's stop). Never a
+/// for a producer-owned scan refusal (work and collection stops only),
+/// or the pin-time mount-table wrapper with the exact stop detail —
+/// for `pid` only, when given (another process's wrapped stop is not
+/// this member's stop). The wrapper additionally classifies deadline
+/// and I/O stops; the bare and refusal shapes never do. Never a
 /// substring match: producer advice embeds shell-quoted module
 /// pathnames, and a path containing the sentence must not classify as a
 /// budget stop. Every consumer (the scanner and member continuation
@@ -9365,7 +9381,7 @@ pub(crate) fn scan_stop_kind(reason: &str, pid: Option<u32>) -> Option<ScanStopK
     if pid.is_some_and(|pid| pid != owner) {
         return None;
     }
-    bare_scan_stop(detail)
+    mount_table_wrapped_scan_stop(detail)
 }
 
 /// Whether `reason` is a genuine scan work-ceiling stop under
@@ -26850,25 +26866,31 @@ int main(int argc, char **argv) {
         assert_eq!(skipped.len(), 7);
     }
 
-    /// Stop-provenance table (finding 2): the exact bare sentence, the
-    /// producer-owned scan-refusal wrappings and the pin-time mount-table
-    /// wrapper all classify work, deadline, I/O and collection stops;
-    /// another process's wrapped stop, a pathname containing the sentence
-    /// and unrelated text never classify. The presentation fold still
-    /// matches work stops only.
+    /// Stop-provenance table (finding 2, narrowed by ruling 17:58):
+    /// the exact bare sentence and the producer-owned scan-refusal
+    /// wrappings classify work and collection stops only; the pin-time
+    /// mount-table wrapper additionally classifies deadline and I/O
+    /// stops. Another process's wrapped stop, a pathname containing the
+    /// sentence and unrelated text never classify. The presentation
+    /// fold still matches work stops only.
     #[test]
     fn scan_stop_kind_names_every_healable_stop_shape() {
+        // (stop, kind, bare/refusal shapes classify it)
         let kinds = [
-            (WORK_CEILING_REASON, ScanStopKind::WorkCeiling),
-            (SCAN_DEADLINE_REASON, ScanStopKind::Deadline),
-            (IO_CEILING_REASON, ScanStopKind::IoCeiling),
-            (COLLECTION_STOP_REASON, ScanStopKind::CollectionStop),
+            (WORK_CEILING_REASON, ScanStopKind::WorkCeiling, true),
+            (COLLECTION_STOP_REASON, ScanStopKind::CollectionStop, true),
+            (SCAN_DEADLINE_REASON, ScanStopKind::Deadline, false),
+            (IO_CEILING_REASON, ScanStopKind::IoCeiling, false),
         ];
-        for (stop, kind) in kinds {
-            assert_eq!(scan_stop_kind(stop, None), Some(kind), "bare [{stop}]");
+        for (stop, kind, bare) in kinds {
+            assert_eq!(
+                scan_stop_kind(stop, None),
+                bare.then_some(kind),
+                "bare [{stop}] classifies work/collection only"
+            );
             assert_eq!(
                 scan_stop_kind(stop, Some(7)),
-                Some(kind),
+                bare.then_some(kind),
                 "a bare stop ignores pid"
             );
             for prefix in [
@@ -26879,8 +26901,8 @@ int main(int argc, char **argv) {
                 let wrapped = format!("{prefix}: {stop}");
                 assert_eq!(
                     scan_stop_kind(&wrapped, None),
-                    Some(kind),
-                    "refusal [{wrapped}]"
+                    bare.then_some(kind),
+                    "refusal [{wrapped}] classifies work/collection only"
                 );
             }
             let tabled = mount_table_read_reason(7, stop);
@@ -26938,11 +26960,12 @@ int main(int argc, char **argv) {
         assert!(!is_work_ceiling_stop(IO_CEILING_REASON), "I/O never folds");
     }
 
-    /// Continuation twin (finding 2): while the view holds unfinished
-    /// cursors, deadline and I/O stops — bare or in this member's
-    /// mount-table wrapper — drop like work stops and the in-progress gap
-    /// names the continuation; another member's wrapped stop and unrelated
-    /// text stay verbatim.
+    /// Continuation twin (finding 2, narrowed by ruling 17:58): while
+    /// the view holds unfinished cursors, deadline and I/O stops in this
+    /// member's mount-table wrapper drop like work stops and the
+    /// in-progress gap names the continuation; bare deadline and I/O
+    /// stops, another member's wrapped stop and unrelated text stay
+    /// verbatim.
     #[test]
     fn continued_view_gap_drops_deadline_and_io_stops_while_unfinished() {
         let foreign = mount_table_read_reason(8, IO_CEILING_REASON);
@@ -26987,8 +27010,13 @@ int main(int argc, char **argv) {
                 .iter()
                 .map(|skip| skip.reason.as_str())
                 .collect::<Vec<_>>(),
-            vec![foreign.as_str(), "unrelated refusal"],
-            "healable stops drop while unfinished, foreign and unrelated stay"
+            vec![
+                SCAN_DEADLINE_REASON,
+                IO_CEILING_REASON,
+                foreign.as_str(),
+                "unrelated refusal"
+            ],
+            "wrapped healable stops drop while unfinished; bare, foreign and unrelated stay"
         );
         let bare = CaptureWorkBudget::default();
         let mut skipped = skips();

@@ -6501,6 +6501,8 @@ impl CallerRegistry {
                     | Mutation::EndWatches { .. }
                     | Mutation::RecordGap { .. }
                     | Mutation::RecordKeyedGap { .. }
+                    | Mutation::RecordNote { .. }
+                    | Mutation::ClassifyGap { .. }
                     | Mutation::RecordAggregatedUnrouted { .. } => false,
                 }
             })
@@ -11581,6 +11583,7 @@ pub(crate) mod tests {
             subject: "filler".into(),
             reason: "r".into(),
             budget: None,
+            units: None,
         });
         let row = RegistryGap {
             caller: None,
@@ -11589,6 +11592,7 @@ pub(crate) mod tests {
             subject: "s".into(),
             reason: "r".into(),
             budget: None,
+            units: None,
         };
         registry.record_note(row.clone(), NoteKind::FoldDeferredOversized);
         registry.record_gap(row);

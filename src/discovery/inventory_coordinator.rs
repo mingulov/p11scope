@@ -48646,6 +48646,7 @@ int main(void) {
                 subject: subject.into(),
                 reason: "r".into(),
                 budget: None,
+                units: None,
             });
             coordinator.registry.record_note(
                 RegistryGap {
@@ -48655,6 +48656,7 @@ int main(void) {
                     subject: format!("{subject} note"),
                     reason: "r".into(),
                     budget: None,
+                    units: None,
                 },
                 crate::discovery::caller_registry::NoteKind::FoldDeferredOversized,
             );

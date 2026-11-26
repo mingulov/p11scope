@@ -666,6 +666,11 @@ else:
         self.assertEqual(install["needs"], "package")
         bodies = "\n".join(item.get("run", "") for item in install["steps"])
         for marker in ("apt-get install", "p11scope --version", "p11scope doctor",
+                       'test "$code" -eq 0', "capture available",
+                       "Binary: /usr/bin/p11scope", "missing CAP_BPF", "setcap",
+                       "cmp /usr/bin/p11scope", 'check-capture-evidence.py" clean-metrics',
+                       "check-count-multiset.py", "softhsm2-util --init-token",
+                       '-S "$UBUNTU_APT_SNAPSHOT" install',
                        "p11scope-discover --version", "apt-get remove",
                        "fedora:44", "dnf install", "dnf remove"):
             self.assertIn(marker, bodies, f"install test must {marker}")

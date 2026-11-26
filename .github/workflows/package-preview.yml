@@ -246,9 +246,63 @@ jobs:
           code=$?
           set -e
           cat doctor.txt
-          test "$code" -eq 0 -o "$code" -eq 1
+          test "$code" -eq 0
           grep -q '^Doctor:' doctor.txt
+          grep -q 'capture available' doctor.txt
+          grep -q '^Binary: /usr/bin/p11scope (p11scope ' doctor.txt
           p11scope-discover --version
+      - name: Install capture-cell dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=300 -o Acquire::https::Timeout=300 -S "$UBUNTU_APT_SNAPSHOT" update
+          sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=300 -o Acquire::https::Timeout=300 -S "$UBUNTU_APT_SNAPSHOT" install -y gcc softhsm2
+      - name: Prove the installed DEB bytes with a real capture
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+          . scripts/lib.sh
+          work="$RUNNER_TEMP/deb-capture-cell"
+          mkdir -m 700 "$work"
+          cd install-test
+          set -- p11scope-[0-9]*-x86_64-linux-musl.tar.gz
+          test "$#" -eq 1 && test -f "$1"
+          mkdir "$work/tarball"
+          tar -xzf "$1" -C "$work/tarball"
+          set -- "$work/tarball"/p11scope-[0-9]*-x86_64-linux-musl/p11scope
+          test "$#" -eq 1 && test -x "$1"
+          cmp /usr/bin/p11scope "$1"
+          sha256sum /usr/bin/p11scope "$1" | tee "$work/binary.sha256"
+          module=/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so
+          test -f "$module"
+          gcc -O0 -o "$work/harness" "$GITHUB_WORKSPACE/spike/harness.c" -ldl
+          export SOFTHSM2_CONF="$work/softhsm2.conf"
+          mkdir -m 700 "$work/tokens"
+          printf 'directories.tokendir = %s/tokens\nobjectstore.backend = file\nlog.level = ERROR\nslots.removable = false\n' "$work" >"$SOFTHSM2_CONF"
+          softhsm2-util --init-token --free --label deb-cell --so-pin 5678 --pin 1234
+          SOFTHSM2_CONF="$SOFTHSM2_CONF" "$work/harness" "$module" "$work/go" "$work/fin" >"$work/harness.log" 2>&1 &
+          hpid=$!
+          trap 'kill "$hpid" "${opid-}" 2>/dev/null || true' EXIT
+          attempt=0
+          while [ "$attempt" -lt 200 ]; do
+            grep -Fq libsofthsm2.so "/proc/$hpid/maps" 2>/dev/null && break
+            attempt=$((attempt + 1))
+            sleep 0.05
+          done
+          grep -Fq libsofthsm2.so "/proc/$hpid/maps" 2>/dev/null
+          sudo -n p11scope profile --pid "$hpid" --mode metrics --duration 10 -o "$work/observed.json" >"$work/observer.log" 2>&1 &
+          opid=$!
+          SPID=$opid
+          wait_for_capture_ready "$work/observer.log" aggregate-only metrics
+          SPID=
+          touch "$work/go"
+          wait "$opid"
+          touch "$work/fin"
+          wait "$hpid"
+          sudo -n chown "$(id -u):$(id -g)" "$work/observed.json"
+          python3 -I "$GITHUB_WORKSPACE/scripts/matrix/check-count-multiset.py" "$work/observed.json" "$GITHUB_WORKSPACE/spike/expected.txt" | tee "$work/count-oracle.log"
+          python3 -I "$GITHUB_WORKSPACE/scripts/check-capture-evidence.py" clean-metrics "$work/observed.json" "$GITHUB_WORKSPACE/spike/expected.txt" | tee "$work/evidence-oracle.log"
           sudo apt-get remove -y p11scope
           test ! -e /usr/bin/p11scope
           test ! -e /usr/bin/p11scope-discover
@@ -267,8 +321,10 @@ jobs:
             code=$?
             set -e
             cat /tmp/doctor.txt
-            test "$code" -eq 0 -o "$code" -eq 1
+            test "$code" -eq 1
             grep -q "^Doctor:" /tmp/doctor.txt
+            grep -q "missing CAP_BPF" /tmp/doctor.txt
+            grep -q "setcap" /tmp/doctor.txt
             p11scope-discover --version
             dnf remove -y p11scope
             test ! -e /usr/bin/p11scope

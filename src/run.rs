@@ -11561,16 +11561,18 @@ fn fallback_streamed_report_to_stdout(
     }
 }
 
-/// Commits a streamed `-o` report for terminal publication. Every
-/// failure stays a typed [`crate::output::CommitFailure`], so the
-/// publisher suppresses the stdout rescue exactly for a recovery-dir
-/// save (the bytes are safe; a rescue would deliver twice) while a
-/// double failure (`capture lost`) or a kept temp keeps the rescue as
-/// the last resort.
+/// Commits a streamed `-o` report for terminal publication. A commit
+/// the output layer already saved to the recovery dir becomes a typed
+/// [`crate::output::CommitFailure`], so the publisher suppresses the
+/// stdout rescue (the bytes are safe; a rescue would deliver twice).
+/// Every other failure — a double failure (`capture lost`), a kept
+/// temp, or a pre-commit write error — stays a plain message, and the
+/// stdout rescue remains the last resort.
 fn commit_streamed_report(out_file: crate::output::AtomicFile) -> Result<()> {
     match out_file.commit_with_outcome() {
         Ok(()) => Ok(()),
-        Err(failure) => Err(anyhow::Error::new(failure)),
+        Err(failure) if failure.saved_to_recovery().is_some() => Err(anyhow::Error::new(failure)),
+        Err(failure) => Err(anyhow::Error::msg(failure.into_message())),
     }
 }
 

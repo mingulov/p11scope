@@ -31564,44 +31564,27 @@ int main(int argc, char **argv) {
 
     /// #6: `note_outputs_attempted` answers whether a stop was already
     /// counted — the detach hint reads `again` after a counted stop
-    /// and `twice` after a `--duration` end.
+    /// and `twice` after a `--duration` end. The whole body runs in an
+    /// isolated child through the shared helper: an armed, counted
+    /// flag must never linger in the suite process, where a stray
+    /// hangup would exit it at once.
     #[test]
     fn note_outputs_attempted_reports_a_previously_counted_stop() {
+        const TEST: &str =
+            "run::tests::note_outputs_attempted_reports_a_previously_counted_stop";
+        if !crate::test_support::isolation::enter(TEST, "note-counted-stop") {
+            return;
+        }
         // A duration end counts no stop: the hint reads `twice`. No
         // handlers installed, no signals raised.
         let fresh = crate::inventory_dashboard::StopFlag::test_without_handlers();
         assert!(!fresh.note_outputs_attempted());
-        // A counted stop reads `again`. The raise runs in a child: an
-        // armed, counted flag must never linger in this process, where
-        // a stray hangup would exit it at once.
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "run::tests::note_outputs_child_counts_a_stop_before_outputs",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env("P11SCOPE_NOTE_CHILD", "1")
-            .output()
-            .unwrap();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("COUNTED_STOP_READS_AGAIN"), "{stdout}");
-        assert!(output.status.success(), "{output:?}");
-    }
-
-    /// The child half of the hint-answer test: inert unless the parent
-    /// sets the environment.
-    #[test]
-    fn note_outputs_child_counts_a_stop_before_outputs() {
-        if std::env::var_os("P11SCOPE_NOTE_CHILD").is_none() {
-            return;
-        }
+        // A counted stop reads `again`.
         let flag = crate::inventory_dashboard::StopFlag::install().unwrap();
         // SAFETY: raising a signal whose handler is installed.
         unsafe { libc::raise(libc::SIGINT) };
         assert!(flag.stopped());
         assert!(flag.note_outputs_attempted());
-        println!("COUNTED_STOP_READS_AGAIN");
     }
 
     /// F-T4-5: the owned command starts with SIGPIPE at its default. The

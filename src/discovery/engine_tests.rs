@@ -3166,8 +3166,8 @@ fn missing_fallback_replacement_files_a_named_gap() {
         &[(key_plan, "sha-plan", 7), (key_repl, "sha-repl", 7)],
         false,
     );
-    let mut ids = pins.pinned().map(|pin| pin.id);
-    let (plan_id, replacement) = (ids.next().unwrap(), ids.next().unwrap());
+    let ids: Vec<_> = pins.pinned().map(|pin| pin.id).collect();
+    let (plan_id, replacement) = (ids[0], ids[1]);
     let mut plan = plan_with(2, 0);
     plan.modules[0].object = plan_id;
     for slot in &mut plan.slots {

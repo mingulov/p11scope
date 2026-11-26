@@ -20727,11 +20727,10 @@ impl Engine {
         )
     }
 
-    /// `exit_proven`: modules whose every committed mapper provably left
-    /// the scope — exited by its original-process pin (the conservative
-    /// replay) or departed an authoritative membership walk (the
-    /// inventory refresh); `None` for every other apply. Only those can
-    /// park a zero-mapper retire instead of opening a lossy window.
+    /// `exit_proven`: modules whose every committed mapper the
+    /// conservative replay proved exited by its original-process pin
+    /// (`None` for every other apply). Only those can park a zero-mapper
+    /// retire instead of opening a lossy window.
     #[allow(clippy::too_many_arguments)]
     fn apply_candidate_with_ended(
         &mut self,
@@ -37597,32 +37596,16 @@ impl Engine {
             .iter()
             .map(|prepared| (prepared.view, prepared.serial))
             .collect();
-        // A view that departed an authoritative membership walk (absent
-        // from a complete /proc or cgroup walk) left the scope: no call
-        // of that generation is in scope any more. Its modules, when no
-        // other committed scan maps them, retire with zero mappers
-        // (retire-window lane, F1/H1b); stale (generation-lost) views
-        // never vouch.
-        let departed_gone: BTreeSet<ProcessViewId> =
-            removed.intersection(&departed).copied().collect();
-        let exit_proven = self.zero_mapper_modules(&departed_gone);
-        let outcome = match self.apply_candidate_with_ended(
-            session,
-            candidate,
-            additions_allowed,
-            true,
-            &extra_views,
-            None,
-            Some(&exit_proven),
-        ) {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                self.note_dropped_tick(&error, &serviced_requests, &failed_refresh_pids);
-                *additions_allowed = false;
-                closure.fail();
-                return Ok(changed);
-            }
-        };
+        let outcome =
+            match self.apply_candidate(session, candidate, additions_allowed, true, &extra_views) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    self.note_dropped_tick(&error, &serviced_requests, &failed_refresh_pids);
+                    *additions_allowed = false;
+                    closure.fail();
+                    return Ok(changed);
+                }
+            };
         self.record_apply_timing(&outcome);
         if outcome.disposition == ApplyDisposition::Deferred {
             // Retain exact original request serials, ages, newcomers and exec

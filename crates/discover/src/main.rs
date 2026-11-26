@@ -646,6 +646,13 @@ fn write_private_atomically_with(
 /// The manifest about to be written, checked against the observer's own
 /// limits first: structural validity plus the 16 MiB total. A manifest
 /// the observer would reject is refused here instead of published.
+/// The most manifest JSON the helper publishes: the observer reads
+/// files up to `MAX_MANIFEST_BYTES`, and the stdout path appends one
+/// trailing newline the byte count must leave room for, so JSON stops
+/// one byte lower. The `-o` path writes exactly these bytes and is
+/// fail-safe by that byte.
+const MAX_PUBLISHED_JSON_BYTES: u64 = p11scope_manifest::validate::MAX_MANIFEST_BYTES - 1;
+
 fn validated_manifest_json(m: &p11scope_discover::manifest::Manifest) -> Result<String, String> {
     let problems = p11scope_manifest::validate::validate_structure(m);
     if !problems.is_empty() {
@@ -655,11 +662,10 @@ fn validated_manifest_json(m: &p11scope_discover::manifest::Manifest) -> Result<
         ));
     }
     let json = serde_json::to_string_pretty(m).expect("manifest serializes");
-    if json.len() as u64 > p11scope_manifest::validate::MAX_MANIFEST_BYTES {
+    if json.len() as u64 > MAX_PUBLISHED_JSON_BYTES {
         return Err(format!(
-            "refusing to write a {}-byte manifest; limit is {}",
+            "refusing to write a {}-byte manifest; limit is {MAX_PUBLISHED_JSON_BYTES} JSON bytes",
             json.len(),
-            p11scope_manifest::validate::MAX_MANIFEST_BYTES
         ));
     }
     Ok(json)
@@ -1145,6 +1151,134 @@ mod tests {
     /// temporary file exists: nothing is published and nothing is left
     /// behind. A plain-serialize mutant at the validated call publishes
     /// the file and fails here.
+    /// Skeleton for the size-boundary tests: minimal interface
+    /// surfaces (no name evidence) with canonical functions whose
+    /// unusable-file reasons carry `reason_lens` bytes in order.
+    fn boundary_skeleton(
+        surface_count: usize,
+        names: &[&'static str],
+        reason_lens: &[usize],
+    ) -> Manifest {
+        let hex = "11".repeat(32);
+        let identity = p11scope_manifest::identity::ObjectIdentity {
+            kind: p11scope_manifest::identity::IdentityKind::Sha256,
+            value: Some(hex.clone()),
+            sha256: Some(hex),
+            reusable: true,
+            note: None,
+        };
+        let mut surfaces = vec![SurfaceRecord {
+            source: SurfaceSource::LegacyFunctionList,
+            acquisition: Acquisition::Absent,
+            version: None,
+            walk: WalkOutcome::NotWalked,
+            functions: vec![],
+        }];
+        let mut lens = reason_lens.iter();
+        for index in 0..surface_count {
+            surfaces.push(SurfaceRecord {
+                source: SurfaceSource::Interface {
+                    index,
+                    raw_name_hex: None,
+                    name_lossy: None,
+                    name_error: None,
+                    flags: 0,
+                    classification: InterfaceClassification::CorroboratedStandardPrefix,
+                },
+                acquisition: Acquisition::Ok,
+                version: Some(Version { major: 3, minor: 2 }),
+                walk: WalkOutcome::KnownPrefix,
+                functions: names
+                    .iter()
+                    .map(|name| FunctionRecord {
+                        name: name.to_string(),
+                        resolution: Resolution::UnusableFile {
+                            reason: "r".repeat(*lens.next().unwrap()),
+                            path_hex: String::new(),
+                        },
+                    })
+                    .collect(),
+            });
+        }
+        Manifest {
+            schema: p11scope_manifest::manifest::SCHEMA.to_string(),
+            module_path: "/obj/mod.so".into(),
+            objects: vec![ObjectRecord {
+                id: 0,
+                path: "/obj/mod.so".into(),
+                identity: identity.clone(),
+            }],
+            provenance_objects: vec![ProvenanceObject {
+                path: "/obj/mod.so".into(),
+                device_major: 8,
+                device_minor: 1,
+                inode: 7,
+                identity,
+            }],
+            interface_list: Acquisition::Ok,
+            surfaces,
+            vendor_interfaces: vec![],
+            alias_groups: vec![],
+            selection_evidence: SelectionEvidence::default(),
+            getters: vec![],
+        }
+    }
+
+    /// A structurally valid manifest whose pretty JSON is exactly
+    /// `target_total` bytes: the fixed skeleton is measured once, then
+    /// per-function reasons (4096 bytes each at most) fill the exact
+    /// remainder. Panics unless the total lands exactly on target, so a
+    /// boundary test built on it cannot drift off the boundary.
+    fn exact_size_manifest(target_total: u64) -> Manifest {
+        let names = canonical_32_names();
+        const SURFACES: usize = 64;
+        let slots = SURFACES * names.len();
+        let base =
+            serde_json::to_string_pretty(&boundary_skeleton(SURFACES, &names, &vec![0; slots]))
+                .unwrap()
+                .len() as u64;
+        let fill = target_total
+            .checked_sub(base)
+            .expect("target above skeleton size") as usize;
+        assert!(
+            fill <= slots * 4096,
+            "target within reason capacity: {fill} > {}",
+            slots * 4096
+        );
+        let mut remaining = fill;
+        let mut lens = Vec::with_capacity(slots);
+        for _ in 0..slots {
+            let take = remaining.min(4096);
+            lens.push(take);
+            remaining -= take;
+        }
+        assert_eq!(remaining, 0);
+        let manifest = boundary_skeleton(SURFACES, &names, &lens);
+        let total = serde_json::to_string_pretty(&manifest).unwrap().len() as u64;
+        assert_eq!(
+            total, target_total,
+            "fixture must sit exactly on the boundary"
+        );
+        assert!(
+            p11scope_manifest::validate::validate_structure(&manifest).is_empty(),
+            "the boundary fixture must be structurally valid"
+        );
+        manifest
+    }
+
+    /// The stdout path appends one trailing newline the byte count must
+    /// leave room for: JSON of exactly MAX bytes is refused, MAX - 1 is
+    /// accepted.
+    #[test]
+    fn manifest_size_boundary_leaves_room_for_the_stdout_newline() {
+        let limit = p11scope_manifest::validate::MAX_MANIFEST_BYTES;
+        let under = exact_size_manifest(limit - 1);
+        assert!(super::validated_manifest_json(&under).is_ok());
+        let at = exact_size_manifest(limit);
+        let error = super::validated_manifest_json(&at).unwrap_err();
+        assert!(error.contains("limit"), "{error}");
+    }
+
     #[test]
     fn publish_refuses_invalid_manifest_without_writing() {
         let directory = publish_dir("invalid");

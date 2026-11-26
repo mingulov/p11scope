@@ -41,12 +41,9 @@
     {
       "file": "src/attach.rs",
       "path": "attach::tests::bpf_loop_probe_reports_helper_presence_on_live_kernel",
-      "reason": "live-kernel BPF lane; reports bpf_loop helper presence without asserting it",
+      "reason": "live-kernel BPF lane; reports bpf_loop helper presence without asserting it; re-deferred to 0.8.0: old-kernel live lanes in CI",
       "cell": "privileged",
-      "until": {
-        "item": "old-kernel live lanes in CI",
-        "owner": "WP-9"
-      }
+      "until": "0.8.0"
     },
     {
       "file": "src/attach.rs",
@@ -75,12 +72,9 @@
     {
       "file": "src/attach/counter_banks.rs",
       "path": "attach::counter_banks::tests::counter_preparation_refuses_without_bpf_loop_on_old_kernels",
-      "reason": "historical/private opt-in control outside current live-positive qualification: pre-5.17 kernel lane; proves preparation refuses cleanly without the bpf_loop helper",
+      "reason": "historical/private opt-in control outside current live-positive qualification: pre-5.17 kernel lane; proves preparation refuses cleanly without the bpf_loop helper; re-deferred to 0.8.0: pre-5.17 kernel lane in CI",
       "cell": "privileged",
-      "until": {
-        "item": "pre-5.17 kernel lane in CI",
-        "owner": "WP-9"
-      }
+      "until": "0.8.0"
     },
     {
       "file": "src/attach/identity_iter.rs",
@@ -229,12 +223,9 @@
     {
       "file": "src/attach/instance_tests.rs",
       "path": "attach::instance_tests::privileged_instance_small_state_lru_eviction_never_joins",
-      "reason": "privileged: needs a small-state build, run by hand (1-entry INSTANCE_START eviction injection; evicted calls surface Unstamped, sequential calls join)",
+      "reason": "privileged: needs a small-state build, run by hand (1-entry INSTANCE_START eviction injection; evicted calls surface Unstamped, sequential calls join); re-deferred to 0.8.0: small-state build lane in CI",
       "cell": "privileged",
-      "until": {
-        "item": "small-state build lane in CI",
-        "owner": "maintainer"
-      }
+      "until": "0.8.0"
     },
     {
       "file": "src/attach/instance_tests.rs",
@@ -1648,12 +1639,9 @@
     {
       "file": "src/metrics/counter_reader.rs",
       "path": "metrics::counter_reader::tests::counter_bank_session_verifier_complexity_refuses_clean_lp64",
-      "reason": "historical/private opt-in control outside current live-positive qualification: 6.1 E2BIG lane; proves the verifier-budget refusal maps before lifecycle without activating",
+      "reason": "historical/private opt-in control outside current live-positive qualification: 6.1 E2BIG lane; proves the verifier-budget refusal maps before lifecycle without activating; re-deferred to 0.8.0: 6.1 verifier-budget lane in CI",
       "cell": "privileged",
-      "until": {
-        "item": "6.1 verifier-budget lane in CI",
-        "owner": "WP-9"
-      }
+      "until": "0.8.0"
     },
     {
       "file": "src/metrics/counter_reader.rs",
@@ -1795,32 +1783,23 @@
     {
       "file": "src/s1_tests/resource_probe.rs",
       "path": "s1_tests::resource_probe::native_semantic_resource_final_probe",
-      "reason": "explicit controller-granted host measurement; spawns bounded children",
+      "reason": "explicit controller-granted host measurement; spawns bounded children; re-deferred to 0.8.0: controller-authorized measurement plan",
       "cell": "privileged",
-      "until": {
-        "item": "controller-authorized measurement plan",
-        "owner": "controller"
-      }
+      "until": "0.8.0"
     },
     {
       "file": "src/s1_tests/resource_probe.rs",
       "path": "s1_tests::resource_probe::native_semantic_resource_registry_probe",
-      "reason": "explicit controller-granted host measurement; spawns bounded children",
+      "reason": "explicit controller-granted host measurement; spawns bounded children; re-deferred to 0.8.0: controller-authorized measurement plan",
       "cell": "privileged",
-      "until": {
-        "item": "controller-authorized measurement plan",
-        "owner": "controller"
-      }
+      "until": "0.8.0"
     },
     {
       "file": "src/semantics_edge/resource_tests.rs",
       "path": "semantics_edge::resource_tests::native_semantic_resource_probe",
-      "reason": "explicit controller-granted host measurement; spawns bounded children",
+      "reason": "explicit controller-granted host measurement; spawns bounded children; re-deferred to 0.8.0: controller-authorized measurement plan",
       "cell": "privileged",
-      "until": {
-        "item": "controller-authorized measurement plan",
-        "owner": "controller"
-      }
+      "until": "0.8.0"
     },
     {
       "file": "tests/bpf_load_feasibility.rs",
@@ -1920,7 +1899,7 @@
       "cell": "privileged",
       "file": "src/attach/image_bank_proof.rs",
       "path": "attach::image_bank_proof::tests::privileged_image_bank_cut_262145th_leader_in_b",
-      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N7 cut cell with 16,385 leaders; re-deferred to 0.8.0: image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) hand-run on a root BPF lane; not a campaign cell",
+      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N7 cut cell with 262,145 leaders; re-deferred to 0.8.0: image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) hand-run on a root BPF lane; not a campaign cell",
       "until": "0.8.0"
     },
     {

@@ -1992,9 +1992,11 @@ class IgnoredTestsTests(unittest.TestCase):
     def test_skip_entry_with_standing_until_passes(self):
         # "0.7.3" is the standing known label (controller fix1 note
         # 2026-11-26: a version until must name a known release;
-        # "0.7.0" no longer does).
-        for until in ("0.7.3",
-                      {"item": "kernel lanes", "owner": "WP-9"}):
+        # "0.7.0" no longer does). A dict until stands only as a
+        # permanent standing skip (controller fix2 ruling N3).
+        for until in ("0.7.3", "0.9.0",
+                      {"item": "permanent: kernel lanes",
+                       "owner": "WP-9"}):
             with self.subTest(until=until):
                 sources = {
                     "src/lib.rs": "mod a;\n",
@@ -2047,12 +2049,48 @@ class IgnoredTestsTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0, result.stdout)
                 self.assertIn("no known release", result.stdout)
 
+    def test_skip_entry_with_versionless_dict_until_fails(self):
+        # A dict until whose item is not a permanent standing skip
+        # names no version and fails (controller fix2 ruling N3):
+        # real deferrals carry an expiry version instead.
+        for item in ("kernel lanes in CI",
+                     "permanent kernel lanes in CI"):
+            with self.subTest(item=item):
+                sources = {
+                    "src/lib.rs": "mod a;\n",
+                    "src/a.rs": (
+                        "#[test]\n"
+                        '#[ignore = "privileged: needs the lane"]\n'
+                        "fn t_skip() {}\n"
+                    ),
+                }
+                entries = [
+                    {"file": "src/a.rs", "path": "a::t_skip",
+                     "reason": "privileged: needs the lane",
+                     "cell": "privileged",
+                     "until": {"item": item, "owner": "WP-9"}},
+                ]
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    write_fixture(root, sources, entries, [],
+                                  skip_registered=["a::t_skip"])
+                    result = run_checker(root)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("names no version", result.stdout)
+
     def test_development_version_pin_is_deliberate(self):
         # The checker judges skip expiry against max(manifest,
         # DEVELOPMENT_VERSION); a stale constant lets next-release
         # untils stand a whole cycle (fail-closed but late), so the
         # value is pinned and bumps are reviewed.
         self.assertEqual(CHECKER_MOD["DEVELOPMENT_VERSION"], "0.6.0")
+
+    def test_allowed_until_versions_pin_is_deliberate(self):
+        # The known-release allowlist is the only thing standing
+        # between a stale label and silent acceptance, so the tuple
+        # itself is pinned: widening it needs a reviewed bump.
+        self.assertEqual(CHECKER_MOD["ALLOWED_UNTIL_VERSIONS"],
+                         ("0.7.3", "0.8.0", "0.9.0"))
 
     def test_malformed_until_fails(self):
         for until in ("0.6.x", "soon", 7,

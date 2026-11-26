@@ -17,7 +17,9 @@ compares them both ways against tests/ignored-tests.json:
   deferral ("deferred to 0.6.0") cannot outlive its release silently;
   a version above it must name a known release
   (ALLOWED_UNTIL_VERSIONS), so a stale label ("0.8.1") cannot stand
-  silently either.
+  silently either. A dict `until` is a permanent standing skip only:
+  its item must start with "permanent:"; any other dict names no
+  version and fails, so every real deferral carries an expiry.
 - a `feature` entry without a non-empty `owner` fails: the owner names
   the lane that runs the test (a runner list or a dedicated build).
   The owner must be one of ALLOWED_OWNERS, and every allowed owner has
@@ -528,7 +530,9 @@ def until_problem(until, current):
     development (expiry judges first, so a past label reports
     expired, never unknown), or above it without naming a known
     release; a work item fails when it is not exactly
-    {"item": ..., "owner": ...} with non-empty strings.
+    {"item": ..., "owner": ...} with non-empty strings, and when its
+    item is not a permanent standing skip (only "permanent:" items
+    stand versionless; every other deferral names a version).
     """
     if isinstance(until, str):
         version = parse_version(until)
@@ -546,6 +550,8 @@ def until_problem(until, current):
     for key in ("item", "owner"):
         if not isinstance(until[key], str) or not until[key].strip():
             return f"until {key} must be a non-empty string"
+    if not until["item"].startswith("permanent:"):
+        return f"until item {until['item']!r} names no version: standing skips say 'permanent:', deferrals name a version"
     return None
 
 

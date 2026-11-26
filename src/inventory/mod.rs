@@ -2718,9 +2718,12 @@ impl Drop for TerminalDrains<'_> {
 #[cfg(test)]
 pub(crate) mod terminal_drains_test {
     //! Counts terminal-drain runs on this thread, so the D6 twins
-    //! prove one run per exit path from a typed count.
+    //! prove one run per exit path from a typed count. The step
+    //! recorder pins the drain order before the semantic cleanup (N1).
     std::thread_local! {
         static RUNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        static STEPS: std::cell::RefCell<Vec<TerminalStep>> =
+            const { std::cell::RefCell::new(Vec::new()) };
     }
     pub(crate) fn note_run() {
         RUNS.with(|runs| runs.set(runs.get() + 1));
@@ -2728,12 +2731,27 @@ pub(crate) mod terminal_drains_test {
     pub(crate) fn take_runs() -> u64 {
         RUNS.with(|runs| runs.replace(0))
     }
+    /// One terminal-cleanup leg, in run order.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum TerminalStep {
+        MetadataJoin,
+        CloseDrain,
+        SemanticCleanup,
+    }
+    pub(crate) fn note_step(step: TerminalStep) {
+        STEPS.with(|steps| steps.borrow_mut().push(step));
+    }
+    pub(crate) fn take_steps() -> Vec<TerminalStep> {
+        STEPS.with(|steps| std::mem::take(&mut *steps.borrow_mut()))
+    }
 }
 
 fn finish_caller_metadata_cleanup(
     coordinator: &mut InventoryCoordinator<OsProcessSource>,
     second_signal: &dyn Fn() -> bool,
 ) {
+    #[cfg(test)]
+    terminal_drains_test::note_step(terminal_drains_test::TerminalStep::MetadataJoin);
     // Outputs have already been attempted. Join the cancelled optional job
     // through its real owner; another operator signal leaves owned custody
     // in the helper's process-lifetime slot rather than detaching its thread.
@@ -2765,6 +2783,8 @@ fn finish_pending_close_drain(
     coordinator: &mut InventoryCoordinator<OsProcessSource>,
     second_signal: &dyn Fn() -> bool,
 ) {
+    #[cfg(test)]
+    terminal_drains_test::note_step(terminal_drains_test::TerminalStep::CloseDrain);
     let rest = coordinator.drain_pending_closes_for_exit(second_signal);
     if !rest.is_empty() {
         ExitRetention::hold(rest);
@@ -2775,6 +2795,8 @@ fn finish_semantic_native_cleanup(
     lane: Option<crate::inventory_semantics::AttestedSemanticLane>,
     second_signal: &dyn Fn() -> bool,
 ) -> Result<()> {
+    #[cfg(test)]
+    terminal_drains_test::note_step(terminal_drains_test::TerminalStep::SemanticCleanup);
     lane.map_or(Ok(()), |lane| {
         lane.finish_owned_terminal_cleanup(
             second_signal,
@@ -34917,6 +34939,77 @@ mod seal_readiness_tests {
             deadline_gaps(false, vec![refused(), refused()], StopAt::Prepare(3)),
             vec![key_operations_unavailable(), ended_ordinary],
             "ordinary re-mint gate"
+        );
+    }
+
+    /// N1 classic tail: a seated lane through the real run ends
+    /// with the drains before the semantic cleanup, in that exact
+    /// order. Deleting the tail's explicit `finish()` reorders the
+    /// sequence (the guard's drop runs the drains after the cleanup).
+    #[test]
+    fn n1_classic_tail_drains_before_semantic_cleanup() {
+        use super::terminal_drains_test::{TerminalStep, take_steps};
+        let dir = tempfile::tempdir().expect("private tempdir");
+        let out = dir.path().join("out.json");
+        let mut stdout = Vec::new();
+        take_steps();
+        let code = seal_startup_test::with_start_queue(
+            vec![some_preparation(), some_preparation()],
+            vec![Ok(wind_down_lane(WindDownIo::completing()))],
+            || {
+                super::native_preparation_test::with(
+                    |_, _, _| Err(anyhow::anyhow!("native unavailable for test")),
+                    || {
+                        super::run_with_terminal_budget(
+                            InspectScope::Pid(std::process::id()),
+                            &[],
+                            &[],
+                            &[PathBuf::from("/missing/p11scope-manifest.json")],
+                            &[],
+                            &[],
+                            &HookRegistry::builtin(),
+                            true,
+                            Some(1),
+                            None,
+                            inventory_endpoint_budget(None).unwrap(),
+                            None,
+                            Some(&out),
+                            false,
+                            None,
+                            None,
+                            None,
+                            None,
+                            CaptureMode::Auto,
+                            crate::attach::BackendSelection::Singles,
+                            None,
+                            false,
+                            &|| false,
+                            &|| {},
+                            false,
+                            &mut WriterStdout(&mut stdout),
+                            &DashboardIo::stdio(),
+                            DiagnosticRequest::disabled(),
+                            None,
+                            &|| Ok(crate::attach::MultiCapableHost::for_test()),
+                            None,
+                            None,
+                            true,
+                            false,
+                            false,
+                        )
+                    },
+                )
+            },
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(
+            take_steps(),
+            vec![
+                TerminalStep::MetadataJoin,
+                TerminalStep::CloseDrain,
+                TerminalStep::SemanticCleanup,
+            ]
         );
     }
 

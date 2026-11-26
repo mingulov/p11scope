@@ -634,6 +634,82 @@ fn failed_started_record_retires_event_log_before_classic_or_dashboard_finalizat
     }
 }
 
+/// N1 dashboard tail: a dashboard run stopped at once still ends
+/// its success tail with the drains before the semantic cleanup, in
+/// that exact order. Deleting the tail's explicit `finish()` reorders
+/// the sequence (the guard's drop runs the drains after the cleanup).
+#[test]
+fn n1_dashboard_tail_drains_before_semantic_cleanup() {
+    use crate::inventory::terminal_drains_test::{TerminalStep, take_steps};
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let dir = private_tempdir();
+    let report = dir.path().join("report.json");
+    let mut master = -1;
+    let mut slave = -1;
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        },
+        0
+    );
+    let _master = unsafe { std::fs::File::from_raw_fd(master) };
+    let slave = unsafe { std::fs::File::from_raw_fd(slave) };
+    let notices = std::fs::File::create(dir.path().join("notices")).unwrap();
+    let terminal = DashboardIo {
+        output: slave.as_raw_fd(),
+        input: None,
+        account: None,
+        stderr_fd: notices.as_raw_fd(),
+        stderr: StderrRoute::Leave,
+    };
+    let mut stdout = Vec::new();
+    take_steps();
+    let code =
+        crate::pidns::test_seam::with_numbering(crate::pidns::PidNumbering::agreeing(), || {
+            run_with_terminal_diagnostics(
+                InspectScope::Pid(std::process::id()),
+                &[],
+                &HookRegistry::builtin(),
+                true,
+                Some(1),
+                None,
+                None,
+                Some(&report),
+                true,
+                None,
+                None,
+                None,
+                None,
+                CaptureMode::Auto,
+                crate::attach::BackendSelection::Auto,
+                None,
+                &|| true,
+                &|| {},
+                true,
+                &mut WriterStdout(&mut stdout),
+                &terminal,
+                DiagnosticRequest::disabled(),
+                None,
+            )
+        })
+        .unwrap();
+    assert_eq!(code, 0);
+    assert_eq!(
+        take_steps(),
+        vec![
+            TerminalStep::MetadataJoin,
+            TerminalStep::CloseDrain,
+            TerminalStep::SemanticCleanup,
+        ]
+    );
+}
+
 #[test]
 fn failed_prologue_writer_cannot_resume_during_final_sinks() {
     let dir = private_tempdir();

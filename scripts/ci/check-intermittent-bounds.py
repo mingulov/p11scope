@@ -16,12 +16,14 @@ History comes from the workflow's own uploaded run-tree artifacts
 branches, so the gate needs no ordering behind the current run-tree
 matrix and judges with one run of lag. The declarations are
 workflow-level, so a cell passing nowhere in the window is broken or
-stale wherever it runs. Cancelled, skipped and still-running runs,
-and expired or missing artifacts, contribute nothing; a pair the
-window never ran bootstraps with a note instead of failing (the
-per-run --intermittent-failure presence check owns row presence;
-with no history at all the gate bootstraps once and self-corrects
-on the next run).
+stale wherever it runs. Cancelled, skipped and still-running runs
+contribute nothing. A self-skip is red, never a pass: no history
+at all, no artifacts for a leg in the window, or a declared cell
+that never ran all fail the gate (a dropped, renamed or
+never-scheduled cell disables no bound), as does a window with no
+positive row. A positive row is exactly `pass is true` with
+qualification `qualified`; anything else, however shaped, is not
+a pass.
 
 Usage:
   python3 -I scripts/ci/check-intermittent-bounds.py --repo OWNER/REPO
@@ -179,15 +181,30 @@ def load_history_json(path):
     return history, ""
 
 
+def is_positive(row):
+    # A pass is exactly a schema-valid positive row: boolean true
+    # with the qualified verdict. Anything else (failed,
+    # expected-failure, nonqualifying, a non-boolean pass, missing
+    # keys) is not a pass; malformed rows are refused, never
+    # counted. In particular an unexpected pass
+    # (pass+expected-failure) and an inconsistent row
+    # (pass+failed) never reset the window.
+    return (
+        isinstance(row, dict)
+        and row.get("pass") is True
+        and row.get("qualification") == "qualified"
+    )
+
+
 def judge(history, cells, kernels, window):
     lanes = {}
     for cell, lane in cells:
         lanes.setdefault(cell, []).append(lane)
     if not history:
-        print("check-intermittent-bounds: BOOTSTRAP: no runs with "
-              "run-tree artifacts in scope; the gate self-corrects once "
-              "history exists")
-        return 0
+        print("check-intermittent-bounds: no runs with run-tree "
+              "artifacts in scope: cannot bound anything; refusing "
+              "to pass on no evidence", file=sys.stderr)
+        return 1
     window_runs = history[:window]
     print("check-intermittent-bounds: window: %s" % ", ".join(
         f"{run.get('id')} ({run.get('branch')})" for run in window_runs))
@@ -196,20 +213,29 @@ def judge(history, cells, kernels, window):
         for kernel in kernels:
             observed = []
             last_pass = None
+            artifacts = 0
             for run in window_runs:
                 rows = (run.get("results") or {}).get(kernel)
                 if not isinstance(rows, list):
                     continue
+                artifacts += 1
                 for row in rows:
                     if isinstance(row, dict) and row.get("cell") == cell:
                         observed.append(run.get("id"))
-                        if row.get("pass") is True and last_pass is None:
+                        if is_positive(row) and last_pass is None:
                             last_pass = run.get("id")
-            if not observed:
-                print(f"check-intermittent-bounds: BOOTSTRAP: {cell} on "
-                      f"{kernel} never ran in the window")
-                continue
-            if last_pass is None:
+            if not artifacts:
+                failures.append(
+                    f"{cell} on {kernel} has no run-tree artifacts in "
+                    f"the window (lanes: {', '.join(lanes[cell])}): a "
+                    f"missing leg disables no bound")
+            elif not observed:
+                failures.append(
+                    f"{cell} on {kernel} never ran in the window "
+                    f"(lanes: {', '.join(lanes[cell])}; runs: "
+                    f"{', '.join(str(run.get('id')) for run in window_runs)}): "
+                    f"a dropped or renamed cell disables no bound")
+            elif last_pass is None:
                 failures.append(
                     f"{cell} on {kernel} went {len(window_runs)} runs "
                     f"without passing (lanes: {', '.join(lanes[cell])}; "

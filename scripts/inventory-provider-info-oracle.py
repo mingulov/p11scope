@@ -47,6 +47,68 @@ CELL = "inventory-provider-info-pid"
 LEDGER_SCHEMA = "p11scope/provider-info-ledger/v1"
 FORBIDDEN_KEY_SUBSTRINGS = ("serial", "label")
 
+# Exact row key sets from the frozen consumer contract
+# (docs/schema/inventory-v1-object-observations-v8.schema.json,
+# additionalProperties false) and docs/schema/inventory-v1.md. Any
+# key outside base + approved-optionals is refused before value
+# comparisons, so privacy-excluded bytes (serial, label, session
+# counts, memory sizes, clock readings, PINs, values, argv, env)
+# and any unrelated extra key fail here even when no value check
+# names them. The report-wide serial/label scan stays as a second
+# layer, never as the schema check.
+PROVIDER_INFO_KEYS = frozenset(
+    (
+        "cryptoki_major",
+        "cryptoki_minor",
+        "manufacturer",
+        "description",
+        "flags",
+        "library_major",
+        "library_minor",
+    )
+)
+PROVIDER_INFO_OPTIONAL = frozenset(("manufacturer_reason", "description_reason"))
+TOKEN_ROW_KEYS = frozenset(
+    (
+        "module",
+        "caller",
+        "slot",
+        "manufacturer",
+        "model",
+        "hardware_major",
+        "hardware_minor",
+        "firmware_major",
+        "firmware_minor",
+        "flags",
+        "pin_min_len",
+        "pin_max_len",
+        "completions",
+        "changes",
+    )
+)
+TOKEN_ROW_OPTIONAL = frozenset(("instance", "manufacturer_reason", "model_reason"))
+MECHANISM_ROW_KEYS = frozenset(
+    (
+        "module",
+        "caller",
+        "slot",
+        "mechanism",
+        "min_key_size",
+        "max_key_size",
+        "flags",
+        "completions",
+        "changes",
+    )
+)
+MECHANISM_ROW_OPTIONAL = frozenset(("instance",))
+
+
+def check_row_keys(kind, row, required, optional):
+    unknown = sorted(set(row) - required - optional)
+    require(not unknown, "%s carries unknown keys: %r" % (kind, unknown))
+    missing = sorted(required - set(row))
+    require(not missing, "%s misses required keys: %r" % (kind, missing))
+
 
 class EvidenceError(Exception):
     pass
@@ -321,6 +383,7 @@ def snapshot_owned(report, provider, pid):
 def check_provider_info(module, info):
     record = module.get("provider_info")
     require(isinstance(record, dict), "owned module carries no provider_info")
+    check_row_keys("provider_info", record, PROVIDER_INFO_KEYS, PROVIDER_INFO_OPTIONAL)
     for key in ("cryptoki_major", "cryptoki_minor", "library_major", "library_minor"):
         require(
             record.get(key) == info[key],
@@ -356,6 +419,7 @@ def check_observations(report, owned, caller, token_slots, mech_facts):
     seen_tokens = {}
     for row in tokens:
         require(isinstance(row, dict), "token row is not an object")
+        check_row_keys("token row", row, TOKEN_ROW_KEYS, TOKEN_ROW_OPTIONAL)
         require(row.get("module") == owned, "token row on another module: %r" % (row,))
         require(row.get("caller") == caller, "token row on another caller: %r" % (row,))
         slot = row.get("slot")
@@ -410,6 +474,7 @@ def check_observations(report, owned, caller, token_slots, mech_facts):
     seen_mechs = {}
     for row in mechanisms:
         require(isinstance(row, dict), "mechanism row is not an object")
+        check_row_keys("mechanism row", row, MECHANISM_ROW_KEYS, MECHANISM_ROW_OPTIONAL)
         require(
             row.get("module") == owned, "mechanism row on another module: %r" % (row,)
         )

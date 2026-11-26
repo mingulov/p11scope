@@ -155,6 +155,83 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
         self.ci = CI_YML.read_text(encoding="utf-8")
         self.yml = PRIV_YML.read_text(encoding="utf-8")
 
+    def test_public_cli_closed_sets_stay_in_step(self):
+        # The campaign script's summary(), the release-matrix PUBLIC
+        # map and the workflow's two closed sets (uniform checker
+        # flags + inline need set) must name the same cells: a cell
+        # dropped from any one of them would self-skip on some leg.
+        # The host-leg and uniform checker invocations must also
+        # require the same set (the exact drift that once left the
+        # provider-info cell host-only).
+        import ast
+
+        script = (ROOT / "scripts" / "qualify-public-cli.sh").read_text(
+            encoding="utf-8"
+        )
+        match = re.search(r"^summary doctor .+$", script, re.M)
+        self.assertIsNotNone(match, "qualify script has no summary line")
+        summary = set(match.group(0).split()[1:])
+        self.assertTrue(summary, "summary names no cells")
+        contract = ast.parse(
+            (ROOT / "scripts" / "release-matrix-contract.py").read_text(
+                encoding="utf-8"
+            )
+        )
+        public = None
+        for node in ast.walk(contract):
+            if (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id == "PUBLIC"
+            ):
+                public = ast.literal_eval(node.value)
+        self.assertIsInstance(public, dict, "PUBLIC map is not a literal dict")
+        body = job_body(self.yml, "public-cli")
+        need = set(
+            re.findall(
+                r"need = \{(.*?)\}", body, re.S
+            )[0].replace('"', "").replace(",", " ").split()
+        )
+        # The inline need set is exactly the campaign summary: any
+        # drift in either direction fails loudly here, not as a
+        # silent self-skip on a guest leg.
+        self.assertEqual(summary, need, "summary/need drift")
+        count = re.search(r"full (\d+)-cell gate", body)
+        self.assertIsNotNone(count, "closed-set count comment missing")
+        self.assertEqual(
+            int(count.group(1)), len(need), "closed-set count comment drifted"
+        )
+        host = re.search(
+            r"run-cell-script\.sh public-cli-host .*?>(?:\"\$RUNNER_TEMP/qual\.log\")",
+            body,
+            re.S,
+        )
+        self.assertIsNotNone(host, "host leg has no checker invocation")
+        host_requires = set(re.findall(r"--require (\S+)", host.group(0)))
+        start = body.index('check-cell-results.py "$out/cells/results.jsonl"')
+        uniform_lines = []
+        for line in body[start:].splitlines()[1:]:
+            uniform_lines.append(line)
+            if not line.rstrip().endswith("\\"):
+                break
+        self.assertTrue(uniform_lines, "uniform checker invocation missing")
+        uniform_requires = set(
+            re.findall(r"--require (\S+)", "\n".join(uniform_lines))
+        )
+        self.assertTrue(uniform_requires, "uniform checker requires nothing")
+        self.assertEqual(
+            host_requires, uniform_requires, "host/uniform require drift"
+        )
+        self.assertTrue(
+            uniform_requires <= need, "uniform requires outside the closed set"
+        )
+        self.assertIn("inventory-provider-info-pid", uniform_requires)
+        self.assertIn("inventory-provider-info-pid", need)
+        self.assertEqual(
+            public.get("inventory-provider-info-pid"), "provider-info-exact"
+        )
+
     def test_toolchain_and_action_pins_match_ci(self):
         release = RELEASE_RUST_VERSION.read_text(encoding="utf-8").strip()
         problems = (_BPF.check_bpf_linker(self.ci, self.yml)

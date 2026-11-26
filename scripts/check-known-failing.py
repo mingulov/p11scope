@@ -89,6 +89,10 @@ RESULT_SELECTION_FIELDS = {"path", "test", "invocation"}
 RESULT_ROW_FIELDS = {"path", "test", "invocation", "state", "signature"}
 RESULT_STATES = {"passed", "failed", "error", "skipped", "unexpected_success", "not_run", "not_applicable"}
 NEUTRAL_STATES = {"skipped", "not_applicable"}
+# A row branch naming a bare producer state or scope token accepts any
+# failure of that shape (every AssertionError looks like the named issue).
+# Rows need a test-raised typed branch instead.
+GENERIC_SIGNATURE_BRANCHES = RESULT_STATES | {"class_skip", "module_skip"}
 ISSUE_RE = re.compile(r"^KI-[0-9]{2}$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SIGNATURE_KEY_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
@@ -242,6 +246,9 @@ def validate_row(raw, index):
     problems.extend(f"{label}: {problem}" for problem in signature_problems(raw["signature"]))
     if isinstance(raw["signature"], dict) and "branch" not in raw["signature"]:
         problems.append(f"{label}: signature lacks a typed branch")
+    if isinstance(raw.get("signature"), dict) and raw["signature"].get("branch") in GENERIC_SIGNATURE_BRANCHES:
+        problems.append(f"{label}: signature branch {raw['signature']['branch']!r} is a generic producer state or scope token; "
+                        "rows need a test-raised typed branch")
     if isinstance(raw["signature"], dict) and "cell" in raw["signature"] and raw["signature"]["cell"] != raw["cell"]:
         problems.append(f"{label}: signature cell must equal the row cell")
     if not isinstance(raw["lane"], str) or not raw["lane"].strip():
@@ -844,6 +851,9 @@ def validate_static(root, list_path, discover_executables=True):
         if key in seen_row_keys:
             problems.append(f"duplicate row for {row['runner']} {row['path']} {row['test']}: split composite cells instead")
         seen_row_keys.add(key)
+        if (root / "docs/releases" / f"v{row['target']}.md").is_file():
+            problems.append(f"{row['test']}: target {row['target']} already released "
+                            f"(docs/releases/v{row['target']}.md exists): rows expire at their target release")
         candidate = root / row["path"]
         if not candidate.is_file():
             problems.append(f"{row['path']}: path does not exist for {row['test']}")

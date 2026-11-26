@@ -23,13 +23,16 @@ Required fields: `path`, `test`, `cell`, `issues`, `target`, `runner`,
   row `cell`.
 - `issues`: nonempty unique list of `KI-nn` ids. One row may cover two
   issues.
-- `target`: `0.7.3` or `0.8.0`.
+- `target`: `0.7.3` or `0.8.0`. A row expires at its target release:
+  once `docs/releases/v<target>.md` exists the row is refused.
 - `runner`: `privileged-lib`, `python-suite`, or `cell:<script>`. There
   is no `host-matrix` runner: the schema as implemented is accepted
   (controller ruling, fix4 brief N8).
 - `signature`: nonempty nested record of typed values only (snake-case
   field names, enum-like leaves, never log text), with a mandatory
-  `branch` naming the typed failure branch.
+  `branch` naming the typed failure branch. A bare producer state or
+  scope token is refused as a branch: Python rows need a test-raised
+  `p11scope_signature`.
 - `lane`: the lane that owns the fix. `reason`: nonempty printable
   plain human text. `last_green_sha`: newest passing commit, 40-hex.
 - `hosts`: optional unique nonempty subset of `github`, `vng`,
@@ -45,6 +48,10 @@ Required fields: `path`, `test`, `cell`, `issues`, `target`, `runner`,
   `--known-failing-runner` and a compatible host (`"$kf_host"` matches
   any host). A `cell:` row's `path` equals its runner script, except
   `.rs` rows whose typed path comes from `tests/ignored-tests.json`.
+  The static check proves a typed stream exists for the runner and
+  host; cell selection itself is enforced at judgment, where a row
+  whose cell the stream never selects fails as a listed row with no
+  terminal result.
 
 `privileged-lib` rows are refused until the privileged summary counts
 `XFAIL` rows: a typed row prints `XFAIL`, which `Prove full coverage`

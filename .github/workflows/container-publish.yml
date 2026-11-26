@@ -155,9 +155,13 @@ jobs:
           cat smoke-doctor.txt
           test "$code" -eq 0 -o "$code" -eq 1
           grep -q '^Doctor:' smoke-doctor.txt
+          set +e
           docker run --rm "${flags[@]}" p11scope-observer:preview \
             inventory --system --duration 15 --json >smoke-inventory.json 2>smoke-inventory.err
-          echo "inventory exit=$?"
+          inventory_code=$?
+          set -e
+          echo "inventory exit=$inventory_code"
+          test "$inventory_code" -eq 0
           python3 -I - smoke-inventory.json smoke-inventory.err <<'PY'
           import json
           import re
@@ -180,7 +184,7 @@ jobs:
           python3 -I scripts/ci/check-cell-results.py "$RUNNER_TEMP/cell/results.jsonl" \
             --require host-exact --require container-exact \
             --require refusal-pidns --require refusal-cap \
-            --require five-cap-exact
+            --require five-cap-exact --require recovery-var-tmp
       - name: Save the image for the push job
         shell: bash
         run: |

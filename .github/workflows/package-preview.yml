@@ -439,9 +439,13 @@ jobs:
           cat smoke-doctor.txt
           test "$code" -eq 0 -o "$code" -eq 1
           grep -q '^Doctor:' smoke-doctor.txt
+          set +e
           docker run --rm "${flags[@]}" p11scope-observer:preview \
             inventory --system --duration 15 --json >smoke-inventory.json 2>smoke-inventory.err
-          echo "inventory exit=$?"
+          inventory_code=$?
+          set -e
+          echo "inventory exit=$inventory_code"
+          test "$inventory_code" -eq 0
           python3 -I - smoke-inventory.json smoke-inventory.err <<'PY'
           import json
           import re
@@ -453,6 +457,18 @@ jobs:
           assert scanned and max(scanned) > 0, "the smoke must scan host processes"
           print(f"smoke ok: schema p11scope/inventory/v1, scanned {max(scanned)}")
           PY
+      - name: Prove capture on the built image bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+          bash scripts/matrix/verify-container-image.sh --image p11scope-observer:preview \
+            --out "$RUNNER_TEMP/cell"
+          test -s "$RUNNER_TEMP/cell/results.jsonl"
+          python3 -I scripts/ci/check-cell-results.py "$RUNNER_TEMP/cell/results.jsonl" \
+            --require host-exact --require container-exact \
+            --require refusal-pidns --require refusal-cap \
+            --require five-cap-exact --require recovery-var-tmp
       - name: Save the smoke-tested image
         shell: bash
         run: |

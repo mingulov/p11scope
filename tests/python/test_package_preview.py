@@ -672,6 +672,9 @@ else:
         # Smoke: the image runs the observer entrypoint, reports doctor and
         # completes a short inventory --system with SoftHSM on the runner.
         for marker in ("docker run", "--version", "doctor", "inventory --system",
+                       "inventory_code=$?", 'test "$inventory_code" -eq 0',
+                       "verify-container-image.sh --image p11scope-observer:preview",
+                       "--require five-cap-exact --require recovery-var-tmp",
                        "softhsm", "p11scope/inventory/v1"):
             self.assertIn(marker, bodies, f"container-image smoke must {marker}")
         uploads = [item for item in image["steps"] if "upload-artifact" in item.get("uses", "")]

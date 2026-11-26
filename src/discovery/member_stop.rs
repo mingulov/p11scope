@@ -1329,21 +1329,23 @@ impl Engine {
         // A refused staging settles without probes: never "attached". A
         // rejected staging key refuses too: no slot ever builds under a
         // rejected key, so the hold's attach is impossible (never at the
-        // bound). Refused takes precedence over attached below on
-        // purpose (fail-closed over-refusal): the shape needs a
-        // committed or pending key rejection to land after its slots
-        // attached within one pass, and then the hold ends refused
-        // with the first-use row instead of risking unobserved first
-        // calls. Trial-only rejections never reach this bool.
-        let refused = held.providers.iter().any(|identity| {
-            self.member_stops.refused.contains(identity)
-                || self.stop_staged_key_rejected(*identity)
-                || self.stop_staged_key_superseded(*identity)
+        // bound). That refusal takes precedence over attached on purpose
+        // (fail-closed over-refusal): the shape needs a committed or
+        // pending key rejection to land after its slots attached within
+        // one pass, and then the hold ends refused with the first-use
+        // row instead of risking unobserved first calls. Trial-only
+        // rejections never reach this bool. A superseded key refuses
+        // only while its provider is not attached: once probes are
+        // really live the hold ends attached instead of ending refused
+        // forever over a timestamp rotation.
+        let hard_refused = held.providers.iter().any(|identity| {
+            self.member_stops.refused.contains(identity) || self.stop_staged_key_rejected(*identity)
         });
         // Attached means real session attach stamps, never scheduling
         // flags: a deferred, refused or no-link apply can clear those
-        // without one probe live.
-        let attached = !refused
+        // without one probe live. Evaluated only when no hard refusal
+        // already settled the hold.
+        let attached_now = !hard_refused
             && held.providers.iter().all(|identity| {
                 !self
                     .pending_learned
@@ -1351,6 +1353,13 @@ impl Engine {
                     .any(|queued| (queued.dev, queued.ino) == *identity)
                     && self.provider_object_attached(*identity, session)
             });
+        let refused = hard_refused
+            || (!attached_now
+                && held
+                    .providers
+                    .iter()
+                    .any(|identity| self.stop_staged_key_superseded(*identity)));
+        let attached = !refused && attached_now;
         HoldState {
             departed,
             attached,

@@ -2012,12 +2012,12 @@ pub struct PinnedObjects {
     rejected_keys: BTreeSet<ObjectKey>,
     /// Maps keys whose retained pin a same-file generation rotation
     /// superseded (same kernel file, equal digest, stepped ctime, a
-    /// live scan on one side): the stale entry was evicted and the
-    /// fresh observation filed, so the key stays routable and the
-    /// attach races on. A per-absorb signal, not identity content:
-    /// entry diffs already distinguish superseded sets, so the
-    /// content comparison and the conservative copy skip it; the
-    /// engine-side pending set is the durable record.
+    /// live scan on one side): the pin rotated in place, so the key
+    /// stays routable and the attach races on. Carried through absorb
+    /// and the conservative copy like the rejected set; the content
+    /// comparison skips it (entry diffs already distinguish superseded
+    /// sets). The engine-side pending set covers candidates that never
+    /// commit.
     superseded_keys: BTreeSet<ObjectKey>,
     /// Transient pin-failure marks per viewing process: refused
     /// observations never reject by themselves, but two views refusing
@@ -2435,6 +2435,7 @@ impl PinnedObjects {
         }
         self.proven_collision_keys
             .extend(other.proven_collision_keys.iter().copied());
+        self.superseded_keys.extend(other.superseded_keys);
         for (view, key) in &other.refused_keys {
             if self
                 .refused_keys
@@ -5012,9 +5013,12 @@ impl PinnedObjects {
             self.raw_to_id.insert(entry.raw, id);
             return Some(id);
         }
-        if !same_key.is_empty()
-            && !self.supersede_same_file_generation(key, &same_key, &entry, incoming_scan_only)
-        {
+        if !same_key.is_empty() {
+            if let Some(id) =
+                self.rotate_same_file_generation(key, &same_key, entry, incoming_scan_only)
+            {
+                return Some(id);
+            }
             // Group rejection: two proven entries contradict under one
             // key. The only rejection that marks a proven collision.
             self.reject_key(key);
@@ -5062,12 +5066,10 @@ impl PinnedObjects {
     }
 
     /// Evicts every unproven entry under `key` with full custody (ids,
-    /// raws, ownership, claims, proven targets): shared by rejection
-    /// (which then poisons the key) and supersede (which files the
-    /// fresh generation instead). Returns whether anything was
-    /// evicted. A witness-proven pre-copy-up observation stands on its
-    /// own file: a carried rejection, a sibling's forgery — or a
-    /// rotation, which never involves one — never nukes it. Only
+    /// raws, ownership, claims, proven targets) for rejection (which
+    /// then poisons the key). Returns whether anything was evicted. A
+    /// witness-proven pre-copy-up observation stands on its own file:
+    /// a carried rejection or a sibling's forgery never nukes it. Only
     /// unproven entries under the key are removed; their raws,
     /// ownership and claims go with them exactly as before, while the
     /// kept pre's raws stay routable.
@@ -5101,59 +5103,73 @@ impl PinnedObjects {
         !ids.is_empty()
     }
 
-    /// Whether `entry` supersedes every observation kept under `key`:
-    /// a same-file generation rotation (stepped ctime, identical
-    /// bytes, same observation path) with a live scan on one side.
-    /// Evicts the stale entries, records the rotation, and returns
-    /// true; the caller then files `entry` through the fresh-insert
-    /// path, so the key stays routable and the attach races on. A
-    /// false return keeps today's rejection. The merge above already
-    /// failed, and the predicate pins every merge conjunct (mapping,
-    /// fd device, digest, inode uniqueness) plus the observation path,
-    /// so a firing arm always rotates the pin in place — never across
-    /// a rename, which keeps failing closed through the collision path.
-    fn supersede_same_file_generation(
+    /// Rotate the pin in place when `entry` re-observes the single
+    /// observation kept under `key` at a newer generation: same kernel
+    /// file, equal hashed bytes, same mount view and observation path,
+    /// strictly newer ctime, a live scan on one side. The kept id
+    /// survives with the fresh pin and the merged raws, so live views
+    /// keep routing and no slot retires; the rotation is recorded.
+    /// Returns the kept id. A stale look (same shape, older ctime)
+    /// merges its raw silently without rotating. Anything else keeps
+    /// today's rejection (`None`).
+    fn rotate_same_file_generation(
         &mut self,
         key: ObjectKey,
         same_key: &[PinnedObjectId],
-        entry: &Entry,
+        entry: Entry,
         incoming_scan_only: bool,
-    ) -> bool {
-        // Only a live scan supersedes: two point-in-time proofs
+    ) -> Option<PinnedObjectId> {
+        // Only a live scan rotates: two point-in-time proofs
         // disagreeing (a second staging — the drain never produces
-        // one) fail closed, like today.
+        // one) fail closed, like today. In-place rotation needs a
+        // unique target; several kept identities fail closed too.
         let scan_involved = incoming_scan_only
             || same_key.iter().any(|id| {
                 self.by_id
                     .get(id)
                     .is_some_and(|kept| kept.raw.mount_namespace.is_some())
             });
-        if !scan_involved || entry.pre_copy_up {
-            return false;
+        if !scan_involved || entry.pre_copy_up || same_key.len() != 1 {
+            return None;
         }
-        // Unanimity: every kept observation must be the same kernel
-        // file with the same hashed bytes under the same mount view
-        // and observation path. A rewrite, a distinct file, an
-        // unhashed, cross-view or moved-path side, or a proven pre
-        // fails closed instead.
-        let rotation = !same_key.is_empty()
-            && same_key.iter().all(|id| {
-                self.by_id.get(id).is_some_and(|kept| {
-                    !kept.pre_copy_up
-                        && !kept.sha256.is_empty()
-                        && kept.sha256 == entry.sha256
-                        && kept.mapping == entry.mapping
-                        && kept.fd_dev == entry.fd_dev
-                        && kept.raw.path == entry.raw.path
-                        && same_kernel_file(&kept.file, &entry.file)
-                })
-            });
+        let kept_id = same_key[0];
+        // The kept observation must be the same kernel file with the
+        // same hashed bytes under the same mount view and observation
+        // path. A rewrite, a distinct file, an unhashed, cross-view or
+        // moved-path side, or a proven pre fails closed instead.
+        let rotation = self.by_id.get(&kept_id).is_some_and(|kept| {
+            !kept.pre_copy_up
+                && !kept.sha256.is_empty()
+                && kept.sha256 == entry.sha256
+                && kept.mapping == entry.mapping
+                && kept.fd_dev == entry.fd_dev
+                && kept.raw.path == entry.raw.path
+                && same_kernel_file(&kept.file, &entry.file)
+        });
         if !rotation {
-            return false;
+            return None;
         }
-        self.evict_key_entries(key);
+        // Recency: only a strictly newer observation rotates the pin.
+        // A stale look merges its raw onto the kept entry silently.
+        let newer = self
+            .by_id
+            .get(&kept_id)
+            .is_some_and(|kept| kept.pin.ctime < entry.pin.ctime);
+        if !newer {
+            self.raw_to_id.insert(entry.raw, kept_id);
+            return Some(kept_id);
+        }
+        // Membership is unchanged (same ids), so the revision fence
+        // stands still; the copy-version fence bumped at insert entry.
+        if let Some(kept) = self.by_id.get_mut(&kept_id) {
+            kept.pin = entry.pin;
+            if let Some(now) = crate::attach::monotonic_ns() {
+                kept.last_ok_ns.set(Some(now));
+            }
+        }
+        self.raw_to_id.insert(entry.raw, kept_id);
         self.superseded_keys.insert(key);
-        true
+        Some(kept_id)
     }
 
     /// Records another member of a group that is already known only as rejected.
@@ -5685,6 +5701,7 @@ mod conservative_copy {
         ProvenCollision,
         Ambiguous,
         Published,
+        Superseded,
         ApplyRejected,
         Publish,
         Ready,
@@ -6313,6 +6330,7 @@ mod conservative_copy {
                 Phase::ProvenCollision => &source.proven_collision_keys,
                 Phase::Ambiguous => &source.ambiguous_keys,
                 Phase::Published => &source.ambiguity_published,
+                Phase::Superseded => &source.superseded_keys,
                 Phase::ApplyRejected => &selection.rejected,
                 _ => return Err(GraphRefusal::Identity),
             };
@@ -6331,6 +6349,9 @@ mod conservative_copy {
                     Phase::Published => {
                         self.output_mut()?.ambiguity_published.insert(key);
                     }
+                    Phase::Superseded => {
+                        self.output_mut()?.superseded_keys.insert(key);
+                    }
                     _ => return Err(GraphRefusal::Identity),
                 }
                 if self.phase == Phase::ApplyRejected && source.rejected_keys.contains(&key) {
@@ -6341,7 +6362,8 @@ mod conservative_copy {
                     Phase::Rejected => Phase::ProvenCollision,
                     Phase::ProvenCollision => Phase::Ambiguous,
                     Phase::Ambiguous => Phase::Published,
-                    Phase::Published => Phase::ApplyRejected,
+                    Phase::Published => Phase::Superseded,
+                    Phase::Superseded => Phase::ApplyRejected,
                     _ => Phase::Publish,
                 });
             }
@@ -6560,6 +6582,7 @@ mod conservative_copy {
                 | Phase::ProvenCollision
                 | Phase::Ambiguous
                 | Phase::Published
+                | Phase::Superseded
                 | Phase::ApplyRejected => self.advance_sets(source, selection)?,
                 Phase::Publish => {
                     let next = next_set(
@@ -20578,25 +20601,29 @@ mod tests {
         // file, one mount): align the forged mount ids.
         let staged_mapping = acc.by_id.values().next().unwrap().mapping;
         scan.by_id.values_mut().next().unwrap().mapping = staged_mapping;
+        let kept = acc.pinned().next().unwrap().id;
         let skipped = acc.absorb(scan);
         assert!(!acc.rejects(key), "a touched file is not a collision");
         assert!(acc.supersedes(key), "the rotation is recorded");
         assert!(skipped.is_empty(), "supersede files no skip: {skipped:?}");
         assert_eq!(acc.pinned().count(), 1, "the fresh generation routes");
+        assert!(acc.by_id.contains_key(&kept), "the id is stable");
         let routed = acc
             .sweep_match_keys()
             .get(&key)
             .copied()
             .expect("the key routes the fresh pin");
+        assert_eq!(routed, kept, "the sweep routes the kept id");
         assert_eq!(
             acc.by_id.get(&routed).unwrap().pin.test_parts().2,
             (2, 7),
             "generation 2 is kept"
         );
-        assert_eq!(acc.raw_to_id.len(), 1, "the stale raw is gone");
-        let (raw, owner) = acc.raw_to_id.iter().next().unwrap();
-        assert!(raw.mount_namespace.is_some(), "only the scan raw survives");
-        assert_eq!(*owner, routed, "the scan raw owns the fresh pin");
+        assert_eq!(
+            acc.raw_to_id.values().filter(|id| **id == kept).count(),
+            2,
+            "staged and scan raws share the kept id"
+        );
     }
 
     #[test]
@@ -20844,6 +20871,10 @@ mod tests {
             (2, 7),
             "the pin rotates in place"
         );
+        assert!(
+            acc.by_id.get(&kept).unwrap().last_ok_ns.get().is_some(),
+            "the rotation re-stamps the proof"
+        );
         assert_eq!(
             acc.raw_to_id.get(&kept_raw),
             Some(&kept),
@@ -21032,6 +21063,34 @@ mod tests {
         let skipped = acc.absorb(rotated);
         assert!(skipped.is_empty(), "{skipped:?}");
         assert!(acc.supersedes(key), "the marker carries through absorb");
+    }
+
+    #[test]
+    fn absorbing_rotation_with_several_kept_identities_fails_closed() {
+        // In-place rotation needs a unique target: several kept
+        // identities under one key fail closed even when every side
+        // matches (unreachable through absorb — the pair arm only files
+        // pre-involved seconds — so this crafts the shape directly).
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let mut staged = prearm_pin(key, "aaaaaaaa", 1);
+        reback(&mut staged, &file);
+        let mut acc = PinnedObjects::empty();
+        assert!(acc.absorb(staged).is_empty());
+        let twin = acc.by_id.values().next().unwrap().clone();
+        acc.by_id.insert(PinnedObjectId(424242), twin);
+        let mut scan = image_pins(&[(key, "aaaaaaaa", 2)]);
+        reback(&mut scan, &file);
+        let staged_mapping = acc.by_id.values().next().unwrap().mapping;
+        scan.by_id.values_mut().next().unwrap().mapping = staged_mapping;
+        let skipped = acc.absorb(scan);
+        assert!(acc.rejects(key), "several kept identities fail closed");
+        assert!(!acc.supersedes(key), "no rotation without a unique target");
+        assert!(!skipped.is_empty(), "the rejection is disclosed");
     }
 
     #[test]

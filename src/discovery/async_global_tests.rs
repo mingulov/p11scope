@@ -2878,8 +2878,8 @@ fn remap_provider(
 }
 
 /// F1 twin (a): the most common `--system` flow. A client maps the
-/// provider, runs and exits; its pin proves the exit and no mapper is
-/// left. No call was possible, so the retire files no window, no gap
+/// provider, runs and exits; every scanned mapper exited or provably
+/// left the scope and none remains. The retire files no window, no gap
 /// row and no retired-slot count: the verdict stays COMPLETE. The retire
 /// is parked for the module, in case a mapper returns.
 #[test]
@@ -3190,6 +3190,10 @@ fn repeated_retire_cycles_stay_bounded_with_an_exact_slot_count() {
         "no retire window yet, so no folded key"
     );
     let cycles = MAX_COVERAGE_RETIRE_WINDOWS_PER_MODULE + 4;
+    // Pin once against the live child and reuse clones: the view and
+    // its modules never change across cycles, and every re-pin is a
+    // load race against the child exiting mid-discovery.
+    let pinned_once = pin_test_modules(&engine.views[0], &modules);
     for cycle in 0..cycles {
         let one = engine
             .plan
@@ -3200,7 +3204,7 @@ fn repeated_retire_cycles_stay_bounded_with_an_exact_slot_count() {
             .expect("module one has live cover");
         session.scripted_stamps.insert(one.index, 1);
         let mut pins = engine.pinned.clone();
-        let skipped = pins.absorb(pin_test_modules(&engine.views[0], &modules));
+        let skipped = pins.absorb(pinned_once.clone());
         let mut retire = engine
             .live_candidate(pins, modules.to_vec(), skipped)
             .unwrap();
@@ -3211,7 +3215,7 @@ fn repeated_retire_cycles_stay_bounded_with_an_exact_slot_count() {
             .unwrap();
         assert!(!engine.plan.is_active(one.index), "cycle {cycle}: retired");
         let mut pins = engine.pinned.clone();
-        let skipped = pins.absorb(pin_test_modules(&engine.views[0], &modules));
+        let skipped = pins.absorb(pinned_once.clone());
         let revive = engine
             .live_candidate(pins, modules.to_vec(), skipped)
             .unwrap();
@@ -3544,6 +3548,328 @@ fn cgroup_refresh_listed_dead_pid_departs_without_a_window() {
     assert_eq!(engine.coverage_retired_slots(), 0);
     assert!(!retire_skip_filed(&engine));
     assert_eq!(engine.coverage_retire_parked(), retired);
+}
+
+/// Probe SoftHSM (Debian then Fedora paths); panic loudly when absent —
+/// the B1 refresh twins need a real provider the real scan decodes,
+/// never a skip.
+fn b1_softhsm_path() -> std::path::PathBuf {
+    for candidate in [
+        "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so",
+        "/usr/lib64/pkcs11/libsofthsm2.so",
+    ] {
+        let path = std::path::PathBuf::from(candidate);
+        if path.is_file() {
+            return path;
+        }
+    }
+    panic!("SoftHSM not installed (probed Debian and Fedora paths)");
+}
+
+/// A long-lived holder mapping the real SoftHSM provider (no calls,
+/// just the mapping): `python3 -c` loads it with ctypes, then sleeps.
+/// Returns the child once `libsofthsm2.so` is visible in its maps.
+fn b1_softhsm_holder() -> std::process::Child {
+    let mut child = std::process::Command::new("python3")
+        .args([
+            "-c",
+            "import ctypes, sys, time; ctypes.CDLL(sys.argv[1]); time.sleep(30)",
+        ])
+        .arg(b1_softhsm_path())
+        .die_with_parent()
+        .spawn()
+        .expect("spawn the SoftHSM holder");
+    let pid = child.id();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let maps =
+            std::fs::read_to_string(format!("/proc/{pid}/maps")).expect("read the holder maps");
+        if maps.contains("libsofthsm2.so") {
+            return child;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the holder never mapped SoftHSM"
+        );
+        assert!(
+            child.try_wait().expect("poll the holder").is_none(),
+            "the holder exited before mapping SoftHSM"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// Tick 0 of the B1 refresh twins: admit the first SoftHSM holder
+/// through the real refresh path. Returns the engine, the reused
+/// session, the live scope dir, the attached module ids, the live
+/// holder (the caller kills it) and the attached endpoint count.
+fn cgroup_refresh_admit_first() -> (
+    Engine,
+    ScriptedSession,
+    tempfile::TempDir,
+    std::collections::BTreeSet<crate::plan::ModuleId>,
+    std::process::Child,
+    usize,
+) {
+    let mut engine = Engine::empty();
+    let dir = tempfile::tempdir().expect("a scope directory");
+    engine.scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
+    engine.max_scan_pids = 1024;
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    let mut session = ScriptedSession::with_records([], 0);
+    let first = b1_softhsm_holder();
+    std::fs::write(dir.path().join("cgroup.procs"), format!("{}\n", first.id()))
+        .expect("a cgroup.procs");
+    cgroup_refresh_until_cover(&mut engine, &mut session);
+    assert!(
+        engine.views.iter().any(|view| view.pid() == first.id()),
+        "premise: tick 0 admitted the first holder"
+    );
+    let attached: Vec<u32> = engine
+        .plan
+        .slots
+        .iter()
+        .filter(|slot| engine.plan.is_active(slot.index))
+        .map(|slot| slot.index)
+        .collect();
+    assert!(
+        !attached.is_empty(),
+        "premise: tick 0 attached the provider"
+    );
+    let retired: std::collections::BTreeSet<crate::plan::ModuleId> =
+        engine.plan.slots[0].module_ids.iter().copied().collect();
+    assert!(!retired.is_empty(), "premise: the slot names its module");
+    let endpoints = attached.len();
+    for slot in attached {
+        session.scripted_stamps.entry(slot).or_insert(1);
+    }
+    (engine, session, dir, retired, first, endpoints)
+}
+
+/// Tick 1 of the B1 refresh twins: the only mapper exits and the real
+/// refresh path parks its zero-mapper retire (no window, no row, no
+/// count). Returns the engine, the reused session, the live scope dir
+/// (kept alive for later ticks), the retired module ids and the
+/// retired endpoint count.
+fn cgroup_refresh_park() -> (
+    Engine,
+    ScriptedSession,
+    tempfile::TempDir,
+    std::collections::BTreeSet<crate::plan::ModuleId>,
+    usize,
+) {
+    let (mut engine, mut session, dir, retired, mut first, endpoints) =
+        cgroup_refresh_admit_first();
+    first.kill().unwrap();
+    first.wait().unwrap();
+    std::fs::write(dir.path().join("cgroup.procs"), String::new()).expect("a cgroup.procs");
+    refresh_inventory_with(&mut engine, &mut session);
+    assert!(
+        engine.views.is_empty(),
+        "premise: the refresh retired the only view"
+    );
+    assert!(
+        engine
+            .plan
+            .slots
+            .iter()
+            .all(|slot| !engine.plan.is_active(slot.index)),
+        "premise: the refresh retired the provider's live slots"
+    );
+    assert!(
+        engine.coverage_retire_windows().is_empty(),
+        "premise: the zero-mapper retire parked"
+    );
+    assert_eq!(
+        engine.coverage_retire_parked(),
+        retired,
+        "premise: parked for its module"
+    );
+    (engine, session, dir, retired, endpoints)
+}
+
+/// Refresh until the provider has live cover again (bounded):
+/// newcomer admission pipelines over ticks (a scan can defer a tick),
+/// so the B1 twins wait for the re-attach they assert about instead
+/// of assuming its tick. Fails loudly when cover never returns.
+fn cgroup_refresh_until_cover(engine: &mut Engine, session: &mut ScriptedSession) {
+    for _ in 0..6 {
+        refresh_inventory_with(engine, session);
+        if engine
+            .plan
+            .slots
+            .iter()
+            .any(|slot| engine.plan.is_active(slot.index))
+        {
+            return;
+        }
+    }
+    panic!("cover never returned within 6 ticks");
+}
+
+/// B1 twin (1): a parked retire plus a same-tick admit and re-attach
+/// through the real refresh path (the mapper rides only as an
+/// extra_view: its scans commit in the apply but its view joins
+/// `self.views` after it). The post-push settlement promotes the park
+/// to one window from the detach instant, closed at the re-attach,
+/// with the row and an exact endpoint count — and a later idle tick
+/// leaves its end untouched. Regression twin: on success-path ticks
+/// the loader-arm follow-up promotes even without the post-push
+/// settlement, so this pins the contract, not the fix's red path; the
+/// fix covers the tick without a follow-up (additions blocked, frame
+/// exhausted), which no deterministic test constructs.
+#[test]
+fn cgroup_refresh_admit_and_reattach_promotes_parked_retire_closed_at_reattach() {
+    let (mut engine, mut session, dir, retired, endpoints) = cgroup_refresh_park();
+    let mut mapper = b1_softhsm_holder();
+    let mapper_pid = mapper.id();
+    std::fs::write(dir.path().join("cgroup.procs"), format!("{mapper_pid}\n"))
+        .expect("a cgroup.procs");
+    cgroup_refresh_until_cover(&mut engine, &mut session);
+    assert!(
+        engine.views.iter().any(|view| view.pid() == mapper_pid),
+        "premise: the refresh admitted the mapper"
+    );
+    let windows = engine.coverage_retire_windows();
+    assert_eq!(windows.len(), retired.len(), "one window: {windows:?}");
+    for window in &windows {
+        assert_eq!(
+            window.modules, retired,
+            "the window attributes to the retired module"
+        );
+        assert!(
+            window.end_ns.is_some(),
+            "the re-attach closed the window: {window:?}"
+        );
+        assert!(
+            window.end_ns.unwrap() >= window.start_ns,
+            "the window never ends before it starts: {window:?}"
+        );
+    }
+    let closed_end = windows[0].end_ns;
+    assert_eq!(
+        engine.coverage_retired_slots(),
+        endpoints as u64,
+        "every retired endpoint counted once"
+    );
+    assert!(
+        retire_skip_filed(&engine),
+        "the coverage-retired row is filed"
+    );
+    assert!(
+        engine.coverage_retire_parked().is_empty(),
+        "promotion drained the park"
+    );
+    for module in &retired {
+        assert_eq!(record_retire_windows(&engine, *module).len(), 1);
+    }
+    // An idle tick with the mapper still listed leaves the closed
+    // window untouched: its end is the re-attach, not a later apply.
+    refresh_inventory_with(&mut engine, &mut session);
+    let windows = engine.coverage_retire_windows();
+    assert_eq!(
+        windows.len(),
+        retired.len(),
+        "no second window: {windows:?}"
+    );
+    assert_eq!(windows[0].end_ns, closed_end, "the end is the re-attach");
+    mapper.kill().unwrap();
+    mapper.wait().unwrap();
+}
+
+/// B1 twin (1b): the park and the admit share one tick (the common
+/// sequential-client shape: A exits while B is already listed). The
+/// replay parks before B's scans commit, the apply admits and
+/// re-attaches B, and the post-push settlement closes the window at
+/// the re-attach.
+#[test]
+fn cgroup_refresh_same_tick_exit_and_admit_discloses_until_reattach() {
+    let (mut engine, mut session, dir, retired, mut first, endpoints) =
+        cgroup_refresh_admit_first();
+    let mut mapper = b1_softhsm_holder();
+    let mapper_pid = mapper.id();
+    first.kill().unwrap();
+    first.wait().unwrap();
+    std::fs::write(dir.path().join("cgroup.procs"), format!("{mapper_pid}\n"))
+        .expect("a cgroup.procs");
+    cgroup_refresh_until_cover(&mut engine, &mut session);
+    assert!(
+        engine.views.iter().any(|view| view.pid() == mapper_pid),
+        "premise: the refresh admitted the mapper"
+    );
+    let windows = engine.coverage_retire_windows();
+    assert_eq!(windows.len(), retired.len(), "one window: {windows:?}");
+    for window in &windows {
+        assert_eq!(window.modules, retired);
+        assert!(
+            window.end_ns.is_some(),
+            "closed at the re-attach: {window:?}"
+        );
+    }
+    assert_eq!(engine.coverage_retired_slots(), endpoints as u64);
+    assert!(retire_skip_filed(&engine));
+    assert!(engine.coverage_retire_parked().is_empty());
+    mapper.kill().unwrap();
+    mapper.wait().unwrap();
+}
+
+/// B1 twin (2): the mapper admitted in tick 2 exits before tick 3. The
+/// post-push settlement already promoted the park, so the closed
+/// window survives the exit. Tick 3 parks the mapper's own exit, like
+/// twin (a). Regression twin, same caveat as twin (1): the loader-arm
+/// follow-up promotes on success-path ticks with or without the fix.
+#[test]
+fn cgroup_refresh_short_lived_mapper_leaves_a_disclosed_window() {
+    let (mut engine, mut session, dir, retired, endpoints) = cgroup_refresh_park();
+    let mut mapper = b1_softhsm_holder();
+    let mapper_pid = mapper.id();
+    std::fs::write(dir.path().join("cgroup.procs"), format!("{mapper_pid}\n"))
+        .expect("a cgroup.procs");
+    cgroup_refresh_until_cover(&mut engine, &mut session);
+    let windows = engine.coverage_retire_windows();
+    assert_eq!(
+        windows.len(),
+        retired.len(),
+        "premise: one window: {windows:?}"
+    );
+    assert!(
+        windows[0].end_ns.is_some(),
+        "premise: closed at the re-attach: {:?}",
+        windows[0]
+    );
+    let (start_ns, end_ns) = (windows[0].start_ns, windows[0].end_ns);
+    mapper.kill().unwrap();
+    mapper.wait().unwrap();
+    std::fs::write(dir.path().join("cgroup.procs"), String::new()).expect("a cgroup.procs");
+    for slot in engine
+        .plan
+        .slots
+        .iter()
+        .map(|slot| slot.index)
+        .collect::<Vec<_>>()
+    {
+        session.scripted_stamps.entry(slot).or_insert(1);
+    }
+    refresh_inventory_with(&mut engine, &mut session);
+    let windows = engine.coverage_retire_windows();
+    assert_eq!(
+        windows.len(),
+        retired.len(),
+        "the exit left the window undisclosed or duplicated: {windows:?}"
+    );
+    assert_eq!(windows[0].start_ns, start_ns, "the detach instant is kept");
+    assert_eq!(windows[0].end_ns, end_ns, "the re-attach end is kept");
+    assert_eq!(
+        engine.coverage_retired_slots(),
+        endpoints as u64,
+        "every retired endpoint counted once"
+    );
+    assert!(retire_skip_filed(&engine));
+    assert_eq!(
+        engine.coverage_retire_parked(),
+        retired,
+        "the mapper's own exit parks like twin (a)"
+    );
 }
 
 /// A plan listing is no mapper (audit H1b, the manifest-held getter

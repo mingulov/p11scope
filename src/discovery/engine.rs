@@ -16955,6 +16955,28 @@ impl Engine {
     /// owned arm composed with same-apply reattach), on empty cover, no
     /// proven attach, or an unreadable clock. Call before any arm mutates
     /// the plan; the caller opens it once the detach commits.
+    ///
+    /// The retired-endpoint identity of one attached slot: the exact
+    /// opened identity when the object has one, else the capture-local
+    /// pin (which can only over-count, never merge two files). Shared
+    /// with the re-attach drop below so the two can never disagree on
+    /// what "the same endpoint" means.
+    fn retired_endpoint_for(
+        object: PinnedObjectId,
+        file_offset: u64,
+        pinned: &PinnedObjects,
+    ) -> crate::discovery::coverage_retire::RetiredEndpoint {
+        match pinned.owned_timing_key(object) {
+            Some(object) => crate::discovery::coverage_retire::RetiredEndpoint::Keyed {
+                object,
+                file_offset,
+            },
+            None => crate::discovery::coverage_retire::RetiredEndpoint::Pinned {
+                object,
+                file_offset,
+            },
+        }
+    }
     fn coverage_retire_snapshot(
         &self,
         session: &dyn EngineSession,
@@ -16983,16 +17005,8 @@ impl Engine {
             if session.slot_attached_at(committed.index).is_none() {
                 continue;
             }
-            let endpoint = match self.pinned.owned_timing_key(committed.object) {
-                Some(object) => crate::discovery::coverage_retire::RetiredEndpoint::Keyed {
-                    object,
-                    file_offset: committed.file_offset,
-                },
-                None => crate::discovery::coverage_retire::RetiredEndpoint::Pinned {
-                    object: committed.object,
-                    file_offset: committed.file_offset,
-                },
-            };
+            let endpoint =
+                Self::retired_endpoint_for(committed.object, committed.file_offset, &self.pinned);
             attached.push(RetireEntry {
                 index: committed.index,
                 key: plan::AttachKey::of(committed),
@@ -17162,6 +17176,35 @@ impl Engine {
             .flat_map(|slot| slot.module_ids.iter().copied())
             .collect();
         self.coverage_retire.close_revived(&active, now);
+    }
+
+    /// Endpoint identities with live cover right now (active plan
+    /// slots, through the same mapping the retire snapshot uses, so a
+    /// re-attach compares equal to its park). A pin-identified endpoint
+    /// re-pinned under a fresh id compares unequal and keeps its park
+    /// for promotion; only the key-identified production path drops.
+    fn active_covered_endpoints(
+        &self,
+    ) -> BTreeSet<crate::discovery::coverage_retire::RetiredEndpoint> {
+        self.plan
+            .slots
+            .iter()
+            .filter(|slot| self.plan.is_active(slot.index))
+            .map(|slot| Self::retired_endpoint_for(slot.object, slot.file_offset, &self.pinned))
+            .collect()
+    }
+
+    /// Drop parked retires whose every endpoint re-attached without
+    /// promotion (see `CoverageRetireLedger::drop_reattached`). Runs
+    /// where promotion just ran: the post-apply hook when the apply
+    /// admitted no out-of-band newcomers, and the refresh tick right
+    /// after it pushes its admitted newcomers.
+    fn drop_reattached_coverage_retires(&mut self) {
+        if !self.coverage_retire.has_parked() {
+            return;
+        }
+        let active = self.active_covered_endpoints();
+        self.coverage_retire.drop_reattached(&active);
     }
 
     /// Whether the scope is the whole machine: only then does a pass see
@@ -20768,6 +20811,17 @@ impl Engine {
         // including the early returns that skip the in-apply close.
         if self.promote_remapped_coverage_retires() {
             self.close_revived_coverage_windows();
+        }
+        // Parks filed above are stamped with this apply's outcome, so a
+        // park filed by a failed apply is never dropped (its detach may
+        // still have happened). A park whose endpoints all re-attached
+        // without promotion never surfaces — but only when this apply
+        // saw every newcomer it admitted: a refresh apply holds its
+        // newcomers in extra_views until the push below, so the drop
+        // waits for the post-push settlement there.
+        self.coverage_retire.settle_fresh_parks(outcome.is_ok());
+        if outcome.is_ok() && extra_views.is_empty() {
+            self.drop_reattached_coverage_retires();
         }
         outcome
     }
@@ -33830,8 +33884,10 @@ impl Engine {
                     self.settle_leader_exits_at_removal([view]);
                     if let Some(index) = self.views.iter().position(|owner| owner.id() == view) {
                         let owner = self.views.remove(index);
-                        // Ready ExpectedRemoval: the original-process pin
-                        // proved the exit (retirement_ready above).
+                        // Ready ExpectedRemoval: every scanned mapper
+                        // exited or provably left the scope — the pin
+                        // proved the exit, or a complete walk proved the
+                        // departure (the ready bypass above).
                         self.exit_proven_views.insert(view);
                         self.note_ended_loader_origin(&owner);
                         if let Some(proof) = ended {
@@ -37688,10 +37744,20 @@ impl Engine {
             // set here, so their queue ages sample now, just before the
             // tick's event drain.
             let admission_now = crate::attach::monotonic_ns();
+            let admitted_any = !admitted.is_empty();
             for (view, _, _) in admitted {
                 self.sample_newcomer_admission(view.pid(), admission_now);
                 self.views.push(view);
             }
+            // Same-tick newcomers join `self.views` only here, after the
+            // apply committed their scans: promote parked retires they
+            // map (a short-lived mapper that exits before the next tick
+            // still discloses), close what re-attached, and drop parks
+            // whose endpoints all re-attached without promotion.
+            if admitted_any && self.promote_remapped_coverage_retires() {
+                self.close_revived_coverage_windows();
+            }
+            self.drop_reattached_coverage_retires();
             self.record_cgroup_view_admissions(new_view_ids.iter().copied());
             self.coalesce_pre_admission_exits(records, &new_view_ids);
         }

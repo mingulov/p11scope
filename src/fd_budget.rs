@@ -287,6 +287,17 @@ impl FdReserveTick {
     pub(crate) fn note_opened_n(&mut self, count: u64) {
         self.opened = self.opened.saturating_add(count);
     }
+
+    /// Debit one newly parked mount-table fd: the view held no park
+    /// before its scan and holds one after. A resumed re-park nets zero
+    /// (the same fd stays held all along); a park that discarded or
+    /// completed holds nothing. Drops are never subtracted, like every
+    /// same-tick debit — the fresh snapshot bounds the drift every tick.
+    pub(crate) fn note_mount_table_park(&mut self, parked_before: bool, parked_after: bool) {
+        if !parked_before && parked_after {
+            self.note_opened();
+        }
+    }
 }
 
 /// True when the next views must wait for the next tick. Fail open: an
@@ -461,6 +472,22 @@ mod tests {
     #[test]
     fn reserve_proceeds_when_snapshot_unreadable() {
         assert!(!reserve_defers(None));
+    }
+
+    /// Healthy: only a newly parked mount-table fd debits the tick — a
+    /// resumed re-park, a discard and a no-park scan debit nothing.
+    #[test]
+    fn mount_table_park_debits_only_a_newly_parked_fd() {
+        for (before, after, debit) in
+            [(false, true, 1), (false, false, 0), (true, true, 0), (true, false, 0)]
+        {
+            let mut tick = FdReserveTick::from_counts(100, 1024);
+            tick.note_mount_table_park(before, after);
+            assert_eq!(
+                tick.opened, debit,
+                "parked {before} -> {after} debits {debit}"
+            );
+        }
     }
 
     /// Healthy: the tick snapshot counts exactly the fd directory entries

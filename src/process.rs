@@ -950,6 +950,25 @@ impl ProcessView {
         let _ = self.mount_table_parking.set(pool);
     }
 
+    /// Whether an owner granted this view mount-table parking: only a
+    /// view kept across passes holds the grant, and only a granted view
+    /// may retain a parked fd. The pin loop projects one fd of headroom
+    /// for the park a granted view may hold.
+    pub(crate) fn mount_table_parking_granted(&self) -> bool {
+        self.mount_table_parking.get().is_some()
+    }
+
+    /// Whether this view currently holds a parked mount-table read: its
+    /// open table fd plus the progress beside it, bytes charged to the
+    /// granting owner's pool. The engine debits a newly parked fd to the
+    /// tick's fd reserve after the scan.
+    pub(crate) fn has_parked_mount_table(&self) -> bool {
+        self.parked_mount_table
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+
     /// Bytes of this view's parked mount-table read, if one is parked.
     #[cfg(test)]
     pub(crate) fn parked_mount_table_bytes_for_test(&self) -> Option<u64> {
@@ -4805,6 +4824,59 @@ int main(int argc, char **argv) {
             (after.charged_bytes, after.refused),
             (before.charged_bytes, before.refused),
             "a terminal stop leases no bytes and counts no refusal"
+        );
+    }
+
+    /// Accessor twin (finding 3): the grant and slot predicates track the
+    /// view exactly — granted-but-empty, parked, and resumed states.
+    #[test]
+    fn parked_mount_table_predicates_track_grant_and_slot() {
+        let view = parking_view();
+        assert!(
+            view.mount_table_parking_granted(),
+            "a granted view reports its grant"
+        );
+        assert!(
+            !view.has_parked_mount_table(),
+            "nothing parked before the first read"
+        );
+        let witness = MountChangeWitness::new();
+        let expected = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+        assert!(
+            expected.len() as u64 > 2 * (MOUNT_LEG + 1),
+            "non-vacuous: the host table spans several legs"
+        );
+        mount_pass(&view, MOUNT_LEG, |_| false).expect_err("pass 1 parks at the leg");
+        assert!(
+            view.has_parked_mount_table(),
+            "the parked read reports its slot"
+        );
+        let mut text = None;
+        for _ in 0..(expected.len() as u64 / MOUNT_LEG + 2) {
+            match mount_pass(&view, MOUNT_LEG, |_| false) {
+                Ok(done) => {
+                    text = Some(done);
+                    break;
+                }
+                Err(_) => {}
+            }
+        }
+        let text = text.expect("the parked read completes");
+        assert!(
+            !view.has_parked_mount_table(),
+            "the completed read unparks"
+        );
+        if !witness.changed() {
+            assert_eq!(text, expected, "the resumed table is the whole table");
+        }
+        let plain = ProcessView::open(ProcessViewId(3), std::process::id()).unwrap();
+        assert!(
+            !plain.mount_table_parking_granted(),
+            "an ungranted view reports no grant"
+        );
+        assert!(
+            !plain.has_parked_mount_table(),
+            "an ungranted view never parks"
         );
     }
 

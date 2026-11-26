@@ -11895,6 +11895,14 @@ fn pin_scanned_view_objects_with(
     // opened — so the projection below tracks exactly what the
     // admission debit will charge.
     let mut scan_opens: u64 = 0;
+    // A granted view may also retain its mount-table park (one fd, at
+    // most one per view): project headroom for it on every pin, since
+    // the park lands mid-scan past the tick snapshot. Conservative by
+    // one fd for a view parked on an earlier tick (that fd is already
+    // in the snapshot): a scan-phase park this tick is
+    // indistinguishable from it, and undercounting would sneak the
+    // persistent fd past the reserve.
+    let park_extra = u64::from(view.mount_table_parking_granted());
     // Probe-local scratch (`Filing::Scratch` only): proven pins that
     // build no entries and file no rows, dropped at return.
     let mut scratch = Vec::new();
@@ -11919,8 +11927,13 @@ fn pin_scanned_view_objects_with(
         // attempted, never rejected. The admission loops defer the
         // whole view on the wait subject, so the next tick retries the
         // full scan. `None` (or an unreadable snapshot inside) never
-        // stops: fail open, exactly like the admission-level guard.
-        if crate::fd_budget::reserve_defers_next_open(reserve, scan_opens) {
+        // stops: fail open, exactly like the admission-level guard. The
+        // projection adds the granted view's park headroom, so a park
+        // the scan would retain also stops the scan first.
+        if crate::fd_budget::reserve_defers_next_open(
+            reserve,
+            scan_opens.saturating_add(park_extra),
+        ) {
             record_pin_stop(
                 &mut pinned,
                 view.id(),
@@ -31307,6 +31320,166 @@ mod tests {
             "the retry pins cleanly: {retry_skipped:?}"
         );
         assert_eq!(retry_pins.entry_count_for_test(), PINS);
+    }
+
+    /// Parked-fd decision-time twin (finding 3): a granted view's scan
+    /// projects one fd of headroom for the mount-table park it may
+    /// retain. With soft AND hard `RLIMIT_NOFILE` at 256 and blockers
+    /// holding the table to exactly one projected open above the
+    /// reserve, the scan defers whole under the named reserve gap before
+    /// attempting any open — the park never sneaks past the reserve.
+    /// Runs in an isolated child: lowering the hard limit is
+    /// process-global and irreversible.
+    #[test]
+    fn granted_scan_projects_park_headroom_and_defers_whole() {
+        const TEST: &str =
+            "discovery::identity::tests::granted_scan_projects_park_headroom_and_defers_whole";
+        if !crate::test_support::isolation::enter(TEST, "park-headroom") {
+            return;
+        }
+        const PINS: usize = 4;
+        const SOFT: u64 = 256;
+        let dir = tempfile::tempdir().unwrap();
+        let mut budget = CaptureWorkBudget::default();
+        let view = ProcessView::open_with_budget(ProcessViewId(7), std::process::id(), &mut budget)
+            .unwrap();
+        let modules = pin_wait_modules(&view, dir.path(), PINS, &mut budget);
+        let pool = crate::semantics_edge::resources::SemanticResourcePool::default();
+        view.grant_mount_table_parking(pool.reserver());
+        // A tiny leg, so any attempted mountinfo read would park at
+        // its leg instead of completing.
+        let mut budget = CaptureWorkBudget::new(crate::discovery::scan::ScanLimits {
+            per_object_bytes: 10,
+            total_bytes: u64::MAX,
+        });
+        let current = crate::test_support::isolation::FdLimitGuard::current();
+        assert!(
+            current.rlim_max >= SOFT,
+            "the box must allow a 256 hard fd limit for the park-headroom child"
+        );
+        let _limit = crate::test_support::isolation::FdLimitGuard::lower_both(SOFT);
+        // The exact boundary: one projected pin-open of headroom fits,
+        // but the park headroom on top breaches.
+        let target_open = SOFT - crate::fd_budget::FD_RESERVE - 1;
+        let mut blockers = Vec::new();
+        loop {
+            let open = crate::fd_budget::open_fd_count_in(std::path::Path::new("/proc/self/fd"))
+                .expect("a readable count while holding blockers") as u64;
+            assert!(
+                open <= target_open,
+                "ambient fds already past the {target_open} target: {open}"
+            );
+            if open == target_open {
+                break;
+            }
+            blockers.push(
+                std::fs::File::open("/dev/null").expect("a blocker must open below the target"),
+            );
+        }
+        let tick = crate::fd_budget::FdReserveTick::sample().expect("a readable snapshot");
+        assert!(
+            !crate::fd_budget::reserve_defers(Some(&tick)),
+            "the blocked table still admits the scan"
+        );
+        let (pins, skipped) =
+            pin_scanned_view_objects_with_reserve(&view, &modules, &mut budget, Some(&tick))
+                .unwrap();
+        assert_eq!(
+            pins.entry_count_for_test(),
+            0,
+            "the scan stops before any open: {skipped:?}"
+        );
+        assert_eq!(skipped.len(), PINS, "every pin waits: {skipped:?}");
+        assert!(
+            skipped.iter().all(|skip| skip.subject == PIN_WAIT_SUBJECT),
+            "the waits file the defer-whole subject: {skipped:?}"
+        );
+        assert!(
+            skipped
+                .iter()
+                .all(|skip| skip.reason.contains(PIN_RESERVE_STOP_DETAIL)),
+            "the waits name the pre-emptive reserve stop: {skipped:?}"
+        );
+        assert_eq!(
+            view.parked_mount_table_bytes_for_test(),
+            None,
+            "no park sneaks past the reserve"
+        );
+        assert!(
+            pins.rejected_keys.is_empty(),
+            "waited keys are never rejected: {:?}",
+            pins.rejected_keys
+        );
+    }
+
+    /// Control for the park-headroom twin: with one more fd of headroom
+    /// the same scan attempts its reads and parks at the tiny leg, so
+    /// the deferral above is the reserve gate, not an inability to park.
+    #[test]
+    fn granted_scan_with_park_headroom_parks_at_the_leg() {
+        const TEST: &str =
+            "discovery::identity::tests::granted_scan_with_park_headroom_parks_at_the_leg";
+        if !crate::test_support::isolation::enter(TEST, "park-control") {
+            return;
+        }
+        const PINS: usize = 4;
+        const SOFT: u64 = 256;
+        let dir = tempfile::tempdir().unwrap();
+        let mut budget = CaptureWorkBudget::default();
+        let view = ProcessView::open_with_budget(ProcessViewId(7), std::process::id(), &mut budget)
+            .unwrap();
+        let modules = pin_wait_modules(&view, dir.path(), PINS, &mut budget);
+        let pool = crate::semantics_edge::resources::SemanticResourcePool::default();
+        view.grant_mount_table_parking(pool.reserver());
+        let mut budget = CaptureWorkBudget::new(crate::discovery::scan::ScanLimits {
+            per_object_bytes: 10,
+            total_bytes: u64::MAX,
+        });
+        let current = crate::test_support::isolation::FdLimitGuard::current();
+        assert!(
+            current.rlim_max >= SOFT,
+            "the box must allow a 256 hard fd limit for the park-control child"
+        );
+        let _limit = crate::test_support::isolation::FdLimitGuard::lower_both(SOFT);
+        let target_open = SOFT - crate::fd_budget::FD_RESERVE - 2;
+        let mut blockers = Vec::new();
+        loop {
+            let open = crate::fd_budget::open_fd_count_in(std::path::Path::new("/proc/self/fd"))
+                .expect("a readable count while holding blockers") as u64;
+            assert!(
+                open <= target_open,
+                "ambient fds already past the {target_open} target: {open}"
+            );
+            if open == target_open {
+                break;
+            }
+            blockers.push(
+                std::fs::File::open("/dev/null").expect("a blocker must open below the target"),
+            );
+        }
+        let tick = crate::fd_budget::FdReserveTick::sample().expect("a readable snapshot");
+        let (pins, skipped) =
+            pin_scanned_view_objects_with_reserve(&view, &modules, &mut budget, Some(&tick))
+                .unwrap();
+        assert!(
+            view.parked_mount_table_bytes_for_test().is_some(),
+            "the tiny leg parks"
+        );
+        assert!(
+            skipped.iter().all(|skip| skip.subject != PIN_WAIT_SUBJECT),
+            "nothing waits on the reserve gate: {skipped:?}"
+        );
+        assert!(
+            skipped.iter().all(|skip| skip
+                .reason
+                .contains(crate::discovery::scan::MOUNTINFO_RESUME_REASON)),
+            "every pin names the leg it parked at: {skipped:?}"
+        );
+        assert!(
+            pins.rejected_keys.is_empty(),
+            "parked reads reject nothing: {:?}",
+            pins.rejected_keys
+        );
     }
 
     /// View-collapse fix8 F2 (blocking reserve probe, kept as the

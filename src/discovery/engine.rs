@@ -10312,6 +10312,7 @@ fn discover_plan(
         // through the single `acquire()`, so one scan can no longer
         // retain past the cap; shares file no new row.
         let admits_before = discovered.handle_table.stats().admits;
+        let mount_parked_before = view.has_parked_mount_table();
         let stop_before = discovered.budget.stopped_reason();
         let scan_result = scan_and_pin_with_proof(
             &view,
@@ -10467,6 +10468,14 @@ fn discover_plan(
                 // mid-pass. Shares filed no row and hold no new fd.
                 if let Some(tick) = reserve_tick.as_mut() {
                     tick.note_opened_n(discovered.handle_table.stats().admits - admits_before);
+                    // The scan's mount-table park, if newly retained,
+                    // debits here beside the pins: the slot persists
+                    // across passes, so the next admission decision must
+                    // see it the same tick.
+                    tick.note_mount_table_park(
+                        mount_parked_before,
+                        view.has_parked_mount_table(),
+                    );
                 }
                 discovered.note_scan_observed(view.id(), view.view_admission(), &found);
                 discovered.scan_inputs.insert(
@@ -36310,6 +36319,7 @@ impl Engine {
             // scan can no longer retain past the cap; shares file no
             // new row.
             let admits_before = self.handle_table.stats().admits;
+            let mount_parked_before = view.has_parked_mount_table();
             let cancel = self.cancel_flag.as_deref();
             let (scan_result, mut counters) = Self::scan_retained_view(
                 &view,
@@ -36415,6 +36425,14 @@ impl Engine {
                     // and hold no new fd.
                     if let Some(tick) = reserve_tick.as_mut() {
                         tick.note_opened_n(self.handle_table.stats().admits - admits_before);
+                        // The scan's mount-table park, if newly retained,
+                        // debits here beside the pins: the slot persists
+                        // across passes, so the next admission decision
+                        // must see it the same tick.
+                        tick.note_mount_table_park(
+                            mount_parked_before,
+                            view.has_parked_mount_table(),
+                        );
                     }
                     // Provider-proven slot priority: a complete scan that
                     // proves provider-freedom yields the last free slot

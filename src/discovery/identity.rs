@@ -2054,7 +2054,9 @@ pub struct PinnedObjects {
     next_id: u32,
     /// Sticky proof loss from either accepted scan-only overlay heuristic.
     overlay_uncertain: bool,
-    /// Latched by `check_unchanged` the first time any pin differs.
+    /// Sticky history, latched by `check_unchanged` the first time any pin
+    /// differs: the report's provider-changed evidence. Never the live
+    /// identity gate (`check_unchanged` judges the pins as they are now).
     changed: std::cell::Cell<bool>,
     /// Membership revision (B2): bumped on every pin-set membership change
     /// (inserts, removals, absorbs, replaces, binds). The run loop's
@@ -2970,13 +2972,13 @@ impl PinnedObjects {
         })
     }
 
+    /// Custody of one pinned object, judged on that object's pin as it is
+    /// now (the held-fd check below), never on the set's sticky history: a
+    /// re-proved rotation retains, a stale pin refuses.
     pub(crate) fn retain_inventory_target(
         &self,
         id: PinnedObjectId,
     ) -> Result<RetainedInventoryTarget, String> {
-        if self.provider_changed() {
-            return Err("provider changed before Inventory target retention".into());
-        }
         let entry = self
             .by_id
             .get(&id)
@@ -4705,25 +4707,31 @@ impl PinnedObjects {
         })
     }
 
-    /// `Ok(true)` when every pinned object still has the `(ino, size, ctime)` seen
-    /// at pinning; `Ok(false)` when any changed (sticky: once seen, every later
-    /// call is `Ok(false)` without re-checking); `Err` only when `fstat` itself fails.
-    /// Success advances every checked object's `last_ok_ns`; the first
-    /// detected change records the same per-object evidence a targeted
-    /// check would, so both paths agree on the bracket.
+    /// `Ok(true)` when every object pinned now still has its pin's
+    /// `(ino, size, ctime)`; `Ok(false)` when any differs; `Err` only when
+    /// `fstat` itself fails. The live identity gate: it judges the pins as
+    /// they are now on every call, never the sticky history. A detected
+    /// change latches the history ([`Self::provider_changed`]) and the
+    /// object's bracket, but an in-place rotation that re-proves a touched
+    /// file's same bytes under its fresh ctime passes again, and a changed
+    /// object that left the set stops counting. A stale pin keeps refusing
+    /// on every call: user space cannot set a ctime back. Success advances
+    /// `last_ok_ns` only for objects never seen changed, and the first
+    /// detection's bracket stays, so both paths agree on the evidence.
     pub fn check_unchanged(&self) -> Result<bool, String> {
-        if self.changed.get() {
-            return Ok(false);
-        }
         for entry in self.by_id.values() {
             let before = crate::attach::monotonic_ns();
             if pin_of(&entry.file).map_err(|e| format!("{}: {e}", entry.path))? != entry.pin {
-                entry.changed.set(true);
-                entry.detected_ns.set(crate::attach::monotonic_ns());
+                if !entry.changed.get() {
+                    entry.changed.set(true);
+                    entry.detected_ns.set(crate::attach::monotonic_ns());
+                }
                 self.changed.set(true);
                 return Ok(false);
             }
-            entry.last_ok_ns.set(before);
+            if !entry.changed.get() {
+                entry.last_ok_ns.set(before);
+            }
         }
         Ok(true)
     }
@@ -4756,8 +4764,9 @@ impl PinnedObjects {
 
     /// Per-object held-fd `(ino, size, ctime)` check (packet 6.13, R2-D1-8):
     /// `Ok(true)` when this one object still matches its pin. Unlike the
-    /// all-objects sticky bool, this attributes a change to one module.
-    /// Success advances that object's `last_ok_ns`; detection latches
+    /// all-objects gate, this attributes a change to one module and stays
+    /// sticky per object (a watch's coverage ended at the change, whatever
+    /// re-proof follows). Success advances that object's `last_ok_ns`; detection latches
     /// sticky per-object evidence (and the global flag, so changed-byte
     /// refusal keeps precedence whatever checked first).
     pub fn check_object_unchanged(&self, id: PinnedObjectId) -> Result<bool, String> {
@@ -20768,6 +20777,40 @@ mod tests {
             "repeated detections keep the first bracket"
         );
         assert!(acc.provider_changed());
+    }
+
+    /// Target custody follows the same gate: a stale pin refuses its
+    /// retention, and once a rotation re-proves it the object retains
+    /// again even though the set's history stays latched (the counter and
+    /// selected attach paths need this custody to attach at all).
+    #[test]
+    fn retain_inventory_target_judges_the_object_as_it_is_now() {
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (staged, path, file) = staged_real_pin(&dir, "provider.so", key);
+        let mut acc = PinnedObjects::empty();
+        assert!(acc.absorb(staged).is_empty());
+        let kept = acc.pinned().next().unwrap().id;
+        assert!(
+            acc.retain_inventory_target(kept).is_ok(),
+            "a fresh pin retains"
+        );
+        step_mtime(&path, 1_000_000);
+        assert_eq!(acc.check_unchanged(), Ok(false));
+        assert!(
+            acc.retain_inventory_target(kept).is_err(),
+            "a stale pin refuses custody"
+        );
+        let scan = rotating_scan_for(&acc, key, &file);
+        assert!(acc.absorb(scan).is_empty());
+        assert!(acc.provider_changed(), "the history stays latched");
+        let retained = acc
+            .retain_inventory_target(kept)
+            .expect("the re-proved pin retains");
+        assert_eq!(retained.check_unchanged(), Ok(true));
     }
 
     /// A changed object that left the set (here: a rewrite under the same

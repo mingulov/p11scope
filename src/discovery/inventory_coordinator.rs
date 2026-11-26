@@ -6591,6 +6591,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 _ => None,
             })
             .collect();
+        // Fold room, once per pass: rows that cannot tombstone will
+        // fold, so pre-evict for exactly those (plus any overhang)
+        // with one window of probes; the due loop then only inserts.
+        let folds_expected = due.len().saturating_sub(
+            self.pair_prune_cap
+                .saturating_sub(self.pair_dropped_tombstones.len()),
+        );
+        self.preevict_folded_room(folds_expected, gone_memo);
         for key in due {
             let Some(PairTarget::Dropped {
                 base,
@@ -6627,7 +6635,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 );
             } else {
                 self.pair_prune_overflow = self.pair_prune_overflow.saturating_add(1);
-                self.remember_folded_pair(key, pid, base, now_ns, gone_memo);
+                self.remember_folded_pair(key, pid, base, now_ns);
             }
         }
         // Age drain: a tombstone past the keep window leaves the map
@@ -7058,57 +7066,94 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         );
     }
 
-    /// Remember one cap-folded dropped pair for its revival, bounded
-    /// by the tombstone bound: a gone-task fold evicts first and
-    /// silently (a gone task cannot revive, and its fold is already
-    /// counted), otherwise the oldest scanned live fold drops with a
-    /// counted overflow that names the limit. One bounded scan.
-    fn remember_folded_pair(
+    /// Pre-evict room for this pass's folded rows, once per pass: one
+    /// snapshot sorted oldest-first, one rotated window of liveness
+    /// probes (gone folds leave silently), then the oldest visited
+    /// folds leave counted-and-latched until the shortfall is
+    /// covered — all without further probes. Unvisited folds wait
+    /// for the next pass's rotation; the due loop below only
+    /// inserts. Quiet passes (no shortfall) skip the sweep entirely:
+    /// no snapshot, no probes. The shortfall assumes every expected
+    /// fold grows the map, so a pass that also tombstones rebound
+    /// keys may over-evict slightly — every eviction is still
+    /// counted, never silent.
+    fn preevict_folded_room(
         &mut self,
-        key: PairKey,
-        pid: u32,
-        base: u64,
-        now_ns: u64,
+        folds_expected: usize,
         gone_memo: &mut HashMap<u32, bool>,
     ) {
+        let shortfall = self
+            .pair_folded
+            .len()
+            .saturating_add(folds_expected)
+            .saturating_sub(self.pair_prune_cap);
+        if shortfall == 0 {
+            return;
+        }
+        // Total order even for small maps: pops below take the oldest
+        // first, and rotation windows are stamp-ordered too.
+        let mut candidates: Vec<(PairKey, u64, u32)> = self
+            .pair_folded
+            .iter()
+            .map(|(candidate, folded)| (*candidate, folded.folded_since, folded.pid))
+            .collect();
+        candidates.sort_by_key(|a| (a.1, a.2));
+        let (start, end) =
+            Self::rotate_sweep_window(&mut candidates, &mut self.pair_fold_evict_cursor);
+        let source = self.adapter.source();
+        let mut gone_victims = Vec::new();
+        for (candidate, _, candidate_pid) in &candidates[start..end] {
+            if Self::tombstone_owner_gone(gone_memo, source, *candidate_pid) {
+                gone_victims.push(*candidate);
+            }
+        }
+        for victim in &gone_victims {
+            self.pair_folded.remove(victim);
+        }
+        // Silent evictions may have covered the shortfall; otherwise
+        // the oldest visited folds leave counted-and-latched (an
+        // impossible revival stays impossible), oldest first, without
+        // new probes — then unvisited oldest-first, same counting.
+        let mut shortfall = self
+            .pair_folded
+            .len()
+            .saturating_add(folds_expected)
+            .saturating_sub(self.pair_prune_cap);
+        for pos in (start..end).chain(0..start).chain(end..candidates.len()) {
+            if shortfall == 0 {
+                break;
+            }
+            let (victim, _, _) = candidates[pos];
+            if self.pair_folded.remove(&victim).is_none() {
+                continue;
+            }
+            self.pair_fold_memory_overflow =
+                self.pair_fold_memory_overflow.saturating_add(1);
+            self.pair_fold_lost.insert(PairFoldLatchKey {
+                domain: victim.image.domain(),
+                image: victim.image,
+                object: victim.object,
+            });
+            shortfall -= 1;
+        }
+    }
+
+    /// Remember one aggregate-folded dropped pair for its revival.
+    /// Room was pre-evicted once per pass before the due loop; the
+    /// fallback below only fires if prediction drifted, so the map
+    /// holds its bound by construction either way. Never probes: all
+    /// liveness for the pass happened in the pre-eviction window.
+    fn remember_folded_pair(&mut self, key: PairKey, pid: u32, base: u64, now_ns: u64) {
         if self.pair_folded.len() >= self.pair_prune_cap {
-            let mut candidates: Vec<(PairKey, u64, u32)> = self
-                .pair_folded
-                .iter()
-                .map(|(candidate, folded)| (*candidate, folded.folded_since, folded.pid))
-                .collect();
-            let (start, end) =
-                Self::rotate_sweep_window(&mut candidates, &mut self.pair_fold_evict_cursor);
-            let source = self.adapter.source();
-            let mut gone_victims = Vec::new();
-            for (candidate, _, candidate_pid) in &candidates[start..end] {
-                if Self::tombstone_owner_gone(gone_memo, source, *candidate_pid) {
-                    gone_victims.push(*candidate);
-                }
-            }
-            for victim in &gone_victims {
-                self.pair_folded.remove(victim);
-            }
-            // No gone task in the window: the oldest unvisited fold
-            // leaves, counted, and latches its class — a later
-            // revival with no fold memory in that class files the
-            // fold-revival gap over the outer-bound window instead of
-            // re-crediting (an impossible revival stays impossible).
-            if gone_victims.is_empty() && self.pair_folded.len() >= self.pair_prune_cap {
-                let oldest = candidates[start..end]
-                    .iter()
-                    .min_by_key(|(_, since, pid)| (*since, *pid))
-                    .map(|(victim, _, _)| *victim);
-                if let Some(victim) = oldest {
-                    self.pair_folded.remove(&victim);
-                    self.pair_fold_memory_overflow =
-                        self.pair_fold_memory_overflow.saturating_add(1);
-                    self.pair_fold_lost.insert(PairFoldLatchKey {
-                        domain: victim.image.domain(),
-                        image: victim.image,
-                        object: victim.object,
-                    });
-                }
+            if let Some(victim) = self.pair_folded.keys().next().copied() {
+                self.pair_folded.remove(&victim);
+                self.pair_fold_memory_overflow =
+                    self.pair_fold_memory_overflow.saturating_add(1);
+                self.pair_fold_lost.insert(PairFoldLatchKey {
+                    domain: victim.image.domain(),
+                    image: victim.image,
+                    object: victim.object,
+                });
             }
         }
         self.pair_folded.insert(
@@ -46440,25 +46485,40 @@ int main(void) {
                 "pass {pass}: the sweep is mid-rotation, resuming next pass"
             );
         }
-        // Rotation order: the 8 oldest folds left first, oldest first.
-        for object in 0..2 * ROWS as u32 {
+        // Rotation order: pass 1 evicted its window's oldest, pass 2
+        // resumed at the next window and evicted its oldest; the
+        // unvisited entries between them wait for the wrap.
+        for object in [0u32, 1, 2, 3] {
             assert!(
                 !native.scene.coordinator.pair_folded.contains_key(&PairKey {
                     image: DomainCookie::scripted(native.domain, 41),
                     exec: 1,
                     object,
                 }),
-                "fold object {object} (stamp at+{object}) evicted in rotation order"
+                "pass 1 evicted window-1 oldest {object}"
             );
         }
-        assert!(
-            native.scene.coordinator.pair_folded.contains_key(&PairKey {
-                image: DomainCookie::scripted(native.domain, 41),
-                exec: 1,
-                object: 2 * ROWS as u32,
-            }),
-            "younger folds stay until the rotation reaches them"
-        );
+        for object in 0u32..ROWS as u32 {
+            let object = EVER_ENUMERATED_SWEEP as u32 + object;
+            assert!(
+                !native.scene.coordinator.pair_folded.contains_key(&PairKey {
+                    image: DomainCookie::scripted(native.domain, 41),
+                    exec: 1,
+                    object,
+                }),
+                "pass 2 evicted window-2 oldest {object}"
+            );
+        }
+        for object in [4u32, 8, EVER_ENUMERATED_SWEEP as u32 + ROWS as u32] {
+            assert!(
+                native.scene.coordinator.pair_folded.contains_key(&PairKey {
+                    image: DomainCookie::scripted(native.domain, 41),
+                    exec: 1,
+                    object,
+                }),
+                "fold object {object} stays until its window comes round"
+            );
+        }
     }
 
     /// A gone task's tombstone still keeps its full window: a pass

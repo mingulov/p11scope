@@ -2973,7 +2973,8 @@ The old bounds are measurements, not a product startup SLA.
   object) key: a revival-shaped staging with no fold memory under a
   latched key files the same gap over the outer-bound window instead
   of re-crediting, then consumes the latch so later growth stages.
-  Both victim
+  Room for a pass's folds is pre-evicted once per pass with a single
+  window of probes; the due loop then only inserts. Both victim
   sweeps rotate oldest-first with a resume cursor, like the age drain,
   so a sweep that cannot finish in one pass resumes instead of
   re-scanning its head. Tombstones past the keep window

@@ -38967,6 +38967,63 @@ fn an_ended_pid_retirement_retiring_nothing_keeps_every_grouped_slot() {
     assert_eq!(session.physical_gap_summary().episodes, 0);
 }
 
+/// Twin of the refreshed-export retry: a manifest getter view whose loader
+/// arm deferred (refresh already queued) retries its getter attach instead
+/// of filing a permanent gap for a transient the re-arm resolves. Without
+/// a queued refresh it still files.
+#[test]
+fn manifest_getter_attach_with_queued_refresh_retries_without_filing_the_gap() {
+    let sleeps = e06_spawn_sleeps(1);
+    let pids: Vec<u32> = sleeps.iter().map(|sleep| sleep.pid()).collect();
+    let (mut engine, _scope) = engine_over_cgroup_naming(&pids);
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    refresh_inventory_once(&mut engine);
+    let view = engine.views[0].id();
+    let pid = engine.views[0].pid();
+    let (path, offset) = executable_file_mapping(pid);
+    let (manifest, pins) = manifest_and_pins_for(&path);
+    let mut manifest = with_getters(manifest, &[("C_GetFunctionList", 0, offset + 0x10)]);
+    manifest.surfaces.clear();
+    assert!(crate::manifest_input::is_getter_only(&manifest));
+    let _ = engine.pinned.absorb(pins);
+    engine.manifests = vec![manifest];
+    engine.manifest_ordinals = vec![0];
+    // A prior pass requested this view's loader (ungating it), but the arm
+    // deferred: no context, and the re-arm refresh is already queued.
+    engine.getter_loader_views.insert(view);
+    assert!(!engine.loader_arming_gated(view));
+    assert!(engine.loader_registry.ids_for_view(view).is_empty());
+    engine.refresh_queue.remove_for_test(&pid);
+    let mut session = ScriptedSession::default();
+    let mut additions_allowed = true;
+    let outcome =
+        engine.attach_manifest_getters(view, &mut session, &mut additions_allowed);
+    assert_eq!(outcome, (false, false, false, false));
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live manifest getter hook"
+                && skip.reason
+                    == "a manifest getter's process had no unique attached loader context"
+        }),
+        "{:?}",
+        engine.counters.object_skips
+    );
+    let filed = engine.counters.object_skips.len();
+    assert!(
+        engine.request_refresh(pid, crate::attach::monotonic_ns()),
+        "the deferred arm's re-arm request queues"
+    );
+    let outcome =
+        engine.attach_manifest_getters(view, &mut session, &mut additions_allowed);
+    assert_eq!(outcome, (false, false, true, false));
+    assert_eq!(
+        engine.counters.object_skips.len(),
+        filed,
+        "the retry files no second gap: {:?}",
+        engine.counters.object_skips
+    );
+}
+
 /// A view whose manifest getter work a closed or spent pass skipped is
 /// requested again even with no loader context (a static program's owner
 /// is view-owned); a settled view is not.
@@ -95761,6 +95818,36 @@ fn export_attach_without_context_on_a_live_group_still_files_the_gap() {
             skip.subject == "live export hook"
                 && skip.reason == "a refreshed provider had no unique attached loader context"
         }),
+        "{:?}",
+        engine.counters.object_skips
+    );
+}
+
+/// A deferred loader arm queues the view's refresh for next tick; the same
+/// tick's export attach must retry with it instead of filing a permanent
+/// gap for a condition the re-arm resolves. Filing here leaves a stale
+/// PARTIAL skip beside exact counts (metrics-cgroup flake).
+#[test]
+fn export_attach_with_queued_refresh_retries_without_filing_the_gap() {
+    let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+    let view = engine.views[0].id();
+    let pid = engine.views[0].pid();
+    engine.modules[0].scanned.exports = vec!["C_GetFunctionList".into()];
+    assert!(engine.refresh_queue.is_empty());
+    assert!(
+        engine.request_refresh(pid, crate::attach::monotonic_ns()),
+        "the deferred arm's re-arm request queues"
+    );
+    let outcome = engine.attach_refreshed_exports(view, &mut ScriptedSession::default(), &mut true);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_eq!(outcome, (false, false, true, false));
+    assert!(
+        !engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.subject == "live export hook"),
         "{:?}",
         engine.counters.object_skips
     );

@@ -3392,6 +3392,25 @@ where
     }
 }
 
+/// One retained-loop hold quantum (NB5): drains a bounded lifecycle
+/// quantum into the lane's held batches when both shared caps still
+/// have room (lifecycle plus INFO shells). True when it drained.
+fn hold_native_quantum<Pin, L>(lane: &mut NativeLane<L>, rows: usize, deadline: Instant) -> bool
+where
+    L: CaptureLane<Pin>,
+{
+    let room = lane.windows.held_records.saturating_sub(lane.held_records);
+    if room == 0 || lane.batches_held() >= lane.windows.held_batches {
+        return false;
+    }
+    let window = ReadWindow::new(rows.min(room).max(1), deadline)
+        .expect("positive room in the original held-record bound");
+    let batch = lane.drain_within(window);
+    lane.held_records += batch.records.len();
+    lane.held.push(batch);
+    true
+}
+
 /// Service an already gated, retained run for one finite cooperative slice.
 /// The same driver/coordinator must remain beside every returned owner. This
 /// never launches another collector or invents a disposition for a failed
@@ -3454,17 +3473,9 @@ where
         match run.service {
             RetainedServiceCursor::HoldNative => {
                 if let Some(RetainedNative::Live(lane)) = run.native.as_mut() {
-                    let room = lane.windows.held_records.saturating_sub(lane.held_records);
-                    if room > 0 && lane.held.len() < lane.windows.held_batches {
-                        let window = ReadWindow::new(
-                            lane.windows.discovery_records.min(room).max(1),
-                            budget.deadline.min(now + lane.windows.discovery_budget),
-                        )
-                        .expect("positive room in the original held-record bound");
-                        let batch = lane.drain_within(window);
-                        lane.held_records += batch.records.len();
-                        lane.held.push(batch);
-                    }
+                    let rows = lane.windows.discovery_records;
+                    let deadline = budget.deadline.min(now + lane.windows.discovery_budget);
+                    hold_native_quantum(lane, rows, deadline);
                 }
                 run.service = RetainedServiceCursor::ServiceNative;
                 continue;

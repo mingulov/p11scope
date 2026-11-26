@@ -6102,6 +6102,43 @@ fn d1_lifecycle_and_info_share_the_batch_cap() {
     );
 }
 
+/// NB5: the retained-loop hold quantum respects the combined
+/// lifecycle-plus-INFO shells: with the batch cap already held in
+/// INFO, it drains nothing; with room, it drains one lifecycle
+/// quantum.
+#[test]
+fn hold_native_quantum_skips_when_info_holds_the_batch_cap() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let lane = ScriptedLane::new(&log);
+    let windows = LaneWindows {
+        held_batches: 1,
+        ..windows()
+    };
+    let mut started = NativeLane::start(lane, &mut scene, windows, None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    // One INFO shell held (as a collection tick would).
+    started
+        .held_info
+        .push(InfoBatch::empty(started.capture.domain));
+    let rows = started.windows.discovery_records;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    assert!(
+        !hold_native_quantum(&mut started, rows, deadline),
+        "the combined shells already reach the cap"
+    );
+    assert!(started.held.is_empty(), "nothing drains past the cap");
+    // Healthy twin: with room, one lifecycle quantum drains.
+    started.held_info.clear();
+    started.held_records = 0;
+    assert!(
+        hold_native_quantum(&mut started, rows, deadline),
+        "room drains one quantum"
+    );
+    assert_eq!(started.held.len(), 1);
+}
+
 /// D1: ticks on a quiet capture service the INFO ring but hold no
 /// batches: empty complete quanta stay out of the held cap, so the
 /// lifecycle bounds behave exactly as before.

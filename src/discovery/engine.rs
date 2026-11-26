@@ -29074,6 +29074,22 @@ impl Engine {
             // a later pass attaches the getters under it.
             Ok(GetterOwner::AwaitLoader) => return (false, false, true, false),
             Err(reason) => {
+                // Like the refreshed-export twin below: a deferred loader
+                // arm queued this view's refresh for next tick, so retry
+                // with the re-arm instead of filing a permanent gap for a
+                // transient. Other reasons (unidentifiable loader,
+                // exhausted owner IDs) still file: those are never a
+                // deferred arm.
+                if reason == "a manifest getter's process had no unique attached loader context"
+                    && let Some(pid) = self
+                        .views
+                        .iter()
+                        .find(|candidate| candidate.id() == view)
+                        .map(ProcessView::pid)
+                    && self.refresh_queue.contains_key(&pid)
+                {
+                    return (false, false, true, false);
+                }
                 self.mark_partial("live manifest getter hook", reason);
                 return (false, false, false, false);
             }
@@ -29155,6 +29171,22 @@ impl Engine {
             if contexts.is_empty() && self.original_ending(view) {
                 self.invalidate_causal_timing();
                 return (false, true, false, false);
+            }
+            // A deferred loader arm queued this view's refresh for next
+            // tick; the re-arm resolves the missing context, so retry with
+            // it instead of filing a permanent gap for a transient. Filing
+            // here leaves a stale PARTIAL skip beside exact counts. An
+            // ambiguous pair (two attached) still files: that is never a
+            // deferred arm.
+            if contexts.is_empty()
+                && let Some(pid) = self
+                    .views
+                    .iter()
+                    .find(|candidate| candidate.id() == view)
+                    .map(ProcessView::pid)
+                && self.refresh_queue.contains_key(&pid)
+            {
+                return (false, false, true, false);
             }
             self.mark_partial(
                 "live export hook",

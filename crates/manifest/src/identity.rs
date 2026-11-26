@@ -294,12 +294,11 @@ pub fn inspect_file_with_reader_exporting(
     // catchable error, never SIGBUS. Callers keep their pin-before/after
     // discipline around this call. The digest streams over the same
     // chunks the parse accumulates, so no second pass reads the file.
-    let mut digest = Sha256::new();
-    let data = read_object_bytes_with(file, reader, &mut digest)?;
+    let (data, digest) = read_object_bytes_with(file, reader)?;
     // The shared validated parse: corrupt segment ranges refuse here, before
     // the export walk below; the executable ranges arrive validated with it.
     let (object, abi, executable_ranges) = classified_validated_object(&data)?;
-    let sha256 = hex(&digest.finalize());
+    let sha256 = hex(&digest);
     let mut note = None;
     // object reads the build-id from PT_NOTE program headers too, so a
     // stripped section table does not lose it (review finding, 2026-08-11).
@@ -348,19 +347,19 @@ pub fn inspect_file_with_reader_exporting(
 
 #[cfg(feature = "identify")]
 pub(crate) fn read_object_bytes(file: &std::fs::File) -> Result<Vec<u8>, String> {
-    read_object_bytes_with(
-        file,
-        |file, bytes, offset| file.read_at(bytes, offset),
-        &mut Sha256::new(),
-    )
+    let (data, _) =
+        read_object_bytes_with(file, |file, bytes, offset| file.read_at(bytes, offset))?;
+    Ok(data)
 }
 
+/// Reads the whole object through `reader`, returning the bytes with
+/// the SHA-256 the same chunks streamed into. Callers that only need
+/// the bytes drop the digest.
 #[cfg(feature = "identify")]
 pub(crate) fn read_object_bytes_with(
     file: &std::fs::File,
     mut reader: impl FnMut(&std::fs::File, &mut [u8], u64) -> std::io::Result<usize>,
-    digest: &mut Sha256,
-) -> Result<Vec<u8>, String> {
+) -> Result<(Vec<u8>, [u8; 32]), String> {
     let metadata = file
         .metadata()
         .map_err(|error| format!("metadata failed: {error}"))?;
@@ -371,6 +370,7 @@ pub(crate) fn read_object_bytes_with(
     let len: usize = len
         .try_into()
         .map_err(|_| "object length does not fit usize")?;
+    let mut digest = Sha256::new();
     let mut data = Vec::with_capacity(len.min(1024 * 1024));
     while data.len() < len {
         let done = data.len();
@@ -390,7 +390,7 @@ pub(crate) fn read_object_bytes_with(
         data.truncate(done + read);
         digest.update(&data[done..done + read]);
     }
-    Ok(data)
+    Ok((data, digest.finalize().into()))
 }
 
 #[cfg(feature = "identify")]
@@ -929,15 +929,11 @@ mod tests {
         let file = open_object(Path::new("/bin/sh")).unwrap();
         let len = file.metadata().unwrap().len();
         let calls = Cell::new(0);
-        let result = read_object_bytes_with(
-            &file,
-            |_, bytes, _| {
-                let call = calls.get();
-                calls.set(call + 1);
-                if call == 0 { Ok(0) } else { Ok(bytes.len()) }
-            },
-            &mut Sha256::new(),
-        );
+        let result = read_object_bytes_with(&file, |_, bytes, _| {
+            let call = calls.get();
+            calls.set(call + 1);
+            if call == 0 { Ok(0) } else { Ok(bytes.len()) }
+        });
 
         assert_eq!(calls.get(), 1, "the short-read guard stops before a retry");
         let expected = format!("short read: 0 of {len} bytes");

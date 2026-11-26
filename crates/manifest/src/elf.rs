@@ -15,7 +15,6 @@ use object::{
     Architecture, BinaryFormat, Object as _, ObjectSection as _, ObjectSegment as _,
     ObjectSymbol as _, SymbolKind, elf,
 };
-use sha2::Digest as _;
 
 const MAX_INTERPRETER_BYTES: usize = 4096;
 
@@ -930,7 +929,7 @@ impl ElfSnapshot {
         file: &std::fs::File,
         reader: impl FnMut(&std::fs::File, &mut [u8], u64) -> std::io::Result<usize>,
     ) -> Result<Self, String> {
-        let data = read_object_bytes_with(file, reader, &mut sha2::Sha256::new())?;
+        let (data, _) = read_object_bytes_with(file, reader)?;
         Self::from_data(data)
     }
 

@@ -4,7 +4,7 @@
 //! captures validated against the v0.7.1-tag schema and the current
 //! schema. See `tests/fixtures/upgrade/README.md` for provenance.
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 const SCHEMA071: &[u8] =
     include_bytes!("../tests/fixtures/upgrade/v071-observed-profile-v3.schema.json");
@@ -74,6 +74,48 @@ fn v072_documents_fail_the_old_schema() {
             "{name} fails the v0.7.1 schema (one-way break)"
         );
     }
+}
+
+/// The version-tolerant fields are all-or-none in the profile
+/// lane: v0.7.1 documents carry none, current documents carry all
+/// four, and any partial set is malformed.
+#[test]
+fn profile_version_tolerant_fields_are_all_or_none() {
+    const FIELDS: [&str; 4] = [
+        "coverage_retired_slots",
+        "member_stop_attached",
+        "member_stop_unattached",
+        "pid_descendant_gaps_admitted",
+    ];
+    let new = schema_head();
+    for held in 0..FIELDS.len() {
+        let mut singleton = document(PROFILE071);
+        singleton["evidence"][FIELDS[held]] = json!(0);
+        assert!(
+            !valid(&new, &singleton),
+            "a lone {} is malformed",
+            FIELDS[held]
+        );
+        let mut all_but_one = document(PROFILE071);
+        for (index, field) in FIELDS.iter().enumerate() {
+            if index != held {
+                all_but_one["evidence"][field] = json!(0);
+            }
+        }
+        assert!(
+            !valid(&new, &all_but_one),
+            "missing only {} is malformed",
+            FIELDS[held]
+        );
+    }
+    let mut full = document(PROFILE071);
+    for field in FIELDS {
+        full["evidence"][field] = json!(0);
+    }
+    assert!(
+        valid(&new, &full),
+        "all four fields validate (the v0.7.2 shape)"
+    );
 }
 
 /// The matrix is not vacuous: a document missing a

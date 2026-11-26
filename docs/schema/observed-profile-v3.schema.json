@@ -1188,7 +1188,13 @@
         "properties": {
           "schema": {"const": "p11scope/observed-profile/v3"},
           "evidence": {
-            "required": ["interface_selection", "attach_mechanisms", "pid_descendant_gaps", "multi_rebuild_gaps", "learned_staged_files", "learned_event_loss", "learned_cap_skipped"]
+            "required": ["interface_selection", "attach_mechanisms", "pid_descendant_gaps", "multi_rebuild_gaps", "learned_staged_files", "learned_event_loss", "learned_cap_skipped"],
+            "dependentRequired": {
+              "coverage_retired_slots": ["member_stop_attached", "member_stop_unattached", "pid_descendant_gaps_admitted"],
+              "member_stop_attached": ["coverage_retired_slots", "member_stop_unattached", "pid_descendant_gaps_admitted"],
+              "member_stop_unattached": ["coverage_retired_slots", "member_stop_attached", "pid_descendant_gaps_admitted"],
+              "pid_descendant_gaps_admitted": ["coverage_retired_slots", "member_stop_attached", "member_stop_unattached"]
+            }
           }
         },
         "required": ["mechanisms", "sessions", "logins", "templates", "cgroups"]

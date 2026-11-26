@@ -1774,64 +1774,209 @@ fn r1_collapse_never_touches_authorized_rows() {
     );
 }
 
+/// The R1 base interface the interface-field twins prepare on both rows.
+fn r1_interface(row: &mut ScannedModule) {
+    row.interfaces.push(ScannedInterface {
+        index: 0,
+        name_class: "exact_standard",
+        name_lossy: Some("PKCS 11".into()),
+        name_private: None,
+        flags: 0,
+        table: Some(0),
+    });
+}
+
+/// One unpinned record the unpinned-content twin prepares on both rows.
+fn r1_unpinned(row: &mut ScannedModule) {
+    row.tables[0].unpinned.push(Skipped {
+        subject: "C_Finalize".into(),
+        reason: "no comparable pinned object".into(),
+    });
+}
+
+fn r1_noop(_: &mut ScannedModule) {}
+
+type R1Mutation = fn(&mut ScannedModule);
+
+/// Every field of a scanned row the binder, the proof path or the plan
+/// reads, as (field, prepare-both, change-one). Run-path R1 r2 ruling:
+/// two carried rows are redundant only when they are equal on every one
+/// of these. The owning view and each table's runtime address are the
+/// only fields left out: both are generation-local, and no consumer reads
+/// them across rows (`r1_collapse_keeps_the_oldest_of_equal_carried_rows`
+/// pins that rows differing only there still collapse).
+const R1_READ_FIELDS: &[(&str, R1Mutation, R1Mutation)] = &[
+    // Row (module) fields.
+    ("mapped_identity", r1_noop, |row| {
+        row.mapped_identity = Some(crate::discovery::identity::FileIdentity { dev: 1, ino: 2 })
+    }),
+    ("key_is_identity", r1_noop, |row| {
+        row.key_is_identity = !row.key_is_identity
+    }),
+    ("mount_namespace", r1_noop, |row| {
+        row.mount_namespace.inode += 1
+    }),
+    ("key", r1_noop, |row| row.key = overlay_key(90)),
+    ("double_loaded", r1_noop, |row| {
+        row.double_loaded = !row.double_loaded
+    }),
+    ("module_hint", r1_noop, |row| {
+        row.module_hint = Some(PathBuf::from("/opt/hint.so"))
+    }),
+    ("same_file_loads", r1_noop, |row| row.same_file_loads += 1),
+    ("pre_copy_up", r1_noop, |row| {
+        row.pre_copy_up = Some(row.pre_copy_up.map_or(0, |value| value + 1))
+    }),
+    ("path", r1_noop, |row| {
+        row.path = "/usr/lib/other/libsofthsm2.so".into()
+    }),
+    ("tables_scan_finished", r1_noop, |row| {
+        row.tables_scan_finished = !row.tables_scan_finished
+    }),
+    ("decoder_abi", r1_noop, |row| {
+        row.decoder_abi = Some(if row.decoder_abi == Some(ElfAbi::Ilp32) {
+            ElfAbi::Lp64
+        } else {
+            ElfAbi::Ilp32
+        })
+    }),
+    ("exports", r1_noop, |row| {
+        row.exports.push("C_GetInterfaceList".into())
+    }),
+    ("tables", r1_noop, |row| {
+        let mut second = row.tables[0].clone();
+        second.file_offset = Some(second.file_offset.map_or(8, |offset| offset + 8));
+        row.tables.push(second);
+    }),
+    ("interfaces", r1_noop, r1_interface),
+    // Table fields.
+    ("table.version", r1_noop, |row| {
+        row.tables[0].version.1 = row.tables[0].version.1.wrapping_add(1)
+    }),
+    ("table.walk", r1_noop, |row| {
+        row.tables[0].walk = if row.tables[0].walk == "full" {
+            "known_prefix"
+        } else {
+            "full"
+        }
+    }),
+    ("table.entries", r1_noop, |row| {
+        let mut extra = row.tables[0].entries[0].clone();
+        extra.file_offset += 0x100;
+        row.tables[0].entries.push(extra);
+    }),
+    ("table.null_entries", r1_noop, |row| {
+        row.tables[0].null_entries.push("C_Finalize")
+    }),
+    ("table.unpinned", r1_unpinned, |row| {
+        row.tables[0].unpinned[0].reason = "a different named reason".into()
+    }),
+    ("table.file_offset", r1_noop, |row| {
+        row.tables[0].file_offset = Some(row.tables[0].file_offset.map_or(8, |offset| offset + 8))
+    }),
+    ("table.live_return", r1_noop, |row| {
+        row.tables[0].live_return = !row.tables[0].live_return
+    }),
+    ("table.manifest_supported", r1_noop, |row| {
+        row.tables[0].manifest_supported = !row.tables[0].manifest_supported
+    }),
+    ("table.extension_impossible", r1_noop, |row| {
+        row.tables[0].extension_impossible = !row.tables[0].extension_impossible
+    }),
+    // Entry fields.
+    ("entry.name", r1_noop, |row| {
+        let entry = &mut row.tables[0].entries[0];
+        entry.name = if entry.name == "C_Finalize" {
+            "C_GetInfo"
+        } else {
+            "C_Finalize"
+        };
+    }),
+    ("entry.object", r1_noop, |row| {
+        row.tables[0].entries[0].object = overlay_key(91)
+    }),
+    ("entry.object_path", r1_noop, |row| {
+        row.tables[0].entries[0].object_path = "/usr/lib/other/peer.so".into()
+    }),
+    ("entry.file_offset", r1_noop, |row| {
+        row.tables[0].entries[0].file_offset += 0x10
+    }),
+    // Interface fields.
+    ("interface.index", r1_interface, |row| {
+        row.interfaces[0].index = 1
+    }),
+    ("interface.name_class", r1_interface, |row| {
+        row.interfaces[0].name_class = "other"
+    }),
+    ("interface.name_lossy", r1_interface, |row| {
+        row.interfaces[0].name_lossy = Some("Vendor".into())
+    }),
+    ("interface.name_private", r1_interface, |row| {
+        row.interfaces[0].name_private = Some(b"Vendor".to_vec())
+    }),
+    ("interface.flags", r1_interface, |row| {
+        row.interfaces[0].flags = 1
+    }),
+    ("interface.table", r1_interface, |row| {
+        row.interfaces[0].table = None
+    }),
+];
+
 #[test]
-fn r1_collapse_keeps_rows_that_add_a_contribution() {
-    // A different target offset is a different slot: both rows stay.
+fn r1_collapse_keeps_rows_that_differ_in_any_read_field() {
+    // Every field is checked and every failing field is named, so one
+    // run shows the whole class.
+    let mut failures: Vec<String> = Vec::new();
+    for (field, prepare, change) in R1_READ_FIELDS {
+        // Equal on every read field: the two carried rows collapse to the
+        // oldest (the positive control for this field's fixture).
+        let mut older = r1_row(1, &[0x1000]);
+        let mut newer = r1_row(2, &[0x1000]);
+        prepare(&mut older);
+        prepare(&mut newer);
+        let mut equal = newer.clone();
+        change(&mut older);
+        change(&mut equal);
+        let collapsed = r1_collapse(vec![older.clone(), equal], &[1, 2]).1;
+        if collapsed != vec![2] {
+            failures.push(format!("{field}: equal rows kept apart ({collapsed:?})"));
+        }
+        // Different only in this field: both rows stay, whichever is the
+        // older one, and no view is reported collapsed.
+        let swapped = {
+            let mut first = newer.clone();
+            first.view = ProcessViewId(1);
+            let mut second = older.clone();
+            second.view = ProcessViewId(2);
+            vec![first, second]
+        };
+        for (order, rows) in [
+            ("changed older", vec![older.clone(), newer.clone()]),
+            ("changed newer", swapped),
+        ] {
+            let (kept, collapsed) = r1_collapse(rows, &[1, 2]);
+            let kept: Vec<u32> = kept.iter().map(|(view, _)| *view).collect();
+            if kept != vec![1, 2] || !collapsed.is_empty() {
+                failures.push(format!(
+                    "{field} ({order}): kept {kept:?}, collapsed {collapsed:?}"
+                ));
+            }
+        }
+    }
+    assert_eq!(failures, Vec::<String>::new());
+    // A different target offset is a different slot, and a superset row
+    // is not equal to its subset: both stay in each case.
     assert_eq!(
         r1_collapse(vec![r1_row(1, &[0x1000]), r1_row(2, &[0x2000])], &[1, 2]),
         (vec![(1, vec![0x1000]), (2, vec![0x2000])], vec![])
     );
-    // A superset covers its subset whatever the committed order: the
-    // richer row goes first, so exactly one row stays.
     assert_eq!(
         r1_collapse(
             vec![r1_row(1, &[0x1000]), r1_row(2, &[0x1000, 0x2000])],
             &[1, 2]
         ),
-        (vec![(2, vec![0x1000, 0x2000])], vec![1])
+        (vec![(1, vec![0x1000]), (2, vec![0x1000, 0x2000])], vec![])
     );
-    // Other contributions count too. A row that only adds (a finished
-    // scan, an export) covers the plain row, which goes; a row that
-    // differs (a live-returned table, a second load) keeps both.
-    for (label, mutate, kept) in [
-        (
-            "scan finished",
-            (|row: &mut ScannedModule| row.tables_scan_finished = true) as fn(&mut ScannedModule),
-            vec![2],
-        ),
-        (
-            "export",
-            |row| row.exports.push("C_GetInterfaceList".into()),
-            vec![2],
-        ),
-        (
-            "live return",
-            |row| row.tables[0].live_return = true,
-            vec![1, 2],
-        ),
-        ("second load", |row| row.same_file_loads = 2, vec![1, 2]),
-        (
-            "interface",
-            |row| {
-                row.interfaces.push(ScannedInterface {
-                    index: 0,
-                    name_class: "exact_standard",
-                    name_lossy: Some("PKCS 11".into()),
-                    name_private: None,
-                    flags: 0,
-                    table: Some(0),
-                })
-            },
-            vec![2],
-        ),
-    ] {
-        let mut richer = r1_row(2, &[0x1000]);
-        mutate(&mut richer);
-        let (rows, _) = r1_collapse(vec![r1_row(1, &[0x1000]), richer], &[1, 2]);
-        let mut views: Vec<u32> = rows.iter().map(|(view, _)| *view).collect();
-        views.sort_unstable();
-        assert_eq!(views, kept, "{label}");
-    }
 }
 
 #[test]
@@ -1895,6 +2040,58 @@ fn r1_collapse_reports_only_views_left_without_rows() {
             &[1, 2, 3]
         ),
         (vec![(1, vec![0x1000]), (2, vec![0x1000])], vec![3])
+    );
+}
+
+#[test]
+fn r1_loader_candidate_rebuild_collapses_redundant_carry() {
+    // Run-path R1 site: a loader candidate reaches the same rebuild
+    // choke as every other builder, so two carried rows of retired views
+    // (900, 901: not live, no claims) equal on every read field leave the
+    // loader's candidate as one row, the oldest.
+    let fixture = LoaderPlanningFixture::new();
+    let mut engine = fixture.cold_engine();
+    let template = engine
+        .modules
+        .iter()
+        .find(|module| module.scanned.path.ends_with("provider.so"))
+        .expect("the fixture provider row")
+        .clone();
+    for view in [900, 901] {
+        let mut carried = template.clone();
+        carried.scanned.view = ProcessViewId(view);
+        // A carried row keeps its view's raw scan custody (only its
+        // claims are scrubbed), as after a real retirement.
+        record_scan_ownership(
+            &mut engine.pinned,
+            carried.scanned.view,
+            carried.scanned.key,
+            &carried.scanned.path,
+        );
+        engine.modules.push(carried);
+    }
+    let (candidate, loader) = engine
+        .loader_candidate(
+            fixture.warm_loader.view,
+            &fixture.warm_loader,
+            &fixture.warm_loader_pins,
+            fixture.local_warm_loader,
+            Vec::new(),
+        )
+        .expect("the loader candidate rebuilds");
+    assert!(loader.is_some());
+    let carried: Vec<u32> = candidate
+        .modules
+        .iter()
+        .map(|module| module.scanned.view.0)
+        .filter(|view| *view >= 900)
+        .collect();
+    assert_eq!(carried, vec![900], "the redundant carried row collapsed");
+    let raw_owned = candidate.pinned.raw_owned_views_for_test();
+    assert!(raw_owned.contains(&ProcessViewId(900)), "{raw_owned:?}");
+    assert!(
+        !raw_owned.contains(&ProcessViewId(901)),
+        "the collapsed view's custody ends: {raw_owned:?}"
     );
 }
 

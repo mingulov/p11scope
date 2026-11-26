@@ -12950,103 +12950,112 @@ fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedM
     dropped
 }
 
-/// Union one module and accumulate the per-module cap's counted
-/// overflow into `dropped`: every rebuild and harvest path counts
-/// through this one line, so a refused table is never silent.
-/// One attach contribution a scanned row makes to the plan. Rows of one
-/// file in one mount namespace that make the same contributions bind the
-/// same slots, names and evidence, whatever process generation they came
-/// from: generation-local runtime addresses are left out on purpose.
-#[derive(Debug, PartialEq)]
-enum CarriedContribution<'a> {
-    Target {
-        name: &'static str,
-        object: ObjectKey,
-        object_path: &'a str,
-        file_offset: u64,
-    },
-    Export(&'a str),
-    Table {
-        version: (u8, u8),
-        walk: &'static str,
-        file_offset: Option<u64>,
-        live_return: bool,
-        null_entries: &'a [&'static str],
-        unpinned: usize,
-    },
-    Interface {
-        name_class: &'static str,
-        name_lossy: Option<&'a str>,
-        name_private: Option<&'a [u8]>,
-        flags: u64,
-        table_offset: Option<Option<u64>>,
-    },
-    Loads {
-        double_loaded: bool,
-        same_file_loads: u32,
-    },
-    ScanFinished,
-}
-
-fn carried_contributions(module: &ScannedModule) -> Vec<CarriedContribution<'_>> {
-    let mut items = Vec::new();
-    for table in &module.tables {
-        items.push(CarriedContribution::Table {
-            version: table.version,
-            walk: table.walk,
-            file_offset: table.file_offset,
-            live_return: table.live_return,
-            null_entries: &table.null_entries,
-            unpinned: table.unpinned.len(),
-        });
-        for entry in &table.entries {
-            items.push(CarriedContribution::Target {
-                name: entry.name,
-                object: entry.object,
-                object_path: &entry.object_path,
-                file_offset: entry.file_offset,
-            });
-        }
-    }
-    items.extend(
-        module
-            .exports
+/// Whether two carried rows are the same row up to their generation-local
+/// fields (run-path R1, r2 ruling): equal on every field the binder, the
+/// proof path or the plan reads. Only the owning view and each table's
+/// runtime address are left out; both are generation-local, and no
+/// consumer reads them across rows (fallback proofs match a table address
+/// within its own row and land as that row's `manifest_supported`, which
+/// is compared). The destructuring is exhaustive, so a new row, table,
+/// entry or interface field fails to compile until it is classified here.
+fn carried_rows_equal(left: &ScannedModule, right: &ScannedModule) -> bool {
+    let ScannedModule {
+        mapped_identity,
+        key_is_identity,
+        view: _,
+        mount_namespace,
+        key,
+        double_loaded,
+        module_hint,
+        same_file_loads,
+        pre_copy_up,
+        path,
+        tables_scan_finished,
+        decoder_abi,
+        exports,
+        tables,
+        interfaces,
+    } = left;
+    *mapped_identity == right.mapped_identity
+        && *key_is_identity == right.key_is_identity
+        && *mount_namespace == right.mount_namespace
+        && *key == right.key
+        && *double_loaded == right.double_loaded
+        && *module_hint == right.module_hint
+        && *same_file_loads == right.same_file_loads
+        && *pre_copy_up == right.pre_copy_up
+        && *path == right.path
+        && *tables_scan_finished == right.tables_scan_finished
+        && *decoder_abi == right.decoder_abi
+        && *exports == right.exports
+        && tables.len() == right.tables.len()
+        && tables
             .iter()
-            .map(|export| CarriedContribution::Export(export.as_str())),
-    );
-    for interface in &module.interfaces {
-        items.push(CarriedContribution::Interface {
-            name_class: interface.name_class,
-            name_lossy: interface.name_lossy.as_deref(),
-            name_private: interface.name_private.as_deref(),
-            flags: interface.flags,
-            table_offset: interface
-                .table
-                .map(|index| module.tables.get(index).and_then(|table| table.file_offset)),
-        });
-    }
-    items.push(CarriedContribution::Loads {
-        double_loaded: module.double_loaded,
-        same_file_loads: module.same_file_loads,
-    });
-    if module.tables_scan_finished {
-        items.push(CarriedContribution::ScanFinished);
-    }
-    items
+            .zip(&right.tables)
+            .all(|(left, right)| carried_tables_equal(left, right))
+        && interfaces.len() == right.interfaces.len()
+        && interfaces
+            .iter()
+            .zip(&right.interfaces)
+            .all(|(left, right)| carried_interfaces_equal(left, right))
 }
 
-/// Whether two rows are one file seen from one mount namespace with the
-/// same scan provenance: the only rows whose contributions may stand in
-/// for each other.
-fn same_carried_file(left: &ScannedModule, right: &ScannedModule) -> bool {
-    left.mount_namespace == right.mount_namespace
-        && left.key == right.key
-        && left.path == right.path
-        && left.pre_copy_up == right.pre_copy_up
-        && left.mapped_identity == right.mapped_identity
-        && left.key_is_identity == right.key_is_identity
-        && left.module_hint == right.module_hint
-        && left.decoder_abi == right.decoder_abi
+fn carried_tables_equal(left: &ScannedTable, right: &ScannedTable) -> bool {
+    let ScannedTable {
+        version,
+        walk,
+        entries,
+        null_entries,
+        unpinned,
+        address: _,
+        file_offset,
+        live_return,
+        manifest_supported,
+        extension_impossible,
+    } = left;
+    *version == right.version
+        && *walk == right.walk
+        && entries.len() == right.entries.len()
+        && entries
+            .iter()
+            .zip(&right.entries)
+            .all(|(left, right)| carried_entries_equal(left, right))
+        && *null_entries == right.null_entries
+        && *unpinned == right.unpinned
+        && *file_offset == right.file_offset
+        && *live_return == right.live_return
+        && *manifest_supported == right.manifest_supported
+        && *extension_impossible == right.extension_impossible
+}
+
+fn carried_entries_equal(left: &ScannedEntry, right: &ScannedEntry) -> bool {
+    let ScannedEntry {
+        name,
+        object,
+        object_path,
+        file_offset,
+    } = left;
+    *name == right.name
+        && *object == right.object
+        && *object_path == right.object_path
+        && *file_offset == right.file_offset
+}
+
+fn carried_interfaces_equal(left: &ScannedInterface, right: &ScannedInterface) -> bool {
+    let ScannedInterface {
+        index,
+        name_class,
+        name_lossy,
+        name_private,
+        flags,
+        table,
+    } = left;
+    *index == right.index
+        && *name_class == right.name_class
+        && *name_lossy == right.name_lossy
+        && *name_private == right.name_private
+        && *flags == right.flags
+        && *table == right.table
 }
 
 /// The carried-row bound (run-path audit R1). A carried row (a retired
@@ -13055,50 +13064,39 @@ fn same_carried_file(left: &ScannedModule, right: &ScannedModule) -> bool {
 /// numeric view ID out of admission while it rides. One carried row per
 /// retired view therefore grows the plan inputs without a bound and
 /// exhausts the view IDs under churn (every short-lived descendant that
-/// maps the provider). Carried rows of one file are interchangeable up to
-/// their attach contributions, so only the rows that add a contribution
-/// no other kept carried row of that file makes stay: the rest end their
-/// carry (CARRIED → RETIRED as redundant carry). The slots, names and
-/// evidence the plan binds are unchanged; the kept rows per file are
-/// bounded by that file's distinct contributions, not by churn.
+/// maps the provider). A carried row equal to an older kept carried row on
+/// every read field (`carried_rows_equal`) is redundant: it binds the same
+/// slots, names, proofs and named skips, so it ends its carry (CARRIED →
+/// RETIRED as redundant carry). A row that differs in any read field
+/// stays. The kept rows are bounded by the distinct row contents, not by
+/// churn.
 ///
-/// Richer rows go first so one superset row covers its subsets; ties keep
-/// the committed order (the oldest carried row stays, so the plan is
-/// unchanged tick for tick). Rows of authorized views (`carried` false)
-/// are never touched. Returns the views every row of which was collapsed,
-/// so the caller can end their claimless pin custody too.
+/// The committed order decides: the oldest of equal rows stays, so the
+/// plan is unchanged tick for tick. Rows of authorized views (`carried`
+/// false) are never touched. Returns the views every row of which was
+/// collapsed, so the caller can end their claimless pin custody too.
 fn collapse_redundant_carried_rows(
     raw_modules: &mut Vec<ScannedModule>,
     carried: impl Fn(ProcessViewId) -> bool,
 ) -> BTreeSet<ProcessViewId> {
-    let mut order: Vec<(usize, usize)> = raw_modules
-        .iter()
-        .enumerate()
-        .filter(|(_, module)| carried(module.view))
-        .map(|(index, module)| (index, carried_contributions(module).len()))
-        .collect();
-    if order.len() < 2 {
-        return BTreeSet::new();
-    }
-    order.sort_by_key(|&(index, items)| (std::cmp::Reverse(items), index));
-    let mut kept: Vec<(usize, Vec<CarriedContribution<'_>>)> = Vec::new();
+    let mut kept: Vec<usize> = Vec::new();
     let mut dropped = vec![false; raw_modules.len()];
-    for (index, _) in order {
-        let module = &raw_modules[index];
-        let items = carried_contributions(module);
-        let mut covered: Vec<&CarriedContribution<'_>> = Vec::new();
-        for (kept_index, kept_items) in &kept {
-            if same_carried_file(&raw_modules[*kept_index], module) {
-                covered.extend(kept_items.iter());
-            }
+    for (index, module) in raw_modules.iter().enumerate() {
+        if !carried(module.view) {
+            continue;
         }
-        if items.iter().all(|item| covered.contains(&item)) {
+        if kept
+            .iter()
+            .any(|&kept_index| carried_rows_equal(&raw_modules[kept_index], module))
+        {
             dropped[index] = true;
         } else {
-            kept.push((index, items));
+            kept.push(index);
         }
     }
-    drop(kept);
+    if !dropped.contains(&true) {
+        return BTreeSet::new();
+    }
     let mut collapsed: BTreeSet<ProcessViewId> = raw_modules
         .iter()
         .zip(&dropped)
@@ -13117,6 +13115,9 @@ fn collapse_redundant_carried_rows(
     collapsed
 }
 
+/// Union one module and accumulate the per-module cap's counted
+/// overflow into `dropped`: every rebuild and harvest path counts
+/// through this one line, so a refused table is never silent.
 fn merge_scanned_module_counted(
     modules: &mut Vec<ScannedModule>,
     incoming: ScannedModule,

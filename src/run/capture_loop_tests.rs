@@ -3890,9 +3890,12 @@ fn unavailable_capture_stdout_degrades_to_a_closed_sink_with_a_gap() {
 #[test]
 fn available_capture_stdout_opens_live_with_no_gap() {
     let gap = std::cell::Cell::new(false);
-    let opened =
-        open_capture_stdout(|| gap.set(true), crate::sink::stdout_sink, SignalState::new().stop_token())
-        .expect("a live stdout must open");
+    let opened = open_capture_stdout(
+        || gap.set(true),
+        crate::sink::stdout_sink,
+        SignalState::new().stop_token(),
+    )
+    .expect("a live stdout must open");
     assert!(!gap.get(), "a live open files no gap");
     assert!(opened.open, "a live open stays open");
     assert!(opened.deferred.is_none(), "a live open defers nothing");

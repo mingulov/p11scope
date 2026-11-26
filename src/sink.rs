@@ -162,7 +162,9 @@ pub(crate) fn stdout_sink() -> io::Result<SinkWriter<StdoutInner>> {
 /// sheds slow flushes promptly instead of waiting out budgets.
 /// Takes the token (not a bare flag), so only a SignalState-minted
 /// flag can reach it. Unit tests cover the unwired primitive directly.
-pub(crate) fn watched_stdout_sink(stop: crate::run::StopToken) -> io::Result<SinkWriter<StdoutInner>> {
+pub(crate) fn watched_stdout_sink(
+    stop: crate::run::StopToken,
+) -> io::Result<SinkWriter<StdoutInner>> {
     let mut sink = stdout_sink()?;
     sink.set_cancel_flag(stop.into_inner());
     Ok(sink)
@@ -189,7 +191,9 @@ pub(crate) fn null_sink() -> io::Result<SinkWriter<StdoutInner>> {
 /// the only way production builds a fallback null sink. Bytes still
 /// reach `/dev/null`; the flag keeps the invariant total (every
 /// capture sink watched, no exceptions).
-pub(crate) fn watched_null_sink(stop: crate::run::StopToken) -> io::Result<SinkWriter<StdoutInner>> {
+pub(crate) fn watched_null_sink(
+    stop: crate::run::StopToken,
+) -> io::Result<SinkWriter<StdoutInner>> {
     let mut sink = null_sink()?;
     sink.set_cancel_flag(stop.into_inner());
     Ok(sink)

@@ -98677,6 +98677,213 @@ fn member_stop_superseded_staging_key_refuses_the_hold() {
     );
 }
 
+/// A hold whose staged key superseded still attaches once its provider
+/// is really attached (stamps plus live links): the supersede refusal
+/// yields to a proven attach instead of ending refused forever. The
+/// unattached direction still refuses (the superseded and committed
+/// twins beside this one).
+#[test]
+fn member_stop_superseded_key_attaches_once_proven() {
+    let (fixture, view, module, _pins) = loaded_seed_provider();
+    let pid = fixture.child.id();
+    let library = fixture._dir.path().join("seed-provider.so");
+    // Generation 1.
+    touch_for_test(&library, 1_000_000);
+    stop_member_for_test(pid);
+    let key = member_exec_key_for_test(pid, &library);
+    let mut io = ScriptedMemberStops::default();
+    io.rows.insert(pid, member_stop_row(pid, &library, key));
+    let mut engine = member_stop_engine();
+    // A pause-owned batch defers the event-driven apply: the staging
+    // stays unattached until the batch ends.
+    engine.pause_owned_batch = true;
+    let mut session = attaching_session();
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        1,
+        "generation 1 stages"
+    );
+    assert!(engine.member_stops_held(), "intake holds the mapper");
+    let staged_key = engine
+        .prearm_input
+        .as_ref()
+        .and_then(|prearm| prearm.inputs.first().map(|input| input.key))
+        .expect("staging records its key");
+    // Generation 2 supersedes in a working copy only (a dropped
+    // candidate): the rotation is recorded, nothing commits.
+    touch_for_test(&library, 2_000_000);
+    let mut budget = CaptureWorkBudget::default();
+    let (scan2, _scan_skips) =
+        pin_scanned_view_objects(&view, std::slice::from_ref(&module), &mut budget).unwrap();
+    assert_eq!(scan2.pinned().count(), 1, "the scan observes generation 2");
+    let mut working = engine.pinned.clone();
+    let absorbed = working.absorb(scan2);
+    assert!(
+        !working.rejects(staged_key),
+        "a touched file is not a collision"
+    );
+    assert!(working.supersedes(staged_key), "the rotation is recorded");
+    assert!(absorbed.is_empty(), "supersede files no skip: {absorbed:?}");
+    let _candidate = engine.live_candidate_with_pending(
+        working,
+        vec![module],
+        Vec::new(),
+        None,
+        &std::collections::BTreeSet::new(),
+        &std::collections::BTreeSet::new(),
+        &std::collections::BTreeSet::new(),
+    );
+    assert!(
+        engine.pending_superseded_keys.contains(&staged_key),
+        "the bind harvests the supersede"
+    );
+    // The batch ends: apply the staging directly (a service pass would
+    // resolve the hold first) and stamp it attached — the supersede
+    // must not override the proven attach.
+    engine.pause_owned_batch = false;
+    engine.apply_learned_staging(&mut session);
+    assert!(!engine.learned_unapplied, "the staging applied");
+    engine.service_member_stops(&mut io, &mut session, Some(20));
+    assert!(!engine.member_stops_held(), "the hold resolves");
+    let stats = engine.member_stop_stats_for_test();
+    assert_eq!(stats.attached_resumes, 1, "{stats:?}");
+    assert_eq!(stats.refused_resumes, 0, "{stats:?}");
+    assert_eq!(stats.timed_out, 0, "{stats:?}");
+    assert!(member_resumed_for_test(pid), "the member runs again");
+    let public: Vec<_> = engine
+        .counters
+        .object_skips
+        .iter()
+        .map(render::capture_skipped_out)
+        .collect();
+    assert!(
+        public
+            .iter()
+            .all(|skip| skip.name != "learned provider file"),
+        "an attached hold files no first-use row: {public:?}"
+    );
+}
+
+/// The churn seam end to end (df2401d80's path): a file-changed HIT
+/// requeues, the retry stages generation 1, a scan observes generation
+/// 2, and the bind keeps the module — across a second rotation the same
+/// object id routes (in-place rotation retires nothing). Slot liveness
+/// itself is proven by the attaches-once-proven twin.
+#[test]
+fn member_stop_retry_staged_rotation_keeps_stable_object() {
+    let (fixture, view, module, _pins) = loaded_seed_provider();
+    let pid = fixture.child.id();
+    let library = fixture._dir.path().join("seed-provider.so");
+    // Generation 1.
+    touch_for_test(&library, 1_000_000);
+    stop_member_for_test(pid);
+    let key = member_exec_key_for_test(pid, &library);
+    let mut io = ScriptedMemberStops::default();
+    io.rows.insert(pid, member_stop_row(pid, &library, key));
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::default();
+    let probe = std::fs::File::open(&library).unwrap();
+    let identity = crate::fanotify::file_identity(&probe).unwrap();
+    // The first prove HITs the race and requeues instead of refusing.
+    crate::discovery::identity::prearm_pin_test::inject_file_change_once();
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    assert!(engine.member_stops_held(), "intake holds the mapper");
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        0,
+        "the HIT stages nothing yet"
+    );
+    assert_eq!(
+        engine.learned_pin_retries.get(&identity).copied(),
+        Some(1),
+        "the HIT requeues"
+    );
+    // The retry re-proves the settled file and stages.
+    engine.service_learned_files();
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        1,
+        "the retry stages generation 1"
+    );
+    let staged_key = engine
+        .prearm_input
+        .as_ref()
+        .and_then(|prearm| prearm.inputs.first().map(|input| input.key))
+        .expect("staging records its key");
+    // Generation 2: the scan's observation supersedes in a working copy
+    // and the bind keeps the module with slots for the file.
+    touch_for_test(&library, 2_000_000);
+    let mut budget = CaptureWorkBudget::default();
+    let (scan2, _scan_skips) =
+        pin_scanned_view_objects(&view, std::slice::from_ref(&module), &mut budget).unwrap();
+    assert_eq!(scan2.pinned().count(), 1, "the scan observes generation 2");
+    let mut working = engine.pinned.clone();
+    assert!(working.absorb(scan2).is_empty());
+    assert!(working.supersedes(staged_key), "the rotation is recorded");
+    let candidate = engine
+        .live_candidate_with_pending(
+            working,
+            vec![module.clone()],
+            Vec::new(),
+            None,
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
+        )
+        .expect("the candidate builds");
+    assert!(
+        candidate
+            .modules
+            .iter()
+            .any(|bound| bound.scanned.key == staged_key),
+        "the rotated module binds"
+    );
+    let objects: std::collections::BTreeSet<_> = candidate
+        .pinned
+        .pinned()
+        .filter(|pin| pin.key == staged_key)
+        .map(|pin| pin.id)
+        .collect();
+    assert_eq!(objects.len(), 1, "one file, one object");
+    // Generation 3: a second rotation keeps the same slot objects —
+    // nothing retires for one touched file.
+    touch_for_test(&library, 3_000_000);
+    let (scan3, _scan_skips) =
+        pin_scanned_view_objects(&view, std::slice::from_ref(&module), &mut budget).unwrap();
+    let mut working = candidate.pinned.clone();
+    assert!(working.absorb(scan3).is_empty());
+    assert!(working.supersedes(staged_key), "the rotation is recorded");
+    let candidate = engine
+        .live_candidate_with_pending(
+            working,
+            vec![module],
+            Vec::new(),
+            None,
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
+        )
+        .expect("the candidate builds");
+    assert!(
+        candidate
+            .modules
+            .iter()
+            .any(|bound| bound.scanned.key == staged_key),
+        "the twice-rotated module binds"
+    );
+    let objects_after: std::collections::BTreeSet<_> = candidate
+        .pinned
+        .pinned()
+        .filter(|pin| pin.key == staged_key)
+        .map(|pin| pin.id)
+        .collect();
+    assert_eq!(
+        objects_after, objects,
+        "a second rotation keeps the object id"
+    );
+}
+
 /// Staging a new generation over a committed scan pin (the scan-first
 /// order) supersedes in the committed set directly: no candidate runs,
 /// so the hold refuses through the committed markers alone.
@@ -98734,9 +98941,12 @@ fn member_stop_committed_supersede_refuses_the_hold() {
         engine.pinned.supersedes(scan_key),
         "the rotation is recorded"
     );
-    // The fresh entry is the staging (a sweep matches scan aliases
-    // only, so it cannot route here): prove the rotation by pin
-    // freshness instead — the kept pin is the live file's.
+    // In-place rotation keeps the scan entry (and its alias) under the
+    // same id with the fresh pin: the key routes and the pin is live.
+    assert!(
+        engine.pinned.sweep_match_keys().contains_key(&scan_key),
+        "the key routes the fresh pin"
+    );
     assert_eq!(engine.pinned.pinned().count(), 1, "one generation routes");
     let kept_id = engine.pinned.pinned().next().expect("one pin").id;
     let kept_pin = engine.pinned.pin_for(kept_id).expect("the kept pin");

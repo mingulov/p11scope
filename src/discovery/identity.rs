@@ -20801,10 +20801,11 @@ mod tests {
     }
 
     #[test]
-    fn absorbing_supersede_evicts_with_full_custody() {
-        // The evicted stale entry leaves nothing behind: its id, raws,
-        // view ownership, claims and proven targets are scrubbed exactly
-        // like a rejection's, while the fresh entry files clean.
+    fn absorbing_supersede_rotates_in_place_and_keeps_custody() {
+        // In-place rotation: the kept id survives with the fresh pin and
+        // merged raws; view ownership, claims and proven targets for it
+        // are preserved (never scrubbed), while the rotation is recorded.
+        // No slot retires and no second object is minted for one file.
         let key = ObjectKey {
             device: Device { major: 8, minor: 1 },
             inode: INODE,
@@ -20815,51 +20816,62 @@ mod tests {
         reback(&mut staged, &file);
         let mut acc = PinnedObjects::empty();
         assert!(acc.absorb(staged).is_empty());
-        let stale = acc.pinned().next().unwrap().id;
-        let stale_raw = acc.raw_to_id.iter().next().unwrap().0.clone();
+        let kept = acc.pinned().next().unwrap().id;
+        let kept_raw = acc.raw_to_id.iter().next().unwrap().0.clone();
         let view = crate::process::ProcessViewId(7);
         acc.raw_ownership
             .entry(view)
             .or_default()
-            .insert(stale_raw.clone());
-        acc.ownership.entry(view).or_default().pins.push(stale);
+            .insert(kept_raw.clone());
+        acc.ownership.entry(view).or_default().pins.push(kept);
         acc.ownership
             .entry(view)
             .or_default()
             .targets
-            .push((stale, 0x1000));
-        acc.proven_targets.insert((stale, 0x1000));
+            .push((kept, 0x1000));
+        acc.proven_targets.insert((kept, 0x1000));
         let mut scan = image_pins(&[(key, "aaaaaaaa", 2)]);
         reback(&mut scan, &file);
         let staged_mapping = acc.by_id.values().next().unwrap().mapping;
         scan.by_id.values_mut().next().unwrap().mapping = staged_mapping;
         let skipped = acc.absorb(scan);
-        assert!(!acc.rejects(key));
-        assert!(acc.supersedes(key));
+        assert!(!acc.rejects(key), "a touched file is not a collision");
+        assert!(acc.supersedes(key), "the rotation is recorded");
         assert!(skipped.is_empty(), "{skipped:?}");
-        assert!(!acc.by_id.contains_key(&stale), "the stale id is gone");
-        assert!(
-            !acc.raw_to_id.contains_key(&stale_raw),
-            "the stale raw is gone"
+        assert!(acc.by_id.contains_key(&kept), "the id is stable");
+        assert_eq!(
+            acc.by_id.get(&kept).unwrap().pin.test_parts().2,
+            (2, 7),
+            "the pin rotates in place"
+        );
+        assert_eq!(
+            acc.raw_to_id.get(&kept_raw),
+            Some(&kept),
+            "the kept raw survives"
+        );
+        assert_eq!(
+            acc.raw_to_id.values().filter(|id| **id == kept).count(),
+            2,
+            "the scan raw merges onto the kept id"
         );
         assert!(
             acc.raw_ownership
                 .get(&view)
-                .is_none_or(|raws| !raws.contains(&stale_raw)),
-            "the stale raw ownership is gone"
+                .is_some_and(|raws| raws.contains(&kept_raw)),
+            "the kept raw ownership survives"
         );
         for claims in acc.ownership.values() {
-            assert!(!claims.pins.contains(&stale), "stale pin claims are gone");
+            assert!(claims.pins.contains(&kept), "kept pin claims survive");
             assert!(
-                !claims.targets.iter().any(|(id, _)| *id == stale),
-                "stale target claims are gone"
+                claims.targets.iter().any(|(id, _)| *id == kept),
+                "kept target claims survive"
             );
         }
         assert!(
-            !acc.proven_targets.iter().any(|(id, _)| *id == stale),
-            "stale proven targets are gone"
+            acc.proven_targets.contains(&(kept, 0x1000)),
+            "kept proven targets survive"
         );
-        assert_eq!(acc.pinned().count(), 1, "the fresh entry files");
+        assert_eq!(acc.pinned().count(), 1, "one file, one object");
     }
 
     #[test]
@@ -20889,6 +20901,137 @@ mod tests {
         assert!(!acc.supersedes(key), "no supersede across a rename");
         assert_eq!(acc.pinned().count(), 0);
         assert!(!skipped.is_empty(), "the rejection is disclosed");
+    }
+
+    #[test]
+    fn absorbing_rotation_across_views_survives_newcomer_view_removal() {
+        // Two scan views share one provider file: the long-lived view A
+        // pins generation 1, the newcomer view B observes generation 2.
+        // The rotation merges B's raw onto A's kept id; removing B then
+        // prunes only B's raw — the fresh object, its alias and A's
+        // module aliasing survive (no eviction orphans them).
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let view_a = crate::process::ProcessViewId(11);
+        let view_b = crate::process::ProcessViewId(12);
+        let mut first = image_pins(&[(key, "aaaaaaaa", 1)]);
+        reback(&mut first, &file);
+        let raw_a = first.raw_to_id.keys().next().unwrap().clone();
+        first
+            .raw_ownership
+            .entry(view_a)
+            .or_default()
+            .insert(raw_a.clone());
+        let mut acc = PinnedObjects::empty();
+        assert!(acc.absorb(first).is_empty());
+        let kept = acc.pinned().next().unwrap().id;
+        let mut second = image_pins(&[(key, "aaaaaaaa", 2)]);
+        reback(&mut second, &file);
+        let kept_mapping = acc.by_id.values().next().unwrap().mapping;
+        second.by_id.values_mut().next().unwrap().mapping = kept_mapping;
+        let raw_b = second.raw_to_id.keys().next().unwrap().clone();
+        second
+            .raw_ownership
+            .entry(view_b)
+            .or_default()
+            .insert(raw_b.clone());
+        let skipped = acc.absorb(second);
+        assert!(!acc.rejects(key), "a touched file is not a collision");
+        assert!(acc.supersedes(key), "the rotation is recorded");
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert!(acc.by_id.contains_key(&kept), "the id is stable");
+        assert_eq!(acc.raw_to_id.get(&raw_a), Some(&kept), "A's raw survives");
+        assert_eq!(acc.raw_to_id.get(&raw_b), Some(&kept), "B's raw merges");
+        assert!(
+            acc.module_aliased_under(&module(key), view_a),
+            "the long-lived view stays aliased"
+        );
+        // The newcomer view goes: only its raw is pruned.
+        acc.remove_view(view_b);
+        assert!(
+            acc.by_id.contains_key(&kept),
+            "the fresh object survives newcomer removal"
+        );
+        assert_eq!(
+            acc.raw_to_id.get(&raw_a),
+            Some(&kept),
+            "the long-lived alias survives"
+        );
+        assert!(
+            acc.module_aliased_under(&module(key), view_a),
+            "the long-lived view stays aliased after newcomer removal"
+        );
+        assert_eq!(acc.pinned().count(), 1, "one file, one object");
+    }
+
+    #[test]
+    fn absorbing_stale_rotation_observation_merges_without_superseding() {
+        // A rotation observation older than the kept pin (a delayed scan
+        // meeting a fresher staging) must not move the pin backwards:
+        // its raw merges onto the kept entry, silently, with no marker
+        // and no rejection.
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let mut staged = prearm_pin(key, "aaaaaaaa", 2);
+        reback(&mut staged, &file);
+        let mut acc = PinnedObjects::empty();
+        assert!(acc.absorb(staged).is_empty());
+        let kept = acc.pinned().next().unwrap().id;
+        let mut scan = image_pins(&[(key, "aaaaaaaa", 1)]);
+        reback(&mut scan, &file);
+        let staged_mapping = acc.by_id.values().next().unwrap().mapping;
+        scan.by_id.values_mut().next().unwrap().mapping = staged_mapping;
+        let skipped = acc.absorb(scan);
+        assert!(!acc.rejects(key), "a stale look is not a collision");
+        assert!(!acc.supersedes(key), "a stale look records no rotation");
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert!(acc.by_id.contains_key(&kept), "the id is stable");
+        assert_eq!(
+            acc.by_id.get(&kept).unwrap().pin.test_parts().2,
+            (2, 7),
+            "the pin never moves backwards"
+        );
+        assert_eq!(
+            acc.raw_to_id.values().filter(|id| **id == kept).count(),
+            2,
+            "the stale raw merges onto the kept id"
+        );
+        assert_eq!(acc.pinned().count(), 1, "one file, one object");
+    }
+
+    #[test]
+    fn absorbing_supersede_markers_carry_through_absorb() {
+        // Supersede markers travel with the pins: absorbing a set that
+        // superseded a key marks the key here too, whichever commit path
+        // the pins take.
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let mut staged = prearm_pin(key, "aaaaaaaa", 1);
+        reback(&mut staged, &file);
+        let mut rotated = PinnedObjects::empty();
+        assert!(rotated.absorb(staged).is_empty());
+        let mut scan = image_pins(&[(key, "aaaaaaaa", 2)]);
+        reback(&mut scan, &file);
+        let staged_mapping = rotated.by_id.values().next().unwrap().mapping;
+        scan.by_id.values_mut().next().unwrap().mapping = staged_mapping;
+        assert!(rotated.absorb(scan).is_empty());
+        assert!(rotated.supersedes(key), "the rotation is recorded");
+        let mut acc = PinnedObjects::empty();
+        let skipped = acc.absorb(rotated);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert!(acc.supersedes(key), "the marker carries through absorb");
     }
 
     #[test]
@@ -25340,6 +25483,36 @@ mod tests {
         assert!(
             cursor.required_bytes().unwrap() >= peak.realloc_overlap_bytes.max(peak.peak_bytes)
         );
+    }
+
+    #[test]
+    fn conservative_copy_cursor_carries_superseded_keys() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        let (_dir, mut source, modules) = conservative_cursor_fixture();
+        let rotated = modules[0].key;
+        source.superseded_keys.insert(rotated);
+        let pool = SemanticResourcePool::default();
+        let selection = conservative_selection(
+            &pool,
+            BTreeSet::from([ProcessViewId(1)]),
+            BTreeSet::from([modules[1].key]),
+        );
+        let reserve = pool.reserver();
+        let mut cursor = PinnedConservativeCursor::new();
+        let mut ready = false;
+        for _ in 0..4096 {
+            match source.poll_conservative_copy(&mut cursor, &selection, &reserve, 1) {
+                Ok(GraphStep::Ready) => {
+                    ready = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(error) => panic!("the copy runs to Ready: {error:?}"),
+            }
+        }
+        assert!(ready, "the copy runs to Ready");
+        let copy = cursor.pinned().expect("a Ready copy resolves");
+        assert!(copy.supersedes(rotated), "the copy carries superseded keys");
     }
 
     #[test]

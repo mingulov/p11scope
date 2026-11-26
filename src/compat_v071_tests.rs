@@ -8,7 +8,8 @@ use serde_json::Value;
 
 const SCHEMA071: &[u8] =
     include_bytes!("../tests/fixtures/upgrade/v071-observed-profile-v3.schema.json");
-const PROFILE071: &[u8] = include_bytes!("../tests/fixtures/upgrade/v071-observed-profile.json");
+const PROFILE071: &[u8] =
+    include_bytes!("../tests/fixtures/upgrade/v071-observed-profile-signer.json");
 const METRICS071: &[u8] = include_bytes!("../tests/fixtures/upgrade/v071-observed-metrics.json");
 const PROFILE072: &[u8] = include_bytes!("../tests/fixtures/upgrade/v072-observed-profile.json");
 const METRICS072: &[u8] = include_bytes!("../tests/fixtures/upgrade/v072-observed-metrics.json");

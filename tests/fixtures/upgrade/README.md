@@ -32,9 +32,13 @@ Files:
   refuse; both releases agree), so it proves real-shape acceptance
   only — the nonzero established-count proof needs a host where the
   lane births.
-- `v071-observed-profile.json`, `v071-observed-metrics.json`,
+- `v071-observed-profile-signer.json`, `v071-observed-metrics.json`,
   `v072-observed-profile.json`, `v072-observed-metrics.json`: one
   signing anchor per lane and release (`--duration 20s`).
+- `v071-observed-profile.json` is owned by the upgrade-cells lane
+  (its own capture, read by `scripts/upgrade-gate6.py`); this
+  lane's profile fixture carries the `-signer` suffix so the two
+  never collide.
 - `v071-manifest-softhsm.json`: `p11scope-discover --module`
   SoftHSM output. No discover emits getter-only manifests (both
   versions leave `getters` empty), and those stay covered by the

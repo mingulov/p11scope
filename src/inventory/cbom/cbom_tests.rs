@@ -572,7 +572,7 @@ fn projection_refuses_unsupported_schemas() {
 const KEYOPS071: &[u8] =
     include_bytes!("../../../tests/fixtures/upgrade/v071-inventory-keyops.json");
 const PROFILE071: &[u8] =
-    include_bytes!("../../../tests/fixtures/upgrade/v071-observed-profile.json");
+    include_bytes!("../../../tests/fixtures/upgrade/v071-observed-profile-signer.json");
 const METRICS071: &[u8] =
     include_bytes!("../../../tests/fixtures/upgrade/v071-observed-metrics.json");
 

@@ -3070,6 +3070,57 @@ fn discovery_evidence_without_a_pin_for_a_planned_slot_files_a_gap() {
     );
 }
 
+/// Class test (binding controller note): every row-dropping
+/// `pinned.summary()` lookup in `discovery_evidence` — the module
+/// identity and each active slot object — also appears in
+/// `resolve_merge_inputs`, so preflight refuses (dropped pass)
+/// instead of certifying clean a publication the render would
+/// drop rows from. (Inline-degrading lookups — the pre-copy-up
+/// flag, the first-loaded-by annotation, the manifest fallbacks —
+/// need no preflight: they render degraded output, never drop
+/// rows.)
+#[test]
+fn resolve_merge_inputs_refuses_plan_objects_without_pins() {
+    use crate::discovery::identity::test_fixture::pin_set;
+    let key = ObjectKey {
+        device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+        inode: 42,
+    };
+    let pins = pin_set(&[(key, "sha-module", 7)], false);
+    let present = pins.pinned().next().unwrap().id;
+    let missing = crate::discovery::identity::PinnedObjectId(424242);
+    let facts = CaptureFacts::default();
+    // Module identity without a pin refuses, naming the module.
+    let mut plan = plan_with(2, 0);
+    plan.modules[0].object = missing;
+    plan.modules[0].path = "/opt/p11.so".to_string();
+    plan.slots[0].object = present;
+    plan.slots[1].object = present;
+    let err = facts
+        .resolve_merge_inputs(&plan, &pins, &[], &[], &[])
+        .unwrap_err();
+    assert_eq!(
+        format!("{err:#}"),
+        "planned module '/opt/p11.so' has no comparable pin"
+    );
+    // Active slot object without a pin refuses, naming the slot path.
+    plan.modules[0].object = present;
+    plan.slots[1].object = missing;
+    plan.slots[1].object_path = "/opt/p11-gone.so".to_string();
+    let err = facts
+        .resolve_merge_inputs(&plan, &pins, &[], &[], &[])
+        .unwrap_err();
+    assert_eq!(
+        format!("{err:#}"),
+        "planned slot object '/opt/p11-gone.so' has no comparable pin"
+    );
+    // Complete pins pass.
+    plan.slots[1].object = present;
+    facts
+        .resolve_merge_inputs(&plan, &pins, &[], &[], &[])
+        .expect("complete pins resolve");
+}
+
 #[test]
 fn discovery_pair_rows_share_the_merge_view_key() {
     // Both rows of a witness-proven copy-up pair publish the merge

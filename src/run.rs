@@ -3855,8 +3855,9 @@ fn refuse_if_interrupted_before_attach(stop: &SignalState) -> Result<()> {
 
 /// A stop observed at a named slow startup stage ends startup with
 /// the same named error: nothing was captured, so there is no report
-/// to write. The match is exhaustive so a new stage cannot slip in
-/// unchecked; the operator line stays uniform across stages.
+/// to write. Every stage maps to that one error and the ordering test
+/// pins each call site, which is what would catch a missing check —
+/// the exhaustive match alone would not.
 fn refuse_if_interrupted_at_stage(stop: &SignalState, stage: StartupStage) -> Result<()> {
     match stage {
         StartupStage::Policy

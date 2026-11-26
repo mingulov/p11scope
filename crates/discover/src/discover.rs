@@ -330,6 +330,7 @@ fn discover_with_budget(
         &module_identity,
         &mut objects,
         &identify_spent,
+        &|| std::fs::read("/proc/self/maps"),
     );
     let selection_evidence = selection_records(selection_raw, &surfaces);
     let alias_groups = alias_groups(&surfaces);
@@ -1459,6 +1460,7 @@ fn selection_acquisition(
     module_identity: &ObjectIdentity,
     objects: &mut ObjectTable,
     identify_spent: &Cell<u64>,
+    read_maps: &impl Fn() -> std::io::Result<Vec<u8>>,
 ) -> (SelectionAcquisition, Vec<RawSelectionQuery>) {
     if raw_export.is_none() {
         return (SelectionAcquisition::ExportAbsent, Vec::new());
@@ -1513,6 +1515,7 @@ fn selection_acquisition(
                             module_file_key,
                             module_identity,
                             identify_spent,
+                            read_maps,
                         )
                     },
                     |maps_a| {
@@ -1630,6 +1633,7 @@ fn selection_acquisition(
                             module_file_key,
                             module_identity,
                             identify_spent,
+                            read_maps,
                         )
                     },
                 );
@@ -1818,8 +1822,10 @@ fn stable_selection_maps(
     expected_key: ObjectKey,
     expected_identity: &ObjectIdentity,
     identify_spent: &Cell<u64>,
+    read_maps: &impl Fn() -> std::io::Result<Vec<u8>>,
 ) -> Result<Vec<maps::MapEntry>, ()> {
     let mut budget = UnboundedProbeBudget;
+    let bytes = read_maps().map_err(|_| ())?;
     stable_selection_maps_with_probe(
         module_path,
         expected_key,
@@ -1827,6 +1833,7 @@ fn stable_selection_maps(
         &KernelSelfMappingProbe,
         &mut budget,
         identify_spent,
+        &bytes,
     )
 }
 
@@ -1837,9 +1844,9 @@ fn stable_selection_maps_with_probe(
     probe: &impl SelfMappingProbe,
     budget: &mut dyn ProbeBudget,
     identify_spent: &Cell<u64>,
+    maps_bytes: &[u8],
 ) -> Result<Vec<maps::MapEntry>, ()> {
-    let bytes = std::fs::read("/proc/self/maps").map_err(|_| ())?;
-    let current_maps = maps::parse_maps(&bytes).map_err(|_| ())?;
+    let current_maps = maps::parse_maps(maps_bytes).map_err(|_| ())?;
     let file = identity::open_object(module_path).map_err(|_| ())?;
     let current_key = file_key(&file).map_err(|_| ())?;
     let current_identity = validated_file_identity_with_probe(
@@ -2843,6 +2850,17 @@ mod tests {
     /// `ObjectTable::resolve` identifies dependencies against the table's
     /// shared counter, not a fresh one: an exhausted budget turns the
     /// target unusable with the limit reason instead of resolving it.
+    /// One synthetic maps line carrying `key`, for tests that must not
+    /// depend on a live (tearing) maps read. Addresses are fixed: only
+    /// device/inode feed the key under test.
+    fn scripted_maps_bytes(key: &ObjectKey) -> Vec<u8> {
+        format!(
+            "10000000-10001000 r-xp 00000000 {:02x}:{:02x} {} /synthetic/probe-target\n",
+            key.device.major, key.device.minor, key.inode
+        )
+        .into_bytes()
+    }
+
     /// A minimal provider whose C_GetInterface answers CKR_OK with a
     /// garbage table pointer: every selection query runs both maps
     /// snapshots, then fails reading the interface. Shape-only; the
@@ -2888,9 +2906,8 @@ mod tests {
     /// selection run over the garbage-output fixture, the counter holds
     /// exactly twenty module reads (ten queries times two snapshots). A
     /// fresh counter smuggled into either snapshot closure halves the
-    /// debit and fails here. Retried because a torn `/proc/self/maps`
-    /// read under the suite's parallel mapping churn skips one snapshot
-    /// spend; a smuggled counter misses every attempt instead.
+    /// debit and fails here. The snapshots parse scripted maps bytes,
+    /// so no live (tearing) read can skip a debit: single attempt.
     #[test]
     fn selection_snapshots_charge_the_shared_identify_budget() {
         let provider = selection_spend_fixture();
@@ -2900,38 +2917,33 @@ mod tests {
         let module_file = identity::open_object(&provider).unwrap();
         let module_file_key = file_key(&module_file).unwrap();
         let module_identity = identity_and_key(&provider, &Cell::new(0)).unwrap().1;
-        let mut debited = 0;
-        for _ in 0..5 {
-            let spent = Rc::new(Cell::new(0u64));
-            let mut objects = ObjectTable::new(
-                provider.clone(),
-                module_file_key,
-                module_identity.clone(),
-                BTreeSet::from([module_file_key]),
-                Rc::clone(&spent),
-            );
-            let (acquisition, queries) = selection_acquisition(
-                &lib,
-                Some(1),
-                Some(1),
-                &memory,
-                &[],
-                &provider,
-                module_file_key,
-                module_file_key,
-                &module_identity,
-                &mut objects,
-                &spent,
-            );
-            assert_eq!(acquisition, SelectionAcquisition::Queried);
-            assert_eq!(queries.len(), 10);
-            debited = spent.get();
-            if debited == 20 * len {
-                break;
-            }
-        }
+        let maps_bytes = scripted_maps_bytes(&module_file_key);
+        let spent = Rc::new(Cell::new(0u64));
+        let mut objects = ObjectTable::new(
+            provider.clone(),
+            module_file_key,
+            module_identity.clone(),
+            BTreeSet::from([module_file_key]),
+            Rc::clone(&spent),
+        );
+        let (acquisition, queries) = selection_acquisition(
+            &lib,
+            Some(1),
+            Some(1),
+            &memory,
+            &[],
+            &provider,
+            module_file_key,
+            module_file_key,
+            &module_identity,
+            &mut objects,
+            &spent,
+            &|| Ok(maps_bytes.clone()),
+        );
+        assert_eq!(acquisition, SelectionAcquisition::Queried);
+        assert_eq!(queries.len(), 10);
         assert_eq!(
-            debited,
+            spent.get(),
             20 * len,
             "every selection snapshot debits the shared counter"
         );
@@ -2957,16 +2969,15 @@ mod tests {
         assert!(error.contains("total more than the"), "{error}");
     }
 
-    /// Every production call edge into the identify machinery passes the
-    /// pipeline's shared counter: one assertion per edge, each naming the
-    /// edge, over this file's own text (the `include_str!` pin mechanism
-    /// this codebase already uses for structural properties). Behavioral
-    /// pass/fail cannot attribute edges — every exhausted read fails
-    /// identically and the pipeline short-circuits — so the wiring shape
-    /// itself is pinned here while the callees' counter use is pinned
-    /// behaviorally by the spend tests above.
+    /// Structural pin (not a behavioral guarantee): every production
+    /// call edge into the identify machinery spells the shared counter
+    /// at its call site, one assertion per edge over this file's own
+    /// text. Behavioral pass/fail cannot attribute edges — every
+    /// exhausted read fails identically and the pipeline short-circuits
+    /// — so the wiring shape is pinned here while the callees' counter
+    /// use is pinned behaviorally by the spend tests above.
     #[test]
-    fn discovery_call_edges_pass_the_shared_identify_budget() {
+    fn discovery_call_edges_pin_the_shared_counter_wiring() {
         let lines: Vec<&str> = include_str!("discover.rs").lines().collect();
         let window_has_counter = |anchor: &str, window: usize| {
             let at = lines
@@ -3069,10 +3080,9 @@ mod tests {
 
     /// `stable_selection_maps` revalidates the module against the passed
     /// counter: an exhausted budget refuses the snapshot. Driven on the
-    /// test executable itself, which is always mapped. The fresh-counter
-    /// arm retries past torn `/proc/self/maps` reads under the suite's
-    /// parallel mapping churn; the exhausted arm needs no retry because
-    /// any failure is the expected verdict there.
+    /// test executable with scripted maps carrying its key, so no live
+    /// (tearing) read stands between the test and the exact debit:
+    /// single attempt.
     #[test]
     fn stable_selection_maps_charges_the_shared_identify_budget() {
         let exe = std::env::current_exe().unwrap();
@@ -3080,22 +3090,17 @@ mod tests {
         let file = identity::open_object(&exe).unwrap();
         let key = file_key(&file).unwrap();
         let identity = identity_and_key(&exe, &Cell::new(0)).unwrap().1;
-        let mut debited = None;
-        for _ in 0..5 {
-            let spent = Cell::new(0u64);
-            if let Ok(maps) = stable_selection_maps(&exe, key, &identity, &spent) {
-                assert!(!maps.is_empty());
-                debited = Some(spent.get());
-                break;
-            }
-        }
-        assert_eq!(
-            debited,
-            Some(len),
-            "a successful revalidation debits exactly one module read"
-        );
+        let maps_bytes = scripted_maps_bytes(&key);
+        let spent = Cell::new(0u64);
+        let maps = stable_selection_maps(&exe, key, &identity, &spent, &|| Ok(maps_bytes.clone()))
+            .unwrap();
+        assert!(!maps.is_empty());
+        assert_eq!(spent.get(), len);
         let spent = Cell::new(MAX_TOTAL_OBJECT_BYTES);
-        assert!(stable_selection_maps(&exe, key, &identity, &spent).is_err());
+        assert!(
+            stable_selection_maps(&exe, key, &identity, &spent, &|| Ok(maps_bytes.clone()))
+                .is_err()
+        );
     }
 
     /// `provenance_objects` debits the passed counter for every mapping
@@ -3678,11 +3683,8 @@ mod tests {
     }
 
     #[test]
-    fn stable_maps_live_module_accepts_without_probing() {
+    fn stable_maps_matching_module_accepts_without_probing() {
         let exe = small_owned_elf();
-        // The module must be live-mapped in this process: dlopen the
-        // fixture instead of relying on the test binary's own mapping.
-        let _live = unsafe { Library::new(&exe) }.expect("dlopen the owned fixture");
         let (key, identity) = identity_and_key(&exe, &Cell::new(0)).unwrap();
         let probe = FakeSelfMappingProbe::new(true, None);
         let mut budget = UnboundedProbeBudget;
@@ -3693,6 +3695,7 @@ mod tests {
             &probe,
             &mut budget,
             &Cell::new(0),
+            &scripted_maps_bytes(&key),
         )
         .unwrap();
         assert!(maps.iter().any(|mapping| ObjectKey::of(mapping) == key));
@@ -3716,6 +3719,7 @@ mod tests {
             &probe,
             &mut budget,
             &Cell::new(0),
+            &scripted_maps_bytes(&key),
         )
         .unwrap_err();
         assert_eq!(probe.probes.get(), 0);

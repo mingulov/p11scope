@@ -210,8 +210,12 @@ impl RefreshQueue {
     /// admitted head would sit unserviced; refuse it instead. The
     /// sweep spends the per-pass allowance one `/proc` examination at
     /// a time and stops at zero, so arrivals past one full sweep per
-    /// pass refuse without scanning; the refused work defers (it is
-    /// never dropped as loss) and retries next pass.
+    /// pass refuse without scanning. A refused retry, or refused
+    /// consumed work whose member is still reachable (a retained view
+    /// or a live `/proc` entry), defers and retries next pass; refused
+    /// consumed work of a gone member, or under the collected finish,
+    /// is dropped with its loss by the engine (run-path R2,
+    /// `Engine::refused_refresh_retryable`).
     pub(crate) fn relieve_one(
         &mut self,
         waiter: u32,

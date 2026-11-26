@@ -431,7 +431,7 @@ sys.stdout.write((api / name).read_text())
         steps = workflow()["jobs"]["package"]["steps"]
         self.assertEqual(steps[1]["name"], "Verify package checkout")
 
-    def test_build_packages_install_from_the_pinned_ubuntu_snapshot(self):
+    def test_clang_installs_from_the_pinned_ubuntu_snapshot(self):
         self.assertTrue(WORKFLOW.is_file(), "the package-only workflow is missing")
         document = workflow()
         snapshot = document["env"].get("UBUNTU_APT_SNAPSHOT")
@@ -442,10 +442,20 @@ sys.stdout.write((api / name).read_text())
         pinned = set(re.findall(r"UBUNTU_APT_SNAPSHOT=([0-9]{8}T[0-9]{6}Z)", helper))
         self.assertTrue(pinned, "the helper lane must pin its snapshot")
         self.assertEqual(pinned, {snapshot})
-        body = step("Install build packages from the pinned Ubuntu snapshot")["run"]
-        self.assertIn('-S "$UBUNTU_APT_SNAPSHOT" update', body)
-        self.assertIn('-S "$UBUNTU_APT_SNAPSHOT" install', body)
-        self.assertIn("clang-18", body)
+        # Only the byte-relevant compiler installs from the snapshot: it
+        # lands fresh with no preinstalled dependents, so its snapshot
+        # closure resolves. The byte-irrelevant set stays floating: a
+        # snapshot install of it conflicts with the runner's newer
+        # preinstalled packages (duplicate-version solver failure).
+        clang = step("Install clang-18 from the pinned Ubuntu snapshot")["run"]
+        self.assertIn('-S "$UBUNTU_APT_SNAPSHOT" update', clang)
+        self.assertIn('-S "$UBUNTU_APT_SNAPSHOT" install -y clang-18', clang)
+        for other in ("gcc-multilib", "softhsm2", "musl-tools", "libseccomp-dev"):
+            self.assertNotIn(other, clang,
+                             "the snapshot step installs only clang-18")
+        bulk = step("Install build packages")["run"]
+        self.assertNotIn("-S ", bulk, "the bulk set stays floating")
+        self.assertIn("clang-18", clang)
 
     def prepare_package_children(self):
         scripts = self.repo / "scripts"
@@ -670,7 +680,6 @@ else:
                        "Binary: /usr/bin/p11scope", "missing CAP_BPF", "setcap",
                        "cmp /usr/bin/p11scope", 'check-capture-evidence.py" clean-metrics',
                        "check-count-multiset.py", "softhsm2-util --init-token",
-                       '-S "$UBUNTU_APT_SNAPSHOT" install',
                        "p11scope-discover --version", "apt-get remove",
                        "fedora:44", "dnf install", "dnf remove"):
             self.assertIn(marker, bodies, f"install test must {marker}")

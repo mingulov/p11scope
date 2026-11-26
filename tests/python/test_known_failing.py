@@ -526,6 +526,23 @@ class CellDeclarationTests(unittest.TestCase):
                 result = f.run_checker()
                 self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_cell_row_with_wrong_existing_runner_has_no_judge(self):
+        f = fixture(self)
+        f.registry()
+        f.shell_cell()
+        other = f.root / "scripts/ci/other.sh"
+        other.write_text(
+            "#!/bin/sh\nif [ \"$1\" = --list-cells ]; then echo mt-exact; exit 0; fi\nexit 0\n",
+            encoding="utf-8")
+        other.chmod(0o755)
+        f.rows([row(path="scripts/ci/other.sh", test="mt-exact", cell="mt-exact",
+                    runner="cell:scripts/ci/other.sh",
+                    signature={"cell": "mt-exact", "branch": "B"})])
+        result = f.run_checker()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("has no CI judge", result.stderr)
+        self.assertIn("same --known-failing-runner", result.stderr)
+
     def test_cell_row_with_bogus_stream_host_has_no_judge(self):
         for host in ("bogus-host", "$other"):
             with self.subTest(host=host):
@@ -858,6 +875,29 @@ class FallbackBranchTests(unittest.TestCase):
         judged = f.run_checker("--results", str(merged))
         self.assertEqual(judged.returncode, 0, judged.stderr)
         self.assertIn("1 expected failures", judged.stdout)
+
+
+class StaticWiringTests(unittest.TestCase):
+    STATIC_RUN = "python3 -I scripts/check-known-failing.py"
+    SUITES_RUN = "python3 -I scripts/run-python-suites.py"
+
+    def scripts_run_steps(self):
+        import yaml
+        document = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))
+        steps = document["jobs"]["scripts"]["steps"]
+        return [step.get("run") for step in steps
+                if isinstance(step, dict) and isinstance(step.get("run"), str)]
+
+    def test_scripts_job_runs_static_checker_before_suites(self):
+        runs = self.scripts_run_steps()
+        static = [index for index, run in enumerate(runs) if run.strip() == self.STATIC_RUN]
+        suites = [index for index, run in enumerate(runs) if run.strip() == self.SUITES_RUN]
+        self.assertEqual(len(static), 1,
+                         f"scripts job must run the static checker exactly once, found {len(static)}")
+        self.assertEqual(len(suites), 1,
+                         f"scripts job must run the suite driver exactly once, found {len(suites)}")
+        self.assertLess(static[0], suites[0],
+                        "static ledger check must precede typed judgment")
 
 
 class ProducerTests(unittest.TestCase):
@@ -1910,6 +1950,9 @@ class MutationSweepTests(unittest.TestCase):
             "runner-vocabulary": ('if not valid_runner(raw["runner"]):', 'if False:'),
             "results-discovery-skip": ('discover_executables=args.results is None', 'discover_executables=True'),
             "generic-branch-refused": ('if isinstance(raw.get("signature"), dict) and raw["signature"].get("branch") in GENERIC_SIGNATURE_BRANCHES:', 'if False:'),
+            "target-release-expiry": ('if (root / "docs/releases" / f"v{row[\'target\']}.md").is_file():', 'if False:'),
+            "bogus-host-refused": ('if not isinstance(host, str) or host not in HOSTS:', 'if False:'),
+            "cell-judge-runner": ('if invocation.get("runner") != row["runner"]:', 'if False:'),
         }
         green_to_red = {"results-discovery-skip"}
 
@@ -2022,6 +2065,49 @@ class MutationSweepTests(unittest.TestCase):
                 f.python_suite()
                 f.rows([row(signature={"branch": "failed", "exception": "AssertionError",
                                         "oracle": "unittest"})])
+                return None
+            if name == "target-release-expiry":
+                f.registry()
+                f.python_suite()
+                f.rows([row(target="0.7.3")])
+                target_doc = f.root / "docs/releases/v0.7.3.md"
+                target_doc.parent.mkdir(parents=True, exist_ok=True)
+                target_doc.write_text("# p11scope v0.7.3\n", encoding="utf-8")
+                return None
+            if name == "bogus-host-refused":
+                f.registry()
+                f.shell_cell(declarations=False)
+                (f.root / ".github/workflows/main.yml").write_text(
+                    "jobs:\n  test:\n    steps:\n      - run: |\n"
+                    "          python3 -I scripts/ci/check-cell-results.py \"$out/results.jsonl\" "
+                    "--require mt-exact"
+                    " --known-failing-results \"$out/kf.json\""
+                    " --known-failing-runner cell:scripts/ci/cells.sh"
+                    " --known-failing-host bogus-host\n",
+                    encoding="utf-8")
+                f.rows([row(path="scripts/ci/cells.sh", test="mt-exact", cell="mt-exact",
+                            runner="cell:scripts/ci/cells.sh",
+                            signature={"cell": "mt-exact", "branch": "B"})])
+                return None
+            if name == "cell-judge-runner":
+                f.registry()
+                f.shell_cell(declarations=False)
+                (f.root / ".github/workflows/main.yml").write_text(
+                    "jobs:\n  test:\n    steps:\n      - run: |\n"
+                    "          python3 -I scripts/ci/check-cell-results.py \"$out/results.jsonl\" "
+                    "--require mt-exact"
+                    " --known-failing-results \"$out/kf.json\""
+                    " --known-failing-runner cell:scripts/ci/cells.sh"
+                    " --known-failing-host github\n",
+                    encoding="utf-8")
+                other = f.root / "scripts/ci/other.sh"
+                other.write_text(
+                    "#!/bin/sh\nif [ \"$1\" = --list-cells ]; then echo mt-exact; exit 0; fi\nexit 0\n",
+                    encoding="utf-8")
+                other.chmod(0o755)
+                f.rows([row(path="scripts/ci/other.sh", test="mt-exact", cell="mt-exact",
+                            runner="cell:scripts/ci/other.sh",
+                            signature={"cell": "mt-exact", "branch": "B"})])
                 return None
             raise AssertionError(name)
 

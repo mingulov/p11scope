@@ -865,7 +865,7 @@ jobs:
           TREE=$(git rev-parse 'HEAD^{tree}')
           cat >"$RUNNER_TEMP/lanes.txt" <<EOF
           commit $GITHUB_SHA tree $TREE
-          scope: printed before any step runs, so it is scope, never a result — each step's own status is the evidence. The hosted check jobs lint, audit, tests, contracts and scripts attempt the cargo fmt/check/test/clippy gates (the workspace test gate split between the tests job and the contracts shards), the diagnostic-object inventory test and the advisory/licence gates; this job attempts every --self-test and these lanes in full: scripts/verify-inspect-doctor.sh, scripts/verify-attach-e2e.sh, scripts/run-python-suites.py
+          scope: printed before any step runs, so it is scope, never a result — each step's own status is the evidence. The hosted check jobs lint, audit, tests, contracts and scripts attempt the cargo fmt/check/test/clippy gates (the workspace test gate split between the tests job and the contracts shards), the diagnostic-object inventory test and the advisory/licence gates; this job attempts every --self-test and these lanes in full: scripts/verify-inspect-doctor.sh, scripts/verify-attach-e2e.sh, scripts/run-python-suites.py, scripts/check-known-failing.py
           UNRUN: scripts/attach-pod.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/bench-overhead.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/bench-count-overhead.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
@@ -1108,6 +1108,9 @@ jobs:
       - run: python3 -I scripts/system-scope-soak-oracle.py --self-test
       - run: scripts/verify-inspect-doctor.sh
       - run: scripts/verify-attach-e2e.sh --diagnose-skips
+      # Static known-failing ledger check, with executable discovery: the
+      # typed --results judgment below trusts this step, so it runs first.
+      - run: python3 -I scripts/check-known-failing.py
       # Every tests/python suite (F-62): the runner checks that each file is
       # registered exactly once (run here, driven by a named cargo test or
       # self-test, or excluded with a reason), fails on any unregistered or

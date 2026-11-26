@@ -11171,23 +11171,32 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
         // quoted "sudo" is a shell-token boundary in COMMAND_BOUNDARY for parsing
         // workflow text, never a sudo argv invocation (it only runs the typed
         // probe, the cargo wrapper and cell --list-cells, all unprivileged).
-        // The pin below fails if a second quoted sudo appears or the boundary
-        // table goes away, so a real sudo invocation cannot hide here.
+        // The pin below fails if a second quoted sudo appears, if the boundary
+        // table goes away, or if the quoted line stops being a bare string
+        // literal (a real argv invocation needs a call, list or assignment),
+        // so a real sudo invocation cannot hide here.
         let own_text_quotes_sudo = read(script).lines().map(str::trim).any(|line| {
             !line.starts_with('#') && (line.contains("\"sudo\"") || line.contains("'sudo'"))
         });
         if script == "scripts/check-known-failing.py" {
-            let quoted = read(script)
+            let text = read(script);
+            let quoted: Vec<&str> = text
                 .lines()
                 .filter(|line| line.contains("\"sudo\"") || line.contains("'sudo'"))
-                .count();
+                .collect();
             assert_eq!(
-                quoted, 1,
-                "check-known-failing.py quotes sudo {quoted}x, not 1x: re-review the boundary-table exclusion"
+                quoted.len(),
+                1,
+                "check-known-failing.py quotes sudo {}x, not 1x: re-review the boundary-table exclusion",
+                quoted.len()
             );
             assert!(
                 read(script).contains("COMMAND_BOUNDARY"),
                 "check-known-failing.py lost COMMAND_BOUNDARY: re-review the sudo_invoked exclusion"
+            );
+            assert!(
+                !quoted[0].contains('(') && !quoted[0].contains('[') && !quoted[0].contains('='),
+                "check-known-failing.py quoted sudo is no longer a bare literal: re-review the sudo_invoked exclusion"
             );
         }
         if own_text_quotes_sudo && script != "scripts/check-known-failing.py" {

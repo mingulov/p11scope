@@ -1167,6 +1167,49 @@ class ShutdownCrashTests(unittest.TestCase):
                          "process_exit_inconsistent")
 
 
+class FragmentAdmissionTests(unittest.TestCase):
+    TEMPLATE = (
+        '{"schema": "p11scope/python-suite-fragment/v1", '
+        '"path": "tests/python/test_sample.py", "invocation": [], '
+        '"process_exit": %s, "complete": true, '
+        '"selection": [{"test": "Sample.test_x"}], '
+        '"results": [{"test": "Sample.test_x", "state": "failed", '
+        '"signature": {"cell": "X", "branch": "B"}}], "suite_events": []}\n')
+
+    def merge_text(self, text):
+        runner = load_script(ROOT / "scripts/run-python-suites.py",
+                             "python_suite_runner_admission")
+        with tempfile.TemporaryDirectory() as temporary:
+            temp = Path(temporary)
+            fragment = temp / "fragment.json"
+            fragment.write_text(text, encoding="utf-8")
+            output = temp / "merged.json"
+            problems = runner.merge_typed_fragments(
+                [(fragment, "test_sample.py", [], 1)], output, "github")
+            document = json.loads(output.read_text(encoding="utf-8"))
+            rows = {item["test"]: item for item in document["results"]}
+            return problems, rows["<suite-process>"]
+
+    def test_boolean_process_exit_is_fragment_invalid(self):
+        problems, process = self.merge_text(self.TEMPLATE % "true")
+        self.assertTrue(problems)
+        self.assertEqual(process["state"], "failed")
+        self.assertEqual(process["signature"]["branch"], "fragment_invalid")
+
+    def test_duplicate_fragment_keys_are_fragment_invalid(self):
+        text = self.TEMPLATE % "1"
+        text = text.replace('{"schema":', '{"process_exit": 0, "schema":', 1)
+        problems, process = self.merge_text(text)
+        self.assertTrue(problems)
+        self.assertEqual(process["state"], "failed")
+        self.assertEqual(process["signature"]["branch"], "fragment_invalid")
+
+    def test_wellformed_failure_merges_clean(self):
+        problems, process = self.merge_text(self.TEMPLATE % "1")
+        self.assertEqual(problems, [])
+        self.assertEqual(process["state"], "passed")
+
+
 class ScopeSkipTests(unittest.TestCase):
     CLASS_SKIP_BODY = (
         "import unittest\n"
@@ -1494,6 +1537,7 @@ class ProducerMutationSweepTests(unittest.TestCase):
                 temp = Path(temporary)
                 script = temp / "run-python-suites.py"
                 script.write_text(source, encoding="utf-8")
+                shutil.copy2(ROOT / "scripts/check-known-failing.py", temp / "check-known-failing.py")
                 module = load_script(script, f"runner_{label}")
                 fragment = temp / "fragment.json"
                 write_json(fragment, {
@@ -1524,6 +1568,7 @@ class ProducerMutationSweepTests(unittest.TestCase):
                 temp = Path(temporary)
                 script = temp / "run-python-suites.py"
                 script.write_text(source, encoding="utf-8")
+                shutil.copy2(ROOT / "scripts/check-known-failing.py", temp / "check-known-failing.py")
                 module = load_script(script, f"runner_crash_{label}")
                 fragment = temp / "fragment.json"
                 write_json(fragment, {
@@ -1543,6 +1588,69 @@ class ProducerMutationSweepTests(unittest.TestCase):
                 else:
                     mutant_ok = ok
         self.record(results, "python-outer-exit", original_ok, mutant_ok)
+
+        # Fragment admission is exact-typed: a boolean process_exit must not
+        # pass as the integer 1 via isinstance.
+        bool_mutant = self.mutate_source(ROOT / "scripts/run-python-suites.py",
+                                         "and type(fragment.get(\"process_exit\")) is int",
+                                         "and isinstance(fragment.get(\"process_exit\"), int)")
+        for label, source in (("original", runner_source), ("mutant", bool_mutant)):
+            with tempfile.TemporaryDirectory() as temporary:
+                temp = Path(temporary)
+                script = temp / "run-python-suites.py"
+                script.write_text(source, encoding="utf-8")
+                shutil.copy2(ROOT / "scripts/check-known-failing.py", temp / "check-known-failing.py")
+                module = load_script(script, f"runner_bool_{label}")
+                fragment = temp / "fragment.json"
+                write_json(fragment, {
+                    "schema": "p11scope/python-suite-fragment/v1",
+                    "path": "tests/python/test_sample.py", "invocation": [], "process_exit": True,
+                    "complete": True,
+                    "selection": [{"test": "Sample.test_x"}],
+                    "results": [{"test": "Sample.test_x", "state": "failed",
+                                 "signature": {"cell": "X", "branch": "B"}}],
+                    "suite_events": [],
+                })
+                output = temp / "merged.json"
+                problems = module.merge_typed_fragments([(fragment, "test_sample.py", [], 1)], output, "github")
+                rows = {row_["test"]: row_ for row_ in json.loads(output.read_text())["results"]}
+                ok = bool(problems) and rows["<suite-process>"]["state"] == "failed"
+                if label == "original":
+                    original_ok = ok
+                else:
+                    mutant_ok = ok
+        self.record(results, "python-fragment-bool-exit", original_ok, mutant_ok)
+
+        # Fragment admission rejects duplicate keys: plain json.loads keeps
+        # the last one and would launder a contradictory process_exit.
+        dup_mutant = self.mutate_source(ROOT / "scripts/run-python-suites.py",
+                                        "fragment, _load_problems = checker.strict_json(text, str(fragment_path))",
+                                        "fragment = json.loads(text)")
+        for label, source in (("original", runner_source), ("mutant", dup_mutant)):
+            with tempfile.TemporaryDirectory() as temporary:
+                temp = Path(temporary)
+                script = temp / "run-python-suites.py"
+                script.write_text(source, encoding="utf-8")
+                shutil.copy2(ROOT / "scripts/check-known-failing.py", temp / "check-known-failing.py")
+                module = load_script(script, f"runner_dup_{label}")
+                fragment = temp / "fragment.json"
+                fragment.write_text(
+                    '{"schema": "p11scope/python-suite-fragment/v1", '
+                    '"path": "tests/python/test_sample.py", "invocation": [], '
+                    '"process_exit": 0, "process_exit": 1, "complete": true, '
+                    '"selection": [{"test": "Sample.test_x"}], '
+                    '"results": [{"test": "Sample.test_x", "state": "failed", '
+                    '"signature": {"cell": "X", "branch": "B"}}], "suite_events": []}\n',
+                    encoding="utf-8")
+                output = temp / "merged.json"
+                problems = module.merge_typed_fragments([(fragment, "test_sample.py", [], 1)], output, "github")
+                rows = {row_["test"]: row_ for row_ in json.loads(output.read_text())["results"]}
+                ok = bool(problems) and rows["<suite-process>"]["state"] == "failed"
+                if label == "original":
+                    original_ok = ok
+                else:
+                    mutant_ok = ok
+        self.record(results, "python-fragment-dup-keys", original_ok, mutant_ok)
 
         # Python module terminal events must reach the typed fragment.
         typed_source = (ROOT / "scripts/typed-python-suite.py").read_text(encoding="utf-8")
@@ -2014,7 +2122,7 @@ class ProducerMutationSweepTests(unittest.TestCase):
                 outcomes[label] = run.returncode == 0
         self.record(results, "workflow-require-file-empty-selection", outcomes["original"], outcomes["mutant"])
 
-        total = 24
+        total = 26
         self.assertEqual(results["failures"], [],
                          f"surviving producer mutants: {results['failures']}; killed {results['killed']}/{total}")
         print(f"known-failing producer mutation sweep: {results['killed']}/{total} killed")

@@ -29,6 +29,7 @@ Usage:
   python3 -I scripts/run-python-suites.py SUITE...   # check, run only these
 """
 
+import importlib.util
 import json
 import os
 import subprocess
@@ -39,6 +40,21 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SUITE_DIR = "tests/python"
+
+
+def checker_module():
+    """The typed-ledger checker, shared for its strict JSON document loader.
+
+    Fragments are typed gate evidence, so they are admitted with the same
+    strictness as result documents: duplicate keys and non-strict
+    constants are rejected instead of silently coerced.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "known_failing_checker_strict",
+        Path(__file__).resolve().parent / "check-known-failing.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 # Tokens of an invocation or an argument list. A quoted suite path counts
 # as driven only in argument position (after `(`, `,` or `[`) with one of
@@ -453,6 +469,7 @@ def merge_typed_fragments(fragment_specs, output, host):
     failure_states = {"failed", "error", "unexpected_success", "not_run"}
     event_failure_states = {"failed", "error", "unexpected_success"}
     required_keys = {"schema", "path", "invocation", "process_exit", "complete", "selection", "results", "suite_events"}
+    checker = checker_module()
 
     for spec in fragment_specs:
         fragment_path, name, outer_invocation = spec[0], spec[1], spec[2]
@@ -465,19 +482,24 @@ def merge_typed_fragments(fragment_specs, output, host):
         fragment = None
         invalid = True
         try:
-            fragment = json.loads(fragment_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            text = fragment_path.read_text(encoding="utf-8")
+        except OSError:
             fragment = None
-        if isinstance(fragment, dict) and set(fragment) == required_keys:
+        else:
+            fragment, _load_problems = checker.strict_json(text, str(fragment_path))
+        if type(fragment) is dict and set(fragment) == required_keys:
+            actual_invocation = fragment.get("invocation")
             invalid = not (
                 fragment.get("schema") == "p11scope/python-suite-fragment/v1"
                 and fragment.get("path") == suite_path
-                and fragment.get("invocation") == invocation
-                and isinstance(fragment.get("process_exit"), int)
-                and isinstance(fragment.get("complete"), bool)
-                and isinstance(fragment.get("selection"), list)
-                and isinstance(fragment.get("results"), list)
-                and isinstance(fragment.get("suite_events"), list)
+                and type(actual_invocation) is list
+                and all(type(item) is str for item in actual_invocation)
+                and actual_invocation == invocation
+                and type(fragment.get("process_exit")) is int
+                and type(fragment.get("complete")) is bool
+                and type(fragment.get("selection")) is list
+                and type(fragment.get("results")) is list
+                and type(fragment.get("suite_events")) is list
             )
         if invalid:
             complete = False
@@ -487,13 +509,20 @@ def merge_typed_fragments(fragment_specs, output, host):
 
         selected_tests = []
         for item in fragment["selection"]:
-            if isinstance(item, dict) and isinstance(item.get("test"), str) and item["test"]:
+            if (type(item) is dict and set(item) == {"test"}
+                    and type(item.get("test")) is str and item["test"]):
                 selected_tests.append(item["test"])
                 selection.append({"path": suite_path, "test": item["test"], "invocation": invocation})
+            else:
+                invalid = True
+                complete = False
         outcome_rows = []
         failure_present = False
         for item in fragment["results"]:
-            if not isinstance(item, dict) or not isinstance(item.get("test"), str) or not item["test"]:
+            if (type(item) is not dict or set(item) != {"test", "state", "signature"}
+                    or type(item.get("test")) is not str or not item["test"]
+                    or type(item.get("state")) is not str or not item["state"]):
+                invalid = True
                 complete = False
                 continue
             state = item.get("state")
@@ -516,12 +545,14 @@ def merge_typed_fragments(fragment_specs, output, host):
 
         suite_events = []
         for event in fragment["suite_events"]:
-            if (isinstance(event, dict) and isinstance(event.get("event"), str) and event["event"]
-                    and isinstance(event.get("state"), str)):
+            if (type(event) is dict and set(event) == {"event", "state", "signature"}
+                    and type(event.get("event")) is str and event["event"]
+                    and type(event.get("state")) is str and event["state"]):
                 suite_events.append(event)
                 if event["state"] in event_failure_states:
                     failure_present = True
             else:
+                invalid = True
                 complete = False
 
         process_identity = {"path": suite_path, "test": "<suite-process>", "invocation": invocation}

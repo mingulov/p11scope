@@ -11110,6 +11110,47 @@ fn hosted_python_privilege_covers_real_owned_launcher_call_sites() {
     ));
 }
 
+/// Every predicate the `COMMAND_BOUNDARY` sudo exclusion relies on: one
+/// quoted sudo line, the table present, the full assignment verbatim, the
+/// quoted line a bare literal, and exactly two `COMMAND_BOUNDARY` mentions
+/// (definition plus the sole scanner membership use). Any edit that moves,
+/// recomputes or reuses the token changes one of these and fails loudly.
+fn checker_sudo_exclusion_holds(text: &str) -> Result<(), &'static str> {
+    let quoted: Vec<&str> = text
+        .lines()
+        .filter(|line| line.contains("\"sudo\"") || line.contains("'sudo'"))
+        .collect();
+    if quoted.len() != 1 {
+        return Err("quotes sudo != 1x");
+    }
+    if !text.contains("COMMAND_BOUNDARY") {
+        return Err("lost COMMAND_BOUNDARY");
+    }
+    if !text.contains(
+        "COMMAND_BOUNDARY = {\n    \";\", \"&&\", \"||\", \"|\", \"then\", \"do\", \"done\", \"fi\", \"if\", \"else\", \"elif\",\n    \"python3\", \"sudo\", \"env\", \"PY\", \"EOF\",\n}\n",
+    ) {
+        return Err("boundary assignment changed");
+    }
+    if quoted[0].contains('(') || quoted[0].contains('[') || quoted[0].contains('=') {
+        return Err("quoted sudo is no longer a bare literal");
+    }
+    if text.matches("COMMAND_BOUNDARY").count() != 2 {
+        return Err("COMMAND_BOUNDARY use count != 2");
+    }
+    Ok(())
+}
+
+#[test]
+fn sudo_exclusion_pin_rejects_computed_reuse() {
+    let text = read("scripts/check-known-failing.py");
+    assert!(checker_sudo_exclusion_holds(&text).is_ok());
+    let probe = "\n\ndef review_probe_computed_privileged_call():\n    subprocess.run([sorted(COMMAND_BOUNDARY)[12], \"-n\", \"true\"], check=False)\n";
+    assert!(
+        checker_sudo_exclusion_holds(&(text.clone() + probe)).is_err(),
+        "the pin must reject a computed reuse of the boundary set"
+    );
+}
+
 /// A green hosted job must never imply a privileged or container lane ran.
 /// The pipeline names every such lane verbatim as `UNRUN: <path>` (the
 /// `verify-capability-tier.sh` idiom) in the log and the job summary, as its
@@ -11171,39 +11212,16 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
         // quoted "sudo" is a shell-token boundary in COMMAND_BOUNDARY for parsing
         // workflow text, never a sudo argv invocation (it only runs the typed
         // probe, the cargo wrapper and cell --list-cells, all unprivileged).
-        // The pin below fails if a second quoted sudo appears, if the boundary
-        // token line changes at all, or if the quoted line stops being a bare
-        // string literal (a real argv invocation needs a call, list or
-        // assignment). Any edit that moves, recomputes or reuses the token
-        // therefore fails loudly instead of silently dropping the file from
-        // the privileged set.
+        // The pin this exclusion relies on is checked by
+        // `checker_sudo_exclusion_holds` (one quoted line, full assignment
+        // verbatim, bare literal, exactly two mentions); a self-test proves
+        // it rejects a computed reuse of the set.
         let own_text_quotes_sudo = read(script).lines().map(str::trim).any(|line| {
             !line.starts_with('#') && (line.contains("\"sudo\"") || line.contains("'sudo'"))
         });
         if script == "scripts/check-known-failing.py" {
-            let text = read(script);
-            let quoted: Vec<&str> = text
-                .lines()
-                .filter(|line| line.contains("\"sudo\"") || line.contains("'sudo'"))
-                .collect();
-            assert_eq!(
-                quoted.len(),
-                1,
-                "check-known-failing.py quotes sudo {}x, not 1x: re-review the boundary-table exclusion",
-                quoted.len()
-            );
-            assert!(
-                read(script).contains("COMMAND_BOUNDARY"),
-                "check-known-failing.py lost COMMAND_BOUNDARY: re-review the sudo_invoked exclusion"
-            );
-            assert!(
-                read(script).contains("    \"python3\", \"sudo\", \"env\", \"PY\", \"EOF\",\n"),
-                "check-known-failing.py boundary token line changed: re-review the sudo_invoked exclusion"
-            );
-            assert!(
-                !quoted[0].contains('(') && !quoted[0].contains('[') && !quoted[0].contains('='),
-                "check-known-failing.py quoted sudo is no longer a bare literal: re-review the sudo_invoked exclusion"
-            );
+            checker_sudo_exclusion_holds(&read(script))
+                .expect("check-known-failing.py sudo exclusion pin failed: re-review the sudo_invoked exclusion");
         }
         if own_text_quotes_sudo && script != "scripts/check-known-failing.py" {
             return true;

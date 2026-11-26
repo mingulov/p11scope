@@ -5,6 +5,7 @@
 pub mod attribution;
 pub(crate) mod caller_registry;
 pub(crate) mod confirm_shards;
+pub(crate) mod coverage_retire;
 pub(crate) mod elf_needed;
 pub mod engine;
 pub(crate) mod handle_table;

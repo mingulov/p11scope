@@ -528,8 +528,10 @@ def check_proxy_counts(report, ledger, failures, notes, allow_prefix_gap):
     branches, and a zero-count proxy layer fails (0 != ledger): the
     P1 arrival shape is named by the live-signal leg, but it no
     longer passes the counts. `C_GetFunctionList`/`C_GetInterface`
-    are excluded like in every other table comparison (the proxy
-    never counts them; see the GFL/GI leg for the interface pair).
+    are not table calls: any counted proxy row for them fails here
+    in both branches (the proxy never counts the interface pair;
+    the GFL/GI leg reads only backend and spy), and the exact note
+    counts only table calls.
     """
     order = table_order(ledger)
     mark = len(failures)
@@ -538,15 +540,24 @@ def check_proxy_counts(report, ledger, failures, notes, allow_prefix_gap):
         return
     notes.append(f"proxy ledger: total={ledger.total} prefix-ok")
     view = proxy_layer_view(report)
+    gfl_gi = [fn for fn in ("C_GetFunctionList", "C_GetInterface")
+              if view.calls.get(fn, 0)]
+    for fn in gfl_gi:
+        failures.append(
+            f"proxy {fn}: obs calls={view.calls[fn]} "
+            f"errs={view.errors.get(fn, 0)}, want 0 (the proxy never "
+            f"counts the interface pair)")
     exact, deficits = layer_books(ledger, view.calls, view.errors,
                                   "proxy", failures,
                                   strict=not allow_prefix_gap)
-    if exact:
-        notes.append(f"proxy: exact {sum(view.calls.values())}/"
+    if exact and not gfl_gi:
+        table_calls = sum(calls for fn, calls in view.calls.items()
+                          if fn not in ("C_GetFunctionList", "C_GetInterface"))
+        notes.append(f"proxy: exact {table_calls}/"
                      f"{ledger.total - ledger.counts.get('C_GetInterface', 0)
                       - ledger.counts.get('C_GetFunctionList', 0)}")
         return
-    if not allow_prefix_gap:
+    if not allow_prefix_gap or gfl_gi:
         return
     miss = pinned_prefix_failure(ledger, deficits, "proxy")
     if miss is not None:
@@ -707,7 +718,9 @@ def judge_opensc_outer(report, ledger, tool_rc, tool_out):
     exact when every forwarded call is counted, else passes as a
     prefix gap only for exactly the ledger's leading prefix with its
     full typed disclosure (books balanced, window, PARTIAL, zero
-    in-flight, zero loss, no surplus). Anything else fails.
+    loss, no surplus; in-flight rows are counted under
+    KI-v072-proxy-phantom-inflight, never failed). Anything else
+    fails.
     """
     failures, notes = [], []
     if tool_rc != 1 or "Available slots:" not in tool_out:
@@ -1750,6 +1763,30 @@ class PrefixMultisetTwins(unittest.TestCase):
         self.assertFalse(verdict, verdict.detail)
         self.assertIn("spy miss is not the ledger prefix", verdict.detail)
 
+    def test_prefix_deficit_with_error_mismatch_fails_both_layers(self):
+        # A prefix-shaped deficit that also mismatches errors is not
+        # a gap: Initialize missed plus GetSlotList at 1 call and 1
+        # error against a ledger of 2 calls and 0 errors. The real
+        # code fails it on the error mismatch; without the
+        # goterr==wanterr clause the miss files as {Init:1, GSL:1}
+        # == Counter(order[:2]) and passes as a prefix gap. Both
+        # layers, both judges.
+        for layer, sha in (("spy", SPY_SHA), ("proxy", PROXY_SHA)):
+            def miss_and_err(report, _ledger, sha=sha):
+                report["functions"] = [r for r in report["functions"]
+                                       if not (r["names"] == ["C_Initialize"]
+                                               and (r["module"] or {}).get("sha256") == sha)]
+                for row in report["functions"]:
+                    if (row["names"] == ["C_GetSlotList"]
+                            and (row["module"] or {}).get("sha256") == sha):
+                        row["calls"] = 1
+                        row["errors"] = 1
+            for judge in (judge_proxy_outer, judge_proxy_outer_prefix_gap):
+                ledger, report = gsl_fixture(count=2, mutate=miss_and_err)
+                verdict = judge(report, ledger, 0, 2, 2)
+                self.assertFalse(verdict, verdict.detail)
+                self.assertIn(f"{layer} C_GetSlotList", verdict.detail)
+
 
 class ProxyCountTwins(unittest.TestCase):
     """The proxy count leg: typed counts equal the ledger multiset."""
@@ -1872,6 +1909,21 @@ class ProxyCountTwins(unittest.TestCase):
         self.assertFalse(verdict, verdict.detail)
         self.assertIn("proxy ledger shape drifted", verdict.detail)
 
+    def test_proxy_gfl_gi_counted_fails_both_judges(self):
+        # The interface pair is evidenced, never proxy-counted: any
+        # counted proxy C_GetFunctionList/C_GetInterface row fails
+        # both judges (the GFL/GI leg reads only backend and spy),
+        # with no exact note.
+        for fn, calls in (("C_GetFunctionList", 5), ("C_GetInterface", 1)):
+            def counted(report, _ledger, fn=fn, calls=calls):
+                report["functions"].append(function_row(fn, PROXY_SHA, calls))
+            for judge in (judge_proxy_outer, judge_proxy_outer_prefix_gap):
+                ledger, report = proxy_fixture(counted)
+                verdict = judge(report, ledger, 0, 2, 2)
+                self.assertFalse(verdict, verdict.detail)
+                self.assertIn(f"proxy {fn}", verdict.detail)
+                self.assertNotIn("proxy: exact", verdict.detail)
+
 
 class RealReportTwins(unittest.TestCase):
     """Twins built from real runs, not synthetic fixtures.
@@ -1881,6 +1933,12 @@ class RealReportTwins(unittest.TestCase):
     the real 0/109 A03 report must fail on typed counts, and the
     real 106-prefix A02 report must pass the proxy prefix leg
     while failing the (P2) spy leg.
+
+    Provenance: r4-r2 was produced by candidate b3850fa09 (base
+    563fdf30d, which contains the gate commits c10ab04f3,
+    ec21f6683 and ceba89905), not by a cut binary — the cut has
+    not yet landed a live exact 109/109 proxy run. Swap in a
+    cut-binary exact report when one lands.
     """
 
     def test_real_healthy_r4_r2_passes_exact(self):

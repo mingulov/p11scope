@@ -32,6 +32,23 @@ def daemonset_image_and_policy():
     return image.group(2), policy.group(2)
 
 
+def millicores(value):
+    if type(value) is int:
+        return value * 1000
+    if isinstance(value, str) and value.endswith("m") and value[:-1].isdigit():
+        return int(value[:-1])
+    raise AssertionError(f"unsupported cpu request shape: {value!r}")
+
+
+def observer_cpu_request_millicores():
+    daemonsets = [document for document in yaml.safe_load_all(DAEMONSET.read_text())
+                  if isinstance(document, dict) and document.get("kind") == "DaemonSet"]
+    assert len(daemonsets) == 1, "20-daemonset.yaml must hold the single observer DaemonSet"
+    containers = daemonsets[0]["spec"]["template"]["spec"]["containers"]
+    assert len(containers) == 1, "the observer pod must stay a single container for the CPU pin"
+    return millicores(containers[0]["resources"]["requests"]["cpu"])
+
+
 def minimal_recipe_blocks():
     text = DEPLOY_README.read_text()
     blocks = re.findall(r"```sh\n(.*?)```", text, re.S)
@@ -126,7 +143,7 @@ class DeployDefaultsTests(unittest.TestCase):
         self.assertEqual(seen["ledger-a"]["requests"], seen["ledger-a"]["limits"],
                          "ledger-a keeps the hosted Guaranteed cgroup depth")
         workload_cpu = sum(int(seen[name]["requests"]["cpu"][:-1]) for name in expected)
-        hosted_cpu = 950 + 50 + workload_cpu
+        hosted_cpu = 950 + observer_cpu_request_millicores() + workload_cpu
         self.assertEqual(hosted_cpu, 1760,
                          "hosted kind budget: measured system pods + observer + workloads")
         self.assertLessEqual(hosted_cpu, 4000)

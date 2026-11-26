@@ -3582,6 +3582,43 @@ impl PinnedObjects {
         }
     }
 
+    /// Whether `left` and `right` hold the same scan custody over every raw
+    /// of `module` — its own file plus each table-entry dependency (run-path
+    /// R1, T2 NB1). The carried-row collapse treats two field-equal rows as
+    /// redundant only when this holds: `id_for_scanned` resolves through the
+    /// resolving view's own custody first, so rows whose views differ here
+    /// bind differently while a third view owns the raw. Call only for rows
+    /// equal under `carried_rows_equal` (their raw sets are then identical,
+    /// so one module's raws stand for both).
+    pub(crate) fn scan_custody_matches(
+        &self,
+        left: ProcessViewId,
+        right: ProcessViewId,
+        module: &ScannedModule,
+    ) -> bool {
+        let mut raws = Vec::new();
+        if let Some(own) = RawObjectInstance::scanned(module, module.key, &module.path) {
+            raws.push(own);
+        }
+        for entry in module.tables.iter().flat_map(|table| &table.entries) {
+            if let Some(raw) = RawObjectInstance::scanned(module, entry.object, &entry.object_path)
+            {
+                raws.push(raw);
+            }
+        }
+        raws.iter().all(|raw| {
+            let left_has = self
+                .raw_ownership
+                .get(&left)
+                .is_some_and(|owned| owned.contains(raw));
+            let right_has = self
+                .raw_ownership
+                .get(&right)
+                .is_some_and(|owned| owned.contains(raw));
+            left_has == right_has
+        })
+    }
+
     /// Ends the pin custody of a carried view whose every row the
     /// carried-row bound collapsed (CARRIED → RETIRED as redundant
     /// carry): its claims (it is outside the authority, so the post-bind

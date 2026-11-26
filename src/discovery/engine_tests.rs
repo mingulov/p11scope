@@ -1594,8 +1594,8 @@ fn r1_churn_twin(
     // provider retires with carry. One carried row per retired view,
     // which keeps its own slot active and its numeric ID held, grows
     // `modules` without a bound and exhausts the 1024 view IDs. The
-    // bound: one carried row per distinct attach contribution of one
-    // file, so 1100 generations end exactly where the first one did.
+    // bound: carried rows equal on every read field collapse to the
+    // oldest, so 1100 generations end exactly where the first one did.
     let (mut engine, base, object, _) = engine_with_overlay(89);
     engine.scope = scope;
     if owned_run {
@@ -1701,12 +1701,166 @@ fn r1_system_removal_churn_keeps_one_carried_row() {
     });
 }
 
+/// R1 container-churn typed oracle (T2 NB2): carried rows and minted view
+/// IDs after container-per-request churn with a fresh mount namespace and
+/// key per generation.
+#[derive(Debug, PartialEq, Eq)]
+struct R1ContainerChurn {
+    carried_rows: usize,
+    minted_ids: u32,
+    capacity_rows: usize,
+}
+
+#[test]
+fn r1_container_churn_keeps_one_carried_row_per_generation_until_capacity() {
+    // T2 NB2 (test-only; the production bound is unchanged): each generation
+    // runs in a fresh mount namespace with a fresh overlay key. Namespace and
+    // key are compared, so no two rows are ever equal: each generation keeps
+    // one carried row and holds one view ID until the view-ID capacity row
+    // refuses the next admission. Container churn is on the v0.8.0 list.
+    let (mut engine, base, _, _) = engine_with_overlay(89);
+    engine.scope = Scope::System;
+    // Small capacity so the test reaches the capacity row quickly
+    // (test-only; production keeps its bound).
+    engine.max_scan_pids = 128;
+    engine.next_view_id = 90;
+    let empty: BTreeSet<ProcessViewId> = BTreeSet::new();
+    let mut ids = BTreeSet::new();
+    let mut generations = 0u32;
+    loop {
+        let me = std::process::id();
+        let id = match engine.allocate_view_id_for_newcomer(me) {
+            Ok(id) => id,
+            Err(error) => {
+                assert!(
+                    error.to_string().contains("capture process-view capacity"),
+                    "capacity exhaustion names the capacity: {error}"
+                );
+                break;
+            }
+        };
+        assert!(
+            ids.insert(id),
+            "no ID is reused while carried rows hold them: {id:?}"
+        );
+        let view = ProcessView::open(id, me).unwrap();
+        let mut module = base.clone();
+        module.view = id;
+        // Fresh container instance: same path, fresh mount namespace and key.
+        let minor = 200 + u64::from(generations);
+        module.key = overlay_key(minor);
+        module.mount_namespace.inode = minor;
+        for entry in module
+            .tables
+            .iter_mut()
+            .flat_map(|table| &mut table.entries)
+        {
+            entry.object = module.key;
+        }
+        let mut pins = overlay_view_pin(&module, module.key.device.minor + 1, OVERLAY_SHA, 1, true);
+        record_scan_ownership(&mut pins, id, module.key, &module.path);
+        pins.prove_scanned_entries_for_test(std::slice::from_ref(&module));
+        let admitted = engine
+            .inventory_candidate(
+                &empty,
+                &[],
+                &[(view, vec![module], pins)],
+                Vec::new(),
+                &empty,
+            )
+            .expect("the churn admission rebuilds");
+        engine.plan = admitted.plan;
+        engine.pinned = admitted.pinned;
+        engine.modules = admitted.modules;
+        engine.views.push(ProcessView::open(id, me).unwrap());
+        engine.views.retain(|held| held.id() != id);
+        let retired = engine
+            .inventory_candidate(&BTreeSet::from([id]), &[], &[], Vec::new(), &empty)
+            .expect("the removal carry rebuilds");
+        engine.plan = retired.plan;
+        engine.pinned = retired.pinned;
+        engine.modules = retired.modules;
+        engine.release_view_id(id);
+        generations += 1;
+        // One carried row and one held view ID per generation.
+        let live: BTreeSet<ProcessViewId> = engine.views.iter().map(ProcessView::id).collect();
+        let carried = engine
+            .modules
+            .iter()
+            .filter(|module| !live.contains(&module.scanned.view))
+            .count();
+        assert_eq!(
+            engine.modules.len() as u32,
+            generations + 1,
+            "generation {generations}: one row per generation plus the fixture"
+        );
+        assert_eq!(
+            carried as u32,
+            generations + 1,
+            "generation {generations}: every row is carried"
+        );
+        assert_eq!(
+            engine.next_view_id,
+            90 + generations,
+            "generation {generations}: one minted ID per generation, no reuse"
+        );
+    }
+    assert_eq!(generations, 38, "90..128 mints 38 IDs before capacity");
+    // The next real admission files the capacity row and admits nothing.
+    let me = std::process::id();
+    let max_scan_pids = engine.max_scan_pids;
+    let (new_views, _, skipped) = engine.admit_inventory_new_views(
+        vec![me],
+        &AdmissionLedger::Free {
+            backlog: BTreeSet::new(),
+        },
+        max_scan_pids,
+        &mut || Some(0),
+    );
+    assert!(
+        new_views.iter().all(|(view, _, _)| view.pid() != me),
+        "nobody is admitted at capacity: {:?}",
+        new_views
+            .iter()
+            .map(|(view, _, _)| view.pid())
+            .collect::<Vec<_>>()
+    );
+    let outcome = R1ContainerChurn {
+        carried_rows: engine.modules.len(),
+        minted_ids: engine.next_view_id - 90,
+        capacity_rows: skipped
+            .iter()
+            .filter(|skip| skip.reason.starts_with("capture process-view capacity"))
+            .count(),
+    };
+    assert_eq!(
+        outcome,
+        R1ContainerChurn {
+            carried_rows: 39,
+            minted_ids: 38,
+            capacity_rows: 1,
+        },
+        "one carried row and one view ID per generation, up to one capacity row"
+    );
+}
+
 /// R1 unit oracle: (view, entry offsets) of every row the bound keeps,
-/// in order, plus the views it reports fully collapsed.
+/// in order, plus the views it reports fully collapsed. Custody is empty,
+/// so every view trivially matches every other (all lack all raws).
 fn r1_collapse(rows: Vec<ScannedModule>, carried: &[u32]) -> (Vec<(u32, Vec<u64>)>, Vec<u32>) {
+    r1_collapse_with_pins(rows, carried, &PinnedObjects::empty())
+}
+
+/// R1 unit oracle with explicit scan custody for the T2 NB1 twin.
+fn r1_collapse_with_pins(
+    rows: Vec<ScannedModule>,
+    carried: &[u32],
+    pinned: &PinnedObjects,
+) -> (Vec<(u32, Vec<u64>)>, Vec<u32>) {
     let mut rows = rows;
     let carried: BTreeSet<ProcessViewId> = carried.iter().map(|id| ProcessViewId(*id)).collect();
-    let collapsed = collapse_redundant_carried_rows(&mut rows, |view| carried.contains(&view));
+    let collapsed =
+        collapse_redundant_carried_rows(&mut rows, |view| carried.contains(&view), pinned);
     (
         rows.iter()
             .map(|row| {
@@ -1740,7 +1894,7 @@ fn r1_row(view: u32, offsets: &[u64]) -> ScannedModule {
 
 #[test]
 fn r1_collapse_keeps_the_oldest_of_equal_carried_rows() {
-    // Equal contributions (only the generation-local address differs):
+    // Equal rows (only the generation-local address differs):
     // the oldest committed row stays, the rest end their carry.
     let mut newer = r1_row(2, &[0x1000]);
     newer.tables[0].address = 0x9999_0000;
@@ -1756,8 +1910,8 @@ fn r1_collapse_keeps_the_oldest_of_equal_carried_rows() {
 #[test]
 fn r1_collapse_never_touches_authorized_rows() {
     // Live rows are not carried: equal live rows all stay, and a carried
-    // row is never collapsed against a live one (the carry keeps its own
-    // coverage until a carried peer makes the same contributions).
+    // row is never collapsed against a live one (the carry keeps its row
+    // until a carried peer is equal on every read field).
     assert_eq!(
         r1_collapse(
             vec![
@@ -1802,9 +1956,13 @@ type R1Mutation = fn(&mut ScannedModule);
 /// reads, as (field, prepare-both, change-one). Run-path R1 r2 ruling:
 /// two carried rows are redundant only when they are equal on every one
 /// of these. The owning view and each table's runtime address are the
-/// only fields left out: both are generation-local, and no consumer reads
-/// them across rows (`r1_collapse_keeps_the_oldest_of_equal_carried_rows`
-/// pins that rows differing only there still collapse).
+/// only fields left out of this field equality. The address is
+/// generation-local and never read across rows; the view IS read across
+/// rows through scan custody, which the collapse checks separately (T2
+/// NB1, `r1_collapse_keeps_equal_rows_whose_views_differ_in_scan_custody`).
+/// `r1_collapse_keeps_the_oldest_of_equal_carried_rows` pins that rows
+/// differing only in view and address still collapse when their custody
+/// matches.
 const R1_READ_FIELDS: &[(&str, R1Mutation, R1Mutation)] = &[
     // Row (module) fields.
     ("mapped_identity", r1_noop, |row| {
@@ -1924,6 +2082,25 @@ const R1_READ_FIELDS: &[(&str, R1Mutation, R1Mutation)] = &[
 
 #[test]
 fn r1_collapse_keeps_rows_that_differ_in_any_read_field() {
+    // The table must name every read field: a future field classified in
+    // `carried_rows_equal` without a killing case here would pass silently.
+    assert_eq!(R1_READ_FIELDS.len(), 33);
+    let count = |prefix: &str| {
+        R1_READ_FIELDS
+            .iter()
+            .filter(|(field, _, _)| {
+                if prefix.is_empty() {
+                    !field.contains('.')
+                } else {
+                    field.starts_with(prefix)
+                }
+            })
+            .count()
+    };
+    assert_eq!(count(""), 14, "row (module) fields");
+    assert_eq!(count("table."), 9, "table fields");
+    assert_eq!(count("entry."), 4, "entry fields");
+    assert_eq!(count("interface."), 6, "interface fields");
     // Every field is checked and every failing field is named, so one
     // run shows the whole class.
     let mut failures: Vec<String> = Vec::new();
@@ -1981,7 +2158,7 @@ fn r1_collapse_keeps_rows_that_differ_in_any_read_field() {
 
 #[test]
 fn r1_collapse_never_merges_rows_of_different_files() {
-    // Same contributions, but another file (key), mount namespace or
+    // Same row contents, but another file (key), mount namespace or
     // path: not interchangeable, so every row stays.
     let other_key = {
         let mut row = r1_row(2, &[0x1000]);
@@ -2040,6 +2217,53 @@ fn r1_collapse_reports_only_views_left_without_rows() {
             &[1, 2, 3]
         ),
         (vec![(1, vec![0x1000]), (2, vec![0x1000])], vec![3])
+    );
+}
+
+#[test]
+fn r1_collapse_keeps_equal_rows_whose_views_differ_in_scan_custody() {
+    // T2 NB1: the scan-custody fence (`id_for_scanned`) resolves through
+    // the resolving view's own custody first. Two field-equal carried rows
+    // whose views hold different custody over an entry raw bind differently
+    // while a third view owns that raw, so both stay.
+    let older = r1_row(1, &[0x1000]);
+    let newer = r1_row(2, &[0x1000]);
+    // The r1 rows share one raw (the entry object is the module's own
+    // file). Pin it, give custody to the newer view and a live third owner,
+    // but not to the older view.
+    let mut pins = overlay_pins(&[(overlay_key(89), OVERLAY_SHA, 1)]);
+    record_scan_ownership(&mut pins, ProcessViewId(2), overlay_key(89), OVERLAY_PATH);
+    record_scan_ownership(&mut pins, ProcessViewId(3), overlay_key(89), OVERLAY_PATH);
+    // The rows bind differently: the older resolves None (a peer owns its
+    // raw), the newer resolves through its own custody.
+    assert_eq!(
+        pins.id_for_scanned(&older, older.key, &older.path),
+        None,
+        "the custody-less older row binds nothing while a peer owns its raw"
+    );
+    assert!(
+        pins.id_for_scanned(&newer, newer.key, &newer.path)
+            .is_some(),
+        "the newer row binds through its own custody"
+    );
+    assert_eq!(
+        r1_collapse_with_pins(vec![older, newer], &[1, 2], &pins),
+        (vec![(1, vec![0x1000]), (2, vec![0x1000])], vec![]),
+        "custody-differing equal rows both stay"
+    );
+    // Control: with the same custody on both views, equal rows still
+    // collapse to the oldest.
+    let mut both = overlay_pins(&[(overlay_key(89), OVERLAY_SHA, 1)]);
+    record_scan_ownership(&mut both, ProcessViewId(1), overlay_key(89), OVERLAY_PATH);
+    record_scan_ownership(&mut both, ProcessViewId(2), overlay_key(89), OVERLAY_PATH);
+    assert_eq!(
+        r1_collapse_with_pins(
+            vec![r1_row(1, &[0x1000]), r1_row(2, &[0x1000])],
+            &[1, 2],
+            &both
+        ),
+        (vec![(1, vec![0x1000])], vec![2]),
+        "custody-matching equal rows collapse to the oldest"
     );
 }
 
@@ -57830,9 +58054,12 @@ fn r2_full_queue_engine(scope: Scope) -> (Engine, tempfile::TempDir) {
     (engine, proc_root)
 }
 
-fn r2_refusal(engine: &Engine, accepted: bool) -> R2Refusal {
+fn r2_refusal(engine: &Engine) -> R2Refusal {
     R2Refusal {
-        accepted,
+        // Derived from the queue length, never passed in: the R2 twins all
+        // run at a full queue, so a refusal leaves it full (accepted false).
+        // A caller-passed boolean here would compare the oracle to itself.
+        accepted: engine.refresh_queue.len() < MAX_PENDING_REFRESH,
         truncated: engine.discovery_truncated,
         dropped: engine.newcomer_ages.dropped,
         dropped_unknown: engine.newcomer_ages.dropped_unknown,
@@ -57861,9 +58088,12 @@ fn refresh_queue_full_consumed_exec_files_live_loss_and_truncation() {
     let gone = FAKE_PID_FLOOR + 10_000;
     // Diff-first arrival 3 ms before the refusal: the dropped age is known.
     engine.newcomer_first_seen.insert(gone, Some(1_000_000));
-    let accepted = engine.request_refresh_consumed(gone, Some(4_000_000));
+    assert!(
+        !engine.request_refresh_consumed(gone, Some(4_000_000)),
+        "the full queue refuses the consumed request"
+    );
     assert_eq!(
-        r2_refusal(&engine, accepted),
+        r2_refusal(&engine),
         R2Refusal {
             accepted: false,
             truncated: 1,
@@ -57874,9 +58104,12 @@ fn refresh_queue_full_consumed_exec_files_live_loss_and_truncation() {
         }
     );
     // Without a diff mark the age is unknown, never zero.
-    let accepted = engine.request_refresh_consumed(gone + 1, Some(4_000_000));
+    assert!(
+        !engine.request_refresh_consumed(gone + 1, Some(4_000_000)),
+        "the full queue refuses the consumed request"
+    );
     assert_eq!(
-        r2_refusal(&engine, accepted),
+        r2_refusal(&engine),
         R2Refusal {
             accepted: false,
             truncated: 2,
@@ -57940,7 +58173,7 @@ fn refresh_queue_full_consumed_export_record_of_a_gone_pid_files_live_loss() {
             outcome,
             DiscoveryRecordOutcome::Rejected(RecordRejection::ExportNoRetainedView)
         );
-        assert_eq!(r2_refusal(&engine, false), expected, "live member: {live}");
+        assert_eq!(r2_refusal(&engine), expected, "live member: {live}");
     }
 }
 
@@ -57956,7 +58189,7 @@ fn refresh_queue_full_consumed_exec_dispatch_files_live_loss() {
         &mut PendingViewRetirements::new(),
     );
     assert_eq!(
-        r2_refusal(&engine, false),
+        r2_refusal(&engine),
         R2Refusal {
             accepted: false,
             truncated: 1,
@@ -57976,9 +58209,12 @@ fn refresh_queue_full_consumed_live_member_defers_unfinished() {
     let live = FAKE_PID_FLOOR + 20_000;
     std::fs::create_dir(proc_root.path().join(live.to_string())).unwrap();
     engine.newcomer_first_seen.insert(live, Some(1_000_000));
-    let accepted = engine.request_refresh_consumed(live, Some(4_000_000));
+    assert!(
+        !engine.request_refresh_consumed(live, Some(4_000_000)),
+        "the full queue refuses the consumed request"
+    );
     assert_eq!(
-        r2_refusal(&engine, accepted),
+        r2_refusal(&engine),
         R2Refusal {
             accepted: false,
             truncated: 0,
@@ -58001,9 +58237,12 @@ fn refresh_queue_full_consumed_retained_view_defers_unfinished() {
     engine
         .views
         .push(ProcessView::open(ProcessViewId(5_000), me).unwrap());
-    let accepted = engine.request_refresh_consumed(me, Some(4_000_000));
+    assert!(
+        !engine.request_refresh_consumed(me, Some(4_000_000)),
+        "the full queue refuses the consumed request"
+    );
     assert_eq!(
-        r2_refusal(&engine, accepted),
+        r2_refusal(&engine),
         R2Refusal {
             accepted: false,
             truncated: 0,
@@ -58023,9 +58262,12 @@ fn refresh_queue_full_consumed_under_collected_finish_files_live_loss() {
     let live = FAKE_PID_FLOOR + 20_000;
     std::fs::create_dir(proc_root.path().join(live.to_string())).unwrap();
     engine.collected_finish_actions = Some(64);
-    let accepted = engine.request_refresh_consumed(live, Some(4_000_000));
+    assert!(
+        !engine.request_refresh_consumed(live, Some(4_000_000)),
+        "the full queue refuses the consumed request"
+    );
     assert_eq!(
-        r2_refusal(&engine, accepted),
+        r2_refusal(&engine),
         R2Refusal {
             accepted: false,
             truncated: 1,
@@ -58043,9 +58285,12 @@ fn refresh_queue_full_retry_of_a_gone_member_stays_unfinished() {
     // loss whatever its member's state; it stays an unfinished row.
     let (mut engine, _proc) = r2_full_queue_engine(Scope::System);
     let gone = FAKE_PID_FLOOR + 10_000;
-    let accepted = engine.request_refresh(gone, Some(4_000_000));
+    assert!(
+        !engine.request_refresh(gone, Some(4_000_000)),
+        "the full queue refuses the retry"
+    );
     assert_eq!(
-        r2_refusal(&engine, accepted),
+        r2_refusal(&engine),
         R2Refusal {
             accepted: false,
             truncated: 0,

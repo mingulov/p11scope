@@ -12950,14 +12950,19 @@ fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedM
     dropped
 }
 
-/// Whether two carried rows are the same row up to their generation-local
-/// fields (run-path R1, r2 ruling): equal on every field the binder, the
-/// proof path or the plan reads. Only the owning view and each table's
-/// runtime address are left out; both are generation-local, and no
-/// consumer reads them across rows (fallback proofs match a table address
-/// within its own row and land as that row's `manifest_supported`, which
-/// is compared). The destructuring is exhaustive, so a new row, table,
-/// entry or interface field fails to compile until it is classified here.
+/// Whether two carried rows hold the same field contents up to their
+/// generation-local fields (run-path R1, r2 ruling): equal on every field
+/// the binder, the proof path or the plan reads. Only the owning view and
+/// each table's runtime address are left out of this field equality. The
+/// address is generation-local and never read across rows (fallback proofs
+/// match a table address within its own row and land as that row's
+/// `manifest_supported`, which is compared). The view IS read across rows
+/// through scan custody — `id_for_scanned` resolves through the resolving
+/// view's own custody first — so the collapse additionally requires both
+/// views to hold the same custody over the row's own raws (T2 NB1,
+/// `PinnedObjects::scan_custody_matches`). The destructuring is exhaustive,
+/// so a new row, table, entry or interface field fails to compile until it
+/// is classified here.
 fn carried_rows_equal(left: &ScannedModule, right: &ScannedModule) -> bool {
     let ScannedModule {
         mapped_identity,
@@ -13000,6 +13005,10 @@ fn carried_rows_equal(left: &ScannedModule, right: &ScannedModule) -> bool {
             .all(|(left, right)| carried_interfaces_equal(left, right))
 }
 
+// Never replace this comparison with `==`: `ScannedTable`'s hand-written
+// `PartialEq` deliberately skips `live_return`, `manifest_supported` and
+// `extension_impossible` (scan.rs:3334), so `==` would silently bring back
+// the r1 blocker (rows differing only there would collapse).
 fn carried_tables_equal(left: &ScannedTable, right: &ScannedTable) -> bool {
     let ScannedTable {
         version,
@@ -13065,11 +13074,12 @@ fn carried_interfaces_equal(left: &ScannedInterface, right: &ScannedInterface) -
 /// retired view therefore grows the plan inputs without a bound and
 /// exhausts the view IDs under churn (every short-lived descendant that
 /// maps the provider). A carried row equal to an older kept carried row on
-/// every read field (`carried_rows_equal`) is redundant: it binds the same
-/// slots, names, proofs and named skips, so it ends its carry (CARRIED →
-/// RETIRED as redundant carry). A row that differs in any read field
-/// stays. The kept rows are bounded by the distinct row contents, not by
-/// churn.
+/// every read field (`carried_rows_equal`) whose view holds the same scan
+/// custody over the row's own raws (`scan_custody_matches`) is redundant:
+/// it binds the same slots, names, proofs and named skips, so it ends its
+/// carry (CARRIED → RETIRED as redundant carry). A row that differs in any
+/// read field, or whose view's custody differs, stays. The kept rows are
+/// bounded by the distinct row contents, not by churn.
 ///
 /// The committed order decides: the oldest of equal rows stays, so the
 /// plan is unchanged tick for tick. Rows of authorized views (`carried`
@@ -13078,6 +13088,7 @@ fn carried_interfaces_equal(left: &ScannedInterface, right: &ScannedInterface) -
 fn collapse_redundant_carried_rows(
     raw_modules: &mut Vec<ScannedModule>,
     carried: impl Fn(ProcessViewId) -> bool,
+    pinned: &PinnedObjects,
 ) -> BTreeSet<ProcessViewId> {
     let mut kept: Vec<usize> = Vec::new();
     let mut dropped = vec![false; raw_modules.len()];
@@ -13085,10 +13096,10 @@ fn collapse_redundant_carried_rows(
         if !carried(module.view) {
             continue;
         }
-        if kept
-            .iter()
-            .any(|&kept_index| carried_rows_equal(&raw_modules[kept_index], module))
-        {
+        if kept.iter().any(|&kept_index| {
+            carried_rows_equal(&raw_modules[kept_index], module)
+                && pinned.scan_custody_matches(raw_modules[kept_index].view, module.view, module)
+        }) {
             dropped[index] = true;
         } else {
             kept.push(index);
@@ -18984,9 +18995,11 @@ impl Engine {
         // authority: redundant carried rows end their carry here, and a
         // view left with no row drops its claimless raw custody, so its
         // numeric ID returns to admission with nothing to inherit.
-        for view in
-            collapse_redundant_carried_rows(&mut raw_modules, |view| !authority.authorizes(view))
-        {
+        for view in collapse_redundant_carried_rows(
+            &mut raw_modules,
+            |view| !authority.authorizes(view),
+            &pinned,
+        ) {
             pinned.release_collapsed_carried_view(view);
         }
         let bind_start = crate::attach::monotonic_ns();

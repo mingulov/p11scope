@@ -346,10 +346,17 @@ pub fn require_numbering_agrees(numbering: &PidNumbering, what: &str) -> Result<
 /// [`nested_warning`] already emitted. Every other numbering proceeds:
 /// a foreign `/proc` may still show host processes, and an unreadable
 /// namespace cannot prove host invisibility.
+///
+/// `gap` names the engine state that left the empty plan unproven (the
+/// scan-unavailable reason, else one classified plan gap); `None` keeps
+/// the unnamed refusal for scopes the emptiness proof never covers.
+/// The naming stays on the refusal's single line: gap bytes are
+/// target-controlled, so controls are escaped at this boundary.
 pub fn refuse_nested_empty_capture(
     numbering: &PidNumbering,
     what: &str,
     modules_empty: bool,
+    gap: Option<NestedEmptyGap<'_>>,
 ) -> Result<()> {
     if !modules_empty {
         return Ok(());
@@ -359,6 +366,18 @@ pub fn refuse_nested_empty_capture(
     {
         return Ok(());
     }
+    let suffix = match gap {
+        None => String::new(),
+        Some(NestedEmptyGap::ScanUnavailable(reason)) => format!(
+            "; gap: memory scan unavailable: {}",
+            crate::render::escape_controls(reason)
+        ),
+        Some(NestedEmptyGap::PlanGap { subject, reason }) => format!(
+            "; gap: {}: {}",
+            crate::render::escape_controls(subject),
+            crate::render::escape_controls(reason)
+        ),
+    };
     Err(anyhow::Error::new(NumberingMismatch(format!(
         "{MISMATCH_CODE}: refusing {what}: it found no countable modules, but this observer runs \
          in a container PID namespace with its own /proc, so host processes are not visible and \
@@ -366,8 +385,18 @@ pub fn refuse_nested_empty_capture(
          nothing uses PKCS#11. Run p11scope in the host's initial PID namespace with its own \
          /proc (Kubernetes: hostPID: true on a real node; docker: --pid host); on a nested \
          kind/k3d node hostPID is already set - use a real node or capture a workload pod \
-         with --cgroup"
+         with --cgroup{suffix}"
     ))))
+}
+
+/// What a DR-K8S-5 refusal names: the engine state that left the empty
+/// plan unproven. Borrowed; the caller holds the engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NestedEmptyGap<'a> {
+    /// The memory scan could not run at all (`scan_unavailable`).
+    ScanUnavailable(&'a str),
+    /// One classified plan gap: what was skipped and why.
+    PlanGap { subject: &'a str, reason: &'a str },
 }
 
 /// Refuses every capture when the mounted `/proc` has no entry for this
@@ -643,7 +672,7 @@ mod tests {
             observer: ObserverPidNs::Nested,
             proc_view: ProcView::Own,
         };
-        let error = refuse_nested_empty_capture(&nested_own, "a --system capture", true)
+        let error = refuse_nested_empty_capture(&nested_own, "a --system capture", true, None)
             .expect_err("nested observer, own /proc, zero modules must refuse");
         let text = format!("{error:#}");
         assert!(
@@ -653,7 +682,7 @@ mod tests {
         assert!(text.contains("host processes are not visible"), "{text}");
         assert!(text.contains("hostPID"), "{text}");
         // Modules found: in-namespace data proceeds.
-        refuse_nested_empty_capture(&nested_own, "a --system capture", false)
+        refuse_nested_empty_capture(&nested_own, "a --system capture", false, None)
             .expect("modules found proceed");
         // Every other numbering proceeds: nothing to name.
         for (name, numbering) in [
@@ -680,7 +709,7 @@ mod tests {
                 },
             ),
         ] {
-            refuse_nested_empty_capture(&numbering, "a --system capture", true)
+            refuse_nested_empty_capture(&numbering, "a --system capture", true, None)
                 .unwrap_or_else(|error| panic!("{name} with zero modules proceeds: {error:#}"));
         }
     }
@@ -694,7 +723,7 @@ mod tests {
             observer: ObserverPidNs::Nested,
             proc_view: ProcView::Own,
         };
-        let error = refuse_nested_empty_capture(&nested_own, "a --system capture", true)
+        let error = refuse_nested_empty_capture(&nested_own, "a --system capture", true, None)
             .expect_err("nested observer, own /proc, zero modules must refuse");
         let text = format!("{error:#}");
         assert!(text.contains("no countable modules"), "{text}");
@@ -707,7 +736,7 @@ mod tests {
             observer: ObserverPidNs::Nested,
             proc_view: ProcView::Own,
         };
-        let error = refuse_nested_empty_capture(&nested_own, "a --system capture", true)
+        let error = refuse_nested_empty_capture(&nested_own, "a --system capture", true, None)
             .expect_err("nested observer, own /proc, zero modules must refuse");
         let text = format!("{error:#}");
         assert!(text.contains("--cgroup"), "{text}");
@@ -716,6 +745,93 @@ mod tests {
         assert!(text.contains("hostPID"), "{text}");
         assert!(text.contains("host processes are not visible"), "{text}");
         assert!(!text.contains('\n'), "the refusal stays one line: {text}");
+    }
+
+    /// Twin 1: the refusal names the scan-unavailable reason it holds,
+    /// on the same single line.
+    #[test]
+    fn nested_empty_refusal_names_the_scan_unavailable_reason() {
+        let nested_own = PidNumbering {
+            observer: ObserverPidNs::Nested,
+            proc_view: ProcView::Own,
+        };
+        let error = refuse_nested_empty_capture(
+            &nested_own,
+            "a --cgroup capture",
+            true,
+            Some(NestedEmptyGap::ScanUnavailable("ptrace")),
+        )
+        .expect_err("nested observer, own /proc, zero modules must refuse");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("; gap: memory scan unavailable: ptrace"),
+            "{text}"
+        );
+        assert!(!text.contains('\n'), "the refusal stays one line: {text}");
+    }
+
+    /// Twin 2: the refusal names one classified plan gap — subject and
+    /// reason — on the same single line.
+    #[test]
+    fn nested_empty_refusal_names_the_plan_gap() {
+        let nested_own = PidNumbering {
+            observer: ObserverPidNs::Nested,
+            proc_view: ProcView::Own,
+        };
+        let error = refuse_nested_empty_capture(
+            &nested_own,
+            "a --cgroup capture",
+            true,
+            Some(NestedEmptyGap::PlanGap {
+                subject: "leaf.scope",
+                reason: "cgroup.procs could not be read (EACCES)",
+            }),
+        )
+        .expect_err("nested observer, own /proc, zero modules must refuse");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("; gap: leaf.scope: cgroup.procs could not be read (EACCES)"),
+            "{text}"
+        );
+        assert!(!text.contains('\n'), "the refusal stays one line: {text}");
+    }
+
+    /// No gap held, no gap named: scopes the emptiness proof never
+    /// covers keep the unnamed refusal byte for byte.
+    #[test]
+    fn nested_empty_refusal_without_a_gap_names_nothing() {
+        let nested_own = PidNumbering {
+            observer: ObserverPidNs::Nested,
+            proc_view: ProcView::Own,
+        };
+        let error = refuse_nested_empty_capture(&nested_own, "a --cgroup capture", true, None)
+            .expect_err("nested observer, own /proc, zero modules must refuse");
+        let text = format!("{error:#}");
+        assert!(!text.contains("; gap:"), "{text}");
+    }
+
+    /// Gap bytes are target-controlled: controls escape so the
+    /// refusal cannot break its single line.
+    #[test]
+    fn nested_empty_refusal_escapes_gap_controls_to_one_line() {
+        let nested_own = PidNumbering {
+            observer: ObserverPidNs::Nested,
+            proc_view: ProcView::Own,
+        };
+        let error = refuse_nested_empty_capture(
+            &nested_own,
+            "a --cgroup capture",
+            true,
+            Some(NestedEmptyGap::PlanGap {
+                subject: "a\nb",
+                reason: "x\ty",
+            }),
+        )
+        .expect_err("nested observer, own /proc, zero modules must refuse");
+        let text = format!("{error:#}");
+        assert!(!text.contains('\n'), "the refusal stays one line: {text}");
+        assert!(!text.contains('\t'), "no raw tab survives: {text}");
+        assert!(text.contains("; gap: a\\nb: x\\ty"), "{text}");
     }
 
     #[test]

@@ -7282,6 +7282,32 @@ fn cgroup_empty_proof(scope: &ScopeArg, engine: &Engine) -> bool {
     empty_plan_is_clean(engine.plan())
 }
 
+/// DR-K8S-5 naming: the engine state that left this empty plan
+/// unproven — the scan-unavailable reason first (it poisons every gap
+/// below it), else the highest-priority classified plan gap (confirmed
+/// provider, unexamined file, discovery stop, in that order). `None`
+/// when the plan is clean: a scope the proof never covers refuses
+/// unnamed, exactly as before.
+fn nested_empty_gap<'a>(
+    scan_unavailable: Option<&'a str>,
+    plan: &'a crate::plan::AttachPlan,
+) -> Option<crate::pidns::NestedEmptyGap<'a>> {
+    if let Some(reason) = scan_unavailable {
+        return Some(crate::pidns::NestedEmptyGap::ScanUnavailable(reason));
+    }
+    let classes = classify_empty_plan(plan);
+    classes
+        .confirmed
+        .iter()
+        .chain(classes.unexamined.iter())
+        .chain(classes.discovery_stops.iter())
+        .next()
+        .map(|skip| crate::pidns::NestedEmptyGap::PlanGap {
+            subject: skip.subject.as_str(),
+            reason: skip.reason.as_str(),
+        })
+}
+
 /// DR-K8S-5 refusal with the `--system` and `--cgroup` carve-outs:
 /// an idle node at capture start is normal (pods arrive later), so a
 /// nested observer's `--system` capture always proceeds as an
@@ -7304,7 +7330,16 @@ fn refuse_nested_empty_capture_for_scope(
     if cgroup_empty_proof(scope, engine) {
         return Ok(());
     }
-    crate::pidns::refuse_nested_empty_capture(numbering, what, engine.plan().modules.is_empty())
+    let gap = nested_empty_gap(
+        engine.discovery().scan_unavailable.as_deref(),
+        engine.plan(),
+    );
+    crate::pidns::refuse_nested_empty_capture(
+        numbering,
+        what,
+        engine.plan().modules.is_empty(),
+        gap,
+    )
 }
 
 /// The carved-out empty line: the existing nothing-found sentence
@@ -25203,6 +25238,88 @@ int main(int argc, char **argv) {
             text.starts_with("pid-namespace-mismatch: refusing a --cgroup capture:"),
             "{text}"
         );
+    }
+
+    /// The refusal names the plan gap that kept it: a denied member
+    /// reads as its cgroup.procs denial, not as an unnamed unknown.
+    /// Mirrors `nested_cgroup_capture_with_an_unreadable_member_is_still_refused`,
+    /// including its privilege branch.
+    #[test]
+    fn nested_cgroup_refusal_names_its_plan_gap() {
+        let dir = tempfile::tempdir().expect("a scope directory");
+        let leaf = dir.path().join("leaf.scope");
+        std::fs::create_dir(&leaf).expect("a leaf cgroup");
+        std::fs::write(leaf.join("cgroup.procs"), "99999999\n").expect("a cgroup.procs");
+        let mut permissions = std::fs::metadata(&leaf).unwrap().permissions();
+        permissions.set_mode(0o000);
+        std::fs::set_permissions(&leaf, permissions).unwrap();
+        let denied = std::fs::read_dir(&leaf).is_err();
+        let scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
+        let engine = Engine::discover(
+            &capture_args(ScopeArg::Cgroup(dir.path().to_path_buf())),
+            &scope,
+            None,
+        )
+        .expect("discovery over a denied leaf captures");
+        std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let verdict = refuse_nested_empty_capture_for_scope(
+            &nested_own_numbering_for_test(),
+            &ScopeArg::Cgroup(dir.path().to_path_buf()),
+            "a --cgroup capture",
+            &engine,
+        );
+        if !denied {
+            verdict.expect("nothing was denied, so the empty cgroup proceeds");
+            return;
+        }
+        let error = verdict.expect_err("a denied member keeps the refusal");
+        let text = format!("{error:#}");
+        assert!(text.contains("; gap: "), "{text}");
+        assert!(text.contains("leaf.scope"), "{text}");
+        assert!(text.contains("could not be "), "{text}");
+        assert!(!text.contains('\n'), "the refusal stays one line: {text}");
+    }
+
+    /// The scan-unavailable reason outranks every plan gap: when the
+    /// memory scan could not run, the gaps below it are downstream.
+    #[test]
+    fn nested_empty_gap_prefers_scan_unavailable() {
+        let dir = tempfile::tempdir().expect("a scope directory");
+        let leaf = dir.path().join("leaf.scope");
+        std::fs::create_dir(&leaf).expect("a leaf cgroup");
+        std::fs::write(leaf.join("cgroup.procs"), "99999999\n").expect("a cgroup.procs");
+        let mut permissions = std::fs::metadata(&leaf).unwrap().permissions();
+        permissions.set_mode(0o000);
+        std::fs::set_permissions(&leaf, permissions).unwrap();
+        let scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
+        let engine = Engine::discover(
+            &capture_args(ScopeArg::Cgroup(dir.path().to_path_buf())),
+            &scope,
+            None,
+        )
+        .expect("discovery over a denied leaf captures");
+        std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            nested_empty_gap(Some("ptrace"), engine.plan()),
+            Some(crate::pidns::NestedEmptyGap::ScanUnavailable("ptrace")),
+        );
+    }
+
+    /// A clean plan names nothing: the gap selector only fires on the
+    /// unclean state the refusal already required.
+    #[test]
+    fn nested_empty_gap_is_none_for_a_clean_plan() {
+        let dir = tempfile::tempdir().expect("a scope directory");
+        std::fs::write(dir.path().join("cgroup.procs"), "").expect("an empty cgroup.procs");
+        let scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
+        let engine = Engine::discover(
+            &capture_args(ScopeArg::Cgroup(dir.path().to_path_buf())),
+            &scope,
+            None,
+        )
+        .expect("discovery over an empty cgroup captures");
+        assert!(empty_plan_is_clean(engine.plan()));
+        assert_eq!(nested_empty_gap(None, engine.plan()), None);
     }
 
     /// A `--pid` scope keeps the refusal even over a proven-clean

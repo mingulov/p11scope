@@ -1275,6 +1275,27 @@ fn se04_zero_duration_is_a_usage_error_exit_2() {
     }
 }
 
+/// `run --user` with an unknown account refuses like a usage error
+/// (exit 2) before anything is resolved, forked, or attached. Without
+/// root the privilege refusal lands first; as root the unknown
+/// account names itself.
+#[test]
+fn run_unknown_user_is_a_usage_error_exit_2() {
+    let usage = run(&["run", "--user", "p11scope-no-such-user", "--", "/bin/true"]);
+    assert_eq!(usage.code, Some(2), "{}", usage.stderr);
+    let expected = if unsafe { libc::geteuid() } == 0 {
+        "--user p11scope-no-such-user: unknown account"
+    } else {
+        "--user needs root"
+    };
+    assert!(
+        usage.stderr.contains(expected),
+        "{}",
+        usage.stderr
+    );
+    assert_scoped_hint(&usage.stderr, "run");
+}
+
 /// B2: a huge `--duration` is a usage error, never a panic. A bare
 /// `u64::MAX` used to parse and then panic `inventory` in
 /// `Instant::now() + window` (exit 101, no report); both huge spellings

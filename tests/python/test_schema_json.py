@@ -1271,6 +1271,34 @@ class SchemaOracleAgreement(unittest.TestCase):
                     properties[field], {"type": "integer", "minimum": 0})
                 self.assertIn(field, CHECKER["PROFILE_V3_FIELDS"])
 
+    def test_version_tolerant_fields_are_all_or_none_in_profile_branch(self):
+        """The profile branch requires the four version-tolerant
+        fields all-or-none via dependentRequired (v0.7.1 documents
+        carry none, current documents carry all four)."""
+        branches = SCHEMA["allOf"]
+        profile = next(
+            b
+            for b in branches
+            if b["if"] == {"properties": {"lane": {"const": "profile"}}}
+        )
+        self.assertEqual(
+            profile["then"]["properties"]["evidence"]["dependentRequired"],
+            {
+                "coverage_retired_slots": [
+                    "member_stop_attached", "member_stop_unattached",
+                    "pid_descendant_gaps_admitted"],
+                "member_stop_attached": [
+                    "coverage_retired_slots", "member_stop_unattached",
+                    "pid_descendant_gaps_admitted"],
+                "member_stop_unattached": [
+                    "coverage_retired_slots", "member_stop_attached",
+                    "pid_descendant_gaps_admitted"],
+                "pid_descendant_gaps_admitted": [
+                    "coverage_retired_slots", "member_stop_attached",
+                    "member_stop_unattached"],
+            },
+        )
+
     def test_unregistered_standard_layout_mechanisms_registered(self):
         """The producer's always-emitted withheld-count field is a
         required, informational u64 in the closed evidence shape: zero

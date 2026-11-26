@@ -2340,6 +2340,11 @@ fn real_mixed_churn_keeps_every_group_present() {
     let new = upgrade_snapshot(UPGRADE_CHURN072);
     assert!(old.pre_fold_input);
     assert!(!new.pre_fold_input);
+    assert_eq!(old.gap_links_dropped, 0);
+    assert_eq!(
+        new.gap_links_dropped, 1,
+        "the folded c6 gap link drops and counts"
+    );
     for (left, right, code) in [
         (&old, &new, "pre_fold_before"),
         (&new, &old, "pre_fold_after"),
@@ -2489,6 +2494,9 @@ fn dropped_gap_links_render_their_count() {
     let report = compare(&side, &side);
     assert_eq!(report.before.gap_links_dropped, 1);
     assert_eq!(report.after.gap_links_dropped, 1);
+    let wire = serde_json::to_value(&report).unwrap();
+    assert_eq!(wire["before"]["gap_links_dropped"], 1);
+    assert_eq!(wire["after"]["gap_links_dropped"], 1);
     let outputs = rendered(&report);
     assert!(
         outputs[0].contains("Dropped gap subject links 1"),

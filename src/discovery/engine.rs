@@ -826,6 +826,11 @@ pub struct Engine {
     /// preflight, installed backing). One pool per Engine, so per capture;
     /// the graph never charges the registry pool.
     collected_graph_pool: SemanticResourcePool,
+    /// The pool an owner granted for parking this engine's retained
+    /// views' mount-table reads across passes (the inventory registry's
+    /// pool). `None` (a Detailed capture without a registry): views read
+    /// their tables one-shot and park nothing.
+    mount_park_reserver: Option<SemanticResourceReserver>,
     /// Dedicated accounting pool for counter captures (terminal hold,
     /// keepalive, stages, reads). One pool per Engine, so per capture;
     /// counter captures never charge the graph, registry or test pools.
@@ -15270,6 +15275,7 @@ impl Engine {
             collected_graph_requested: false,
             collected_graph: None,
             collected_graph_pool: SemanticResourcePool::with_limit(COLLECTED_GRAPH_POOL_BYTES),
+            mount_park_reserver: None,
             counter_pool: SemanticResourcePool::with_limit(COUNTER_POOL_BYTES),
             #[cfg(test)]
             counter_cpus_override: None,
@@ -36265,7 +36271,14 @@ impl Engine {
                 crate::attach::monotonic_ns(),
             );
             let view = match opened {
-                Ok(view) => view,
+                Ok(view) => {
+                    // An admitted view is retained across passes: its
+                    // owner's grant lets its mount-table read park.
+                    if let Some(reserver) = &self.mount_park_reserver {
+                        view.grant_mount_table_parking(reserver.share());
+                    }
+                    view
+                }
                 Err(error) => {
                     // Allocated but never admitted: the ID returns to
                     // the pool instead of burning for the capture lifetime.
@@ -38863,6 +38876,17 @@ impl Engine {
     /// preflight from this reserver; no graph lease comes from the registry.
     pub(crate) fn collected_graph_reserver(&self) -> SemanticResourceReserver {
         self.collected_graph_pool.reserver()
+    }
+
+    /// Grants this engine's retained views (current and later admitted)
+    /// the right to park their mount-table reads across passes, charged
+    /// to `reserver`'s pool. Transient views (watch scans, probationary
+    /// probes) are opened fresh per scan and never get the grant.
+    pub(crate) fn set_mount_park_reserver(&mut self, reserver: SemanticResourceReserver) {
+        for view in &self.views {
+            view.grant_mount_table_parking(reserver.share());
+        }
+        self.mount_park_reserver = Some(reserver);
     }
 
     /// Reservation handle on the Engine's dedicated counter pool. Each

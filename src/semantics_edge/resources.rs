@@ -175,6 +175,14 @@ impl SemanticResourceReserver {
         ResourceLease::acquire(&self.shared, bytes)
     }
 
+    /// Another reservation handle on the same pool (never a new budget),
+    /// for an owner that hands its reserver to the resources it retains.
+    pub(crate) fn share(&self) -> Self {
+        Self {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+
     /// Checks this lease's live charge in the original pool without changing it.
     /// Coverage alone grants no input identity or native mutation authority.
     pub(crate) fn covers(&self, lease: &ResourceLease, required_bytes: usize) -> bool {

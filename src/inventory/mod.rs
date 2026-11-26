@@ -6323,10 +6323,13 @@ where
 /// its honest `unavailable` summary; broad Inventory runs either way.
 /// Under `--key-operations` the lane first attempts a linked journal
 /// start; a refused journal start keeps S1 with the finite journal
-/// reason and retries ordinary. A live run control rechecks at every
-/// new-start boundary below, so a stop latching during settle, mints
-/// or an earlier start still forbids later capture work (F1); `None`
-/// keeps the existing always-attempt behavior.
+/// reason and retries ordinary. Every new-start boundary below
+/// rechecks the stop: the run control (cgroup) when one is handed, and
+/// always the coordinator's stop query, which reads the operator's live
+/// signal counter on every scope (manifest and scan paths pass no run
+/// control). A stop latching during settle, mints or an earlier start
+/// therefore forbids later capture work (F1, D2), and a stop after a
+/// refused journal start names the retry it skipped.
 fn start_semantic_lane(
     coordinator: &mut InventoryCoordinator<OsProcessSource>,
     scope: &Scope,
@@ -6340,10 +6343,14 @@ fn start_semantic_lane(
     // stop contract). An already-started attempt finishes its own
     // disposition; nothing later begins. The seal stays pending for
     // the terminal disclosure.
-    let stopped = || run_control.is_some_and(|control| control.check().is_err());
+    let operator_stop = coordinator.stop_query();
+    let stopped = || operator_stop() || run_control.is_some_and(|control| control.check().is_err());
     if stopped() {
         return None;
     }
+    // Set once a journal start refused: a stop before the ordinary
+    // retry then names the skipped retry (with the refusal's reason).
+    let mut journal_refused: Option<String> = None;
     // The bytes rule before any semantic-lane BPF work: a stale or
     // mismatched embedded object degrades here with the plain mismatch
     // message (never the bare attachment code); broad inventory continues.
@@ -6386,7 +6393,7 @@ fn start_semantic_lane(
             scope,
             backend,
             Some(&spec),
-            run_control,
+            &stopped,
         ) {
             Ok(lane) => {
                 note_semantic_lane_sealed(true, key_operations);
@@ -6394,10 +6401,12 @@ fn start_semantic_lane(
                 return Some(lane);
             }
             Err(journal_refusal) => {
-                // The ordinary retry below is a separate new capture
-                // attempt: a stop latching during the journal start
-                // forbids it, so it never begins.
+                // The sizes-off and ordinary retries below are separate
+                // new capture attempts: a stop latching during the
+                // journal start forbids them, so neither begins, and the
+                // skipped retry is named.
                 if stopped() {
+                    note_retry_skipped_on_stop(coordinator, spec.key_sizes, &journal_refusal);
                     return None;
                 }
                 // A sizes-on refusal retries the journal once with
@@ -6413,7 +6422,7 @@ fn start_semantic_lane(
                         scope,
                         backend,
                         scan_subset,
-                        run_control,
+                        &stopped,
                     ) {
                         RetryWithoutSizes::Sealed(lane) => {
                             coordinator.note_scope_gap(
@@ -6452,7 +6461,10 @@ fn start_semantic_lane(
                             ));
                             refusal = retry_refusal;
                         }
-                        RetryWithoutSizes::Stopped => return None,
+                        RetryWithoutSizes::Stopped => {
+                            note_retry_skipped_on_stop(coordinator, true, &refusal);
+                            return None;
+                        }
                     }
                 }
                 let reason = key_operations_refusal_reason(&refusal);
@@ -6466,13 +6478,23 @@ fn start_semantic_lane(
                     "p11scope: key operations unavailable: {reason}; broad inventory \
                      continues with S1 mechanisms and API results"
                 ));
+                journal_refused = Some(reason);
             }
         }
     }
     // A refused journal start consumed its subsets above; the retry
     // re-mints here. Recheck first (a stop latching during the
     // journal start forbids the retry) and again after the mints.
+    let skip_ordinary = |coordinator: &mut InventoryCoordinator<OsProcessSource>| {
+        if let Some(reason) = journal_refused.as_deref() {
+            coordinator.note_scope_gap(
+                KEY_OPERATIONS_RETRY_SKIPPED_SUBJECT.into(),
+                ordinary_retry_skipped_reason(reason),
+            );
+        }
+    };
     if stopped() {
+        skip_ordinary(coordinator);
         return None;
     }
     let Ok((attach_subset, convert_subset)) =
@@ -6481,6 +6503,7 @@ fn start_semantic_lane(
         return None;
     };
     if stopped() {
+        skip_ordinary(coordinator);
         return None;
     }
     match seal_start_live(
@@ -6489,7 +6512,7 @@ fn start_semantic_lane(
         scope,
         backend,
         None,
-        run_control,
+        &stopped,
     ) {
         Ok(lane) => {
             note_semantic_lane_sealed(false, key_operations);
@@ -6511,6 +6534,50 @@ fn start_semantic_lane(
     }
 }
 
+/// Named gap subject: a stop after a refused `--key-sizes` journal
+/// start skipped both the sizes-off and the ordinary retries (D2).
+const KEY_SIZES_RETRY_SKIPPED_SUBJECT: &str = "key sizes retry skipped";
+/// Named gap subject: a stop after a refused journal start skipped
+/// the ordinary retry (D2).
+const KEY_OPERATIONS_RETRY_SKIPPED_SUBJECT: &str = "key operations retry skipped";
+
+fn sizes_retry_skipped_reason(reason: &str) -> String {
+    format!(
+        "stop requested; the key-sizes journal start was refused ({reason}), so neither the \
+         sizes-off nor the ordinary retry runs"
+    )
+}
+
+fn ordinary_retry_skipped_reason(reason: &str) -> String {
+    format!(
+        "stop requested; the key-operations journal start was refused ({reason}), so the \
+         ordinary retry does not run"
+    )
+}
+
+/// A stop seen right after a refused journal start (or during the
+/// sizes-off re-mint): no retry begins, and the run names which ones
+/// it skipped with the refusal's reason (D2).
+fn note_retry_skipped_on_stop(
+    coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    key_sizes: bool,
+    refusal: &crate::inventory_semantics::SemanticRefusal,
+) {
+    let reason = key_operations_refusal_reason(refusal);
+    let (subject, detail) = if key_sizes {
+        (
+            KEY_SIZES_RETRY_SKIPPED_SUBJECT,
+            sizes_retry_skipped_reason(&reason),
+        )
+    } else {
+        (
+            KEY_OPERATIONS_RETRY_SKIPPED_SUBJECT,
+            ordinary_retry_skipped_reason(&reason),
+        )
+    };
+    coordinator.note_scope_gap(subject.into(), detail);
+}
+
 /// Outcome of the sizes-off journal retry: a seated lane, a second
 /// refusal (the ordinary retry still follows), or a latched stop.
 /// The lane rides boxed: it dwarfs the other variants.
@@ -6524,19 +6591,16 @@ enum RetryWithoutSizes {
 /// (the refused start consumed its subsets) and seal the journal
 /// with `key_sizes: false`. A refused re-mint refuses with its first
 /// code (the mint already disclosed its subset gaps), so the
-/// ordinary retry still follows; a latched stop ends the startup
-/// with no new work.
+/// ordinary retry still follows; a stop latching during the re-mint
+/// ends the startup with no new work. The caller checks the stop
+/// immediately before this retry.
 fn retry_journal_without_sizes(
     coordinator: &mut InventoryCoordinator<OsProcessSource>,
     scope: &Scope,
     backend: crate::attach::BackendSelection,
     scan_subset: bool,
-    run_control: Option<&crate::scope::inventory_cgroup::CollectionControl>,
+    stopped: &dyn Fn() -> bool,
 ) -> RetryWithoutSizes {
-    let stopped = || run_control.is_some_and(|control| control.check().is_err());
-    if stopped() {
-        return RetryWithoutSizes::Stopped;
-    }
     let (attach_subset, convert_subset) =
         match seal_mint_start_subsets(coordinator, scan_subset, false) {
             Ok(pair) => pair,
@@ -6559,7 +6623,7 @@ fn retry_journal_without_sizes(
         scope,
         backend,
         Some(&spec),
-        run_control,
+        stopped,
     ) {
         Ok(lane) => RetryWithoutSizes::Sealed(Box::new(lane)),
         Err(refusal) => RetryWithoutSizes::Refused(refusal),
@@ -6766,7 +6830,7 @@ fn seal_start_live(
     scope: &Scope,
     backend: crate::attach::BackendSelection,
     journal: Option<&crate::attach::journal::JournalSpec>,
-    run_control: Option<&crate::scope::inventory_cgroup::CollectionControl>,
+    stopped: &dyn Fn() -> bool,
 ) -> Result<
     crate::inventory_semantics::AttestedSemanticLane,
     crate::inventory_semantics::SemanticRefusal,
@@ -6775,7 +6839,7 @@ fn seal_start_live(
     // capture work begins, without consuming a verdict or recording
     // a start. Callers recheck after a refusal, so this variant
     // never surfaces as a gap on its own.
-    if run_control.is_some_and(|control| control.check().is_err()) {
+    if stopped() {
         return Err(crate::inventory_semantics::SemanticRefusal::Unavailable);
     }
     #[cfg(test)]
@@ -6844,9 +6908,30 @@ mod seal_startup_test {
             const { std::cell::RefCell::new(VecDeque::new()) };
         static START_HOOKS: std::cell::RefCell<VecDeque<StartupHook>> =
             const { std::cell::RefCell::new(VecDeque::new()) };
+        // One hook per consumed scripted preparation, in order: the
+        // stop-blind retry twins (D2) latch the operator counter while
+        // a mint returns, so the post-mint checks are exercised.
+        static PREPARE_HOOKS: std::cell::RefCell<VecDeque<StartupHook>> =
+            const { std::cell::RefCell::new(VecDeque::new()) };
     }
     pub(super) fn take_prepared() -> Option<Preparation> {
-        PREPARE.with(|queued| queued.borrow_mut().pop_front())
+        let prepared = PREPARE.with(|queued| queued.borrow_mut().pop_front());
+        if prepared.is_some()
+            && let Some(hook) = PREPARE_HOOKS.with(|queued| queued.borrow_mut().pop_front())
+        {
+            hook();
+        }
+        prepared
+    }
+    /// Scripted preparations not yet consumed: a twin proves no mint
+    /// ran past a stop by the count left.
+    pub(super) fn prepared_left() -> usize {
+        PREPARE.with(|queued| queued.borrow().len())
+    }
+    /// Queue one preparation stimulus: it runs when the next scripted
+    /// preparation is consumed.
+    pub(super) fn queue_prepare_hook(hook: StartupHook) {
+        PREPARE_HOOKS.with(|queued| queued.borrow_mut().push_back(hook));
     }
     pub(super) fn take_start_verdict() -> Option<StartVerdict> {
         let verdict = START.with(|queued| queued.borrow_mut().pop_front());
@@ -6905,6 +6990,7 @@ mod seal_startup_test {
                 STARTS.with(|recorded| recorded.borrow_mut().clear());
                 START_JOURNALS.with(|recorded| recorded.borrow_mut().clear());
                 START_HOOKS.with(|queued| queued.borrow_mut().clear());
+                PREPARE_HOOKS.with(|queued| queued.borrow_mut().clear());
             }
         }
         PREPARE.with(|queued| queued.borrow_mut().extend(prepares));
@@ -33685,6 +33771,368 @@ mod seal_readiness_tests {
             vec![SEAL_LINE_KEY_OPERATIONS.to_string()],
             "the retried journal records key operations"
         );
+    }
+
+    /// D2 (lifecycle audit 11-25): which stop channel the startup
+    /// sees. `Coordinator` is the manifest and scan path (no run
+    /// control; the operator counter is wired on the coordinator, as
+    /// the run setup does); `RunControl` is the cgroup path (the
+    /// collection control carries the same counter).
+    #[derive(Clone, Copy, Debug)]
+    enum StopChannel {
+        Coordinator,
+        RunControl,
+    }
+
+    /// Where the twin latches the operator counter: before the
+    /// startup, while the k-th scripted live start returns, or while
+    /// the k-th scripted preparation (two per mint) returns.
+    #[derive(Clone, Copy, Debug)]
+    enum StopAt {
+        Never,
+        Before,
+        Start(usize),
+        Prepare(usize),
+    }
+
+    /// The typed outcome of one scripted startup: whether a lane
+    /// seated, the journal request of every live start in order,
+    /// the scripted preparations no mint consumed, and the
+    /// startup's lane gaps (subject, reason) in staging order.
+    #[derive(Debug, PartialEq, Eq)]
+    struct StopRun {
+        seated: bool,
+        journals: Vec<Option<bool>>,
+        prepared_left: usize,
+        gaps: Vec<(String, String)>,
+    }
+
+    const STARTUP_GAP_SUBJECTS: [&str; 6] = [
+        "key sizes retry skipped",
+        "key operations retry skipped",
+        "key sizes unavailable",
+        "key operations unavailable",
+        "semantic lane unavailable",
+        "semantic subset refused",
+    ];
+
+    fn startup_with_stop(
+        channel: StopChannel,
+        key_operations: bool,
+        key_sizes: bool,
+        starts: Vec<Result<crate::inventory_semantics::AttestedSemanticLane, SemanticRefusal>>,
+        at: StopAt,
+    ) -> StopRun {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        take_sealed_for_test();
+        let mut coordinator = coordinator();
+        coordinator.set_key_sizes_requested(key_sizes);
+        let source = Arc::new(AtomicUsize::new(0));
+        // The run setup wires the counter on the coordinator for
+        // every scope; the cgroup path additionally hands the
+        // collection control (which reads the same counter).
+        coordinator.set_stop_source(Arc::clone(&source));
+        let control = match channel {
+            StopChannel::Coordinator => None,
+            StopChannel::RunControl => Some(
+                crate::scope::inventory_cgroup::CollectionControl::new(None)
+                    .with_operator_stop_source(Arc::clone(&source)),
+            ),
+        };
+        if matches!(channel, StopChannel::RunControl) {
+            // Isolate the channel: the cgroup twin must stop through
+            // the run control alone.
+            coordinator.set_stop_source(Arc::new(AtomicUsize::new(0)));
+        }
+        let prepares = 8;
+        let scope = Scope::Pid(std::process::id());
+        let (seated, journals, prepared_left) = seal_startup_test::with_start_queue(
+            (0..prepares).map(|_| some_preparation()).collect(),
+            starts,
+            || {
+                let latch = {
+                    let source = Arc::clone(&source);
+                    move || source.store(1, Ordering::SeqCst)
+                };
+                match at {
+                    StopAt::Never => {}
+                    StopAt::Before => latch(),
+                    StopAt::Start(k) => {
+                        for _ in 0..k {
+                            seal_startup_test::queue_start_hook(Box::new(|| {}));
+                        }
+                        seal_startup_test::queue_start_hook(Box::new(latch));
+                    }
+                    StopAt::Prepare(k) => {
+                        for _ in 0..k {
+                            seal_startup_test::queue_prepare_hook(Box::new(|| {}));
+                        }
+                        seal_startup_test::queue_prepare_hook(Box::new(latch));
+                    }
+                }
+                let lane = start_semantic_lane(
+                    &mut coordinator,
+                    &scope,
+                    crate::attach::BackendSelection::Auto,
+                    key_operations,
+                    false,
+                    control.as_ref(),
+                );
+                (
+                    lane.is_some(),
+                    seal_startup_test::take_start_journals(),
+                    seal_startup_test::prepared_left(),
+                )
+            },
+        );
+        coordinator.registry_mut().publish();
+        let gaps = coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .filter(|gap| STARTUP_GAP_SUBJECTS.contains(&gap.subject.as_str()))
+            .map(|gap| (gap.subject.clone(), gap.reason.clone()))
+            .collect();
+        StopRun {
+            seated,
+            journals,
+            prepared_left,
+            gaps,
+        }
+    }
+
+    fn refused_reason() -> String {
+        super::key_operations_refusal_reason(&SemanticRefusal::Unavailable)
+    }
+
+    fn sizes_retry_skipped() -> (String, String) {
+        (
+            "key sizes retry skipped".into(),
+            format!(
+                "stop requested; the key-sizes journal start was refused ({}), so neither \
+                 the sizes-off nor the ordinary retry runs",
+                refused_reason()
+            ),
+        )
+    }
+
+    fn ordinary_retry_skipped() -> (String, String) {
+        (
+            "key operations retry skipped".into(),
+            format!(
+                "stop requested; the key-operations journal start was refused ({}), so the \
+                 ordinary retry does not run",
+                refused_reason()
+            ),
+        )
+    }
+
+    fn key_operations_unavailable() -> (String, String) {
+        (
+            "key operations unavailable".into(),
+            format!(
+                "{}; broad inventory continues with S1 mechanisms and API results",
+                refused_reason()
+            ),
+        )
+    }
+
+    fn sizes_double_refused() -> (String, String) {
+        (
+            "key sizes unavailable".into(),
+            format!(
+                "{}; sizes-off retry also refused ({})",
+                refused_reason(),
+                refused_reason()
+            ),
+        )
+    }
+
+    /// D2 site table, driven per stop channel: every new-start
+    /// boundary of the startup (the entry, the post-mint journal
+    /// gate, the sizes-off retry gate and its post-mint gate, the
+    /// ordinary retry gate and its post-mint gate, the fallback-shell
+    /// gate) sees the operator counter, and a stop after a refused
+    /// journal start names the skipped retry. Exact typed outcomes.
+    #[test]
+    fn d2_operator_stop_reaches_every_startup_boundary() {
+        let refused = || Err(SemanticRefusal::Unavailable);
+        for channel in [StopChannel::Coordinator, StopChannel::RunControl] {
+            let cases: Vec<(&str, bool, bool, Vec<_>, StopAt, StopRun)> = vec![
+                (
+                    "stop before the startup: nothing mints or starts",
+                    true,
+                    true,
+                    vec![refused()],
+                    StopAt::Before,
+                    StopRun {
+                        seated: false,
+                        journals: vec![],
+                        prepared_left: 8,
+                        gaps: vec![],
+                    },
+                ),
+                (
+                    "stop during the journal mint: the journal never starts",
+                    true,
+                    true,
+                    vec![refused()],
+                    StopAt::Prepare(1),
+                    StopRun {
+                        seated: false,
+                        journals: vec![],
+                        prepared_left: 6,
+                        gaps: vec![],
+                    },
+                ),
+                (
+                    "stop during the sizes-on journal start: no sizes-off or ordinary retry",
+                    true,
+                    true,
+                    vec![refused(), refused(), refused()],
+                    StopAt::Start(0),
+                    StopRun {
+                        seated: false,
+                        journals: vec![Some(true)],
+                        prepared_left: 6,
+                        gaps: vec![sizes_retry_skipped()],
+                    },
+                ),
+                (
+                    "stop during the sizes-off re-mint: that retry never starts",
+                    true,
+                    true,
+                    vec![refused(), refused(), refused()],
+                    StopAt::Prepare(3),
+                    StopRun {
+                        seated: false,
+                        journals: vec![Some(true)],
+                        prepared_left: 4,
+                        gaps: vec![sizes_retry_skipped()],
+                    },
+                ),
+                (
+                    "stop during the sizes-off retry start: no ordinary retry",
+                    true,
+                    true,
+                    vec![refused(), refused(), refused()],
+                    StopAt::Start(1),
+                    StopRun {
+                        seated: false,
+                        journals: vec![Some(true), Some(false)],
+                        prepared_left: 4,
+                        gaps: vec![
+                            sizes_double_refused(),
+                            key_operations_unavailable(),
+                            ordinary_retry_skipped(),
+                        ],
+                    },
+                ),
+                (
+                    "stop during the sizes-off journal start (no --key-sizes): no ordinary retry",
+                    true,
+                    false,
+                    vec![refused(), refused()],
+                    StopAt::Start(0),
+                    StopRun {
+                        seated: false,
+                        journals: vec![Some(false)],
+                        prepared_left: 6,
+                        gaps: vec![ordinary_retry_skipped()],
+                    },
+                ),
+                (
+                    "stop during the ordinary re-mint: the ordinary retry never starts",
+                    true,
+                    false,
+                    vec![refused(), refused()],
+                    StopAt::Prepare(3),
+                    StopRun {
+                        seated: false,
+                        journals: vec![Some(false)],
+                        prepared_left: 4,
+                        gaps: vec![key_operations_unavailable(), ordinary_retry_skipped()],
+                    },
+                ),
+                (
+                    "stop during the ordinary start: no fallback shell",
+                    false,
+                    false,
+                    vec![refused()],
+                    StopAt::Start(0),
+                    StopRun {
+                        seated: false,
+                        journals: vec![None],
+                        prepared_left: 6,
+                        gaps: vec![],
+                    },
+                ),
+            ];
+            for (label, key_operations, key_sizes, starts, at, expected) in cases {
+                let run = startup_with_stop(channel, key_operations, key_sizes, starts, at);
+                assert_eq!(run, expected, "{channel:?}: {label}");
+            }
+        }
+    }
+
+    /// D2 healthy twins: the counter is wired but never set, so
+    /// every retry still runs and seats (sizes-off retry; ordinary
+    /// retry; the fallback shell after an ordinary refusal).
+    #[test]
+    fn d2_without_a_stop_every_retry_still_runs() {
+        use super::promotion_driver_tests::WindDownIo;
+        for channel in [StopChannel::Coordinator, StopChannel::RunControl] {
+            let run = startup_with_stop(
+                channel,
+                true,
+                true,
+                vec![
+                    Err(SemanticRefusal::Unavailable),
+                    Ok(wind_down_lane(WindDownIo::completing())),
+                ],
+                StopAt::Never,
+            );
+            assert!(run.seated, "{channel:?}: the sizes-off retry seats");
+            assert_eq!(run.journals, vec![Some(true), Some(false)], "{channel:?}");
+            assert_eq!(run.prepared_left, 4, "{channel:?}");
+            let run = startup_with_stop(
+                channel,
+                true,
+                false,
+                vec![
+                    Err(SemanticRefusal::Unavailable),
+                    Ok(wind_down_lane(WindDownIo::completing())),
+                ],
+                StopAt::Never,
+            );
+            assert!(run.seated, "{channel:?}: the ordinary retry seats");
+            assert_eq!(run.journals, vec![Some(false), None], "{channel:?}");
+            assert_eq!(run.gaps, vec![key_operations_unavailable()], "{channel:?}");
+            let run = startup_with_stop(
+                channel,
+                false,
+                false,
+                vec![Err(SemanticRefusal::Unavailable)],
+                StopAt::Never,
+            );
+            assert_eq!(
+                run.prepared_left, 5,
+                "{channel:?}: the fallback shell mints"
+            );
+            assert_eq!(run.journals, vec![None], "{channel:?}");
+            assert_eq!(
+                run.gaps,
+                vec![(
+                    "semantic lane unavailable".to_string(),
+                    format!(
+                        "{}; broad inventory continues without instance semantics",
+                        SemanticRefusal::Unavailable
+                    )
+                )],
+                "{channel:?}"
+            );
+        }
     }
 
     /// Both journal starts refuse with `--key-sizes`: the sizes

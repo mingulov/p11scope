@@ -510,7 +510,7 @@ fn start_joint_lane_with_journal(
         .subset
         .context("the conversion subset prepares")?;
     let scope = Scope::System;
-    let spec = crate::attach::journal::JournalSpec;
+    let spec = crate::attach::journal::JournalSpec { key_sizes: false };
     let mut lane = crate::inventory_semantics::AttestedSemanticLane::start_live(
         attach_subset,
         convert_subset,
@@ -4025,6 +4025,7 @@ fn record_test_gap(
         subject: subject.to_string(),
         reason: reason.to_string(),
         budget: None,
+        units: None,
     });
     coordinator.registry_mut().publish();
 }
@@ -5050,7 +5051,17 @@ fn seal_cell_across_stop(force_shed: bool) -> Result<()> {
                 }
             }
         }
-        if matches!(joint_branch(&coordinator), JointBranch::S1) {
+        let mut gate_join = StopJoin::default();
+        gate_join.feeds = coordinator.registry().joint_feeds() as u64;
+        if matches!(
+            joint_branch(
+                &coordinator,
+                lane.shed_calls_disclosed(),
+                caller_of(&coordinator, process_a.pid())?,
+                &gate_join
+            ),
+            JointBranch::S1
+        ) {
             eprintln!("P11SCOPE_CELL_BRANCH={tag}:s1-precluded");
             anyhow::bail!(
                 "{tag}: SHED: no journal feed: the cell needs a journal-build libtest \
@@ -5306,8 +5317,13 @@ fn seal_cell_across_stop(force_shed: bool) -> Result<()> {
             .chain(driver.coordinator.registry().staged_gaps_for_test())
             .filter(|gap| gap.subject == history_subject)
             .collect::<Vec<_>>();
+        let mut shed_join = StopJoin::default();
+        shed_join.feeds = driver.coordinator.registry().joint_feeds() as u64;
         ensure!(
-            matches!(joint_branch(driver.coordinator), JointBranch::Unattributed),
+            matches!(
+                joint_branch(driver.coordinator, lane_shed, caller_a, &shed_join),
+                JointBranch::Unattributed
+            ),
             "{tag}: SHED: zero installs with the default link latch \
              (feeds={} journal_linked={})",
             driver.coordinator.registry().joint_feeds(),
@@ -5542,7 +5558,17 @@ fn seal_cell_across_stop(force_shed: bool) -> Result<()> {
     // before the seal) puts the production stop before the first
     // take. Only an S1 build precludes the cell here (no journal
     // feed at all).
-    if matches!(joint_branch(&coordinator), JointBranch::S1) {
+    let mut seal_gate_join = StopJoin::default();
+    seal_gate_join.feeds = coordinator.registry().joint_feeds() as u64;
+    if matches!(
+        joint_branch(
+            &coordinator,
+            lane.shed_calls_disclosed(),
+            caller_of(&coordinator, process_a.pid())?,
+            &seal_gate_join
+        ),
+        JointBranch::S1
+    ) {
         eprintln!("P11SCOPE_CELL_BRANCH={tag}:s1-precluded");
         anyhow::bail!(
             "{tag}: no journal feed: the seal needs a journal-build libtest \

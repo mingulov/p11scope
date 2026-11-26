@@ -730,13 +730,15 @@ fn validated_file_identity(
 }
 
 /// The identify-read wrapper every object read in one discovery goes
-/// through for `key`, plus the completion handle that marks the key
-/// charged. Reads debit while the key is uncharged and stream free
-/// once charged; the handle must run only after a complete, successful
-/// identification, so every attempt debits until one succeeds. Reads
-/// fail incrementally once the cumulative allowance is gone. A file is
-/// never refused for its own size: what fits is read and hashed, and a
-/// failed inspection keeps its partial debit.
+/// through for the opened fd's own key, plus the completion handle
+/// that marks the key charged. Reads debit while the key is uncharged
+/// and stream free once charged; the handle must run only after a
+/// complete, successful identification, so every attempt debits until
+/// one succeeds (a dropped handle warns as `unused variable: complete`).
+/// Reads fail incrementally once the cumulative
+/// allowance is gone. A file is never refused for its own size: what
+/// fits is read and hashed, and a failed inspection keeps its partial
+/// debit.
 /// The reader/completer pair is returned as a tuple so the two stay
 /// together; boxing them only to simplify this signature would add two
 /// heap allocations per identification for no gain.
@@ -779,9 +781,14 @@ fn validated_file_identity_with_probe(
     budget: &mut dyn ProbeBudget,
     identify_spent: &IdentifyBudget,
 ) -> Result<ObjectIdentity, String> {
-    let (reader, complete) = budgeted_reader_for(identify_spent, expected);
-    let identity =
-        validated_file_identity_with_probe_and_reader(path, file, expected, probe, budget, reader)?;
+    // Charged under the opened fd's own key, not the claim: on split
+    // hosts the expected maps key differs, and recharging the same
+    // bytes under a second key would refuse large providers.
+    let actual = file_key(file)?;
+    let (reader, complete) = budgeted_reader_for(identify_spent, actual);
+    let identity = validated_file_identity_with_probe_and_reader(
+        path, file, expected, actual, probe, budget, reader,
+    )?;
     complete();
     Ok(identity)
 }
@@ -790,11 +797,11 @@ fn validated_file_identity_with_probe_and_reader(
     path: &Path,
     file: &File,
     expected: ObjectKey,
+    actual: ObjectKey,
     probe: &impl SelfMappingProbe,
     budget: &mut dyn ProbeBudget,
     reader: impl FnMut(&File, &mut [u8], u64) -> std::io::Result<usize>,
 ) -> Result<ObjectIdentity, String> {
-    let actual = file_key(file)?;
     // On pre-6.8 kernels an overlayfs fd and its mappings legitimately
     // carry different keys (overlay vs backing device); the self-mapping
     // probe asks the kernel how it renders this exact fd before refusing.
@@ -820,27 +827,17 @@ fn validated_file_identity_with_probe_and_reader(
     Ok(value)
 }
 
-/// Provenance-loop identity with the discovery-wide byte allowance
-/// enforced incrementally as identify reads stream (never an upfront
-/// size refusal). `identify_spent` carries the cumulative hashed bytes.
+/// Provenance-loop identity: the same budgeted validation as every
+/// other identify read, so there is exactly one completion site. The
+/// discovery-wide byte allowance is enforced incrementally as identify
+/// reads stream (never an upfront size refusal).
 fn validated_provenance_identity(
     path: &Path,
     file: &File,
     expected: ObjectKey,
     identify_spent: &IdentifyBudget,
 ) -> Result<ObjectIdentity, String> {
-    let mut budget = UnboundedProbeBudget;
-    let (reader, complete) = budgeted_reader_for(identify_spent, expected);
-    let identity = validated_file_identity_with_probe_and_reader(
-        path,
-        file,
-        expected,
-        &KernelSelfMappingProbe,
-        &mut budget,
-        reader,
-    )?;
-    complete();
-    Ok(identity)
+    validated_file_identity(path, file, expected, identify_spent)
 }
 
 struct ProcessMemory(File);
@@ -2948,6 +2945,39 @@ mod tests {
     /// A key whose bytes read in full but fail identification (here:
     /// unparseable bytes) is not marked charged either: every attempt
     /// debits until one succeeds.
+    /// Split-identity twin: the same fd identified first under its own
+    /// file key F and then under its maps rendering M (bridged by the
+    /// probe) debits once — charging follows the opened fd, not the
+    /// expected key — so the second identification leaves `spent`
+    /// unchanged.
+    #[test]
+    fn split_identity_recheck_under_maps_key_is_free() {
+        let exe = small_owned_elf();
+        let len = std::fs::metadata(&exe).unwrap().len();
+        let file = identity::open_object(&exe).unwrap();
+        let fd_key = file_key(&file).unwrap();
+        let probe = FakeSelfMappingProbe::new(true, Some(split_maps_key()));
+        let mut budget = UnboundedProbeBudget;
+        let spent = IdentifyBudget::default();
+        validated_file_identity_with_probe(&exe, &file, fd_key, &probe, &mut budget, &spent)
+            .unwrap();
+        assert_eq!(spent.spent.get(), len);
+        validated_file_identity_with_probe(
+            &exe,
+            &file,
+            split_maps_key(),
+            &probe,
+            &mut budget,
+            &spent,
+        )
+        .unwrap();
+        assert_eq!(
+            spent.spent.get(),
+            len,
+            "same fd under its maps key streams free"
+        );
+    }
+
     #[test]
     fn failed_parse_does_not_charge_the_key() {
         let dir = std::env::temp_dir().join(format!(
@@ -3123,7 +3153,29 @@ mod tests {
         let open_memory = || ProcessMemory::open().unwrap().0;
         let spent = Rc::new(IdentifyBudget::default());
         let manifest = discover_with_budget(&provider, open_memory(), Rc::clone(&spent)).unwrap();
-        assert!(spent.spent.get() > 0, "a discovery debits its budget");
+        // Exact end-to-end spend: every debited byte belongs to a
+        // distinct object the manifest or its provenance records, each
+        // counted once by key.
+        let mut paths = BTreeSet::new();
+        for object in &manifest.objects {
+            paths.insert(object.path.clone());
+        }
+        for object in &manifest.provenance_objects {
+            paths.insert(object.path.clone());
+        }
+        let mut by_key = BTreeMap::new();
+        for path in &paths {
+            let file = std::fs::File::open(path).unwrap();
+            let key = file_key(&file).unwrap();
+            let len = file.metadata().unwrap().len();
+            by_key.entry(key).or_insert(len);
+        }
+        let expected: u64 = by_key.values().sum();
+        assert_eq!(
+            spent.spent.get(),
+            expected,
+            "the pipeline debits exactly its distinct objects"
+        );
         assert!(
             p11scope_manifest::validate::validate_structure(&manifest).is_empty(),
             "the budgeted discovery stays structurally valid"
@@ -3360,6 +3412,35 @@ mod tests {
     /// `provenance_objects` debits the passed counter for every mapping
     /// it identifies: with an exhausted budget nothing validates, so the
     /// loop ends with no file-backed executable mappings.
+    /// The provenance wrapper shares the single validation: the same
+    /// key reached through a second path (a hardlink here; a bind mount
+    /// in production) streams free instead of debiting again. Kills a
+    /// wrapper that bypasses the shared budgeted path.
+    #[test]
+    fn provenance_same_key_through_two_paths_charges_once() {
+        let exe = small_owned_elf();
+        let len = std::fs::metadata(&exe).unwrap().len();
+        let dir =
+            std::env::temp_dir().join(format!("p11scope-discover-hardlink-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let link = dir.join("link.so");
+        let _ = std::fs::remove_file(&link);
+        std::fs::hard_link(&exe, &link).unwrap();
+        let file = identity::open_object(&exe).unwrap();
+        let key = file_key(&file).unwrap();
+        let link_file = identity::open_object(&link).unwrap();
+        assert_eq!(file_key(&link_file).unwrap(), key);
+        let budget = IdentifyBudget::default();
+        validated_provenance_identity(&exe, &file, key, &budget).unwrap();
+        assert_eq!(budget.spent.get(), len);
+        validated_provenance_identity(&link, &link_file, key, &budget).unwrap();
+        assert_eq!(
+            budget.spent.get(),
+            len,
+            "same key through a second path streams free"
+        );
+    }
+
     #[test]
     fn provenance_objects_charges_the_shared_identify_budget() {
         let entries = read_self_maps().unwrap();

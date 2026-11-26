@@ -1288,11 +1288,7 @@ fn run_unknown_user_is_a_usage_error_exit_2() {
     } else {
         "--user needs root"
     };
-    assert!(
-        usage.stderr.contains(expected),
-        "{}",
-        usage.stderr
-    );
+    assert!(usage.stderr.contains(expected), "{}", usage.stderr);
     assert_scoped_hint(&usage.stderr, "run");
 }
 

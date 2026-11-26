@@ -30375,19 +30375,49 @@ int main(int argc, char **argv) {
 
     /// Installing the stop flag replaces an inherited SIG_IGN (a
     /// backgrounded launch ignores SIGINT): the disposition becomes
-    /// the observer's handler. No signal is delivered, so nothing
-    /// else observes the dance; the previous disposition restores on
-    /// scope end. Serialized with the other actual-signal tests.
+    /// the observer's handler, and a delivery records. Runs in a
+    /// subprocess with a fresh signal-hook registry: in-process, an
+    /// earlier install's registry slot would skip the reinstall and
+    /// the test could not isolate this install. Deterministic: no
+    /// timing, the child raises SIGINT to itself.
     #[test]
     fn installing_the_stop_flag_overrides_inherited_ignore() {
-        let _signal_guard = ACTUAL_SIGNAL_TEST.lock().unwrap();
-        let _restore = RestoreDisposition::save(libc::SIGINT);
-        set_disposition(libc::SIGINT, libc::SIG_IGN);
-        assert_eq!(current_disposition(libc::SIGINT), libc::SIG_IGN);
-        let _state = install_stop_flag().expect("install succeeds");
-        let installed = current_disposition(libc::SIGINT);
-        assert_ne!(installed, libc::SIG_IGN, "ignore survives install");
-        assert_ne!(installed, libc::SIG_DFL, "install leaves default");
+        if std::env::var("P11SCOPE_F11_CHILD").is_ok() {
+            // SAFETY: `signal` with SIG_IGN installs no handler code;
+            // `raise` delivers SIGINT to this thread, whose handler
+            // the install below provides.
+            unsafe {
+                libc::signal(libc::SIGINT, libc::SIG_IGN);
+            }
+            assert_eq!(current_disposition(libc::SIGINT), libc::SIG_IGN);
+            let state = install_stop_flag().expect("install succeeds");
+            let installed = current_disposition(libc::SIGINT);
+            assert_ne!(installed, libc::SIG_IGN, "ignore survives install");
+            assert_ne!(installed, libc::SIG_DFL, "install leaves default");
+            unsafe {
+                libc::raise(libc::SIGINT);
+            }
+            assert_eq!(
+                state.first_signal(),
+                Some(libc::SIGINT),
+                "a delivery records on the installed flag"
+            );
+            return;
+        }
+        let exe = std::env::current_exe().expect("test binary path");
+        let output = std::process::Command::new(exe)
+            .arg("run::tests::installing_the_stop_flag_overrides_inherited_ignore")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env("P11SCOPE_F11_CHILD", "1")
+            .output()
+            .expect("spawn self");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("test result: ok. 1 passed"),
+            "child override check failed: {} {stdout}",
+            output.status
+        );
     }
 
     /// Exercises the interrupt path directly, with no real signal sent:

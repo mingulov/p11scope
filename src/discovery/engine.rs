@@ -3503,6 +3503,31 @@ impl CaptureFacts {
         for (object, _) in plan.refused_modules() {
             self.module_id_for_object(pinned, object)?;
         }
+        // Row-dropping pin lookups, in render order per module (slot
+        // objects, then the module identity, mirroring
+        // `discovery_evidence`): a missing pin here fails the merge
+        // into a counted dropped pass instead of certifying clean a
+        // publication the render would drop rows from. Appended last
+        // so pre-existing first-failure order is unchanged.
+        // Inline-degrading lookups (the pre-copy-up flag, the
+        // first-loaded-by annotation, the manifest fallbacks) take no
+        // check: they render degraded output, never drop rows, so
+        // preflighting them would refuse renderable publications.
+        for m in &plan.modules {
+            for s in &plan.slots {
+                if plan.is_active(s.index) && s.module_ids.contains(&m.id) {
+                    pinned.summary(s.object).ok_or_else(|| {
+                        anyhow!(
+                            "planned slot object '{}' has no comparable pin",
+                            s.object_path
+                        )
+                    })?;
+                }
+            }
+            pinned
+                .summary(m.object)
+                .ok_or_else(|| anyhow!("planned module '{}' has no comparable pin", m.path))?;
+        }
         Ok(())
     }
 

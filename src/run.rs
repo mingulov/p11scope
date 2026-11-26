@@ -33693,11 +33693,13 @@ int main(int argc, char **argv) {
 
     /// The real handler stamps every delivery, so the coalescing above is
     /// what production runs; `observe` (no stamp) stays test-only.
+    /// The handler lives in `install_stop_flag_for` (the list-taking
+    /// install both production callers share).
     #[test]
     fn the_stop_handler_stamps_each_delivery_with_the_monotonic_clock() {
         let source = include_str!("run.rs");
         let install = source
-            .split_once("fn install_stop_flag()")
+            .split_once("fn install_stop_flag_for(signals: &[libc::c_int])")
             .unwrap()
             .1
             .split_once("\n}\n")

@@ -146,4 +146,19 @@ job stays green). A `setUpClass` error leaves its tests `not_run` and
 the fragment incomplete (the job stays red). Skip reasons are never
 copied into typed records. `scripts/run-python-suites.py` merges the
 fragments and adds per-suite `<suite-process>` / `<suite-events>`
-integrity rows before the checker judges the document.
+integrity rows before the checker judges the document. The merged
+`<suite-process>` row is failed unless the fragment's self-reported
+`process_exit` equals the outer-observed returncode, so a teardown
+crash after the fragment write cannot pass as green.
+
+## Follow-ups
+
+- Stream identity: a row currently applies to every result stream with
+  the same runner and host. The first real cell row selected by only
+  one of several same-runner streams will need a stream identity so
+  the other streams do not fail it as unselected.
+- FF-NOMOD row: the browser cells run untyped, and the typed stream
+  skips them when prerequisites are missing (a skipped listed row
+  stays red). The post-tag row needs the browser job running under
+  `typed-python-suite.py` with its own judgment, plus the stream
+  identity above.

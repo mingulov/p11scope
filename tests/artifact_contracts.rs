@@ -11172,9 +11172,11 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
         // workflow text, never a sudo argv invocation (it only runs the typed
         // probe, the cargo wrapper and cell --list-cells, all unprivileged).
         // The pin below fails if a second quoted sudo appears, if the boundary
-        // table goes away, or if the quoted line stops being a bare string
-        // literal (a real argv invocation needs a call, list or assignment),
-        // so a real sudo invocation cannot hide here.
+        // token line changes at all, or if the quoted line stops being a bare
+        // string literal (a real argv invocation needs a call, list or
+        // assignment). Any edit that moves, recomputes or reuses the token
+        // therefore fails loudly instead of silently dropping the file from
+        // the privileged set.
         let own_text_quotes_sudo = read(script).lines().map(str::trim).any(|line| {
             !line.starts_with('#') && (line.contains("\"sudo\"") || line.contains("'sudo'"))
         });
@@ -11193,6 +11195,10 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
             assert!(
                 read(script).contains("COMMAND_BOUNDARY"),
                 "check-known-failing.py lost COMMAND_BOUNDARY: re-review the sudo_invoked exclusion"
+            );
+            assert!(
+                read(script).contains("    \"python3\", \"sudo\", \"env\", \"PY\", \"EOF\",\n"),
+                "check-known-failing.py boundary token line changed: re-review the sudo_invoked exclusion"
             );
             assert!(
                 !quoted[0].contains('(') && !quoted[0].contains('[') && !quoted[0].contains('='),

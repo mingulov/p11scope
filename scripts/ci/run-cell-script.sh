@@ -11,7 +11,7 @@
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd) || exit 2
 REPO=$(cd "$HERE/../.." && pwd) || exit 2
-if [ $# -lt 3 ]; then echo "usage: run-cell-script.sh NAME P11SCOPE OUTDIR [--expected-failure CELL ...] [--intermittent-failure CELL ...] [--allow-nonqualifying CELL ...] [--require CELL ...] [--known-failing-results PATH --known-failing-runner RUNNER --known-failing-host HOST]" >&2; exit 2; fi
+if [ $# -lt 3 ]; then echo "usage: run-cell-script.sh NAME P11SCOPE OUTDIR [--expected-failure CELL ...] [--intermittent-failure CELL ...] [--allow-nonqualifying CELL ...] [--require CELL ...] [--require-file PATH ...] [--known-failing-results PATH --known-failing-runner RUNNER --known-failing-host HOST]" >&2; exit 2; fi
 NAME=$1; P11SCOPE=$2; OUT=$3; shift 3
 case $NAME in
   *[/.]*|"") echo "run-cell-script: NAME must be a bare script name without path" >&2; exit 2 ;;

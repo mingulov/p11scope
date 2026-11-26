@@ -441,7 +441,10 @@ def merge_typed_fragments(fragment_specs, output, host):
     process-exit/terminal-outcome consistency proof and one for module or
     class-level terminal events. Those rows are typed executable state, not
     log text, so a pass-then-nonzero-exit or tearDownModule error cannot be
-    erased after every selected test passed.
+    erased after every selected test passed. The fragment's self-reported
+    process_exit must also equal the outer-observed returncode, since the
+    fragment is written before interpreter shutdown and a teardown crash
+    never reaches it.
     """
     selection = []
     results = []
@@ -451,7 +454,12 @@ def merge_typed_fragments(fragment_specs, output, host):
     event_failure_states = {"failed", "error", "unexpected_success"}
     required_keys = {"schema", "path", "invocation", "process_exit", "complete", "selection", "results", "suite_events"}
 
-    for fragment_path, name, outer_invocation in fragment_specs:
+    for spec in fragment_specs:
+        fragment_path, name, outer_invocation = spec[0], spec[1], spec[2]
+        # The outer exit code is authoritative: the fragment is written before
+        # interpreter shutdown, so a teardown crash never reaches it. Legacy
+        # 3-tuples (unit callers) carry no outer code and keep the old shape.
+        observed_returncode = spec[3] if len(spec) > 3 else None
         suite_path = f"{SUITE_DIR}/{name}"
         invocation = list(outer_invocation)
         fragment = None
@@ -520,10 +528,13 @@ def merge_typed_fragments(fragment_specs, output, host):
         events_identity = {"path": suite_path, "test": "<suite-events>", "invocation": invocation}
         selection.extend([process_identity, events_identity])
         process_exit = fragment.get("process_exit")
+        if observed_returncode is None:
+            observed_returncode = process_exit
         process_consistent = (
             not invalid
             and process_exit in (0, 1)
             and ((process_exit == 1) == failure_present)
+            and observed_returncode == process_exit
         )
         if process_consistent:
             process_state = "passed"
@@ -580,10 +591,11 @@ def run_suites(selected):
                     sys.executable, "-I", "scripts/typed-python-suite.py",
                     f"{SUITE_DIR}/{name}", str(fragment), *args, "-v",
                 ]
-                fragments.append((fragment, name, list(args)))
             else:
                 command = [sys.executable, "-I", f"{SUITE_DIR}/{name}", *args, "-v"]
             result = subprocess.run(command, cwd=ROOT, env=os.environ.copy())
+            if typed:
+                fragments.append((fragment, name, list(args), result.returncode))
             seconds = time.monotonic() - start
             verdict = "PASS" if result.returncode == 0 else f"FAIL rc={result.returncode}"
             print(f"=== {verdict} {label} ({seconds:.0f}s)", flush=True)

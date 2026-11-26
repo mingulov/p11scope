@@ -665,6 +665,12 @@ def workflow_invocations(root):
                 try:
                     tokens = shlex.split(executable_script, comments=False, posix=True)
                 except ValueError:
+                    if ("check-cell-results.py" in executable_script
+                            or "run-cell-script.sh" in executable_script):
+                        where = f"{path.relative_to(root)}:{job_name}:{step_index}"
+                        problems.append(
+                            f"{where}: unparsable step mentions a cell checker; "
+                            "fix the quoting so the scan cannot miss a declaration")
                     continue
                 for index, token in enumerate(tokens):
                     kind = None

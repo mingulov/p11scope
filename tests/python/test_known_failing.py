@@ -885,11 +885,12 @@ class StaticWiringTests(unittest.TestCase):
         import yaml
         document = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))
         steps = document["jobs"]["scripts"]["steps"]
-        return [step.get("run") for step in steps
+        return [step for step in steps
                 if isinstance(step, dict) and isinstance(step.get("run"), str)]
 
     def test_scripts_job_runs_static_checker_before_suites(self):
-        runs = self.scripts_run_steps()
+        steps = self.scripts_run_steps()
+        runs = [step["run"] for step in steps]
         static = [index for index, run in enumerate(runs) if run.strip() == self.STATIC_RUN]
         suites = [index for index, run in enumerate(runs) if run.strip() == self.SUITES_RUN]
         self.assertEqual(len(static), 1,
@@ -898,6 +899,8 @@ class StaticWiringTests(unittest.TestCase):
                          f"scripts job must run the suite driver exactly once, found {len(suites)}")
         self.assertLess(static[0], suites[0],
                         "static ledger check must precede typed judgment")
+        self.assertEqual(set(steps[static[0]]), {"run"},
+                         "static checker step must carry no guard keys (an if: could disable it)")
 
 
 class ProducerTests(unittest.TestCase):
@@ -1100,6 +1103,68 @@ class PythonProducerProcessTests(unittest.TestCase):
             rows = {item["test"]: item for item in data["results"]}
             self.assertEqual(rows["<suite-events>"]["state"], "failed")
             self.assertEqual(rows["<suite-process>"]["state"], "passed")
+
+
+class WorkflowScanTests(unittest.TestCase):
+    def workflow_with_run_block(self, f, body):
+        (f.root / ".github/workflows/main.yml").write_text(
+            "jobs:\n  test:\n    steps:\n      - run: |\n" + body,
+            encoding="utf-8")
+
+    def test_unparsable_step_mentioning_checker_is_reported(self):
+        for mention in ("scripts/ci/check-cell-results.py", "scripts/ci/run-cell-script.sh"):
+            with self.subTest(mention=mention):
+                f = fixture(self)
+                self.workflow_with_run_block(
+                    f, f"          python3 -I {mention} \"$out/results.jsonl --require x\n")
+                result = f.run_checker()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("unparsable step mentions a cell checker", result.stderr)
+
+    def test_unparsable_step_without_checker_stays_silent(self):
+        f = fixture(self)
+        self.workflow_with_run_block(f, "          echo \"oops --require x\n")
+        result = f.run_checker()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_workflow_invocation_count_is_pinned(self):
+        checker = load_script(CHECKER, "known_failing_checker_scan_count")
+        invocations, problems = checker.workflow_invocations(ROOT)
+        self.assertEqual(problems, [])
+        self.assertEqual(len(invocations), 14)
+
+
+class ShutdownCrashTests(unittest.TestCase):
+    CRASH_BODY = (
+        "import atexit\nimport os\nimport signal\nimport unittest\n"
+        "class Crash(unittest.TestCase):\n"
+        "    def test_ok(self): pass\n"
+        "atexit.register(lambda: os.kill(os.getpid(), signal.SIGSEGV))\n"
+        "if __name__ == '__main__': unittest.main()\n")
+
+    def test_atexit_crash_fails_typed_run(self):
+        f = fixture(self)
+        shutil.copy2(ROOT / "scripts/run-python-suites.py",
+                     f.root / "scripts/run-python-suites.py")
+        shutil.copy2(ROOT / "scripts/check-known-failing.py",
+                     f.root / "scripts/check-known-failing.py")
+        suite = f.root / "tests/python/test_crash_atexit.py"
+        suite.parent.mkdir(parents=True, exist_ok=True)
+        suite.write_text(self.CRASH_BODY, encoding="utf-8")
+        runner = load_script(f.root / "scripts/run-python-suites.py",
+                             "python_suite_runner_shutdown_crash")
+        runner.RUN = [("test_crash_atexit.py", [])]
+        merged = f.root / "merged.json"
+        env = {"P11SCOPE_KNOWN_FAILING_RESULTS": str(merged),
+               "P11SCOPE_KNOWN_FAILING_HOST": "github"}
+        with mock.patch.dict(os.environ, env):
+            failed = runner.run_suites(set())
+        self.assertTrue(failed, "an atexit crash must fail the typed run")
+        document = json.loads(merged.read_text(encoding="utf-8"))
+        rows = {item["test"]: item for item in document["results"]}
+        self.assertEqual(rows["<suite-process>"]["state"], "failed")
+        self.assertEqual(rows["<suite-process>"]["signature"]["branch"],
+                         "process_exit_inconsistent")
 
 
 class ScopeSkipTests(unittest.TestCase):
@@ -1448,6 +1513,36 @@ class ProducerMutationSweepTests(unittest.TestCase):
                 else:
                     mutant_ok = ok
         self.record(results, "python-process-exit", original_ok, mutant_ok)
+
+        # Outer-observed exit must equal the fragment's self-report: a
+        # teardown crash never reaches the fragment, so dropping the
+        # equality reopens the green-on-crash hole.
+        crash_mutant = self.mutate_source(ROOT / "scripts/run-python-suites.py",
+                                          "and observed_returncode == process_exit", "and True")
+        for label, source in (("original", runner_source), ("mutant", crash_mutant)):
+            with tempfile.TemporaryDirectory() as temporary:
+                temp = Path(temporary)
+                script = temp / "run-python-suites.py"
+                script.write_text(source, encoding="utf-8")
+                module = load_script(script, f"runner_crash_{label}")
+                fragment = temp / "fragment.json"
+                write_json(fragment, {
+                    "schema": "p11scope/python-suite-fragment/v1",
+                    "path": "tests/python/test_sample.py", "invocation": [], "process_exit": 0,
+                    "complete": True,
+                    "selection": [{"test": "Sample.test_pass"}],
+                    "results": [{"test": "Sample.test_pass", "state": "passed", "signature": None}],
+                    "suite_events": [],
+                })
+                output = temp / "merged.json"
+                problems = module.merge_typed_fragments([(fragment, "test_sample.py", [], 139)], output, "github")
+                rows = {row_["test"]: row_ for row_ in json.loads(output.read_text())["results"]}
+                ok = bool(problems) and rows["<suite-process>"]["state"] == "failed"
+                if label == "original":
+                    original_ok = ok
+                else:
+                    mutant_ok = ok
+        self.record(results, "python-outer-exit", original_ok, mutant_ok)
 
         # Python module terminal events must reach the typed fragment.
         typed_source = (ROOT / "scripts/typed-python-suite.py").read_text(encoding="utf-8")
@@ -1919,7 +2014,7 @@ class ProducerMutationSweepTests(unittest.TestCase):
                 outcomes[label] = run.returncode == 0
         self.record(results, "workflow-require-file-empty-selection", outcomes["original"], outcomes["mutant"])
 
-        total = 23
+        total = 24
         self.assertEqual(results["failures"], [],
                          f"surviving producer mutants: {results['failures']}; killed {results['killed']}/{total}")
         print(f"known-failing producer mutation sweep: {results['killed']}/{total} killed")
@@ -1953,6 +2048,7 @@ class MutationSweepTests(unittest.TestCase):
             "target-release-expiry": ('if (root / "docs/releases" / f"v{row[\'target\']}.md").is_file():', 'if False:'),
             "bogus-host-refused": ('if not isinstance(host, str) or host not in HOSTS:', 'if False:'),
             "cell-judge-runner": ('if invocation.get("runner") != row["runner"]:', 'if False:'),
+            "unparsable-checker-mention": ('if ("check-cell-results.py" in executable_script\n                            or "run-cell-script.sh" in executable_script):', 'if False:'),
         }
         green_to_red = {"results-discovery-skip"}
 
@@ -2108,6 +2204,12 @@ class MutationSweepTests(unittest.TestCase):
                 f.rows([row(path="scripts/ci/other.sh", test="mt-exact", cell="mt-exact",
                             runner="cell:scripts/ci/other.sh",
                             signature={"cell": "mt-exact", "branch": "B"})])
+                return None
+            if name == "unparsable-checker-mention":
+                (f.root / ".github/workflows/main.yml").write_text(
+                    "jobs:\n  test:\n    steps:\n      - run: |\n"
+                    "          python3 -I scripts/ci/check-cell-results.py \"$out/results.jsonl --require x\n",
+                    encoding="utf-8")
                 return None
             raise AssertionError(name)
 

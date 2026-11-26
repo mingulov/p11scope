@@ -1011,6 +1011,18 @@ order, so their manifests are unchanged.
 A Firefox run that presents an RSA client certificate can lose those
 per-key rows while call counts stay exact. A fix is planned for 0.8.0.
 
+### Backgrounded observer ignores an early SIGINT
+
+- What the user sees: an observer started in the background (`&`) inherits
+  SIGINT ignored, so a SIGINT landing before its handler is installed is
+  lost silently and the run continues until `--duration` ends instead of
+  exiting promptly. Present since v0.7.1; 0.7.2 narrows the window to
+  process start (loader plus argument parsing).
+- Kernels/conditions: backgrounded launches without a terminal.
+- Disclosure: this row.
+- Workaround: stop it with SIGTERM, or send SIGINT again.
+- Planned: documented limit; no further change planned.
+
 ## Known limitations in 0.6.0
 
 The following limits apply to the v0.6.0 release. Rate, latency and

@@ -3587,6 +3587,19 @@ fn capture_with_host(
     a: &CaptureArgs,
     host: &dyn Fn() -> crate::attach::MultiHostVerdict,
 ) -> Result<()> {
+    // M-1: own Ctrl-C/SIGTERM/SIGHUP on the first line, before the
+    // policy checks, the preflights, the host capability probe (which
+    // loads BPF and can take a noticeable slice of startup), the `-o`
+    // temp file, and discovery. A default disposition there would
+    // strand the temp files, and an inherited SIG_IGN (a backgrounded
+    // launch ignores SIGINT) would lose a stop landing before the
+    // handler is installed: the run would then run on until
+    // `--duration` ends instead of exiting promptly (without a
+    // duration it waits for a provider until one arrives). A stop
+    // that lands before the attach is honoured just after discovery
+    // (which cannot be interrupted part-way), by returning an error
+    // that drops the sink.
+    let stop = install_stop_flag()?;
     let kind = a.kind;
     let policy = capture_policy(
         kind,
@@ -3624,18 +3637,6 @@ fn capture_with_host(
         // No named view and no cgroup path: discovery sweeps /proc itself.
         ScopeArg::System => (Scope::System, None),
     };
-    // M-1: own Ctrl-C/SIGTERM/SIGHUP before anything slow or
-    // strandable runs. The host capability probe below loads BPF and
-    // can take a noticeable slice of startup; the `-o` temp file, a
-    // created trace file, and discovery follow. A default
-    // disposition there would strand the temp files, and an
-    // inherited SIG_IGN (a backgrounded launch ignores SIGINT) would
-    // lose a stop landing before the handler is installed: the run
-    // would then wait for a provider forever instead of exiting. A
-    // stop that lands before the attach is honoured just after
-    // discovery (which cannot be interrupted part-way), by returning
-    // an error that drops the sink.
-    let stop = install_stop_flag()?;
     let _host = host()?;
     match (kind, a.duration) {
         (Kind::Trace, None) => emit_capture_diagnostic(&no_duration_notice()),

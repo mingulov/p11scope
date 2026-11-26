@@ -349,6 +349,13 @@ versioned separately and are opaque, exact dispatch keys.
   counts), and each rebased seed discloses its window through one
   `demoted count placed` gap recording a count of placements on its
   module.
+- A stop landing during capture startup is honored instead of lost or
+  fatal: the observer owns its stop signals before the host
+  capability probe, so an early SIGINT/SIGTERM exits 1 with the
+  startup-interrupt message. That exit 1 replaces the old behavior in
+  the probe window — death by signal (exit 130) when the signal was
+  not ignored, or a silently lost stop that ran on when SIGINT was
+  inherited ignored by a backgrounded launch — and is intended.
 
 ### Known limitations
 

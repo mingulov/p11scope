@@ -202,7 +202,9 @@ fn departed_callers_and_calls_stay_in_both_dashboard_headers() {
     let live_callers = presentation.callers.len();
     let live_edges = presentation.edges.len();
     presentation.budgets.callers_retired = 2;
-    presentation.budgets.callers_retired_with_calls = 2;
+    // One retiree exited without attributed calls: the dashboard N
+    // still counts it (a lifetime total), unlike the concise split.
+    presentation.budgets.callers_retired_with_calls = 1;
     presentation.budgets.edges_folded = 4;
     presentation.budgets.edges_folded_entries = 27;
     let frame = frame_for(&presentation);

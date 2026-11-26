@@ -572,6 +572,9 @@ pub(crate) fn render_frame(
 /// run has retired caller rows — one pass after a caller exits its row
 /// leaves the live list, but its calls stay on screen here and in the
 /// folded header totals. Nouns stay invariant, like the totals lines.
+/// N counts every retired caller, including rows that exited without
+/// attributed calls (the concise snapshot splits those out instead);
+/// M folds only from rows that carried calls.
 fn departed_line(budgets: &crate::inventory_present::BudgetView, width: usize) -> Option<String> {
     (budgets.callers_retired > 0).then(|| {
         truncate_cell(

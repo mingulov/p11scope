@@ -4300,6 +4300,16 @@ def demotion_self_test():
             census.update(rows=2, unbound=1, unbound_reasons={"lifecycle_loss": 1})
             census["placement"]["unresolved"] = 1
         case("closure-coherent-native-loss", "nonqualifying", "unhealthy_public_capture", coherent_loss)
+        def coherent_clock_loss(r, i, l, m):
+            census = i["observation"]["native_witnesses"]
+            census.update(rows=2, unbound=1, unbound_reasons={"clocks_incomparable": 1})
+            census["placement"]["unresolved"] = 1
+        case("closure-coherent-clock-loss", "nonqualifying", "unhealthy_public_capture", coherent_clock_loss)
+        def coherent_unknown_loss(r, i, l, m):
+            census = i["observation"]["native_witnesses"]
+            census.update(rows=2, unbound=1, unbound_reasons={"not_a_reason": 1})
+            census["placement"]["unresolved"] = 1
+        case("closure-coherent-unknown-reason", "nonqualifying", "unsupported_public_health", coherent_unknown_loss)
         case("closure-false-public-capture-time", "fail", "public_observation_mismatch",
              lambda r, i, l, m: i["observation"].update(started_ns=200, ended_ns=201))
         case("closure-public-window-before-ledger", "fail", "public_observation_mismatch",

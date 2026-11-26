@@ -2229,7 +2229,8 @@ impl NativeBinder {
         // A known-invalidated binding: an exec or lost lifecycle evidence
         // at or after the caller's admission. Those orderings are
         // cross-clock; without a comparable clock no current image is
-        // exportable at all.
+        // exportable at all. Production stages, syncing this flag,
+        // before any proof read.
         if !self.exit_clocks_comparable {
             return None;
         }
@@ -2338,6 +2339,7 @@ impl NativeBinder {
             Some(UnboundReason::ExecTransition)
         } else if state.callers.get(&request.caller) != Some(&(request.image, request.exec_id)) {
             Some(UnboundReason::ExecAmbiguous)
+        // Production stages, syncing this flag, before any proof read.
         } else if !self.exit_clocks_comparable {
             Some(UnboundReason::ClocksIncomparable)
         } else if state

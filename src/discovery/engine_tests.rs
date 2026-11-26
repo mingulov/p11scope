@@ -98584,6 +98584,72 @@ fn member_stop_pending_rejection_refuses_the_hold() {
     );
 }
 
+/// Two staged identities sharing one maps key both refuse when the
+/// key rejects: the alias shape (btrfs subvolume clones share the
+/// maps key while `st_dev` differs). Two real held mappers with real
+/// stagings; only the key-sharing is seeded, through the recorder.
+#[test]
+fn member_stop_shared_staging_key_refuses_both_holds() {
+    let (fixture1, _view1, _module1, _pins1) = loaded_seed_provider();
+    let pid1 = fixture1.child.id();
+    let library1 = fixture1._dir.path().join("seed-provider.so");
+    let (fixture2, _view2, _module2, _pins2) = loaded_seed_provider();
+    let pid2 = fixture2.child.id();
+    let library2 = fixture2._dir.path().join("seed-provider.so");
+    stop_member_for_test(pid1);
+    stop_member_for_test(pid2);
+    let mut io = ScriptedMemberStops::default();
+    io.rows.insert(
+        pid1,
+        member_stop_row(pid1, &library1, member_exec_key_for_test(pid1, &library1)),
+    );
+    io.rows.insert(
+        pid2,
+        member_stop_row(pid2, &library2, member_exec_key_for_test(pid2, &library2)),
+    );
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    assert!(engine.member_stops_held(), "intake holds both mappers");
+    assert_eq!(
+        engine.member_stop_stats_for_test().provider_holds,
+        2,
+        "two holds, one per mapper"
+    );
+    engine.service_learned_files();
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        2,
+        "both providers stage"
+    );
+    let file1 = std::fs::File::open(&library1).unwrap();
+    let id1 = crate::fanotify::file_identity(&file1).unwrap();
+    let file2 = std::fs::File::open(&library2).unwrap();
+    let id2 = crate::fanotify::file_identity(&file2).unwrap();
+    assert_ne!(id1, id2, "two staged identities");
+    // Only the alias is seeded: both identities stage under one key.
+    let shared = engine
+        .prearm_input
+        .as_ref()
+        .and_then(|prearm| prearm.inputs.first().map(|input| input.key))
+        .expect("staging records its key");
+    engine.member_stops.note_staged_key(id1, shared);
+    engine.member_stops.note_staged_key(id2, shared);
+    engine.pending_rejected_keys.insert(shared);
+    engine.service_member_stops(&mut io, &mut session, Some(10_000_000));
+    assert!(
+        !engine.member_stops_held(),
+        "the shared rejection refuses both holds"
+    );
+    let stats = engine.member_stop_stats_for_test();
+    assert_eq!(stats.refused_resumes, 2, "{stats:?}");
+    assert_eq!(stats.timed_out, 0, "{stats:?}");
+    assert!(
+        files_the_first_use_row(&engine),
+        "the refused holds file the first-use row"
+    );
+}
+
 /// The watchdog gone, the observer alone must not keep anyone stopped:
 /// the next pass deactivates (and detaches) the stops and resumes every
 /// held and pending member, and later passes resume any row that is

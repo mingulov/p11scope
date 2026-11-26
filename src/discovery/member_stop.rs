@@ -1914,6 +1914,38 @@ mod tests {
         );
     }
 
+    /// Re-recording a retained identity in a full map overwrites in
+    /// place without overflow: the retain-disjunct, not the cap,
+    /// governs identities already recorded (adapted: the reverse
+    /// index is gone, so the move clause asserts the forward map).
+    #[test]
+    fn staged_keys_rerecord_in_a_full_map_without_overflow() {
+        let mut state = MemberStopState::default();
+        for index in 0..(MEMBER_STOP_STAGED_CAP as u64) {
+            let key = ObjectKey {
+                device: p11scope_manifest::maps::Device { major: 0, minor: 1 },
+                inode: 100 + index,
+            };
+            state.note_staged_key((0, index), key);
+        }
+        assert_eq!(state.staged_keys.len(), MEMBER_STOP_STAGED_CAP);
+        let moved = ObjectKey {
+            device: p11scope_manifest::maps::Device { major: 0, minor: 2 },
+            inode: 999_999,
+        };
+        state.note_staged_key((0, 0), moved);
+        assert_eq!(
+            state.staged_keys.get(&(0, 0)),
+            Some(&moved),
+            "the forward map takes the new key"
+        );
+        assert_eq!(state.staged_keys.len(), MEMBER_STOP_STAGED_CAP);
+        assert_eq!(
+            state.stats.stop_staged_overflow, 0,
+            "re-recording a retained identity never overflows"
+        );
+    }
+
     /// A refused staging past the refused cap stays unretained and
     /// counted: its hold keeps the bound backstop (counted there as
     /// timed-out), and the dropped refusal is visible instead of

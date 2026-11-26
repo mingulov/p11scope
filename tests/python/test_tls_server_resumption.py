@@ -67,7 +67,7 @@ class FakeConn:
 class ResumptionTest(unittest.TestCase):
     def test_full_presented_handshake_counts_a_signature(self):
         server = FlowServer()
-        server.note_handshake_ok(FakeConn(peer=b"cert", reused=False))
+        server.note_handshake_ok(FakeConn(peer=b"cert", reused=False), cert_request_seen=True)
         self.assertEqual(server.handshakes_ok, 1)
         self.assertEqual(server.client_certs_presented, 1)
         self.assertEqual(server.sessions_reused, 0)
@@ -79,7 +79,7 @@ class ResumptionTest(unittest.TestCase):
 
     def test_resumed_handshake_counts_no_signature(self):
         server = FlowServer()
-        server.note_handshake_ok(FakeConn(peer=b"cert", reused=True))
+        server.note_handshake_ok(FakeConn(peer=b"cert", reused=True), cert_request_seen=False)
         self.assertEqual(server.handshakes_ok, 1)
         self.assertEqual(server.client_certs_presented, 1)
         self.assertEqual(server.sessions_reused, 1)
@@ -96,7 +96,7 @@ class ResumptionTest(unittest.TestCase):
 
     def test_absent_cert_counts_neither(self):
         server = FlowServer()
-        server.note_handshake_ok(FakeConn(peer=None, reused=False))
+        server.note_handshake_ok(FakeConn(peer=None, reused=False), cert_request_seen=False)
         self.assertEqual(server.handshakes_ok, 1)
         self.assertEqual(server.client_certs_presented, 0)
         self.assertEqual(server.sessions_reused, 0)
@@ -108,7 +108,7 @@ class ResumptionTest(unittest.TestCase):
 
     def test_missing_session_reused_fails_soft_to_full(self):
         server = FlowServer()
-        server.note_handshake_ok(FakeConn(peer=b"cert", reused_raises=True))
+        server.note_handshake_ok(FakeConn(peer=b"cert", reused_raises=True), cert_request_seen=True)
         self.assertEqual(server.handshakes_ok, 1)
         self.assertEqual(server.client_certs_presented, 1)
         self.assertEqual(server.sessions_reused, 0)
@@ -121,10 +121,10 @@ class ResumptionTest(unittest.TestCase):
 
     def test_mixed_handshakes_split_exactly(self):
         server = FlowServer()
-        server.note_handshake_ok(FakeConn(peer=b"a", reused=False))
-        server.note_handshake_ok(FakeConn(peer=b"a", reused=True))
-        server.note_handshake_ok(FakeConn(peer=None, reused=False))
-        server.note_handshake_ok(FakeConn(peer=b"b", reused=False, version="TLSv1.2"))
+        server.note_handshake_ok(FakeConn(peer=b"a", reused=False), cert_request_seen=True)
+        server.note_handshake_ok(FakeConn(peer=b"a", reused=True), cert_request_seen=False)
+        server.note_handshake_ok(FakeConn(peer=None, reused=False), cert_request_seen=False)
+        server.note_handshake_ok(FakeConn(peer=b"b", reused=False, version="TLSv1.2"), cert_request_seen=True)
         self.assertEqual(
             (
                 server.handshakes_ok,

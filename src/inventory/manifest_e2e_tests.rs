@@ -1374,6 +1374,31 @@ fn privileged_inventory_system_manifest_scale4097_softsm_edges_lp64() -> Result<
     keep_workload_on_failure(workload, outcome, "SCALE2_E2E")
 }
 
+/// Proves one mechanisms array carries the ledger caller's
+/// populated-mechanisms proof: the summed calls and whether any
+/// mechanism records a CKR_OK API result. Every mechanism must carry
+/// its returns rows. Shared by the live edge arm and the folded
+/// aggregate arm of the scale verdict so the two cannot drift.
+fn mechanism_proof(mechanisms: &[serde_json::Value]) -> Result<(u64, bool)> {
+    let mut calls = 0u64;
+    let mut ok = false;
+    for mechanism in mechanisms {
+        calls += mechanism
+            .get("calls")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let returns = mechanism
+            .get("evidence")
+            .and_then(|evidence| evidence.get("returns"))
+            .and_then(serde_json::Value::as_array)
+            .context("mechanism returns")?;
+        ok |= returns
+            .iter()
+            .any(|ret| ret.get("rv").and_then(serde_json::Value::as_u64) == Some(0));
+    }
+    Ok((calls, ok))
+}
+
 /// Counts the ledger caller's populated folded aggregates in a scale
 /// report: only `departed_use` aggregates whose identities name
 /// `ledger_pid` count, every mechanism must carry its returns rows
@@ -1412,25 +1437,9 @@ fn count_folded_ledger_aggregates(report: &serde_json::Value, ledger_pid: u32) -
         if mechanisms.is_empty() {
             continue;
         }
-        let mut calls = 0u64;
-        let mut ok = false;
-        for mechanism in mechanisms {
-            calls += mechanism
-                .get("calls")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0);
-            let returns = mechanism
-                .get("evidence")
-                .and_then(|evidence| evidence.get("returns"))
-                .and_then(serde_json::Value::as_array)
-                .context("mechanism returns")?;
-            ok |= returns
-                .iter()
-                .any(|ret| ret.get("rv").and_then(serde_json::Value::as_u64) == Some(0));
-        }
-        if calls == 0 || !ok {
-            continue;
-        }
+        let (calls, ok) = mechanism_proof(mechanisms)?;
+        ensure!(calls > 0, "the folded aggregate records mechanism calls");
+        ensure!(ok, "the folded aggregate records a CKR_OK API result");
         let entries = departed
             .get("entries")
             .and_then(|entries| entries.get("count"))
@@ -1453,20 +1462,31 @@ fn count_folded_ledger_aggregates(report: &serde_json::Value, ledger_pid: u32) -
 /// (with CKR_OK returns rows when `with_returns`), and positive
 /// entry/API-return totals.
 fn folded_module(pid: u32, calls: u64, with_returns: bool) -> serde_json::Value {
-    let mechanism = if with_returns {
-        serde_json::json!({
+    folded_module_full(pid, calls, with_returns.then_some(0), calls, calls)
+}
+
+/// One synthetic folded row with explicit returns `rv` (none when
+/// `returns_rv` is `None`) and explicit entry/API-return totals.
+fn folded_module_full(
+    pid: u32,
+    calls: u64,
+    returns_rv: Option<u64>,
+    entries: u64,
+    api_returns: u64,
+) -> serde_json::Value {
+    let mechanism = match returns_rv {
+        Some(rv) => serde_json::json!({
             "calls": calls,
-            "evidence": {"returns": [{"rv": 0}]},
-        })
-    } else {
-        serde_json::json!({"calls": calls})
+            "evidence": {"returns": [{"rv": rv}]},
+        }),
+        None => serde_json::json!({"calls": calls}),
     };
     serde_json::json!({
         "departed_use": {
             "identities": [{"pid": pid}],
             "mechanisms": [mechanism],
-            "entries": {"count": calls},
-            "instances": {"api_returns": calls},
+            "entries": {"count": entries},
+            "instances": {"api_returns": api_returns},
         },
     })
 }
@@ -1522,6 +1542,45 @@ fn folded_other_pid_aggregate_without_returns_is_ignored() {
     assert_eq!(
         count_folded_ledger_aggregates(&report, 4242).expect("non-ledger rows never error"),
         0,
+    );
+}
+
+#[test]
+fn folded_ledger_aggregate_without_ok_errors() {
+    // A ledger row whose returns carry no CKR_OK is a hard error
+    // naming the missing proof (a silent skip would return Ok(0)).
+    let report = folded_report(vec![folded_module_full(4242, 5, Some(1), 5, 5)]);
+    let error =
+        count_folded_ledger_aggregates(&report, 4242).expect_err("the non-OK ledger row errors");
+    assert!(
+        format!("{error:#}").contains("CKR_OK"),
+        "the error names the missing CKR_OK result: {error:#}"
+    );
+}
+
+#[test]
+fn folded_ledger_aggregate_without_entries_errors() {
+    // A ledger row with populated mechanisms but zero entries is a
+    // hard error (deleting the entries check would count it).
+    let report = folded_report(vec![folded_module_full(4242, 5, Some(0), 0, 5)]);
+    let error = count_folded_ledger_aggregates(&report, 4242)
+        .expect_err("the entries-less ledger row errors");
+    assert!(
+        format!("{error:#}").contains("records entries"),
+        "the error names the missing entries: {error:#}"
+    );
+}
+
+#[test]
+fn folded_ledger_aggregate_without_api_returns_errors() {
+    // A ledger row with populated mechanisms but zero API returns is
+    // a hard error (deleting the API-returns check would count it).
+    let report = folded_report(vec![folded_module_full(4242, 5, Some(0), 5, 0)]);
+    let error = count_folded_ledger_aggregates(&report, 4242)
+        .expect_err("the API-returns-less ledger row errors");
+    assert!(
+        format!("{error:#}").contains("records API returns"),
+        "the error names the missing API returns: {error:#}"
     );
 }
 
@@ -1879,22 +1938,7 @@ fn scale4097_inner(
             if mechanisms.is_empty() {
                 continue;
             }
-            let mut calls = 0u64;
-            let mut ok = false;
-            for mechanism in mechanisms {
-                calls += mechanism
-                    .get("calls")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0);
-                let returns = mechanism
-                    .get("evidence")
-                    .and_then(|evidence| evidence.get("returns"))
-                    .and_then(serde_json::Value::as_array)
-                    .context("mechanism returns")?;
-                ok |= returns
-                    .iter()
-                    .any(|ret| ret.get("rv").and_then(serde_json::Value::as_u64) == Some(0));
-            }
+            let (calls, ok) = mechanism_proof(mechanisms)?;
             ensure!(calls > 0, "the edge records mechanism calls");
             ensure!(ok, "the edge records a CKR_OK API result");
             let api_returns = edge

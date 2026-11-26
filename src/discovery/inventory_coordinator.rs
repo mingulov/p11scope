@@ -11352,40 +11352,29 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                             recovery.sighting = Some(sighting);
                         }
                     }
-                    Err(UnboundReason::CookieUnavailable) => {
-                        self.diagnostic_recovery_wait(
-                            key,
-                            &mut recovery,
-                            DiagnosticReason::BindingUnproven,
-                            held,
-                        );
-                    }
-                    Err(
-                        reason @ (UnboundReason::NoLiveCaller
-                        | UnboundReason::CallerExited
-                        | UnboundReason::CookieMismatch
-                        | UnboundReason::BeforeAdmission
-                        | UnboundReason::ExecAfterAdmission
-                        | UnboundReason::LifecycleLoss
-                        | UnboundReason::ExecAmbiguous
-                        | UnboundReason::ExecTransition
-                        | UnboundReason::ExecCoverageGap
-                        | UnboundReason::ClocksIncomparable
-                        | UnboundReason::EvidenceIncomplete
-                        | UnboundReason::Capacity),
-                    ) => {
-                        // A failed completion clock also supplies no authority.
-                        // Preserve history, but never retry a rejected read as
-                        // though its original identity proof merely waited.
-                        self.cancel_retirement_candidate(
-                            key,
-                            &mut recovery,
-                            held,
-                            diagnostic_binding_reason(reason),
-                        );
-                        self.recoveries.insert(key, recovery);
-                        continue;
-                    }
+                    Err(reason) => match classify_recovery_sighting_refusal(reason) {
+                        RecoverySightingRefusal::Wait => {
+                            self.diagnostic_recovery_wait(
+                                key,
+                                &mut recovery,
+                                DiagnosticReason::BindingUnproven,
+                                held,
+                            );
+                        }
+                        RecoverySightingRefusal::Cancel => {
+                            // A failed completion clock also supplies no authority.
+                            // Preserve history, but never retry a rejected read as
+                            // though its original identity proof merely waited.
+                            self.cancel_retirement_candidate(
+                                key,
+                                &mut recovery,
+                                held,
+                                diagnostic_binding_reason(reason),
+                            );
+                            self.recoveries.insert(key, recovery);
+                            continue;
+                        }
+                    },
                 }
             }
             // Selection above retained an unproven candidate only. A genuine
@@ -14365,6 +14354,37 @@ fn diagnostic_revocation_reason(cause: RevocationCause) -> Option<DiagnosticReas
         RevocationCause::InvalidEdge => DiagnosticReason::InvalidEdge,
         RevocationCause::AuthorityFailure => DiagnosticReason::AuthorityFailure,
     })
+}
+
+/// How `reconcile_count_eligibility` treats a refused current-binding sighting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoverySightingRefusal {
+    /// The cookie is merely missing: keep the candidate pending.
+    Wait,
+    /// The refusal supplies no authority to wait for: cancel the candidate.
+    Cancel,
+}
+
+/// Only a missing cookie waits for the cookie; every other refusal —
+/// including an incomparable completion clock — cancels the retirement
+/// candidate, since a failed completion clock also supplies no authority.
+/// Exhaustive over `UnboundReason`: a new variant must pick a side here.
+fn classify_recovery_sighting_refusal(reason: UnboundReason) -> RecoverySightingRefusal {
+    match reason {
+        UnboundReason::CookieUnavailable => RecoverySightingRefusal::Wait,
+        UnboundReason::NoLiveCaller
+        | UnboundReason::CallerExited
+        | UnboundReason::CookieMismatch
+        | UnboundReason::BeforeAdmission
+        | UnboundReason::ExecAfterAdmission
+        | UnboundReason::LifecycleLoss
+        | UnboundReason::ExecAmbiguous
+        | UnboundReason::ExecTransition
+        | UnboundReason::ExecCoverageGap
+        | UnboundReason::ClocksIncomparable
+        | UnboundReason::EvidenceIncomplete
+        | UnboundReason::Capacity => RecoverySightingRefusal::Cancel,
+    }
 }
 
 fn diagnostic_binding_reason(reason: UnboundReason) -> DiagnosticReason {
@@ -29405,6 +29425,99 @@ exit 0
             Some(0),
             "ambiguous growth never lands on B either"
         );
+    }
+
+    #[test]
+    fn recovery_sighting_refusal_waits_only_for_a_missing_cookie() {
+        // Every unbound reason names its recovery side explicitly: only a
+        // missing cookie waits; an incomparable completion clock cancels,
+        // since it supplies no authority to wait for. Moving any reason
+        // across the classifier arms must fail here.
+        assert_eq!(
+            classify_recovery_sighting_refusal(UnboundReason::CookieUnavailable),
+            RecoverySightingRefusal::Wait,
+        );
+        for reason in [
+            UnboundReason::NoLiveCaller,
+            UnboundReason::CallerExited,
+            UnboundReason::CookieMismatch,
+            UnboundReason::BeforeAdmission,
+            UnboundReason::ExecAfterAdmission,
+            UnboundReason::LifecycleLoss,
+            UnboundReason::ExecAmbiguous,
+            UnboundReason::ExecTransition,
+            UnboundReason::ExecCoverageGap,
+            UnboundReason::ClocksIncomparable,
+            UnboundReason::EvidenceIncomplete,
+            UnboundReason::Capacity,
+        ] {
+            assert_eq!(
+                classify_recovery_sighting_refusal(reason),
+                RecoverySightingRefusal::Cancel,
+                "{reason:?} must cancel the retirement candidate, never wait",
+            );
+        }
+    }
+
+    #[test]
+    fn diagnostic_binding_reason_maps_every_unbound_reason() {
+        // The diagnostic projection of each census reason, pinned per
+        // variant: an incomparable completion clock reads unproven, never
+        // changed-identity. Dropping any explicit arm must fail here.
+        for (reason, expected) in [
+            (
+                UnboundReason::CookieUnavailable,
+                DiagnosticReason::BindingUnproven,
+            ),
+            (
+                UnboundReason::ExecCoverageGap,
+                DiagnosticReason::BindingUnproven,
+            ),
+            (
+                UnboundReason::ClocksIncomparable,
+                DiagnosticReason::BindingUnproven,
+            ),
+            (
+                UnboundReason::EvidenceIncomplete,
+                DiagnosticReason::BindingUnproven,
+            ),
+            (UnboundReason::LifecycleLoss, DiagnosticReason::CaptureLoss),
+            (UnboundReason::Capacity, DiagnosticReason::BudgetRefused),
+            (
+                UnboundReason::NoLiveCaller,
+                DiagnosticReason::IdentityChanged,
+            ),
+            (
+                UnboundReason::CallerExited,
+                DiagnosticReason::IdentityChanged,
+            ),
+            (
+                UnboundReason::CookieMismatch,
+                DiagnosticReason::IdentityChanged,
+            ),
+            (
+                UnboundReason::BeforeAdmission,
+                DiagnosticReason::IdentityChanged,
+            ),
+            (
+                UnboundReason::ExecAfterAdmission,
+                DiagnosticReason::IdentityChanged,
+            ),
+            (
+                UnboundReason::ExecAmbiguous,
+                DiagnosticReason::IdentityChanged,
+            ),
+            (
+                UnboundReason::ExecTransition,
+                DiagnosticReason::IdentityChanged,
+            ),
+        ] {
+            assert_eq!(
+                diagnostic_binding_reason(reason),
+                expected,
+                "{reason:?} must project to {expected:?}",
+            );
+        }
     }
 
     #[test]

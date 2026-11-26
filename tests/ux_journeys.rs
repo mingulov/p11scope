@@ -1296,6 +1296,28 @@ fn run_unknown_user_is_a_usage_error_exit_2() {
     assert_scoped_hint(&usage.stderr, "run");
 }
 
+/// A missing `--exclude-module` path refuses after parsing like a
+/// usage error (exit 2) with the scoped hint, before any capture.
+#[test]
+fn missing_exclude_path_is_a_usage_error_exit_2() {
+    let usage = run(&[
+        "profile",
+        "--pid",
+        "42",
+        "--exclude-module",
+        "/no/such/p11scope-missing.so",
+    ]);
+    assert_eq!(usage.code, Some(2), "{}", usage.stderr);
+    assert!(
+        usage
+            .stderr
+            .contains("--exclude-module /no/such/p11scope-missing.so does not exist"),
+        "{}",
+        usage.stderr
+    );
+    assert_scoped_hint(&usage.stderr, "profile");
+}
+
 /// B2: a huge `--duration` is a usage error, never a panic. A bare
 /// `u64::MAX` used to parse and then panic `inventory` in
 /// `Instant::now() + window` (exit 101, no report); both huge spellings

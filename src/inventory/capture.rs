@@ -911,6 +911,11 @@ pub(crate) struct NativeLane<L> {
     /// Quanta drained while the pass's collection ran, in drain order, not
     /// yet staged (C5.7); and the records they hold.
     held: Vec<DiscoveryBatch>,
+    /// INFO quanta drained while the pass's collection ran, in drain
+    /// order, not yet staged (D1). Their records count in
+    /// `held_records`, sharing the held caps with the lifecycle
+    /// quanta above.
+    held_info: Vec<InfoBatch>,
     held_records: usize,
     tally: LifecycleTally,
     /// The run's lifecycle-ring high-water so far (every drained batch,
@@ -1001,6 +1006,7 @@ impl<L> NativeLane<L> {
             failed: receipt.failed.len(),
             refusal_reported: false,
             held: Vec::new(),
+            held_info: Vec::new(),
             held_records: 0,
             tally: LifecycleTally::default(),
             lifecycle_high_water_bytes: None,
@@ -1358,7 +1364,9 @@ impl<L> NativeLane<L> {
         // What the collection ticks drained stages here, where the ring's
         // own records of that window always staged: after the scan applied
         // and the extend receipt, before any later quantum and the read.
-        events.extend(self.stage_held(host));
+        // The ticks' held INFO batches stage after the witnesses below.
+        let (held_events, held_info) = self.stage_held(host);
+        events.extend(held_events);
         events.extend(self.service(host, self.windows.pass_quanta));
         let batch = self.read();
         events.extend(
@@ -1369,11 +1377,18 @@ impl<L> NativeLane<L> {
             )
             .events,
         );
+        // D1: the ticks' held INFO batches, in drain order, then one
+        // fresh quantum. Cold traffic needs no mid-run multi-quantum
+        // loop; the terminal cut reports the observed backlog.
+        for info in held_info {
+            events.extend(
+                host.stage_native(NativeBatch::Info(info), &mut self.capture, now_ns())
+                    .events,
+            );
+        }
         // Keymeta Task 7 (spec §17.4): one INFO quantum per pass,
         // staged after the witnesses whose bindings the join
-        // resolves against, so same-pass images already bind. Cold
-        // traffic needs no mid-run multi-quantum loop; the terminal
-        // cut reports the observed backlog.
+        // resolves against, so same-pass images already bind.
         let info = self.drain_info();
         events.extend(
             host.stage_native(NativeBatch::Info(info), &mut self.capture, now_ns())
@@ -1388,6 +1403,23 @@ impl<L> NativeLane<L> {
         L: CaptureLane<Pin>,
     {
         self.capture.service_info(self.windows.discovery())
+    }
+
+    /// A tick INFO quantum worth holding (D1): records, malformed
+    /// frames, a failure, evidence deltas or errors, a
+    /// produced-counter error, or an incomplete drain. Empty complete
+    /// quanta stay out of the held batches: their cumulative
+    /// produced/consumed counters ride the next content quantum, so
+    /// dropping them loses nothing and quiet captures hold no INFO
+    /// shells at all.
+    fn info_quantum_holds(batch: &InfoBatch) -> bool {
+        !batch.records.is_empty()
+            || batch.malformed > 0
+            || batch.failure.is_some()
+            || batch.evidence_delta.iter().any(|delta| *delta > 0)
+            || batch.evidence_error.is_some()
+            || batch.produced_error.is_some()
+            || !batch.complete
     }
 
     /// One service tick between passes (invariant 3): first one
@@ -1428,13 +1460,18 @@ impl<L> NativeLane<L> {
     /// a cutoff inside a tick returns the prefix tail in facade order,
     /// so the order can drift within one prefix until the next pass
     /// re-sorts (`sort_drain_order` still decides every pass window).
+    /// Then one bounded INFO quantum (D1) into held INFO batches,
+    /// sharing both caps: its records count in `held_records`, its
+    /// shell in `held_batches`. Empty complete quanta hold nothing
+    /// (their cumulative counters ride the next content quantum), so
+    /// quiet captures behave exactly as before.
     pub(crate) fn collecting_tick<Pin>(&mut self, extend: bool)
     where
         L: CaptureLane<Pin>,
     {
         for _ in 0..self.windows.pass_quanta {
             let room = self.windows.held_records.saturating_sub(self.held_records);
-            if room == 0 || self.held.len() >= self.windows.held_batches {
+            if room == 0 || self.batches_held() >= self.windows.held_batches {
                 break;
             }
             let batch = self.drain_within(self.windows.discovery_at_most(room));
@@ -1445,13 +1482,40 @@ impl<L> NativeLane<L> {
                 break;
             }
         }
+        // D1: one bounded INFO quantum per tick into held INFO
+        // batches, sharing the held caps with the lifecycle quanta
+        // above: a provider-info burst during a slow collection would
+        // otherwise overflow the 64 KiB INFO ring and be lost. The
+        // pass stages the held batches after the witnesses. Past the
+        // caps the tick drains nothing more (the ring keeps the rest,
+        // and what it cannot hold is counted lost by the kernel,
+        // never dropped here).
+        let room = self.windows.held_records.saturating_sub(self.held_records);
+        if room > 0 && self.batches_held() < self.windows.held_batches {
+            let batch = self
+                .capture
+                .service_info(self.windows.discovery_at_most(room));
+            self.held_records += batch.records.len();
+            if Self::info_quantum_holds(&batch) {
+                self.held_info.push(batch);
+            }
+        }
         if extend {
             self.tick_extend_cached();
         }
     }
 
-    /// Stages the held quanta in drain order, never rebuilt.
-    fn stage_held<Pin, H>(&mut self, host: &mut H) -> Vec<CallerEvent>
+    /// Lifecycle plus INFO batch shells held (D1): both share the
+    /// held-batches cap.
+    fn batches_held(&self) -> usize {
+        self.held.len() + self.held_info.len()
+    }
+
+    /// Stages the held quanta in drain order, never rebuilt. Takes
+    /// the held INFO batches too — their records share
+    /// `held_records`, so the bound resets once — and returns them
+    /// for staging after the witnesses (D1).
+    fn stage_held<Pin, H>(&mut self, host: &mut H) -> (Vec<CallerEvent>, Vec<InfoBatch>)
     where
         L: CaptureLane<Pin>,
         H: LaneHost<Pin> + ?Sized,
@@ -1464,7 +1528,7 @@ impl<L> NativeLane<L> {
                     .events,
             );
         }
-        events
+        (events, std::mem::take(&mut self.held_info))
     }
 
     /// One discovery quantum, counted.
@@ -1659,7 +1723,10 @@ impl<L> NativeLane<L> {
         self.flush_tick_progress(host);
         let mut events = std::mem::take(&mut self.pending_events);
         // Nothing is held after a pass; staged first all the same.
-        events.extend(self.stage_held(host));
+        // (The startup drain can hold INFO before the first pass; it
+        // stages with the terminal cut below.)
+        let (held_events, held_info) = self.stage_held(host);
+        events.extend(held_events);
         // Drain the lifecycle ring completely (bounded) right before the
         // terminal read, each quantum staged before the coverage ends: a
         // loss still in the ring then reaches the watch before it freezes
@@ -1781,6 +1848,14 @@ impl<L> NativeLane<L> {
         // producer quiescence (D3 — FD retirement proves no callback
         // quiescence), exact loss is unproven. Every mid-run batch
         // stays provisional.
+        // D1: INFO the ticks held stages ahead of the terminal
+        // cut, in drain order.
+        for info in held_info {
+            events.extend(
+                host.stage_native(NativeBatch::Info(info), &mut self.capture, now_ns())
+                    .events,
+            );
+        }
         let cleanup = self.capture.cleanup();
         let settled = info_cut_settled(retired, &poll_error, cleanup.as_ref());
         loop {
@@ -1892,6 +1967,9 @@ pub(crate) struct NativeStop<L> {
     lane: NativeLane<L>,
     events: Vec<CallerEvent>,
     held: std::vec::IntoIter<DiscoveryBatch>,
+    /// INFO quanta the collection ticks held, staged after the held
+    /// lifecycle batches in the Held phase (D1).
+    held_info: std::vec::IntoIter<InfoBatch>,
     phase: NativeStopPhase,
     pending: Option<NativeBatch>,
     after_stage: NativeAfterStage,
@@ -1925,11 +2003,13 @@ impl<L> NativeStop<L> {
     fn new(mut lane: NativeLane<L>) -> Self {
         let events = std::mem::take(&mut lane.pending_events);
         let held = std::mem::take(&mut lane.held).into_iter();
+        let held_info = std::mem::take(&mut lane.held_info).into_iter();
         lane.held_records = 0;
         Self {
             lane,
             events,
             held,
+            held_info,
             phase: NativeStopPhase::Held,
             pending: None,
             after_stage: NativeAfterStage::Held,
@@ -2018,7 +2098,14 @@ impl<L> NativeStop<L> {
                     self.after_stage = NativeAfterStage::Held;
                     self.phase = NativeStopPhase::Stage;
                 }
-                None => self.enter(NativeStopPhase::PreDrain, now),
+                None => match self.held_info.next() {
+                    Some(info) => {
+                        self.pending = Some(NativeBatch::Info(info));
+                        self.after_stage = NativeAfterStage::Held;
+                        self.phase = NativeStopPhase::Stage;
+                    }
+                    None => self.enter(NativeStopPhase::PreDrain, now),
+                },
             },
             NativeStopPhase::Stage => {
                 let batch = self

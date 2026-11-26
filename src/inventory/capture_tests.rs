@@ -489,6 +489,17 @@ struct ScriptedLane {
     /// (empty: the default empty quantum, honoring
     /// `info_incomplete_services`).
     staged_info: VecDeque<InfoBatch>,
+    /// Scripted INFO ring contents (D1 twins): when `info_ring_cap`
+    /// is set, INFO services drain from this bounded ring instead of
+    /// `staged_info`, and arrivals past the cap drop with counted
+    /// ring loss, like the kernel ring under a burst.
+    info_ring: VecDeque<[u8; 176]>,
+    info_ring_cap: Option<usize>,
+    /// INFO records dropped on ring overflow (typed ring loss).
+    info_ring_loss: u64,
+    /// Cumulative INFO triple over the ring model: arrived, drained.
+    info_produced: u64,
+    info_consumed: u64,
     /// The stop-time cleanup reports retained links (failed closes):
     /// retirement transferred but never settled clean.
     dirty_cleanup: bool,
@@ -585,6 +596,11 @@ impl ScriptedLane {
             records_per_service: 0,
             info_incomplete_services: 0,
             staged_info: VecDeque::new(),
+            info_ring: VecDeque::new(),
+            info_ring_cap: None,
+            info_ring_loss: 0,
+            info_produced: 0,
+            info_consumed: 0,
             dirty_cleanup: false,
             detach_done: false,
             teardown: InfoTeardown::Proven,
@@ -616,6 +632,20 @@ impl ScriptedLane {
             CaptureScopeCoverage::System => ScopeCustody::System,
             CaptureScopeCoverage::Pid(_) => ScopeCustody::PidHeld,
             CaptureScopeCoverage::Cgroup => ScopeCustody::CgroupHeld,
+        }
+    }
+
+    /// Inject `n` INFO records into the scripted ring (D1 twins):
+    /// arrivals past the cap drop with counted ring loss.
+    fn arrive_info(&mut self, n: usize) {
+        let cap = self.info_ring_cap.expect("the INFO ring model is armed");
+        for _ in 0..n {
+            self.info_produced += 1;
+            if self.info_ring.len() >= cap {
+                self.info_ring_loss += 1;
+            } else {
+                self.info_ring.push_back([0xAB; 176]);
+            }
         }
     }
 }
@@ -803,6 +833,19 @@ impl CaptureLane<Pin> for ScriptedLane {
 
     fn service_info(&mut self, window: ReadWindow) -> InfoBatch {
         self.info_windows.borrow_mut().push(window.deadline());
+        if self.info_ring_cap.is_some() {
+            let take = self.info_ring.len().min(window.max_rows());
+            let records: Vec<[u8; 176]> = self.info_ring.drain(..take).collect();
+            self.info_consumed += records.len() as u64;
+            let mut batch = InfoBatch::empty(self.domain);
+            batch.records = records;
+            batch.produced = self.info_produced;
+            batch.consumed = self.info_consumed;
+            batch.loss = self.info_produced - self.info_consumed;
+            batch.complete = self.info_ring.is_empty();
+            batch.produced_fresh = true;
+            return batch;
+        }
         if let Some(batch) = self.staged_info.pop_front() {
             return batch;
         }
@@ -5731,6 +5774,226 @@ fn a_collection_tick_drains_full_quanta_until_the_held_bound() {
         .count();
     assert_eq!(services, 3);
     assert_eq!((started.held_records, started.tally.records), (600, 600));
+}
+
+/// D1: an INFO burst spread over a slow collection drains tick by
+/// tick into held batches. Staged plus counted loss plus the ring
+/// remainder equals produced, and loss is zero within the held cap.
+/// The staged sequence pins the order: the ticks' held batches in
+/// drain order, then the pass's fresh quantum.
+#[test]
+fn d1_collecting_ticks_drain_info_bursts_without_ring_loss() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let mut lane = ScriptedLane::new(&log);
+    lane.info_ring_cap = Some(400);
+    let mut started = NativeLane::start(lane, &mut scene, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    for _ in 0..50 {
+        started.capture.arrive_info(20);
+        started.collecting_tick(true);
+    }
+    started.after_pass(&mut scene);
+    let staged: usize = scene.staged_info_records.iter().sum();
+    let capture = &started.capture;
+    assert_eq!(capture.info_produced, 1000);
+    assert_eq!(staged, 1000, "every arrival stages: {staged}");
+    assert_eq!(
+        capture.info_ring_loss, 0,
+        "no ring loss within the held cap"
+    );
+    assert_eq!(
+        staged as u64 + capture.info_ring_loss + capture.info_ring.len() as u64,
+        capture.info_produced,
+        "staged plus loss plus ring remainder equals produced"
+    );
+    let mut sequence = vec![20usize; 50];
+    sequence.push(0);
+    assert_eq!(
+        scene.staged_info_records, sequence,
+        "held batches in drain order, then the fresh quantum"
+    );
+}
+
+/// D1 over-cap twin: a burst past the shared held-record cap stops
+/// the tick drain at the cap; the ring keeps what it holds and the
+/// overflow is counted exactly.
+#[test]
+fn d1_info_overflow_past_the_held_cap_is_counted_exactly() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let mut lane = ScriptedLane::new(&log);
+    lane.info_ring_cap = Some(400);
+    let windows = LaneWindows {
+        held_records: 100,
+        ..windows()
+    };
+    let mut started = NativeLane::start(lane, &mut scene, windows, None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    for _ in 0..50 {
+        started.capture.arrive_info(20);
+        started.collecting_tick(true);
+    }
+    started.after_pass(&mut scene);
+    let staged: usize = scene.staged_info_records.iter().sum();
+    let capture = &started.capture;
+    // Five ticks hold 20 records each, then the shared record cap
+    // stops the drain; the 400-record ring keeps 400 and drops 500;
+    // the pass stages the 100 held plus a fresh 256-quantum.
+    assert_eq!(capture.info_produced, 1000);
+    assert_eq!(staged, 356, "held plus the fresh quantum: {staged}");
+    assert_eq!(capture.info_ring_loss, 500, "the exact counted overflow");
+    assert_eq!(
+        staged as u64 + capture.info_ring_loss + capture.info_ring.len() as u64,
+        capture.info_produced,
+        "staged plus loss plus ring remainder equals produced"
+    );
+}
+
+/// D1: INFO the ticks held stages in the stop's Held phase, ahead of
+/// the terminal cut.
+#[test]
+fn d1_stop_stages_held_info_before_the_terminal_cut() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let mut lane = ScriptedLane::new(&log);
+    lane.info_ring_cap = Some(400);
+    let mut started = NativeLane::start(lane, &mut scene, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    started.capture.arrive_info(30);
+    started.collecting_tick(true);
+    started.collecting_tick(true);
+    let stop = started
+        .into_finite_stop(NativeStopDisposition::Error, None)
+        .ok()
+        .expect("the error disposition is always admissible");
+    let keep_running = || false;
+    let clock = LoopClock {
+        deadline: Some(Instant::now() + Duration::from_secs(60)),
+        stop: &keep_running,
+        now: &Instant::now,
+        interval: Duration::ZERO,
+        tick: Duration::from_millis(1),
+        collection_tick: NO_COLLECTION_TICK,
+    };
+    let mut stop = stop;
+    let mut steps = 0u32;
+    let _stopped = loop {
+        steps += 1;
+        assert!(steps <= 10_000, "the cooperative stop finishes its phases");
+        let now = Instant::now();
+        match stop.step(&mut scene, now, now + Duration::from_secs(60), &clock) {
+            NativeStopProgress::Pending(next) => stop = next,
+            NativeStopProgress::Stopped(stopped) => break stopped,
+        }
+    };
+    assert_eq!(
+        scene.staged_info_records,
+        [30, 0],
+        "the held batch, then the terminal cut: {:?}",
+        scene.staged_info_records
+    );
+    assert_eq!(
+        scene.staged_info_terminal,
+        [false, true],
+        "only the terminal cut marks terminal: {:?}",
+        scene.staged_info_terminal
+    );
+}
+
+/// D1: the blocking stop stages tick-held INFO ahead of its
+/// terminal cut, like the cooperative stop.
+#[test]
+fn d1_blocking_stop_stages_held_info_before_its_terminal_cut() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let mut lane = ScriptedLane::new(&log);
+    lane.info_ring_cap = Some(400);
+    let mut started = NativeLane::start(lane, &mut scene, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    started.after_pass(&mut scene);
+    started.capture.arrive_info(30);
+    started.collecting_tick(true);
+    let _stopped = started.stop(&mut scene);
+    assert_eq!(
+        scene.staged_info_records,
+        [0, 30, 0],
+        "the pass quantum, the held batch, then the terminal cut: {:?}",
+        scene.staged_info_records
+    );
+    assert_eq!(
+        scene.staged_info_terminal,
+        [false, false, true],
+        "only the terminal cut marks terminal: {:?}",
+        scene.staged_info_terminal
+    );
+}
+
+/// D1: lifecycle and INFO shells share the held-batches cap in
+/// both directions: either side stops once their combined shells
+/// reach it.
+#[test]
+fn d1_lifecycle_and_info_share_the_batch_cap() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let mut lane = ScriptedLane::new(&log);
+    lane.info_ring_cap = Some(400);
+    let windows = LaneWindows {
+        held_batches: 3,
+        ..windows()
+    };
+    let mut started = NativeLane::start(lane, &mut scene, windows, None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    // Tick 1 holds a lifecycle shell and an INFO shell; tick 2 holds
+    // one more lifecycle shell while INFO skips; tick 3 holds
+    // nothing: three shells are held.
+    for _ in 0..3 {
+        started.capture.arrive_info(20);
+        started.collecting_tick(true);
+    }
+    assert_eq!(started.held.len(), 2, "lifecycle stops at the shared cap");
+    assert_eq!(started.held_info.len(), 1, "INFO stops at the shared cap");
+    assert_eq!(started.held_info[0].records.len(), 20);
+    started.after_pass(&mut scene);
+    let staged: usize = scene.staged_info_records.iter().sum();
+    assert_eq!(staged, 60, "20 held plus the fresh 40-quantum: {staged}");
+    let capture = &started.capture;
+    assert_eq!(capture.info_ring_loss, 0);
+    assert_eq!(
+        staged as u64 + capture.info_ring_loss + capture.info_ring.len() as u64,
+        capture.info_produced,
+    );
+}
+
+/// D1: ticks on a quiet capture service the INFO ring but hold no
+/// batches: empty complete quanta stay out of the held cap, so the
+/// lifecycle bounds behave exactly as before.
+#[test]
+fn d1_quiet_ticks_hold_no_info_batches() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let lane = ScriptedLane::new(&log);
+    let mut started = NativeLane::start(lane, &mut scene, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    let serviced = started.capture.info_windows.borrow().len();
+    for _ in 0..5 {
+        started.collecting_tick(true);
+    }
+    assert_eq!(
+        started.capture.info_windows.borrow().len(),
+        serviced + 5,
+        "every tick services the INFO ring"
+    );
+    assert!(
+        started.held_info.is_empty(),
+        "empty quanta hold no INFO shells"
+    );
 }
 
 /// C5.7 (review M-1): collection-time drains are counted like any other:

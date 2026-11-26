@@ -1534,11 +1534,12 @@ fn async_global_live_retire_opens_a_counted_coverage_window() {
         "premise: the retired slot leaves the active plan"
     );
     assert_eq!(
-        engine.coverage_retire_windows.len(),
+        engine.coverage_retire_windows().len(),
         1,
         "one window opens for the retired live cover"
     );
-    let window = &engine.coverage_retire_windows[0];
+    let windows_view = engine.coverage_retire_windows();
+    let window = &windows_view[0];
     assert_eq!(window.modules, retired_modules);
     assert_eq!(window.slots, 1);
     assert!(window.start_ns > 0);
@@ -1590,7 +1591,7 @@ fn async_global_revived_module_closes_its_coverage_window() {
         .apply_candidate(&mut session, candidate, &mut additions, false, &[])
         .unwrap();
     assert_eq!(
-        engine.coverage_retire_windows.len(),
+        engine.coverage_retire_windows().len(),
         1,
         "premise: the retire opened its window"
     );
@@ -1607,11 +1608,12 @@ fn async_global_revived_module_closes_its_coverage_window() {
         .apply_candidate(&mut session, revive, &mut additions, false, &[])
         .unwrap();
     assert_eq!(
-        engine.coverage_retire_windows.len(),
+        engine.coverage_retire_windows().len(),
         1,
         "reviving closes the window instead of opening another"
     );
-    let window = &engine.coverage_retire_windows[0];
+    let windows_view = engine.coverage_retire_windows();
+    let window = &windows_view[0];
     let end = window.end_ns.expect("the revive stamps the window end");
     assert!(
         end >= window.start_ns,
@@ -1619,10 +1621,10 @@ fn async_global_revived_module_closes_its_coverage_window() {
     );
 }
 
-/// A shared window over two retired modules stays open while only one
-/// re-attaches: closing on the first revival would end the window on
-/// the still-dark module's record, silently un-disclosing its tail
-/// loss. Only the second revival closes it.
+/// One retire of two modules opens one window per module. A partial
+/// revival closes only the revived module's window: the still-dark
+/// module's record keeps its window open, never silently un-disclosing
+/// its tail loss. Only the second revival closes the second window.
 #[test]
 fn async_global_partial_revive_keeps_the_shared_coverage_window_open() {
     let (_child, mut engine, modules) = engine_with_one_accepted_provider();
@@ -1658,12 +1660,23 @@ fn async_global_partial_revive_keeps_the_shared_coverage_window_open() {
     engine
         .apply_candidate(&mut session, retire, &mut additions, false, &[])
         .unwrap();
+    let opened = engine.coverage_retire_windows();
+    assert_eq!(opened.len(), 2, "one window per retired module: {opened:?}");
+    let windowed: std::collections::BTreeSet<crate::plan::ModuleId> = opened
+        .iter()
+        .flat_map(|window| window.modules.iter().copied())
+        .collect();
     assert_eq!(
-        engine.coverage_retire_windows.len(),
-        1,
-        "premise: one window covers both retired modules"
+        windowed.len(),
+        2,
+        "the windows name both modules: {opened:?}"
     );
-    assert_eq!(engine.coverage_retire_windows[0].modules.len(), 2);
+    assert!(
+        opened
+            .iter()
+            .all(|window| window.modules.len() == 1 && window.end_ns.is_none()),
+        "each window names one module and stays open: {opened:?}"
+    );
     assert_eq!(engine.coverage_retired_slots(), 2);
     let one_mods: std::collections::BTreeSet<crate::plan::ModuleId> =
         engine.plan.slots[0].module_ids.iter().copied().collect();
@@ -1712,17 +1725,28 @@ fn async_global_partial_revive_keeps_the_shared_coverage_window_open() {
         one_mods.iter().all(|id| live_mods.contains(id)),
         "premise: module one revived: {live_mods:?}"
     );
+    let partial_view = engine.coverage_retire_windows();
     assert!(
-        engine.coverage_retire_windows[0]
-            .modules
+        partial_view
             .iter()
+            .flat_map(|window| window.modules.iter())
             .any(|id| !live_mods.contains(id)),
         "premise: a windowed module stayed dark: {live_mods:?}"
     );
-    assert_eq!(
-        engine.coverage_retire_windows[0].end_ns, None,
-        "the partial revival leaves the shared window open"
-    );
+    for window in &partial_view {
+        let module = *window.modules.iter().next().unwrap();
+        if live_mods.contains(&module) {
+            let end = window
+                .end_ns
+                .expect("the revived module's window closes at its revival");
+            assert!(end >= window.start_ns, "sane bounds: {window:?}");
+        } else {
+            assert_eq!(
+                window.end_ns, None,
+                "the partial revival leaves the dark module's window open"
+            );
+        }
+    }
     let mut pins = engine.pinned.clone();
     let skipped = pins.absorb(pin_test_modules(&engine.views[0], &modules));
     let full = engine
@@ -1732,14 +1756,17 @@ fn async_global_partial_revive_keeps_the_shared_coverage_window_open() {
     engine
         .apply_candidate(&mut session, full, &mut additions, false, &[])
         .unwrap();
-    let window = &engine.coverage_retire_windows[0];
-    let end = window
-        .end_ns
-        .expect("the full revival stamps the window end");
-    assert!(
-        end >= window.start_ns,
-        "the closed window keeps sane bounds"
-    );
+    let full_view = engine.coverage_retire_windows();
+    assert_eq!(full_view.len(), 2, "revivals open no new window");
+    for window in &full_view {
+        let end = window
+            .end_ns
+            .expect("the full revival stamps every window end");
+        assert!(
+            end >= window.start_ns,
+            "the closed window keeps sane bounds"
+        );
+    }
 }
 
 /// Retiring plan-active cover the session never attached opens no
@@ -1767,7 +1794,7 @@ fn async_global_unattached_retire_opens_no_coverage_window() {
         "premise: the scripted detach commits"
     );
     assert!(
-        engine.coverage_retire_windows.is_empty(),
+        engine.coverage_retire_windows().is_empty(),
         "a never-attached retire files no window"
     );
     assert_eq!(engine.coverage_retired_slots(), 0);
@@ -1846,11 +1873,12 @@ fn async_global_retire_of_later_slot_snapshots_that_slot_by_index() {
         session.detached_slot_indices
     );
     assert_eq!(
-        engine.coverage_retire_windows.len(),
+        engine.coverage_retire_windows().len(),
         1,
         "the retired later slot files its window"
     );
-    let window = &engine.coverage_retire_windows[0];
+    let windows_view = engine.coverage_retire_windows();
+    let window = &windows_view[0];
     assert_eq!(window.modules, retired_modules);
     assert_eq!(window.slots, 1);
     assert_eq!(window.end_ns, None, "nothing revived it yet");
@@ -1926,11 +1954,19 @@ fn async_global_ended_pid_retire_opens_no_coverage_window() {
         modules_unchanged: false,
     };
     let outcome = engine
-        .apply_candidate_with_ended(&mut session, candidate, &mut true, true, &[], Some(&ended))
+        .apply_candidate_with_ended(
+            &mut session,
+            candidate,
+            &mut true,
+            true,
+            &[],
+            Some(&ended),
+            None,
+        )
         .unwrap();
     assert!(!outcome.detach_failed, "premise: the ended detach commits");
     assert!(
-        engine.coverage_retire_windows.is_empty(),
+        engine.coverage_retire_windows().is_empty(),
         "a dead owner's retire files no window"
     );
     assert_eq!(engine.coverage_retired_slots(), 0);
@@ -1979,11 +2015,12 @@ fn async_global_running_owned_pure_retire_opens_a_counted_coverage_window() {
         "premise: the owned retire detaches synchronously"
     );
     assert_eq!(
-        engine.coverage_retire_windows.len(),
+        engine.coverage_retire_windows().len(),
         1,
         "a running-owned pure retire files its window"
     );
-    let window = &engine.coverage_retire_windows[0];
+    let windows_view = engine.coverage_retire_windows();
+    let window = &windows_view[0];
     assert_eq!(window.modules, retired_modules);
     assert_eq!(window.slots, 1);
     assert_eq!(engine.coverage_retired_slots(), 1);
@@ -2026,7 +2063,7 @@ fn async_global_owned_retire_with_reattach_stays_silent() {
         "premise: the scripted detach commits"
     );
     assert!(
-        engine.coverage_retire_windows.is_empty(),
+        engine.coverage_retire_windows().is_empty(),
         "an owned turnover retire files no window"
     );
     assert_eq!(engine.coverage_retired_slots(), 0);
@@ -2153,7 +2190,7 @@ fn async_global_paused_owned_generation_turnover_with_running_reattach_stays_sil
         "premise: the fresh attach installed a Session link"
     );
     assert!(
-        engine.coverage_retire_windows.is_empty(),
+        engine.coverage_retire_windows().is_empty(),
         "a paused owned turnover files no window"
     );
     assert_eq!(engine.coverage_retired_slots(), 0);
@@ -2230,14 +2267,25 @@ fn async_global_owned_leader_with_descendant_pure_retire_opens_a_counted_coverag
         !outcome.detach_failed,
         "premise: the scripted detach commits"
     );
+    // Per-module windows (retire-window lane, F2): one open window per
+    // retired module, together covering exactly the retired set, and the
+    // slot count names the two distinct retired endpoints.
+    let windows_view = engine.coverage_retire_windows();
     assert_eq!(
-        engine.coverage_retire_windows.len(),
-        1,
-        "an all-owned pure retire files its window"
+        windows_view.len(),
+        retired_modules.len(),
+        "an all-owned pure retire files one window per retired module"
     );
-    let window = &engine.coverage_retire_windows[0];
-    assert_eq!(window.modules, retired_modules);
-    assert_eq!(window.slots, 2);
+    let covered: std::collections::BTreeSet<_> = windows_view
+        .iter()
+        .flat_map(|window| window.modules.iter().copied())
+        .collect();
+    assert_eq!(covered, retired_modules);
+    assert!(
+        windows_view
+            .iter()
+            .all(|window| window.modules.len() == 1 && window.end_ns.is_none())
+    );
     assert_eq!(engine.coverage_retired_slots(), 2);
 }
 
@@ -2326,11 +2374,12 @@ fn async_global_owned_with_true_descendant_pure_retire_opens_a_counted_coverage_
         "premise: the scripted detach commits"
     );
     assert_eq!(
-        engine.coverage_retire_windows.len(),
+        engine.coverage_retire_windows().len(),
         1,
         "a pure owned retire with a descendant present files its window"
     );
-    let window = &engine.coverage_retire_windows[0];
+    let windows_view = engine.coverage_retire_windows();
+    let window = &windows_view[0];
     assert_eq!(window.modules, retired_modules);
     assert_eq!(window.slots, 1);
     assert_eq!(engine.coverage_retired_slots(), 1);
@@ -2432,11 +2481,12 @@ fn async_global_same_module_mixed_retire_discloses_the_dark_endpoint() {
         "premise: the sibling endpoint re-attached"
     );
     assert_eq!(
-        engine.coverage_retire_windows.len(),
+        engine.coverage_retire_windows().len(),
         1,
         "the dark endpoint files its window"
     );
-    let window = &engine.coverage_retire_windows[0];
+    let windows_view = engine.coverage_retire_windows();
+    let window = &windows_view[0];
     assert_eq!(window.modules, retired_modules);
     assert_eq!(window.slots, 1);
     assert_eq!(engine.coverage_retired_slots(), 1);
@@ -2528,11 +2578,12 @@ fn async_global_precheck_failed_replacement_discloses_the_stranded_endpoint() {
         "premise: the stranded slot deactivates"
     );
     assert_eq!(
-        engine.coverage_retire_windows.len(),
+        engine.coverage_retire_windows().len(),
         1,
         "the stranded endpoint files its window"
     );
-    let window = &engine.coverage_retire_windows[0];
+    let windows_view = engine.coverage_retire_windows();
+    let window = &windows_view[0];
     assert_eq!(window.modules, retired_modules);
     assert_eq!(window.slots, 1);
     assert_eq!(window.end_ns, None, "nothing revived it yet");
@@ -2623,11 +2674,12 @@ fn async_global_pending_retirement_with_planned_reattach_files_for_every_attache
         "premise: the planned reattach never ran"
     );
     assert_eq!(
-        case.engine.coverage_retire_windows.len(),
+        case.engine.coverage_retire_windows().len(),
         1,
         "the pending retire files its window"
     );
-    let window = &case.engine.coverage_retire_windows[0];
+    let windows_view = case.engine.coverage_retire_windows();
+    let window = &windows_view[0];
     assert_eq!(window.modules, retired_modules);
     assert_eq!(window.slots, 1);
     assert_eq!(window.end_ns, None, "nothing revived it yet");
@@ -2656,4 +2708,824 @@ fn async_global_pending_retirement_with_planned_reattach_files_for_every_attache
             })),
         "the original owner's record carries the window: {record:?}"
     );
+}
+
+// ---------------------------------------------------------------------
+// v0.7.2 retire-window lane (F1/F2): a proof-backed retire that leaves
+// zero mappers loses nothing and opens no window; a mapper seen again
+// before the re-attach discloses from the detach instant; the ledger
+// stays bounded with an exact distinct-slot count.
+// ---------------------------------------------------------------------
+
+fn retire_skip_filed(engine: &Engine) -> bool {
+    engine.counters.object_skips.iter().any(|skip| {
+        skip.subject == crate::render::COVERAGE_RETIRED_SUBJECT
+            && skip.reason == crate::render::COVERAGE_RETIRED_REASON
+    })
+}
+
+fn record_retire_windows(engine: &Engine, module: crate::plan::ModuleId) -> Vec<(u64, u64)> {
+    engine
+        .capture_facts()
+        .discovery
+        .modules
+        .iter()
+        .filter(|record| record.id == module)
+        .flat_map(|record| record.unobserved_windows.clone().unwrap_or_default())
+        .filter(|window| window.reason == crate::render::UnobservedReason::CoverageRetired)
+        .map(|window| (window.start_ns, window.end_ns))
+        .collect()
+}
+
+/// System-scope engine whose only provider mapper exits: the slot is
+/// session-proven attached, the child is killed and reaped, and the real
+/// ExpectedRemoval path (pin-proven readiness, view removal, conservative
+/// replay) runs through `process_discovery_records`. Returns the engine,
+/// session, the scanned modules and the retired slot's module ids.
+fn system_zero_mapper_exit() -> (
+    Engine,
+    ScriptedSession,
+    Vec<ScannedModule>,
+    std::collections::BTreeSet<crate::plan::ModuleId>,
+) {
+    let (mut child, mut engine, modules) = engine_with_one_accepted_provider();
+    engine.scope = Scope::System;
+    let slot = engine.plan.slots[0].index;
+    let retired: std::collections::BTreeSet<crate::plan::ModuleId> =
+        engine.plan.slots[0].module_ids.iter().copied().collect();
+    assert!(!retired.is_empty(), "premise: the slot names its module");
+    let mut session = ScriptedSession::default();
+    session.scripted_stamps.insert(slot, 1);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let view = engine.views[0].id();
+    let mut pending = PendingViewRetirements::new();
+    engine.queue_retirement(view, RetirementCause::ExpectedRemoval, &mut pending);
+    let mut collect = |_: &mut dyn EngineSession| Ok((Vec::new(), 0));
+    engine
+        .process_discovery_records(
+            &mut session,
+            &mut Vec::new(),
+            &mut pending,
+            &mut true,
+            &mut collect,
+            &mut PauseClosure::new(true),
+        )
+        .unwrap();
+    assert!(
+        engine.views.is_empty(),
+        "premise: the proven exit removed the only view"
+    );
+    assert!(
+        !engine.plan.is_active(slot),
+        "premise: the replay retired the provider's live slot"
+    );
+    assert!(
+        engine.pending_retirements.is_empty(),
+        "premise: the conservative replay consumed the retirement"
+    );
+    (engine, session, modules, retired)
+}
+
+/// Commit a candidate in which a new live process maps the provider
+/// again. `reattach` false strips the re-attach (the mapper is seen but
+/// its cover does not return in this apply).
+fn remap_provider(
+    engine: &mut Engine,
+    session: &mut ScriptedSession,
+    reattach: bool,
+) -> std::process::Child {
+    let child = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let view = ProcessView::open(ProcessViewId(5), child.id()).unwrap();
+    let modules = child_provider_modules(&view);
+    engine.next_view_id = engine.next_view_id.max(6);
+    engine.views.push(view);
+    let mut pins = engine.pinned.clone();
+    let view = engine
+        .views
+        .iter()
+        .find(|view| view.id() == ProcessViewId(5))
+        .unwrap();
+    let skipped = pins.absorb(pin_test_modules(view, &modules[..1]));
+    let mut candidate = engine
+        .live_candidate(pins, vec![modules[0].clone()], skipped)
+        .expect("the new mapper offers a candidate");
+    assert!(
+        !candidate.delta.new.is_empty(),
+        "premise: the new mapper re-attaches the provider"
+    );
+    if !reattach {
+        for slot in std::mem::take(&mut candidate.delta.new) {
+            candidate.plan.deactivate(slot.index);
+        }
+    }
+    let outcome = engine
+        .apply_candidate(session, candidate, &mut true, false, &[])
+        .unwrap();
+    assert!(outcome.accepted(), "premise: the remap commits");
+    child
+}
+
+/// F1 twin (a): the most common `--system` flow. A client maps the
+/// provider, runs and exits; its pin proves the exit and no mapper is
+/// left. No call was possible, so the retire files no window, no gap
+/// row and no retired-slot count: the verdict stays COMPLETE. The retire
+/// is parked for the module, in case a mapper returns.
+#[test]
+fn system_proven_exit_with_zero_mappers_opens_no_coverage_window() {
+    let (engine, _session, _modules, retired) = system_zero_mapper_exit();
+    assert!(
+        engine.coverage_retire_windows().is_empty(),
+        "no window: {:?}",
+        engine.coverage_retire_windows()
+    );
+    assert_eq!(engine.coverage_retired_slots(), 0);
+    assert!(
+        !retire_skip_filed(&engine),
+        "no coverage-retired row: {:?}",
+        engine.counters.object_skips
+    );
+    assert_eq!(
+        engine.coverage_retire_parked(),
+        retired,
+        "the zero-mapper retire is parked for its module"
+    );
+    for module in &retired {
+        assert!(record_retire_windows(&engine, *module).is_empty());
+    }
+}
+
+/// F1 twin (b), re-attach in the same apply: a new process maps the
+/// provider after the zero-mapper retire. Its calls before the re-attach
+/// were not observed, so the parked retire turns into a disclosed window
+/// from the detach instant, closed at the re-attach, with the row and an
+/// exact one-slot count.
+#[test]
+fn system_mapper_seen_after_zero_mapper_retire_discloses_until_reattach() {
+    let (mut engine, mut session, _modules, retired) = system_zero_mapper_exit();
+    let mut child = remap_provider(&mut engine, &mut session, true);
+    let windows = engine.coverage_retire_windows();
+    assert_eq!(
+        windows.len(),
+        retired.len(),
+        "one window per module: {windows:?}"
+    );
+    for window in &windows {
+        assert!(retired.is_superset(&window.modules));
+        assert_eq!(window.slots, 1);
+        let end = window.end_ns.expect("the same-apply re-attach closes it");
+        assert!(end >= window.start_ns && window.start_ns > 0);
+    }
+    assert_eq!(engine.coverage_retired_slots(), 1);
+    assert!(retire_skip_filed(&engine), "the row files on promotion");
+    assert!(engine.coverage_retire_parked().is_empty());
+    for module in &retired {
+        assert_eq!(record_retire_windows(&engine, *module).len(), 1);
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+/// F1 twin (b), no re-attach yet: the mapper is seen but its cover has
+/// not returned, so the promoted window stays open (PARTIAL), and a later
+/// re-attach closes it without opening another.
+#[test]
+fn system_mapper_seen_without_reattach_keeps_the_window_open() {
+    let (mut engine, mut session, _modules, retired) = system_zero_mapper_exit();
+    let mut child = remap_provider(&mut engine, &mut session, false);
+    let windows = engine.coverage_retire_windows();
+    assert_eq!(windows.len(), retired.len());
+    assert!(
+        windows.iter().all(|window| window.end_ns.is_none()),
+        "no cover yet: the window stays open: {windows:?}"
+    );
+    assert_eq!(engine.coverage_retired_slots(), 1);
+    assert!(retire_skip_filed(&engine));
+    for module in &retired {
+        let projected = record_retire_windows(&engine, *module);
+        assert_eq!(projected.len(), 1, "the record discloses it open-ended");
+        assert!(projected[0].1 >= projected[0].0);
+    }
+    let mut pins = engine.pinned.clone();
+    let view = engine
+        .views
+        .iter()
+        .find(|view| view.id() == ProcessViewId(5))
+        .unwrap();
+    let modules = child_provider_modules(view);
+    let skipped = pins.absorb(pin_test_modules(view, &modules[..1]));
+    let revive = engine
+        .live_candidate(pins, vec![modules[0].clone()], skipped)
+        .unwrap();
+    assert!(
+        !revive.delta.new.is_empty(),
+        "premise: the re-attach is planned"
+    );
+    engine
+        .apply_candidate(&mut session, revive, &mut true, false, &[])
+        .unwrap();
+    let windows = engine.coverage_retire_windows();
+    assert_eq!(
+        windows.len(),
+        retired.len(),
+        "the re-attach opens no new window"
+    );
+    assert!(windows.iter().all(|window| window.end_ns.is_some()));
+    assert_eq!(
+        engine.coverage_retired_slots(),
+        1,
+        "the endpoint counts once"
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+/// Promotion counts only live mappers: while a pending retire still
+/// lists the module in the committed plan, the exited view's stale
+/// module row must not promote the parked retire. A live view mapping
+/// the provider does.
+#[test]
+fn parked_retire_promotes_only_for_a_live_mapper() {
+    let (child, mut engine, _modules) = engine_with_one_accepted_provider();
+    let module = engine.plan.slots[0].module_ids[0];
+    let endpoint = crate::discovery::coverage_retire::RetiredEndpoint::Pinned {
+        object: engine.plan.slots[0].object,
+        file_offset: engine.plan.slots[0].file_offset,
+    };
+    engine
+        .coverage_retire
+        .park(&[module].into_iter().collect(), endpoint, 1);
+    let view = engine.views.remove(0);
+    assert!(
+        engine
+            .plan
+            .modules
+            .iter()
+            .any(|summary| summary.id == module),
+        "premise: the plan still lists the module"
+    );
+    assert!(
+        !engine.promote_remapped_coverage_retires(),
+        "an exited view's row is no mapper"
+    );
+    assert!(engine.coverage_retire_windows().is_empty());
+    engine.views.push(view);
+    assert!(
+        engine.promote_remapped_coverage_retires(),
+        "a live view maps it"
+    );
+    assert_eq!(engine.coverage_retire_windows().len(), 1);
+    assert!(retire_skip_filed(&engine));
+    let mut child = child;
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+/// Killing twin for the exit proof: the same replay with the retiring
+/// view still tracked live (a lost generation or an unproven removal)
+/// keeps the lossy window, even when an exit proof was recorded for it.
+#[test]
+fn system_replay_without_a_proven_exit_keeps_the_lossy_window() {
+    for recorded_proof in [false, true] {
+        let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+        engine.scope = Scope::System;
+        let slot = engine.plan.slots[0].index;
+        let mut session = ScriptedSession::default();
+        session.scripted_stamps.insert(slot, 1);
+        let view = engine.views[0].id();
+        if recorded_proof {
+            engine.exit_proven_views.insert(view);
+        }
+        engine.pending_retirements.insert(view);
+        engine.replay_pending_conservative(
+            &mut session,
+            &mut true,
+            &mut PendingViewRetirements::new(),
+        );
+        assert!(!engine.plan.is_active(slot), "premise: the slot retired");
+        assert_eq!(
+            engine.coverage_retire_windows().len(),
+            1,
+            "recorded_proof={recorded_proof}: a live retiring mapper keeps the window"
+        );
+        assert_eq!(engine.coverage_retired_slots(), 1);
+        assert!(retire_skip_filed(&engine));
+        assert!(engine.coverage_retire_parked().is_empty());
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+}
+
+/// Killing twin for the proof source: the same proven-exit replay with
+/// the exit proof absent (only `exit_proven_views` vouches for a removed
+/// view) keeps the lossy window.
+#[test]
+fn system_removed_view_without_exit_proof_keeps_the_lossy_window() {
+    let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+    engine.scope = Scope::System;
+    let slot = engine.plan.slots[0].index;
+    let mut session = ScriptedSession::default();
+    session.scripted_stamps.insert(slot, 1);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let view = engine.views.remove(0).id();
+    engine.pending_retirements.insert(view);
+    engine.replay_pending_conservative(&mut session, &mut true, &mut PendingViewRetirements::new());
+    assert!(!engine.plan.is_active(slot), "premise: the slot retired");
+    assert_eq!(engine.coverage_retire_windows().len(), 1);
+    assert!(retire_skip_filed(&engine));
+    // Twin: the same removal with the pin-proven exit recorded parks.
+    let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+    engine.scope = Scope::System;
+    let slot = engine.plan.slots[0].index;
+    let mut session = ScriptedSession::default();
+    session.scripted_stamps.insert(slot, 1);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let view = engine.views.remove(0).id();
+    engine.exit_proven_views.insert(view);
+    engine.pending_retirements.insert(view);
+    engine.replay_pending_conservative(&mut session, &mut true, &mut PendingViewRetirements::new());
+    assert!(!engine.plan.is_active(slot));
+    assert!(engine.coverage_retire_windows().is_empty());
+    assert!(!retire_skip_filed(&engine));
+    assert!(
+        engine.exit_proven_views.is_empty(),
+        "the settled replay drops its proof"
+    );
+}
+
+/// Killing twin for rejected keys: a replay that also retries a rejected
+/// object carries no exit proof (the rejected object's mappers live on),
+/// so the retire keeps its lossy window.
+#[test]
+fn system_replay_with_rejected_keys_keeps_the_lossy_window() {
+    let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+    engine.scope = Scope::System;
+    let slot = engine.plan.slots[0].index;
+    let mut session = ScriptedSession::default();
+    session.scripted_stamps.insert(slot, 1);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let view = engine.views.remove(0).id();
+    engine.exit_proven_views.insert(view);
+    engine.pending_retirements.insert(view);
+    engine.pending_rejected_keys.insert(ObjectKey {
+        device: p11scope_manifest::maps::Device { major: 0, minor: 1 },
+        inode: 1,
+    });
+    engine.replay_pending_conservative(&mut session, &mut true, &mut PendingViewRetirements::new());
+    assert!(!engine.plan.is_active(slot), "premise: the slot retired");
+    assert_eq!(engine.coverage_retire_windows().len(), 1);
+    assert!(retire_skip_filed(&engine));
+}
+
+/// Killing twin for remaining mappers: an exit proof for the module does
+/// not exempt a retire whose candidate still plans the module (some
+/// mapper remains and can call while the probes are down).
+#[test]
+fn exit_proof_with_a_remaining_mapper_keeps_the_lossy_window() {
+    let (_child, mut engine, modules) = engine_with_one_accepted_provider();
+    let mut candidate = peer_candidate(&mut engine, &modules);
+    candidate.delta.retire.push(engine.plan.slots[0].clone());
+    candidate.plan.deactivate(0);
+    let retired: std::collections::BTreeSet<crate::plan::ModuleId> =
+        engine.plan.slots[0].module_ids.iter().copied().collect();
+    assert!(
+        candidate
+            .plan
+            .modules
+            .iter()
+            .any(|module| retired.contains(&module.id)),
+        "premise: the candidate still plans the retired module"
+    );
+    let mut session = ScriptedSession::default();
+    session
+        .scripted_stamps
+        .insert(engine.plan.slots[0].index, 1);
+    engine
+        .apply_candidate_with_ended(
+            &mut session,
+            candidate,
+            &mut true,
+            false,
+            &[],
+            None,
+            Some(&retired),
+        )
+        .unwrap();
+    assert_eq!(engine.coverage_retire_windows().len(), 1);
+    assert!(engine.coverage_retire_parked().is_empty());
+    assert!(retire_skip_filed(&engine));
+}
+
+/// F2 through the real apply path: repeated lossy retire/re-attach
+/// cycles of one provider keep at most the per-module cap of windows and
+/// count the provider's one endpoint once.
+#[test]
+fn repeated_retire_cycles_stay_bounded_with_an_exact_slot_count() {
+    use crate::discovery::coverage_retire::MAX_COVERAGE_RETIRE_WINDOWS_PER_MODULE;
+    let (_child, mut engine, modules) = engine_with_one_accepted_provider();
+    let mut session = ScriptedSession::default();
+    let peer = peer_candidate(&mut engine, &modules);
+    engine
+        .apply_candidate(&mut session, peer, &mut true, false, &[])
+        .unwrap();
+    let module = engine.plan.slots[0].module_ids[0];
+    let cycles = MAX_COVERAGE_RETIRE_WINDOWS_PER_MODULE + 4;
+    for cycle in 0..cycles {
+        let one = engine
+            .plan
+            .slots
+            .iter()
+            .find(|slot| engine.plan.is_active(slot.index) && slot.module_ids.contains(&module))
+            .cloned()
+            .expect("module one has live cover");
+        session.scripted_stamps.insert(one.index, 1);
+        let mut pins = engine.pinned.clone();
+        let skipped = pins.absorb(pin_test_modules(&engine.views[0], &modules));
+        let mut retire = engine
+            .live_candidate(pins, modules.to_vec(), skipped)
+            .unwrap();
+        retire.delta.retire.push(one.clone());
+        retire.plan.deactivate(one.index);
+        engine
+            .apply_candidate(&mut session, retire, &mut true, false, &[])
+            .unwrap();
+        assert!(!engine.plan.is_active(one.index), "cycle {cycle}: retired");
+        let mut pins = engine.pinned.clone();
+        let skipped = pins.absorb(pin_test_modules(&engine.views[0], &modules));
+        let revive = engine
+            .live_candidate(pins, modules.to_vec(), skipped)
+            .unwrap();
+        assert!(
+            !revive.delta.new.is_empty(),
+            "cycle {cycle}: re-attach planned"
+        );
+        engine
+            .apply_candidate(&mut session, revive, &mut true, false, &[])
+            .unwrap();
+    }
+    let windows = engine.coverage_retire_windows();
+    assert_eq!(windows.len(), MAX_COVERAGE_RETIRE_WINDOWS_PER_MODULE);
+    assert_eq!(
+        engine.coverage_retire.folded_for(module),
+        (cycles - MAX_COVERAGE_RETIRE_WINDOWS_PER_MODULE) as u64
+    );
+    assert!(windows.iter().all(|window| window.end_ns.is_some()));
+    assert_eq!(
+        engine.coverage_retired_slots(),
+        1,
+        "one endpoint retired {cycles} times counts once"
+    );
+    assert_eq!(
+        record_retire_windows(&engine, module).len(),
+        MAX_COVERAGE_RETIRE_WINDOWS_PER_MODULE
+    );
+}
+
+/// The pending (async worker) open point, which the live `--system`
+/// path takes: a proof-backed zero-mapper retire parks there too, and the
+/// pending ticket (whose plan still lists the module while the exited
+/// view's row lingers) never promotes it.
+#[test]
+fn system_pending_zero_mapper_retire_parks_without_a_window() {
+    let mut case = Case::new();
+    let slot = case.engine.plan.slots[0].index;
+    let retired: std::collections::BTreeSet<crate::plan::ModuleId> = case.engine.plan.slots[0]
+        .module_ids
+        .iter()
+        .copied()
+        .collect();
+    case.session.scripted_stamps.insert(slot, 1);
+    case.child.kill().unwrap();
+    case.child.wait().unwrap();
+    let view = case.engine.views.remove(0).id();
+    case.engine.exit_proven_views.insert(view);
+    case.engine.pending_retirements.insert(view);
+    let outcome = case.engine.replay_pending_conservative(
+        &mut case.session,
+        &mut true,
+        &mut PendingViewRetirements::new(),
+    );
+    assert_eq!(
+        outcome.disposition,
+        ApplyDisposition::Deferred,
+        "premise: the retire pends on the async worker"
+    );
+    assert!(case.engine.pending_global_retirement.is_some());
+    case.entered.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(
+        case.engine.coverage_retire_windows().is_empty(),
+        "the pending zero-mapper retire opens no window: {:?}",
+        case.engine.coverage_retire_windows()
+    );
+    assert_eq!(case.engine.coverage_retired_slots(), 0);
+    assert!(!retire_skip_filed(&case.engine));
+    assert_eq!(case.engine.coverage_retire_parked(), retired);
+    case.release();
+    let Case {
+        ref mut engine,
+        ref mut session,
+        ..
+    } = case;
+    wait_for(|| {
+        engine.service_backlog_quantum(session).unwrap();
+        engine.pending_global_retirement.is_none()
+    });
+    assert!(engine.coverage_retire_windows().is_empty());
+    assert!(!retire_skip_filed(engine));
+}
+
+/// Killing twin for the unproven-mapper subtraction: two processes map
+/// the provider; one exits with a pin-proven exit, the other retires
+/// without one (still live). The object keeps an unproven mapper, so the
+/// retire stays lossy.
+#[test]
+fn shared_object_with_an_unproven_retiring_mapper_keeps_the_lossy_window() {
+    let (mut child, mut engine, modules) = engine_with_one_accepted_provider();
+    engine.scope = Scope::System;
+    let mut second = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let view = ProcessView::open(ProcessViewId(5), second.id()).unwrap();
+    let modules2 = child_provider_modules(&view);
+    engine.next_view_id = engine.next_view_id.max(6);
+    engine.views.push(view);
+    let mut pins = engine.pinned.clone();
+    let skipped = pins.absorb(pin_test_modules(&engine.views[1], &modules2[..1]));
+    let both = engine
+        .live_candidate(pins, vec![modules[0].clone(), modules2[0].clone()], skipped)
+        .unwrap();
+    let mut session = ScriptedSession::default();
+    engine
+        .apply_candidate(&mut session, both, &mut true, false, &[])
+        .unwrap();
+    let live: Vec<_> = engine
+        .plan
+        .slots
+        .iter()
+        .filter(|slot| engine.plan.is_active(slot.index))
+        .map(|slot| slot.index)
+        .collect();
+    assert!(!live.is_empty(), "premise: the shared provider is attached");
+    for index in &live {
+        session.scripted_stamps.insert(*index, 1);
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let first = engine.views.remove(0).id();
+    let other = engine.views[0].id();
+    engine.exit_proven_views.insert(first);
+    engine.pending_retirements.insert(first);
+    engine.pending_retirements.insert(other);
+    engine.replay_pending_conservative(&mut session, &mut true, &mut PendingViewRetirements::new());
+    assert!(
+        live.iter().all(|index| !engine.plan.is_active(*index)),
+        "premise: both retirements retire the shared cover"
+    );
+    assert!(
+        !engine.coverage_retire_windows().is_empty(),
+        "an unproven mapper keeps the retire lossy"
+    );
+    assert!(engine.coverage_retire_parked().is_empty());
+    assert!(retire_skip_filed(&engine));
+    second.kill().unwrap();
+    second.wait().unwrap();
+}
+
+/// A reallocated view id names a new generation: an earlier exit proof
+/// recorded under that id must not vouch for it.
+#[test]
+fn reallocated_view_id_drops_its_exit_proof() {
+    let mut engine = Engine::empty();
+    engine.next_view_id = 8;
+    engine.retired_view_ids.push(3);
+    engine.exit_proven_views.insert(ProcessViewId(3));
+    engine.exit_proven_views.insert(ProcessViewId(4));
+    let id = engine.allocate_view_id().unwrap();
+    assert_eq!(id, ProcessViewId(3), "premise: the free id is reused");
+    assert!(!engine.exit_proven_views.contains(&id));
+    assert!(
+        engine.exit_proven_views.contains(&ProcessViewId(4)),
+        "other proofs stay"
+    );
+}
+
+/// The `observed-profile/v3-metrics` evidence an engine state projects:
+/// the engine's retired-slot count and its skip rows, through the public
+/// skip projection and the shared verdict, into the metrics document.
+fn metrics_evidence(engine: &Engine) -> serde_json::Value {
+    let mut ev = crate::render::tests::evidence();
+    ev.coverage_retired_slots = engine.coverage_retired_slots();
+    ev.skipped = engine
+        .counters
+        .object_skips
+        .iter()
+        .map(crate::render::capture_skipped_out)
+        .collect();
+    ev.verdict();
+    let capture = crate::render::CaptureMeta {
+        started: "t0",
+        ended: "t1",
+        kernel: "6.8.0",
+        policy: crate::attach::CapturePolicy::Allowlisted,
+        scope: "system",
+        caller: None,
+        ring_bytes: p11scope_ebpf_common::RING_BYTES,
+        drain_interval_ms: 1000,
+    };
+    let document = crate::render::json(&[], &ev, &capture);
+    assert_eq!(
+        document["schema"], "p11scope/observed-profile/v3-metrics",
+        "premise: the metrics schema"
+    );
+    document["evidence"].clone()
+}
+
+/// F1 twin (a) in metrics mode (addendum G1): the state a proof-backed
+/// zero-mapper exit leaves projects a v3-metrics `evidence.completeness`
+/// of COMPLETE with zero retired slots; the unproven twin (the same
+/// removal without the exit proof) projects PARTIAL with the counted
+/// cause, so the typed field decides, not log text.
+#[test]
+fn system_zero_mapper_exit_keeps_metrics_completeness_complete() {
+    let (engine, _session, _modules, _retired) = system_zero_mapper_exit();
+    let evidence = metrics_evidence(&engine);
+    assert_eq!(evidence["completeness"], "COMPLETE", "{evidence}");
+    assert_eq!(evidence["coverage_retired_slots"], 0);
+    assert!(
+        !evidence["gap_classes"]["observation"]["causes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|cause| cause == "coverage_retired_slots"),
+        "{evidence}"
+    );
+
+    let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+    engine.scope = Scope::System;
+    let slot = engine.plan.slots[0].index;
+    let mut session = ScriptedSession::default();
+    session.scripted_stamps.insert(slot, 1);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let view = engine.views.remove(0).id();
+    engine.pending_retirements.insert(view);
+    engine.replay_pending_conservative(&mut session, &mut true, &mut PendingViewRetirements::new());
+    assert!(!engine.plan.is_active(slot), "premise: the slot retired");
+    let evidence = metrics_evidence(&engine);
+    assert_eq!(evidence["completeness"], "PARTIAL", "{evidence}");
+    assert_eq!(evidence["coverage_retired_slots"], 1);
+    assert!(
+        evidence["gap_classes"]["observation"]["causes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|cause| cause == "coverage_retired_slots"),
+        "{evidence}"
+    );
+}
+
+/// The inventory-refresh open point (live `--cgroup`/`--system` path,
+/// audit H1b): the provider's only mapper leaves an authoritative
+/// membership walk, so the refresh retires its cover with zero mappers.
+/// `listed` keeps the reaped pid in `cgroup.procs`: a listed pid with no
+/// live process is not a member either (the walk keeps live user
+/// processes only), so it departs the same way.
+fn cgroup_refresh_retire(
+    listed: bool,
+) -> (Engine, std::collections::BTreeSet<crate::plan::ModuleId>) {
+    let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+    let pid = child.id();
+    let dir = tempfile::tempdir().expect("a scope directory");
+    std::fs::write(dir.path().join("cgroup.procs"), format!("{pid}\n")).expect("a cgroup.procs");
+    engine.scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
+    engine.max_scan_pids = 1024;
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    let slot = engine.plan.slots[0].index;
+    let retired: std::collections::BTreeSet<crate::plan::ModuleId> =
+        engine.plan.slots[0].module_ids.iter().copied().collect();
+    assert!(!retired.is_empty(), "premise: the slot names its module");
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let listing = if listed {
+        format!("{pid}\n")
+    } else {
+        String::new()
+    };
+    std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
+    let mut session = ScriptedSession::with_records([], 0);
+    session.scripted_stamps.insert(slot, 1);
+    refresh_inventory_with(&mut engine, &mut session);
+    assert!(
+        engine.views.is_empty(),
+        "premise: the refresh retired the only view: {:?}",
+        engine
+            .views
+            .iter()
+            .map(ProcessView::pid)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !engine.plan.is_active(slot),
+        "premise: the refresh retired the provider's live slot"
+    );
+    drop(dir);
+    (engine, retired)
+}
+
+#[test]
+fn cgroup_refresh_departure_with_zero_mappers_opens_no_coverage_window() {
+    let (engine, retired) = cgroup_refresh_retire(false);
+    assert!(
+        engine.coverage_retire_windows().is_empty(),
+        "no window: {:?}",
+        engine.coverage_retire_windows()
+    );
+    assert_eq!(engine.coverage_retired_slots(), 0);
+    assert!(
+        !retire_skip_filed(&engine),
+        "no coverage-retired row: {:?}",
+        engine.counters.object_skips
+    );
+    assert_eq!(engine.coverage_retire_parked(), retired);
+    let evidence = metrics_evidence(&engine);
+    assert_eq!(evidence["coverage_retired_slots"], 0, "{evidence}");
+}
+
+/// The same departure with the reaped pid still listed: still no member,
+/// so still a zero-mapper retire. A generation-lost view (a live reused
+/// pid) never vouches; that arm needs pid reuse and has no deterministic
+/// fixture (named in the lane report).
+#[test]
+fn cgroup_refresh_listed_dead_pid_departs_without_a_window() {
+    let (engine, retired) = cgroup_refresh_retire(true);
+    assert!(
+        engine.coverage_retire_windows().is_empty(),
+        "{:?}",
+        engine.coverage_retire_windows()
+    );
+    assert_eq!(engine.coverage_retired_slots(), 0);
+    assert!(!retire_skip_filed(&engine));
+    assert_eq!(engine.coverage_retire_parked(), retired);
+}
+
+/// A plan listing is no mapper (audit H1b, the manifest-held getter
+/// cell): the candidate still lists the retired module (a manifest keeps
+/// its object planned) but no scan the candidate keeps maps it, so the
+/// proven exit parks the retire. Twin of
+/// `exit_proof_with_a_remaining_mapper_keeps_the_lossy_window`, whose
+/// candidate keeps the live scan.
+#[test]
+fn exit_proof_with_a_plan_listing_but_no_scan_parks_the_retire() {
+    let (_child, mut engine, modules) = engine_with_one_accepted_provider();
+    let mut candidate = peer_candidate(&mut engine, &modules);
+    candidate.delta.retire.push(engine.plan.slots[0].clone());
+    candidate.plan.deactivate(0);
+    let retired: std::collections::BTreeSet<crate::plan::ModuleId> =
+        engine.plan.slots[0].module_ids.iter().copied().collect();
+    let objects: std::collections::BTreeSet<_> = candidate
+        .plan
+        .modules
+        .iter()
+        .filter(|module| retired.contains(&module.id))
+        .map(|module| module.object)
+        .collect();
+    assert!(
+        !objects.is_empty(),
+        "premise: the candidate still lists the module"
+    );
+    candidate
+        .modules
+        .retain(|module| !objects.contains(&module.object));
+    let mut session = ScriptedSession::default();
+    session
+        .scripted_stamps
+        .insert(engine.plan.slots[0].index, 1);
+    engine
+        .apply_candidate_with_ended(
+            &mut session,
+            candidate,
+            &mut true,
+            false,
+            &[],
+            None,
+            Some(&retired),
+        )
+        .unwrap();
+    assert!(!engine.plan.is_active(0), "premise: the slot retired");
+    assert!(
+        engine.coverage_retire_windows().is_empty(),
+        "{:?}",
+        engine.coverage_retire_windows()
+    );
+    assert!(!retire_skip_filed(&engine));
+    assert_eq!(engine.coverage_retire_parked(), retired);
 }

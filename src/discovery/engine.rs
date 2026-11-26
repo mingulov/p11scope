@@ -1227,13 +1227,18 @@ pub struct Engine {
     /// group per rebuild transaction. Ungated by scope — a rebuild blinds
     /// its members wherever the capture runs.
     multi_rebuild_gaps: u64,
-    /// Mid-capture counting-coverage retirements: one entry per live
-    /// global-retire apply that detached attached counting slots with no
-    /// same-apply reattach. Open (`end_ns: None`) until the module
-    /// re-attaches or the capture ends; projected onto the affected
-    /// records as `coverage_retired` unobserved windows at every
-    /// `capture_facts` read. Bounded by applies (one per retire apply).
-    coverage_retire_windows: Vec<CoverageRetireWindow>,
+    /// Mid-capture counting-coverage retirements (see
+    /// `coverage_retire`): per-module lossy windows, open until the
+    /// module re-attaches or the capture ends, projected onto the
+    /// affected records as `coverage_retired` unobserved windows at
+    /// every `capture_facts` read; plus the proof-backed zero-mapper
+    /// retires parked until a mapper returns. Bounded per module.
+    coverage_retire: crate::discovery::coverage_retire::CoverageRetireLedger,
+    /// Views whose ExpectedRemoval retirement the original-process pin
+    /// proved (the process exited), still awaiting their conservative
+    /// replay. Only these can back a zero-mapper retire; an id leaves
+    /// when its replay settles or the id is reallocated.
+    exit_proven_views: BTreeSet<ProcessViewId>,
     // Both ledgers are capture-local and bounded by the process-view ceiling;
     // only the scalar crosses the render boundary.
     admitted_cgroup_views: BTreeMap<ProcessViewId, CgroupAdmission>,
@@ -2446,17 +2451,14 @@ struct InventorySurfaceKey {
     duplicate: u16,
 }
 
-/// One mid-capture counting-coverage retirement: live attached slots
-/// detached by a global-retire apply with no same-apply reattach.
-/// `end_ns` closes when the module re-attaches, else the projection
-/// reads it open-ended at capture end. `slots` counts the live
-/// attached slots that went down (scope, never a missed-call count).
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CoverageRetireWindow {
+/// One snapshotted attached endpoint a global detach may retire: the
+/// committed original index, endpoint key, module ids and the endpoint's
+/// stable identity (for distinct slot counting across re-pins).
+struct RetireEntry {
+    index: u32,
+    key: plan::AttachKey,
     modules: BTreeSet<plan::ModuleId>,
-    start_ns: u64,
-    end_ns: Option<u64>,
-    slots: u64,
+    endpoint: crate::discovery::coverage_retire::RetiredEndpoint,
 }
 
 /// The live attached cover a global detach is about to retire: one entry
@@ -2471,28 +2473,37 @@ struct CoverageRetireWindow {
 /// original endpoints whose replace attempt stranded), so no endpoint
 /// files twice within one apply.
 struct CoverageRetireSnapshot {
-    attached: Vec<(u32, plan::AttachKey, BTreeSet<plan::ModuleId>)>,
+    attached: Vec<RetireEntry>,
     replace_attempts: BTreeSet<u32>,
     start_ns: u64,
+    /// Modules whose every retiring mapper provably exited (the
+    /// conservative replay's exit proof); empty without one.
+    exit_proven: BTreeSet<plan::ModuleId>,
+    /// Modules a scan the candidate keeps still maps: a mapper remains.
+    remaining: BTreeSet<plan::ModuleId>,
 }
 
 impl CoverageRetireSnapshot {
-    /// Aggregate attached cover into (modules, slots), keeping only the
-    /// original endpoints the caller's outcome covers.
+    /// The original endpoints the caller's outcome covers.
     fn cover(
-        attached: &[(u32, plan::AttachKey, BTreeSet<plan::ModuleId>)],
+        &self,
         mut keep: impl FnMut(u32, &plan::AttachKey) -> bool,
-    ) -> (BTreeSet<plan::ModuleId>, u64) {
-        let mut modules = BTreeSet::new();
-        let mut slots = 0u64;
-        for (index, key, ids) in attached {
-            if !keep(*index, key) {
-                continue;
-            }
-            modules.extend(ids.iter().copied());
-            slots += 1;
-        }
-        (modules, slots)
+    ) -> impl Iterator<Item = &RetireEntry> {
+        self.attached
+            .iter()
+            .filter(move |entry| keep(entry.index, &entry.key))
+    }
+
+    /// A retire loses nothing only when every module of the endpoint
+    /// had all its retiring mappers proven exited and the candidate
+    /// keeps no mapper of it: no process can call into it until a
+    /// mapper is seen again.
+    fn zero_mapper_proven(&self, entry: &RetireEntry) -> bool {
+        !entry.modules.is_empty()
+            && entry
+                .modules
+                .iter()
+                .all(|module| self.exit_proven.contains(module) && !self.remaining.contains(module))
     }
 }
 
@@ -15328,7 +15339,8 @@ impl Engine {
             pid_descendant_gaps_admitted: 0,
             run_tree_handed_back: 0,
             multi_rebuild_gaps: 0,
-            coverage_retire_windows: Vec::new(),
+            coverage_retire: Default::default(),
+            exit_proven_views: BTreeSet::new(),
             admitted_cgroup_views: BTreeMap::new(),
             admitted_cgroup_pid_counts: BTreeMap::new(),
             unmatched_leader_exit_events: BTreeSet::new(),
@@ -16603,13 +16615,13 @@ impl Engine {
         // read open-ended at now (an unreadable clock omits them rather
         // than fabricating an end); the stored windows stay untouched so
         // repeated reads project identically.
-        if !self.coverage_retire_windows.is_empty() {
+        if !self.coverage_retire.is_empty() {
             let now = crate::attach::monotonic_ns();
             for record in discovery.modules.iter_mut() {
                 let mut extra: Vec<render::UnobservedWindow> = self
-                    .coverage_retire_windows
+                    .coverage_retire
+                    .windows_for(record.id)
                     .iter()
-                    .filter(|window| window.modules.contains(&record.id))
                     .filter_map(|window| {
                         let end_ns = match (window.end_ns, now) {
                             (Some(end), _) => end,
@@ -16897,13 +16909,24 @@ impl Engine {
         self.multi_rebuild_gaps
     }
 
-    /// Live attached counting slots retired mid-capture across every
-    /// coverage-retire window (scope, never a missed-call count).
+    /// Distinct live attached counting endpoints retired mid-capture
+    /// with possible loss (scope, never a missed-call count): repeated
+    /// retire/re-attach cycles of one endpoint count it once, and a
+    /// parked zero-mapper retire counts nothing until it is promoted.
     pub(crate) fn coverage_retired_slots(&self) -> u64 {
-        self.coverage_retire_windows
-            .iter()
-            .map(|window| window.slots)
-            .fold(0u64, |total, slots| total.saturating_add(slots))
+        self.coverage_retire.retired_slots()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn coverage_retire_windows(
+        &self,
+    ) -> Vec<crate::discovery::coverage_retire::CoverageRetireWindowView> {
+        self.coverage_retire.views()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn coverage_retire_parked(&self) -> BTreeSet<plan::ModuleId> {
+        self.coverage_retire.parked_modules()
     }
 
     /// Snapshot the live attached cover `selected` is about to detach:
@@ -16928,10 +16951,11 @@ impl Engine {
     fn coverage_retire_snapshot(
         &self,
         session: &dyn EngineSession,
+        candidate: &LiveCandidate,
         selected: &[plan::Slot],
-        replace: &[plan::Slot],
         live_global: bool,
         start_ns: Option<u64>,
+        exit_proven: Option<&BTreeSet<plan::ModuleId>>,
     ) -> Option<CoverageRetireSnapshot> {
         if !live_global {
             return None;
@@ -16952,20 +16976,54 @@ impl Engine {
             if session.slot_attached_at(committed.index).is_none() {
                 continue;
             }
-            attached.push((
-                committed.index,
-                plan::AttachKey::of(committed),
-                committed.module_ids.iter().copied().collect(),
-            ));
+            let endpoint = match self.pinned.owned_timing_key(committed.object) {
+                Some(object) => crate::discovery::coverage_retire::RetiredEndpoint::Keyed {
+                    object,
+                    file_offset: committed.file_offset,
+                },
+                None => crate::discovery::coverage_retire::RetiredEndpoint::Pinned {
+                    object: committed.object,
+                    file_offset: committed.file_offset,
+                },
+            };
+            attached.push(RetireEntry {
+                index: committed.index,
+                key: plan::AttachKey::of(committed),
+                modules: committed.module_ids.iter().copied().collect(),
+                endpoint,
+            });
         }
         if attached.is_empty() {
             return None;
         }
-        let replace_attempts = replace.iter().map(|slot| slot.index).collect();
+        let replace_attempts = candidate
+            .delta
+            .replace
+            .iter()
+            .map(|slot| slot.index)
+            .collect();
         Some(CoverageRetireSnapshot {
             attached,
             replace_attempts,
             start_ns,
+            exit_proven: exit_proven.cloned().unwrap_or_default(),
+            remaining: {
+                // A mapper remains only where a scan the candidate keeps
+                // maps the object. A plan listing alone (a manifest-held
+                // object whose last mapper exited) is no mapper.
+                let mapped: BTreeSet<PinnedObjectId> = candidate
+                    .modules
+                    .iter()
+                    .map(|module| module.object)
+                    .collect();
+                candidate
+                    .plan
+                    .modules
+                    .iter()
+                    .filter(|module| mapped.contains(&module.object))
+                    .map(|module| module.id)
+                    .collect()
+            },
         })
     }
 
@@ -16982,49 +17040,108 @@ impl Engine {
             .collect()
     }
 
-    /// File one coverage-retire window with its paired finite gap row.
+    /// File the retired endpoints one open point covers. A proof-backed
+    /// zero-mapper endpoint parks (no window, no row, no count: no
+    /// process can call into it); every other endpoint opens its
+    /// modules' lossy windows and files the paired finite gap row.
     /// Empty cover files nothing; `mark_partial` dedupes the row when the
     /// early and follow-up opens of one apply both fire.
-    fn open_coverage_retire_window(
+    fn file_coverage_retire<'a>(
         &mut self,
-        modules: BTreeSet<plan::ModuleId>,
-        slots: u64,
-        start_ns: u64,
+        snapshot: &'a CoverageRetireSnapshot,
+        entries: impl Iterator<Item = &'a RetireEntry>,
     ) {
-        if modules.is_empty() {
-            return;
+        let mut lossy = false;
+        for entry in entries {
+            if entry.modules.is_empty() {
+                continue;
+            }
+            if snapshot.zero_mapper_proven(entry) {
+                self.coverage_retire.park(
+                    &entry.modules,
+                    entry.endpoint.clone(),
+                    snapshot.start_ns,
+                );
+            } else {
+                self.coverage_retire.open(
+                    &entry.modules,
+                    entry.endpoint.clone(),
+                    snapshot.start_ns,
+                );
+                lossy = true;
+            }
         }
-        self.coverage_retire_windows.push(CoverageRetireWindow {
-            modules,
-            start_ns,
-            end_ns: None,
-            slots,
-        });
+        if lossy {
+            self.mark_coverage_retired();
+        }
+    }
+
+    fn mark_coverage_retired(&mut self) {
         self.mark_partial(
             crate::render::COVERAGE_RETIRED_SUBJECT,
             crate::render::COVERAGE_RETIRED_REASON,
         );
     }
 
-    /// Close open coverage-retire windows whose every module has live
-    /// cover again (any plan slot of the module active). All-module
-    /// close keeps a partial revival conservative: closing on the
-    /// first revived module would end the window on the records of
-    /// modules that are still dark, silently un-disclosing their tail
-    /// loss. Runs at the end of every apply that reaches it; a window
-    /// opened earlier in the same apply closes here when every windowed
-    /// module kept a plan-active slot — the partial-module retire, or a
-    /// same-module mixed retire whose sibling re-attached. The slot
-    /// count still forces PARTIAL, so only the window tail (never the
-    /// disclosure) is cut. An unreadable clock leaves windows open (fail
-    /// closed: the projection reads them open-ended instead of
-    /// fabricating an end).
-    fn close_revived_coverage_windows(&mut self) {
-        if !self
-            .coverage_retire_windows
+    /// A parked zero-mapper retire whose module is mapped again turns
+    /// into a lossy window from its detach instant, so the new mapper's
+    /// calls before the re-attach are disclosed. Mapped again means the
+    /// committed plan lists the module and a committed scan of a live
+    /// tracked view maps its object; the exited views a pending retire
+    /// has not yet dropped never count. Returns whether any parked
+    /// retire was promoted.
+    fn promote_remapped_coverage_retires(&mut self) -> bool {
+        if !self.coverage_retire.has_parked() {
+            return false;
+        }
+        let parked = self.coverage_retire.parked_ids();
+        let listed: Vec<(plan::ModuleId, PinnedObjectId)> = self
+            .plan
+            .modules
             .iter()
-            .any(|window| window.end_ns.is_none())
+            .filter(|module| parked.contains(&module.id))
+            .map(|module| (module.id, module.object))
+            .collect();
+        if listed.is_empty() {
+            return false;
+        }
+        let live_views: BTreeSet<ProcessViewId> = self.views.iter().map(ProcessView::id).collect();
+        let live_objects: BTreeSet<PinnedObjectId> = self
+            .modules
+            .iter()
+            .filter(|module| live_views.contains(&module.scanned.view))
+            .map(|module| module.object)
+            .collect();
+        let mapped: BTreeSet<plan::ModuleId> = listed
+            .into_iter()
+            .filter(|(_, object)| live_objects.contains(object))
+            .map(|(id, _)| id)
+            .collect();
+        if self
+            .coverage_retire
+            .promote_seen(|module| mapped.contains(&module))
+            == 0
         {
+            return false;
+        }
+        self.mark_coverage_retired();
+        true
+    }
+
+    /// Close the open coverage-retire window of every module with live
+    /// cover again (any plan slot of the module active). Windows are per
+    /// module, so a partial revival closes only the revived module's
+    /// window: the still-dark modules' records keep theirs open, never
+    /// silently un-disclosing their tail loss. Runs at the end of every
+    /// apply that reaches it; a window opened earlier in the same apply
+    /// closes here when its module kept a plan-active slot — the
+    /// partial-module retire, or a same-module mixed retire whose
+    /// sibling re-attached. The slot count still forces PARTIAL, so only
+    /// the window tail (never the disclosure) is cut. An unreadable
+    /// clock leaves windows open (fail closed: the projection reads them
+    /// open-ended instead of fabricating an end).
+    fn close_revived_coverage_windows(&mut self) {
+        if !self.coverage_retire.has_open() {
             return;
         }
         let Some(now) = crate::attach::monotonic_ns() else {
@@ -17037,15 +17154,7 @@ impl Engine {
             .filter(|slot| self.plan.is_active(slot.index))
             .flat_map(|slot| slot.module_ids.iter().copied())
             .collect();
-        for window in self
-            .coverage_retire_windows
-            .iter_mut()
-            .filter(|window| window.end_ns.is_none())
-        {
-            if window.modules.iter().all(|id| active.contains(id)) {
-                window.end_ns = Some(now);
-            }
-        }
+        self.coverage_retire.close_revived(&active, now);
     }
 
     /// Whether the scope is the whole machine: only then does a pass see
@@ -17577,6 +17686,9 @@ impl Engine {
 
     fn allocate_view_id(&mut self) -> Result<ProcessViewId> {
         let id = self.allocate_view_id_inner()?;
+        // A reused id names a new generation: no earlier exit proof
+        // may vouch for it.
+        self.exit_proven_views.remove(&id);
         #[cfg(test)]
         self.record_view_log(ViewLogKind::Allocated, id, None);
         Ok(id)
@@ -20611,9 +20723,16 @@ impl Engine {
             preflighted,
             extra_views,
             None,
+            None,
         )
     }
 
+    /// `exit_proven`: modules whose every committed mapper provably left
+    /// the scope — exited by its original-process pin (the conservative
+    /// replay) or departed an authoritative membership walk (the
+    /// inventory refresh); `None` for every other apply. Only those can
+    /// park a zero-mapper retire instead of opening a lossy window.
+    #[allow(clippy::too_many_arguments)]
     fn apply_candidate_with_ended(
         &mut self,
         session: &mut dyn EngineSession,
@@ -20622,6 +20741,7 @@ impl Engine {
         preflighted: bool,
         extra_views: &[&ProcessView],
         ended: Option<&PendingEndedPidRetirement>,
+        exit_proven: Option<&BTreeSet<plan::ModuleId>>,
     ) -> Result<ApplyOutcome> {
         let outcome = self.apply_candidate_inner(
             session,
@@ -20630,14 +20750,23 @@ impl Engine {
             preflighted,
             extra_views,
             ended,
+            exit_proven,
         );
         // Every application funnels through here, so the revival
         // clearance the next merge reads is always fresh — including
         // after a failed application, whose links may still have moved.
         self.refresh_revivable(session);
+        // A parked zero-mapper retire whose provider is mapped again
+        // discloses from its detach instant; the same apply's re-attach
+        // (if any) closes it at once. Every application funnels here,
+        // including the early returns that skip the in-apply close.
+        if self.promote_remapped_coverage_retires() {
+            self.close_revived_coverage_windows();
+        }
         outcome
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn apply_candidate_inner(
         &mut self,
         session: &mut dyn EngineSession,
@@ -20646,6 +20775,7 @@ impl Engine {
         preflighted: bool,
         extra_views: &[&ProcessView],
         ended: Option<&PendingEndedPidRetirement>,
+        exit_proven: Option<&BTreeSet<plan::ModuleId>>,
     ) -> Result<ApplyOutcome> {
         #[cfg(test)]
         if std::mem::take(&mut self.fail_next_apply_for_test) {
@@ -21030,10 +21160,11 @@ impl Engine {
         // only when a pure-live global detach commits.
         let retire_snapshot = self.coverage_retire_snapshot(
             &*session,
+            &candidate,
             &selected,
-            &candidate.delta.replace,
             live_global,
             detach_slots_start,
+            exit_proven,
         );
         #[cfg(feature = "h6-reexec-diagnostic")]
         let detach_span = session.reexec_diagnostic().filter(|d| d.active()).map(|d| {
@@ -21129,16 +21260,15 @@ impl Engine {
             && let Some(snapshot) = &retire_snapshot
         {
             if matches!(&detach_slots_outcome, Ok(report) if report.pending.is_some()) {
-                let (modules, slots) =
-                    CoverageRetireSnapshot::cover(&snapshot.attached, |_, _| true);
-                self.open_coverage_retire_window(modules, slots, snapshot.start_ns);
+                self.file_coverage_retire(snapshot, snapshot.cover(|_, _| true));
             } else {
                 let planned = Self::planned_new_keys(&candidate);
-                let (modules, slots) =
-                    CoverageRetireSnapshot::cover(&snapshot.attached, |index, key| {
+                self.file_coverage_retire(
+                    snapshot,
+                    snapshot.cover(|index, key| {
                         !planned.contains(key) && !snapshot.replace_attempts.contains(&index)
-                    });
-                self.open_coverage_retire_window(modules, slots, snapshot.start_ns);
+                    }),
+                );
             }
         }
         self.sync_physical_gap(session);
@@ -21702,11 +21832,10 @@ impl Engine {
                 .map(|slot| slot.index)
                 .collect();
             if !stranded.is_empty() {
-                let (modules, slots) =
-                    CoverageRetireSnapshot::cover(&snapshot.attached, |index, _| {
-                        stranded.contains(&index)
-                    });
-                self.open_coverage_retire_window(modules, slots, snapshot.start_ns);
+                self.file_coverage_retire(
+                    snapshot,
+                    snapshot.cover(|index, _| stranded.contains(&index)),
+                );
             }
         }
         if new_targets_attached && !self.pause_owned_batch && !candidate.delta.new.is_empty() {
@@ -31681,6 +31810,7 @@ impl Engine {
         self.freshen_newcomer_marks();
         let retirements = self.pending_retirements.clone();
         let keys = self.pending_rejected_keys.clone();
+        let exit_proven = self.exit_proven_retire_modules(&retirements, &keys);
         let candidate = match self.conservative_candidate(&retirements, &keys) {
             Ok(candidate) => candidate,
             Err(_) => {
@@ -31703,6 +31833,7 @@ impl Engine {
             ended
                 .as_ref()
                 .filter(|ended| retirements.contains(&ended.owner.id())),
+            Some(&exit_proven),
         ) {
             Ok(outcome) => outcome,
             Err(_) => {
@@ -31726,7 +31857,65 @@ impl Engine {
         }
         self.record_apply_timing(&outcome);
         self.queue_conservative_outcome(&outcome, &retirements, &keys, pending_views);
+        let pending = &self.pending_retirements;
+        self.exit_proven_views.retain(|view| pending.contains(view));
         outcome
+    }
+
+    /// Committed modules whose every mapper this conservative replay
+    /// retires was proven exited by its original-process pin (an
+    /// ExpectedRemoval that dropped the view). A module also mapped by a
+    /// retiring view without that proof (a lost generation, an unproven
+    /// removal) is not proven; nor is anything when the replay also
+    /// retries rejected keys (a rejected object's mappers stay alive).
+    /// Whether a mapper remains outside the retirements is judged per
+    /// endpoint against the candidate at the open point.
+    fn exit_proven_retire_modules(
+        &self,
+        retirements: &BTreeSet<ProcessViewId>,
+        keys: &BTreeSet<ObjectKey>,
+    ) -> BTreeSet<plan::ModuleId> {
+        if !keys.is_empty() || retirements.is_empty() {
+            return BTreeSet::new();
+        }
+        let live: BTreeSet<ProcessViewId> = self.views.iter().map(ProcessView::id).collect();
+        let proven: BTreeSet<ProcessViewId> = retirements
+            .iter()
+            .copied()
+            .filter(|view| self.exit_proven_views.contains(view) && !live.contains(view))
+            .collect();
+        self.zero_mapper_modules(&proven)
+    }
+
+    /// Committed modules whose every committed mapper is one of
+    /// `proven_gone` (views whose generation provably left the scope).
+    /// Any other committed scan of the same object — a retained,
+    /// refreshed or unproven view, or a stale entry whose view is not in
+    /// the set — keeps the object unproven, so the retire stays lossy.
+    /// Whether the candidate still plans a mapper is judged per endpoint
+    /// at the open point.
+    fn zero_mapper_modules(
+        &self,
+        proven_gone: &BTreeSet<ProcessViewId>,
+    ) -> BTreeSet<plan::ModuleId> {
+        if proven_gone.is_empty() {
+            return BTreeSet::new();
+        }
+        let mut proven = BTreeSet::new();
+        let mut unproven = BTreeSet::new();
+        for module in &self.modules {
+            if proven_gone.contains(&module.scanned.view) {
+                proven.insert(module.object);
+            } else {
+                unproven.insert(module.object);
+            }
+        }
+        self.plan
+            .modules
+            .iter()
+            .filter(|module| proven.contains(&module.object) && !unproven.contains(&module.object))
+            .map(|module| module.id)
+            .collect()
     }
 
     /// No candidate or native application is necessary if this exact retired
@@ -33634,6 +33823,9 @@ impl Engine {
                     self.settle_leader_exits_at_removal([view]);
                     if let Some(index) = self.views.iter().position(|owner| owner.id() == view) {
                         let owner = self.views.remove(index);
+                        // Ready ExpectedRemoval: the original-process pin
+                        // proved the exit (retirement_ready above).
+                        self.exit_proven_views.insert(view);
                         self.note_ended_loader_origin(&owner);
                         if let Some(proof) = ended {
                             self.ended_pid_retirement =
@@ -37405,16 +37597,32 @@ impl Engine {
             .iter()
             .map(|prepared| (prepared.view, prepared.serial))
             .collect();
-        let outcome =
-            match self.apply_candidate(session, candidate, additions_allowed, true, &extra_views) {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    self.note_dropped_tick(&error, &serviced_requests, &failed_refresh_pids);
-                    *additions_allowed = false;
-                    closure.fail();
-                    return Ok(changed);
-                }
-            };
+        // A view that departed an authoritative membership walk (absent
+        // from a complete /proc or cgroup walk) left the scope: no call
+        // of that generation is in scope any more. Its modules, when no
+        // other committed scan maps them, retire with zero mappers
+        // (retire-window lane, F1/H1b); stale (generation-lost) views
+        // never vouch.
+        let departed_gone: BTreeSet<ProcessViewId> =
+            removed.intersection(&departed).copied().collect();
+        let exit_proven = self.zero_mapper_modules(&departed_gone);
+        let outcome = match self.apply_candidate_with_ended(
+            session,
+            candidate,
+            additions_allowed,
+            true,
+            &extra_views,
+            None,
+            Some(&exit_proven),
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.note_dropped_tick(&error, &serviced_requests, &failed_refresh_pids);
+                *additions_allowed = false;
+                closure.fail();
+                return Ok(changed);
+            }
+        };
         self.record_apply_timing(&outcome);
         if outcome.disposition == ApplyDisposition::Deferred {
             // Retain exact original request serials, ages, newcomers and exec

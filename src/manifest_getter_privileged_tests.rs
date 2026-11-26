@@ -800,10 +800,9 @@ fn privileged_getter_manifest_counts_a_dynamic_program_under_cgroup_exactly() ->
     // getter probes stay for later processes of the scope; they share one
     // attach group, so they are reattached and the report names that
     // short reattach window (a real interval, though nothing ran in it).
-    // The exit also retires the table's live counting cover, which R1
-    // discloses under its fixed row (controller ruling, 6g round 2:
-    // counts match the DONE ledger exactly in the captured cell
-    // output, so the retire lands after DONE and is vocabulary-only).
+    // The program's proven exit leaves the table's cover with zero
+    // mappers, so its retire loses nothing and files no R1 row
+    // (v0.7.2 retire-window lane, audit H1b: the v0.7.1 expectation).
     run_cell_with(
         "cgroup",
         &["C_GetFunctionList", "C_GetInterface"],
@@ -811,11 +810,10 @@ fn privileged_getter_manifest_counts_a_dynamic_program_under_cgroup_exactly() ->
         true,
         CellScope::DynamicCgroup,
         false,
-        &["skipped", "multi_rebuild_gaps", "coverage_retired_slots"],
+        &["skipped", "multi_rebuild_gaps"],
         &[
             "discovery unavailable",
             "static probes detached and exact pairs reattached",
-            crate::render::COVERAGE_RETIRED_REASON,
         ],
     )
 }

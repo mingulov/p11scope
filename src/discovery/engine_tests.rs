@@ -38730,7 +38730,15 @@ fn an_ended_pid_retirement_keeping_a_grouped_slot_deactivates_it() {
         modules_unchanged: false,
     };
     let outcome = engine
-        .apply_candidate_with_ended(&mut session, candidate, &mut true, true, &[], Some(&ended))
+        .apply_candidate_with_ended(
+            &mut session,
+            candidate,
+            &mut true,
+            true,
+            &[],
+            Some(&ended),
+            None,
+        )
         .unwrap();
     assert!(!outcome.detach_failed);
     assert_eq!(
@@ -38827,7 +38835,15 @@ fn an_ended_pid_retirement_closes_over_the_disturbed_group_only() {
         modules_unchanged: false,
     };
     let outcome = engine
-        .apply_candidate_with_ended(&mut session, candidate, &mut true, true, &[], Some(&ended))
+        .apply_candidate_with_ended(
+            &mut session,
+            candidate,
+            &mut true,
+            true,
+            &[],
+            Some(&ended),
+            None,
+        )
         .unwrap();
     assert!(!outcome.detach_failed);
     assert!(
@@ -38908,7 +38924,15 @@ fn an_ended_pid_retirement_retiring_nothing_keeps_every_grouped_slot() {
         modules_unchanged: false,
     };
     let outcome = engine
-        .apply_candidate_with_ended(&mut session, candidate, &mut true, true, &[], Some(&ended))
+        .apply_candidate_with_ended(
+            &mut session,
+            candidate,
+            &mut true,
+            true,
+            &[],
+            Some(&ended),
+            None,
+        )
         .unwrap();
     assert!(!outcome.detach_failed);
     assert_eq!(

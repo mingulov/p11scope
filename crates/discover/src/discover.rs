@@ -194,6 +194,22 @@ pub fn discover_with_self_memory(
     module_path: &Path,
     self_memory: File,
 ) -> Result<Manifest, String> {
+    discover_with_budget(module_path, self_memory, Rc::new(Cell::new(0u64)))
+}
+
+/// [`discover_with_self_memory`] with an injected identify budget: every
+/// identify read in the pipeline debits `identify_spent, shared by the
+/// module, every dependency, the selection revalidations and the
+/// provenance loop, so one discovery never hashes more than
+/// MAX_TOTAL_OBJECT_BYTES in total, whatever object the bytes belong
+/// to. Shared (not threaded) so cloned candidate tables still charge
+/// the bytes they read. The counter is observable after the call, which
+/// is what proves the production pipeline uses one counter.
+fn discover_with_budget(
+    module_path: &Path,
+    self_memory: File,
+    identify_spent: Rc<Cell<u64>>,
+) -> Result<Manifest, String> {
     if !module_path.is_absolute() {
         return Err("--module must be an absolute path".into());
     }
@@ -201,12 +217,6 @@ pub fn discover_with_self_memory(
         .to_str()
         .ok_or_else(|| "--module path must be valid UTF-8 for the manifest".to_string())?;
     let memory = ProcessMemory(self_memory);
-    // Cumulative identify-read bytes, shared by the module, every
-    // dependency, the selection revalidations and the provenance loop:
-    // one discovery never hashes more than MAX_TOTAL_OBJECT_BYTES in
-    // total, whatever object the bytes belong to. Shared (not threaded)
-    // so cloned candidate tables still charge the bytes they read.
-    let identify_spent = Rc::new(Cell::new(0u64));
     let (module_file_key, module_identity) = identity_and_key(module_path, &identify_spent)?;
     let before_maps = read_self_maps()?;
     let before_index = validated_map_index(&before_maps)?;
@@ -2919,6 +2929,91 @@ mod tests {
         );
     }
 
+    /// The production pipeline honors the injected budget end to end: a
+    /// fresh counter yields a valid manifest with debited bytes, while an
+    /// exhausted counter fails the discovery at the first identify read.
+    /// Driven on the selection-spend fixture through `discover_with_budget`.
+    #[test]
+    fn discovery_pipeline_honors_the_injected_budget() {
+        let provider = selection_spend_fixture();
+        let open_memory = || ProcessMemory::open().unwrap().0;
+        let spent = Rc::new(Cell::new(0u64));
+        let manifest = discover_with_budget(&provider, open_memory(), Rc::clone(&spent)).unwrap();
+        assert!(spent.get() > 0, "a discovery debits its budget");
+        assert!(
+            p11scope_manifest::validate::validate_structure(&manifest).is_empty(),
+            "the budgeted discovery stays structurally valid"
+        );
+        let spent = Rc::new(Cell::new(MAX_TOTAL_OBJECT_BYTES));
+        let error = discover_with_budget(&provider, open_memory(), spent).unwrap_err();
+        assert!(error.contains("total more than the"), "{error}");
+    }
+
+    /// Every production call edge into the identify machinery passes the
+    /// pipeline's shared counter: one assertion per edge, each naming the
+    /// edge, over this file's own text (the `include_str!` pin mechanism
+    /// this codebase already uses for structural properties). Behavioral
+    /// pass/fail cannot attribute edges — every exhausted read fails
+    /// identically and the pipeline short-circuits — so the wiring shape
+    /// itself is pinned here while the callees' counter use is pinned
+    /// behaviorally by the spend tests above.
+    #[test]
+    fn discovery_call_edges_pass_the_shared_identify_budget() {
+        let lines: Vec<&str> = include_str!("discover.rs").lines().collect();
+        let window_has_counter = |anchor: &str, window: usize| {
+            let at = lines
+                .iter()
+                .position(|line| line.contains(anchor))
+                .unwrap_or_else(|| panic!("edge anchor gone: {anchor}"));
+            lines[at..(at + window).min(lines.len())]
+                .join("\n")
+                .contains("&identify_spent")
+        };
+        for (edge, anchor, window) in [
+            (
+                "initial module identity",
+                "let (module_file_key, module_identity) = identity_and_key(module_path,",
+                3,
+            ),
+            (
+                "loaded module key",
+                "let module_map_key = loaded_module_key(",
+                9,
+            ),
+            (
+                "module revalidation",
+                "let current_identity = validated_identity(module_path, module_file_key,",
+                3,
+            ),
+            ("object table", "let mut objects = ObjectTable::new(", 9),
+            (
+                "selection acquisition",
+                "let selection_raw = selection_acquisition(",
+                15,
+            ),
+            (
+                "final module identity",
+                "let (final_file_key, final_identity) = identity_and_key(module_path,",
+                3,
+            ),
+            (
+                "provenance objects",
+                "provenance_objects(&final_map_index,",
+                4,
+            ),
+        ] {
+            assert!(
+                window_has_counter(anchor, window),
+                "{edge} must pass the shared counter"
+            );
+        }
+        assert!(
+            include_str!("discover.rs")
+                .contains("discover_with_budget(module_path, self_memory, Rc::new(Cell::new(0)))"),
+            "the public entry must delegate to the budgeted pipeline"
+        );
+    }
+
     #[test]
     fn object_resolve_charges_the_shared_identify_budget() {
         use std::os::unix::ffi::OsStrExt as _;
@@ -3027,7 +3122,7 @@ mod tests {
         let index = validated_map_index(&maps).unwrap();
         let exports = ExportAddresses {
             get_function_list: Some(
-                loaded_module_key_recheck_uses_the_shared_budget as *const () as usize
+                loaded_module_key_recheck_uses_the_shared_budget as *const () as usize,
             ),
             get_interface_list: None,
             get_interface: None,

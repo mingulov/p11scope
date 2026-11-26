@@ -1506,8 +1506,7 @@ fn folded_ledger_aggregate_without_returns_errors() {
     // missing proof (optional returns would return Ok(0) instead).
     let report = folded_report(vec![folded_module(4242, 5, false)]);
     let error = count_folded_ledger_aggregates(&report, 4242)
-        .err()
-        .expect("the returns-less ledger row errors");
+        .expect_err("the returns-less ledger row errors");
     assert!(
         format!("{error:#}").contains("mechanism returns"),
         "the error names the missing returns: {error:#}"

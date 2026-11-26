@@ -2831,6 +2831,235 @@ mod tests {
         assert_eq!(spent.get(), MAX_TOTAL_OBJECT_BYTES);
     }
 
+    /// `ObjectTable::resolve` identifies dependencies against the table's
+    /// shared counter, not a fresh one: an exhausted budget turns the
+    /// target unusable with the limit reason instead of resolving it.
+    /// A minimal provider whose C_GetInterface answers CKR_OK with a
+    /// garbage table pointer: every selection query runs both maps
+    /// snapshots, then fails reading the interface. Shape-only; the
+    /// table is never walked.
+    fn selection_spend_fixture() -> PathBuf {
+        static FIXTURE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        FIXTURE
+            .get_or_init(|| {
+                let dir = std::env::temp_dir().join(format!(
+                    "p11scope-discover-spend-{}",
+                    std::process::id()
+                ));
+                std::fs::create_dir_all(&dir).unwrap();
+                let source = dir.join("selection-spend.c");
+                let path = dir.join("selection-spend.so");
+                std::fs::write(
+                    &source,
+                    "typedef unsigned long CK_RV;\n\
+                     typedef unsigned long CK_FLAGS;\n\
+                     CK_RV C_GetInterface(void *name, void *version, void **output, CK_FLAGS flags) {\n\
+                         (void)name; (void)version; (void)flags;\n\
+                         *output = (void *)0x12345;\n\
+                         return 0;\n\
+                     }\n",
+                )
+                .unwrap();
+                assert!(
+                    std::process::Command::new("gcc")
+                        .args(["-shared", "-fPIC", "-o"])
+                        .arg(&path)
+                        .arg(&source)
+                        .status()
+                        .unwrap()
+                        .success(),
+                    "the selection-spend fixture must compile"
+                );
+                path
+            })
+            .clone()
+    }
+
+    /// Both selection snapshots debit the shared counter: after one
+    /// selection run over the garbage-output fixture, the counter holds
+    /// exactly twenty module reads (ten queries times two snapshots). A
+    /// fresh counter smuggled into either snapshot closure halves the
+    /// debit and fails here.
+    #[test]
+    fn selection_snapshots_charge_the_shared_identify_budget() {
+        let provider = selection_spend_fixture();
+        let lib = unsafe { Library::new(&provider) }.unwrap();
+        let memory = ProcessMemory::open().unwrap();
+        let len = std::fs::metadata(&provider).unwrap().len();
+        let module_file = identity::open_object(&provider).unwrap();
+        let module_file_key = file_key(&module_file).unwrap();
+        let module_identity = identity_and_key(&provider, &Cell::new(0)).unwrap().1;
+        let spent = Rc::new(Cell::new(0u64));
+        let mut objects = ObjectTable::new(
+            provider.clone(),
+            module_file_key,
+            module_identity.clone(),
+            BTreeSet::from([module_file_key]),
+            Rc::clone(&spent),
+        );
+        let (acquisition, queries) = selection_acquisition(
+            &lib,
+            Some(1),
+            Some(1),
+            &memory,
+            &[],
+            &provider,
+            module_file_key,
+            module_file_key,
+            &module_identity,
+            &mut objects,
+            &spent,
+        );
+        assert_eq!(acquisition, SelectionAcquisition::Queried);
+        assert_eq!(queries.len(), 10);
+        assert_eq!(
+            spent.get(),
+            20 * len,
+            "every selection snapshot debits the shared counter"
+        );
+    }
+
+    #[test]
+    fn object_resolve_charges_the_shared_identify_budget() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let exe = small_owned_elf();
+        let len = std::fs::metadata(&exe).unwrap().len();
+        let file = identity::open_object(&exe).unwrap();
+        let key = file_key(&file).unwrap();
+        let module_key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: 7,
+        };
+        assert_ne!(key, module_key);
+        let identity = identity_and_key(&exe, &Cell::new(0)).unwrap().1;
+        let resolve = |spent: Rc<Cell<u64>>| {
+            let mut objects = ObjectTable::new(
+                exe.clone(),
+                module_key,
+                identity.clone(),
+                BTreeSet::from([module_key, key]),
+                spent,
+            );
+            objects.resolve(
+                MappedPath::Usable(exe.clone()),
+                exe.as_os_str().as_bytes().to_vec(),
+                0,
+                key,
+            )
+        };
+        let spent = Rc::new(Cell::new(0u64));
+        assert_eq!(
+            resolve(Rc::clone(&spent)),
+            Resolution::Resolved {
+                object: 1,
+                file_offset: 0
+            }
+        );
+        assert_eq!(spent.get(), len);
+        let spent = Rc::new(Cell::new(MAX_TOTAL_OBJECT_BYTES));
+        let resolution = resolve(spent);
+        let Resolution::UnusableFile { reason, .. } = resolution else {
+            panic!("an exhausted budget must not resolve: {resolution:?}");
+        };
+        assert!(reason.contains("total more than the"), "{reason}");
+    }
+
+    /// `stable_selection_maps` revalidates the module against the passed
+    /// counter: an exhausted budget refuses the snapshot. Driven on the
+    /// test executable itself, which is always mapped.
+    #[test]
+    fn stable_selection_maps_charges_the_shared_identify_budget() {
+        let exe = std::env::current_exe().unwrap();
+        let len = std::fs::metadata(&exe).unwrap().len();
+        let file = identity::open_object(&exe).unwrap();
+        let key = file_key(&file).unwrap();
+        let identity = identity_and_key(&exe, &Cell::new(0)).unwrap().1;
+        let spent = Cell::new(0u64);
+        let maps = stable_selection_maps(&exe, key, &identity, &spent).unwrap();
+        assert!(!maps.is_empty());
+        assert_eq!(spent.get(), len);
+        let spent = Cell::new(MAX_TOTAL_OBJECT_BYTES);
+        assert!(stable_selection_maps(&exe, key, &identity, &spent).is_err());
+    }
+
+    /// `provenance_objects` debits the passed counter for every mapping
+    /// it identifies: with an exhausted budget nothing validates, so the
+    /// loop ends with no file-backed executable mappings.
+    #[test]
+    fn provenance_objects_charges_the_shared_identify_budget() {
+        let entries = read_self_maps().unwrap();
+        let index = validated_map_index(&entries).unwrap();
+        let table = |spent: Rc<Cell<u64>>| ObjectTable {
+            module_key: ObjectKey {
+                device: Device { major: 8, minor: 1 },
+                inode: 7,
+            },
+            approved: BTreeSet::new(),
+            ids: BTreeMap::new(),
+            records: Vec::new(),
+            identify_spent: spent,
+        };
+        let spent = Rc::new(Cell::new(0u64));
+        let objects = provenance_objects(&index, &table(Rc::clone(&spent)), &spent).unwrap();
+        assert!(!objects.is_empty());
+        assert!(spent.get() > 0, "provenance reads charge the counter");
+        let spent = Rc::new(Cell::new(MAX_TOTAL_OBJECT_BYTES));
+        let error = provenance_objects(&index, &table(Rc::clone(&spent)), &spent).unwrap_err();
+        assert!(
+            error.contains("no file-backed executable mappings"),
+            "{error}"
+        );
+        assert_eq!(spent.get(), MAX_TOTAL_OBJECT_BYTES);
+    }
+
+    /// `loaded_module_key` rechecks the resolved module against the
+    /// passed counter: an exhausted budget skips every export instead of
+    /// confirming one. Driven on the test executable at a real code
+    /// address in its own mappings.
+    #[test]
+    fn loaded_module_key_recheck_uses_the_shared_budget() {
+        let exe = std::env::current_exe().unwrap();
+        let len = std::fs::metadata(&exe).unwrap().len();
+        let module_file = identity::open_object(&exe).unwrap();
+        let module_file_key = file_key(&module_file).unwrap();
+        let module_identity = identity_and_key(&exe, &Cell::new(0)).unwrap().1;
+        let maps = read_self_maps().unwrap();
+        let index = validated_map_index(&maps).unwrap();
+        let exports = ExportAddresses {
+            get_function_list: Some(loaded_module_key_recheck_uses_the_shared_budget as usize),
+            get_interface_list: None,
+            get_interface: None,
+        };
+        let mut budget = UnboundedProbeBudget;
+        let spent = Cell::new(0u64);
+        let found = loaded_module_key_with_probe(
+            exports,
+            &index,
+            module_file_key,
+            &module_identity,
+            &module_file,
+            &KernelSelfMappingProbe,
+            &mut budget,
+            &spent,
+        )
+        .unwrap();
+        assert_eq!(found, module_file_key);
+        assert_eq!(spent.get(), len);
+        let spent = Cell::new(MAX_TOTAL_OBJECT_BYTES);
+        let error = loaded_module_key_with_probe(
+            exports,
+            &index,
+            module_file_key,
+            &module_identity,
+            &module_file,
+            &KernelSelfMappingProbe,
+            &mut budget,
+            &spent,
+        )
+        .unwrap_err();
+        assert!(error.contains("no module acquisition export"), "{error}");
+    }
+
     #[test]
     fn loaded_module_key_reports_invalid_snapshot_before_export_absence() {
         let module_key = ObjectKey {

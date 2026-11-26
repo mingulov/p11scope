@@ -103443,10 +103443,7 @@ fn carried_fix2_held_back_keeps_carrier() {
         engine.newcomer_first_seen.is_empty(),
         "no timing mark remains"
     );
-    assert!(
-        engine.refresh_queue.is_empty(),
-        "no refresh request waits"
-    );
+    assert!(engine.refresh_queue.is_empty(), "no refresh request waits");
     assert!(
         engine.views.len() < engine.max_scan_pids,
         "view capacity is spare"
@@ -104393,10 +104390,7 @@ fn carried_fix2_selection_deferred_keeps_carrier() {
         engine.newcomer_first_seen.is_empty(),
         "no timing mark remains"
     );
-    assert!(
-        engine.refresh_queue.is_empty(),
-        "no refresh request waits"
-    );
+    assert!(engine.refresh_queue.is_empty(), "no refresh request waits");
     assert!(engine.held_back.is_empty(), "no held-back retry waits");
     assert!(
         engine.views.len() < engine.max_scan_pids,

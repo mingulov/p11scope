@@ -4853,12 +4853,9 @@ int main(int argc, char **argv) {
         );
         let mut text = None;
         for _ in 0..(expected.len() as u64 / MOUNT_LEG + 2) {
-            match mount_pass(&view, MOUNT_LEG, |_| false) {
-                Ok(done) => {
-                    text = Some(done);
-                    break;
-                }
-                Err(_) => {}
+            if let Ok(done) = mount_pass(&view, MOUNT_LEG, |_| false) {
+                text = Some(done);
+                break;
             }
         }
         let text = text.expect("the parked read completes");

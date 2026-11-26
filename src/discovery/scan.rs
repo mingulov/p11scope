@@ -9229,11 +9229,7 @@ impl ScanIo for ProcScanIo {
         // for the continuation filters); only a normalization failure
         // names nothing.
         let mut mounts = MountTableCache::default();
-        let table = view.open_then_cached_mountinfo(|_| Ok(()), &mut mounts, budget);
-        let ((), text) = match table {
-            Ok(table) => table,
-            Err(error) => return Err(error),
-        };
+        let ((), text) = view.open_then_cached_mountinfo(|_| Ok(()), &mut mounts, budget)?;
         let Some(normalized) = merged
             .to_str()
             .and_then(crate::discovery::identity::normalize_target_path)

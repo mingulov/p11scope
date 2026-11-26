@@ -3531,6 +3531,24 @@ thread_local! {
         const { std::cell::Cell::new(false) };
 }
 
+/// Registers one stop-signal handler, failing startup with a named
+/// error — never a silent drop, which would leave that signal killing
+/// the run with no report. Shared by the capture install below and
+/// inventory's `StopFlag::install_for`, so the fail-loudly guard
+/// exists once and the install-failure test kills mutants here for
+/// both paths. The callback must be async-signal-safe (atomic
+/// operations, `clock_gettime`, `_exit` only); each caller says what
+/// its own callback does.
+pub(crate) fn register_stop_handler(
+    signal: libc::c_int,
+    handler: impl Fn() + Send + Sync + 'static,
+) -> Result<signal_hook::SigId> {
+    // SAFETY: every caller passes an async-signal-safe callback (see
+    // above); `register` itself only installs it.
+    unsafe { signal_hook::low_level::register(signal, handler) }
+        .with_context(|| format!("installing handler for signal {signal}"))
+}
+
 fn install_stop_flag() -> Result<Arc<SignalState>> {
     // Plain assert, not debug-only: release-mode unit tests must keep
     // the guard too. Still test-only via the gate below.
@@ -3552,14 +3570,11 @@ fn install_stop_flag() -> Result<Arc<SignalState>> {
             signal
         };
         let observed = Arc::clone(&state);
-        // SAFETY: the callback performs only atomic operations and
+        // The callback performs only atomic operations and
         // `clock_gettime`, which is async-signal-safe.
-        unsafe {
-            signal_hook::low_level::register(signal, move || {
-                observed.observe_delivery(recorded, crate::attach::monotonic_ns())
-            })
-        }
-        .with_context(|| format!("installing handler for signal {signal}"))?;
+        register_stop_handler(signal, move || {
+            observed.observe_delivery(recorded, crate::attach::monotonic_ns())
+        })?;
     }
     Ok(state)
 }

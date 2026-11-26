@@ -35,7 +35,6 @@ use crate::inventory_promotion::{
     ViewRevision,
 };
 use crate::render::escape_controls;
-use anyhow::Context as _;
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::Write as _;
@@ -2373,10 +2372,11 @@ impl StopFlag {
         Self::install_for(&[libc::SIGINT, libc::SIGTERM, libc::SIGHUP])
     }
 
-    /// Install the stop handlers for exactly `signals`. A failed
-    /// registration fails startup with a named error, like
-    /// `install_stop_flag` — never a silent drop, which would leave
-    /// that signal killing the run with no report.
+    /// Install the stop handlers for each of `signals` (an ignored
+    /// SIGHUP is left alone). A failed registration fails startup with
+    /// a named error through the shared `register_stop_handler` —
+    /// never a silent drop, which would leave that signal killing the
+    /// run with no report.
     fn install_for(signals: &[libc::c_int]) -> anyhow::Result<Self> {
         let counts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let outputs_attempted = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2395,25 +2395,22 @@ impl StopFlag {
             let count = Arc::clone(&counts);
             let phase = Arc::clone(&outputs_attempted);
             // The callback uses lock-free atomics on supported x86-64, or
-            // `_exit` (async-signal-safe); no allocation, no
-            // I/O, no locks.
-            // SAFETY: the callback performs only atomic operations and
-            // `_exit`, which is async-signal-safe.
-            let id = unsafe {
-                signal_hook::low_level::register(signal, move || {
-                    // After the outputs a further stop ends the wait at
-                    // once — but only once a stop was already counted,
-                    // so the first signal of a duration-ended run is
-                    // counted, never fatal.
-                    if phase.load(Ordering::SeqCst) && count.load(Ordering::SeqCst) >= 1 {
-                        libc::_exit(128 + signal);
-                    }
-                    let _ = count.try_update(Ordering::SeqCst, Ordering::SeqCst, |seen| {
-                        (seen < 2).then_some(seen + 1)
-                    });
-                })
-            }
-            .with_context(|| format!("installing handler for signal {signal}"))?;
+            // `_exit` (async-signal-safe); no allocation, no I/O, no
+            // locks.
+            let id = crate::run::register_stop_handler(signal, move || {
+                // After the outputs a further stop ends the wait at
+                // once — but only once a stop was already counted,
+                // so the first signal of a duration-ended run is
+                // counted, never fatal.
+                if phase.load(Ordering::SeqCst) && count.load(Ordering::SeqCst) >= 1 {
+                    // SAFETY: `_exit` is async-signal-safe and never
+                    // returns; the handler holds no locks or state.
+                    unsafe { libc::_exit(128 + signal) };
+                }
+                let _ = count.try_update(Ordering::SeqCst, Ordering::SeqCst, |seen| {
+                    (seen < 2).then_some(seen + 1)
+                });
+            })?;
             hooks.push(id);
         }
         Ok(Self {

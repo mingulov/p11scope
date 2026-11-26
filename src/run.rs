@@ -3394,6 +3394,16 @@ impl SignalState {
         ((self.state.load(Ordering::SeqCst) >> 8) & 3) as u8
     }
 
+    /// A second Ctrl-C was delivered: blocking waits (link detach,
+    /// child settlement) abandon instead of waiting them out. Only
+    /// SIGINT counts — a second SIGTERM never escalates — and an
+    /// immediate duplicate delivery is one stop request (see
+    /// `observe_delivery`), so it cannot trip this. Every abandon
+    /// check reads this one threshold.
+    fn second_sigint_seen(&self) -> bool {
+        self.sigint_deliveries() >= 2
+    }
+
     fn interrupted(&self) -> bool {
         self.first_signal().is_some()
     }
@@ -4849,7 +4859,7 @@ fn settle_after_signal_with_grace_and(
     let mut second_sigint_forwarded = false;
     let mut fallback_term_forwarded = false;
     loop {
-        if signal == libc::SIGINT && !second_sigint_forwarded && signals.sigint_deliveries() >= 2 {
+        if signal == libc::SIGINT && !second_sigint_forwarded && signals.second_sigint_seen() {
             match child.forward_signal(libc::SIGINT) {
                 Ok(ForwardAction::Escalated) => {
                     return child
@@ -5101,7 +5111,7 @@ fn finish_capture_error(
         None => Ok(()),
     };
     let detach = session.detach_producers_driven(
-        || signals.sigint_deliveries() >= 2,
+        || signals.second_sigint_seen(),
         terminal_diagnostics().as_mut(),
     );
     combine_capture_failure(error, finish, detach)
@@ -5306,7 +5316,7 @@ fn finish_owned_handoff_error(
         seal_owned_handoff_partial,
         |context| {
             context.session.detach_producers_driven(
-                || context.signals.sigint_deliveries() >= 2,
+                || context.signals.second_sigint_seen(),
                 terminal_diagnostics().as_mut(),
             )
         },
@@ -6822,7 +6832,7 @@ fn run_owned_inner_with_host(
                 error,
                 || {
                     session.detach_producers_driven(
-                        || stop.sigint_deliveries() >= 2,
+                        || stop.second_sigint_seen(),
                         terminal_diagnostics().as_mut(),
                     )
                 },
@@ -10589,7 +10599,7 @@ fn capture_profile(
                     let result = context.1.detach_producers_driven(
                         || {
                             poll_terminal_cancellation();
-                            interrupted.sigint_deliveries() >= 2
+                            interrupted.second_sigint_seen()
                         },
                         terminal_diagnostics().as_mut(),
                     );
@@ -10621,7 +10631,7 @@ fn capture_profile(
             let result = context.1.detach_producers_driven(
                 || {
                     poll_terminal_cancellation();
-                    interrupted.sigint_deliveries() >= 2
+                    interrupted.second_sigint_seen()
                 },
                 terminal_diagnostics().as_mut(),
             );
@@ -12281,7 +12291,7 @@ fn capture_trace(
                     let result = context.1.detach_producers_driven(
                         || {
                             poll_terminal_cancellation();
-                            interrupted.sigint_deliveries() >= 2
+                            interrupted.second_sigint_seen()
                         },
                         terminal_diagnostics().as_mut(),
                     );
@@ -12312,7 +12322,7 @@ fn capture_trace(
             let result = context.1.detach_producers_driven(
                 || {
                     poll_terminal_cancellation();
-                    interrupted.sigint_deliveries() >= 2
+                    interrupted.second_sigint_seen()
                 },
                 terminal_diagnostics().as_mut(),
             );
@@ -33580,6 +33590,40 @@ int main(int argc, char **argv) {
 
         assert_eq!(state.first_signal(), Some(libc::SIGTERM));
         assert_eq!(state.sigint_deliveries(), 2);
+    }
+
+    /// The abandon threshold is exactly two counted SIGINTs: one
+    /// Ctrl-C (or any run of SIGTERMs) never abandons a blocking
+    /// wait, and an immediate duplicate delivery is one request.
+    #[test]
+    fn second_sigint_seen_needs_two_counted_sigints() {
+        assert!(!SignalState::new().second_sigint_seen());
+        let one = SignalState::new();
+        one.observe(libc::SIGINT);
+        assert!(!one.second_sigint_seen());
+        let terms = SignalState::new();
+        terms.observe(libc::SIGTERM);
+        terms.observe(libc::SIGTERM);
+        assert!(!terms.second_sigint_seen());
+        let mixed = SignalState::new();
+        mixed.observe(libc::SIGTERM);
+        mixed.observe(libc::SIGINT);
+        assert!(!mixed.second_sigint_seen());
+        let two = SignalState::new();
+        two.observe(libc::SIGINT);
+        two.observe(libc::SIGINT);
+        assert!(two.second_sigint_seen());
+        let three = SignalState::new();
+        three.observe(libc::SIGINT);
+        three.observe(libc::SIGINT);
+        three.observe(libc::SIGINT);
+        assert!(three.second_sigint_seen());
+        // An immediate duplicate is one stop request, not an abandon.
+        const T0: u64 = 5_000_000_000;
+        let duplicate = SignalState::new();
+        duplicate.observe_delivery(libc::SIGINT, Some(T0));
+        duplicate.observe_delivery(libc::SIGINT, Some(T0 + 20_000));
+        assert!(!duplicate.second_sigint_seen());
     }
 
     /// DR-K8S-1: outside the initial PID namespace `--pid` is refused by

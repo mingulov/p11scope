@@ -5983,12 +5983,17 @@ fn production_absence_acquisition_preflights_final_latches_first() {
 #[test]
 fn production_consume_birth_validates_before_row_reads() {
     let source = include_str!("../semantic_capture.rs");
-    for (name, end_marker) in [
+    for (name, end_marker, validator) in [
         (
             "pub(crate) fn consume_birth(",
             "pub(crate) fn validate_current(",
+            "validate_birth_candidate(",
         ),
-        ("pub(crate) fn fresh_evidence(", "fn fresh_evidence_with("),
+        (
+            "pub(crate) fn fresh_evidence(",
+            "fn fresh_evidence_with(",
+            "revalidate_for_take(",
+        ),
     ] {
         let start = source
             .find(name)
@@ -5997,7 +6002,7 @@ fn production_consume_birth_validates_before_row_reads() {
             .find(end_marker)
             .expect("the next item follows the production port");
         let body = &source[start..start + end];
-        let validates: Vec<_> = body.match_indices("validate_birth_candidate(").collect();
+        let validates: Vec<_> = body.match_indices(validator).collect();
         assert_eq!(
             validates.len(),
             2,

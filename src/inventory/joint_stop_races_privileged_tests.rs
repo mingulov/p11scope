@@ -1077,6 +1077,7 @@ fn parse_unrouted_reason(reason: &str) -> Result<UnroutedShedCounts> {
 /// starved birth receipt (the held caller's `no_receipt` deferral or a
 /// caller-less `partition` refusal), else calls not proven foreign
 /// that the lane shed without a route. Each is its own failing cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JointBranch {
     Linked,
     S1,
@@ -5051,14 +5052,16 @@ fn seal_cell_across_stop(force_shed: bool) -> Result<()> {
                 }
             }
         }
-        let mut gate_join = StopJoin::default();
-        gate_join.feeds = coordinator.registry().joint_feeds() as u64;
+        // The S1 decision needs only installs and linkage: the typed
+        // arms never report S1, so the gate leaves them unattributed
+        // without consulting receipts, shed or any join.
         if matches!(
-            joint_branch(
-                &coordinator,
-                lane.shed_calls_disclosed(),
-                caller_of(&coordinator, process_a.pid())?,
-                &gate_join
+            joint_branch_from(
+                coordinator.registry().joint_feeds(),
+                coordinator.registry().journal_linked(),
+                false,
+                false,
+                false
             ),
             JointBranch::S1
         ) {
@@ -5317,17 +5320,36 @@ fn seal_cell_across_stop(force_shed: bool) -> Result<()> {
             .chain(driver.coordinator.registry().staged_gaps_for_test())
             .filter(|gap| gap.subject == history_subject)
             .collect::<Vec<_>>();
-        let mut shed_join = StopJoin::default();
-        shed_join.feeds = driver.coordinator.registry().joint_feeds() as u64;
-        ensure!(
-            matches!(
-                joint_branch(driver.coordinator, lane_shed, caller_a, &shed_join),
-                JointBranch::Unattributed
-            ),
-            "{tag}: SHED: zero installs with the default link latch \
-             (feeds={} journal_linked={})",
+        // This cell runs no stop-join loop, so there is no join-end
+        // feed count to consult: join_fed is false by construction and
+        // the branch decides from installs, linkage, starvation and
+        // shed alone.
+        let starved = receipt_starvation(driver.coordinator, caller_a);
+        let shed = lane_shed_split(driver.coordinator, lane_shed);
+        let branch = joint_branch_from(
             driver.coordinator.registry().joint_feeds(),
             driver.coordinator.registry().journal_linked(),
+            false,
+            starved.no_receipt + starved.partition > 0,
+            shed.unproven > 0,
+        );
+        eprintln!(
+            "JOINT_STOP {tag}: SHED branch={branch:?} feeds={} linked={} no_receipt={} \
+             partition={} unproven_shed={} foreign_shed={}",
+            driver.coordinator.registry().joint_feeds(),
+            driver.coordinator.registry().journal_linked(),
+            starved.no_receipt,
+            starved.partition,
+            shed.unproven,
+            shed.foreign,
+        );
+        ensure!(
+            matches!(
+                branch,
+                JointBranch::CallsShed | JointBranch::ReceiptStarved
+            ),
+            "{tag}: SHED: zero installs with the default link latch take the \
+             typed shed/starved branch (got {branch:?})",
         );
         ensure!(
             finish == "published",
@@ -5558,14 +5580,16 @@ fn seal_cell_across_stop(force_shed: bool) -> Result<()> {
     // before the seal) puts the production stop before the first
     // take. Only an S1 build precludes the cell here (no journal
     // feed at all).
-    let mut seal_gate_join = StopJoin::default();
-    seal_gate_join.feeds = coordinator.registry().joint_feeds() as u64;
+    // The S1 decision needs only installs and linkage: the typed
+    // arms never report S1, so the gate leaves them unattributed
+    // without consulting receipts, shed or any join.
     if matches!(
-        joint_branch(
-            &coordinator,
-            lane.shed_calls_disclosed(),
-            caller_of(&coordinator, process_a.pid())?,
-            &seal_gate_join
+        joint_branch_from(
+            coordinator.registry().joint_feeds(),
+            coordinator.registry().journal_linked(),
+            false,
+            false,
+            false
         ),
         JointBranch::S1
     ) {

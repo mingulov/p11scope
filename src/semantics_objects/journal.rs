@@ -8516,17 +8516,18 @@ impl JournalAdapter {
         if fresh
             && let Some(siblings) = self.image_keys.get(&(key.cookie, key.exec))
             && siblings.iter().any(|sibling| {
-                // Either rule blocks a second live key: the re-entry
-                // rule (no unfenced history a new key could
-                // re-examine) or the scoped-fence rule (a conversion
-                // fenced only by a scoped void still blocks: scoped
-                // fences never exempt). The scoped rule subsumes the
-                // re-entry one and governs; the re-entry predicate
-                // stays so the merged guard names both reviewed
-                // conditions.
+                // A second live key refuses only beside a live,
+                // registered sibling whose conversion still blocks
+                // rebirth (actively converting, or fenced by no
+                // global void: scoped fences never exempt). Dead,
+                // tainted, ended and unregistered siblings hold no
+                // live conversion to re-examine, so the liveness and
+                // registration gates come first; with them, this
+                // covers the re-entry rule too.
                 sibling != &key
-                    && (self.sibling_holds_unfenced_history(*sibling)
-                        || self.sibling_blocks_rebirth(*sibling))
+                    && self.key_is_live(*sibling)
+                    && self.keys[sibling].model_registered
+                    && self.sibling_blocks_rebirth(*sibling)
             })
         {
             return Err(AttestationRefusal::ImageSealed);
@@ -8537,9 +8538,6 @@ impl JournalAdapter {
         Ok(())
     }
 
-    // (Integrator: HEAD's pre-incarnation `bind_admitted_key` head is
-    // superseded by the lane's rewritten bind below; the lane's
-    // `binding_incarnations`/`resolve_binding_key` take this slot.)
     /// Resolve one admission binding to its effective journal key: the
     /// live incarnation when one is live; else a fresh incarnation when
     /// every retained incarnation is permanently dead
@@ -9090,22 +9088,6 @@ impl JournalAdapter {
     fn binding_scoped_key(&self, base: JournalDomainKey) -> JournalDomainKey {
         let (live, latest) = self.binding_incarnations(base);
         live.or(latest).unwrap_or(base)
-    }
-
-    /// Whether a live registered sibling still seals genuinely new
-    /// history, so a second key for the image would re-examine its
-    /// sole-key attributions. A sibling fenced past everything it
-    /// converted (a void fence strictly above zero and at/above its
-    /// sealed frontier) holds no history a fresh birth at/above the
-    /// fence could re-examine: its staged custody was wiped, its
-    /// model domain voided, and later births refuse below the fence.
-    /// Such a sibling never blocks a new incarnation for the image.
-    fn sibling_holds_unfenced_history(&self, sibling: JournalDomainKey) -> bool {
-        self.key_is_live(sibling)
-            && self.keys.get(&sibling).is_some_and(|state| {
-                state.model_registered
-                    && !(state.void_fence > 0 && state.void_fence >= state.sealed_through)
-            })
     }
 
     /// Bind one H3-admitted call's incarnation to a journal key without
@@ -35998,6 +35980,52 @@ pub(crate) mod tests {
             scene.closure_generation(),
         );
         BootstrapReceipt::attest(&scene.adapter, &grant).expect("rebirth births above the fence");
+    }
+
+    #[test]
+    fn ended_unfenced_sibling_does_not_block_a_fresh_binding() {
+        // The rebirth guard gates on liveness first: an ended sibling
+        // holds no live conversion to re-examine, so a fresh binding
+        // for the same image binds instead of refusing ImageSealed —
+        // even with void_fence == 0, which alone never blocks.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.seal(&bootstrap).expect("sole key seals");
+        // End the sibling without any void: dead, registered, fenceless.
+        scene
+            .adapter
+            .keys
+            .edit()
+            .get_mut(&proof.key)
+            .expect("sealed key")
+            .era_ended = true;
+        scene.adapter.note_ended_mark(proof.key);
+        {
+            let state = scene.adapter.keys.get(&proof.key).expect("ended key");
+            assert!(state.era_ended, "the sibling ended");
+            assert_eq!(state.void_fence, 0, "no void ever fenced it");
+            assert!(state.model_registered, "it converted before it ended");
+        }
+        assert!(
+            !scene.adapter.key_is_live(proof.key),
+            "an ended key is not live"
+        );
+        let mut other = AttestationFixture::new(image_default());
+        let rebind = scene
+            .adapter
+            .attest_key(&other.admit())
+            .expect("a fresh binding binds beside an ended unfenced sibling");
+        assert_ne!(
+            rebind.key, proof.key,
+            "the fresh binding names a new key"
+        );
     }
 
     #[test]

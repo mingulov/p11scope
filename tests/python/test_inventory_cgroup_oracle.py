@@ -1244,15 +1244,13 @@ class CrossPairTests(unittest.TestCase):
         # The seven other filed preparation reasons carry the same
         # producer shape and straddle the same run deadline, but none
         # was ever observed, so each fails loudly on both substrates,
-        # identically under -O. Re-allowing one needs evidence plus an
-        # allowlist edit here and in the qualifier.
+        # identically under -O. The refusal is decided from the typed
+        # verdict, never from log text. Re-allowing one needs evidence
+        # plus an allowlist edit here and in the qualifier.
         self.assertEqual(len(OTHER_PREP_REASONS), 7)
         for reason in OTHER_PREP_REASONS:
-            for modfs, base, message in (
-                    ("overlayfs", decided_report,
-                     "overlay published extra gap"),
-                    ("ext4", witness_available_report,
-                     "witness-available published extra gap")):
+            for modfs, base in (("overlayfs", decided_report),
+                                ("ext4", witness_available_report)):
                 for optimized in (False, True):
                     with self.subTest(reason=reason,
                                       substrate=modfs,
@@ -1263,9 +1261,15 @@ class CrossPairTests(unittest.TestCase):
                         report["gaps"].append(straddle_deadline_row())
                         run = (run_oracle_optimized if optimized
                                else run_oracle)
-                        rc, out = run(report, modfs=modfs)
+                        verdict = {}
+                        rc, out = run(report, modfs=modfs,
+                                        verdict_out=verdict)
+                        # Rule id first: restoring a reason must fail
+                        # here (rule None), not just on rc.
+                        self.assertEqual(verdict.get("rule"),
+                                         "gap.unclassified", out)
+                        self.assertEqual(verdict.get("verdict"), "fail", out)
                         self.assertNotEqual(rc, 0, out)
-                        self.assertIn(message, out)
 
     def test_unnamed_extra_gap_fails_witness_available(self):
         # The witness-available branch refuses unnamed gaps too: a

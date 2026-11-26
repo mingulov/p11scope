@@ -19765,7 +19765,7 @@ impl Engine {
         // Retired carrier rows keep the stricter filter: no live
         // prover refreshes them, so a rejected entry dependency drops
         // the stale row wholesale and its carrier-only pin reclaims.
-        let mut rejected_keys = Vec::new();
+        let mut rejected_keys = BTreeSet::new();
         raw_modules.retain(|module| {
             let keep = if pinned.rejects(module.key) {
                 false
@@ -19779,7 +19779,7 @@ impl Engine {
                     .any(|entry| pinned.rejects(entry.object))
             };
             if !keep {
-                rejected_keys.push(module.key);
+                rejected_keys.insert(module.key);
             }
             keep
         });
@@ -19787,13 +19787,13 @@ impl Engine {
         // ever builds under it, so the hold's attach is impossible (never
         // at the bound) — even when this candidate never commits. Only
         // key rejections refuse; an entry-only drop leaves a live key
-        // waiting for its attach. The reverse lookup scans the staged map;
-        // rejection ticks only.
+        // waiting for its attach. One indexed lookup per distinct
+        // rejected key; rejection ticks only.
         for key in rejected_keys {
             if !pinned.rejects(key) {
                 continue;
             }
-            if let Some(identity) = self.member_stops.staged_identity_for_key(key) {
+            for identity in self.member_stops.staged_identities_for_key(key) {
                 self.member_stops.note_refused(identity);
             }
         }

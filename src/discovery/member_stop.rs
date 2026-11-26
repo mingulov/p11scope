@@ -129,6 +129,12 @@ pub(crate) struct MemberStopState {
     /// the cap an identity goes unrecorded and its hold keeps the bound
     /// backstop.
     staged_keys: BTreeMap<(u64, u64), ObjectKey>,
+    /// Reverse index of `staged_keys`: the staged identities pinned
+    /// under each maps key, so a bind rejection refuses every hold on
+    /// it with one indexed lookup instead of a whole-map scan (two
+    /// staged identities can share one key on btrfs subvolume clones).
+    /// Derived 1:1 from `staged_keys`: same bound, no new cap.
+    staged_by_key: BTreeMap<ObjectKey, BTreeSet<(u64, u64)>>,
     /// Rows left in place for a retry (counted once as stopped), with
     /// the stop instant their bound runs from.
     retrying: BTreeMap<u32, u64>,
@@ -181,28 +187,26 @@ impl MemberStopState {
     }
 
     /// Records a refused staging (bounded like the settled set: past the
-    /// cap a refused identity is not retained, and its hold ends at the
-    /// bound instead).
+    /// cap a refused identity is not retained and counted, and its hold
+    /// ends at the bound instead). Re-recording a retained identity is
+    /// free at any size.
     pub(crate) fn note_refused(&mut self, identity: (u64, u64)) {
-        if self.refused.len() < MEMBER_STOP_REFUSED_CAP {
+        if self.refused.contains(&identity) || self.refused.len() < MEMBER_STOP_REFUSED_CAP {
             self.refused.insert(identity);
+        } else {
+            self.stats.refused_overflow = self.stats.refused_overflow.saturating_add(1);
         }
     }
 
-    /// The staged identity pinned under `key`, if any: reverse lookup
-    /// for bind rejections (rejection ticks only).
-    pub(crate) fn staged_identity_for_key(&self, key: ObjectKey) -> Option<(u64, u64)> {
-        self.staged_keys
-            .iter()
-            .find(|(_, staged)| **staged == key)
-            .map(|(identity, _)| *identity)
-    }
-
     /// The staged identities pinned under `key`: reverse lookup for
-    /// bind rejections (rejection ticks only). RED stub: the single
-    /// old result until the reverse index lands.
+    /// bind rejections (rejection ticks only). One indexed lookup over
+    /// the reverse index, never a scan: every identity under a shared
+    /// key refuses, and an unknown key refuses nothing.
     pub(crate) fn staged_identities_for_key(&self, key: ObjectKey) -> Vec<(u64, u64)> {
-        self.staged_identity_for_key(key).into_iter().collect()
+        self.staged_by_key
+            .get(&key)
+            .map(|identities| identities.iter().copied().collect())
+            .unwrap_or_default()
     }
 
     /// Records the maps key a staged identity pinned under. Every staging
@@ -210,12 +214,26 @@ impl MemberStopState {
     /// so conditioning on the stop mark would miss drain-first holds, and
     /// only held identities are ever consulted. Bounded like the staged
     /// set: past the cap the key goes unrecorded, counted with the staged
-    /// overflow, and the hold keeps the bound backstop.
+    /// overflow, and the hold keeps the bound backstop. Re-recording a
+    /// retained identity moves its reverse entry off the old key.
     pub(crate) fn note_staged_key(&mut self, identity: (u64, u64), key: ObjectKey) {
         if self.staged_keys.len() < MEMBER_STOP_STAGED_CAP
             || self.staged_keys.contains_key(&identity)
         {
-            self.staged_keys.insert(identity, key);
+            if let Some(old) = self.staged_keys.insert(identity, key)
+                && old != key
+            {
+                let drop_empty = if let Some(identities) = self.staged_by_key.get_mut(&old) {
+                    identities.remove(&identity);
+                    identities.is_empty()
+                } else {
+                    false
+                };
+                if drop_empty {
+                    self.staged_by_key.remove(&old);
+                }
+            }
+            self.staged_by_key.entry(key).or_default().insert(identity);
         } else {
             self.stats.stop_staged_overflow = self.stats.stop_staged_overflow.saturating_add(1);
         }
@@ -1329,7 +1347,11 @@ impl Engine {
         // A refused staging settles without probes: never "attached". A
         // rejected staging key refuses too: no slot ever builds under a
         // rejected key, so the hold's attach is impossible (never at the
-        // bound).
+        // bound). Refused takes precedence over attached below on
+        // purpose (fail-closed over-refusal): the shape needs a key
+        // rejected after its slots attached within one pass, and then
+        // the hold ends refused with the first-use row instead of
+        // risking unobserved first calls.
         let refused = held.providers.iter().any(|identity| {
             self.member_stops.refused.contains(identity) || self.stop_staged_key_rejected(*identity)
         });
@@ -1704,6 +1726,7 @@ impl Engine {
                  {} not members, {} kept for a retry, {} resumed unverified at bound, \
                  {} moved out and resumed, {} resumed unproven, \
                  {} resumed at watchdog loss, {} staged identities over the cap, \
+                 {} refused identities over the cap, \
                  {} resumed with a FUSE-backed file, {} settled by a maps read; \
                  kernel requested {}, table full {}, signal refused {}, identity unread {}",
                 stats.stopped,
@@ -1721,6 +1744,7 @@ impl Engine {
                 stats.unproven_resumes,
                 stats.lost_guard_resumes,
                 stats.stop_staged_overflow,
+                stats.refused_overflow,
                 stats.fuse_resumes,
                 stats.unsettled_reads,
                 kernel[0],
@@ -2005,14 +2029,9 @@ mod tests {
         }
         assert_eq!(state.refused.len(), MEMBER_STOP_REFUSED_CAP);
         state.note_refused((0, MEMBER_STOP_REFUSED_CAP as u64));
-        assert_eq!(
-            state.stats.refused_overflow, 1,
-            "the excess refusal counts"
-        );
+        assert_eq!(state.stats.refused_overflow, 1, "the excess refusal counts");
         assert!(
-            !state
-                .refused
-                .contains(&(0, MEMBER_STOP_REFUSED_CAP as u64)),
+            !state.refused.contains(&(0, MEMBER_STOP_REFUSED_CAP as u64)),
             "the excess refusal stays unretained"
         );
         state.note_refused((0, 0));

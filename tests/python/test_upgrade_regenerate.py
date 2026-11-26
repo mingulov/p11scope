@@ -422,7 +422,7 @@ class ChurnTests(unittest.TestCase):
             (out / "v071.go").write_text("go\n", encoding="utf-8")
             env = dict(os.environ, CHURN_SIGNER_RC=str(signer_rc))
             proc = subprocess.run(
-                ["sh", str(TOOLS / "churn-workload.sh"),
+                [str(TOOLS / "churn-workload.sh"),
                  str(out), "v071", str(helpers), "/nonexistent-prov.so"],
                 capture_output=True, text=True, timeout=300, env=env)
             return proc
@@ -446,6 +446,9 @@ class ChurnTests(unittest.TestCase):
         text = (TOOLS / "capture-churn.sh").read_text(encoding="utf-8")
         self.assertIn("churn-workload.sh", text)
         self.assertNotIn("shortlived-sign", text)
+        self.assertTrue(
+            os.access(TOOLS / "churn-workload.sh", os.X_OK),
+            "the template is directly executable")
 
     def test_cgkeyops_gates_on_readiness(self):
         """The cgroup key-ops driver touches its gate only on

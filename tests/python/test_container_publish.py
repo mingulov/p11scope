@@ -103,6 +103,7 @@ class ContainerPublishTests(unittest.TestCase):
                        "sha256sum --check", "deploy/Dockerfile.observer-release",
                        "TARBALL_SHA256", "docker pull",
                        "docker build --network=none",
+                       "SOURCE_DATE_EPOCH", "rewrite-timestamp=true",
                        "scratch"):
             self.assertIn(marker, bodies, f"build must {marker}")
         self.assertIn("GITHUB_SHA", bodies, "build must bind the RELEASE check to the tag commit")

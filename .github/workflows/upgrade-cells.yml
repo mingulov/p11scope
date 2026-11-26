@@ -165,7 +165,7 @@ jobs:
       - name: Gate 5 RPM upgrade
         run: |
           set -euo pipefail
-          docker run --rm \
+          docker run --rm --pid=host --privileged \
             -v "$GITHUB_WORKSPACE:/src:ro" \
             -v "$RUNNER_TEMP/old-pkgs:/old-pkgs:ro" \
             -v "$RUNNER_TEMP/new-pkgs:/new-pkgs:ro" \

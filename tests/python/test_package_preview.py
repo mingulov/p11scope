@@ -7,6 +7,7 @@ import copy
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -429,6 +430,22 @@ sys.stdout.write((api / name).read_text())
         self.assertNotEqual(dirty.returncode, 0)
         steps = workflow()["jobs"]["package"]["steps"]
         self.assertEqual(steps[1]["name"], "Verify package checkout")
+
+    def test_build_packages_install_from_the_pinned_ubuntu_snapshot(self):
+        self.assertTrue(WORKFLOW.is_file(), "the package-only workflow is missing")
+        document = workflow()
+        snapshot = document["env"].get("UBUNTU_APT_SNAPSHOT")
+        # The pin is the helper lane's snapshot, single-sourced: the
+        # workflow env and every helper-lane assignment must agree, so a
+        # clang-18 rebuild "with network" resolves the same archive day.
+        helper = (ROOT / "scripts/verify-discover-containers.sh").read_text()
+        pinned = set(re.findall(r"UBUNTU_APT_SNAPSHOT=([0-9]{8}T[0-9]{6}Z)", helper))
+        self.assertTrue(pinned, "the helper lane must pin its snapshot")
+        self.assertEqual(pinned, {snapshot})
+        body = step("Install build packages from the pinned Ubuntu snapshot")["run"]
+        self.assertIn('-S "$UBUNTU_APT_SNAPSHOT" update', body)
+        self.assertIn('-S "$UBUNTU_APT_SNAPSHOT" install', body)
+        self.assertIn("clang-18", body)
 
     def prepare_package_children(self):
         scripts = self.repo / "scripts"

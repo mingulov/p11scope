@@ -2465,10 +2465,13 @@ fn mixed_version_fold_marks_only_the_folded_group() {
             report.module_contents[0].changes
         );
         for output in rendered(&report) {
-            let words = output.split_whitespace().collect::<Vec<_>>().join(" ");
-            let flat_note = note.split_whitespace().collect::<Vec<_>>().join(" ");
+            // The text renderer hard-wraps at 80 columns, mid-word, so
+            // both sides drop all whitespace before comparing; any word
+            // change still fails.
+            let flat: String = output.split_whitespace().collect();
+            let want: String = format!("Note: {note}").split_whitespace().collect();
             assert!(
-                words.contains(&format!("Note: {flat_note}")),
+                flat.contains(&want),
                 "both renderings carry the full fold note: {output}"
             );
         }

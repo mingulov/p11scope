@@ -832,12 +832,9 @@ class BrowserCells(unittest.TestCase):
         the background provider alone)."""
         missing = cells.missing_nss_seed_tools()
         if missing:
-            if STRICT:
-                raise AssertionError(
-                    "strict installed mode requires this cell: "
-                    f"NSS seed tools missing: {', '.join(missing)}")
-            self.skipTest("browser gate prerequisite missing: "
-                          f"NSS seed tools missing: {', '.join(missing)}")
+            raise AssertionError(
+                "installed browser cell requires NSS seed tools: "
+                f"{', '.join(missing)}")
         store, cred = self.seed()
         bg = cells.start_soft_call(store.lib, self.work / "bg", env=store.env)
         self.addCleanup(bg.stop)
@@ -3213,9 +3210,9 @@ def seeding_cells_missing_nss_gate(source):
     post-terminator lines) never counts as gating, while dead or
     unprovably-shaped seeding calls (``*args``/``**kwargs``,
     positional credentials) count as seeding: both fail closed. A
-    future seeding cell that forgets the gate — skipping (or
-    strict-failing) at the gate instead of erroring mid-cell from
-    the seed step — lands in ``missing``.
+    future seeding cell that forgets the gate — erroring at the gate
+    instead of erroring mid-cell from the seed step — lands in
+    ``missing``.
     """
     found, missing = [], []
     for node in ast.walk(ast.parse(source)):
@@ -4224,9 +4221,9 @@ class BrowserS1Oracle(unittest.TestCase):
 
         CR-RUN-SIGN, CR-RUN-NODELAY and FF-FIRST-BG seed an NSS client
         credential before launch; all must call missing_nss_seed_tools
-        at the gate (skip, or strict-fail, naming the absent tools)
-        instead of erroring mid-cell from the seed step. The seeding
-        set is pinned exactly: a future seeder fails here until gated.
+        at the gate (error, naming the absent tools) instead of
+        erroring mid-cell from the seed step. The seeding set is
+        pinned exactly: a future seeder fails here until gated.
         """
         found, missing = seeding_cells_missing_nss_gate(
             Path(__file__).read_text())
@@ -4237,11 +4234,57 @@ class BrowserS1Oracle(unittest.TestCase):
         ])
         self.assertEqual(missing, [])
 
+    def test_nss_seed_gate_errors_when_tools_are_missing(self):
+        """Twin: a missing seed tool errors, never skips (STRICT or not).
+
+        Ruling G: the browser gate prerequisite is an error. Every
+        seeding cell's ``if missing:`` branch raises AssertionError
+        naming the tools; no branch may skipTest (a skip would hide a
+        broken seed setup in non-strict runs) or consult STRICT. The
+        set is pinned exactly: renaming a cell or its gate call fails
+        here, and reintroducing a skip fails below.
+        """
+        import ast as _ast
+        cells = [
+            "test_cr_run_nodelay_observes_client_cert_signs",
+            "test_cr_run_sign_observes_client_cert_signs",
+            "test_ff_first_with_background_provider_covers_browser",
+        ]
+        tree = _ast.parse(Path(__file__).read_text())
+        seen = []
+        for node in _ast.walk(tree):
+            if not isinstance(node, _ast.ClassDef) or node.name != "BrowserCells":
+                continue
+            for item in node.body:
+                if not isinstance(item, _ast.FunctionDef) or item.name not in cells:
+                    continue
+                seen.append(item.name)
+                branches = [n for n in _ast.walk(item)
+                            if isinstance(n, _ast.If)
+                            and isinstance(n.test, _ast.Name)
+                            and n.test.id == "missing"]
+                self.assertEqual(len(branches), 1,
+                                 f"{item.name}: exactly one `if missing:` branch")
+                body = branches[0].body
+                raises = [n for n in _ast.walk(_ast.Module(body=body, type_ignores=[]))
+                          if isinstance(n, _ast.Raise)]
+                self.assertTrue(raises, f"{item.name}: the branch raises")
+                skips = [n for n in _ast.walk(_ast.Module(body=body, type_ignores=[]))
+                         if isinstance(n, _ast.Call)
+                         and isinstance(n.func, _ast.Attribute)
+                         and n.func.attr == "skipTest"]
+                self.assertEqual(skips, [], f"{item.name}: the branch never skips")
+                stricts = [n for n in _ast.walk(_ast.Module(body=body, type_ignores=[]))
+                           if isinstance(n, _ast.Name) and n.id == "STRICT"]
+                self.assertEqual(stricts, [],
+                                 f"{item.name}: the branch never consults STRICT")
+        self.assertEqual(sorted(seen), sorted(cells))
+
     def test_nss_gate_probe_flags_ungated_seeders_only(self):
         """Twin: the gate probe flags exactly the ungated seeders.
 
         An ungated seeder lands in missing; a gated seeder (the
-        real skip/strict-fail branch shape) and a None-credential
+        real error branch shape) and a None-credential
         drive (no seed runs) pass. Deleting either live gate block
         moves that cell into missing (see the sweep); renaming the
         probe's driver set or the gate call breaks the live-file
@@ -4259,9 +4302,7 @@ class BrowserS1Oracle(unittest.TestCase):
             "    def test_probe_gated(self):\n"
             "        missing = cells.missing_nss_seed_tools()\n"
             "        if missing:\n"
-            "            if STRICT:\n"
-            "                raise AssertionError(\"NSS seed tools missing\")\n"
-            "            self.skipTest(\"NSS seed tools missing\")\n"
+            "            raise AssertionError(\"NSS seed tools missing\")\n"
             "        cells.run_direct(\"P\", \"firefox\", work, url,\n"
             "                         nss_credential=cred)\n"
             '    @gate("firefox")\n'

@@ -620,6 +620,17 @@ impl Engine {
         self.member_stops.stats
     }
 
+    /// Adds a provider identity to `tgid`'s hold (test seam for a
+    /// multi-provider hold). Returns whether the hold exists.
+    #[cfg(test)]
+    pub(crate) fn add_held_provider_for_test(&mut self, tgid: u32, identity: (u64, u64)) -> bool {
+        self.member_stops
+            .held
+            .get_mut(&tgid)
+            .map(|held| held.providers.push(identity))
+            .is_some()
+    }
+
     /// Whether `identity`'s staging was refused (test probe for the
     /// refusal record each staging-refusal site owes its holds).
     #[cfg(test)]

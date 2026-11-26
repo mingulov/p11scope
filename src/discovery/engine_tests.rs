@@ -98845,6 +98845,68 @@ fn member_stop_superseded_attached_provider_with_queued_retry_never_refuses() {
     assert!(member_resumed_for_test(pid), "the member runs again");
 }
 
+/// Multi-provider hold: a superseded provider that is really attached
+/// never refuses the hold because another, unrelated provider is still
+/// unattached; the hold keeps waiting for that provider instead of
+/// resuming early with its first calls unobserved. The single-provider
+/// healthy twin is `member_stop_superseded_key_attaches_once_proven`.
+#[test]
+fn member_stop_superseded_attached_provider_waits_for_another_provider() {
+    let (fixture, view, module, _pins) = loaded_seed_provider();
+    let pid = fixture.child.id();
+    let library = fixture._dir.path().join("seed-provider.so");
+    touch_for_test(&library, 1_000_000);
+    stop_member_for_test(pid);
+    let key = member_exec_key_for_test(pid, &library);
+    let mut io = ScriptedMemberStops::default();
+    io.rows.insert(pid, member_stop_row(pid, &library, key));
+    let mut engine = member_stop_engine();
+    engine.pause_owned_batch = true;
+    let mut session = attaching_session();
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    assert_eq!(engine.learned_staged_files_for_test(), 1);
+    let staged_key = engine
+        .prearm_input
+        .as_ref()
+        .and_then(|prearm| prearm.inputs.first().map(|input| input.key))
+        .expect("staging records its key");
+    touch_for_test(&library, 2_000_000);
+    let mut budget = CaptureWorkBudget::default();
+    let (scan2, _scan_skips) =
+        pin_scanned_view_objects(&view, std::slice::from_ref(&module), &mut budget).unwrap();
+    let mut working = engine.pinned.clone();
+    assert!(working.absorb(scan2).is_empty());
+    assert!(working.supersedes(staged_key), "the rotation is recorded");
+    let _candidate = engine.live_candidate_with_pending(
+        working,
+        vec![module],
+        Vec::new(),
+        None,
+        &std::collections::BTreeSet::new(),
+        &std::collections::BTreeSet::new(),
+        &std::collections::BTreeSet::new(),
+    );
+    assert!(engine.pending_superseded_keys.contains(&staged_key));
+    engine.pause_owned_batch = false;
+    engine.apply_learned_staging(&mut session);
+    assert!(!engine.learned_unapplied, "the staging applied");
+    // An unrelated second provider: never staged, no slots.
+    let probe = std::fs::File::open(&library).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&probe).unwrap();
+    assert!(engine.add_held_provider_for_test(pid, (dev, ino.wrapping_add(0x5eed))));
+    engine.service_member_stops(&mut io, &mut session, Some(20));
+    let stats = engine.member_stop_stats_for_test();
+    assert_eq!(
+        stats.refused_resumes, 0,
+        "the attached superseded provider never refuses: {stats:?}"
+    );
+    assert_eq!(stats.attached_resumes, 0, "{stats:?}");
+    assert!(
+        engine.member_stops_held(),
+        "the hold must wait for the unrelated unattached provider"
+    );
+}
+
 /// The churn seam end to end (df2401d80's path): a file-changed HIT
 /// requeues, the retry stages generation 1, a scan observes generation
 /// 2, and the bind keeps the module — across a second rotation the same
@@ -98926,6 +98988,14 @@ fn member_stop_retry_staged_rotation_keeps_stable_object() {
         .map(|pin| pin.id)
         .collect();
     assert_eq!(objects.len(), 1, "one file, one object");
+    assert!(
+        candidate
+            .plan
+            .slots
+            .iter()
+            .any(|slot| { candidate.plan.is_active(slot.index) && objects.contains(&slot.object) }),
+        "generation 2 binds an active slot on the stable object"
+    );
     // Generation 3: a second rotation keeps the same slot objects —
     // nothing retires for one touched file.
     touch_for_test(&library, 3_000_000);
@@ -98961,6 +99031,12 @@ fn member_stop_retry_staged_rotation_keeps_stable_object() {
     assert_eq!(
         objects_after, objects,
         "a second rotation keeps the object id"
+    );
+    assert!(
+        candidate.plan.slots.iter().any(|slot| {
+            candidate.plan.is_active(slot.index) && objects_after.contains(&slot.object)
+        }),
+        "generation 3 keeps an active slot on the stable object"
     );
 }
 

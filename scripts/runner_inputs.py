@@ -35,10 +35,11 @@ _LIB = _CI + _COUNTER + _WRAP
 _PUBLIC = ("scripts/public-cli-oracle.py", "scripts/check-capture-evidence.py", "scripts/system-scope-measure.py",
            "scripts/qualify_records.py", "scripts/release-matrix-contract.py", _PIN,
            "scripts/inventory-mt-oracle.py", "scripts/system-cell-census.py", "scripts/inventory-mt-gate.py",
+           "scripts/inventory-provider-info-oracle.py", "scripts/ci/result_row.py",
            "tests/fixtures/public-cli/gated.c", "tests/fixtures/public-cli/mt.c",
            "tests/fixtures/public-cli/prearm-first-use.c", "tests/fixtures/public-cli/cgroup-fork.c",
            "tests/fixtures/public-cli/chain-parent.c", "tests/fixtures/public-cli/mt_mixed.c",
-           "tests/fixtures/public-cli/mt_fork.c")
+           "tests/fixtures/public-cli/mt_fork.c", "tests/fixtures/public-cli/provider_info.c")
 # The native lanes, their C8 gate and the oracle's capacity run (every
 # capacity population compiles the catalog driver; synthetic ones also the
 # version-matrix provider). One mode: a run may take any of these paths.

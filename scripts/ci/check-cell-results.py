@@ -31,13 +31,15 @@ Usage:
   python3 -I scripts/ci/check-cell-results.py RESULTS.JSONL [--expected-failure CELL ...] [--intermittent-failure CELL=LANE ...] [--allow-nonqualifying CELL ...] [--require CELL ...]
 """
 
-import json
 import re
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from result_row import validate_row  # noqa: E402
+# A gate must not mutate the tree it validates: importing the shared
+# row validator must not drop __pycache__ into staged scripts.
+sys.dont_write_bytecode = True
+from result_row import parse_json_strict, validate_row  # noqa: E402
 
 
 def fail(message):
@@ -116,8 +118,8 @@ def main(argv):
         if not line.strip():
             continue
         try:
-            row = json.loads(line)
-        except json.JSONDecodeError as error:
+            row = parse_json_strict(line)
+        except ValueError as error:
             problems.append(f"line {number}: invalid JSON: {error}")
             continue
         row_problems = validate_row(row)

@@ -14,6 +14,7 @@ Run: python3 -I tests/python/test_cell_results.py -v
 """
 
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -332,25 +333,102 @@ class CheckCellResultsTests(unittest.TestCase):
         self.assertIn("flaky=task/one+task/two", result.stdout)
 
     def test_malformed_rows_fail(self):
+        # Each malformed shape is refused with its exact typed
+        # error, never a bare nonzero exit or a traceback.
         cases = [
-            ["not json"],
-            [json.dumps({"cell": "a", "pass": True})],
-            [json.dumps({"cell": "a", "pass": True, "qualification": "qualified",
-                         "detail": "ok", "extra": 1})],
-            [json.dumps({"cell": "", "pass": True, "qualification": "qualified", "detail": "x"})],
-            [json.dumps({"cell": "a", "pass": 1, "qualification": "qualified", "detail": "x"})],
-            [json.dumps({"cell": "a", "pass": True, "qualification": "", "detail": "x"})],
-            [json.dumps({"cell": "a", "pass": True, "qualification": "qualified", "detail": 1})],
+            (["not json"], "invalid JSON"),
+            ([json.dumps(["a", True])], "row is not an object"),
+            ([json.dumps("a")], "row is not an object"),
+            ([json.dumps(42)], "row is not an object"),
+            ([json.dumps({"cell": "a", "pass": True})],
+             "row must have exactly cell/pass/qualification/detail"),
+            ([json.dumps({"cell": "a", "pass": True, "qualification": "qualified",
+                          "detail": "ok", "extra": 1})],
+             "row must have exactly cell/pass/qualification/detail"),
+            ([json.dumps({"cell": "", "pass": True, "qualification": "qualified", "detail": "x"})],
+             "cell must be a nonempty string"),
+            ([json.dumps({"cell": 1, "pass": True, "qualification": "qualified", "detail": "x"})],
+             "cell must be a nonempty string"),
+            ([json.dumps({"cell": None, "pass": True, "qualification": "qualified", "detail": "x"})],
+             "cell must be a nonempty string"),
+            ([json.dumps({"cell": "a", "pass": 1, "qualification": "qualified", "detail": "x"})],
+             "pass must be a boolean"),
+            ([json.dumps({"cell": "a", "pass": True, "qualification": "", "detail": "x"})],
+             "qualification must be a nonempty string"),
+            ([json.dumps({"cell": "a", "pass": True, "qualification": 1, "detail": "x"})],
+             "qualification must be a nonempty string"),
+            ([json.dumps({"cell": "a", "pass": True, "qualification": "qualified", "detail": 1})],
+             "detail must be a string"),
         ]
-        for case in cases:
+        for case, message in cases:
             with self.subTest(case=case):
                 result = run_checker(case)
                 self.assertNotEqual(result.returncode, 0, case)
+                self.assertIn(message, result.stderr, case)
 
     def test_duplicate_cells_fail(self):
         result = run_checker([row("a", True), row("a", True)])
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("duplicate cell a", result.stderr)
+
+    def test_proof_null_is_refused_everywhere(self):
+        # An explicit JSON null is a present proof, never absence:
+        # refused on plain qualifications and on exact-proof ones
+        # alike (null is not an object).
+        plain = dict(row("a", True, "qualified", "ok"))
+        plain["proof"] = None
+        result = run_checker([plain], "--require", "a")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("want no proof", result.stderr)
+        self.assertNotIn("PASS a", result.stdout)
+        exact = dict(
+            row(
+                "inventory-provider-info-pid",
+                True,
+                "provider-info-exact",
+                "human detail",
+                proof=info_proof(),
+            )
+        )
+        exact["proof"] = None
+        result = run_checker([exact])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must be an object", result.stderr)
+
+    def test_duplicate_scalar_keys_refused(self):
+        # The lossy-collapse repro: the first boolean must not be
+        # silently replaced before the typed verdict is judged.
+        line = (
+            '{"cell":"a","pass":false,"pass":true,'
+            '"qualification":"qualified","detail":"ok"}'
+        )
+        result = run_checker([line], "--require", "a")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("duplicate key", result.stderr)
+        self.assertNotIn("PASS a", result.stdout)
+
+    def test_duplicate_proof_keys_refused(self):
+        proof = (
+            '{"edge_total": 1, "edge_total": 2, "caller_count": 1}'
+        )
+        line = (
+            '{"cell":"inventory-mt-pid","pass":true,'
+            '"qualification":"owned-edge-usage-counts",'
+            '"detail":"human detail","proof":' + proof + "}"
+        )
+        result = run_checker([line])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("duplicate key", result.stderr)
+
+    def test_checker_leaves_no_bytecode_beside_shared_validator(self):
+        # A gate must not mutate the tree it validates: importing
+        # the shared row validator must not drop __pycache__ next
+        # to the staged scripts.
+        cache = CHECKER.parent / "__pycache__"
+        shutil.rmtree(cache, ignore_errors=True)
+        result = run_checker([row("a", True)], "--require", "a")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(cache.exists())
 
     def test_empty_and_missing_files_fail(self):
         result = run_checker([])

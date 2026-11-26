@@ -16,6 +16,8 @@ these typed proof records with exact equality, never over the
 human `detail` prose.
 """
 
+import json
+
 QUALIFIED = {
     "qualified",
     "command-contract",
@@ -36,6 +38,50 @@ VALID_QUALIFICATIONS = QUALIFIED | {"nonqualifying", "expected-failure"}
 # proof shape each requires. Only these two may carry `proof`.
 PROOF_QUALS = frozenset({"owned-edge-usage-counts", "provider-info-exact"})
 
+# Sentinel distinguishing a missing `proof` key from an explicit
+# JSON null: absence is valid off the proof verdicts, null never is.
+_MISSING = object()
+
+
+def parse_json_strict(text):
+    """Parse JSON evidence, refusing duplicate keys at any depth.
+
+    Bare `json.loads` silently collapses duplicate object keys
+    (last wins), which can replace a recorded verdict before any
+    schema sees it; the release-matrix contract already rejects
+    duplicates, and verdict gates do the same. Raises ValueError
+    naming the duplicate key.
+    """
+
+    def hook(pairs):
+        seen = set()
+        for key, _ in pairs:
+            if key in seen:
+                raise ValueError("duplicate key: %r" % (key,))
+            seen.add(key)
+        return dict(pairs)
+
+    return json.loads(text, object_pairs_hook=hook)
+
+
+def duplicate_cells(rows):
+    """Cell ids occurring more than once, in first-repeat order.
+
+    Collection-level companion to `validate_row`: the per-run
+    results-file invariant is one row per cell. Callers add
+    their own location (line number, run/kernel) to the report.
+    """
+    seen = set()
+    dups = []
+    for row in rows:
+        cell = row.get("cell") if isinstance(row, dict) else None
+        if cell in seen:
+            if cell not in dups:
+                dups.append(cell)
+        else:
+            seen.add(cell)
+    return dups
+
 
 def _is_int(value):
     # type() is bool-proof: isinstance(True, int) is True, and a
@@ -44,12 +90,18 @@ def _is_int(value):
 
 
 def proof_problems(qualification, proof):
-    """Problems with a row's proof record (empty when valid)."""
+    """Problems with a row's proof record (empty when valid).
+
+    `proof` is the `_MISSING` sentinel when the key is absent:
+    absence is valid off the proof verdicts, but an explicit
+    JSON null is a present proof and is refused everywhere
+    (null is not an object).
+    """
     if qualification not in PROOF_QUALS:
-        if proof is None:
+        if proof is _MISSING:
             return []
         return ["proof present on %s, want no proof" % qualification]
-    if proof is None:
+    if proof is _MISSING:
         return ["missing %s proof" % qualification]
     if not isinstance(proof, dict):
         return ["invalid %s proof: must be an object" % qualification]
@@ -108,7 +160,8 @@ def validate_row(row):
         return ["unknown qualification %r for %s" % (qualification, row["cell"])]
     if not isinstance(row["detail"], str):
         return ["detail must be a string for %s" % row["cell"]]
+    proof = row["proof"] if "proof" in row else _MISSING
     return [
         "%s for %s" % (problem, row["cell"])
-        for problem in proof_problems(qualification, row.get("proof"))
+        for problem in proof_problems(qualification, proof)
     ]

@@ -9,6 +9,7 @@ judge pre-fetched histories (--history-json), never the network.
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -228,6 +229,47 @@ class IntermittentBoundsTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("cell must be a nonempty string", result.stderr)
 
+    def test_bounds_leaves_no_bytecode_beside_shared_validator(self):
+        # A gate must not mutate the tree it validates: importing
+        # the shared row validator must not drop __pycache__ next
+        # to the staged scripts.
+        cache = SCRIPT.parent / "__pycache__"
+        shutil.rmtree(cache, ignore_errors=True)
+        doc = history([
+            run_entry(1, host_rows=[row(CELL, True)],
+                      guest_rows=[row(CELL, True)]),
+        ])
+        result = self.run_bounds(doc, "--cell", f"{CELL}=task/fix",
+                                 window=1)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(cache.exists())
+
+    def test_history_duplicate_keys_are_refused(self):
+        # Duplicate JSON keys collapse lossily under bare
+        # json.loads; the history document is parsed strictly,
+        # so a flipped pass bit never reaches the judge.
+        text = (
+            '{"runs": [{"id": 2, "branch": "test/x", "results": {"host": ['
+            '{"cell": "flaky_cell", "pass": false, "pass": true, '
+            '"qualification": "qualified", "detail": "ok"}], '
+            '"v6.6.157": []}}, '
+            '{"id": 1, "branch": "test/x", "results": {"host": [], '
+            '"v6.6.157": []}}]}'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "history.json"
+            path.write_text(text)
+            args = [sys.executable, "-I", str(SCRIPT),
+                    "--history-json", str(path),
+                    "--window", "3",
+                    "--kernel", "host", "--kernel", "v6.6.157",
+                    "--cell", f"{CELL}=task/fix"]
+            result = subprocess.run(args, capture_output=True, text=True,
+                                    timeout=30)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("duplicate key", result.stderr)
+        self.assertNotIn("last pass", result.stdout)
+
     def test_live_malformed_artifact_is_skipped_loudly(self):
         # The live fetch path (fake gh below, no network): an
         # artifact whose rows fail the shared schema is skipped
@@ -298,6 +340,62 @@ class IntermittentBoundsTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(f"{CELL} on host went", result.stderr)
         self.assertIn(f"PASS {OTHER} on host", result.stdout)
+
+    def test_duplicate_cell_history_is_refused(self):
+        # Devin's repro: run 2 host carries an expected-failure row
+        # plus a duplicate qualified-pass row for the same cell.
+        # The per-run contract allows one row per cell, so the
+        # duplicate positive must never reset the window.
+        doc = history([
+            run_entry(2, host_rows=[row(CELL, False, "expected-failure"),
+                                    row(CELL, True)],
+                      guest_rows=[row(CELL, True)]),
+            run_entry(1, host_rows=[row(CELL, False, "expected-failure")],
+                      guest_rows=[row(CELL, True)]),
+        ])
+        result = self.run_bounds(doc, "--cell", f"{CELL}=task/fix")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("duplicate cell", result.stderr)
+        self.assertNotIn(f"PASS {CELL} on host", result.stdout)
+
+    def test_live_duplicate_cell_artifact_is_skipped_loudly(self):
+        # Live fetch path (fake gh, no network): a zip whose
+        # results carry two rows for one cell is unusable as a
+        # whole, exactly like a schema-invalid artifact.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            archive = tmpdir / "results.zip"
+            with zipfile.ZipFile(archive, "w") as bundle:
+                bundle.writestr(
+                    "cells/results.jsonl",
+                    json.dumps(row(CELL, False, "expected-failure")) + "\n"
+                    + json.dumps(row(CELL, True)) + "\n",
+                )
+            fake = tmpdir / "gh"
+            fake.write_text(
+                "#!/bin/sh\n"
+                'if [ "$1" = "run" ]; then\n'
+                "  echo '[{\"databaseId\": 7, \"headBranch\": \"test/x\","
+                ' "conclusion": "failure", "createdAt": "t"}]\'\n'
+                'elif [ "$2" = "repos/x/y/actions/runs/7/artifacts" ]; then\n'
+                f"  printf 'run-tree-host\\tfile://{archive}\\tfalse\\n'\n"
+                "else\n"
+                '  cat "${2#file://}"\n'
+                "fi\n"
+            )
+            fake.chmod(0o755)
+            env = dict(os.environ)
+            env["PATH"] = str(tmpdir) + ":" + env["PATH"]
+            args = [sys.executable, "-I", str(SCRIPT),
+                    "--repo", "x/y", "--window", "3",
+                    "--kernel", "host",
+                    "--cell", f"{CELL}=task/fix"]
+            proc = subprocess.run(args, capture_output=True, text=True,
+                                  timeout=30, env=env)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("SKIP run 7 host: unusable artifact", proc.stdout)
+        self.assertIn("duplicate cell", proc.stdout)
+        self.assertNotIn("last pass", proc.stdout)
 
     def test_bad_cell_shape_refused(self):
         result = self.run_bounds(history([]), "--cell", "flaky")

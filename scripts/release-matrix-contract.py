@@ -21,6 +21,12 @@ import sys
 import tempfile
 import uuid
 
+sys.path.insert(0, str(Path(__file__).resolve().parent / "ci"))
+# A gate must not mutate the tree it validates: importing the shared
+# row validator must not drop __pycache__ into staged scripts.
+sys.dont_write_bytecode = True
+from result_row import validate_row  # noqa: E402
+
 SCHEMA = "p11scope/release-matrix-contract/v1"
 ROOT = Path(__file__).resolve().parents[1]
 # The Fedora live-cell lane: Fedora 7.2.9 runs live cells on the real
@@ -1601,9 +1607,10 @@ def judge(stage, contract_path):
     public_ids = [r.get("cell") for r in public_rows]
     require(len(public_ids) == len(set(public_ids)) and set(public_ids) == {r["cell"] for r in contract["public_cells"]}, "missing/duplicate/unexpected public cell ID")
     for result in public_rows:
+        row_problems = validate_row(result)
+        require(not row_problems, "invalid public terminal row: " + "; ".join(row_problems))
         name = result["cell"]
         qualification = PUBLIC[name]
-        require(set(result) == {"cell", "pass", "detail", "qualification"} and isinstance(result["detail"], str), "invalid public terminal row")
         require(result["qualification"] == qualification and result["pass"] is (qualification != "nonqualifying"), "failed/wrong public classification: " + name)
         row("public:" + name, qualification, result["detail"])
     exact_test(read("pidflt.log"), PID_TEST)

@@ -70,6 +70,16 @@ PUBLIC = {
     "run-short": "nonqualifying", "run-cover": "nonqualifying",
     "trace-pid": "nonqualifying", "mt-trace": "nonqualifying", "run-prearm": "prearm-exactness",
 }
+# Typed proof records in the real producer shape (see the two
+# inventory oracles): exact-proof rows carry one, all others must
+# not. Values mirror a healthy live run, not a real capture.
+PROOFS = {
+    "inventory-mt-pid": {"edge_total": 209, "caller_count": 1},
+    "inventory-mt-system": {"edge_total": 209, "caller_count": 5},
+    "inventory-provider-info-pid": {"manufacturer": "SoftHSM", "library_major": 2,
+                                    "library_minor": 6, "token_rows": 2,
+                                    "mechanism_rows": 140, "slots": 2},
+}
 
 
 def candidate_receipt(bins, path, source_root=ROOT):
@@ -146,8 +156,9 @@ class MatrixContract(unittest.TestCase):
         self.log("version.log", "p11scope 0.4.0\n", "version", 0)
         self.log("doctor.log", "capability tier: T4\nuprobe-multi attach (own libc) .... ok self-link attached and detached\n", "doctor", 0)
         self.log("qual.log", "SUMMARY pass=11 fail=0 nonqualifying=3\n", "qual", 2)
-        self.public_rows = [{"cell": name, "pass": qualification != "nonqualifying",
-                             "detail": "controlled assertion", "qualification": qualification}
+        self.public_rows = [dict({"cell": name, "pass": qualification != "nonqualifying",
+                             "detail": "controlled assertion", "qualification": qualification},
+                            **({"proof": PROOFS[name]} if name in PROOFS else {}))
                             for name, qualification in PUBLIC.items()]
         self.write_rows()
         self.log("inv-native.log", "qualified owned inventory\n", "inv_native", 0)
@@ -490,6 +501,29 @@ class MatrixContract(unittest.TestCase):
                          "--candidate-receipt", str(receipt), "--lib-test", LIB_A)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return repo, stage
+
+    def test_staged_sources_cover_every_qualify_script_reference(self):
+        # qualify-release-matrix.sh executes qualify-public-cli.sh
+        # from the staged source tree, so every script that file
+        # invokes through $HERE must be staged: compare the
+        # references against SOURCE_FILES so neither side drifts.
+        # ($HERE/../tests/... is the fixture directory, covered by
+        # RUNTIME_SOURCES, not a script reference.)
+        text = (ROOT / "scripts/qualify-public-cli.sh").read_text()
+        referenced = set(
+            "scripts/" + match
+            for match in re.findall(r"\$HERE/([A-Za-z0-9_.-]+\.py)", text)
+        )
+        referenced.update(
+            "scripts/" + match
+            for match in re.findall(r"\$HERE/([A-Za-z0-9_.-]+\.sh)", text)
+        )
+        staged = set(CHECKER_MOD["SOURCE_FILES"])
+        self.assertTrue(referenced, "no script references found")
+        self.assertEqual(
+            sorted(referenced - staged), [], "unstaged script references"
+        )
+        self.assertIn("scripts/ci/result_row.py", staged)
 
     def test_no_object_staged_sources_run_real_public_and_native_oracles_without_checkout(self):
         # Reuse only the existing external child/report fixtures. The staged
@@ -1281,8 +1315,9 @@ class MatrixContract(unittest.TestCase):
         log("doctor.log", "capability tier: T4\nuprobe-multi attach (own libc) .... ok self-link attached and detached\n", "doctor", 0)
         log("qual.log", "SUMMARY pass=11 fail=0 nonqualifying=3\n", "qual", 2)
         write("cells/results.jsonl", "".join(
-            json.dumps({"cell": name, "pass": qualification != "nonqualifying",
-                        "detail": "controlled assertion", "qualification": qualification}) + "\n"
+            json.dumps(dict({"cell": name, "pass": qualification != "nonqualifying",
+                        "detail": "controlled assertion", "qualification": qualification},
+                        **({"proof": PROOFS[name]} if name in PROOFS else {}))) + "\n"
             for name, qualification in PUBLIC.items()))
         log("inv-native.log", "qualified owned inventory\n", "inv_native", 0)
         log("inv-scan.log", "valid scan plumbing, nonqualifying\n", "inv_scan", 2)
@@ -2664,6 +2699,22 @@ class MatrixContract(unittest.TestCase):
         path.write_text(path.read_text().replace('"pass": true', '"pass": false, "pass": true', 1))
         self.seal(); self.reject()
 
+    def test_missing_proof_on_exact_cell_fails(self):
+        for row in self.public_rows:
+            if row["cell"] == "inventory-provider-info-pid":
+                del row["proof"]
+        self.write_rows(); self.seal(); self.reject()
+
+    def test_malformed_proof_fails(self):
+        for row in self.public_rows:
+            if row["cell"] == "inventory-mt-pid":
+                row["proof"] = {"edge_total": 0, "caller_count": 1}
+        self.write_rows(); self.seal(); self.reject()
+
+    def test_proof_on_plain_cell_fails(self):
+        self.public_rows[0]["proof"] = {"edge_total": 1, "caller_count": 1}
+        self.write_rows(); self.seal(); self.reject()
+
     def test_pid_multi_needs_two_owned_threads_and_zero_foreign_hits(self):
         for evidence in ("PIDFLT_PROBE own=1 other=0 proves=true", "PIDFLT_PROBE own=2 other=1 proves=true", "PIDFLT_PROBE own=2 other=0 proves=false", ""):
             with self.subTest(evidence=evidence):
@@ -2725,6 +2776,14 @@ class MatrixContract(unittest.TestCase):
         for path in (RUNNER, CHECKER, ROOT / "scripts/runner_inputs.py", ROOT / "scripts/public-cli-oracle.py",
                      ROOT / "scripts/system-scope-measure.py", ROOT / "scripts/check-capture-evidence.py"):
             shutil.copy2(path, repo / "scripts" / path.name)
+        # Staged SOURCE_FILES the contract seals: real bytes, like the
+        # checker itself (the staged checker imports result_row at
+        # startup, and prepare requires every staged input to exist).
+        for name in ("scripts/inventory-mt-oracle.py", "scripts/inventory-provider-info-oracle.py",
+                     "scripts/inventory-mt-gate.py", "scripts/system-cell-census.py",
+                     "scripts/ci/result_row.py"):
+            path = repo / name; path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(ROOT / name, path)
         for name in ("qualify-public-cli.sh", "qualify-inventory-native.sh", "run-privileged-lib-tests.sh"):
             path = repo / "scripts" / name
             path.write_text("#!/bin/bash\nprintf '%s\\n' \"$THREADS\" \"$@\" > \"$CONTROL_ARGS/" + name + ".args\"\necho 'SUMMARY pass=1 fail=0 skipped=0'\nexit 0\n" if name == "qualify-public-cli.sh" else "#!/bin/bash\nprintf '%s\\n' \"$@\" > \"$CONTROL_ARGS/" + name + ".args\"\necho 'SUMMARY pass=1 fail=0 skipped=0'\nexit 0\n")

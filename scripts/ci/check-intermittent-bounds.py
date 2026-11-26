@@ -44,7 +44,10 @@ import zipfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from result_row import validate_row  # noqa: E402
+# A gate must not mutate the tree it validates: importing the shared
+# row validator must not drop __pycache__ into staged scripts.
+sys.dont_write_bytecode = True
+from result_row import duplicate_cells, parse_json_strict, validate_row  # noqa: E402
 
 # The run-tree matrix legs (privileged-tests.yml); public-cli and
 # witness-cli carry v7.4-rc3 too, run-tree does not.
@@ -129,13 +132,16 @@ def artifact_results(url):
         if not line.strip():
             continue
         try:
-            row = json.loads(line)
+            row = parse_json_strict(line)
         except ValueError as error:
             return None, "line %d: invalid JSON: %s" % (number, error)
         problems = validate_row(row)
         if problems:
             return None, "line %d: %s" % (number, problems[0])
         rows.append(row)
+    dups = duplicate_cells(rows)
+    if dups:
+        return None, "duplicate cell %r (one row per cell)" % (dups[0],)
     return rows, ""
 
 
@@ -186,7 +192,7 @@ def load_history_json(path):
     except OSError as error:
         return None, f"cannot read {path}: {error}"
     try:
-        document = json.loads(text)
+        document = parse_json_strict(text)
     except ValueError as error:
         return None, f"invalid history JSON: {error}"
     if not isinstance(document, dict) or not isinstance(
@@ -208,6 +214,10 @@ def load_history_json(path):
                 if problems:
                     return None, "history run %r kernel %r: %s" % (
                         run.get("id"), kernel, problems[0])
+            dups = duplicate_cells(rows)
+            if dups:
+                return None, "history run %r kernel %r: duplicate cell %r" % (
+                    run.get("id"), kernel, dups[0])
         history.append(run)
     return history, ""
 

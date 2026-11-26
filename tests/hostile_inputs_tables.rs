@@ -63,6 +63,8 @@ const HOSTILE_PROVIDERS: &[&str] = &[
     "overfill",
     // hostile_interface_names_and_lists_are_evidence_only
     "ifaces",
+    // manifest_strings_carry_no_helper_addresses
+    "addr_sweep",
 ];
 
 /// Builds `name` from `source`, recording the name so each test can assert it
@@ -428,8 +430,155 @@ fn hostile_provider_corpus_is_pinned() {
             "growing",
             "overfill",
             "ifaces",
+            "addr_sweep",
         ]
     );
+}
+
+/// True when `text` carries a rendered pointer (`0x` plus hex): the
+/// shape every helper address takes in an error string.
+fn contains_rendered_address(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i + 6 <= bytes.len() {
+        if bytes[i] == b'0' && bytes[i + 1] == b'x' {
+            let hex = bytes[i + 2..]
+                .iter()
+                .take_while(|byte| byte.is_ascii_hexdigit())
+                .count();
+            if hex >= 4 {
+                return true;
+            }
+            i += 2 + hex;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+/// Every string in the serialized manifest must be free of rendered
+/// helper addresses. The walk covers each field rather than grepping
+/// the document, so a number-shaped field can never false-positive.
+fn assert_manifest_strings_carry_no_addresses(value: &serde_json::Value, path: &str) {
+    match value {
+        serde_json::Value::String(text) => {
+            assert!(
+                !contains_rendered_address(text),
+                "helper address leaked at {path}: {text:?}"
+            );
+        }
+        serde_json::Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                assert_manifest_strings_carry_no_addresses(item, &format!("{path}[{index}]"));
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (key, item) in map {
+                assert_manifest_strings_carry_no_addresses(item, &format!("{path}.{key}"));
+            }
+        }
+        _ => {}
+    }
+}
+
+#[test]
+fn manifest_strings_carry_no_helper_addresses() {
+    let dir = workdir("addr-sweep");
+    let mut built = Vec::new();
+    let provider = build_tracked(
+        &dir,
+        &mut built,
+        HOSTILE_PROVIDERS[13],
+        r#"typedef unsigned long CK_RV; typedef unsigned long CK_ULONG; typedef unsigned long CK_FLAGS;
+typedef struct { char *pInterfaceName; void *pFunctionList; CK_FLAGS flags; } CK_INTERFACE;
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+static char vendor_name[] = "sweep-vendor";
+static CK_INTERFACE ifaces[6];
+__attribute__((constructor)) static void fill(void){
+    unsigned char *heap_list = malloc(2);
+    heap_list[0] = 7; heap_list[1] = 7;
+    char *heap_name = malloc(16);
+    strcpy(heap_name, "heap-sweep-name");
+    void *guard = mmap(0, 4096, PROT_NONE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    ifaces[0].pInterfaceName = 0;                    // NULL name, NULL list
+    ifaces[0].pFunctionList = 0;
+    ifaces[1].pInterfaceName = (char *)0x12345;      // unmapped name and list
+    ifaces[1].pFunctionList = (void *)0x54321;
+    ifaces[2].pInterfaceName = guard;                // PROT_NONE name, unmapped list
+    ifaces[2].pFunctionList = (void *)0x54321;      // (mem reads bypass PROT_NONE, so a guard
+                                                    // list would be kernel-dependent)
+    ifaces[3].pInterfaceName = heap_name;            // heap name, heap list
+    ifaces[3].pFunctionList = heap_list;
+    ifaces[4].pInterfaceName = (char *)0x12345;      // unmapped name, heap list
+    ifaces[4].pFunctionList = heap_list;
+    ifaces[5].pInterfaceName = vendor_name;          // vendor name, NULL list
+    ifaces[5].pFunctionList = 0;
+}
+CK_RV C_GetInterfaceList(CK_INTERFACE *out, CK_ULONG *count){
+    if (!out) { *count = 6; return 0; }
+    for (int i = 0; i < 6; i++) out[i] = ifaces[i];
+    *count = 6; return 0;
+}
+"#,
+    );
+    let manifest = discover(&provider).expect("hostile pointers must record evidence");
+    assert_eq!(manifest.interface_list, Acquisition::Ok);
+    assert!(
+        only_absent_legacy(&manifest),
+        "vendor names must not walk: {:?}",
+        manifest.surfaces
+    );
+    assert_eq!(manifest.vendor_interfaces.len(), 6);
+    // Each entry keeps its evidence with fixed text: the sweep below is
+    // non-vacuous only because these errors exist.
+    let errors: Vec<(Option<&str>, Option<&str>)> = manifest
+        .vendor_interfaces
+        .iter()
+        .map(|vendor| {
+            (
+                vendor.name_error.as_deref(),
+                vendor.version_error.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        errors,
+        [
+            (
+                Some("null name pointer"),
+                Some("null function-list pointer"),
+            ),
+            (
+                Some("name pointer outside any mapping"),
+                Some("function-list version header unreadable"),
+            ),
+            (
+                Some("name pointer in a non-readable mapping"),
+                Some("function-list version header unreadable"),
+            ),
+            (Some("name pointer outside the provider mappings"), None),
+            (Some("name pointer outside any mapping"), None),
+            (None, Some("null function-list pointer")),
+        ]
+    );
+    let v7 = Some(p11scope_manifest::manifest::Version { major: 7, minor: 7 });
+    let versions: Vec<Option<p11scope_manifest::manifest::Version>> = manifest
+        .vendor_interfaces
+        .iter()
+        .map(|vendor| vendor.version)
+        .collect();
+    assert_eq!(versions, [None, None, None, v7, v7, None]);
+    assert_eq!(
+        manifest.vendor_interfaces[5].name_lossy.as_deref(),
+        Some("sweep-vendor")
+    );
+    let document = serde_json::to_value(&manifest).unwrap();
+    assert_manifest_strings_carry_no_addresses(&document, "$");
+    assert_nothing_resolved(&manifest, "hostile pointers");
+    assert_eq!(built, HOSTILE_PROVIDERS[13..14]);
 }
 
 #[test]

@@ -790,16 +790,14 @@ fn read_name(
         return NameRead {
             raw: None,
             lossy: None,
-            error: Some(format!("name pointer outside any mapping at 0x{address:x}")),
+            error: Some("name pointer outside any mapping".into()),
         };
     };
     if mapping.permissions[0] != b'r' {
         return NameRead {
             raw: None,
             lossy: None,
-            error: Some(format!(
-                "name pointer in a non-readable mapping at 0x{address:x}"
-            )),
+            error: Some("name pointer in a non-readable mapping".into()),
         };
     }
     let provider = match maps.resolve(address as u64) {
@@ -832,7 +830,7 @@ fn read_name(
                 return NameRead {
                     raw: (!raw.is_empty()).then_some(raw),
                     lossy: None,
-                    error: Some(format!("short name pread at 0x{at:x}")),
+                    error: Some("short name pread".into()),
                 };
             }
             Ok(read) => read,
@@ -840,7 +838,7 @@ fn read_name(
                 return NameRead {
                     raw: (!raw.is_empty()).then_some(raw),
                     lossy: None,
-                    error: Some(format!("name pread at 0x{at:x}: {error}")),
+                    error: Some(format!("name pread failed: {error}")),
                 };
             }
         };
@@ -860,10 +858,7 @@ fn read_name(
         raw: (!raw.is_empty()).then_some(raw),
         lossy: None,
         error: Some(if limit < INTERFACE_NAME_CAP {
-            format!(
-                "unterminated interface name at readable mapping end 0x{:x}",
-                address as u64 + limit as u64
-            )
+            "unterminated interface name at readable mapping end".into()
         } else {
             format!("overlong interface name (cap {INTERFACE_NAME_CAP} bytes)")
         }),
@@ -1202,7 +1197,22 @@ fn interface_records(
                 None,
             ));
         } else {
-            vendor.push(vendor_interface(index, &entry, name, None, version.err()));
+            // The read failure carries the helper's raw address; the
+            // manifest keeps fixed text, branched on the null pointer
+            // (already recorded in `func_list_null`), never on the
+            // error string.
+            let version_error = if entry.func_list.is_null() {
+                "null function-list pointer"
+            } else {
+                "function-list version header unreadable"
+            };
+            vendor.push(vendor_interface(
+                index,
+                &entry,
+                name,
+                None,
+                Some(version_error.to_string()),
+            ));
         }
     }
     (Acquisition::Ok, surfaces, vendor, table_ptrs)

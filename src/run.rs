@@ -31215,6 +31215,13 @@ int main(int argc, char **argv) {
             Duration::from_secs(10),
             Some(Duration::from_secs(5))
         ));
+        // The boundary itself ends the loop: at exactly the duration
+        // the interval has elapsed.
+        assert!(should_stop(
+            &interrupted,
+            Duration::from_secs(5),
+            Some(Duration::from_secs(5))
+        ));
         assert!(!should_stop(
             &interrupted,
             Duration::from_secs(4),

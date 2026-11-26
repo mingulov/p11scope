@@ -19757,7 +19757,7 @@ impl Engine {
         // too (it is authorized below, so the scrub spares it).
         let ridden: BTreeSet<ProcessViewId> =
             raw_modules.iter().map(|module| module.view).collect();
-        // Entry-dependency rejections never drop a live module here:
+        // an entry-dependency rejection never drops a live module:
         // a rejected key's raws still resolve to the kept file, so the
         // strict binder below refuses those entries while keeping the
         // module's valid ones. Only a rejected module key — the
@@ -19765,38 +19765,19 @@ impl Engine {
         // Retired carrier rows keep the stricter filter: no live
         // prover refreshes them, so a rejected entry dependency drops
         // the stale row wholesale and its carrier-only pin reclaims.
-        let mut rejected_keys = BTreeSet::new();
         raw_modules.retain(|module| {
-            let keep = if pinned.rejects(module.key) {
-                false
-            } else if module.view != Self::CARRIED_VIEW_ID {
-                true
-            } else {
-                !module
-                    .tables
-                    .iter()
-                    .flat_map(|table| &table.entries)
-                    .any(|entry| pinned.rejects(entry.object))
-            };
-            if !keep {
-                rejected_keys.insert(module.key);
+            if pinned.rejects(module.key) {
+                return false;
             }
-            keep
+            if module.view != Self::CARRIED_VIEW_ID {
+                return true;
+            }
+            !module
+                .tables
+                .iter()
+                .flat_map(|table| &table.entries)
+                .any(|entry| pinned.rejects(entry.object))
         });
-        // A rejected module key refuses the staged holds on it: no slot
-        // ever builds under it, so the hold's attach is impossible (never
-        // at the bound) — even when this candidate never commits. Only
-        // key rejections refuse; an entry-only drop leaves a live key
-        // waiting for its attach. One indexed lookup per distinct
-        // rejected key; rejection ticks only.
-        for key in rejected_keys {
-            if !pinned.rejects(key) {
-                continue;
-            }
-            for identity in self.member_stops.staged_identities_for_key(key) {
-                self.member_stops.note_refused(identity);
-            }
-        }
         if crate::run::capture_diagnostics_on() && raw_with_learned > raw_before_learned {
             eprintln!(
                 "p11scope: candidate scan inputs: {} frame + {} run-learned, {} survive rejects",

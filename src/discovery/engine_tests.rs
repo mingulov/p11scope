@@ -98230,8 +98230,6 @@ fn member_stop_bind_rejected_key_refuses_the_hold_without_a_commit() {
         module.key, staged_key,
         "the fixture scan names the staged key"
     );
-    let file = std::fs::File::open(&library).unwrap();
-    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
     // Reject in a working copy only: the committed pins stay clean, so
     // only the bind observes the rejection (a dropped candidate).
     let mut working = engine.pinned.clone();
@@ -98251,8 +98249,8 @@ fn member_stop_bind_rejected_key_refuses_the_hold_without_a_commit() {
         &std::collections::BTreeSet::new(),
     );
     assert!(
-        engine.hold_refused_for_test((dev, ino)),
-        "a bind rejection records the hold refusal"
+        engine.pending_rejected_keys.contains(&staged_key),
+        "a bind rejection queues the pending key"
     );
     engine.service_member_stops(&mut io, &mut session, Some(10_000_000));
     assert!(

@@ -129,12 +129,6 @@ pub(crate) struct MemberStopState {
     /// the cap an identity goes unrecorded and its hold keeps the bound
     /// backstop.
     staged_keys: BTreeMap<(u64, u64), ObjectKey>,
-    /// Reverse index of `staged_keys`: the staged identities pinned
-    /// under each maps key, so a bind rejection refuses every hold on
-    /// it with one indexed lookup instead of a whole-map scan (two
-    /// staged identities can share one key on btrfs subvolume clones).
-    /// Derived 1:1 from `staged_keys`: same bound, no new cap.
-    staged_by_key: BTreeMap<ObjectKey, BTreeSet<(u64, u64)>>,
     /// Rows left in place for a retry (counted once as stopped), with
     /// the stop instant their bound runs from.
     retrying: BTreeMap<u32, u64>,
@@ -198,42 +192,18 @@ impl MemberStopState {
         }
     }
 
-    /// The staged identities pinned under `key`: reverse lookup for
-    /// bind rejections (rejection ticks only). One indexed lookup over
-    /// the reverse index, never a scan: every identity under a shared
-    /// key refuses, and an unknown key refuses nothing.
-    pub(crate) fn staged_identities_for_key(&self, key: ObjectKey) -> Vec<(u64, u64)> {
-        self.staged_by_key
-            .get(&key)
-            .map(|identities| identities.iter().copied().collect())
-            .unwrap_or_default()
-    }
-
     /// Records the maps key a staged identity pinned under. Every staging
     /// records, held or not: the intake and the drain race to queue first,
     /// so conditioning on the stop mark would miss drain-first holds, and
     /// only held identities are ever consulted. Bounded like the staged
     /// set: past the cap the key goes unrecorded, counted with the staged
     /// overflow, and the hold keeps the bound backstop. Re-recording a
-    /// retained identity moves its reverse entry off the old key.
+    /// retained identity overwrites in place at any size.
     pub(crate) fn note_staged_key(&mut self, identity: (u64, u64), key: ObjectKey) {
         if self.staged_keys.len() < MEMBER_STOP_STAGED_CAP
             || self.staged_keys.contains_key(&identity)
         {
-            if let Some(old) = self.staged_keys.insert(identity, key)
-                && old != key
-            {
-                let drop_empty = if let Some(identities) = self.staged_by_key.get_mut(&old) {
-                    identities.remove(&identity);
-                    identities.is_empty()
-                } else {
-                    false
-                };
-                if drop_empty {
-                    self.staged_by_key.remove(&old);
-                }
-            }
-            self.staged_by_key.entry(key).or_default().insert(identity);
+            self.staged_keys.insert(identity, key);
         } else {
             self.stats.stop_staged_overflow = self.stats.stop_staged_overflow.saturating_add(1);
         }
@@ -1360,10 +1330,11 @@ impl Engine {
         // rejected staging key refuses too: no slot ever builds under a
         // rejected key, so the hold's attach is impossible (never at the
         // bound). Refused takes precedence over attached below on
-        // purpose (fail-closed over-refusal): the shape needs a key
-        // rejected after its slots attached within one pass, and then
-        // the hold ends refused with the first-use row instead of
-        // risking unobserved first calls.
+        // purpose (fail-closed over-refusal): the shape needs a
+        // committed or pending key rejection to land after its slots
+        // attached within one pass, and then the hold ends refused
+        // with the first-use row instead of risking unobserved first
+        // calls. Trial-only rejections never reach this bool.
         let refused = held.providers.iter().any(|identity| {
             self.member_stops.refused.contains(identity) || self.stop_staged_key_rejected(*identity)
         });
@@ -1387,14 +1358,20 @@ impl Engine {
 
     /// Whether a stop-staged identity's maps key has been rejected since
     /// its staging: no slot ever builds under a rejected key (the bind
-    /// drops every module under it, and rejections commit sticky), so a
-    /// hold on it can never attach and ends refused. Unrecorded
-    /// identities (never staged, or past the cap) keep the bound backstop.
+    /// drops every module under it), so a hold on it can never attach
+    /// and ends refused. Committed rejections refuse, and so do the
+    /// engine's pending (uncommitted, non-trial) ones — a stalled
+    /// candidate pipeline that never commits still proves the attach
+    /// impossible. Trial builds restore the pending set, so a
+    /// trial-only rejection never refuses. Unrecorded identities
+    /// (never staged, or past the cap) keep the bound backstop.
     fn stop_staged_key_rejected(&self, identity: (u64, u64)) -> bool {
         self.member_stops
             .staged_keys
             .get(&identity)
-            .is_some_and(|key| self.pinned.rejects(*key))
+            .is_some_and(|key| {
+                self.pinned.rejects(*key) || self.pending_rejected_keys.contains(key)
+            })
     }
 
     /// Whether the provider file `identity` (its `(st_dev, st_ino)`) is
@@ -1934,102 +1911,6 @@ mod tests {
                 .staged_keys
                 .contains_key(&(0, MEMBER_STOP_STAGED_CAP as u64 + 1)),
             "the excess identity goes unrecorded"
-        );
-    }
-
-    /// Reverse lookup misses unknown keys: a bind rejection for a file no
-    /// staging recorded refuses nothing.
-    #[test]
-    fn staged_identity_lookup_misses_unknown_keys() {
-        let key = ObjectKey {
-            device: p11scope_manifest::maps::Device { major: 0, minor: 1 },
-            inode: 7,
-        };
-        let mut state = MemberStopState::default();
-        state.note_staged_key((0, 1), key);
-        let other = ObjectKey {
-            device: p11scope_manifest::maps::Device { major: 0, minor: 1 },
-            inode: 8,
-        };
-        assert_eq!(state.staged_identities_for_key(key), vec![(0, 1)]);
-        assert!(state.staged_identities_for_key(other).is_empty());
-    }
-
-    /// Reverse lookup returns every staged identity under a shared maps
-    /// key: two staged identities can share one key (btrfs subvolume
-    /// clones render the one filesystem-wide `s_dev` while `st_dev` is
-    /// per-subvolume anonymous), and a bind rejection must refuse every
-    /// hold on it, not just the first recorded.
-    #[test]
-    fn staged_lookup_returns_every_identity_under_a_shared_key() {
-        let key = ObjectKey {
-            device: p11scope_manifest::maps::Device { major: 0, minor: 1 },
-            inode: 7,
-        };
-        let mut state = MemberStopState::default();
-        state.note_staged_key((0, 1), key);
-        state.note_staged_key((1, 1), key);
-        assert_eq!(
-            state.staged_identities_for_key(key),
-            vec![(0, 1), (1, 1)],
-            "a shared key refuses every staged identity on it"
-        );
-    }
-
-    /// Re-recording a retained identity under a new key moves the
-    /// reverse lookup: the old key resolves nothing, the new key
-    /// resolves it (a stale old-key entry would refuse a hold for a
-    /// key it no longer stages under).
-    #[test]
-    fn staged_lookup_forgets_the_old_key_on_rerecord() {
-        let key = ObjectKey {
-            device: p11scope_manifest::maps::Device { major: 0, minor: 1 },
-            inode: 7,
-        };
-        let key2 = ObjectKey {
-            device: p11scope_manifest::maps::Device { major: 0, minor: 2 },
-            inode: 8,
-        };
-        let mut state = MemberStopState::default();
-        state.note_staged_key((0, 1), key);
-        state.note_staged_key((0, 1), key2);
-        assert!(
-            state.staged_identities_for_key(key).is_empty(),
-            "the old key resolves nothing after the move"
-        );
-        assert_eq!(state.staged_identities_for_key(key2), vec![(0, 1)]);
-        assert!(
-            !state.staged_by_key.contains_key(&key),
-            "the emptied old key leaves no reverse entry"
-        );
-    }
-
-    /// Reverse lookup resolves at a full staged map: the first and
-    /// last recorded identities stay resolvable at the cap (the
-    /// lookup is indexed, never a whole-map scan).
-    #[test]
-    fn staged_lookup_resolves_a_full_staged_map() {
-        let mut state = MemberStopState::default();
-        for index in 0..(MEMBER_STOP_STAGED_CAP as u64) {
-            let key = ObjectKey {
-                device: p11scope_manifest::maps::Device { major: 0, minor: 1 },
-                inode: 100 + index,
-            };
-            state.note_staged_key((0, index), key);
-        }
-        assert_eq!(state.staged_keys.len(), MEMBER_STOP_STAGED_CAP);
-        let first = ObjectKey {
-            device: p11scope_manifest::maps::Device { major: 0, minor: 1 },
-            inode: 100,
-        };
-        let last = ObjectKey {
-            device: p11scope_manifest::maps::Device { major: 0, minor: 1 },
-            inode: 100 + MEMBER_STOP_STAGED_CAP as u64 - 1,
-        };
-        assert_eq!(state.staged_identities_for_key(first), vec![(0, 0)]);
-        assert_eq!(
-            state.staged_identities_for_key(last),
-            vec![(0, MEMBER_STOP_STAGED_CAP as u64 - 1)]
         );
     }
 

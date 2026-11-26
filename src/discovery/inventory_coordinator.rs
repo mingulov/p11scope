@@ -46428,6 +46428,16 @@ int main(void) {
         batch.counts_read_ns = at + 1;
         native.stage(NativeBatch::Witness(Box::new(batch)));
         native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(
+            native
+                .scene
+                .coordinator
+                .registry
+                .gaps()
+                .iter()
+                .all(|gap| gap.subject != "revived folded count"),
+            "no fold gap for a demotion re-root that is not the evicted key"
+        );
         let edge_of = |native: &NativeScene, needle: &str| {
             let registry = &native.scene.coordinator.registry;
             registry
@@ -46444,16 +46454,6 @@ int main(void) {
         assert_eq!(a_count, 5, "A keeps exactly its history");
         let (b_count, _) = edge_of(&native, "b.so").expect("B keeps its edge");
         assert_eq!(b_count, 1, "B carries only post-demotion growth");
-        assert!(
-            native
-                .scene
-                .coordinator
-                .registry
-                .gaps()
-                .iter()
-                .all(|gap| gap.subject != "revived folded count"),
-            "no fold gap for a demotion re-root that is not the evicted key"
-        );
         // The evicted (41, exec 9) revives: the latch is still its
         // own, so it gaps instead of re-crediting.
         let row = native.row(41, 9, 7, at, 0);

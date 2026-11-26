@@ -2993,8 +2993,11 @@ fn discovery_row_marks_only_the_pre_copy_up_object() {
 #[test]
 fn discovery_evidence_without_a_pin_for_a_planned_object_files_a_gap() {
     let mut plan = plan_with(2, 0);
-    // Distinct pinless objects per slot, so each dropped row files.
+    // Distinct pinless objects and paths per slot, so each dropped
+    // row files its own distinguishable gap.
+    plan.slots[0].object_path = "/opt/p11-a.so".to_string();
     plan.slots[1].object = crate::discovery::identity::PinnedObjectId(43);
+    plan.slots[1].object_path = "/opt/p11-b.so".to_string();
     let pins = crate::discovery::identity::PinnedObjects::empty();
     let (evidence, gaps) = discovery_evidence(
         &plan,
@@ -3009,19 +3012,29 @@ fn discovery_evidence_without_a_pin_for_a_planned_object_files_a_gap() {
         evidence.modules
     );
     // Two slots + one module identity, all pinless: one named gap
-    // each, so the loss is counted, not just present.
-    assert_eq!(gaps.len(), 3, "every dropped row files a gap: {gaps:?}");
-    for gap in &gaps {
-        assert_eq!(gap.subject, "planned provider object");
-        assert!(
-            gap.reason.contains("lost its comparable pin") && gap.reason.contains("unattributed"),
-            "unexpected gap reason: {:?}",
-            gap.reason
-        );
-    }
-    assert!(
-        gaps.iter().any(|gap| gap.reason.contains("/opt/p11.so")),
-        "the gap names the planned path: {gaps:?}"
+    // each, in render order with exact text, so the loss is counted,
+    // not just present.
+    let reasons: Vec<(&str, &str)> = gaps
+        .iter()
+        .map(|gap| (gap.subject.as_str(), gap.reason.as_str()))
+        .collect();
+    assert_eq!(
+        reasons,
+        vec![
+            (
+                "planned provider object",
+                "planned object '/opt/p11-a.so' lost its comparable pin before evidence rendered; its calls are unattributed",
+            ),
+            (
+                "planned provider object",
+                "planned object '/opt/p11-b.so' lost its comparable pin before evidence rendered; its calls are unattributed",
+            ),
+            (
+                "planned provider object",
+                "planned object '/opt/p11.so' lost its comparable pin before evidence rendered; its calls are unattributed",
+            ),
+        ],
+        "every dropped row files its exact gap: {gaps:?}"
     );
 }
 
@@ -3061,12 +3074,79 @@ fn discovery_evidence_without_a_pin_for_a_planned_slot_files_a_gap() {
         "the pinless slot object leaves the row: {:?}",
         evidence.modules[0].objects
     );
-    assert_eq!(gaps.len(), 1, "one gap for the one dropped object");
-    assert_eq!(gaps[0].subject, "planned provider object");
+    assert_eq!(
+        gaps.iter()
+            .map(|gap| (gap.subject.as_str(), gap.reason.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(
+            "planned provider object",
+            "planned object '/opt/p11-gone.so' lost its comparable pin before evidence rendered; its calls are unattributed",
+        )],
+        "one exact gap for the one dropped object: {gaps:?}"
+    );
+}
+
+/// A missing module pin drops pin-bearing slot rows too: each
+/// dropped row files its own gap — the module gap plus one per
+/// live slot object naming its path — so no rendered row vanishes
+/// silently when its module cannot render.
+#[test]
+fn discovery_evidence_without_a_module_pin_gaps_its_live_slot_rows() {
+    use crate::discovery::identity::test_fixture::pin_set;
+    let key_a = ObjectKey {
+        device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+        inode: 42,
+    };
+    let key_b = ObjectKey {
+        device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+        inode: 43,
+    };
+    let pins = pin_set(
+        &[(key_a, "sha-a", 7), (key_b, "sha-b", 7)],
+        false,
+    );
+    let mut ids = pins.pinned().map(|pin| pin.id);
+    let (id_a, id_b) = (ids.next().unwrap(), ids.next().unwrap());
+    let mut plan = plan_with(2, 0);
+    plan.modules[0].object = crate::discovery::identity::PinnedObjectId(424242);
+    plan.modules[0].path = "/opt/p11.so".to_string();
+    plan.slots[0].object = id_a;
+    plan.slots[0].object_path = "/opt/p11-a.so".to_string();
+    plan.slots[1].object = id_b;
+    plan.slots[1].object_path = "/opt/p11-b.so".to_string();
+    let (evidence, gaps) = discovery_evidence(
+        &plan,
+        &pins,
+        &DiscoveryCounters::default(),
+        &crate::prearm_module::PrearmState::empty(),
+        &BTreeMap::new(),
+    );
     assert!(
-        gaps[0].reason.contains("/opt/p11-gone.so"),
-        "the gap names the dropped slot path: {:?}",
-        gaps[0].reason
+        evidence.modules.is_empty(),
+        "an unrenderable module leaves no row: {:?}",
+        evidence.modules
+    );
+    let reasons: Vec<(&str, &str)> = gaps
+        .iter()
+        .map(|gap| (gap.subject.as_str(), gap.reason.as_str()))
+        .collect();
+    assert_eq!(
+        reasons,
+        vec![
+            (
+                "planned provider object",
+                "planned slot object '/opt/p11-a.so' dropped with its unrenderable module; its calls are unattributed",
+            ),
+            (
+                "planned provider object",
+                "planned slot object '/opt/p11-b.so' dropped with its unrenderable module; its calls are unattributed",
+            ),
+            (
+                "planned provider object",
+                "planned object '/opt/p11.so' lost its comparable pin before evidence rendered; its calls are unattributed",
+            ),
+        ],
+        "the module gap plus one gap per dropped live slot row: {gaps:?}"
     );
 }
 

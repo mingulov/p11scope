@@ -11021,6 +11021,15 @@ fn discovery_evidence(
             ),
         }
     }
+    fn dropped_slot_gap(path: &str) -> Skipped {
+        Skipped {
+            subject: PLANNED_OBJECT_WITHOUT_PIN_SUBJECT.into(),
+            reason: format!(
+                "planned slot object '{}' dropped with its unrenderable module; its calls are unattributed",
+                crate::render::escape_controls(path),
+            ),
+        }
+    }
     let summary_of = |id, path: &str| {
         let pin = pinned.summary(id)?;
         Some(render::ObjectSummary {
@@ -11060,6 +11069,22 @@ fn discovery_evidence(
                 })
                 .collect();
             let identity = summary_of(m.object, &m.path).or_else(|| {
+                // The module row drops: its pin-bearing slot objects
+                // (rendered above into a row that now vanishes) file
+                // one context gap each, first occurrence wins on
+                // shared objects; pinless ones already filed in the
+                // objects loop.
+                let mut gapped: Vec<PinnedObjectId> = Vec::new();
+                for s in &plan.slots {
+                    if !(plan.is_active(s.index) && s.module_ids.contains(&m.id)) {
+                        continue;
+                    }
+                    if pinned.summary(s.object).is_none() || gapped.contains(&s.object) {
+                        continue;
+                    }
+                    gapped.push(s.object);
+                    gaps.push(dropped_slot_gap(&s.object_path));
+                }
                 gaps.push(missing_pin_gap(&m.path));
                 None
             })?;

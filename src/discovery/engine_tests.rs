@@ -3156,9 +3156,9 @@ fn discovery_evidence_without_a_module_pin_gaps_its_live_slot_rows() {
 /// `resolve_merge_inputs`, so preflight refuses (dropped pass)
 /// instead of certifying clean a publication the render would
 /// drop rows from. (Inline-degrading lookups — the pre-copy-up
-/// flag, the first-loaded-by annotation, the manifest fallbacks —
-/// need no preflight: they render degraded output, never drop
-/// rows.)
+/// flag, the first-loaded-by annotation, the manifest fallbacks,
+/// the dropped-module slot-context probes — need no preflight:
+/// they render degraded output, never drop rows.)
 #[test]
 fn resolve_merge_inputs_refuses_plan_objects_without_pins() {
     use crate::discovery::identity::test_fixture::pin_set;

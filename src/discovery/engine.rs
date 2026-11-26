@@ -1424,6 +1424,13 @@ pub struct Engine {
     /// candidate. Stays armed until cleared.
     #[cfg(test)]
     fail_candidate_with_pid_for_test: Option<u32>,
+    /// Test-only persistent poison: like `fail_candidate_with_pid_for_test`
+    /// but failing after the bind, modelling a newcomer whose build
+    /// queues pending rejections and then breaks (plan extension can
+    /// fail after the bind filled the pending set). Stays armed until
+    /// cleared.
+    #[cfg(test)]
+    fail_candidate_with_pid_after_bind_for_test: Option<u32>,
     /// Test-only: every full candidate rebuild fails (the unchanged-tick
     /// fast path is untouched), modelling committed reuse state that a
     /// fresh rebuild cannot use whatever the newcomers.
@@ -15378,6 +15385,8 @@ impl Engine {
             fail_inventory_candidate_call_for_test: None,
             #[cfg(test)]
             fail_candidate_with_pid_for_test: None,
+            #[cfg(test)]
+            fail_candidate_with_pid_after_bind_for_test: None,
             #[cfg(test)]
             fail_full_candidate_rebuild_for_test: false,
             #[cfg(test)]
@@ -34557,6 +34566,12 @@ impl Engine {
             removed,
             Some(&pre_carriers),
         )?;
+        #[cfg(test)]
+        if let Some(poison) = self.fail_candidate_with_pid_after_bind_for_test
+            && new_views.iter().any(|(view, _, _)| view.pid() == poison)
+        {
+            bail!("test-forced post-bind candidate failure");
+        }
         candidate.views.retain(|view| !carried.contains(view));
         candidate
             .views

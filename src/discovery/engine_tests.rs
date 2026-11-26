@@ -98541,6 +98541,289 @@ fn member_stop_trial_only_rejection_keeps_a_live_hold_attached() {
     );
 }
 
+/// Mixed newcomer isolation clears trial-only rejections before the
+/// final rebuild: one healthy newcomer, one broken newcomer whose
+/// trial binds a rejected staged key and then fails (post-bind
+/// poison, modelling a plan-extension failure after the bind filled
+/// the pending set). The pre-rebuild restore drops the broken
+/// trial's key and the survivor rebuilds clean, so the live hold
+/// ends attached.
+#[test]
+fn member_stop_trial_mixed_newcomers_clear_trial_keys_before_rebuild() {
+    let (fixture1, view1, module1, _pins1) = loaded_seed_provider();
+    let pid1 = fixture1.child.id();
+    let library1 = fixture1._dir.path().join("seed-provider.so");
+    let (fixture2, view2, module2, _pins2) = loaded_seed_provider();
+    stop_member_for_test(pid1);
+    let key = member_exec_key_for_test(pid1, &library1);
+    let mut io = ScriptedMemberStops::default();
+    io.rows.insert(pid1, member_stop_row(pid1, &library1, key));
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    assert!(engine.member_stops_held(), "intake holds the mapper");
+    engine.service_learned_files();
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        1,
+        "the staging lands"
+    );
+    engine.service_member_stops(&mut io, &mut session, Some(20));
+    assert!(
+        engine.member_stops_held(),
+        "no stamps: the hold waits for its attach"
+    );
+    let staged_key = engine
+        .prearm_input
+        .as_ref()
+        .and_then(|prearm| prearm.inputs.first().map(|input| input.key))
+        .expect("staging records its key");
+    assert_eq!(
+        module1.key, staged_key,
+        "the fixture scan names the staged key"
+    );
+    let file = std::fs::File::open(&library1).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    let attached: Vec<u32> = session
+        .attached_requests
+        .iter()
+        .flat_map(|targets| targets.iter().map(|(slot, _, _)| *slot))
+        .collect();
+    assert!(!attached.is_empty(), "the apply attached slots");
+    for slot in attached {
+        session.scripted_stamps.insert(slot, 5);
+        session.scripted_links.insert(slot);
+    }
+    assert!(
+        engine.provider_attached_for_test((dev, ino), &session),
+        "stamps landed: the attach side holds"
+    );
+    assert!(!engine.pinned.rejects(staged_key), "nothing committed");
+    assert!(
+        !engine.pending_rejected_keys.contains(&staged_key),
+        "nothing pending"
+    );
+    // The mixed trial: A healthy, B binds the rejected staged key and
+    // then fails.
+    let pins_a = engine.pinned.clone();
+    let mut pins_b = engine.pinned.clone();
+    pins_b.reapply_rejected_keys(&std::collections::BTreeSet::from([staged_key]));
+    engine.fail_candidate_with_pid_after_bind_for_test = Some(view2.pid());
+    let mut new_views = vec![
+        (view1, vec![module1], pins_a),
+        (view2, vec![module2], pins_b),
+    ];
+    let saved = engine.pending_rejected_keys.clone();
+    let calls_before = engine.inventory_candidate_calls_for_test;
+    let mut skipped = Vec::new();
+    let mut tick: fn() -> Option<u64> = || None;
+    let isolation = engine.isolate_broken_newcomers(
+        &std::collections::BTreeSet::new(),
+        &[],
+        &mut new_views,
+        &mut skipped,
+        &std::collections::BTreeSet::new(),
+        saved.clone(),
+        &mut tick,
+    );
+    engine.fail_candidate_with_pid_after_bind_for_test = None;
+    let isolation = isolation.expect("mixed newcomers rebuild a final candidate");
+    assert_eq!(new_views.len(), 1, "the broken newcomer is excluded");
+    assert!(
+        isolation.held.contains(&fixture2.child.id()) || isolation.held.len() == 1,
+        "one newcomer held back: {:?}",
+        isolation.held
+    );
+    assert!(
+        engine.inventory_candidate_calls_for_test >= calls_before + 4,
+        "baseline, both trials and the final rebuild ran"
+    );
+    assert_eq!(
+        engine.pending_rejected_keys, saved,
+        "the pre-rebuild restore clears the trial key"
+    );
+    assert!(
+        !engine.hold_refused_for_test((dev, ino)),
+        "a trial-only rejection records no refusal"
+    );
+    assert!(
+        engine.provider_attached_for_test((dev, ino), &session),
+        "the slots stay live"
+    );
+    engine.service_member_stops(&mut io, &mut session, Some(10_000_000));
+    assert!(!engine.member_stops_held(), "the hold ends");
+    let stats = engine.member_stop_stats_for_test();
+    assert_eq!(stats.attached_resumes, 1, "{stats:?}");
+    assert_eq!(stats.refused_resumes, 0, "{stats:?}");
+    assert_eq!(stats.timed_out, 0, "{stats:?}");
+    assert!(
+        !files_the_first_use_row(&engine),
+        "an attached end files no gap row"
+    );
+    let _ = fixture2;
+}
+
+/// Isolation entry restores the pre-first-build pending set:
+/// first-build pollution is discarded before the baseline runs, so a
+/// staged key rejected only by the failed first build never refuses
+/// a live hold.
+#[test]
+fn member_stop_trial_entry_discards_first_build_pollution() {
+    let (fixture, view, module, _pins) = loaded_seed_provider();
+    let pid = fixture.child.id();
+    let library = fixture._dir.path().join("seed-provider.so");
+    stop_member_for_test(pid);
+    let key = member_exec_key_for_test(pid, &library);
+    let mut io = ScriptedMemberStops::default();
+    io.rows.insert(pid, member_stop_row(pid, &library, key));
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    assert!(engine.member_stops_held(), "intake holds the mapper");
+    engine.service_learned_files();
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        1,
+        "the staging lands"
+    );
+    engine.service_member_stops(&mut io, &mut session, Some(20));
+    assert!(
+        engine.member_stops_held(),
+        "no stamps: the hold waits for its attach"
+    );
+    let staged_key = engine
+        .prearm_input
+        .as_ref()
+        .and_then(|prearm| prearm.inputs.first().map(|input| input.key))
+        .expect("staging records its key");
+    let file = std::fs::File::open(&library).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    let attached: Vec<u32> = session
+        .attached_requests
+        .iter()
+        .flat_map(|targets| targets.iter().map(|(slot, _, _)| *slot))
+        .collect();
+    assert!(!attached.is_empty(), "the apply attached slots");
+    for slot in attached {
+        session.scripted_stamps.insert(slot, 5);
+        session.scripted_links.insert(slot);
+    }
+    assert!(
+        engine.provider_attached_for_test((dev, ino), &session),
+        "stamps landed: the attach side holds"
+    );
+    assert!(!engine.pinned.rejects(staged_key), "nothing committed");
+    // First-build pollution: the failed first build queued the key;
+    // the pre-first-build set is empty.
+    engine.pending_rejected_keys.insert(staged_key);
+    let mut trial_pins = engine.pinned.clone();
+    trial_pins.reapply_rejected_keys(&std::collections::BTreeSet::from([staged_key]));
+    let mut new_views = vec![(view, vec![module], trial_pins)];
+    let saved = std::collections::BTreeSet::new();
+    let mut skipped = Vec::new();
+    let mut tick: fn() -> Option<u64> = || None;
+    let isolation = engine.isolate_broken_newcomers(
+        &std::collections::BTreeSet::new(),
+        &[],
+        &mut new_views,
+        &mut skipped,
+        &std::collections::BTreeSet::new(),
+        saved.clone(),
+        &mut tick,
+    );
+    assert!(
+        isolation.is_none(),
+        "a clean trial takes the no-broken early return"
+    );
+    assert_eq!(
+        engine.pending_rejected_keys, saved,
+        "entry plus restores clear the pollution and the trial key"
+    );
+    assert!(
+        !engine.hold_refused_for_test((dev, ino)),
+        "a trial-only rejection records no refusal"
+    );
+    assert!(
+        engine.provider_attached_for_test((dev, ino), &session),
+        "the slots stay live"
+    );
+    engine.service_member_stops(&mut io, &mut session, Some(10_000_000));
+    assert!(!engine.member_stops_held(), "the hold ends");
+    let stats = engine.member_stop_stats_for_test();
+    assert_eq!(stats.attached_resumes, 1, "{stats:?}");
+    assert_eq!(stats.refused_resumes, 0, "{stats:?}");
+    assert_eq!(stats.timed_out, 0, "{stats:?}");
+    assert!(
+        !files_the_first_use_row(&engine),
+        "an attached end files no gap row"
+    );
+}
+
+/// All-broken isolation reinstates the baseline pending set: with
+/// every newcomer excluded, the final candidate is the baseline and
+/// its pending set stands — so a staged key pending from before the
+/// isolation still refuses its hold.
+#[test]
+fn member_stop_trial_all_broken_keeps_the_baseline_pending() {
+    let (fixture, view, module, _pins) = loaded_seed_provider();
+    let pid = fixture.child.id();
+    let library = fixture._dir.path().join("seed-provider.so");
+    stop_member_for_test(pid);
+    let key = member_exec_key_for_test(pid, &library);
+    let mut io = ScriptedMemberStops::default();
+    io.rows.insert(pid, member_stop_row(pid, &library, key));
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    assert!(engine.member_stops_held(), "intake holds the mapper");
+    engine.service_learned_files();
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        1,
+        "the staging lands"
+    );
+    let staged_key = engine
+        .prearm_input
+        .as_ref()
+        .and_then(|prearm| prearm.inputs.first().map(|input| input.key))
+        .expect("staging records its key");
+    assert!(!engine.pinned.rejects(staged_key), "nothing committed");
+    // Baseline pending: the key was queued before the isolation.
+    engine.pending_rejected_keys.insert(staged_key);
+    let saved = engine.pending_rejected_keys.clone();
+    // One poisoned newcomer: excluded before its bind.
+    engine.fail_candidate_with_pid_for_test = Some(view.pid());
+    let mut new_views = vec![(view, vec![module], engine.pinned.clone())];
+    let mut skipped = Vec::new();
+    let mut tick: fn() -> Option<u64> = || None;
+    let isolation = engine.isolate_broken_newcomers(
+        &std::collections::BTreeSet::new(),
+        &[],
+        &mut new_views,
+        &mut skipped,
+        &std::collections::BTreeSet::new(),
+        saved.clone(),
+        &mut tick,
+    );
+    engine.fail_candidate_with_pid_for_test = None;
+    let isolation = isolation.expect("all-broken isolation reuses the baseline");
+    assert!(new_views.is_empty(), "every newcomer is excluded");
+    assert_eq!(isolation.held.len(), 1, "one newcomer held back");
+    assert_eq!(
+        engine.pending_rejected_keys, saved,
+        "the baseline pending set stands"
+    );
+    engine.service_member_stops(&mut io, &mut session, Some(10_000_000));
+    assert!(!engine.member_stops_held(), "the hold ends");
+    let stats = engine.member_stop_stats_for_test();
+    assert_eq!(stats.refused_resumes, 1, "{stats:?}");
+    assert_eq!(stats.timed_out, 0, "{stats:?}");
+    assert!(
+        files_the_first_use_row(&engine),
+        "the refused hold files the first-use row"
+    );
+}
+
 /// A pending rejection beats live slots: refused takes precedence
 /// over attached (deliberate fail-closed over-refusal for a
 /// committed or pending rejection that lands after the attach).

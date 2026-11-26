@@ -5103,13 +5103,15 @@ impl PinnedObjects {
 
     /// Whether `entry` supersedes every observation kept under `key`:
     /// a same-file generation rotation (stepped ctime, identical
-    /// bytes) with a live scan on one side. Evicts the stale entries,
-    /// records the rotation, and returns true; the caller then files
-    /// `entry` through the fresh-insert path, so the key stays
-    /// routable and the attach races on. A false return keeps today's
-    /// rejection. The merge above already failed, and the predicate
-    /// pins every other merge conjunct (mapping, fd device, digest,
-    /// inode uniqueness), so a firing arm always rotates the pin.
+    /// bytes, same observation path) with a live scan on one side.
+    /// Evicts the stale entries, records the rotation, and returns
+    /// true; the caller then files `entry` through the fresh-insert
+    /// path, so the key stays routable and the attach races on. A
+    /// false return keeps today's rejection. The merge above already
+    /// failed, and the predicate pins every merge conjunct (mapping,
+    /// fd device, digest, inode uniqueness) plus the observation path,
+    /// so a firing arm always rotates the pin in place — never across
+    /// a rename, which keeps failing closed through the collision path.
     fn supersede_same_file_generation(
         &mut self,
         key: ObjectKey,
@@ -5130,9 +5132,10 @@ impl PinnedObjects {
             return false;
         }
         // Unanimity: every kept observation must be the same kernel
-        // file with the same hashed bytes under the same mount view.
-        // A rewrite, a distinct file, an unhashed or cross-view side,
-        // or a proven pre fails closed instead.
+        // file with the same hashed bytes under the same mount view
+        // and observation path. A rewrite, a distinct file, an
+        // unhashed, cross-view or moved-path side, or a proven pre
+        // fails closed instead.
         let rotation = !same_key.is_empty()
             && same_key.iter().all(|id| {
                 self.by_id.get(id).is_some_and(|kept| {
@@ -5141,6 +5144,7 @@ impl PinnedObjects {
                         && kept.sha256 == entry.sha256
                         && kept.mapping == entry.mapping
                         && kept.fd_dev == entry.fd_dev
+                        && kept.raw.path == entry.raw.path
                         && same_kernel_file(&kept.file, &entry.file)
                 })
             });
@@ -20856,6 +20860,35 @@ mod tests {
             "stale proven targets are gone"
         );
         assert_eq!(acc.pinned().count(), 1, "the fresh entry files");
+    }
+
+    #[test]
+    fn absorbing_same_file_rotation_under_a_moved_path_still_rejects() {
+        // Same file, same bytes, stepped ctime — but the observation
+        // moved path (a rename): the retained spelling dangles, so the
+        // rotation fails closed through the collision path instead of
+        // superseding.
+        // Engine-level twin: e07_same_key_renamed_path_replaces_stale_module.
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let mut staged = prearm_pin(key, "aaaaaaaa", 1);
+        reback(&mut staged, &file);
+        let mut acc = PinnedObjects::empty();
+        assert!(acc.absorb(staged).is_empty());
+        let mut scan = image_pins(&[(key, "aaaaaaaa", 2)]);
+        reback(&mut scan, &file);
+        let staged_mapping = acc.by_id.values().next().unwrap().mapping;
+        scan.by_id.values_mut().next().unwrap().mapping = staged_mapping;
+        repath_single_pin(&mut scan, "/usr/lib/softhsm/libsofthsm2-moved.so");
+        let skipped = acc.absorb(scan);
+        assert!(acc.rejects(key), "a moved path fails closed");
+        assert!(!acc.supersedes(key), "no supersede across a rename");
+        assert_eq!(acc.pinned().count(), 0);
+        assert!(!skipped.is_empty(), "the rejection is disclosed");
     }
 
     #[test]

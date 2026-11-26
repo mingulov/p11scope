@@ -1546,6 +1546,20 @@ fn folded_other_pid_aggregate_without_returns_is_ignored() {
 }
 
 #[test]
+fn folded_ledger_aggregate_without_calls_errors() {
+    // A ledger row with zero mechanism calls is a hard error naming
+    // the missing calls, even with positive entries and API returns
+    // (deleting the calls check would count it).
+    let report = folded_report(vec![folded_module_full(4242, 0, Some(0), 5, 5)]);
+    let error = count_folded_ledger_aggregates(&report, 4242)
+        .expect_err("the calls-less ledger row errors");
+    assert!(
+        format!("{error:#}").contains("records mechanism calls"),
+        "the error names the missing mechanism calls: {error:#}"
+    );
+}
+
+#[test]
 fn folded_ledger_aggregate_without_ok_errors() {
     // A ledger row whose returns carry no CKR_OK is a hard error
     // naming the missing proof (a silent skip would return Ok(0)).

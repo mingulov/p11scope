@@ -3523,7 +3523,20 @@ fn clear_startup_signal_dispositions_for_test() {
     STARTUP_SIGNAL_DISPOSITIONS.store(0, Ordering::SeqCst);
 }
 
+/// B2 class guard (test builds only): set while the current test
+/// thread holds `ActualSignalTestGuard`.
+#[cfg(test)]
+thread_local! {
+    static SIGNAL_TEST_HOLDING: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
 fn install_stop_flag() -> Result<Arc<SignalState>> {
+    #[cfg(test)]
+    debug_assert!(
+        SIGNAL_TEST_HOLDING.with(|held| held.get()),
+        "install_stop_flag in tests must hold ActualSignalTestGuard (see the B2 site table)",
+    );
     let state = Arc::new(SignalState::new());
     for signal in STOP_SIGNALS {
         if signal == libc::SIGHUP && !should_install_hangup_handler(current_disposition(signal)) {
@@ -14787,6 +14800,39 @@ mod tests {
 
     static ACTUAL_SIGNAL_TEST: Mutex<()> = Mutex::new(());
 
+    /// B2 class guard: whoever installs stop handlers (or dances
+    /// dispositions) in a test holds this. It locks
+    /// `ACTUAL_SIGNAL_TEST` and marks this thread; `install_stop_flag`
+    /// debug-asserts the mark, so an unguarded install fails loudly
+    /// instead of racing a fidelity test's dispositions.
+    struct ActualSignalTestGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ActualSignalTestGuard {
+        fn hold() -> Self {
+            let lock = ACTUAL_SIGNAL_TEST.lock().unwrap();
+            super::SIGNAL_TEST_HOLDING.with(|held| held.set(true));
+            Self { _lock: lock }
+        }
+    }
+
+    impl Drop for ActualSignalTestGuard {
+        fn drop(&mut self) {
+            super::SIGNAL_TEST_HOLDING.with(|held| held.set(false));
+        }
+    }
+
+    /// B2: installing without the guard panics (the class guard
+    /// fires before any registration, so no handler is installed).
+    #[test]
+    fn installing_without_the_guard_panics() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = super::install_stop_flag();
+        }));
+        assert!(result.is_err(), "unguarded install must panic");
+    }
+
     /// CLI text: an all-clear newcomer-queue line stays off default
     /// stderr (statistics print under `-v` or
     /// `P11SCOPE_CAPTURE_DIAGNOSTICS=1`, per the documented stderr
@@ -15145,7 +15191,7 @@ mod tests {
 
     #[test]
     fn stopped_preexec_release_observes_actual_sigterm_before_rescue() {
-        let _signal_guard = ACTUAL_SIGNAL_TEST.lock().unwrap();
+        let _signal_guard = ActualSignalTestGuard::hold();
         let signals = install_stop_flag().unwrap();
         let directory = tempfile::tempdir().unwrap();
         let marker = directory.path().join("ran");
@@ -15443,7 +15489,7 @@ mod tests {
     /// same dispositions either way.
     #[test]
     fn the_pre_exec_child_does_not_inherit_the_observer_stop_handlers() {
-        let _signal_guard = ACTUAL_SIGNAL_TEST.lock().unwrap();
+        let _signal_guard = ActualSignalTestGuard::hold();
         let _stop = install_stop_flag().unwrap();
         let both = (1u64 << (libc::SIGINT - 1)) | (1u64 << (libc::SIGTERM - 1));
         assert_eq!(
@@ -24178,6 +24224,7 @@ int main(int argc, char **argv) {
     /// command (the command here could not even run).
     #[test]
     fn a_nested_observer_refuses_run_before_anything_is_forked() {
+        let _signal_guard = ActualSignalTestGuard::hold();
         let error = nested(|| {
             run_owned(&run_args(
                 cli::PausePolicy::Never,
@@ -24224,7 +24271,7 @@ int main(int argc, char **argv) {
 
     #[test]
     fn refused_multi_host_precedes_capture_sinks_and_empty_provider_discovery() {
-        let _signal_guard = ACTUAL_SIGNAL_TEST.lock().unwrap();
+        let _signal_guard = ActualSignalTestGuard::hold();
         use crate::attach::{MultiHostRefusal, MultiHostStage};
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path().join("existing-trace.jsonl");
@@ -24260,7 +24307,7 @@ int main(int argc, char **argv) {
 
     #[test]
     fn refused_multi_host_precedes_owned_workload_and_output() {
-        let _signal_guard = ACTUAL_SIGNAL_TEST.lock().unwrap();
+        let _signal_guard = ActualSignalTestGuard::hold();
         use crate::attach::{MultiHostRefusal, MultiHostStage};
         let dir = tempfile::tempdir().unwrap();
         let sentinel = dir.path().join("workload-ran");
@@ -24470,6 +24517,7 @@ int main(int argc, char **argv) {
 
     #[test]
     fn counter_capture_and_run_require_host_after_build_policy_validation() {
+        let _signal_guard = ActualSignalTestGuard::hold();
         use crate::attach::{MultiHostRefusal, MultiHostStage};
         use p11scope_ebpf_common::CounterMode;
         for mode in [
@@ -24528,6 +24576,7 @@ int main(int argc, char **argv) {
 
     #[test]
     fn counter_modes_pass_the_cli_gate_into_capture_setup() {
+        let _signal_guard = ActualSignalTestGuard::hold();
         // Builds without counter objects (SMALL) refuse every mode
         // by name at the policy gate instead of reaching setup.
         let objects = env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") == "1";
@@ -24562,6 +24611,7 @@ int main(int argc, char **argv) {
 
     #[test]
     fn counter_modes_pass_the_cli_gate_into_owned_run_setup() {
+        let _signal_guard = ActualSignalTestGuard::hold();
         // Builds without counter objects (SMALL) refuse every mode
         // by name at the policy gate instead of reaching setup.
         let objects = env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") == "1";
@@ -25097,6 +25147,7 @@ int main(int argc, char **argv) {
     /// even opened (this PID cannot exist).
     #[test]
     fn a_nested_observer_refuses_a_pid_capture_before_opening_its_target() {
+        let _signal_guard = ActualSignalTestGuard::hold();
         let error = nested(|| {
             capture(&capture_args(ScopeArg::Pid(i32::MAX as u32)))
                 .expect_err("a nested observer must refuse --pid")
@@ -25116,6 +25167,7 @@ int main(int argc, char **argv) {
     /// self-probe, which would otherwise fail and point at the override.
     #[test]
     fn an_unserved_proc_refuses_a_system_capture_by_name() {
+        let _signal_guard = ActualSignalTestGuard::hold();
         let unserved = crate::pidns::PidNumbering {
             observer: crate::pidns::ObserverPidNs::Unknown("/proc/self/ns/pid: ENOENT".into()),
             proc_view: crate::pidns::ProcView::Unserved("/proc/self: ENOENT".into()),
@@ -25500,6 +25552,7 @@ int main(int argc, char **argv) {
     /// `PARTIAL` instead of a refusal.
     #[test]
     fn every_owned_run_error_category_is_named_and_distinct() {
+        let _signal_guard = ActualSignalTestGuard::hold();
         // exec: named as its own category before anything is forked.
         let exec = format!(
             "{:#}",
@@ -30402,6 +30455,9 @@ int main(int argc, char **argv) {
     #[test]
     fn installing_the_stop_flag_overrides_inherited_ignore() {
         if std::env::var("P11SCOPE_F11_CHILD").is_ok() {
+            // Fresh process, no contention, but the install contract
+            // requires the guard all the same.
+            let _signal_guard = ActualSignalTestGuard::hold();
             // SAFETY: `signal` with SIG_IGN installs no handler code;
             // `raise` delivers SIGINT to this thread, whose handler
             // the install below provides.
@@ -30451,6 +30507,9 @@ int main(int argc, char **argv) {
     #[ignore = "privileged: startup stop through real capture startup (needs BPF probe admission)"]
     fn startup_stop_in_host_window_refuses_and_leaves_no_temp() {
         if std::env::var("P11SCOPE_F11_SEAM_CHILD").is_ok() {
+            // Fresh process, no contention, but the install contract
+            // requires the guard all the same.
+            let _signal_guard = ActualSignalTestGuard::hold();
             // SAFETY: `signal` installs no handler code; `raise`
             // delivers SIGINT to this thread, whose handler the
             // install below provides.
@@ -30604,7 +30663,7 @@ int main(int argc, char **argv) {
     /// mid-write.
     #[test]
     fn sigterm_sets_the_stop_flag() {
-        let _signal_guard = ACTUAL_SIGNAL_TEST.lock().unwrap();
+        let _signal_guard = ActualSignalTestGuard::hold();
         let stop = install_stop_flag().unwrap();
         assert!(!should_stop(&stop, Duration::ZERO, None));
         // SAFETY: raise() with a handled signal; the handler only sets atomics.
@@ -30675,7 +30734,7 @@ int main(int argc, char **argv) {
     /// mask and flags — not the handler alone with a zeroed mask/flags.
     #[test]
     fn restore_disposition_restores_the_whole_saved_sigaction() {
-        let _signal_guard = ACTUAL_SIGNAL_TEST.lock().unwrap();
+        let _signal_guard = ActualSignalTestGuard::hold();
         // SIGUSR2: no p11scope path installs or reads it.
         let signal = libc::SIGUSR2;
         let original = full_sigaction(signal);
@@ -30734,7 +30793,7 @@ int main(int argc, char **argv) {
     /// or burning grace into SIGKILL (137).
     #[test]
     fn sighup_stops_the_capture_like_sigterm_and_resumes_a_held_child() {
-        let _signal_guard = ACTUAL_SIGNAL_TEST.lock().unwrap();
+        let _signal_guard = ActualSignalTestGuard::hold();
         // Never depend on the runner's inherited dispositions: the suite
         // itself may run under a SIGHUP-ignoring parent. Only an ignore is
         // reset — signal_hook installs its OS handler once per process, so
@@ -30790,7 +30849,7 @@ int main(int argc, char **argv) {
     /// hangup is sent; the disposition is read back directly.
     #[test]
     fn inherited_sighup_ignore_survives_stop_flag_install() {
-        let _signal_guard = ACTUAL_SIGNAL_TEST.lock().unwrap();
+        let _signal_guard = ActualSignalTestGuard::hold();
         let _restore = RestoreDisposition::save(libc::SIGHUP);
         set_disposition(libc::SIGHUP, libc::SIG_IGN);
         let _stop = install_stop_flag().unwrap();
@@ -30844,7 +30903,7 @@ int main(int argc, char **argv) {
     /// here: the child reads only the captured startup state.
     #[test]
     fn owned_command_inherits_ignored_stop_dispositions() {
-        let _signal_guard = ACTUAL_SIGNAL_TEST.lock().unwrap();
+        let _signal_guard = ActualSignalTestGuard::hold();
         let _restore_int = RestoreDisposition::save(libc::SIGINT);
         let _restore_hup = RestoreDisposition::save(libc::SIGHUP);
         let _clear_store = ClearStartupDispositions;
@@ -31207,7 +31266,7 @@ int main(int argc, char **argv) {
     fn owned_command_restores_captured_ignores_through_the_stop_flag_install() {
         use std::io::Read as _;
 
-        let _signal_guard = ACTUAL_SIGNAL_TEST.lock().unwrap();
+        let _signal_guard = ActualSignalTestGuard::hold();
         let own_before = [
             signal_disposition(libc::SIGINT),
             signal_disposition(libc::SIGTERM),
@@ -31314,7 +31373,7 @@ int main(int argc, char **argv) {
         );
         let sleeper =
             std::env::var(G7_SLEEPER_ENV).expect("P11SCOPE_G7_SLEEPER names the sleeper binary");
-        let _signal_guard = ACTUAL_SIGNAL_TEST.lock().unwrap();
+        let _signal_guard = ActualSignalTestGuard::hold();
         for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
             set_disposition(signal, libc::SIG_DFL);
         }
@@ -31369,7 +31428,7 @@ int main(int argc, char **argv) {
     fn install_through_capture_pins_in_a_fresh_registry() {
         use std::process::Stdio;
 
-        let _signal_guard = ACTUAL_SIGNAL_TEST.lock().unwrap();
+        let _signal_guard = ActualSignalTestGuard::hold();
         let own_before = [
             signal_disposition(libc::SIGINT),
             signal_disposition(libc::SIGTERM),
@@ -31436,7 +31495,7 @@ int main(int argc, char **argv) {
     /// SIGHUP at its default, like every other stop signal.
     #[test]
     fn the_pre_exec_child_does_not_inherit_the_observer_hangup_handler() {
-        let _signal_guard = ACTUAL_SIGNAL_TEST.lock().unwrap();
+        let _signal_guard = ActualSignalTestGuard::hold();
         // As in the hangup stop test: reset only an ignore, never disarm
         // an already-installed handler behind the registry's back.
         if signal_disposition(libc::SIGHUP) == libc::SIG_IGN {
@@ -31662,7 +31721,7 @@ int main(int argc, char **argv) {
     fn sigkill_of_the_observer_resumes_a_stopped_owned_child() {
         use std::io::Read as _;
 
-        let _signal_guard = ACTUAL_SIGNAL_TEST.lock().unwrap();
+        let _signal_guard = ActualSignalTestGuard::hold();
         // SAFETY: prctl with only integer arguments.
         assert_eq!(
             unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) },

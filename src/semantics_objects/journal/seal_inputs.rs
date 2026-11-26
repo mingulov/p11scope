@@ -1,6 +1,5 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-// SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
-
+//! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Versioned seal-scan inputs.
 //!
 //! A production seal scans staging across polls and keeps partial and

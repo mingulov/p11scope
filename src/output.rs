@@ -4472,6 +4472,80 @@ mod tests {
         assert_eq!(temp_litter(dir.path()), Vec::<String>::new());
     }
 
+    /// Redirects process stderr to `path` until dropped (restores even
+    /// on panic). Other test threads may interleave; the capture
+    /// asserts the absence of unique values, so interleaving is
+    /// harmless. Mirrors the prearm witness capture.
+    struct StderrCapture {
+        saved: std::os::fd::OwnedFd,
+    }
+
+    impl StderrCapture {
+        fn start(path: &std::path::Path) -> Self {
+            use std::os::unix::io::{AsRawFd as _, FromRawFd as _};
+            let file = std::fs::File::create(path).expect("stderr capture file");
+            // SAFETY: dup of the stderr fd; checked return.
+            let saved_raw = unsafe { libc::dup(2) };
+            assert!(saved_raw >= 0, "dup stderr");
+            // SAFETY: owned dup from the checked call above.
+            let saved = unsafe { std::os::fd::OwnedFd::from_raw_fd(saved_raw) };
+            // SAFETY: flush C streams before swapping the fd.
+            unsafe {
+                libc::fflush(std::ptr::null_mut());
+            }
+            // SAFETY: stderr (fd 2) redirected to the capture file; checked.
+            let redirected = unsafe { libc::dup2(file.as_raw_fd(), 2) };
+            assert_eq!(redirected, 2, "redirect stderr");
+            Self { saved }
+        }
+    }
+
+    impl Drop for StderrCapture {
+        fn drop(&mut self) {
+            use std::os::unix::io::AsRawFd as _;
+            // SAFETY: restore stderr from the saved dup; best effort.
+            unsafe {
+                libc::fflush(std::ptr::null_mut());
+                libc::dup2(self.saved.as_raw_fd(), 2);
+            }
+        }
+    }
+
+    /// The typed stderr capture for the commit path: a commit that
+    /// falls back to the recovery dir returns the typed failure, and
+    /// the output layer itself writes no recovery line to stderr —
+    /// callers print the returned message exactly once. The capture
+    /// asserts the absence of this run's unique `-o` and saved paths.
+    #[test]
+    fn commit_with_outcome_prints_no_recovery_line_itself() {
+        let dir = private_tempdir();
+        let path = dir.path().join("observed.json");
+        let recovered_parent = private_tempdir();
+        let recovered_base = recovered_parent.path().join("p11scope-recovered");
+        let mut a = AtomicFile::create(&path).unwrap();
+        std::io::Write::write_all(a.file(), b"{\"ok\":true}").unwrap();
+        a.fail_sync_with = Some(libc::EIO);
+        let _override = hold_recovered_override(&recovered_base);
+        let capture_path = dir.path().join("stderr-capture.log");
+        let capture = StderrCapture::start(&capture_path);
+        let failure = a.commit_with_outcome().unwrap_err();
+        drop(capture);
+        assert_eq!(failure.kind(), CommitFailureKind::SavedToRecovery);
+        let saved = failure
+            .saved_to_recovery()
+            .expect("a saved fallback names its path")
+            .to_path_buf();
+        assert_eq!(std::fs::read(&saved).unwrap(), b"{\"ok\":true}");
+        let captured = std::fs::read_to_string(&capture_path).unwrap();
+        for unique in [path.display().to_string(), saved.display().to_string()] {
+            assert!(
+                !captured.contains(&unique),
+                "the output layer printed its own recovery line: {unique:?} in {captured:?}"
+            );
+        }
+        assert_eq!(temp_litter(dir.path()), Vec::<String>::new());
+    }
+
     /// A refused recovery dir (a planted symlink here) reports a typed
     /// `RecoveryFailed` failure: no saved path, the message carries
     /// both errors with `capture lost`, and nothing is created through

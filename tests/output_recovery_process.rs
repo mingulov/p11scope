@@ -240,13 +240,18 @@ impl Drop for SleepTarget {
     }
 }
 
+fn private_output_dir(path: &Path) {
+    std::fs::create_dir(path).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
 fn cases(root: &Path, target: Option<&SleepTarget>) -> Vec<(String, Vec<String>, &'static str)> {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/inventory-diff/scan-current.json");
     let mut cases = Vec::new();
     if let Some(target) = target {
         let out = root.join("profile-out");
-        std::fs::create_dir(&out).unwrap();
+        private_output_dir(&out);
         cases.push((
             "profile".to_string(),
             vec![
@@ -262,7 +267,7 @@ fn cases(root: &Path, target: Option<&SleepTarget>) -> Vec<(String, Vec<String>,
         ));
     }
     let cbom_out = root.join("cbom-out");
-    std::fs::create_dir(&cbom_out).unwrap();
+    private_output_dir(&cbom_out);
     cases.push((
         "cbom".to_string(),
         vec![
@@ -276,7 +281,7 @@ fn cases(root: &Path, target: Option<&SleepTarget>) -> Vec<(String, Vec<String>,
         "write",
     ));
     let inventory_out = root.join("inventory-out");
-    std::fs::create_dir(&inventory_out).unwrap();
+    private_output_dir(&inventory_out);
     cases.push((
         "inventory".to_string(),
         vec![

@@ -98541,6 +98541,67 @@ fn member_stop_trial_only_rejection_keeps_a_live_hold_attached() {
     );
 }
 
+/// A pending rejection beats live slots: refused takes precedence
+/// over attached (deliberate fail-closed over-refusal for a
+/// committed or pending rejection that lands after the attach).
+#[test]
+fn member_stop_pending_rejection_beats_live_slots() {
+    let (fixture, _view, _module, _pins) = loaded_seed_provider();
+    let pid = fixture.child.id();
+    let library = fixture._dir.path().join("seed-provider.so");
+    stop_member_for_test(pid);
+    let key = member_exec_key_for_test(pid, &library);
+    let mut io = ScriptedMemberStops::default();
+    io.rows.insert(pid, member_stop_row(pid, &library, key));
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    assert!(engine.member_stops_held(), "intake holds the mapper");
+    engine.service_learned_files();
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        1,
+        "the staging lands"
+    );
+    engine.service_member_stops(&mut io, &mut session, Some(20));
+    assert!(
+        engine.member_stops_held(),
+        "no stamps: the hold waits for its attach"
+    );
+    let staged_key = engine
+        .prearm_input
+        .as_ref()
+        .and_then(|prearm| prearm.inputs.first().map(|input| input.key))
+        .expect("staging records its key");
+    let file = std::fs::File::open(&library).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    let attached: Vec<u32> = session
+        .attached_requests
+        .iter()
+        .flat_map(|targets| targets.iter().map(|(slot, _, _)| *slot))
+        .collect();
+    assert!(!attached.is_empty(), "the apply attached slots");
+    for slot in attached {
+        session.scripted_stamps.insert(slot, 5);
+        session.scripted_links.insert(slot);
+    }
+    assert!(
+        engine.provider_attached_for_test((dev, ino), &session),
+        "stamps landed: the attach side holds"
+    );
+    engine.pending_rejected_keys.insert(staged_key);
+    engine.service_member_stops(&mut io, &mut session, Some(10_000_000));
+    assert!(!engine.member_stops_held(), "the hold ends");
+    let stats = engine.member_stop_stats_for_test();
+    assert_eq!(stats.refused_resumes, 1, "{stats:?}");
+    assert_eq!(stats.attached_resumes, 0, "{stats:?}");
+    assert_eq!(stats.timed_out, 0, "{stats:?}");
+    assert!(
+        files_the_first_use_row(&engine),
+        "the refused hold files the first-use row"
+    );
+}
+
 /// A pending (uncommitted, non-trial) rejection refuses the hold: the
 /// stalled-pipeline shape, where rejections never commit but stay
 /// queued in the engine's pending rejected-key set.

@@ -508,6 +508,95 @@ fn stop_flag_install_names_a_failed_handler_registration() {
     assert!(text.contains("installing handler for signal -1"), "{text}");
 }
 
+/// The detach-abort decision table, exact: before the outputs no
+/// signal exits and the count saturates at 2; after the outputs the
+/// first signal is counted (never fatal) and any further one exits.
+/// The exiting handler keeps its reserved slot.
+#[test]
+fn detach_stop_decision_matches_the_count_and_phase_table() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    for (phase, start, exit, end) in [
+        (false, 0, false, 1),
+        (false, 1, false, 2),
+        (false, 2, false, 2),
+        (true, 0, false, 1),
+        (true, 1, true, 2),
+        (true, 2, true, 2),
+    ] {
+        let count = AtomicUsize::new(start);
+        let attempted = AtomicBool::new(phase);
+        assert_eq!(
+            detach_on_stop_signal(&count, &attempted),
+            exit,
+            "phase={phase} start={start}"
+        );
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            end,
+            "phase={phase} start={start}"
+        );
+    }
+}
+
+/// Two stop signals racing after the outputs — the interleaving a
+/// split load-then-increment gets wrong: both handlers must not see
+/// slot 0. Barrier-aligned (no sleeps, no timing): every round one
+/// reserves slot 0 and the other exits on slot 1, whatever the
+/// schedule, because the RMW linearizes the pair.
+#[test]
+fn detach_concurrent_stops_after_outputs_exit_exactly_once() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+    for _ in 0..1000 {
+        let count = Arc::new(AtomicUsize::new(0));
+        let attempted = Arc::new(AtomicBool::new(true));
+        let gate = Arc::new(Barrier::new(2));
+        let pair: Vec<bool> = std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                gate.wait();
+                detach_on_stop_signal(&count, &attempted)
+            });
+            let second = scope.spawn(|| {
+                gate.wait();
+                detach_on_stop_signal(&count, &attempted)
+            });
+            vec![first.join().unwrap(), second.join().unwrap()]
+        });
+        assert_eq!(
+            pair.iter().filter(|exited| **exited).count(),
+            1,
+            "exactly one of the pair exits: {pair:?}"
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 2, "both reserved a slot");
+    }
+}
+
+/// Control: the same racing pair before the outputs counts twice
+/// and never exits.
+#[test]
+fn detach_concurrent_stops_before_outputs_count_twice_without_exiting() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+    for _ in 0..200 {
+        let count = Arc::new(AtomicUsize::new(0));
+        let attempted = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new(Barrier::new(2));
+        let pair: Vec<bool> = std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                gate.wait();
+                detach_on_stop_signal(&count, &attempted)
+            });
+            let second = scope.spawn(|| {
+                gate.wait();
+                detach_on_stop_signal(&count, &attempted)
+            });
+            vec![first.join().unwrap(), second.join().unwrap()]
+        });
+        assert_eq!(pair, [false, false]);
+        assert_eq!(count.load(Ordering::SeqCst), 2, "both reserved a slot");
+    }
+}
+
 /// Capture the harness's current registry state as a presentation
 /// (same extraction the JSON path uses for its observation block).
 fn capture_from_harness(harness: &Harness) -> Presentation {

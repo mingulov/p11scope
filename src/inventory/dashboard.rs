@@ -2367,6 +2367,30 @@ pub(crate) struct StopFlag {
 
 // `signal_hook::low_level::register` is process-global; the dashboard
 // runs once per process, so the hooks live for the run.
+
+/// One detach-abort decision for a delivered stop signal (R-C51-4):
+/// reserves a count slot with a single atomic RMW and decides on the
+/// PREVIOUS value, so two handlers racing on two threads — or a
+/// nested distinct signal interrupting a handler — can never both
+/// see slot 0. Returns true when the caller must exit at once
+/// (`_exit(128 + signal)`): the outputs were attempted and a stop
+/// was already counted. The first signal of a duration-ended run is
+/// counted, never fatal. The count saturates at 2 (the
+/// `second_signal` threshold); the exiting handler keeps its
+/// reserved slot, so the count afterwards reads 2. Signal-safe:
+/// atomics only, no locks, no allocation.
+fn detach_on_stop_signal(
+    count: &std::sync::atomic::AtomicUsize,
+    outputs_attempted: &std::sync::atomic::AtomicBool,
+) -> bool {
+    let previous = match count.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |seen| {
+        (seen < 2).then_some(seen + 1)
+    }) {
+        Ok(previous) | Err(previous) => previous,
+    };
+    outputs_attempted.load(Ordering::SeqCst) && previous >= 1
+}
+
 impl StopFlag {
     pub(crate) fn install() -> anyhow::Result<Self> {
         Self::install_for(&[libc::SIGINT, libc::SIGTERM, libc::SIGHUP])
@@ -2401,15 +2425,15 @@ impl StopFlag {
                 // After the outputs a further stop ends the wait at
                 // once — but only once a stop was already counted,
                 // so the first signal of a duration-ended run is
-                // counted, never fatal.
-                if phase.load(Ordering::SeqCst) && count.load(Ordering::SeqCst) >= 1 {
+                // counted, never fatal. The decision is one atomic
+                // step (see `detach_on_stop_signal`): a split
+                // load-then-increment would let two racing handlers
+                // both see count 0 and neither exit.
+                if detach_on_stop_signal(&count, &phase) {
                     // SAFETY: `_exit` is async-signal-safe and never
                     // returns; the handler holds no locks or state.
                     unsafe { libc::_exit(128 + signal) };
                 }
-                let _ = count.try_update(Ordering::SeqCst, Ordering::SeqCst, |seen| {
-                    (seen < 2).then_some(seen + 1)
-                });
             })?;
             hooks.push(id);
         }

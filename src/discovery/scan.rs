@@ -75,6 +75,41 @@ const MAX_MAPS_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_MAP_ENTRIES: usize = 1_048_576;
 const MAX_MOUNTINFO_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_MOUNTINFO_ENTRIES: usize = 1_048_576;
+/// Mount-table lines charged per credit (INV-2): one positive credit is
+/// one bounded step of at most 64 leaf units, with a stop poll between
+/// strides.
+const MOUNTINFO_STRIDE: usize = 64;
+/// Mount-table bytes scanned per byte credit (INV-2 companion): at most
+/// 8 KiB scanned per credit, with a stop poll between strides, so a
+/// 1 MiB chunk without newlines cannot scan unbounded for one line
+/// credit. 8 KiB matches the member-stop per-read poll precedent;
+/// normal 64-line strides (~2-4 KiB) never hit it.
+const MOUNTINFO_BYTE_STRIDE: usize = 8 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    static READER_NEWLINES_SCANNED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static READER_BYTES_SCANNED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Newline terminators the mount-table reader actually scanned (test seam).
+#[cfg(test)]
+pub(crate) fn reader_newlines_scanned_for_test() -> u64 {
+    READER_NEWLINES_SCANNED.with(std::cell::Cell::get)
+}
+
+/// Bytes the mount-table reader actually scanned for newlines (test seam).
+#[cfg(test)]
+pub(crate) fn reader_bytes_scanned_for_test() -> u64 {
+    READER_BYTES_SCANNED.with(std::cell::Cell::get)
+}
+
+/// Reset the reader scan counters (test seam).
+#[cfg(test)]
+pub(crate) fn reset_reader_scan_counters_for_test() {
+    READER_NEWLINES_SCANNED.with(|counter| counter.set(0));
+    READER_BYTES_SCANNED.with(|counter| counter.set(0));
+}
 /// One operation's proof allowance on every pass: the pin-time
 /// self-mapping probe reads through `allowed_io`, so its proof range
 /// is this per-operation leg, never the ordinary maps scanner's byte
@@ -474,8 +509,10 @@ fn raw_anchor_overlaps_metadata(ranges: &[(u64, u64)], offset: u64, width: usize
 /// second-byte restrictions `str` enforces); an incomplete tail
 /// refuses at EOF. The all-zero state is fresh (`remaining == 0`
 /// short-circuits `lo`/`hi`, and every multi-byte lead resets both),
-/// so the derived `Default` starts validation cleanly.
-#[derive(Debug, Default)]
+/// so the derived `Default` starts validation cleanly. `Copy` so the
+/// scan probes each byte on a copy and commits only scanned bytes,
+/// keeping the validator exactly at the cursor across a parked stop.
+#[derive(Debug, Default, Clone, Copy)]
 struct MountinfoUtf8 {
     remaining: u8,
     lo: u8,
@@ -600,6 +637,24 @@ pub(crate) struct MountinfoProgress {
     /// resumable legs so a multi-byte sequence split by a leg boundary
     /// still validates (and refuses) exactly once.
     encoding: MountinfoUtf8,
+    /// Scan cursor: bytes of `table` fully scanned (validated and
+    /// stride-charged). A parked mid-chunk stop leaves
+    /// `scanned < table.len()`; the next pass scans from the cursor
+    /// before reading more, so no byte is skipped, repeated, or
+    /// published unvalidated.
+    scanned: usize,
+    /// Counted-but-uncharged lines (an incomplete stride): persists
+    /// across a parked stop and drains at the next stride boundary.
+    pending_lines: usize,
+    /// Byte meter within the current byte stride: persists across a
+    /// parked stop, resets at each drain and byte-stride spend.
+    byte_stride_used: usize,
+    /// Line charges already spent this segment: persists across a
+    /// parked stop and folds into `observed_lines` at the drain.
+    lines_charged: usize,
+    /// Newlines scanned in the current logical chunk: folds into
+    /// `newline_count` when the chunk drains, persists across a park.
+    chunk_newlines: usize,
 }
 
 impl MountinfoProgress {
@@ -657,6 +712,220 @@ fn mountinfo_stop_parks(reason: &str) -> bool {
     )
 }
 
+/// Scan `progress.table[progress.scanned..]` (freshly appended bytes or a
+/// parked tail): validate UTF-8 incrementally, charge 64-line strides and
+/// 8 KiB byte strides with stop polls between them, and advance the
+/// cursor past every scanned byte. A stop returns it through `stop`
+/// (parked, or refused for terminal stops) with the cursor and stride
+/// meters persisted; the next pass resumes the stride checks exactly
+/// where this one stopped, so every line charges exactly once. Invalid
+/// bytes refuse at their exact position. `Continue(())` scanned the
+/// whole range; `Break(outcome)` is the pass's return value.
+fn scan_mountinfo_segment(
+    progress: &mut MountinfoProgress,
+    budget: &mut CaptureWorkBudget,
+    deadline: &mut impl FnMut(&mut CaptureWorkBudget) -> Option<&'static str>,
+    stop: &impl Fn(&str) -> Result<MountinfoStep, String>,
+) -> std::ops::ControlFlow<Result<MountinfoStep, String>> {
+    use std::ops::ControlFlow::{Break, Continue};
+    // A newline first completes the prior partial for free; the freebie
+    // is spent once the segment scanned any newline, so a resume
+    // derives it from the persisted newline count instead of
+    // re-granting it.
+    let mut first_newline_free =
+        progress.observed_lines > progress.newline_count && progress.chunk_newlines == 0;
+    while progress.scanned < progress.table.len() {
+        let at = progress.scanned;
+        let byte = progress.table[at];
+        // Invalid input fails fast before the stride spend below, so a
+        // bad byte never charges its boundary credit — but the probe runs
+        // on a copy: a stop inside the stride checks below parks with the
+        // validator exactly at the cursor, so the resume re-validates the
+        // boundary byte from the right state instead of double-stepping a
+        // split multibyte sequence.
+        let mut probe = progress.encoding;
+        if !probe.next(byte) {
+            return Break(Err(format!(
+                "mount table is not valid UTF-8: invalid sequence at byte {at}"
+            )));
+        }
+        if progress.pending_lines == MOUNTINFO_STRIDE {
+            if progress
+                .observed_lines
+                .checked_add(progress.lines_charged)
+                .and_then(|lines| lines.checked_add(MOUNTINFO_STRIDE))
+                .is_none_or(|lines| lines > MAX_MOUNTINFO_ENTRIES)
+            {
+                return Break(Err(MOUNTINFO_ENTRY_CEILING_REASON.into()));
+            }
+            if let Err(reason) = budget.spend(u64::try_from(MOUNTINFO_STRIDE).unwrap_or(u64::MAX)) {
+                return Break(stop(reason));
+            }
+            progress.lines_charged += MOUNTINFO_STRIDE;
+            progress.pending_lines = 0;
+            progress.byte_stride_used = 0;
+            if let Some(reason) = budget.stopped_reason() {
+                return Break(stop(reason));
+            }
+            if let Some(reason) = deadline(budget) {
+                return Break(stop(reason));
+            }
+        }
+        if progress.byte_stride_used == MOUNTINFO_BYTE_STRIDE {
+            if let Err(reason) = budget.spend(1) {
+                return Break(stop(reason));
+            }
+            progress.byte_stride_used = 0;
+            if let Some(reason) = budget.stopped_reason() {
+                return Break(stop(reason));
+            }
+            if let Some(reason) = deadline(budget) {
+                return Break(stop(reason));
+            }
+        }
+        #[cfg(test)]
+        READER_BYTES_SCANNED.with(|counter| counter.set(counter.get() + 1));
+        progress.encoding = probe;
+        progress.byte_stride_used += 1;
+        progress.scanned += 1;
+        if byte == b'\n' {
+            #[cfg(test)]
+            READER_NEWLINES_SCANNED.with(|counter| counter.set(counter.get() + 1));
+            progress.chunk_newlines += 1;
+            if first_newline_free {
+                first_newline_free = false;
+            } else {
+                progress.pending_lines += 1;
+            }
+        }
+    }
+    Continue(())
+}
+
+/// Drain one scanned segment: count its trailing partial line, charge the
+/// remaining counted lines in strides, fold the segment into the pass
+/// totals, and apply the per-object leg. The segment meters reset, so the
+/// next segment starts clean. `Break` carries a spend-stop (parked through
+/// `stop`, or refused for terminal stops), a ceiling refusal, or the leg
+/// outcome.
+///
+/// The trailing partial stays out of `pending_lines` and charges last, on
+/// its own: a stop inside the newline strides then parks newline
+/// remainder only, and the resume re-derives the still-uncounted trailing
+/// from scratch instead of double-counting a parked counted-but-uncharged
+/// partial (or counting its completing newline as new). Every spend
+/// failure first folds the completed counts (`newline_count` advances past
+/// every scanned newline, `observed_lines` past every paid charge), so the
+/// parked state keeps the pass shape: every scanned newline folded, every
+/// paid charge observed, the uncharged remainder in `pending_lines`, and at
+/// most one open partial at the table end.
+fn drain_mountinfo_segment(
+    progress: &mut MountinfoProgress,
+    budget: &mut CaptureWorkBudget,
+    stop: &impl Fn(&str) -> Result<MountinfoStep, String>,
+    bound: MountinfoBound,
+    leg: u64,
+    pass_start: usize,
+    table_cap: u64,
+) -> std::ops::ControlFlow<Result<MountinfoStep, String>> {
+    use std::ops::ControlFlow::{Break, Continue};
+    // A trailing partial line is new unless it continues the same
+    // prior partial (no newline in this segment while the previous
+    // segment ended mid-line): a newline first completes the prior
+    // partial for free, leaving the new trailing bytes uncounted.
+    let prev_partial = progress.observed_lines > progress.newline_count;
+    let trailing_new = progress.table.last().is_some_and(|last| *last != b'\n')
+        && (progress.chunk_newlines > 0 || !prev_partial);
+    let Some(next_newline_count) = progress.newline_count.checked_add(progress.chunk_newlines)
+    else {
+        return Break(Err(MOUNTINFO_ENTRY_CEILING_REASON.into()));
+    };
+    // Fold the completed counts before parking on a spend failure: the
+    // scanned newlines are final and the paid charges must survive, while
+    // the uncharged remainder (`pending_lines`) and the byte meter resume
+    // untouched. `None` is unreachable in practice — every folded add was
+    // pre-checked below — but the caller refuses closed on it.
+    let fold_for_stop = |progress: &mut MountinfoProgress| -> Option<()> {
+        progress.newline_count = next_newline_count;
+        progress.observed_lines = progress
+            .observed_lines
+            .checked_add(progress.lines_charged)?;
+        progress.lines_charged = 0;
+        progress.chunk_newlines = 0;
+        Some(())
+    };
+    // Park on a spend failure, refusing closed when the stop fold itself
+    // overflows (unreachable: every folded add was pre-checked).
+    let park_on_spend_stop = |progress: &mut MountinfoProgress, reason: &'static str| {
+        if fold_for_stop(progress).is_none() {
+            Break(Err(MOUNTINFO_ENTRY_CEILING_REASON.into()))
+        } else {
+            Break(stop(reason))
+        }
+    };
+    while progress.pending_lines > 0 {
+        let stride = progress.pending_lines.min(MOUNTINFO_STRIDE);
+        if progress
+            .observed_lines
+            .checked_add(progress.lines_charged)
+            .and_then(|lines| lines.checked_add(stride))
+            .is_none_or(|lines| lines > MAX_MOUNTINFO_ENTRIES)
+        {
+            return Break(Err(MOUNTINFO_ENTRY_CEILING_REASON.into()));
+        }
+        if let Err(reason) = budget.spend(u64::try_from(stride).unwrap_or(u64::MAX)) {
+            return park_on_spend_stop(progress, reason);
+        }
+        progress.lines_charged += stride;
+        progress.pending_lines -= stride;
+    }
+    if trailing_new {
+        if progress
+            .observed_lines
+            .checked_add(progress.lines_charged)
+            .and_then(|lines| lines.checked_add(1))
+            .is_none_or(|lines| lines > MAX_MOUNTINFO_ENTRIES)
+        {
+            return Break(Err(MOUNTINFO_ENTRY_CEILING_REASON.into()));
+        }
+        if let Err(reason) = budget.spend(1) {
+            return park_on_spend_stop(progress, reason);
+        }
+        progress.lines_charged += 1;
+    }
+    // A segment ending exactly on a byte-stride edge still pays the
+    // boundary byte stride: one conservative unit, since the line
+    // charges above do not reset the byte meter.
+    if progress.byte_stride_used == MOUNTINFO_BYTE_STRIDE {
+        if let Err(reason) = budget.spend(1) {
+            return park_on_spend_stop(progress, reason);
+        }
+    }
+    if u64::try_from(progress.table.len()).unwrap_or(u64::MAX) > table_cap {
+        return Break(Err(MOUNTINFO_CEILING_REASON.into()));
+    }
+    let Some(next_lines) = progress.observed_lines.checked_add(progress.lines_charged) else {
+        return Break(Err(MOUNTINFO_ENTRY_CEILING_REASON.into()));
+    };
+    if next_lines > MAX_MOUNTINFO_ENTRIES {
+        return Break(Err(MOUNTINFO_ENTRY_CEILING_REASON.into()));
+    }
+    progress.newline_count = next_newline_count;
+    progress.observed_lines = next_lines;
+    progress.pending_lines = 0;
+    progress.byte_stride_used = 0;
+    progress.lines_charged = 0;
+    progress.chunk_newlines = 0;
+    if bound == MountinfoBound::Resumable
+        && u64::try_from(progress.table.len().saturating_sub(pass_start)).unwrap_or(u64::MAX) > leg
+    {
+        // The probe byte past the leg proved more table: keep every
+        // byte read (the fd position moved past them) and park.
+        return Break(Ok(MountinfoStep::LegReached));
+    }
+    Continue(())
+}
+
 fn read_mountinfo_pass<R: Read>(
     mut reader: R,
     budget: &mut CaptureWorkBudget,
@@ -691,8 +960,23 @@ fn read_mountinfo_pass<R: Read>(
         MountinfoBound::Resumable => Err(reason.to_string()),
     };
 
+    use std::ops::ControlFlow::Break;
     let mut chunk = vec![0; chunk_size.max(1)];
     loop {
+        // Resume: scan the parked tail (bytes the fd already returned
+        // past the cursor) and drain it before reading more. The stride
+        // checks pick up exactly where the parked pass stopped, so a
+        // stop mid-chunk neither skips nor double-charges any line.
+        if progress.scanned < progress.table.len() {
+            if let Break(outcome) = scan_mountinfo_segment(progress, budget, &mut deadline, &stop) {
+                return outcome;
+            }
+            if let Break(outcome) =
+                drain_mountinfo_segment(progress, budget, &stop, bound, leg, pass_start, table_cap)
+            {
+                return outcome;
+            }
+        }
         if let Some(reason) = budget.stopped_reason() {
             return stop(reason);
         }
@@ -735,11 +1019,24 @@ fn read_mountinfo_pass<R: Read>(
             if let Some(reason) = deadline(budget) {
                 return stop(reason);
             }
+            // The table ends here: the incremental validator must be at
+            // a character boundary, else the table ends mid-sequence.
+            if !progress.encoding.complete() {
+                return Err(
+                    "mount table is not valid UTF-8: incomplete sequence at end of table".into(),
+                );
+            }
             // Lines a stopped pass read but could not charge are owed:
-            // charge them before the table is published.
-            let lines = progress.newline_count.saturating_add(usize::from(
-                progress.table.last().is_some_and(|byte| *byte != b'\n'),
-            ));
+            // charge them before the table is published. The drain folds
+            // its segment newlines even when its spends fail, so the
+            // unfolded term below is always zero here; it stays as a
+            // fail-closed exact count, pinned by the assert.
+            let lines = progress
+                .newline_count
+                .saturating_add(progress.chunk_newlines)
+                .saturating_add(usize::from(
+                    progress.table.last().is_some_and(|byte| *byte != b'\n'),
+                ));
             let owed = lines.saturating_sub(progress.observed_lines);
             if owed > 0 {
                 if let Err(reason) = budget.spend(u64::try_from(owed).unwrap_or(u64::MAX)) {
@@ -747,183 +1044,38 @@ fn read_mountinfo_pass<R: Read>(
                 }
                 progress.observed_lines = lines;
             }
-            if !progress.encoding.complete() {
-                return Err(
-                    "mount table is not valid UTF-8: incomplete sequence at end of table".into(),
-                );
-            }
-            // SAFETY: every byte in `progress.table` passed through
-            // `progress.encoding` in the chunk loop of this or an
-            // earlier pass (the validator state persists in the
-            // progress across resumable legs), which accepts exactly
-            // valid UTF-8 and refuses otherwise (invalid in-loop,
-            // incomplete here), so the accumulated table is valid.
-            return Ok(MountinfoStep::Complete(unsafe {
-                String::from_utf8_unchecked(std::mem::take(&mut progress.table))
-            }));
+            debug_assert!(
+                progress.scanned == progress.table.len(),
+                "mount-table EOF with unscanned bytes"
+            );
+            debug_assert!(
+                progress.chunk_newlines == 0,
+                "mount-table EOF with an unfolded segment"
+            );
+            return String::from_utf8(std::mem::take(&mut progress.table))
+                .map(MountinfoStep::Complete)
+                .map_err(|error| format!("mount table is not valid UTF-8: {error}"));
         }
 
-        let next_len = progress
+        // INV-2: the chunk is scanned in bounded strides — at most
+        // MOUNTINFO_STRIDE new lines or MOUNTINFO_BYTE_STRIDE bytes per
+        // credit, with a stop poll before looking past each boundary —
+        // so a stop landing mid-chunk parks with a scan cursor instead
+        // of charging the whole chunk in one spend. Line totals match
+        // the old whole-chunk scan exactly.
+        progress
             .table
             .len()
             .checked_add(read)
             .ok_or_else(|| MOUNTINFO_CEILING_REASON.to_string())?;
-        // INV-2: the chunk is scanned in bounded strides — at most
-        // MOUNTINFO_STRIDE new lines or MOUNTINFO_BYTE_STRIDE bytes per
-        // credit, with a stop poll before looking past each boundary —
-        // so a stop landing mid-chunk refuses without scanning the
-        // rest. Line totals match the old whole-chunk scan exactly.
-        // Byte strides bound 8 KiB runs that never complete 64 lines
-        // (newline-free or long-line runs; short-line tables never hit
-        // them), and completing a line stride covers its bytes. A full
-        // stride completing exactly on the 8 KiB chunk edge still pays
-        // the boundary byte stride below: one conservative unit, since
-        // the post-loop line charge does not reset the byte meter.
-        let prev_partial = progress.observed_lines > progress.newline_count;
-        let mut first_newline_free = prev_partial;
-        let mut chunk_newlines = 0usize;
-        let mut pending_lines = 0usize;
-        let mut lines_charged = 0usize;
-        let mut byte_stride_used = 0usize;
-        let chunk_base = progress.table.len();
-        for (index, byte) in chunk[..read].iter().enumerate() {
-            // Invalid input fails fast before the stride spend below,
-            // so a bad byte never charges its boundary credit.
-            if !progress.encoding.next(*byte) {
-                return Err(format!(
-                    "mount table is not valid UTF-8: invalid sequence at byte {}",
-                    chunk_base.saturating_add(index)
-                ));
-            }
-            if pending_lines == MOUNTINFO_STRIDE {
-                if progress
-                    .observed_lines
-                    .checked_add(lines_charged)
-                    .and_then(|lines| lines.checked_add(MOUNTINFO_STRIDE))
-                    .is_none_or(|lines| lines > MAX_MOUNTINFO_ENTRIES)
-                {
-                    return Err(MOUNTINFO_ENTRY_CEILING_REASON.into());
-                }
-                budget
-                    .spend(u64::try_from(MOUNTINFO_STRIDE).unwrap_or(u64::MAX))
-                    .map_err(str::to_string)?;
-                lines_charged += MOUNTINFO_STRIDE;
-                pending_lines = 0;
-                byte_stride_used = 0;
-                if let Some(reason) = budget.stopped_reason() {
-                    return Err(reason.into());
-                }
-                if let Some(reason) = deadline(budget) {
-                    return Err(reason.into());
-                }
-            }
-            if byte_stride_used == MOUNTINFO_BYTE_STRIDE {
-                budget.spend(1).map_err(str::to_string)?;
-                byte_stride_used = 0;
-                if let Some(reason) = budget.stopped_reason() {
-                    return Err(reason.into());
-                }
-                if let Some(reason) = deadline(budget) {
-                    return Err(reason.into());
-                }
-            }
-            #[cfg(test)]
-            READER_BYTES_SCANNED.with(|counter| counter.set(counter.get() + 1));
-            byte_stride_used += 1;
-            if *byte == b'\n' {
-                #[cfg(test)]
-                READER_NEWLINES_SCANNED.with(|counter| counter.set(counter.get() + 1));
-                chunk_newlines += 1;
-                if first_newline_free {
-                    first_newline_free = false;
-                } else {
-                    pending_lines += 1;
-                }
-            }
-        }
-        // A trailing partial line is new unless it continues the same
-        // prior partial (no newline in this chunk while the previous
-        // chunk ended mid-line): a newline first completes the prior
-        // partial for free, leaving the new trailing bytes uncounted.
-        pending_lines +=
-            usize::from(chunk[read - 1] != b'\n' && (chunk_newlines > 0 || !prev_partial));
-        let next_newline_count = progress
-            .newline_count
-            .checked_add(chunk_newlines)
-            .ok_or_else(|| MOUNTINFO_ENTRY_CEILING_REASON.to_string())?;
-        // A stop inside the chunk tail heals on a resumable read (the
-        // bytes already left the fd): the shared block below keeps
-        // them, advances past the strides already spent, and parks.
-        let mut stop_reason: Option<String> = None;
-        while pending_lines > 0 && stop_reason.is_none() {
-            let stride = pending_lines.min(MOUNTINFO_STRIDE);
-            if progress
-                .observed_lines
-                .checked_add(lines_charged)
-                .and_then(|lines| lines.checked_add(stride))
-                .is_none_or(|lines| lines > MAX_MOUNTINFO_ENTRIES)
-            {
-                return Err(MOUNTINFO_ENTRY_CEILING_REASON.into());
-            }
-            match budget.spend(u64::try_from(stride).unwrap_or(u64::MAX)) {
-                Ok(()) => {
-                    lines_charged += stride;
-                    pending_lines -= stride;
-                }
-                Err(reason) => stop_reason = Some(reason.to_string()),
-            }
-        }
-        if byte_stride_used == MOUNTINFO_BYTE_STRIDE && stop_reason.is_none() {
-            if let Err(reason) = budget.spend(1) {
-                stop_reason = Some(reason.to_string());
-            }
-        }
-        if let Some(reason) = stop_reason {
-            if bound == MountinfoBound::OneShot {
-                return Err(reason);
-            }
-            // The bytes already left the fd: keep them (the caps still
-            // refuse) so a resumed read never skips any. Strides
-            // already spent stay spent (`observed_lines` advances past
-            // them, never double-charged); the rest stays owed and is
-            // charged by the next chunk or at EOF.
-            if u64::try_from(next_len).unwrap_or(u64::MAX) > table_cap {
-                return Err(MOUNTINFO_CEILING_REASON.into());
-            }
-            let kept_lines = progress
-                .observed_lines
-                .checked_add(lines_charged)
-                .and_then(|lines| lines.checked_add(pending_lines));
-            if kept_lines.is_none_or(|lines| lines > MAX_MOUNTINFO_ENTRIES) {
-                return Err(MOUNTINFO_ENTRY_CEILING_REASON.into());
-            }
-            progress.table.extend_from_slice(&chunk[..read]);
-            progress.newline_count = next_newline_count;
-            progress.observed_lines = progress
-                .observed_lines
-                .checked_add(lines_charged)
-                .unwrap_or(usize::MAX);
-            return stop(&reason);
-        }
-        if u64::try_from(next_len).unwrap_or(u64::MAX) > table_cap {
-            return Err(MOUNTINFO_CEILING_REASON.into());
-        }
-        let next_lines = progress
-            .observed_lines
-            .checked_add(lines_charged)
-            .ok_or_else(|| MOUNTINFO_ENTRY_CEILING_REASON.to_string())?;
-        if next_lines > MAX_MOUNTINFO_ENTRIES {
-            return Err(MOUNTINFO_ENTRY_CEILING_REASON.into());
-        }
         progress.table.extend_from_slice(&chunk[..read]);
-        progress.newline_count = next_newline_count;
-        progress.observed_lines = next_lines;
-        if bound == MountinfoBound::Resumable
-            && u64::try_from(progress.table.len() - pass_start).unwrap_or(u64::MAX) > leg
+        if let Break(outcome) = scan_mountinfo_segment(progress, budget, &mut deadline, &stop) {
+            return outcome;
+        }
+        if let Break(outcome) =
+            drain_mountinfo_segment(progress, budget, &stop, bound, leg, pass_start, table_cap)
         {
-            // The probe byte past the leg proved more table: keep every
-            // byte read (the fd position moved past them) and park.
-            return Ok(MountinfoStep::LegReached);
+            return outcome;
         }
     }
 }
@@ -8768,6 +8920,16 @@ impl ScanMemory for File {
     }
 }
 
+/// Whether a mount-table read result is kernel-empty: `Ok` with empty
+/// text (a sandboxed target's dangling root breaks table rendering), as
+/// opposed to an unreadable or nonempty table, which keeps the
+/// mount-table guard. Pure over the read result — the [`ScanIo`]
+/// default and the scripted live-probe arm both delegate here — so tests
+/// drive every arm without a live empty-table target.
+fn mountinfo_read_is_empty(read: &Result<((), &str), String>) -> bool {
+    matches!(read, Ok(((), text)) if text.is_empty())
+}
+
 pub(crate) trait ScanIo {
     type Memory: ScanMemory;
     fn open_maps(
@@ -8898,10 +9060,7 @@ pub(crate) trait ScanIo {
         mounts: &mut crate::process::MountTableCache,
         budget: &mut CaptureWorkBudget,
     ) -> bool {
-        matches!(
-            view.open_then_cached_mountinfo(|_| Ok(()), mounts, budget),
-            Ok(((), text)) if text.is_empty()
-        )
+        mountinfo_read_is_empty(&view.open_then_cached_mountinfo(|_| Ok(()), mounts, budget))
     }
     /// The served file's own key, re-stated for the exempt-path
     /// maps-key check (the exemption skips the mount-table guard, so
@@ -21649,6 +21808,17 @@ int main(int argc, char **argv) {
                 .unwrap();
         assert_eq!(step, MountinfoStep::Stopped(WORK_CEILING_REASON.into()));
         assert_eq!(progress.bytes_read(), table.len() as u64);
+        assert_eq!(
+            (
+                progress.newline_count,
+                progress.observed_lines,
+                progress.pending_lines,
+                progress.chunk_newlines,
+                progress.lines_charged,
+            ),
+            (1, 0, 1, 0, 0),
+            "a failed drain folds its scanned newline and parks the uncharged line"
+        );
         let mut resume = CaptureWorkBudget::new(ScanLimits {
             per_object_bytes: u64::MAX,
             total_bytes: u64::MAX,
@@ -21666,6 +21836,192 @@ int main(int argc, char **argv) {
             resume.work_units_count(),
             2,
             "one read charge plus the one owed line"
+        );
+    }
+
+    /// A drain stopped inside its remainder strides folds the paid
+    /// charges and every scanned newline, parks the uncharged remainder,
+    /// and reports the stop: seventy counted lines under a 64 ceiling pay
+    /// one stride and owe six.
+    #[test]
+    fn mountinfo_drain_folds_paid_charges_when_its_strides_stop() {
+        let mut progress = MountinfoProgress {
+            table: b"a\n".to_vec(),
+            observed_lines: 0,
+            newline_count: 0,
+            encoding: MountinfoUtf8::default(),
+            scanned: 2,
+            pending_lines: 70,
+            byte_stride_used: 0,
+            lines_charged: 0,
+            chunk_newlines: 70,
+        };
+        let mut budget = CaptureWorkBudget::new(ScanLimits {
+            per_object_bytes: u64::MAX,
+            total_bytes: u64::MAX,
+        });
+        budget.set_work_ceiling_for_test(64);
+        let outcome = drain_mountinfo_segment(
+            &mut progress,
+            &mut budget,
+            &|reason: &str| Ok(MountinfoStep::Stopped(reason.to_string())),
+            MountinfoBound::Resumable,
+            u64::MAX,
+            0,
+            MAX_MOUNTINFO_BYTES,
+        );
+        assert_eq!(
+            outcome,
+            std::ops::ControlFlow::Break(Ok(MountinfoStep::Stopped(WORK_CEILING_REASON.into())))
+        );
+        assert_eq!(
+            (
+                progress.newline_count,
+                progress.observed_lines,
+                progress.pending_lines,
+                progress.chunk_newlines,
+                progress.lines_charged,
+            ),
+            (70, 64, 6, 0, 0),
+            "the paid stride folds, the six owed lines park"
+        );
+    }
+
+    /// The mid-chunk stop (INV-2): a deadline landing inside the scan —
+    /// past the first 64-line stride — parks with the scan cursor behind
+    /// the table end; the resume scans the parked tail from the cursor and
+    /// converges byte-exact, charging every line exactly once. The byte at
+    /// the stop point starts a two-byte sequence, so the resume must
+    /// re-validate the boundary byte from the cursor state, not
+    /// double-step a split sequence.
+    #[test]
+    fn mountinfo_resumable_reader_stops_mid_chunk_and_resumes_byte_exact() {
+        let mut table: Vec<u8> = (0..64)
+            .flat_map(|line| format!("{line:02} 1 8:1 / /m rw\n").into_bytes())
+            .collect();
+        assert_eq!(table.len(), 64 * 17, "sixty-four 17-byte rows");
+        table.extend_from_slice("é4 1 8:1 / /m rw\n".as_bytes());
+        table.extend((65..70).flat_map(|line| format!("{line:02} 1 8:1 / /m rw\n").into_bytes()));
+        assert_eq!(
+            table.len(),
+            64 * 17 + 18 + 5 * 17,
+            "the two-byte row adds one"
+        );
+        let roomy = || {
+            CaptureWorkBudget::new(ScanLimits {
+                per_object_bytes: u64::MAX,
+                total_bytes: u64::MAX,
+            })
+        };
+        let mut reader = StreamReader {
+            data: table.clone(),
+            at: 0,
+            requests: Vec::new(),
+        };
+        let mut budget = roomy();
+        let mut progress = MountinfoProgress::default();
+        reset_reader_scan_counters_for_test();
+        let mut calls = 0u32;
+        let step = read_mountinfo_resumable_with(
+            &mut reader,
+            &mut budget,
+            2048,
+            |_| {
+                calls += 1;
+                // Call 1 is the pre-read poll; call 2 is the poll after
+                // the first 64-line stride spend, mid-scan.
+                (calls == 2).then_some(SCAN_DEADLINE_REASON)
+            },
+            &mut progress,
+        )
+        .unwrap();
+        assert_eq!(step, MountinfoStep::Stopped(SCAN_DEADLINE_REASON.into()));
+        assert_eq!(
+            reader.requests,
+            vec![2048],
+            "pass 1 reads the whole table at once"
+        );
+        assert_eq!(progress.table.len(), table.len(), "every byte read is kept");
+        assert_eq!(
+            progress.scanned,
+            64 * 17,
+            "the cursor parks right past the 64th newline"
+        );
+        assert_eq!(
+            reader_bytes_scanned_for_test(),
+            64 * 17,
+            "the scan stops before looking past the stride boundary"
+        );
+        assert_eq!(
+            budget.work_units_count() - reader.requests.len() as u64,
+            64,
+            "pass 1 charges the read plus the one completed stride"
+        );
+        let mut resume = roomy();
+        reader.requests.clear();
+        let step =
+            read_mountinfo_resumable_with(&mut reader, &mut resume, 2048, |_| None, &mut progress)
+                .unwrap();
+        assert_eq!(reader.requests, vec![2048], "the resume reads only EOF");
+        assert_eq!(
+            step,
+            MountinfoStep::Complete(String::from_utf8(table).unwrap()),
+            "the resumed read is the whole table, no byte skipped or repeated"
+        );
+        assert_eq!(
+            resume.work_units_count() - reader.requests.len() as u64,
+            6,
+            "the resume charges exactly the six tail lines"
+        );
+    }
+
+    /// Invalid bytes past a mid-chunk stop refuse on resume at their exact
+    /// position: the parked tail is never published unvalidated.
+    #[test]
+    fn mountinfo_resumable_reader_refuses_invalid_utf8_after_a_mid_chunk_stop() {
+        let mut table: Vec<u8> = (0..70)
+            .flat_map(|line| format!("{line:02} 1 8:1 / /m rw\n").into_bytes())
+            .collect();
+        assert_eq!(table.len(), 70 * 17);
+        table[1150] = 0xFF;
+        let mut reader = StreamReader {
+            data: table.clone(),
+            at: 0,
+            requests: Vec::new(),
+        };
+        let mut budget = CaptureWorkBudget::new(ScanLimits {
+            per_object_bytes: u64::MAX,
+            total_bytes: u64::MAX,
+        });
+        let mut progress = MountinfoProgress::default();
+        let mut calls = 0u32;
+        let step = read_mountinfo_resumable_with(
+            &mut reader,
+            &mut budget,
+            2048,
+            |_| {
+                calls += 1;
+                (calls == 2).then_some(SCAN_DEADLINE_REASON)
+            },
+            &mut progress,
+        )
+        .unwrap();
+        assert_eq!(step, MountinfoStep::Stopped(SCAN_DEADLINE_REASON.into()));
+        assert_eq!(
+            progress.scanned,
+            64 * 17,
+            "pass 1 stops before the invalid byte"
+        );
+        let mut resume = CaptureWorkBudget::new(ScanLimits {
+            per_object_bytes: u64::MAX,
+            total_bytes: u64::MAX,
+        });
+        let error =
+            read_mountinfo_resumable_with(&mut reader, &mut resume, 2048, |_| None, &mut progress)
+                .unwrap_err();
+        assert_eq!(
+            error,
+            "mount table is not valid UTF-8: invalid sequence at byte 1150"
         );
     }
 
@@ -31822,6 +32178,25 @@ int main(int argc, char **argv) {
         );
     }
 
+    /// Empty-check decision table (NB1 seam): the shared predicate answers
+    /// every read shape — `Ok` empty (exempt), `Ok` nonempty and `Err`
+    /// (both keep the guard) — without a live empty-table target.
+    #[test]
+    fn mountinfo_empty_decision_covers_every_read_shape() {
+        assert!(
+            mountinfo_read_is_empty(&Ok(((), ""))),
+            "a kernel-empty table is exempt"
+        );
+        assert!(
+            !mountinfo_read_is_empty(&Ok(((), "17 1 8:1 / / rw\n"))),
+            "a nonempty table keeps the guard"
+        );
+        assert!(
+            !mountinfo_read_is_empty(&Err("cannot read mount table: stale".to_string())),
+            "a failed read keeps the guard"
+        );
+    }
+
     /// Lower-candidate chain twin: a mount-table stop while enumerating
     /// propagates through the fallback search and the copy-up join with
     /// its exact text.
@@ -33272,11 +33647,12 @@ int main(int argc, char **argv) {
         ) -> bool {
             match self.mountinfo_empty {
                 Some(scripted) => scripted,
-                // The live probe, mirroring the default.
-                None => matches!(
-                    view.open_then_cached_mountinfo(|_| Ok(()), mounts, budget),
-                    Ok(((), text)) if text.is_empty()
-                ),
+                // The live probe, deciding through the shared predicate.
+                None => mountinfo_read_is_empty(&view.open_then_cached_mountinfo(
+                    |_| Ok(()),
+                    mounts,
+                    budget,
+                )),
             }
         }
         fn restated_fd_key(&mut self, file: &File) -> std::io::Result<ObjectKey> {

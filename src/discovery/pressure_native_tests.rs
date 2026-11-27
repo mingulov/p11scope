@@ -1497,14 +1497,15 @@ fn freed_slot_wait_phase(state: FreedSlotWaitState) -> FreedSlotWaitPhase {
 fn freed_slot_wait_phase_classifies_typed_retirement_state() {
     use FreedSlotWaitPhase::{Engine, Refused, WorkerPending};
     // (ticket, batch, worker, retirements, rejected keys, phase)
-    let rows: &[(
+    type PhaseRow = (
         bool,
         Option<BatchStatus>,
         bool,
         bool,
         bool,
         FreedSlotWaitPhase,
-    )] = &[
+    );
+    let rows: &[PhaseRow] = &[
         (false, None, false, false, false, Engine),
         (false, None, true, false, false, Engine),
         (false, None, true, true, false, Engine),
@@ -4765,10 +4766,10 @@ fn pressure_live256_all_blocked_twin_refuses_once() {
             .iter()
             .any(|view| view.pid() == head_pid && view.still_the_same());
         let ticket = engine.pending_global_retirement.as_ref();
-        if link_total == 0 {
-            if let Some(total) = ticket.and_then(|ticket| ticket.link_total_for_test()) {
-                link_total = total;
-            }
+        if link_total == 0
+            && let Some(total) = ticket.and_then(|ticket| ticket.link_total_for_test())
+        {
+            link_total = total;
         }
         let phase = freed_slot_wait_phase(FreedSlotWaitState {
             ticket_present: ticket.is_some(),

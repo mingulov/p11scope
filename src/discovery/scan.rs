@@ -896,10 +896,10 @@ fn drain_mountinfo_segment(
     // A segment ending exactly on a byte-stride edge still pays the
     // boundary byte stride: one conservative unit, since the line
     // charges above do not reset the byte meter.
-    if progress.byte_stride_used == MOUNTINFO_BYTE_STRIDE {
-        if let Err(reason) = budget.spend(1) {
-            return park_on_spend_stop(progress, reason);
-        }
+    if progress.byte_stride_used == MOUNTINFO_BYTE_STRIDE
+        && let Err(reason) = budget.spend(1)
+    {
+        return park_on_spend_stop(progress, reason);
     }
     if u64::try_from(progress.table.len()).unwrap_or(u64::MAX) > table_cap {
         return Break(Err(MOUNTINFO_CEILING_REASON.into()));
@@ -21951,6 +21951,11 @@ int main(int argc, char **argv) {
             reader_bytes_scanned_for_test(),
             64 * 17,
             "the scan stops before looking past the stride boundary"
+        );
+        assert_eq!(
+            reader_newlines_scanned_for_test(),
+            64,
+            "exactly the first stride of newlines is scanned"
         );
         assert_eq!(
             budget.work_units_count() - reader.requests.len() as u64,

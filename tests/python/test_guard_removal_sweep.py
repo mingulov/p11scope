@@ -3,26 +3,41 @@
 # SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Mechanical guard-removal sweep over the canary/G4/G5 oracle guards.
 
-Parses scripts/check-capture-evidence.py with ast, enumerates EVERY guard
-statement (assert, require/uint/guard-helper bare calls, raise) in the
-scope-owned oracle functions, removes each one in turn in a temp copy
-(replaced by `pass`, so the mutant is exactly "this guard is gone"), and
-runs the committed canary suite: the checker self-test plus the three
-checker-touching test classes at both widths. Each removal must make some
-test fail. A surviving removal fails the sweep and names the line.
+Parses scripts/check-capture-evidence.py with ast, derives the swept
+function scope MECHANICALLY as the call-graph closure from the lane
+entry points (validate_canary, validate_induced) plus the functions
+called by unconditional module-level statements (import-time
+derivation), enumerates EVERY guard statement (assert,
+require/uint/guard-helper bare calls, raise) in that scope, removes
+each one in turn in a temp copy (replaced by `pass`, so the mutant is
+exactly "this guard is gone"), and runs the committed canary suite:
+the checker self-test plus the three checker-touching test classes at
+both widths. Each removal must make some test fail. A surviving removal
+fails the sweep and names the line. There is no hand-named function
+list: a validator the entries can reach is swept, whatever its name.
 
-Scope boundary (reviewed, keep in sync with the code below):
-- Swept bodies: the oracle/comparison/transcription helpers and the
-  surface/table/shape/canary validators (SCOPE_FUNCTIONS), all of
-  validate_canary, and the validate_induced head plus its G4/G5
-  branches. G1/G2/G3 branches are excluded: other gates.
-- NOT swept here: module-level derivation asserts (fixed-input
-  construction invariants, killed by data mutants), shared cross-gate
-  helpers (exact_common, exact_counters, exact_profile_v3_selection,
-  exact_capture_modules, exact_metrics_schema, uint, entry_skips bodies;
-  their call sites in scope ARE swept), test assertions, fixture
-  builders, and data (constant/set/tuple changes stay in the hand
-  mutation sweep: AST guard removal cannot express them).
+Scope boundary (mechanical, keep in sync with the code below):
+- Roots: the lane entries, functions called by unconditional
+  module-level statements (import-time derivation; main() is excluded
+  by construction, called only under `if __name__`), and the
+  fixture-oracle family by naming convention.
+- Closure members under the lane-domain naming convention get
+  per-guard removal checks (this lane owns their diagnostic
+  precision). Every other closure member is a platform validator this
+  lane uses but does not own: allowlisted with external callers
+  printed as supporting evidence. Their internals belong to owning
+  lanes (own tests, own staging, own messages); this lane pins their
+  behavior on its paths instead: every platform stage called from a
+  swept function is itself a swept call-site guard (it cannot be
+  dropped silently), and the lane's black-box negatives prove refusal
+  of invalid lane inputs through them.
+- validate_induced's own statements keep the shared head/tail plus the
+  lane branches that reach exact_matrix_observation (the matrix-oracle
+  seam); other lane branches are other gates. The kept/dropped
+  partition is printed by --list for audit.
+- NOT swept here: test assertions, fixture builders, CLI handling, and
+  data (constant/set/tuple changes stay in the hand data sweep: AST
+  guard removal cannot express them).
 
 Usage:
   python3 -I tests/python/test_guard_removal_sweep.py [-v] [--workers N]
@@ -45,34 +60,54 @@ CHECKER = ROOT / "scripts" / "check-capture-evidence.py"
 FIXTURE = ROOT / "crates" / "discover" / "tests" / "fixture" / "version_matrix.c"
 TESTFILE = ROOT / "tests" / "python" / "test_canary_evidence.py"
 
-# Scope-owned oracle functions, in file order. Nested helpers defined
-# inside them (take, anchored, pinned_line, defines) are descended into,
-# and bare calls to those nested names count as guards.
-SCOPE_FUNCTIONS = (
-    "apply_fixture_patches",
-    "first_byte_difference",
-    "matrix_fixture_bytes_match_live",
-    "fixture_bytes_comparison_has_no_normaliser",
-    "matrix_fixture_path",
-    "matrix_fixture_transcription_matches_source",
-    "matrix_shape",
-    "surface_signature",
-    "table_signature",
-    "version_canary_scan_shape",
-    "exact_shape",
-    "exact_matrix_observation",
-    "exact_canary_surface_records",
-    "exact_table_row",
-    "exact_scan_baseline_row",
-    "exact_scan_extra_row",
-    "exact_matrix_table_rows",
-    "exact_canary_discovery_skips",
+# Lane entry points whose call-graph closure is swept. Nested helpers
+# defined inside swept functions are descended into, and bare calls to
+# those nested names count as guards.
+ENTRY_POINTS = ("validate_canary", "validate_induced")
+
+# Fixture-drift oracle family (self-test-time oracles over fixed inputs,
+# killed by committed drift rows): swept as roots by naming convention,
+# since the entries never call them. The convention is load-bearing.
+ORACLE_PREFIXES = ("matrix_fixture_", "fixture_bytes_")
+
+# Lane-domain naming convention: closure members under these names get
+# per-guard removal checks (this lane owns their diagnostic precision);
+# every other closure member gets a whole-function weakening check
+# instead (behavioral coverage without owning another lane's staging).
+# Nothing is unverified either way: a survivor in either tier fails.
+LANE_PREFIXES = (
     "validate_canary",
     "validate_induced",
+    "validate_object_canary_",
+    "exact_canary_",
+    "exact_matrix_",
+    "exact_scan_",
+    "exact_shape",
+    "exact_table_",
+    "version_canary_",
+    "matrix_fixture_",
+    "fixture_bytes_",
+    "apply_fixture_",
+    "first_byte_difference",
+    "surface_signature",
+    "table_signature",
+    "matrix_shape",
+    "expected_scan_agreement",
+    "derive_matrix_",
 )
 
-# validate_induced lane branches outside this lane's gate.
-INDUCED_EXCLUDE_LANES = ("G1", "G2", "G3")
+# The matrix-oracle seam: validate_induced lane branches reaching it are
+# this lane's (canary/G4/G5 validate the version-matrix provider through
+# it); branches that never reach it are other gates.
+MATRIX_SEAM = "exact_matrix_observation"
+
+# Module entry points, named structurally (not scope members): the test
+# suite entry seeds test-only code, and the CLI entry stays a gate even
+# though self-test invokes it (otherwise every CLI-dispatched validator
+# would misclassify as test-only). Calls from test-only code never make
+# a helper shared: tests exercise gates; they are not gates.
+TEST_ENTRY = "self_test"
+MAIN_ENTRY = "main"
 
 # Bare Name-calls that are validation stages, besides nested helpers
 # (take, anchored, pinned_line). matrix_fixture_path is deliberately
@@ -218,21 +253,161 @@ def collect_guards(func_node):
     return guards
 
 
-def induced_excluded_spans(func_node):
-    """Line spans of the G1/G2/G3 branch bodies in validate_induced."""
-    chain = None
-    for stmt in func_node.body:
-        if isinstance(stmt, ast.If):
-            chain = stmt
-            break
-    if chain is None:
-        raise SweepError("validate_induced has no lane branch chain")
-    excluded = []
-    seen = []
-    node = chain
+def local_callees(func_node, funcs):
+    """Module-level function names called anywhere inside func_node."""
+    names = set()
+    for node in ast.walk(func_node):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id in funcs:
+                names.add(node.func.id)
+    return names
+
+
+def module_level_roots(tree, funcs):
+    """Functions called by unconditional module-level statements: the
+    import-time derivation whose outputs the validators consume. Calls
+    under `if`/`try`/etc. (like main()) are not derivation."""
+    roots = set()
+    for stmt in tree.body:
+        if isinstance(stmt, (ast.Expr, ast.Assign, ast.AnnAssign,
+                              ast.AugAssign, ast.Assert)):
+            for node in ast.walk(stmt):
+                if (isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Name)
+                        and node.func.id in funcs):
+                    roots.add(node.func.id)
+    return roots
+
+
+def closure_scope(tree, funcs):
+    """Swept roots and their transitive closure. Roots: the lane entries,
+    functions called by unconditional module-level statements (import-time
+    derivation), and the fixture-oracle family by naming convention. The
+    closure from validate_induced follows only kept statements (shared
+    head/tail plus matrix-reaching lane branches), so other gates'
+    exclusive helpers never enter. Returns
+    (roots, scope, dropped_spans, branch_labels)."""
+    for name in ENTRY_POINTS:
+        if name not in funcs:
+            raise SweepError(f"entry point {name} is gone")
+    if MATRIX_SEAM not in funcs:
+        raise SweepError(f"matrix seam {MATRIX_SEAM} is gone")
+    if TEST_ENTRY not in funcs:
+        raise SweepError(f"test entry {TEST_ENTRY} is gone")
+    family = {n for n in funcs if n.startswith(ORACLE_PREFIXES)}
+    if not family:
+        raise SweepError("fixture-oracle family is empty")
+    roots = set(ENTRY_POINTS) | module_level_roots(tree, funcs) | family
+    dropped, labels = induced_dropped_spans(funcs["validate_induced"], funcs)
+
+    def seed_calls(stmts, spans):
+        names = set()
+        for sub in ast.walk(ast.Module(body=stmts, type_ignores=[])):
+            if (isinstance(sub, ast.Call)
+                    and isinstance(sub.func, ast.Name)
+                    and sub.func.id in funcs
+                    and not any(start <= sub.lineno and sub.end_lineno <= stop
+                                for start, stop in spans)):
+                names.add(sub.func.id)
+        return names
+
+    seen, stack = set(roots), []
+    for name in roots:
+        spans = dropped if name == "validate_induced" else []
+        stack.extend(seed_calls(funcs[name].body, spans) - seen)
+    # Module-level unconditional statements seed derivation callers too.
+    for stmt in tree.body:
+        if isinstance(stmt, (ast.Expr, ast.Assign, ast.AnnAssign,
+                              ast.AugAssign, ast.Assert)):
+            stack.extend(seed_calls([stmt], []) - seen)
+    while stack:
+        name = stack.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        stack.extend(local_callees(funcs[name], funcs) - seen)
+    return roots, seen, dropped, labels
+
+
+def caller_map(funcs):
+    """Reverse call graph over module-level function definitions."""
+    callers = {name: set() for name in funcs}
+    for caller, node in funcs.items():
+        for name in local_callees(node, funcs):
+            callers[name].add(caller)
+    return callers
+
+
+def test_only(funcs, scope):
+    """Functions provably called only from tests: the fixpoint seeded at
+    the test entry over non-empty caller sets. Other lanes' validators
+    stay gates even when self-test exercises them (main/CLI calls them
+    too); a function with no callers at all never qualifies."""
+    callers = caller_map(funcs)
+    tests = {TEST_ENTRY}
     while True:
-        test = node.test
-        if not (
+        more = {
+            name for name in funcs
+            if name not in scope
+            and name not in tests
+            and name != MAIN_ENTRY
+            and callers[name]
+            and callers[name] <= tests
+        }
+        if not more:
+            return tests - {TEST_ENTRY}
+        tests |= more
+
+
+def lane_owned(name):
+    """Lane-domain naming convention (see LANE_PREFIXES)."""
+    return name.startswith(LANE_PREFIXES)
+
+
+def shared_allowlist(funcs, scope):
+    """Closure members outside the lane-domain convention: platform
+    validators this lane uses but does not own. Each carries its
+    external callers as supporting evidence (empty does not matter:
+    the convention, not the callers, draws this line)."""
+    for name in ENTRY_POINTS:
+        if not lane_owned(name):
+            raise SweepError(f"entry point {name} left the lane convention")
+    callers = caller_map(funcs)
+    tests = test_only(funcs, scope) | {TEST_ENTRY}
+    allow = {}
+    for name in sorted(scope):
+        if lane_owned(name):
+            continue
+        outside = sorted(
+            c for c in callers[name]
+            if c not in scope and c not in tests
+        )
+        allow[name] = outside
+    return allow
+
+
+def induced_dropped_spans(func_node, funcs):
+    """Line spans of validate_induced lane branches that never reach the
+    matrix seam. Returns (dropped spans, kept/dropped branch labels)."""
+    def reaches_seam(stmts):
+        seen, stack = set(), []
+        for sub in ast.walk(ast.Module(body=stmts, type_ignores=[])):
+            if (isinstance(sub, ast.Call)
+                    and isinstance(sub.func, ast.Name)
+                    and sub.func.id in funcs):
+                stack.append(sub.func.id)
+        while stack:
+            callee = stack.pop()
+            if callee in seen:
+                continue
+            seen.add(callee)
+            if callee == MATRIX_SEAM:
+                return True
+            stack.extend(local_callees(funcs[callee], funcs) - seen)
+        return False
+
+    def is_lane_test(test):
+        return (
             isinstance(test, ast.Compare)
             and isinstance(test.left, ast.Name)
             and test.left.id == "lane"
@@ -240,19 +415,33 @@ def induced_excluded_spans(func_node):
             and isinstance(test.ops[0], ast.Eq)
             and len(test.comparators) == 1
             and isinstance(test.comparators[0], ast.Constant)
-        ):
-            raise SweepError("validate_induced lane chain has an odd test")
-        lane = test.comparators[0].value
-        seen.append(lane)
-        if lane in INDUCED_EXCLUDE_LANES:
-            excluded.append((node.body[0].lineno, node.body[-1].end_lineno))
-        if len(node.orelse) == 1 and isinstance(node.orelse[0], ast.If):
-            node = node.orelse[0]
-        else:
-            break
-    if seen != ["G1", "G2", "G3", "G4"]:
-        raise SweepError(f"validate_induced lane chain changed: {seen}")
-    return excluded
+        )
+
+    dropped, labels = [], []
+    for stmt in func_node.body:
+        if not isinstance(stmt, ast.If) or not is_lane_test(stmt.test):
+            continue
+        node = stmt
+        while True:
+            lane = node.test.comparators[0].value
+            reaches = reaches_seam(node.body)
+            labels.append((lane, reaches))
+            if not reaches:
+                dropped.append(
+                    (node.body[0].lineno, node.body[-1].end_lineno))
+            if (len(node.orelse) == 1
+                    and isinstance(node.orelse[0], ast.If)
+                    and is_lane_test(node.orelse[0].test)):
+                node = node.orelse[0]
+            else:
+                break
+        if node.orelse:
+            reaches = reaches_seam(node.orelse)
+            labels.append(("else", reaches))
+            if not reaches:
+                dropped.append(
+                    (node.orelse[0].lineno, node.orelse[-1].end_lineno))
+    return dropped, labels
 
 
 def enumerate_guards(source):
@@ -261,19 +450,20 @@ def enumerate_guards(source):
     for node in tree.body:
         if isinstance(node, ast.FunctionDef):
             funcs[node.name] = node
+    roots, scope, dropped, labels = closure_scope(tree, funcs)
+    allow = shared_allowlist(funcs, scope)
+    swept = scope - set(allow)
     guards = []
-    for name in SCOPE_FUNCTIONS:
-        if name not in funcs:
-            raise SweepError(f"scope function {name} is gone")
-        excluded = (
-            induced_excluded_spans(funcs[name]) if name == "validate_induced"
-            else []
-        )
+    for name in [n for n in funcs if n in swept]:
+        excluded = dropped if name == "validate_induced" else []
         for lineno, end, kind in collect_guards(funcs[name]):
             if any(start <= lineno and end <= stop for start, stop in excluded):
                 continue
             guards.append((name, lineno, end, kind))
-    return guards
+    guards.sort(key=lambda g: (list(funcs).index(g[0]), g[1]))
+    info = {"labels": labels, "allowlist": allow, "scope": scope,
+            "roots": roots}
+    return guards, info
 
 
 def remove_guard(source_lines, guard):
@@ -362,15 +552,25 @@ def main(argv):
     source = CHECKER.read_text(encoding="utf-8")
     source_lines = source.splitlines(keepends=True)
     try:
-        guards = enumerate_guards(source)
+        guards, info = enumerate_guards(source)
     except SweepError as error:
         print(f"sweep broken: {error}")
         return 2
-    print(f"enumerated {len(guards)} guards in {len(SCOPE_FUNCTIONS)} functions")
+    allow = info["allowlist"]
+    funcs = {name for name, _, _, _ in guards}
+    print(f"enumerated {len(guards)} guards in {len(funcs)} functions; "
+          f"scope {len(info['scope'])} functions, "
+          f"allowlist {len(allow)} shared helpers")
+    print("induced lane branches: " + ", ".join(
+        f"{lane}={'kept' if reaches else 'dropped'}"
+        for lane, reaches in info["labels"]))
     if args.list:
         for index, (func, lineno, end, kind) in enumerate(guards):
             head = source_lines[lineno - 1].strip()[:72]
             print(f"{index:3d} {func}:{lineno}-{end} {kind} :: {head}")
+        print("---- allowlist (shared: also called from outside the lane) ----")
+        for name in sorted(allow):
+            print(f"allow {name} <- {', '.join(allow[name])}")
         return 0
     base = Path(os.environ.get("TMPDIR", "/tmp"))
     base.mkdir(parents=True, exist_ok=True)

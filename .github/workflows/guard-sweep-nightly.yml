@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
+# Nightly guard-removal sweep for the canary/G4/G5 oracle. The sweep
+# takes about an hour on 2 CPUs, too slow for the serial scripts lane,
+# so it runs here daily and on manual dispatch instead of in the
+# run-python-suites RUN set (registered DRIVEN against this file).
+name: guard-sweep-nightly
+on:
+  schedule:
+    - cron: "23 2 * * *"
+  workflow_dispatch:
+jobs:
+  guard-sweep:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: python3 -I "tests/python/test_guard_removal_sweep.py"

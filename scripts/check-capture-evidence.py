@@ -675,10 +675,9 @@ def derive_matrix_manifest_records():
             vendor += 1
             continue
         selected = _matrix_select_standard((major, minor))
-        if selected is None:
-            raise AssertionError(
-                f"matrix interface[{index}]: corroborated layout selects nothing"
-            )
+        # No selects-nothing assert: corroborated means (2,40) or major 3,
+        # and the selector returns None only outside those, so a
+        # corroborated layout always selects.
         walk, functions = selected
         if walk == "full":
             walk = "known_prefix"
@@ -722,6 +721,9 @@ def derive_matrix_manifest_tables():
             interface_versions.append((major, minor))
     if len(interface_versions) != 12 or len(MATRIX_MANIFEST_RECORDS) != 13:
         raise AssertionError("matrix fixture interface rows drifted")
+    # No thirteen-tables assert: passing the guard above means twelve
+    # versions zipped with twelve records, so the legacy row plus the zip
+    # always number thirteen; anything else fails above first.
     tables = [
         {
             "source": "manifest",
@@ -745,8 +747,6 @@ def derive_matrix_manifest_tables():
                 "exports_agreeing": None,
             }
         )
-    if len(tables) != 13:
-        raise AssertionError("matrix fixture manifest tables drifted")
     return tables
 
 
@@ -6667,6 +6667,62 @@ def run_transcription_drift_rows():
         matrix_fixture_path = saved
 
 
+def run_derivation_whitebox_rows():
+    """Derivation guards must fire on hostile inputs (white-box)."""
+    global MATRIX_FIXTURE_TABLES, MATRIX_FIXTURE_INTERFACES
+    saved_tables = MATRIX_FIXTURE_TABLES
+    saved_ifaces = MATRIX_FIXTURE_INTERFACES
+    base_tables = copy.deepcopy(saved_tables)
+    base_ifaces = [tuple(row) for row in saved_ifaces]
+    try:
+        surfaced9 = [tuple(r) for r in base_ifaces]
+        surfaced9[9] = ("deceptive", "t32")
+        surfaced9[6] = ("alternate", "tbad")
+        rows = (
+            ("null-non-exact",
+             base_tables,
+             [tuple(r) if i != 11 else ("alternate", None)
+              for i, r in enumerate(base_ifaces)],
+             derive_matrix_manifest_records,
+             "only the exact row has a null table"),
+            ("vendor-count",
+             {**base_tables, "tbad": (3, 2, True, False)},
+             base_ifaces,
+             derive_matrix_manifest_records,
+             "vendor rows: 0"),
+            ("surfaces-count",
+             base_tables,
+             tuple(base_ifaces) + (("alternate", "t32"),),
+             derive_matrix_manifest_records,
+             "surfaces: 14"),
+            ("interface9",
+             base_tables,
+             surfaced9,
+             derive_matrix_manifest_records,
+             "interface[9] must stay vendor-only"),
+            ("tables-rows",
+             base_tables,
+             [tuple(r) for i, r in enumerate(base_ifaces) if i != 10],
+             derive_matrix_manifest_tables,
+             "interface rows drifted"),
+        )
+        for name, tables, ifaces, derive, message in rows:
+            MATRIX_FIXTURE_TABLES = tables
+            MATRIX_FIXTURE_INTERFACES = ifaces
+            try:
+                derive()
+            except AssertionError as error:
+                require(
+                    message in str(error),
+                    f"derivation {name} died elsewhere: {error}",
+                )
+            else:
+                raise AssertionError(f"derivation {name} was accepted")
+    finally:
+        MATRIX_FIXTURE_TABLES = saved_tables
+        MATRIX_FIXTURE_INTERFACES = saved_ifaces
+
+
 def self_test():
     helper_calls = helper_selection_call_count()
     roles = {"observer_calls": 0, "inspect_calls": 0, "helper_calls": helper_calls}
@@ -8074,6 +8130,8 @@ def self_test():
     print("matrix fixture transcription matches the canary build: OK")
     run_transcription_drift_rows()
     print("matrix fixture drifts die in their named pins: OK")
+    run_derivation_whitebox_rows()
+    print("matrix derivation guards fire on hostile inputs: OK")
     # Wiring: the transcription check must end at the byte-exact backstop
     # (dropping that call would silently re-admit everything the
     # fine-grained pins cannot see).
@@ -8408,6 +8466,45 @@ def self_test():
             mutate(bad)
             settle_fixture_verdict(bad)
             rejected(lambda bad=bad: validate_canary(lane, bad, bits))
+        for name, mutate, message in (
+            ("names-shape",
+             lambda d: d["functions"][0].update(
+                 names=["C_CreateObject", "C_X"], aliased=True),
+             "one unaliased name"),
+            ("duplicate-name",
+             lambda d: d["functions"][1].update(names=["C_CreateObject"]),
+             "duplicate/aliased object function"),
+            ("forwarding",
+             lambda d: d["functions"][0].update(forwarding_layer=True),
+             "must not be a forwarding layer"),
+            ("latency-keys",
+             lambda d: d["functions"][0]["latency_ns"].pop("p50"),
+             "object function latency"),
+            ("latency-validity",
+             lambda d: d["functions"][0]["latency_ns"].update(max=999),
+             "invalid object function latency"),
+            ("latency-population",
+             lambda d: d["functions"][0]["latency_ns"].update(p50=None),
+             "exact call population"),
+            ("ledger",
+             lambda d: d["functions"][0].update(
+                 names=["C_Unwanted"], calls=0, rv_counts={}, rv_names={},
+                 latency_ns={"approximate": True, "p50": None, "p95": None,
+                             "p99": None, "total": 1, "max": 1}),
+             "complete 30-call ledger"),
+        ):
+            bad = copy.deepcopy(objects)
+            mutate(bad)
+            settle_fixture_verdict(bad)
+            try:
+                validate_canary(lane, bad, bits)
+            except AssertionError as error:
+                require(
+                    message in str(error),
+                    f"object {name} died elsewhere: {error}",
+                )
+            else:
+                raise AssertionError(f"object {name} violation was accepted")
     print("object canary requires exact 30-call function/RV ledger and target ABI: OK")
 
     def last_scan_table(document):

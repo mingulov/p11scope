@@ -10,11 +10,12 @@ of three ways:
   (`python3 -I tests/python/<file> [args] -v`; the suites are not an
   importable package, so `-m unittest` cannot address them).
 - DRIVEN: a suite that needs a built artifact (an eBPF object, a fixture
-  binary, a prepared toolchain) and is run by the named driver, which must
-  drive it through an invocation-shaped reference: the suite path as an
-  argument of a python/pytest/unittest call or of the runner's own suite
-  list. The driver is a cargo integration test or a self-test the hosted
-  pipeline already runs.
+  binary, a prepared toolchain), or that is too slow for the serial lane
+  and runs on its own schedule instead, and is run by the named driver,
+  which must drive it through an invocation-shaped reference: the suite
+  path as an argument of a python/pytest/unittest call or of the runner's
+  own suite list. The driver is a cargo integration test, a self-test the
+  hosted pipeline already runs, or a scheduled workflow.
 - EXCLUDED: a suite that cannot run anywhere today, with the reason.
 
 The registry is checked against the directory both ways before anything
@@ -105,7 +106,6 @@ RUN = [
     ("test_discovery_retry_classes_oracle.py", []),
     ("test_canary_evidence.py", ["--target-bits", "32"]),
     ("test_canary_evidence.py", ["--target-bits", "64"]),
-    ("test_guard_removal_sweep.py", []),
     ("test_canary_object.py", []),
     ("test_canary_observer_verbosity.py", []),
     ("test_ci_dependency_selection.py", []),
@@ -242,6 +242,7 @@ _RECEIPTS = "tests/receipt_build_subjects.rs"
 # mention in a comment or a message does not count.
 DRIVEN = {
     "test_audit_oracle.py": _ARTIFACT_CONTRACTS,
+    "test_guard_removal_sweep.py": ".github/workflows/guard-sweep-nightly.yml",
     "test_bpf_map_defs.py": "tests/bpf_map_contracts.rs",
     "test_build_offline.py": _ARTIFACT_CONTRACTS,
     "test_canary_process_custody.py": _ARTIFACT_CONTRACTS,
@@ -346,14 +347,23 @@ def _strip_driver_comments(text, driver):
     return "".join(out)
 
 
-def _invocation_shaped(stripped, needle):
+def _invocation_shaped(stripped, needle, driver=""):
     """True when some occurrence is passed as an invocation argument.
 
     An occurrence counts when it sits in argument position (after `(`, `,`
     or `[`, closed by `,`, `)` or `]` or whitespace) with an invocation
-    marker within two lines; a bare mention has neither and fails.
+    marker within two lines; a bare mention has neither and fails. In a
+    scheduled workflow (YAML `run:` shell lines have no call punctuation),
+    a quoted path on the same line as a python/pytest/unittest invocation
+    counts instead. Comments are blanked before either rule runs.
     """
     lines = stripped.splitlines()
+    if driver.endswith((".yml", ".yaml")):
+        return any(
+            needle in line
+            and any(marker in line for marker in ("python", "pytest", "unittest"))
+            for line in lines
+        )
     start = 0
     while True:
         at = stripped.find(needle, start)
@@ -378,7 +388,7 @@ def driven_state(text, name, driver):
     needles = (f'"{SUITE_DIR}/{name}"', f'"{name}"')
     if not any(needle in stripped for needle in needles):
         return "missing"
-    if any(_invocation_shaped(stripped, needle) for needle in needles):
+    if any(_invocation_shaped(stripped, needle, driver) for needle in needles):
         return "driven"
     return "named"
 

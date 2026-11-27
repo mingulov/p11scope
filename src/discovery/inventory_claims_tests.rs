@@ -1017,6 +1017,96 @@ fn merge_ownership_e8_release_carried_provider_stays_claimless() {
 }
 
 #[test]
+fn merge_ownership_e8_release_drains_released_owner_pins() {
+    // E8 x release drain: X owns a distinct provider file while R and L
+    // share another. Releasing X must drain X's solely-owned pins from
+    // the committed set (the remove_view call in release_scoped_owner),
+    // not merely drop its view and modules: without the drain, X's pins
+    // would linger resolvable-but-claimless (stale carried coverage)
+    // and X's ID occupancy would never return. The live owner's pins
+    // and slots, and the shared pin, all survive.
+    let mut fixture = mo_owners();
+    let providers = mo_providers(&fixture, fixture.view_x, 3);
+    let module_r = mo_reassign(providers[0].clone(), fixture.view_r);
+    let module_l = mo_reassign(providers[0].clone(), fixture.view_live);
+    let module_x = mo_reassign(providers[1].clone(), fixture.view_x);
+    seed_claims(&mut fixture.engine, fixture.view_r, &[module_r]);
+    seed_claims(&mut fixture.engine, fixture.view_live, &[module_l]);
+    seed_claims(
+        &mut fixture.engine,
+        fixture.view_x,
+        std::slice::from_ref(&module_x),
+    );
+    let x_object = fixture
+        .engine
+        .modules
+        .iter()
+        .find(|module| module.scanned.view == fixture.view_x)
+        .expect("X's module seeded")
+        .object;
+    let shared = fixture
+        .engine
+        .modules
+        .iter()
+        .find(|module| module.scanned.view == fixture.view_live)
+        .expect("L's module seeded")
+        .object;
+    assert_ne!(x_object, shared, "X owns a distinct pin");
+    assert!(
+        fixture.engine.pinned.summary(x_object).is_some(),
+        "X's pin is resolvable before release"
+    );
+    mo_carry_r(&mut fixture);
+    fixture.engine.release_scoped_owner(fixture.view_x).unwrap();
+    assert!(
+        fixture
+            .engine
+            .views
+            .iter()
+            .all(|view| view.id() != fixture.view_x),
+        "the release dropped the owner's view"
+    );
+    assert!(
+        fixture
+            .engine
+            .modules
+            .iter()
+            .all(|module| module.scanned.view != fixture.view_x),
+        "the release dropped the owner's modules"
+    );
+    assert!(
+        fixture.engine.pinned.view_claims(fixture.view_x).is_none(),
+        "the released owner files no claims"
+    );
+    assert!(
+        fixture.engine.pinned.summary(x_object).is_none(),
+        "the released owner's sole pin drains from the committed set"
+    );
+    assert!(
+        !fixture
+            .engine
+            .pinned
+            .module_aliased_under(&module_x, fixture.view_x),
+        "the released owner's module no longer routes"
+    );
+    assert!(
+        !fixture.engine.pinned.carried_ids().contains(&x_object),
+        "the drained pin does not linger as carried coverage"
+    );
+    mo_assert_owner_live(
+        &fixture.engine.pinned,
+        &fixture.engine.modules,
+        &fixture.engine.plan,
+        fixture.view_live,
+        "scoped release drain",
+    );
+    assert!(
+        fixture.engine.pinned.summary(shared).is_some(),
+        "the shared pin stays resolvable (scoped release drain)"
+    );
+}
+
+#[test]
 fn merge_ownership_e9_reconcile_shared_pin_stays_claimless() {
     // E9 × shared-pin: R and L share one provider file. After E1 carries
     // R, a partial receipt for L (its committed file plus one fresh

@@ -21507,6 +21507,86 @@ mod tests {
         assert_eq!(acc.pinned().count(), 0, "nothing is stranded");
     }
 
+    #[test]
+    fn prearm_alias_survives_its_only_view_retirement() {
+        // Pre-arm aliases are view-independent operator inputs (like
+        // manifest aliases): when the only claiming view retires, the
+        // namespace-less retained chain keeps the id resolvable instead
+        // of collecting it as unowned.
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let view = crate::process::ProcessViewId(11);
+        let mut staged = plain_prearm_pin(key, "aaaaaaaa", 1);
+        reback(&mut staged, &file);
+        let mut acc = PinnedObjects::empty();
+        assert!(acc.absorb(staged).is_empty());
+        let id = acc.pinned().next().unwrap().id;
+        let raw = acc.raw_to_id.keys().next().unwrap().clone();
+        assert!(
+            raw.mount_namespace.is_none(),
+            "the pre-arm alias files namespace-less"
+        );
+        acc.ownership.entry(view).or_default().pins.push(id);
+        let removed = acc.remove_view(view);
+        assert!(removed.is_some(), "the retirement must execute");
+        assert!(
+            acc.by_id.contains_key(&id),
+            "the pre-arm id survives its only view's retirement"
+        );
+        assert_eq!(
+            acc.raw_to_id.get(&raw),
+            Some(&id),
+            "the pre-arm alias stays filed"
+        );
+        assert_eq!(acc.pinned().count(), 1, "one file, one object");
+    }
+
+    #[test]
+    fn drop_view_claims_bumps_revision_once_per_claimed_drop() {
+        // Revision discipline: dropping a claimed view bumps the
+        // membership revision (pin sweeps must re-run); dropping an
+        // already claimless view is a no-op that bumps nothing.
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let view = crate::process::ProcessViewId(11);
+        let mut module_v = module(key);
+        module_v.view = view;
+        let mut pins = view_pin(&module_v, key.device.minor + 1, "aaaaaaaa", 1, false);
+        reback(&mut pins, &file);
+        let mut acc = PinnedObjects::empty();
+        assert!(acc.absorb(pins).is_empty());
+        acc.alias_scanned_module_under(&module_v, view);
+        assert!(
+            acc.view_claims(view).is_some(),
+            "the fixture files claims before the drop"
+        );
+        let before = acc.revision();
+        acc.drop_view_claims(view);
+        assert_eq!(
+            acc.revision(),
+            before + 1,
+            "dropping a claimed view bumps the revision"
+        );
+        assert!(
+            acc.view_claims(view).is_none(),
+            "the drop removes the view's claims"
+        );
+        acc.drop_view_claims(view);
+        assert_eq!(
+            acc.revision(),
+            before + 1,
+            "dropping an already claimless view bumps nothing"
+        );
+    }
+
     /// The kept staging and the incoming scan of one touched file, with
     /// the mount ids aligned (one file, one mount) and the given overlay
     /// flags on each side.

@@ -1094,9 +1094,12 @@ fn merge_ownership_e8_release_drains_released_owner_pins() {
         "the drained pin does not linger as carried coverage"
     );
     assert!(
-        !fixture.engine.plan.slots.iter().any(|slot| {
-            fixture.engine.plan.is_active(slot.index) && slot.object == x_object
-        }),
+        !fixture
+            .engine
+            .plan
+            .slots
+            .iter()
+            .any(|slot| { fixture.engine.plan.is_active(slot.index) && slot.object == x_object }),
         "the drained pin keeps no active slots (retired rows may linger as tombstones)"
     );
     mo_assert_owner_live(
@@ -1357,6 +1360,259 @@ fn merge_ownership_e8_release_pin_shared_with_a_live_claimant_survives() {
         &fixture.engine.plan,
         fixture.view_live,
         "scoped release live-shared",
+    );
+}
+
+#[test]
+fn merge_ownership_e8_release_preserves_dependency_pin_referenced_by_a_carried_view() {
+    // E8 x carried-dependency: R's module binds one ordinary self
+    // entry plus one entry in a distinct dependency object; X owns
+    // and claims that dependency; L is unrelated and live. After E1
+    // carries R, releasing X must preserve the dependency pin (the
+    // keep closure covers bound entry targets, not just provider
+    // objects): R's dependency entry stays bound and its active
+    // dependency endpoint survives, while X is fully gone.
+    let mut fixture = mo_owners();
+    let providers = mo_providers(&fixture, fixture.view_x, 3);
+    let mut module_r = mo_reassign(providers[0].clone(), fixture.view_r);
+    let dep_entry = crate::discovery::scan::ScannedEntry {
+        name: "C_Initialize",
+        object: providers[2].key,
+        object_path: providers[2].path.clone(),
+        file_offset: providers[2].tables[0].entries[0].file_offset,
+    };
+    module_r.tables[0].entries.push(dep_entry);
+    let module_x = mo_reassign(providers[2].clone(), fixture.view_x);
+    let module_l = mo_reassign(providers[1].clone(), fixture.view_live);
+    seed_claims(&mut fixture.engine, fixture.view_x, &[module_x]);
+    seed_claims(&mut fixture.engine, fixture.view_r, &[module_r]);
+    seed_claims(&mut fixture.engine, fixture.view_live, &[module_l]);
+    let dep_object = fixture
+        .engine
+        .modules
+        .iter()
+        .find(|module| module.scanned.view == fixture.view_x)
+        .expect("X's module seeded")
+        .object;
+    let r_object = fixture
+        .engine
+        .modules
+        .iter()
+        .find(|module| module.scanned.view == fixture.view_r)
+        .expect("R's module seeded")
+        .object;
+    assert_ne!(dep_object, r_object, "the dependency is a distinct object");
+    let r_entries: Vec<_> = fixture
+        .engine
+        .modules
+        .iter()
+        .find(|module| module.scanned.view == fixture.view_r)
+        .expect("R's module seeded")
+        .entry_objects
+        .iter()
+        .flatten()
+        .copied()
+        .collect();
+    assert!(
+        r_entries.contains(&dep_object),
+        "R's dependency entry binds pre-release"
+    );
+    assert!(
+        r_entries.contains(&r_object),
+        "R's self entry binds pre-release"
+    );
+    assert!(
+        fixture
+            .engine
+            .pinned
+            .view_claims(fixture.view_x)
+            .is_some_and(|claims| claims.pins.contains(&dep_object)),
+        "X claims the dependency before R is carried"
+    );
+    mo_carry_r(&mut fixture);
+    assert!(
+        fixture.engine.pinned.summary(dep_object).is_some(),
+        "the dependency is resolvable before release"
+    );
+    assert!(
+        fixture
+            .engine
+            .plan
+            .slots
+            .iter()
+            .any(|slot| { fixture.engine.plan.is_active(slot.index) && slot.object == dep_object }),
+        "the dependency has an active endpoint before release"
+    );
+    fixture.engine.release_scoped_owner(fixture.view_x).unwrap();
+    assert!(
+        fixture
+            .engine
+            .views
+            .iter()
+            .all(|view| view.id() != fixture.view_x),
+        "the release dropped the owner's view"
+    );
+    assert!(
+        fixture
+            .engine
+            .modules
+            .iter()
+            .all(|module| module.scanned.view != fixture.view_x),
+        "the release dropped the owner's modules"
+    );
+    assert!(
+        fixture.engine.pinned.summary(dep_object).is_some(),
+        "the carried module's dependency object survives X's release"
+    );
+    let r_entries_after: Vec<_> = fixture
+        .engine
+        .modules
+        .iter()
+        .find(|module| module.scanned.view == fixture.view_r)
+        .expect("R's retained carried module still rides after X's release")
+        .entry_objects
+        .iter()
+        .flatten()
+        .copied()
+        .collect();
+    assert!(
+        r_entries_after.contains(&dep_object),
+        "R's dependency entry stays bound after X's release"
+    );
+    assert!(
+        fixture
+            .engine
+            .plan
+            .slots
+            .iter()
+            .any(|slot| { fixture.engine.plan.is_active(slot.index) && slot.object == dep_object }),
+        "the carried dependency keeps an active endpoint after X's release"
+    );
+}
+
+#[test]
+fn restore_start_publication_preserves_pin_shared_with_a_carried_view() {
+    // Rollback twin for the E8 keep rule: R and X share one provider
+    // file; R is carried then X's view departs mid-attempt. Restoring
+    // the failed start must not purge the carried-shared pin: R's
+    // module still rides and keeps its active slot, while the removed
+    // view's own modules are gone.
+    let mut fixture = mo_owners();
+    let providers = mo_providers(&fixture, fixture.view_x, 2);
+    let module_r = mo_reassign(providers[0].clone(), fixture.view_r);
+    let module_x = mo_reassign(providers[0].clone(), fixture.view_x);
+    seed_claims(&mut fixture.engine, fixture.view_r, &[module_r]);
+    seed_claims(&mut fixture.engine, fixture.view_x, &[module_x]);
+    let shared = fixture
+        .engine
+        .modules
+        .iter()
+        .find(|module| module.scanned.view == fixture.view_r)
+        .expect("R's module seeded")
+        .object;
+    assert_eq!(
+        fixture
+            .engine
+            .modules
+            .iter()
+            .find(|module| module.scanned.view == fixture.view_x)
+            .expect("X's module seeded")
+            .object,
+        shared,
+        "R and X share one canonical pin"
+    );
+    mo_carry_r(&mut fixture);
+    assert!(
+        fixture.engine.pinned.summary(shared).is_some(),
+        "the shared pin is resolvable before restore"
+    );
+    assert!(
+        fixture
+            .engine
+            .plan
+            .slots
+            .iter()
+            .any(|slot| { fixture.engine.plan.is_active(slot.index) && slot.object == shared }),
+        "the shared object has an active slot before restore"
+    );
+    let snapshot = crate::discovery::engine::StartPublicationSnapshot {
+        plan: fixture.engine.plan.clone(),
+        pinned: fixture.engine.pinned.clone(),
+        discovery: fixture.engine.discovery.clone(),
+        modules: fixture.engine.modules.clone(),
+        corroboration: fixture.engine.counters.corroboration.clone(),
+        manifest_fallbacks: fixture.engine.counters.manifest_fallbacks.clone(),
+        views: fixture.engine.views.iter().map(|view| view.id()).collect(),
+        next_selection_binding_id: fixture.engine.next_selection_binding_id,
+        selection_bindings: fixture.engine.selection_bindings.clone(),
+        selection_claims: fixture.engine.selection_claims.clone(),
+        selection_tables: fixture.engine.selection_tables.clone(),
+    };
+    fixture
+        .engine
+        .views
+        .retain(|view| view.id() != fixture.view_x);
+    fixture.engine.restore_start_publication(snapshot);
+    assert!(
+        fixture.engine.pinned.summary(shared).is_some(),
+        "the carried shared pin survives the restore"
+    );
+    assert!(
+        fixture
+            .engine
+            .modules
+            .iter()
+            .any(|module| module.scanned.view == fixture.view_r),
+        "R's retained carried module still rides after restore"
+    );
+    assert!(
+        fixture
+            .engine
+            .plan
+            .slots
+            .iter()
+            .any(|slot| { fixture.engine.plan.is_active(slot.index) && slot.object == shared }),
+        "the carried shared pin keeps an active slot after restore"
+    );
+    assert!(
+        fixture
+            .engine
+            .modules
+            .iter()
+            .all(|module| module.scanned.view != fixture.view_x),
+        "the restore dropped the removed view's modules"
+    );
+}
+
+#[test]
+fn merge_ownership_e8_release_drained_pin_keeps_no_active_slots() {
+    // Slot-focused twin for the sole-owner drain: X owns a distinct
+    // file and is released. The only assertion family is slot state:
+    // no ACTIVE slot may reference X's drained pin (retired tombstone
+    // rows may linger). This isolates the slot outcome that the drain
+    // twin asserts downstream of its pin/module lines: combined
+    // drain+filter loss fails here, while either single loss is
+    // covered before slots are reached.
+    let mut fixture = mo_owners();
+    let providers = mo_providers(&fixture, fixture.view_x, 1);
+    let module_x = mo_reassign(providers[0].clone(), fixture.view_x);
+    seed_claims(&mut fixture.engine, fixture.view_x, &[module_x]);
+    let x_object = fixture
+        .engine
+        .modules
+        .iter()
+        .find(|module| module.scanned.view == fixture.view_x)
+        .expect("X's module seeded")
+        .object;
+    fixture.engine.release_scoped_owner(fixture.view_x).unwrap();
+    assert!(
+        !fixture
+            .engine
+            .plan
+            .slots
+            .iter()
+            .any(|slot| { fixture.engine.plan.is_active(slot.index) && slot.object == x_object }),
+        "the drained pin keeps no active slots"
     );
 }
 

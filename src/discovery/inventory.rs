@@ -668,18 +668,17 @@ impl Engine {
         let mut pinned = self.pinned.clone();
         // E8 keeps every still-referenced object: live riders keep
         // theirs through their own claims, but carried views ride
-        // claimless by design, so objects referenced by retained
-        // carried or non-owner modules must be carried through the
-        // removal explicitly — otherwise releasing their last claimant
-        // would purge the shared pin and the retained carried module
-        // and slot would vanish with it. The released owner's own
-        // modules do not ride (filtered below), so owner-only pins
-        // still drain. Unresolvable keep members are no-ops.
+        // claimless by design, so the riding modules' required objects
+        // must be carried through the removal explicitly — otherwise
+        // releasing their last claimant would purge a shared pin and
+        // the retained carried module and slot would vanish with it.
+        // The released owner's own modules do not ride (filtered
+        // below), so owner-only pins still drain.
         let keep: BTreeSet<_> = self
             .modules
             .iter()
             .filter(|module| module.scanned.view != owner)
-            .map(|module| module.object)
+            .flat_map(|module| module.required_objects())
             .filter(|id| pinned.summary(*id).is_some())
             .collect();
         pinned.retire_view_except_proven(
@@ -689,6 +688,11 @@ impl Engine {
             crate::discovery::refresh_queue::RetirementProof::OperatorRemoval,
             &keep,
         );
+        // E8 invariant: the removal above must spare every object the
+        // keep closure named. (Keep *completeness* is pinned by the
+        // carried-dependency twin plus its mutant; this pins keep
+        // *respect* at the site.)
+        pinned.debug_assert_keep_respected(&keep);
         let modules: Vec<_> = self
             .modules
             .iter()

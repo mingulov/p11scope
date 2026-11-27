@@ -19734,6 +19734,18 @@ impl Engine {
             .copied()
             .collect();
         let mut pinned = snapshot.pinned;
+        // Same keep rule as scoped release: objects referenced by
+        // retained riding modules (including claimless carried ones)
+        // must survive the removed views' retirement, or a pin the
+        // rollback shares with a carried view would be purged and the
+        // restored publication would lose its carried module and slot.
+        let keep: BTreeSet<_> = snapshot
+            .modules
+            .iter()
+            .filter(|module| !removed_views.contains(&module.scanned.view))
+            .flat_map(|module| module.required_objects())
+            .filter(|id| pinned.summary(*id).is_some())
+            .collect();
         for view in &removed_views {
             // Publication restore syncs pins to surviving views; the
             // removed views are already untracked, so the prover always
@@ -19741,8 +19753,9 @@ impl Engine {
             let proof = self
                 .retirement_proof_for(*view)
                 .unwrap_or(RetirementProof::OperatorRemoval);
-            pinned.retire_view_only_if_proven_gone(*view, proof);
+            pinned.retire_view_except_proven(*view, proof, &keep);
         }
+        pinned.debug_assert_keep_respected(&keep);
         let modules: Vec<_> = snapshot
             .modules
             .into_iter()

@@ -1859,6 +1859,19 @@ pub struct ReconciledModule {
     pub witness_fault: bool,
 }
 
+impl ReconciledModule {
+    /// Every object this module needs to stay bound: its provider
+    /// object plus every bound entry target (an entry may land in a
+    /// dependency the module only forwards to). Depth one is complete:
+    /// entry targets are pins, and binding resolves targets to
+    /// identities without recursing into further modules.
+    /// View-removal keep sets are built from this over riding modules,
+    /// so provider objects and entry targets can never split again.
+    pub(crate) fn required_objects(&self) -> impl Iterator<Item = PinnedObjectId> + '_ {
+        std::iter::once(self.object).chain(self.entry_objects.iter().flatten().copied())
+    }
+}
+
 /// One target under its complete opened-file identity plus offset.
 type TargetKey = (MappingFileKey, u64, Pin, String, u64);
 
@@ -4012,6 +4025,19 @@ impl PinnedObjects {
             claims.pins.retain(|claimed| *claimed != id);
         }
         true
+    }
+
+    /// Keep-respect tripwire (debug/test builds only; compiled out in
+    /// release): every id the caller computed into `keep` must still
+    /// resolve after the removal. Callers invoke it right after their
+    /// `remove_view_except` when they computed a keep set, so a purge
+    /// of a retained object fails at the site instead of surfacing as
+    /// a dangling module downstream.
+    pub(crate) fn debug_assert_keep_respected(&self, keep: &BTreeSet<PinnedObjectId>) {
+        debug_assert!(
+            keep.iter().all(|id| self.summary(*id).is_some()),
+            "view removal purged an object retained modules still reference"
+        );
     }
 
     /// Whether `module`'s own file raw and every table-entry
@@ -14401,9 +14427,9 @@ pub(crate) mod test_fixture {
 #[cfg(test)]
 mod tests {
     use super::test_fixture::{
-        FakeSelfMappingProbe, INODE, PATH, SHA, backing_file, mark_pre_copy_up, module, overlay,
-        own_all_raws, own_all_raws_under, pin_set, pins, plain_prearm_pin, prearm_pin, reback,
-        repath_single_pin, view_pin,
+        FakeSelfMappingProbe, INODE, PATH, SHA, backing_file, manifest_pin, mark_pre_copy_up,
+        module, overlay, own_all_raws, own_all_raws_under, pin_set, pins, plain_prearm_pin,
+        prearm_pin, reback, repath_single_pin, view_pin,
     };
     use super::*;
     use crate::discovery::scan::ScannedEntry;
@@ -21541,6 +21567,88 @@ mod tests {
             acc.raw_to_id.get(&raw),
             Some(&id),
             "the pre-arm alias stays filed"
+        );
+        assert_eq!(acc.pinned().count(), 1, "one file, one object");
+    }
+
+    #[test]
+    fn manifest_alias_survives_its_only_view_retirement() {
+        // Manifest aliases file namespace-less like pre-arm aliases,
+        // so the same retained chain keeps the id resolvable when its
+        // only claiming view retires (no overlay rotation is involved:
+        // a single absorb, then the retirement).
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let view = crate::process::ProcessViewId(11);
+        let mut staged = manifest_pin(key, "aaaaaaaa", 1);
+        reback(&mut staged, &file);
+        let mut acc = PinnedObjects::empty();
+        assert!(acc.absorb(staged).is_empty());
+        let id = acc.pinned().next().unwrap().id;
+        let raw = acc.raw_to_id.keys().next().unwrap().clone();
+        assert!(
+            raw.mount_namespace.is_none(),
+            "the manifest alias files namespace-less"
+        );
+        acc.ownership.entry(view).or_default().pins.push(id);
+        let removed = acc.remove_view(view);
+        assert!(removed.is_some(), "the retirement must execute");
+        assert!(
+            acc.by_id.contains_key(&id),
+            "the manifest id survives its only view's retirement"
+        );
+        assert_eq!(
+            acc.raw_to_id.get(&raw),
+            Some(&id),
+            "the manifest alias stays filed"
+        );
+        assert_eq!(acc.pinned().count(), 1, "one file, one object");
+    }
+
+    #[test]
+    fn unrelated_retirement_spares_claimless_carried_pins() {
+        // Unowned is computed from the REMOVED view's claims only: a
+        // carried (claimless) pin that the removed view never claimed
+        // cannot be collected by its retirement. (This is the mechanism
+        // that makes provider-free eviction of claimless exploratory
+        // views safe for carried coverage: empty claims prune nothing.)
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let view_v = crate::process::ProcessViewId(11);
+        let view_w = crate::process::ProcessViewId(12);
+        let mut module_v = module(key);
+        module_v.view = view_v;
+        let mut pins = view_pin(&module_v, key.device.minor + 1, "aaaaaaaa", 1, false);
+        reback(&mut pins, &file);
+        let carried_raw = pins.raw_to_id.keys().next().unwrap().clone();
+        let mut acc = PinnedObjects::empty();
+        assert!(acc.absorb(pins).is_empty());
+        let carried = acc.pinned().next().unwrap().id;
+        acc.alias_scanned_module_under(&module_v, view_v);
+        acc.drop_view_claims(view_v);
+        assert!(
+            acc.view_claims(view_v).is_none(),
+            "the carried view files no claims"
+        );
+        acc.ownership.entry(view_w).or_default();
+        let removed = acc.remove_view(view_w);
+        assert!(removed.is_some(), "the retirement must execute");
+        assert!(
+            acc.by_id.contains_key(&carried),
+            "the unrelated retirement spares the carried pin"
+        );
+        assert_eq!(
+            acc.raw_to_id.get(&carried_raw),
+            Some(&carried),
+            "the carried alias stays filed"
         );
         assert_eq!(acc.pinned().count(), 1, "one file, one object");
     }

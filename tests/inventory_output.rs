@@ -93,7 +93,10 @@ fn control_mode(case: &str, without_report: bool) {
         assert_eq!(document["scope"], format!("pid:{pid}"));
         // Immediate capture cancellation can correctly commit an empty report.
         // The staged signal-progress cell and natural captures retain positives.
-        if case == "signal-baseline" || case == "signal-stall" && cell["label"] == "baseline-one" {
+        if case == "signal-baseline"
+            || case == "signal-nohup"
+            || case == "signal-stall" && cell["label"] == "baseline-one"
+        {
             continue;
         }
         let caller = document["callers"]
@@ -168,6 +171,10 @@ fn signal_stall() {
 fn signal_progress() {
     control("signal-progress");
 }
+#[test]
+fn signal_nohup() {
+    control("signal-nohup");
+}
 
 // These additional controls establish eligible stdout behavior where the
 // environment refuses trusted -o/event ancestors. Required independent-report
@@ -207,6 +214,10 @@ fn signal_stall_without_report() {
 #[test]
 fn signal_progress_without_report() {
     control_mode("signal-progress", true);
+}
+#[test]
+fn signal_nohup_without_report() {
+    control_mode("signal-nohup", true);
 }
 
 #[test]

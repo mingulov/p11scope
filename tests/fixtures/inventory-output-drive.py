@@ -34,12 +34,42 @@ def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+
+
+def proc_sig_masks(pid):
+    """Typed /proc signal masks for a live owned pid (ints)."""
+    masks = {}
+    for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+        if line.startswith(("SigIgn:", "SigCgt:", "SigBlk:")):
+            key, value = line.split(":", 1)
+            masks[key] = int(value.strip(), 16)
+    return masks
+
+
+def reset_stop_signals(*, ignore_hup):
+    """Child-side hermetic signal precondition: the three tested stop
+    signals start default (SIGHUP explicitly ignored for the nohup twin
+    only), regardless of the harness environment. Ignored dispositions
+    survive exec, so inheriting the harness's would test nothing — the
+    SIGHUP cell would hang where the harness ignores SIGHUP."""
+    for sig in STOP_SIGNALS:
+        signal.signal(sig, signal.SIG_IGN if ignore_hup and sig == signal.SIGHUP else signal.SIG_DFL)
+
+
 def save(path, value):
     Path(path).write_text(json.dumps(value, indent=2) + "\n")
 
 
 def launcher(spec_path):
     spec = json.loads(Path(spec_path).read_text())
+    hup = spec.get("hup", "default")
+    assert hup in ("default", "ignore"), f"unknown SIGHUP precondition {hup!r}"
+    # Hermetic dispositions before anything this launcher owns exists:
+    # the target and (through exec) the observer. The nohup twin's
+    # target harmlessly inherits the explicit SIGHUP ignore too; it is
+    # only ever SIGTERMed, which always resets to default.
+    reset_stop_signals(ignore_hup=(hup == "ignore"))
     target = subprocess.Popen(spec["target"], stdin=subprocess.DEVNULL,
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     save(spec["target_receipt"], {"pid": target.pid, "spawned": time.monotonic()})
@@ -54,7 +84,15 @@ def launcher(spec_path):
             pid = None
             time.sleep(0.01)
     assert pid == target.pid
-    save(spec["target_receipt"], {"pid": pid, "ready": time.monotonic()})
+    pre_exec = proc_sig_masks(os.getpid())
+    save(spec["target_receipt"], {"pid": pid, "ready": time.monotonic(),
+                                  "hup_precondition": hup,
+                                  "pre_exec_sigign": f"{pre_exec['SigIgn']:016x}",
+                                  "pre_exec_sigcgt": f"{pre_exec['SigCgt']:016x}"})
+    if hup == "ignore":
+        assert pre_exec["SigIgn"] & 0x1, "nohup twin must exec with SIGHUP ignored"
+    else:
+        assert not pre_exec["SigIgn"] & 0x1, "observer must exec with SIGHUP default"
     argv = [x.replace("TARGET_PID", str(pid)) for x in spec["observer"]]
     os.execv(argv[0], argv)
 
@@ -126,7 +164,7 @@ def writer_wait(pid):
 
 
 def run_cell(args, root, label, *, json_output=True, first_signal=None,
-             baseline=0, large=False):
+             baseline=0, large=False, nohup=False, second_signal=None):
     root.mkdir(mode=0o700)
     begin = time.monotonic()
     report, events = root / "report.json", root / "events.jsonl"
@@ -198,7 +236,8 @@ def run_cell(args, root, label, *, json_output=True, first_signal=None,
             receipt = root / "target.json"
             spec = root / "launch.json"
             save(spec, {"target": [str(driver), "--ready", str(ready), "--call", "--sleep", "120", *modules],
-                        "ready": str(ready), "target_receipt": str(receipt), "observer": argv})
+                        "ready": str(ready), "target_receipt": str(receipt), "observer": argv,
+                        "hup": "ignore" if nohup else "default"})
             command = [sys.executable, "-I", str(Path(__file__).resolve()), "--launch-spec", str(spec)]
             cell["workload"] = {"kind": "owned-catalog", "provider_count": len(modules),
                                 "driver_sha256": digest(driver), "provider_sha256": digest(modules[0])}
@@ -212,8 +251,14 @@ def run_cell(args, root, label, *, json_output=True, first_signal=None,
             command = argv
             cell["workload"] = {"kind": "coordinator-owned-native", "pid": target_pid,
                                 "ledger": config["ledger"]}
+        def _child_dispositions():
+            # Direct-spawn twin of the launcher reset: the observer (or the
+            # launcher, which re-resets before exec) starts hermetic.
+            reset_stop_signals(ignore_hup=nohup)
+
         observer = subprocess.Popen(command, stdin=input_fd, stdout=write_fd,
-                                    stderr=write_fd if shared else err_write, start_new_session=True)
+                                    stderr=write_fd if shared else err_write, start_new_session=True,
+                                    preexec_fn=_child_dispositions)
         os.close(err_write)
         fds.remove(err_write)
         deadline = begin + (90 if large else 20)
@@ -240,6 +285,24 @@ def run_cell(args, root, label, *, json_output=True, first_signal=None,
                 stdout, stderr, event_bytes, without_report=without_report,
                 dashboard=dashboard,
             )
+            if capture_ready and "observer_sigign_at_ready" not in cell:
+                # Readiness requires observer output, so exec (and the
+                # child-side reset) has provably happened; the observer's
+                # own installs move signals default->caught, never
+                # ->ignored, and the nohup twin never installs SIGHUP.
+                # Either way this read is race-free and deterministic.
+                ready_masks = proc_sig_masks(observer.pid)
+                cell["observer_sigign_at_ready"] = f"{ready_masks['SigIgn']:016x}"
+                cell["observer_sigcgt_at_ready"] = f"{ready_masks['SigCgt']:016x}"
+                hup_ignored = bool(ready_masks["SigIgn"] & 0x1)
+                if nohup:
+                    assert hup_ignored, "nohup twin reached readiness without SIGHUP ignored"
+                else:
+                    assert not hup_ignored, "observer reached readiness with SIGHUP ignored"
+                if args.capture == "scan":
+                    receipt = json.loads((root / "target.json").read_text())
+                    cell["observer_pre_exec_sigign"] = receipt.get("pre_exec_sigign")
+                    assert receipt.get("hup_precondition") == ("ignore" if nohup else "default")
             if capture_ready and tty and not stopped:
                 if dashboard and b"p11scope inventory" not in stdout:
                     time.sleep(0.01)
@@ -276,6 +339,17 @@ def run_cell(args, root, label, *, json_output=True, first_signal=None,
                 os.kill(observer.pid, first_signal)
                 signals.append({"signal": first_signal, "sent": now, "phase": "capture"})
                 signal_sent = True
+            if nohup and signal_sent and second_signal is not None and not later_sent:
+                # The ignored SIGHUP must leave capture running: a stopped
+                # observer exits in ~0.2s (baseline shape), so survival a
+                # full grace window later is a 10x-separated, deterministic
+                # twin assertion — then SIGINT must still stop it cleanly.
+                if now - signals[0]["sent"] >= 2.0:
+                    assert observer.poll() is None, "observer stopped on ignored SIGHUP"
+                    cell["nohup_survived_seconds"] = now - signals[0]["sent"]
+                    os.kill(observer.pid, second_signal)
+                    signals.append({"signal": second_signal, "sent": now, "phase": "capture"})
+                    later_sent = True
             if args.capture == "native" and capture_ready and config.get("gate"):
                 Path(config["gate"]).touch()
             if report.exists() and committed_at is None:
@@ -385,6 +459,16 @@ def run_cell(args, root, label, *, json_output=True, first_signal=None,
             if args.case == "large-slow":
                 assert reader_times[-1] - reader_times[0] > 5, "healthy CLI slow output did not last >5s"
         assert capture_ready, "command never reached capture readiness"
+        if nohup:
+            # The grace check runs inside the poll loop; an observer that
+            # died on SIGHUP would exit the loop before it. Pin the twin
+            # post-loop too, or the defect it hunts goes green silently.
+            assert cell.get("nohup_survived_seconds", 0.0) >= 2.0, (
+                "nohup grace never observed; the observer exited early"
+            )
+            assert [entry["signal"] for entry in signals] == [signal.SIGHUP, second_signal], (
+                f"nohup twin must deliver SIGHUP then {second_signal}: {signals!r}"
+            )
         if args.capture == "scan":
             target_pid = json.loads((root / "target.json").read_text())["pid"]
         return cell
@@ -502,7 +586,7 @@ def main():
     parser.add_argument("--capture", choices=["scan", "native"], required=True)
     parser.add_argument("--case", choices=["pipe-stall", "tty-stall", "tty-shared-stderr",
                         "dashboard-json-stall", "xoff-resume", "large-slow", "signal-baseline",
-                        "signal-stall", "signal-progress"], required=True)
+                        "signal-stall", "signal-progress", "signal-nohup"], required=True)
     parser.add_argument("--evidence-dir", type=Path, required=True)
     args = parser.parse_args()
     args.binary = str(Path(args.binary).resolve())
@@ -516,6 +600,11 @@ def main():
         elif args.case == "signal-baseline":
             cells = [(str(sig), {"first_signal": sig, "baseline": 1})
                      for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)]
+        elif args.case == "signal-nohup":
+            # Item #5 twin: SIGHUP inherited ignored must leave capture
+            # running (proven by survival + a clean SIGINT stop after).
+            cells = [("nohup", {"first_signal": signal.SIGHUP, "nohup": True,
+                                "second_signal": signal.SIGINT})]
         elif args.case == "signal-stall":
             cells = [("baseline-zero", {}), ("baseline-one", {"first_signal": signal.SIGINT, "baseline": 1})]
         elif args.case == "signal-progress":

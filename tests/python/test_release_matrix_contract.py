@@ -625,6 +625,11 @@ class MatrixContract(unittest.TestCase):
         # build-counter-fixtures.sh builds "$REPO_ROOT/tests/fixtures/$src" for these sources
         "scripts/ci/build-counter-fixtures.sh": {"tests/fixtures/counter-banks.c",
                                                  "tests/fixtures/counter-bank-growth.c"},
+        # Both staged runners use the checker, which imports the shared
+        # row validator through a sys.path insert the text scan cannot
+        # see (the declaration itself is read, never walked).
+        "scripts/qualify-public-cli.sh": {"scripts/ci/result_row.py"},
+        "scripts/qualify-release-matrix.sh": {"scripts/ci/result_row.py"},
     }
 
     @classmethod
@@ -2797,10 +2802,15 @@ class MatrixContract(unittest.TestCase):
             path.write_text(text.replace("exit 0\n", body + "exit 0\n"))
             path.chmod(0o755)
         # Every other staged source (the full SOURCE_FILES list) is a
-        # controlled stand-in.
+        # controlled stand-in. Already-written files keep their bytes,
+        # including subdirectory inputs like the shared row validator.
         shutil.copy2(ROOT / ".release-rust-version", repo / ".release-rust-version")
-        for name in sorted(DECLARED - {"scripts/" + p.name for p in repo.joinpath("scripts").iterdir()}
-                           - {".release-rust-version"}):
+        staged_now = {
+            "scripts/" + p.relative_to(repo / "scripts").as_posix()
+            for p in (repo / "scripts").rglob("*")
+            if p.is_file()
+        }
+        for name in sorted(DECLARED - staged_now - {".release-rust-version"}):
             path = repo / name; path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("controlled external fixture\n")
             if name.endswith(".sh"): path.chmod(0o755)

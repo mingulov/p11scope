@@ -9725,21 +9725,30 @@ fn recovery_staging_gaps_latched_revival_then_stages_growth() {
         .anchor_ns;
     // Evict the ceremony key's fold so only its own revival trips the
     // latch; fillers keep the tiny cap honest.
-    scene.native.scene.coordinator.set_pair_prune_cap_for_test(2);
+    scene
+        .native
+        .scene
+        .coordinator
+        .set_pair_prune_cap_for_test(2);
     for ticket in [90u64, 91] {
-        scene.native.scene.coordinator.pair_dropped_tombstones.insert(
-            PairKey {
-                image: DomainCookie::scripted(scene.native.domain, ticket),
-                exec: 1,
-                object: 0,
-            },
-            PrunedPairBase {
-                base: 9,
-                base_since: 100,
-                pruned_since: 100,
-                pid: 7,
-            },
-        );
+        scene
+            .native
+            .scene
+            .coordinator
+            .pair_dropped_tombstones
+            .insert(
+                PairKey {
+                    image: DomainCookie::scripted(scene.native.domain, ticket),
+                    exec: 1,
+                    object: 0,
+                },
+                PrunedPairBase {
+                    base: 9,
+                    base_since: 100,
+                    pruned_since: 100,
+                    pid: 7,
+                },
+            );
     }
     for (pass, exec) in [1u64, 2, 3].iter().enumerate() {
         scene.native.scene.coordinator.pair_targets.insert(
@@ -9839,8 +9848,7 @@ fn recovery_staging_gaps_latched_revival_then_stages_growth() {
         "a refused revival stages no growth onto any edge"
     );
     assert_eq!(
-        scene.native.scene.coordinator.recoveries[&key].watermark,
-        12,
+        scene.native.scene.coordinator.recoveries[&key].watermark, 12,
         "the arm advances the watermark past the disclosed read"
     );
     // Advance past the consumed latch: normal growth stages through

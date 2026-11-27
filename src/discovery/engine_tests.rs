@@ -87178,12 +87178,8 @@ fn tails_with_missing_module_pin_publish_others_plus_gap() {
 /// one's pin is then lost on committed state while nothing rescans
 /// it this batch. Returns the engine plus victim and healthy plan
 /// objects and the victim's reconciled module.
-fn committed_two_provider_engine_with_pin_loss() -> (
-    Engine,
-    PinnedObjectId,
-    PinnedObjectId,
-    ReconciledModule,
-) {
+fn committed_two_provider_engine_with_pin_loss()
+-> (Engine, PinnedObjectId, PinnedObjectId, ReconciledModule) {
     let raw_a = overlay_module(overlay_key(86));
     let raw_b = overlay_module(overlay_key(87));
     let view_a = raw_a.view;
@@ -87199,8 +87195,12 @@ fn committed_two_provider_engine_with_pin_loss() -> (
     assert!(skipped.is_empty(), "{skipped:?}");
     assert_eq!(modules.len(), 2, "both providers reconcile");
     let mut engine = Engine::empty();
-    engine.views.push(ProcessView::open(view_a, std::process::id()).unwrap());
-    engine.views.push(ProcessView::open(view_b, std::process::id()).unwrap());
+    engine
+        .views
+        .push(ProcessView::open(view_a, std::process::id()).unwrap());
+    engine
+        .views
+        .push(ProcessView::open(view_b, std::process::id()).unwrap());
     engine.plan = plan::build_from_reconciled_modules(&modules);
     engine.pinned = pins;
     engine.modules = modules;

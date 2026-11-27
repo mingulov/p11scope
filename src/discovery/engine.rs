@@ -20117,12 +20117,10 @@ impl Engine {
             if pinned.summary(slot.object).is_some() {
                 continue;
             }
-            let module_kept = slot.module_ids.iter().any(|id| {
-                candidate_plan
-                    .modules
-                    .iter()
-                    .any(|kept| kept.id == *id)
-            });
+            let module_kept = slot
+                .module_ids
+                .iter()
+                .any(|id| candidate_plan.modules.iter().any(|kept| kept.id == *id));
             if !module_kept {
                 continue;
             }

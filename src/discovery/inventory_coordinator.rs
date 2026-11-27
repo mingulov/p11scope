@@ -46617,9 +46617,10 @@ int main(void) {
                     pid: 7,
                 },
             );
-            native.scene.coordinator.prune_departed_native_state(
-                at + EXEC_STATE_GRACE_NS + pass as u64,
-            );
+            native
+                .scene
+                .coordinator
+                .prune_departed_native_state(at + EXEC_STATE_GRACE_NS + pass as u64);
         }
         assert_eq!(
             native
@@ -46725,9 +46726,10 @@ int main(void) {
                     pid: 7,
                 },
             );
-            native.scene.coordinator.prune_departed_native_state(
-                at + EXEC_STATE_GRACE_NS + pass as u64,
-            );
+            native
+                .scene
+                .coordinator
+                .prune_departed_native_state(at + EXEC_STATE_GRACE_NS + pass as u64);
         }
         // The evicted (41, exec 11) fires first and consumes its unit.
         let row = native.row(41, 11, 7, at, 0);
@@ -46745,13 +46747,15 @@ int main(void) {
             .collect();
         assert_eq!(gaps.len(), 1, "exactly one overflow gap: {gaps:?}");
         assert!(
-            !native.scene.coordinator.pair_fold_lost_overflow.contains(
-                &PairKey {
+            !native
+                .scene
+                .coordinator
+                .pair_fold_lost_overflow
+                .contains(&PairKey {
                     image: DomainCookie::scripted(native.domain, 41),
                     exec: 11,
                     object: 0,
-                }
-            ),
+                }),
             "the fired unit leaves the overflow tier"
         );
         // A newcomer after the consumption stages its full count.
@@ -46809,9 +46813,10 @@ int main(void) {
                     pid: 7,
                 },
             );
-            native.scene.coordinator.prune_departed_native_state(
-                at + EXEC_STATE_GRACE_NS + pass as u64,
-            );
+            native
+                .scene
+                .coordinator
+                .prune_departed_native_state(at + EXEC_STATE_GRACE_NS + pass as u64);
         }
         assert_eq!(
             native
@@ -46832,12 +46837,14 @@ int main(void) {
             "the overflow tier holds its cap"
         );
         assert!(
-            native.scene.coordinator.pair_fold_lost_poisoned.contains(
-                &PairKeyClass {
+            native
+                .scene
+                .coordinator
+                .pair_fold_lost_poisoned
+                .contains(&PairKeyClass {
                     domain: native.domain,
                     object: 0,
-                }
-            ),
+                }),
             "the fifth eviction poisons the class"
         );
         // Four newcomers in the same class all gap: the poison does

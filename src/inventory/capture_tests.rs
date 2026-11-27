@@ -1951,6 +1951,8 @@ struct ReceiptHost {
     /// (`info_return_deferred`, `info_return_refused_hazard`,
     /// `info_revoked`, `info_revoke_failed`).
     receipt_info: Vec<(u64, u64, u64, u64)>,
+    /// Every terminal stop-backlog note, in order.
+    stop_backlogs: Vec<TargetDelta>,
     gaps: Vec<(String, String)>,
 }
 
@@ -1963,6 +1965,7 @@ impl ReceiptHost {
             receipts: Vec::new(),
             receipt_max: Vec::new(),
             receipt_info: Vec::new(),
+            stop_backlogs: Vec::new(),
             gaps: Vec::new(),
         }
     }
@@ -1993,6 +1996,7 @@ impl ReceiptHost {
             receipts: Vec::new(),
             receipt_max: Vec::new(),
             receipt_info: Vec::new(),
+            stop_backlogs: Vec::new(),
             gaps: Vec::new(),
         }
     }
@@ -2001,6 +2005,9 @@ impl ReceiptHost {
 impl LaneHost<Pin> for ReceiptHost {
     fn begin_capture_coverage(&mut self, _scope: CaptureScopeCoverage) {}
     fn abandon_capture_coverage(&mut self) {}
+    fn note_stop_backlog(&mut self, backlog: TargetDelta) {
+        self.stop_backlogs.push(backlog);
+    }
     fn note_extend_receipt(&mut self, receipt: &ExtendReceipt) {
         self.receipts
             .push((receipt.attached.len(), receipt.deferred.endpoints.len()));
@@ -2883,12 +2890,14 @@ fn tick_and_pass_carry_info_revoked_alike() {
     lane.tick(&mut host);
     lane.after_pass(&mut host);
     assert_eq!(
-        host.receipt_info[2], (0, 0, 2, 0),
+        host.receipt_info[2],
+        (0, 0, 2, 0),
         "the flush carries the tick's revocation count: {:?}",
         host.receipt_info
     );
     assert_eq!(
-        host.receipt_info[3], (0, 0, 2, 0),
+        host.receipt_info[3],
+        (0, 0, 2, 0),
         "the pass receipt carries its own revocation count: {:?}",
         host.receipt_info
     );
@@ -2896,7 +2905,8 @@ fn tick_and_pass_carry_info_revoked_alike() {
 
 /// The stop gaps the tick backlog still deferred when it lands: five
 /// endpoints never reached any pass receipt, so the summary names them
-/// still deferred instead of dropping them silently.
+/// still deferred instead of dropping them silently. Stop-only folds
+/// name no pass span and no per-pass peak: no pass measured them.
 #[test]
 fn stop_gaps_the_tick_backlog_as_still_deferred() {
     use crate::discovery::engine::inventory_coordinator::DEFERRED_ATTACH_SUBJECT;
@@ -2910,11 +2920,21 @@ fn stop_gaps_the_tick_backlog_as_still_deferred() {
     lane.stop(&mut coordinator);
     coordinator.commit_batch(false).unwrap();
     let gaps = coordinator.registry().gaps();
-    assert!(
-        gaps.iter().any(|gap| gap.subject == DEFERRED_ATTACH_SUBJECT
+    let summary = gaps.iter().find(|gap| {
+        gap.subject == DEFERRED_ATTACH_SUBJECT
             && gap.reason.contains("5 endpoint(s) with no recorded module")
-            && gap.reason.contains("still deferred at stop")),
+            && gap.reason.contains("still deferred at stop")
+    });
+    assert!(
+        summary.is_some(),
         "the stop gaps its backlog as still deferred: {gaps:?}"
+    );
+    let reason = &summary.unwrap().reason;
+    assert_eq!(
+        reason.as_str(),
+        "attach unfinished at stop: 5 endpoint(s) with no recorded module deferred at stop \
+         (5 still deferred at stop); counted uses are lower bounds",
+        "a stop-only fold names no pass span and no per-pass peak"
     );
 }
 
@@ -3020,6 +3040,344 @@ fn stop_with_already_folded_backlog_stages_no_second_row() {
             && gap.reason.contains("deferred over 1 pass")
             && gap.reason.contains("5 still deferred at stop")),
         "the summary keeps its honest pass count: {gaps:?}"
+    );
+}
+
+/// Carrier completeness: the tick merge handles every receipt field and
+/// every deferred-delta field explicitly (no `..` rest anywhere, here or
+/// in the merge), so a new field fails to compile until it chooses its
+/// merge. Rows accumulate in order, counts saturate-add, the wall-time
+/// max folds, the first refusal wins and the last custody wins; the
+/// tick's deferred re-queues into the backlog (objects keep their
+/// superset) and never accumulates in the buffer.
+#[test]
+fn merge_tick_receipt_carries_every_field() {
+    use crate::attach::capture::EndpointFailure;
+    use crate::discovery::inventory_attach_set::{AttachObjectId, EndpointId};
+    use p11scope_manifest::elf::ElfAbi;
+    let domain = NativeDomainId::mint();
+    let endpoint = |id: u32| AttachEndpoint {
+        id: EndpointId(id),
+        object: AttachObjectId::scripted(0),
+        file_offset: 0x1000 + u64::from(id) * 16,
+        abi: ElfAbi::Lp64,
+        info_kind: None,
+    };
+    let mut buffer = ExtendReceipt {
+        attached: vec![AttachedEndpoint {
+            id: EndpointId(1),
+            object: AttachObjectId::scripted(0),
+            at_ns: 10,
+        }],
+        info_return_deferred: 10,
+        refused: Some("first refusal".into()),
+        custody: Some(ScopeCustody::PidHeld),
+        attach_ns_total: 50,
+        attach_ns_max: 100,
+        exec_coverage: Some(ExecCoverage::scripted(domain, 7)),
+        ..ExtendReceipt::default()
+    };
+    let tick = ExtendReceipt {
+        activated_roots: true,
+        exec_coverage: Some(ExecCoverage::scripted(domain, 9)),
+        attached: vec![AttachedEndpoint {
+            id: EndpointId(2),
+            object: AttachObjectId::scripted(0),
+            at_ns: 20,
+        }],
+        failed: vec![EndpointFailure {
+            id: EndpointId(3),
+            object: AttachObjectId::scripted(0),
+            reason: "tick failure".into(),
+            link_retained: false,
+        }],
+        known: vec![EndpointId(4)],
+        deferred: TargetDelta {
+            endpoints: vec![endpoint(200), endpoint(201)],
+            objects: vec![AttachObjectId::scripted(9)],
+            info_revoked: vec![EndpointId(202)],
+        },
+        fd_exhausted: true,
+        info_return_deferred: 3,
+        info_return_refused_hazard: 2,
+        info_revoked: 5,
+        info_revoke_failed: 1,
+        halt_closed_links: 7,
+        refused: Some("second refusal".into()),
+        custody: Some(ScopeCustody::System),
+        attach_ns_total: 100,
+        attach_ns_max: 40,
+        groups: vec![crate::attach::capture::AttachGroup {
+            serial: 6,
+            object: AttachObjectId::scripted(0),
+            program: "tick-group",
+            members: vec![EndpointId(2)],
+            links: 1,
+        }],
+    };
+    let mut backlog = fabricated_delta(10);
+    merge_tick_receipt(&mut buffer, tick, &mut backlog, 4);
+    assert_eq!(
+        buffer
+            .attached
+            .iter()
+            .map(|attached| attached.id.0)
+            .collect::<Vec<_>>(),
+        vec![1, 2],
+        "attached rows accumulate in tick order"
+    );
+    assert_eq!(buffer.failed.len(), 1);
+    assert_eq!(buffer.failed[0].id, EndpointId(3));
+    assert_eq!(buffer.known, vec![EndpointId(4)]);
+    assert_eq!(buffer.info_return_deferred, 13);
+    assert_eq!(buffer.info_return_refused_hazard, 2);
+    assert_eq!(buffer.info_revoked, 5);
+    assert_eq!(buffer.info_revoke_failed, 1);
+    assert_eq!(buffer.halt_closed_links, 7);
+    assert_eq!(buffer.refused.as_deref(), Some("first refusal"));
+    assert_eq!(buffer.custody, Some(ScopeCustody::System));
+    assert_eq!(buffer.attach_ns_total, 150);
+    assert_eq!(buffer.attach_ns_max, 100);
+    assert!(buffer.fd_exhausted);
+    assert!(buffer.activated_roots);
+    assert_eq!(
+        buffer.exec_coverage,
+        Some(ExecCoverage::scripted(domain, 7)),
+        "the first coverage wins"
+    );
+    assert_eq!(buffer.groups.len(), 1);
+    assert_eq!(buffer.groups[0].serial, 6);
+    assert!(
+        buffer.deferred.endpoints.is_empty()
+            && buffer.deferred.objects.is_empty()
+            && buffer.deferred.info_revoked.is_empty(),
+        "the buffer never holds deferred"
+    );
+    assert_eq!(
+        backlog
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.id.0)
+            .collect::<Vec<_>>(),
+        vec![200, 201, 4, 5, 6, 7, 8, 9],
+        "the tick's deferred re-queues ahead of the untouched suffix"
+    );
+    assert!(
+        backlog.objects.is_empty(),
+        "the objects keep their superset, never a per-tick rebuild"
+    );
+    assert_eq!(backlog.info_revoked, vec![EndpointId(202)]);
+}
+
+/// The forward predicate fires on endpoint progress, a refusal, coverage
+/// or any INFO count — and on nothing else: custody, descriptor
+/// exhaustion and attach-cost diagnostics alone forward no receipt.
+#[test]
+fn tick_receipt_forwards_only_on_forwardable_progress() {
+    use crate::discovery::inventory_attach_set::EndpointId;
+    let mut receipt = ExtendReceipt::default();
+    assert!(!tick_receipt_forwards(&receipt));
+    receipt.custody = Some(ScopeCustody::System);
+    receipt.fd_exhausted = true;
+    receipt.attach_ns_total = 100;
+    receipt.attach_ns_max = 40;
+    receipt.halt_closed_links = 7;
+    receipt.groups = vec![crate::attach::capture::AttachGroup {
+        serial: 1,
+        object: crate::discovery::inventory_attach_set::AttachObjectId::scripted(0),
+        program: "ignored-group",
+        members: Vec::new(),
+        links: 1,
+    }];
+    assert!(
+        !tick_receipt_forwards(&receipt),
+        "custody, exhaustion and diagnostics alone forward nothing"
+    );
+    for set in [
+        ExtendReceipt {
+            attached: vec![AttachedEndpoint {
+                id: EndpointId(1),
+                object: crate::discovery::inventory_attach_set::AttachObjectId::scripted(0),
+                at_ns: 10,
+            }],
+            ..ExtendReceipt::default()
+        },
+        ExtendReceipt {
+            failed: vec![crate::attach::capture::EndpointFailure {
+                id: EndpointId(1),
+                object: crate::discovery::inventory_attach_set::AttachObjectId::scripted(0),
+                reason: "tick failure".into(),
+                link_retained: false,
+            }],
+            ..ExtendReceipt::default()
+        },
+        ExtendReceipt {
+            known: vec![EndpointId(1)],
+            ..ExtendReceipt::default()
+        },
+        ExtendReceipt {
+            refused: Some("tick refused".into()),
+            ..ExtendReceipt::default()
+        },
+        ExtendReceipt {
+            info_return_deferred: 1,
+            ..ExtendReceipt::default()
+        },
+        ExtendReceipt {
+            info_return_refused_hazard: 1,
+            ..ExtendReceipt::default()
+        },
+        ExtendReceipt {
+            info_revoked: 1,
+            ..ExtendReceipt::default()
+        },
+        ExtendReceipt {
+            info_revoke_failed: 1,
+            ..ExtendReceipt::default()
+        },
+        ExtendReceipt {
+            activated_roots: true,
+            ..ExtendReceipt::default()
+        },
+        ExtendReceipt {
+            exec_coverage: Some(ExecCoverage::scripted(NativeDomainId::mint(), 3)),
+            ..ExtendReceipt::default()
+        },
+        ExtendReceipt {
+            deferred: fabricated_delta(1),
+            ..ExtendReceipt::default()
+        },
+        ExtendReceipt {
+            deferred: TargetDelta {
+                endpoints: Vec::new(),
+                objects: vec![crate::discovery::inventory_attach_set::AttachObjectId::scripted(0)],
+                info_revoked: Vec::new(),
+            },
+            ..ExtendReceipt::default()
+        },
+        ExtendReceipt {
+            deferred: TargetDelta {
+                endpoints: Vec::new(),
+                objects: Vec::new(),
+                info_revoked: vec![crate::discovery::inventory_attach_set::EndpointId(9)],
+            },
+            ..ExtendReceipt::default()
+        },
+    ] {
+        assert!(tick_receipt_forwards(&set));
+    }
+}
+
+/// The stop notes the lane backlog still deferred when it lands — and
+/// nothing else: the host delta stays untouched (no target delta is
+/// taken after the stop).
+#[test]
+fn stop_notes_the_lane_backlog_without_taking_the_host_delta() {
+    let log = Log::default();
+    let mut host = ReceiptHost::with_delta(TargetDelta::default());
+    let mut lane = NativeLane::start(ScriptedLane::new(&log), &mut host, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    lane.after_pass(&mut host);
+    preset_backlog(&mut lane, 5);
+    host.delta = fabricated_delta(3);
+    lane.stop(&mut host);
+    assert_eq!(
+        host.stop_backlogs.len(),
+        1,
+        "one terminal note per stop: {:?}",
+        host.stop_backlogs
+            .iter()
+            .map(|backlog| backlog.endpoints.len())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        host.stop_backlogs[0]
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.id.0)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2, 3, 4],
+        "the lane backlog only"
+    );
+    assert_eq!(
+        host.delta.endpoints.len(),
+        3,
+        "the host delta stays untouched: no take after the stop"
+    );
+}
+
+/// Healthy twin: a stop with an empty backlog notes nothing — the
+/// terminal note fires only for endpoints still deferred when it lands.
+#[test]
+fn stop_without_backlog_notes_nothing() {
+    let log = Log::default();
+    let mut host = ReceiptHost::with_delta(TargetDelta::default());
+    let mut lane = NativeLane::start(ScriptedLane::new(&log), &mut host, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    lane.after_pass(&mut host);
+    assert!(lane.backlog.endpoints.is_empty());
+    lane.stop(&mut host);
+    assert!(
+        host.stop_backlogs.is_empty(),
+        "no terminal note without deferred endpoints: {:?}",
+        host.stop_backlogs
+            .iter()
+            .map(|backlog| backlog.endpoints.len())
+            .collect::<Vec<_>>()
+    );
+}
+
+/// The cooperative stop notes the lane backlog too: its first action
+/// folds what is still deferred, before the coverage ends — the same
+/// terminal accounting as the blocking stop.
+#[test]
+fn cooperative_stop_notes_the_lane_backlog() {
+    let log = Log::default();
+    let mut host = ReceiptHost::with_delta(TargetDelta::default());
+    let mut lane = NativeLane::start(ScriptedLane::new(&log), &mut host, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    lane.after_pass(&mut host);
+    preset_backlog(&mut lane, 5);
+    let stop = lane
+        .into_finite_stop(NativeStopDisposition::Error, None)
+        .ok()
+        .expect("the error disposition is always admissible");
+    let keep_running = || false;
+    let clock = LoopClock {
+        deadline: Some(Instant::now() + Duration::from_secs(60)),
+        stop: &keep_running,
+        now: &Instant::now,
+        interval: Duration::ZERO,
+        tick: Duration::from_millis(1),
+        collection_tick: NO_COLLECTION_TICK,
+    };
+    let mut stop = stop;
+    let mut steps = 0u32;
+    loop {
+        steps += 1;
+        assert!(steps <= 10_000, "the cooperative stop finishes its phases");
+        let now = Instant::now();
+        match stop.step(&mut host, now, now + Duration::from_secs(60), &clock) {
+            NativeStopProgress::Pending(next) => stop = next,
+            NativeStopProgress::Stopped(_) => break,
+        }
+    }
+    assert_eq!(
+        host.stop_backlogs.len(),
+        1,
+        "one terminal note per cooperative stop"
+    );
+    assert_eq!(
+        host.stop_backlogs[0]
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.id.0)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2, 3, 4],
+        "the cooperative stop folds the lane backlog"
     );
 }
 

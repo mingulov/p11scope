@@ -261,6 +261,25 @@ struct DeferralFold {
     deferred_ids: BTreeSet<EndpointId>,
 }
 
+/// Inserts one deferred endpoint id under every module claiming it
+/// (or the run-wide fold when none does). Pass receipts and the stop
+/// note share this so both attribute identically; the stop summary
+/// splits each fold's own ids, never reattributed.
+fn fold_deferred_id(
+    folds: &mut BTreeMap<Option<AttachModuleKey>, DeferralFold>,
+    attach_set: &InventoryAttachSet,
+    id: EndpointId,
+) {
+    let owners: Vec<AttachModuleKey> = attach_set.modules_with_member(id).cloned().collect();
+    if owners.is_empty() {
+        folds.entry(None).or_default().deferred_ids.insert(id);
+    } else {
+        for key in owners {
+            folds.entry(Some(key)).or_default().deferred_ids.insert(id);
+        }
+    }
+}
+
 /// The caller-registry key for an attach-set module key (O1 gap
 /// attribution, mid-run and folded alike): one spelling, so the folded
 /// gap can only attribute where the per-receipt gaps did.
@@ -5268,10 +5287,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     ),
                     None,
                 );
-                let fold = self.deferral_folds.entry(Some(key)).or_default();
-                fold.passes += 1;
-                fold.max_deferred = fold.max_deferred.max(deferred_here_count);
-                fold.deferred_ids.extend(deferred_here);
+                {
+                    let fold = self.deferral_folds.entry(Some(key)).or_default();
+                    fold.passes += 1;
+                    fold.max_deferred = fold.max_deferred.max(deferred_here_count);
+                }
+                for id in &deferred_here {
+                    fold_deferred_id(&mut self.deferral_folds, &self.attach_set, *id);
+                }
             }
         }
         let (unclaimed_failed, unclaimed_deferred) = unclaimed;
@@ -5303,10 +5326,43 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 budget: None,
                 units: None,
             });
-            let fold = self.deferral_folds.entry(None).or_default();
-            fold.passes += 1;
-            fold.max_deferred = fold.max_deferred.max(unclaimed_deferred_count);
-            fold.deferred_ids.extend(unclaimed_deferred);
+            {
+                let fold = self.deferral_folds.entry(None).or_default();
+                fold.passes += 1;
+                fold.max_deferred = fold.max_deferred.max(unclaimed_deferred_count);
+            }
+            for id in &unclaimed_deferred {
+                fold_deferred_id(&mut self.deferral_folds, &self.attach_set, *id);
+            }
+        }
+    }
+
+    /// Terminal accounting for the lane backlog still deferred when the
+    /// stop lands. Folds whatever no receipt covered so the stop summary
+    /// names it still deferred; ids already folded gain no second row
+    /// and the pass count stays honest (rows count pass receipts, and
+    /// the stop is not one). Runs before `end_capture_coverage`
+    /// consumes the folds.
+    pub(crate) fn note_stop_backlog(&mut self, backlog: TargetDelta) {
+        let deferred: BTreeSet<EndpointId> = backlog
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.id)
+            .collect();
+        if deferred.is_empty() {
+            return;
+        }
+        if self.capture.is_none() {
+            return;
+        }
+        for id in &deferred {
+            let folded = self
+                .deferral_folds
+                .values()
+                .any(|fold| fold.deferred_ids.contains(id));
+            if !folded {
+                fold_deferred_id(&mut self.deferral_folds, &self.attach_set, *id);
+            }
         }
     }
 
@@ -5354,16 +5410,21 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             } else {
                 " with no recorded module".to_string()
             };
-            let passes = if fold.passes == 1 {
-                "1 pass".to_string()
+            // Stop-only folds (the stop note folded ids no pass receipt
+            // ever deferred) name no pass span and no per-pass peak: no
+            // pass measured them.
+            let span = if fold.passes == 0 {
+                "deferred at stop".to_string()
+            } else if fold.passes == 1 {
+                "deferred over 1 pass".to_string()
             } else {
-                format!("{} passes", fold.passes)
+                format!("deferred over {} passes", fold.passes)
             };
             // The distinct total is exact; the per-pass peak rides
             // beside it only when it differs (non-nested patterns),
             // so the line stays truthful either way.
             let mut outcome = Vec::new();
-            if fold.max_deferred != total {
+            if fold.passes > 0 && fold.max_deferred != total {
                 outcome.push(format!("peak {} in one pass", fold.max_deferred));
             }
             let finished = failed == 0 && still == 0;
@@ -5388,8 +5449,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 "attach unfinished at stop"
             };
             let reason = format!(
-                "{head}: {total} endpoint(s){scope} deferred over {passes} ({}); \
-                 counted uses are lower bounds",
+                "{head}: {total} endpoint(s){scope} {span} ({}); counted uses are lower bounds",
                 outcome.join("; "),
             );
             match key.as_ref().map(attach_module_registry_key) {
@@ -22726,6 +22786,101 @@ pub(crate) mod tests {
         assert_eq!(
             folded[0].module, None,
             "the unclaimed fold reports run-wide: {:?}",
+            folded[0]
+        );
+    }
+
+    /// Stop accounting: deferred ids no receipt covered fold without
+    /// staging a per-receipt row, so the stop summary names them still
+    /// deferred under their module — beside the ids a pass receipt
+    /// deferred, whose row and pass count stay honest.
+    #[test]
+    fn note_stop_backlog_folds_ids_no_receipt_covered() {
+        use crate::attach::capture::ExtendReceipt;
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let dir = tempfile::tempdir().unwrap();
+        let a = fx::provider(&dir, "a.so", "provider-a");
+        let pins = fx::pass_pins(&[(&a, "sha-a")]);
+        let mut coordinator = coordinator();
+        let policy = crate::plan::AdmissionPolicy::Inventory(coordinator.attach_set.budget());
+        let absorbed = coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module(&pins, &a, &fx::offsets(2))),
+                &pins,
+                policy,
+            ),
+            &pins,
+        );
+        let verdicts = absorbed.verdicts;
+        let pid = std::process::id();
+        let _caller = coordinator
+            .adapter
+            .admit(pid, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        let generation = Some(crate::inspect_system::MemberGeneration {
+            start_time: crate::process::process_start_time(pid).ok(),
+            exe: crate::discovery::caller_registry::read_exe_identity(pid),
+        });
+        let catalog = capture_catalog(&pins, &[&a], pid, generation);
+        coordinator.begin_capture_coverage(CaptureScopeCoverage::System);
+        coordinator.project_catalog(&catalog, &verdicts, 60);
+        coordinator.registry.publish();
+        // One endpoint deferred by a pass receipt: one row, one pass.
+        let first = absorbed.delta.endpoints[0];
+        coordinator.note_extend_receipt(&ExtendReceipt {
+            deferred: crate::discovery::inventory_attach_set::TargetDelta {
+                endpoints: vec![first],
+                objects: vec![first.object],
+                info_revoked: vec![],
+            },
+            ..ExtendReceipt::default()
+        });
+        // The stop note carries both endpoints — the receipt-covered one
+        // and the never-extended one — but folds only the latter.
+        coordinator.note_stop_backlog(absorbed.delta);
+        coordinator.commit_batch(false).unwrap();
+        coordinator.end_capture_coverage(1000);
+        coordinator.commit_batch(false).unwrap();
+        let gaps: Vec<_> = coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == "native endpoint attach deferred")
+            .collect();
+        let rows = gaps
+            .iter()
+            .filter(|gap| is_deferral_receipt_reason(&gap.reason))
+            .count();
+        assert_eq!(
+            rows,
+            1,
+            "only the pass receipt stages a row: {:?}",
+            coordinator.registry.gaps()
+        );
+        let folded: Vec<_> = gaps
+            .iter()
+            .filter(|gap| is_deferral_folded_reason(&gap.reason))
+            .collect();
+        assert_eq!(
+            folded.len(),
+            1,
+            "one summary covers both endpoints: {:?}",
+            coordinator.registry.gaps()
+        );
+        assert!(
+            folded[0].reason.contains("deferred over 1 pass"),
+            "the stop note bumps no pass count: {}",
+            folded[0].reason
+        );
+        assert!(
+            folded[0].reason.contains("peak 1 in one pass")
+                && folded[0].reason.contains("2 still deferred at stop"),
+            "the summary splits both ids as still deferred: {}",
+            folded[0].reason
+        );
+        assert!(
+            folded[0].module.is_some(),
+            "the claimed fold attributes its module: {:?}",
             folded[0]
         );
     }

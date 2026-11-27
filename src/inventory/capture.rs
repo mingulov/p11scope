@@ -48,10 +48,10 @@
 //! discloses the mechanism and any fallback reason.
 
 use crate::attach::capture::{
-    AttachedEndpoint, CaptureScope, CaptureScopeCoverage, CaptureTargets, CleanupSummary,
-    CookieQuery, DiscoveryBatch, EndpointFailure, ExtendReceipt, ExtendWindow, InfoBatch,
-    InfoTeardown, InventoryCapture, MapperEstimate, NativeDomainId, ReadWindow, RetiredCapture,
-    RetiringCapture, ScopeCustody, WitnessBatch, default_caller_budget,
+    CaptureScope, CaptureScopeCoverage, CaptureTargets, CleanupSummary, CookieQuery,
+    DiscoveryBatch, ExtendReceipt, ExtendWindow, InfoBatch, InfoTeardown, InventoryCapture,
+    MapperEstimate, NativeDomainId, ReadWindow, RetiredCapture, RetiringCapture, ScopeCustody,
+    WitnessBatch, default_caller_budget,
 };
 use crate::attach::{AttachBackend, BackendSelection};
 use crate::discovery::caller_registry::{CallerEvent, ProcessSource, UnknownReason, now_ns};
@@ -555,6 +555,11 @@ pub(crate) trait LaneHost<Pin> {
     /// Forget a capture coverage that never activated (the auto fallback).
     fn abandon_capture_coverage(&mut self);
     fn note_extend_receipt(&mut self, receipt: &ExtendReceipt);
+    /// Terminal accounting for the lane backlog still deferred when the
+    /// stop lands. The coordinator folds whatever no receipt covered so
+    /// the stop summary names it still deferred. Default: ignore (hosts
+    /// without a fold).
+    fn note_stop_backlog(&mut self, _backlog: TargetDelta) {}
     /// The lane's initial attach completed: stamp the tick cutover new
     /// callers are measured against. Default: ignore (test hosts set
     /// the cutover explicitly when they need it).
@@ -627,6 +632,10 @@ impl<S: ProcessSource> LaneHost<S::Pin> for InventoryCoordinator<S> {
 
     fn note_extend_receipt(&mut self, receipt: &ExtendReceipt) {
         InventoryCoordinator::note_extend_receipt(self, receipt);
+    }
+
+    fn note_stop_backlog(&mut self, backlog: TargetDelta) {
+        InventoryCoordinator::note_stop_backlog(self, backlog);
     }
 
     fn note_attach_ticks(&mut self) {
@@ -897,6 +906,123 @@ impl CaptureTargets for TickTargets<'_> {
     }
 }
 
+/// Merges one tick extend's receipt into the pass-to-pass buffer: endpoint
+/// rows accumulate in tick order, counts saturate-add, the wall-time max
+/// folds, the first refusal wins and the last custody wins. The tick's
+/// deferred re-queues into `backlog` (ahead of the untouched suffix past
+/// `take`, as before); the buffer never holds deferred, so the pass
+/// receipt reports it if still deferred. The destructure is exhaustive on
+/// purpose — no `..` rest — so a new receipt or delta field fails to
+/// compile here until it chooses its merge.
+fn merge_tick_receipt(
+    buffer: &mut ExtendReceipt,
+    tick: ExtendReceipt,
+    backlog: &mut TargetDelta,
+    take: usize,
+) {
+    let ExtendReceipt {
+        activated_roots,
+        exec_coverage,
+        attached,
+        failed,
+        known,
+        deferred,
+        fd_exhausted,
+        info_return_deferred,
+        info_return_refused_hazard,
+        info_revoked,
+        info_revoke_failed,
+        halt_closed_links,
+        refused,
+        custody,
+        attach_ns_total,
+        attach_ns_max,
+        groups,
+    } = tick;
+    buffer.activated_roots |= activated_roots;
+    if buffer.exec_coverage.is_none() {
+        buffer.exec_coverage = exec_coverage;
+    }
+    buffer.attached.extend(attached);
+    buffer.failed.extend(failed);
+    buffer.known.extend(known);
+    let TargetDelta {
+        endpoints: deferred_endpoints,
+        objects: _deferred_objects,
+        info_revoked: deferred_revocations,
+    } = deferred;
+    // Ticks only shrink the endpoint list, so the old objects stay a
+    // valid superset: no per-tick rebuild over the whole backlog
+    // (extends look up only their delta; the next pass receipt makes
+    // the objects exact again). The tick's `_deferred_objects` drop
+    // here, by name.
+    let mut rest = backlog.endpoints.split_off(take);
+    let mut endpoints = deferred_endpoints;
+    endpoints.append(&mut rest);
+    backlog.endpoints = endpoints;
+    backlog.info_revoked.extend(deferred_revocations);
+    buffer.fd_exhausted |= fd_exhausted;
+    buffer.info_return_deferred = buffer
+        .info_return_deferred
+        .saturating_add(info_return_deferred);
+    buffer.info_return_refused_hazard = buffer
+        .info_return_refused_hazard
+        .saturating_add(info_return_refused_hazard);
+    buffer.info_revoked = buffer.info_revoked.saturating_add(info_revoked);
+    buffer.info_revoke_failed = buffer.info_revoke_failed.saturating_add(info_revoke_failed);
+    buffer.halt_closed_links = buffer.halt_closed_links.saturating_add(halt_closed_links);
+    if buffer.refused.is_none() {
+        buffer.refused = refused;
+    }
+    if custody.is_some() {
+        buffer.custody = custody;
+    }
+    buffer.attach_ns_total = buffer.attach_ns_total.saturating_add(attach_ns_total);
+    buffer.attach_ns_max = buffer.attach_ns_max.max(attach_ns_max);
+    buffer.groups.extend(groups);
+}
+
+/// Whether a merged tick buffer forwards as its own receipt: endpoint
+/// progress, a refusal, coverage, or any INFO count does; custody,
+/// descriptor exhaustion and attach-cost diagnostics alone do not (the
+/// pass receipt carries custody anyway, and exhaustion re-probes on the
+/// next pass). The destructure is exhaustive on purpose — no `..` rest —
+/// so a new receipt field fails to compile here until it chooses a side.
+fn tick_receipt_forwards(receipt: &ExtendReceipt) -> bool {
+    let ExtendReceipt {
+        activated_roots,
+        exec_coverage,
+        attached,
+        failed,
+        known,
+        deferred,
+        fd_exhausted: _fd_exhausted,
+        info_return_deferred,
+        info_return_refused_hazard,
+        info_revoked,
+        info_revoke_failed,
+        halt_closed_links: _halt_closed_links,
+        refused,
+        custody: _custody,
+        attach_ns_total: _attach_ns_total,
+        attach_ns_max: _attach_ns_max,
+        groups: _groups,
+    } = receipt;
+    !attached.is_empty()
+        || !failed.is_empty()
+        || !known.is_empty()
+        || refused.is_some()
+        || *info_return_deferred > 0
+        || *info_return_refused_hazard > 0
+        || *info_revoked > 0
+        || *info_revoke_failed > 0
+        || *activated_roots
+        || exec_coverage.is_some()
+        || !deferred.endpoints.is_empty()
+        || !deferred.objects.is_empty()
+        || !deferred.info_revoked.is_empty()
+}
+
 /// The lane: the capture plus the state the loop keeps between passes.
 pub(crate) struct NativeLane<L> {
     capture: L,
@@ -931,15 +1057,13 @@ pub(crate) struct NativeLane<L> {
     /// A superset is harmless (extends look up only their delta).
     tick_targets: BTreeMap<AttachObjectId, CachedTickTarget>,
     /// Tick attach progress buffered for the next pass to forward as one
-    /// ordered receipt (attached/failed in tick order; deferred stays in
-    /// `backlog` and is reported by the pass receipt if still deferred).
-    pending_tick_attached: Vec<AttachedEndpoint>,
-    pending_tick_failed: Vec<EndpointFailure>,
-    pending_tick_custody: Option<ScopeCustody>,
-    pending_tick_refused: Option<String>,
-    /// The worst single-attach wall time across the buffered ticks,
-    /// forwarded with their receipt.
-    pending_tick_attach_ns_max: u64,
+    /// ordered receipt: the merged whole receipts of the ticks since the
+    /// last pass (attached/failed/known in tick order, counts summed,
+    /// worst single-attach wall time folded). Deferred re-queues into
+    /// `backlog` at every tick merge and is reported by the pass receipt
+    /// if still deferred, so ticks never flood gaps; the stop notes
+    /// whatever is still deferred (see `note_stop_backlog`).
+    pending_tick_receipt: ExtendReceipt,
     /// A tick (or the last pass) hit EMFILE: later ticks skip their
     /// extend until the next pass re-probes descriptors once, instead
     /// of retrying the failing attach at tick rate.
@@ -1014,11 +1138,7 @@ impl<L> NativeLane<L> {
             loss_seen: false,
             rescanning: false,
             tick_targets: BTreeMap::new(),
-            pending_tick_attached: Vec::new(),
-            pending_tick_failed: Vec::new(),
-            pending_tick_custody: None,
-            pending_tick_refused: None,
-            pending_tick_attach_ns_max: 0,
+            pending_tick_receipt: ExtendReceipt::default(),
             tick_fd_exhausted: false,
         };
         lane.cache_backlog_targets(host);
@@ -1159,37 +1279,23 @@ impl<L> NativeLane<L> {
     }
 
     /// Forwards tick attach progress buffered since the last pass as one
-    /// ordered receipt (attached/failed in tick order, worst single-attach
-    /// wall time folded across the ticks). Deferred stays in `backlog` and
-    /// is reported by the pass receipt if still deferred, so ticks never
-    /// flood gaps. Custody-only ticks (no attaches, fails or refusal)
-    /// forward nothing; the pass receipt carries custody anyway. The rest
-    /// of the tick receipts stays behind deliberately: totals and group
-    /// handles are per-extend diagnostics nothing downstream reads,
-    /// `fd_exhausted` re-probes on the next pass, `known` is idempotent,
-    /// and activation never happens in a tick so no `exec_coverage` or
-    /// `activated_roots` is lost.
+    /// ordered receipt: every field the ticks' extends reported, merged
+    /// (attached/failed/known in tick order, counts summed, worst
+    /// single-attach wall time folded across the ticks). Deferred stays
+    /// in `backlog` and is reported by the pass receipt if still
+    /// deferred, so ticks never flood gaps. Ticks that report nothing
+    /// forwardable (no attaches, fails, known, refusal or INFO counts)
+    /// forward nothing; the pass receipt carries custody anyway, and
+    /// descriptor exhaustion re-probes on the next pass.
     fn flush_tick_progress<Pin, H>(&mut self, host: &mut H)
     where
         L: CaptureLane<Pin>,
         H: LaneHost<Pin> + ?Sized,
     {
-        let attach_ns_max = std::mem::take(&mut self.pending_tick_attach_ns_max);
-        if self.pending_tick_attached.is_empty()
-            && self.pending_tick_failed.is_empty()
-            && self.pending_tick_refused.is_none()
-        {
-            self.pending_tick_custody = None;
+        let receipt = std::mem::take(&mut self.pending_tick_receipt);
+        if !tick_receipt_forwards(&receipt) {
             return;
         }
-        let receipt = ExtendReceipt {
-            attached: std::mem::take(&mut self.pending_tick_attached),
-            failed: std::mem::take(&mut self.pending_tick_failed),
-            refused: self.pending_tick_refused.take(),
-            custody: self.pending_tick_custody.take(),
-            attach_ns_max,
-            ..ExtendReceipt::default()
-        };
         host.note_extend_receipt(&receipt);
         self.attached += receipt.attached.len();
         self.failed += receipt.failed.len();
@@ -1207,8 +1313,27 @@ impl<L> NativeLane<L> {
         }
     }
 
+    /// Notes the lane backlog still deferred when the stop lands. Fires
+    /// only on the terminal stops (never mid-run, where the next pass
+    /// extends the backlog); the take makes repeated calls no-ops. The
+    /// coordinator folds only what no receipt covered, so already-folded
+    /// endpoints gain no second row. Must precede `end_capture_coverage`
+    /// so the stop summary splits the folded ids. Never touches the host
+    /// delta: no target delta is taken after the stop (F9).
+    fn note_stop_backlog<Pin, H>(&mut self, host: &mut H)
+    where
+        L: CaptureLane<Pin>,
+        H: LaneHost<Pin> + ?Sized,
+    {
+        if self.backlog.endpoints.is_empty() {
+            return;
+        }
+        let backlog = std::mem::take(&mut self.backlog);
+        host.note_stop_backlog(backlog);
+    }
+
     /// Extends the backlog prefix within one tick window against `targets`,
-    /// buffering attached/failed/custody/refusal for the next pass to
+    /// merging the whole receipt into the buffer for the next pass to
     /// forward. Skips when the backlog is empty or an extend already
     /// refused (no progress possible). The backlog is the receipt's
     /// deferred (the prefix tail) plus the untouched suffix; a cutoff
@@ -1224,11 +1349,7 @@ impl<L> NativeLane<L> {
         Self::tick_extend_inner(
             &mut self.capture,
             &mut self.backlog,
-            &mut self.pending_tick_attached,
-            &mut self.pending_tick_failed,
-            &mut self.pending_tick_custody,
-            &mut self.pending_tick_refused,
-            &mut self.pending_tick_attach_ns_max,
+            &mut self.pending_tick_receipt,
             &mut self.tick_fd_exhausted,
             &self.windows,
             self.refusal_reported,
@@ -1247,25 +1368,10 @@ impl<L> NativeLane<L> {
         };
         // Disjoint field borrows: the targets borrow `tick_targets`
         // shared while the extend mutates the capture and buffers.
-        let (
-            capture,
-            backlog,
-            pending_attached,
-            pending_failed,
-            pending_custody,
-            pending_refused,
-            pending_attach_ns_max,
-            fd_exhausted_latch,
-            windows,
-            refusal_reported,
-        ) = (
+        let (capture, backlog, pending, fd_exhausted_latch, windows, refusal_reported) = (
             &mut self.capture,
             &mut self.backlog,
-            &mut self.pending_tick_attached,
-            &mut self.pending_tick_failed,
-            &mut self.pending_tick_custody,
-            &mut self.pending_tick_refused,
-            &mut self.pending_tick_attach_ns_max,
+            &mut self.pending_tick_receipt,
             &mut self.tick_fd_exhausted,
             &self.windows,
             self.refusal_reported,
@@ -1273,11 +1379,7 @@ impl<L> NativeLane<L> {
         Self::tick_extend_inner(
             capture,
             backlog,
-            pending_attached,
-            pending_failed,
-            pending_custody,
-            pending_refused,
-            pending_attach_ns_max,
+            pending,
             fd_exhausted_latch,
             windows,
             refusal_reported,
@@ -1286,15 +1388,10 @@ impl<L> NativeLane<L> {
     }
 
     /// One tick extend against `targets`, shared by host and cached ticks.
-    #[allow(clippy::too_many_arguments)]
     fn tick_extend_inner<Pin, C>(
         capture: &mut C,
         backlog: &mut TargetDelta,
-        pending_attached: &mut Vec<AttachedEndpoint>,
-        pending_failed: &mut Vec<EndpointFailure>,
-        pending_custody: &mut Option<ScopeCustody>,
-        pending_refused: &mut Option<String>,
-        pending_attach_ns_max: &mut u64,
+        pending: &mut ExtendReceipt,
         fd_exhausted_latch: &mut bool,
         windows: &LaneWindows,
         refusal_reported: bool,
@@ -1304,7 +1401,7 @@ impl<L> NativeLane<L> {
     {
         if backlog.endpoints.is_empty()
             || refusal_reported
-            || pending_refused.is_some()
+            || pending.refused.is_some()
             || *fd_exhausted_latch
         {
             return;
@@ -1334,26 +1431,10 @@ impl<L> NativeLane<L> {
             info_revoked: Vec::new(),
         };
         let receipt = capture.extend(prefix, targets, window);
-        *pending_attach_ns_max = (*pending_attach_ns_max).max(receipt.attach_ns_max);
         if receipt.fd_exhausted {
             *fd_exhausted_latch = true;
         }
-        if let Some(custody) = receipt.custody.clone() {
-            *pending_custody = Some(custody);
-        }
-        if pending_refused.is_none() {
-            *pending_refused = receipt.refused.clone();
-        }
-        pending_attached.extend(receipt.attached);
-        pending_failed.extend(receipt.failed);
-        let mut rest = backlog.endpoints.split_off(take);
-        let mut endpoints = receipt.deferred.endpoints;
-        endpoints.append(&mut rest);
-        // Ticks only shrink the endpoint list, so the old objects stay a
-        // valid superset: no per-tick rebuild over the whole backlog
-        // (extends look up only their delta; the next pass receipt makes
-        // the objects exact again).
-        backlog.endpoints = endpoints;
+        merge_tick_receipt(pending, receipt, backlog, take);
     }
 
     fn stage_pass_evidence<Pin, H>(&mut self, host: &mut H) -> Vec<CallerEvent>
@@ -1722,6 +1803,9 @@ impl<L> NativeLane<L> {
         // Tick attach progress buffered before the stop forwards first
         // (evidence of links already held, not new work after the latch).
         self.flush_tick_progress(host);
+        // Whatever is still deferred folds now, before the coverage ends:
+        // no pass will extend it after the latch.
+        self.note_stop_backlog(host);
         let mut events = std::mem::take(&mut self.pending_events);
         // Nothing is held after a pass; staged first all the same.
         // (The startup drain can hold INFO before the first pass; it
@@ -2138,8 +2222,11 @@ impl<L> NativeStop<L> {
         self.not_before = None;
         // Tick attach progress buffered before the stop forwards on the
         // first action (evidence of links already held; later actions
-        // no-op once flushed).
+        // no-op once flushed). Whatever is still deferred folds with it,
+        // before the coverage ends: no pass will extend it after the
+        // latch, and the take makes later actions no-ops too.
         self.lane.flush_tick_progress(host);
+        self.lane.note_stop_backlog(host);
         match self.phase {
             NativeStopPhase::Held => match self.held.next() {
                 Some(batch) => {

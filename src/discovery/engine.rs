@@ -14160,6 +14160,28 @@ struct LoaderLocator {
     maps: Vec<MapEntry>,
 }
 
+/// Mutation-input completeness: every freshly reconciled module
+/// and every attach-bound delta slot (new/replace; retire detaches
+/// by index and needs no pin) resolves to an exact pin.
+/// Committed-plan staleness is not checked here: pinless plan rows
+/// degrade at merge with named gaps instead of refusing the
+/// candidate. Callers that mutate identity itself keep the strict
+/// check below.
+fn candidate_mutation_inputs_are_complete(
+    modules: &[ReconciledModule],
+    delta: &plan::AttachDelta,
+    pinned: &PinnedObjects,
+) -> bool {
+    modules
+        .iter()
+        .all(|module| pinned.summary(module.object).is_some())
+        && delta
+            .new
+            .iter()
+            .chain(delta.replace.iter())
+            .all(|slot| pinned.summary(slot.object).is_some())
+}
+
 fn candidate_identity_is_complete(
     plan: &plan::AttachPlan,
     modules: &[ReconciledModule],
@@ -20050,8 +20072,74 @@ impl Engine {
         let delta = candidate_plan
             .extend_exact_with_stable_module_ids(rebuilt)
             .map_err(anyhow::Error::msg)?;
-        if !candidate_identity_is_complete(&candidate_plan, &modules, &pinned) {
-            bail!("live candidate retained an active module or slot without exact pinned identity");
+        if !candidate_mutation_inputs_are_complete(&modules, &delta, &pinned) {
+            bail!("live candidate mutation inputs lack exact pinned identity");
+        }
+        // Committed-plan rows the rebuild omitted while pinless degrade
+        // here (the merge never sees them): one exact omission gap per
+        // module into history losses, plus one per orphan pinless slot
+        // of a kept module. Keyed insertion deduplicates across
+        // batches; healthy dropped rows stay silent (normal
+        // retention, nothing lost).
+        let mut omission_gaps = Vec::new();
+        for module in &self.plan.modules {
+            if candidate_plan
+                .modules
+                .iter()
+                .any(|kept| kept.object == module.object)
+            {
+                continue;
+            }
+            if pinned.summary(module.object).is_some() {
+                continue;
+            }
+            omission_gaps.push(Skipped {
+                subject: PLANNED_OBJECT_WITHOUT_PIN_SUBJECT.into(),
+                reason: format!(
+                    "planned object '{}' lost its comparable pin before evidence rendered; its calls are unattributed",
+                    crate::render::escape_controls(&module.path),
+                ),
+            });
+        }
+        for slot in self
+            .plan
+            .slots
+            .iter()
+            .filter(|slot| self.plan.is_active(slot.index))
+        {
+            if candidate_plan
+                .slots
+                .iter()
+                .any(|kept| kept.index == slot.index)
+            {
+                continue;
+            }
+            if pinned.summary(slot.object).is_some() {
+                continue;
+            }
+            let module_kept = slot.module_ids.iter().any(|id| {
+                candidate_plan
+                    .modules
+                    .iter()
+                    .any(|kept| kept.id == *id)
+            });
+            if !module_kept {
+                continue;
+            }
+            omission_gaps.push(Skipped {
+                subject: PLANNED_OBJECT_WITHOUT_PIN_SUBJECT.into(),
+                reason: format!(
+                    "planned object '{}' lost its comparable pin before evidence rendered; its calls are unattributed",
+                    crate::render::escape_controls(&slot.object_path),
+                ),
+            });
+        }
+        for gap in omission_gaps {
+            self.capture_facts
+                .history
+                .losses
+                .entry((gap.subject.clone(), gap.reason.clone()))
+                .or_insert(gap);
         }
         record_object_skips(
             &mut candidate_plan,
@@ -22084,8 +22172,12 @@ impl Engine {
     /// mutation. Post-mutation cleanup only ever drops sources, so a candidate
     /// that passes here still publishes after a conservative retirement.
     fn preflight_candidate_publication(&self, candidate: &LiveCandidate) -> Result<()> {
-        if !candidate_identity_is_complete(&candidate.plan, &candidate.modules, &candidate.pinned) {
-            bail!("live candidate lost exact pinned identity before link mutation");
+        if !candidate_mutation_inputs_are_complete(
+            &candidate.modules,
+            &candidate.delta,
+            &candidate.pinned,
+        ) {
+            bail!("live candidate mutation inputs lost exact pinned identity before link mutation");
         }
         // A dedicated preflight walk over the merge's fallible surface
         // (E25): proves exactly what `merge_current` would fail on without

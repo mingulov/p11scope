@@ -87265,12 +87265,13 @@ fn candidate_build_succeeds_with_pinless_plan_module() {
         "planned object '{}' lost its comparable pin before evidence rendered; its calls are unattributed",
         victim_path
     );
-    let gaps: Vec<(&str, &str)> = candidate
-        .plan
-        .modules_skipped
-        .iter()
-        .filter(|skip| skip.reason.contains("lost its comparable pin"))
-        .map(|skip| (skip.subject.as_str(), skip.reason.as_str()))
+    let gaps: Vec<(&str, &str)> = engine
+        .capture_facts
+        .history
+        .losses
+        .values()
+        .filter(|loss| loss.reason.contains("lost its comparable pin"))
+        .map(|loss| (loss.subject.as_str(), loss.reason.as_str()))
         .collect();
     assert_eq!(
         gaps,
@@ -87370,6 +87371,7 @@ fn candidate_apply_publishes_healthy_rows_plus_victim_gap() {
     engine
         .apply_candidate(&mut session, candidate, &mut additions, false, &[])
         .expect("the degraded candidate applies");
+    engine.publish_batch_tail(false).unwrap();
     let ids: Vec<_> = engine
         .discovery
         .modules
@@ -87385,25 +87387,17 @@ fn candidate_apply_publishes_healthy_rows_plus_victim_gap() {
         victim_path
     );
     let gaps: Vec<(&str, &str)> = engine
-        .plan
-        .modules_skipped
-        .iter()
-        .filter(|skip| skip.reason.contains("lost its comparable pin"))
-        .map(|skip| (skip.subject.as_str(), skip.reason.as_str()))
+        .capture_facts
+        .history
+        .losses
+        .values()
+        .filter(|loss| loss.reason.contains("lost its comparable pin"))
+        .map(|loss| (loss.subject.as_str(), loss.reason.as_str()))
         .collect();
     assert_eq!(
         gaps,
         vec![("planned provider object", expected.as_str())],
         "one exact gap names the omitted victim"
-    );
-    assert!(
-        engine
-            .capture_facts
-            .history
-            .losses
-            .values()
-            .all(|loss| !loss.reason.contains("lost its comparable pin")),
-        "the omission gap is filed once, not also at render"
     );
     assert!(
         engine.pinned.summary(victim).is_none(),

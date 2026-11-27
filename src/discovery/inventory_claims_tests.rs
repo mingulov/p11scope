@@ -1158,7 +1158,9 @@ fn merge_ownership_e8_release_preserves_pin_shared_with_a_carried_view() {
             .engine
             .modules
             .iter()
-            .any(|module| module.scanned.view == fixture.view_r),
+            .any(|module| {
+                module.scanned.view == Engine::CARRIED_VIEW_ID && module.object == shared
+            }),
         "R's module rides before release"
     );
     assert!(
@@ -1196,7 +1198,9 @@ fn merge_ownership_e8_release_preserves_pin_shared_with_a_carried_view() {
             .engine
             .modules
             .iter()
-            .any(|module| module.scanned.view == fixture.view_r),
+            .any(|module| {
+                module.scanned.view == Engine::CARRIED_VIEW_ID && module.object == shared
+            }),
         "R's retained carried module still rides after X's release"
     );
     assert!(
@@ -1279,7 +1283,9 @@ fn merge_ownership_e8_release_shared_pin_with_live_and_carried_riders_survives()
             .engine
             .modules
             .iter()
-            .any(|module| module.scanned.view == fixture.view_r),
+            .any(|module| {
+                module.scanned.view == Engine::CARRIED_VIEW_ID && module.object == shared
+            }),
         "R's retained carried module still rides after X's release"
     );
     assert!(
@@ -1468,7 +1474,9 @@ fn merge_ownership_e8_release_preserves_dependency_pin_referenced_by_a_carried_v
         .engine
         .modules
         .iter()
-        .find(|module| module.scanned.view == fixture.view_r)
+        .find(|module| {
+            module.scanned.view == Engine::CARRIED_VIEW_ID && module.object == r_object
+        })
         .expect("R's retained carried module still rides after X's release")
         .entry_objects
         .iter()
@@ -1562,7 +1570,9 @@ fn restore_start_publication_preserves_pin_shared_with_a_carried_view() {
             .engine
             .modules
             .iter()
-            .any(|module| module.scanned.view == fixture.view_r),
+            .any(|module| {
+                module.scanned.view == Engine::CARRIED_VIEW_ID && module.object == shared
+            }),
         "R's retained carried module still rides after restore"
     );
     assert!(
@@ -1624,11 +1634,21 @@ fn restore_start_publication_preserves_dependency_pin_referenced_by_a_carried_vi
         fixture.engine.pinned.summary(dep_object).is_some(),
         "the dependency is resolvable before restore"
     );
+    // The carry re-owns R's rows under the reserved carrier: the raw
+    // route resolves through the carried module, not the stale view.
+    let carried_r = fixture
+        .engine
+        .modules
+        .iter()
+        .find(|module| module.scanned.view == Engine::CARRIED_VIEW_ID)
+        .expect("R's carried module rides before restore")
+        .scanned
+        .clone();
     assert_eq!(
         fixture
             .engine
             .pinned
-            .id_for_scanned(&module_r, providers[2].key, &providers[2].path),
+            .id_for_scanned(&carried_r, providers[2].key, &providers[2].path),
         Some(dep_object),
         "the dependency raw route resolves before restore"
     );
@@ -1667,7 +1687,7 @@ fn restore_start_publication_preserves_dependency_pin_referenced_by_a_carried_vi
         .engine
         .modules
         .iter()
-        .find(|module| module.scanned.view == fixture.view_r)
+        .find(|module| module.scanned.view == Engine::CARRIED_VIEW_ID)
         .expect("R's retained carried module still rides after restore")
         .entry_objects
         .iter()
@@ -1682,7 +1702,7 @@ fn restore_start_publication_preserves_dependency_pin_referenced_by_a_carried_vi
         fixture
             .engine
             .pinned
-            .id_for_scanned(&module_r, providers[2].key, &providers[2].path),
+            .id_for_scanned(&carried_r, providers[2].key, &providers[2].path),
         Some(dep_object),
         "R's dependency raw route survives the restore"
     );

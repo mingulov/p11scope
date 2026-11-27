@@ -3309,6 +3309,19 @@ const STOP_SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHU
 pub(crate) struct StopToken(Arc<AtomicBool>);
 
 impl StopToken {
+    /// The live stop predicate: sinks consult this on every flush
+    /// instead of holding an unwrapped flag, so a construct-time
+    /// snapshot of the shared flag is not expressible — the only
+    /// value a sink can consult is the minted token itself.
+    pub(crate) fn is_stopped(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+
+    /// Unwraps the shared flag for the discovery engine, the sole
+    /// production consumer: the engine's cancel threads through its
+    /// scan helpers as a borrowed flag, which a token cannot name.
+    /// Nothing else unwraps a token (pinned by count in the engine
+    /// tests); sinks hold the token and consult [`StopToken::is_stopped`].
     pub(crate) fn into_inner(self) -> Arc<AtomicBool> {
         self.0
     }
@@ -3331,6 +3344,31 @@ pub(crate) fn mint_test_stop_token(observed: bool) -> StopToken {
         state.observe(libc::SIGINT);
     }
     state.stop_token()
+}
+
+/// Test-only observation handle for a minted token: the real
+/// [`SignalState`] behind it, so seam tests construct first and
+/// observe afterwards, proving later observations reach the sink —
+/// a construct-time snapshot would fail them.
+#[cfg(test)]
+pub(crate) struct TestStopHandle {
+    state: Arc<SignalState>,
+}
+
+/// Test-only minter with a retained observation handle: the state
+/// behind the token stays alive for a later real `observe`.
+#[cfg(test)]
+pub(crate) fn mint_observable_test_stop() -> (StopToken, TestStopHandle) {
+    let state = Arc::new(SignalState::new());
+    let token = state.stop_token();
+    (token, TestStopHandle { state })
+}
+
+#[cfg(test)]
+impl TestStopHandle {
+    pub(crate) fn observe_sigint(&self) {
+        self.state.observe(libc::SIGINT);
+    }
 }
 
 /// `signal_hook::low_level::register` is used instead of a hand-rolled
@@ -6334,7 +6372,7 @@ fn open_capture_stdout(
     match open() {
         Ok(sink) => {
             let mut sink = sink;
-            sink.set_cancel_flag(stop.into_inner());
+            sink.watch_stop(stop);
             Ok(OpenedCaptureStdout {
                 sink,
                 open: true,
@@ -31387,7 +31425,7 @@ int main(int argc, char **argv) {
         while filler.write(&chunk).is_ok() {}
         drop(filler);
         let mut sink = SinkWriter::new(writer).unwrap();
-        sink.set_cancel_flag(interrupted.cancel_flag());
+        sink.watch_stop(interrupted.stop_token());
         sink.begin_tick(Duration::from_millis(250));
         let payload = vec![8u8; 4096];
         sink.write_all(&payload).unwrap();
@@ -31439,14 +31477,16 @@ int main(int argc, char **argv) {
         assert_eq!(count("SinkWriter::new("), 0, "raw SinkWriter::new(");
         assert_eq!(count("sink_on_fd("), 0, "dashboard-only sink_on_fd(");
         assert_eq!(count("without_flag_change("), 0, "raw without_flag_change(");
-        // The opener wires whatever `open` returns, and the engine
-        // keeps its single direct wiring with the exact shared flag.
-        // The engine call is a bare statement, so only an exact full
-        // line matches it: a dead branch reindents, a comment prefixes,
-        // and a fresh flag rewords — all fail. (Every other wiring is
-        // a `let` binding whose removal or commenting breaks compilation,
-        // or a watched constructor pinned behaviorally.)
-        assert_eq!(count("set_cancel_flag("), 2, "direct wirings");
+        // The opener wires whatever `open` returns with the token it
+        // was passed (never unwrapped: sinks hold the token opaquely),
+        // and the engine keeps its single direct wiring with the exact
+        // shared token. The engine call is a bare statement, so only an
+        // exact full line matches it: a dead branch reindents, a comment
+        // prefixes, and a fresh flag rewords — all fail. (Every other
+        // wiring is a `let` binding whose removal or commenting breaks
+        // compilation, or a watched constructor pinned behaviorally.)
+        assert_eq!(count("set_cancel_flag("), 1, "direct wirings");
+        assert_eq!(count("watch_stop("), 1, "opener token wiring");
         assert_eq!(
             code.iter()
                 .filter(|line| {
@@ -31463,10 +31503,10 @@ int main(int argc, char **argv) {
         // private field at all.
         assert_eq!(count("StopToken("), 2, "token mint sites");
         // Exactly one production stop state exists (the install in
-        // `install_stop_flag_for`); the other two constructions are the
-        // cfg(test) loop helper and the cfg(test) token minter, which a
-        // production decoy state would push to four.
-        assert_eq!(count("SignalState::new()"), 3, "stop-state constructions");
+        // `install_stop_flag_for`); the other three constructions are
+        // the cfg(test) loop helper and the two cfg(test) token
+        // minters, which a production decoy state would push to five.
+        assert_eq!(count("SignalState::new()"), 4, "stop-state constructions");
     }
 
     /// The engine takes the shared stop flag before the capture

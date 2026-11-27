@@ -3902,14 +3902,14 @@ fn available_capture_stdout_opens_live_with_no_gap() {
 }
 
 /// The opener wires whatever `open` returns to the capture's stop
-/// flag: with the flag set, a stalled injected sink sheds promptly
-/// with counters instead of waiting out the budget.
+/// token: the sink is opened first and the stop observed after, so a
+/// construct-time snapshot would fail — only live sharing sheds the
+/// stalled injected sink promptly with counters instead of waiting
+/// out the budget.
 #[test]
 fn opener_wires_the_returned_sink_to_the_stop_flag() {
     use std::io::Write as _;
-    // The loop-ending stop, observed before the final publish.
     let interrupted = SignalState::new();
-    interrupted.observe(libc::SIGINT);
     // A stalled injected open: fill the pipe, then hold it.
     let (writer, reader) = std::os::unix::net::UnixStream::pair().unwrap();
     let mut filler = writer.try_clone().unwrap();
@@ -3927,6 +3927,8 @@ fn opener_wires_the_returned_sink_to_the_stop_flag() {
     )
     .expect("a live open must hand back a sink");
     assert!(opened.open);
+    // The stop lands after the open: the sink must share it live.
+    interrupted.observe(libc::SIGINT);
     let mut sink = opened.sink;
     sink.begin_tick(std::time::Duration::from_millis(250));
     let payload = vec![8u8; 4096];

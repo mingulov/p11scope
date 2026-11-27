@@ -56,6 +56,25 @@ fn named_contradicted_loss_report_defers_without_bail() {
     assert!(!engine.expected_target_exit());
 }
 
+/// The engine shares the token's flag live: the token is set first
+/// and the stop observed after, so a construct-time snapshot in the
+/// setter would fail — only the shared flag passes.
+#[test]
+fn engine_observes_a_stop_after_the_token_is_set() {
+    let (_fixture, mut engine, _session) = continuity_route();
+    let (token, stop) = crate::run::mint_observable_test_stop();
+    engine.set_cancel_flag(token);
+    assert!(
+        !engine.cancellation_requested(),
+        "no stop observed yet: the setter must not invent one"
+    );
+    stop.observe_sigint();
+    assert!(
+        engine.cancellation_requested(),
+        "the engine must see the stop observed after the token was set"
+    );
+}
+
 #[test]
 fn recorded_named_loss_still_fails_closed() {
     let (_fixture, mut engine, mut session) = continuity_route();

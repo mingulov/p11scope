@@ -8,10 +8,7 @@
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, FromRawFd as _, IntoRawFd as _, OwnedFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt as _;
-use std::sync::{
-    Arc, OnceLock,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 /// Sink buffer size: one 64 KiB batch per tick instead of a syscall per
@@ -59,7 +56,10 @@ pub(crate) struct SinkWriter<W: Write + AsRawFd> {
     buf: Vec<u8>,
     tick_budget: Duration,
     drops: SinkDrops,
-    cancel: Option<Arc<AtomicBool>>,
+    /// The minted stop token, held opaquely and consulted live on
+    /// every flush: a construct-time snapshot of the shared flag is
+    /// not expressible, because no bare flag is ever held here.
+    cancel: Option<crate::run::StopToken>,
 }
 
 /// What `stdout_sink` writes through: unbuffered, so every byte passes
@@ -166,7 +166,7 @@ pub(crate) fn watched_stdout_sink(
     stop: crate::run::StopToken,
 ) -> io::Result<SinkWriter<StdoutInner>> {
     let mut sink = stdout_sink()?;
-    sink.set_cancel_flag(stop.into_inner());
+    sink.watch_stop(stop);
     Ok(sink)
 }
 
@@ -195,7 +195,7 @@ pub(crate) fn watched_null_sink(
     stop: crate::run::StopToken,
 ) -> io::Result<SinkWriter<StdoutInner>> {
     let mut sink = null_sink()?;
-    sink.set_cancel_flag(stop.into_inner());
+    sink.watch_stop(stop);
     Ok(sink)
 }
 
@@ -903,18 +903,18 @@ impl<W: Write + AsRawFd> SinkWriter<W> {
         self.tick_budget = budget;
     }
 
-    /// Watches the capture's cancellation flag: a flush that sees it set
-    /// stops waiting and sheds promptly (F4) instead of riding out the
-    /// tick budget. Unset (unit-test default), flushes keep the legacy
-    /// wait-out-the-budget behavior.
-    pub(crate) fn set_cancel_flag(&mut self, cancel: Arc<AtomicBool>) {
-        self.cancel = Some(cancel);
+    /// Watches the capture's stop token: a flush that sees it stopped
+    /// sheds promptly (F4) instead of riding out the tick budget. The
+    /// token is held opaquely and consulted live — never unwrapped to
+    /// a bare flag — so a later stop always reaches the sink. Unset
+    /// (unit-test default), flushes keep the legacy wait-out-the-budget
+    /// behavior.
+    pub(crate) fn watch_stop(&mut self, stop: crate::run::StopToken) {
+        self.cancel = Some(stop);
     }
 
     fn cancelled(&self) -> bool {
-        self.cancel
-            .as_deref()
-            .is_some_and(|cancel| cancel.load(Ordering::SeqCst))
+        self.cancel.as_ref().is_some_and(|stop| stop.is_stopped())
     }
 
     /// Drains the drop counters accumulated since the last call.
@@ -1516,7 +1516,7 @@ mod tests {
     /// cancellation). Returns the payload the test offered the sink.
     fn stalled_sink_with(
         budget: Duration,
-        cancel: Option<Arc<AtomicBool>>,
+        stop: Option<crate::run::StopToken>,
     ) -> (SinkWriter<UnixStream>, UnixStream, Vec<u8>) {
         let (writer, reader) = pair();
         let mut filler = writer.try_clone().unwrap();
@@ -1525,8 +1525,8 @@ mod tests {
         while filler.write(&chunk).is_ok() {}
         drop(filler);
         let mut sink = SinkWriter::new(writer).unwrap();
-        if let Some(cancel) = cancel {
-            sink.set_cancel_flag(cancel);
+        if let Some(stop) = stop {
+            sink.watch_stop(stop);
         }
         sink.begin_tick(budget);
         let payload = vec![8u8; 4096];
@@ -1551,6 +1551,10 @@ mod tests {
         );
         assert_eq!(drops.timeouts, 1);
         assert_eq!(drops.dropped_bytes, payload.len() as u64);
+        assert_eq!(
+            drops.cancelled_sheds, 0,
+            "the budget path sheds without the cancel record"
+        );
     }
 
     #[test]
@@ -1559,13 +1563,13 @@ mod tests {
         // (one 250ms poll retried past the interruption). With the flag
         // watched, the flush sheds on the interruption, or at worst at
         // the next slice end.
-        let cancel = Arc::new(AtomicBool::new(false));
+        let (token, stop) = crate::run::mint_observable_test_stop();
         let (mut sink, _reader, payload) =
-            stalled_sink_with(Duration::from_millis(250), Some(Arc::clone(&cancel)));
+            stalled_sink_with(Duration::from_millis(250), Some(token));
         let setter = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(20));
             let set = Instant::now();
-            cancel.store(true, Ordering::SeqCst);
+            stop.observe_sigint();
             set
         });
         sink.flush().unwrap();
@@ -1588,9 +1592,8 @@ mod tests {
         // The prompt shed is not a blind drop: bytes the reader already
         // has room for still leave, so a fast-sink cancel stays lossless.
         let (writer, mut reader) = pair();
-        let cancel = Arc::new(AtomicBool::new(true));
         let mut sink = SinkWriter::new(writer).unwrap();
-        sink.set_cancel_flag(cancel);
+        sink.watch_stop(crate::run::mint_test_stop_token(true));
         sink.begin_tick(Duration::from_millis(250));
         sink.write_all(b"late trace bytes\n").unwrap();
         sink.flush().unwrap();
@@ -1618,15 +1621,21 @@ mod tests {
     }
 
     /// The watched constructors wire the exact token they are given,
-    /// minted by a real stop state: a watched sink observes a later
-    /// stop through the same predicate the flush path consults, while
-    /// an unwired sink never does.
+    /// minted by a real stop state: the sink is built first and the
+    /// stop observed after, so a construct-time snapshot would fail —
+    /// only live sharing passes. An unwired sink never observes.
     #[test]
     fn watched_stdout_sink_observes_the_passed_stop_flag() {
         let quiet = watched_stdout_sink(crate::run::mint_test_stop_token(false)).unwrap();
         assert!(!quiet.cancelled(), "an unset flag cancels nothing");
-        let stopped = watched_stdout_sink(crate::run::mint_test_stop_token(true)).unwrap();
-        assert!(stopped.cancelled(), "a watched sink must see the stop");
+        let (token, stop) = crate::run::mint_observable_test_stop();
+        let sink = watched_stdout_sink(token).unwrap();
+        assert!(!sink.cancelled(), "no stop observed yet");
+        stop.observe_sigint();
+        assert!(
+            sink.cancelled(),
+            "a watched sink must see the stop observed after construction"
+        );
         let unwired = stdout_sink().unwrap();
         assert!(
             !unwired.cancelled(),
@@ -1639,8 +1648,33 @@ mod tests {
     fn watched_null_sink_observes_the_passed_stop_flag() {
         let quiet = watched_null_sink(crate::run::mint_test_stop_token(false)).unwrap();
         assert!(!quiet.cancelled(), "an unset flag cancels nothing");
-        let stopped = watched_null_sink(crate::run::mint_test_stop_token(true)).unwrap();
-        assert!(stopped.cancelled(), "a watched sink must see the stop");
+        let (token, stop) = crate::run::mint_observable_test_stop();
+        let sink = watched_null_sink(token).unwrap();
+        assert!(!sink.cancelled(), "no stop observed yet");
+        stop.observe_sigint();
+        assert!(
+            sink.cancelled(),
+            "a watched sink must see the stop observed after construction"
+        );
+    }
+
+    /// Deterministic cancel record at the sink level: a pre-observed
+    /// token over a stalled transport sheds on the cancel path (not
+    /// the budget path), recording the typed `cancelled_sheds`.
+    #[test]
+    fn pre_observed_stop_sheds_a_stalled_flush_on_the_cancel_path() {
+        let (mut sink, _reader, payload) = stalled_sink_with(
+            Duration::from_millis(250),
+            Some(crate::run::mint_test_stop_token(true)),
+        );
+        sink.flush().unwrap();
+        let drops = sink.take_drops();
+        assert_eq!(drops.timeouts, 1);
+        assert_eq!(drops.dropped_bytes, payload.len() as u64);
+        assert_eq!(
+            drops.cancelled_sheds, 1,
+            "a stopped flush must take the cancel path, not the budget path"
+        );
     }
 
     /// PA-14: a single write larger than the ceiling must not grow the
@@ -1799,9 +1833,8 @@ mod tests {
         while filler.write(&chunk).is_ok() {}
         drop(filler);
 
-        let cancel = Arc::new(AtomicBool::new(true));
         let mut sink = SinkWriter::new(writer).unwrap();
-        sink.set_cancel_flag(Arc::clone(&cancel));
+        sink.watch_stop(crate::run::mint_test_stop_token(true));
         sink.begin_tick(Duration::from_millis(250));
         let len = SINK_BUFFER_BYTES * 2 + 1000;
         let payload = vec![8u8; len];

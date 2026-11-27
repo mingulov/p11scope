@@ -21207,12 +21207,15 @@ fn idle_recovery_yields_collection_when_budget_spent() {
 }
 
 /// An Idle admission between polls rescans before collection: after the
-/// re-arm's first absence scan completes with the scoped void outstanding,
-/// a direct binder admits a second caller without staging EVENTS. The next
-/// Idle polls must examine the admitted caller's eligible target before any
-/// void unit or collection runs — the cached completion flag and its cursors
-/// reset on the admission revision move. The unchanged-input re-arm twin
-/// keeps guarding the pacing (no rescan without an admission).
+/// re-arm's first absence scan completes its visits with the scoped void
+/// outstanding, a direct binder admits a second caller without staging
+/// EVENTS. The completing poll starts the void drain (its completion flag
+/// clears as the Idle episode ends); the drain runs its units without
+/// collecting; then the post-drain Idle polls must examine the admitted
+/// caller's eligible target and re-complete before any collection runs —
+/// the cached cursors reset on the admission revision move, and the
+/// post-recovery skip yields to moved inputs. The unchanged-input re-arm
+/// twin keeps guarding the pacing (no rescan without an admission).
 #[test]
 fn joint_machine_idle_admission_between_polls_rescans_before_collection() {
     use crate::discovery::caller_registry::CallerId;
@@ -21325,15 +21328,29 @@ fn joint_machine_idle_admission_between_polls_rescans_before_collection() {
             "the scan stays Idle"
         );
     }
+    let (_, rev_before, req_before, _, _, _) = fixture.machine.absence_episode_for_test();
     fixture
         .service(1)
         .expect("the completing poll never refuses");
-    let (done, _, _, binding, after, entry) = fixture.machine.absence_episode_for_test();
-    assert!(done, "the first absence scan completes");
+    let (done, rev, req, binding, after, entry) = fixture.machine.absence_episode_for_test();
     assert_eq!(
         (binding, after, entry),
         (0, None, 0),
-        "completion resets the cursors"
+        "the exhausted scan resets the cursors"
+    );
+    assert_eq!(
+        (rev, req),
+        (rev_before, req_before),
+        "no revision move: the reset is a completion, not an invalidation"
+    );
+    assert_eq!(
+        fixture.machine.diagnostic_snapshot_for_test().0,
+        "Voiding",
+        "the completing poll starts the void drain"
+    );
+    assert!(
+        !done,
+        "the completion flag clears as its Idle episode ends (it re-arms at the rescan completion below)"
     );
     let units_after_scan = fixture
         .scene
@@ -21428,10 +21445,13 @@ fn joint_machine_idle_admission_between_polls_rescans_before_collection() {
         "admission bumps the revision once"
     );
 
-    // The rescan must examine the admitted caller before any void unit
-    // or collection runs. A cached completion would void/collect first.
-    // Completion only follows an exhaustive visit of every binding in
-    // order, so re-completion proves the admitted index was examined.
+    // The rescan must examine the admitted caller before any collection
+    // runs. The void started on the completing poll, so the drain runs
+    // first (no Idle polls, no visits, no collection); then the
+    // post-drain Idle polls rescan from scratch and re-complete before
+    // collecting. Completion only follows an exhaustive visit of every
+    // binding in order, so re-completion proves the admitted index was
+    // examined.
     let units_before_rescan = fixture
         .scene
         .real
@@ -21441,30 +21461,23 @@ fn joint_machine_idle_admission_between_polls_rescans_before_collection() {
         .adapter()
         .recovery_units_for_test();
     let collect_before_rescan = fixture.native.collect_calls;
-    // The first poll after admission must clear the stale completion and
-    // restart from scratch without spending void units or collecting.
-    fixture.service(1).expect("the rescan never refuses");
-    let (done, _, _, _, _, _) = fixture.machine.absence_episode_for_test();
-    assert!(!done, "admission clears the completed flag for a rescan");
-    assert_eq!(
-        fixture
-            .scene
-            .real
-            .scene
-            .coordinator
-            .joint_capture()
-            .adapter()
-            .recovery_units_for_test(),
-        units_before_rescan,
-        "the invalidating poll spends no void units"
-    );
-    assert_eq!(
-        fixture.native.collect_calls, collect_before_rescan,
-        "no collection starts before the rescan"
-    );
-    // The rescan then runs to completion (visiting the admitted index)
-    // before void or collection resumes.
-    for poll in 2..=8 {
+    // Phase D: the scoped drain. Each poll spends its one scoped unit
+    // while work stands (the completing poll spends nothing further);
+    // the rescan cursors stay frozen and nothing collects.
+    let mut drain_polls = 0usize;
+    while fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .void_outstanding_for_test()
+    {
+        assert!(
+            drain_polls < 64,
+            "the scoped drain ends (hang guard; observed 12)"
+        );
         let units_before = fixture
             .scene
             .real
@@ -21473,8 +21486,7 @@ fn joint_machine_idle_admission_between_polls_rescans_before_collection() {
             .joint_capture()
             .adapter()
             .recovery_units_for_test();
-        let collect_before = fixture.native.collect_calls;
-        fixture.service(1).expect("the rescan never refuses");
+        fixture.service(1).expect("the drain never refuses");
         let units_after = fixture
             .scene
             .real
@@ -21483,42 +21495,149 @@ fn joint_machine_idle_admission_between_polls_rescans_before_collection() {
             .joint_capture()
             .adapter()
             .recovery_units_for_test();
-        let (done, _, _, _, _, _) = fixture.machine.absence_episode_for_test();
-        if done {
-            // Completion re-arms the episode and lets void resume in the
-            // same poll (one unit, like the first scan's completing poll),
-            // still before any collection.
+        let still_outstanding = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .void_outstanding_for_test();
+        if still_outstanding {
             assert_eq!(
                 units_after,
-                units_before_rescan + 1,
-                "the re-completing poll voids one unit"
+                units_before + 1,
+                "drain poll {} spends its one scoped unit",
+                drain_polls + 1,
             );
+        } else {
             assert_eq!(
-                fixture.native.collect_calls, collect_before_rescan,
-                "no collection starts before the void drains"
+                units_after, units_before,
+                "the completing drain poll spends nothing further"
             );
-            assert_eq!(
-                fixture.machine.diagnostic_snapshot_for_test().0,
-                "Idle",
-                "the rescan stays Idle"
-            );
-            return;
         }
         assert_eq!(
-            units_after, units_before,
-            "rescan poll {poll} spends no void units before re-completion"
+            fixture.native.collect_calls, collect_before_rescan,
+            "no collection starts before the drain ends"
+        );
+        let (_, _, _, binding, _, _) = fixture.machine.absence_episode_for_test();
+        assert_eq!(
+            binding, 0,
+            "no rescan visit runs during the drain"
+        );
+        drain_polls += 1;
+    }
+    let drain_units = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .recovery_units_for_test()
+        - units_before_rescan;
+    assert_eq!(
+        drain_units + 1,
+        drain_polls,
+        "one scoped unit per drain poll plus the free completion"
+    );
+    // Derived total bound: the measured drain units at one scoped unit
+    // per poll, plus one visit per binding target step (targets and
+    // bindings read live; each target costs at most one entry poll per
+    // birth plus one advance), one completion poll and one slack poll.
+    let mut nbindings = 0usize;
+    while fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_absence_binding(nbindings)
+        .is_some()
+    {
+        nbindings += 1;
+    }
+    let ntargets = fixture.scene.real.lane.subset().required().len();
+    let bound = drain_units + nbindings * (ntargets * 2 + 1) + 2;
+    // Phase R: the rescan. Every poll must advance the cursors or
+    // complete (no silent spins); collection runs only once the flag
+    // re-arms at re-completion.
+    let mut rescan_polls = 0usize;
+    let mut max_binding = 0usize;
+    let mut done_poll = None;
+    let mut first_collect_poll = None;
+    loop {
+        assert!(
+            drain_polls + rescan_polls < bound,
+            "the rescan lands within its derived bound (polls={} bound={bound} drain={drain_units} bindings={nbindings} targets={ntargets})",
+            drain_polls + rescan_polls,
+        );
+        let before = fixture.machine.absence_episode_for_test();
+        let collect_before = fixture.native.collect_calls;
+        fixture.service(1).expect("the rescan never refuses");
+        let (done, _, _, binding, after, entry) = fixture.machine.absence_episode_for_test();
+        rescan_polls += 1;
+        max_binding = max_binding.max(binding);
+        if fixture.native.collect_calls > collect_before {
+            assert!(
+                first_collect_poll.is_none(),
+                "first collection recorded once"
+            );
+            first_collect_poll = Some(rescan_polls);
+        }
+        if done {
+            assert_eq!(
+                (binding, after, entry),
+                (0, None, 0),
+                "re-completion resets the cursors"
+            );
+            done_poll = Some(rescan_polls);
+            break;
+        }
+        assert!(
+            (binding, after, entry) != (before.3, before.4, before.5),
+            "rescan poll {rescan_polls} advances the cursors"
         );
         assert_eq!(
             fixture.native.collect_calls, collect_before,
             "no collection starts before the rescan re-completes"
         );
-        assert_eq!(
-            fixture.machine.diagnostic_snapshot_for_test().0,
-            "Idle",
-            "the rescan stays Idle"
+    }
+    assert!(
+        max_binding >= nbindings,
+        "the rescan walked past the admitted index {nbindings} (max {max_binding})"
+    );
+    // The admission set is exact: A plus the admitted B, nothing else.
+    let binding_b = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_absence_binding(1)
+        .expect("the admitted binding stands");
+    assert_eq!(
+        binding_b.image(),
+        image_b,
+        "the admitted index carries B's image"
+    );
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_absence_binding(nbindings)
+            .is_none(),
+        "no binding past the admitted set"
+    );
+    // Collection waits for the rescan: the first collection runs at or
+    // after re-completion, never before.
+    if let Some(collect_poll) = first_collect_poll {
+        assert!(
+            collect_poll >= done_poll.expect("re-completed"),
+            "collection waits for re-completion (collect {collect_poll} done {})",
+            done_poll.unwrap_or(0),
         );
     }
-    panic!("the rescan must re-complete within eight polls and before any void or collection");
 }
 
 /// E9b: a scoped void sheds barrier-causing unbound staging — a stuck
@@ -46628,4 +46747,3 @@ fn joint_disposed_terminal_check_is_metered() {
         "one delivery per paid unit, then the advance"
     );
 }
-

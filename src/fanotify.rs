@@ -1045,6 +1045,14 @@ fn open_learn_group() -> Result<OwnedFd, LearnAbsent> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
+/// The live mount table the production startup arming reads, as an
+/// owned path for the bounded helper thread. Extracted so the leaf is
+/// pinned: pointing production startup anywhere else fails
+/// `learn_production_startup_leaves_select_live_inputs`.
+fn production_mountinfo_path() -> std::path::PathBuf {
+    std::path::PathBuf::from("/proc/self/mountinfo")
+}
+
 /// One startup mark step that honors cancellation: once the arming
 /// helper is cancelled (its owner timed out and detached it), no
 /// further mark is attempted — not even opening the mount point — so
@@ -1158,7 +1166,7 @@ impl FileLearner {
         startup_arming(
             open_learn_group,
             measure_fionread_unit,
-            std::path::PathBuf::from("/proc/self/mountinfo"),
+            production_mountinfo_path(),
             |group, cancel, point, mounts| cancel_aware_mark(cancel, group, point, mounts),
         )
         .map(|(learner, channel, _)| (learner, channel))
@@ -5677,6 +5685,31 @@ mod tests {
         );
     }
 
+    /// Production startup selects the live inputs: the observer's own
+    /// mount table, and the real group opener — without the grant the
+    /// real `start()` fails closed with the exact fanotify_init
+    /// refusal (it only ever proceeds with privileges). Pointing
+    /// startup anywhere else, or swapping the opener, fails this twin.
+    /// (Unprivileged in the named gate; root truthfully proceeds.)
+    #[test]
+    fn learn_production_startup_leaves_select_live_inputs() {
+        assert_eq!(
+            super::production_mountinfo_path(),
+            std::path::PathBuf::from("/proc/self/mountinfo")
+        );
+        match super::FileLearner::start() {
+            Err(absent) => assert_eq!(
+                absent.reason,
+                "fanotify_init failed: Operation not permitted (os error 1)"
+            ),
+            Ok(_) => {
+                // SAFETY: geteuid takes no arguments and always succeeds.
+                let root = unsafe { libc::geteuid() } == 0;
+                assert!(root, "startup proceeds only with the grant");
+            }
+        }
+    }
+
     /// The driver stops between slices once cancelled, preserving the
     /// partial rotation: covered mounts stay covered, the cursor points
     /// at the last offer, and the remainder counts uncovered with the
@@ -5745,10 +5778,11 @@ mod tests {
 
     /// The begin-drain composition hands the pending arming to the
     /// drain body exactly: a recorder drain receives the covered set,
-    /// cursor, gap, and FIONREAD unit the pending arming carried, and a
-    /// second call is a no-op. Zeroing any handoff field, or skipping
-    /// the split, fails this twin. (Unprivileged: dummy group fd, the
-    /// recorder thread is joined.)
+    /// cursor, gap, FIONREAD unit, and production knobs the pending
+    /// arming carried, and a second call is a no-op. Zeroing any
+    /// handoff field, skipping the split, or swapping the knobs fails
+    /// this twin. (Unprivileged: dummy group fd, the recorder thread is
+    /// joined.)
     #[test]
     fn learn_begin_drain_handoff_reaches_drain() {
         let dummy = std::fs::File::open("/dev/null").unwrap();
@@ -5771,13 +5805,13 @@ mod tests {
         };
         let (seen_tx, seen_rx) = std::sync::mpsc::channel();
         learner
-            .begin_drain_with(move |_group, _tx, _state, remark, fionread, _deps| {
-                seen_tx.send((remark, fionread)).unwrap();
+            .begin_drain_with(move |_group, _tx, _state, remark, fionread, deps| {
+                seen_tx.send((remark, fionread, deps)).unwrap();
             })
             .expect("drain begins");
         assert!(learner.thread.is_some(), "the drain thread exists");
         assert!(learner.pending.is_none(), "pending is consumed");
-        let (remark, fionread) = seen_rx
+        let (remark, fionread, deps) = seen_rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("the recorder drain ran");
         assert_eq!(remark.covered, covered);
@@ -5794,6 +5828,42 @@ mod tests {
                 exact: false
             }
         );
+        // The production knobs arrive exactly: live table, 30 s period,
+        // 200 ms polls, and a spawner that runs the boxed job given.
+        assert_eq!(
+            deps.mountinfo,
+            std::path::PathBuf::from("/proc/self/mountinfo")
+        );
+        assert_eq!(deps.remark_period, std::time::Duration::from_secs(30));
+        assert_eq!(deps.poll_timeout_ms, 200);
+        let dummy = std::fs::File::open("/dev/null").unwrap();
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(Some(
+            std::os::unix::io::OwnedFd::from(dummy),
+        )));
+        let prev = std::collections::BTreeSet::new();
+        let mut pending = None;
+        let expected = super::MarkPassOutcome {
+            covered: [mnt(51, 8, 1)].into_iter().collect(),
+            uncovered: 1,
+            attempted: 1,
+            spent: false,
+            resume_after: None,
+            table_gap: false,
+        };
+        let job: super::BoxedRemarkJob = Box::new({
+            let expected = expected.clone();
+            move |_, _| expected.clone()
+        });
+        assert!((deps.spawner)(&shared, &prev, &mut pending, job));
+        let gate = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let landed = loop {
+            if let Some(outcome) = super::adopt_remark_result(&prev, &mut pending) {
+                break outcome;
+            }
+            assert!(std::time::Instant::now() < gate, "the job never lands");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        assert_eq!(landed, expected, "the received spawner runs its job");
         // Idempotent: a second begin runs no drain body.
         learner
             .begin_drain_with(|_, _, _, _, _, _| panic!("must not run again"))
@@ -6327,6 +6397,12 @@ mod tests {
             assert!(Instant::now() < gate, "second spawn never captured");
             std::thread::sleep(Duration::from_millis(1));
         }
+        // The adoption send precedes its spawn in program order (same
+        // tick, earlier lines), so it is already buffered here; if the
+        // pre-spawn send were dropped, nothing arrives until a later
+        // tick adopts again.
+        let first = rx.try_recv().expect("the adoption send precedes its spawn");
+        assert!(matches!(first, super::LearnMsg::Unavailable));
         state
             .shutdown
             .store(true, std::sync::atomic::Ordering::Release);
@@ -6343,11 +6419,151 @@ mod tests {
         assert_eq!(job.prev_len, 0, "the adopted covered set is empty");
         assert_eq!(job.attempted, 5, "only the tail past the cursor is offered");
         assert_eq!(job.uncovered, 10, "head counted plus tail failing-open");
+        assert!(
+            rx.try_recv().is_err(),
+            "exactly the landing gap is sent, already consumed above"
+        );
+        drop(_pipe_write);
+    }
+
+    /// The drain defers re-mark spawns until a full period elapses: with
+    /// an hour-long period nothing spawns and nothing is sent during a
+    /// short run. Spawning unconditionally fails this twin.
+    /// (Unprivileged: pipe group fd, counting spawner.)
+    #[test]
+    fn learn_drain_loop_defers_remark_until_period() {
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let table = write_task_mountinfo(dir.path(), "mountinfo", 10, 0);
+        let calls: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let counter = Arc::clone(&calls);
+        let spawner: Box<super::RemarkSpawner> = Box::new(
+            move |_: &Arc<Mutex<Option<std::os::unix::io::OwnedFd>>>,
+                  _: &std::collections::BTreeSet<super::MountIdentity>,
+                  _: &mut Option<std::sync::mpsc::Receiver<super::MarkPassOutcome>>,
+                  _: super::BoxedRemarkJob|
+                  -> bool {
+                *counter.lock().unwrap() += 1;
+                true
+            },
+        );
+        let deps = super::DrainDeps {
+            spawner,
+            mountinfo: table,
+            remark_period: Duration::from_secs(3600),
+            poll_timeout_ms: 50,
+        };
+        let (group, _pipe_write) = pipe_group();
+        let (tx, rx) = std::sync::mpsc::sync_channel(64);
+        let state = Arc::new(super::LearnShutdownState::default());
+        let _stop = StopDrainOnDrop(Arc::clone(&state));
+        let remark = super::RemarkState {
+            covered: std::collections::BTreeSet::new(),
+            cursor: None,
+            gap_owed: false,
+        };
+        let fionread = super::FionreadUnit {
+            bytes: 32,
+            exact: true,
+        };
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let drain_state = Arc::clone(&state);
+        let handle = std::thread::Builder::new()
+            .name("test-drain-defer".to_string())
+            .spawn(move || {
+                super::drain_loop(group, tx, drain_state, remark, fionread, deps);
+                let _ = done_tx.send(());
+            })
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        state
+            .shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
+        done_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("drain exits on shutdown");
+        handle.join().unwrap();
+        assert_eq!(*calls.lock().unwrap(), 0, "no spawn before the period");
+        assert!(rx.try_recv().is_err(), "no gap without any spawn");
+        drop(_pipe_write);
+    }
+
+    /// A refused re-mark spawn files the gap exactly once through the
+    /// loop: with a spawner that always refuses, the first due tick
+    /// records the failure, sends once, and later ticks send nothing
+    /// more. Dropping the spawn-failure send fails this twin.
+    /// (Unprivileged: pipe group fd, refusing spawner.)
+    #[test]
+    fn learn_drain_loop_files_gap_when_spawn_refused() {
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let table = write_task_mountinfo(dir.path(), "mountinfo", 10, 0);
+        let calls: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let counter = Arc::clone(&calls);
+        let spawner: Box<super::RemarkSpawner> = Box::new(
+            move |_: &Arc<Mutex<Option<std::os::unix::io::OwnedFd>>>,
+                  _: &std::collections::BTreeSet<super::MountIdentity>,
+                  _: &mut Option<std::sync::mpsc::Receiver<super::MarkPassOutcome>>,
+                  _: super::BoxedRemarkJob|
+                  -> bool {
+                *counter.lock().unwrap() += 1;
+                false
+            },
+        );
+        let deps = super::DrainDeps {
+            spawner,
+            mountinfo: table,
+            remark_period: Duration::from_millis(100),
+            poll_timeout_ms: 50,
+        };
+        let (group, _pipe_write) = pipe_group();
+        let (tx, rx) = std::sync::mpsc::sync_channel(64);
+        let state = Arc::new(super::LearnShutdownState::default());
+        let _stop = StopDrainOnDrop(Arc::clone(&state));
+        let remark = super::RemarkState {
+            covered: std::collections::BTreeSet::new(),
+            cursor: None,
+            gap_owed: false,
+        };
+        let fionread = super::FionreadUnit {
+            bytes: 32,
+            exact: true,
+        };
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let drain_state = Arc::clone(&state);
+        let handle = std::thread::Builder::new()
+            .name("test-drain-refuse".to_string())
+            .spawn(move || {
+                super::drain_loop(group, tx, drain_state, remark, fionread, deps);
+                let _ = done_tx.send(());
+            })
+            .unwrap();
+        // Two refusals prove the send-once latch: the first refusal
+        // sends, the second adds no further send.
+        let gate = Instant::now() + Duration::from_secs(30);
+        loop {
+            if *calls.lock().unwrap() >= 2 {
+                break;
+            }
+            assert!(Instant::now() < gate, "refusals never happen");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // Let the second refusal's tick settle, then stop and join.
+        std::thread::sleep(Duration::from_millis(100));
+        state
+            .shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
+        done_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("drain exits on shutdown");
+        handle.join().unwrap();
         let mut sends = 0;
         while rx.try_recv().is_ok() {
             sends += 1;
         }
-        assert_eq!(sends, 1, "exactly the landing gap is sent");
+        assert_eq!(sends, 1, "one refusal gap, sent once");
         drop(_pipe_write);
     }
 

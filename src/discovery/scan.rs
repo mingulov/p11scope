@@ -21844,9 +21844,9 @@ int main(int argc, char **argv) {
     }
 
     /// A drain stopped inside its remainder strides folds the paid
-    /// charges and every scanned newline, parks the uncharged remainder,
-    /// and reports the stop: seventy counted lines under a 64 ceiling pay
-    /// one stride and owe six.
+    /// charges and every scanned newline, parks the uncharged remainder
+    /// and the byte meter untouched, and reports the stop: seventy
+    /// counted lines under a 64 ceiling pay one stride and owe six.
     #[test]
     fn mountinfo_drain_folds_paid_charges_when_its_strides_stop() {
         let mut progress = MountinfoProgress {
@@ -21856,7 +21856,7 @@ int main(int argc, char **argv) {
             encoding: MountinfoUtf8::default(),
             scanned: 2,
             pending_lines: 70,
-            byte_stride_used: 0,
+            byte_stride_used: 8000,
             lines_charged: 0,
             chunk_newlines: 70,
         };
@@ -21888,6 +21888,10 @@ int main(int argc, char **argv) {
             ),
             (70, 64, 6, 0, 0),
             "the paid stride folds, the six owed lines park"
+        );
+        assert_eq!(
+            progress.byte_stride_used, 8000,
+            "the stop fold keeps the byte meter for the resume"
         );
     }
 
@@ -21981,6 +21985,192 @@ int main(int argc, char **argv) {
             resume.work_units_count() - reader.requests.len() as u64,
             6,
             "the resume charges exactly the six tail lines"
+        );
+    }
+
+    /// The byte-stride twin (INV-2): a newline-free table crosses two
+    /// 8 KiB byte strides; a deadline at the first stride's poll parks
+    /// with the cursor exactly at the boundary, and the resume pays the
+    /// second stride plus the trailing partial — two byte units and one
+    /// line unit, each exactly once.
+    #[test]
+    fn mountinfo_byte_stride_stops_and_resumes_with_exact_work() {
+        let table = vec![b'a'; 20_000];
+        let roomy = || {
+            CaptureWorkBudget::new(ScanLimits {
+                per_object_bytes: u64::MAX,
+                total_bytes: u64::MAX,
+            })
+        };
+        let mut reader = StreamReader {
+            data: table.clone(),
+            at: 0,
+            requests: Vec::new(),
+        };
+        let mut budget = roomy();
+        let mut progress = MountinfoProgress::default();
+        reset_reader_scan_counters_for_test();
+        let mut calls = 0u32;
+        let step = read_mountinfo_resumable_with(
+            &mut reader,
+            &mut budget,
+            20_000,
+            |_| {
+                calls += 1;
+                // Call 1 is the pre-read poll; call 2 is the poll after
+                // the first 8 KiB byte-stride spend, mid-scan.
+                (calls == 2).then_some(SCAN_DEADLINE_REASON)
+            },
+            &mut progress,
+        )
+        .unwrap();
+        assert_eq!(step, MountinfoStep::Stopped(SCAN_DEADLINE_REASON.into()));
+        assert_eq!(progress.table.len(), table.len(), "every byte read is kept");
+        assert_eq!(
+            progress.scanned, 8192,
+            "the cursor parks exactly at the byte-stride boundary"
+        );
+        assert_eq!(
+            reader_bytes_scanned_for_test(),
+            8192,
+            "the scan stops before looking past the boundary"
+        );
+        assert_eq!(
+            budget.work_units_count() - reader.requests.len() as u64,
+            1,
+            "pass 1 charges the read plus the one completed byte stride"
+        );
+        let mut resume = roomy();
+        reader.requests.clear();
+        let step =
+            read_mountinfo_resumable_with(&mut reader, &mut resume, 20_000, |_| None, &mut progress)
+                .unwrap();
+        assert_eq!(reader.requests, vec![20_000], "the resume reads only EOF");
+        assert_eq!(
+            step,
+            MountinfoStep::Complete(String::from_utf8(table).unwrap()),
+            "the resumed read is the whole table, no byte skipped or repeated"
+        );
+        assert_eq!(
+            resume.work_units_count() - reader.requests.len() as u64,
+            2,
+            "the resume charges exactly the second byte stride and the trailing partial"
+        );
+    }
+
+    /// The byte meter resets at each segment fold: across two 10000-byte
+    /// reads the second stride fires 8192 bytes into the second segment
+    /// (absolute 18192), not 8192 bytes after the first stride. A stop
+    /// there parks the cursor at the folded position.
+    #[test]
+    fn mountinfo_byte_meter_resets_at_each_segment_fold() {
+        let table = vec![b'a'; 20_000];
+        let roomy = || {
+            CaptureWorkBudget::new(ScanLimits {
+                per_object_bytes: u64::MAX,
+                total_bytes: u64::MAX,
+            })
+        };
+        let mut reader = StreamReader {
+            data: table.clone(),
+            at: 0,
+            requests: Vec::new(),
+        };
+        let mut budget = roomy();
+        let mut progress = MountinfoProgress::default();
+        reset_reader_scan_counters_for_test();
+        let mut calls = 0u32;
+        let step = read_mountinfo_resumable_with(
+            &mut reader,
+            &mut budget,
+            10_000,
+            |_| {
+                calls += 1;
+                // Calls 1-3 are the pre-read polls and the first
+                // segment's byte-stride poll; call 4 is the second
+                // segment's byte-stride poll.
+                (calls == 4).then_some(SCAN_DEADLINE_REASON)
+            },
+            &mut progress,
+        )
+        .unwrap();
+        assert_eq!(step, MountinfoStep::Stopped(SCAN_DEADLINE_REASON.into()));
+        assert_eq!(
+            progress.scanned,
+            10_000 + 8192,
+            "the second stride fires 8192 bytes into its own segment"
+        );
+        assert_eq!(
+            reader_bytes_scanned_for_test(),
+            10_000 + 8192,
+            "the scan stops at the folded boundary"
+        );
+        assert_eq!(
+            budget.work_units_count() - reader.requests.len() as u64,
+            3,
+            "pass 1 charges two byte strides and the first segment's trailing"
+        );
+        let mut resume = roomy();
+        reader.requests.clear();
+        let step =
+            read_mountinfo_resumable_with(&mut reader, &mut resume, 10_000, |_| None, &mut progress)
+                .unwrap();
+        assert_eq!(
+            step,
+            MountinfoStep::Complete(String::from_utf8(table).unwrap()),
+            "the resumed read is the whole table"
+        );
+        assert_eq!(
+            resume.work_units_count() - reader.requests.len() as u64,
+            0,
+            "the resume charges nothing new: every stride already folded"
+        );
+    }
+
+    /// The byte meter persists across a stop: a drain stopped on its
+    /// trailing spend parks 8000 metered bytes, and the resume fires
+    /// its byte stride 192 bytes into the fresh segment (absolute
+    /// 8192) instead of missing it.
+    #[test]
+    fn mountinfo_byte_meter_persists_across_a_stop() {
+        let table = vec![b'a'; 8200];
+        let mut reader = StreamReader {
+            data: table.clone(),
+            at: 0,
+            requests: Vec::new(),
+        };
+        let mut budget = CaptureWorkBudget::new(ScanLimits {
+            per_object_bytes: u64::MAX,
+            total_bytes: u64::MAX,
+        });
+        budget.set_work_ceiling_for_test(1);
+        let mut progress = MountinfoProgress::default();
+        let step =
+            read_mountinfo_resumable_with(&mut reader, &mut budget, 8000, |_| None, &mut progress)
+                .unwrap();
+        assert_eq!(step, MountinfoStep::Stopped(WORK_CEILING_REASON.into()));
+        assert_eq!(
+            (progress.scanned, progress.table.len()),
+            (8000, 8000),
+            "the failed trailing spend parks a fully scanned segment"
+        );
+        let mut resume = CaptureWorkBudget::new(ScanLimits {
+            per_object_bytes: u64::MAX,
+            total_bytes: u64::MAX,
+        });
+        reader.requests.clear();
+        let step =
+            read_mountinfo_resumable_with(&mut reader, &mut resume, 8000, |_| None, &mut progress)
+                .unwrap();
+        assert_eq!(
+            step,
+            MountinfoStep::Complete(String::from_utf8(table).unwrap()),
+            "the resumed read is the whole table"
+        );
+        assert_eq!(
+            resume.work_units_count() - reader.requests.len() as u64,
+            2,
+            "the trailing partial plus the one persisted-meter byte stride"
         );
     }
 

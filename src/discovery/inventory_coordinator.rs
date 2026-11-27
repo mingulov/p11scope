@@ -11014,6 +11014,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         limit: MAX_DEFERRED_EXIT_HOOKS,
                         requested: MAX_DEFERRED_EXIT_HOOKS + 1,
                     }),
+                    units: None,
                 });
             }
             DeferredPush::LatchTransition => {
@@ -11031,6 +11032,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         limit: DEFAULT_MAX_CALLERS,
                         requested: DEFAULT_MAX_CALLERS + 1,
                     }),
+                    units: None,
                 });
             }
         }
@@ -11064,6 +11066,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                      retry on a later batch"
                     .into(),
                 budget: None,
+                units: None,
             });
         }
         if self.holder_pool.queued_holds() > 0 {
@@ -11076,6 +11079,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                      the owed rows and held decisions retry after the queued hooks drain"
                     .into(),
                 budget: None,
+                units: None,
             });
         }
     }

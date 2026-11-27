@@ -4285,6 +4285,7 @@ impl LaneHost<Pin> for ContinuationHost {
             NativeBatch::Lifecycle(_) => "stage:lifecycle",
             NativeBatch::Finish { .. } => "stage:finish",
             NativeBatch::Semantic(_) => "stage:semantic",
+            NativeBatch::Info(_) => "stage:info",
         });
         if matches!(batch, NativeBatch::Finish { .. }) {
             self.finishes += 1;

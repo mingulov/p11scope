@@ -6678,7 +6678,8 @@ impl CallerRegistry {
                     | Mutation::RecordKeyedGap { .. }
                     | Mutation::RecordNote { .. }
                     | Mutation::ClassifyGap { .. }
-                    | Mutation::RecordAggregatedUnrouted { .. } => false,
+                    | Mutation::RecordAggregatedUnrouted { .. }
+                    | Mutation::RecordAggregatedExhaustion { .. } => false,
                 }
             })
             .count()
@@ -7334,6 +7335,7 @@ impl CallerRegistry {
                 subject: subject.clone(),
                 reason: old,
                 budget: old_budget,
+                units: None,
             });
             self.gap_index.insert(
                 RegistryGap {
@@ -7343,6 +7345,7 @@ impl CallerRegistry {
                     subject,
                     reason,
                     budget,
+                    units: None,
                 },
                 index,
             );
@@ -7361,9 +7364,10 @@ impl CallerRegistry {
             subject,
             reason,
             budget,
+            units: None,
         };
         let before = self.gaps.len();
-        self.push_gap_as(gap.clone(), terminal);
+        self.push_gap_as(gap.clone(), terminal, false);
         if let Some(&index) = self.gap_index.get(&gap) {
             if let Some(aggregate) = self.exhaustion_aggregate.as_mut() {
                 aggregate.gap_index = Some(index);
@@ -12372,6 +12376,7 @@ pub(crate) mod tests {
             subject: "unrelated".into(),
             reason: "an unrelated gap past the cap".into(),
             budget: None,
+            units: None,
         });
         registry.publish();
         assert_eq!(registry.gaps().len(), 1, "{:?}", registry.gaps());
@@ -12392,6 +12397,7 @@ pub(crate) mod tests {
             subject: "unrelated".into(),
             reason: "the gap that fills the cap".into(),
             budget: None,
+            units: None,
         });
         registry.publish();
         registry.record_aggregated_exhaustion(1, 66_000, 65_536);

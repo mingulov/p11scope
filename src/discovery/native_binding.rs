@@ -1513,7 +1513,10 @@ impl NativeBinder {
                 sighted_ns: None,
             }),
             retained: None,
+            retained_is_exit: false,
+            read_healthy: true,
             resight_due: false,
+            exit_retry_owed: false,
             last_attempt: None,
         });
         self.census.pending = self.census.pending.saturating_add(1);
@@ -1551,7 +1554,10 @@ impl NativeBinder {
                 exec_observed: true,
                 lifecycle: CallerLifecycle::Exited,
             }),
+            retained_is_exit: false,
+            read_healthy: true,
             resight_due: false,
+            exit_retry_owed: false,
             last_attempt: None,
         });
         self.census.pending = self.census.pending.saturating_add(1);
@@ -1568,7 +1574,7 @@ impl NativeBinder {
         }
         self.domains[index].lifecycle_ns = Some(2);
         self.domains[index].health_ns = Some(2);
-        self.decide_ready(index);
+        self.decide_ready(index, None);
     }
 
     /// Test-only: every caller still bound to a cookie sequence.
